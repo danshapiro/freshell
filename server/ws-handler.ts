@@ -1899,12 +1899,40 @@ export class WsHandler {
         let error = false
         let rateLimited = false
         const requestedSessionRef = normalizeUiSessionLocator(m.sessionRef)
+        let codexDurabilityForDecision = m.codexDurability
+        if (m.mode === 'codex' && !requestedSessionRef && !codexDurabilityForDecision) {
+          try {
+            codexDurabilityForDecision = await this.registry.readCodexDurabilityForRestoreLocator({
+              ...(m.liveTerminal?.terminalId ? { terminalId: m.liveTerminal.terminalId } : {}),
+              ...(m.tabId ? { tabId: m.tabId } : {}),
+              ...(m.paneId ? { paneId: m.paneId } : {}),
+              ...(m.liveTerminal?.serverInstanceId ? { serverInstanceId: m.liveTerminal.serverInstanceId } : {}),
+            })
+          } catch (err) {
+            error = true
+            log.warn({
+              err,
+              requestId: m.requestId,
+              connectionId: ws.connectionId,
+              tabId: m.tabId,
+              paneId: m.paneId,
+              terminalId: m.liveTerminal?.terminalId,
+            }, 'Failed to resolve Codex durability record for restore locator')
+            this.sendError(ws, {
+              code: 'RESTORE_UNAVAILABLE',
+              message: 'Codex restore identity is ambiguous or unavailable.',
+              requestId: m.requestId,
+            })
+            endCreateTimer({ error, rateLimited })
+            return
+          }
+        }
         const codexRestorePlan = m.mode === 'codex'
           ? planCodexCreateRestoreDecision({
             restoreRequested: m.restore === true,
             legacyResumeSessionId: m.resumeSessionId,
             sessionRef: requestedSessionRef,
-            codexDurability: m.codexDurability,
+            codexDurability: codexDurabilityForDecision,
           })
           : undefined
         let effectiveResumeSessionId: string | undefined
@@ -2104,7 +2132,7 @@ export class WsHandler {
                   restoreRequested: m.restore === true,
                   legacyResumeSessionId: m.resumeSessionId,
                   sessionRef: requestedSessionRef,
-                  codexDurability: m.codexDurability,
+                  codexDurability: codexDurabilityForDecision,
                   findLiveTerminalByCandidate: (candidate) => (
                     this.registry.findRunningCodexTerminalByCandidate(
                       candidate.candidateThreadId,
@@ -2196,7 +2224,7 @@ export class WsHandler {
                 }
               }
 
-              if (!m.codexDurability?.candidate) {
+              if (!codexDurabilityForDecision?.candidate) {
                 const live = requestedLiveTerminal()
                 if (live) {
                   await attachReusedTerminal(live.terminalId, live.createdAt, live.resumeSessionId)

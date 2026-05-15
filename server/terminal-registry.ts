@@ -32,7 +32,10 @@ import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-
 import { generateMcpInjection, cleanupMcpConfig } from './mcp/config-writer.js'
 import type { CodexLaunchPlan, CodexLaunchSidecar } from './coding-cli/codex-app-server/launch-planner.js'
 import { isCodexSidecarTeardownError } from './coding-cli/codex-app-server/launch-planner.js'
-import { CodexDurabilityStore } from './coding-cli/codex-app-server/durability-store.js'
+import {
+  CodexDurabilityStore,
+  type CodexDurabilityRestoreLocator,
+} from './coding-cli/codex-app-server/durability-store.js'
 import { proofCodexRollout } from './coding-cli/codex-app-server/durability-proof.js'
 import type { CodexRemoteProxyCandidate } from './coding-cli/codex-app-server/remote-proxy.js'
 import type { CodexTurnEvent } from './coding-cli/codex-app-server/client.js'
@@ -1722,6 +1725,11 @@ export class TerminalRegistry extends EventEmitter {
       ...(record.durableThreadId ? { durableThreadId: record.durableThreadId } : {}),
       ...(record.nonRestorableReason ? { nonRestorableReason: record.nonRestorableReason } : {}),
     }
+  }
+
+  async readCodexDurabilityForRestoreLocator(locator: CodexDurabilityRestoreLocator): Promise<CodexDurabilityRef | undefined> {
+    const record = await this.codexDurabilityStore.readForRestoreLocator(locator)
+    return record ? this.codexDurabilityRecordToRef(record) : undefined
   }
 
   private async writeCodexDurability(record: TerminalRecord, durability: CodexDurabilityRef, updatedAt = Date.now()): Promise<CodexDurabilityRef> {

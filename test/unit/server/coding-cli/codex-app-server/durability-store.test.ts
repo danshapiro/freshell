@@ -2,7 +2,10 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { CodexDurabilityStore } from '../../../../../server/coding-cli/codex-app-server/durability-store.js'
+import {
+  CodexDurabilityRestoreAmbiguousError,
+  CodexDurabilityStore,
+} from '../../../../../server/coding-cli/codex-app-server/durability-store.js'
 import type { CodexDurabilityStoreRecord } from '../../../../../shared/codex-durability.js'
 
 let tempDir: string
@@ -72,6 +75,51 @@ describe('CodexDurabilityStore', () => {
     const store = new CodexDurabilityStore({ dir: tempDir })
 
     await expect(store.read('legacy-terminal')).resolves.toBeUndefined()
+  })
+
+  it('finds restore records by terminal id', async () => {
+    const store = new CodexDurabilityStore({ dir: tempDir })
+    const stored = await store.write(record())
+
+    await expect(store.readForRestoreLocator({ terminalId: 'term-1' })).resolves.toEqual(stored)
+  })
+
+  it('finds restore records by exact tab and pane identity', async () => {
+    const store = new CodexDurabilityStore({ dir: tempDir })
+    const stored = await store.write(record())
+
+    await expect(store.readForRestoreLocator({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      serverInstanceId: 'srv-1',
+    })).resolves.toEqual(stored)
+  })
+
+  it('does not match a wrong pane or server instance', async () => {
+    const store = new CodexDurabilityStore({ dir: tempDir })
+    await store.write(record())
+
+    await expect(store.readForRestoreLocator({
+      tabId: 'tab-1',
+      paneId: 'pane-other',
+      serverInstanceId: 'srv-1',
+    })).resolves.toBeUndefined()
+    await expect(store.readForRestoreLocator({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      serverInstanceId: 'srv-other',
+    })).resolves.toBeUndefined()
+  })
+
+  it('reports ambiguity instead of choosing by time', async () => {
+    const store = new CodexDurabilityStore({ dir: tempDir })
+    await store.write(record({ terminalId: 'term-1' }))
+    await store.write(record({ terminalId: 'term-2', updatedAt: Date.now() + 10 }))
+
+    await expect(store.readForRestoreLocator({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+    })).rejects.toBeInstanceOf(CodexDurabilityRestoreAmbiguousError)
   })
 
   it('deletes records idempotently', async () => {

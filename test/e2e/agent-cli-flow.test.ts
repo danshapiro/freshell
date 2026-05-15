@@ -138,6 +138,15 @@ async function waitForExpect(assertions: () => void, timeoutMs = 2000, intervalM
   throw lastError ?? new Error('Timed out waiting for expectations to pass')
 }
 
+function findPaneContent(node: any, paneId: string): any | undefined {
+  if (!node) return undefined
+  if (node.type === 'leaf') return node.id === paneId ? node.content : undefined
+  if (node.type === 'split') {
+    return findPaneContent(node.children?.[0], paneId) ?? findPaneContent(node.children?.[1], paneId)
+  }
+  return undefined
+}
+
 describe('cli e2e flow', () => {
   it('runs list-tabs end-to-end', async () => {
     const { url, close } = await startTestServer()
@@ -422,6 +431,87 @@ describe('cli e2e flow', () => {
         expect(snapshot.paneTitles[created.data.tabId][created.data.paneId]).toBe('Main shell')
         expect(snapshot.tabs.find((tab: any) => tab.id === created.data.tabId)?.title).toBe('Main shell')
       })
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('passes canonical Codex session refs through new-tab, split-pane, and respawn-pane', async () => {
+    const server = await startTestServerWithRealLayoutStore()
+    try {
+      const created = await runCliJson<{ data: { tabId: string; paneId: string } }>(server.url, [
+        'new-tab',
+        '--mode',
+        'codex',
+        '--session-ref',
+        'codex:thread-cli-new',
+      ])
+      const tabId = created.data.tabId
+      const firstPaneId = created.data.paneId
+
+      await waitForExpect(() => {
+        const snapshot = (server.layoutStore as any).snapshot
+        expect(findPaneContent(snapshot.layouts[tabId], firstPaneId)).toEqual(expect.objectContaining({
+          mode: 'codex',
+          sessionRef: { provider: 'codex', sessionId: 'thread-cli-new' },
+        }))
+      })
+
+      const split = await runCliJson<{ data: { paneId: string } }>(server.url, [
+        'split-pane',
+        '-t',
+        firstPaneId,
+        '--mode',
+        'codex',
+        '--session-ref=codex:thread-cli-split',
+      ])
+
+      await runCliJson<{ data: { terminalId: string } }>(server.url, [
+        'respawn-pane',
+        '-t',
+        firstPaneId,
+        '--mode',
+        'codex',
+        '--session-ref',
+        'codex:thread-cli-respawn',
+      ])
+
+      await waitForExpect(() => {
+        const snapshot = (server.layoutStore as any).snapshot
+        expect(findPaneContent(snapshot.layouts[tabId], firstPaneId)).toEqual(expect.objectContaining({
+          mode: 'codex',
+          sessionRef: { provider: 'codex', sessionId: 'thread-cli-respawn' },
+        }))
+        expect(findPaneContent(snapshot.layouts[tabId], split.data.paneId)).toEqual(expect.objectContaining({
+          mode: 'codex',
+          sessionRef: { provider: 'codex', sessionId: 'thread-cli-split' },
+        }))
+      })
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('rejects raw Codex resume ids in new-tab, split-pane, and respawn-pane', async () => {
+    const server = await startTestServerWithRealLayoutStore()
+    try {
+      const created = await runCliJson<{ data: { paneId: string } }>(server.url, [
+        'new-tab',
+        '--mode',
+        'codex',
+      ])
+
+      const commands = [
+        ['new-tab', '--mode', 'codex', '--resume', 'thread-raw-new'],
+        ['split-pane', '-t', created.data.paneId, '--mode', 'codex', '--resume', 'thread-raw-split'],
+        ['respawn-pane', '-t', created.data.paneId, '--mode', 'codex', '--resume', 'thread-raw-respawn'],
+      ]
+
+      for (const args of commands) {
+        const output = await runCliResult(server.url, args)
+        expect(output.code).toBe(1)
+        expect(output.stderr).toContain('Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.')
+      }
     } finally {
       await server.close()
     }

@@ -249,6 +249,7 @@ async function sendTerminalInput(
       resolve(result)
     }
     const retry = () => {
+      if (settled) return
       const next = registry.input(terminalId, data) as TerminalInputResult
       if (next.status === 'blocked_codex_identity_pending') return
       finish(next)
@@ -929,7 +930,9 @@ export function createAgentApiRouter({
 
       const sentinel = `__FRESHELL_DONE_${nanoid()}__`
       const input = capture ? `${command}; echo ${sentinel}\r` : `${command}\r`
-      const inputResult = registry.input(terminal.terminalId, input) as TerminalInputResult
+      const inputResult = await sendTerminalInput(registry, terminal.terminalId, input, {
+        waitForCodexIdentity: mode === 'codex',
+      })
       if (inputResult.status !== 'written') {
         throw new Error(terminalInputFailureMessage(inputResult))
       }

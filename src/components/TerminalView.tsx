@@ -2301,7 +2301,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           // (e.g., due to permission errors on cwd). User must explicitly restart.
           if (currentTerminalId && current?.status !== 'exited') {
             const hasCodexCapturedRestoreState = current?.mode === 'codex' && Boolean(current.codexDurability?.candidate)
-            if (!current?.sessionRef && !hasCodexCapturedRestoreState) {
+            const canAskServerForCodexRestoreState = current?.mode === 'codex'
+            if (!current?.sessionRef && !hasCodexCapturedRestoreState && !canAskServerForCodexRestoreState) {
               const restoreDiagnostic = {
                 event: 'restore_unavailable' as const,
                 reason: 'dead_live_handle' as const,

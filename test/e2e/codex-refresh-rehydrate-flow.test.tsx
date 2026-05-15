@@ -591,7 +591,7 @@ describe('codex refresh rehydrate flow (e2e)', () => {
     expect(sentMessages().some((msg) => msg?.type === 'terminal.create')).toBe(false)
   })
 
-  it('surfaces restore-unavailable instead of starting a fresh Codex session when a live-only terminal is gone', async () => {
+  it('asks the server to recover live-only Codex panes when the old terminal is gone', async () => {
     const tabId = 'tab-codex-live-only'
     const paneId = 'pane-codex-live-only'
     const store = createStore({
@@ -651,11 +651,14 @@ describe('codex refresh rehydrate flow (e2e)', () => {
     })
 
     await waitFor(() => {
-      expect(sentMessages().slice(baselineMessages).some((msg) => msg?.type === 'terminal.create')).toBe(false)
-      expect((getTerminalPaneContent(store, tabId) as any)?.restoreError).toEqual({
-        code: 'RESTORE_UNAVAILABLE',
-        reason: 'dead_live_handle',
+      const recreated = sentMessages().slice(baselineMessages).find((msg) => msg?.type === 'terminal.create')
+      expect(recreated).toMatchObject({
+        type: 'terminal.create',
+        mode: 'codex',
+        restore: true,
       })
+      expect(recreated?.sessionRef).toBeUndefined()
+      expect(recreated?.codexDurability).toBeUndefined()
     })
   })
 })

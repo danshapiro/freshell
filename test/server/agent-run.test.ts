@@ -107,16 +107,25 @@ it('uses the Codex planner and marks fresh /api/run sessions as starts', async (
   expect(codexLaunchPlanner.sidecar.adoptCalls).toEqual([{ terminalId: 'term1', generation: 0 }])
 })
 
-it('rejects fresh Codex /api/run input while restore identity is pending', async () => {
-  const registry = {
+it('waits for fresh Codex /api/run restore identity before sending input', async () => {
+  const emitter = new EventEmitter()
+  let identityReady = false
+  const registry = Object.assign(emitter, {
     create: vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term1' })),
     get: vi.fn(() => ({
       status: 'running',
       codexInputGate: { state: 'identity_pending' },
     })),
-    input: vi.fn(() => ({ status: 'blocked_codex_identity_pending', terminalId: 'term1' })),
+    input: vi.fn(() => {
+      if (identityReady) return { status: 'written' }
+      queueMicrotask(() => {
+        identityReady = true
+        emitter.emit('terminal.codex.durability.updated', { terminalId: 'term1' })
+      })
+      return { status: 'blocked_codex_identity_pending', terminalId: 'term1' }
+    }),
     killAndWait: vi.fn(async () => true),
-  }
+  })
   const codexLaunchPlanner = new FakeCodexLaunchPlanner()
 
   const app = express()
@@ -132,10 +141,11 @@ it('rejects fresh Codex /api/run input while restore identity is pending', async
 
   const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
 
-  expect(res.status).toBe(500)
-  expect(res.body.message).toBe('Codex restore identity is not ready yet.')
-  expect(registry.input).toHaveBeenCalledTimes(1)
-  expect(registry.killAndWait).toHaveBeenCalledWith('term1')
+  expect(res.status).toBe(200)
+  expect(res.body.status).toBe('ok')
+  expect(res.body.message).toBe('command sent')
+  expect(registry.input).toHaveBeenCalledTimes(2)
+  expect(registry.killAndWait).not.toHaveBeenCalled()
 })
 
 it('does not buffer pending Codex /api/run input even if the terminal exits later', async () => {
@@ -171,7 +181,7 @@ it('does not buffer pending Codex /api/run input even if the terminal exits late
   const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
 
   expect(res.status).toBe(500)
-  expect(res.body.message).toBe('Codex restore identity is not ready yet.')
+  expect(res.body.message).toBe('Terminal is not running.')
   expect(registry.input).toHaveBeenCalledTimes(1)
   expect(registry.killAndWait).toHaveBeenCalledWith('term1')
 })

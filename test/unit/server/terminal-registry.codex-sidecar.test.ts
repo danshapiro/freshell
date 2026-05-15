@@ -399,6 +399,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     let writeCount = 0
     const fsImpl = {
       mkdir: fsp.mkdir,
+      readdir: fsp.readdir,
       readFile: fsp.readFile,
       rename: fsp.rename,
       unlink: fsp.unlink,
