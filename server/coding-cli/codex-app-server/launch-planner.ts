@@ -10,8 +10,6 @@ import {
 type CodexRuntimeLike = Pick<
   CodexAppServerRuntime,
   | 'ensureReady'
-  | 'startThread'
-  | 'listLoadedThreads'
   | 'shutdown'
   | 'updateOwnershipMetadata'
   | 'onThreadLifecycleLoss'
@@ -22,7 +20,6 @@ type CodexRuntimeLike = Pick<
 
 export type CodexLaunchSidecar = {
   adopt(input: { terminalId: string; generation: number }): Promise<void>
-  listLoadedThreads(): Promise<string[]>
   markCandidatePersisted?(): void
   onCandidate?(handler: (candidate: CodexRemoteProxyCandidate) => void): () => void
   onTurnStarted?(handler: (event: CodexTurnEvent) => void): () => void
@@ -34,7 +31,6 @@ export type CodexLaunchSidecar = {
   watchPath?(targetPath: string, watchId: string): Promise<{ path: string }>
   unwatchPath?(watchId: string): Promise<void>
   shutdown(): Promise<void>
-  waitForLoadedThread(threadId: string, options?: { timeoutMs?: number; pollMs?: number }): Promise<void>
 }
 
 export type CodexLaunchPlan = {
@@ -194,17 +190,10 @@ export class CodexLaunchPlanner {
         throw new Error('Codex launch sidecar is shutting down; it cannot be adopted.')
       }
     }
-    const assertReadable = () => {
+    const assertActive = () => {
       if (this.shutdownStarted || shutdownAttemptStarted) {
-        throw new Error('Codex launch sidecar is shutting down; loaded-thread readiness polling stopped.')
+        throw new Error('Codex launch sidecar is shutting down; remote operations stopped.')
       }
-    }
-    const waitForNextPoll = async (pollMs: number) => {
-      await Promise.race([
-        new Promise((resolve) => setTimeout(resolve, pollMs)),
-        shutdownStarted,
-      ])
-      assertReadable()
     }
     const sidecar: CodexLaunchSidecar = {
       adopt: async ({ terminalId, generation }) => {
@@ -213,12 +202,6 @@ export class CodexLaunchPlanner {
         assertAdoptable()
         this.activeSidecars.delete(sidecar)
         this.failedSidecarShutdowns.delete(sidecar)
-      },
-      listLoadedThreads: async () => {
-        assertReadable()
-        const loaded = await runtime.listLoadedThreads()
-        assertReadable()
-        return loaded
       },
       markCandidatePersisted: () => getProxy()?.markCandidatePersisted(),
       onCandidate: (handler) => getProxy()?.onCandidate(handler) ?? (() => undefined),
@@ -236,15 +219,15 @@ export class CodexLaunchPlanner {
         }
       },
       watchPath: async (targetPath, watchId) => {
-        assertReadable()
+        assertActive()
         const result = await runtime.watchPath(targetPath, watchId)
-        assertReadable()
+        assertActive()
         return result
       },
       unwatchPath: async (watchId) => {
-        assertReadable()
+        assertActive()
         await runtime.unwatchPath(watchId)
-        assertReadable()
+        assertActive()
       },
       shutdown: async () => {
         if (shutdownSucceeded) return
@@ -278,19 +261,6 @@ export class CodexLaunchPlanner {
             shutdownPromise = null
           }
         }
-      },
-      waitForLoadedThread: async (threadId, options = {}) => {
-        const timeoutMs = options.timeoutMs ?? 10_000
-        const pollMs = options.pollMs ?? 100
-        const deadline = Date.now() + timeoutMs
-
-        while (Date.now() < deadline) {
-          const loaded = await sidecar.listLoadedThreads()
-          if (loaded.includes(threadId)) return
-          await waitForNextPoll(pollMs)
-        }
-
-        throw new Error(`Codex app-server did not load thread ${threadId} within ${timeoutMs}ms.`)
       },
     }
     return sidecar

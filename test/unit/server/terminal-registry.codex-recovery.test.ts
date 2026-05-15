@@ -71,14 +71,11 @@ function deferred<T = void>() {
 }
 
 function createFakeSidecar(options: {
-  waitForLoadedThread?: CodexLaunchSidecar['waitForLoadedThread']
   shutdown?: CodexLaunchSidecar['shutdown']
 } = {}): CodexLaunchSidecar {
   return {
     adopt: vi.fn().mockResolvedValue(undefined),
-    listLoadedThreads: vi.fn().mockResolvedValue([]),
     shutdown: vi.fn(options.shutdown ?? (async () => undefined)),
-    waitForLoadedThread: vi.fn(options.waitForLoadedThread ?? (async () => undefined)),
     onLifecycleLoss: vi.fn(() => vi.fn()),
   }
 }
@@ -124,7 +121,7 @@ describe('TerminalRegistry Codex durable recovery', () => {
 
     oldPty.onExit.mock.calls[0][0]({ exitCode: 1, signal: 0 })
 
-    await vi.waitFor(() => expect(replacementSidecar.waitForLoadedThread).toHaveBeenCalledWith('thread-durable-1', expect.any(Object)))
+    await vi.waitFor(() => expect(replacementSidecar.adopt).toHaveBeenCalledWith({ terminalId: record.terminalId, generation: 1 }))
     await vi.waitFor(() => expect(currentSidecar.shutdown).toHaveBeenCalledTimes(1))
     const [, replacementPty] = await spawnedPtys()
 
@@ -141,16 +138,17 @@ describe('TerminalRegistry Codex durable recovery', () => {
   })
 
   it('blocks input during durable recovery and sends later input only to the replacement PTY', async () => {
-    const readiness = deferred()
+    const planReady = deferred()
     const currentSidecar = createFakeSidecar()
-    const replacementSidecar = createFakeSidecar({
-      waitForLoadedThread: () => readiness.promise,
+    const replacementSidecar = createFakeSidecar()
+    const planCreate = vi.fn(async () => {
+      await planReady.promise
+      return {
+        sessionId: 'thread-durable-1',
+        remote: { wsUrl: 'ws://127.0.0.1:46003/' },
+        sidecar: replacementSidecar,
+      }
     })
-    const planCreate = vi.fn(async () => ({
-      sessionId: 'thread-durable-1',
-      remote: { wsUrl: 'ws://127.0.0.1:46003/' },
-      sidecar: replacementSidecar,
-    }))
     const record = registry.create({
       mode: 'codex',
       cwd: '/repo',
@@ -166,7 +164,7 @@ describe('TerminalRegistry Codex durable recovery', () => {
     const [oldPty] = await spawnedPtys()
 
     oldPty.onExit.mock.calls[0][0]({ exitCode: 1, signal: 0 })
-    await vi.waitFor(() => expect(replacementSidecar.waitForLoadedThread).toHaveBeenCalledTimes(1))
+    await vi.waitFor(() => expect(planCreate).toHaveBeenCalledTimes(1))
 
     expect(registry.input(record.terminalId, 'during recovery')).toEqual({
       status: 'blocked_codex_recovery_pending',
@@ -174,7 +172,7 @@ describe('TerminalRegistry Codex durable recovery', () => {
     })
     expect(oldPty.write).not.toHaveBeenCalledWith('during recovery')
 
-    readiness.resolve()
+    planReady.resolve()
     await vi.waitFor(() => expect(currentSidecar.shutdown).toHaveBeenCalledTimes(1))
     const [, replacementPty] = await spawnedPtys()
 

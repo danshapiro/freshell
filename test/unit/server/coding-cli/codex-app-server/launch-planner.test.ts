@@ -315,7 +315,7 @@ describe('CodexLaunchPlanner', () => {
     await expect(shutdown).rejects.toThrow('fast verified runtime teardown failed')
   })
 
-  it('waits for candidate-local loaded-thread readiness', async () => {
+  it('does not poll loaded-thread state for resume plans', async () => {
     const runtime = new FakeRuntime(
       'ws://127.0.0.1:43020',
       'thread-ready',
@@ -326,24 +326,7 @@ describe('CodexLaunchPlanner', () => {
 
     const plan = await planner.planCreate({ resumeSessionId: 'thread-ready' })
 
-    await expect(plan.sidecar.waitForLoadedThread('thread-ready', { timeoutMs: 1_000, pollMs: 1 }))
-      .resolves.toBeUndefined()
-    expect(runtime.loadedThreadListCalls).toBe(3)
-  })
-
-  it('stops loaded-thread readiness polling after sidecar shutdown starts', async () => {
-    const runtime = new FakeRuntime('ws://127.0.0.1:43021', 'thread-never-loads')
-    const planner = new CodexLaunchPlanner(() => runtime as any)
-
-    const plan = await planner.planCreate({ resumeSessionId: 'thread-never-loads' })
-    const readiness = plan.sidecar.waitForLoadedThread('thread-never-loads', { timeoutMs: 250, pollMs: 20 })
-    await vi.waitFor(() => expect(runtime.loadedThreadListCalls).toBeGreaterThan(0))
-
-    await plan.sidecar.shutdown()
-    await expect(readiness).rejects.toThrow(/shutting down/i)
-
-    const callsAfterShutdown = runtime.loadedThreadListCalls
-    await new Promise((resolve) => setTimeout(resolve, 50))
-    expect(runtime.loadedThreadListCalls).toBe(callsAfterShutdown)
+    expect(plan.sessionId).toBe('thread-ready')
+    expect(runtime.loadedThreadListCalls).toBe(0)
   })
 })

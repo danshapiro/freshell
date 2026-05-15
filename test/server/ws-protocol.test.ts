@@ -229,6 +229,10 @@ class FakeRegistry {
     return undefined
   }
 
+  async readCodexDurabilityForRestoreLocator() {
+    return null
+  }
+
   repairLegacySessionOwners() {
     return { repaired: false, clearedTerminalIds: [] }
   }
@@ -340,8 +344,6 @@ describe('ws protocol', () => {
     codexLaunchPlanner.sidecar.shutdownCalls = 0
     codexLaunchPlanner.sidecar.shutdownStarted = false
     codexLaunchPlanner.sidecar.shutdownError = null
-    codexLaunchPlanner.sidecar.waitForLoadedThreadCalls = []
-    codexLaunchPlanner.sidecar.waitForLoadedThreadError = null
   })
 
   afterAll(async () => {
@@ -788,56 +790,7 @@ describe('ws protocol', () => {
     expect(localRegistry.records.size).toBe(0)
   })
 
-  it('aborts in-flight Codex resume terminal.create when shutdown starts during loaded-list readiness', async () => {
-    const localServer = http.createServer((_req, res) => {
-      res.statusCode = 404
-      res.end()
-    })
-    const localRegistry = new FakeRegistry()
-    const sidecar = new FakeCodexLaunchSidecar()
-    const readiness = deferred()
-    const originalWaitForLoadedThread = sidecar.waitForLoadedThread.bind(sidecar)
-    const localPlanner = new FakeCodexLaunchPlanner({
-      sessionId: 'thread-during-readiness',
-      remote: { wsUrl: DEFAULT_CODEX_REMOTE_WS_URL },
-      sidecar,
-    })
-    const localHandler = new WsHandler(localServer, localRegistry as any, { codexLaunchPlanner: localPlanner })
-    vi.spyOn(sidecar, 'waitForLoadedThread').mockImplementation(async (threadId, options) => {
-      await originalWaitForLoadedThread(threadId, options)
-      localHandler.close()
-      await readiness.promise
-    })
-    const sent: any[] = []
-    const ws = createOpenFakeWs('shutdown-during-readiness', sent)
-    const state = createAuthenticatedState()
-
-    const message = (localHandler as any).onMessage(
-      ws,
-      state,
-      Buffer.from(JSON.stringify({
-        type: 'terminal.create',
-        requestId: 'shutdown-during-readiness',
-        mode: 'codex',
-        sessionRef: { provider: 'codex', sessionId: 'thread-during-readiness' },
-      })),
-    )
-    await vi.waitFor(() => expect(sidecar.waitForLoadedThreadCalls).toHaveLength(1))
-    readiness.resolve()
-    await message
-
-    expect(sent).toContainEqual(expect.objectContaining({
-      type: 'error',
-      requestId: 'shutdown-during-readiness',
-    }))
-    expect(sidecar.adoptCalls).toHaveLength(1)
-    expect(localRegistry.publishCalls).toEqual([])
-    expect(localRegistry.killCalls).toHaveLength(1)
-    expect(sidecar.shutdownCalls).toBe(1)
-    expect(localRegistry.records.size).toBe(0)
-  })
-
-  it('waits for candidate-local loaded-thread readiness before reporting Codex resume create success', async () => {
+  it('reports Codex resume create success without loaded-thread readiness polling', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
     ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
@@ -859,48 +812,15 @@ describe('ws protocol', () => {
     expect(codexLaunchPlanner.planCreateCalls[0]).toEqual(expect.objectContaining({
       resumeSessionId: 'thread-resume-1',
     }))
-    expect(codexLaunchPlanner.sidecar.waitForLoadedThreadCalls).toEqual([{
-      threadId: 'thread-resume-1',
-      options: undefined,
-    }])
     expect(registry.publishCalls).toEqual([created.terminalId])
 
     await closeWebSocket(ws)
   })
 
-  it('kills the created terminal and sidecar when Codex resume loaded-list readiness fails', async () => {
-    codexLaunchPlanner.sidecar.waitForLoadedThreadError = new Error('resume thread never loaded')
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
-    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
-    await waitForMessage(ws, (msg) => msg.type === 'ready', 5000)
-
-    const requestId = 'codex-resume-loaded-list-fails'
-    ws.send(JSON.stringify({
-      type: 'terminal.create',
-      requestId,
-      mode: 'codex',
-      sessionRef: { provider: 'codex', sessionId: 'thread-missing' },
-    }))
-    const error = await waitForMessage(
-      ws,
-      (msg) => msg.type === 'error' && msg.requestId === requestId,
-      5000,
-    )
-
-    expect(error.message).toContain('resume thread never loaded')
-    expect(codexLaunchPlanner.sidecar.waitForLoadedThreadCalls).toHaveLength(1)
-    expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
-    expect(registry.killCalls).toHaveLength(1)
-    expect(registry.records.size).toBe(0)
-
-    await closeWebSocket(ws)
-  })
-
   it('kills the created terminal and sidecar when the Codex resume PTY exits before publication', async () => {
-    const originalWaitForLoadedThread = codexLaunchPlanner.sidecar.waitForLoadedThread.bind(codexLaunchPlanner.sidecar)
-    const waitSpy = vi.spyOn(codexLaunchPlanner.sidecar, 'waitForLoadedThread').mockImplementation(async (threadId, options) => {
-      await originalWaitForLoadedThread(threadId, options)
+    const originalAdopt = codexLaunchPlanner.sidecar.adopt.bind(codexLaunchPlanner.sidecar)
+    const adoptSpy = vi.spyOn(codexLaunchPlanner.sidecar, 'adopt').mockImplementation(async (input) => {
+      await originalAdopt(input)
       const terminalId = codexLaunchPlanner.sidecar.adoptCalls[0]?.terminalId
       const record = terminalId ? registry.get(terminalId) : null
       if (record) record.status = 'exited'
@@ -925,12 +845,11 @@ describe('ws protocol', () => {
       )
 
       expect(error.message).toContain('Codex terminal PTY exited before create completed')
-      expect(codexLaunchPlanner.sidecar.waitForLoadedThreadCalls).toHaveLength(1)
       expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
       expect(registry.killCalls).toHaveLength(1)
       expect(registry.records.size).toBe(0)
     } finally {
-      waitSpy.mockRestore()
+      adoptSpy.mockRestore()
       await closeWebSocket(ws)
     }
   })

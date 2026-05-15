@@ -174,14 +174,6 @@ async function cleanupUnadoptedCodexLaunch(launch: ResolvedSpawnProviderSettings
   await launch?.codexPlan?.sidecar.shutdown()
 }
 
-async function waitForCodexResumeReadiness(
-  launch: ResolvedSpawnProviderSettings | undefined,
-  requestedResumeSessionId: string | undefined,
-): Promise<void> {
-  if (!launch?.codexPlan || !requestedResumeSessionId) return
-  await launch.codexPlan.sidecar.waitForLoadedThread(requestedResumeSessionId)
-}
-
 function publishCodexLaunch(registry: any, launch: ResolvedSpawnProviderSettings | undefined, terminalId: string): void {
   if (!launch?.codexPlan) return
   registry.publishCodexSidecar?.(terminalId)
@@ -532,8 +524,6 @@ export function createAgentApiRouter({
         const launchResumeSessionId = launch.resumeSessionId
         assertTerminalAdmission()
         await adoptCodexLaunch(launch, terminal.terminalId)
-        assertTerminalAdmission()
-        await waitForCodexResumeReadiness(launch, requestedResumeSessionId)
         assertCodexCreateTerminalRunning(terminal)
         assertTerminalAdmission()
         publishCodexLaunch(registry, launch, terminal.terminalId)
@@ -1049,8 +1039,6 @@ export function createAgentApiRouter({
         const launchResumeSessionId = launch.resumeSessionId
         assertTerminalAdmission()
         await adoptCodexLaunch(launch, terminal.terminalId)
-        assertTerminalAdmission()
-        await waitForCodexResumeReadiness(launch, requestedResumeSessionId)
         assertCodexCreateTerminalRunning(terminal)
         assertTerminalAdmission()
         publishCodexLaunch(registry, launch, terminal.terminalId)
@@ -1288,8 +1276,6 @@ export function createAgentApiRouter({
       const launchResumeSessionId = launch.resumeSessionId
       assertTerminalAdmission()
       await adoptCodexLaunch(launch, terminal.terminalId)
-      assertTerminalAdmission()
-      await waitForCodexResumeReadiness(launch, requestedResumeSessionId)
       assertCodexCreateTerminalRunning(terminal)
       assertTerminalAdmission()
       publishCodexLaunch(registry, launch, terminal.terminalId)

@@ -171,10 +171,6 @@ async function prepareRealProviderCodexHome(targetCodexHome: string): Promise<{ 
   return { sessionId: selected.id }
 }
 
-function stripAnsi(value: string): string {
-  return value.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
-}
-
 afterEach(async () => {
   await Promise.all([...registries].map(async (registry) => {
     registries.delete(registry)
@@ -197,13 +193,6 @@ describe('Codex real-provider smoke', () => {
     const { sessionId } = await prepareRealProviderCodexHome(codexHome)
     const registry = new TerminalRegistry()
     registries.add(registry)
-    const outputChunks: string[] = []
-    const outputHandler = (event: { data?: unknown }) => {
-      if (typeof event.data === 'string') {
-        outputChunks.push(stripAnsi(event.data))
-      }
-    }
-    registry.on('terminal.output.raw', outputHandler)
     const previousCodexHome = process.env.CODEX_HOME
     process.env.CODEX_HOME = codexHome
     const planner = new CodexLaunchPlanner(() => new CodexAppServerRuntime({
@@ -235,14 +224,6 @@ describe('Codex real-provider smoke', () => {
         },
       })
       await resumePlan.sidecar.adopt({ terminalId: term.terminalId, generation: 0 })
-      try {
-        await resumePlan.sidecar.waitForLoadedThread(sessionId, { timeoutMs: 20_000, pollMs: 250 })
-      } catch (error) {
-        const outputTail = outputChunks.join('').slice(-1_000)
-        throw new Error(
-          `${error instanceof Error ? error.message : String(error)}\nCodex TUI output before failure:\n${outputTail}`,
-        )
-      }
       const ownershipId = await readOwnershipId(metadataDir)
 
       await registry.killAndWait(term.terminalId)
@@ -255,7 +236,6 @@ describe('Codex real-provider smoke', () => {
       } else {
         process.env.CODEX_HOME = previousCodexHome
       }
-      registry.off('terminal.output.raw', outputHandler)
     }
   }, 60_000)
 })

@@ -441,7 +441,6 @@ describe('tab endpoints', () => {
       message: INVALID_RAW_CODEX_RESUME_MESSAGE,
     })
     expect(codexLaunchPlanner.planCreateCalls).toEqual([])
-    expect(codexLaunchPlanner.sidecar.waitForLoadedThreadCalls).toEqual([])
     expect(registry.create).not.toHaveBeenCalled()
     expect(registry.killAndWait).not.toHaveBeenCalled()
     expect(layoutStore.createTab).not.toHaveBeenCalled()
@@ -483,7 +482,6 @@ describe('tab endpoints', () => {
     expect(codexLaunchPlanner.planCreateCalls[0]).toEqual(expect.objectContaining({
       resumeSessionId: 'thread-canonical',
     }))
-    expect(codexLaunchPlanner.sidecar.waitForLoadedThreadCalls).toEqual([{ threadId: 'thread-canonical', options: undefined }])
     expect(registry.create).toHaveBeenCalledWith(expect.objectContaining({
       mode: 'codex',
       resumeSessionId: 'thread-canonical',
@@ -540,7 +538,6 @@ describe('tab endpoints', () => {
     expect(res.status).toBe(500)
     expect(res.body.message).toContain('Server is shutting down')
     expect(codexLaunchPlanner.sidecar.adoptCalls).toEqual([{ terminalId: 'term_shutdown_after_adopt', generation: 0 }])
-    expect(codexLaunchPlanner.sidecar.waitForLoadedThreadCalls).toEqual([])
     expect(registry.publishCodexSidecar).not.toHaveBeenCalled()
     expect(registry.killAndWait).toHaveBeenCalledWith('term_shutdown_after_adopt')
     expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)

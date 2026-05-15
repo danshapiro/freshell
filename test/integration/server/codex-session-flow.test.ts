@@ -693,8 +693,6 @@ describe('Codex Session Flow Integration', () => {
       const recovery = {
         planCreate: vi.fn(() => replacementPlanner.planCreate({ resumeSessionId: 'thread-existing-1' })),
         retryDelayMs: 0,
-        readinessTimeoutMs: 1_000,
-        readinessPollMs: 25,
       }
       const term = registry.create({
         mode: 'codex',

@@ -206,8 +206,6 @@ export type CodexRecoveryLaunchInput = {
 export type CodexRecoveryOptions = {
   planCreate(input: CodexRecoveryLaunchInput): Promise<CodexLaunchPlan>
   retryDelayMs?: number
-  readinessTimeoutMs?: number
-  readinessPollMs?: number
 }
 
 function resolveCodingCliCommand(
@@ -2383,10 +2381,6 @@ export class TerminalRegistry extends EventEmitter {
 
       candidate = this.spawnCodexRecoveryPty(record, plan, resumeSessionId)
       await plan.sidecar.adopt({ terminalId: record.terminalId, generation })
-      await plan.sidecar.waitForLoadedThread(resumeSessionId, {
-        ...(recovery.readinessTimeoutMs !== undefined ? { timeoutMs: recovery.readinessTimeoutMs } : {}),
-        ...(recovery.readinessPollMs !== undefined ? { pollMs: recovery.readinessPollMs } : {}),
-      })
       if (candidate.exited) {
         throw new Error(`Codex recovery candidate PTY exited before publication with code ${candidate.exitCode ?? 'unknown'}.`)
       }

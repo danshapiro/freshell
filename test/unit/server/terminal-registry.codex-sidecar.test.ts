@@ -73,7 +73,7 @@ function deferred<T = void>() {
 }
 
 function createFakeSidecar(options: {
-  waitForLoadedThread?: () => Promise<void>
+  adopt?: () => Promise<void>
   shutdown?: () => Promise<void>
 } = {}) {
   const lifecycleLossHandlers = new Set<(event: unknown) => void>()
@@ -83,9 +83,7 @@ function createFakeSidecar(options: {
   const repairHandlers = new Set<(event: any) => void>()
   const fsChangedHandlers = new Set<(event: any) => void>()
   return {
-    adopt: vi.fn(async () => undefined),
-    listLoadedThreads: vi.fn(async () => ['thread-1']),
-    waitForLoadedThread: vi.fn(options.waitForLoadedThread ?? (async () => undefined)),
+    adopt: vi.fn(options.adopt ?? (async () => undefined)),
     shutdown: vi.fn(options.shutdown ?? (async () => undefined)),
     markCandidatePersisted: vi.fn(),
     watchPath: vi.fn(async (targetPath: string) => ({ path: targetPath })),
@@ -908,7 +906,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         terminalId: term.terminalId,
         resumeSessionId: 'thread-final-recovery',
       })))
-      await vi.waitFor(() => expect(replacementSidecar.waitForLoadedThread).toHaveBeenCalledWith('thread-final-recovery', expect.any(Object)))
+      await vi.waitFor(() => expect(replacementSidecar.adopt).toHaveBeenCalledWith({ terminalId: term.terminalId, generation: 1 }))
       expect(registry.get(term.terminalId)?.codexDurability).toMatchObject({
         state: 'durable',
         durableThreadId: 'thread-final-recovery',
@@ -1094,7 +1092,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
 
     expect(currentSidecar.onLifecycleLoss).toHaveBeenCalledTimes(1)
     currentSidecar.emitLifecycleLoss({ method: 'thread/status/changed', threadId: 'thread-1', status: 'notLoaded' })
-    await vi.waitFor(() => expect(replacementSidecar.waitForLoadedThread).toHaveBeenCalledWith('thread-1', expect.any(Object)))
+    await vi.waitFor(() => expect(replacementSidecar.adopt).toHaveBeenCalledWith({ terminalId: term.terminalId, generation: 1 }))
 
     expect(registry.get(term.terminalId)?.status).toBe('running')
     expect(planCreate).toHaveBeenCalledWith(expect.objectContaining({
@@ -1169,7 +1167,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
 
     registry.publishCodexSidecar(term.terminalId)
     currentSidecar.emitLifecycleLoss({ method: 'thread/closed', threadId: 'thread-1' })
-    await vi.waitFor(() => expect(replacementSidecar.waitForLoadedThread).toHaveBeenCalledWith('thread-1', expect.any(Object)))
+    await vi.waitFor(() => expect(replacementSidecar.adopt).toHaveBeenCalledWith({ terminalId: term.terminalId, generation: 1 }))
 
     expect(planCreate).toHaveBeenCalledTimes(1)
   })
@@ -1249,8 +1247,8 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     const registry = new TerminalRegistry()
     const currentSidecar = createFakeSidecar()
     const replacementSidecar = createFakeSidecar({
-      waitForLoadedThread: async () => {
-        throw new Error('candidate never became ready')
+      adopt: async () => {
+        mockPtyProcess.instances[1]._emitExit(42)
       },
       shutdown: async () => {
         throw new Error('candidate sidecar teardown failed')
@@ -1326,8 +1324,8 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       .mockRejectedValueOnce(new Error('candidate verified teardown failed'))
       .mockResolvedValueOnce(undefined)
     const replacementSidecar = createFakeSidecar({
-      waitForLoadedThread: async () => {
-        throw new Error('candidate never became ready')
+      adopt: async () => {
+        mockPtyProcess.instances[1]._emitExit(42)
       },
       shutdown: candidateShutdown,
     })
@@ -1364,8 +1362,8 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       .mockRejectedValueOnce(new Error('candidate verified teardown failed'))
       .mockResolvedValueOnce(undefined)
     const replacementSidecar = createFakeSidecar({
-      waitForLoadedThread: async () => {
-        throw new Error('candidate never became ready')
+      adopt: async () => {
+        mockPtyProcess.instances[1]._emitExit(42)
       },
       shutdown: candidateShutdown,
     })
@@ -1393,12 +1391,13 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     expect(replacementSidecar.shutdown).toHaveBeenCalledTimes(2)
   })
 
-  it('does not publish a recovery candidate whose PTY exited before readiness completed', async () => {
+  it('does not publish a recovery candidate whose PTY exited before publication', async () => {
     const registry = new TerminalRegistry()
     const currentSidecar = createFakeSidecar()
-    const readiness = deferred()
     const firstCandidate = createFakeSidecar({
-      waitForLoadedThread: () => readiness.promise,
+      adopt: async () => {
+        mockPtyProcess.instances[1]._emitExit(42)
+      },
     })
     const secondCandidate = createFakeSidecar()
     const planCreate = vi.fn()
@@ -1425,9 +1424,6 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     })
 
     currentSidecar.emitLifecycleLoss({ method: 'thread/closed', threadId: 'thread-1' })
-    await vi.waitFor(() => expect(firstCandidate.waitForLoadedThread).toHaveBeenCalledTimes(1))
-    mockPtyProcess.instances[1]._emitExit(42)
-    readiness.resolve()
 
     await vi.waitFor(() => expect(firstCandidate.shutdown).toHaveBeenCalledTimes(1))
     await vi.waitFor(() => expect(secondCandidate.adopt).toHaveBeenCalledTimes(1))
@@ -1484,8 +1480,8 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     const currentSidecar = createFakeSidecar()
     const firstShutdown = deferred()
     const firstCandidate = createFakeSidecar({
-      waitForLoadedThread: async () => {
-        throw new Error('candidate not ready')
+      adopt: async () => {
+        mockPtyProcess.instances[1]._emitExit(42)
       },
       shutdown: () => firstShutdown.promise,
     })
@@ -1523,7 +1519,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     await vi.waitFor(() => expect(secondCandidate.adopt).toHaveBeenCalled())
   })
 
-  it('does not grow active recovery candidates across repeated readiness failures', async () => {
+  it('does not grow active recovery candidates across repeated recovery candidate exits', async () => {
     const registry = new TerminalRegistry()
     const currentSidecar = createFakeSidecar()
     let activeCandidates = 0
@@ -1536,9 +1532,10 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         sessionId: 'thread-1',
         remote: { wsUrl: `ws://127.0.0.1:${43124 + attempt}` },
         sidecar: createFakeSidecar({
-          waitForLoadedThread: async () => {
-            if (attempt >= 3) return
-            throw new Error('candidate not ready')
+          adopt: async () => {
+            if (attempt < 3) {
+              mockPtyProcess.instances[attempt]._emitExit(42)
+            }
           },
           shutdown: async () => {
             activeCandidates -= 1
@@ -1601,10 +1598,10 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
   it('final close with an unpublished recovery candidate awaits candidate shutdown', async () => {
     const registry = new TerminalRegistry()
     const currentSidecar = createFakeSidecar()
-    const readiness = deferred()
+    const adopt = deferred()
     const shutdown = deferred()
     const replacementSidecar = createFakeSidecar({
-      waitForLoadedThread: () => readiness.promise,
+      adopt: () => adopt.promise,
       shutdown: () => shutdown.promise,
     })
     const planCreate = vi.fn(async () => ({
@@ -1625,9 +1622,9 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     })
 
     currentSidecar.emitLifecycleLoss({ method: 'thread/closed', threadId: 'thread-1' })
-    await vi.waitFor(() => expect(replacementSidecar.waitForLoadedThread).toHaveBeenCalledTimes(1))
+    await vi.waitFor(() => expect(replacementSidecar.adopt).toHaveBeenCalledTimes(1))
     const close = registry.killAndWait(term.terminalId)
-    readiness.resolve()
+    adopt.resolve()
     await vi.waitFor(() => expect(replacementSidecar.shutdown).toHaveBeenCalledTimes(1))
 
     let closed = false
@@ -1784,10 +1781,10 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
   it('awaits recovery candidate teardown for exited Codex terminals while shutting down other running terminals', async () => {
     const registry = new TerminalRegistry()
     const currentSidecar = createFakeSidecar()
-    const readiness = deferred()
+    const adopt = deferred()
     const candidateShutdown = deferred()
     const replacementSidecar = createFakeSidecar({
-      waitForLoadedThread: () => readiness.promise,
+      adopt: () => adopt.promise,
       shutdown: () => candidateShutdown.promise,
     })
     const planCreate = vi.fn(async () => ({
@@ -1808,9 +1805,9 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     })
 
     currentSidecar.emitLifecycleLoss({ method: 'thread/closed', threadId: 'thread-1' })
-    await vi.waitFor(() => expect(replacementSidecar.waitForLoadedThread).toHaveBeenCalledTimes(1))
+    await vi.waitFor(() => expect(replacementSidecar.adopt).toHaveBeenCalledTimes(1))
     registry.kill(codexTerm.terminalId)
-    readiness.resolve()
+    adopt.resolve()
     await vi.waitFor(() => expect(replacementSidecar.shutdown).toHaveBeenCalledTimes(1))
 
     registry.create({ mode: 'shell' })

@@ -2560,10 +2560,8 @@ describe('TerminalRegistry', () => {
     }> = {}) {
       return {
         adopt: vi.fn().mockResolvedValue(undefined),
-        listLoadedThreads: vi.fn().mockResolvedValue([]),
         markCandidatePersisted: vi.fn(),
         shutdown: vi.fn(overrides.shutdown ?? (async () => undefined)),
-        waitForLoadedThread: vi.fn().mockResolvedValue(undefined),
         onLifecycleLoss: vi.fn(overrides.onLifecycleLoss ?? (() => vi.fn())),
       }
     }

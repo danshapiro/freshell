@@ -2437,10 +2437,6 @@ export class WsHandler {
               if (codexPlan) {
                 await codexPlan.sidecar.adopt({ terminalId: record.terminalId, generation: 0 })
                 this.assertTerminalCreateAccepted()
-                if (requestedCodexResumeSessionId) {
-                  await codexPlan.sidecar.waitForLoadedThread(requestedCodexResumeSessionId)
-                  this.assertTerminalCreateAccepted()
-                }
                 assertCodexCreateTerminalRunning(record)
                 this.assertTerminalCreateAccepted()
                 this.registry.publishCodexSidecar?.(record.terminalId)
