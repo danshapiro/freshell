@@ -1900,14 +1900,17 @@ export class WsHandler {
         let rateLimited = false
         const requestedSessionRef = normalizeUiSessionLocator(m.sessionRef)
         let codexDurabilityForDecision = m.codexDurability
-        if (m.mode === 'codex' && !requestedSessionRef && !codexDurabilityForDecision) {
+        let codexDurabilityStoreRecordTerminalId: string | undefined
+        if (m.mode === 'codex' && m.restore === true && !requestedSessionRef && !codexDurabilityForDecision) {
           try {
-            codexDurabilityForDecision = await this.registry.readCodexDurabilityForRestoreLocator({
+            const restoreRecord = await this.registry.readCodexDurabilityRecordForRestoreLocator({
               ...(m.liveTerminal?.terminalId ? { terminalId: m.liveTerminal.terminalId } : {}),
               ...(m.tabId ? { tabId: m.tabId } : {}),
               ...(m.paneId ? { paneId: m.paneId } : {}),
               ...(m.liveTerminal?.serverInstanceId ? { serverInstanceId: m.liveTerminal.serverInstanceId } : {}),
             })
+            codexDurabilityForDecision = restoreRecord?.durability
+            codexDurabilityStoreRecordTerminalId = restoreRecord?.terminalId
           } catch (err) {
             error = true
             log.warn({
@@ -2127,6 +2130,14 @@ export class WsHandler {
 
               let clearCodexDurabilityOnCreate = false
               let restoreErrorOnCreate: RestoreError | undefined
+              let codexDurabilityStoreRecordToDeleteOnSuccessfulUse: string | undefined
+              const deleteCodexDurabilityStoreRecord = async (recordTerminalId: string | undefined, reason: string) => {
+                if (!recordTerminalId) return
+                await this.registry.deleteCodexDurabilityStoreRecord(recordTerminalId, reason)
+                if (codexDurabilityStoreRecordToDeleteOnSuccessfulUse === recordTerminalId) {
+                  codexDurabilityStoreRecordToDeleteOnSuccessfulUse = undefined
+                }
+              }
               if (m.mode === 'codex') {
                 const decision = await resolveCodexCreateRestoreDecision({
                   restoreRequested: m.restore === true,
@@ -2161,6 +2172,12 @@ export class WsHandler {
                 } else if (decision.kind === 'proof_succeeded_resume_durable') {
                   const { candidate, liveTerminal: live } = decision
                   if (live) {
+                    if (codexDurabilityStoreRecordTerminalId && codexDurabilityStoreRecordTerminalId !== live.terminalId) {
+                      await deleteCodexDurabilityStoreRecord(
+                        codexDurabilityStoreRecordTerminalId,
+                        'restore_proof_succeeded_attached_live',
+                      )
+                    }
                     const promoted = typeof this.registry.promoteCodexDurabilityFromCreateProof === 'function'
                       ? await this.registry.promoteCodexDurabilityFromCreateProof(live.terminalId, decision.sessionId)
                       : undefined
@@ -2192,6 +2209,7 @@ export class WsHandler {
                     }, 'Codex captured restore state proved durable but live terminal binding failed')
                   }
                   effectiveResumeSessionId = decision.sessionId
+                  codexDurabilityStoreRecordToDeleteOnSuccessfulUse = codexDurabilityStoreRecordTerminalId
                   log.info({
                     requestId: m.requestId,
                     connectionId: ws.connectionId,
@@ -2207,6 +2225,12 @@ export class WsHandler {
                     rolloutPath: candidate.rolloutPath,
                     reason: proof.reason,
                   }, 'Codex captured restore state could not be proved during terminal.create')
+                  if (codexDurabilityStoreRecordTerminalId && codexDurabilityStoreRecordTerminalId !== live.terminalId) {
+                    await deleteCodexDurabilityStoreRecord(
+                      codexDurabilityStoreRecordTerminalId,
+                      'restore_proof_failed_attached_live',
+                    )
+                  }
                   await attachReusedTerminal(live.terminalId, live.createdAt, live.resumeSessionId)
                   return
                 } else if (decision.kind === 'proof_failed_fresh_create') {
@@ -2218,6 +2242,10 @@ export class WsHandler {
                     rolloutPath: candidate.rolloutPath,
                     reason: proof.reason,
                   }, 'Codex captured restore state could not be proved during terminal.create')
+                  await deleteCodexDurabilityStoreRecord(
+                    codexDurabilityStoreRecordTerminalId,
+                    'restore_proof_failed_fresh_create',
+                  )
                   clearCodexDurabilityOnCreate = decision.clearCodexDurability
                   restoreErrorOnCreate = decision.restoreError
                   effectiveResumeSessionId = undefined
@@ -2248,6 +2276,10 @@ export class WsHandler {
                   )
                 }
                 if (existing) {
+                  await deleteCodexDurabilityStoreRecord(
+                    codexDurabilityStoreRecordToDeleteOnSuccessfulUse,
+                    'restore_proof_succeeded_attached_existing',
+                  )
                   await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
                   return
                 }
@@ -2308,6 +2340,10 @@ export class WsHandler {
                   )
                 }
                 if (existing) {
+                  await deleteCodexDurabilityStoreRecord(
+                    codexDurabilityStoreRecordToDeleteOnSuccessfulUse,
+                    'restore_proof_succeeded_attached_existing',
+                  )
                   await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
                   return
                 }
@@ -2452,6 +2488,10 @@ export class WsHandler {
                   })
                 }
               }
+              await deleteCodexDurabilityStoreRecord(
+                codexDurabilityStoreRecordToDeleteOnSuccessfulUse,
+                'restore_proof_succeeded_created_replacement',
+              )
               this.assertTerminalCreateAccepted()
 
               if (m.mode !== 'shell' && typeof m.cwd === 'string' && m.cwd.trim()) {

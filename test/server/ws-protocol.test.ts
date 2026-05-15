@@ -229,9 +229,15 @@ class FakeRegistry {
     return undefined
   }
 
+  async readCodexDurabilityRecordForRestoreLocator() {
+    return null
+  }
+
   async readCodexDurabilityForRestoreLocator() {
     return null
   }
+
+  async deleteCodexDurabilityStoreRecord() {}
 
   repairLegacySessionOwners() {
     return { repaired: false, clearedTerminalIds: [] }

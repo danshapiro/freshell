@@ -208,6 +208,11 @@ export type CodexRecoveryOptions = {
   retryDelayMs?: number
 }
 
+export type CodexDurabilityRestoreRecord = {
+  terminalId: string
+  durability: CodexDurabilityRef
+}
+
 function resolveCodingCliCommand(
   mode: TerminalMode,
   resumeSessionId?: string,
@@ -1726,8 +1731,22 @@ export class TerminalRegistry extends EventEmitter {
   }
 
   async readCodexDurabilityForRestoreLocator(locator: CodexDurabilityRestoreLocator): Promise<CodexDurabilityRef | undefined> {
+    return (await this.readCodexDurabilityRecordForRestoreLocator(locator))?.durability
+  }
+
+  async readCodexDurabilityRecordForRestoreLocator(locator: CodexDurabilityRestoreLocator): Promise<CodexDurabilityRestoreRecord | undefined> {
     const record = await this.codexDurabilityStore.readForRestoreLocator(locator)
-    return record ? this.codexDurabilityRecordToRef(record) : undefined
+    return record
+      ? {
+          terminalId: record.terminalId,
+          durability: this.codexDurabilityRecordToRef(record),
+        }
+      : undefined
+  }
+
+  async deleteCodexDurabilityStoreRecord(terminalId: string, reason: string): Promise<void> {
+    await this.codexDurabilityStore.delete(terminalId)
+    logger.info({ terminalId, reason }, 'Deleted Codex durability store record')
   }
 
   private async writeCodexDurability(record: TerminalRecord, durability: CodexDurabilityRef, updatedAt = Date.now()): Promise<CodexDurabilityRef> {

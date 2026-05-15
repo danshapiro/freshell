@@ -77,7 +77,7 @@ export function planCodexCreateRestoreDecision(input: {
   }
 
   const candidate = input.codexDurability?.candidate
-  if (candidate && !input.legacyResumeSessionId) {
+  if (input.restoreRequested && candidate && !input.legacyResumeSessionId) {
     return {
       kind: 'proof_existing_candidate_first',
       candidate,

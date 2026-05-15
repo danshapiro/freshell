@@ -184,6 +184,7 @@ class FakeRegistry extends EventEmitter {
   repairCalls: Array<{ mode: string; sessionId: string }> = []
   candidatePersistedAcks: any[] = []
   promoteCalls: Array<{ terminalId: string; durableThreadId: string }> = []
+  deletedDurabilityRecords: Array<{ terminalId: string; reason: string }> = []
   durabilityRestoreRecords: Array<{
     terminalId: string
     tabId?: string
@@ -279,14 +280,15 @@ class FakeRegistry extends EventEmitter {
     ))
   }
 
-  async readCodexDurabilityForRestoreLocator(locator: {
+  async readCodexDurabilityRecordForRestoreLocator(locator: {
     terminalId?: string
     tabId?: string
     paneId?: string
     serverInstanceId?: string
   }) {
     if (locator.terminalId) {
-      return this.durabilityRestoreRecords.find((record) => record.terminalId === locator.terminalId)?.durability
+      const record = this.durabilityRestoreRecords.find((candidate) => candidate.terminalId === locator.terminalId)
+      return record ? { terminalId: record.terminalId, durability: record.durability } : undefined
     }
     if (!locator.tabId || !locator.paneId) return undefined
     const matches = this.durabilityRestoreRecords.filter((record) => (
@@ -295,7 +297,21 @@ class FakeRegistry extends EventEmitter {
       && (!locator.serverInstanceId || record.serverInstanceId === locator.serverInstanceId)
     ))
     if (matches.length > 1) throw new Error('ambiguous restore locator')
-    return matches[0]?.durability
+    return matches[0] ? { terminalId: matches[0].terminalId, durability: matches[0].durability } : undefined
+  }
+
+  async readCodexDurabilityForRestoreLocator(locator: {
+    terminalId?: string
+    tabId?: string
+    paneId?: string
+    serverInstanceId?: string
+  }) {
+    return (await this.readCodexDurabilityRecordForRestoreLocator(locator))?.durability
+  }
+
+  async deleteCodexDurabilityStoreRecord(terminalId: string, reason: string) {
+    this.deletedDurabilityRecords.push({ terminalId, reason })
+    this.durabilityRestoreRecords = this.durabilityRestoreRecords.filter((record) => record.terminalId !== terminalId)
   }
 
   attach(terminalId: string, ws: WebSocket, opts?: any) {
@@ -364,6 +380,7 @@ describe('terminal.create reuse running codex terminal', () => {
     registry.repairCalls = []
     registry.candidatePersistedAcks = []
     registry.promoteCalls = []
+    registry.deletedDurabilityRecords = []
     registry.durabilityRestoreRecords = []
   }, HOOK_TIMEOUT_MS)
 
@@ -763,6 +780,65 @@ describe('terminal.create reuse running codex terminal', () => {
         mode: 'codex',
         resumeSessionId: 'thread-store-proved',
       })
+      expect(registry.deletedDurabilityRecords).toEqual([{
+        terminalId: 'old-store-terminal',
+        reason: 'restore_proof_succeeded_created_replacement',
+      }])
+    } finally {
+      await closeWebSocket(ws)
+      await fsp.rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('does not use server-stored Codex durability for non-restore fresh creates', async () => {
+    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-store-fresh-'))
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    try {
+      const rolloutPath = path.join(tempDir, 'rollout.jsonl')
+      await fsp.writeFile(
+        rolloutPath,
+        '{"type":"session_meta","payload":{"id":"thread-store-stale"}}\n',
+        'utf8',
+      )
+      registry.durabilityRestoreRecords.push({
+        terminalId: 'old-store-terminal',
+        tabId: 'tab-fresh',
+        paneId: 'pane-fresh',
+        durability: {
+          schemaVersion: 1,
+          state: 'captured_pre_turn',
+          candidate: {
+            provider: 'codex',
+            candidateThreadId: 'thread-store-stale',
+            rolloutPath,
+            source: 'thread_started_notification',
+            capturedAt: Date.now(),
+          },
+        },
+      })
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const requestId = 'codex-fresh-ignores-store-record'
+      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'codex',
+        tabId: 'tab-fresh',
+        paneId: 'pane-fresh',
+      }))
+
+      await createdPromise
+      expect(codexLaunchPlanner.planCreateCalls[0]).toMatchObject({
+        resumeSessionId: undefined,
+      })
+      expect(registry.createCalls[0]).toMatchObject({
+        mode: 'codex',
+        resumeSessionId: undefined,
+      })
+      expect(registry.deletedDurabilityRecords).toEqual([])
+      expect(registry.durabilityRestoreRecords).toHaveLength(1)
     } finally {
       await closeWebSocket(ws)
       await fsp.rm(tempDir, { recursive: true, force: true })
@@ -821,6 +897,11 @@ describe('terminal.create reuse running codex terminal', () => {
         mode: 'codex',
         resumeSessionId: undefined,
       })
+      expect(registry.deletedDurabilityRecords).toEqual([{
+        terminalId: 'old-store-terminal',
+        reason: 'restore_proof_failed_fresh_create',
+      }])
+      expect(registry.durabilityRestoreRecords).toHaveLength(0)
     } finally {
       await closeWebSocket(ws)
       await fsp.rm(tempDir, { recursive: true, force: true })

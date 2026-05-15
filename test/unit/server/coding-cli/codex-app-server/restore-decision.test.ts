@@ -98,6 +98,15 @@ describe('Codex create/restore decision', () => {
     })
   })
 
+  it('ignores captured Codex candidates for non-restore fresh creates', () => {
+    expect(planCodexCreateRestoreDecision({
+      restoreRequested: false,
+      codexDurability: durability,
+    })).toEqual({
+      kind: 'fresh_codex_launch',
+    })
+  })
+
   it('uses exact rollout proof as the durable session id and returns a matching live terminal when present', async () => {
     const liveTerminal: CodexLiveRestoreTerminal = {
       terminalId: 'term-live',
