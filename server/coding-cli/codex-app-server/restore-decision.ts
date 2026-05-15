@@ -76,6 +76,15 @@ export function planCodexCreateRestoreDecision(input: {
     }
   }
 
+  const durableSessionId = input.restoreRequested ? getDurableCodexSessionId(input.codexDurability) : undefined
+  if (durableSessionId) {
+    return {
+      kind: 'durable_session_ref_resume',
+      sessionRef: { provider: 'codex', sessionId: durableSessionId },
+      sessionId: durableSessionId,
+    }
+  }
+
   const candidate = input.codexDurability?.candidate
   if (input.restoreRequested && candidate && !input.legacyResumeSessionId) {
     return {
@@ -154,6 +163,10 @@ function isCodexSessionRef(value: SessionRef | undefined): value is SessionRef &
 
 function hasRawLegacyResume(value: string | undefined): boolean {
   return typeof value === 'string' && value.length > 0
+}
+
+function getDurableCodexSessionId(value: CodexDurabilityRef | undefined): string | undefined {
+  return value?.state === 'durable' ? value.durableThreadId : undefined
 }
 
 export function isExactLiveCodexCandidate(

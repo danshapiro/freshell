@@ -61,6 +61,7 @@ vi.mock('../../../server/logger', () => {
 import { TerminalRegistry } from '../../../server/terminal-registry.js'
 import { CodexDurabilityStore } from '../../../server/coding-cli/codex-app-server/durability-store.js'
 import { logger } from '../../../server/logger.js'
+import { CODEX_DURABILITY_SCHEMA_VERSION } from '../../../shared/codex-durability.js'
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -462,6 +463,87 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     }
   })
 
+  it('serializes per-terminal Codex candidate persistence so the first deterministic candidate wins', async () => {
+    const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
+    const firstCandidateWriteStarted = deferred()
+    const releaseFirstCandidateWrite = deferred()
+    class StoreWithDelayedFirstCandidateWrite extends CodexDurabilityStore {
+      readonly writeThreadIds: string[] = []
+
+      override async write(...args: Parameters<CodexDurabilityStore['write']>) {
+        const threadId = args[0].candidate?.candidateThreadId
+        if (threadId) this.writeThreadIds.push(threadId)
+        if (threadId === 'thread-first') {
+          firstCandidateWriteStarted.resolve()
+          await releaseFirstCandidateWrite.promise
+        }
+        return super.write(...args)
+      }
+    }
+
+    try {
+      const store = new StoreWithDelayedFirstCandidateWrite({ dir: durabilityDir })
+      const registry = new TerminalRegistry(undefined, undefined, undefined, {
+        codexDurabilityStore: store,
+        serverInstanceId: 'srv-test',
+      })
+      const sidecar = createFakeSidecar()
+      const term = registry.create({
+        mode: 'codex',
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
+          },
+        } as any,
+      })
+
+      sidecar.emitCandidate({
+        source: 'thread_start_response',
+        thread: {
+          id: 'thread-first',
+          path: path.join(durabilityDir, 'first-rollout.jsonl'),
+          ephemeral: false,
+        },
+      })
+      await firstCandidateWriteStarted.promise
+
+      sidecar.emitCandidate({
+        source: 'thread_start_response',
+        thread: {
+          id: 'thread-second',
+          path: path.join(durabilityDir, 'second-rollout.jsonl'),
+          ephemeral: false,
+        },
+      })
+      await Promise.resolve()
+      expect(store.writeThreadIds).toEqual(['thread-first'])
+
+      releaseFirstCandidateWrite.resolve()
+
+      await vi.waitFor(() => expect(registry.get(term.terminalId)?.codexDurability?.candidate?.candidateThreadId).toBe('thread-first'))
+      await vi.waitFor(() => expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          terminalId: term.terminalId,
+          existingThreadId: 'thread-first',
+          candidateThreadId: 'thread-second',
+        }),
+        'Ignoring mismatched Codex restore identity candidate after one was already persisted',
+      ))
+      await expect(store.read(term.terminalId)).resolves.toMatchObject({
+        candidate: {
+          candidateThreadId: 'thread-first',
+          rolloutPath: path.join(durabilityDir, 'first-rollout.jsonl'),
+        },
+      })
+      expect(store.writeThreadIds).toEqual(['thread-first'])
+      expect(sidecar.markCandidatePersisted).toHaveBeenCalledTimes(1)
+    } finally {
+      releaseFirstCandidateWrite.resolve()
+      await fsp.rm(durabilityDir, { recursive: true, force: true })
+    }
+  })
+
   it('closes the terminal when candidate persistence fails before user input', async () => {
     const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
     class StoreWithFirstWriteFailure extends CodexDurabilityStore {
@@ -657,6 +739,53 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
           durableThreadId: 'thread-create-durable',
         }),
       }))
+    } finally {
+      await fsp.rm(durabilityDir, { recursive: true, force: true })
+    }
+  })
+
+  it('uses the bindSession result when promoting create-time Codex durability', async () => {
+    const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
+    try {
+      const store = new CodexDurabilityStore({ dir: durabilityDir })
+      const registry = new TerminalRegistry(undefined, undefined, undefined, {
+        codexDurabilityStore: store,
+        serverInstanceId: 'srv-test',
+      })
+      const term = registry.create({
+        mode: 'codex',
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar: createFakeSidecar(),
+          },
+        } as any,
+      })
+      vi.spyOn(registry, 'bindSession').mockImplementation((terminalId) => {
+        registry.get(terminalId)!.resumeSessionId = 'stale-side-effect'
+        return { ok: true, terminalId, sessionId: 'thread-create-durable' }
+      })
+
+      await expect(registry.promoteCodexDurabilityFromCreateProof(
+        term.terminalId,
+        'thread-create-durable',
+        67890,
+      )).resolves.toEqual({
+        ok: true,
+        terminalId: term.terminalId,
+        sessionId: 'thread-create-durable',
+      })
+
+      expect(registry.get(term.terminalId)?.codexDurability).toMatchObject({
+        state: 'durable',
+        durableThreadId: 'thread-create-durable',
+      })
+      expect(registry.get(term.terminalId)?.resumeSessionId).toBe('thread-create-durable')
+      await expect(store.read(term.terminalId)).resolves.toMatchObject({
+        state: 'durable',
+        durableThreadId: 'thread-create-durable',
+        updatedAt: 67890,
+      })
     } finally {
       await fsp.rm(durabilityDir, { recursive: true, force: true })
     }
@@ -1172,7 +1301,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     expect(planCreate).toHaveBeenCalledTimes(1)
   })
 
-  it('keeps the old Codex generation current when retiring sidecar teardown fails', async () => {
+  it('closes the Codex terminal when retiring sidecar teardown blocks recovery', async () => {
     const registry = new TerminalRegistry()
     const currentSidecar = createFakeSidecar({
       shutdown: async () => {
@@ -1198,12 +1327,13 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     })
 
     currentSidecar.emitLifecycleLoss({ method: 'thread/closed', threadId: 'thread-1' })
-    await vi.waitFor(() => expect(currentSidecar.shutdown).toHaveBeenCalledTimes(1))
+    await vi.waitFor(() => expect(currentSidecar.shutdown).toHaveBeenCalled())
     await vi.waitFor(() => expect(replacementSidecar.shutdown).toHaveBeenCalledTimes(1))
 
     expect(planCreate).toHaveBeenCalledTimes(1)
-    expect(registry.input(term.terminalId, 'still old generation')).toEqual({ status: 'written' })
-    expect(mockPtyProcess.instances[0].write).toHaveBeenCalledWith('still old generation')
+    await vi.waitFor(() => expect(registry.get(term.terminalId)?.status).toBe('exited'))
+    expect(registry.input(term.terminalId, 'still old generation')).toEqual({ status: 'not_running' })
+    expect(mockPtyProcess.instances[0].write).not.toHaveBeenCalledWith('still old generation')
     expect(mockPtyProcess.instances[1].write).not.toHaveBeenCalled()
   })
 
@@ -1233,13 +1363,15 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     })
 
     currentSidecar.emitLifecycleLoss({ method: 'thread/closed', threadId: 'thread-1' })
-    await vi.waitFor(() => expect(currentSidecar.shutdown).toHaveBeenCalledTimes(1))
+    await vi.waitFor(() => expect(currentSidecar.shutdown).toHaveBeenCalled())
     await vi.waitFor(() => expect(replacementSidecar.shutdown).toHaveBeenCalledTimes(1))
+    const currentShutdownCalls = currentSidecar.shutdown.mock.calls.length
 
     currentSidecar.emitLifecycleLoss({ method: 'thread/closed', threadId: 'thread-1' })
     await new Promise((resolve) => setTimeout(resolve, 25))
 
     expect(planCreate).toHaveBeenCalledTimes(1)
+    expect(currentSidecar.shutdown).toHaveBeenCalledTimes(currentShutdownCalls)
     expect(replacementSidecar.shutdown).toHaveBeenCalledTimes(1)
   })
 
@@ -1315,6 +1447,39 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     } finally {
       await registry.killAndWait(term.terminalId).catch(() => undefined)
     }
+  })
+
+  it('closes a Codex terminal when lifecycle-loss durable recovery becomes blocked', async () => {
+    const registry = new TerminalRegistry()
+    const exited = vi.fn()
+    registry.on('terminal.exit', exited)
+    const currentSidecar = createFakeSidecar()
+    const teardownError = new Error('planner-owned sidecar teardown failed') as Error & {
+      codexSidecarTeardownFailed?: boolean
+    }
+    teardownError.codexSidecarTeardownFailed = true
+    const planCreate = vi.fn(async () => {
+      throw teardownError
+    })
+    const term = registry.create({
+      mode: 'codex',
+      resumeSessionId: 'thread-1',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar: currentSidecar,
+          recovery: { planCreate, retryDelayMs: 0 },
+        },
+      } as any,
+    })
+    mockPtyProcess.instances[0].autoExitOnKill = false
+
+    currentSidecar.emitLifecycleLoss({ method: 'thread/closed', threadId: 'thread-1' })
+
+    await vi.waitFor(() => expect(registry.get(term.terminalId)?.codexRecoveryBlockedError).toBe(teardownError))
+    await vi.waitFor(() => expect(registry.get(term.terminalId)?.status).toBe('exited'))
+    expect(planCreate).toHaveBeenCalledTimes(1)
+    expect(exited).toHaveBeenCalledWith({ terminalId: term.terminalId, exitCode: 0 })
   })
 
   it('keeps unpublished candidate teardown failure retryable for final close', async () => {
@@ -1473,6 +1638,58 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     expect(registry.input(term.terminalId, 'after atomic handoff')).toEqual({ status: 'written' })
     expect(mockPtyProcess.instances[0].write).not.toHaveBeenCalled()
     expect(mockPtyProcess.instances[1].write).toHaveBeenCalledWith('after atomic handoff')
+  })
+
+  it('deletes Codex durability store records when a published recovery PTY exits finally', async () => {
+    const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
+    try {
+      const store = new CodexDurabilityStore({ dir: durabilityDir })
+      const registry = new TerminalRegistry(undefined, undefined, undefined, {
+        codexDurabilityStore: store,
+        serverInstanceId: 'srv-test',
+      })
+      const currentSidecar = createFakeSidecar()
+      const replacementSidecar = createFakeSidecar()
+      const planCreate = vi.fn(async () => ({
+        sessionId: 'thread-1',
+        remote: { wsUrl: 'ws://127.0.0.1:43124' },
+        sidecar: replacementSidecar,
+      }))
+      const term = registry.create({
+        mode: 'codex',
+        resumeSessionId: 'thread-1',
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar: currentSidecar,
+            recovery: { planCreate, retryDelayMs: 0 },
+          },
+        } as any,
+      })
+      await store.write({
+        schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+        terminalId: term.terminalId,
+        serverInstanceId: 'srv-test',
+        state: 'durable',
+        durableThreadId: 'thread-1',
+        updatedAt: 123,
+      })
+
+      currentSidecar.emitLifecycleLoss({ method: 'thread/closed', threadId: 'thread-1' })
+      await vi.waitFor(() => expect(replacementSidecar.adopt).toHaveBeenCalledTimes(1))
+      const replacementPty = mockPtyProcess.instances[1]
+      expect(registry.get(term.terminalId)?.pty).toBe(replacementPty)
+
+      registry.get(term.terminalId)!.codexRecovery = undefined
+      replacementPty._emitExit(17)
+
+      await vi.waitFor(() => expect(registry.get(term.terminalId)?.status).toBe('exited'))
+      await vi.waitFor(async () => {
+        await expect(store.read(term.terminalId)).resolves.toBeUndefined()
+      })
+    } finally {
+      await fsp.rm(durabilityDir, { recursive: true, force: true })
+    }
   })
 
   it('waits for a failed recovery candidate to shut down before retrying', async () => {

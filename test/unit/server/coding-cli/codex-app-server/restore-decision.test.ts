@@ -24,6 +24,14 @@ const durability: CodexDurabilityRef = {
   turnCompletedAt: 2,
 }
 
+const durableDurability: CodexDurabilityRef = {
+  schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+  state: 'durable',
+  candidate,
+  durableThreadId: 'thread-durable',
+  turnCompletedAt: 3,
+}
+
 const proofOk: CodexRolloutProofResult = {
   ok: true,
   candidateThreadId: candidate.candidateThreadId,
@@ -61,7 +69,7 @@ describe('Codex create/restore decision', () => {
     })
   })
 
-  it('requires a canonical sessionRef or candidate for restore', () => {
+  it('rejects restore requests without sessionRef, durable ref, or candidate', () => {
     expect(planCodexCreateRestoreDecision({ restoreRequested: true })).toEqual({
       kind: 'reject_missing_codex_session_ref',
       code: 'RESTORE_UNAVAILABLE',
@@ -88,6 +96,62 @@ describe('Codex create/restore decision', () => {
     expect(proofRollout).not.toHaveBeenCalled()
   })
 
+  it('uses durable Codex durability state as a canonical restore sessionRef', () => {
+    expect(planCodexCreateRestoreDecision({
+      restoreRequested: true,
+      codexDurability: {
+        schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+        state: 'durable',
+        durableThreadId: 'thread-durable',
+      },
+    })).toEqual({
+      kind: 'durable_session_ref_resume',
+      sessionRef: { provider: 'codex', sessionId: 'thread-durable' },
+      sessionId: 'thread-durable',
+    })
+  })
+
+  it('uses explicit sessionRef before durable Codex durability state', () => {
+    expect(planCodexCreateRestoreDecision({
+      restoreRequested: true,
+      sessionRef: { provider: 'codex', sessionId: 'thread-explicit' },
+      codexDurability: durableDurability,
+    })).toEqual({
+      kind: 'durable_session_ref_resume',
+      sessionRef: { provider: 'codex', sessionId: 'thread-explicit' },
+      sessionId: 'thread-explicit',
+    })
+  })
+
+  it('uses durable Codex durability state before candidate proof', async () => {
+    const proofRollout = vi.fn(async () => proofOk)
+
+    const decision = await resolveCodexCreateRestoreDecision({
+      restoreRequested: true,
+      codexDurability: durableDurability,
+      proofRollout,
+    })
+
+    expect(decision).toEqual({
+      kind: 'durable_session_ref_resume',
+      sessionRef: { provider: 'codex', sessionId: 'thread-durable' },
+      sessionId: 'thread-durable',
+    })
+    expect(proofRollout).not.toHaveBeenCalled()
+  })
+
+  it('rejects raw legacy resume ids even when durable Codex durability is present without sessionRef', () => {
+    expect(planCodexCreateRestoreDecision({
+      restoreRequested: true,
+      legacyResumeSessionId: 'thread-raw',
+      codexDurability: durableDurability,
+    })).toEqual({
+      kind: 'reject_invalid_raw_codex_resume_request',
+      code: 'INVALID_MESSAGE',
+      message: INVALID_RAW_CODEX_RESUME_MESSAGE,
+    })
+  })
+
   it('plans candidate proof before a restored candidate can become durable', () => {
     expect(planCodexCreateRestoreDecision({
       restoreRequested: true,
@@ -102,6 +166,15 @@ describe('Codex create/restore decision', () => {
     expect(planCodexCreateRestoreDecision({
       restoreRequested: false,
       codexDurability: durability,
+    })).toEqual({
+      kind: 'fresh_codex_launch',
+    })
+  })
+
+  it('ignores durable Codex durability state for non-restore fresh creates', () => {
+    expect(planCodexCreateRestoreDecision({
+      restoreRequested: false,
+      codexDurability: durableDurability,
     })).toEqual({
       kind: 'fresh_codex_launch',
     })

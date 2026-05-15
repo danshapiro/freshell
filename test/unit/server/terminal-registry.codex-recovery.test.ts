@@ -215,4 +215,31 @@ describe('TerminalRegistry Codex durable recovery', () => {
     expect(registry.get(record.terminalId)?.status).toBe('exited')
     await vi.waitFor(() => expect(currentSidecar.shutdown).toHaveBeenCalledTimes(1))
   })
+
+  it('runs normal PTY-exit cleanup when durable recovery is already blocked', async () => {
+    const exited = vi.fn()
+    registry.on('terminal.exit', exited)
+    const currentSidecar = createFakeSidecar()
+    const planCreate = vi.fn()
+    const record = registry.create({
+      mode: 'codex',
+      cwd: '/repo',
+      resumeSessionId: 'thread-durable-1',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:46001/',
+          sidecar: currentSidecar,
+          recovery: { planCreate, retryDelayMs: 0 },
+        },
+      } as any,
+    })
+    const [pty] = await spawnedPtys()
+    record.codexRecoveryBlockedError = new Error('previous teardown failed')
+
+    pty.onExit.mock.calls[0][0]({ exitCode: 9, signal: 0 })
+
+    expect(planCreate).not.toHaveBeenCalled()
+    expect(registry.get(record.terminalId)?.status).toBe('exited')
+    expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 9 })
+  })
 })

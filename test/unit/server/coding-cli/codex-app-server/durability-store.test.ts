@@ -39,6 +39,10 @@ function record(overrides: Partial<CodexDurabilityStoreRecord> = {}): CodexDurab
   }
 }
 
+async function writeRawRecordFile(terminalId: string, content: string): Promise<void> {
+  await fsp.writeFile(path.join(tempDir, `${encodeURIComponent(terminalId)}.json`), content)
+}
+
 describe('CodexDurabilityStore', () => {
   it('atomically writes and reads a record', async () => {
     const store = new CodexDurabilityStore({ dir: tempDir })
@@ -95,6 +99,46 @@ describe('CodexDurabilityStore', () => {
     })).resolves.toEqual(stored)
   })
 
+  it('skips bad records during tab and pane restore scans', async () => {
+    const store = new CodexDurabilityStore({ dir: tempDir })
+    const stored = await store.write(record())
+    await writeRawRecordFile('malformed-record', '{not-json')
+    await writeRawRecordFile('schema-invalid-record', JSON.stringify({
+      schemaVersion: 1,
+      terminalId: 'schema-invalid-record',
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      serverInstanceId: 'srv-1',
+      state: 'not-a-durability-state',
+      updatedAt: Date.now(),
+    }))
+    await fsp.mkdir(path.join(tempDir, `${encodeURIComponent('directory-record')}.json`))
+
+    await expect(store.readForRestoreLocator({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      serverInstanceId: 'srv-1',
+    })).resolves.toEqual(stored)
+  })
+
+  it('keeps exact terminal id restore lookups strict for bad records', async () => {
+    const store = new CodexDurabilityStore({ dir: tempDir })
+    await writeRawRecordFile('malformed-record', '{not-json')
+    await writeRawRecordFile('schema-invalid-record', JSON.stringify({
+      schemaVersion: 1,
+      terminalId: 'schema-invalid-record',
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      serverInstanceId: 'srv-1',
+      state: 'not-a-durability-state',
+      updatedAt: Date.now(),
+    }))
+
+    await expect(store.readForRestoreLocator({ terminalId: 'malformed-record' })).rejects.toThrow(SyntaxError)
+    await expect(store.readForRestoreLocator({ terminalId: 'schema-invalid-record' }))
+      .rejects.toThrow(/invalid for terminal schema-invalid-record/)
+  })
+
   it('does not match a wrong pane or server instance', async () => {
     const store = new CodexDurabilityStore({ dir: tempDir })
     await store.write(record())
@@ -115,6 +159,7 @@ describe('CodexDurabilityStore', () => {
     const store = new CodexDurabilityStore({ dir: tempDir })
     await store.write(record({ terminalId: 'term-1' }))
     await store.write(record({ terminalId: 'term-2', updatedAt: Date.now() + 10 }))
+    await writeRawRecordFile('malformed-record', '{not-json')
 
     await expect(store.readForRestoreLocator({
       tabId: 'tab-1',

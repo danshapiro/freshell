@@ -519,7 +519,7 @@ function isCodexStartupTerminalControlInput(data: string): boolean {
 export type BindSessionResult =
   | { ok: true; terminalId: string; sessionId: string }
   | { ok: false; reason: 'terminal_missing' | 'mode_mismatch' | 'invalid_session_id' | 'terminal_not_running' }
-  | BindResult
+  | Extract<BindResult, { ok: false }>
 
 export type RepairLegacySessionOwnersResult = {
   repaired: boolean
@@ -1064,6 +1064,7 @@ export class TerminalRegistry extends EventEmitter {
   private maxPendingSnapshotChars: number
   private sidecarShutdowns = new Map<string, SidecarShutdownEntry>()
   private codexDurabilityStore: CodexDurabilityStore
+  private codexCandidatePersistenceQueues = new Map<string, Promise<void>>()
   private serverInstanceId: string
   // Legacy transport batching path. Broker cutover destination:
   // - outputBuffers/flush timers/mobile batching -> broker client-output queue.
@@ -1253,6 +1254,32 @@ export class TerminalRegistry extends EventEmitter {
     void this.codexDurabilityStore.delete(record.terminalId).catch((err) => {
       logger.warn({ err, terminalId: record.terminalId, reason }, 'Failed to delete Codex durability store record')
     })
+  }
+
+  private finishTerminalPtyExit(
+    record: TerminalRecord,
+    event: { exitCode: number; signal?: number },
+  ): void {
+    this.markCodexRecoveryFinalClose(record)
+    record.status = 'exited'
+    record.exitCode = event.exitCode
+    const now = Date.now()
+    record.lastActivityAt = now
+    record.exitedAt = now
+    cleanupMcpConfig(record.terminalId, record.mode, record.mcpCwd)
+    for (const client of record.clients) {
+      this.flushOutputBuffer(client)
+      this.safeSend(client, { type: 'terminal.exit', terminalId: record.terminalId, exitCode: event.exitCode }, { terminalId: record.terminalId, perf: record.perf })
+    }
+    record.clients.clear()
+    record.suppressedOutputClients.clear()
+    record.pendingSnapshotClients.clear()
+    this.releaseBinding(record.terminalId, 'exit')
+    this.emit('terminal.exit', { terminalId: record.terminalId, exitCode: event.exitCode })
+    this.recordTerminalExitWithoutDurableSession(record, event.exitCode, 'pty_exit')
+    this.forgetCodexDurabilityStoreRecord(record, 'pty_exit')
+    void this.releaseCodexSidecar(record).catch(() => undefined)
+    this.reapExitedTerminals()
   }
 
   private reapExitedTerminals(): void {
@@ -1502,26 +1529,7 @@ export class TerminalRegistry extends EventEmitter {
         })) {
           return
         }
-        this.markCodexRecoveryFinalClose(record)
-        record.status = 'exited'
-        record.exitCode = e.exitCode
-        const now = Date.now()
-        record.lastActivityAt = now
-        record.exitedAt = now
-        cleanupMcpConfig(terminalId, opts.mode, record.mcpCwd)
-        for (const client of record.clients) {
-          this.flushOutputBuffer(client)
-          this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: e.exitCode }, { terminalId, perf: record.perf })
-        }
-        record.clients.clear()
-        record.suppressedOutputClients.clear()
-        record.pendingSnapshotClients.clear()
-        this.releaseBinding(terminalId, 'exit')
-        this.emit('terminal.exit', { terminalId, exitCode: e.exitCode })
-        this.recordTerminalExitWithoutDurableSession(record, e.exitCode, 'pty_exit')
-        this.forgetCodexDurabilityStoreRecord(record, 'pty_exit')
-        void this.releaseCodexSidecar(record).catch(() => undefined)
-        this.reapExitedTerminals()
+        this.finishTerminalPtyExit(record, e)
       }
       if (this.needsCodexFinalDurabilityProof(record)) {
         void (async () => {
@@ -1763,7 +1771,26 @@ export class TerminalRegistry extends EventEmitter {
     return storedDurability
   }
 
+  private async replaceCodexDurabilityStoreRecord(record: TerminalRecord, durability: CodexDurabilityRef, updatedAt = Date.now()): Promise<CodexDurabilityRef> {
+    await this.codexDurabilityStore.delete(record.terminalId)
+    return this.writeCodexDurability(record, durability, updatedAt)
+  }
+
   private async persistCodexCandidate(terminalId: string, candidate: CodexRemoteProxyCandidate): Promise<void> {
+    const previous = this.codexCandidatePersistenceQueues.get(terminalId) ?? Promise.resolve()
+    const next = previous
+      .catch(() => undefined)
+      .then(() => this.persistCodexCandidateSerial(terminalId, candidate))
+    this.codexCandidatePersistenceQueues.set(terminalId, next)
+    void next.finally(() => {
+      if (this.codexCandidatePersistenceQueues.get(terminalId) === next) {
+        this.codexCandidatePersistenceQueues.delete(terminalId)
+      }
+    }).catch(() => undefined)
+    return next
+  }
+
+  private async persistCodexCandidateSerial(terminalId: string, candidate: CodexRemoteProxyCandidate): Promise<void> {
     const record = this.terminals.get(terminalId)
     if (!record || record.status !== 'running') return
     if (record.mode !== 'codex') return
@@ -1814,7 +1841,11 @@ export class TerminalRegistry extends EventEmitter {
       || record.resumeSessionId
       || record.codexDurability?.state === 'non_restorable'
     ) {
-      await this.codexDurabilityStore.delete(terminalId)
+      if (record.status === 'running' && record.resumeSessionId && record.codexDurability?.state === 'durable') {
+        await this.replaceCodexDurabilityStoreRecord(record, record.codexDurability)
+      } else {
+        await this.codexDurabilityStore.delete(terminalId)
+      }
       logger.warn({
         terminalId,
         threadId: durability.candidate.candidateThreadId,
@@ -1829,6 +1860,8 @@ export class TerminalRegistry extends EventEmitter {
         && existing.rolloutPath === durability.candidate.rolloutPath
       ) {
         record.codexSidecar?.markCandidatePersisted?.()
+      } else if (record.codexDurability) {
+        await this.replaceCodexDurabilityStoreRecord(record, record.codexDurability)
       }
       return
     }
@@ -2064,8 +2097,8 @@ export class TerminalRegistry extends EventEmitter {
 
     const bound = this.bindSession(terminalId, 'codex', durableThreadId, 'association')
     if (!bound.ok) return bound
-    const sessionId = record.resumeSessionId
-    if (!sessionId) return { ok: false, reason: 'invalid_session_id' }
+    const sessionId = bound.sessionId
+    record.resumeSessionId = sessionId
 
     const durability: CodexDurabilityRef = {
       schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
@@ -2108,6 +2141,16 @@ export class TerminalRegistry extends EventEmitter {
     } catch (err) {
       logger.warn({ err, terminalId: record.terminalId, trigger }, 'Final Codex rollout proof read failed')
     }
+  }
+
+  private closeCodexTerminalAfterBlockedLifecycleLoss(record: TerminalRecord, event: unknown): void {
+    if (!record.codexRecoveryBlockedError) return
+    if (this.terminals.get(record.terminalId) !== record || record.status !== 'running') return
+    logger.error(
+      { err: record.codexRecoveryBlockedError, terminalId: record.terminalId, event },
+      'Closing Codex terminal because durable recovery is blocked after lifecycle loss',
+    )
+    this.kill(record.terminalId)
   }
 
   private broadcastCodexDurability(record: TerminalRecord, durability: CodexDurabilityRef): void {
@@ -2181,7 +2224,9 @@ export class TerminalRegistry extends EventEmitter {
         await this.proveCodexBeforeFinalLoss(record, 'lifecycle_loss')
         if (record.status !== 'running') return
         if (record.resumeSessionId && record.codexRecovery) {
-          this.startCodexDurableRecovery(record, { source: 'lifecycle_loss', event })
+          if (!this.startCodexDurableRecovery(record, { source: 'lifecycle_loss', event })) {
+            this.closeCodexTerminalAfterBlockedLifecycleLoss(record, event)
+          }
           return
         }
         logger.warn(
@@ -2195,7 +2240,9 @@ export class TerminalRegistry extends EventEmitter {
       return
     }
 
-    this.startCodexDurableRecovery(record, { source: 'lifecycle_loss', event })
+    if (!this.startCodexDurableRecovery(record, { source: 'lifecycle_loss', event })) {
+      this.closeCodexTerminalAfterBlockedLifecycleLoss(record, event)
+    }
   }
 
   private startCodexDurableRecovery(
@@ -2217,7 +2264,7 @@ export class TerminalRegistry extends EventEmitter {
         { err: record.codexRecoveryBlockedError, terminalId: record.terminalId, trigger },
         'Codex durable recovery is blocked by a previous sidecar teardown failure',
       )
-      return true
+      return false
     }
 
     if (record.codexRecoveryAttempt) return true
@@ -2229,6 +2276,16 @@ export class TerminalRegistry extends EventEmitter {
     const attempt = this.runCodexRecoveryLoop(record.terminalId)
       .catch((err) => {
         logger.error({ err, terminalId: record.terminalId }, 'Codex durable recovery loop failed')
+        if (record.codexRecoveryBlockedError && this.terminals.get(record.terminalId) === record && record.status === 'running') {
+          if (trigger.source === 'pty_exit') {
+            this.finishTerminalPtyExit(record, {
+              exitCode: trigger.exitCode,
+              signal: trigger.signal,
+            })
+          } else {
+            this.closeCodexTerminalAfterBlockedLifecycleLoss(record, trigger.event)
+          }
+        }
       })
       .finally(() => {
         const latest = this.terminals.get(record.terminalId)
@@ -2572,24 +2629,7 @@ export class TerminalRegistry extends EventEmitter {
         })) {
           return
         }
-        this.markCodexRecoveryFinalClose(record)
-        record.status = 'exited'
-        record.exitCode = event.exitCode
-        const now = Date.now()
-        record.lastActivityAt = now
-        record.exitedAt = now
-        cleanupMcpConfig(record.terminalId, record.mode, record.mcpCwd)
-        for (const client of record.clients) {
-          this.flushOutputBuffer(client)
-          this.safeSend(client, { type: 'terminal.exit', terminalId: record.terminalId, exitCode: event.exitCode }, { terminalId: record.terminalId, perf: record.perf })
-        }
-        record.clients.clear()
-        record.suppressedOutputClients.clear()
-        record.pendingSnapshotClients.clear()
-        this.releaseBinding(record.terminalId, 'exit')
-        this.emit('terminal.exit', { terminalId: record.terminalId, exitCode: event.exitCode })
-        void this.releaseCodexSidecar(record).catch(() => undefined)
-        this.reapExitedTerminals()
+        this.finishTerminalPtyExit(record, event)
       }
       if (this.needsCodexFinalDurabilityProof(record)) {
         void (async () => {

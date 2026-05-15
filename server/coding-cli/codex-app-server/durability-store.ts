@@ -69,8 +69,14 @@ export class CodexDurabilityStore {
     const matches: CodexDurabilityStoreRecord[] = []
     for (const entry of entries) {
       if (!entry.endsWith('.json')) continue
-      const terminalId = decodeURIComponent(entry.slice(0, -'.json'.length))
-      const record = await this.read(terminalId)
+      let terminalId: string
+      let record: CodexDurabilityStoreRecord | undefined
+      try {
+        terminalId = decodeURIComponent(entry.slice(0, -'.json'.length))
+        record = await this.read(terminalId)
+      } catch {
+        continue
+      }
       if (!record) continue
       if (record.tabId !== locator.tabId || record.paneId !== locator.paneId) continue
       if (locator.serverInstanceId && record.serverInstanceId !== locator.serverInstanceId) continue
