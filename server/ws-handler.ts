@@ -1908,10 +1908,7 @@ export class WsHandler {
           })
           : undefined
         let effectiveResumeSessionId: string | undefined
-        if (
-          codexRestorePlan?.kind === 'durable_session_ref_resume'
-          || codexRestorePlan?.kind === 'legacy_raw_resume_passthrough'
-        ) {
+        if (codexRestorePlan?.kind === 'durable_session_ref_resume') {
           effectiveResumeSessionId = codexRestorePlan.sessionId
         } else if (m.mode !== 'codex') {
           effectiveResumeSessionId = m.resumeSessionId
@@ -2108,7 +2105,7 @@ export class WsHandler {
                   legacyResumeSessionId: m.resumeSessionId,
                   sessionRef: requestedSessionRef,
                   codexDurability: m.codexDurability,
-                  findExactLiveTerminalByCandidate: (candidate) => (
+                  findLiveTerminalByCandidate: (candidate) => (
                     this.registry.findRunningCodexTerminalByCandidate(
                       candidate.candidateThreadId,
                       candidate.rolloutPath,
@@ -2129,7 +2126,7 @@ export class WsHandler {
                   return
                 }
 
-                if (decision.kind === 'durable_session_ref_resume' || decision.kind === 'legacy_raw_resume_passthrough') {
+                if (decision.kind === 'durable_session_ref_resume') {
                   effectiveResumeSessionId = decision.sessionId
                 } else if (decision.kind === 'fresh_codex_launch') {
                   effectiveResumeSessionId = undefined

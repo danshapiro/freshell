@@ -3,6 +3,7 @@ import express from 'express'
 import request from 'supertest'
 import { createAgentApiRouter } from '../../server/agent-api/router'
 import { FakeCodexLaunchPlanner } from '../helpers/coding-cli/fake-codex-launch-planner.js'
+import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../../server/coding-cli/codex-app-server/restore-decision.js'
 
 class FakeRegistry {
   create = vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term_1' }))
@@ -408,21 +409,16 @@ describe('tab endpoints', () => {
     expect(layoutStore.attachPaneContent).not.toHaveBeenCalled()
   })
 
-  it('fresh-creates Codex tabs when only legacy raw resume ids arrive without durability proof', async () => {
+  it('rejects raw Codex resume ids instead of fresh-creating tabs', async () => {
     const app = express()
     app.use(express.json())
-    const terminal = { terminalId: 'term_exited_before_publish', status: 'running' }
     const registry = {
-      create: vi.fn(() => terminal),
+      create: vi.fn(),
       killAndWait: vi.fn(async () => true),
     }
     const codexLaunchPlanner = new FakeCodexLaunchPlanner()
-    vi.spyOn(codexLaunchPlanner.sidecar, 'waitForLoadedThread').mockImplementation(async (threadId, options) => {
-      codexLaunchPlanner.sidecar.waitForLoadedThreadCalls.push({ threadId, options })
-      terminal.status = 'exited'
-    })
     const layoutStore = {
-      createTab: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+      createTab: vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' })),
       attachPaneContent: vi.fn(),
       selectTab: () => ({}),
       renameTab: () => ({}),
@@ -439,20 +435,17 @@ describe('tab endpoints', () => {
       resumeSessionId: 'thread-resume-exits',
     })
 
-    expect(res.status).toBe(200)
-    expect(codexLaunchPlanner.planCreateCalls[0]).toEqual(expect.objectContaining({
-      resumeSessionId: undefined,
-    }))
+    expect(res.status).toBe(400)
+    expect(res.body).toEqual({
+      status: 'error',
+      message: INVALID_RAW_CODEX_RESUME_MESSAGE,
+    })
+    expect(codexLaunchPlanner.planCreateCalls).toEqual([])
     expect(codexLaunchPlanner.sidecar.waitForLoadedThreadCalls).toEqual([])
-    expect(registry.create).toHaveBeenCalledWith(expect.objectContaining({
-      mode: 'codex',
-      resumeSessionId: undefined,
-    }))
+    expect(registry.create).not.toHaveBeenCalled()
     expect(registry.killAndWait).not.toHaveBeenCalled()
-    expect(layoutStore.attachPaneContent).toHaveBeenCalledWith('tab_1', 'pane_1', expect.any(Object))
-    const content = layoutStore.attachPaneContent.mock.calls[0]?.[2]
-    expect(content).not.toHaveProperty('sessionRef')
-    expect(content).not.toHaveProperty('resumeSessionId')
+    expect(layoutStore.createTab).not.toHaveBeenCalled()
+    expect(layoutStore.attachPaneContent).not.toHaveBeenCalled()
   })
 
   it('uses canonical Codex sessionRef as the durable resume path', async () => {
@@ -541,7 +534,7 @@ describe('tab endpoints', () => {
     const res = await request(app).post('/api/tabs').send({
       mode: 'codex',
       name: 'resume tab',
-      resumeSessionId: 'thread-resume-shutdown',
+      sessionRef: { provider: 'codex', sessionId: 'thread-resume-shutdown' },
     })
 
     expect(res.status).toBe(500)

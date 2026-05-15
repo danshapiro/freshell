@@ -8,6 +8,7 @@
 import { z } from 'zod'
 import { createApiClient, resolveConfig, type ApiClient } from './http-client.js'
 import { translateKeys } from '../cli/keys.js'
+import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../coding-cli/codex-app-server/restore-decision.js'
 
 // Lazy-initialized client -- created on first use so env vars are read at call time.
 let _client: ApiClient | undefined
@@ -254,14 +255,14 @@ const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> 
   'has-tab':         { required: ['target'],                  optional: [] },
   'next-tab':        { required: [],                          optional: [] },
   'prev-tab':        { required: [],                          optional: [] },
-  'split-pane':      { required: [],                          optional: ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor', 'sessionRef'] },
+  'split-pane':      { required: [],                          optional: ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'sessionRef'] },
   'list-panes':      { required: [],                          optional: ['target'] },
   'select-pane':     { required: ['target'],                  optional: [] },
   'rename-pane':     { required: ['name'],                    optional: ['target'] },
   'kill-pane':       { required: ['target'],                  optional: [] },
   'resize-pane':     { required: ['target'],                  optional: ['x', 'y', 'sizes'] },
   'swap-pane':       { required: ['target', 'with'],          optional: [] },
-  'respawn-pane':    { required: ['target'],                  optional: ['mode', 'shell', 'cwd', 'sessionRef'] },
+  'respawn-pane':    { required: ['target'],                  optional: ['mode', 'shell', 'cwd', 'resume', 'sessionRef'] },
   'send-keys':       { required: [],                          optional: ['target', 'keys', 'literal'] },
   'capture-pane':    { required: [],                          optional: ['target', 'S', 'J', 'e'] },
   'wait-for':        { required: [],                          optional: ['target', 'pattern', 'stable', 'exit', 'prompt', 'timeout'] },
@@ -279,6 +280,8 @@ const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> 
   'health':          { required: [],                          optional: [] },
   'help':            { required: [],                          optional: [] },
 }
+
+const RAW_CODEX_RESUME_HINT = 'Use sessionRef: { provider: "codex", sessionId } after Codex identity is durable.'
 
 const COMMON_CONFUSIONS: Record<string, Record<string, string>> = {
   'new-tab': {
@@ -307,6 +310,29 @@ function validateParams(action: string, params: Record<string, unknown> | undefi
     error: `Unknown parameter${unknownKeys.length > 1 ? 's' : ''} '${unknownKeys.join("', '")}' for action '${action}'.`,
     hint: `Valid params: ${allValid.join(', ') || '(none)'}`,
   }
+}
+
+function isCodexSessionRef(value: unknown): boolean {
+  return !!value
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && (value as { provider?: unknown }).provider === 'codex'
+    && typeof (value as { sessionId?: unknown }).sessionId === 'string'
+    && (value as { sessionId: string }).sessionId.length > 0
+}
+
+function rejectRawCodexResume(
+  mode: unknown,
+  resume: unknown,
+  sessionRef: unknown,
+): { error: string; hint: string } | undefined {
+  if (mode === 'codex' && typeof resume === 'string' && resume.length > 0 && !isCodexSessionRef(sessionRef)) {
+    return {
+      error: INVALID_RAW_CODEX_RESUME_MESSAGE,
+      hint: RAW_CODEX_RESUME_HINT,
+    }
+  }
+  return undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -349,7 +375,7 @@ Tab commands:
   prev-tab        Switch to the previous tab.
 
 Pane commands:
-  split-pane      Split a pane. Params: target?, direction (horizontal|vertical, default vertical), mode?, shell?, cwd?, browser?, editor?, sessionRef?
+  split-pane      Split a pane. Params: target?, direction (horizontal|vertical, default vertical), mode?, shell?, cwd?, browser?, editor?, resume?, sessionRef?
                   Omit target to split your own pane (the pane where this MCP server was spawned). Returns { paneId, tabId }.
   list-panes      List panes. Params: target? (tab ID or title to filter by). Returns { panes: [...] }.
   select-pane     Activate a pane. Params: target (pane ID or index)
@@ -358,7 +384,7 @@ Pane commands:
                   Omit target to rename the caller pane (or the tab's active pane as fallback).
   resize-pane     Resize a pane. Params: target, x? (1-99), y? (1-99)
   swap-pane       Swap two panes. Params: target, with (other pane ID)
-  respawn-pane    Restart a pane's terminal. Params: target, mode?, shell?, cwd?, sessionRef?
+  respawn-pane    Restart a pane's terminal. Params: target, mode?, shell?, cwd?, resume?, sessionRef?
 
 Terminal I/O:
   send-keys       Send input to a pane. Params: target, keys, literal?
@@ -540,10 +566,12 @@ async function routeAction(
   switch (action) {
     // -- Tab actions --
     case 'new-tab': {
-      const { name, mode, shell, cwd, browser, editor, resume, prompt, ...rest } = params || {}
-      const sessionRef = typeof mode === 'string' && mode !== 'codex' && typeof resume === 'string'
+      const { name, mode, shell, cwd, browser, editor, resume, sessionRef: explicitSessionRef, prompt, ...rest } = params || {}
+      const codexResumeError = rejectRawCodexResume(mode, resume, explicitSessionRef)
+      if (codexResumeError) return codexResumeError
+      const sessionRef = explicitSessionRef ?? (typeof mode === 'string' && mode !== 'codex' && typeof resume === 'string'
         ? { provider: mode, sessionId: resume }
-        : undefined
+        : undefined)
       const tabResult = await c.post('/api/tabs', {
         name,
         mode,
@@ -605,9 +633,14 @@ async function routeAction(
       const resolved = await resolvePaneTarget(rawTarget)
       if (!resolved.pane) return { error: resolved.message || 'No pane found', hint: "Run action 'list-panes' to see available panes." }
       const paneId = resolved.pane.id
-      const { direction, browser, editor, mode, shell, cwd, target: _t, ...rest } = params || {}
+      const { direction, browser, editor, mode, shell, cwd, target: _t, resume, sessionRef, ...rest } = params || {}
+      const codexResumeError = rejectRawCodexResume(mode, resume, sessionRef)
+      if (codexResumeError) return codexResumeError
+      const effectiveSessionRef = sessionRef ?? (typeof mode === 'string' && mode !== 'codex' && typeof resume === 'string'
+        ? { provider: mode, sessionId: resume }
+        : undefined)
       return c.post(`/api/panes/${encodeURIComponent(paneId)}/split`, {
-        direction, browser, editor, mode, shell, cwd, ...rest,
+        direction, browser, editor, mode, shell, cwd, ...(effectiveSessionRef ? { sessionRef: effectiveSessionRef } : {}), ...rest,
       })
     }
     case 'list-panes': {
@@ -649,8 +682,13 @@ async function routeAction(
     }
     case 'respawn-pane': {
       const target = requireParam(params, 'target')
-      const { mode, shell, cwd, sessionRef } = params || {}
-      return c.post(`/api/panes/${encodeURIComponent(target)}/respawn`, { mode, shell, cwd, sessionRef })
+      const { mode, shell, cwd, resume, sessionRef } = params || {}
+      const codexResumeError = rejectRawCodexResume(mode, resume, sessionRef)
+      if (codexResumeError) return codexResumeError
+      const effectiveSessionRef = sessionRef ?? (typeof mode === 'string' && mode !== 'codex' && typeof resume === 'string'
+        ? { provider: mode, sessionId: resume }
+        : undefined)
+      return c.post(`/api/panes/${encodeURIComponent(target)}/respawn`, { mode, shell, cwd, sessionRef: effectiveSessionRef })
     }
 
     // -- Terminal I/O --

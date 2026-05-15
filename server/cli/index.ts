@@ -7,6 +7,7 @@ import { resolveConfig } from './config.js'
 import { resolveTarget } from './targets.js'
 import { runCommand as sendKeysCommand } from './commands/sendKeys.js'
 import { partitionSendKeysArgs } from './send-keys-args.js'
+import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../coding-cli/codex-app-server/restore-decision.js'
 
 type Flags = Record<string, string | boolean>
 
@@ -105,6 +106,15 @@ function resolveRenameArgs(
 const isTruthy = (value: unknown) => value === true || value === 'true' || value === '1' || value === 'yes'
 
 const unwrap = (response: any) => (response && typeof response === 'object' && 'data' in response ? response.data : response)
+
+function rejectRawCodexResume(mode: unknown, resumeSessionId: unknown): boolean {
+  if (mode === 'codex' && typeof resumeSessionId === 'string' && resumeSessionId.length > 0) {
+    writeError(INVALID_RAW_CODEX_RESUME_MESSAGE)
+    process.exitCode = 1
+    return true
+  }
+  return false
+}
 
 async function fetchTabs(client: ReturnType<typeof createHttpClient>): Promise<{ tabs: TabSummary[]; activeTabId?: string | null }> {
   const res = await client.get('/api/tabs')
@@ -312,6 +322,7 @@ async function main() {
       const editor = getFlag(flags, 'editor') as string | undefined
       const resumeSessionId = getFlag(flags, 'resume') as string | undefined
       const prompt = getFlag(flags, 'prompt') as string | undefined
+      if (rejectRawCodexResume(mode, resumeSessionId)) return
 
       const res = await client.post('/api/tabs', { name, mode, shell, cwd, browser, editor, resumeSessionId })
       const data = unwrap(res)
@@ -408,6 +419,8 @@ async function main() {
       const mode = getFlag(flags, 'mode') as string | undefined
       const shell = getFlag(flags, 'shell') as string | undefined
       const cwd = getFlag(flags, 'cwd') as string | undefined
+      const resumeSessionId = getFlag(flags, 'resume') as string | undefined
+      if (rejectRawCodexResume(mode, resumeSessionId)) return
 
       const resolved = await resolvePaneTarget(client, target)
       if (!resolved.pane?.id) {
@@ -539,6 +552,8 @@ async function main() {
       const mode = getFlag(flags, 'mode') as string | undefined
       const shell = getFlag(flags, 'shell') as string | undefined
       const cwd = getFlag(flags, 'cwd') as string | undefined
+      const resumeSessionId = getFlag(flags, 'resume') as string | undefined
+      if (rejectRawCodexResume(mode, resumeSessionId)) return
       const resolved = await resolvePaneTarget(client, target)
       if (!resolved.pane?.id) {
         writeError(resolved.message || 'pane not found')

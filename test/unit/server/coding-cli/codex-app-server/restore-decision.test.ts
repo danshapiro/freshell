@@ -51,6 +51,16 @@ describe('Codex create/restore decision', () => {
     })
   })
 
+  it('rejects non-restore creates that provide a raw legacy Codex resume id', () => {
+    expect(planCodexCreateRestoreDecision({
+      legacyResumeSessionId: 'thread-raw',
+    })).toEqual({
+      kind: 'reject_invalid_raw_codex_resume_request',
+      code: 'INVALID_MESSAGE',
+      message: INVALID_RAW_CODEX_RESUME_MESSAGE,
+    })
+  })
+
   it('requires a canonical sessionRef or candidate for restore', () => {
     expect(planCodexCreateRestoreDecision({ restoreRequested: true })).toEqual({
       kind: 'reject_missing_codex_session_ref',
@@ -99,7 +109,7 @@ describe('Codex create/restore decision', () => {
       restoreRequested: true,
       codexDurability: durability,
       proofRollout: async () => proofOk,
-      findExactLiveTerminalByCandidate: () => liveTerminal,
+      findLiveTerminalByCandidate: () => liveTerminal,
     })
 
     expect(decision).toEqual({
@@ -122,7 +132,7 @@ describe('Codex create/restore decision', () => {
       restoreRequested: true,
       codexDurability: durability,
       proofRollout: async () => proofMissing,
-      findExactLiveTerminalByCandidate: () => liveTerminal,
+      findLiveTerminalByCandidate: () => liveTerminal,
     })
 
     expect(decision).toEqual({
@@ -138,7 +148,39 @@ describe('Codex create/restore decision', () => {
       restoreRequested: true,
       codexDurability: durability,
       proofRollout: async () => proofMissing,
-      findExactLiveTerminalByCandidate: () => undefined,
+      findLiveTerminalByCandidate: () => undefined,
+    })
+
+    expect(decision).toEqual({
+      kind: 'proof_failed_fresh_create',
+      candidate,
+      proof: proofMissing,
+      clearCodexDurability: true,
+      restoreError: {
+        code: 'RESTORE_UNAVAILABLE',
+        reason: 'durable_artifact_missing',
+      },
+    })
+  })
+
+  it('does not accept a loose live terminal candidate returned by the caller', async () => {
+    const looseLiveTerminal: CodexLiveRestoreTerminal = {
+      terminalId: 'term-loose-live',
+      createdAt: 10,
+      codexDurability: {
+        ...durability,
+        candidate: {
+          ...candidate,
+          candidateThreadId: 'thread-other',
+        },
+      },
+    }
+
+    const decision = await resolveCodexCreateRestoreDecision({
+      restoreRequested: true,
+      codexDurability: durability,
+      proofRollout: async () => proofMissing,
+      findLiveTerminalByCandidate: () => looseLiveTerminal,
     })
 
     expect(decision).toEqual({

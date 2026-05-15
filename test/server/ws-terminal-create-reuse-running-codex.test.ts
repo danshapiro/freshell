@@ -479,6 +479,39 @@ describe('terminal.create reuse running codex terminal', () => {
     }
   })
 
+  it.each([
+    ['omitted', undefined],
+    ['false', false],
+  ] as const)('rejects raw Codex resume ids when restore is %s', async (_label, restore) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const requestId = `codex-raw-resume-create-${_label}`
+      const errorPromise = waitForMessage(ws, (m) => m.type === 'error' && m.requestId === requestId)
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'codex',
+        ...(restore === undefined ? {} : { restore }),
+        resumeSessionId: 'thread-raw-create',
+      }))
+
+      const error = await errorPromise
+      expect(error).toMatchObject({
+        type: 'error',
+        code: 'INVALID_MESSAGE',
+        message: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+        requestId,
+      })
+      expect(codexLaunchPlanner.planCreateCalls).toHaveLength(0)
+      expect(registry.createCalls).toHaveLength(0)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
   it('existingId branch returns created only and requires explicit attach', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {

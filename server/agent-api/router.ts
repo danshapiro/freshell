@@ -12,6 +12,7 @@ import {
   getCodexSessionBindingReason,
   normalizeCodexSandboxSetting,
 } from '../coding-cli/codex-launch-config.js'
+import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../coding-cli/codex-app-server/restore-decision.js'
 import { makeSessionKey } from '../coding-cli/types.js'
 import { terminalIdFromCreateError, type ProviderSettings, type TerminalInputResult } from '../terminal-registry.js'
 import { MAX_TERMINAL_TITLE_OVERRIDE_LENGTH } from '../terminals-router.js'
@@ -27,8 +28,15 @@ const SYNCABLE_TERMINAL_MODES = new Set(['claude', 'codex', 'opencode', 'gemini'
 const log = logger.child({ component: 'agent-api' })
 const CODEX_INPUT_READY_WAIT_TIMEOUT_MS = 60_000
 
+class AgentRouteInputError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'AgentRouteInputError'
+  }
+}
+
 function agentRouteErrorStatus(error: unknown): number {
-  return error instanceof CodexLaunchConfigError ? 400 : 500
+  return error instanceof CodexLaunchConfigError || error instanceof AgentRouteInputError ? 400 : 500
 }
 
 function errorMessage(error: unknown): string {
@@ -134,7 +142,12 @@ function requestedResumeSessionIdForMode(
 ): string | undefined {
   const acceptedSessionRef = acceptedSessionRefForMode(sessionRef, mode)
   if (acceptedSessionRef) return acceptedSessionRef.sessionId
-  if (mode === 'codex') return undefined
+  if (mode === 'codex') {
+    if (isNonEmptyString(legacyResumeSessionId)) {
+      throw new AgentRouteInputError(INVALID_RAW_CODEX_RESUME_MESSAGE)
+    }
+    return undefined
+  }
   return typeof legacyResumeSessionId === 'string' ? legacyResumeSessionId : undefined
 }
 
@@ -144,6 +157,10 @@ function acceptedSessionRefForMode(
 ): ReturnType<typeof sanitizeSessionRef> {
   if (!sessionRef || sessionRef.provider !== mode) return undefined
   return sessionRef
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0
 }
 
 async function adoptCodexLaunch(
@@ -963,6 +980,18 @@ export function createAgentApiRouter({
       const direction = req.body?.direction || 'vertical'
       const wantsBrowser = !!req.body?.browser
       const wantsEditor = !!req.body?.editor
+      const splitMode = !wantsBrowser && !wantsEditor ? req.body?.mode || 'shell' : undefined
+      const requestedSessionRef = splitMode ? sanitizeSessionRef(req.body?.sessionRef) : undefined
+      const acceptedSessionRef = splitMode
+        ? acceptedSessionRefForMode(requestedSessionRef, splitMode)
+        : undefined
+      const requestedResumeSessionId = splitMode
+        ? requestedResumeSessionIdForMode(
+          requestedSessionRef,
+          splitMode,
+          req.body?.resumeSessionId,
+        )
+        : undefined
       if (!wantsBrowser && !wantsEditor) {
         assertTerminalAdmission()
       }
@@ -989,16 +1018,9 @@ export function createAgentApiRouter({
       } else if (wantsEditor) {
         content = { kind: 'editor', filePath: req.body.editor, language: null, readOnly: false, content: '', viewMode: 'source' }
       } else {
-        const splitMode = req.body?.mode || 'shell'
-        const requestedSessionRef = sanitizeSessionRef(req.body?.sessionRef)
-        const acceptedSessionRef = acceptedSessionRefForMode(requestedSessionRef, splitMode)
-        const requestedResumeSessionId = requestedResumeSessionIdForMode(
-          requestedSessionRef,
-          splitMode,
-          req.body?.resumeSessionId,
-        )
+        const terminalMode = splitMode ?? 'shell'
         launch = await resolveSpawnProviderSettings(
-          splitMode,
+          terminalMode,
           configStore,
           {},
           {
@@ -1009,10 +1031,10 @@ export function createAgentApiRouter({
           },
         )
         assertTerminalAdmission()
-        const sessionBindingReason = getCodexSessionBindingReason(splitMode, requestedResumeSessionId)
+        const sessionBindingReason = getCodexSessionBindingReason(terminalMode, requestedResumeSessionId)
         assertTerminalAdmission()
         const terminal = registry.create({
-          mode: splitMode,
+          mode: terminalMode,
           shell: req.body?.shell,
           cwd: req.body?.cwd,
           resumeSessionId: launch.resumeSessionId,

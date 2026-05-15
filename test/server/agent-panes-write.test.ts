@@ -3,6 +3,7 @@ import express from 'express'
 import request from 'supertest'
 import { createAgentApiRouter } from '../../server/agent-api/router'
 import { FakeCodexLaunchPlanner } from '../helpers/coding-cli/fake-codex-launch-planner.js'
+import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../../server/coding-cli/codex-app-server/restore-decision.js'
 
 it('splits a pane horizontally', async () => {
   const app = express()
@@ -127,6 +128,36 @@ it('kills the created Codex terminal when split adoption fails after registry.cr
   expect(attachPaneContent).not.toHaveBeenCalled()
 })
 
+it('rejects raw Codex resume ids before splitting a pane', async () => {
+  const app = express()
+  app.use(express.json())
+  const splitPane = vi.fn(() => ({ newPaneId: 'pane_new', tabId: 'tab_1' }))
+  const attachPaneContent = vi.fn()
+  const registryCreate = vi.fn(() => ({ terminalId: 'term_new' }))
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  app.use('/api', createAgentApiRouter({
+    layoutStore: { splitPane, attachPaneContent },
+    registry: { create: registryCreate },
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/panes/pane_1/split').send({
+    direction: 'horizontal',
+    mode: 'codex',
+    resumeSessionId: 'thread-raw-split',
+  })
+
+  expect(res.status).toBe(400)
+  expect(res.body).toEqual({
+    status: 'error',
+    message: INVALID_RAW_CODEX_RESUME_MESSAGE,
+  })
+  expect(codexLaunchPlanner.planCreateCalls).toEqual([])
+  expect(splitPane).not.toHaveBeenCalled()
+  expect(registryCreate).not.toHaveBeenCalled()
+  expect(attachPaneContent).not.toHaveBeenCalled()
+})
+
 it('kills the created Codex split terminal without waiting for readiness when shutdown admission closes after adoption', async () => {
   const app = express()
   app.use(express.json())
@@ -158,7 +189,7 @@ it('kills the created Codex split terminal without waiting for readiness when sh
   const res = await request(app).post('/api/panes/pane_1/split').send({
     direction: 'horizontal',
     mode: 'codex',
-    resumeSessionId: 'thread-split-shutdown',
+    sessionRef: { provider: 'codex', sessionId: 'thread-split-shutdown' },
   })
 
   expect(res.status).toBe(500)
@@ -278,6 +309,38 @@ it('kills the created Codex terminal when respawn adoption fails after registry.
   expect(attachPaneContent).not.toHaveBeenCalled()
 })
 
+it('rejects raw Codex resume ids before respawning a pane', async () => {
+  const app = express()
+  app.use(express.json())
+  const attachPaneContent = vi.fn()
+  const registryCreate = vi.fn(() => ({ terminalId: 'term_new' }))
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  const resolveTarget = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      attachPaneContent,
+      resolveTarget,
+    } as any,
+    registry: { create: registryCreate },
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/panes/pane_1/respawn').send({
+    mode: 'codex',
+    resumeSessionId: 'thread-raw-respawn',
+  })
+
+  expect(res.status).toBe(400)
+  expect(res.body).toEqual({
+    status: 'error',
+    message: INVALID_RAW_CODEX_RESUME_MESSAGE,
+  })
+  expect(codexLaunchPlanner.planCreateCalls).toEqual([])
+  expect(resolveTarget).toHaveBeenCalledWith('pane_1')
+  expect(registryCreate).not.toHaveBeenCalled()
+  expect(attachPaneContent).not.toHaveBeenCalled()
+})
+
 it('kills the created Codex respawn terminal without waiting for readiness when shutdown admission closes after adoption', async () => {
   const app = express()
   app.use(express.json())
@@ -310,7 +373,7 @@ it('kills the created Codex respawn terminal without waiting for readiness when 
 
   const res = await request(app).post('/api/panes/pane_1/respawn').send({
     mode: 'codex',
-    resumeSessionId: 'thread-respawn-shutdown',
+    sessionRef: { provider: 'codex', sessionId: 'thread-respawn-shutdown' },
   })
 
   expect(res.status).toBe(500)

@@ -102,21 +102,20 @@ describe('executeAction -- tab actions', () => {
     expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('resumeSessionId')
   })
 
-  it('new-tab does not treat Codex resume as a durable sessionRef', async () => {
+  it('new-tab rejects raw Codex resume ids', async () => {
     mockClient.post.mockResolvedValue({ id: 't1' })
 
-    await executeAction('new-tab', {
+    const result = await executeAction('new-tab', {
       name: 'Codex',
       mode: 'codex',
       resume: 'thread-pre-durable',
     })
 
-    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({
-      name: 'Codex',
-      mode: 'codex',
-    }))
-    expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('sessionRef')
-    expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('resumeSessionId')
+    expect(result).toEqual({
+      error: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+      hint: 'Use sessionRef: { provider: "codex", sessionId } after Codex identity is durable.',
+    })
+    expect(mockClient.post).not.toHaveBeenCalled()
   })
 
   it('new-tab passes explicit canonical Codex sessionRef', async () => {
@@ -234,6 +233,26 @@ describe('executeAction -- pane actions', () => {
     )
   })
 
+  it('split-pane rejects raw Codex resume ids', async () => {
+    mockClient.get.mockImplementation((path: string) => {
+      if (path === '/api/tabs') return Promise.resolve({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' })
+      if (path.includes('/api/panes')) return Promise.resolve({ panes: [{ id: 'p1', index: 0, kind: 'terminal', terminalId: 'term-1' }] })
+      return Promise.resolve({})
+    })
+
+    const result = await executeAction('split-pane', {
+      target: 'p1',
+      mode: 'codex',
+      resume: 'thread-pre-durable',
+    })
+
+    expect(result).toEqual({
+      error: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+      hint: 'Use sessionRef: { provider: "codex", sessionId } after Codex identity is durable.',
+    })
+    expect(mockClient.post).not.toHaveBeenCalled()
+  })
+
   it('list-panes calls GET /api/panes', async () => {
     mockClient.get.mockResolvedValue({ panes: [] })
     await executeAction('list-panes')
@@ -335,6 +354,22 @@ describe('executeAction -- pane actions', () => {
         },
       }),
     )
+  })
+
+  it('respawn-pane rejects raw Codex resume ids', async () => {
+    mockClient.post.mockResolvedValue({ ok: true })
+
+    const result = await executeAction('respawn-pane', {
+      target: 'p1',
+      mode: 'codex',
+      resume: 'thread-pre-durable',
+    })
+
+    expect(result).toEqual({
+      error: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+      hint: 'Use sessionRef: { provider: "codex", sessionId } after Codex identity is durable.',
+    })
+    expect(mockClient.post).not.toHaveBeenCalled()
   })
 })
 
