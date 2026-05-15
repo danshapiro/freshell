@@ -583,6 +583,20 @@ The current app-server client schema handles thread lifecycle notifications and 
 
 The current recovery path also has a timer-based live-only success surface: `/home/user/code/freshell/.worktrees/dev/server/terminal-registry.ts:1979` through `/home/user/code/freshell/.worktrees/dev/server/terminal-registry.ts:1997` starts a pre-durable stability timer and marks `running_live_only`. Under the revised contract, a live-only state is acceptable only before a completed turn or while visibly degraded after proof failure; it must not be a silent green/grey steady state after `turn/completed`.
 
+#### 2026-05-14 central restore decision lesson
+
+Commit `da2e0076` (`Centralize Codex restore create decisions`) turned one implementation lesson into part of the design contract: deterministic restore is not only rollout-proof logic. Every restore-like create path must enter one typed decision contract before it can spawn, resume, attach, or fall back to a fresh Codex terminal. Otherwise separate entry points can drift into different restore semantics even if the proof reader is correct.
+
+At the design level, `da2e0076` added `/home/user/code/freshell/.worktrees/codex-stability-implementation-20260514/server/coding-cli/codex-app-server/restore-decision.ts` with `planCodexCreateRestoreDecision` and `resolveCodexCreateRestoreDecision`, then rewired `/home/user/code/freshell/.worktrees/codex-stability-implementation-20260514/server/ws-handler.ts` so Codex `terminal.create` and reopen handling route through that module. The module separates canonical durable resume through `sessionRef { provider: 'codex', sessionId: candidateThreadId }`, proof-first handling for captured candidates, attach-live-on-proof-failure, fresh create, and the remaining legacy raw-resume passthrough case. Focused coverage passed for `/home/user/code/freshell/.worktrees/codex-stability-implementation-20260514/test/unit/server/coding-cli/codex-app-server/restore-decision.test.ts` and `/home/user/code/freshell/.worktrees/codex-stability-implementation-20260514/test/server/ws-terminal-create-reuse-running-codex.test.ts`.
+
+The review verdict was pass with concerns. The refactor is a useful boundary, but it does not mean every surface is complete:
+
+- `legacy_raw_resume_passthrough` still exists for non-restore creates. It should be removed or replaced once callers can provide canonical `sessionRef` or captured candidate state.
+- The central module currently trusts the caller's exact-live-terminal lookup to enforce that a live handle matches both `candidateThreadId` and `rolloutPath`. A follow-up should either enforce that match inside the module or make the typed input contract return enough candidate identity for the module to verify it itself.
+- Some side-effect branching remains in `/home/user/code/freshell/.worktrees/codex-stability-implementation-20260514/server/ws-handler.ts` because spawn, attach, broadcast, and error response effects still live there. That is acceptable for the narrow refactor, but the decision surface should stay pure and explicit as more effects move behind it.
+- REST, MCP, CLI, and any other future restore-like surfaces must route through the same decision path or an equivalent shared contract. They should not grow parallel semantics for raw resume, candidate proof, live attach, or fresh fallback.
+- Tests should include a surface matrix that proves each external entry point reaches the same decision semantics, not only unit tests for the decision module and the current websocket path.
+
 ### Codex allowed behavior
 
 - Fresh Codex panes may be captured-but-unproven before a turn completes, but user input should not be accepted until the pre-durable candidate root TUI `ThreadId` and provider-reported `rolloutPath` have been captured and persisted.

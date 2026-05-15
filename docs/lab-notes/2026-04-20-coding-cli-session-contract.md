@@ -233,6 +233,19 @@ Allowed Freshell behavior:
 - Freshell may only persist canonical Codex identity after the durable `.jsonl` artifact exists at the provider-reported `thread.path`.
 - Freshell must not treat the bootstrap `thread/start` id as durable restore identity.
 
+### 2026-05-14 Codex restore decision addendum
+
+The `da2e0076` refactor added a design constraint that belongs with the provider contract: deterministic Codex restore needs one typed create/restore decision path, not only a correct rollout proof reader. Restore-like entry points must make the same decision about canonical `sessionRef`, captured candidate proof, live attach after proof failure, fresh create, and legacy raw resume. Keeping those choices local to each caller risks separate restore semantics.
+
+Design-level change recorded from `/home/user/code/freshell/.worktrees/codex-stability-implementation-20260514`: `/home/user/code/freshell/.worktrees/codex-stability-implementation-20260514/server/coding-cli/codex-app-server/restore-decision.ts` now owns `planCodexCreateRestoreDecision` and `resolveCodexCreateRestoreDecision`, and `/home/user/code/freshell/.worktrees/codex-stability-implementation-20260514/server/ws-handler.ts` routes Codex `terminal.create` and reopen handling through it. This is a narrow centralization, not a claim that every surface is done.
+
+Follow-up constraints:
+
+- Move exact live-candidate matching into the central module or make its typed input contract require enough live candidate identity for the module to verify `candidateThreadId` and `rolloutPath`.
+- Remove or replace `legacy_raw_resume_passthrough`; raw resume should not remain a durable restore identity path.
+- Extend the same decision path to REST, MCP, CLI, and any future restore-like surface instead of maintaining parallel semantics.
+- Add surface matrix tests so coverage proves all entry points use the same restore decisions, not just the decision module and the current websocket route.
+
 ## Claude
 
 Version and binaries:
