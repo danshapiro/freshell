@@ -78,11 +78,14 @@ import {
   UiScreenshotResultSchema,
   WS_PROTOCOL_VERSION,
 } from '../shared/ws-protocol.js'
-import { buildRestoreError, LiveTerminalHandleSchema, type RestoreError } from '../shared/session-contract.js'
+import { LiveTerminalHandleSchema, type RestoreError } from '../shared/session-contract.js'
 import { CODEX_DURABILITY_SCHEMA_VERSION, CodexDurabilityRefSchema } from '../shared/codex-durability.js'
 import { UiLayoutSyncSchema } from './agent-api/layout-schema.js'
 import type { LayoutStore } from './agent-api/layout-store.js'
-import { proofCodexRollout } from './coding-cli/codex-app-server/durability-proof.js'
+import {
+  planCodexCreateRestoreDecision,
+  resolveCodexCreateRestoreDecision,
+} from './coding-cli/codex-app-server/restore-decision.js'
 
 type WsHandlerConfig = {
   maxConnections: number
@@ -1896,14 +1899,41 @@ export class WsHandler {
         let error = false
         let rateLimited = false
         const requestedSessionRef = normalizeUiSessionLocator(m.sessionRef)
-        let effectiveResumeSessionId = m.resumeSessionId
-        if (!effectiveResumeSessionId && requestedSessionRef && requestedSessionRef.provider === m.mode) {
+        const codexRestorePlan = m.mode === 'codex'
+          ? planCodexCreateRestoreDecision({
+            restoreRequested: m.restore === true,
+            legacyResumeSessionId: m.resumeSessionId,
+            sessionRef: requestedSessionRef,
+            codexDurability: m.codexDurability,
+          })
+          : undefined
+        let effectiveResumeSessionId: string | undefined
+        if (
+          codexRestorePlan?.kind === 'durable_session_ref_resume'
+          || codexRestorePlan?.kind === 'legacy_raw_resume_passthrough'
+        ) {
+          effectiveResumeSessionId = codexRestorePlan.sessionId
+        } else if (m.mode !== 'codex') {
+          effectiveResumeSessionId = m.resumeSessionId
+        }
+        if (m.mode !== 'codex' && !effectiveResumeSessionId && requestedSessionRef && requestedSessionRef.provider === m.mode) {
           effectiveResumeSessionId = requestedSessionRef.sessionId
         }
-        const hasCodexCapturedRestoreState = m.mode === 'codex' && !!m.codexDurability?.candidate
+        if (codexRestorePlan?.kind === 'reject_invalid_raw_codex_resume_request') {
+          error = true
+          this.sendError(ws, {
+            code: codexRestorePlan.code,
+            message: codexRestorePlan.message,
+            requestId: m.requestId,
+          })
+          endCreateTimer({ error, rateLimited })
+          return
+        }
+        const hasCodexCapturedRestoreState = codexRestorePlan?.kind === 'proof_existing_candidate_first'
         if (
           m.restore === true
           && modeSupportsResume(m.mode as TerminalMode)
+          && m.mode !== 'codex'
           && m.resumeSessionId
           && !requestedSessionRef
         ) {
@@ -2072,56 +2102,79 @@ export class WsHandler {
 
               let clearCodexDurabilityOnCreate = false
               let restoreErrorOnCreate: RestoreError | undefined
-              if (m.mode === 'codex' && !effectiveResumeSessionId && m.codexDurability?.candidate) {
-                const candidate = m.codexDurability.candidate
-                const proof = await proofCodexRollout({
-                  rolloutPath: candidate.rolloutPath,
-                  candidateThreadId: candidate.candidateThreadId,
+              if (m.mode === 'codex') {
+                const decision = await resolveCodexCreateRestoreDecision({
+                  restoreRequested: m.restore === true,
+                  legacyResumeSessionId: m.resumeSessionId,
+                  sessionRef: requestedSessionRef,
+                  codexDurability: m.codexDurability,
+                  findExactLiveTerminalByCandidate: (candidate) => (
+                    this.registry.findRunningCodexTerminalByCandidate(
+                      candidate.candidateThreadId,
+                      candidate.rolloutPath,
+                    ) ?? requestedLiveCodexCandidate(candidate)
+                  ),
                 })
-                if (proof.ok) {
-                  const live = this.registry.findRunningCodexTerminalByCandidate(
-                    candidate.candidateThreadId,
-                    candidate.rolloutPath,
-                  ) ?? requestedLiveCodexCandidate(candidate)
+
+                if (
+                  decision.kind === 'reject_invalid_raw_codex_resume_request'
+                  || decision.kind === 'reject_missing_codex_session_ref'
+                ) {
+                  error = true
+                  this.sendError(ws, {
+                    code: decision.code,
+                    message: decision.message,
+                    requestId: m.requestId,
+                  })
+                  return
+                }
+
+                if (decision.kind === 'durable_session_ref_resume' || decision.kind === 'legacy_raw_resume_passthrough') {
+                  effectiveResumeSessionId = decision.sessionId
+                } else if (decision.kind === 'fresh_codex_launch') {
+                  effectiveResumeSessionId = undefined
+                } else if (decision.kind === 'proof_succeeded_resume_durable') {
+                  const { candidate, liveTerminal: live } = decision
                   if (live) {
                     const promoted = typeof this.registry.promoteCodexDurabilityFromCreateProof === 'function'
-                      ? await this.registry.promoteCodexDurabilityFromCreateProof(live.terminalId, proof.rolloutProofId)
+                      ? await this.registry.promoteCodexDurabilityFromCreateProof(live.terminalId, decision.sessionId)
                       : undefined
-                    const bound = promoted ?? this.registry.bindSession?.(live.terminalId, 'codex', proof.rolloutProofId, 'association')
+                    const bound = promoted ?? this.registry.bindSession?.(live.terminalId, 'codex', decision.sessionId, 'association')
                     if (!bound || bound.ok) {
                       if (!promoted) {
-                        live.resumeSessionId = proof.rolloutProofId
+                        live.resumeSessionId = decision.sessionId
                         live.codexDurability = {
                           schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
                           state: 'durable',
-                          durableThreadId: proof.rolloutProofId,
+                          durableThreadId: decision.sessionId,
                         }
                       }
                       broadcastCodexDurabilityUpdated(live.terminalId, live.codexDurability ?? {
                         schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
                         state: 'durable',
-                        durableThreadId: proof.rolloutProofId,
+                        durableThreadId: decision.sessionId,
                       })
-                      await attachReusedTerminal(live.terminalId, live.createdAt, proof.rolloutProofId)
-                      broadcastCodexSessionAssociated(live.terminalId, proof.rolloutProofId)
+                      await attachReusedTerminal(live.terminalId, live.createdAt, decision.sessionId)
+                      broadcastCodexSessionAssociated(live.terminalId, decision.sessionId)
                       return
                     }
                     log.warn({
                       requestId: m.requestId,
                       connectionId: ws.connectionId,
                       terminalId: live.terminalId,
-                      sessionId: proof.rolloutProofId,
+                      sessionId: decision.sessionId,
                       reason: bound.reason,
                     }, 'Codex captured restore state proved durable but live terminal binding failed')
                   }
-                  effectiveResumeSessionId = proof.rolloutProofId
+                  effectiveResumeSessionId = decision.sessionId
                   log.info({
                     requestId: m.requestId,
                     connectionId: ws.connectionId,
                     candidateThreadId: candidate.candidateThreadId,
                     rolloutPath: candidate.rolloutPath,
                   }, 'Codex captured restore state proved durable during terminal.create')
-                } else {
+                } else if (decision.kind === 'proof_failed_attach_live_candidate') {
+                  const { candidate, proof, liveTerminal: live } = decision
                   log.warn({
                     requestId: m.requestId,
                     connectionId: ws.connectionId,
@@ -2129,16 +2182,20 @@ export class WsHandler {
                     rolloutPath: candidate.rolloutPath,
                     reason: proof.reason,
                   }, 'Codex captured restore state could not be proved during terminal.create')
-                  const live = this.registry.findRunningCodexTerminalByCandidate(
-                    candidate.candidateThreadId,
-                    candidate.rolloutPath,
-                  )
-                  if (live) {
-                    await attachReusedTerminal(live.terminalId, live.createdAt, live.resumeSessionId)
-                    return
-                  }
-                  clearCodexDurabilityOnCreate = true
-                  restoreErrorOnCreate = buildRestoreError('durable_artifact_missing')
+                  await attachReusedTerminal(live.terminalId, live.createdAt, live.resumeSessionId)
+                  return
+                } else if (decision.kind === 'proof_failed_fresh_create') {
+                  const { candidate, proof } = decision
+                  log.warn({
+                    requestId: m.requestId,
+                    connectionId: ws.connectionId,
+                    candidateThreadId: candidate.candidateThreadId,
+                    rolloutPath: candidate.rolloutPath,
+                    reason: proof.reason,
+                  }, 'Codex captured restore state could not be proved during terminal.create')
+                  clearCodexDurabilityOnCreate = decision.clearCodexDurability
+                  restoreErrorOnCreate = decision.restoreError
+                  effectiveResumeSessionId = undefined
                 }
               }
 
