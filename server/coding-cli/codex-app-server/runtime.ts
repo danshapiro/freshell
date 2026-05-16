@@ -885,17 +885,25 @@ export class CodexAppServerRuntime {
   }
 
   private async readWrapperIdentityInto(ownership: ActiveOwnership): Promise<void> {
-    const wrapperIdentity = await this.processIdentityReader(ownership.metadata.wrapperPid)
-    if (!isCompleteWrapperIdentity(wrapperIdentity)) {
-      throw new Error(
-        `Codex app-server wrapper identity could not be completely read for PID ${ownership.metadata.wrapperPid}.`,
-      )
+    const timeoutMs = Math.min(this.startupAttemptTimeoutMs, 1_000)
+    const deadline = Date.now() + timeoutMs
+
+    while (Date.now() < deadline) {
+      const wrapperIdentity = await this.processIdentityReader(ownership.metadata.wrapperPid)
+      if (isCompleteWrapperIdentity(wrapperIdentity)) {
+        ownership.metadata = {
+          ...ownership.metadata,
+          wrapperIdentity,
+          updatedAt: new Date().toISOString(),
+        }
+        return
+      }
+      await sleep(25)
     }
-    ownership.metadata = {
-      ...ownership.metadata,
-      wrapperIdentity,
-      updatedAt: new Date().toISOString(),
-    }
+
+    throw new Error(
+      `Codex app-server wrapper identity could not be completely read for PID ${ownership.metadata.wrapperPid}.`,
+    )
   }
 
   private async writeOwnershipRecord(ownership: ActiveOwnership): Promise<void> {

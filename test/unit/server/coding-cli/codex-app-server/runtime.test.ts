@@ -385,6 +385,44 @@ describe('CodexAppServerRuntime', () => {
     }
   })
 
+  it('keeps the same sidecar when wrapper identity is transiently incomplete', async () => {
+    const tempDir = await makeTempDir()
+    const metadataDir = path.join(tempDir, 'metadata')
+    const processGroups: number[] = []
+    const seenProcessGroups = new Set<number>()
+    let identityReadAttempts = 0
+    const runtime = createRuntime({
+      metadataDir,
+      serverInstanceId: 'srv-runtime-test',
+      startupAttemptLimit: 1,
+      startupAttemptTimeoutMs: 500,
+      processIdentityReader: async (pid) => {
+        identityReadAttempts += 1
+        if (identityReadAttempts === 1) {
+          return { commandLine: [], cwd: null, startTimeTicks: null }
+        }
+        return readWrapperIdentityForTest(pid)
+      },
+      metadataWriter: async (filePath, metadata) => {
+        if (!seenProcessGroups.has(metadata.processGroupId)) {
+          seenProcessGroups.add(metadata.processGroupId)
+          processGroups.push(metadata.processGroupId)
+        }
+        await fsp.mkdir(path.dirname(filePath), { recursive: true })
+        await fsp.writeFile(filePath, JSON.stringify(metadata), 'utf8')
+      },
+    })
+
+    const ready = await runtime.ensureReady()
+    const record = JSON.parse(await fsp.readFile(ready.metadataPath, 'utf8'))
+
+    expect(processGroups).toEqual([ready.processGroupId])
+    expect(identityReadAttempts).toBe(2)
+    expect(record.wrapperIdentity.commandLine.length).toBeGreaterThan(0)
+    expect(record.wrapperIdentity.cwd).toEqual(expect.any(String))
+    expect(record.wrapperIdentity.startTimeTicks).toEqual(expect.any(Number))
+  }, 3_000)
+
   it('tears down both the wrapper and native child in its process group', async () => {
     const metadataDir = await makeTempDir()
     const nativePidFile = path.join(metadataDir, 'native.pid')
@@ -516,7 +554,7 @@ describe('CodexAppServerRuntime', () => {
       requestTimeoutMs: 1_000,
       processIdentityReader: async (pid) => {
         identityReadAttempts += 1
-        if (identityReadAttempts === 1) return null
+        if (pid === processGroups[0]) return null
         return readWrapperIdentityForTest(pid)
       },
       metadataWriter: async (filePath, metadata) => {
@@ -536,7 +574,7 @@ describe('CodexAppServerRuntime', () => {
     const record = JSON.parse(await fsp.readFile(ready.metadataPath, 'utf8'))
 
     expect(processGroups).toHaveLength(2)
-    expect(identityReadAttempts).toBe(2)
+    expect(identityReadAttempts).toBeGreaterThan(2)
     expect(previousAttemptGoneBeforeRetry).toBe(true)
     expect(record.processGroupId).toBe(processGroups[1])
     expect(record.wrapperIdentity.startTimeTicks).toEqual(expect.any(Number))
@@ -557,7 +595,7 @@ describe('CodexAppServerRuntime', () => {
       requestTimeoutMs: 1_000,
       processIdentityReader: async (pid) => {
         identityReadAttempts += 1
-        if (identityReadAttempts === 1) {
+        if (pid === processGroups[0]) {
           return { commandLine: [], cwd: null, startTimeTicks: null }
         }
         return readWrapperIdentityForTest(pid)
@@ -579,7 +617,7 @@ describe('CodexAppServerRuntime', () => {
     const record = JSON.parse(await fsp.readFile(ready.metadataPath, 'utf8'))
 
     expect(processGroups).toHaveLength(2)
-    expect(identityReadAttempts).toBe(2)
+    expect(identityReadAttempts).toBeGreaterThan(2)
     expect(previousAttemptGoneBeforeRetry).toBe(true)
     expect(record.processGroupId).toBe(processGroups[1])
     expect(record.wrapperIdentity.commandLine.length).toBeGreaterThan(0)
