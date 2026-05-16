@@ -22,6 +22,7 @@ import type {
   OpencodeActivityRecord,
   SdkServerMessage,
   SdkSessionStatus,
+  TerminalTurnCompleteMessage,
 } from '../shared/ws-protocol.js'
 import type { ExtensionManager } from './extension-manager.js'
 import { allocateLocalhostPort } from './local-port.js'
@@ -55,6 +56,7 @@ import {
   OpencodeActivityListResponseSchema,
   OpencodeActivityListSchema,
   OpencodeActivityUpdatedSchema,
+  TerminalTurnCompleteSchema,
   HelloSchema,
   PingSchema,
   ClientDiagnosticSchema,
@@ -75,6 +77,14 @@ import {
   SdkAttachSchema,
   SdkSetModelSchema,
   SdkSetPermissionModeSchema,
+  FreshAgentCreateSchema,
+  FreshAgentAttachSchema,
+  FreshAgentSendSchema,
+  FreshAgentInterruptSchema,
+  FreshAgentApprovalRespondSchema,
+  FreshAgentQuestionRespondSchema,
+  FreshAgentKillSchema,
+  FreshAgentForkSchema,
   UiScreenshotResultSchema,
   WS_PROTOCOL_VERSION,
 } from '../shared/ws-protocol.js'
@@ -102,6 +112,48 @@ type WsHandlerConfig = {
   terminalCreateRateWindowMs: number
 }
 
+type FreshAgentRuntimeManagerLike = {
+  create: (input: any) => Promise<any>
+  attach: (input: any) => any
+  subscribe?: (locator: any, listener: (message: unknown) => void) => Promise<() => void> | (() => void)
+  send?: (locator: any, input: any) => Promise<void> | void
+  interrupt?: (locator: any) => Promise<void> | void
+  resolveApproval?: (locator: any, requestId: string | number, decision: Record<string, unknown>) => Promise<void> | void
+  answerQuestion?: (locator: any, requestId: string | number, answers: Record<string, string>) => Promise<void> | void
+  kill?: (locator: any) => Promise<boolean> | boolean
+  fork?: (locator: any, input?: Record<string, unknown>) => Promise<unknown> | unknown
+}
+
+type FreshAgentLocator = {
+  sessionId: string
+  sessionType: string
+  provider: string
+}
+
+type FreshAgentCreatedRecord = {
+  sessionId: string
+  sessionType: string
+  provider: string
+  runtimeProvider: string
+  sessionRef?: { provider: string; sessionId: string }
+}
+
+type FreshAgentSubscriptionEntry = {
+  active: boolean
+  off?: () => void
+  pending?: Promise<void>
+}
+
+type WsErrorLogEntry = {
+  code: string
+  messageClass: string
+  terminalId?: string
+  count: number
+  suppressedCount: number
+  firstRequestId?: string
+  lastRequestId?: string
+}
+
 export type WsHandlerOptions = {
   codingCliManager?: CodingCliSessionManager
   codexLaunchPlanner?: CodexLaunchPlanner
@@ -116,6 +168,7 @@ export type WsHandlerOptions = {
   codexActivityListProvider?: () => CodexActivityRecord[]
   agentHistorySource?: AgentHistorySource
   opencodeActivityListProvider?: () => OpencodeActivityRecord[]
+  freshAgentRuntimeManager?: FreshAgentRuntimeManagerLike
 }
 
 function readWsHandlerConfig(): WsHandlerConfig {
@@ -372,6 +425,8 @@ type ClientState = {
   sdkSessions: Set<string>
   sdkSubscriptions: Map<string, () => void>
   sdkSessionTargets: Map<string, string>
+  freshAgentSubscriptions: Map<string, FreshAgentSubscriptionEntry>
+  wsErrorLogs: Map<string, WsErrorLogEntry>
   interestedSessions: Set<string>
   sidebarOpenSessionKeys: Set<string>
   helloTimer?: NodeJS.Timeout
@@ -431,12 +486,15 @@ export class WsHandler {
   private layoutStore?: LayoutStore
   private extensionManager?: ExtensionManager
   private agentHistorySource?: AgentHistorySource
+  private freshAgentRuntimeManager?: FreshAgentRuntimeManagerLike
   private terminalStreamBroker: TerminalStreamBroker
   private terminalCreateLocks = new Map<string, Promise<void>>()
   private createdTerminalByRequestId = new Map<string, string>()
   private sdkCreateLocks = new Map<string, Promise<void>>()
   private createdSdkSessionByRequestId = new Map<string, string>()
   private sdkSessionByCreateOwnerKey = new Map<string, string>()
+  private freshAgentCreateLocks = new Map<string, Promise<void>>()
+  private createdFreshAgentByRequestId = new Map<string, FreshAgentCreatedRecord>()
   private screenshotRequests = new Map<string, PendingScreenshot>()
   private sessionsRevision = 0
   private terminalsRevision = 0
@@ -484,6 +542,7 @@ export class WsHandler {
     this.tabsRegistryStore = options.tabsRegistryStore
     this.layoutStore = options.layoutStore
     this.extensionManager = options.extensionManager
+    this.freshAgentRuntimeManager = options.freshAgentRuntimeManager
     this.agentHistorySource = options.agentHistorySource ?? (this.sdkBridge
       ? createAgentHistorySource({
         loadSessionHistory,
@@ -528,6 +587,7 @@ export class WsHandler {
       codexDurability: CodexDurabilityRefSchema.optional(),
       liveTerminal: LiveTerminalHandleSchema.optional(),
       restore: z.boolean().optional(),
+      recoveryIntent: z.literal('fresh_after_restore_unavailable').optional(),
       tabId: z.string().min(1).optional(),
       paneId: z.string().min(1).optional(),
     }).strict()
@@ -572,6 +632,14 @@ export class WsHandler {
       dynamicCodingCliCreateSchema,
       CodingCliInputSchema,
       CodingCliKillSchema,
+      FreshAgentCreateSchema,
+      FreshAgentAttachSchema,
+      FreshAgentSendSchema,
+      FreshAgentInterruptSchema,
+      FreshAgentApprovalRespondSchema,
+      FreshAgentQuestionRespondSchema,
+      FreshAgentKillSchema,
+      FreshAgentForkSchema,
       SdkCreateSchema,
       SdkSendSchema,
       SdkPermissionRespondSchema,
@@ -810,6 +878,23 @@ export class WsHandler {
       })
 
     this.sdkCreateLocks.set(key, current)
+    return current
+  }
+
+  private withFreshAgentCreateLock(key: string, task: () => Promise<void>): Promise<void> {
+    const previous = this.freshAgentCreateLocks.get(key) ?? Promise.resolve()
+
+    let current: Promise<void>
+    current = previous
+      .catch(() => undefined)
+      .then(task)
+      .finally(() => {
+        if (this.freshAgentCreateLocks.get(key) === current) {
+          this.freshAgentCreateLocks.delete(key)
+        }
+      })
+
+    this.freshAgentCreateLocks.set(key, current)
     return current
   }
 
@@ -1123,6 +1208,8 @@ export class WsHandler {
       sdkSessions: new Set(),
       sdkSubscriptions: new Map(),
       sdkSessionTargets: new Map(),
+      freshAgentSubscriptions: new Map(),
+      wsErrorLogs: new Map(),
       interestedSessions: new Set(),
       sidebarOpenSessionKeys: new Set(),
     }
@@ -1175,6 +1262,8 @@ export class WsHandler {
       off()
     }
     state.sdkSubscriptions.clear()
+    this.cancelAllFreshAgentSubscriptions(state)
+    this.flushWsErrorLogSummaries(state, 'connection_close')
 
     for (const [requestId, pending] of this.screenshotRequests) {
       if (pending.connectionId !== ws.connectionId) continue
@@ -1204,6 +1293,130 @@ export class WsHandler {
     if (off) {
       off()
       state.codingCliSubscriptions.delete(sessionId)
+    }
+  }
+
+  private freshAgentKey(locator: FreshAgentLocator): string {
+    return `${locator.sessionType}:${locator.provider}:${locator.sessionId}`
+  }
+
+  private freshAgentEventMessage(locator: FreshAgentLocator, event: unknown) {
+    return {
+      type: 'freshAgent.event',
+      sessionId: locator.sessionId,
+      sessionType: locator.sessionType,
+      provider: locator.provider,
+      event,
+    }
+  }
+
+  private freshAgentUnavailableMessage() {
+    return 'Fresh Agent runtime is not enabled'
+  }
+
+  private sendFreshAgentSubscriptionError(ws: LiveWebSocket, locator: FreshAgentLocator, error: unknown): void {
+    this.safeSend(ws, this.freshAgentEventMessage(locator, {
+      type: 'sdk.error',
+      sessionId: locator.sessionId,
+      code: 'FRESH_AGENT_SUBSCRIBE_FAILED',
+      message: errorMessage(error),
+    }))
+  }
+
+  private logFreshAgentSubscriptionOffError(locator: FreshAgentLocator, error: unknown): void {
+    log.warn({
+      err: error instanceof Error ? error : new Error(String(error)),
+      sessionId: locator.sessionId,
+      sessionType: locator.sessionType,
+      provider: locator.provider,
+    }, 'Fresh Agent subscription cleanup failed')
+  }
+
+  private ensureFreshAgentSubscription(
+    ws: LiveWebSocket,
+    state: ClientState,
+    locator: FreshAgentLocator,
+  ): void {
+    const manager = this.freshAgentRuntimeManager
+    if (!manager?.subscribe) return
+
+    const key = this.freshAgentKey(locator)
+    const existing = state.freshAgentSubscriptions.get(key)
+    if (existing) {
+      existing.active = true
+      return
+    }
+
+    const entry: FreshAgentSubscriptionEntry = { active: true }
+    state.freshAgentSubscriptions.set(key, entry)
+
+    const listener = (event: unknown) => {
+      if (!entry.active) return
+      this.safeSend(ws, this.freshAgentEventMessage(locator, event))
+    }
+
+    entry.pending = Promise.resolve()
+      .then(() => manager.subscribe?.(locator, listener))
+      .then((off) => {
+        entry.pending = undefined
+        if (!entry.active) {
+          if (off) {
+            try {
+              off()
+            } catch (error) {
+              this.logFreshAgentSubscriptionOffError(locator, error)
+            }
+          }
+          state.freshAgentSubscriptions.delete(key)
+          return
+        }
+        if (off) {
+          entry.off = off
+        }
+      })
+      .catch((error) => {
+        entry.pending = undefined
+        state.freshAgentSubscriptions.delete(key)
+        if (entry.active) {
+          this.sendFreshAgentSubscriptionError(ws, locator, error)
+        }
+      })
+  }
+
+  private cancelFreshAgentSubscription(
+    state: ClientState,
+    locator: FreshAgentLocator,
+  ): void {
+    const key = this.freshAgentKey(locator)
+    const entry = state.freshAgentSubscriptions.get(key)
+    if (!entry) return
+
+    entry.active = false
+    state.freshAgentSubscriptions.delete(key)
+    if (entry.off) {
+      try {
+        entry.off()
+      } catch (error) {
+        this.logFreshAgentSubscriptionOffError(locator, error)
+      }
+    }
+  }
+
+  private cancelAllFreshAgentSubscriptions(state: ClientState): void {
+    if (!state.freshAgentSubscriptions) return
+    for (const [key, entry] of Array.from(state.freshAgentSubscriptions.entries())) {
+      entry.active = false
+      state.freshAgentSubscriptions.delete(key)
+      if (entry.off) {
+        try {
+          entry.off()
+        } catch (error) {
+          log.warn({
+            err: error instanceof Error ? error : new Error(String(error)),
+            key,
+          }, 'Fresh Agent subscription cleanup failed')
+        }
+      }
     }
   }
 
@@ -1297,17 +1510,87 @@ export class WsHandler {
     }
   }
 
+  private classifyWsError(params: { code: z.infer<typeof ErrorCode>; message: string }): string {
+    if (params.code === 'INVALID_TERMINAL_ID') {
+      return 'terminal_not_running'
+    }
+    return params.code.toLowerCase()
+  }
+
+  private wsErrorLogKey(params: {
+    code: z.infer<typeof ErrorCode>
+    messageClass: string
+    terminalId?: string
+  }): string {
+    return `${params.code}:${params.messageClass}:${params.terminalId ?? ''}`
+  }
+
+  private recordWsErrorLog(
+    ws: LiveWebSocket,
+    params: { code: z.infer<typeof ErrorCode>; message: string; requestId?: string; terminalId?: string },
+  ): void {
+    const state = this.clientStates.get(ws)
+    const messageClass = this.classifyWsError(params)
+    const key = this.wsErrorLogKey({
+      code: params.code,
+      messageClass,
+      terminalId: params.terminalId,
+    })
+    const logs = state?.wsErrorLogs
+    const existing = logs?.get(key)
+    if (existing) {
+      existing.count += 1
+      existing.suppressedCount += 1
+      if (params.requestId) {
+        existing.lastRequestId = params.requestId
+      }
+      return
+    }
+
+    const entry: WsErrorLogEntry = {
+      code: params.code,
+      messageClass,
+      terminalId: params.terminalId,
+      count: 1,
+      suppressedCount: 0,
+      firstRequestId: params.requestId,
+      lastRequestId: params.requestId,
+    }
+    logs?.set(key, entry)
+    log.warn({
+      event: 'ws_send_error',
+      connectionId: ws.connectionId || 'unknown',
+      code: params.code,
+      messageClass,
+      ...(params.requestId ? { requestId: params.requestId } : {}),
+      ...(params.terminalId ? { terminalId: params.terminalId } : {}),
+    }, 'ws_send_error')
+  }
+
+  private flushWsErrorLogSummaries(state: ClientState, reason: 'connection_close'): void {
+    if (!state.wsErrorLogs) return
+    for (const entry of state.wsErrorLogs.values()) {
+      if (entry.suppressedCount <= 0) continue
+      log.warn({
+        event: 'ws_send_error_suppressed_summary',
+        reason,
+        code: entry.code,
+        messageClass: entry.messageClass,
+        ...(entry.terminalId ? { terminalId: entry.terminalId } : {}),
+        suppressedCount: entry.suppressedCount,
+        totalCount: entry.count,
+        ...(entry.firstRequestId ? { firstRequestId: entry.firstRequestId } : {}),
+        ...(entry.lastRequestId ? { lastRequestId: entry.lastRequestId } : {}),
+      }, 'ws_send_error_suppressed_summary')
+    }
+    state.wsErrorLogs.clear()
+  }
+
   private sendError(
     ws: LiveWebSocket,
     params: { code: z.infer<typeof ErrorCode>; message: string; requestId?: string; terminalId?: string }
   ) {
-    log.warn({
-      connectionId: ws.connectionId || 'unknown',
-      code: params.code,
-      message: params.message,
-      ...(params.requestId ? { requestId: params.requestId } : {}),
-      ...(params.terminalId ? { terminalId: params.terminalId } : {}),
-    }, 'Sending WebSocket error')
+    this.recordWsErrorLog(ws, params)
     this.send(ws, {
       type: 'error',
       code: params.code,
@@ -1742,10 +2025,46 @@ export class WsHandler {
         return
       }
 
+      if (rawBytes > this.config.maxRegularWsMessageBytes) {
+        const isScreenshotResult = msg?.type === 'ui.screenshot.result'
+        if (!isScreenshotResult) {
+          this.sendError(ws, {
+            code: 'INVALID_MESSAGE',
+            message: `WebSocket message exceeds ${this.config.maxRegularWsMessageBytes} bytes.`,
+            requestId: msg?.requestId,
+          })
+          return
+        }
+
+        const allowedScreenshotResultKeys = new Set([
+          'type',
+          'requestId',
+          'ok',
+          'mimeType',
+          'imageBase64',
+          'width',
+          'height',
+          'changedFocus',
+          'restoredFocus',
+          'error',
+        ])
+        const unknownKeys = msg && typeof msg === 'object'
+          ? Object.keys(msg).filter((key) => !allowedScreenshotResultKeys.has(key))
+          : []
+        if (unknownKeys.length > 0) {
+          this.sendError(ws, {
+            code: 'INVALID_MESSAGE',
+            message: `Unknown field in oversized screenshot result message: ${unknownKeys.join(', ')}`,
+            requestId: msg?.requestId,
+          })
+          return
+        }
+      }
+
       if (msg?.type === 'hello' && msg?.protocolVersion !== WS_PROTOCOL_VERSION) {
         this.sendError(ws, {
           code: 'PROTOCOL_MISMATCH',
-          message: `Expected protocol version ${WS_PROTOCOL_VERSION}`,
+          message: `Expected protocol version ${WS_PROTOCOL_VERSION}. Please reload the page.`,
         })
         ws.close(CLOSE_CODES.PROTOCOL_MISMATCH, 'Protocol version mismatch')
         return
@@ -1761,11 +2080,6 @@ export class WsHandler {
       // discriminated union once provider names become dynamic, so we cast once at the boundary.
       const m = parsed.data as any
       messageType = m.type
-
-      if (rawBytes > this.config.maxRegularWsMessageBytes && m.type !== 'ui.screenshot.result') {
-        ws.close(1009, 'Message too large')
-        return
-      }
 
       if (m.type === 'ping') {
         // Respond to confirm liveness.
@@ -1901,6 +2215,20 @@ export class WsHandler {
           hasRequestedSessionRef: !!m.sessionRef,
           ...(m.resumeSessionId || m.sessionRef?.sessionId ? { requestedSessionId: m.resumeSessionId ?? m.sessionRef.sessionId } : {}),
         })
+        if (m.recoveryIntent === 'fresh_after_restore_unavailable') {
+          recordSessionLifecycleEvent({
+            kind: 'restore_unavailable_fresh_fallback',
+            requestId: m.requestId,
+            connectionId: ws.connectionId || 'unknown',
+            ...(m.tabId ? { tabId: m.tabId } : {}),
+            ...(m.paneId ? { paneId: m.paneId } : {}),
+            mode: m.mode as TerminalMode,
+            reason: m.recoveryIntent,
+            restoreRequested: false,
+            treatedAsFresh: true,
+            hasSessionRef: !!m.sessionRef,
+          })
+        }
         const endCreateTimer = startPerfTimer(
           'terminal_create',
           { connectionId: ws.connectionId, mode: m.mode, shell: m.shell },
@@ -1912,6 +2240,33 @@ export class WsHandler {
         let error = false
         let rateLimited = false
         const requestedSessionRef = normalizeUiSessionLocator(m.sessionRef)
+        if (
+          m.recoveryIntent === 'fresh_after_restore_unavailable'
+          && (
+            m.restore === true
+            || !!m.resumeSessionId
+            || !!requestedSessionRef
+            || !!m.codexDurability
+            || !!m.liveTerminal
+          )
+        ) {
+          error = true
+          this.sendError(ws, {
+            code: 'INVALID_CREATE_REQUEST',
+            message: 'Fresh recovery requests cannot include restore identity.',
+            requestId: m.requestId,
+          })
+          endCreateTimer({ error, rateLimited })
+          return
+        }
+        const hasReusableRequestedLiveTerminal = Boolean(
+          m.liveTerminal?.serverInstanceId === this.serverInstanceId
+            && m.liveTerminal.terminalId
+            && (() => {
+              const live = this.registry.get(m.liveTerminal.terminalId)
+              return live && live.status === 'running' && live.mode === m.mode
+            })(),
+        )
         let codexDurabilityForDecision = m.codexDurability
         let codexDurabilityStoreRecordTerminalId: string | undefined
         if (m.mode === 'codex' && m.restore === true && !requestedSessionRef && !codexDurabilityForDecision) {
@@ -1955,7 +2310,9 @@ export class WsHandler {
         if (codexRestorePlan?.kind === 'durable_session_ref_resume') {
           effectiveResumeSessionId = codexRestorePlan.sessionId
         } else if (m.mode !== 'codex') {
-          effectiveResumeSessionId = m.resumeSessionId
+          effectiveResumeSessionId = requestedSessionRef && requestedSessionRef.provider === m.mode
+            ? requestedSessionRef.sessionId
+            : m.resumeSessionId
         }
         if (m.mode !== 'codex' && !effectiveResumeSessionId && requestedSessionRef && requestedSessionRef.provider === m.mode) {
           effectiveResumeSessionId = requestedSessionRef.sessionId
@@ -1974,6 +2331,7 @@ export class WsHandler {
         if (
           m.restore === true
           && modeSupportsResume(m.mode as TerminalMode)
+          && !hasReusableRequestedLiveTerminal
           && m.mode !== 'codex'
           && m.resumeSessionId
           && !requestedSessionRef
@@ -1991,6 +2349,7 @@ export class WsHandler {
           m.restore === true
           && modeSupportsResume(m.mode as TerminalMode)
           && !hasCodexCapturedRestoreState
+          && !hasReusableRequestedLiveTerminal
           && (
             !requestedSessionRef
             || requestedSessionRef.provider !== m.mode
@@ -1998,6 +2357,17 @@ export class WsHandler {
           )
         ) {
           error = true
+          recordSessionLifecycleEvent({
+            kind: 'restore_unavailable',
+            requestId: m.requestId,
+            connectionId: ws.connectionId || 'unknown',
+            ...(m.tabId ? { tabId: m.tabId } : {}),
+            ...(m.paneId ? { paneId: m.paneId } : {}),
+            mode: m.mode as TerminalMode,
+            reason: 'missing_canonical_session_id',
+            restoreRequested: true,
+            hasSessionRef: !!requestedSessionRef,
+          })
           this.sendError(ws, {
             code: 'RESTORE_UNAVAILABLE',
             message: 'Restore requires a canonical session reference.',
@@ -2602,7 +2972,12 @@ export class WsHandler {
             connectionId: ws.connectionId || 'unknown',
             operation: 'terminal.attach',
           })
-          this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Terminal not running', terminalId: m.terminalId })
+          this.sendError(ws, {
+            code: 'INVALID_TERMINAL_ID',
+            message: 'Terminal not running',
+            requestId: m.attachRequestId,
+            terminalId: m.terminalId,
+          })
           return
         }
         if (record.status !== 'running') {
@@ -2615,6 +2990,7 @@ export class WsHandler {
           this.sendError(ws, {
             code: 'INVALID_TERMINAL_ID',
             message: formatExitedTerminalAttachMessage(record),
+            requestId: m.attachRequestId,
             terminalId: m.terminalId,
           })
           return
@@ -2642,6 +3018,7 @@ export class WsHandler {
             this.sendError(ws, {
               code: 'INVALID_TERMINAL_ID',
               message: formatExitedTerminalAttachMessage(latestRecord),
+              requestId: m.attachRequestId,
               terminalId: m.terminalId,
             })
             return
@@ -2652,7 +3029,12 @@ export class WsHandler {
             connectionId: ws.connectionId || 'unknown',
             operation: 'terminal.attach',
           })
-          this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Unknown terminalId', terminalId: m.terminalId })
+          this.sendError(ws, {
+            code: 'INVALID_TERMINAL_ID',
+            message: 'Unknown terminalId',
+            requestId: m.attachRequestId,
+            terminalId: m.terminalId,
+          })
           return
         }
         if (attachResult === 'duplicate') return
@@ -3076,6 +3458,214 @@ export class WsHandler {
           sessionId: m.sessionId,
           success: removed,
         })
+        return
+      }
+
+      case 'freshAgent.create': {
+        const manager = this.freshAgentRuntimeManager
+        if (!manager) {
+          this.send(ws, {
+            type: 'freshAgent.create.failed',
+            requestId: m.requestId,
+            code: 'FRESH_AGENT_RUNTIME_UNAVAILABLE',
+            message: this.freshAgentUnavailableMessage(),
+            retryable: false,
+          })
+          return
+        }
+
+        await this.withFreshAgentCreateLock(m.requestId, async () => {
+          const cached = this.createdFreshAgentByRequestId.get(m.requestId)
+          if (cached) {
+            this.send(ws, {
+              type: 'freshAgent.created',
+              requestId: m.requestId,
+              ...cached,
+            })
+            this.ensureFreshAgentSubscription(ws, state, {
+              sessionId: cached.sessionId,
+              sessionType: cached.sessionType,
+              provider: cached.runtimeProvider,
+            })
+            return
+          }
+
+          try {
+            const result = await manager.create({
+              requestId: m.requestId,
+              sessionType: m.sessionType,
+              provider: m.provider,
+              cwd: m.cwd,
+              resumeSessionId: m.resumeSessionId,
+              sessionRef: m.sessionRef,
+              model: m.model,
+              modelSelection: m.modelSelection ?? undefined,
+              permissionMode: m.permissionMode,
+              sandbox: m.sandbox,
+              effort: m.effort,
+              plugins: m.plugins,
+            })
+            const runtimeProvider = typeof result?.runtimeProvider === 'string'
+              ? result.runtimeProvider
+              : m.provider
+            if (!runtimeProvider) {
+              throw new Error('Fresh Agent runtime provider was not resolved')
+            }
+            const record: FreshAgentCreatedRecord = {
+              sessionId: result.sessionId,
+              sessionType: result.sessionType ?? m.sessionType,
+              provider: runtimeProvider,
+              runtimeProvider,
+              ...(result.sessionRef ? { sessionRef: result.sessionRef } : {}),
+            }
+            this.createdFreshAgentByRequestId.set(m.requestId, record)
+            this.send(ws, {
+              type: 'freshAgent.created',
+              requestId: m.requestId,
+              ...record,
+            })
+            this.ensureFreshAgentSubscription(ws, state, {
+              sessionId: record.sessionId,
+              sessionType: record.sessionType,
+              provider: record.runtimeProvider,
+            })
+          } catch (error) {
+            log.warn({
+              err: error instanceof Error ? error : new Error(String(error)),
+              requestId: m.requestId,
+              sessionType: m.sessionType,
+              provider: m.provider,
+            }, 'freshAgent.create failed')
+            const code = typeof (error as { code?: unknown })?.code === 'string'
+              ? (error as { code: string }).code
+              : 'FRESH_AGENT_CREATE_FAILED'
+            this.send(ws, {
+              type: 'freshAgent.create.failed',
+              requestId: m.requestId,
+              code,
+              message: errorMessage(error),
+              retryable: true,
+            })
+          }
+        })
+        return
+      }
+
+      case 'freshAgent.attach': {
+        const manager = this.freshAgentRuntimeManager
+        if (!manager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: this.freshAgentUnavailableMessage() })
+          return
+        }
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        try {
+          await Promise.resolve(manager.attach(locator))
+          this.ensureFreshAgentSubscription(ws, state, locator)
+        } catch (error) {
+          log.warn({
+            err: error instanceof Error ? error : new Error(String(error)),
+            ...locator,
+          }, 'freshAgent.attach failed')
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error) })
+        }
+        return
+      }
+
+      case 'freshAgent.send': {
+        const manager = this.freshAgentRuntimeManager
+        if (!manager?.send) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: this.freshAgentUnavailableMessage() })
+          return
+        }
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        try {
+          await manager.send(locator, { text: m.text, images: m.images })
+        } catch (error) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error) })
+        }
+        return
+      }
+
+      case 'freshAgent.interrupt': {
+        const manager = this.freshAgentRuntimeManager
+        if (!manager?.interrupt) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: this.freshAgentUnavailableMessage() })
+          return
+        }
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        try {
+          await manager.interrupt(locator)
+        } catch (error) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error) })
+        }
+        return
+      }
+
+      case 'freshAgent.approval.respond': {
+        const manager = this.freshAgentRuntimeManager
+        if (!manager?.resolveApproval) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: this.freshAgentUnavailableMessage() })
+          return
+        }
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        try {
+          await manager.resolveApproval(locator, m.requestId, m.decision)
+        } catch (error) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error) })
+        }
+        return
+      }
+
+      case 'freshAgent.question.respond': {
+        const manager = this.freshAgentRuntimeManager
+        if (!manager?.answerQuestion) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: this.freshAgentUnavailableMessage() })
+          return
+        }
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        try {
+          await manager.answerQuestion(locator, m.requestId, m.answers)
+        } catch (error) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error) })
+        }
+        return
+      }
+
+      case 'freshAgent.fork': {
+        const manager = this.freshAgentRuntimeManager
+        if (!manager?.fork) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: this.freshAgentUnavailableMessage() })
+          return
+        }
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        try {
+          await manager.fork(locator, m.input)
+        } catch (error) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error) })
+        }
+        return
+      }
+
+      case 'freshAgent.kill': {
+        const manager = this.freshAgentRuntimeManager
+        if (!manager?.kill) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: this.freshAgentUnavailableMessage() })
+          return
+        }
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        this.cancelFreshAgentSubscription(state, locator)
+        try {
+          const success = await manager.kill(locator)
+          this.send(ws, {
+            type: 'freshAgent.killed',
+            sessionId: m.sessionId,
+            sessionType: m.sessionType,
+            provider: m.provider,
+            success,
+          })
+        } catch (error) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error) })
+        }
         return
       }
 
@@ -3696,6 +4286,20 @@ export class WsHandler {
 
     if (!parsed.success) {
       log.warn({ issues: parsed.error.issues }, 'Invalid opencode.activity.updated payload')
+      return
+    }
+
+    this.broadcastAuthenticated(parsed.data)
+  }
+
+  broadcastTerminalTurnComplete(msg: Omit<TerminalTurnCompleteMessage, 'type'>): void {
+    const parsed = TerminalTurnCompleteSchema.safeParse({
+      type: 'terminal.turn.complete',
+      ...msg,
+    })
+
+    if (!parsed.success) {
+      log.warn({ issues: parsed.error.issues }, 'Invalid terminal.turn.complete payload')
       return
     }
 

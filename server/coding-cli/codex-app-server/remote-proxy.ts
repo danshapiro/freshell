@@ -3,8 +3,6 @@ import { allocateLocalhostPort, type LoopbackServerEndpoint } from '../../local-
 import {
   CodexFsChangedNotificationSchema,
   CodexThreadLifecycleNotificationSchema,
-  CodexThreadOperationResultSchema,
-  CodexThreadStartedNotificationSchema,
   CodexTurnCompletedNotificationSchema,
   CodexTurnStartedNotificationSchema,
   type CodexThreadHandle,
@@ -317,24 +315,33 @@ export class CodexRemoteProxy {
   private maybeEmitThreadStartResponseCandidate(parsed: unknown): void {
     if (!parsed || typeof parsed !== 'object') return
     const result = (parsed as Record<string, unknown>).result
-    const parsedResult = CodexThreadOperationResultSchema.safeParse(result)
-    if (!parsedResult.success) return
+    const thread = result && typeof result === 'object'
+      ? normalizeCandidateThread((result as Record<string, unknown>).thread)
+      : undefined
+    if (!thread) return
     this.emitCandidate({
-      thread: normalizeThread(parsedResult.data.thread),
+      thread,
       source: 'thread_start_response',
     })
   }
 
   private handleUpstreamNotification(parsed: unknown): void {
-    const threadStarted = CodexThreadStartedNotificationSchema.safeParse(parsed)
-    if (threadStarted.success) {
+    const method = parsed && typeof parsed === 'object'
+      ? (parsed as Record<string, unknown>).method
+      : undefined
+    if (method === 'thread/started') {
+      const params = (parsed as Record<string, unknown>).params
+      const thread = params && typeof params === 'object'
+        ? normalizeCandidateThread((params as Record<string, unknown>).thread)
+        : undefined
+      if (!thread) return
       this.emitCandidate({
-        thread: normalizeThread(threadStarted.data.params.thread),
+        thread,
         source: 'thread_started_notification',
       })
       this.emitThreadLifecycle({
         kind: 'thread_started',
-        thread: normalizeThread(threadStarted.data.params.thread),
+        thread,
       })
       return
     }
@@ -504,6 +511,17 @@ function sendIfOpen(socket: WebSocket, data: WebSocket.RawData | string): void {
     socket.once('open', () => {
       if (socket.readyState === WebSocket.OPEN) socket.send(data)
     })
+  }
+}
+
+function normalizeCandidateThread(thread: unknown): CodexThreadHandle | undefined {
+  if (!thread || typeof thread !== 'object') return undefined
+  const candidate = thread as Record<string, unknown>
+  if (typeof candidate.id !== 'string' || candidate.id.length === 0) return undefined
+  return {
+    id: candidate.id,
+    path: typeof candidate.path === 'string' ? candidate.path : null,
+    ephemeral: typeof candidate.ephemeral === 'boolean' ? candidate.ephemeral : false,
   }
 }
 

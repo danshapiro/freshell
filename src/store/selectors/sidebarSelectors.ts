@@ -501,6 +501,7 @@ export function buildSessionItems(
       runningTerminalIds: [terminal.terminalId],
       isFallback: true,
       liveTerminalOnly: true,
+      isRestorable: false,
     }
     items.push(item)
     itemsByKey.set(key, item)

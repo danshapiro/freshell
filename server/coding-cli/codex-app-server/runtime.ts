@@ -99,6 +99,7 @@ const DEFAULT_STARTUP_ATTEMPT_TIMEOUT_MS = 3_000
 const STARTUP_POLL_MS = 50
 const DEFAULT_TERMINATE_GRACE_MS = 1_000
 const OWNERSHIP_SCHEMA_VERSION = 1
+export const DEFAULT_CODEX_SIDECAR_METADATA_DIR = path.join(os.homedir(), '.freshell', 'codex-sidecars')
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -106,7 +107,7 @@ function sleep(ms: number): Promise<void> {
 
 function defaultMetadataDir(): string {
   return process.env.FRESHELL_CODEX_SIDECAR_DIR
-    || path.join(os.homedir(), '.freshell', 'codex-sidecars')
+    || DEFAULT_CODEX_SIDECAR_METADATA_DIR
 }
 
 function normalizeLaunchCwd(cwd: string | undefined): string | undefined {

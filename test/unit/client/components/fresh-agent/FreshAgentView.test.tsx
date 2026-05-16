@@ -379,6 +379,7 @@ describe('FreshAgentView', () => {
 
   it('recreates a lost freshclaude session through fresh-agent transport events with the durable resume id', async () => {
     const store = createStore()
+    const durableSessionId = '00000000-0000-4000-8000-000000000441'
     apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('Failed to parse URL from /api/fresh-agent/threads/claude/dead-session-id'))
     store.dispatch(initLayout({
       tabId: 'tab-1',
@@ -414,7 +415,7 @@ describe('FreshAgentView', () => {
           sessionId: 'dead-session-id',
           latestTurnId: 'turn-1',
           status: 'idle',
-          timelineSessionId: 'cli-session-abc-123',
+          timelineSessionId: durableSessionId,
           revision: 2,
         },
       })
@@ -445,7 +446,7 @@ describe('FreshAgentView', () => {
         type: 'freshAgent.create',
         sessionType: 'freshclaude',
         provider: 'claude',
-        resumeSessionId: 'cli-session-abc-123',
+        resumeSessionId: durableSessionId,
       }))
     })
   })

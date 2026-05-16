@@ -14,6 +14,7 @@ import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { consumePaneRefreshRequest, splitPane, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
+import { recordPaneTabActivity } from '@/store/tabRecencySlice'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 import { clearPaneRuntimeActivity, setPaneRuntimeActivity } from '@/store/paneRuntimeActivitySlice'
 import { recordTurnComplete, clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
@@ -52,6 +53,7 @@ import { findLocalFilePaths } from '@/lib/path-utils'
 import { findUrls } from '@/lib/url-utils'
 import { setHoveredUrl, clearHoveredUrl } from '@/lib/terminal-hovered-url'
 import { getTabSwitchShortcutDirection, getTabLifecycleAction } from '@/lib/tab-switch-shortcuts'
+import { bucketTabRecencyAt } from '@/lib/tab-recency'
 import {
   createTurnCompleteSignalParserState,
   extractTurnCompleteSignals,
@@ -124,6 +126,10 @@ type TerminalInputBlockedReason =
   | 'codex_identity_capture_timeout'
   | 'codex_identity_unavailable'
   | 'codex_recovery_pending'
+
+function shouldSuppressNativeTouchScroll(term: Terminal): boolean {
+  return term.buffer.active.type === 'alternate' && term.modes.mouseTrackingMode !== 'none'
+}
 
 function terminalInputBlockedNotice(reason: TerminalInputBlockedReason): string {
   switch (reason) {
@@ -320,6 +326,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
   const tabOrder = useAppSelector((s) => s.tabs.tabs.map((t) => t.id), shallowEqual)
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
+  const paneLastInputAt = useAppSelector((s) => s.tabRecency?.paneLastInputAt?.[paneId])
   const refreshRequest = useAppSelector((s) => s.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
   const connectionErrorCode = useAppSelector((s) => s.connection.lastErrorCode)
   const settings = useAppSelector((s) => s.settings.settings)
@@ -363,6 +370,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const hiddenRef = useRef(hidden)
   const hydrationRegisteredRef = useRef(false)
   const lastSessionActivityAtRef = useRef(0)
+  const paneLastInputAtRef = useRef<number | undefined>(paneLastInputAt)
   const rateLimitRetryRef = useRef<{ count: number; timer: ReturnType<typeof setTimeout> | null }>({ count: 0, timer: null })
   const restoreRequestIdRef = useRef<string | null>(null)
   const restoreFlagRef = useRef(false)
@@ -568,6 +576,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   // Sync during render (not in useEffect) so refs always have latest values
   hasAttentionRef.current = hasAttention
   hasPaneAttentionRef.current = hasPaneAttention
+  paneLastInputAtRef.current = paneLastInputAt
   attentionDismissRef.current = settings.panes?.attentionDismiss ?? 'click'
   debugRef.current = !!settings.logging?.debug
   refreshRequestRef.current = refreshRequest
@@ -741,7 +750,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const rawLines = touchScrollAccumulatorRef.current / TOUCH_SCROLL_PIXELS_PER_LINE
     const lines = rawLines > 0 ? Math.floor(rawLines) : Math.ceil(rawLines)
     if (lines !== 0) {
-      if (!translateScrollLinesToInput(term, lines)) {
+      if (!translateScrollLinesToInput(term, lines) && !shouldSuppressNativeTouchScroll(term)) {
         term.scrollLines(lines)
       }
 
@@ -1358,7 +1367,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       const currentContent = contentRef.current
       if (currentTab) {
         const now = Date.now()
-        dispatch(updateTab({ id: currentTab.id, updates: { lastInputAt: now } }))
+        const bucket = bucketTabRecencyAt(now)
+        if (
+          bucket !== undefined
+          && (
+            paneLastInputAtRef.current === undefined
+            || bucket > paneLastInputAtRef.current
+          )
+        ) {
+          paneLastInputAtRef.current = bucket
+          dispatch(recordPaneTabActivity({ paneId: paneIdRef.current, at: now }))
+        }
         const resumeSessionId = currentContent?.resumeSessionId
         if (resumeSessionId && currentContent?.mode && currentContent.mode !== 'shell') {
           if (now - lastSessionActivityAtRef.current >= SESSION_ACTIVITY_THROTTLE_MS) {

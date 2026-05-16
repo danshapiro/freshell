@@ -23,6 +23,7 @@ const wsHarness = vi.hoisted(() => {
   const reconnectHandlers = new Set<() => void>()
   const latestAttachRequestIdByTerminal = new Map<string, string>()
   const addedRestoreIds = new Set<string>()
+  const addedFreshRecoveryIds = new Map<string, string>()
 
   const withCurrentAttachRequestId = (msg: any) => {
     if (
@@ -64,15 +65,28 @@ const wsHarness = vi.hoisted(() => {
       addedRestoreIds.add(id)
     },
     consumeRestoreRequestId(id: string) {
+      if (addedFreshRecoveryIds.has(id)) return false
       if (!addedRestoreIds.has(id)) return false
       addedRestoreIds.delete(id)
       return true
+    },
+    addFreshRecoveryRequestId(id: string, intent: string) {
+      addedRestoreIds.delete(id)
+      addedFreshRecoveryIds.set(id, intent)
+    },
+    consumeFreshRecoveryRequest(id: string) {
+      const intent = addedFreshRecoveryIds.get(id)
+      if (!intent) return undefined
+      addedFreshRecoveryIds.delete(id)
+      addedRestoreIds.delete(id)
+      return intent
     },
     reset() {
       messageHandlers.clear()
       reconnectHandlers.clear()
       latestAttachRequestIdByTerminal.clear()
       addedRestoreIds.clear()
+      addedFreshRecoveryIds.clear()
     },
   }
 })
@@ -89,6 +103,8 @@ vi.mock('@/lib/ws-client', () => ({
 vi.mock('@/lib/terminal-restore', () => ({
   addTerminalRestoreRequestId: (id: string) => wsHarness.addRestoreRequestId(id),
   consumeTerminalRestoreRequestId: (id: string) => wsHarness.consumeRestoreRequestId(id),
+  addTerminalFreshRecoveryRequestId: (id: string, intent: string) => wsHarness.addFreshRecoveryRequestId(id, intent),
+  consumeTerminalFreshRecoveryRequest: (id: string) => wsHarness.consumeFreshRecoveryRequest(id),
 }))
 
 vi.mock('@/lib/terminal-themes', () => ({
@@ -655,8 +671,9 @@ describe('codex refresh rehydrate flow (e2e)', () => {
       expect(recreated).toMatchObject({
         type: 'terminal.create',
         mode: 'codex',
-        restore: true,
+        recoveryIntent: 'fresh_after_restore_unavailable',
       })
+      expect(recreated?.restore).toBeUndefined()
       expect(recreated?.sessionRef).toBeUndefined()
       expect(recreated?.codexDurability).toBeUndefined()
     })

@@ -9,9 +9,11 @@ import { mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { clearPendingCreateFailure } from '@/store/freshAgentSlice'
 import { handleFreshAgentTransportEvent, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
-import { getPreferredResumeSessionId } from '@/store/persistControl'
+import { getCanonicalDurableSessionId, getPreferredResumeSessionId } from '@/store/persistControl'
+import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
+import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
 import { FreshAgentApprovalBanner } from './FreshAgentApprovalBanner'
 import FreshAgentQuestionBanner from './FreshAgentQuestionBanner'
 import { FreshAgentTranscript } from './FreshAgentTranscript'
@@ -48,6 +50,16 @@ function getStatusLabel(status: FreshAgentPaneContent['status'], restoring: bool
   }
 }
 
+function getCanonicalPaneResumeSessionId(pane: FreshAgentPaneContent): string | undefined {
+  if (pane.sessionRef?.provider === 'claude' && isValidClaudeSessionId(pane.sessionRef.sessionId)) {
+    return pane.sessionRef.sessionId
+  }
+  if (isValidClaudeSessionId(pane.resumeSessionId)) {
+    return pane.resumeSessionId
+  }
+  return undefined
+}
+
 function getQuestionAgentLabel(paneContent: FreshAgentPaneContent, descriptorLabel?: string): string {
   if (paneContent.sessionType === 'kilroy') return 'Kilroy'
   switch (paneContent.provider) {
@@ -59,6 +71,23 @@ function getQuestionAgentLabel(paneContent: FreshAgentPaneContent, descriptorLab
       return 'Opencode'
     default:
       return descriptorLabel ?? 'Fresh Agent'
+  }
+}
+
+function getRestoreErrorMessage(reason: RestoreErrorReason): string {
+  switch (reason) {
+    case 'invalid_legacy_restore_target':
+      return 'This session cannot be resumed because Freshell only has a legacy name, not a canonical Claude session id.'
+    case 'dead_live_handle':
+      return 'This session cannot be resumed because the live session handle is gone and no durable session id was saved.'
+    case 'missing_canonical_identity':
+      return 'This session cannot be resumed because no canonical session id was saved.'
+    case 'durable_artifact_missing':
+      return 'This session cannot be resumed because the saved session artifact is no longer available.'
+    case 'provider_runtime_failed':
+      return 'This session cannot be resumed because the provider runtime rejected the restore request.'
+    default:
+      return 'This session cannot be resumed.'
   }
 }
 
@@ -171,13 +200,36 @@ export function FreshAgentView({
       restoreTimeoutRef.current = null
     }
     const nextRequestId = nanoid()
+    const canonicalResumeSessionId = getCanonicalDurableSessionId(claudeSession)
+      ?? getCanonicalPaneResumeSessionId(paneContentRef.current)
+    if (!canonicalResumeSessionId) {
+      const hadLegacyRestoreTarget = Boolean(getPreferredResumeSessionId(claudeSession) || paneContentRef.current.resumeSessionId)
+      dispatch(updatePaneContent({
+        tabId,
+        paneId,
+        content: {
+          ...paneContentRef.current,
+          sessionId: undefined,
+          resumeSessionId: undefined,
+          sessionRef: undefined,
+          restoreError: buildRestoreError(hadLegacyRestoreTarget ? 'invalid_legacy_restore_target' : 'dead_live_handle'),
+          createRequestId: nextRequestId,
+          status: 'idle',
+          createError: undefined,
+        },
+      }))
+      return
+    }
+
     dispatch(updatePaneContent({
       tabId,
       paneId,
       content: {
         ...paneContentRef.current,
         sessionId: undefined,
-        resumeSessionId: getPreferredResumeSessionId(claudeSession) ?? paneContentRef.current.resumeSessionId,
+        resumeSessionId: canonicalResumeSessionId,
+        sessionRef: { provider: 'claude', sessionId: canonicalResumeSessionId },
+        restoreError: undefined,
         createRequestId: nextRequestId,
         status: 'creating',
         createError: undefined,
@@ -363,16 +415,31 @@ export function FreshAgentView({
   useEffect(() => {
     if (paneContent.provider !== 'claude') return
     if (!paneContent.sessionId) return
-    if (!preferredResumeSessionId || preferredResumeSessionId === paneContent.resumeSessionId) return
+    const canonicalResumeSessionId = getCanonicalDurableSessionId(claudeSession)
+    const shouldUpdateResumeSessionId = Boolean(
+      preferredResumeSessionId && preferredResumeSessionId !== paneContent.resumeSessionId,
+    )
+    const shouldClearRestoreError = Boolean(canonicalResumeSessionId && paneContent.restoreError)
+    if (!shouldUpdateResumeSessionId && !shouldClearRestoreError) return
     dispatch(mergePaneContent({
       tabId,
       paneId,
-      updates: { resumeSessionId: preferredResumeSessionId },
+      updates: {
+        ...(shouldUpdateResumeSessionId ? { resumeSessionId: preferredResumeSessionId } : {}),
+        ...(canonicalResumeSessionId
+          ? {
+              sessionRef: { provider: 'claude', sessionId: canonicalResumeSessionId },
+              restoreError: undefined,
+            }
+          : {}),
+      },
     }))
   }, [
+    claudeSession,
     dispatch,
     paneContent.provider,
     paneContent.resumeSessionId,
+    paneContent.restoreError,
     paneContent.sessionId,
     paneId,
     preferredResumeSessionId,
@@ -444,7 +511,10 @@ export function FreshAgentView({
     const visibleRestoreFailure = paneContent.provider === 'claude'
       ? claudeSession?.restoreFailureMessage
       : null
-    const visibleLoadError = visibleRestoreFailure ? null : loadError
+    const visiblePaneRestoreFailure = visibleRestoreFailure
+      ? null
+      : (paneContent.restoreError ? getRestoreErrorMessage(paneContent.restoreError.reason) : null)
+    const visibleLoadError = visibleRestoreFailure || visiblePaneRestoreFailure || isRestoring ? null : loadError
 
     return (
       <div className="flex h-full min-h-0 flex-col" data-context="fresh-agent" data-session-id={paneContent.sessionId}>
@@ -523,6 +593,7 @@ export function FreshAgentView({
                 </div>
               ) : null}
               {visibleRestoreFailure ? <FreshAgentApprovalBanner text={visibleRestoreFailure} /> : null}
+              {visiblePaneRestoreFailure ? <FreshAgentApprovalBanner text={visiblePaneRestoreFailure} /> : null}
               {visibleLoadError ? <FreshAgentApprovalBanner text={visibleLoadError} /> : null}
               {pendingApprovals.map((approval) => (
                 <PermissionBanner

@@ -22,7 +22,7 @@ import panesReducer, { initLayout } from '@/store/panesSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import settingsReducer from '@/store/settingsSlice'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
-import type { AgentChatPaneContent } from '@/store/paneTypes'
+import type { AgentChatPaneContent, FreshAgentPaneContent, PaneContent } from '@/store/paneTypes'
 import type { PaneNode } from '@/store/paneTypes'
 
 // jsdom doesn't implement scrollIntoView
@@ -148,6 +148,19 @@ const RELOAD_PANE_WITH_CANONICAL_RESUME: AgentChatPaneContent = {
 const RELOAD_PANE_WITH_NAMED_RESUME: AgentChatPaneContent = {
   ...RELOAD_PANE,
   resumeSessionId: 'named-resume-token',
+}
+
+function normalizeAgentChatPaneContent(content: PaneContent | undefined): AgentChatPaneContent | undefined {
+  if (!content) return undefined
+  if (content.kind === 'agent-chat') return content
+  if (content.kind !== 'fresh-agent') return undefined
+  if (content.sessionType !== 'freshclaude' && content.sessionType !== 'kilroy') return undefined
+  const migrated: FreshAgentPaneContent = content
+  return {
+    ...migrated,
+    kind: 'agent-chat',
+    provider: migrated.sessionType,
+  }
 }
 
 describe('AgentChatView reload/restore behavior', () => {
@@ -283,9 +296,7 @@ describe('AgentChatView reload/restore behavior', () => {
 
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
-        ? root.content
-        : undefined
+      const content = root?.type === 'leaf' ? normalizeAgentChatPaneContent(root.content) : undefined
       if (!content) return null
       return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
     }
@@ -354,9 +365,7 @@ describe('AgentChatView reload/restore behavior', () => {
 
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
-        ? root.content
-        : undefined
+      const content = root?.type === 'leaf' ? normalizeAgentChatPaneContent(root.content) : undefined
       if (!content) return null
       return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
     }
@@ -392,9 +401,7 @@ describe('AgentChatView reload/restore behavior', () => {
 
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
-        ? root.content
-        : undefined
+      const content = root?.type === 'leaf' ? normalizeAgentChatPaneContent(root.content) : undefined
       if (!content) return null
       return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
     }
@@ -448,9 +455,7 @@ describe('AgentChatView reload/restore behavior', () => {
 
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
-        ? root.content
-        : undefined
+      const content = root?.type === 'leaf' ? normalizeAgentChatPaneContent(root.content) : undefined
       if (!content) return null
       return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
     }
@@ -488,9 +493,7 @@ describe('AgentChatView reload/restore behavior', () => {
 
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
-        ? root.content
-        : undefined
+      const content = root?.type === 'leaf' ? normalizeAgentChatPaneContent(root.content) : undefined
       if (!content) return null
       return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
     }
@@ -548,9 +551,7 @@ describe('AgentChatView reload/restore behavior', () => {
 
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
-        ? root.content
-        : undefined
+      const content = root?.type === 'leaf' ? normalizeAgentChatPaneContent(root.content) : undefined
       if (!content) return null
       return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
     }
@@ -1878,8 +1879,8 @@ function getPaneContent(store: ReturnType<typeof makeStore>, tabId: string, pane
   const root = store.getState().panes.layouts[tabId]
   if (!root) return undefined
   function find(node: PaneNode): AgentChatPaneContent | undefined {
-    if (node.type === 'leaf' && node.id === paneId && node.content.kind === 'agent-chat') {
-      return node.content
+    if (node.type === 'leaf' && node.id === paneId) {
+      return normalizeAgentChatPaneContent(node.content)
     }
     if (node.type === 'split') {
       return find(node.children[0]) || find(node.children[1])
@@ -2002,9 +2003,7 @@ describe('AgentChatView server-restart recovery', () => {
 
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
-        ? root.content
-        : undefined
+      const content = root?.type === 'leaf' ? normalizeAgentChatPaneContent(root.content) : undefined
       if (!content) return null
       return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
     }
@@ -2069,9 +2068,7 @@ describe('AgentChatView server-restart recovery', () => {
 
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
-        ? root.content
-        : undefined
+      const content = root?.type === 'leaf' ? normalizeAgentChatPaneContent(root.content) : undefined
       if (!content) return null
       return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
     }

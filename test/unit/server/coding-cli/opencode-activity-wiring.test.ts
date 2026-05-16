@@ -33,14 +33,9 @@ describe('wireOpencodeActivityTracker', () => {
     })
 
     try {
-      wired.tracker.emit('changed', {
-        upsert: [{
-          terminalId: 'term-opencode-1',
-          sessionId: 'ses_open_1',
-          phase: 'busy',
-          updatedAt: 1,
-        }],
-        remove: [],
+      wired.tracker.emit('association.requested', {
+        terminalId: 'term-opencode-1',
+        sessionId: 'ses_open_1',
       })
 
       expect(onAssociated).toHaveBeenCalledWith({
