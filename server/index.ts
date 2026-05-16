@@ -20,7 +20,7 @@ import { SessionsSyncService } from './sessions-sync/service.js'
 import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
 import { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { wireCodexActivityTracker } from './coding-cli/codex-activity-wiring.js'
-import { wireOpencodeActivityTracker } from './coding-cli/opencode-activity-wiring.js'
+import { createOpencodeActivityIntegration } from './coding-cli/opencode-activity-integration.js'
 import { claudeProvider } from './coding-cli/providers/claude.js'
 import { codexProvider } from './coding-cli/providers/codex.js'
 import { opencodeProvider } from './coding-cli/providers/opencode.js'
@@ -196,7 +196,7 @@ async function main() {
   const terminalMetadata = new TerminalMetadataService()
   const layoutStore = new LayoutStore()
   const codexActivity = wireCodexActivityTracker({ registry, codingCliIndexer })
-  let opencodeActivity: ReturnType<typeof wireOpencodeActivityTracker> | undefined
+  let opencodeActivity: ReturnType<typeof createOpencodeActivityIntegration> | undefined
 
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
   const serverInstanceId = await loadOrCreateServerInstanceId()
@@ -421,8 +421,9 @@ async function main() {
     }
   })
 
-  opencodeActivity = wireOpencodeActivityTracker({
+  opencodeActivity = createOpencodeActivityIntegration({
     registry,
+    opencodeProvider,
     onActivityChanged: (payload) => {
       wsHandler.broadcastOpencodeActivityUpdated(payload)
     },

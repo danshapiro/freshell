@@ -1173,6 +1173,39 @@ export class TerminalRegistry extends EventEmitter {
     })
   }
 
+  private forgetCodexDurabilityStoreRecord(record: TerminalRecord, reason: string): void {
+    if (record.mode !== 'codex') return
+    if (!record.codexDurability) return
+    void this.codexDurabilityStore.delete(record.terminalId).catch((err) => {
+      logger.warn({ err, terminalId: record.terminalId, reason }, 'Failed to delete Codex durability store record')
+    })
+  }
+
+  private finishTerminalPtyExit(
+    record: TerminalRecord,
+    event: { exitCode: number; signal?: number },
+  ): void {
+    this.markCodexRecoveryFinalClose(record)
+    record.status = 'exited'
+    record.exitCode = event.exitCode
+    const now = Date.now()
+    record.lastActivityAt = now
+    record.exitedAt = now
+    cleanupMcpConfig(record.terminalId, record.mode, record.mcpCwd)
+    for (const client of record.clients) {
+      this.flushOutputBuffer(client)
+      this.safeSend(client, { type: 'terminal.exit', terminalId: record.terminalId, exitCode: event.exitCode }, { terminalId: record.terminalId, perf: record.perf })
+    }
+    record.clients.clear()
+    record.suppressedOutputClients.clear()
+    record.pendingSnapshotClients.clear()
+    this.recordTerminalExitWithoutDurableSession(record, event.exitCode, 'pty_exit')
+    this.releaseBinding(record.terminalId, 'exit')
+    this.emit('terminal.exit', { terminalId: record.terminalId, exitCode: event.exitCode })
+    this.forgetCodexDurabilityStoreRecord(record, 'pty_exit')
+    void this.releaseCodexSidecar(record).catch(() => undefined)
+    this.reapExitedTerminals()
+  }
   private reapExitedTerminals(): void {
     const max = this.maxExitedTerminals
     if (!max || max <= 0) return
@@ -1412,9 +1445,9 @@ export class TerminalRegistry extends EventEmitter {
       record.clients.clear()
       record.suppressedOutputClients.clear()
       record.pendingSnapshotClients.clear()
+      this.recordTerminalExitWithoutDurableSession(record, e.exitCode, 'pty_exit')
       this.releaseBinding(terminalId, 'exit')
       this.emit('terminal.exit', { terminalId, exitCode: e.exitCode })
-      this.recordTerminalExitWithoutDurableSession(record, e.exitCode, 'pty_exit')
       void this.releaseCodexSidecar(record).catch(() => undefined)
       this.reapExitedTerminals()
     })
@@ -1927,9 +1960,10 @@ export class TerminalRegistry extends EventEmitter {
     term.clients.clear()
     term.suppressedOutputClients.clear()
     term.pendingSnapshotClients.clear()
+    this.recordTerminalExitWithoutDurableSession(term, term.exitCode, 'user_final_close')
     this.releaseBinding(terminalId, 'exit')
     this.emit('terminal.exit', { terminalId, exitCode: term.exitCode })
-    this.recordTerminalExitWithoutDurableSession(term, term.exitCode, 'user_final_close')
+    this.forgetCodexDurabilityStoreRecord(term, 'user_final_close')
     void this.releaseCodexSidecar(term).catch(() => undefined)
     this.reapExitedTerminals()
     return true
