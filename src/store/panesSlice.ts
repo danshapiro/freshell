@@ -19,8 +19,9 @@ import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { createLogger } from '@/lib/client-logger'
 import { patchBrowserPreferencesRecord } from '@/lib/browser-preferences'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
-import { RestoreErrorSchema, sanitizeSessionRef } from '@shared/session-contract'
+import { RestoreErrorSchema, migrateLegacyAgentChatDurableState, sanitizeSessionRef } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
+import { migrateLegacyFreshAgentContent } from '@shared/fresh-agent'
 
 
 const log = createLogger('PanesSlice')
@@ -44,6 +45,7 @@ function normalizePaneContent(
   input: PaneContentInput | PaneContent,
   previous?: PaneContent,
 ): PaneContent {
+  input = migrateLegacyFreshAgentContent(input as any) as PaneContentInput | PaneContent
   if (input.kind === 'terminal') {
     const mode = typeof input.mode === 'string' ? input.mode : 'shell'
     const inputResumeSessionId = typeof input.resumeSessionId === 'string'
@@ -84,7 +86,13 @@ function normalizePaneContent(
     }
   }
   if (input.kind === 'fresh-agent') {
-    const sessionRef = sanitizeSessionRef(input.sessionRef)
+    const durableState = input.provider === 'claude'
+      ? migrateLegacyAgentChatDurableState({
+          sessionRef: input.sessionRef,
+          resumeSessionId: typeof input.resumeSessionId === 'string' ? input.resumeSessionId : undefined,
+        })
+      : { sessionRef: sanitizeSessionRef(input.sessionRef) }
+    const sessionRef = durableState.sessionRef
     const restoreError = RestoreErrorSchema.safeParse((input as { restoreError?: unknown }).restoreError)
     return {
       kind: 'fresh-agent',
@@ -96,7 +104,9 @@ function normalizePaneContent(
       resumeSessionId: input.resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
       serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
-      ...(restoreError.success ? { restoreError: restoreError.data } : {}),
+      ...(restoreError.success
+        ? { restoreError: restoreError.data }
+        : ('restoreError' in durableState && durableState.restoreError ? { restoreError: durableState.restoreError } : {})),
       initialCwd: input.initialCwd,
       createError: input.createError,
       modelSelection: normalizeAgentChatModelSelection(
@@ -1315,7 +1325,7 @@ export const panesSlice = createSlice({
 
       function restartContent(node: PaneNode): PaneNode {
         if (node.type === 'leaf') {
-          if (node.id !== paneId || node.content.kind !== 'agent-chat') {
+          if (node.id !== paneId || (node.content.kind !== 'agent-chat' && node.content.kind !== 'fresh-agent')) {
             return node
           }
           return {

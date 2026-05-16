@@ -18,6 +18,7 @@ import {
   serializePersistableTabRecency,
   type TabRecencyState,
 } from './tabRecencySlice'
+import { migrateLegacyFreshAgentContent } from '@shared/fresh-agent'
 
 
 const log = createLogger('PanesPersist')
@@ -140,6 +141,7 @@ function migratePaneContent(content: any): any {
   if (!content || typeof content !== 'object') {
     return content
   }
+  content = migrateLegacyFreshAgentContent(content)
   if (content.kind === 'agent-chat') {
     const { model: _legacyModel, ...rest } = content
     return {
