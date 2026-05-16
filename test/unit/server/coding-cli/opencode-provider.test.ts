@@ -41,6 +41,7 @@ const fakeDatabaseState = new Map<string, {
 
 class FakeDatabaseSync {
   private static openFailures: Error[] = []
+  private static rootQueryFailures: Error[] = []
 
   static seed(
     dbPath: string,
@@ -57,8 +58,13 @@ class FakeDatabaseSync {
     this.openFailures.push(err)
   }
 
+  static failRootQueryOnce(err: Error): void {
+    this.rootQueryFailures.push(err)
+  }
+
   static reset(): void {
     this.openFailures = []
+    this.rootQueryFailures = []
   }
 
   constructor(private readonly dbPath: string) {
@@ -84,6 +90,8 @@ class FakeDatabaseSync {
           ]
         }
         if (/SELECT\s+id,\s+parent_id\s+FROM\s+session/i.test(sql)) {
+          const failure = FakeDatabaseSync.rootQueryFailures.shift()
+          if (failure) throw failure
           if (!hasParentId) throw new Error('no such column: parent_id')
           const requested = new Set(params)
           return rows.sessions
@@ -113,6 +121,8 @@ class FakeDatabaseSync {
       },
     }
   }
+
+  exec(): void {}
 
   close(): void {}
 }
@@ -304,6 +314,47 @@ describe('OpencodeProvider', () => {
 
     expect(resolved.rootsBySessionId.get('child_session')).toBe('root_session')
     expect(resolved.unresolvedSessionIds.size).toBe(0)
+  })
+
+  it('retries transient OpenCode root resolution read errors before marking sessions unresolved', async () => {
+    const dbPath = path.join(tempDir, 'opencode.db')
+    await fsp.writeFile(dbPath, 'fake sqlite file', 'utf8')
+    FakeDatabaseSync.seed(dbPath, {
+      projects: [],
+      sessions: [
+        {
+          id: 'root_session',
+          project_id: 'project-1',
+          parent_id: null,
+          directory: '/repo/root',
+          title: 'Root',
+          time_created: 1000,
+          time_updated: 2000,
+          time_archived: null,
+        },
+        {
+          id: 'child_session',
+          project_id: 'project-1',
+          parent_id: 'root_session',
+          directory: '/repo/root',
+          title: 'Child',
+          time_created: 1001,
+          time_updated: 2001,
+          time_archived: null,
+        },
+      ],
+    })
+    FakeDatabaseSync.failRootQueryOnce(new Error('database is locked'))
+
+    const provider = new OpencodeProvider(tempDir)
+    const resolved = await provider.resolveOpencodeSessionRoots(['child_session'])
+
+    expect(resolved.rootsBySessionId.get('child_session')).toBe('root_session')
+    expect(resolved.unresolvedSessionIds.size).toBe(0)
+    expect(loggerMock.warn).not.toHaveBeenCalledWith(
+      expect.objectContaining({ messageClass: 'read_error' }),
+      'Failed to resolve OpenCode root sessions',
+    )
   })
 
   it('treats an OpenCode schema without parent_id as flat roots', async () => {

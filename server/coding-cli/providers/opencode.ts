@@ -30,6 +30,10 @@ type OpencodeDatabaseMessageClass =
 
 type OpencodeDatabaseLogLevel = 'debug' | 'info' | 'warn'
 
+const OPENCODE_DB_BUSY_TIMEOUT_MS = 5000
+const OPENCODE_ROOT_RESOLUTION_ATTEMPTS = 3
+const OPENCODE_ROOT_RESOLUTION_RETRY_MS = 50
+
 export type OpencodeRootResolution = {
   rootsBySessionId: Map<string, string>
   unresolvedSessionIds: Set<string>
@@ -48,6 +52,10 @@ export function defaultOpencodeDataHome(): string {
 
 function toValidTimestamp(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 export class OpencodeProvider implements CodingCliProvider {
@@ -111,6 +119,10 @@ export class OpencodeProvider implements CodingCliProvider {
     }
   }
 
+  private configureReadOnlyDatabase(db: { exec?: (sql: string) => unknown }): void {
+    db.exec?.(`PRAGMA busy_timeout = ${OPENCODE_DB_BUSY_TIMEOUT_MS}`)
+  }
+
   async listSessionsDirect(): Promise<CodingCliSession[]> {
     const dbPath = this.getDatabasePath()
     try {
@@ -135,6 +147,7 @@ export class OpencodeProvider implements CodingCliProvider {
     let phase: 'open' | 'schema' | 'query' | 'map' = 'open'
     try {
       db = new sqlite.DatabaseSync(dbPath, { readOnly: true })
+      this.configureReadOnlyDatabase(db)
       phase = 'schema'
       const schema = this.inspectSessionSchema(db)
       const rootFilter = schema.hasParentId ? 'AND s.parent_id IS NULL' : ''
@@ -223,70 +236,81 @@ export class OpencodeProvider implements CodingCliProvider {
       return { rootsBySessionId, unresolvedSessionIds }
     }
 
-    let db: InstanceType<typeof sqlite.DatabaseSync> | undefined
-    let phase: 'open' | 'schema' | 'query' | 'map' = 'open'
-    try {
-      db = new sqlite.DatabaseSync(dbPath, { readOnly: true })
-      phase = 'schema'
-      const schema = this.inspectSessionSchema(db)
-      if (!schema.hasParentId) {
-        for (const id of requestedIds) rootsBySessionId.set(id, id)
+    let lastError: unknown
+    let lastPhase: 'open' | 'schema' | 'query' | 'map' = 'open'
+    for (let attempt = 1; attempt <= OPENCODE_ROOT_RESOLUTION_ATTEMPTS; attempt += 1) {
+      let db: InstanceType<typeof sqlite.DatabaseSync> | undefined
+      let phase: 'open' | 'schema' | 'query' | 'map' = 'open'
+      try {
+        db = new sqlite.DatabaseSync(dbPath, { readOnly: true })
+        this.configureReadOnlyDatabase(db)
+        phase = 'schema'
+        const schema = this.inspectSessionSchema(db)
+        if (!schema.hasParentId) {
+          for (const id of requestedIds) rootsBySessionId.set(id, id)
+          return { rootsBySessionId, unresolvedSessionIds }
+        }
+
+        const rowsById = new Map<string, string | null>()
+        let pending = requestedIds
+        phase = 'query'
+        while (pending.length > 0) {
+          const placeholders = pending.map(() => '?').join(',')
+          const rows = db.prepare(
+            `SELECT id, parent_id FROM session WHERE id IN (${placeholders})`,
+          ).all(...pending) as Array<{ id: string; parent_id: string | null }>
+          const nextPending: string[] = []
+          for (const row of rows) {
+            if (typeof row.id !== 'string') continue
+            rowsById.set(row.id, typeof row.parent_id === 'string' ? row.parent_id : null)
+            if (row.parent_id && !rowsById.has(row.parent_id)) {
+              nextPending.push(row.parent_id)
+            }
+          }
+          pending = Array.from(new Set(nextPending))
+        }
+
+        phase = 'map'
+        for (const requestedId of requestedIds) {
+          let current: string | null | undefined = requestedId
+          const seen = new Set<string>()
+          while (current) {
+            if (seen.has(current)) {
+              unresolvedSessionIds.add(requestedId)
+              break
+            }
+            seen.add(current)
+            if (!rowsById.has(current)) {
+              unresolvedSessionIds.add(requestedId)
+              break
+            }
+            const parentId = rowsById.get(current)
+            if (!parentId) {
+              rootsBySessionId.set(requestedId, current)
+              break
+            }
+            current = parentId
+          }
+        }
         return { rootsBySessionId, unresolvedSessionIds }
-      }
-
-      const rowsById = new Map<string, string | null>()
-      let pending = requestedIds
-      phase = 'query'
-      while (pending.length > 0) {
-        const placeholders = pending.map(() => '?').join(',')
-        const rows = db.prepare(
-          `SELECT id, parent_id FROM session WHERE id IN (${placeholders})`,
-        ).all(...pending) as Array<{ id: string; parent_id: string | null }>
-        const nextPending: string[] = []
-        for (const row of rows) {
-          if (typeof row.id !== 'string') continue
-          rowsById.set(row.id, typeof row.parent_id === 'string' ? row.parent_id : null)
-          if (row.parent_id && !rowsById.has(row.parent_id)) {
-            nextPending.push(row.parent_id)
-          }
+      } catch (err) {
+        lastError = err
+        lastPhase = phase
+        if (attempt < OPENCODE_ROOT_RESOLUTION_ATTEMPTS) {
+          await sleep(OPENCODE_ROOT_RESOLUTION_RETRY_MS)
         }
-        pending = Array.from(new Set(nextPending))
+      } finally {
+        db?.close()
       }
-
-      phase = 'map'
-      for (const requestedId of requestedIds) {
-        let current: string | null | undefined = requestedId
-        const seen = new Set<string>()
-        while (current) {
-          if (seen.has(current)) {
-            unresolvedSessionIds.add(requestedId)
-            break
-          }
-          seen.add(current)
-          if (!rowsById.has(current)) {
-            unresolvedSessionIds.add(requestedId)
-            break
-          }
-          const parentId = rowsById.get(current)
-          if (!parentId) {
-            rootsBySessionId.set(requestedId, current)
-            break
-          }
-          current = parentId
-        }
-      }
-      return { rootsBySessionId, unresolvedSessionIds }
-    } catch (err) {
-      this.logDatabaseStateOnce('warn', this.classifyDatabaseFailure(phase), 'Failed to resolve OpenCode root sessions', {
-        scope: 'resolve',
-        error: err,
-        extra: { requestedSessionCount: requestedIds.length },
-      })
-      for (const id of requestedIds) unresolvedSessionIds.add(id)
-      return { rootsBySessionId, unresolvedSessionIds }
-    } finally {
-      db?.close()
     }
+
+    this.logDatabaseStateOnce('warn', this.classifyDatabaseFailure(lastPhase), 'Failed to resolve OpenCode root sessions', {
+      scope: 'resolve',
+      error: lastError,
+      extra: { requestedSessionCount: requestedIds.length },
+    })
+    for (const id of requestedIds) unresolvedSessionIds.add(id)
+    return { rootsBySessionId, unresolvedSessionIds }
   }
 
   private inspectSessionSchema(db: { prepare: (sql: string) => { all: (...args: any[]) => unknown[] } }): OpencodeSessionSchema {

@@ -751,7 +751,6 @@ export default function App() {
             lastReadyServerInstanceId !== nextServerInstanceId
           ) {
             platformCapabilitiesLoaded = false
-            dispatch(setRegistry([]))
           }
           if (ready.success) {
             lastReadyServerInstanceId = nextServerInstanceId
@@ -1008,7 +1007,7 @@ export default function App() {
           ws.serverInstanceId &&
           previousServerInstanceId !== ws.serverInstanceId
         ) {
-          dispatch(setRegistry([]))
+          platformCapabilitiesLoaded = false
         }
         lastReadyServerInstanceId = ws.serverInstanceId
         resetCodexActivityOverlay()

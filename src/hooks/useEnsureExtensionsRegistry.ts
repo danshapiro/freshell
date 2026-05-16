@@ -44,13 +44,15 @@ export function useEnsureExtensionsRegistry(enabled = true): boolean {
 
   const get = (api as { get?: (<T = unknown>(path: string) => Promise<T> | T) }).get
   const loadKey = resolveRegistryLoadKey(serverInstanceId)
+  const currentRecord = registryLoadCache.get(loadKey)
+  const needsLoadForServer = currentRecord?.status !== 'loaded'
   const canLoad = enabled
-    && extensionEntries.length === 0
+    && needsLoadForServer
     && !!getAuthToken()
     && typeof get === 'function'
 
   useEffect(() => {
-    if (!enabled || extensionEntries.length > 0) {
+    if (!enabled) {
       setLoadSettled(true)
       return
     }
@@ -58,14 +60,13 @@ export function useEnsureExtensionsRegistry(enabled = true): boolean {
       setLoadSettled(true)
       return
     }
-    let cancelled = false
-    const currentRecord = registryLoadCache.get(loadKey)
     if (currentRecord?.status === 'loaded') {
       dispatch(setRegistry(currentRecord.entries))
       setLoadSettled(true)
       return
     }
 
+    let cancelled = false
     let promise = currentRecord?.promise
     if (!promise) {
       promise = Promise.resolve(get<ClientExtensionEntry[]>(resolveExtensionsRegistryPath()))
@@ -91,7 +92,7 @@ export function useEnsureExtensionsRegistry(enabled = true): boolean {
     }
 
     requestedRef.current = loadKey
-    setLoadSettled(false)
+    setLoadSettled(extensionEntries.length > 0)
 
     promise
       .then((entries) => {
@@ -108,7 +109,7 @@ export function useEnsureExtensionsRegistry(enabled = true): boolean {
     return () => {
       cancelled = true
     }
-  }, [connectionStatus, dispatch, enabled, extensionEntries.length, get, loadKey])
+  }, [connectionStatus, currentRecord, dispatch, enabled, extensionEntries.length, get, loadKey])
 
-  return !canLoad || loadSettled
+  return extensionEntries.length > 0 || !canLoad || loadSettled
 }
