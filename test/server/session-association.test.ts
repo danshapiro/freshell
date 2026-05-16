@@ -193,6 +193,28 @@ describe('SessionAssociationCoordinator integration', () => {
     registry.shutdown()
   })
 
+  it('does not record a missing-durable-session warning when a bound OpenCode terminal is closed', () => {
+    const registry = new TerminalRegistry()
+    const terminal = registry.create({
+      mode: 'opencode',
+      cwd: '/home/user/project',
+      providerSettings: { opencodeServer: { hostname: '127.0.0.1', port: 4173 } },
+    })
+
+    registry.rebindSession(terminal.terminalId, 'opencode', 'ses-opencode-root-1', 'association')
+    vi.mocked(recordSessionLifecycleEvent).mockClear()
+
+    registry.kill(terminal.terminalId)
+
+    expect(recordSessionLifecycleEvent).not.toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'terminal_exit_without_durable_session',
+      terminalId: terminal.terminalId,
+      mode: 'opencode',
+    }))
+
+    registry.shutdown()
+  })
+
   it('records a lifecycle event when Codex durable identity is proven from the rollout file', async () => {
     const testDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-proof-'))
     const durabilityDir = path.join(testDir, 'durability')

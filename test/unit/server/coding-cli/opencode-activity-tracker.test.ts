@@ -45,6 +45,13 @@ function createRawSseResponse(blocks: string[]) {
 describe('OpencodeActivityTracker', () => {
   afterEach(() => {
     vi.useRealTimers()
+    vi.unstubAllEnvs()
+  })
+
+  it('requires an explicit root resolver outside tests', () => {
+    vi.stubEnv('NODE_ENV', 'production')
+
+    expect(() => new OpencodeActivityTracker()).toThrow(/OpenCode root session resolver is required/)
   })
 
   it('waits for health to become ready, snapshots busy state, and emits an upsert', async () => {
