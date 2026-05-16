@@ -198,8 +198,9 @@ describe('TabsView', () => {
 
     const copiedLayout = store.getState().panes.layouts[copiedTab.id] as any
     expect(copiedLayout.content).toMatchObject({
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       resumeSessionId: undefined,
       sessionRef: {
         provider: 'claude',

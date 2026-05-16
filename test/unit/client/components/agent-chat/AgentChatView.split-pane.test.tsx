@@ -21,7 +21,7 @@ import agentChatReducer, {
 } from '@/store/agentChatSlice'
 import panesReducer, { initLayout, addPane } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
-import type { AgentChatPaneContent } from '@/store/paneTypes'
+import type { AgentChatPaneContent, FreshAgentPaneContent, PaneContent } from '@/store/paneTypes'
 import type { PaneNode } from '@/store/paneTypes'
 
 // jsdom doesn't implement scrollIntoView
@@ -122,8 +122,20 @@ function getPaneContent(store: ReturnType<typeof makeStore>, tabId: string, pane
   const root = store.getState().panes.layouts[tabId]
   if (!root) return undefined
   const leaf = findLeaf(root, paneId)
-  if (leaf && leaf.content.kind === 'agent-chat') return leaf.content
-  return undefined
+  return normalizeAgentChatPaneContent(leaf?.content)
+}
+
+function normalizeAgentChatPaneContent(content: PaneContent | undefined): AgentChatPaneContent | undefined {
+  if (!content) return undefined
+  if (content.kind === 'agent-chat') return content
+  if (content.kind !== 'fresh-agent') return undefined
+  if (content.sessionType !== 'freshclaude' && content.sessionType !== 'kilroy') return undefined
+  const migrated: FreshAgentPaneContent = content
+  return {
+    ...migrated,
+    kind: 'agent-chat',
+    provider: migrated.sessionType,
+  }
 }
 
 /**
@@ -135,12 +147,13 @@ function ReactiveWrapper({ store, tabId, paneId }: {
   tabId: string
   paneId: string
 }) {
-  const content = useSelector((s: ReturnType<typeof store.getState>) => {
+  const rawContent = useSelector((s: ReturnType<typeof store.getState>) => {
     const root = s.panes.layouts[tabId]
     if (!root) return undefined
     const leaf = findLeaf(root, paneId)
-    return leaf?.content.kind === 'agent-chat' ? leaf.content : undefined
+    return leaf?.content
   })
+  const content = normalizeAgentChatPaneContent(rawContent)
   if (!content) return <div data-testid="no-content">No content</div>
   return <AgentChatView tabId={tabId} paneId={paneId} paneContent={content} />
 }
