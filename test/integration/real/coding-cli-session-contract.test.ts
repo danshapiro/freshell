@@ -475,8 +475,17 @@ describe.sequential('coding cli real provider session contract', () => {
           const attachedDbRow = await waitForOpencodeDbSession(homes.dbPath, busyStatus.sessionId)
           expect(attachedDbRow.id).toBe(busyStatus.sessionId)
           expect((await attachedRun.waitForExit(120_000)).code).toBe(0)
-          expect(note.providers.opencode.attachFormatJsonEmitsEvents).toBe(false)
-          expect(attachedRun.stdout().trim()).toBe('')
+          const attachedStdout = attachedRun.stdout().trim()
+          if (note.providers.opencode.attachFormatJsonEmitsEvents) {
+            expect(attachedStdout).not.toBe('')
+            const attachedEventLines = attachedStdout
+              .split(/\r?\n/)
+              .filter(Boolean)
+              .map((line) => JSON.parse(line))
+            expect(attachedEventLines.some((event) => event.sessionID === busyStatus.sessionId)).toBe(true)
+          } else {
+            expect(attachedStdout).toBe('')
+          }
 
         const titledRun = await workspace.spawnProcess(
           opencodePath,
