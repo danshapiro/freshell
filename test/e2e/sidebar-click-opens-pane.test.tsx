@@ -62,7 +62,7 @@ vi.mock('@/lib/api', async () => {
 const sessionId = (label: string) => {
   const chars = Array.from(label).map((ch, idx) => ((ch.charCodeAt(0) + idx) % 16).toString(16))
   const hex = chars.join('').padEnd(32, '0').slice(0, 32)
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`
 }
 
 function createStore(options: {
