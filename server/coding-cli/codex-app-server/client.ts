@@ -135,7 +135,9 @@ export class CodexAppServerClient {
     if (!parsed.success) {
       throw new Error('Codex app-server returned an invalid thread/start payload.')
     }
-    return { threadId: parsed.data.thread.id }
+    const thread = normalizeThread(parsed.data.thread)
+    this.emitThreadStartedEvidence(thread)
+    return { threadId: thread.id }
   }
 
   async resumeThread(
@@ -150,7 +152,9 @@ export class CodexAppServerClient {
     if (!parsed.success) {
       throw new Error('Codex app-server returned an invalid thread/resume payload.')
     }
-    return { threadId: parsed.data.thread.id }
+    const thread = normalizeThread(parsed.data.thread)
+    this.emitThreadStartedEvidence(thread)
+    return { threadId: thread.id }
   }
 
   async watchPath(targetPath: string, watchId: string): Promise<{ path: string }> {
@@ -477,16 +481,7 @@ export class CodexAppServerClient {
   private emitThreadLifecycle(notification: import('./protocol.js').CodexThreadLifecycleNotification): void {
     if (notification.method === 'thread/started') {
       const thread = normalizeThread(notification.params.thread)
-      const event: CodexThreadLifecycleEvent = {
-        kind: 'thread_started',
-        thread,
-      }
-      for (const handler of this.threadLifecycleHandlers) {
-        handler(event)
-      }
-      for (const handler of this.threadStartedHandlers) {
-        handler(thread)
-      }
+      this.emitThreadStartedEvidence(thread)
       return
     }
 
@@ -508,6 +503,19 @@ export class CodexAppServerClient {
     }
     for (const handler of this.threadLifecycleHandlers) {
       handler(event)
+    }
+  }
+
+  private emitThreadStartedEvidence(thread: CodexThreadOperationResult['thread']): void {
+    const event: CodexThreadLifecycleEvent = {
+      kind: 'thread_started',
+      thread,
+    }
+    for (const handler of this.threadLifecycleHandlers) {
+      handler(event)
+    }
+    for (const handler of this.threadStartedHandlers) {
+      handler(thread)
     }
   }
 
