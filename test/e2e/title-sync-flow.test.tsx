@@ -294,6 +294,7 @@ describe('title sync flow', () => {
       sessionId: VALID_CLAUDE_SESSION_ID,
       provider: 'claude',
       title: 'Renamed from sidebar',
+      hasTitle: true,
     }))
 
     render(

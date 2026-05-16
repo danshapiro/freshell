@@ -376,6 +376,7 @@ export function ContextMenuProvider({
       firstUserMessage: session.firstUserMessage,
       isSubagent: session.isSubagent,
       isNonInteractive: session.isNonInteractive,
+      hasTitle: !!session.title,
     }))
   }, [dispatch, getSessionInfo, menuState?.target])
 
@@ -594,6 +595,7 @@ export function ContextMenuProvider({
               isSubagent: session.isSubagent,
               isNonInteractive: session.isNonInteractive,
               forceNew: true,
+              hasTitle: !!session.title,
             }))
           }
         }
