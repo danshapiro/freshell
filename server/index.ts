@@ -73,6 +73,11 @@ import { createAgentHistorySource } from './agent-timeline/history-source.js'
 import { createTerminalViewService } from './terminal-view/service.js'
 import { resolveStartupBanner } from './startup-banner.js'
 import { shouldPromoteSessionTitle } from './session-title-sync.js'
+import { createFreshAgentProviderRegistry } from './fresh-agent/provider-registry.js'
+import { FreshAgentRuntimeManager } from './fresh-agent/runtime-manager.js'
+import { createFreshAgentRouter } from './fresh-agent/router.js'
+import { createClaudeFreshAgentAdapter } from './fresh-agent/adapters/claude/adapter.js'
+import { createCodexFreshAgentAdapter } from './fresh-agent/adapters/codex/adapter.js'
 import {
   CodexAppServerRuntime,
   runCodexStartupReaper,
@@ -298,6 +303,33 @@ async function main() {
   sdkBridge = new SdkBridge(agentHistorySource)
 
   const server = http.createServer(app)
+  const codexFreshAgentRuntime = new CodexAppServerRuntime({ serverInstanceId })
+  const claudeFreshAgentAdapter = createClaudeFreshAgentAdapter({
+    sdkBridge,
+    agentHistorySource,
+  })
+  const codexFreshAgentAdapter = createCodexFreshAgentAdapter({
+    runtime: codexFreshAgentRuntime,
+  })
+  const freshAgentRuntimeManager = new FreshAgentRuntimeManager({
+    registry: createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshclaude',
+        runtimeProvider: 'claude',
+        adapter: claudeFreshAgentAdapter,
+      },
+      {
+        sessionType: 'kilroy',
+        runtimeProvider: 'claude',
+        adapter: claudeFreshAgentAdapter,
+      },
+      {
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+        adapter: codexFreshAgentAdapter,
+      },
+    ]),
+  })
   const codexLaunchPlanner = new CodexLaunchPlanner(() => new CodexAppServerRuntime({ serverInstanceId }))
   const wsHandler = new WsHandler(
     server,
@@ -306,6 +338,7 @@ async function main() {
       codingCliManager: codingCliSessionManager,
       codexLaunchPlanner,
       sdkBridge,
+      freshAgentRuntimeManager,
       sessionRepairService,
       handshakeSnapshotProvider: async () => {
         const currentSettings = migrateSettingsSortMode(await configStore.getSettings())
@@ -353,6 +386,9 @@ async function main() {
     codexActivityTracker: codexActivity.tracker,
     codexLaunchPlanner,
     assertTerminalCreateAccepted,
+  }))
+  app.use('/api', createFreshAgentRouter({
+    runtimeManager: freshAgentRuntimeManager,
   }))
 
   // --- Extension lifecycle broadcasts ---
@@ -843,6 +879,7 @@ async function main() {
       await joinCodexShutdownOwners({
         registry,
         codexLaunchPlanner,
+        codexFreshAgentRuntime,
         terminalShutdownTimeoutMs: 5000,
       })
     } finally {
