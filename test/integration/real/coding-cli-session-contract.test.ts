@@ -457,7 +457,7 @@ describe.sequential('coding cli real provider session contract', () => {
           opencodePath,
             [
               'run',
-              'Explain the purpose of this repository in one sentence.',
+              'Write ten short sentences about terminal multiplexers. Do not use bullets.',
               '--format',
               'json',
               '--dangerously-skip-permissions',
@@ -470,12 +470,13 @@ describe.sequential('coding cli real provider session contract', () => {
           )
 
           const busyStatusPromise = waitForAnyHttpBusyStatus(statusUrl)
-          const attachedStepStart = await waitForJsonLine(attachedRun, (value) => value?.type === 'step_start', 60_000)
-          const attachedSessionId = attachedStepStart.sessionID as string
           const busyStatus = await busyStatusPromise
-          expect(busyStatus.sessionId).toBe(attachedSessionId)
-          expect(busyStatus.payload[attachedSessionId]).toEqual({ type: 'busy' })
+          expect(busyStatus.payload[busyStatus.sessionId]).toEqual({ type: 'busy' })
+          const attachedDbRow = await waitForOpencodeDbSession(homes.dbPath, busyStatus.sessionId)
+          expect(attachedDbRow.id).toBe(busyStatus.sessionId)
           expect((await attachedRun.waitForExit(120_000)).code).toBe(0)
+          expect(note.providers.opencode.attachFormatJsonEmitsEvents).toBe(false)
+          expect(attachedRun.stdout().trim()).toBe('')
 
         const titledRun = await workspace.spawnProcess(
           opencodePath,

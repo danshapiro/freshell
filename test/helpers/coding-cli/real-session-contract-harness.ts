@@ -74,6 +74,7 @@ type OpencodeFacts = {
   canonicalIdentity: 'session-id'
   runEventSessionIdMatchesDbId: boolean
   busyStatusUsesAuthoritativeSessionId: boolean
+  attachFormatJsonEmitsEvents: boolean
   titleOnResumeMutatesStoredTitle: boolean
   sessionSubcommands: string[]
 }

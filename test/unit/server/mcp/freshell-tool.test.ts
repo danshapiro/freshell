@@ -102,6 +102,44 @@ describe('executeAction -- tab actions', () => {
     expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('resumeSessionId')
   })
 
+  it('new-tab rejects raw Codex resume ids', async () => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+
+    const result = await executeAction('new-tab', {
+      name: 'Codex',
+      mode: 'codex',
+      resume: 'thread-pre-durable',
+    })
+
+    expect(result).toEqual({
+      error: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+      hint: 'Use sessionRef: { provider: "codex", sessionId } after Codex identity is durable.',
+    })
+    expect(mockClient.post).not.toHaveBeenCalled()
+  })
+
+  it('new-tab passes explicit canonical Codex sessionRef', async () => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+
+    await executeAction('new-tab', {
+      name: 'Codex',
+      mode: 'codex',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: '019e180a-9e92-7b63-9189-edaec526ad1a',
+      },
+    })
+
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({
+      name: 'Codex',
+      mode: 'codex',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: '019e180a-9e92-7b63-9189-edaec526ad1a',
+      },
+    }))
+  })
+
   it('list-tabs calls GET /api/tabs', async () => {
     mockClient.get.mockResolvedValue({ tabs: [] })
     await executeAction('list-tabs')
@@ -164,6 +202,55 @@ describe('executeAction -- pane actions', () => {
       expect.stringContaining('/api/panes/p1/split'),
       expect.objectContaining({ direction: 'vertical' }),
     )
+  })
+
+  it('split-pane passes explicit canonical Codex sessionRef', async () => {
+    mockClient.get.mockImplementation((path: string) => {
+      if (path === '/api/tabs') return Promise.resolve({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' })
+      if (path.includes('/api/panes')) return Promise.resolve({ panes: [{ id: 'p1', index: 0, kind: 'terminal', terminalId: 'term-1' }] })
+      return Promise.resolve({})
+    })
+    mockClient.post.mockResolvedValue({ ok: true })
+
+    await executeAction('split-pane', {
+      target: 'p1',
+      mode: 'codex',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: '019e180a-9e92-7b63-9189-edaec526ad1a',
+      },
+    })
+
+    expect(mockClient.post).toHaveBeenCalledWith(
+      expect.stringContaining('/api/panes/p1/split'),
+      expect.objectContaining({
+        mode: 'codex',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: '019e180a-9e92-7b63-9189-edaec526ad1a',
+        },
+      }),
+    )
+  })
+
+  it('split-pane rejects raw Codex resume ids', async () => {
+    mockClient.get.mockImplementation((path: string) => {
+      if (path === '/api/tabs') return Promise.resolve({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' })
+      if (path.includes('/api/panes')) return Promise.resolve({ panes: [{ id: 'p1', index: 0, kind: 'terminal', terminalId: 'term-1' }] })
+      return Promise.resolve({})
+    })
+
+    const result = await executeAction('split-pane', {
+      target: 'p1',
+      mode: 'codex',
+      resume: 'thread-pre-durable',
+    })
+
+    expect(result).toEqual({
+      error: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+      hint: 'Use sessionRef: { provider: "codex", sessionId } after Codex identity is durable.',
+    })
+    expect(mockClient.post).not.toHaveBeenCalled()
   })
 
   it('list-panes calls GET /api/panes', async () => {
@@ -243,6 +330,46 @@ describe('executeAction -- pane actions', () => {
     mockClient.post.mockResolvedValue({ ok: true })
     await executeAction('respawn-pane', { target: 'p1' })
     expect(mockClient.post).toHaveBeenCalledWith(expect.stringContaining('/api/panes/p1/respawn'), expect.anything())
+  })
+
+  it('respawn-pane passes explicit canonical Codex sessionRef', async () => {
+    mockClient.post.mockResolvedValue({ ok: true })
+
+    await executeAction('respawn-pane', {
+      target: 'p1',
+      mode: 'codex',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: '019e180a-9e92-7b63-9189-edaec526ad1a',
+      },
+    })
+
+    expect(mockClient.post).toHaveBeenCalledWith(
+      expect.stringContaining('/api/panes/p1/respawn'),
+      expect.objectContaining({
+        mode: 'codex',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: '019e180a-9e92-7b63-9189-edaec526ad1a',
+        },
+      }),
+    )
+  })
+
+  it('respawn-pane rejects raw Codex resume ids', async () => {
+    mockClient.post.mockResolvedValue({ ok: true })
+
+    const result = await executeAction('respawn-pane', {
+      target: 'p1',
+      mode: 'codex',
+      resume: 'thread-pre-durable',
+    })
+
+    expect(result).toEqual({
+      error: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+      hint: 'Use sessionRef: { provider: "codex", sessionId } after Codex identity is durable.',
+    })
+    expect(mockClient.post).not.toHaveBeenCalled()
   })
 })
 
@@ -979,6 +1106,25 @@ describe('executeAction -- new-tab with prompt sends keys', () => {
     expect(mockClient.post).toHaveBeenCalledWith(
       '/api/panes/p-new/send-keys',
       expect.objectContaining({ data: 'build the thing\r' }),
+    )
+  })
+
+  it('new-tab with a Codex prompt asks the server to wait for Codex identity capture', async () => {
+    mockClient.post.mockImplementation((path: string) => {
+      if (path === '/api/tabs') {
+        return Promise.resolve({ status: 'ok', data: { id: 't1', paneId: 'p-new' } })
+      }
+      return Promise.resolve({ ok: true })
+    })
+
+    await executeAction('new-tab', { name: 'Work', mode: 'codex', prompt: 'build the thing' })
+
+    expect(mockClient.post).toHaveBeenCalledWith(
+      '/api/panes/p-new/send-keys',
+      expect.objectContaining({
+        data: 'build the thing\r',
+        waitForCodexIdentity: true,
+      }),
     )
   })
 

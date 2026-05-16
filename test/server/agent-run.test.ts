@@ -1,11 +1,9 @@
 import { it, expect, vi } from 'vitest'
 import express from 'express'
 import request from 'supertest'
+import { EventEmitter } from 'node:events'
 import { createAgentApiRouter } from '../../server/agent-api/router'
 import { FakeCodexLaunchPlanner, DEFAULT_CODEX_REMOTE_WS_URL } from '../helpers/coding-cli/fake-codex-launch-planner.js'
-
-const expectedFreshellToken = process.env.AUTH_TOKEN || ''
-const expectedFreshellUrl = process.env.FRESHELL_URL || 'http://localhost:3001'
 
 it('runs a command and returns captured output', async () => {
   let buffer = ''
@@ -14,7 +12,7 @@ it('runs a command and returns captured output', async () => {
     input: (_terminalId: string, data: string) => {
       const match = data.match(/__FRESHELL_DONE_[A-Za-z0-9_-]+__/)
       if (match) buffer = `done\n${match[0]}\n`
-      return true
+      return { status: 'written' }
     },
     get: () => ({ buffer: { snapshot: () => buffer }, status: 'running' }),
   }
@@ -38,7 +36,7 @@ it('allocates and passes an OpenCode control endpoint for /api/run in opencode m
     input: (_terminalId: string, data: string) => {
       const match = data.match(/__FRESHELL_DONE_[A-Za-z0-9_-]+__/)
       if (match) buffer = `done\n${match[0]}\n`
-      return true
+      return { status: 'written' }
     },
     get: () => ({ buffer: { snapshot: () => buffer }, status: 'running' }),
   }
@@ -64,16 +62,13 @@ it('allocates and passes an OpenCode control endpoint for /api/run in opencode m
   }))
 })
 
-it('uses the shared Codex planner and marks fresh /api/run sessions as starts', async () => {
+it('uses the Codex planner and marks fresh /api/run sessions as starts', async () => {
   const registry = {
     create: vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term1' })),
-    input: vi.fn(() => true),
+    input: vi.fn(() => ({ status: 'written' })),
   }
   const codexLaunchPlanner = new FakeCodexLaunchPlanner()
-  const createTab = vi.fn((input: { tabId: string; paneId: string }) => ({
-    tabId: input.tabId,
-    paneId: input.paneId,
-  }))
+  const createTab = vi.fn(() => ({ tabId: 't1', paneId: 'p1' }))
 
   const app = express()
   app.use(express.json())
@@ -97,42 +92,285 @@ it('uses the shared Codex planner and marks fresh /api/run sessions as starts', 
     model: undefined,
     resumeSessionId: undefined,
     sandbox: undefined,
-    terminalId: expect.any(String),
-    env: expect.objectContaining({
-      FRESHELL: '1',
-      FRESHELL_TERMINAL_ID: expect.any(String),
-      FRESHELL_TOKEN: expectedFreshellToken,
-      FRESHELL_URL: expectedFreshellUrl,
-    }),
   }))
-  expect(planCreate.env.FRESHELL_TERMINAL_ID).toBe(planCreate.terminalId)
-  expect(planCreate.env.FRESHELL_TAB_ID).toBe(createTab.mock.calls[0]?.[0]?.tabId)
-  expect(planCreate.env.FRESHELL_PANE_ID).toBe(createTab.mock.calls[0]?.[0]?.paneId)
   expect(registry.create).toHaveBeenCalledWith(expect.objectContaining({
     mode: 'codex',
-    terminalId: planCreate.terminalId,
-    codexSidecar: codexLaunchPlanner.sidecar,
     resumeSessionId: undefined,
     sessionBindingReason: 'start',
     providerSettings: expect.objectContaining({
-      codexAppServer: {
+      codexAppServer: expect.objectContaining({
+        sidecar: codexLaunchPlanner.sidecar,
         wsUrl: DEFAULT_CODEX_REMOTE_WS_URL,
-      },
+      }),
     }),
   }))
+  expect(codexLaunchPlanner.sidecar.adoptCalls).toEqual([{ terminalId: 'term1', generation: 0 }])
+})
+
+it('waits for fresh Codex /api/run restore identity before sending input', async () => {
+  const emitter = new EventEmitter()
+  let identityReady = false
+  const registry = Object.assign(emitter, {
+    create: vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term1' })),
+    get: vi.fn(() => ({
+      status: 'running',
+      codexInputGate: { state: 'identity_pending' },
+    })),
+    input: vi.fn(() => {
+      if (identityReady) return { status: 'written' }
+      queueMicrotask(() => {
+        identityReady = true
+        emitter.emit('terminal.codex.durability.updated', { terminalId: 'term1' })
+      })
+      return { status: 'blocked_codex_identity_pending', terminalId: 'term1' }
+    }),
+    killAndWait: vi.fn(async () => true),
+  })
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      createTab: () => ({ tabId: 't1', paneId: 'p1' }),
+      attachPaneContent: () => {},
+    },
+    registry,
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
+
+  expect(res.status).toBe(200)
+  expect(res.body.status).toBe('ok')
+  expect(res.body.message).toBe('command sent')
+  expect(registry.input).toHaveBeenCalledTimes(2)
+  expect(registry.killAndWait).not.toHaveBeenCalled()
+})
+
+it('does not buffer pending Codex /api/run input even if the terminal exits later', async () => {
+  const emitter = new EventEmitter()
+  const registry = Object.assign(emitter, {
+    create: vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term1' })),
+    get: vi.fn(() => ({
+      status: 'running',
+      codexInputGate: { state: 'identity_pending' },
+    })),
+    input: vi.fn(() => {
+      queueMicrotask(() => {
+        emitter.emit('terminal.exit', { terminalId: 'term1' })
+      })
+      return { status: 'blocked_codex_identity_pending', terminalId: 'term1' }
+    }),
+    killAndWait: vi.fn(async () => true),
+  })
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      createTab: () => ({ tabId: 't1', paneId: 'p1' }),
+      closeTab: vi.fn(),
+      attachPaneContent: () => {},
+    },
+    registry,
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
+
+  expect(res.status).toBe(500)
+  expect(res.body.message).toBe('Terminal is not running.')
+  expect(registry.input).toHaveBeenCalledTimes(1)
+  expect(registry.killAndWait).toHaveBeenCalledWith('term1')
+})
+
+it('fails when Codex restore identity is unavailable before /api/run input', async () => {
+  const registry = {
+    create: vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term1' })),
+    get: vi.fn(() => ({
+      status: 'running',
+      codexDurability: { state: 'non_restorable' },
+    })),
+    input: vi.fn(() => ({ status: 'blocked_codex_identity_unavailable', terminalId: 'term1' })),
+    killAndWait: vi.fn(async () => true),
+  }
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      createTab: () => ({ tabId: 't1', paneId: 'p1' }),
+      closeTab: vi.fn(),
+      attachPaneContent: () => {},
+    },
+    registry,
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
+
+  expect(res.status).toBe(500)
+  expect(res.body.message).toBe('Codex restore identity could not be captured before input could be accepted.')
+  expect(registry.input).toHaveBeenCalledTimes(1)
+  expect(registry.killAndWait).toHaveBeenCalledWith('term1')
+})
+
+it('reports Codex recovery-pending input rejection for /api/run', async () => {
+  const registry = {
+    create: vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term1' })),
+    input: vi.fn(() => ({ status: 'blocked_codex_recovery_pending', terminalId: 'term1' })),
+    killAndWait: vi.fn(async () => true),
+  }
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      createTab: () => ({ tabId: 't1', paneId: 'p1' }),
+      closeTab: vi.fn(),
+      attachPaneContent: () => {},
+    },
+    registry,
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
+
+  expect(res.status).toBe(500)
+  expect(res.body.message).toBe('Codex durable recovery is still in progress.')
+  expect(registry.input).toHaveBeenCalledTimes(1)
+  expect(registry.killAndWait).toHaveBeenCalledWith('term1')
+})
+
+it('shuts down the pending Codex sidecar when /api/run fails after planning', async () => {
+  const registry = {
+    create: vi.fn(() => {
+      throw new Error('spawn failed after planning')
+    }),
+    input: vi.fn(() => ({ status: 'written' })),
+  }
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      createTab: () => ({ tabId: 't1', paneId: 'p1' }),
+      attachPaneContent: () => {},
+    },
+    registry,
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
+
+  expect(res.status).toBe(500)
+  expect(res.body.message).toBe('spawn failed after planning')
+  expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
+  expect(codexLaunchPlanner.sidecar.adoptCalls).toEqual([])
+})
+
+it('reports pending Codex sidecar shutdown failure when /api/run fails after planning', async () => {
+  const registry = {
+    create: vi.fn(() => {
+      throw new Error('spawn failed after planning')
+    }),
+    input: vi.fn(() => ({ status: 'written' })),
+  }
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  codexLaunchPlanner.sidecar.shutdownError = new Error('verified sidecar teardown failed')
+
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      createTab: () => ({ tabId: 't1', paneId: 'p1' }),
+      attachPaneContent: () => {},
+    },
+    registry,
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
+
+  expect(res.status).toBe(500)
+  expect(res.body.message).toContain('spawn failed after planning')
+  expect(res.body.message).toContain('verified sidecar teardown failed')
+  expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
+  expect(codexLaunchPlanner.sidecar.adoptCalls).toEqual([])
+})
+
+it('kills the created terminal and sidecar when /api/run fails after registry.create', async () => {
+  const registry = {
+    create: vi.fn(() => ({ terminalId: 'term1' })),
+    input: vi.fn(() => ({ status: 'written' })),
+    killAndWait: vi.fn(async () => true),
+  }
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  vi.spyOn(codexLaunchPlanner.sidecar, 'adopt').mockRejectedValue(new Error('adopt failed after create'))
+
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      createTab: () => ({ tabId: 't1', paneId: 'p1' }),
+      attachPaneContent: () => {},
+    },
+    registry,
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
+
+  expect(res.status).toBe(500)
+  expect(res.body.message).toBe('adopt failed after create')
+  expect(registry.killAndWait).toHaveBeenCalledWith('term1')
+  expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
+})
+
+it('reports created-terminal cleanup failure when /api/run fails after registry.create', async () => {
+  const registry = {
+    create: vi.fn(() => ({ terminalId: 'term1' })),
+    input: vi.fn(() => ({ status: 'written' })),
+    killAndWait: vi.fn(async () => {
+      throw new Error('terminal cleanup failed')
+    }),
+  }
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  vi.spyOn(codexLaunchPlanner.sidecar, 'adopt').mockRejectedValue(new Error('adopt failed after create'))
+
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      createTab: () => ({ tabId: 't1', paneId: 'p1' }),
+      attachPaneContent: () => {},
+    },
+    registry,
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
+
+  expect(res.status).toBe(500)
+  expect(res.body.message).toContain('adopt failed after create')
+  expect(res.body.message).toContain('terminal cleanup failed')
+  expect(registry.killAndWait).toHaveBeenCalledWith('term1')
+  expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
 })
 
 it('retries initial Codex launch before starting a detached /api/run session', async () => {
   const registry = {
     create: vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term1' })),
-    input: vi.fn(() => true),
+    input: vi.fn(() => ({ status: 'written' })),
   }
   const codexLaunchPlanner = new FakeCodexLaunchPlanner()
   codexLaunchPlanner.failNext(2)
-  const createTab = vi.fn((input: { tabId: string; paneId: string }) => ({
-    tabId: input.tabId,
-    paneId: input.paneId,
-  }))
+  const createTab = vi.fn(() => ({ tabId: 't1', paneId: 'p1' }))
 
   const app = express()
   app.use(express.json())
@@ -162,14 +400,11 @@ it('retries initial Codex launch before starting a detached /api/run session', a
 it('fails detached /api/run without mutating layout when Codex launch retries are exhausted', async () => {
   const registry = {
     create: vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term1' })),
-    input: vi.fn(() => true),
+    input: vi.fn(() => ({ status: 'written' })),
   }
   const codexLaunchPlanner = new FakeCodexLaunchPlanner()
   codexLaunchPlanner.failNext(5)
-  const createTab = vi.fn((input: { tabId: string; paneId: string }) => ({
-    tabId: input.tabId,
-    paneId: input.paneId,
-  }))
+  const createTab = vi.fn(() => ({ tabId: 't1', paneId: 'p1' }))
 
   const app = express()
   app.use(express.json())
@@ -201,13 +436,10 @@ it('shuts down the planned Codex sidecar when /api/run terminal creation fails b
     create: vi.fn(() => {
       throw new Error('spawn failed')
     }),
-    input: vi.fn(() => true),
+    input: vi.fn(() => ({ status: 'written' })),
   }
   const codexLaunchPlanner = new FakeCodexLaunchPlanner()
-  const createTab = vi.fn((input: { tabId: string; paneId: string }) => ({
-    tabId: input.tabId,
-    paneId: input.paneId,
-  }))
+  const createTab = vi.fn(() => ({ tabId: 't1', paneId: 'p1' }))
   const closeTab = vi.fn()
 
   const app = express()
@@ -228,7 +460,7 @@ it('shuts down the planned Codex sidecar when /api/run terminal creation fails b
   expect(res.body).toEqual({ status: 'error', message: 'spawn failed' })
   expect(codexLaunchPlanner.planCreateCalls).toHaveLength(1)
   expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
-  expect(closeTab).toHaveBeenCalledWith(createTab.mock.calls[0]?.[0]?.tabId)
+  expect(closeTab).toHaveBeenCalledWith('t1')
   expect(registry.input).not.toHaveBeenCalled()
 })
 
@@ -236,7 +468,7 @@ it('rejects invalid Codex settings for /api/run before creating a tab', async ()
   const createTab = vi.fn(() => ({ tabId: 't1', paneId: 'p1' }))
   const registry = {
     create: vi.fn(() => ({ terminalId: 'term1' })),
-    input: vi.fn(() => true),
+    input: vi.fn(() => ({ status: 'written' })),
   }
   const codexLaunchPlanner = new FakeCodexLaunchPlanner()
 
@@ -272,4 +504,48 @@ it('rejects invalid Codex settings for /api/run before creating a tab', async ()
   expect(codexLaunchPlanner.planCreateCalls).toEqual([])
   expect(createTab).not.toHaveBeenCalled()
   expect(registry.create).not.toHaveBeenCalled()
+})
+
+it('rejects Codex /api/run without planning when shutdown admission closes while reading settings', async () => {
+  let acceptingCreates = true
+  const createTab = vi.fn(() => ({ tabId: 't1', paneId: 'p1' }))
+  const registry = {
+    create: vi.fn(() => ({ terminalId: 'term1' })),
+    input: vi.fn(() => ({ status: 'written' })),
+    killAndWait: vi.fn(async () => true),
+  }
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      createTab,
+      attachPaneContent: vi.fn(),
+    },
+    registry,
+    codexLaunchPlanner,
+    configStore: {
+      getSettings: vi.fn(async () => {
+        acceptingCreates = false
+        return { codingCli: { providers: { codex: {} } } }
+      }),
+    },
+    assertTerminalCreateAccepted: () => {
+      if (!acceptingCreates) {
+        throw new Error('Server is shutting down; terminal creation is not accepted.')
+      }
+    },
+  }))
+
+  const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
+
+  expect(res.status).toBe(500)
+  expect(res.body.message).toContain('Server is shutting down')
+  expect(codexLaunchPlanner.planCreateCalls).toEqual([])
+  expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(0)
+  expect(createTab).not.toHaveBeenCalled()
+  expect(registry.create).not.toHaveBeenCalled()
+  expect(registry.input).not.toHaveBeenCalled()
+  expect(registry.killAndWait).not.toHaveBeenCalled()
 })

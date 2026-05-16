@@ -12,14 +12,7 @@ import {
 import { shallowEqual } from 'react-redux'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
-import {
-  clearRestoreFallbackAttempt,
-  consumePaneRefreshRequest,
-  recordRestoreFallbackAttempt,
-  splitPane,
-  updatePaneContent,
-  updatePaneTitle,
-} from '@/store/panesSlice'
+import { consumePaneRefreshRequest, splitPane, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 import { clearPaneRuntimeActivity, setPaneRuntimeActivity } from '@/store/paneRuntimeActivitySlice'
@@ -28,7 +21,6 @@ import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTer
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
 import { buildTerminalDurableSessionRefUpdate, flushPersistedLayoutNow } from '@/store/persistControl'
 import { getWsClient } from '@/lib/ws-client'
-import { bucketTabRecencyAt } from '@/lib/tab-recency'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import { getCreateSessionStateFromRef } from '@/components/terminal-view-utils'
 import { copyText, readText } from '@/lib/clipboard'
@@ -105,8 +97,6 @@ import {
   shouldTranslateScrollToCursorKeys,
 } from '@/lib/terminal-behavior'
 import { buildRestoreError } from '@shared/session-contract'
-import { recordPaneTabActivity } from '@/store/tabRecencySlice'
-import type { CodingCliProviderName } from '@/store/types'
 
 const log = createLogger('TerminalView')
 
@@ -127,6 +117,26 @@ const LIGHT_THEME_MIN_CONTRAST_RATIO = 4.5
 const DEFAULT_MIN_CONTRAST_RATIO = 1
 const MAX_LAST_SENT_VIEWPORT_CACHE_ENTRIES = 200
 const TRUNCATED_REPLAY_BYTES = 128 * 1024
+const INPUT_BLOCKED_NOTICE_THROTTLE_MS = 2000
+
+type TerminalInputBlockedReason =
+  | 'codex_identity_pending'
+  | 'codex_identity_capture_timeout'
+  | 'codex_identity_unavailable'
+  | 'codex_recovery_pending'
+
+function terminalInputBlockedNotice(reason: TerminalInputBlockedReason): string {
+  switch (reason) {
+    case 'codex_identity_pending':
+      return 'Input not sent: Codex is still saving restore state. Try again in a moment.'
+    case 'codex_recovery_pending':
+      return 'Input not sent: Codex is still reconnecting. Try again in a moment.'
+    case 'codex_identity_capture_timeout':
+      return 'Input not sent: Codex did not provide restore state before startup timed out. Start a new Codex pane or resume inside Codex.'
+    case 'codex_identity_unavailable':
+      return 'Input not sent: Codex did not provide restorable session state. Start a new Codex pane or resume inside Codex.'
+  }
+}
 
 type StartupProbeReplayDiscardState = {
   remainder: string | null
@@ -311,17 +321,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const tabOrder = useAppSelector((s) => s.tabs.tabs.map((t) => t.id), shallowEqual)
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
   const refreshRequest = useAppSelector((s) => s.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
-  const restoreFallbackAttempt = useAppSelector(
-    (s) => s.panes.restoreFallbackAttemptsByPane?.[tabId]?.[paneId] ?? null,
-    shallowEqual,
-  )
   const connectionErrorCode = useAppSelector((s) => s.connection.lastErrorCode)
   const settings = useAppSelector((s) => s.settings.settings)
   const hasAttention = useAppSelector((s) => !!s.turnCompletion?.attentionByTab?.[tabId])
   const hasAttentionRef = useRef(hasAttention)
   const hasPaneAttention = useAppSelector((s) => !!s.turnCompletion?.attentionByPane?.[paneId])
   const hasPaneAttentionRef = useRef(hasPaneAttention)
-  const paneTabRecencyBucket = useAppSelector((s) => s.tabRecency?.paneLastInputAt?.[paneId])
 
   // All hooks MUST be called before any conditional returns
   const ws = useMemo(() => getWsClient(), [])
@@ -358,7 +363,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const hiddenRef = useRef(hidden)
   const hydrationRegisteredRef = useRef(false)
   const lastSessionActivityAtRef = useRef(0)
-  const lastPaneTabRecencyBucketRef = useRef<number | undefined>(paneTabRecencyBucket)
   const rateLimitRetryRef = useRef<{ count: number; timer: ReturnType<typeof setTimeout> | null }>({ count: 0, timer: null })
   const restoreRequestIdRef = useRef<string | null>(null)
   const restoreFlagRef = useRef(false)
@@ -394,6 +398,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const tapCountRef = useRef(0)
   const terminalFirstOutputMarkedRef = useRef(false)
   const turnCompletedSinceLastInputRef = useRef(true)
+  const lastInputBlockedNoticeRef = useRef<{ reason: TerminalInputBlockedReason; at: number } | null>(null)
 
   // Extract terminal-specific fields (safe because we check kind later)
   const isTerminal = paneContent.kind === 'terminal'
@@ -452,7 +457,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const contentRef = useRef<TerminalPaneContent | null>(terminalContent)
   const providerBehaviorRef = useRef(providerBehavior)
   const refreshRequestRef = useRef<PaneRefreshRequest | null>(refreshRequest)
-  const restoreFallbackAttemptRef = useRef(restoreFallbackAttempt)
   const handledRefreshRequestIdRef = useRef<string | null>(null)
   const hasMountedRefreshEffectRef = useRef(false)
 
@@ -503,10 +507,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       contentRef.current = terminalContent
     }
   }, [terminalContent, paneId, applySeqState])
-
-  useEffect(() => {
-    lastPaneTabRecencyBucketRef.current = paneTabRecencyBucket
-  }, [paneId, paneTabRecencyBucket])
 
   // Register terminal buffer accessor with test harness (for E2E tests).
   // Uses xterm.js Terminal.buffer.active API which works with all renderers
@@ -571,8 +571,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   attentionDismissRef.current = settings.panes?.attentionDismiss ?? 'click'
   debugRef.current = !!settings.logging?.debug
   refreshRequestRef.current = refreshRequest
-  restoreFallbackAttemptRef.current = restoreFallbackAttempt
   providerBehaviorRef.current = providerBehavior
+
+  useEffect(() => {
+    serverInstanceIdRef.current = serverInstanceId
+  }, [serverInstanceId])
 
   const shouldFocusActiveTerminal = !hidden && activeTabId === tabId && activePaneId === paneId
 
@@ -739,9 +742,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const lines = rawLines > 0 ? Math.floor(rawLines) : Math.ceil(rawLines)
     if (lines !== 0) {
       if (!translateScrollLinesToInput(term, lines)) {
-        if (term.buffer.active.type !== 'alternate') {
-          term.scrollLines(lines)
-        }
+        term.scrollLines(lines)
       }
 
       touchScrollAccumulatorRef.current -= lines * TOUCH_SCROLL_PIXELS_PER_LINE
@@ -837,10 +838,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       content: next,
     }))
   }, [dispatch, tabId, paneId]) // NO terminalContent dependency - uses ref
-
-  useEffect(() => {
-    serverInstanceIdRef.current = serverInstanceId
-  }, [serverInstanceId])
 
   const requestTerminalLayout = useCallback((options: {
     fit?: boolean
@@ -1361,12 +1358,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       const currentContent = contentRef.current
       if (currentTab) {
         const now = Date.now()
-        const bucket = bucketTabRecencyAt(now)
-        const previousBucket = lastPaneTabRecencyBucketRef.current
-        if (bucket !== undefined && (previousBucket === undefined || bucket > previousBucket)) {
-          lastPaneTabRecencyBucketRef.current = bucket
-          dispatch(recordPaneTabActivity({ paneId, at: now }))
-        }
+        dispatch(updateTab({ id: currentTab.id, updates: { lastInputAt: now } }))
         const resumeSessionId = currentContent?.resumeSessionId
         if (resumeSessionId && currentContent?.mode && currentContent.mode !== 'shell') {
           if (now - lastSessionActivityAtRef.current >= SESSION_ACTIVITY_THROTTLE_MS) {
@@ -1496,30 +1488,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   useEffect(() => {
     tabHasSinglePaneRef.current = tabHasSinglePane
   }, [tabHasSinglePane])
-
-  const persistDurableSessionIdentity = useCallback((
-    provider: CodingCliProviderName,
-    sessionId: string,
-  ) => {
-    const currentTab = tabHasSinglePaneRef.current ? tabRef.current : undefined
-    const durableIdentityUpdate = buildTerminalDurableSessionRefUpdate({
-      provider,
-      sessionId,
-      paneSessionRef: contentRef.current?.sessionRef,
-      tabSessionRef: currentTab?.sessionRef,
-      paneResumeSessionId: contentRef.current?.resumeSessionId,
-      tabResumeSessionId: currentTab?.resumeSessionId,
-    })
-    if (durableIdentityUpdate?.paneUpdates) {
-      updateContent(durableIdentityUpdate.paneUpdates)
-    }
-    if (currentTab && durableIdentityUpdate?.tabUpdates) {
-      dispatch(updateTab({ id: currentTab.id, updates: durableIdentityUpdate.tabUpdates }))
-    }
-    if (durableIdentityUpdate?.shouldFlush) {
-      dispatch(flushPersistedLayoutNow())
-    }
-  }, [dispatch, updateContent])
 
   // Ref for paneId to avoid stale closures in title handlers
   const paneIdRef = useRef(paneId)
@@ -1839,6 +1807,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         sessionRef: createSessionState.sessionRef,
         liveTerminal: createSessionState.liveTerminal,
         contentRefResumeSessionId: contentRef.current?.resumeSessionId,
+        codexDurability: createSessionState.codexDurability,
         mode,
         recoveryIntent,
       })
@@ -1849,6 +1818,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         shell: shell || 'system',
         cwd: initialCwd,
         ...(!recoveryIntent && createSessionState.sessionRef ? { sessionRef: createSessionState.sessionRef } : {}),
+        ...(!recoveryIntent && createSessionState.codexDurability ? { codexDurability: createSessionState.codexDurability } : {}),
         ...(!recoveryIntent && createSessionState.liveTerminal ? { liveTerminal: createSessionState.liveTerminal } : {}),
         tabId,
         paneId: paneIdRef.current,
@@ -2103,6 +2073,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             requestId: reqId,
             terminalId: newId,
             restore: pendingLaunch?.requestId === reqId ? pendingLaunch.restore : false,
+            ...(pendingLaunch?.requestId === reqId && pendingLaunch.recoveryIntent
+              ? { recoveryIntent: pendingLaunch.recoveryIntent }
+              : {}),
             attachReady: false,
           }
           currentAttachRef.current = null
@@ -2117,13 +2090,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             terminalId: newId,
             serverInstanceId: serverInstanceIdRef.current,
             status: 'running',
-            restoreError: undefined,
+            ...(msg.clearCodexDurability ? { codexDurability: undefined } : {}),
+            ...(msg.restoreError ? { restoreError: msg.restoreError } : {}),
           })
-          dispatch(clearRestoreFallbackAttempt({ tabId, paneId: paneIdRef.current }))
           // Also update tab status
           const currentTab = tabRef.current
           if (currentTab) {
-            dispatch(updateTab({ id: currentTab.id, updates: { status: 'running' } }))
+            dispatch(updateTab({
+              id: currentTab.id,
+              updates: {
+                status: 'running',
+                ...(msg.clearCodexDurability ? { codexDurability: undefined } : {}),
+              },
+            }))
           }
 
           applySeqState(createAttachSeqState({ lastSeq: 0 }))
@@ -2218,7 +2197,79 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             oldResumeSessionId: contentRef.current?.resumeSessionId,
             sessionRef,
           })
-          persistDurableSessionIdentity(sessionRef.provider, sessionRef.sessionId)
+          const currentTab = tabHasSinglePaneRef.current ? tabRef.current : undefined
+          const durableIdentityUpdate = buildTerminalDurableSessionRefUpdate({
+            provider: sessionRef.provider,
+            sessionId: sessionRef.sessionId,
+            paneSessionRef: contentRef.current?.sessionRef,
+            tabSessionRef: currentTab?.sessionRef,
+            paneResumeSessionId: contentRef.current?.resumeSessionId,
+            tabResumeSessionId: currentTab?.resumeSessionId,
+          })
+          const paneCodexDurability = contentRef.current?.codexDurability
+          const nextPaneCodexDurability = sessionRef.provider === 'codex'
+            && paneCodexDurability?.state === 'durable'
+            && (
+              paneCodexDurability.durableThreadId === sessionRef.sessionId
+              || paneCodexDurability.candidate?.candidateThreadId === sessionRef.sessionId
+            )
+            ? paneCodexDurability
+            : undefined
+          const tabCodexDurability = currentTab?.codexDurability
+          const nextTabCodexDurability = sessionRef.provider === 'codex'
+            && tabCodexDurability?.state === 'durable'
+            && (
+              tabCodexDurability.durableThreadId === sessionRef.sessionId
+              || tabCodexDurability.candidate?.candidateThreadId === sessionRef.sessionId
+            )
+            ? tabCodexDurability
+            : undefined
+          if (durableIdentityUpdate?.paneUpdates) {
+            updateContent({ ...durableIdentityUpdate.paneUpdates, codexDurability: nextPaneCodexDurability })
+          }
+          if (currentTab && durableIdentityUpdate?.tabUpdates) {
+            dispatch(updateTab({ id: currentTab.id, updates: { ...durableIdentityUpdate.tabUpdates, codexDurability: nextTabCodexDurability } }))
+          }
+          if (durableIdentityUpdate?.shouldFlush) {
+            dispatch(flushPersistedLayoutNow())
+          }
+        }
+
+        if (msg.type === 'terminal.codex.durability.updated' && msg.terminalId === tid) {
+          const durability = msg.durability
+          updateContent({ codexDurability: durability })
+          const currentTab = tabHasSinglePaneRef.current ? tabRef.current : undefined
+          if (currentTab) {
+            dispatch(updateTab({ id: currentTab.id, updates: { codexDurability: durability } }))
+          }
+          dispatch(flushPersistedLayoutNow())
+          const candidate = durability?.candidate
+          if (candidate) {
+            ws.send({
+              type: 'terminal.codex.candidate.persisted',
+              terminalId: tid,
+              candidateThreadId: candidate.candidateThreadId,
+              rolloutPath: candidate.rolloutPath,
+              capturedAt: candidate.capturedAt,
+            })
+          }
+        }
+
+        if (msg.type === 'terminal.input.blocked' && msg.terminalId === tid) {
+          const reason = msg.reason as TerminalInputBlockedReason
+          log.warn('terminal_input_blocked', {
+            tabId,
+            paneId: paneIdRef.current,
+            terminalId: tid,
+            reason,
+          })
+          const now = Date.now()
+          const previous = lastInputBlockedNoticeRef.current
+          if (!previous || previous.reason !== reason || now - previous.at >= INPUT_BLOCKED_NOTICE_THROTTLE_MS) {
+            lastInputBlockedNoticeRef.current = { reason, at: now }
+            term.writeln(`\r\n[${terminalInputBlockedNotice(reason)}]\r\n`)
+          }
+          return
         }
 
         if (msg.type === 'error' && msg.requestId === reqId) {
@@ -2285,26 +2336,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           // This prevents an infinite respawn loop when terminals fail immediately
           // (e.g., due to permission errors on cwd). User must explicitly restart.
           if (currentTerminalId && current?.status !== 'exited') {
-            if (!current?.sessionRef) {
-              const existingFallback = restoreFallbackAttemptRef.current
-              if (existingFallback?.staleTerminalId === currentTerminalId) {
-                term.writeln('\r\n[Launch failed] Unable to start a replacement terminal after the stale terminal disappeared.\r\n')
-                launchAttemptRef.current = null
-                clearRateLimitRetry()
-                setIsAttaching(false)
-                dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
-                updateContent({
-                  terminalId: undefined,
-                  serverInstanceId: undefined,
-                  status: 'error',
-                  restoreError: buildRestoreError('dead_live_handle'),
-                })
-                const currentTab = tabRef.current
-                if (currentTab) {
-                  dispatch(updateTab({ id: currentTab.id, updates: { status: 'error' } }))
-                }
-                return
-              }
+            const hasCodexCapturedRestoreState = current?.mode === 'codex' && Boolean(current.codexDurability?.candidate)
+            if (!current?.sessionRef && !hasCodexCapturedRestoreState) {
               const restoreDiagnostic = {
                 event: 'restore_unavailable' as const,
                 reason: 'dead_live_handle' as const,
@@ -2323,23 +2356,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               })
               term.writeln('\r\n[Starting a new terminal because the previous live terminal is gone and no durable session identity was saved]\r\n')
               const newRequestId = nanoid()
-              const fallbackAttempt = {
-                staleTerminalId: currentTerminalId,
-                requestId: newRequestId,
-                reason: 'dead_live_handle_without_session_ref' as const,
-              }
-              restoreFallbackAttemptRef.current = fallbackAttempt
               launchAttemptRef.current = null
               clearRateLimitRetry()
               setIsAttaching(false)
               dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
               consumeTerminalRestoreRequestId(requestIdRef.current)
               addTerminalFreshRecoveryRequestId(newRequestId, 'fresh_after_restore_unavailable')
-              dispatch(recordRestoreFallbackAttempt({
-                tabId,
-                paneId: paneIdRef.current,
-                ...fallbackAttempt,
-              }))
               requestIdRef.current = newRequestId
               clearTerminalCursor(currentTerminalId)
               forgetSentViewport(currentTerminalId)

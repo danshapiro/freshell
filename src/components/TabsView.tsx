@@ -1,4 +1,4 @@
-import { createElement, memo, useMemo, useState } from 'react'
+import { createElement, memo, useEffect, useMemo, useState } from 'react'
 import { nanoid } from 'nanoid'
 import {
   Archive,
@@ -15,11 +15,13 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
+import { getWsClient } from '@/lib/ws-client'
 import type { RegistryPaneSnapshot, RegistryTabRecord } from '@/store/tabRegistryTypes'
 import { addTab, setActiveTab } from '@/store/tabsSlice'
 import { addPane, initLayout } from '@/store/panesSlice'
-import { setTabRegistryClosedTabRetentionDays } from '@/store/tabRegistrySlice'
+import { setTabRegistryLoading, setTabRegistrySearchRangeDays } from '@/store/tabRegistrySlice'
 import { selectTabsRegistryGroups } from '@/store/selectors/tabsRegistrySelectors'
+import { getCurrentTabRegistryClientInstanceId } from '@/store/tabRegistrySync'
 import { isNonShellMode } from '@/lib/coding-cli-utils'
 import { copyText } from '@/lib/clipboard'
 import { cn } from '@/lib/utils'
@@ -32,7 +34,9 @@ import {
   type SessionLocator,
 } from '@/store/paneTypes'
 import type { CodingCliProviderName, TabMode } from '@/store/types'
-import { buildRestoreError, migrateLegacyAgentChatDurableState } from '@shared/session-contract'
+import type { AgentChatProviderName } from '@/lib/agent-chat-types'
+import { migrateLegacyAgentChatDurableState } from '@shared/session-contract'
+import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                             */
@@ -41,10 +45,7 @@ import { buildRestoreError, migrateLegacyAgentChatDurableState } from '@shared/s
 type FilterMode = 'all' | 'open' | 'closed'
 type ScopeMode = 'all' | 'local' | 'remote'
 
-type DisplayRecord = RegistryTabRecord & {
-  displayDeviceLabel: string
-  registryScope: 'local' | 'same-device' | 'remote' | 'closed'
-}
+type DisplayRecord = RegistryTabRecord & { displayDeviceLabel: string }
 
 type DeviceGroupData = {
   deviceId: string
@@ -112,11 +113,15 @@ function sanitizePaneSnapshot(
     const mode = (payload.mode as TabMode) || 'shell'
     const sessionRef = resolveSessionRef({ payload })
     const liveTerminal = parseLiveTerminalHandle(payload.liveTerminal, record.serverInstanceId)
+    const codexDurability = mode === 'codex'
+      ? sanitizeCodexDurabilityRef(payload.codexDurability)
+      : undefined
     return {
       kind: 'terminal',
       mode,
       shell: (payload.shell as 'system' | 'cmd' | 'powershell' | 'wsl') || 'system',
       sessionRef,
+      ...(codexDurability ? { codexDurability } : {}),
       terminalId: sameServer ? liveTerminal?.terminalId : undefined,
       serverInstanceId: record.serverInstanceId,
       initialCwd: payload.initialCwd as string | undefined,
@@ -146,50 +151,16 @@ function sanitizePaneSnapshot(
       timelineSessionId: typeof payload.timelineSessionId === 'string' ? payload.timelineSessionId : undefined,
       resumeSessionId: typeof payload.resumeSessionId === 'string' ? payload.resumeSessionId : undefined,
     })
-    const sessionType = ((payload.provider as string | undefined) || 'freshclaude') as any
-    const sessionRef = durableState.sessionRef
-    const restoreError = sessionRef || sameServer
-      ? undefined
-      : buildRestoreError('missing_canonical_identity')
     return {
-      kind: 'fresh-agent',
-      provider: 'claude',
-      sessionType,
+      kind: 'agent-chat',
+      provider: ((payload.provider as string | undefined) || 'freshclaude') as AgentChatProviderName,
       sessionId: sameServer && typeof payload.sessionId === 'string' ? payload.sessionId : undefined,
-      resumeSessionId: sameServer && typeof payload.resumeSessionId === 'string'
-        ? payload.resumeSessionId
-        : undefined,
-      ...(sessionRef ? { sessionRef } : {}),
-      ...(restoreError ? { restoreError } : {}),
-      serverInstanceId: sameServer ? record.serverInstanceId : undefined,
+      ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
+      ...(durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
+      serverInstanceId: record.serverInstanceId,
       initialCwd: payload.initialCwd as string | undefined,
       modelSelection: normalizeAgentChatModelSelection(payload.modelSelection, payload.model),
       permissionMode: payload.permissionMode as string | undefined,
-      effort: normalizeAgentChatEffortOverride(payload.effort),
-      plugins: payload.plugins as string[] | undefined,
-    }
-  }
-  if (snapshot.kind === 'fresh-agent') {
-    const resumeSessionId = payload.resumeSessionId as string | undefined
-    const provider = ((payload.provider as string | undefined) || 'claude') as CodingCliProviderName
-    const sessionRef = resolveSessionRef({ payload })
-    const restoreError = sessionRef || sameServer
-      ? undefined
-      : buildRestoreError('missing_canonical_identity')
-    return {
-      kind: 'fresh-agent',
-      provider: provider as any,
-      sessionType: ((payload.sessionType as string | undefined) || 'freshclaude') as any,
-      resumeSessionId: sameServer ? resumeSessionId : undefined,
-      sessionId: sameServer && typeof payload.sessionId === 'string' ? payload.sessionId : undefined,
-      sessionRef,
-      ...(restoreError ? { restoreError } : {}),
-      serverInstanceId: sameServer ? record.serverInstanceId : undefined,
-      initialCwd: payload.initialCwd as string | undefined,
-      modelSelection: normalizeAgentChatModelSelection(payload.modelSelection, provider === 'claude' ? payload.model : undefined),
-      model: payload.model as string | undefined,
-      permissionMode: payload.permissionMode as string | undefined,
-      sandbox: payload.sandbox as 'read-only' | 'workspace-write' | 'danger-full-access' | undefined,
       effort: normalizeAgentChatEffortOverride(payload.effort),
       plugins: payload.plugins as string[] | undefined,
     }
@@ -204,21 +175,21 @@ function sanitizePaneSnapshot(
   return { kind: 'picker' }
 }
 
-function deriveModeFromContent(content: PaneContentInput): TabMode {
-  if (content.kind === 'terminal') return content.mode || 'shell'
+function deriveModeFromRecord(record: RegistryTabRecord): TabMode {
+  const firstKind = record.panes[0]?.kind
+  if (firstKind === 'terminal') {
+    const mode = record.panes[0]?.payload?.mode
+    if (typeof mode === 'string') return mode as TabMode
+    return 'shell'
+  }
+  if (firstKind === 'agent-chat') return 'claude'
   return 'shell'
-}
-
-function deriveModeFromSanitizedContents(contents: readonly PaneContentInput[]): TabMode {
-  if (contents.some((content) => content.kind === 'fresh-agent')) return 'shell'
-  return contents[0] ? deriveModeFromContent(contents[0]) : 'shell'
 }
 
 function paneKindIcon(kind: RegistryPaneSnapshot['kind']): LucideIcon {
   if (kind === 'terminal') return TerminalSquare
   if (kind === 'browser') return Globe
   if (kind === 'editor') return FileCode2
-  if (kind === 'fresh-agent') return Bot
   if (kind === 'agent-chat') return Bot
   return Square
 }
@@ -227,7 +198,6 @@ function paneKindColorClass(kind: RegistryPaneSnapshot['kind']): string {
   if (kind === 'terminal') return 'text-foreground/50'
   if (kind === 'browser') return 'text-blue-500'
   if (kind === 'editor') return 'text-emerald-500'
-  if (kind === 'fresh-agent') return 'text-amber-500'
   if (kind === 'agent-chat' || kind === 'claude-chat') return 'text-amber-500'
   if (kind === 'extension') return 'text-purple-500'
   return 'text-muted-foreground'
@@ -237,7 +207,6 @@ function paneKindLabel(kind: RegistryPaneSnapshot['kind']): string {
   if (kind === 'terminal') return 'Terminal'
   if (kind === 'browser') return 'Browser'
   if (kind === 'editor') return 'Editor'
-  if (kind === 'fresh-agent') return 'Fresh Agent'
   if (kind === 'agent-chat' || kind === 'claude-chat') return 'Agent'
   if (kind === 'extension') return 'Extension'
   return kind
@@ -522,11 +491,11 @@ function DeviceSection({
 function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
   const dispatch = useAppDispatch()
   const store = useAppStore()
+  const ws = useMemo(() => getWsClient(), [])
   const groups = useAppSelector(selectTabsRegistryGroups)
-  const { deviceId, deviceLabel, deviceAliases, closedTabRetentionDays, searchRangeDays, syncError } = useAppSelector(
+  const { deviceId, deviceLabel, deviceAliases, searchRangeDays, syncError } = useAppSelector(
     (state) => state.tabRegistry,
   )
-  const effectiveClosedRetentionDays = closedTabRetentionDays ?? searchRangeDays
   const localServerInstanceId = useAppSelector((state) => state.connection.serverInstanceId)
   const connectionStatus = useAppSelector((state) => state.connection.status)
   const connectionError = useAppSelector((state) => state.connection.lastError)
@@ -543,9 +512,8 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
 
   const withDisplayDeviceLabel = useMemo(
     () =>
-      (record: RegistryTabRecord, registryScope: DisplayRecord['registryScope']): DisplayRecord => ({
+      (record: RegistryTabRecord): DisplayRecord => ({
         ...record,
-        registryScope,
         displayDeviceLabel:
           record.deviceId === deviceId
             ? deviceLabel
@@ -554,15 +522,26 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     [deviceAliases, deviceId, deviceLabel],
   )
 
+  /* -- search range sync -------------------------------------------- */
+
+  useEffect(() => {
+    if (ws.state !== 'ready') return
+    if (searchRangeDays <= 30) return
+    dispatch(setTabRegistryLoading(true))
+    ws.sendTabsSyncQuery({
+      requestId: `tabs-range-${Date.now()}`,
+      deviceId,
+      clientInstanceId: getCurrentTabRegistryClientInstanceId(),
+      closedTabRetentionDays: searchRangeDays,
+    })
+  }, [dispatch, ws, deviceId, searchRangeDays])
+
   /* -- filtering ---------------------------------------------------- */
 
   const filtered = useMemo(() => {
-    const localOpen = groups.localOpen.map((record) => withDisplayDeviceLabel(record, 'local')).filter((r) => matchRecord(r, query))
-    const remoteOpen = [
-      ...groups.sameDeviceOpen.map((record) => withDisplayDeviceLabel(record, 'same-device')),
-      ...groups.remoteOpen.map((record) => withDisplayDeviceLabel(record, 'remote')),
-    ].filter((r) => matchRecord(r, query))
-    const closed = groups.closed.map((record) => withDisplayDeviceLabel(record, 'closed')).filter((r) => matchRecord(r, query))
+    const localOpen = groups.localOpen.map(withDisplayDeviceLabel).filter((r) => matchRecord(r, query))
+    const remoteOpen = groups.remoteOpen.map(withDisplayDeviceLabel).filter((r) => matchRecord(r, query))
+    const closed = groups.closed.map(withDisplayDeviceLabel).filter((r) => matchRecord(r, query))
 
     const byScope = (records: DisplayRecord[], scope: 'local' | 'remote') => {
       if (scopeMode === 'all') return records
@@ -589,32 +568,33 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
   const openRecordAsUnlinkedCopy = (record: RegistryTabRecord) => {
     const tabId = nanoid()
     const paneSnapshots = record.panes || []
-    const sanitizedContents = paneSnapshots.map((pane) => sanitizePaneSnapshot(record, pane, localServerInstanceId))
-    const firstContent = sanitizedContents[0] ?? ({ kind: 'terminal', mode: 'shell' } as const)
+    const firstPane = paneSnapshots[0]
+    const firstContent = firstPane
+      ? sanitizePaneSnapshot(record, firstPane, localServerInstanceId)
+      : ({ kind: 'terminal', mode: 'shell' } as const)
     dispatch(
       addTab({
         id: tabId,
         title: record.tabName,
-        mode: deriveModeFromSanitizedContents(sanitizedContents),
+        mode: deriveModeFromRecord(record),
         status: 'creating',
         serverInstanceId: record.serverInstanceId,
       }),
     )
     dispatch(initLayout({ tabId, content: firstContent }))
-    for (const newContent of sanitizedContents.slice(1)) {
-      dispatch(addPane({ tabId, newContent }))
+    for (const pane of paneSnapshots.slice(1)) {
+      dispatch(addPane({ tabId, newContent: sanitizePaneSnapshot(record, pane, localServerInstanceId) }))
     }
     onOpenTab?.()
   }
 
   const openPaneInNewTab = (record: RegistryTabRecord, pane: RegistryPaneSnapshot) => {
     const tabId = nanoid()
-    const content = sanitizePaneSnapshot(record, pane, localServerInstanceId)
     dispatch(
       addTab({
         id: tabId,
         title: `${record.tabName} · ${pane.title || pane.kind}`,
-        mode: deriveModeFromContent(content),
+        mode: deriveModeFromRecord(record),
         status: 'creating',
         serverInstanceId: record.serverInstanceId,
       }),
@@ -622,7 +602,7 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     dispatch(
       initLayout({
         tabId,
-        content,
+        content: sanitizePaneSnapshot(record, pane, localServerInstanceId),
       }),
     )
     onOpenTab?.()
@@ -650,8 +630,8 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     e.preventDefault()
     e.stopPropagation()
 
+    const isLocal = record.deviceId === deviceId
     const isOpen = record.status === 'open'
-    const isLocal = isOpen && record.registryScope === 'local'
     const items: MenuItem[] = []
 
     if (isLocal && isOpen) {
@@ -758,15 +738,14 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
             ariaLabel="Device scope filter"
           />
           <select
-            value={String(effectiveClosedRetentionDays)}
-            onChange={(e) => dispatch(setTabRegistryClosedTabRetentionDays(Number(e.target.value)))}
+            value={String(searchRangeDays)}
+            onChange={(e) => dispatch(setTabRegistrySearchRangeDays(Number(e.target.value)))}
             className="h-7 px-2 text-xs rounded-md border border-border bg-background text-muted-foreground"
             aria-label="Closed range filter"
           >
-            <option value="1">Last 1 day</option>
-            <option value="7">Last 7 days</option>
-            <option value="14">Last 14 days</option>
             <option value="30">Last 30 days</option>
+            <option value="90">Last 90 days</option>
+            <option value="365">Last year</option>
           </select>
         </div>
       </div>

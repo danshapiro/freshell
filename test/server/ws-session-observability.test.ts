@@ -385,7 +385,7 @@ describe('websocket session observability', () => {
   })
 
   it('records stale terminal input without logging input data', async () => {
-    registry.input.mockReturnValue(false)
+    registry.input.mockReturnValue({ status: 'no_terminal' })
     const ws = await connectReady(port)
 
     try {

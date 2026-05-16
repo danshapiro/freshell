@@ -1,6 +1,7 @@
 import type { TerminalMode } from '../terminal-registry.js'
 import type { TerminalDirectoryQuery } from '../../shared/read-models.js'
 import type { SessionLocator } from '../../shared/ws-protocol.js'
+import type { CodexDurabilityRef } from '../../shared/codex-durability.js'
 
 export type TerminalDirectoryItem = {
   terminalId: string
@@ -13,8 +14,7 @@ export type TerminalDirectoryItem = {
   status: 'running' | 'exited'
   hasClients: boolean
   cwd?: string
-  lastLine?: string
-  last_line?: string
+  codexDurability?: CodexDurabilityRef
 }
 
 export type TerminalDirectoryPage = {

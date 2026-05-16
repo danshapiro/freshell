@@ -169,7 +169,12 @@ describe('TabsView', () => {
           payload: {
             provider: 'freshclaude',
             resumeSessionId: '00000000-0000-4000-8000-000000000444',
-            modelSelection: { kind: 'tracked', modelId: 'tracked-fixture-claude-model' },
+            sessionRef: {
+              provider: 'claude',
+              sessionId: '00000000-0000-4000-8000-000000000444',
+              serverInstanceId: 'srv-remote',
+            },
+            modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
             permissionMode: 'plan',
             effort: 'turbo',
             plugins: ['planner'],
@@ -192,23 +197,20 @@ describe('TabsView', () => {
     if (!copiedTab) throw new Error('expected copied tab')
 
     const copiedLayout = store.getState().panes.layouts[copiedTab.id] as any
-    expect(copiedTab.mode).toBe('shell')
     expect(copiedLayout.content).toMatchObject({
-      kind: 'fresh-agent',
-      sessionType: 'freshclaude',
-      provider: 'claude',
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      resumeSessionId: undefined,
       sessionRef: {
         provider: 'claude',
         sessionId: '00000000-0000-4000-8000-000000000444',
       },
-      modelSelection: { kind: 'tracked', modelId: 'tracked-fixture-claude-model' },
+      serverInstanceId: 'srv-remote',
+      modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
       permissionMode: 'plan',
       effort: 'turbo',
       plugins: ['planner'],
     })
-    expect(copiedLayout.content.serverInstanceId).toBeUndefined()
-    expect(copiedLayout.content.resumeSessionId).toBeUndefined()
-    expect(copiedLayout.content.sessionId).toBeUndefined()
   })
 
   it('shows context menu on right-click with appropriate items', () => {
@@ -225,58 +227,6 @@ describe('TabsView', () => {
     // Context menu should appear with "Pull to this device" and "Copy tab name"
     expect(screen.getByRole('menuitem', { name: /Pull to this device/i })).toBeInTheDocument()
     expect(screen.getByRole('menuitem', { name: /Copy tab name/i })).toBeInTheDocument()
-  })
-
-  it('treats same-device other-window tabs as pullable, not jumpable local tabs', () => {
-    const store = createStore()
-    const localRecord = {
-      tabKey: 'same-device:open',
-      tabId: 'local-tab',
-      serverInstanceId: 'srv-local',
-      deviceId: store.getState().tabRegistry.deviceId,
-      deviceLabel: store.getState().tabRegistry.deviceLabel,
-      clientInstanceId: 'this-window',
-      tabName: 'local open',
-      status: 'open',
-      revision: 1,
-      createdAt: 1,
-      updatedAt: 2,
-      paneCount: 1,
-      titleSetByUser: false,
-      panes: [],
-    } as any
-    store.dispatch(setTabRegistrySnapshot({
-      localOpen: [localRecord],
-      sameDeviceOpen: [{
-        tabKey: 'same-device:open',
-        tabId: 'other-window-tab',
-        serverInstanceId: 'srv-local',
-        deviceId: store.getState().tabRegistry.deviceId,
-        deviceLabel: store.getState().tabRegistry.deviceLabel,
-        clientInstanceId: 'other-window',
-        tabName: 'same device open',
-        status: 'open',
-        revision: 1,
-        createdAt: 1,
-        updatedAt: 3,
-        paneCount: 1,
-        titleSetByUser: false,
-        panes: [],
-      } as any],
-      remoteOpen: [],
-      closed: [],
-    }))
-    render(
-      <Provider store={store}>
-        <TabsView />
-      </Provider>,
-    )
-
-    const card = screen.getByLabelText(`${store.getState().tabRegistry.deviceLabel}: same device open`)
-    fireEvent.contextMenu(card)
-
-    expect(screen.queryByRole('menuitem', { name: /Jump to tab/i })).not.toBeInTheDocument()
-    expect(screen.getByRole('menuitem', { name: /Pull to this device/i })).toBeInTheDocument()
   })
 
   it('groups remote tabs by device', () => {

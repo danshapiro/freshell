@@ -1,13 +1,12 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { nanoid } from '@reduxjs/toolkit'
 import { Terminal, Folder, Settings, LayoutGrid, Search, Loader2, X, Archive, PanelLeftClose, AlertCircle } from 'lucide-react'
 import NetworkQuickAccess from '@/components/NetworkQuickAccess'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { shallowEqual } from 'react-redux'
-import { addTab, openSessionTab, setActiveTab, updateTab } from '@/store/tabsSlice'
-import { addPane, initLayout, setActivePane } from '@/store/panesSlice'
+import { openSessionTab, setActiveTab, updateTab } from '@/store/tabsSlice'
+import { addPane, setActivePane } from '@/store/panesSlice'
 import { findPaneForSession } from '@/lib/session-utils'
 import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
@@ -20,9 +19,8 @@ import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { fetchSessionWindow } from '@/store/sessionsThunks'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 import { collectBusySessionKeys } from '@/lib/pane-activity'
-import { selectPaneLocationByTerminalId, selectPrimaryTerminalIdForTab } from '@/store/selectors/paneTerminalSelectors'
+import { selectPrimaryTerminalIdForTab, selectTabIdByTerminalId } from '@/store/selectors/paneTerminalSelectors'
 import type { ChatSessionState } from '@/store/agentChatTypes'
-import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 
 const EMPTY_TERMINALS: BackgroundTerminal[] = []
@@ -30,7 +28,6 @@ const EMPTY_LAYOUTS: Record<string, never> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
-const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 
 function sameSessionRef(
@@ -40,6 +37,23 @@ function sameSessionRef(
   if (a === b) return true
   if (!a || !b) return false
   return a.provider === b.provider && a.sessionId === b.sessionId
+}
+
+function sameCodexDurability(
+  a?: BackgroundTerminal['codexDurability'],
+  b?: BackgroundTerminal['codexDurability'],
+): boolean {
+  if (a === b) return true
+  if (!a || !b) return false
+  return a.state === b.state
+    && a.durableThreadId === b.durableThreadId
+    && a.candidate?.candidateThreadId === b.candidate?.candidateThreadId
+    && a.candidate?.rolloutPath === b.candidate?.rolloutPath
+    && a.turnCompletedAt === b.turnCompletedAt
+    && a.nonRestorableReason === b.nonRestorableReason
+    && a.lastProofFailure?.reason === b.lastProofFailure?.reason
+    && a.lastProofFailure?.message === b.lastProofFailure?.message
+    && a.lastProofFailure?.checkedAt === b.lastProofFailure?.checkedAt
 }
 
 /** Compare two BackgroundTerminal arrays by sidebar-relevant fields only.
@@ -56,7 +70,8 @@ export function areTerminalsEqual(a: BackgroundTerminal[], b: BackgroundTerminal
       ai.status !== bi.status ||
       ai.hasClients !== bi.hasClients ||
       ai.mode !== bi.mode ||
-      !sameSessionRef(ai.sessionRef, bi.sessionRef)
+      !sameSessionRef(ai.sessionRef, bi.sessionRef) ||
+      !sameCodexDurability(ai.codexDurability, bi.codexDurability)
     ) return false
   }
   return true
@@ -87,7 +102,10 @@ export function areSessionItemsEqual(a: SessionItem[], b: SessionItem[]): boolea
       ai.cwd !== bi.cwd ||
       ai.projectPath !== bi.projectPath ||
       ai.isFallback !== bi.isFallback ||
-      ai.liveTerminalOnly !== bi.liveTerminalOnly ||
+      ai.isRestorable !== bi.isRestorable ||
+      !sameCodexDurability(ai.codexDurability, bi.codexDurability) ||
+      ai.codexDurabilityState !== bi.codexDurabilityState ||
+      ai.codexDurabilityReason !== bi.codexDurabilityReason ||
       ai.timestamp !== bi.timestamp
     ) return false
   }
@@ -140,13 +158,37 @@ function isSessionItemEqual(a: SessionItem, b: SessionItem): boolean {
     a.cwd === b.cwd &&
     a.projectPath === b.projectPath &&
     a.isFallback === b.isFallback &&
-    a.liveTerminalOnly === b.liveTerminalOnly &&
     a.ratchetedActivity === b.ratchetedActivity &&
     a.hasTitle === b.hasTitle &&
     a.isSubagent === b.isSubagent &&
     a.isNonInteractive === b.isNonInteractive &&
-    a.firstUserMessage === b.firstUserMessage
+    a.firstUserMessage === b.firstUserMessage &&
+    a.isRestorable === b.isRestorable &&
+    sameCodexDurability(a.codexDurability, b.codexDurability) &&
+    a.codexDurabilityState === b.codexDurabilityState &&
+    a.codexDurabilityReason === b.codexDurabilityReason
   )
+}
+
+function getCodexDurabilityStatusLabel(item: SessionItem): string | undefined {
+  if (item.provider !== 'codex') return undefined
+  switch (item.codexDurabilityState) {
+    case 'identity_pending':
+      return 'Preparing restore'
+    case 'captured_pre_turn':
+    case 'turn_in_progress_unproven':
+      return 'Restore pending'
+    case 'proof_checking':
+      return 'Checking restore'
+    case 'durable_resuming':
+      return 'Restoring'
+    case 'durability_unproven_after_completion':
+      return 'Restore not verified'
+    case 'non_restorable':
+      return 'Not restorable'
+    default:
+      return undefined
+  }
 }
 
 /**
@@ -326,7 +368,6 @@ export default function Sidebar({
     opencodeActivityByTerminalId: state.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID,
     paneRuntimeActivityByPaneId: state.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID,
     agentChatSessions: state.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS,
-    freshAgentSessions: state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS,
   }), shallowEqual)
   const busySessionKeySet = useMemo(() => new Set(busySessionKeys), [busySessionKeys])
 
@@ -340,34 +381,26 @@ export default function Sidebar({
     const runningTerminalId = item.isRunning ? item.runningTerminalId : undefined
     const localServerInstanceId = state.connection.serverInstanceId
 
-    if (item.liveTerminalOnly && runningTerminalId) {
-      const existing = selectPaneLocationByTerminalId(state, runningTerminalId)
-      if (existing) {
-        dispatch(setActiveTab(existing.tabId))
-        dispatch(setActivePane({ tabId: existing.tabId, paneId: existing.paneId }))
+    if (runningTerminalId && item.isRestorable === false) {
+      const existingTabId = selectTabIdByTerminalId(state, runningTerminalId)
+      if (existingTabId) {
+        dispatch(setActiveTab(existingTabId))
+        const activePaneId = state.panes.activePane[existingTabId]
+        if (activePaneId) {
+          dispatch(setActivePane({ tabId: existingTabId, paneId: activePaneId }))
+        }
         onNavigate('terminal')
         return
       }
-
-      const tabId = nanoid()
-      dispatch(addTab({
-        id: tabId,
+      dispatch(openSessionTab({
+        sessionId: item.sessionId,
         title: item.title,
-        status: 'running',
-        mode: provider,
-        codingCliProvider: provider,
-        initialCwd: item.cwd,
-      }))
-      dispatch(initLayout({
-        tabId,
-        content: {
-          kind: 'terminal',
-          mode: provider,
-          terminalId: runningTerminalId,
-          serverInstanceId: localServerInstanceId,
-          initialCwd: item.cwd,
-          status: 'running',
-        },
+        cwd: item.cwd,
+        provider,
+        sessionType: item.sessionType || provider,
+        terminalId: runningTerminalId,
+        isRestorable: false,
+        codexDurability: item.codexDurability,
       }))
       onNavigate('terminal')
       return
@@ -406,9 +439,11 @@ export default function Sidebar({
         provider,
         sessionType,
         terminalId: runningTerminalId,
+        isRestorable: item.isRestorable,
         firstUserMessage: item.firstUserMessage,
         isSubagent: item.isSubagent,
         isNonInteractive: item.isNonInteractive,
+        codexDurability: item.codexDurability,
       }))
       onNavigate('terminal')
       return
@@ -424,30 +459,32 @@ export default function Sidebar({
         provider,
         sessionType,
         terminalId: runningTerminalId,
+        isRestorable: item.isRestorable,
         firstUserMessage: item.firstUserMessage,
         isSubagent: item.isSubagent,
         isNonInteractive: item.isNonInteractive,
+        codexDurability: item.codexDurability,
       }))
       onNavigate('terminal')
       return
     }
 
+    const newContent = item.isRestorable === false && provider === 'codex'
+      ? {
+          kind: 'terminal' as const,
+          mode: provider,
+          initialCwd: item.cwd,
+          codexDurability: item.codexDurability,
+        }
+      : buildResumeContent({
+          sessionType,
+          sessionId: item.sessionId,
+          cwd: item.cwd,
+          agentChatProviderSettings: providerSettings,
+        })
     dispatch(addPane({
       tabId: currentActiveTabId,
-      newContent: buildResumeContent({
-        sessionType,
-        sessionId: item.sessionId,
-        cwd: item.cwd,
-        agentChatProviderSettings: providerSettings,
-        ...(runningTerminalId && localServerInstanceId
-          ? {
-              liveTerminal: {
-                terminalId: runningTerminalId,
-                serverInstanceId: localServerInstanceId,
-              },
-            }
-          : {}),
-      }),
+      newContent,
     }))
     const activeTab = state.tabs.tabs.find((tab) => tab.id === currentActiveTabId)
     const sessionMetadataByKey = mergeSessionMetadataByKey(
@@ -461,7 +498,7 @@ export default function Sidebar({
         isNonInteractive: item.isNonInteractive,
       },
     )
-    if (activeTab && sessionMetadataByKey !== activeTab.sessionMetadataByKey) {
+    if (activeTab && item.isRestorable !== false && sessionMetadataByKey !== activeTab.sessionMetadataByKey) {
       dispatch(updateTab({
         id: currentActiveTabId,
         updates: { sessionMetadataByKey },
@@ -859,7 +896,10 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
     a.cwd === b.cwd &&
     a.projectPath === b.projectPath &&
     a.isFallback === b.isFallback &&
-    a.liveTerminalOnly === b.liveTerminalOnly
+    a.isRestorable === b.isRestorable &&
+    sameCodexDurability(a.codexDurability, b.codexDurability) &&
+    a.codexDurabilityState === b.codexDurabilityState &&
+    a.codexDurabilityReason === b.codexDurabilityReason
   )
 }
 
@@ -867,6 +907,7 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
   const { item, isActiveTab, isBusy = false, showProjectBadge, onClick } = props
   const extensionEntries = useAppSelector((s) => s.extensions?.entries)
   const { icon: SessionIcon, label: sessionLabel } = resolveSessionTypeConfig(item.sessionType, extensionEntries)
+  const codexStatusLabel = getCodexDurabilityStatusLabel(item)
   return (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -882,8 +923,7 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
           data-session-id={item.sessionId}
           data-provider={item.provider}
           data-session-type={item.sessionType}
-          data-is-running={item.isRunning ? 'true' : 'false'}
-          data-running-terminal-id={item.runningTerminalId ?? ''}
+          data-running-terminal-id={item.runningTerminalId}
           data-has-tab={item.hasTab ? 'true' : 'false'}
         >
           {/* Provider icon */}
@@ -900,7 +940,7 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
 
           {/* Content */}
           <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 min-w-0">
               <span
                 className={cn(
                   'text-sm truncate',
@@ -911,6 +951,11 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
               </span>
               {item.archived && (
                 <Archive className="h-3 w-3 text-muted-foreground/70" aria-label="Archived session" />
+              )}
+              {codexStatusLabel && (
+                <span className="text-2xs text-muted-foreground/70 flex-shrink-0">
+                  {codexStatusLabel}
+                </span>
               )}
             </div>
             {item.subtitle && showProjectBadge && (
@@ -929,6 +974,11 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
       <TooltipContent>
         <div>{sessionLabel}: {item.title}</div>
         <div className="text-muted-foreground">{item.subtitle || item.projectPath || sessionLabel}</div>
+        {codexStatusLabel && (
+          <div className="text-muted-foreground">
+            {codexStatusLabel}{item.codexDurabilityReason ? `: ${item.codexDurabilityReason}` : ''}
+          </div>
+        )}
       </TooltipContent>
     </Tooltip>
   )

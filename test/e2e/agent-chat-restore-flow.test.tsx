@@ -1,66 +1,70 @@
-import { describe, it, expect, vi, afterEach } from 'vitest'
-import { act, render, screen, cleanup, waitFor } from '@testing-library/react'
+import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest'
+import { render, screen, cleanup, act, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
-import FreshAgentView from '@/components/fresh-agent/FreshAgentView'
+import AgentChatView from '@/components/agent-chat/AgentChatView'
 import agentChatReducer from '@/store/agentChatSlice'
-import freshAgentReducer from '@/store/freshAgentSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import tabsReducer from '@/store/tabsSlice'
-import type { FreshAgentPaneContent, PaneNode } from '@/store/paneTypes'
+import type { AgentChatPaneContent, PaneNode } from '@/store/paneTypes'
 import type { Tab } from '@/store/types'
+import { handleSdkMessage } from '@/lib/sdk-message-handler'
+
+beforeAll(() => {
+  Element.prototype.scrollIntoView = vi.fn()
+})
 
 const wsHarness = vi.hoisted(() => {
   const reconnectHandlers = new Set<() => void>()
-  const messageHandlers = new Set<(message: any) => void>()
-  const send = vi.fn()
-  const onMessage = vi.fn((handler: (message: any) => void) => {
-    messageHandlers.add(handler)
-    return () => messageHandlers.delete(handler)
+  const sent: unknown[] = []
+  const inFlightSdkCreates = new Map<string, unknown>()
+
+  const send = vi.fn((msg: unknown) => {
+    sent.push(msg)
+    if (!msg || typeof msg !== 'object') return
+    const candidate = msg as { type?: unknown; requestId?: unknown }
+    if (candidate.type === 'sdk.create' && typeof candidate.requestId === 'string') {
+      inFlightSdkCreates.set(candidate.requestId, msg)
+    }
   })
-  const onReconnect = vi.fn((handler: () => void) => {
-    reconnectHandlers.add(handler)
-    return () => reconnectHandlers.delete(handler)
-  })
+
   return {
     send,
-    onMessage,
-    onReconnect,
-    reconnect: () => {
-      for (const handler of [...reconnectHandlers]) {
+    onReconnect: vi.fn((handler: () => void) => {
+      reconnectHandlers.add(handler)
+      return () => reconnectHandlers.delete(handler)
+    }),
+    reconnect() {
+      for (const handler of reconnectHandlers) {
         handler()
       }
-    },
-    emit: (message: any) => {
-      for (const handler of [...messageHandlers]) {
-        handler(message)
+      for (const create of inFlightSdkCreates.values()) {
+        send(create)
       }
     },
-    reset: () => {
-      reconnectHandlers.clear()
-      messageHandlers.clear()
-      send.mockReset()
-      onMessage.mockReset()
-      onMessage.mockImplementation((handler: (message: any) => void) => {
-        messageHandlers.add(handler)
-        return () => messageHandlers.delete(handler)
-      })
-      onReconnect.mockClear()
+    clearInFlight(requestId: string) {
+      inFlightSdkCreates.delete(requestId)
     },
-    freshAgentCreates: () => send.mock.calls
-      .map(([message]) => message)
-      .filter((message: any) => message?.type === 'freshAgent.create'),
+    sdkCreates() {
+      return sent.filter((msg) => (msg as { type?: unknown })?.type === 'sdk.create')
+    },
+    reset() {
+      reconnectHandlers.clear()
+      sent.length = 0
+      inFlightSdkCreates.clear()
+      send.mockClear()
+      this.onReconnect.mockClear()
+    },
   }
 })
-
-const wsSend = wsHarness.send
-const getFreshAgentThreadSnapshot = vi.fn()
+const getAgentTimelinePage = vi.fn()
+const getAgentTurnBody = vi.fn()
+const setSessionMetadata = vi.fn(() => Promise.resolve(undefined))
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: wsHarness.send,
-    onMessage: wsHarness.onMessage,
     onReconnect: wsHarness.onReconnect,
   }),
 }))
@@ -69,7 +73,9 @@ vi.mock('@/lib/api', async () => {
   const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api')
   return {
     ...actual,
-    getFreshAgentThreadSnapshot: (...args: unknown[]) => getFreshAgentThreadSnapshot(...args),
+    getAgentTimelinePage: (...args: unknown[]) => getAgentTimelinePage(...args),
+    getAgentTurnBody: (...args: unknown[]) => getAgentTurnBody(...args),
+    setSessionMetadata: (...args: unknown[]) => setSessionMetadata(...args),
   }
 })
 
@@ -77,7 +83,6 @@ function makeStore(tabOverrides: Partial<Tab> = {}) {
   return configureStore({
     reducer: {
       agentChat: agentChatReducer,
-      freshAgent: freshAgentReducer,
       panes: panesReducer,
       settings: settingsReducer,
       tabs: tabsReducer,
@@ -114,58 +119,73 @@ function ReactivePane({ store }: { store: ReturnType<typeof makeStore> }) {
     const root = s.panes.layouts.t1
     if (!root) return undefined
     const leaf = findLeaf(root, 'p1')
-    return leaf?.content.kind === 'fresh-agent' ? leaf.content : undefined
+    return leaf?.content.kind === 'agent-chat' ? leaf.content : undefined
   })
 
   if (!content) return null
-  return <FreshAgentView tabId="t1" paneId="p1" paneContent={content} />
+  return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
 }
 
-describe('fresh-agent restore flow', () => {
+describe('agent chat restore flow', () => {
   afterEach(() => {
     cleanup()
     wsHarness.reset()
-    getFreshAgentThreadSnapshot.mockReset()
+    getAgentTimelinePage.mockReset()
+    getAgentTurnBody.mockReset()
+    setSessionMetadata.mockClear()
   })
 
-  it('restores a reloaded freshclaude pane from the canonical fresh-agent snapshot and keeps the durable id in pane and tab state', async () => {
-    const canonicalSessionId = '00000000-0000-4000-8000-000000000777'
-    getFreshAgentThreadSnapshot.mockResolvedValue({
-      revision: 2,
-      status: 'running',
-      summary: 'Recovered durable history',
-      capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: false },
-      turns: [
-        {
-          id: 'turn-1',
-          role: 'assistant',
-          items: [{ id: 'item-1', kind: 'text', text: 'Hydrated from restore flow' }],
-        },
-      ],
-    })
-
+  it('restores a reloaded pane from sdk.session.snapshot, persists the durable id into pane and tab state, and shows partial output without a blank running gap', async () => {
     const store = makeStore({
-      resumeSessionId: canonicalSessionId,
+      resumeSessionId: 'named-resume',
       sessionMetadataByKey: {
-        [`claude:${canonicalSessionId}`]: {
+        'claude:named-resume': {
           sessionType: 'freshclaude',
           firstUserMessage: 'Continue from the old tab',
         },
       },
     })
+    const pane = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-reload',
+      sessionId: 'sdk-sess-1',
+      status: 'idle',
+    } satisfies AgentChatPaneContent
+
     store.dispatch(initLayout({
       tabId: 't1',
       paneId: 'p1',
-      content: {
-        kind: 'fresh-agent',
-        sessionType: 'freshclaude',
-        provider: 'claude',
-        createRequestId: 'req-reload',
-        sessionId: canonicalSessionId,
-        resumeSessionId: canonicalSessionId,
-        status: 'idle',
-      } satisfies FreshAgentPaneContent,
+      content: pane,
     }))
+
+    const durableSessionId = '00000000-0000-4000-8000-000000000111'
+
+    getAgentTimelinePage.mockResolvedValue({
+      sessionId: durableSessionId,
+      items: [
+        {
+          turnId: 'turn-2',
+          sessionId: durableSessionId,
+          role: 'assistant',
+          summary: 'Recent summary',
+          timestamp: '2026-03-10T10:01:00.000Z',
+        },
+      ],
+      nextCursor: null,
+      revision: 2,
+      bodies: {
+        'turn-2': {
+          sessionId: durableSessionId,
+          turnId: 'turn-2',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Hydrated from restore flow' }],
+            timestamp: '2026-03-10T10:01:00.000Z',
+          },
+        },
+      },
+    })
 
     render(
       <Provider store={store}>
@@ -173,36 +193,72 @@ describe('fresh-agent restore flow', () => {
       </Provider>,
     )
 
+    act(() => {
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.session.snapshot',
+        sessionId: 'sdk-sess-1',
+        latestTurnId: 'turn-2',
+        status: 'running',
+        timelineSessionId: durableSessionId,
+        revision: 2,
+        streamingActive: true,
+        streamingText: 'partial reply',
+      })
+    })
+
+    expect(screen.getByText('partial reply')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Claude is thinking')).not.toBeInTheDocument()
+
     await waitFor(() => {
-      expect(getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
-        'freshclaude',
-        'claude',
-        canonicalSessionId,
-        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      expect(getAgentTimelinePage).toHaveBeenCalledWith(
+        durableSessionId,
+        expect.objectContaining({ priority: 'visible', includeBodies: true }),
+        expect.anything(),
       )
     })
+
+    expect(getAgentTurnBody).not.toHaveBeenCalled()
+    expect(await screen.findByText('Hydrated from restore flow')).toBeInTheDocument()
+    expect(screen.queryByText(/restoring session/i)).not.toBeInTheDocument()
+
     await waitFor(() => {
-      expect(screen.getByText('Recovered durable history')).toBeInTheDocument()
-      expect(screen.getByText('Hydrated from restore flow')).toBeInTheDocument()
+      const root = store.getState().panes.layouts.t1
+      const leaf = root && findLeaf(root, 'p1')
+      expect(leaf?.content.kind === 'agent-chat' ? leaf.content.sessionRef : undefined).toEqual({
+        provider: 'claude',
+        sessionId: durableSessionId,
+      })
+
+      const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't1')
+      expect(tab?.sessionRef).toEqual({
+        provider: 'claude',
+        sessionId: durableSessionId,
+      })
+      expect(tab?.resumeSessionId).toBeUndefined()
+      expect(tab?.sessionMetadataByKey?.[`claude:${durableSessionId}`]).toEqual(expect.objectContaining({
+        sessionType: 'freshclaude',
+        firstUserMessage: 'Continue from the old tab',
+      }))
     })
-
-    const root = store.getState().panes.layouts.t1
-    const leaf = root && findLeaf(root, 'p1')
-    expect(leaf?.content.kind === 'fresh-agent' ? leaf.content.resumeSessionId : undefined).toBe(canonicalSessionId)
-
-    const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't1')
-    expect(tab?.resumeSessionId).toBe(canonicalSessionId)
-    expect(tab?.sessionMetadataByKey?.[`claude:${canonicalSessionId}`]).toEqual(expect.objectContaining({
-      sessionType: 'freshclaude',
-      firstUserMessage: 'Continue from the old tab',
-    }))
-    expect(wsSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.attach' }))
   })
 
-  it('surfaces a visible restore failure when the fresh-agent snapshot cannot be loaded', async () => {
-    getFreshAgentThreadSnapshot.mockRejectedValue(new Error('Stale restore revision'))
-
+  it('retries stale-revision restore once, then surfaces a visible failure on the second stale response', async () => {
     const canonicalSessionId = '00000000-0000-4000-8000-000000000888'
+    const makeStaleRevisionError = (currentRevision: number) => Object.assign(
+      new Error('Stale restore revision'),
+      {
+        status: 409,
+        details: {
+          code: 'RESTORE_STALE_REVISION',
+          currentRevision,
+        },
+      },
+    )
+
+    getAgentTimelinePage
+      .mockRejectedValueOnce(makeStaleRevisionError(13))
+      .mockRejectedValueOnce(makeStaleRevisionError(14))
+
     const store = makeStore({
       resumeSessionId: canonicalSessionId,
       sessionMetadataByKey: {
@@ -211,18 +267,19 @@ describe('fresh-agent restore flow', () => {
         },
       },
     })
+    const pane = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-stale',
+      sessionId: 'sdk-stale-1',
+      status: 'idle',
+      resumeSessionId: canonicalSessionId,
+    } satisfies AgentChatPaneContent
+
     store.dispatch(initLayout({
       tabId: 't1',
       paneId: 'p1',
-      content: {
-        kind: 'fresh-agent',
-        sessionType: 'freshclaude',
-        provider: 'claude',
-        createRequestId: 'req-stale',
-        sessionId: canonicalSessionId,
-        resumeSessionId: canonicalSessionId,
-        status: 'idle',
-      } satisfies FreshAgentPaneContent,
+      content: pane,
     }))
 
     render(
@@ -231,34 +288,50 @@ describe('fresh-agent restore flow', () => {
       </Provider>,
     )
 
-    await waitFor(() => {
-      expect(getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
-        'freshclaude',
-        'claude',
-        canonicalSessionId,
-        expect.objectContaining({ signal: expect.any(AbortSignal) }),
-      )
+    act(() => {
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.session.snapshot',
+        sessionId: 'sdk-stale-1',
+        latestTurnId: 'turn-2',
+        status: 'idle',
+        timelineSessionId: canonicalSessionId,
+        revision: 12,
+      })
     })
-    expect(await screen.findByText('Stale restore revision')).toBeInTheDocument()
-    expect(screen.getByRole('alert')).toHaveTextContent('Stale restore revision')
+
+    await waitFor(() => {
+      const attachCalls = wsHarness.send.mock.calls.filter((call) => call[0]?.type === 'sdk.attach')
+      expect(attachCalls).toHaveLength(2)
+    })
+
+    act(() => {
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.session.snapshot',
+        sessionId: 'sdk-stale-1',
+        latestTurnId: 'turn-2',
+        status: 'idle',
+        timelineSessionId: canonicalSessionId,
+        revision: 13,
+      })
+    })
+
+    await waitFor(() => {
+      expect(getAgentTimelinePage).toHaveBeenCalledTimes(2)
+    })
+
+    expect(await screen.findByText('Session restore failed')).toBeInTheDocument()
+    expect(screen.getByText('Stale restore revision')).toBeInTheDocument()
+    expect(screen.queryByText('Restoring session...')).not.toBeInTheDocument()
   })
 
-  it('reconnect after freshAgent.create but before freshAgent.created resends the same request and binds one session without a retry loop', async () => {
-    getFreshAgentThreadSnapshot.mockResolvedValue({
-      revision: 1,
-      status: 'idle',
-      summary: 'Fresh-agent reconnected',
-      capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: false },
-      turns: [],
-    })
+  it('reconnect after sdk.create but before sdk.created resends the same request and binds one session without a retry loop', async () => {
     const store = makeStore()
     const pane = {
-      kind: 'fresh-agent',
-      sessionType: 'freshclaude',
-      provider: 'claude',
+      kind: 'agent-chat',
+      provider: 'freshclaude',
       createRequestId: 'req-reconnect-create',
       status: 'creating',
-    } satisfies FreshAgentPaneContent
+    } satisfies AgentChatPaneContent
 
     store.dispatch(initLayout({
       tabId: 't1',
@@ -273,12 +346,10 @@ describe('fresh-agent restore flow', () => {
     )
 
     await waitFor(() => {
-      expect(wsHarness.freshAgentCreates()).toEqual([
+      expect(wsHarness.sdkCreates()).toEqual([
         expect.objectContaining({
-          type: 'freshAgent.create',
+          type: 'sdk.create',
           requestId: 'req-reconnect-create',
-          sessionType: 'freshclaude',
-          provider: 'claude',
         }),
       ])
     })
@@ -288,44 +359,50 @@ describe('fresh-agent restore flow', () => {
     })
 
     await waitFor(() => {
-      expect(wsHarness.freshAgentCreates()).toEqual([
+      expect(wsHarness.sdkCreates()).toEqual([
         expect.objectContaining({
-          type: 'freshAgent.create',
+          type: 'sdk.create',
           requestId: 'req-reconnect-create',
         }),
         expect.objectContaining({
-          type: 'freshAgent.create',
+          type: 'sdk.create',
           requestId: 'req-reconnect-create',
         }),
       ])
     })
 
     act(() => {
-      wsHarness.emit({
-        type: 'freshAgent.created',
+      wsHarness.clearInFlight('req-reconnect-create')
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.created',
         requestId: 'req-reconnect-create',
-        sessionId: 'fresh-agent-reconnected-1',
-        sessionType: 'freshclaude',
-        provider: 'claude',
+        sessionId: 'sdk-reconnected-1',
+      })
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.session.init',
+        sessionId: 'sdk-reconnected-1',
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp/project',
+        tools: [],
       })
     })
 
     await waitFor(() => {
       const root = store.getState().panes.layouts.t1
       const leaf = root && findLeaf(root, 'p1')
-      expect(leaf?.content.kind === 'fresh-agent' ? leaf.content.sessionId : undefined).toBe('fresh-agent-reconnected-1')
+      expect(leaf?.content.kind === 'agent-chat' ? leaf.content.sessionId : undefined).toBe('sdk-reconnected-1')
     })
 
     act(() => {
       wsHarness.reconnect()
     })
 
-    expect(wsHarness.freshAgentCreates()).toHaveLength(2)
+    expect(wsHarness.sdkCreates()).toHaveLength(2)
     const root = store.getState().panes.layouts.t1
     const leaf = root && findLeaf(root, 'p1')
-    expect(leaf?.content.kind === 'fresh-agent' ? leaf.content : undefined).toEqual(expect.objectContaining({
-      sessionId: 'fresh-agent-reconnected-1',
-      status: 'idle',
+    expect(leaf?.content.kind === 'agent-chat' ? leaf.content : undefined).toEqual(expect.objectContaining({
+      sessionId: 'sdk-reconnected-1',
+      status: 'connected',
     }))
   })
 })

@@ -6,7 +6,7 @@ import type {
   TerminalSeedRecord,
 } from './terminal-metadata-service.js'
 
-type AssociationBroadcastSource = 'indexer_update' | 'claude_new_session' | 'opencode_controller'
+type AssociationBroadcastSource = 'indexer_update' | 'claude_new_session' | 'opencode_controller' | 'codex_durability'
 
 export type AssociationPublicationStatus =
   | 'published'

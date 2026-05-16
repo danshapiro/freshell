@@ -2,7 +2,8 @@ import { describe, it, expect, vi } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import { createAgentApiRouter } from '../../server/agent-api/router'
-import { DEFAULT_CODEX_REMOTE_WS_URL, FakeCodexLaunchPlanner } from '../helpers/coding-cli/fake-codex-launch-planner.js'
+import { FakeCodexLaunchPlanner } from '../helpers/coding-cli/fake-codex-launch-planner.js'
+import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../../server/coding-cli/codex-app-server/restore-decision.js'
 
 it('splits a pane horizontally', async () => {
   const app = express()
@@ -101,20 +102,19 @@ it('rejects Codex split without planning when shutdown admission closes while re
   expect(attachPaneContent).not.toHaveBeenCalled()
 })
 
-it('shuts down the planned Codex sidecar when split registry creation fails', async () => {
+it('kills the created Codex terminal when split adoption fails after registry.create', async () => {
   const app = express()
   app.use(express.json())
   const splitPane = vi.fn(() => ({ newPaneId: 'pane_new', tabId: 'tab_1' }))
-  const closePane = vi.fn()
   const attachPaneContent = vi.fn()
   const registry = {
-    create: vi.fn(() => {
-      throw new Error('split create failed')
-    }),
+    create: vi.fn(() => ({ terminalId: 'term_new' })),
+    killAndWait: vi.fn(async () => true),
   }
   const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  vi.spyOn(codexLaunchPlanner.sidecar, 'adopt').mockRejectedValue(new Error('adopt failed after split create'))
   app.use('/api', createAgentApiRouter({
-    layoutStore: { splitPane, attachPaneContent, closePane },
+    layoutStore: { splitPane, attachPaneContent },
     registry,
     codexLaunchPlanner,
   }))
@@ -122,75 +122,83 @@ it('shuts down the planned Codex sidecar when split registry creation fails', as
   const res = await request(app).post('/api/panes/pane_1/split').send({ direction: 'horizontal', mode: 'codex' })
 
   expect(res.status).toBe(500)
-  expect(res.body.message).toBe('split create failed')
-  expect(registry.create).toHaveBeenCalledWith(expect.objectContaining({
-    terminalId: expect.any(String),
-    mode: 'codex',
-    codexSidecar: codexLaunchPlanner.sidecar,
-    codexLaunchFactory: expect.any(Function),
-    codexLaunchBaseProviderSettings: {},
-    providerSettings: {
-      codexAppServer: { wsUrl: DEFAULT_CODEX_REMOTE_WS_URL },
-    },
-    envContext: { tabId: 'tab_1', paneId: 'pane_new' },
-  }))
+  expect(res.body.message).toBe('adopt failed after split create')
+  expect(registry.killAndWait).toHaveBeenCalledWith('term_new')
   expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
-  expect(closePane).toHaveBeenCalledWith('pane_new')
   expect(attachPaneContent).not.toHaveBeenCalled()
 })
 
-it('passes the planned Codex sidecar through split registry creation', async () => {
+it('rejects raw Codex resume ids before splitting a pane', async () => {
   const app = express()
   app.use(express.json())
   const splitPane = vi.fn(() => ({ newPaneId: 'pane_new', tabId: 'tab_1' }))
   const attachPaneContent = vi.fn()
-  const registry = {
-    create: vi.fn((opts: any) => ({ terminalId: opts.terminalId, status: 'running' })),
-  }
-  const codexLaunchPlanner = new FakeCodexLaunchPlanner({
-    sessionId: 'thread-split',
-    remote: { wsUrl: DEFAULT_CODEX_REMOTE_WS_URL },
-  })
+  const registryCreate = vi.fn(() => ({ terminalId: 'term_new' }))
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
   app.use('/api', createAgentApiRouter({
     layoutStore: { splitPane, attachPaneContent },
-    registry,
+    registry: { create: registryCreate },
     codexLaunchPlanner,
   }))
 
   const res = await request(app).post('/api/panes/pane_1/split').send({
     direction: 'horizontal',
     mode: 'codex',
-    sessionRef: { provider: 'codex', sessionId: 'thread-split' },
+    resumeSessionId: 'thread-raw-split',
   })
 
-  expect(res.status).toBe(200)
-  const createArg = registry.create.mock.calls[0]?.[0]
-  expect(createArg).toEqual(expect.objectContaining({
-    terminalId: expect.any(String),
-    mode: 'codex',
-    resumeSessionId: 'thread-split',
-    codexSidecar: codexLaunchPlanner.sidecar,
-    codexLaunchFactory: expect.any(Function),
-    codexLaunchBaseProviderSettings: {},
-    providerSettings: {
-      codexAppServer: { wsUrl: DEFAULT_CODEX_REMOTE_WS_URL },
+  expect(res.status).toBe(400)
+  expect(res.body).toEqual({
+    status: 'error',
+    message: INVALID_RAW_CODEX_RESUME_MESSAGE,
+  })
+  expect(codexLaunchPlanner.planCreateCalls).toEqual([])
+  expect(splitPane).not.toHaveBeenCalled()
+  expect(registryCreate).not.toHaveBeenCalled()
+  expect(attachPaneContent).not.toHaveBeenCalled()
+})
+
+it('kills the created Codex split terminal without waiting for readiness when shutdown admission closes after adoption', async () => {
+  const app = express()
+  app.use(express.json())
+  let acceptingCreates = true
+  const splitPane = vi.fn(() => ({ newPaneId: 'pane_new', tabId: 'tab_1' }))
+  const attachPaneContent = vi.fn()
+  const registry = {
+    create: vi.fn(() => ({ terminalId: 'term_split_shutdown', status: 'running' })),
+    killAndWait: vi.fn(async () => true),
+    publishCodexSidecar: vi.fn(),
+  }
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  const originalAdopt = codexLaunchPlanner.sidecar.adopt.bind(codexLaunchPlanner.sidecar)
+  vi.spyOn(codexLaunchPlanner.sidecar, 'adopt').mockImplementation(async (input) => {
+    await originalAdopt(input)
+    acceptingCreates = false
+  })
+  app.use('/api', createAgentApiRouter({
+    layoutStore: { splitPane, attachPaneContent },
+    registry,
+    codexLaunchPlanner,
+    assertTerminalCreateAccepted: () => {
+      if (!acceptingCreates) {
+        throw new Error('Server is shutting down; terminal creation is not accepted.')
+      }
     },
-    envContext: { tabId: 'tab_1', paneId: 'pane_new' },
   }))
-  expect(codexLaunchPlanner.planCreateCalls[0]).toEqual(expect.objectContaining({
-    terminalId: createArg.terminalId,
-    resumeSessionId: 'thread-split',
-    env: expect.objectContaining({
-      FRESHELL_TERMINAL_ID: createArg.terminalId,
-      FRESHELL_TAB_ID: 'tab_1',
-      FRESHELL_PANE_ID: 'pane_new',
-    }),
-  }))
-  expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(0)
-  expect(attachPaneContent).toHaveBeenCalledWith('tab_1', 'pane_new', expect.objectContaining({
-    terminalId: createArg.terminalId,
-    sessionRef: { provider: 'codex', sessionId: 'thread-split' },
-  }))
+
+  const res = await request(app).post('/api/panes/pane_1/split').send({
+    direction: 'horizontal',
+    mode: 'codex',
+    sessionRef: { provider: 'codex', sessionId: 'thread-split-shutdown' },
+  })
+
+  expect(res.status).toBe(500)
+  expect(res.body.message).toContain('Server is shutting down')
+  expect(codexLaunchPlanner.sidecar.adoptCalls).toEqual([{ terminalId: 'term_split_shutdown', generation: 0 }])
+  expect(registry.publishCodexSidecar).not.toHaveBeenCalled()
+  expect(registry.killAndWait).toHaveBeenCalledWith('term_split_shutdown')
+  expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
+  expect(attachPaneContent).not.toHaveBeenCalled()
 })
 
 it('rejects invalid Codex settings when respawning a pane before spawning', async () => {
@@ -272,16 +280,16 @@ it('rejects Codex respawn without planning when shutdown admission closes while 
   expect(attachPaneContent).not.toHaveBeenCalled()
 })
 
-it('shuts down the planned Codex sidecar when respawn registry creation fails', async () => {
+it('kills the created Codex terminal when respawn adoption fails after registry.create', async () => {
   const app = express()
   app.use(express.json())
   const attachPaneContent = vi.fn()
   const registry = {
-    create: vi.fn(() => {
-      throw new Error('respawn create failed')
-    }),
+    create: vi.fn(() => ({ terminalId: 'term_new' })),
+    killAndWait: vi.fn(async () => true),
   }
   const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  vi.spyOn(codexLaunchPlanner.sidecar, 'adopt').mockRejectedValue(new Error('adopt failed after respawn create'))
   app.use('/api', createAgentApiRouter({
     layoutStore: {
       attachPaneContent,
@@ -294,43 +302,59 @@ it('shuts down the planned Codex sidecar when respawn registry creation fails', 
   const res = await request(app).post('/api/panes/pane_1/respawn').send({ mode: 'codex' })
 
   expect(res.status).toBe(500)
-  expect(res.body.message).toBe('respawn create failed')
-  const createArg = registry.create.mock.calls[0]?.[0]
-  expect(createArg).toEqual(expect.objectContaining({
-    terminalId: expect.any(String),
-    mode: 'codex',
-    resumeSessionId: undefined,
-    codexSidecar: codexLaunchPlanner.sidecar,
-    codexLaunchFactory: expect.any(Function),
-    codexLaunchBaseProviderSettings: expect.objectContaining({}),
-    providerSettings: {
-      codexAppServer: { wsUrl: DEFAULT_CODEX_REMOTE_WS_URL },
-    },
-    envContext: { tabId: 'tab_1', paneId: 'pane_1' },
-  }))
-  expect(codexLaunchPlanner.planCreateCalls[0]).toEqual(expect.objectContaining({
-    terminalId: createArg.terminalId,
-    resumeSessionId: undefined,
-    env: expect.objectContaining({
-      FRESHELL_TERMINAL_ID: createArg.terminalId,
-      FRESHELL_TAB_ID: 'tab_1',
-      FRESHELL_PANE_ID: 'pane_1',
-    }),
-  }))
+  expect(res.body.message).toBe('adopt failed after respawn create')
+  expect(registry.killAndWait).toHaveBeenCalledWith('term_new')
   expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
   expect(attachPaneContent).not.toHaveBeenCalled()
 })
 
-it('passes the planned Codex sidecar through respawn registry creation', async () => {
+it('rejects raw Codex resume ids before respawning a pane', async () => {
   const app = express()
   app.use(express.json())
   const attachPaneContent = vi.fn()
+  const registryCreate = vi.fn(() => ({ terminalId: 'term_new' }))
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  const resolveTarget = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      attachPaneContent,
+      resolveTarget,
+    } as any,
+    registry: { create: registryCreate },
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/panes/pane_1/respawn').send({
+    mode: 'codex',
+    resumeSessionId: 'thread-raw-respawn',
+  })
+
+  expect(res.status).toBe(400)
+  expect(res.body).toEqual({
+    status: 'error',
+    message: INVALID_RAW_CODEX_RESUME_MESSAGE,
+  })
+  expect(codexLaunchPlanner.planCreateCalls).toEqual([])
+  expect(resolveTarget).toHaveBeenCalledWith('pane_1')
+  expect(registryCreate).not.toHaveBeenCalled()
+  expect(attachPaneContent).not.toHaveBeenCalled()
+})
+
+it('kills the created Codex respawn terminal without waiting for readiness when shutdown admission closes after adoption', async () => {
+  const app = express()
+  app.use(express.json())
+  let acceptingCreates = true
+  const attachPaneContent = vi.fn()
   const registry = {
-    create: vi.fn((opts: any) => ({ terminalId: opts.terminalId, status: 'running' })),
+    create: vi.fn(() => ({ terminalId: 'term_respawn_shutdown', status: 'running' })),
+    killAndWait: vi.fn(async () => true),
+    publishCodexSidecar: vi.fn(),
   }
-  const codexLaunchPlanner = new FakeCodexLaunchPlanner({
-    sessionId: 'thread-respawn',
-    remote: { wsUrl: DEFAULT_CODEX_REMOTE_WS_URL },
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  const originalAdopt = codexLaunchPlanner.sidecar.adopt.bind(codexLaunchPlanner.sidecar)
+  vi.spyOn(codexLaunchPlanner.sidecar, 'adopt').mockImplementation(async (input) => {
+    await originalAdopt(input)
+    acceptingCreates = false
   })
   app.use('/api', createAgentApiRouter({
     layoutStore: {
@@ -339,61 +363,25 @@ it('passes the planned Codex sidecar through respawn registry creation', async (
     } as any,
     registry,
     codexLaunchPlanner,
-    configStore: {
-      getSettings: async () => ({
-        codingCli: {
-          providers: {
-            codex: {
-              model: 'test-model',
-              permissionMode: 'test-permission',
-              sandbox: 'workspace-write',
-            },
-          },
-        },
-      }),
+    assertTerminalCreateAccepted: () => {
+      if (!acceptingCreates) {
+        throw new Error('Server is shutting down; terminal creation is not accepted.')
+      }
     },
   }))
 
   const res = await request(app).post('/api/panes/pane_1/respawn').send({
     mode: 'codex',
-    sessionRef: { provider: 'codex', sessionId: 'thread-respawn' },
+    sessionRef: { provider: 'codex', sessionId: 'thread-respawn-shutdown' },
   })
 
-  expect(res.status).toBe(200)
-  const createArg = registry.create.mock.calls[0]?.[0]
-  expect(createArg).toEqual(expect.objectContaining({
-    terminalId: expect.any(String),
-    mode: 'codex',
-    resumeSessionId: 'thread-respawn',
-    codexSidecar: codexLaunchPlanner.sidecar,
-    codexLaunchFactory: expect.any(Function),
-    codexLaunchBaseProviderSettings: {
-      model: 'test-model',
-      permissionMode: 'test-permission',
-      sandbox: 'workspace-write',
-    },
-    providerSettings: {
-      codexAppServer: { wsUrl: DEFAULT_CODEX_REMOTE_WS_URL },
-    },
-    envContext: { tabId: 'tab_1', paneId: 'pane_1' },
-  }))
-  expect(codexLaunchPlanner.planCreateCalls[0]).toEqual(expect.objectContaining({
-    terminalId: createArg.terminalId,
-    resumeSessionId: 'thread-respawn',
-    model: 'test-model',
-    approvalPolicy: 'test-permission',
-    sandbox: 'workspace-write',
-    env: expect.objectContaining({
-      FRESHELL_TERMINAL_ID: createArg.terminalId,
-      FRESHELL_TAB_ID: 'tab_1',
-      FRESHELL_PANE_ID: 'pane_1',
-    }),
-  }))
-  expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(0)
-  expect(attachPaneContent).toHaveBeenCalledWith('tab_1', 'pane_1', expect.objectContaining({
-    terminalId: createArg.terminalId,
-    sessionRef: { provider: 'codex', sessionId: 'thread-respawn' },
-  }))
+  expect(res.status).toBe(500)
+  expect(res.body.message).toContain('Server is shutting down')
+  expect(codexLaunchPlanner.sidecar.adoptCalls).toEqual([{ terminalId: 'term_respawn_shutdown', generation: 0 }])
+  expect(registry.publishCodexSidecar).not.toHaveBeenCalled()
+  expect(registry.killAndWait).toHaveBeenCalledWith('term_respawn_shutdown')
+  expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
+  expect(attachPaneContent).not.toHaveBeenCalled()
 })
 
 it('resolves tmux-style pane targets for close', async () => {

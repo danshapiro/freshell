@@ -6,6 +6,7 @@ import {
   CodexFsWatchResultSchema,
   CodexInitializeParamsSchema,
   CodexInitializeResultSchema,
+  CodexLoadedThreadListResultSchema,
   CodexRpcErrorEnvelopeSchema,
   CodexRpcNotificationEnvelopeSchema,
   CodexRpcSuccessEnvelopeSchema,
@@ -25,6 +26,8 @@ import {
   CodexTurnInterruptResultSchema,
   CodexTurnStartParamsSchema,
   CodexTurnStartResultSchema,
+  CodexTurnCompletedNotificationSchema,
+  CodexTurnStartedNotificationSchema,
   type CodexInitializeResult,
   type CodexRequestId,
   type CodexRpcError,
@@ -59,6 +62,7 @@ type PendingRequest = {
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000
+const LOSS_STATUSES = new Set(['notLoaded', 'systemError'])
 
 type CodexThreadStartInput =
   Omit<CodexThreadStartParams, 'experimentalRawEvents' | 'persistExtendedHistory'> & {
@@ -66,6 +70,10 @@ type CodexThreadStartInput =
   }
 
 type CodexThreadResumeInput = Omit<CodexThreadResumeParams, 'persistExtendedHistory'>
+
+export type CodexThreadLifecycleLossEvent =
+  | { method: 'thread/closed'; threadId?: string }
+  | { method: 'thread/status/changed'; threadId?: string; status: 'notLoaded' | 'systemError' }
 
 export type CodexThreadLifecycleEvent = {
   kind: 'thread_started'
@@ -84,6 +92,12 @@ export type CodexAppServerDisconnectEvent = {
   error?: Error
 }
 
+export type CodexTurnEvent = {
+  threadId: string
+  turnId?: string
+  params: Record<string, unknown>
+}
+
 function normalizeThread(thread: CodexThreadHandle): CodexThreadOperationResult['thread'] {
   return CodexThreadSchema.parse(thread)
 }
@@ -99,6 +113,9 @@ export class CodexAppServerClient {
   private readonly threadLifecycleHandlers = new Set<(event: CodexThreadLifecycleEvent) => void>()
   private readonly disconnectHandlers = new Set<(event: CodexAppServerDisconnectEvent) => void>()
   private readonly fsChangedHandlers = new Set<(event: { watchId: string; changedPaths: string[] }) => void>()
+  private readonly turnStartedHandlers = new Set<(event: CodexTurnEvent) => void>()
+  private readonly turnCompletedHandlers = new Set<(event: CodexTurnEvent) => void>()
+  private lifecycleLossHandlers = new Set<(event: CodexThreadLifecycleLossEvent) => void>()
 
   constructor(
     private readonly endpoint: CodexAppServerEndpoint,
@@ -180,6 +197,15 @@ export class CodexAppServerClient {
     await this.request('fs/unwatch', CodexFsUnwatchParamsSchema.parse({
       watchId,
     }))
+  }
+
+  async listLoadedThreads(): Promise<string[]> {
+    const result = await this.request('thread/loaded/list', {})
+    const parsed = CodexLoadedThreadListResultSchema.safeParse(result)
+    if (!parsed.success) {
+      throw new Error('Codex app-server returned an invalid thread/loaded/list payload.')
+    }
+    return parsed.data.data
   }
 
   async forkThread(params: CodexThreadForkParams): Promise<{ threadId: string }> {
@@ -319,6 +345,27 @@ export class CodexAppServerClient {
     }
   }
 
+  onTurnStarted(handler: (event: CodexTurnEvent) => void): () => void {
+    this.turnStartedHandlers.add(handler)
+    return () => {
+      this.turnStartedHandlers.delete(handler)
+    }
+  }
+
+  onTurnCompleted(handler: (event: CodexTurnEvent) => void): () => void {
+    this.turnCompletedHandlers.add(handler)
+    return () => {
+      this.turnCompletedHandlers.delete(handler)
+    }
+  }
+
+  onThreadLifecycleLoss(handler: (event: CodexThreadLifecycleLossEvent) => void): () => void {
+    this.lifecycleLossHandlers.add(handler)
+    return () => {
+      this.lifecycleLossHandlers.delete(handler)
+    }
+  }
+
   private async ensureSocket(): Promise<WebSocket> {
     if (this.socket && this.socket.readyState === WebSocket.OPEN) {
       return this.socket
@@ -379,6 +426,7 @@ export class CodexAppServerClient {
         const lifecycle = CodexThreadLifecycleNotificationSchema.safeParse(notification.data)
         if (lifecycle.success) {
           this.emitThreadLifecycle(lifecycle.data)
+          this.handleNotification(notification.data)
           return
         }
 
@@ -395,7 +443,22 @@ export class CodexAppServerClient {
           for (const handler of this.fsChangedHandlers) {
             handler(fsChanged.data.params)
           }
+          return
         }
+
+        const turnStarted = CodexTurnStartedNotificationSchema.safeParse(notification.data)
+        if (turnStarted.success) {
+          this.emitTurnEvent(this.turnStartedHandlers, turnStarted.data.params)
+          return
+        }
+
+        const turnCompleted = CodexTurnCompletedNotificationSchema.safeParse(notification.data)
+        if (turnCompleted.success) {
+          this.emitTurnEvent(this.turnCompletedHandlers, turnCompleted.data.params)
+          return
+        }
+
+        this.handleNotification(notification.data)
         return
       }
     }
@@ -423,6 +486,79 @@ export class CodexAppServerClient {
     clearTimeout(pending.timeout)
     this.pendingRequests.delete(failure.data.id)
     pending.reject(new Error(this.formatRpcError(pending.method, failure.data.error)))
+  }
+
+  private handleNotification(notification: { method: string; params?: unknown }): void {
+    if (notification.method === 'thread/closed') {
+      this.emitLifecycleLoss({
+        method: 'thread/closed',
+        threadId: this.extractThreadId(notification.params),
+      })
+      return
+    }
+
+    if (notification.method !== 'thread/status/changed') return
+    const status = this.extractThreadStatus(notification.params)
+    if (status !== 'notLoaded' && status !== 'systemError') return
+
+    this.emitLifecycleLoss({
+      method: 'thread/status/changed',
+      threadId: this.extractThreadId(notification.params),
+      status,
+    })
+  }
+
+  private emitLifecycleLoss(event: CodexThreadLifecycleLossEvent): void {
+    for (const handler of this.lifecycleLossHandlers) {
+      handler(event)
+    }
+  }
+
+  private emitTurnEvent(handlers: Set<(event: CodexTurnEvent) => void>, params: { threadId: string; turnId?: string } & Record<string, unknown>): void {
+    const event: CodexTurnEvent = {
+      threadId: params.threadId,
+      ...(typeof params.turnId === 'string' ? { turnId: params.turnId } : {}),
+      params,
+    }
+    for (const handler of handlers) {
+      handler(event)
+    }
+  }
+
+  private extractThreadId(params: unknown): string | undefined {
+    if (!params || typeof params !== 'object') return undefined
+    const object = params as Record<string, unknown>
+    if (typeof object.threadId === 'string') return object.threadId
+    const thread = object.thread
+    if (thread && typeof thread === 'object' && typeof (thread as Record<string, unknown>).id === 'string') {
+      return (thread as Record<string, string>).id
+    }
+    return undefined
+  }
+
+  private extractThreadStatus(params: unknown): 'notLoaded' | 'systemError' | undefined {
+    if (!params || typeof params !== 'object') return undefined
+    const object = params as Record<string, unknown>
+    const status = this.extractLossStatus(object.status)
+    if (status) return status
+    const thread = object.thread
+    if (thread && typeof thread === 'object') {
+      return this.extractLossStatus((thread as Record<string, unknown>).status)
+    }
+    return undefined
+  }
+
+  private extractLossStatus(status: unknown): 'notLoaded' | 'systemError' | undefined {
+    if (typeof status === 'string' && LOSS_STATUSES.has(status)) {
+      return status as 'notLoaded' | 'systemError'
+    }
+    if (status && typeof status === 'object') {
+      const statusType = (status as Record<string, unknown>).type
+      if (typeof statusType === 'string' && LOSS_STATUSES.has(statusType)) {
+        return statusType as 'notLoaded' | 'systemError'
+      }
+    }
+    return undefined
   }
 
   private handleSocketClose(socket: WebSocket, event: CodexAppServerDisconnectEvent): void {

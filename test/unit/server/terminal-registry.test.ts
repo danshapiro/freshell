@@ -4,15 +4,8 @@ import { isValidClaudeSessionId } from '../../../server/claude-session-id'
 import * as fs from 'fs'
 import os from 'os'
 import {
-  CODEX_STARTUP_EXPECTED_REPLIES,
   CODEX_STARTUP_QUERY_FRAMES,
 } from '../../helpers/codex-startup-probes'
-
-const SERVER_PREATTACH_CODEX_STARTUP_EXPECTED_REPLIES = [
-  CODEX_STARTUP_EXPECTED_REPLIES[0],
-  CODEX_STARTUP_EXPECTED_REPLIES[1],
-  '\u001b]10;rgb:c9c9/d1d1/d9d9\u001b\\',
-] as const
 
 // Mock fs.existsSync for shell existence checks
 // Need to provide both named export and default export since the implementation uses `import fs from 'fs'`
@@ -54,7 +47,7 @@ vi.mock('../../../server/logger', () => {
     child: vi.fn(),
   }
   logger.child.mockReturnValue(logger)
-  return { logger }
+  return { logger, sessionLifecycleLogger: logger }
 })
 
 // Mock MCP config writer
@@ -1979,6 +1972,29 @@ describe('TerminalRegistry', () => {
       expect(terminals).toHaveLength(1)
       expect(terminals[0].resumeSessionId).toBeUndefined()
     })
+
+    it('exposes a Codex sessionRef for an explicit durable resume', () => {
+      const created = registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+        resumeSessionId: 'thread-proved-resume',
+      })
+
+      expect(registry.list()[0]).toMatchObject({
+        resumeSessionId: 'thread-proved-resume',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'thread-proved-resume',
+        },
+        codexDurability: {
+          state: 'durable',
+          durableThreadId: 'thread-proved-resume',
+        },
+      })
+
+      const record = registry.get(created.terminalId)!
+      expect(record.codexInputGate).toBeUndefined()
+    })
   })
 
   describe('list() returns mode', () => {
@@ -2550,59 +2566,64 @@ describe('TerminalRegistry', () => {
       return { promise, resolve, reject }
     }
 
-    it('registers the terminal before a synchronous durable-session callback fires', () => {
-      let terminalSeenDuringAttach: string | undefined
+    function createSidecar(overrides: Partial<{
+      shutdown: () => Promise<void>
+      onLifecycleLoss: (handler: (event: unknown) => void) => () => void
+    }> = {}) {
+      return {
+        adopt: vi.fn().mockResolvedValue(undefined),
+        markCandidatePersisted: vi.fn(),
+        shutdown: vi.fn(overrides.shutdown ?? (async () => undefined)),
+        onLifecycleLoss: vi.fn(overrides.onLifecycleLoss ?? (() => vi.fn())),
+      }
+    }
 
+    it('registers the current Codex sidecar when the terminal is created', () => {
+      const sidecar = createSidecar()
       const term = registry.create({
         mode: 'codex',
         cwd: '/home/user/project',
-        codexSidecar: {
-          attachTerminal: ({ terminalId, onDurableSession }) => {
-            terminalSeenDuringAttach = registry.get(terminalId)?.terminalId
-            onDurableSession('codex-session-sync')
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
           },
-          shutdown: vi.fn().mockResolvedValue(undefined),
-        },
+        } as any,
       })
 
-      expect(terminalSeenDuringAttach).toBe(term.terminalId)
-      expect(registry.get(term.terminalId)?.resumeSessionId).toBe('codex-session-sync')
-      expect(registry.isSessionBound('codex', 'codex-session-sync')).toBe(true)
+      expect(sidecar.onLifecycleLoss).toHaveBeenCalledTimes(1)
+      expect(registry.get(term.terminalId)).toBe(term)
     })
 
-    it('keeps the newly created terminal alive when a synchronous fatal callback starts recovery', () => {
-      let createdTerminalId: string | undefined
-      const exited = vi.fn()
-      registry.on('terminal.exit', exited)
-
+    it('does not treat sidecar registration as durable identity', () => {
+      const sidecar = createSidecar()
       const term = registry.create({
         mode: 'codex',
         cwd: '/home/user/project',
-        codexSidecar: {
-          attachTerminal: ({ terminalId, onFatal }) => {
-            createdTerminalId = terminalId
-            onFatal(new Error('sidecar failed during attach'))
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
           },
-          shutdown: vi.fn().mockResolvedValue(undefined),
-        },
+        } as any,
       })
 
-      expect(createdTerminalId).toBe(term.terminalId)
-      expect(registry.get(term.terminalId)?.status).toBe('running')
-      expect(registry.get(term.terminalId)?.codex?.recoveryState).toBe('recovering_pre_durable')
-      expect(exited).not.toHaveBeenCalled()
+      expect(registry.get(term.terminalId)?.resumeSessionId).toBeUndefined()
+      expect(registry.isSessionBound('codex', 'codex-session-sync')).toBe(false)
     })
 
     it('waits for pending Codex sidecar shutdown work during graceful shutdown', async () => {
       const sidecarShutdown = deferred()
-      const sidecar = {
-        attachTerminal: vi.fn(),
-        shutdown: vi.fn(() => sidecarShutdown.promise),
-      }
+      const sidecar = createSidecar({ shutdown: () => sidecarShutdown.promise })
       const term = registry.create({
         mode: 'codex',
         cwd: '/home/user/project',
-        codexSidecar: sidecar,
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
+          },
+        } as any,
       })
 
       registry.kill(term.terminalId)
@@ -2624,7 +2645,7 @@ describe('TerminalRegistry', () => {
   })
 
   describe('pre-attach codex startup probes', () => {
-    it('answers codex startup probes before the first client attaches', async () => {
+    it('leaves Codex startup probe replies to the client-side terminal parser before first attach', async () => {
       registry.create({
         mode: 'codex',
         cwd: '/home/user/project',
@@ -2636,7 +2657,7 @@ describe('TerminalRegistry', () => {
 
       onDataCallback(CODEX_STARTUP_QUERY_FRAMES.join(''))
 
-      expect(mockPty.write.mock.calls.map(([data]: [string]) => data)).toEqual(SERVER_PREATTACH_CODEX_STARTUP_EXPECTED_REPLIES)
+      expect(mockPty.write).not.toHaveBeenCalled()
     })
 
     it('stops server-side startup probe replies after a client has attached once', async () => {

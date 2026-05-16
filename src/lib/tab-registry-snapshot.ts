@@ -17,6 +17,7 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
         mode: content.mode,
         shell: content.shell,
         sessionRef: content.sessionRef,
+        codexDurability: content.mode === 'codex' ? content.codexDurability : undefined,
         liveTerminal: content.terminalId
           ? {
               terminalId: content.terminalId,

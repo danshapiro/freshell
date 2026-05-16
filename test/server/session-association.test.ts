@@ -1,10 +1,16 @@
-import { describe, it, expect, vi } from 'vitest'
+import fsp from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { beforeEach, describe, it, expect, vi } from 'vitest'
 import { TerminalRegistry } from '../../server/terminal-registry'
 import { CodingCliSessionIndexer } from '../../server/coding-cli/session-indexer'
 import { makeSessionKey, type CodingCliSession, type ProjectGroup } from '../../server/coding-cli/types'
 import { SessionAssociationCoordinator } from '../../server/session-association-coordinator'
 import { TerminalMetadataService } from '../../server/terminal-metadata-service'
 import { collectAppliedSessionAssociations } from '../../server/session-association-updates'
+import { recordSessionLifecycleEvent } from '../../server/session-observability'
+import { CodexDurabilityStore } from '../../server/coding-cli/codex-app-server/durability-store'
+import { CODEX_DURABILITY_SCHEMA_VERSION } from '../../shared/codex-durability'
 
 vi.mock('node-pty', () => ({
   spawn: vi.fn(() => ({
@@ -21,8 +27,12 @@ vi.mock('../../server/mcp/config-writer.js', () => ({
   cleanupMcpConfig: vi.fn(),
 }))
 
+vi.mock('../../server/session-observability.js', () => ({
+  recordSessionLifecycleEvent: vi.fn(),
+}))
+
 const SESSION_ID_ONE = '550e8400-e29b-41d4-a716-446655440000'
-const SESSION_ID_TWO = '6f1c2b3a-4d5e-4f70-8a9b-0c1d2e3f4a5b'
+const SESSION_ID_TWO = '6f1c2b3a-4d5e-6f70-8a9b-0c1d2e3f4a5b'
 const SESSION_ID_THREE = 'f47ac10b-58cc-4372-a567-0e02b2c3d479'
 const SESSION_ID_FOUR = '2c1a2a5a-3f9f-4b5e-9b39-7d7e0c9a4b10'
 const SESSION_ID_FIVE = '3a0b2c9f-1e2d-4f6a-8f3a-4b8a9d7c1e20'
@@ -48,6 +58,10 @@ function createMetadataService() {
 function createIndexer(): CodingCliSessionIndexer {
   return new CodingCliSessionIndexer([])
 }
+
+beforeEach(() => {
+  vi.mocked(recordSessionLifecycleEvent).mockClear()
+})
 
 describe('SessionAssociationCoordinator integration', () => {
   it('associates a Claude terminal created with a human-readable resume name after UUID discovery', () => {
@@ -141,6 +155,98 @@ describe('SessionAssociationCoordinator integration', () => {
     expect(onBound).not.toHaveBeenCalled()
 
     registry.shutdown()
+  })
+
+  it('records a lifecycle event when Codex durable identity is explicitly bound', () => {
+    const registry = new TerminalRegistry()
+    const terminal = registry.create({ mode: 'codex', cwd: '/home/user/project' })
+
+    registry.rebindSession(terminal.terminalId, 'codex', 'codex-thread-1', 'association')
+
+    expect(recordSessionLifecycleEvent).toHaveBeenCalledWith({
+      kind: 'terminal_session_bound',
+      provider: 'codex',
+      terminalId: terminal.terminalId,
+      sessionId: 'codex-thread-1',
+      reason: 'association',
+    })
+
+    registry.shutdown()
+  })
+
+  it('records a lifecycle warning when a Codex terminal exits before durable identity exists', () => {
+    const registry = new TerminalRegistry()
+    const terminal = registry.create({ mode: 'codex', cwd: '/home/user/project' })
+    const pty = terminal.pty as unknown as { onExit: ReturnType<typeof vi.fn> }
+    const onExit = pty.onExit.mock.calls[0][0]
+
+    onExit({ exitCode: 0, signal: 0 })
+
+    expect(recordSessionLifecycleEvent).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'terminal_exit_without_durable_session',
+      terminalId: terminal.terminalId,
+      mode: 'codex',
+      exitCode: 0,
+      reason: 'pty_exit',
+    }))
+
+    registry.shutdown()
+  })
+
+  it('records a lifecycle event when Codex durable identity is proven from the rollout file', async () => {
+    const testDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-proof-'))
+    const durabilityDir = path.join(testDir, 'durability')
+    const rolloutPath = path.join(testDir, 'rollout.jsonl')
+    await fsp.writeFile(
+      rolloutPath,
+      `${JSON.stringify({ type: 'session_meta', payload: { id: 'codex-thread-1' } })}\n`,
+      'utf8',
+    )
+    const registry = new TerminalRegistry(undefined, undefined, undefined, {
+      codexDurabilityStore: new CodexDurabilityStore({ dir: durabilityDir }),
+    })
+
+    try {
+      const terminal = registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+        codexSidecar: {
+          shutdown: vi.fn(async () => undefined),
+        } as any,
+      })
+      const record = registry.get(terminal.terminalId)
+      expect(record).toBeTruthy()
+      record!.codexDurability = {
+        schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+        state: 'captured_pre_turn',
+        candidate: {
+          provider: 'codex',
+          candidateThreadId: 'codex-thread-1',
+          rolloutPath,
+          source: 'thread_start_response',
+          capturedAt: 1_000,
+        },
+      }
+
+      await (registry as any).runCodexDurabilityProof(terminal.terminalId, 'test')
+
+      const durableObservationCalls = vi.mocked(recordSessionLifecycleEvent).mock.calls.filter(([event]) =>
+        event.kind === 'codex_durable_session_observed'
+      )
+      expect(durableObservationCalls).toEqual([[
+        {
+          kind: 'codex_durable_session_observed',
+          provider: 'codex',
+          terminalId: terminal.terminalId,
+          sessionId: 'codex-thread-1',
+          generation: 0,
+          source: 'sidecar',
+        },
+      ]])
+    } finally {
+      registry.shutdown()
+      await fsp.rm(testDir, { recursive: true, force: true })
+    }
   })
 })
 
@@ -775,7 +881,7 @@ describe('Session-Terminal Association via onUpdate', () => {
     registry.shutdown()
   })
 
-  it('skips opencode sessions in onUpdate ownership pass', () => {
+  it('associates opencode sessions when resume is supported', () => {
     const registry = new TerminalRegistry()
     const broadcasts: any[] = []
 
@@ -796,8 +902,9 @@ describe('Session-Terminal Association via onUpdate', () => {
       }],
     }], broadcasts)
 
-    expect(broadcasts).toHaveLength(0)
-    expect(registry.get(term.terminalId)?.resumeSessionId).toBeUndefined()
+    expect(broadcasts).toHaveLength(1)
+    expect(broadcasts[0].terminalId).toBe(term.terminalId)
+    expect(registry.get(term.terminalId)?.resumeSessionId).toBe('opencode-session-123')
 
     registry.shutdown()
   })

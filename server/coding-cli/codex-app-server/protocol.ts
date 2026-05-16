@@ -244,6 +244,10 @@ export const CodexFsUnwatchParamsSchema = z.object({
   watchId: z.string().min(1),
 })
 
+export const CodexLoadedThreadListResultSchema = z.object({
+  data: z.array(z.string().min(1)),
+})
+
 export const CodexThreadReadParamsSchema = z.object({
   threadId: z.string().min(1),
   includeTurns: z.boolean().optional().default(false),
@@ -366,6 +370,22 @@ export const CodexFsChangedNotificationSchema = z.object({
   }),
 }).passthrough()
 
+export const CodexTurnStartedNotificationSchema = z.object({
+  method: z.literal('turn/started'),
+  params: z.object({
+    threadId: z.string().min(1),
+    turnId: z.string().min(1).optional(),
+  }).passthrough(),
+}).passthrough()
+
+export const CodexTurnCompletedNotificationSchema = z.object({
+  method: z.literal('turn/completed'),
+  params: z.object({
+    threadId: z.string().min(1),
+    turnId: z.string().min(1).optional(),
+  }).passthrough(),
+}).passthrough()
+
 export type CodexRequestId = z.infer<typeof CodexRequestIdSchema>
 export type CodexInitializeCapabilities = z.infer<typeof CodexInitializeCapabilitiesSchema>
 export type CodexInitializeParams = z.infer<typeof CodexInitializeParamsSchema>
@@ -378,6 +398,7 @@ export type CodexThreadOperationResult = z.infer<typeof CodexThreadOperationResu
 export type CodexFsWatchParams = z.infer<typeof CodexFsWatchParamsSchema>
 export type CodexFsWatchResult = z.infer<typeof CodexFsWatchResultSchema>
 export type CodexFsUnwatchParams = z.infer<typeof CodexFsUnwatchParamsSchema>
+export type CodexLoadedThreadListResult = z.infer<typeof CodexLoadedThreadListResultSchema>
 export type CodexThreadReadParams = z.input<typeof CodexThreadReadParamsSchema>
 export type CodexThreadReadResult = z.infer<typeof CodexThreadReadResultSchema>
 export type CodexThreadPageParams = z.input<typeof CodexThreadPageParamsSchema>
@@ -395,3 +416,5 @@ export type CodexThreadClosedNotification = z.infer<typeof CodexThreadClosedNoti
 export type CodexThreadStatusChangedNotification = z.infer<typeof CodexThreadStatusChangedNotificationSchema>
 export type CodexThreadLifecycleNotification = z.infer<typeof CodexThreadLifecycleNotificationSchema>
 export type CodexFsChangedNotification = z.infer<typeof CodexFsChangedNotificationSchema>
+export type CodexTurnStartedNotification = z.infer<typeof CodexTurnStartedNotificationSchema>
+export type CodexTurnCompletedNotification = z.infer<typeof CodexTurnCompletedNotificationSchema>

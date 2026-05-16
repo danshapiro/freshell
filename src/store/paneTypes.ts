@@ -6,6 +6,7 @@ import {
 } from '@shared/agent-chat-capabilities'
 import type { SessionLocator as SharedSessionLocator } from '@shared/ws-protocol'
 import type { RestoreError } from '@shared/session-contract'
+import type { CodexDurabilityRef } from '@shared/codex-durability'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
 
 export type SessionLocator = SharedSessionLocator
@@ -61,6 +62,8 @@ export type TerminalPaneContent = {
   resumeSessionId?: string
   /** Portable session reference for cross-device tab snapshots */
   sessionRef?: SessionLocator
+  /** Non-canonical Codex restore durability state and proof metadata. */
+  codexDurability?: CodexDurabilityRef
   /** Runtime-only server locality for same-server matching; never part of canonical durable identity. */
   serverInstanceId?: string
   /** Explicit restore failure when no canonical durable target exists. */

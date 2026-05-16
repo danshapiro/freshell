@@ -212,7 +212,9 @@ export class CodexTerminalSidecar {
     })
   }
 
-  static async reapOrphanedSidecars(): Promise<void> {
-    await reapOrphanedCodexAppServerSidecarsOnStartup()
+  static async reapOrphanedSidecars(options: { serverInstanceId?: string } = {}): Promise<void> {
+    await reapOrphanedCodexAppServerSidecarsOnStartup({
+      serverInstanceId: options.serverInstanceId ?? process.env.FRESHELL_SERVER_INSTANCE_ID ?? `srv-${process.pid}`,
+    })
   }
 }
