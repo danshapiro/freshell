@@ -32,13 +32,13 @@ vi.mock('../../server/session-observability.js', () => ({
 }))
 
 const SESSION_ID_ONE = '550e8400-e29b-41d4-a716-446655440000'
-const SESSION_ID_TWO = '6f1c2b3a-4d5e-6f70-8a9b-0c1d2e3f4a5b'
+const SESSION_ID_TWO = '6f1c2b3a-4d5e-4f70-8a9b-0c1d2e3f4a5b'
 const SESSION_ID_THREE = 'f47ac10b-58cc-4372-a567-0e02b2c3d479'
 const SESSION_ID_FOUR = '2c1a2a5a-3f9f-4b5e-9b39-7d7e0c9a4b10'
 const SESSION_ID_FIVE = '3a0b2c9f-1e2d-4f6a-8f3a-4b8a9d7c1e20'
-const SESSION_ID_SIX = '4b1c3d2e-5f6a-7b8c-9d0e-1f2a3b4c5d6e'
-const SESSION_ID_SEVEN = '5c2d4e6f-7a8b-9c0d-1e2f-3a4b5c6d7e8f'
-const SESSION_ID_EIGHT = '6d3e5f7a-8b9c-0d1e-2f3a-4b5c6d7e8f90'
+const SESSION_ID_SIX = '4b1c3d2e-5f6a-4b8c-9d0e-1f2a3b4c5d6e'
+const SESSION_ID_SEVEN = '5c2d4e6f-7a8b-4c0d-9e2f-3a4b5c6d7e8f'
+const SESSION_ID_EIGHT = '6d3e5f7a-8b9c-4d1e-af3a-4b5c6d7e8f90'
 
 function createMetadataService() {
   let now = 1_000
@@ -881,7 +881,7 @@ describe('Session-Terminal Association via onUpdate', () => {
     registry.shutdown()
   })
 
-  it('associates opencode sessions when resume is supported', () => {
+  it('skips opencode sessions in onUpdate ownership pass', () => {
     const registry = new TerminalRegistry()
     const broadcasts: any[] = []
 
@@ -902,9 +902,8 @@ describe('Session-Terminal Association via onUpdate', () => {
       }],
     }], broadcasts)
 
-    expect(broadcasts).toHaveLength(1)
-    expect(broadcasts[0].terminalId).toBe(term.terminalId)
-    expect(registry.get(term.terminalId)?.resumeSessionId).toBe('opencode-session-123')
+    expect(broadcasts).toHaveLength(0)
+    expect(registry.get(term.terminalId)?.resumeSessionId).toBeUndefined()
 
     registry.shutdown()
   })
