@@ -15,9 +15,18 @@ import {
 import type {
   CodexFsWatchResult,
   CodexInitializeResult,
+  CodexThreadForkParams,
   CodexThreadHandle,
+  CodexThreadReadParams,
+  CodexThreadReadResult,
   CodexThreadResumeParams,
   CodexThreadStartParams,
+  CodexThreadTurnReadParams,
+  CodexThreadTurnReadResult,
+  CodexThreadTurnsListParams,
+  CodexThreadTurnsListResult,
+  CodexTurnInterruptParams,
+  CodexTurnStartParams,
 } from './protocol.js'
 
 type RuntimeStatus = 'running' | 'stopped'
@@ -591,6 +600,40 @@ export class CodexAppServerRuntime {
       threadId: result.thread.id,
       wsUrl: ready.wsUrl,
     }
+  }
+
+  async forkThread(params: CodexThreadForkParams): Promise<{ threadId: string; wsUrl: string }> {
+    const ready = await this.ensureReady()
+    const result = await this.client!.forkThread(params)
+    return {
+      threadId: result.threadId,
+      wsUrl: ready.wsUrl,
+    }
+  }
+
+  async readThread(params: CodexThreadReadParams): Promise<CodexThreadReadResult> {
+    await this.ensureReady()
+    return this.client!.readThread(params)
+  }
+
+  async listThreadTurns(params: CodexThreadTurnsListParams): Promise<CodexThreadTurnsListResult> {
+    await this.ensureReady()
+    return this.client!.listThreadTurns(params)
+  }
+
+  async readThreadTurn(params: CodexThreadTurnReadParams): Promise<CodexThreadTurnReadResult> {
+    await this.ensureReady()
+    return this.client!.readThreadTurn(params)
+  }
+
+  async startTurn(params: CodexTurnStartParams): Promise<{ turnId: string }> {
+    await this.ensureReady()
+    return this.client!.startTurn(params)
+  }
+
+  async interruptTurn(params: CodexTurnInterruptParams): Promise<void> {
+    await this.ensureReady()
+    await this.client!.interruptTurn(params)
   }
 
   async listLoadedThreads(): Promise<string[]> {

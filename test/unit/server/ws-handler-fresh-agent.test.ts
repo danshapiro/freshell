@@ -155,6 +155,80 @@ describe('WsHandler fresh-agent routing', () => {
     }
   })
 
+  it('clears fresh-agent create replay entries when the session is killed and when the handler closes', async () => {
+    const runtimeManager = {
+      create: vi.fn().mockResolvedValue({
+        sessionId: 'codex-session-cache-cleanup',
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+      }),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+      kill: vi.fn().mockResolvedValue(true),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const ws = await connectAndAuth(server)
+      const seenMessages: any[] = []
+      ws.on('message', (data) => {
+        seenMessages.push(JSON.parse(data.toString()))
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.create',
+        requestId: 'req-cache-cleanup',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        cwd: '/workspace',
+      }))
+
+      await vi.waitFor(() => {
+        expect(seenMessages).toContainEqual(expect.objectContaining({
+          type: 'freshAgent.created',
+          requestId: 'req-cache-cleanup',
+          sessionId: 'codex-session-cache-cleanup',
+        }))
+      })
+      expect((handler as any).createdFreshAgentByRequestId.size).toBe(1)
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.kill',
+        sessionId: 'codex-session-cache-cleanup',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.kill).toHaveBeenCalledWith({
+          sessionId: 'codex-session-cache-cleanup',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+        })
+        expect((handler as any).createdFreshAgentByRequestId.size).toBe(0)
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.create',
+        requestId: 'req-cache-close',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        cwd: '/workspace',
+      }))
+
+      await vi.waitFor(() => {
+        expect((handler as any).createdFreshAgentByRequestId.size).toBe(1)
+      })
+
+      handler.close()
+      expect((handler as any).createdFreshAgentByRequestId.size).toBe(0)
+      expect((handler as any).freshAgentCreateLocks.size).toBe(0)
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
   it('routes freshAgent.send, freshAgent.interrupt, freshAgent approvals/questions, freshAgent.kill, and freshAgent.fork through the runtime manager after create ownership is established', async () => {
     const runtimeManager = {
       create: vi.fn().mockResolvedValue({
