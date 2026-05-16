@@ -481,16 +481,25 @@ export async function runCodexStartupReaper(
 export const reapOrphanedCodexAppServerSidecarsOnStartup = runCodexStartupReaper
 
 export function assertCodexStartupReaperSucceeded(result: ReapOrphanedSidecarsResult): void {
-  const unreapedOwnershipIds = [
-    ...result.failedOwnershipIds,
-    ...result.skippedActiveOwnershipIds,
-  ]
-  if (unreapedOwnershipIds.length === 0) return
+  const failedOwnershipIds = [...new Set(result.failedOwnershipIds)]
+  const activeOwnershipIds = [...new Set(result.skippedActiveOwnershipIds)]
+  if (failedOwnershipIds.length === 0 && activeOwnershipIds.length === 0) return
 
-  const blockedOwnershipIds = [...new Set(unreapedOwnershipIds)]
+  const reasons: string[] = []
+  if (failedOwnershipIds.length > 0) {
+    reasons.push(
+      `failed to reap ${failedOwnershipIds.length} ownership record(s): ${failedOwnershipIds.join(', ')}`,
+    )
+  }
+  if (activeOwnershipIds.length > 0) {
+    reasons.push(
+      `${activeOwnershipIds.length} ownership record(s) still owned by a live Freshell server/process: ${activeOwnershipIds.join(', ')}`,
+    )
+  }
+
   throw new Error(
-    `Codex app-server startup reaper failed to reap ${blockedOwnershipIds.length} ownership record(s): ${blockedOwnershipIds.join(', ')}. `
-    + 'Refusing to continue until the unreaped Codex sidecar ownership is verified gone or handled explicitly.',
+    `Codex app-server startup reaper blocked startup: ${reasons.join('; ')}. `
+    + 'Refusing to continue until failed ownership records are handled and active owners have shut down or been verified gone.',
   )
 }
 

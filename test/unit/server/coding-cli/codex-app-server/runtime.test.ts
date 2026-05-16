@@ -943,7 +943,46 @@ describe('CodexAppServerRuntime', () => {
       ignoredLegacyRecords: [],
       skippedActiveOwnershipIds: [],
       failedOwnershipIds: ['ownership-alpha', 'ownership-beta'],
-    })).toThrow(/startup reaper failed.*ownership-alpha.*ownership-beta/i)
+    })).toThrow(/startup reaper blocked startup.*failed to reap 2 ownership record.*ownership-alpha.*ownership-beta/i)
+  })
+
+  it('reports active live sidecar owners separately from failed cleanup', () => {
+    let thrown: Error | undefined
+
+    try {
+      assertCodexStartupReaperSucceeded({
+        reapedOwnershipIds: [],
+        ignoredLegacyRecords: [],
+        skippedActiveOwnershipIds: ['active-owner'],
+        failedOwnershipIds: [],
+      })
+    } catch (error) {
+      thrown = error as Error
+    }
+
+    expect(thrown).toBeDefined()
+    expect(thrown?.message).toContain('still owned by a live Freshell server/process')
+    expect(thrown?.message).toContain('active-owner')
+    expect(thrown?.message).not.toContain('failed to reap 1 ownership record(s): active-owner')
+  })
+
+  it('reports mixed active owners and failed reaps without conflating them', () => {
+    let thrown: Error | undefined
+
+    try {
+      assertCodexStartupReaperSucceeded({
+        reapedOwnershipIds: [],
+        ignoredLegacyRecords: [],
+        skippedActiveOwnershipIds: ['active-owner'],
+        failedOwnershipIds: ['failed-owner'],
+      })
+    } catch (error) {
+      thrown = error as Error
+    }
+
+    expect(thrown).toBeDefined()
+    expect(thrown?.message).toContain('failed to reap 1 ownership record(s): failed-owner')
+    expect(thrown?.message).toContain('still owned by a live Freshell server/process: active-owner')
   })
 
   it('blocks startup when a new-schema ownership record is skipped because the owner pid is live', async () => {
