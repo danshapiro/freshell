@@ -42,7 +42,7 @@ OpenCode sessions are stored in SQLite (`~/.local/share/opencode/opencode.db`). 
 CREATE TABLE session (
   id text PRIMARY KEY,
   parent_id text,     -- NULL = root; non-NULL = child sub-agent
-  -- ... 
+  -- ...
 );
 ```
 
@@ -62,7 +62,7 @@ Every parent session spawns 2-4 children. Example from the currently-running Ope
 ```
 ses_1f13ee760 → NULL                                       (root — "Scanning for secrets")
 ses_1f13ec6a6 → ses_1f13ee760  "Read all repo files (@explore subagent)"
-ses_1f13eb2bd → ses_1f13ee760  "Search git history (@explore subagent)"  
+ses_1f13eb2bd → ses_1f13ee760  "Search git history (@explore subagent)"
 ses_1f13ea1a9 → ses_1f13ee760  "Search for hidden secrets (@explore subagent)"
 ```
 

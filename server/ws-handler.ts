@@ -45,6 +45,7 @@ import {
   ErrorCode,
   ShellSchema,
   CodingCliProviderSchema,
+  SessionLocatorSchema,
   TerminalMetaUpdatedSchema,
   CodexActivityListResponseSchema,
   CodexActivityListSchema,
@@ -75,6 +76,7 @@ import {
   UiScreenshotResultSchema,
   WS_PROTOCOL_VERSION,
 } from '../shared/ws-protocol.js'
+import { LiveTerminalHandleSchema } from '../shared/session-contract.js'
 import { UiLayoutSyncSchema } from './agent-api/layout-schema.js'
 import type { LayoutStore } from './agent-api/layout-store.js'
 
@@ -470,7 +472,10 @@ export class WsHandler {
       shell: ShellSchema.default('system'),
       cwd: z.string().optional(),
       resumeSessionId: z.string().optional(),
+      sessionRef: SessionLocatorSchema.optional(),
+      liveTerminal: LiveTerminalHandleSchema.optional(),
       restore: z.boolean().optional(),
+      recoveryIntent: z.literal('fresh_after_restore_unavailable').optional(),
       tabId: z.string().min(1).optional(),
       paneId: z.string().min(1).optional(),
     })
@@ -1809,12 +1814,26 @@ export class WsHandler {
         return
       }
       case 'terminal.create': {
+        const requestedSessionRef = (
+          m.sessionRef?.provider === m.mode && typeof m.sessionRef?.sessionId === 'string'
+            ? m.sessionRef
+            : undefined
+        )
+        const canonicalSessionId = requestedSessionRef?.sessionId
+        const restoreRequested = m.restore === true
+        const localLiveTerminalId = (
+          m.liveTerminal?.serverInstanceId === this.serverInstanceId
+          && typeof m.liveTerminal?.terminalId === 'string'
+        )
+          ? m.liveTerminal.terminalId
+          : undefined
         log.debug({
           requestId: m.requestId,
           connectionId: ws.connectionId,
           mode: m.mode,
           resumeSessionId: m.resumeSessionId,
-        }, '[TRACE resumeSessionId] terminal.create received')
+          sessionRef: requestedSessionRef,
+        }, '[TRACE sessionRef] terminal.create received')
         recordSessionLifecycleEvent({
           kind: 'terminal_create_requested',
           requestId: m.requestId,
@@ -1823,10 +1842,25 @@ export class WsHandler {
           ...(m.paneId ? { paneId: m.paneId } : {}),
           ...(m.cwd ? { cwd: m.cwd } : {}),
           mode: m.mode as TerminalMode,
-          restoreRequested: m.restore === true,
-          hasRequestedSessionRef: false,
-          ...(m.resumeSessionId ? { requestedSessionId: m.resumeSessionId } : {}),
+          restoreRequested,
+          hasRequestedSessionRef: !!requestedSessionRef,
+          ...(canonicalSessionId || m.resumeSessionId ? { requestedSessionId: canonicalSessionId ?? m.resumeSessionId } : {}),
         })
+        if (m.recoveryIntent === 'fresh_after_restore_unavailable') {
+          recordSessionLifecycleEvent({
+            kind: 'restore_unavailable_fresh_fallback',
+            requestId: m.requestId,
+            connectionId: ws.connectionId || 'unknown',
+            ...(m.tabId ? { tabId: m.tabId } : {}),
+            ...(m.paneId ? { paneId: m.paneId } : {}),
+            ...(m.cwd ? { cwd: m.cwd } : {}),
+            mode: m.mode as TerminalMode,
+            reason: m.recoveryIntent,
+            restoreRequested: false,
+            treatedAsFresh: true,
+            hasSessionRef: !!requestedSessionRef,
+          })
+        }
         const endCreateTimer = startPerfTimer(
           'terminal_create',
           { connectionId: ws.connectionId, mode: m.mode, shell: m.shell },
@@ -1837,7 +1871,25 @@ export class WsHandler {
         let reused = false
         let error = false
         let rateLimited = false
-        let effectiveResumeSessionId = m.resumeSessionId
+        let effectiveResumeSessionId = canonicalSessionId ?? m.resumeSessionId
+        if (
+          m.recoveryIntent === 'fresh_after_restore_unavailable'
+          && (
+            m.restore === true
+            || !!m.resumeSessionId
+            || !!requestedSessionRef
+            || !!m.liveTerminal
+          )
+        ) {
+          error = true
+          this.sendError(ws, {
+            code: 'INVALID_CREATE_REQUEST',
+            message: 'Fresh recovery requests cannot include restore identity.',
+            requestId: m.requestId,
+          })
+          endCreateTimer({ error, rateLimited })
+          return
+        }
         try {
           await this.withTerminalCreateLock(
             this.terminalCreateLockKey(m.mode as TerminalMode, m.requestId, effectiveResumeSessionId),
@@ -1926,6 +1978,14 @@ export class WsHandler {
                 this.forgetCreatedRequestId(m.requestId)
               }
 
+              if (localLiveTerminalId) {
+                const liveTerminal = this.registry.get(localLiveTerminalId)
+                if (liveTerminal?.status === 'running' && liveTerminal.mode === m.mode) {
+                  await attachReusedTerminal(liveTerminal.terminalId, liveTerminal.createdAt, liveTerminal.resumeSessionId)
+                  return
+                }
+              }
+
               if (modeSupportsResume(m.mode as TerminalMode) && effectiveResumeSessionId) {
                 let existing = this.registry.getCanonicalRunningTerminalBySession(
                   m.mode as TerminalMode,
@@ -1970,7 +2030,7 @@ export class WsHandler {
               }
 
               // Rate limit: prevent runaway terminal creation (e.g., infinite respawn loops)
-              if (!m.restore) {
+              if (!restoreRequested) {
                 const now = Date.now()
                 state.terminalCreateTimestamps = state.terminalCreateTimestamps.filter(
                   (t) => now - t < this.config.terminalCreateRateWindowMs
@@ -1986,6 +2046,14 @@ export class WsHandler {
 
               // Re-check session ownership after async config loading in case another request
               // created or repaired a matching running session while we were waiting.
+              if (localLiveTerminalId) {
+                const liveTerminal = this.registry.get(localLiveTerminalId)
+                if (liveTerminal?.status === 'running' && liveTerminal.mode === m.mode) {
+                  await attachReusedTerminal(liveTerminal.terminalId, liveTerminal.createdAt, liveTerminal.resumeSessionId)
+                  return
+                }
+              }
+
               if (modeSupportsResume(m.mode as TerminalMode) && effectiveResumeSessionId) {
                 let existing = this.registry.getCanonicalRunningTerminalBySession(
                   m.mode as TerminalMode,
@@ -2038,6 +2106,42 @@ export class WsHandler {
                 }
               }
 
+              if (
+                restoreRequested
+                && modeSupportsResume(m.mode as TerminalMode)
+                && m.mode !== 'codex'
+                && m.resumeSessionId
+                && !canonicalSessionId
+              ) {
+                error = true
+                this.sendError(ws, {
+                  code: 'INVALID_MESSAGE',
+                  message: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+                  requestId: m.requestId,
+                })
+                return
+              }
+
+              if (m.mode === 'opencode' && restoreRequested && !canonicalSessionId) {
+                error = true
+                this.sendError(ws, {
+                  code: 'RESTORE_UNAVAILABLE',
+                  message: 'OpenCode restore requires a canonical durable session id',
+                  requestId: m.requestId,
+                })
+                return
+              }
+
+              if (m.mode === 'claude' && restoreRequested && !isValidClaudeSessionId(effectiveResumeSessionId)) {
+                error = true
+                this.sendError(ws, {
+                  code: 'RESTORE_UNAVAILABLE',
+                  message: 'Claude restore requires a canonical durable session id',
+                  requestId: m.requestId,
+                })
+                return
+              }
+
               // After async repair wait, check if the client disconnected
               if (ws.readyState !== WebSocket.OPEN) {
                 log.debug({ connectionId: ws.connectionId, requestId: m.requestId },
@@ -2052,8 +2156,9 @@ export class WsHandler {
                 requestId: m.requestId,
                 connectionId: ws.connectionId,
                 originalResumeSessionId: m.resumeSessionId,
+                sessionRef: requestedSessionRef,
                 effectiveResumeSessionId,
-              }, '[TRACE resumeSessionId] about to create terminal')
+              }, '[TRACE sessionRef] about to create terminal')
 
               const requestedCodexResumeSessionId = m.mode === 'codex'
                 ? effectiveResumeSessionId

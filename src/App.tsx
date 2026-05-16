@@ -56,7 +56,7 @@ import { updateSettingsLocal } from '@/store/settingsSlice'
 
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
 import { clearDeadTerminals } from '@/store/panesSlice'
-import { addTerminalRestoreRequestId } from '@/lib/terminal-restore'
+import { addTerminalFreshRecoveryRequestId, addTerminalRestoreRequestId } from '@/lib/terminal-restore'
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
 import { setOpencodeActivitySnapshot, upsertOpencodeActivity, removeOpencodeActivity, resetOpencodeActivity } from '@/store/opencodeActivitySlice'
 import { recordTurnComplete } from '@/store/turnCompletionSlice'
@@ -801,16 +801,27 @@ export default function App() {
           dispatch(setLiveTerminalIds(liveIds))
           dispatch(setServerRestarted(false))
           dispatch(clearDeadTerminals({ liveTerminalIds: liveIds }))
-          // Register new createRequestIds with the restore set so the
-          // subsequent terminal.create messages include restore: true
-          // and bypass the server's rate limiter.
+          // Register regenerated createRequestIds with the correct explicit
+          // recovery path after stale terminal handles are cleared.
           const layouts = appStore.getState().panes.layouts
-          for (const layout of Object.values(layouts)) {
+          const fallbackAttempts = appStore.getState().panes.restoreFallbackAttemptsByPane || {}
+          for (const [tabId, layout] of Object.entries(layouts)) {
             ;(function walk(node: any) {
               if (!node) return
               if (node.type === 'leaf') {
                 if (node.content?.kind === 'terminal' && node.content.status === 'creating' && node.content.createRequestId) {
-                  addTerminalRestoreRequestId(node.content.createRequestId)
+                  const fallbackAttempt = fallbackAttempts[tabId]?.[node.id]
+                  if (
+                    fallbackAttempt?.requestId === node.content.createRequestId
+                    && !node.content.sessionRef
+                  ) {
+                    addTerminalFreshRecoveryRequestId(
+                      node.content.createRequestId,
+                      'fresh_after_restore_unavailable',
+                    )
+                  } else if (node.content.sessionRef) {
+                    addTerminalRestoreRequestId(node.content.createRequestId)
+                  }
                 }
                 return
               }

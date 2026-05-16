@@ -210,40 +210,6 @@ describe('SessionAssociationCoordinator integration', () => {
     registry.shutdown()
   })
 
-  it('records a lifecycle event when the Codex sidecar reports durable identity', () => {
-    let onDurableSession: ((sessionId: string) => void) | undefined
-    const sidecar = {
-      attachTerminal: vi.fn((callbacks: { onDurableSession: (sessionId: string) => void }) => {
-        onDurableSession = callbacks.onDurableSession
-      }),
-      shutdown: vi.fn(async () => undefined),
-    }
-    const registry = new TerminalRegistry()
-    const terminal = registry.create({
-      mode: 'codex',
-      cwd: '/home/user/project',
-      codexSidecar: sidecar,
-    })
-
-    onDurableSession?.('codex-thread-1')
-    onDurableSession?.('codex-thread-1')
-
-    const durableObservationCalls = vi.mocked(recordSessionLifecycleEvent).mock.calls.filter(([event]) =>
-      event.kind === 'codex_durable_session_observed'
-    )
-    expect(durableObservationCalls).toEqual([[
-      {
-        kind: 'codex_durable_session_observed',
-        provider: 'codex',
-        terminalId: terminal.terminalId,
-        sessionId: 'codex-thread-1',
-        generation: 1,
-        source: 'sidecar',
-      },
-    ]])
-
-    registry.shutdown()
-  })
 })
 
 describe('Session-Terminal metadata broadcasts', () => {

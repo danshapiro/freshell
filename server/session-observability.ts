@@ -29,6 +29,16 @@ export type SessionLifecycleEvent =
     reused: boolean
     hasSessionRef: boolean
   })
+  | (OptionalUiContext & {
+    kind: 'restore_unavailable_fresh_fallback'
+    requestId: string
+    connectionId: string
+    mode: TerminalMode
+    reason: 'fresh_after_restore_unavailable'
+    restoreRequested: false
+    treatedAsFresh: true
+    hasSessionRef: boolean
+  })
   | {
     kind: 'codex_durable_session_observed'
     provider: 'codex'
@@ -133,6 +143,20 @@ function buildPayload(event: SessionLifecycleEvent): Record<string, unknown> {
         cwd: event.cwd,
         mode: event.mode,
         reused: event.reused,
+        hasSessionRef: event.hasSessionRef,
+      }
+    case 'restore_unavailable_fresh_fallback':
+      return {
+        ...base,
+        requestId: event.requestId,
+        connectionId: event.connectionId,
+        tabId: event.tabId,
+        paneId: event.paneId,
+        cwd: event.cwd,
+        mode: event.mode,
+        reason: event.reason,
+        restoreRequested: event.restoreRequested,
+        treatedAsFresh: event.treatedAsFresh,
         hasSessionRef: event.hasSessionRef,
       }
     case 'codex_durable_session_observed':

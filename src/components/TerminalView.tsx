@@ -26,7 +26,13 @@ import { getCreateSessionStateFromRef } from '@/components/terminal-view-utils'
 import { copyText, readText } from '@/lib/clipboard'
 import { registerTerminalActions } from '@/lib/pane-action-registry'
 import { registerTerminalCaptureHandler } from '@/lib/screenshot-capture-env'
-import { consumeTerminalRestoreRequestId, addTerminalRestoreRequestId } from '@/lib/terminal-restore'
+import {
+  addTerminalFreshRecoveryRequestId,
+  addTerminalRestoreRequestId,
+  consumeTerminalFreshRecoveryRequest,
+  consumeTerminalRestoreRequestId,
+  type TerminalFreshRecoveryIntent,
+} from '@/lib/terminal-restore'
 import { isTerminalPasteShortcut } from '@/lib/terminal-input-policy'
 import { clearTerminalCursor, loadTerminalCursor, saveTerminalCursor } from '@/lib/terminal-cursor'
 import { paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
@@ -210,6 +216,7 @@ type LaunchAttemptState = {
   requestId: string
   terminalId?: string
   restore: boolean
+  recoveryIntent?: TerminalFreshRecoveryIntent
   attachReady: boolean
 }
 
@@ -338,6 +345,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const rateLimitRetryRef = useRef<{ count: number; timer: ReturnType<typeof setTimeout> | null }>({ count: 0, timer: null })
   const restoreRequestIdRef = useRef<string | null>(null)
   const restoreFlagRef = useRef(false)
+  const freshRecoveryRequestIdRef = useRef<string | null>(null)
+  const freshRecoveryIntentRef = useRef<TerminalFreshRecoveryIntent | undefined>(undefined)
   const turnCompleteSignalStateRef = useRef(createTurnCompleteSignalParserState())
   const startupProbeStateRef = useRef(createTerminalStartupProbeState())
   const startupProbeReplayDiscardStateRef = useRef<StartupProbeReplayDiscardState>({
@@ -1744,12 +1753,22 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       return restoreFlagRef.current
     }
 
+    const getFreshRecoveryIntent = (requestId: string) => {
+      if (freshRecoveryRequestIdRef.current !== requestId) {
+        freshRecoveryRequestIdRef.current = requestId
+        freshRecoveryIntentRef.current = consumeTerminalFreshRecoveryRequest(requestId)
+      }
+      return freshRecoveryIntentRef.current
+    }
+
     const sendCreate = (requestId: string) => {
-      const restore = getRestoreFlag(requestId)
+      const recoveryIntent = getFreshRecoveryIntent(requestId)
+      const restore = recoveryIntent ? false : getRestoreFlag(requestId)
       const createSessionState = getCreateSessionStateFromRef(contentRef)
       launchAttemptRef.current = {
         requestId,
         restore,
+        ...(recoveryIntent ? { recoveryIntent } : {}),
         attachReady: false,
       }
       if (handledCreatedMessageRef.current?.requestId === requestId) {
@@ -1762,6 +1781,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         liveTerminal: createSessionState.liveTerminal,
         contentRefResumeSessionId: contentRef.current?.resumeSessionId,
         mode,
+        recoveryIntent,
       })
       ws.send({
         type: 'terminal.create',
@@ -1769,11 +1789,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         mode,
         shell: shell || 'system',
         cwd: initialCwd,
-        ...(createSessionState.sessionRef ? { sessionRef: createSessionState.sessionRef } : {}),
-        ...(createSessionState.liveTerminal ? { liveTerminal: createSessionState.liveTerminal } : {}),
+        ...(!recoveryIntent && createSessionState.sessionRef ? { sessionRef: createSessionState.sessionRef } : {}),
+        ...(!recoveryIntent && createSessionState.liveTerminal ? { liveTerminal: createSessionState.liveTerminal } : {}),
         tabId,
         paneId: paneIdRef.current,
         ...(restore ? { restore: true } : {}),
+        ...(recoveryIntent ? { recoveryIntent } : {}),
       })
     }
 
@@ -2023,6 +2044,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             requestId: reqId,
             terminalId: newId,
             restore: pendingLaunch?.requestId === reqId ? pendingLaunch.restore : false,
+            ...(pendingLaunch?.requestId === reqId && pendingLaunch.recoveryIntent
+              ? { recoveryIntent: pendingLaunch.recoveryIntent }
+              : {}),
             attachReady: false,
           }
           currentAttachRef.current = null
@@ -2233,15 +2257,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               clearRateLimitRetry()
               setIsAttaching(false)
               dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
+              const newRequestId = nanoid()
+              consumeTerminalRestoreRequestId(requestIdRef.current)
+              addTerminalFreshRecoveryRequestId(newRequestId, 'fresh_after_restore_unavailable')
+              requestIdRef.current = newRequestId
+              clearTerminalCursor(currentTerminalId)
+              forgetSentViewport(currentTerminalId)
+              lastSentViewportRef.current = null
+              terminalIdRef.current = undefined
+              deferredAttachStateRef.current = {
+                mode: 'none',
+                pendingIntent: null,
+                pendingSinceSeq: 0,
+              }
+              applySeqState(createAttachSeqState())
               updateContent({
                 terminalId: undefined,
-                status: 'error',
+                createRequestId: newRequestId,
+                status: 'creating',
                 restoreError: buildRestoreError('dead_live_handle'),
               })
-              const currentTab = tabRef.current
-              if (currentTab) {
-                dispatch(updateTab({ id: currentTab.id, updates: { status: 'error' } }))
-              }
               return
             }
             term.writeln('\r\n[Reconnecting...]\r\n')
