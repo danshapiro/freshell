@@ -14,6 +14,8 @@ function deferred<T = void>() {
 class FakeRuntime {
   shutdownCalls = 0
   startThreadCalls = 0
+  ensureReadyCalls: Array<string | undefined> = []
+  startThreadParams: unknown[] = []
   adopted: Array<{ terminalId: string; generation: number }> = []
   loadedThreadListCalls = 0
   adoptError?: Error
@@ -28,7 +30,8 @@ class FakeRuntime {
     private readonly loadedThreadLists: string[][] = [],
   ) {}
 
-  async ensureReady() {
+  async ensureReady(cwd?: string) {
+    this.ensureReadyCalls.push(cwd)
     return {
       wsUrl: this.wsUrl,
       processPid: 100,
@@ -38,8 +41,9 @@ class FakeRuntime {
     }
   }
 
-  async startThread() {
+  async startThread(params?: unknown) {
     this.startThreadCalls += 1
+    this.startThreadParams.push(params)
     await this.startThreadBlocker
     if (this.startError) throw this.startError
     return {
@@ -84,6 +88,8 @@ describe('CodexLaunchPlanner', () => {
     expect(runtimes).toHaveLength(2)
     expect(first.remote.wsUrl).toBe('ws://127.0.0.1:43001')
     expect(second.remote.wsUrl).toBe('ws://127.0.0.1:43002')
+    expect(runtimes[0].startThreadParams[0]).toEqual(expect.objectContaining({ cwd: '/repo/one' }))
+    expect(runtimes[1].startThreadParams[0]).toEqual(expect.objectContaining({ cwd: '/repo/two' }))
 
     await first.sidecar.adopt({ terminalId: 'term-one', generation: 1 })
     await second.sidecar.shutdown()
@@ -313,6 +319,15 @@ describe('CodexLaunchPlanner', () => {
     await expect(plan.sidecar.waitForLoadedThread('thread-ready', { timeoutMs: 1_000, pollMs: 1 }))
       .resolves.toBeUndefined()
     expect(runtime.loadedThreadListCalls).toBe(3)
+  })
+
+  it('passes resume cwd to sidecar readiness', async () => {
+    const runtime = new FakeRuntime('ws://127.0.0.1:43024', 'thread-ready', undefined, [['thread-ready']])
+    const planner = new CodexLaunchPlanner(() => runtime as any)
+
+    await planner.planCreate({ resumeSessionId: 'thread-ready', cwd: '/repo/resume' })
+
+    expect(runtime.ensureReadyCalls).toEqual(['/repo/resume'])
   })
 
   it('stops loaded-thread readiness polling after sidecar shutdown starts', async () => {

@@ -74,7 +74,7 @@ export class CodexLaunchPlanner {
 
     try {
       if (input.resumeSessionId) {
-        const ready = await runtime.ensureReady()
+        const ready = await runtime.ensureReady(input.cwd)
         this.assertAcceptingPlans()
         return {
           sessionId: input.resumeSessionId,
