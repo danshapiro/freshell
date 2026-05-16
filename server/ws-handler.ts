@@ -1403,6 +1403,7 @@ export class WsHandler {
   }
 
   private cancelAllFreshAgentSubscriptions(state: ClientState): void {
+    if (!state.freshAgentSubscriptions) return
     for (const [key, entry] of Array.from(state.freshAgentSubscriptions.entries())) {
       entry.active = false
       state.freshAgentSubscriptions.delete(key)
@@ -1535,7 +1536,8 @@ export class WsHandler {
       messageClass,
       terminalId: params.terminalId,
     })
-    const existing = state?.wsErrorLogs.get(key)
+    const logs = state?.wsErrorLogs
+    const existing = logs?.get(key)
     if (existing) {
       existing.count += 1
       existing.suppressedCount += 1
@@ -1554,7 +1556,7 @@ export class WsHandler {
       firstRequestId: params.requestId,
       lastRequestId: params.requestId,
     }
-    state?.wsErrorLogs.set(key, entry)
+    logs?.set(key, entry)
     log.warn({
       event: 'ws_send_error',
       connectionId: ws.connectionId || 'unknown',
@@ -1566,6 +1568,7 @@ export class WsHandler {
   }
 
   private flushWsErrorLogSummaries(state: ClientState, reason: 'connection_close'): void {
+    if (!state.wsErrorLogs) return
     for (const entry of state.wsErrorLogs.values()) {
       if (entry.suppressedCount <= 0) continue
       log.warn({
@@ -2022,10 +2025,46 @@ export class WsHandler {
         return
       }
 
+      if (rawBytes > this.config.maxRegularWsMessageBytes) {
+        const isScreenshotResult = msg?.type === 'ui.screenshot.result'
+        if (!isScreenshotResult) {
+          this.sendError(ws, {
+            code: 'INVALID_MESSAGE',
+            message: `WebSocket message exceeds ${this.config.maxRegularWsMessageBytes} bytes.`,
+            requestId: msg?.requestId,
+          })
+          return
+        }
+
+        const allowedScreenshotResultKeys = new Set([
+          'type',
+          'requestId',
+          'ok',
+          'mimeType',
+          'imageBase64',
+          'width',
+          'height',
+          'changedFocus',
+          'restoredFocus',
+          'error',
+        ])
+        const unknownKeys = msg && typeof msg === 'object'
+          ? Object.keys(msg).filter((key) => !allowedScreenshotResultKeys.has(key))
+          : []
+        if (unknownKeys.length > 0) {
+          this.sendError(ws, {
+            code: 'INVALID_MESSAGE',
+            message: `Unknown field in oversized screenshot result message: ${unknownKeys.join(', ')}`,
+            requestId: msg?.requestId,
+          })
+          return
+        }
+      }
+
       if (msg?.type === 'hello' && msg?.protocolVersion !== WS_PROTOCOL_VERSION) {
         this.sendError(ws, {
           code: 'PROTOCOL_MISMATCH',
-          message: `Expected protocol version ${WS_PROTOCOL_VERSION}`,
+          message: `Expected protocol version ${WS_PROTOCOL_VERSION}. Please reload the page.`,
         })
         ws.close(CLOSE_CODES.PROTOCOL_MISMATCH, 'Protocol version mismatch')
         return
@@ -2041,11 +2080,6 @@ export class WsHandler {
       // discriminated union once provider names become dynamic, so we cast once at the boundary.
       const m = parsed.data as any
       messageType = m.type
-
-      if (rawBytes > this.config.maxRegularWsMessageBytes && m.type !== 'ui.screenshot.result') {
-        ws.close(1009, 'Message too large')
-        return
-      }
 
       if (m.type === 'ping') {
         // Respond to confirm liveness.

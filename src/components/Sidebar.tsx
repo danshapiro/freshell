@@ -380,6 +380,9 @@ export default function Sidebar({
     const currentActiveTabId = state.tabs.activeTabId
     const runningTerminalId = item.isRunning ? item.runningTerminalId : undefined
     const localServerInstanceId = state.connection.serverInstanceId
+    const liveTerminal = runningTerminalId && localServerInstanceId
+      ? { terminalId: runningTerminalId, serverInstanceId: localServerInstanceId }
+      : undefined
 
     if (runningTerminalId && item.isRestorable === false) {
       const existingTabId = selectTabIdByTerminalId(state, runningTerminalId)
@@ -469,18 +472,26 @@ export default function Sidebar({
       return
     }
 
-    const newContent = item.isRestorable === false && provider === 'codex'
+    const newContent = item.isRestorable === false
       ? {
           kind: 'terminal' as const,
           mode: provider,
           initialCwd: item.cwd,
-          codexDurability: item.codexDurability,
+          codexDurability: provider === 'codex' ? item.codexDurability : undefined,
+          ...(liveTerminal
+            ? {
+                terminalId: liveTerminal.terminalId,
+                serverInstanceId: liveTerminal.serverInstanceId,
+                status: 'running' as const,
+              }
+            : {}),
         }
       : buildResumeContent({
           sessionType,
           sessionId: item.sessionId,
           cwd: item.cwd,
           agentChatProviderSettings: providerSettings,
+          liveTerminal,
         })
     dispatch(addPane({
       tabId: currentActiveTabId,

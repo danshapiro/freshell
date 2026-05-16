@@ -567,11 +567,15 @@ export const openSessionTab = createAsyncThunk(
       mergeSessionMetadataByKey(existing, resolvedProvider, sessionId, sessionMetadataInput)
     const shouldPersistSessionRef = isRestorable !== false
 
+    const liveTerminal = terminalId && localServerInstanceId
+      ? { terminalId, serverInstanceId: localServerInstanceId }
+      : undefined
     const desiredResumeContent = buildResumeContent({
       sessionType: resolvedSessionType,
       sessionId,
       cwd,
       agentChatProviderSettings: providerSettings,
+      liveTerminal,
     })
     const terminalCodexDurability = resolvedProvider === 'codex'
       && !shouldPersistSessionRef
@@ -813,6 +817,7 @@ export const openSessionTab = createAsyncThunk(
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,
+        serverInstanceId: localServerInstanceId,
         sessionRef: shouldPersistSessionRef && (desiredResumeContent.kind === 'terminal' || desiredResumeContent.kind === 'agent-chat')
           ? desiredResumeContent.sessionRef
           : undefined,
@@ -825,6 +830,7 @@ export const openSessionTab = createAsyncThunk(
           kind: 'terminal',
           mode: resolvedProvider,
           terminalId,
+          serverInstanceId: localServerInstanceId,
           sessionRef: shouldPersistSessionRef && desiredResumeContent.kind === 'terminal' ? desiredResumeContent.sessionRef : undefined,
           codexDurability: terminalCodexDurability,
           initialCwd: cwd,
