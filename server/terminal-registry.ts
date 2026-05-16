@@ -30,6 +30,7 @@ import type {
 } from './terminal-stream/registry-events.js'
 import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-launch.js'
 import { generateMcpInjection, cleanupMcpConfig } from './mcp/config-writer.js'
+import { CODEX_MANAGED_REMOTE_CONFIG_ARGS } from './coding-cli/codex-managed-config.js'
 import type { CodexLaunchPlan, CodexLaunchSidecar } from './coding-cli/codex-app-server/launch-planner.js'
 import { isCodexSidecarTeardownError } from './coding-cli/codex-app-server/launch-planner.js'
 import {
@@ -240,7 +241,7 @@ function resolveCodingCliCommand(
     if (parsed.protocol !== 'ws:' || parsed.hostname !== '127.0.0.1') {
       throw new Error('Codex launch requires a loopback app-server websocket URL.')
     }
-    remoteArgs.push('--remote', wsUrl)
+    remoteArgs.push('--remote', wsUrl, ...CODEX_MANAGED_REMOTE_CONFIG_ARGS)
   }
   let resumeArgs: string[] = []
   if (resumeSessionId) {

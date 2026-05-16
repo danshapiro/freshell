@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { CODEX_MANAGED_REMOTE_CONFIG_ARGS } from '../codex-managed-config.js'
 import { allocateLocalhostPort, type LoopbackServerEndpoint } from '../../local-port.js'
 import { logger } from '../../logger.js'
 import {
@@ -710,6 +711,7 @@ export class CodexAppServerRuntime {
       const ownershipId = this.ownershipIdFactory()
       const child = spawn(this.command, [
         ...this.commandArgs,
+        ...CODEX_MANAGED_REMOTE_CONFIG_ARGS,
         'app-server',
         '--listen',
         wsUrl,

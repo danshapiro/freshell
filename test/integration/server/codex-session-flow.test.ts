@@ -450,6 +450,9 @@ describe('Codex Session Flow Integration', () => {
         '--remote',
         expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
       ])
+      const appsFlagIndex = recordedArgs.indexOf('features.apps=false')
+      expect(appsFlagIndex).toBeGreaterThan(0)
+      expect(recordedArgs[appsFlagIndex - 1]).toBe('-c')
       expect(recordedArgs).not.toContain('resume')
       expect(recordedArgs).not.toContain('thread-new-1')
       expect(recordedArgs).not.toContain('tui.notification_method=bel')
