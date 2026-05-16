@@ -204,6 +204,28 @@ describe('CodexAppServerRuntime', () => {
     expect(runtime.status()).toBe('running')
   })
 
+  it('disables Codex apps while starting Freshell-managed app-server processes', async () => {
+    const tempDir = await makeTempDir()
+    const argLogPath = path.join(tempDir, 'argv.json')
+    const runtime = createRuntime({
+      env: {
+        FAKE_CODEX_APP_SERVER_ARG_LOG: argLogPath,
+      },
+    })
+
+    await runtime.ensureReady()
+
+    const payload = JSON.parse(await fsp.readFile(argLogPath, 'utf8')) as {
+      argv: string[]
+    }
+    const args = payload.argv
+
+    expect(args).toContain('-c')
+    expect(args).toContain('features.apps=false')
+    expect(args.indexOf('features.apps=false')).toBeLessThan(args.indexOf('app-server'))
+    expect(args).toContain('--listen')
+  })
+
   it('rejects before spawning on platforms without Linux /proc ownership support', async () => {
     const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
     if (!originalPlatform?.configurable) {
