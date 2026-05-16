@@ -13,6 +13,7 @@ import { getCanonicalDurableSessionId, getPreferredResumeSessionId } from '@/sto
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
+import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
 import { FreshAgentApprovalBanner } from './FreshAgentApprovalBanner'
 import FreshAgentQuestionBanner from './FreshAgentQuestionBanner'
 import { FreshAgentTranscript } from './FreshAgentTranscript'
@@ -70,6 +71,23 @@ function getQuestionAgentLabel(paneContent: FreshAgentPaneContent, descriptorLab
       return 'Opencode'
     default:
       return descriptorLabel ?? 'Fresh Agent'
+  }
+}
+
+function getRestoreErrorMessage(reason: RestoreErrorReason): string {
+  switch (reason) {
+    case 'invalid_legacy_restore_target':
+      return 'This session cannot be resumed because Freshell only has a legacy name, not a canonical Claude session id.'
+    case 'dead_live_handle':
+      return 'This session cannot be resumed because the live session handle is gone and no durable session id was saved.'
+    case 'missing_canonical_identity':
+      return 'This session cannot be resumed because no canonical session id was saved.'
+    case 'durable_artifact_missing':
+      return 'This session cannot be resumed because the saved session artifact is no longer available.'
+    case 'provider_runtime_failed':
+      return 'This session cannot be resumed because the provider runtime rejected the restore request.'
+    default:
+      return 'This session cannot be resumed.'
   }
 }
 
@@ -184,22 +202,34 @@ export function FreshAgentView({
     const nextRequestId = nanoid()
     const canonicalResumeSessionId = getCanonicalDurableSessionId(claudeSession)
       ?? getCanonicalPaneResumeSessionId(paneContentRef.current)
-    const resumeSessionId = canonicalResumeSessionId
-      ?? getPreferredResumeSessionId(claudeSession)
-      ?? paneContentRef.current.resumeSessionId
+    if (!canonicalResumeSessionId) {
+      const hadLegacyRestoreTarget = Boolean(getPreferredResumeSessionId(claudeSession) || paneContentRef.current.resumeSessionId)
+      dispatch(updatePaneContent({
+        tabId,
+        paneId,
+        content: {
+          ...paneContentRef.current,
+          sessionId: undefined,
+          resumeSessionId: undefined,
+          sessionRef: undefined,
+          restoreError: buildRestoreError(hadLegacyRestoreTarget ? 'invalid_legacy_restore_target' : 'dead_live_handle'),
+          createRequestId: nextRequestId,
+          status: 'idle',
+          createError: undefined,
+        },
+      }))
+      return
+    }
+
     dispatch(updatePaneContent({
       tabId,
       paneId,
       content: {
         ...paneContentRef.current,
         sessionId: undefined,
-        resumeSessionId,
-        ...(canonicalResumeSessionId
-          ? {
-              sessionRef: { provider: 'claude', sessionId: canonicalResumeSessionId },
-              restoreError: undefined,
-            }
-          : {}),
+        resumeSessionId: canonicalResumeSessionId,
+        sessionRef: { provider: 'claude', sessionId: canonicalResumeSessionId },
+        restoreError: undefined,
         createRequestId: nextRequestId,
         status: 'creating',
         createError: undefined,
@@ -481,7 +511,10 @@ export function FreshAgentView({
     const visibleRestoreFailure = paneContent.provider === 'claude'
       ? claudeSession?.restoreFailureMessage
       : null
-    const visibleLoadError = visibleRestoreFailure ? null : loadError
+    const visiblePaneRestoreFailure = visibleRestoreFailure
+      ? null
+      : (paneContent.restoreError ? getRestoreErrorMessage(paneContent.restoreError.reason) : null)
+    const visibleLoadError = visibleRestoreFailure || visiblePaneRestoreFailure || isRestoring ? null : loadError
 
     return (
       <div className="flex h-full min-h-0 flex-col" data-context="fresh-agent" data-session-id={paneContent.sessionId}>
@@ -560,6 +593,7 @@ export function FreshAgentView({
                 </div>
               ) : null}
               {visibleRestoreFailure ? <FreshAgentApprovalBanner text={visibleRestoreFailure} /> : null}
+              {visiblePaneRestoreFailure ? <FreshAgentApprovalBanner text={visiblePaneRestoreFailure} /> : null}
               {visibleLoadError ? <FreshAgentApprovalBanner text={visibleLoadError} /> : null}
               {pendingApprovals.map((approval) => (
                 <PermissionBanner

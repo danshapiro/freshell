@@ -7,7 +7,7 @@ import agentChatReducer from '@/store/agentChatSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import tabsReducer from '@/store/tabsSlice'
-import type { AgentChatPaneContent, PaneNode } from '@/store/paneTypes'
+import type { AgentChatPaneContent, FreshAgentPaneContent, PaneContent, PaneNode } from '@/store/paneTypes'
 import type { Tab } from '@/store/types'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
 
@@ -114,13 +114,28 @@ function findLeaf(node: PaneNode, paneId: string): Extract<PaneNode, { type: 'le
   return findLeaf(node.children[0], paneId) || findLeaf(node.children[1], paneId)
 }
 
+function normalizeAgentChatPaneContent(content: PaneContent | undefined): AgentChatPaneContent | undefined {
+  if (!content) return undefined
+  if (content.kind === 'agent-chat') return content
+  if (content.kind !== 'fresh-agent') return undefined
+  if (content.sessionType !== 'freshclaude' && content.sessionType !== 'kilroy') return undefined
+
+  const migrated: FreshAgentPaneContent = content
+  return {
+    ...migrated,
+    kind: 'agent-chat',
+    provider: migrated.sessionType,
+  }
+}
+
 function ReactivePane({ store }: { store: ReturnType<typeof makeStore> }) {
-  const content = useSelector((s: ReturnType<typeof store.getState>) => {
+  const rawContent = useSelector((s: ReturnType<typeof store.getState>) => {
     const root = s.panes.layouts.t1
     if (!root) return undefined
     const leaf = findLeaf(root, 'p1')
-    return leaf?.content.kind === 'agent-chat' ? leaf.content : undefined
+    return leaf?.content
   })
+  const content = normalizeAgentChatPaneContent(rawContent)
 
   if (!content) return null
   return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
@@ -224,7 +239,8 @@ describe('agent chat restore flow', () => {
     await waitFor(() => {
       const root = store.getState().panes.layouts.t1
       const leaf = root && findLeaf(root, 'p1')
-      expect(leaf?.content.kind === 'agent-chat' ? leaf.content.sessionRef : undefined).toEqual({
+      const content = normalizeAgentChatPaneContent(leaf?.content)
+      expect(content?.sessionRef).toEqual({
         provider: 'claude',
         sessionId: durableSessionId,
       })
@@ -390,7 +406,8 @@ describe('agent chat restore flow', () => {
     await waitFor(() => {
       const root = store.getState().panes.layouts.t1
       const leaf = root && findLeaf(root, 'p1')
-      expect(leaf?.content.kind === 'agent-chat' ? leaf.content.sessionId : undefined).toBe('sdk-reconnected-1')
+      const content = normalizeAgentChatPaneContent(leaf?.content)
+      expect(content?.sessionId).toBe('sdk-reconnected-1')
     })
 
     act(() => {
@@ -400,7 +417,7 @@ describe('agent chat restore flow', () => {
     expect(wsHarness.sdkCreates()).toHaveLength(2)
     const root = store.getState().panes.layouts.t1
     const leaf = root && findLeaf(root, 'p1')
-    expect(leaf?.content.kind === 'agent-chat' ? leaf.content : undefined).toEqual(expect.objectContaining({
+    expect(normalizeAgentChatPaneContent(leaf?.content)).toEqual(expect.objectContaining({
       sessionId: 'sdk-reconnected-1',
       status: 'connected',
     }))
