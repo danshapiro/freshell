@@ -97,7 +97,7 @@ The implementation plan file is dated `2026-04-19` because the design work was w
     "opencode": {
       "executable": "opencode",
       "resolvedPath": "/home/user/.opencode/bin/opencode",
-      "version": "1.15.1",
+      "version": "1.15.3",
       "runCommandTemplate": "opencode run <prompt> --format json --dangerously-skip-permissions",
       "serveCommandTemplate": "opencode serve --hostname 127.0.0.1 --port <port>",
       "globalHealthPath": "/global/health",
@@ -304,7 +304,7 @@ command -v opencode
 # /home/user/.opencode/bin/opencode
 
 opencode --version
-# 1.15.1
+# 1.15.3
 ```
 
 Fresh isolated runs were probed with:
@@ -329,10 +329,10 @@ curl http://127.0.0.1:<port>/session/status
 
 Observed control behavior:
 
-- `/global/health` returned a healthy payload with version `1.15.1`.
+- `/global/health` returned a healthy payload with version `1.15.3`.
 - `/session/status` returned `{}` while idle.
 - During an attached `opencode run ... --attach http://127.0.0.1:<port>`, `/session/status` returned an authoritative `sessionID` with `{ "type": "busy" }`, and the same id was persisted as a `session.id` row in the isolated OpenCode database.
-- On OpenCode `1.15.1`, attached `opencode run ... --attach ... --format json` exited successfully but emitted no JSON event lines on stdout, so attached-mode identity must come from `/session/status` plus the persisted database row rather than attached-run stdout.
+- On OpenCode `1.15.3`, attached `opencode run ... --attach ... --format json` exited successfully but emitted no JSON event lines on stdout, so attached-mode identity must come from `/session/status` plus the persisted database row rather than attached-run stdout.
 
 Title semantics were probed with:
 
