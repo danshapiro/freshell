@@ -530,6 +530,7 @@ export class WsHandler {
       codexDurability: CodexDurabilityRefSchema.optional(),
       liveTerminal: LiveTerminalHandleSchema.optional(),
       restore: z.boolean().optional(),
+      recoveryIntent: z.literal('fresh_after_restore_unavailable').optional(),
       tabId: z.string().min(1).optional(),
       paneId: z.string().min(1).optional(),
     }).strict()
@@ -1903,6 +1904,20 @@ export class WsHandler {
           hasRequestedSessionRef: !!m.sessionRef,
           ...(m.resumeSessionId || m.sessionRef?.sessionId ? { requestedSessionId: m.resumeSessionId ?? m.sessionRef.sessionId } : {}),
         })
+        if (m.recoveryIntent === 'fresh_after_restore_unavailable') {
+          recordSessionLifecycleEvent({
+            kind: 'restore_unavailable_fresh_fallback',
+            requestId: m.requestId,
+            connectionId: ws.connectionId || 'unknown',
+            ...(m.tabId ? { tabId: m.tabId } : {}),
+            ...(m.paneId ? { paneId: m.paneId } : {}),
+            mode: m.mode as TerminalMode,
+            reason: m.recoveryIntent,
+            restoreRequested: false,
+            treatedAsFresh: true,
+            hasSessionRef: !!m.sessionRef,
+          })
+        }
         const endCreateTimer = startPerfTimer(
           'terminal_create',
           { connectionId: ws.connectionId, mode: m.mode, shell: m.shell },
@@ -2000,6 +2015,17 @@ export class WsHandler {
           )
         ) {
           error = true
+          recordSessionLifecycleEvent({
+            kind: 'restore_unavailable',
+            requestId: m.requestId,
+            connectionId: ws.connectionId || 'unknown',
+            ...(m.tabId ? { tabId: m.tabId } : {}),
+            ...(m.paneId ? { paneId: m.paneId } : {}),
+            mode: m.mode as TerminalMode,
+            reason: 'missing_canonical_session_id',
+            restoreRequested: true,
+            hasSessionRef: !!requestedSessionRef,
+          })
           this.sendError(ws, {
             code: 'RESTORE_UNAVAILABLE',
             message: 'Restore requires a canonical session reference.',
