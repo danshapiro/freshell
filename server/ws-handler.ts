@@ -144,6 +144,16 @@ type FreshAgentSubscriptionEntry = {
   pending?: Promise<void>
 }
 
+type WsErrorLogEntry = {
+  code: string
+  messageClass: string
+  terminalId?: string
+  count: number
+  suppressedCount: number
+  firstRequestId?: string
+  lastRequestId?: string
+}
+
 export type WsHandlerOptions = {
   codingCliManager?: CodingCliSessionManager
   codexLaunchPlanner?: CodexLaunchPlanner
@@ -416,6 +426,7 @@ type ClientState = {
   sdkSubscriptions: Map<string, () => void>
   sdkSessionTargets: Map<string, string>
   freshAgentSubscriptions: Map<string, FreshAgentSubscriptionEntry>
+  wsErrorLogs: Map<string, WsErrorLogEntry>
   interestedSessions: Set<string>
   sidebarOpenSessionKeys: Set<string>
   helloTimer?: NodeJS.Timeout
@@ -1198,6 +1209,7 @@ export class WsHandler {
       sdkSubscriptions: new Map(),
       sdkSessionTargets: new Map(),
       freshAgentSubscriptions: new Map(),
+      wsErrorLogs: new Map(),
       interestedSessions: new Set(),
       sidebarOpenSessionKeys: new Set(),
     }
@@ -1251,6 +1263,7 @@ export class WsHandler {
     }
     state.sdkSubscriptions.clear()
     this.cancelAllFreshAgentSubscriptions(state)
+    this.flushWsErrorLogSummaries(state, 'connection_close')
 
     for (const [requestId, pending] of this.screenshotRequests) {
       if (pending.connectionId !== ws.connectionId) continue
@@ -1496,17 +1509,85 @@ export class WsHandler {
     }
   }
 
+  private classifyWsError(params: { code: z.infer<typeof ErrorCode>; message: string }): string {
+    if (params.code === 'INVALID_TERMINAL_ID') {
+      return 'terminal_not_running'
+    }
+    return params.code.toLowerCase()
+  }
+
+  private wsErrorLogKey(params: {
+    code: z.infer<typeof ErrorCode>
+    messageClass: string
+    terminalId?: string
+  }): string {
+    return `${params.code}:${params.messageClass}:${params.terminalId ?? ''}`
+  }
+
+  private recordWsErrorLog(
+    ws: LiveWebSocket,
+    params: { code: z.infer<typeof ErrorCode>; message: string; requestId?: string; terminalId?: string },
+  ): void {
+    const state = this.clientStates.get(ws)
+    const messageClass = this.classifyWsError(params)
+    const key = this.wsErrorLogKey({
+      code: params.code,
+      messageClass,
+      terminalId: params.terminalId,
+    })
+    const existing = state?.wsErrorLogs.get(key)
+    if (existing) {
+      existing.count += 1
+      existing.suppressedCount += 1
+      if (params.requestId) {
+        existing.lastRequestId = params.requestId
+      }
+      return
+    }
+
+    const entry: WsErrorLogEntry = {
+      code: params.code,
+      messageClass,
+      terminalId: params.terminalId,
+      count: 1,
+      suppressedCount: 0,
+      firstRequestId: params.requestId,
+      lastRequestId: params.requestId,
+    }
+    state?.wsErrorLogs.set(key, entry)
+    log.warn({
+      event: 'ws_send_error',
+      connectionId: ws.connectionId || 'unknown',
+      code: params.code,
+      messageClass,
+      ...(params.requestId ? { requestId: params.requestId } : {}),
+      ...(params.terminalId ? { terminalId: params.terminalId } : {}),
+    }, 'ws_send_error')
+  }
+
+  private flushWsErrorLogSummaries(state: ClientState, reason: 'connection_close'): void {
+    for (const entry of state.wsErrorLogs.values()) {
+      if (entry.suppressedCount <= 0) continue
+      log.warn({
+        event: 'ws_send_error_suppressed_summary',
+        reason,
+        code: entry.code,
+        messageClass: entry.messageClass,
+        ...(entry.terminalId ? { terminalId: entry.terminalId } : {}),
+        suppressedCount: entry.suppressedCount,
+        totalCount: entry.count,
+        ...(entry.firstRequestId ? { firstRequestId: entry.firstRequestId } : {}),
+        ...(entry.lastRequestId ? { lastRequestId: entry.lastRequestId } : {}),
+      }, 'ws_send_error_suppressed_summary')
+    }
+    state.wsErrorLogs.clear()
+  }
+
   private sendError(
     ws: LiveWebSocket,
     params: { code: z.infer<typeof ErrorCode>; message: string; requestId?: string; terminalId?: string }
   ) {
-    log.warn({
-      connectionId: ws.connectionId || 'unknown',
-      code: params.code,
-      message: params.message,
-      ...(params.requestId ? { requestId: params.requestId } : {}),
-      ...(params.terminalId ? { terminalId: params.terminalId } : {}),
-    }, 'Sending WebSocket error')
+    this.recordWsErrorLog(ws, params)
     this.send(ws, {
       type: 'error',
       code: params.code,
@@ -2125,6 +2206,33 @@ export class WsHandler {
         let error = false
         let rateLimited = false
         const requestedSessionRef = normalizeUiSessionLocator(m.sessionRef)
+        if (
+          m.recoveryIntent === 'fresh_after_restore_unavailable'
+          && (
+            m.restore === true
+            || !!m.resumeSessionId
+            || !!requestedSessionRef
+            || !!m.codexDurability
+            || !!m.liveTerminal
+          )
+        ) {
+          error = true
+          this.sendError(ws, {
+            code: 'INVALID_CREATE_REQUEST',
+            message: 'Fresh recovery requests cannot include restore identity.',
+            requestId: m.requestId,
+          })
+          endCreateTimer({ error, rateLimited })
+          return
+        }
+        const hasReusableRequestedLiveTerminal = Boolean(
+          m.liveTerminal?.serverInstanceId === this.serverInstanceId
+            && m.liveTerminal.terminalId
+            && (() => {
+              const live = this.registry.get(m.liveTerminal.terminalId)
+              return live && live.status === 'running' && live.mode === m.mode
+            })(),
+        )
         let codexDurabilityForDecision = m.codexDurability
         let codexDurabilityStoreRecordTerminalId: string | undefined
         if (m.mode === 'codex' && m.restore === true && !requestedSessionRef && !codexDurabilityForDecision) {
@@ -2168,7 +2276,9 @@ export class WsHandler {
         if (codexRestorePlan?.kind === 'durable_session_ref_resume') {
           effectiveResumeSessionId = codexRestorePlan.sessionId
         } else if (m.mode !== 'codex') {
-          effectiveResumeSessionId = m.resumeSessionId
+          effectiveResumeSessionId = requestedSessionRef && requestedSessionRef.provider === m.mode
+            ? requestedSessionRef.sessionId
+            : m.resumeSessionId
         }
         if (m.mode !== 'codex' && !effectiveResumeSessionId && requestedSessionRef && requestedSessionRef.provider === m.mode) {
           effectiveResumeSessionId = requestedSessionRef.sessionId
@@ -2187,6 +2297,7 @@ export class WsHandler {
         if (
           m.restore === true
           && modeSupportsResume(m.mode as TerminalMode)
+          && !hasReusableRequestedLiveTerminal
           && m.mode !== 'codex'
           && m.resumeSessionId
           && !requestedSessionRef
@@ -2204,6 +2315,7 @@ export class WsHandler {
           m.restore === true
           && modeSupportsResume(m.mode as TerminalMode)
           && !hasCodexCapturedRestoreState
+          && !hasReusableRequestedLiveTerminal
           && (
             !requestedSessionRef
             || requestedSessionRef.provider !== m.mode
@@ -2826,7 +2938,12 @@ export class WsHandler {
             connectionId: ws.connectionId || 'unknown',
             operation: 'terminal.attach',
           })
-          this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Terminal not running', terminalId: m.terminalId })
+          this.sendError(ws, {
+            code: 'INVALID_TERMINAL_ID',
+            message: 'Terminal not running',
+            requestId: m.attachRequestId,
+            terminalId: m.terminalId,
+          })
           return
         }
         if (record.status !== 'running') {
@@ -2839,6 +2956,7 @@ export class WsHandler {
           this.sendError(ws, {
             code: 'INVALID_TERMINAL_ID',
             message: formatExitedTerminalAttachMessage(record),
+            requestId: m.attachRequestId,
             terminalId: m.terminalId,
           })
           return
@@ -2866,6 +2984,7 @@ export class WsHandler {
             this.sendError(ws, {
               code: 'INVALID_TERMINAL_ID',
               message: formatExitedTerminalAttachMessage(latestRecord),
+              requestId: m.attachRequestId,
               terminalId: m.terminalId,
             })
             return
@@ -2876,7 +2995,12 @@ export class WsHandler {
             connectionId: ws.connectionId || 'unknown',
             operation: 'terminal.attach',
           })
-          this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Unknown terminalId', terminalId: m.terminalId })
+          this.sendError(ws, {
+            code: 'INVALID_TERMINAL_ID',
+            message: 'Unknown terminalId',
+            requestId: m.attachRequestId,
+            terminalId: m.terminalId,
+          })
           return
         }
         if (attachResult === 'duplicate') return
