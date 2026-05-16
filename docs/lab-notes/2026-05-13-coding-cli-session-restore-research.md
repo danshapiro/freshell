@@ -8,7 +8,7 @@ This is the primary research record for how Freshell should identify, persist, a
 | --- | --- | --- | --- | --- |
 | Codex | The rollout-backed root TUI `ThreadId` after the exact provider-reported `.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` file exists and starts with matching `session_meta`. | Fresh `codex --remote` creates a thread before user work; Freshell can capture that pre-durable candidate after installing listeners, then promote only after the exact rollout file proves the same root TUI `ThreadId`. `turn/completed` is the required proof-check boundary, not proof itself. | Pre-creating an app-server thread and launching the TUI with `codex resume <threadId>` before the rollout file exists fails with `no rollout found for thread id`. Cwd, time, title, shell snapshot, and bare pre-durable thread id are not durable restore identity. If proof fails after `turn/completed`, Freshell must show a degraded/error state and use only deterministic one-shot repair triggers. | Full long-idle and restart behavior still needs product-level coverage, but the identity contract is known. |
 | Claude Code | The UUID-backed transcript file under `.claude/projects/*/<uuid>.jsonl`. | `--session-id <uuid>` creates a durable transcript, and `--resume <uuid>` restores it. | Titles and names are mutable metadata only. The old title stops resolving after rename. | The proof covers print-mode session creation/resume/rename; broader interactive TUI edge cases are not the source of truth here. |
-| OpenCode | The authoritative `sessionID` from JSON events, the DB row, and `/session/status`. | JSON `step_start` session id matches the DB session id; `/session/status` reports the same busy id while attached. | Titles are metadata and do not replace session identity. No rename subcommand was present in the tested mode. | Full interactive TUI restart and long-idle behavior still needs product-level coverage. |
+| OpenCode | The authoritative root `sessionID` from JSON events, the DB row, and `/session/status` after resolving child ids through `parentID` or `parent_id`. | JSON `step_start` session id matches the DB session id; `/session/status` reports authoritative status ids while attached; OpenCode 1.15.3 exposes root-child metadata through events and the DB. | Titles are metadata and do not replace session identity. A flat `/session/status` id is not enough in multi-session TUI state; child ids must be collapsed to their root before ownership classification. No rename subcommand was present in the tested mode. | Long-idle behavior still needs product-level coverage. |
 
 ## Freshell rules
 
@@ -19,6 +19,8 @@ This is the primary research record for how Freshell should identify, persist, a
 - For Codex, do not try to prevent restore loss by pre-creating an app-server thread and TUI-resuming it before rollout materialization; the real binary rejected that path.
 - For Claude Code, persist the UUID transcript identity, not the visible title or `--name` value.
 - For OpenCode, promote only from authoritative provider surfaces: JSON events, the DB/session row, or `/session/status`.
+- For OpenCode, `/session/status` is a flat process status map, not a root-session map. Freshell must collapse every observed OpenCode session id to its root by using `session.created` or `session.updated` `info.parentID`, or `opencode.db` `session.parent_id`, before classifying ownership or emitting ambiguity. The identity-mapping resolver is valid only for a proven flat schema or a test harness.
+- For OpenCode, `opencode --session <root>` proves the process was asked to open an existing session; it does not prove that children disappear from `/session/status`, and it does not prove pane attachment. Restart coverage must assert the restored process, the pane's attached terminal id, and client attachment state.
 - Cleanup for probes must never stop real user sessions; only processes tagged with the current temp root and sentinel are safe to stop.
 
 ## Implementation learnings from dev integration
@@ -31,10 +33,13 @@ The `2026-05-15` squash integration into `/home/user/code/freshell/.worktrees/de
 - If a live-only terminal handle disappears and no durable identity can be restored, the ergonomic recovery path is one explicit fresh terminal creation. That is still a restore failure, so it must emit the restore-unavailable diagnostic and avoid pretending the old session was recovered.
 - Agent-chat visible timeline hydration must prefer the persisted resume identity over the transient SDK handle after reload. Otherwise the UI can fetch history for the live SDK session id instead of the durable Claude transcript id.
 - Conflict resolution can silently remove these behaviors even when the new Codex durability tests pass. Future changes to session identity, sidebar rows, terminal recovery, or agent-chat reloads should run tests that cover both the new provider-specific contract and the older client repair paths.
+- The `2026-05-16` OpenCode restart failure was a production wiring regression, not a disproof of the root-session design. Commit `dc570273` passed `resolveOpencodeSessionRoots` from `server/index.ts` into `wireOpencodeActivityTracker`; commit `36528c75` reconstructed the tracker as `wireOpencodeActivityTracker({ registry })`, dropping the resolver. Current source therefore falls back to the identity-map resolver at `/home/user/code/freshell/.worktrees/opencode-resilience-postmortem-20260516/server/coding-cli/opencode-activity-tracker.ts:192`, even though the provider root resolver exists at `/home/user/code/freshell/.worktrees/opencode-resilience-postmortem-20260516/server/coding-cli/providers/opencode.ts:190` and the wiring accepts it at `/home/user/code/freshell/.worktrees/opencode-resilience-postmortem-20260516/server/coding-cli/opencode-activity-wiring.ts:37`.
+- The same restart exposed a client boot ordering bug. `/home/user/.freshell/logs/20260516-1446-01-server-debug.production.3001.jsonl:19188` and `/home/user/.freshell/logs/session-lifecycle.production.3001.jsonl:2737` show an attach to stale OpenCode terminal `dPs6gWkZF9-Iq31FZYwMQ`; only after that did `/home/user/.freshell/logs/session-lifecycle.production.3001.jsonl:2740`, `:2744`, and `:2748` request restored OpenCode creates. The stale attach path in `/home/user/code/freshell/.worktrees/opencode-resilience-postmortem-20260516/src/components/TerminalView.tsx:2324` can run before inventory cleanup in `/home/user/code/freshell/.worktrees/opencode-resilience-postmortem-20260516/src/store/panesSlice.ts:1579` finishes clearing old terminal ids.
+- The `terminal_exit_without_durable_session` warnings at `/home/user/.freshell/logs/session-lifecycle.production.3001.jsonl:2734` through `:2736` were observability noise for this restart, not proof that the OpenCode panes lacked session refs before shutdown. `TerminalRegistry.kill()` releases the binding at `/home/user/code/freshell/.worktrees/opencode-resilience-postmortem-20260516/server/terminal-registry.ts:2790`, `releaseBinding` clears `resumeSessionId` at `/home/user/code/freshell/.worktrees/opencode-resilience-postmortem-20260516/server/terminal-registry.ts:3007`, and the warning predicate checks `resumeSessionId` afterward at `/home/user/code/freshell/.worktrees/opencode-resilience-postmortem-20260516/server/terminal-registry.ts:1231`.
 
 ## Scope and provenance
 
-The real-binary provider probes were rerun on `2026-04-26` inside `/home/user/code/freshell/.worktrees/trycycle-codex-session-resilience`. Binary version facts were refreshed on `2026-05-03` inside `/home/user/code/freshell/.worktrees/land-local-main-codex-sidecar-lifecycle`; the Claude Code binary version fact was refreshed again on `2026-05-06` inside `/home/user/code/freshell/.worktrees/codex-sidebar-reopen-corner-origin-pr-20260505` after the installed binary changed. A targeted Codex pre-durable resume and identity-capture experiment was run on `2026-05-13` inside `/home/user/code/freshell/.worktrees/dev` using isolated temp roots.
+The real-binary provider probes were rerun on `2026-04-26` inside `/home/user/code/freshell/.worktrees/trycycle-codex-session-resilience`. Binary version facts were refreshed on `2026-05-03` inside `/home/user/code/freshell/.worktrees/land-local-main-codex-sidecar-lifecycle`; the Claude Code binary version fact was refreshed again on `2026-05-06` inside `/home/user/code/freshell/.worktrees/codex-sidebar-reopen-corner-origin-pr-20260505` after the installed binary changed. A targeted Codex pre-durable resume and identity-capture experiment was run on `2026-05-13` inside `/home/user/code/freshell/.worktrees/dev` using isolated temp roots. OpenCode root-child and TUI restart facts were refreshed on `2026-05-16` against `/home/user/.opencode/bin/opencode` 1.15.3, an isolated temp root under `/tmp/opencode-probe-20260516-144511-994599`, and upstream OpenCode tag `v1.15.3` at commit `37f89b742907c43b20d38b68eabe65981a59690a` in `/tmp/opencode-upstream`.
 
 The later version-only refreshes did not re-prove the full behavior contract, so `capturedOn` remains `2026-04-26`; the `2026-05-13` experiment is recorded as a narrow Codex addendum. A Codex source-code study was added on `2026-05-13` against the locally installed `@openai/codex` package and the official upstream `openai/codex` tag `rust-v0.130.0`.
 
@@ -47,8 +52,8 @@ The real-provider harness parses the next section. Keep the `## Machine-readable
 {
   "capturedOn": "2026-04-26",
   "planCreatedOn": "2026-04-19",
-  "binaryVersionFactsRefreshedOn": "2026-05-06",
-  "dateReason": "The plan was drafted on 2026-04-19, but the checked-in note is dated 2026-04-26 because that is when the durable behavior contract was re-proved on the implementation machine and the earlier 2026-04-23 contract capture was superseded by the newer provider behavior. Binary version facts were refreshed on 2026-05-03 after installed provider versions changed, and the Claude Code binary version fact was refreshed on 2026-05-06 after the local installed binary changed to 2.1.132. These later version-only refreshes did not re-prove the behavior contract.",
+  "binaryVersionFactsRefreshedOn": "2026-05-16",
+  "dateReason": "The plan was drafted on 2026-04-19, but the checked-in note is dated 2026-04-26 because that is when the durable behavior contract was re-proved on the implementation machine and the earlier 2026-04-23 contract capture was superseded by the newer provider behavior. Binary version facts were refreshed on 2026-05-03 after installed provider versions changed, the Claude Code binary version fact was refreshed on 2026-05-06 after the local installed binary changed to 2.1.132, and OpenCode root-child/TUI facts were refreshed on 2026-05-16 after the local installed binary changed to 1.15.3. The later OpenCode refresh re-proved root-child identity behavior but did not re-prove unrelated provider behavior contracts.",
   "cleanup": {
     "liveProcessAuditCommand": "ps -eo pid,ppid,stat,cmd --sort=pid | rg \"codex|claude|opencode\"",
     "ownershipReportFields": [
@@ -243,7 +248,7 @@ The real-provider harness parses the next section. Keep the `## Machine-readable
     "opencode": {
       "executable": "opencode",
       "resolvedPath": "/home/user/.opencode/bin/opencode",
-      "version": "1.14.41",
+      "version": "1.15.3",
       "runCommandTemplate": "opencode run <prompt> --format json --dangerously-skip-permissions",
       "serveCommandTemplate": "opencode serve --hostname 127.0.0.1 --port <port>",
       "globalHealthPath": "/global/health",
@@ -251,6 +256,20 @@ The real-provider harness parses the next section. Keep the `## Machine-readable
       "canonicalIdentity": "session-id",
       "runEventSessionIdMatchesDbId": true,
       "busyStatusUsesAuthoritativeSessionId": true,
+      "sessionStatusShape": "flat-map-keyed-by-session-id",
+      "sessionStatusContainsParentMetadata": false,
+      "sessionCreatedEventIncludesInfoParentID": true,
+      "sessionInfoIncludesParentID": true,
+      "dbSessionParentColumn": "session.parent_id",
+      "sessionFlagSelectsExistingSessionOnly": true,
+      "sessionFlagSuppressesChildStatuses": false,
+      "restoreRequiresRootResolverWired": true,
+      "sessionStatusRootResolutionSources": [
+        "session.created info.parentID",
+        "session.updated info.parentID",
+        "opencode.db session.parent_id"
+      ],
+      "postRestartAttachStateMustBeVerified": true,
       "titleOnResumeMutatesStoredTitle": false,
       "sessionSubcommands": [
         "list",
@@ -687,15 +706,18 @@ Observed rename semantics:
 
 ## OpenCode evidence
 
-### Version
+### Version and source
 
 ```bash
 command -v opencode
 # /home/user/.opencode/bin/opencode
 
 opencode --version
-# 1.14.41
+# 1.15.3
 ```
+
+- The installed binary is `/home/user/.opencode/bin/opencode`.
+- The upstream OpenCode source studied for the `2026-05-16` addendum is `/tmp/opencode-upstream` at commit `37f89b742907c43b20d38b68eabe65981a59690a`; `/tmp/opencode-upstream/packages/opencode/package.json:3` reports version `1.15.3`.
 
 ### Run-event identity
 
@@ -711,7 +733,7 @@ Observed durable identity rule:
 - The first JSON `step_start` event carried a `sessionID`.
 - That exact `sessionID` matched the `session.id` row written into the isolated OpenCode database.
 
-### Control surface identity
+### Control surface identity and topology
 
 The authoritative control surface was probed with:
 
@@ -723,9 +745,53 @@ curl http://127.0.0.1:<port>/session/status
 
 Observed control behavior:
 
-- `/global/health` returned a healthy payload with version `1.14.41`.
+- `/global/health` returned a healthy payload with version `1.15.3`.
 - `/session/status` returned `{}` while idle.
 - During an attached `opencode run ... --attach http://127.0.0.1:<port>`, `/session/status` returned the same authoritative `sessionID` with `{ "type": "busy" }`.
+- In OpenCode 1.15.3 source, `/session/status` is a route at `/tmp/opencode-upstream/packages/opencode/src/server/routes/instance/httpapi/groups/session.ts:117` through `:125`, and the handler returns `Object.fromEntries(yield* statusSvc.list())` at `/tmp/opencode-upstream/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts:73` through `:75`.
+- The upstream status service is an in-memory map keyed by session id: status types are `idle`, `retry`, and `busy` at `/tmp/opencode-upstream/packages/opencode/src/session/status.ts:8` through `:31`; `list()` returns the current map at `/tmp/opencode-upstream/packages/opencode/src/session/status.ts:73` through `:75`; `set()` publishes `session.status` and deletes idle entries at `/tmp/opencode-upstream/packages/opencode/src/session/status.ts:77` through `:86`. It does not carry parent metadata.
+
+### Root-child metadata
+
+The `2026-05-16` isolated probe created a parent and child session with OpenCode 1.15.3 under `/tmp/opencode-probe-20260516-144511-994599`.
+
+- The parent session artifact is `/tmp/opencode-probe-20260516-144511-994599/parent-session.json:1`.
+- The child session artifact is `/tmp/opencode-probe-20260516-144511-994599/child-session.json:1`; it includes `parentID` pointing at the parent.
+- `/tmp/opencode-probe-20260516-144511-994599/tui-children.json:1` shows `/session/<parent>/children` returning that child.
+- `/tmp/opencode-probe-20260516-144511-994599/global-vs-event.event.ndjson:2` shows a `session.created` event whose `properties.info.parentID` identifies a TUI-created child. `/tmp/opencode-probe-20260516-144511-994599/global-vs-event.global.ndjson:5` shows the same event wrapped on `/global/event`.
+- The upstream session schema includes optional `parentID` at `/tmp/opencode-upstream/packages/opencode/src/session/session.ts:207` through `:214`; `session.created` carries `sessionID` and full `info` at `/tmp/opencode-upstream/packages/opencode/src/session/session.ts:290` through `:338`; creation writes `parentID` into the emitted info at `/tmp/opencode-upstream/packages/opencode/src/session/session.ts:522` through `:556`.
+- The OpenCode DB resolver in Freshell is therefore the right source for restart-time root collapse: `/home/user/code/freshell/.worktrees/opencode-resilience-postmortem-20260516/server/coding-cli/providers/opencode.ts:190` through `:278` walks `session.parent_id` to root, and `/home/user/code/freshell/.worktrees/opencode-resilience-postmortem-20260516/server/coding-cli/providers/opencode.ts:139` through `:155` filters indexed session lists to roots when the schema has `parent_id`.
+
+### TUI restore behavior
+
+The `2026-05-16` probe also launched an OpenCode TUI with `opencode --session <parent>` against the isolated temp root. The key result is that `--session` selects a session; it does not make the server status map root-only.
+
+- Upstream CLI parsing defines `--session` as a session id to continue at `/tmp/opencode-upstream/packages/opencode/src/cli/cmd/tui/thread.ts:98` through `:102`, validates it at `/tmp/opencode-upstream/packages/opencode/src/cli/cmd/tui/thread.ts:213` through `:219`, and navigates directly to that session when not forking at `/tmp/opencode-upstream/packages/opencode/src/cli/cmd/tui/app.tsx:386` through `:390`.
+- The isolated TUI status poll still reported both the parent and child ids in `/session/status`; see `/tmp/opencode-probe-20260516-144511-994599/status-retry-window-poll.ndjson:1`.
+- The isolated TUI event stream reported status events for both the parent and child ids; see `/tmp/opencode-probe-20260516-144511-994599/tui-shell-events.ndjson:2` and `:7`.
+
+### 2026-05-16 dev restart failure classification
+
+The research premise was incomplete but correct: OpenCode has authoritative root-child metadata, and Freshell must use it. The PR did not fail because OpenCode lacks parent metadata. It failed in current `/home/user/code/freshell/.worktrees/dev` because the root resolver was not wired into the running tracker after integration, and because the client can attempt a stale live-terminal attach before restored creation finishes.
+
+- Intended resolver wiring existed in commit `dc570273` (`fix: bind unambiguous OpenCode root sessions`): it passed `resolveOpencodeSessionRoots: (sessionIds) => opencodeProvider.resolveOpencodeSessionRoots(sessionIds)` from `server/index.ts` into `wireOpencodeActivityTracker`.
+- Commit `36528c75` (`Integrate Codex stability implementation`) reconstructed OpenCode activity as `wireOpencodeActivityTracker({ registry })`. Current source still shows that call at `/home/user/code/freshell/.worktrees/opencode-resilience-postmortem-20260516/server/index.ts:199`.
+- Without the provider resolver, `OpencodeActivityTracker` uses the identity-map default at `/home/user/code/freshell/.worktrees/opencode-resilience-postmortem-20260516/server/coding-cli/opencode-activity-tracker.ts:192` through `:197`. That makes a child session look like a second root and reintroduces false ambiguous ownership.
+- A read-only query against `/home/user/.local/share/opencode/opencode.db` on `2026-05-16` confirmed the ambiguous ids in the live warnings were children, not independent roots:
+
+```text
+ses_1d05e3b80ffeB0cqhhg0W9NNoX||/home/user/code/nanoclaw-glowforge-slack
+ses_1d0ba9968ffeNn5tFfCoX55KmM||/home/user/code/shapiroserver2
+ses_1ce502cb3ffeldGzu0UyPJYMBZ|ses_1d0ba9968ffeNn5tFfCoX55KmM|/home/user/code/shapiroserver2
+ses_1e63302edffeaYRODfvalZMUA7||/home/user/code/bossbench
+ses_1cea30952ffeIlXaDDq9t1iX3N|ses_1e63302edffeaYRODfvalZMUA7|/home/user/code/bossbench
+ses_1cec5e62bffe25v5Jh92Qivk5V|ses_1e63302edffeaYRODfvalZMUA7|/home/user/code/bossbench
+ses_1ced4980affePGSLe9iPdZqpwE|ses_1e63302edffeaYRODfvalZMUA7|/home/user/code/bossbench
+ses_1cfc3efe7ffe53gmd1WIpzH4tb|ses_1e63302edffeaYRODfvalZMUA7|/home/user/code/bossbench
+```
+
+- The restart logs show the visible restore failure was not simply "no process spawned." `/home/user/.freshell/logs/session-lifecycle.production.3001.jsonl:2740`, `:2744`, and `:2748` requested three OpenCode restored creates with session refs, and `/home/user/.freshell/logs/session-lifecycle.production.3001.jsonl:2740` through `:2750` show those three sessions being bound and created. However, `/home/user/.freshell/logs/session-lifecycle.production.3001.jsonl:2737` and `/home/user/.freshell/logs/20260516-1446-01-server-debug.production.3001.jsonl:19188` show the browser first tried to attach the stale pre-restart terminal `dPs6gWkZF9-Iq31FZYwMQ`.
+- `/home/user/.freshell/logs/20260516-1446-01-server-debug.production.3001.jsonl:21237` then shows the OpenCode activity monitor timing out waiting for health on restored terminal `lEFq8Bxtp4SYkzO4Oo0HE`, so restart tests must assert both spawn and post-spawn monitor/attachment state.
 
 ### Title behavior
 
@@ -745,6 +811,8 @@ Observed title behavior:
 
 ### OpenCode allowed behavior
 
-- Canonical OpenCode identity is the authoritative `sessionID`.
-- Busy or restore state may only be promoted from the control surface or the canonical DB/session events.
+- Canonical OpenCode restore identity is the authoritative root `sessionID`.
+- Busy or restore state may only be promoted from the control surface or canonical DB/session events after child ids have been resolved to roots.
+- `/session/status` alone is insufficient in TUI state because it is a flat status map with no parent metadata.
+- `opencode --session <root>` is necessary for restored launch but insufficient as the whole Freshell restore proof; Freshell must verify that the pane attached to the new terminal and that the activity tracker resolved child statuses to the same root.
 - Titles are metadata and do not replace session identity.

@@ -309,7 +309,7 @@ describe('App WS extension messages', () => {
     expect(store.getState().extensions.entries[0].serverPort).toBeUndefined()
   })
 
-  it('clears stale extension metadata when ready reports a new server instance', async () => {
+  it('keeps extension metadata usable when ready reports a new server instance', async () => {
     const store = createStore()
 
     render(
@@ -358,7 +358,7 @@ describe('App WS extension messages', () => {
 
     await waitFor(() => {
       expect(store.getState().connection.serverInstanceId).toBe('srv-new')
-      expect(store.getState().extensions.entries).toEqual([])
+      expect(store.getState().extensions.entries).toEqual(extensions)
     })
   })
 })

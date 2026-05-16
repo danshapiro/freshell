@@ -403,6 +403,31 @@ export class TestServer {
     await this.stopProcess(false)
   }
 
+  async kill(signal: NodeJS.Signals = 'SIGKILL'): Promise<void> {
+    const proc = this.process
+    this.process = null
+
+    if (!proc) {
+      await this.cleanupArtifacts(false)
+      return
+    }
+
+    await new Promise<void>((resolve) => {
+      const timeout = setTimeout(() => {
+        resolve()
+      }, 5000)
+
+      proc.once('exit', () => {
+        clearTimeout(timeout)
+        resolve()
+      })
+
+      proc.kill(signal)
+    }).finally(async () => {
+      await this.cleanupArtifacts(false)
+    })
+  }
+
   private async waitForHealth(baseUrl: string, timeoutMs: number): Promise<void> {
     const start = Date.now()
 

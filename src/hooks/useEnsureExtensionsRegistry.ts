@@ -44,28 +44,32 @@ export function useEnsureExtensionsRegistry(enabled = true): boolean {
 
   const get = (api as { get?: (<T = unknown>(path: string) => Promise<T> | T) }).get
   const loadKey = resolveRegistryLoadKey(serverInstanceId)
+  const currentRecord = registryLoadCache.get(loadKey)
+  const needsLoadForServer = currentRecord?.status !== 'loaded'
+  const hasRegistryEntries = extensionEntries.length > 0
+  const hasServerInstance = serverInstanceId.length > 0
   const canLoad = enabled
-    && extensionEntries.length === 0
+    && needsLoadForServer
+    && (!hasRegistryEntries || hasServerInstance)
     && !!getAuthToken()
     && typeof get === 'function'
 
   useEffect(() => {
-    if (!enabled || extensionEntries.length > 0) {
+    if (!enabled) {
       setLoadSettled(true)
       return
     }
-    if (!getAuthToken() || typeof get !== 'function') {
+    if (!getAuthToken() || typeof get !== 'function' || (hasRegistryEntries && !hasServerInstance)) {
       setLoadSettled(true)
       return
     }
-    let cancelled = false
-    const currentRecord = registryLoadCache.get(loadKey)
     if (currentRecord?.status === 'loaded') {
       dispatch(setRegistry(currentRecord.entries))
       setLoadSettled(true)
       return
     }
 
+    let cancelled = false
     let promise = currentRecord?.promise
     if (!promise) {
       promise = Promise.resolve(get<ClientExtensionEntry[]>(resolveExtensionsRegistryPath()))
@@ -91,7 +95,7 @@ export function useEnsureExtensionsRegistry(enabled = true): boolean {
     }
 
     requestedRef.current = loadKey
-    setLoadSettled(false)
+    setLoadSettled(hasRegistryEntries)
 
     promise
       .then((entries) => {
@@ -108,7 +112,7 @@ export function useEnsureExtensionsRegistry(enabled = true): boolean {
     return () => {
       cancelled = true
     }
-  }, [connectionStatus, dispatch, enabled, extensionEntries.length, get, loadKey])
+  }, [connectionStatus, currentRecord, dispatch, enabled, get, hasRegistryEntries, hasServerInstance, loadKey])
 
-  return !canLoad || loadSettled
+  return hasRegistryEntries || !canLoad || loadSettled
 }

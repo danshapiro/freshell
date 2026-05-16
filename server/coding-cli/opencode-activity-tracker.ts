@@ -220,6 +220,7 @@ export class OpencodeActivityTracker extends EventEmitter {
     random?: () => number
     homeDir?: string
     resolveOpencodeSessionRoots?: (sessionIds: readonly string[]) => Promise<OpencodeRootResolution>
+    allowIdentityRootResolverForTests?: boolean
   } = {}) {
     super()
     this.fetchImpl = input.fetchImpl ?? fetch
@@ -228,7 +229,13 @@ export class OpencodeActivityTracker extends EventEmitter {
     this.setTimeoutFn = input.setTimeoutFn ?? setTimeout
     this.clearTimeoutFn = input.clearTimeoutFn ?? clearTimeout
     this.random = input.random ?? Math.random
-    this.resolveOpencodeSessionRoots = input.resolveOpencodeSessionRoots ?? defaultResolveOpencodeSessionRoots
+    if (input.resolveOpencodeSessionRoots) {
+      this.resolveOpencodeSessionRoots = input.resolveOpencodeSessionRoots
+    } else if (input.allowIdentityRootResolverForTests || process.env.NODE_ENV === 'test') {
+      this.resolveOpencodeSessionRoots = defaultResolveOpencodeSessionRoots
+    } else {
+      throw new Error('OpenCode root session resolver is required outside tests.')
+    }
   }
 
   list(): OpencodeActivityRecord[] {
