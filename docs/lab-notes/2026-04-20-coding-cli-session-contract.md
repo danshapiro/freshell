@@ -105,7 +105,7 @@ The implementation plan file is dated `2026-04-19` because the design work was w
       "canonicalIdentity": "session-id",
       "runEventSessionIdMatchesDbId": true,
       "busyStatusUsesAuthoritativeSessionId": true,
-      "attachFormatJsonEmitsEvents": false,
+      "attachFormatJsonEmitsEvents": true,
       "titleOnResumeMutatesStoredTitle": false,
       "sessionSubcommands": [
         "list",
@@ -332,7 +332,7 @@ Observed control behavior:
 - `/global/health` returned a healthy payload with version `1.15.3`.
 - `/session/status` returned `{}` while idle.
 - During an attached `opencode run ... --attach http://127.0.0.1:<port>`, `/session/status` returned an authoritative `sessionID` with `{ "type": "busy" }`, and the same id was persisted as a `session.id` row in the isolated OpenCode database.
-- On OpenCode `1.15.3`, attached `opencode run ... --attach ... --format json` exited successfully but emitted no JSON event lines on stdout, so attached-mode identity must come from `/session/status` plus the persisted database row rather than attached-run stdout.
+- On the 2026-05-16 rerun with OpenCode `1.15.3`, attached `opencode run ... --attach ... --format json` exited successfully and emitted JSON event lines on stdout. Freshell still treats `/session/status` plus the persisted database row as the authoritative attached-mode identity while the attached command is busy, because that surface exposes the live session before process exit.
 
 Title semantics were probed with:
 
