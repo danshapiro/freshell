@@ -12,6 +12,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 
 ## Repo Rules
 - Always work in a worktree (in \.worktrees\)
+- Before creating a new worktree, ensure the repo-supported test suite is green on the intended base. If the suite is not green, pause before creating the worktree and notify the user with the failing command and failure summary.
 - New behavior changes start on a worktree branch from `origin/main` and are submitted as PRs to `origin/main`; local `dev` only consumes PR heads.
 - Many agents may be working in the worktree at the same time. If you see activity from other agents (for example test runs or file changes), respect it.
 - Specific user instructions override ALL other instructions, including the above, and including superpowers or skills
