@@ -634,6 +634,9 @@ export const openSessionTab = createAsyncThunk(
           : undefined
         if (existingTab) {
           updateExistingTabMetadata(existingTab)
+          if (title && title !== existingTab.title && !existingTab.titleSetByUser) {
+            dispatch(updateTab({ id: existingTab.id, updates: { title } }))
+          }
           dispatch(setActiveTab(existingTab.id))
           return
         }
@@ -675,6 +678,9 @@ export const openSessionTab = createAsyncThunk(
       if (existingTabId) {
         const existingTab = state.tabs.tabs.find((tab) => tab.id === existingTabId)
         updateExistingTabMetadata(existingTab)
+        if (existingTab && title && title !== existingTab.title && !existingTab.titleSetByUser) {
+          dispatch(updateTab({ id: existingTab.id, updates: { title } }))
+        }
         repairExistingTabLayout(existingTab)
         dispatch(setActiveTab(existingTabId))
         return

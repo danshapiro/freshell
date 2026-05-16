@@ -341,6 +341,10 @@ export default function Sidebar({
       localServerInstanceId,
     )
     if (existing) {
+      const existingTab = state.tabs.tabs.find((t) => t.id === existing.tabId)
+      if (existingTab && item.title && item.title !== existingTab.title && !existingTab.titleSetByUser) {
+        dispatch(updateTab({ id: existingTab.id, updates: { title: item.title } }))
+      }
       dispatch(setActiveTab(existing.tabId))
       if (existing.paneId) {
         dispatch(setActivePane({ tabId: existing.tabId, paneId: existing.paneId }))
