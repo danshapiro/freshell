@@ -527,3 +527,181 @@ A test script confirmed all four ambiguous-entry paths (P1-P4) and the UNION bug
 2. Monitor for `warnAmbiguous` messages. Expect none caused by parent-child scenarios.
 3. If any `warnAmbiguous` fires, capture the raw `/session/status` response and `blockedSessionIds` for root-cause analysis of remaining edge cases.
 4. Verify `turnComplete` and `requestAssociation` events resume flowing for previously-affected terminals.
+
+---
+
+## 7. 2026-05-16 Restart Resilience Addendum
+
+This addendum is the handoff for the restart failure observed on dev after the OpenCode resilience work landed. It extends, and in a few places supersedes, the original implementation plan above. The earlier child/root ownership analysis was correct, but the delivered system did not keep that resolver wired through production startup, and the test plan did not exercise the actual restart shape that failed.
+
+Primary evidence is captured in `docs/lab-notes/2026-05-13-coding-cli-session-restore-research.md`, especially the `2026-05-16 dev restart postmortem` section. The short version:
+
+- `server/coding-cli/providers/opencode.ts` has `OpenCodeProvider.resolveOpencodeSessionRoots(...)`.
+- `server/coding-cli/opencode-activity-wiring.ts` accepts `resolveOpencodeSessionRoots` and forwards it into `OpencodeActivityTracker`.
+- `server/index.ts` currently constructs OpenCode activity with `wireOpencodeActivityTracker({ registry })`, so production uses the tracker's identity resolver instead of the provider-backed root resolver.
+- Existing tests cover the tracker/provider behavior and a shell-pane server restart, but not the production composition of `server/index.ts` plus multiple OpenCode panes across server restart.
+- The `terminal_exit_without_durable_session` logs seen during the restart are also misleading: `TerminalRegistry.kill()` releases the session binding before calling `recordTerminalExitWithoutDurableSession(...)`, so an already-bound OpenCode terminal can be logged as if it lacked durable identity.
+
+### 7.1 Required Fixes
+
+1. Wire the provider root resolver through production startup.
+
+   Change the production construction path so `server/index.ts` passes:
+
+   ```typescript
+   resolveOpencodeSessionRoots: (sessionIds) => opencodeProvider.resolveOpencodeSessionRoots(sessionIds)
+   ```
+
+   into `wireOpencodeActivityTracker(...)`.
+
+   Do not add a hidden parallel DB lookup path in the tracker just to compensate for missing wiring. The provider is already the owner of OpenCode database knowledge; the integration layer must pass it through.
+
+2. Remove or constrain silent identity fallback for production.
+
+   The current default resolver in `OpencodeActivityTracker` maps every session to itself. That is useful for narrow reducer tests, but it made the production wiring omission look like a valid configuration. Make the fallback explicit and test-only, for example by requiring callers to provide a resolver unless they pass a clearly named test option such as `allowIdentityRootResolverForTests: true`.
+
+   If the final design keeps a default resolver, the production construction test in this addendum must still fail when `server/index.ts` omits the provider resolver.
+
+3. Fix the false `terminal_exit_without_durable_session` warning.
+
+   In `server/terminal-registry.ts`, record the durable-session warning decision before `releaseBinding(...)` clears `record.resumeSessionId`, or pass the pre-release durable identity state into `recordTerminalExitWithoutDurableSession(...)`.
+
+   This is observability correctness, not the primary restore bug. It still belongs in the implementation because misleading lifecycle logs slowed the investigation and would hide future regressions.
+
+4. Confirm client restart ordering preserves durable OpenCode identity.
+
+   When a browser reconnects after server restart with stale terminal IDs, an OpenCode pane with an existing `sessionRef` must issue a restored `terminal.create` request for the same root session. It must not fall back to a fresh OpenCode launch merely because `terminal.attach`, `terminal.resize`, or inventory cleanup reports `INVALID_TERMINAL_ID`.
+
+### 7.2 Required Test Coverage
+
+The implementation is not complete until these tests exist and fail for the broken production wiring.
+
+1. Production composition test for OpenCode resolver wiring.
+
+   Add or extend a focused test under `test/unit/server/coding-cli/`, preferably by extracting a small production factory from `server/index.ts` instead of importing the side-effectful entrypoint. One acceptable shape:
+
+   - Create `server/coding-cli/opencode-activity-integration.ts`.
+   - Export a function that receives `{ registry, opencodeProvider, ...callbacks }`.
+   - Inside that function, call `wireOpencodeActivityTracker(...)` with `resolveOpencodeSessionRoots` sourced from the provider.
+   - Use that exported function from `server/index.ts`.
+   - Test the exported function with a fake provider and fake registry.
+
+   Assertions:
+
+   - The fake provider's `resolveOpencodeSessionRoots(...)` is called when the tracker sees a child session.
+   - The terminal binds to the resolved root session, not the child session.
+   - Omitting the resolver in this production integration path is not representable or causes a clear failure.
+
+2. Multi-agent browser/server restart test for OpenCode.
+
+   Add a new Playwright spec such as `test/e2e-browser/specs/opencode-restart-recovery.spec.ts`, or extend `test/e2e-browser/specs/server-restart-recovery.spec.ts` with a separate OpenCode describe block. This must use the existing `TestServer` helper so the test starts a real temporary Freshell server, opens the actual browser app, and reconnects the same page to a fresh server process.
+
+   Required scenario:
+
+   - Start `TestServer` with an isolated home and a deterministic test `opencode` executable first on `PATH`.
+   - Create at least three OpenCode panes or tabs.
+   - Interact with each pane enough for the fake OpenCode process to expose a root session and at least one child session as busy.
+   - Wait until each pane has a durable `sessionRef` rooted at the parent OpenCode session.
+   - Stop the first server gracefully.
+   - Start a second `TestServer` on the same port and token, preserving the same isolated OpenCode data home.
+   - Wait for the browser WebSocket to reconnect.
+   - Assert each OpenCode pane recreates a terminal with `restore: true`, preserves its original root `sessionRef`, and receives a new live `terminalId`.
+   - Assert each fake OpenCode launch used `--session <root-session-id>` or the equivalent restore argument expected by Freshell's OpenCode provider.
+   - Assert no pane adopts a child session ID.
+   - Assert no `warnAmbiguous` log is emitted for parent/child busy state.
+   - Assert `/api/terminals` or the test harness shows restored terminals with attached clients.
+
+   Add restart variations after the graceful baseline passes:
+
+   - Hard kill: add a `TestServer` helper method that terminates the server process with `SIGKILL` without running graceful shutdown, then restarts on the same port and token.
+   - Closed pane: close one OpenCode pane before restart and assert it is not resurrected.
+   - Mixed panes: include at least one shell pane with the OpenCode panes and assert shell recreation does not mask OpenCode durable restore failures.
+
+   Implementation note: the current `TestServer` creates a fresh temporary home on each `start()` and removes it on `stop()` unless `preserveHomeOnStop` is set. The OpenCode restart test must either extend `TestServer` to reuse an explicit home/app-data directory across the two server processes, or set up stable symlinks from each temp home to a shared OpenCode data directory. Do not re-seed the OpenCode DB after restart in a way that hides whether the first process actually persisted the root/child relationship.
+
+3. Deterministic fake OpenCode executable for e2e-browser tests.
+
+   Do not rely on real network/model activity in default CI. The fake executable should live under `test/e2e-browser/fixtures/` or `test/helpers/` and be installed into a temporary `bin` directory by the test's `setupHome` callback.
+
+   It must emulate only the control surface Freshell needs:
+
+   - Long-running terminal process that accepts stdin and stays alive until killed.
+   - Version/help behavior if Freshell's CLI detection asks for it.
+   - Local OpenCode server endpoint with `/global/health`, `/session/status`, `/event`, session listing, and any restore endpoint or route Freshell calls.
+   - Server-sent events for `server.connected`, `session.status`, `session.idle`, and `session.created`.
+   - A persisted `opencode.db` in the isolated `XDG_DATA_HOME` using the real `session.parent_id` shape, so `OpenCodeProvider.resolveOpencodeSessionRoots(...)` reads the same root/child relationship the production code reads.
+   - An audit log of launch arguments, session IDs, status responses, and received stdin so the Playwright test can assert restore behavior without scraping terminal text.
+
+   The fake should create stable root IDs per pane and child IDs under those roots. It should be able to report `{ root: busy, child: busy }` at restart time; that is the condition that previously required root resolution.
+
+4. Client restart ordering tests.
+
+   Extend the client-focused restart tests so OpenCode is covered, not just shell or other provider cases.
+
+   Required assertions:
+
+   - A pane with `mode: 'opencode'`, stale `terminalId`, and existing root `sessionRef` handles `INVALID_TERMINAL_ID` by recreating with `restore: true`.
+   - The recreate request preserves the original root `sessionRef`.
+   - The pane does not enter `fresh_after_restore_unavailable` unless the provider explicitly reports restore unavailable.
+   - Inventory cleanup during reconnect cannot erase the durable identity before the restore request is constructed.
+
+   Candidate files:
+
+   - `test/e2e/terminal-restart-recovery.test.tsx`
+   - `test/unit/client/components/TerminalView.resumeSession.test.tsx`
+   - `test/unit/client/components/TerminalView.lifecycle.test.tsx`
+
+5. Lifecycle logging unit test.
+
+   Add a server-side test proving an OpenCode terminal with a bound durable session does not emit `terminal_exit_without_durable_session` on final close. The test should fail against the current order where `releaseBinding(...)` clears `resumeSessionId` before the warning predicate runs.
+
+   Candidate files:
+
+   - `test/server/session-association.test.ts`
+   - `test/unit/server/terminal-registry.codex-sidecar.test.ts`
+   - A new focused `test/unit/server/terminal-registry-session-lifecycle.test.ts`
+
+6. Optional real-provider contract probe.
+
+   Keep the existing real provider contract tests as opt-in coverage. They are useful for validating the installed OpenCode binary, but they do not replace the deterministic browser/server restart test because they do not run the Freshell app through process death and WebSocket reconnect.
+
+### 7.3 Acceptance Criteria For The Handoff
+
+The agent implementing this addendum should leave the repo in this state:
+
+1. `server/index.ts` reaches OpenCode activity through a tested integration path that passes `OpenCodeProvider.resolveOpencodeSessionRoots(...)`.
+2. The OpenCode activity tracker cannot silently run in production with the identity root resolver because a caller forgot to wire the provider.
+3. The new production composition test fails against the current broken `wireOpencodeActivityTracker({ registry })` startup shape.
+4. The new browser/server restart test creates multiple OpenCode panes, interacts with them, gracefully restarts the temp server, and proves root-session restore for every surviving pane.
+5. A hard-kill restart variation exists, or the plan documents a concrete blocker in `TestServer` with a failing or skipped test that explains what helper is missing.
+6. A closed-pane variation proves restart recovery does not resurrect deliberately closed OpenCode panes.
+7. Client unit/e2e tests cover `INVALID_TERMINAL_ID` for OpenCode panes with durable `sessionRef`.
+8. Lifecycle logging no longer emits `terminal_exit_without_durable_session` for an OpenCode terminal that had a durable binding before final close.
+9. Focused unit/integration tests and the OpenCode restart browser spec are run from the worktree before PR handoff. The broader coordinated suite should be run if the implementer changes shared terminal lifecycle or WebSocket reconnect logic.
+
+### 7.4 Suggested Verification Commands
+
+Run focused tests first:
+
+```bash
+npm run test:vitest -- test/unit/server/coding-cli/opencode-activity-wiring.test.ts --run
+npm run test:vitest -- test/unit/client/components/TerminalView.resumeSession.test.tsx --run
+npm run test:vitest -- test/unit/client/components/TerminalView.lifecycle.test.tsx --run
+npm run test:vitest -- test/server/session-association.test.ts --run
+```
+
+Then build and run the browser restart spec:
+
+```bash
+npm run build
+npm run test:e2e -- test/e2e-browser/specs/opencode-restart-recovery.spec.ts
+```
+
+If the implementation touches shared reconnect behavior, finish with coordinated verification:
+
+```bash
+FRESHELL_TEST_SUMMARY="OpenCode restart resilience" npm run test:status
+FRESHELL_TEST_SUMMARY="OpenCode restart resilience" npm run check
+```
+
+Do not restart the self-hosted dev server for production validation unless the user explicitly approves that restart.
