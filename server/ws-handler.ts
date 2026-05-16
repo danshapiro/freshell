@@ -22,6 +22,7 @@ import type {
   OpencodeActivityRecord,
   SdkServerMessage,
   SdkSessionStatus,
+  TerminalTurnCompleteMessage,
 } from '../shared/ws-protocol.js'
 import type { ExtensionManager } from './extension-manager.js'
 import { allocateLocalhostPort } from './local-port.js'
@@ -55,6 +56,7 @@ import {
   OpencodeActivityListResponseSchema,
   OpencodeActivityListSchema,
   OpencodeActivityUpdatedSchema,
+  TerminalTurnCompleteSchema,
   HelloSchema,
   PingSchema,
   ClientDiagnosticSchema,
@@ -3696,6 +3698,20 @@ export class WsHandler {
 
     if (!parsed.success) {
       log.warn({ issues: parsed.error.issues }, 'Invalid opencode.activity.updated payload')
+      return
+    }
+
+    this.broadcastAuthenticated(parsed.data)
+  }
+
+  broadcastTerminalTurnComplete(msg: Omit<TerminalTurnCompleteMessage, 'type'>): void {
+    const parsed = TerminalTurnCompleteSchema.safeParse({
+      type: 'terminal.turn.complete',
+      ...msg,
+    })
+
+    if (!parsed.success) {
+      log.warn({ issues: parsed.error.issues }, 'Invalid terminal.turn.complete payload')
       return
     }
 

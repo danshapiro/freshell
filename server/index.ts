@@ -378,6 +378,12 @@ async function main() {
   opencodeActivity.tracker.on('changed', (payload) => {
     wsHandler.broadcastOpencodeActivityUpdated(payload)
   })
+  opencodeActivity.tracker.on('turn.complete', (payload) => {
+    wsHandler.broadcastTerminalTurnComplete({
+      provider: 'opencode',
+      ...payload,
+    })
+  })
   opencodeActivity.controller.on('associated', ({ terminalId, sessionId }) => {
     try {
       broadcastTerminalSessionAssociation({

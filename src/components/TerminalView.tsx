@@ -125,6 +125,10 @@ type TerminalInputBlockedReason =
   | 'codex_identity_unavailable'
   | 'codex_recovery_pending'
 
+function shouldSuppressNativeTouchScroll(term: Terminal): boolean {
+  return term.buffer.active.type === 'alternate' && term.modes.mouseTrackingMode !== 'none'
+}
+
 function terminalInputBlockedNotice(reason: TerminalInputBlockedReason): string {
   switch (reason) {
     case 'codex_identity_pending':
@@ -741,7 +745,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const rawLines = touchScrollAccumulatorRef.current / TOUCH_SCROLL_PIXELS_PER_LINE
     const lines = rawLines > 0 ? Math.floor(rawLines) : Math.ceil(rawLines)
     if (lines !== 0) {
-      if (!translateScrollLinesToInput(term, lines)) {
+      if (!translateScrollLinesToInput(term, lines) && !shouldSuppressNativeTouchScroll(term)) {
         term.scrollLines(lines)
       }
 

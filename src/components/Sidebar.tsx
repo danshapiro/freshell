@@ -923,7 +923,8 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
           data-session-id={item.sessionId}
           data-provider={item.provider}
           data-session-type={item.sessionType}
-          data-running-terminal-id={item.runningTerminalId}
+          data-is-running={item.isRunning ? 'true' : 'false'}
+          data-running-terminal-id={item.runningTerminalId ?? ''}
           data-has-tab={item.hasTab ? 'true' : 'false'}
         >
           {/* Provider icon */}
