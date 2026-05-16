@@ -536,6 +536,18 @@ If the proof read succeeds, Freshell promotes to `durable`, persists the canonic
 
 There is no periodic, delayed, or backoff read loop. If a proof read is already in flight and another deterministic trigger arrives, Freshell may coalesce the trigger into at most one additional exact read after the current read resolves. It must not keep retrying because time passed.
 
+#### Proof-to-layout bridge
+
+A successful Codex durability proof is not complete at the registry binding step. The implementation invariant is:
+
+`rollout proof succeeds -> server binds/rebinds the terminal to the proven Codex thread id -> the browser receives terminal.session.associated with sessionRef { provider: "codex", sessionId: durableThreadId } -> TerminalView writes that canonical sessionRef into the terminal pane, and into the tab when the tab is a single-pane terminal tab -> TerminalView dispatches flushPersistedLayoutNow`.
+
+`terminal.session.bound` is a server-local registry event. It may be useful for ownership, activity tracking, lifecycle logs, and metadata, but it is not by itself a persisted browser layout update. Likewise, `terminal.codex.durability.updated` can persist candidate and durability state, but it does not replace `terminal.session.associated` as the canonical terminal durable-promotion event.
+
+The current `/home/user/code/freshell/.worktrees/dev` implementation has two bridge surfaces that should stay covered by tests: `/home/user/code/freshell/.worktrees/dev/server/terminal-registry.ts:2017` binds the proven Codex id, `/home/user/code/freshell/.worktrees/dev/server/terminal-registry.ts:2051` through `/home/user/code/freshell/.worktrees/dev/server/terminal-registry.ts:2052` broadcasts `terminal.session.associated` to attached clients, and `/home/user/code/freshell/.worktrees/dev/server/index.ts:442` through `/home/user/code/freshell/.worktrees/dev/server/index.ts:459` converts Codex `terminal.session.bound` into the shared association publisher path with `source: "codex_durability"`. On the client, `/home/user/code/freshell/.worktrees/dev/src/components/TerminalView.tsx:2189` through `/home/user/code/freshell/.worktrees/dev/src/components/TerminalView.tsx:2234` is the persistence boundary: it accepts `terminal.session.associated`, builds the canonical sessionRef update, updates pane/tab state, and flushes the persisted layout.
+
+Focused verification should prove both halves. A server test should start from a matching Codex rollout proof and assert a client-visible `terminal.session.associated` publication, not only `terminal.session.bound` or `codex_durable_session_observed`. A client test should show that `terminal.created` stays live-only and that pane/tab `sessionRef` plus the immediate layout flush happen only after `terminal.session.associated`.
+
 #### Deterministic repair triggers
 
 Each repair trigger below performs one exact proof read of the stored `rolloutPath`. Success promotes to `durable`. Failure keeps `durability_unproven_after_completion` after a completed turn, or keeps the pre-completion unproven state before a completed turn. User actions are repair paths, not the normal success path.
