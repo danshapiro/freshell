@@ -515,23 +515,32 @@ export class ProbeWorkspace {
       stderr += chunk
     })
 
+    const exitPromise = new Promise<ExitSummary>((resolve, reject) => {
+      child.once('error', reject)
+      child.once('close', (code, signal) => {
+        resolve({
+          code,
+          signal,
+        })
+      })
+    })
+
     const waitForExit = (timeoutMs = 30_000) =>
       new Promise<ExitSummary>((resolve, reject) => {
         const timeout = setTimeout(() => {
           reject(new Error(`Timed out waiting for process ${command} (${child.pid}) to exit.`))
         }, timeoutMs)
 
-        child.once('error', (error) => {
-          clearTimeout(timeout)
-          reject(error)
-        })
-        child.once('close', (code, signal) => {
-          clearTimeout(timeout)
-          resolve({
-            code,
-            signal,
-          })
-        })
+        exitPromise.then(
+          (summary) => {
+            clearTimeout(timeout)
+            resolve(summary)
+          },
+          (error) => {
+            clearTimeout(timeout)
+            reject(error)
+          },
+        )
       })
 
     const stop = async () => {
