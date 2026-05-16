@@ -7,7 +7,7 @@ import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { shallowEqual } from 'react-redux'
 import { addTab, openSessionTab, setActiveTab, updateTab } from '@/store/tabsSlice'
-import { addPane, initLayout, setActivePane } from '@/store/panesSlice'
+import { addPane, initLayout, setActivePane, updatePaneTitle } from '@/store/panesSlice'
 import { findPaneForSession } from '@/lib/session-utils'
 import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
@@ -378,8 +378,11 @@ export default function Sidebar({
     )
     if (existing) {
       const existingTab = state.tabs.tabs.find((t) => t.id === existing.tabId)
-      if (existingTab && item.title && item.title !== existingTab.title && !existingTab.titleSetByUser) {
+      if (existingTab && item.title && item.hasTitle && item.title !== existingTab.title && !existingTab.titleSetByUser) {
         dispatch(updateTab({ id: existingTab.id, updates: { title: item.title } }))
+      }
+      if (existing.paneId && item.hasTitle) {
+        dispatch(updatePaneTitle({ tabId: existing.tabId, paneId: existing.paneId, title: item.title, setByUser: false }))
       }
       dispatch(setActiveTab(existing.tabId))
       if (existing.paneId) {
@@ -400,34 +403,36 @@ export default function Sidebar({
     const paneLayouts = state.panes?.layouts ?? EMPTY_LAYOUTS
     const activeLayout = currentActiveTabId ? paneLayouts[currentActiveTabId] : undefined
     if (!currentActiveTabId || !activeLayout) {
-      dispatch(openSessionTab({
-        sessionId: item.sessionId,
-        title: item.title,
-        cwd: item.cwd,
-        provider,
-        sessionType,
-        terminalId: runningTerminalId,
-        firstUserMessage: item.firstUserMessage,
-        isSubagent: item.isSubagent,
-        isNonInteractive: item.isNonInteractive,
-      }))
-      onNavigate('terminal')
-      return
-    }
+        dispatch(openSessionTab({
+          sessionId: item.sessionId,
+          title: item.title,
+          cwd: item.cwd,
+          provider,
+          sessionType,
+          terminalId: runningTerminalId,
+          firstUserMessage: item.firstUserMessage,
+          isSubagent: item.isSubagent,
+          isNonInteractive: item.isNonInteractive,
+          hasTitle: item.hasTitle,
+        }))
+        onNavigate('terminal')
+        return
+      }
 
-    // 3. Normal: open in new tab or split, based on user preference
-    const sessionOpenMode = state.settings.settings.panes?.sessionOpenMode ?? 'tab'
-    if (sessionOpenMode === 'tab') {
-      dispatch(openSessionTab({
-        sessionId: item.sessionId,
-        title: item.title,
-        cwd: item.cwd,
-        provider,
-        sessionType,
-        terminalId: runningTerminalId,
-        firstUserMessage: item.firstUserMessage,
-        isSubagent: item.isSubagent,
-        isNonInteractive: item.isNonInteractive,
+      // 3. Normal: open in new tab or split, based on user preference
+      const sessionOpenMode = state.settings.settings.panes?.sessionOpenMode ?? 'tab'
+      if (sessionOpenMode === 'tab') {
+        dispatch(openSessionTab({
+          sessionId: item.sessionId,
+          title: item.title,
+          cwd: item.cwd,
+          provider,
+          sessionType,
+          terminalId: runningTerminalId,
+          firstUserMessage: item.firstUserMessage,
+          isSubagent: item.isSubagent,
+          isNonInteractive: item.isNonInteractive,
+          hasTitle: item.hasTitle,
       }))
       onNavigate('terminal')
       return

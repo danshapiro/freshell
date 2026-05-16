@@ -448,6 +448,132 @@ describe('sidebar click opens pane (e2e)', () => {
     expect(state.panes.layouts['tab-2'].type).toBe('leaf')
   })
 
+  it('syncs tab and pane title when clicking a renamed session already open in a pane', async () => {
+    const targetId = sessionId('renamed-session')
+
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/home/user/project',
+        sessions: [
+          {
+            sessionId: targetId,
+            projectPath: '/home/user/project',
+            lastActivityAt: Date.now(),
+            title: 'Renamed beside name',
+            cwd: '/home/user/project',
+          },
+        ],
+      },
+    ]
+
+    const store = createStore({
+      projects,
+      tabs: [
+        { id: 'tab-1', mode: 'shell' },
+        { id: 'tab-2', mode: 'claude', title: 'Stale Title' },
+      ],
+      activeTabId: 'tab-1',
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-1', status: 'running' },
+          },
+          'tab-2': {
+            type: 'leaf',
+            id: 'pane-2',
+            content: {
+              kind: 'terminal', mode: 'claude', createRequestId: 'req-2', status: 'running',
+              resumeSessionId: targetId,
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1', 'tab-2': 'pane-2' },
+        paneTitles: {},
+      },
+    })
+
+    // Set a stale pane title to test it also gets synced
+    store.dispatch({ type: 'panes/updatePaneTitle', payload: { tabId: 'tab-2', paneId: 'pane-2', title: 'Old Pane Name', setByUser: false } })
+
+    renderSidebar(store)
+
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    const sessionButton = screen.getByText('Renamed beside name').closest('button')
+    fireEvent.click(sessionButton!)
+
+    const state = store.getState()
+
+    // Should focus the existing tab
+    expect(state.tabs.activeTabId).toBe('tab-2')
+    // Tab title should be updated
+    const tab = state.tabs.tabs.find((t) => t.id === 'tab-2')
+    expect(tab?.title).toBe('Renamed beside name')
+    // Pane title should also be updated (stale title replaced)
+    const paneTitle = state.panes.paneTitles?.['tab-2']?.['pane-2']
+    expect(paneTitle).toBe('Renamed beside name')
+  })
+
+  it('does not sync title when clicking a session without a custom title (hasTitle=false)', async () => {
+    const targetId = sessionId('untitled-session')
+
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/home/user/project',
+        sessions: [
+          {
+            sessionId: targetId,
+            projectPath: '/home/user/project',
+            lastActivityAt: Date.now(),
+            // No title → hasTitle will be false, title will be sessionId.slice(0, 8)
+            cwd: '/home/user/project',
+          },
+        ],
+      },
+    ]
+
+    const store = createStore({
+      projects,
+      tabs: [
+        { id: 'tab-1', mode: 'claude', title: 'Claude' },
+      ],
+      activeTabId: 'tab-1',
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal', mode: 'claude', createRequestId: 'req-1', status: 'running',
+              resumeSessionId: targetId,
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+      },
+    })
+
+    renderSidebar(store)
+
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    const sessionTitle = screen.getByText(targetId.slice(0, 8), { exact: false })
+    const sessionButton = sessionTitle.closest('button')
+    fireEvent.click(sessionButton!)
+
+    const state = store.getState()
+    const tab = state.tabs.tabs.find((t) => t.id === 'tab-1')
+    // Original title should be preserved (not overwritten by sessionId fallback)
+    expect(tab?.title).toBe('Claude')
+  })
+
   it('clicking a session already open in an agent-chat pane focuses it', async () => {
     const targetId = sessionId('freshclaude-open')
 

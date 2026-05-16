@@ -1,7 +1,7 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
 import { nanoid } from 'nanoid'
-import { closePane, initLayout, restoreLayout, removeLayout, updatePaneContent } from './panesSlice'
+import { closePane, initLayout, restoreLayout, removeLayout, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import type { PaneNode } from './paneTypes'
 import { findTabIdForSession } from '@/lib/session-utils'
@@ -524,7 +524,7 @@ export const reopenClosedTab = createAsyncThunk(
 export const openSessionTab = createAsyncThunk(
   'tabs/openSessionTab',
   async (
-    { sessionId, title, cwd, provider, sessionType, terminalId, forceNew, firstUserMessage, isSubagent, isNonInteractive }: {
+    { sessionId, title, cwd, provider, sessionType, terminalId, forceNew, firstUserMessage, isSubagent, isNonInteractive, hasTitle }: {
       sessionId: string
       title?: string
       cwd?: string
@@ -535,6 +535,8 @@ export const openSessionTab = createAsyncThunk(
       firstUserMessage?: string
       isSubagent?: boolean
       isNonInteractive?: boolean
+      /** Only sync title into an existing tab when the session title is a real rename (not a synthesized fallback). */
+      hasTitle?: boolean
     },
     { dispatch, getState }
   ) => {
@@ -762,8 +764,11 @@ export const openSessionTab = createAsyncThunk(
           : undefined
         if (existingTab) {
           updateExistingTabMetadata(existingTab)
-          if (title && title !== existingTab.title && !existingTab.titleSetByUser) {
+          if (title && hasTitle && title !== existingTab.title && !existingTab.titleSetByUser) {
             dispatch(updateTab({ id: existingTab.id, updates: { title } }))
+          }
+          if (hasTitle) {
+            dispatch(updatePaneTitleByTerminalId({ terminalId, title: title || '', setByUser: false }))
           }
           dispatch(setActiveTab(existingTab.id))
           return
@@ -812,8 +817,14 @@ export const openSessionTab = createAsyncThunk(
         const selectedExistingTabId = existingTabId ?? tabToOpen.id
         const usingStaleSinglePaneFallback = !existingTabId && staleSinglePaneFallbackTab?.id === tabToOpen.id
         updateExistingTabMetadata(tabToOpen)
-        if (title && title !== tabToOpen.title && !tabToOpen.titleSetByUser) {
+        if (title && hasTitle && title !== tabToOpen.title && !tabToOpen.titleSetByUser) {
           dispatch(updateTab({ id: tabToOpen.id, updates: { title } }))
+        }
+        if (hasTitle && title) {
+          const layout = state.panes.layouts[selectedExistingTabId]
+          if (layout?.type === 'leaf') {
+            dispatch(updatePaneTitle({ tabId: selectedExistingTabId, paneId: layout.id, title, setByUser: false }))
+          }
         }
         repairExistingTabLayout(tabToOpen, {
           tabFallbackMissingPaneLocator: usingStaleSinglePaneFallback,
