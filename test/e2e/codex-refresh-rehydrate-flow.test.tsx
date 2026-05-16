@@ -23,6 +23,7 @@ const wsHarness = vi.hoisted(() => {
   const reconnectHandlers = new Set<() => void>()
   const latestAttachRequestIdByTerminal = new Map<string, string>()
   const addedRestoreIds = new Set<string>()
+  const addedFreshRecoveryIds = new Map<string, string>()
 
   const withCurrentAttachRequestId = (msg: any) => {
     if (
@@ -68,11 +69,21 @@ const wsHarness = vi.hoisted(() => {
       addedRestoreIds.delete(id)
       return true
     },
+    addFreshRecoveryRequestId(id: string, intent: string) {
+      addedFreshRecoveryIds.set(id, intent)
+    },
+    consumeFreshRecoveryRequest(id: string) {
+      const intent = addedFreshRecoveryIds.get(id)
+      if (!intent) return undefined
+      addedFreshRecoveryIds.delete(id)
+      return intent
+    },
     reset() {
       messageHandlers.clear()
       reconnectHandlers.clear()
       latestAttachRequestIdByTerminal.clear()
       addedRestoreIds.clear()
+      addedFreshRecoveryIds.clear()
     },
   }
 })
@@ -89,6 +100,8 @@ vi.mock('@/lib/ws-client', () => ({
 vi.mock('@/lib/terminal-restore', () => ({
   addTerminalRestoreRequestId: (id: string) => wsHarness.addRestoreRequestId(id),
   consumeTerminalRestoreRequestId: (id: string) => wsHarness.consumeRestoreRequestId(id),
+  addTerminalFreshRecoveryRequestId: (id: string, intent: string) => wsHarness.addFreshRecoveryRequestId(id, intent),
+  consumeTerminalFreshRecoveryRequest: (id: string) => wsHarness.consumeFreshRecoveryRequest(id),
 }))
 
 vi.mock('@/lib/terminal-themes', () => ({
@@ -429,7 +442,7 @@ describe('codex refresh rehydrate flow (e2e)', () => {
     expect(sentMessages().some((msg) => msg?.type === 'terminal.create')).toBe(false)
   })
 
-  it('surfaces restore-unavailable instead of starting a fresh Codex session when a live-only terminal is gone', async () => {
+  it('surfaces restore-unavailable while starting explicit fresh recovery when a live-only terminal is gone', async () => {
     const tabId = 'tab-codex-live-only'
     const paneId = 'pane-codex-live-only'
     const store = createStore({
@@ -489,7 +502,16 @@ describe('codex refresh rehydrate flow (e2e)', () => {
     })
 
     await waitFor(() => {
-      expect(sentMessages().slice(baselineMessages).some((msg) => msg?.type === 'terminal.create')).toBe(false)
+      const recoveryCreate = sentMessages().slice(baselineMessages).find((msg) => msg?.type === 'terminal.create')
+      expect(recoveryCreate).toMatchObject({
+        type: 'terminal.create',
+        mode: 'codex',
+        recoveryIntent: 'fresh_after_restore_unavailable',
+      })
+      expect(recoveryCreate?.restore).toBeUndefined()
+      expect(recoveryCreate?.sessionRef).toBeUndefined()
+      expect(recoveryCreate?.liveTerminal).toBeUndefined()
+      expect(recoveryCreate?.resumeSessionId).toBeUndefined()
       expect((getTerminalPaneContent(store, tabId) as any)?.restoreError).toEqual({
         code: 'RESTORE_UNAVAILABLE',
         reason: 'dead_live_handle',

@@ -2277,6 +2277,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
                 status: 'creating',
                 restoreError: buildRestoreError('dead_live_handle'),
               })
+              const currentTab = tabRef.current
+              if (currentTab) {
+                dispatch(updateTab({ id: currentTab.id, updates: { status: 'creating' } }))
+              }
               return
             }
             term.writeln('\r\n[Reconnecting...]\r\n')
