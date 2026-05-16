@@ -93,7 +93,7 @@ export class CodexLaunchPlanner {
 
     try {
       if (input.resumeSessionId) {
-        const ready = await runtime.ensureReady()
+        const ready = await runtime.ensureReady(input.cwd)
         proxy = new CodexRemoteProxy({
           upstreamWsUrl: ready.wsUrl,
           requireCandidatePersistence: false,
@@ -109,7 +109,7 @@ export class CodexLaunchPlanner {
         }
       }
 
-      const ready = await runtime.ensureReady()
+      const ready = await runtime.ensureReady(input.cwd)
       proxy = new CodexRemoteProxy({ upstreamWsUrl: ready.wsUrl })
       const proxyReady = await proxy.start()
       this.assertAcceptingPlans()

@@ -1257,23 +1257,50 @@ describe('CodexAppServerRuntime', () => {
 
   it('proxies thread/start through the sidecar client after boot', async () => {
     const runtime = createRuntime()
+    const launchCwd = await makeTempDir()
 
-    await expect(runtime.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
+    await expect(runtime.startThread({ cwd: launchCwd })).resolves.toEqual({
       threadId: 'thread-new-1',
       wsUrl: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
     })
   })
 
+  it('starts the app-server wrapper in the requested thread cwd', async () => {
+    const metadataDir = await makeTempDir()
+    const launchCwd = await makeTempDir()
+    const runtime = createRuntime({ metadataDir })
+
+    await runtime.startThread({ cwd: launchCwd })
+
+    const record = await waitForMetadataRecord(metadataDir)
+    expect(record.wrapperIdentity.cwd).toBe(launchCwd)
+  })
+
   it('proxies thread/resume through the sidecar client after boot', async () => {
     const runtime = createRuntime()
+    const launchCwd = await makeTempDir()
 
     await expect(runtime.resumeThread({
       threadId: '019d9859-5670-72b1-851f-794ad7fef112',
-      cwd: '/repo/worktree',
+      cwd: launchCwd,
     })).resolves.toEqual({
       threadId: '019d9859-5670-72b1-851f-794ad7fef112',
       wsUrl: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
     })
+  })
+
+  it('starts the app-server wrapper in the requested resume cwd', async () => {
+    const metadataDir = await makeTempDir()
+    const launchCwd = await makeTempDir()
+    const runtime = createRuntime({ metadataDir })
+
+    await runtime.resumeThread({
+      threadId: '019d9859-5670-72b1-851f-794ad7fef112',
+      cwd: launchCwd,
+    })
+
+    const record = await waitForMetadataRecord(metadataDir)
+    expect(record.wrapperIdentity.cwd).toBe(launchCwd)
   })
 
   it('re-emits turn notifications from the sidecar client', async () => {
@@ -1355,6 +1382,7 @@ describe('CodexAppServerRuntime', () => {
   })
 
   it('keeps child stdio drained so large app-server logs do not stall thread/start replies', async () => {
+    const launchCwd = await makeTempDir()
     const runtime = createRuntime({
       env: {
         FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
@@ -1366,13 +1394,14 @@ describe('CodexAppServerRuntime', () => {
       requestTimeoutMs: 1_500,
     })
 
-    await expect(runtime.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
+    await expect(runtime.startThread({ cwd: launchCwd })).resolves.toEqual({
       threadId: 'thread-new-1',
       wsUrl: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
     })
   })
 
   it('keeps child stderr drained so large app-server error logs do not stall thread/resume replies', async () => {
+    const launchCwd = await makeTempDir()
     const runtime = createRuntime({
       env: {
         FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
@@ -1386,7 +1415,7 @@ describe('CodexAppServerRuntime', () => {
 
     await expect(runtime.resumeThread({
       threadId: '019d9859-5670-72b1-851f-794ad7fef112',
-      cwd: '/repo/worktree',
+      cwd: launchCwd,
     })).resolves.toEqual({
       threadId: '019d9859-5670-72b1-851f-794ad7fef112',
       wsUrl: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),

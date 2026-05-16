@@ -68,6 +68,7 @@ type ChildProcessHandle = ReturnType<typeof spawn>
 type RuntimeOptions = {
   command?: string
   commandArgs?: string[]
+  cwd?: string
   env?: NodeJS.ProcessEnv
   requestTimeoutMs?: number
   startupAttemptLimit?: number
@@ -106,6 +107,11 @@ function sleep(ms: number): Promise<void> {
 function defaultMetadataDir(): string {
   return process.env.FRESHELL_CODEX_SIDECAR_DIR
     || path.join(os.homedir(), '.freshell', 'codex-sidecars')
+}
+
+function normalizeLaunchCwd(cwd: string | undefined): string | undefined {
+  const trimmed = cwd?.trim()
+  return trimmed ? trimmed : undefined
 }
 
 function assertUnixSidecarSupport(): void {
@@ -523,6 +529,7 @@ export class CodexAppServerRuntime {
 
   private readonly command: string
   private readonly commandArgs: string[]
+  private readonly defaultCwd?: string
   private readonly env?: NodeJS.ProcessEnv
   private readonly requestTimeoutMs?: number
   private readonly startupAttemptLimit: number
@@ -533,10 +540,13 @@ export class CodexAppServerRuntime {
   private readonly ownershipIdFactory: () => string
   private readonly metadataWriter: (filePath: string, metadata: CodexSidecarOwnershipMetadata) => Promise<void>
   private readonly processIdentityReader: (pid: number) => Promise<WrapperIdentity | null>
+  private readyCwd: string | undefined
+  private ensureReadyCwd: string | undefined
 
   constructor(options: RuntimeOptions = {}) {
     this.command = options.command ?? (process.env.CODEX_CMD || 'codex')
     this.commandArgs = options.commandArgs ?? []
+    this.defaultCwd = normalizeLaunchCwd(options.cwd)
     this.env = options.env
     this.requestTimeoutMs = options.requestTimeoutMs
     this.startupAttemptLimit = options.startupAttemptLimit ?? DEFAULT_STARTUP_ATTEMPT_LIMIT
@@ -553,19 +563,38 @@ export class CodexAppServerRuntime {
     return this.statusValue
   }
 
-  async ensureReady(): Promise<ReadyState> {
+  private assertCompatibleLaunchCwd(requestedCwd: string | undefined, activeCwd: string | undefined): void {
+    if (!requestedCwd || requestedCwd === activeCwd) return
+    throw new Error(
+      activeCwd
+        ? `Codex app-server sidecar is already starting or running in cwd ${activeCwd}; it cannot be reused for cwd ${requestedCwd}.`
+        : `Codex app-server sidecar is already starting or running without an explicit cwd; it cannot be reused for cwd ${requestedCwd}.`,
+    )
+  }
+
+  async ensureReady(cwd?: string): Promise<ReadyState> {
     if (this.shutdownRequested) {
       throw new Error('Codex app-server sidecar is shutting down.')
     }
     await this.assertNoBlockedOwnership('ensure Codex app-server sidecar readiness')
-    if (this.ready) return this.ready
-    if (this.ensureReadyPromise) return this.ensureReadyPromise
+    const launchCwd = normalizeLaunchCwd(cwd) ?? this.defaultCwd
+    if (this.ready) {
+      this.assertCompatibleLaunchCwd(launchCwd, this.readyCwd)
+      return this.ready
+    }
+    if (this.ensureReadyPromise) {
+      this.assertCompatibleLaunchCwd(launchCwd, this.ensureReadyCwd)
+      return this.ensureReadyPromise
+    }
 
-    this.ensureReadyPromise = this.startRuntime().finally(() => {
+    this.ensureReadyCwd = launchCwd
+    this.ensureReadyPromise = this.startRuntime(launchCwd).finally(() => {
       this.ensureReadyPromise = null
+      this.ensureReadyCwd = undefined
     })
 
     this.ready = await this.ensureReadyPromise
+    this.readyCwd = launchCwd
     this.statusValue = 'running'
     return this.ready
   }
@@ -573,7 +602,7 @@ export class CodexAppServerRuntime {
   async startThread(
     params: Omit<CodexThreadStartParams, 'experimentalRawEvents' | 'persistExtendedHistory'>,
   ): Promise<{ threadId: string; wsUrl: string }> {
-    const ready = await this.ensureReady()
+    const ready = await this.ensureReady(params.cwd ?? undefined)
     const result = await this.client!.startThread(params)
     return {
       threadId: result.thread.id,
@@ -584,7 +613,7 @@ export class CodexAppServerRuntime {
   async resumeThread(
     params: Omit<CodexThreadResumeParams, 'persistExtendedHistory'>,
   ): Promise<{ threadId: string; wsUrl: string }> {
-    const ready = await this.ensureReady()
+    const ready = await this.ensureReady(params.cwd ?? undefined)
     const result = await this.client!.resumeThread(params)
     return {
       threadId: result.thread.id,
@@ -681,6 +710,8 @@ export class CodexAppServerRuntime {
       const pendingReady = this.ensureReadyPromise
       this.ready = null
       this.ensureReadyPromise = null
+      this.readyCwd = undefined
+      this.ensureReadyCwd = undefined
       this.statusValue = 'stopped'
 
       const client = this.client
@@ -702,7 +733,7 @@ export class CodexAppServerRuntime {
     await this.stopActiveChild()
   }
 
-  private async startRuntime(): Promise<ReadyState> {
+  private async startRuntime(cwd?: string): Promise<ReadyState> {
     await assertProcOwnershipProofAvailable()
     await this.waitForOwnershipTeardown()
     await this.assertNoBlockedOwnership('start a new Codex app-server sidecar')
@@ -726,6 +757,7 @@ export class CodexAppServerRuntime {
         wsUrl,
       ], {
         detached: true,
+        ...(cwd ? { cwd } : {}),
         env: {
           ...process.env,
           ...this.env,
@@ -948,6 +980,8 @@ export class CodexAppServerRuntime {
           this.child = null
           this.ready = null
           this.ensureReadyPromise = null
+          this.readyCwd = undefined
+          this.ensureReadyCwd = undefined
           this.statusValue = 'stopped'
         }
         resolve(launchError)
@@ -965,6 +999,8 @@ export class CodexAppServerRuntime {
       this.child = null
       this.ready = null
       this.ensureReadyPromise = null
+      this.readyCwd = undefined
+      this.ensureReadyCwd = undefined
       this.statusValue = 'stopped'
 
       const client = this.client
@@ -1003,6 +1039,9 @@ export class CodexAppServerRuntime {
     const child = this.child
     this.child = null
     this.ready = null
+    this.ensureReadyPromise = null
+    this.readyCwd = undefined
+    this.ensureReadyCwd = undefined
     this.statusValue = 'stopped'
 
     if (!ownership) {

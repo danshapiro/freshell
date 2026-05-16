@@ -14,6 +14,7 @@ function deferred<T = void>() {
 class FakeRuntime {
   shutdownCalls = 0
   ensureReadyCalls = 0
+  ensureReadyCwdCalls: Array<string | undefined> = []
   startThreadCalls = 0
   adopted: Array<{ terminalId: string; generation: number }> = []
   loadedThreadListCalls = 0
@@ -31,8 +32,9 @@ class FakeRuntime {
     private readonly loadedThreadLists: string[][] = [],
   ) {}
 
-  async ensureReady() {
+  async ensureReady(cwd?: string) {
     this.ensureReadyCalls += 1
+    this.ensureReadyCwdCalls.push(cwd)
     await this.ensureReadyBlocker
     if (this.ensureReadyError) throw this.ensureReadyError
     return {
@@ -96,6 +98,8 @@ describe('CodexLaunchPlanner', () => {
     expect(second.sessionId).toBeUndefined()
     expect(runtimes[0].startThreadCalls).toBe(0)
     expect(runtimes[1].startThreadCalls).toBe(0)
+    expect(runtimes[0].ensureReadyCwdCalls).toEqual(['/repo/one'])
+    expect(runtimes[1].ensureReadyCwdCalls).toEqual(['/repo/two'])
 
     await first.sidecar.adopt({ terminalId: 'term-one', generation: 1 })
     await second.sidecar.shutdown()
@@ -328,5 +332,14 @@ describe('CodexLaunchPlanner', () => {
 
     expect(plan.sessionId).toBe('thread-ready')
     expect(runtime.loadedThreadListCalls).toBe(0)
+  })
+
+  it('passes resume cwd to sidecar readiness', async () => {
+    const runtime = new FakeRuntime('ws://127.0.0.1:43024', 'thread-ready', undefined, [['thread-ready']])
+    const planner = new CodexLaunchPlanner(() => runtime as any)
+
+    await planner.planCreate({ resumeSessionId: 'thread-ready', cwd: '/repo/resume' })
+
+    expect(runtime.ensureReadyCwdCalls).toEqual(['/repo/resume'])
   })
 })
