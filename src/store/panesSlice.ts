@@ -32,7 +32,7 @@ type HydratePanesMeta = {
 }
 
 function buildPreservedSessionRef(
-  localContent: Extract<PaneContent, { kind: 'terminal' | 'agent-chat' }>,
+  localContent: Extract<PaneContent, { kind: 'terminal' | 'agent-chat' | 'fresh-agent' }>,
   _preservedResumeSessionId?: string,
 ) {
   return sanitizeSessionRef(localContent.sessionRef)
@@ -153,12 +153,14 @@ function normalizePaneContent(
   return input
 }
 
-function shouldPreferLocalAgentChatPaneDuringHydration(
+function shouldPreferLocalAgentPaneDuringHydration(
   localContent: PaneContent,
   incomingContent: PaneContent,
   meta: HydratePanesMeta | undefined,
 ): boolean {
-  if (localContent.kind !== 'agent-chat' || incomingContent.kind !== 'agent-chat') {
+  const localIsAgentPane = localContent.kind === 'agent-chat' || localContent.kind === 'fresh-agent'
+  const incomingIsAgentPane = incomingContent.kind === 'agent-chat' || incomingContent.kind === 'fresh-agent'
+  if (!localIsAgentPane || !incomingIsAgentPane || localContent.kind !== incomingContent.kind) {
     return false
   }
 
@@ -644,11 +646,14 @@ function mergeTerminalState(
       }
     }
 
-    // Agent-chat panes: prefer local sessionId and status when the local state
+    // Agent panes: prefer local sessionId and status when the local state
     // is more advanced. The persist debounce means incoming (from localStorage)
     // can be stale — e.g. status 'starting' when local has already reached 'connected'.
-    if (incoming.content?.kind === 'agent-chat' && local.content?.kind === 'agent-chat') {
-      if (shouldPreferLocalAgentChatPaneDuringHydration(local.content, incoming.content, meta)) {
+    if (
+      (incoming.content?.kind === 'agent-chat' || incoming.content?.kind === 'fresh-agent')
+      && incoming.content?.kind === local.content?.kind
+    ) {
+      if (shouldPreferLocalAgentPaneDuringHydration(local.content, incoming.content, meta)) {
         return local
       }
       if (incoming.content.createRequestId === local.content.createRequestId) {
