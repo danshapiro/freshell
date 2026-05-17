@@ -8,7 +8,6 @@ import {
   type PaneContentInput,
   type PaneNode,
   type PaneRefreshRequest,
-  type RestoreFallbackAttempt,
 } from './paneTypes'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { matchesDerivedPaneTitle } from '@/lib/pane-title'
