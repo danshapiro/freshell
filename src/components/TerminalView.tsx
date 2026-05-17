@@ -252,6 +252,12 @@ type LaunchAttemptState = {
   attachReady: boolean
 }
 
+type PendingDurableReplacement = {
+  terminalId: string
+  requestId: string
+  reason: 'opencode_replay_window_exceeded'
+}
+
 type SentViewport = {
   terminalId: string
   cols: number
@@ -461,6 +467,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     requestId: string
     terminalId: string
   } | null>(null)
+  const pendingDurableReplacementRef = useRef<PendingDurableReplacement | null>(null)
   const serverInstanceIdRef = useRef(serverInstanceId)
   const searchTerminalIdCleanupRef = useRef<string | null>(terminalContent?.terminalId ?? null)
   const deferredAttachStateRef = useRef<DeferredAttachState>({
@@ -1876,6 +1883,84 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       return true
     }
 
+    const completeDurableReplacement = (pending: PendingDurableReplacement) => {
+      if (pendingDurableReplacementRef.current?.requestId !== pending.requestId) {
+        return
+      }
+      pendingDurableReplacementRef.current = null
+      addTerminalRestoreRequestId(pending.requestId)
+      requestIdRef.current = pending.requestId
+      terminalIdRef.current = undefined
+      launchAttemptRef.current = null
+      currentAttachRef.current = null
+      deferredAttachStateRef.current = {
+        mode: 'none',
+        pendingIntent: null,
+        pendingSinceSeq: 0,
+      }
+      setIsAttaching(false)
+      setTruncatedHistoryGap(null)
+      dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
+      applySeqState(createAttachSeqState())
+      updateContent({
+        terminalId: undefined,
+        serverInstanceId: undefined,
+        createRequestId: pending.requestId,
+        status: 'creating',
+        restoreError: undefined,
+      })
+      const currentTab = tabRef.current
+      if (currentTab) {
+        dispatch(updateTab({ id: currentTab.id, updates: { status: 'creating' } }))
+      }
+    }
+
+    const beginOpenCodeReplacementAfterExit = (terminalId: string) => {
+      const current = contentRef.current
+      const sessionRef = current?.sessionRef
+      if (
+        current?.mode !== 'opencode'
+        || sessionRef?.provider !== 'opencode'
+        || !sessionRef.sessionId
+      ) {
+        return false
+      }
+
+      const existing = pendingDurableReplacementRef.current
+      if (existing?.terminalId === terminalId) {
+        return true
+      }
+
+      const requestId = nanoid()
+      pendingDurableReplacementRef.current = {
+        terminalId,
+        requestId,
+        reason: 'opencode_replay_window_exceeded',
+      }
+      clearRateLimitRetry()
+      currentAttachRef.current = null
+      launchAttemptRef.current = null
+      deferredAttachStateRef.current = {
+        mode: 'none',
+        pendingIntent: null,
+        pendingSinceSeq: 0,
+      }
+      setIsAttaching(true)
+      setTruncatedHistoryGap(null)
+      dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
+      clearTerminalCursor(terminalId)
+      forgetSentViewport(terminalId)
+      lastSentViewportRef.current = null
+      applySeqState(createAttachSeqState())
+      try {
+        term.writeln('\r\n[Restarting OpenCode session because the saved terminal replay is no longer available]\r\n')
+      } catch {
+        // disposed
+      }
+      ws.send({ type: 'terminal.kill', terminalId })
+      return true
+    }
+
     async function ensure() {
       clearRateLimitRetry()
       // Connection is owned by App.tsx; messages will queue until ready
@@ -2021,6 +2106,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           // byte-budget truncation (recoverable), not ring overflow (data gone).
           const isTruncatedReplay = msg.reason === 'replay_budget_exceeded'
             && seqStateRef.current.pendingReplay
+          const isUnrecoverableOpenCodeViewportHydrate = msg.reason === 'replay_window_exceeded'
+            && currentAttachRef.current?.intent === 'viewport_hydrate'
+            && currentAttachRef.current.sinceSeq === 0
+            && !hiddenRef.current
+            && contentRef.current?.mode === 'opencode'
+            && contentRef.current.sessionRef?.provider === 'opencode'
+          if (isUnrecoverableOpenCodeViewportHydrate && beginOpenCodeReplacementAfterExit(tid)) {
+            return
+          }
+
           if (isTruncatedReplay) {
             setTruncatedHistoryGap({ fromSeq: msg.fromSeq, toSeq: msg.toSeq })
           } else {
@@ -2164,6 +2259,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         }
 
         if (msg.type === 'terminal.exit' && msg.terminalId === tid) {
+          const pendingReplacement = pendingDurableReplacementRef.current
+          if (pendingReplacement?.terminalId === tid) {
+            completeDurableReplacement(pendingReplacement)
+            return
+          }
+
           const launchAttempt = launchAttemptRef.current
           const exitedDuringLaunch = launchAttempt?.terminalId === tid && !launchAttempt.attachReady
           if (exitedDuringLaunch) {
@@ -2337,6 +2438,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const currentTerminalId = terminalIdRef.current
           const current = contentRef.current
           const launchAttempt = launchAttemptRef.current
+          const pendingReplacement = pendingDurableReplacementRef.current
           if (debugRef.current) log.debug('[TRACE resumeSessionId] INVALID_TERMINAL_ID received', {
             paneId: paneIdRef.current,
             msgTerminalId: msg.terminalId,
@@ -2344,6 +2446,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             currentResumeSessionId: current?.resumeSessionId,
             currentStatus: current?.status,
           })
+          if (
+            pendingReplacement
+            && (!msg.terminalId || msg.terminalId === pendingReplacement.terminalId)
+          ) {
+            completeDurableReplacement(pendingReplacement)
+            return
+          }
           if (msg.terminalId && msg.terminalId !== currentTerminalId) {
             // Show feedback if the terminal already exited (the ID was cleared by
             // the exit handler, so msg.terminalId no longer matches the ref)

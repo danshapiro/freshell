@@ -3136,6 +3136,7 @@ describe('TerminalView lifecycle updates', () => {
       requestId?: string
       ackInitialAttach?: boolean
       refreshOnMount?: boolean
+      sessionRef?: TerminalPaneContent['sessionRef']
     }) {
       const tabId = 'tab-v2-stream'
       const paneId = 'pane-v2-stream'
@@ -3151,6 +3152,7 @@ describe('TerminalView lifecycle updates', () => {
         mode,
         shell: 'system',
         ...(terminalId ? { terminalId } : {}),
+        ...(opts?.sessionRef ? { sessionRef: opts.sessionRef } : {}),
       }
 
       const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
@@ -3173,6 +3175,7 @@ describe('TerminalView lifecycle updates', () => {
               titleSetByUser: false,
               createRequestId: requestId,
               ...(terminalId ? { terminalId } : {}),
+              ...(opts?.sessionRef ? { sessionRef: opts.sessionRef } : {}),
             }],
             activeTabId: tabId,
           },
@@ -4064,6 +4067,107 @@ describe('TerminalView lifecycle updates', () => {
       })
       expect(attach?.sinceSeq).toBe(0)
       expect(attach?.attachRequestId).toBeTruthy()
+    })
+
+    it('recreates a restored OpenCode pane when visible viewport hydration cannot replay startup output', async () => {
+      const sessionRef = { provider: 'opencode', sessionId: 'ses_focus_replay_gap' } as const
+      const addedRestoreIds = new Set<string>()
+      restoreMocks.addTerminalRestoreRequestId.mockImplementation((id: string) => {
+        addedRestoreIds.add(id)
+      })
+      restoreMocks.consumeTerminalRestoreRequestId.mockImplementation((id: string) => {
+        if (addedRestoreIds.has(id)) {
+          addedRestoreIds.delete(id)
+          return true
+        }
+        return false
+      })
+
+      const { store, tabId, paneId, terminalId, rerender } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-opencode-focus-gap',
+        mode: 'opencode',
+        hidden: true,
+        clearSends: false,
+        requestId: 'req-opencode-focus-gap',
+        sessionRef,
+      })
+
+      wsMocks.send.mockClear()
+
+      rerender(
+        <Provider store={store}>
+          <TerminalViewFromStore tabId={tabId} paneId={paneId} hidden={false} />
+        </Provider>,
+      )
+
+      let attach: any
+      await waitFor(() => {
+        attach = wsMocks.send.mock.calls
+          .map(([msg]) => msg)
+          .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+        expect(attach?.attachRequestId).toBeTruthy()
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 120,
+          replayFromSeq: 42,
+          replayToSeq: 120,
+          attachRequestId: attach.attachRequestId,
+        })
+      })
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 1,
+          toSeq: 41,
+          reason: 'replay_window_exceeded',
+          attachRequestId: attach.attachRequestId,
+        } as any)
+      })
+
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith({
+          type: 'terminal.kill',
+          terminalId,
+        })
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.exit',
+          terminalId,
+          exitCode: 0,
+        })
+      })
+
+      let replacementRequestId: string | undefined
+      await waitFor(() => {
+        const layout = store.getState().panes.layouts[tabId]
+        expect(layout?.type).toBe('leaf')
+        if (layout?.type !== 'leaf' || layout.content.kind !== 'terminal') {
+          throw new Error('expected terminal pane')
+        }
+        expect(layout.content.terminalId).toBeUndefined()
+        expect(layout.content.status).toBe('creating')
+        expect(layout.content.sessionRef).toEqual(sessionRef)
+        replacementRequestId = layout.content.createRequestId
+        expect(replacementRequestId).not.toBe('req-opencode-focus-gap')
+      })
+
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'terminal.create',
+          requestId: replacementRequestId,
+          mode: 'opencode',
+          sessionRef,
+          restore: true,
+        }))
+      })
     })
 
     it('does not send terminal.resize when an already-live terminal is hidden and revealed with unchanged geometry', async () => {
