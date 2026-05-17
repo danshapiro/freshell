@@ -284,7 +284,7 @@ export class LayoutStore {
       return { kind: 'browser', url: opts.browser, devToolsOpen: false }
     }
     if (opts.editor) {
-      return { kind: 'editor', filePath: opts.editor, language: null, readOnly: false, content: '', viewMode: 'source' }
+      return { kind: 'editor', filePath: opts.editor, language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true }
     }
     return { kind: 'terminal', terminalId: opts.terminalId }
   }

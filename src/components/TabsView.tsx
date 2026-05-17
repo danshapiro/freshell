@@ -143,6 +143,7 @@ function sanitizePaneSnapshot(
       readOnly: !!payload.readOnly,
       content: '',
       viewMode: (payload.viewMode as 'source' | 'preview') || 'source',
+      wordWrap: payload.wordWrap !== false,
     }
   }
   if (snapshot.kind === 'agent-chat') {

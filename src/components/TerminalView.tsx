@@ -1292,6 +1292,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
                 readOnly: false,
                 content: '',
                 viewMode: 'source',
+                wordWrap: true,
               })
             },
           })))

@@ -101,6 +101,8 @@ export type EditorPaneContent = {
   content: string
   /** View mode: source editor or rendered preview */
   viewMode: 'source' | 'preview'
+  /** Line wrap toggle (default true) */
+  wordWrap: boolean
 }
 
 /**

@@ -135,6 +135,9 @@ vi.mock('lucide-react', () => ({
   Code: ({ className }: { className?: string }) => (
     <svg data-testid="code-icon" className={className} />
   ),
+  WrapText: ({ className }: { className?: string }) => (
+    <svg data-testid="wrap-text-icon" className={className} />
+  ),
   FileText: ({ className }: { className?: string }) => (
     <svg data-testid="file-text-icon" className={className} />
   ),
@@ -1425,6 +1428,53 @@ describe('PaneContainer', () => {
       expect(screen.getByTestId('editor-pane-loading')).toBeInTheDocument()
       expect(screen.getByRole('status')).toHaveTextContent('Loading editor...')
       expect(await screen.findByTestId('monaco-mock')).toBeInTheDocument()
+    })
+
+    it('renders word wrap toggle and dispatches wordWrap update to store when clicked', async () => {
+      const editorContent: EditorPaneContent = {
+        kind: 'editor',
+        filePath: '/test.ts',
+        language: 'typescript',
+        readOnly: false,
+        content: 'code',
+        viewMode: 'source',
+        wordWrap: true,
+      }
+
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: editorContent,
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': node },
+        activePane: { 'tab-1': 'pane-1' },
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store
+      )
+
+      expect(await screen.findByTestId('monaco-mock')).toBeInTheDocument()
+
+      const wrapButton = screen.getByRole('button', { name: /disable line wrap/i })
+      expect(wrapButton).toBeInTheDocument()
+
+      fireEvent.click(wrapButton)
+
+      await waitFor(() => {
+        const state = store.getState()
+        const layout = state.panes.layouts['tab-1']
+        expect(layout).toBeDefined()
+        if (layout?.type === 'leaf') {
+          const content = layout.content
+          if (content.kind === 'editor') {
+            expect(content.wordWrap).toBe(false)
+          }
+        }
+      })
     })
   })
 

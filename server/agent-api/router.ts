@@ -490,7 +490,7 @@ export function createAgentApiRouter({
       if (wantsBrowser) {
         paneContent = { kind: 'browser', url: browser, devToolsOpen: false }
       } else if (wantsEditor) {
-        paneContent = { kind: 'editor', filePath: editor, language: null, readOnly: false, content: '', viewMode: 'source' }
+        paneContent = { kind: 'editor', filePath: editor, language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true }
       } else {
         const effectiveMode = mode || 'shell'
         const acceptedSessionRef = acceptedSessionRefForMode(requestedSessionRef, effectiveMode)
@@ -970,7 +970,7 @@ export function createAgentApiRouter({
       const resolved = resolvePaneTarget(rawPaneId)
       if (rejectPaneTargetError(res, resolved)) return
       const paneId = resolved.paneId || rawPaneId
-      const direction = req.body?.direction || 'vertical'
+      const direction = req.body?.direction || 'horizontal'
       const wantsBrowser = !!req.body?.browser
       const wantsEditor = !!req.body?.editor
       const splitMode = !wantsBrowser && !wantsEditor ? req.body?.mode || 'shell' : undefined
@@ -1009,7 +1009,7 @@ export function createAgentApiRouter({
       if (wantsBrowser) {
         content = { kind: 'browser', url: req.body.browser, devToolsOpen: false }
       } else if (wantsEditor) {
-        content = { kind: 'editor', filePath: req.body.editor, language: null, readOnly: false, content: '', viewMode: 'source' }
+        content = { kind: 'editor', filePath: req.body.editor, language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true }
       } else {
         const terminalMode = splitMode ?? 'shell'
         launch = await resolveSpawnProviderSettings(
