@@ -162,6 +162,7 @@ export default function EditorPane({
   const [editorValue, setEditorValue] = useState(content)
   const [currentLanguage, setCurrentLanguage] = useState<string | null>(language)
   const [currentViewMode, setCurrentViewMode] = useState<'source' | 'preview'>(viewMode)
+  const [wordWrap, setWordWrap] = useState(true)
   const [terminalCwds, setTerminalCwds] = useState<Record<string, string>>({})
   const [filePickerMessage, setFilePickerMessage] = useState<string | null>(null)
 
@@ -692,6 +693,10 @@ export default function EditorPane({
     updateContent({ viewMode: nextMode })
   }, [currentViewMode, updateContent])
 
+  const handleToggleWordWrap = useCallback(() => {
+    setWordWrap((prev) => !prev)
+  }, [])
+
   const handleReloadFromDisk = useCallback(() => {
     if (!conflictState) return
     if (autoSaveTimer.current) {
@@ -830,6 +835,8 @@ export default function EditorPane({
             showViewToggle={showPreviewToggle}
             defaultBrowseRoot={defaultBrowseRoot}
             inputRef={pathInputRef}
+            wordWrap={wordWrap}
+            onWordWrapToggle={handleToggleWordWrap}
           />
         </div>
       </div>
@@ -906,6 +913,7 @@ export default function EditorPane({
               automaticLayout: true,
               tabSize: 2,
               readOnly,
+              wordWrap: wordWrap ? 'on' : 'off',
             }}
           />
         )}
