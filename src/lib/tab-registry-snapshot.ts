@@ -36,6 +36,7 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
         language: content.language,
         readOnly: content.readOnly,
         viewMode: content.viewMode,
+        wordWrap: content.wordWrap,
       }
     case 'agent-chat':
       return {

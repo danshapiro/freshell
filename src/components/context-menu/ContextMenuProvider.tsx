@@ -207,6 +207,7 @@ export function ContextMenuProvider({
           readOnly: false,
           content: '',
           viewMode: 'source',
+          wordWrap: true,
         },
       }))
       return

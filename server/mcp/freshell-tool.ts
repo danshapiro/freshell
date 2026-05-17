@@ -54,7 +54,7 @@ FRESHELL_URL and FRESHELL_TOKEN are already set in your environment.
 ## Choosing the right action
 
 - **split-pane vs new-tab:** When the user says "pane", "split", "alongside", "next to", or "side by side", use split-pane. Use new-tab only when the user explicitly says "tab", "window", or "new [thing]" with no spatial reference. When unsure, split-pane is the safer default -- it keeps work in one tab.
-- **split-pane defaults to side-by-side (left/right):** By default, split-pane splits vertically to create left/right panes. Use direction: "horizontal" when you want stacked (top/bottom) panes instead.
+- **split-pane defaults to side-by-side (left/right):** By default, split-pane splits horizontally to create left/right panes. Use direction: "vertical" when you want stacked (top/bottom) panes instead.
 - **Prefer specialized pane types:** Do NOT open a terminal to run cat/vim/nano/curl/wget when a dedicated pane type is a better fit.
   - "open/edit/show a file" -> split-pane({ editor: "/absolute/path" }) or new-tab({ editor: "/absolute/path" }). Use the editor pane type for any file that can be displayed as text (source code, markdown, configs, logs, etc.). The editor renders files with syntax highlighting. Only open a terminal to edit a file when you need to run interactive commands; for passive file viewing, prefer the editor pane.
   - "open/show a URL" or "view a webpage" -> split-pane({ browser: "https://..." }) or open-browser({ url: "https://..." })
@@ -351,7 +351,7 @@ Tab commands:
   prev-tab        Switch to the previous tab.
 
 Pane commands:
-  split-pane      Split a pane. Params: target?, direction? (horizontal=top/bottom, vertical=left/right; defaults to vertical → left/right), mode?, shell?, cwd?, browser?, editor?
+  split-pane      Split a pane. Params: target?, direction? (horizontal=left/right, vertical=top/bottom; defaults to horizontal = left/right), mode?, shell?, cwd?, browser?, editor?
                    Omit target to split your own pane (the pane where this MCP server was spawned). Returns { paneId, tabId }.
   list-panes      List panes. Params: target? (tab ID or title to filter by). Returns { panes: [...] }.
   select-pane     Activate a pane. Params: target (pane ID or index)
