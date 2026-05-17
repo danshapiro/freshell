@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, type MutableRefObject } from 'react'
-import { FolderOpen, Eye, Code } from 'lucide-react'
+import { FolderOpen, Eye, Code, WrapText } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { cn } from '@/lib/utils'
@@ -16,6 +16,8 @@ export interface EditorToolbarProps {
   showViewToggle: boolean
   defaultBrowseRoot?: string | null
   inputRef?: MutableRefObject<HTMLInputElement | null>
+  wordWrap?: boolean
+  onWordWrapToggle?: () => void
 }
 
 function withTrailingSeparator(value: string): string {
@@ -35,6 +37,8 @@ export default function EditorToolbar({
   showViewToggle,
   defaultBrowseRoot,
   inputRef,
+  wordWrap = true,
+  onWordWrapToggle,
 }: EditorToolbarProps) {
   const [inputValue, setInputValue] = useState(filePath || '')
   const [showSuggestions, setShowSuggestions] = useState(false)
@@ -203,6 +207,17 @@ export default function EditorToolbar({
           aria-label={viewMode === 'source' ? 'Preview' : 'Source'}
         >
           {viewMode === 'source' ? <Eye className="h-4 w-4" /> : <Code className="h-4 w-4" />}
+        </Button>
+      )}
+      {onWordWrapToggle && (
+        <Button
+          variant={wordWrap ? 'secondary' : 'ghost'}
+          size="icon"
+          onClick={onWordWrapToggle}
+          title={wordWrap ? 'Disable line wrap' : 'Enable line wrap'}
+          aria-label={wordWrap ? 'Disable line wrap' : 'Enable line wrap'}
+        >
+          <WrapText className="h-4 w-4" />
         </Button>
       )}
     </div>
