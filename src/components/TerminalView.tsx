@@ -119,12 +119,16 @@ const LIGHT_THEME_MIN_CONTRAST_RATIO = 4.5
 const DEFAULT_MIN_CONTRAST_RATIO = 1
 const MAX_LAST_SENT_VIEWPORT_CACHE_ENTRIES = 200
 const TRUNCATED_REPLAY_BYTES = 128 * 1024
+const OPENCODE_REDRAW_REPLAY_BYTES = 1
+const OPENCODE_REDRAW_RESIZE_DELAY_MS = 150
 const INPUT_BLOCKED_NOTICE_THROTTLE_MS = 2000
 
 function viewportHydrateReplayOptions(content?: TerminalPaneContent | null): { maxReplayBytes: number } | undefined {
-  return content?.mode === 'opencode'
-    ? undefined
-    : { maxReplayBytes: TRUNCATED_REPLAY_BYTES }
+  return {
+    maxReplayBytes: content?.mode === 'opencode'
+      ? OPENCODE_REDRAW_REPLAY_BYTES
+      : TRUNCATED_REPLAY_BYTES,
+  }
 }
 
 type TerminalInputBlockedReason =
@@ -238,10 +242,26 @@ interface TerminalViewProps {
 
 type AttachIntent = 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect'
 
+type CurrentAttachState = {
+  requestId: string
+  intent: AttachIntent
+  terminalId: string
+  sinceSeq: number
+  cols: number
+  rows: number
+}
+
 type DeferredAttachState = {
   mode: 'none' | 'waiting_for_geometry' | 'attaching' | 'live'
   pendingIntent: AttachIntent | null
   pendingSinceSeq: number
+}
+
+type PendingOpencodeRedrawResize = {
+  attachRequestId: string
+  terminalId: string
+  cols: number
+  rows: number
 }
 
 type LaunchAttemptState = {
@@ -442,14 +462,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const terminalIdRef = useRef<string | undefined>(terminalContent?.terminalId)
   const seqStateRef = useRef<AttachSeqState>(createAttachSeqState())
   const attachCounterRef = useRef(0)
-  const currentAttachRef = useRef<{
-    requestId: string
-    intent: AttachIntent
-    terminalId: string
-    sinceSeq: number
-    cols: number
-    rows: number
-  } | null>(null)
+  const currentAttachRef = useRef<CurrentAttachState | null>(null)
+  const lastOpencodeRedrawAttachRequestIdRef = useRef<string | null>(null)
+  const opencodeRedrawResizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pendingOpencodeRedrawResizeRef = useRef<PendingOpencodeRedrawResize | null>(null)
   const launchAttemptRef = useRef<LaunchAttemptState | null>(null)
   const suppressNextMatchingResizeRef = useRef<{
     terminalId: string
@@ -868,6 +884,64 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     layoutSchedulerRef.current?.request()
   }, [])
 
+  const sendTerminalResize = useCallback((terminalId: string, cols: number, rows: number) => {
+    if (suppressNetworkEffects) return false
+    ws.send({ type: 'terminal.resize', terminalId, cols, rows })
+    rememberSentViewport(terminalId, cols, rows)
+    lastSentViewportRef.current = { terminalId, cols, rows }
+    return true
+  }, [suppressNetworkEffects, ws])
+
+  const clearPendingOpencodeRedrawResize = useCallback((restoreOriginalSize: boolean) => {
+    if (opencodeRedrawResizeTimerRef.current) {
+      clearTimeout(opencodeRedrawResizeTimerRef.current)
+      opencodeRedrawResizeTimerRef.current = null
+    }
+    const pending = pendingOpencodeRedrawResizeRef.current
+    pendingOpencodeRedrawResizeRef.current = null
+    if (restoreOriginalSize && pending) {
+      sendTerminalResize(pending.terminalId, pending.cols, pending.rows)
+    }
+  }, [sendTerminalResize])
+
+  const requestOpencodeViewportRedraw = useCallback((attach: CurrentAttachState) => {
+    clearPendingOpencodeRedrawResize(true)
+
+    const redrawRows = attach.rows > 2 ? attach.rows - 1 : attach.rows + 1
+    const pending: PendingOpencodeRedrawResize = {
+      attachRequestId: attach.requestId,
+      terminalId: attach.terminalId,
+      cols: attach.cols,
+      rows: attach.rows,
+    }
+    pendingOpencodeRedrawResizeRef.current = pending
+
+    sendTerminalResize(attach.terminalId, attach.cols, redrawRows)
+    // Hold back ordinary layout flushes from immediately undoing the repaint trigger.
+    suppressNextMatchingResizeRef.current = {
+      terminalId: attach.terminalId,
+      cols: attach.cols,
+      rows: attach.rows,
+    }
+
+    opencodeRedrawResizeTimerRef.current = setTimeout(() => {
+      opencodeRedrawResizeTimerRef.current = null
+      if (pendingOpencodeRedrawResizeRef.current !== pending) return
+      pendingOpencodeRedrawResizeRef.current = null
+
+      const latestAttach = currentAttachRef.current
+      if (
+        !latestAttach
+        || latestAttach.requestId !== pending.attachRequestId
+        || latestAttach.terminalId !== pending.terminalId
+      ) {
+        return
+      }
+
+      sendTerminalResize(pending.terminalId, pending.cols, pending.rows)
+    }, OPENCODE_REDRAW_RESIZE_DELAY_MS)
+  }, [clearPendingOpencodeRedrawResize, sendTerminalResize])
+
   const flushScheduledLayout = useCallback(() => {
     const term = termRef.current
     if (!term) return
@@ -905,10 +979,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             && lastSentViewport.rows === term.rows
           if (matchesSuppressedViewport) {
             suppressNextMatchingResizeRef.current = null
-          } else if (!matchesLastSentViewport && !suppressNetworkEffects) {
-            ws.send({ type: 'terminal.resize', terminalId: tid, cols: term.cols, rows: term.rows })
-            rememberSentViewport(tid, term.cols, term.rows)
-            lastSentViewportRef.current = { terminalId: tid, cols: term.cols, rows: term.rows }
+          } else if (!matchesLastSentViewport) {
+            sendTerminalResize(tid, term.cols, term.rows)
           }
         }
       }
@@ -920,7 +992,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     if (shouldFocus) {
       term.focus()
     }
-  }, [suppressNetworkEffects, ws])
+  }, [sendTerminalResize])
 
   const enqueueTerminalWrite = useCallback((data: string, onWritten?: () => void) => {
     if (!data) return
@@ -1652,6 +1724,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       pendingSinceSeq: sinceSeq,
     }
 
+    clearPendingOpencodeRedrawResize(true)
+
     const attachRequestId = `${paneIdRef.current}:${++attachCounterRef.current}:${nanoid(6)}`
     currentAttachRef.current = {
       requestId: attachRequestId,
@@ -1677,7 +1751,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     })
     rememberSentViewport(tid, cols, rows)
     lastSentViewportRef.current = { terminalId: tid, cols, rows }
-  }, [suppressNetworkEffects, ws, applySeqState, resetStartupProbeParser])
+  }, [suppressNetworkEffects, ws, applySeqState, resetStartupProbeParser, clearPendingOpencodeRedrawResize])
 
   const runRefreshAttach = useCallback((request: PaneRefreshRequest | null | undefined) => {
     if (suppressNetworkEffects) return false
@@ -1769,7 +1843,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     setBackgroundHydrationTriggered(false)
     const tid = terminalIdRef.current
     if (!tid || !hiddenRef.current) return
-    attachTerminal(tid, 'viewport_hydrate', { clearViewportFirst: true })
+    attachTerminal(tid, 'viewport_hydrate', {
+      clearViewportFirst: true,
+      ...viewportHydrateReplayOptions(contentRef.current),
+    })
   }, [backgroundHydrationTriggered, attachTerminal])
 
   // Create or attach to backend terminal
@@ -2016,13 +2093,25 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             return
           }
 
+          const currentAttach = currentAttachRef.current
+          const shouldRequestOpencodeRedraw = contentRef.current?.mode === 'opencode'
+            && currentAttach?.intent === 'viewport_hydrate'
+            && (msg.reason === 'replay_budget_exceeded' || msg.reason === 'replay_window_exceeded')
+            && lastOpencodeRedrawAttachRequestIdRef.current !== currentAttach.requestId
+          if (shouldRequestOpencodeRedraw && currentAttach) {
+            lastOpencodeRedrawAttachRequestIdRef.current = currentAttach.requestId
+            // After intentionally skipping stale alternate-screen replay, force OpenCode to repaint.
+            requestOpencodeViewportRedraw(currentAttach)
+          }
+
           // Only show "load more" when the server confirms the gap is from
           // byte-budget truncation (recoverable), not ring overflow (data gone).
           const isTruncatedReplay = msg.reason === 'replay_budget_exceeded'
             && seqStateRef.current.pendingReplay
+            && !shouldRequestOpencodeRedraw
           if (isTruncatedReplay) {
             setTruncatedHistoryGap({ fromSeq: msg.fromSeq, toSeq: msg.toSeq })
-          } else {
+          } else if (!shouldRequestOpencodeRedraw) {
             const reason = msg.reason === 'replay_window_exceeded'
               ? 'reconnect window exceeded'
               : 'slow link backlog'
@@ -2537,6 +2626,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
     return () => {
       clearRateLimitRetry()
+      clearPendingOpencodeRedrawResize(true)
       unsub()
       unsubReconnect()
       if (hydrationRegisteredRef.current) {
@@ -2574,6 +2664,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     markAttachComplete,
     resetStartupProbeParser,
     runRefreshAttach,
+    clearPendingOpencodeRedrawResize,
+    requestOpencodeViewportRedraw,
   ])
 
   useEffect(() => {
