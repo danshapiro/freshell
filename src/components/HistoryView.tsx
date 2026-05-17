@@ -127,6 +127,7 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
       firstUserMessage: session.firstUserMessage,
       isSubagent: session.isSubagent,
       isNonInteractive: session.isNonInteractive,
+      hasTitle: !!session.title,
     }))
     onOpenSession?.()
   }

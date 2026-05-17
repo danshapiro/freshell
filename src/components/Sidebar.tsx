@@ -6,7 +6,7 @@ import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { shallowEqual } from 'react-redux'
 import { openSessionTab, setActiveTab, updateTab } from '@/store/tabsSlice'
-import { addPane, setActivePane } from '@/store/panesSlice'
+import { addPane, setActivePane, updatePaneTitle } from '@/store/panesSlice'
 import { findPaneForSession } from '@/lib/session-utils'
 import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
@@ -19,7 +19,7 @@ import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { fetchSessionWindow } from '@/store/sessionsThunks'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 import { collectBusySessionKeys } from '@/lib/pane-activity'
-import { selectPrimaryTerminalIdForTab, selectTabIdByTerminalId } from '@/store/selectors/paneTerminalSelectors'
+import { selectPrimaryTerminalIdForTab } from '@/store/selectors/paneTerminalSelectors'
 import type { ChatSessionState } from '@/store/agentChatTypes'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 
@@ -39,23 +39,6 @@ function sameSessionRef(
   return a.provider === b.provider && a.sessionId === b.sessionId
 }
 
-function sameCodexDurability(
-  a?: BackgroundTerminal['codexDurability'],
-  b?: BackgroundTerminal['codexDurability'],
-): boolean {
-  if (a === b) return true
-  if (!a || !b) return false
-  return a.state === b.state
-    && a.durableThreadId === b.durableThreadId
-    && a.candidate?.candidateThreadId === b.candidate?.candidateThreadId
-    && a.candidate?.rolloutPath === b.candidate?.rolloutPath
-    && a.turnCompletedAt === b.turnCompletedAt
-    && a.nonRestorableReason === b.nonRestorableReason
-    && a.lastProofFailure?.reason === b.lastProofFailure?.reason
-    && a.lastProofFailure?.message === b.lastProofFailure?.message
-    && a.lastProofFailure?.checkedAt === b.lastProofFailure?.checkedAt
-}
-
 /** Compare two BackgroundTerminal arrays by sidebar-relevant fields only.
  *  Ignores terminal `lastActivityAt` since it changes frequently but doesn't affect rendering. */
 export function areTerminalsEqual(a: BackgroundTerminal[], b: BackgroundTerminal[]): boolean {
@@ -70,8 +53,7 @@ export function areTerminalsEqual(a: BackgroundTerminal[], b: BackgroundTerminal
       ai.status !== bi.status ||
       ai.hasClients !== bi.hasClients ||
       ai.mode !== bi.mode ||
-      !sameSessionRef(ai.sessionRef, bi.sessionRef) ||
-      !sameCodexDurability(ai.codexDurability, bi.codexDurability)
+      !sameSessionRef(ai.sessionRef, bi.sessionRef)
     ) return false
   }
   return true
@@ -102,10 +84,6 @@ export function areSessionItemsEqual(a: SessionItem[], b: SessionItem[]): boolea
       ai.cwd !== bi.cwd ||
       ai.projectPath !== bi.projectPath ||
       ai.isFallback !== bi.isFallback ||
-      ai.isRestorable !== bi.isRestorable ||
-      !sameCodexDurability(ai.codexDurability, bi.codexDurability) ||
-      ai.codexDurabilityState !== bi.codexDurabilityState ||
-      ai.codexDurabilityReason !== bi.codexDurabilityReason ||
       ai.timestamp !== bi.timestamp
     ) return false
   }
@@ -162,33 +140,8 @@ function isSessionItemEqual(a: SessionItem, b: SessionItem): boolean {
     a.hasTitle === b.hasTitle &&
     a.isSubagent === b.isSubagent &&
     a.isNonInteractive === b.isNonInteractive &&
-    a.firstUserMessage === b.firstUserMessage &&
-    a.isRestorable === b.isRestorable &&
-    sameCodexDurability(a.codexDurability, b.codexDurability) &&
-    a.codexDurabilityState === b.codexDurabilityState &&
-    a.codexDurabilityReason === b.codexDurabilityReason
+    a.firstUserMessage === b.firstUserMessage
   )
-}
-
-function getCodexDurabilityStatusLabel(item: SessionItem): string | undefined {
-  if (item.provider !== 'codex') return undefined
-  switch (item.codexDurabilityState) {
-    case 'identity_pending':
-      return 'Preparing restore'
-    case 'captured_pre_turn':
-    case 'turn_in_progress_unproven':
-      return 'Restore pending'
-    case 'proof_checking':
-      return 'Checking restore'
-    case 'durable_resuming':
-      return 'Restoring'
-    case 'durability_unproven_after_completion':
-      return 'Restore not verified'
-    case 'non_restorable':
-      return 'Not restorable'
-    default:
-      return undefined
-  }
 }
 
 /**
@@ -380,34 +333,6 @@ export default function Sidebar({
     const currentActiveTabId = state.tabs.activeTabId
     const runningTerminalId = item.isRunning ? item.runningTerminalId : undefined
     const localServerInstanceId = state.connection.serverInstanceId
-    const liveTerminal = runningTerminalId && localServerInstanceId
-      ? { terminalId: runningTerminalId, serverInstanceId: localServerInstanceId }
-      : undefined
-
-    if (runningTerminalId && item.isRestorable === false) {
-      const existingTabId = selectTabIdByTerminalId(state, runningTerminalId)
-      if (existingTabId) {
-        dispatch(setActiveTab(existingTabId))
-        const activePaneId = state.panes.activePane[existingTabId]
-        if (activePaneId) {
-          dispatch(setActivePane({ tabId: existingTabId, paneId: activePaneId }))
-        }
-        onNavigate('terminal')
-        return
-      }
-      dispatch(openSessionTab({
-        sessionId: item.sessionId,
-        title: item.title,
-        cwd: item.cwd,
-        provider,
-        sessionType: item.sessionType || provider,
-        terminalId: runningTerminalId,
-        isRestorable: false,
-        codexDurability: item.codexDurability,
-      }))
-      onNavigate('terminal')
-      return
-    }
 
     // 1. Dedup: if session is already open in a pane, focus it
     const existing = findPaneForSession(
@@ -416,6 +341,13 @@ export default function Sidebar({
       localServerInstanceId,
     )
     if (existing) {
+      const existingTab = state.tabs.tabs.find((t) => t.id === existing.tabId)
+      if (existingTab && item.title && item.hasTitle && item.title !== existingTab.title && !existingTab.titleSetByUser) {
+        dispatch(updateTab({ id: existingTab.id, updates: { title: item.title } }))
+      }
+      if (existing.paneId && item.hasTitle && item.title) {
+        dispatch(updatePaneTitle({ tabId: existing.tabId, paneId: existing.paneId, title: item.title, setByUser: false }))
+      }
       dispatch(setActiveTab(existing.tabId))
       if (existing.paneId) {
         dispatch(setActivePane({ tabId: existing.tabId, paneId: existing.paneId }))
@@ -442,11 +374,10 @@ export default function Sidebar({
         provider,
         sessionType,
         terminalId: runningTerminalId,
-        isRestorable: item.isRestorable,
         firstUserMessage: item.firstUserMessage,
         isSubagent: item.isSubagent,
         isNonInteractive: item.isNonInteractive,
-        codexDurability: item.codexDurability,
+        hasTitle: item.hasTitle,
       }))
       onNavigate('terminal')
       return
@@ -462,40 +393,23 @@ export default function Sidebar({
         provider,
         sessionType,
         terminalId: runningTerminalId,
-        isRestorable: item.isRestorable,
         firstUserMessage: item.firstUserMessage,
         isSubagent: item.isSubagent,
         isNonInteractive: item.isNonInteractive,
-        codexDurability: item.codexDurability,
+        hasTitle: item.hasTitle,
       }))
       onNavigate('terminal')
       return
     }
 
-    const newContent = item.isRestorable === false
-      ? {
-          kind: 'terminal' as const,
-          mode: provider,
-          initialCwd: item.cwd,
-          codexDurability: provider === 'codex' ? item.codexDurability : undefined,
-          ...(liveTerminal
-            ? {
-                terminalId: liveTerminal.terminalId,
-                serverInstanceId: liveTerminal.serverInstanceId,
-                status: 'running' as const,
-              }
-            : {}),
-        }
-      : buildResumeContent({
-          sessionType,
-          sessionId: item.sessionId,
-          cwd: item.cwd,
-          agentChatProviderSettings: providerSettings,
-          liveTerminal,
-        })
     dispatch(addPane({
       tabId: currentActiveTabId,
-      newContent,
+      newContent: buildResumeContent({
+        sessionType,
+        sessionId: item.sessionId,
+        cwd: item.cwd,
+        agentChatProviderSettings: providerSettings,
+      }),
     }))
     const activeTab = state.tabs.tabs.find((tab) => tab.id === currentActiveTabId)
     const sessionMetadataByKey = mergeSessionMetadataByKey(
@@ -509,7 +423,7 @@ export default function Sidebar({
         isNonInteractive: item.isNonInteractive,
       },
     )
-    if (activeTab && item.isRestorable !== false && sessionMetadataByKey !== activeTab.sessionMetadataByKey) {
+    if (activeTab && sessionMetadataByKey !== activeTab.sessionMetadataByKey) {
       dispatch(updateTab({
         id: currentActiveTabId,
         updates: { sessionMetadataByKey },
@@ -906,11 +820,7 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
     a.projectColor === b.projectColor &&
     a.cwd === b.cwd &&
     a.projectPath === b.projectPath &&
-    a.isFallback === b.isFallback &&
-    a.isRestorable === b.isRestorable &&
-    sameCodexDurability(a.codexDurability, b.codexDurability) &&
-    a.codexDurabilityState === b.codexDurabilityState &&
-    a.codexDurabilityReason === b.codexDurabilityReason
+    a.isFallback === b.isFallback
   )
 }
 
@@ -918,7 +828,6 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
   const { item, isActiveTab, isBusy = false, showProjectBadge, onClick } = props
   const extensionEntries = useAppSelector((s) => s.extensions?.entries)
   const { icon: SessionIcon, label: sessionLabel } = resolveSessionTypeConfig(item.sessionType, extensionEntries)
-  const codexStatusLabel = getCodexDurabilityStatusLabel(item)
   return (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -934,8 +843,7 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
           data-session-id={item.sessionId}
           data-provider={item.provider}
           data-session-type={item.sessionType}
-          data-is-running={item.isRunning ? 'true' : 'false'}
-          data-running-terminal-id={item.runningTerminalId ?? ''}
+          data-running-terminal-id={item.runningTerminalId}
           data-has-tab={item.hasTab ? 'true' : 'false'}
         >
           {/* Provider icon */}
@@ -952,7 +860,7 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
 
           {/* Content */}
           <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 min-w-0">
+            <div className="flex items-center gap-2">
               <span
                 className={cn(
                   'text-sm truncate',
@@ -963,11 +871,6 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
               </span>
               {item.archived && (
                 <Archive className="h-3 w-3 text-muted-foreground/70" aria-label="Archived session" />
-              )}
-              {codexStatusLabel && (
-                <span className="text-2xs text-muted-foreground/70 flex-shrink-0">
-                  {codexStatusLabel}
-                </span>
               )}
             </div>
             {item.subtitle && showProjectBadge && (
@@ -986,11 +889,6 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
       <TooltipContent>
         <div>{sessionLabel}: {item.title}</div>
         <div className="text-muted-foreground">{item.subtitle || item.projectPath || sessionLabel}</div>
-        {codexStatusLabel && (
-          <div className="text-muted-foreground">
-            {codexStatusLabel}{item.codexDurabilityReason ? `: ${item.codexDurabilityReason}` : ''}
-          </div>
-        )}
       </TooltipContent>
     </Tooltip>
   )
