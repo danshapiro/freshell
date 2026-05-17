@@ -3130,6 +3130,7 @@ describe('TerminalView lifecycle updates', () => {
     async function renderTerminalHarness(opts?: {
       status?: 'creating' | 'running'
       terminalId?: string
+      mode?: TerminalPaneContent['mode']
       hidden?: boolean
       clearSends?: boolean
       requestId?: string
@@ -3141,12 +3142,13 @@ describe('TerminalView lifecycle updates', () => {
       const requestId = opts?.requestId ?? 'req-v2-stream'
       const initialStatus = opts?.status ?? 'running'
       const terminalId = opts?.terminalId
+      const mode = opts?.mode ?? 'shell'
 
       const paneContent: TerminalPaneContent = {
         kind: 'terminal',
         createRequestId: requestId,
         status: initialStatus,
-        mode: 'shell',
+        mode,
         shell: 'system',
         ...(terminalId ? { terminalId } : {}),
       }
@@ -3165,9 +3167,9 @@ describe('TerminalView lifecycle updates', () => {
           tabs: {
             tabs: [{
               id: tabId,
-              mode: 'shell',
+              mode,
               status: initialStatus,
-              title: 'Shell',
+              title: mode === 'opencode' ? 'OpenCode' : 'Shell',
               titleSetByUser: false,
               createRequestId: requestId,
               ...(terminalId ? { terminalId } : {}),
@@ -4014,6 +4016,27 @@ describe('TerminalView lifecycle updates', () => {
         sinceSeq: 50,
         attachRequestId: expect.any(String),
       }))
+    })
+
+    it('does not cap OpenCode viewport hydration replay for restored running terminals', async () => {
+      const { terminalId } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-opencode-restored',
+        mode: 'opencode',
+        clearSends: false,
+      })
+
+      const attach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+
+      expect(attach).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      })
+      expect(attach).not.toHaveProperty('maxReplayBytes')
     })
 
     it('revealing a hidden running pane sends a viewport attach with sinceSeq=0', async () => {
