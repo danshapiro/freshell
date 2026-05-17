@@ -213,7 +213,7 @@ async function listFilesRecursive(rootDir: string): Promise<string[]> {
 async function waitForHttpJson(url: string, timeoutMs = 30_000): Promise<unknown> {
   return waitFor(`HTTP JSON at ${url}`, async () => {
     try {
-      const response = await fetch(url)
+      const response = await fetchWithTimeout(url)
       if (!response.ok) {
         return undefined
       }
@@ -222,6 +222,16 @@ async function waitForHttpJson(url: string, timeoutMs = 30_000): Promise<unknown
       return undefined
     }
   }, timeoutMs, 200)
+}
+
+async function fetchWithTimeout(url: string, timeoutMs = 2_000): Promise<Response> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(url, { signal: controller.signal })
+  } finally {
+    clearTimeout(timeout)
+  }
 }
 
 function parseJsonLines(text: string): unknown[] {
@@ -1268,11 +1278,15 @@ export async function waitForFileSizeIncrease(filePath: string, previousSize: nu
 }
 
 export async function fetchJson(url: string): Promise<any> {
-  const response = await fetch(url)
+  const response = await fetchWithTimeout(url)
   if (!response.ok) {
     throw new Error(`Expected a successful response from ${url}, received ${response.status}.`)
   }
   return response.json()
+}
+
+export async function waitForJsonResponse(url: string): Promise<any> {
+  return waitForHttpJson(url)
 }
 
 export async function waitForHttpBusyStatus(url: string, sessionId: string): Promise<Record<string, { type: string }>> {

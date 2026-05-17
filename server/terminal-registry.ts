@@ -258,7 +258,9 @@ function resolveCodingCliCommand(
     )
   }
   const effectiveModel = mode === 'opencode'
-    ? resolveOpencodeLaunchModel(providerSettings?.model, { ...process.env, ...commandEnv })
+    ? (resumeSessionId
+        ? undefined
+        : resolveOpencodeLaunchModel(providerSettings?.model, { ...process.env, ...commandEnv }))
     : providerSettings?.model
   if (effectiveModel && spec.modelArgs) {
     settingsArgs.push(...spec.modelArgs(effectiveModel))
