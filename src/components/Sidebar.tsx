@@ -381,7 +381,7 @@ export default function Sidebar({
       if (existingTab && item.title && item.hasTitle && item.title !== existingTab.title && !existingTab.titleSetByUser) {
         dispatch(updateTab({ id: existingTab.id, updates: { title: item.title } }))
       }
-      if (existing.paneId && item.hasTitle) {
+      if (existing.paneId && item.hasTitle && item.title) {
         dispatch(updatePaneTitle({ tabId: existing.tabId, paneId: existing.paneId, title: item.title, setByUser: false }))
       }
       dispatch(setActiveTab(existing.tabId))
@@ -403,36 +403,36 @@ export default function Sidebar({
     const paneLayouts = state.panes?.layouts ?? EMPTY_LAYOUTS
     const activeLayout = currentActiveTabId ? paneLayouts[currentActiveTabId] : undefined
     if (!currentActiveTabId || !activeLayout) {
-        dispatch(openSessionTab({
-          sessionId: item.sessionId,
-          title: item.title,
-          cwd: item.cwd,
-          provider,
-          sessionType,
-          terminalId: runningTerminalId,
-          firstUserMessage: item.firstUserMessage,
-          isSubagent: item.isSubagent,
-          isNonInteractive: item.isNonInteractive,
-          hasTitle: item.hasTitle,
-        }))
-        onNavigate('terminal')
-        return
-      }
+      dispatch(openSessionTab({
+        sessionId: item.sessionId,
+        title: item.title,
+        cwd: item.cwd,
+        provider,
+        sessionType,
+        terminalId: runningTerminalId,
+        firstUserMessage: item.firstUserMessage,
+        isSubagent: item.isSubagent,
+        isNonInteractive: item.isNonInteractive,
+        hasTitle: item.hasTitle,
+      }))
+      onNavigate('terminal')
+      return
+    }
 
-      // 3. Normal: open in new tab or split, based on user preference
-      const sessionOpenMode = state.settings.settings.panes?.sessionOpenMode ?? 'tab'
-      if (sessionOpenMode === 'tab') {
-        dispatch(openSessionTab({
-          sessionId: item.sessionId,
-          title: item.title,
-          cwd: item.cwd,
-          provider,
-          sessionType,
-          terminalId: runningTerminalId,
-          firstUserMessage: item.firstUserMessage,
-          isSubagent: item.isSubagent,
-          isNonInteractive: item.isNonInteractive,
-          hasTitle: item.hasTitle,
+    // 3. Normal: open in new tab or split, based on user preference
+    const sessionOpenMode = state.settings.settings.panes?.sessionOpenMode ?? 'tab'
+    if (sessionOpenMode === 'tab') {
+      dispatch(openSessionTab({
+        sessionId: item.sessionId,
+        title: item.title,
+        cwd: item.cwd,
+        provider,
+        sessionType,
+        terminalId: runningTerminalId,
+        firstUserMessage: item.firstUserMessage,
+        isSubagent: item.isSubagent,
+        isNonInteractive: item.isNonInteractive,
+        hasTitle: item.hasTitle,
       }))
       onNavigate('terminal')
       return

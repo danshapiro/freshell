@@ -201,7 +201,6 @@ export function buildSessionItems(
       const fallbackTitle = input.title?.trim()
       if (!existing.hasTitle && fallbackTitle) {
         existing.title = fallbackTitle
-        existing.hasTitle = true
       }
       const fallbackSessionType = input.metadata?.sessionType || input.sessionType
       if (fallbackSessionType && (!existing.sessionType || existing.sessionType === existing.provider)) {
@@ -232,7 +231,7 @@ export function buildSessionItems(
       provider: input.provider,
       sessionType: input.metadata?.sessionType || input.sessionType,
       title: fallbackTitle,
-      hasTitle: fallbackTitle !== input.sessionId.slice(0, 8),
+      hasTitle: false,
       subtitle: input.cwd ? getProjectName(input.cwd) : undefined,
       projectPath: input.cwd,
       timestamp: input.timestamp ?? 0,
