@@ -1010,6 +1010,38 @@ describe('buildSpawnSpec Unix paths', () => {
       expect(spec.args).toContain('openai/gpt-5-mini')
     })
 
+    it('does not pass a default OpenCode model when resuming a session', () => {
+      delete process.env.OPENCODE_CMD
+
+      const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system', 'ses_existing', {
+        model: 'abc',
+        opencodeServer: TEST_OPENCODE_SERVER,
+      })
+
+      expect(spec.args).toContain('--session')
+      expect(spec.args).toContain('ses_existing')
+      expect(spec.args).not.toContain('--model')
+      expect(spec.args).not.toContain('abc')
+    })
+
+    it('does not pass an inferred OpenCode model when resuming a session', () => {
+      delete process.env.OPENCODE_CMD
+      delete process.env.GOOGLE_GENERATIVE_AI_API_KEY
+      delete process.env.GOOGLE_API_KEY
+      delete process.env.OPENAI_API_KEY
+      delete process.env.ANTHROPIC_API_KEY
+      process.env.GEMINI_API_KEY = 'gemini-key'
+
+      const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system', 'ses_existing', {
+        opencodeServer: TEST_OPENCODE_SERVER,
+      })
+
+      expect(spec.args).toContain('--session')
+      expect(spec.args).toContain('ses_existing')
+      expect(spec.args).not.toContain('--model')
+      expect(spec.args).not.toContain('google/gemini-3-pro-preview')
+    })
+
     it('defaults OpenCode to a usable Google model and alias env when only GEMINI_API_KEY is set', () => {
       delete process.env.OPENCODE_CMD
       delete process.env.GOOGLE_GENERATIVE_AI_API_KEY

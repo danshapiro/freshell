@@ -10,7 +10,6 @@ import {
   captureCodexBootstrapEvents,
   captureCodexResumeBootstrapEvents,
   extractCodexResumeId,
-  fetchJson,
   findClaudeTranscript,
   findCodexSessionArtifacts,
   loadCodingCliSessionContractNote,
@@ -27,6 +26,7 @@ import {
   waitForFileSizeIncrease,
   waitForAnyHttpBusyStatus,
   waitForHttpHealthy,
+  waitForJsonResponse,
   waitForJsonLine,
   waitForOpencodeDbSession,
 } from '../../helpers/coding-cli/real-session-contract-harness.js'
@@ -451,7 +451,7 @@ describe.sequential('coding cli real provider session contract', () => {
             healthy: true,
             version: note.providers.opencode.version,
           })
-          expect(await fetchJson(statusUrl)).toEqual({})
+          expect(await waitForJsonResponse(statusUrl)).toEqual({})
 
         const attachedRun = await workspace.spawnProcess(
           opencodePath,
