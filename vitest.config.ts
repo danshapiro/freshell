@@ -41,6 +41,7 @@ export default defineConfig({
       'test/integration/session-repair.test.ts',
       'test/integration/session-search-e2e.test.ts',
       'test/e2e-browser/**',
+      'test/integration/real/**',
       // Electron tests run under vitest.electron.config.ts (node environment)
       'test/unit/electron/**',
       // Electron E2E tests run under Playwright, not Vitest
