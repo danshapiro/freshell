@@ -639,8 +639,8 @@ export const openSessionTab = createAsyncThunk(
           if (title && hasTitle && title !== existingTab.title && !existingTab.titleSetByUser) {
             dispatch(updateTab({ id: existingTab.id, updates: { title } }))
           }
-          if (hasTitle) {
-            dispatch(updatePaneTitleByTerminalId({ terminalId, title: title || '', setByUser: false }))
+          if (hasTitle && title) {
+            dispatch(updatePaneTitleByTerminalId({ terminalId, title, setByUser: false }))
           }
           dispatch(setActiveTab(existingTab.id))
           return
@@ -688,8 +688,29 @@ export const openSessionTab = createAsyncThunk(
         }
         if (hasTitle && title) {
           const layout = state.panes.layouts[existingTabId]
-          if (layout?.type === 'leaf') {
-            dispatch(updatePaneTitle({ tabId: existingTabId, paneId: layout.id, title, setByUser: false }))
+          if (layout) {
+            const syncPaneTitles = (node: PaneNode) => {
+              if (node.type === 'leaf') {
+                const content = node.content
+                const sessionRef = (content as { sessionRef?: { provider?: unknown; sessionId?: unknown } }).sessionRef
+                const matchesExplicitRef =
+                  typeof sessionRef?.provider === 'string'
+                  && typeof sessionRef?.sessionId === 'string'
+                  && sessionRef.provider === resolvedProvider
+                  && sessionRef.sessionId === sessionId
+                const matchesImplicitRef = (
+                  (content.kind === 'terminal' && content.mode === resolvedProvider && content.resumeSessionId === sessionId) ||
+                  (content.kind === 'agent-chat' && resolvedProvider === 'claude' && content.resumeSessionId === sessionId)
+                )
+                if (matchesExplicitRef || matchesImplicitRef) {
+                  dispatch(updatePaneTitle({ tabId: existingTabId, paneId: node.id, title, setByUser: false }))
+                }
+                return
+              }
+              syncPaneTitles(node.children[0])
+              syncPaneTitles(node.children[1])
+            }
+            syncPaneTitles(layout)
           }
         }
         repairExistingTabLayout(existingTab)
