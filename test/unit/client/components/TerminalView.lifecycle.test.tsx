@@ -4018,7 +4018,7 @@ describe('TerminalView lifecycle updates', () => {
       }))
     })
 
-    it('does not cap OpenCode viewport hydration replay for restored running terminals', async () => {
+    it('uses redraw-only replay for OpenCode viewport hydration of restored running terminals', async () => {
       const { terminalId } = await renderTerminalHarness({
         status: 'running',
         terminalId: 'term-opencode-restored',
@@ -4035,8 +4035,73 @@ describe('TerminalView lifecycle updates', () => {
         terminalId,
         intent: 'viewport_hydrate',
         sinceSeq: 0,
+        maxReplayBytes: 1,
       })
-      expect(attach).not.toHaveProperty('maxReplayBytes')
+    })
+
+    it('jiggles the PTY size to force an OpenCode redraw when redraw-only hydration reports a replay gap', async () => {
+      const { terminalId } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-opencode-redraw-gap',
+        mode: 'opencode',
+        clearSends: false,
+      })
+
+      const attach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+      const originalRows = attach!.rows
+      const redrawRows = originalRows > 2 ? originalRows - 1 : originalRows + 1
+
+      vi.useFakeTimers()
+      wsMocks.send.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 1,
+          toSeq: 50000,
+          reason: 'replay_budget_exceeded',
+          attachRequestId: attach!.attachRequestId,
+        } as any)
+      })
+
+      expect(wsMocks.send.mock.calls.map(([msg]) => msg)).toEqual([{
+        type: 'terminal.resize',
+        terminalId,
+        cols: attach!.cols,
+        rows: redrawRows,
+      }])
+
+      await act(async () => {
+        vi.advanceTimersByTime(149)
+      })
+      expect(wsMocks.send.mock.calls.map(([msg]) => msg)).toEqual([{
+        type: 'terminal.resize',
+        terminalId,
+        cols: attach!.cols,
+        rows: redrawRows,
+      }])
+
+      await act(async () => {
+        vi.advanceTimersByTime(1)
+      })
+      expect(wsMocks.send.mock.calls.map(([msg]) => msg)).toEqual([
+        {
+          type: 'terminal.resize',
+          terminalId,
+          cols: attach!.cols,
+          rows: redrawRows,
+        },
+        {
+          type: 'terminal.resize',
+          terminalId,
+          cols: attach!.cols,
+          rows: originalRows,
+        },
+      ])
+      expect(wsMocks.send.mock.calls.map(([msg]) => msg).filter((msg) => msg?.type === 'terminal.input')).toEqual([])
     })
 
     it('revealing a hidden running pane sends a viewport attach with sinceSeq=0', async () => {
