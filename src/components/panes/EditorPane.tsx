@@ -134,6 +134,7 @@ interface EditorPaneProps {
   readOnly?: boolean
   content: string
   viewMode?: 'source' | 'preview'
+  wordWrap?: boolean
 }
 
 export default function EditorPane({
@@ -144,6 +145,7 @@ export default function EditorPane({
   readOnly = false,
   content,
   viewMode = 'source',
+  wordWrap = true,
 }: EditorPaneProps) {
   const dispatch = useAppDispatch()
   const monacoTheme = useMonacoTheme()
@@ -162,7 +164,6 @@ export default function EditorPane({
   const [editorValue, setEditorValue] = useState(content)
   const [currentLanguage, setCurrentLanguage] = useState<string | null>(language)
   const [currentViewMode, setCurrentViewMode] = useState<'source' | 'preview'>(viewMode)
-  const [wordWrap, setWordWrap] = useState(true)
   const [terminalCwds, setTerminalCwds] = useState<Record<string, string>>({})
   const [filePickerMessage, setFilePickerMessage] = useState<string | null>(null)
 
@@ -326,6 +327,7 @@ export default function EditorPane({
       content: string
       readOnly: boolean
       viewMode: 'source' | 'preview'
+      wordWrap: boolean
     }>) => {
       const nextContent: EditorPaneContent = {
         kind: 'editor',
@@ -334,6 +336,7 @@ export default function EditorPane({
         readOnly: updates.readOnly !== undefined ? updates.readOnly : readOnly,
         content: updates.content !== undefined ? updates.content : editorValue,
         viewMode: updates.viewMode !== undefined ? updates.viewMode : currentViewMode,
+        wordWrap: updates.wordWrap !== undefined ? updates.wordWrap : wordWrap,
       }
 
       dispatch(
@@ -344,7 +347,7 @@ export default function EditorPane({
         })
       )
     },
-    [dispatch, tabId, paneId, filePath, currentLanguage, readOnly, editorValue, currentViewMode]
+    [dispatch, tabId, paneId, filePath, currentLanguage, readOnly, editorValue, currentViewMode, wordWrap]
   )
 
   const handlePathSelect = useCallback(
@@ -694,8 +697,9 @@ export default function EditorPane({
   }, [currentViewMode, updateContent])
 
   const handleToggleWordWrap = useCallback(() => {
-    setWordWrap((prev) => !prev)
-  }, [])
+    const next = !wordWrap
+    updateContent({ wordWrap: next })
+  }, [wordWrap, updateContent])
 
   const handleReloadFromDisk = useCallback(() => {
     if (!conflictState) return

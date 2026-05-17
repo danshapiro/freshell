@@ -620,6 +620,7 @@ function PickerWrapper({
           readOnly: false,
           content: '',
           viewMode: 'source',
+          wordWrap: true,
         }
       default:
         throw new Error(`Unsupported pane type: ${String(type)}`)
@@ -744,6 +745,7 @@ function renderContent(
             readOnly={content.readOnly}
             content={content.content}
             viewMode={content.viewMode}
+            wordWrap={content.wordWrap}
           />
         </Suspense>
       </ErrorBoundary>

@@ -65,6 +65,7 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
       readOnly: false,
       content: '',
       viewMode: 'source',
+      wordWrap: true,
     }
   } else {
     // 'shell' or default
