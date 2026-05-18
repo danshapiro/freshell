@@ -69,6 +69,7 @@ describe('fresh-agent resume history flow', () => {
   })
 
   it('creates a resumed freshclaude pane through freshAgent.create and hydrates from the fresh-agent snapshot', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000441'
     getFreshAgentThreadSnapshot.mockResolvedValue({
       revision: 4,
       status: 'idle',
@@ -91,7 +92,7 @@ describe('fresh-agent resume history flow', () => {
         provider: 'claude',
         createRequestId: 'req-resume',
         status: 'creating',
-        resumeSessionId: 'cli-session-1',
+        resumeSessionId: canonicalSessionId,
       } satisfies FreshAgentPaneContent,
     }))
 
@@ -106,7 +107,7 @@ describe('fresh-agent resume history flow', () => {
       requestId: 'req-resume',
       sessionType: 'freshclaude',
       provider: 'claude',
-      resumeSessionId: 'cli-session-1',
+      resumeSessionId: canonicalSessionId,
     }))
 
     const onMessage = wsOnMessage.mock.calls[0]?.[0]
