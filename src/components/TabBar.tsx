@@ -449,6 +449,24 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         className="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-muted-foreground/45"
         aria-hidden="true"
       />
+      {sidebarCollapsed && onToggleSidebar && (
+        <div
+          className={cn(
+            "flex-shrink-0 w-10 flex items-end justify-center pb-1",
+            !multirowTabs && "h-full"
+          )}
+          data-testid="desktop-sidebar-reopen-slot"
+        >
+          <button
+            className="p-1 min-h-11 min-w-11 md:h-8 md:w-8 md:min-h-0 md:min-w-0 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-colors"
+            title="Show sidebar"
+            aria-label="Show sidebar"
+            onClick={onToggleSidebar}
+          >
+            <PanelLeft className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
       <DndContext
         sensors={sensors}
         collisionDetection={multirowTabs ? rectIntersection : closestCenter}
@@ -490,16 +508,6 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
                 : "overflow-x-auto overflow-y-hidden scrollbar-none"
             )}
           >
-            {sidebarCollapsed && onToggleSidebar && (
-              <button
-                className="flex-shrink-0 mb-1 p-1 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-colors"
-                title="Show sidebar"
-                aria-label="Show sidebar"
-                onClick={onToggleSidebar}
-              >
-                <PanelLeft className="h-3.5 w-3.5" />
-              </button>
-            )}
             {tabs.map(renderSortableTab)}
           </div>
 

@@ -224,7 +224,7 @@ describe('TabBar multirow tabs', () => {
     expect(flexWrap!.className).not.toContain('overflow-x-hidden')
   })
 
-  it('keeps the sidebar reopen control inside the wrapped tab strip in multirow mode', () => {
+  it('does not apply h-full to sidebar reopen slot in multirow mode', () => {
     const tab = createTab({ id: 'tab-1' })
     const store = createStore({ tabs: [tab], activeTabId: 'tab-1', multirowTabs: true })
     const { container } = renderWithStore(
@@ -232,9 +232,8 @@ describe('TabBar multirow tabs', () => {
       store,
     )
 
-    const tabStrip = container.querySelector('[data-testid="tab-strip"]')
-    const button = screen.getByRole('button', { name: 'Show sidebar' })
-    expect(tabStrip).not.toBeNull()
-    expect(tabStrip).toContainElement(button)
+    const slot = container.querySelector('[data-testid="desktop-sidebar-reopen-slot"]')
+    expect(slot).not.toBeNull()
+    expect(slot!.className).not.toContain('h-full')
   })
 })
