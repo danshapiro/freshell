@@ -80,6 +80,7 @@ describe('OpencodeProvider', () => {
 
   it('lists root sessions from the OpenCode database', async () => {
     const dbPath = path.join(tempDir, 'opencode.db')
+    const walPath = `${dbPath}-wal`
     await fsp.writeFile(dbPath, 'fake sqlite file', 'utf8')
     FakeDatabaseSync.seed(dbPath, {
       projects: [
@@ -122,6 +123,7 @@ describe('OpencodeProvider', () => {
     const provider = new OpencodeProvider(tempDir)
     const sessions = await provider.listSessionsDirect()
 
+    expect(provider.getSessionGlob()).toEqual([dbPath, walPath])
     expect(provider.getSessionRoots()).toEqual([dbPath])
     expect(provider.supportsSessionResume()).toBe(true)
     expect(sessions).toEqual([
