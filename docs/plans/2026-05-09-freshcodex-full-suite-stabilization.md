@@ -64,6 +64,22 @@ Implement these contracts rather than one-off patches:
 
 Do not weaken, delete, or dilute valid tests to obtain green. When a test is obsolete, replace it with a stronger assertion for the accepted canonical contract.
 
+## 2026-05-16 PR Review Corrections
+
+The PR review found four valid closure gaps that belong in this stabilization plan before the branch can be treated as complete:
+
+- Production bootstrap must instantiate the Fresh Agent runtime manager, register Claude and Codex adapters, mount the REST router, and pass the same runtime manager into `WsHandler`. Unit tests that inject `freshAgentRuntimeManager` are not enough; `server/index.ts` must have direct production-wiring proof.
+- Fresh-agent create idempotency caches must be bounded by lifecycle. Duplicate `freshAgent.create` request ids may replay while a session is live, but `createdFreshAgentByRequestId` and `freshAgentCreateLocks` must be cleared when the session is killed and when the WebSocket handler shuts down.
+- The legacy `CodexTerminalSidecar` / `CodexDurableRolloutTracker` polling implementation must not coexist with the current launch-planner plus remote-proxy durability path. Keeping both creates a stale second design that contradicts the event-driven promotion contract.
+- `planCodexLaunchWithRetry()` needs direct unit coverage for transient retry, configuration-error short-circuit, and exhausted non-`Error` failures.
+
+Focused proof added for these corrections:
+
+- `/home/user/code/freshell/.worktrees/dev-green-20260516/test/unit/server/fresh-agent/production-wiring.test.ts`
+- `/home/user/code/freshell/.worktrees/dev-green-20260516/test/unit/server/ws-handler-fresh-agent.test.ts`
+- `/home/user/code/freshell/.worktrees/dev-green-20260516/test/unit/server/coding-cli/codex-app-server/legacy-sidecar-dead-code.test.ts`
+- `/home/user/code/freshell/.worktrees/dev-green-20260516/test/unit/server/coding-cli/codex-app-server/launch-retry.test.ts`
+
 ## Boundary Closure Matrix
 
 This is the matrix-first closure artifact for the plan. Implementation is not complete because a file is mentioned elsewhere in the plan; it is complete only when every boundary below has a production owner, one canonical enforcement point, and direct proof. If implementation discovers a new rich-agent identity boundary, add or update a row here before patching code.
