@@ -855,7 +855,7 @@ describe('Session-Terminal Association via onUpdate', () => {
     registry.shutdown()
   })
 
-  it('skips opencode sessions in onUpdate ownership pass', () => {
+  it('associates opencode sessions when resume is supported', () => {
     const registry = new TerminalRegistry()
     const broadcasts: any[] = []
 
@@ -876,8 +876,9 @@ describe('Session-Terminal Association via onUpdate', () => {
       }],
     }], broadcasts)
 
-    expect(broadcasts).toHaveLength(0)
-    expect(registry.get(term.terminalId)?.resumeSessionId).toBeUndefined()
+    expect(broadcasts).toHaveLength(1)
+    expect(broadcasts[0].terminalId).toBe(term.terminalId)
+    expect(registry.get(term.terminalId)?.resumeSessionId).toBe('opencode-session-123')
 
     registry.shutdown()
   })

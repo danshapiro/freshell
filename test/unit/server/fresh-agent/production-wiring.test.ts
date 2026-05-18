@@ -20,4 +20,4 @@ describe('fresh-agent production wiring', () => {
     expect(source).toContain('codexFreshAgentRuntime')
     expect(source).toMatch(/codexFreshAgentRuntime,\s*\n\s*terminalShutdownTimeoutMs/)
   })
-}
+})
