@@ -168,7 +168,10 @@ describe('TabsView', () => {
           kind: 'agent-chat',
           payload: {
             provider: 'freshclaude',
-            resumeSessionId: '00000000-0000-4000-8000-000000000444',
+            sessionRef: {
+              provider: 'claude',
+              sessionId: '00000000-0000-4000-8000-000000000444',
+            },
             modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
             permissionMode: 'plan',
             effort: 'turbo',
@@ -199,8 +202,8 @@ describe('TabsView', () => {
       sessionRef: {
         provider: 'claude',
         sessionId: '00000000-0000-4000-8000-000000000444',
-        serverInstanceId: 'srv-remote',
       },
+      serverInstanceId: 'srv-remote',
       modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
       permissionMode: 'plan',
       effort: 'turbo',
@@ -418,8 +421,8 @@ describe('TabsView', () => {
     expect(layout?.content?.sessionRef).toEqual({
       provider: 'codex',
       sessionId: 'codex-session-123',
-      serverInstanceId: 'srv-remote',
     })
+    expect(layout?.content?.serverInstanceId).toBe('srv-remote')
   })
 
   it('shows pane kind icons with distinct colors', () => {
