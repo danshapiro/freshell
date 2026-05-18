@@ -3097,7 +3097,6 @@ describe('TerminalView lifecycle updates', () => {
       requestId?: string
       ackInitialAttach?: boolean
       refreshOnMount?: boolean
-      mode?: TerminalPaneContent['mode']
       sessionRef?: TerminalPaneContent['sessionRef']
     }) {
       const tabId = 'tab-v2-stream'
