@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { allocateLocalhostPort, type LoopbackServerEndpoint } from '../../local-port.js'
 import { logger } from '../../logger.js'
+import { convertWindowsPathToWslPath, isWslEnvironment, sanitizeUserPathInput } from '../../path-utils.js'
 import {
   CodexAppServerClient,
   type CodexAppServerDisconnectEvent,
@@ -66,6 +67,7 @@ type ChildProcessHandle = ReturnType<typeof spawn>
 type RuntimeOptions = {
   command?: string
   commandArgs?: string[]
+  cwd?: string
   env?: NodeJS.ProcessEnv
   requestTimeoutMs?: number
   startupAttemptLimit?: number
@@ -99,6 +101,16 @@ const OWNERSHIP_SCHEMA_VERSION = 1
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function resolveAppServerCwd(cwd: string | undefined): string | undefined {
+  if (typeof cwd !== 'string') return undefined
+  const candidate = sanitizeUserPathInput(cwd)
+  if (!candidate) return undefined
+  if (isWslEnvironment()) {
+    return convertWindowsPathToWslPath(candidate) ?? candidate
+  }
+  return candidate
 }
 
 function defaultMetadataDir(): string {
@@ -511,6 +523,7 @@ export class CodexAppServerRuntime {
 
   private readonly command: string
   private readonly commandArgs: string[]
+  private readonly cwd?: string
   private readonly env?: NodeJS.ProcessEnv
   private readonly requestTimeoutMs?: number
   private readonly startupAttemptLimit: number
@@ -525,6 +538,7 @@ export class CodexAppServerRuntime {
   constructor(options: RuntimeOptions = {}) {
     this.command = options.command ?? (process.env.CODEX_CMD || 'codex')
     this.commandArgs = options.commandArgs ?? []
+    this.cwd = resolveAppServerCwd(options.cwd)
     this.env = options.env
     this.requestTimeoutMs = options.requestTimeoutMs
     this.startupAttemptLimit = options.startupAttemptLimit ?? DEFAULT_STARTUP_ATTEMPT_LIMIT
@@ -706,6 +720,7 @@ export class CodexAppServerRuntime {
         wsUrl,
       ], {
         detached: true,
+        ...(this.cwd ? { cwd: this.cwd } : {}),
         env: {
           ...process.env,
           ...this.env,
