@@ -83,9 +83,8 @@ const OTHER_CLAUDE_SESSION_ID = '6f1c2b3a-4d5e-6f70-8a9b-0c1d2e3f4a5b'
 const TEST_OPENCODE_SERVER = { hostname: '127.0.0.1' as const, port: 4173 }
 
 function expectCodexMcpArgs(args: string[]) {
-  // Bell notification still present
-  expect(args).toContain('-c')
-  expect(args).toContain('tui.notification_method=bel')
+  expect(args).not.toContain('tui.notification_method=bel')
+  expect(args).not.toContain("tui.notifications=['agent-turn-complete']")
   // MCP server config instead of skills.config
   const mcpArg = args.find(a => a.includes('mcp_servers.freshell'))
   expect(mcpArg).toBeDefined()
@@ -1722,8 +1721,8 @@ describe('buildSpawnSpec resume validation on Windows shells', () => {
     expect(spec.args).toContain('-NoExit')
     expect(spec.args[3]).toContain("& 'C:\\Program Files\\Codex\\codex.cmd'")
     expect(spec.args[3]).toContain("'-c'")
-    expect(spec.args[3]).toContain("'tui.notification_method=bel'")
-    expect(spec.args[3]).toContain("'tui.notifications=[''agent-turn-complete'']'")
+    expect(spec.args[3]).not.toContain("'tui.notification_method=bel'")
+    expect(spec.args[3]).not.toContain("'tui.notifications=[''agent-turn-complete'']'")
     expect(spec.args[3]).toContain("'resume'")
     expect(spec.args[3]).toContain("'session-123'")
   })
