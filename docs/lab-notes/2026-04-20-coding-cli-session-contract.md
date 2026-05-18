@@ -102,6 +102,16 @@ The implementation plan file is dated `2026-04-19` because the design work was w
       "canonicalIdentity": "session-id",
       "runEventSessionIdMatchesDbId": true,
       "busyStatusUsesAuthoritativeSessionId": true,
+      "tuiVisualRestoreSurface": "terminal-state",
+      "httpTuiFramebufferAvailable": false,
+      "hiddenRestoreCreateWithoutAttachIsDeterministic": false,
+      "viewportHydrateSinceSeq": 0,
+      "viewportHydrateReplayGapIsRestoreFailure": true,
+      "redrawNudgesAreRestoreContract": false,
+      "testedHiddenRestorePolicies": [
+        "immediate_attach_after_terminal_created",
+        "defer_create_until_visible"
+      ],
       "titleOnResumeMutatesStoredTitle": false,
       "sessionSubcommands": [
         "list",
@@ -316,6 +326,30 @@ Observed control behavior:
 - `/session/status` returned `{}` while idle.
 - During an attached `opencode run ... --attach http://127.0.0.1:<port>`, `/session/status` returned the same authoritative `sessionID` with `{ "type": "busy" }`.
 
+### 2026-05-17 TUI visual restore addendum
+
+The 2026-05-17 source pass showed that OpenCode's visible UI is terminal-rendered state, not an HTTP-rendered state Freshell can query after the fact.
+
+- Freshell launches OpenCode as a PTY process, appends `--hostname 127.0.0.1 --port <allocated>`, and for restored panes passes `--session <root>` from the canonical `sessionRef`.
+- OpenCode's HTTP API exposes session metadata, messages, status, events, and TUI control routes, but no canonical framebuffer, screen snapshot, or render-state endpoint was found in the tested OpenCode 1.15.3 surface.
+- Therefore Freshell cannot reconstruct an OpenCode TUI from HTTP after terminal startup frames are missed. The terminal pane model must either preserve terminal state through live attachment and replay from startup, or add a server-side terminal emulator or snapshot owner.
+
+The 2026-05-17 restart failure was a terminal viewport hydration failure, not proof that the OpenCode sessions failed to resume.
+
+- Restored OpenCode creates were requested, bound, created, and still running as `opencode --hostname 127.0.0.1 --port <port> --session <root>` processes.
+- Later visible `viewport_hydrate` attaches requested `sinceSeq: 0` after the replay-ring prefix had already been evicted, producing `terminal_stream_replay_miss` and `terminal_stream_gap` with `reason: "replay_window_exceeded"`.
+- Hidden restored panes with no persisted `terminalId` had started PTYs, stored the new terminal id on `terminal.created`, and deferred `terminal.attach`; that ordering allowed OpenCode startup control frames and first paint output to be missed.
+- Ctrl-L, resize nudges, delayed redraws, and larger replay budgets are not restore contracts. A replay gap during OpenCode viewport hydration is a visible restore failure unless Freshell has another authoritative terminal-state snapshot.
+
+Two focused client lifecycle policies were tested against this failure:
+
+| Policy | Test proof | Product tradeoff |
+| --- | --- | --- |
+| Immediate hidden attach after `terminal.created` | A focused lifecycle test failed before the prototype because hidden restored OpenCode sent no `terminal.attach`, then passed when the client attached immediately after `terminal.created`. | Preserves prewarmed restored panes, but still depends on create-then-attach rather than a formally atomic create-and-attach protocol. |
+| Defer hidden restored OpenCode create until visible | A focused lifecycle test failed before the prototype because hidden restored OpenCode sent `terminal.create`, then passed when the restore request remained unconsumed until reveal. | Deterministically removes hidden-output-before-attach. Hidden restored OpenCode panes become queued restores, not live background terminals, until clicked or otherwise made visible. |
+
+The production recommendation from the addendum is the defer-create policy for hidden restored OpenCode panes, combined with normal immediate visible create and attach. If Freshell later needs background live OpenCode restores, the next architecture should be an explicit atomic create-and-attach protocol or server-side terminal emulator/snapshot support.
+
 Title semantics were probed with:
 
 ```bash
@@ -334,4 +368,7 @@ Allowed Freshell behavior:
 
 - Canonical OpenCode identity is the authoritative `sessionID`.
 - Busy or restore state may only be promoted from the control surface or the canonical DB/session events.
+- Hidden restored OpenCode panes should not start a PTY until visible unless Freshell also creates a live terminal attachment or server-side terminal emulator before OpenCode can emit startup control frames.
+- A replay gap during OpenCode `viewport_hydrate` is a visible restore failure, not a condition to repair with Ctrl-L, resize, redraw delay, or a larger replay cap.
+- OpenCode HTTP can support a native session browser or timeline UI, but it cannot reconstruct the terminal TUI screen in the tested 1.15.3 surface.
 - Titles are metadata and do not replace session identity.
