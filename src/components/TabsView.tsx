@@ -34,6 +34,7 @@ import {
 } from '@/store/paneTypes'
 import type { CodingCliProviderName, TabMode } from '@/store/types'
 import { buildRestoreError, migrateLegacyAgentChatDurableState } from '@shared/session-contract'
+import { normalizeFreshAgentSessionType, resolveFreshAgentRuntimeProvider } from '@shared/fresh-agent'
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                             */
@@ -168,24 +169,34 @@ function sanitizePaneSnapshot(
     }
   }
   if (snapshot.kind === 'fresh-agent') {
-    const resumeSessionId = payload.resumeSessionId as string | undefined
-    const provider = ((payload.provider as string | undefined) || 'claude') as CodingCliProviderName
-    const sessionRef = resolveSessionRef({ payload })
-    const restoreError = sessionRef || sameServer
-      ? undefined
-      : buildRestoreError('missing_canonical_identity')
+    const sessionType = normalizeFreshAgentSessionType(payload.sessionType)
+      ?? normalizeFreshAgentSessionType(payload.provider)
+    const provider = (
+      payload.provider === 'claude'
+      || payload.provider === 'codex'
+      || payload.provider === 'opencode'
+    )
+      ? payload.provider
+      : resolveFreshAgentRuntimeProvider(sessionType)
+    if (!sessionType || !provider) return { kind: 'picker' }
+    const resumeSessionId = typeof payload.resumeSessionId === 'string'
+      ? payload.resumeSessionId
+      : undefined
+    const sessionRef = resolveSessionRef({
+      payload,
+      fallbackProvider: provider,
+      fallbackSessionId: resumeSessionId,
+    })
     return {
       kind: 'fresh-agent',
-      provider: provider as any,
-      sessionType: ((payload.sessionType as string | undefined) || 'freshclaude') as any,
-      resumeSessionId: sameServer ? resumeSessionId : undefined,
-      sessionId: sameServer && typeof payload.sessionId === 'string' ? payload.sessionId : undefined,
-      sessionRef,
-      ...(restoreError ? { restoreError } : {}),
-      serverInstanceId: sameServer ? record.serverInstanceId : undefined,
+      sessionType,
+      provider,
+      resumeSessionId,
+      ...(sessionRef ? { sessionRef } : {}),
+      serverInstanceId: record.serverInstanceId,
       initialCwd: payload.initialCwd as string | undefined,
-      modelSelection: normalizeAgentChatModelSelection(payload.modelSelection, provider === 'claude' ? payload.model : undefined),
       model: payload.model as string | undefined,
+      modelSelection: normalizeAgentChatModelSelection(payload.modelSelection, payload.model),
       permissionMode: payload.permissionMode as string | undefined,
       sandbox: payload.sandbox as 'read-only' | 'workspace-write' | 'danger-full-access' | undefined,
       effort: normalizeAgentChatEffortOverride(payload.effort),
@@ -202,14 +213,20 @@ function sanitizePaneSnapshot(
   return { kind: 'picker' }
 }
 
-function deriveModeFromContent(content: PaneContentInput): TabMode {
-  if (content.kind === 'terminal') return content.mode || 'shell'
+function deriveModeFromRecord(record: RegistryTabRecord): TabMode {
+  const firstKind = record.panes[0]?.kind
+  if (firstKind === 'terminal') {
+    const mode = record.panes[0]?.payload?.mode
+    if (typeof mode === 'string') return mode as TabMode
+    return 'shell'
+  }
+  if (firstKind === 'agent-chat') return 'claude'
+  if (firstKind === 'fresh-agent') {
+    const provider = record.panes[0]?.payload?.provider
+    if (typeof provider === 'string' && isNonShellMode(provider)) return provider as TabMode
+    return 'claude'
+  }
   return 'shell'
-}
-
-function deriveModeFromSanitizedContents(contents: readonly PaneContentInput[]): TabMode {
-  if (contents.some((content) => content.kind === 'fresh-agent')) return 'shell'
-  return contents[0] ? deriveModeFromContent(contents[0]) : 'shell'
 }
 
 function paneKindIcon(kind: RegistryPaneSnapshot['kind']): LucideIcon {
@@ -602,7 +619,7 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
       addTab({
         id: tabId,
         title: record.tabName,
-        mode: deriveModeFromSanitizedContents(sanitizedContents),
+        mode: deriveModeFromRecord(record),
         status: 'creating',
         serverInstanceId: record.serverInstanceId,
       }),
@@ -621,7 +638,7 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
       addTab({
         id: tabId,
         title: `${record.tabName} · ${pane.title || pane.kind}`,
-        mode: deriveModeFromContent(content),
+        mode: deriveModeFromRecord(record),
         status: 'creating',
         serverInstanceId: record.serverInstanceId,
       }),

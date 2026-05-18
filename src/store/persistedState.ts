@@ -6,7 +6,7 @@ import {
   migrateLegacyTerminalDurableState,
   sanitizeSessionRef,
 } from '@shared/session-contract'
-import { migrateLegacyFreshAgentNode } from '@shared/fresh-agent'
+import { migrateLegacyFreshAgentContent } from '@shared/fresh-agent'
 import { normalizeAgentChatEffortOverride, normalizeAgentChatModelSelection } from './paneTypes'
 
 export { LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY }
@@ -225,7 +225,14 @@ function normalizeAgentChatContent(content: Record<string, unknown>): Record<str
 
 function normalizeFreshAgentContent(content: Record<string, unknown>): Record<string, unknown> {
   const provider = typeof content.provider === 'string' ? content.provider : undefined
-  const sanitizedSessionRef = sanitizeSessionRef(content.sessionRef)
+  const durableState = provider === 'claude'
+    ? migrateLegacyAgentChatDurableState({
+        sessionRef: content.sessionRef,
+        cliSessionId: typeof content.cliSessionId === 'string' ? content.cliSessionId : undefined,
+        timelineSessionId: typeof content.timelineSessionId === 'string' ? content.timelineSessionId : undefined,
+        resumeSessionId: typeof content.resumeSessionId === 'string' ? content.resumeSessionId : undefined,
+      })
+    : { sessionRef: sanitizeSessionRef(content.sessionRef) }
   const existingRestoreError = (
     content.restoreError
     && typeof content.restoreError === 'object'
@@ -248,8 +255,8 @@ function normalizeFreshAgentContent(content: Record<string, unknown>): Record<st
       ...rest,
       ...(typeof legacyModel === 'string' ? { model: legacyModel } : {}),
       effort: normalizeAgentChatEffortOverride(legacyEffort),
-      ...(sanitizedSessionRef ? { sessionRef: sanitizedSessionRef } : {}),
-      ...(!sanitizedSessionRef && existingRestoreError ? { restoreError: existingRestoreError } : {}),
+      ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
+      ...(!durableState.sessionRef && existingRestoreError ? { restoreError: existingRestoreError } : {}),
     }
   }
 
@@ -257,8 +264,10 @@ function normalizeFreshAgentContent(content: Record<string, unknown>): Record<st
     ...rest,
     modelSelection: normalizeAgentChatModelSelection(legacyModelSelection, legacyModel),
     effort: normalizeAgentChatEffortOverride(legacyEffort),
-    ...(sanitizedSessionRef ? { sessionRef: sanitizedSessionRef } : {}),
-    ...(!sanitizedSessionRef && existingRestoreError ? { restoreError: existingRestoreError } : {}),
+    ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
+    ...((('restoreError' in durableState && durableState.restoreError) || existingRestoreError)
+      ? { restoreError: ('restoreError' in durableState && durableState.restoreError) || existingRestoreError }
+      : {}),
   }
 }
 
@@ -267,7 +276,7 @@ function normalizePersistedNode(node: unknown): unknown {
 
   const candidate = node as Record<string, unknown>
   if (candidate.type === 'leaf' && candidate.content && typeof candidate.content === 'object') {
-    const content = candidate.content as Record<string, unknown>
+    const content = migrateLegacyFreshAgentContent(candidate.content as Record<string, unknown>) as Record<string, unknown>
     let nextContent = content
     if (content.kind === 'terminal') {
       nextContent = normalizeTerminalContent(content)
@@ -304,10 +313,7 @@ function normalizePersistedNode(node: unknown): unknown {
 
 function normalizePersistedLayouts(layouts: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(
-    Object.entries(layouts).map(([tabId, node]) => [
-      tabId,
-      migrateLegacyFreshAgentNode(normalizePersistedNode(node)),
-    ]),
+    Object.entries(layouts).map(([tabId, node]) => [tabId, normalizePersistedNode(node)]),
   )
 }
 

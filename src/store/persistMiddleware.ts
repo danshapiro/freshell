@@ -11,6 +11,7 @@ import { createLogger } from '@/lib/client-logger'
 import { flushPersistedLayoutNow } from './persistControl'
 import { sanitizeSessionRef } from '@shared/session-contract'
 import { normalizeAgentChatEffortOverride, normalizeAgentChatModelSelection } from './paneTypes'
+import { migrateLegacyFreshAgentContent } from '@shared/fresh-agent'
 
 
 const log = createLogger('PanesPersist')
@@ -133,6 +134,7 @@ function migratePaneContent(content: any): any {
   if (!content || typeof content !== 'object') {
     return content
   }
+  content = migrateLegacyFreshAgentContent(content)
   if (content.kind === 'agent-chat') {
     const { model: _legacyModel, ...rest } = content
     return {
