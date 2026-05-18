@@ -343,7 +343,8 @@ describe('update orchestrator', () => {
     it('returns false by default when no skip conditions are met', () => {
       const result = shouldSkipUpdateCheck({
         argv: ['node', 'script.js'],
-        env: { npm_lifecycle_event: 'preserve' }
+        env: { npm_lifecycle_event: 'preserve' },
+        branch: 'main',
       })
       expect(result).toBe(false)
     })
@@ -367,7 +368,8 @@ describe('update orchestrator', () => {
     it('returns false when SKIP_UPDATE_CHECK env var is other value', () => {
       const result = shouldSkipUpdateCheck({
         argv: ['node', 'script.js'],
-        env: { SKIP_UPDATE_CHECK: 'false' }
+        env: { SKIP_UPDATE_CHECK: 'false' },
+        branch: 'main',
       })
       expect(result).toBe(false)
     })
@@ -383,7 +385,8 @@ describe('update orchestrator', () => {
     it('returns false when npm_lifecycle_event is "preserve"', () => {
       const result = shouldSkipUpdateCheck({
         argv: ['node', 'script.js'],
-        env: { npm_lifecycle_event: 'preserve' }
+        env: { npm_lifecycle_event: 'preserve' },
+        branch: 'main',
       })
       expect(result).toBe(false)
     })
@@ -392,9 +395,50 @@ describe('update orchestrator', () => {
       // This is the key behavior change - NODE_ENV should not affect the check
       const result = shouldSkipUpdateCheck({
         argv: ['node', 'script.js'],
-        env: { NODE_ENV: 'development', npm_lifecycle_event: 'preserve' }
+        env: { NODE_ENV: 'development', npm_lifecycle_event: 'preserve' },
+        branch: 'main',
       })
       expect(result).toBe(false)
+    })
+
+    it('skips update checks on dev branch', () => {
+      const result = shouldSkipUpdateCheck({
+        argv: ['node', 'script.js'],
+        env: {},
+        branch: 'dev',
+      })
+
+      expect(result).toBe(true)
+    })
+
+    it('skips update checks on feature branches', () => {
+      const result = shouldSkipUpdateCheck({
+        argv: ['node', 'script.js'],
+        env: {},
+        branch: 'feature/x',
+      })
+
+      expect(result).toBe(true)
+    })
+
+    it('does not skip update checks on main branch by branch policy alone', () => {
+      const result = shouldSkipUpdateCheck({
+        argv: ['node', 'script.js'],
+        env: {},
+        branch: 'main',
+      })
+
+      expect(result).toBe(false)
+    })
+
+    it('skips update checks when branch detection fails', () => {
+      const result = shouldSkipUpdateCheck({
+        argv: ['node', 'script.js'],
+        env: {},
+        branch: undefined,
+      })
+
+      expect(result).toBe(true)
     })
 
     it('uses process.argv and process.env by default', () => {

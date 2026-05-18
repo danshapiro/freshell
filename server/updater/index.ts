@@ -2,6 +2,7 @@
 import { checkForUpdate } from './version-checker.js'
 import { promptForUpdate } from './prompt.js'
 import { executeUpdate, type UpdateProgress } from './executor.js'
+import { shouldSkipSourceUpdateForBranch } from '../../shared/selfhost-branch-policy.js'
 
 export type UpdateAction = 'none' | 'updated' | 'skipped' | 'error' | 'check-failed'
 
@@ -67,6 +68,7 @@ export async function runUpdateCheck(currentVersion: string): Promise<UpdateChec
  * - --skip-update-check CLI flag is present
  * - SKIP_UPDATE_CHECK env var is 'true'
  * - Running via 'npm run dev' (predev lifecycle event)
+ * - Current branch is not main or cannot be determined
  *
  * Does NOT skip based on NODE_ENV because that may be set persistently
  * in dev environments even when running 'npm run serve'.
@@ -74,6 +76,7 @@ export async function runUpdateCheck(currentVersion: string): Promise<UpdateChec
 export interface SkipCheckOptions {
   argv?: string[]
   env?: NodeJS.ProcessEnv
+  branch?: string
 }
 
 export function shouldSkipUpdateCheck(options: SkipCheckOptions = {}): boolean {
@@ -83,6 +86,7 @@ export function shouldSkipUpdateCheck(options: SkipCheckOptions = {}): boolean {
   if (argv.includes('--skip-update-check')) return true
   if (env.SKIP_UPDATE_CHECK === 'true') return true
   if (env.npm_lifecycle_event === 'predev') return true
+  if (shouldSkipSourceUpdateForBranch({ branch: options.branch, env })) return true
 
   return false
 }
