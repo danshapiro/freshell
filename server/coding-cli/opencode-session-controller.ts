@@ -21,12 +21,6 @@ type OpencodeSessionRegistry = {
     sessionId: string,
     reason?: SessionBindingReason,
   ) => BindSessionResult
-  rebindSession?: (
-    terminalId: string,
-    provider: 'opencode',
-    sessionId: string,
-    reason?: SessionBindingReason,
-  ) => BindSessionResult
   on: (event: 'terminal.exit', handler: (payload: { terminalId?: string }) => void) => void
   off: (event: 'terminal.exit', handler: (payload: { terminalId?: string }) => void) => void
 }
@@ -86,21 +80,23 @@ export class OpencodeSessionController extends EventEmitter {
       reason,
       ...extra,
     }, 'Rejected OpenCode association request')
-    this.tracker.rejectSessionAssociation(request)
   }
 
   private promoteAssociation(request: OpencodeAssociationRequestedEvent): void {
     const terminal = this.registry.get(request.terminalId)
     if (!terminal) {
       this.rejectAssociation(request, 'terminal_missing_or_not_running')
+      this.tracker.rejectSessionAssociation(request)
       return
     }
     if (terminal.mode !== 'opencode') {
       this.rejectAssociation(request, 'terminal_not_opencode', { mode: terminal.mode })
+      this.tracker.rejectSessionAssociation(request)
       return
     }
     if (terminal.status !== 'running') {
       this.rejectAssociation(request, 'terminal_missing_or_not_running', { status: terminal.status })
+      this.tracker.rejectSessionAssociation(request)
       return
     }
 
@@ -111,16 +107,14 @@ export class OpencodeSessionController extends EventEmitter {
       return
     }
 
-    const bind = previousSessionId && this.registry.rebindSession
-      ? this.registry.rebindSession.bind(this.registry)
-      : this.registry.bindSession.bind(this.registry)
-    const result = bind(request.terminalId, 'opencode', request.sessionId, 'association')
+    const result = this.registry.bindSession(request.terminalId, 'opencode', request.sessionId, 'association')
 
     if (!result.ok) {
       this.rejectAssociation(request, result.reason, {
         ...(previousSessionId ? { previousSessionId } : {}),
         ...('owner' in result ? { ownerTerminalId: result.owner } : {}),
       })
+      this.tracker.rejectSessionAssociation(request)
       return
     }
 

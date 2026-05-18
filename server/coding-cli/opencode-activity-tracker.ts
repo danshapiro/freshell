@@ -88,8 +88,9 @@ const SessionCreatedEventSchema = z.object({
   properties: z.object({
     sessionID: z.string().min(1),
     info: z.object({
-      parentID: z.string().min(1).nullable().optional(),
-    }).passthrough().optional(),
+      id: z.string().min(1),
+      parentID: z.string().nullable().optional(),
+    }).passthrough(),
   }).passthrough(),
 }).passthrough()
 
@@ -471,7 +472,7 @@ export class OpencodeActivityTracker extends EventEmitter {
     event: Exclude<z.infer<typeof OpencodeEventSchema>, { type: 'server.connected' }>,
   ): Promise<void> {
     if (event.type === 'session.created') {
-      const parentId = event.properties.info?.parentID
+      const parentId = event.properties.info.parentID
       if (parentId) {
         this.registerChildSession(monitor.terminalId, event.properties.sessionID, parentId)
         if (monitor.lastSnapshot && monitor.ownership.kind === 'ambiguous') {

@@ -19,12 +19,6 @@ type OpencodeActivityRegistry = {
     sessionId: string,
     reason?: SessionBindingReason,
   ) => BindSessionResult
-  rebindSession?: (
-    terminalId: string,
-    provider: 'opencode',
-    sessionId: string,
-    reason?: SessionBindingReason,
-  ) => BindSessionResult
   on: (event: string, handler: (...args: any[]) => void) => void
   off: (event: string, handler: (...args: any[]) => void) => void
 }
