@@ -97,6 +97,9 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
   background: hsl(var(--background)); flex-shrink: 0; position: relative; z-index: 20;
   transition: background-color .2s; gap: 2px;
 }
+.tabbar.multirow {
+  height: auto; max-height: 128px; flex-wrap: wrap; overflow-y: auto;
+}
 .tabbar::after {
   content: ''; position: absolute; inset: auto 0 0 0; height: 1px;
   background: hsl(var(--muted-foreground) / .45); z-index: 0;

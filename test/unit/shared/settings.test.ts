@@ -310,4 +310,46 @@ describe('shared settings contract', () => {
       },
     })
   })
+
+  it('defaults multirowTabs to false in resolved local settings', () => {
+    expect(resolveLocalSettings(undefined).panes.multirowTabs).toBe(false)
+  })
+
+  it('accepts multirowTabs boolean in local settings patch', () => {
+    const resolved = resolveLocalSettings({ panes: { multirowTabs: true } })
+    expect(resolved.panes.multirowTabs).toBe(true)
+  })
+
+  it('preserves multirowTabs when extracting legacy local settings seed', () => {
+    expect(extractLegacyLocalSettingsSeed({
+      panes: {
+        multirowTabs: true,
+      },
+    } as Record<string, unknown>)).toEqual({
+      panes: {
+        multirowTabs: true,
+      },
+    })
+  })
+
+  it('rejects non-boolean multirowTabs in legacy seed extraction', () => {
+    expect(extractLegacyLocalSettingsSeed({
+      panes: {
+        multirowTabs: 'yes',
+      },
+    } as Record<string, unknown>)).toEqual(undefined)
+  })
+
+  it('includes multirowTabs in composed resolved settings', () => {
+    const resolved = composeResolvedSettings(
+      createDefaultServerSettings({ loggingDebug: false }),
+      resolveLocalSettings({ panes: { multirowTabs: true } }),
+    )
+    expect(resolved.panes.multirowTabs).toBe(true)
+  })
+
+  it('rejects multirowTabs in server patch schema', () => {
+    const schema = buildServerSettingsPatchSchema()
+    expect(schema.safeParse({ panes: { multirowTabs: true } }).success).toBe(false)
+  })
 })

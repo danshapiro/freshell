@@ -53,7 +53,7 @@ const TERMINAL_LOCAL_KEYS = [
   'osc52Clipboard',
   'renderer',
 ] as const
-const PANES_LOCAL_KEYS = ['snapThreshold', 'iconsOnTabs', 'tabAttentionStyle', 'attentionDismiss', 'sessionOpenMode'] as const
+const PANES_LOCAL_KEYS = ['snapThreshold', 'iconsOnTabs', 'tabAttentionStyle', 'attentionDismiss', 'sessionOpenMode', 'multirowTabs'] as const
 const SIDEBAR_LOCAL_KEYS = [
   'sortMode',
   'worktreeGrouping',
@@ -178,6 +178,7 @@ export type LocalSettings = {
     tabAttentionStyle: TabAttentionStyle
     attentionDismiss: AttentionDismiss
     sessionOpenMode: SessionOpenMode
+    multirowTabs: boolean
   }
   sidebar: {
     sortMode: SidebarSortMode
@@ -434,6 +435,9 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
     }
     if (SessionOpenModeSchema.safeParse(patch.panes.sessionOpenMode).success) {
       panes.sessionOpenMode = patch.panes.sessionOpenMode as SessionOpenMode
+    }
+    if (typeof patch.panes.multirowTabs === 'boolean') {
+      panes.multirowTabs = patch.panes.multirowTabs as boolean
     }
     if (Object.keys(panes).length > 0) {
       normalized.panes = panes
@@ -723,6 +727,7 @@ export const defaultLocalSettings: LocalSettings = {
     tabAttentionStyle: 'highlight',
     attentionDismiss: 'click',
     sessionOpenMode: 'tab',
+    multirowTabs: false,
   },
   sidebar: {
     sortMode: 'activity',

@@ -7,7 +7,7 @@ import { getWsClient } from '@/lib/ws-client'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { collectPaneEntries, collectTerminalIds } from '@/lib/pane-utils'
 import { getBusyPaneIdsForTab } from '@/lib/pane-activity'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTabBarScroll } from '@/hooks/useTabBarScroll'
 import TabItem from './TabItem'
 import { cancelCodingCliRequest } from '@/store/codingCliSlice'
@@ -17,6 +17,7 @@ import { TabSwitcher } from './TabSwitcher'
 import {
   DndContext,
   closestCenter,
+  rectIntersection,
   KeyboardSensor,
   PointerSensor,
   TouchSensor,
@@ -30,15 +31,23 @@ import {
   SortableContext,
   sortableKeyboardCoordinates,
   horizontalListSortingStrategy,
+  rectSortingStrategy,
   useSortable,
 } from '@dnd-kit/sortable'
-import { CSS } from '@dnd-kit/utilities'
+import { CSS as DndCSS } from '@dnd-kit/utilities'
 import type { Tab, TabAttentionStyle } from '@/store/types'
 import type { PaneContent, PaneNode } from '@/store/paneTypes'
 import type { ChatSessionState } from '@/store/agentChatTypes'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { applyTabRename } from '@/store/titleSync'
+
+function escapeSelector(id: string): string {
+  if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+    return CSS.escape(id)
+  }
+  return id.replace(/(["\\])/g, '\\$1')
+}
 
 interface SortableTabProps {
   tab: Tab
@@ -90,7 +99,7 @@ function SortableTab({
   } = useSortable({ id: tab.id })
 
   const style = {
-    transform: CSS.Transform.toString(transform),
+    transform: DndCSS.Transform.toString(transform),
     transition: transition || 'transform 150ms ease',
   }
 
@@ -161,6 +170,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   const attentionDismiss = useAppSelector((s) => s.settings?.settings?.panes?.attentionDismiss ?? 'click')
   const iconsOnTabs = useAppSelector((s) => s.settings?.settings?.panes?.iconsOnTabs ?? true)
   const tabAttentionStyle = useAppSelector((s) => s.settings?.settings?.panes?.tabAttentionStyle ?? 'highlight')
+  const multirowTabs = useAppSelector((s) => s.settings?.settings?.panes?.multirowTabs ?? false)
   const extensions = useAppSelector((s) => s.extensions?.entries)
 
   const ws = useMemo(() => getWsClient(), [])
@@ -369,11 +379,47 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     callbackRef,
     canScrollLeft,
     canScrollRight,
+    scrollToTab,
     handleArrowClick,
     startHoldScroll,
     stopHoldScroll,
     cancelHoldScroll,
-  } = useTabBarScroll(activeTabId, tabs.length)
+  } = useTabBarScroll(activeTabId, tabs.length, multirowTabs)
+
+  // Container ref for multirow auto-scroll (scoped, not global DOM query)
+  const multirowContainerRef = useRef<HTMLDivElement | null>(null)
+  const combinedRef = useCallback((node: HTMLDivElement | null) => {
+    callbackRef(node)
+    multirowContainerRef.current = node
+  }, [callbackRef])
+
+  // Container-scoped scroll for active tab in multirow mode (vertical)
+  useEffect(() => {
+    if (!multirowTabs || !activeTabId) return
+    const container = multirowContainerRef.current
+    if (!container) return
+    const tabEl = container.querySelector(`[data-tab-id="${escapeSelector(activeTabId)}"]`) as HTMLElement | null
+    if (!tabEl) return
+    const containerRect = container.getBoundingClientRect()
+    const tabRect = tabEl.getBoundingClientRect()
+    // Only scroll if tab is outside the visible area
+    if (tabRect.top < containerRect.top || tabRect.bottom > containerRect.bottom) {
+      const offset = tabRect.top - containerRect.top - (containerRect.height / 2) + (tabRect.height / 2)
+      container.scrollBy({ top: offset, behavior: 'smooth' })
+    }
+  }, [activeTabId, multirowTabs])
+
+  // Re-fire horizontal scroll when transitioning from multirow to single-row
+  const prevMultirowRef = useRef(multirowTabs)
+  useEffect(() => {
+    let raf: number | null = null
+    if (prevMultirowRef.current && !multirowTabs && activeTabId) {
+      // Defer to next frame so the DOM has re-rendered with single-row layout
+      raf = requestAnimationFrame(() => scrollToTab(activeTabId))
+    }
+    prevMultirowRef.current = multirowTabs
+    return () => { if (raf !== null) cancelAnimationFrame(raf) }
+  }, [multirowTabs, activeTabId, scrollToTab])
 
   const activeTab = activeId ? tabs.find((t: Tab) => t.id === activeId) : null
 
@@ -395,43 +441,54 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   }
 
   return (
-    <div className="relative z-20 h-12 md:h-10 shrink-0 flex items-end px-2 bg-background" data-context={ContextIds.Global}>
+    <div className={cn(
+      "relative z-20 shrink-0 flex items-end px-2 bg-background",
+      multirowTabs ? "h-auto" : "h-12 md:h-10"
+    )} data-context={ContextIds.Global}>
       <div
         className="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-muted-foreground/45"
         aria-hidden="true"
       />
       <DndContext
         sensors={sensors}
-        collisionDetection={closestCenter}
+        collisionDetection={multirowTabs ? rectIntersection : closestCenter}
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
       >
         <SortableContext
           items={tabs.map((t: Tab) => t.id)}
-          strategy={horizontalListSortingStrategy}
+          strategy={multirowTabs ? rectSortingStrategy : horizontalListSortingStrategy}
         >
           {/* Left scroll arrow -- flex sibling alongside the scroll container */}
-          <button
-            className={cn(
-              'flex-shrink-0 w-7 h-8 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-all duration-150',
-              canScrollLeft ? 'opacity-100' : 'opacity-0 pointer-events-none',
-            )}
-            aria-label="Scroll tabs left"
-            aria-hidden={canScrollLeft ? undefined : true}
-            tabIndex={canScrollLeft ? 0 : -1}
-            onClick={() => handleArrowClick('left')}
-            onPointerDown={() => startHoldScroll('left')}
-            onPointerUp={stopHoldScroll}
-            onPointerLeave={cancelHoldScroll}
-            onPointerCancel={cancelHoldScroll}
-          >
-            <ChevronLeft className="h-4 w-4" />
-          </button>
+          {!multirowTabs && (
+            <button
+              className={cn(
+                'flex-shrink-0 w-7 h-8 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-all duration-150',
+                canScrollLeft ? 'opacity-100' : 'opacity-0 pointer-events-none',
+              )}
+              aria-label="Scroll tabs left"
+              aria-hidden={canScrollLeft ? undefined : true}
+              tabIndex={canScrollLeft ? 0 : -1}
+              onClick={() => handleArrowClick('left')}
+              onPointerDown={() => startHoldScroll('left')}
+              onPointerUp={stopHoldScroll}
+              onPointerLeave={cancelHoldScroll}
+              onPointerCancel={cancelHoldScroll}
+            >
+              <ChevronLeft className="h-4 w-4" />
+            </button>
+          )}
 
           {/* Scrollable tab strip */}
           <div
-            ref={callbackRef}
-            className="flex items-end gap-0.5 overflow-x-auto overflow-y-hidden scrollbar-none pt-px flex-1 min-w-0"
+            ref={combinedRef}
+            data-testid="tab-strip"
+            className={cn(
+              "flex items-end gap-0.5 pt-px flex-1 min-w-0",
+              multirowTabs
+                ? "flex-wrap max-h-32 overflow-y-auto"
+                : "overflow-x-auto overflow-y-hidden scrollbar-none"
+            )}
           >
             {sidebarCollapsed && onToggleSidebar && (
               <button
@@ -447,22 +504,24 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
           </div>
 
           {/* Right scroll arrow -- flex sibling alongside the scroll container */}
-          <button
-            className={cn(
-              'flex-shrink-0 w-7 h-8 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-all duration-150',
-              canScrollRight ? 'opacity-100' : 'opacity-0 pointer-events-none',
-            )}
-            aria-label="Scroll tabs right"
-            aria-hidden={canScrollRight ? undefined : true}
-            tabIndex={canScrollRight ? 0 : -1}
-            onClick={() => handleArrowClick('right')}
-            onPointerDown={() => startHoldScroll('right')}
-            onPointerUp={stopHoldScroll}
-            onPointerLeave={cancelHoldScroll}
-            onPointerCancel={cancelHoldScroll}
-          >
-            <ChevronRight className="h-4 w-4" />
-          </button>
+          {!multirowTabs && (
+            <button
+              className={cn(
+                'flex-shrink-0 w-7 h-8 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-all duration-150',
+                canScrollRight ? 'opacity-100' : 'opacity-0 pointer-events-none',
+              )}
+              aria-label="Scroll tabs right"
+              aria-hidden={canScrollRight ? undefined : true}
+              tabIndex={canScrollRight ? 0 : -1}
+              onClick={() => handleArrowClick('right')}
+              onPointerDown={() => startHoldScroll('right')}
+              onPointerUp={stopHoldScroll}
+              onPointerLeave={cancelHoldScroll}
+              onPointerCancel={cancelHoldScroll}
+            >
+              <ChevronRight className="h-4 w-4" />
+            </button>
+          )}
         </SortableContext>
 
         {/* Pinned + button -- outside the scrollable area */}

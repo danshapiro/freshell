@@ -211,6 +211,15 @@ export default function WorkspaceSettings({
           />
         </SettingsRow>
 
+        <SettingsRow label="Multi-row tabs" description="Show tabs in multiple rows instead of a single scrollable row.">
+          <Toggle
+            checked={settings.panes?.multirowTabs ?? false}
+            onChange={(checked) => {
+              applyLocalSetting({ panes: { multirowTabs: checked } })
+            }}
+          />
+        </SettingsRow>
+
         <SettingsRow label="Tab completion indicator">
           <SegmentedControl
             value={settings.panes?.tabAttentionStyle ?? 'highlight'}

@@ -64,6 +64,26 @@ describe('browserPreferencesPersistence', () => {
     })
   })
 
+  it('persists multirowTabs when enabled locally', () => {
+    const store = createStore()
+
+    store.dispatch(updateSettingsLocal({
+      panes: {
+        multirowTabs: true,
+      },
+    }))
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    expect(JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')).toEqual({
+      settings: {
+        panes: {
+          multirowTabs: true,
+        },
+      },
+    })
+  })
+
   it('debounces updateSettingsLocal writes and flushes them on pagehide', () => {
     const store = createStore()
 
