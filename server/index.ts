@@ -78,6 +78,7 @@ import {
   runCodexStartupReaper,
 } from './coding-cli/codex-app-server/runtime.js'
 import { CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
+import { CodexTerminalSidecar } from './coding-cli/codex-app-server/sidecar.js'
 import { registerStaticClientRoutes } from './static-client-routes.js'
 import { joinCodexShutdownOwners } from './shutdown-join.js'
 
@@ -298,9 +299,13 @@ async function main() {
   sdkBridge = new SdkBridge(agentHistorySource)
 
   const server = http.createServer(app)
-  const codexLaunchPlanner = new CodexLaunchPlanner((input) => new CodexAppServerRuntime({
-    serverInstanceId,
-    cwd: input.cwd,
+  const codexLaunchPlanner = new CodexLaunchPlanner((input) => new CodexTerminalSidecar({
+    runtime: new CodexAppServerRuntime({
+      serverInstanceId,
+      cwd: input.cwd,
+      commandArgs: input.commandArgs,
+      env: input.env,
+    }),
   }))
   const wsHandler = new WsHandler(
     server,

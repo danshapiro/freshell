@@ -1,13 +1,14 @@
 import type http from 'http'
 import { randomUUID } from 'crypto'
+import { nanoid } from 'nanoid'
 import WebSocket, { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { logger } from './logger.js'
 import { recordSessionLifecycleEvent } from './session-observability.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
 import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed, timingSafeCompare } from './auth.js'
-import { modeSupportsResume, terminalIdFromCreateError } from './terminal-registry.js'
-import type { TerminalRecord, TerminalRegistry, TerminalMode } from './terminal-registry.js'
+import { buildFreshellTerminalEnv, modeSupportsResume } from './terminal-registry.js'
+import type { TerminalEnvContext, TerminalRecord, TerminalRegistry, TerminalMode } from './terminal-registry.js'
 import { configStore, type ConfigReadError } from './config-store.js'
 import type { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import type { ProjectGroup } from './coding-cli/types.js'
@@ -22,6 +23,7 @@ import type {
   OpencodeActivityRecord,
   SdkServerMessage,
   SdkSessionStatus,
+  TerminalStatusMessage,
 } from '../shared/ws-protocol.js'
 import type { ExtensionManager } from './extension-manager.js'
 import { allocateLocalhostPort } from './local-port.js'
@@ -33,7 +35,7 @@ import { TabRegistryRecordBaseSchema, TabRegistryRecordSchema } from './tabs-reg
 import type { TabsRegistryStore } from './tabs-registry/store.js'
 import type { ServerSettings } from '../shared/settings.js'
 import { stripAnsi } from './ai-prompts.js'
-import type { CodexLaunchPlan, CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
+import { runCodexLaunchWithRetry, type CodexLaunchFactory, type CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
 import {
   CodexLaunchConfigError,
   getCodexSessionBindingReason,
@@ -173,6 +175,20 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
 }
 
+function buildCanonicalTerminalSessionRef(
+  mode: TerminalMode,
+  resumeSessionId?: string,
+): { provider: string; sessionId: string } | undefined {
+  if (mode === 'shell' || !isNonEmptyString(resumeSessionId)) return undefined
+  if (mode === 'claude' && !isValidClaudeSessionId(resumeSessionId)) {
+    return undefined
+  }
+  return {
+    provider: mode,
+    sessionId: resumeSessionId,
+  }
+}
+
 const TERMINAL_FAILURE_SUMMARY_MAX_CHARS = 200
 
 function summarizeTerminalFailureOutput(snapshot: string): string | undefined {
@@ -200,27 +216,17 @@ function formatExitedTerminalAttachMessage(record: Pick<TerminalRecord, 'title' 
   return `${label} is no longer running${exitSuffix}.`
 }
 
-function assertCodexCreateTerminalRunning(record: Pick<TerminalRecord, 'status'>): void {
-  if (record.status !== 'running') {
-    throw new Error('Codex terminal PTY exited before create completed.')
-  }
-}
-
 function normalizeUiSessionLocator(value: unknown): SidebarSessionLocator | undefined {
   if (!value || typeof value !== 'object') return undefined
   const candidate = value as {
     provider?: unknown
     sessionId?: unknown
-    serverInstanceId?: unknown
   }
   const provider = CodingCliProviderSchema.safeParse(candidate.provider)
   if (!provider.success || !isNonEmptyString(candidate.sessionId)) return undefined
   return {
     provider: provider.data,
     sessionId: candidate.sessionId,
-    ...(isNonEmptyString(candidate.serverInstanceId)
-      ? { serverInstanceId: candidate.serverInstanceId }
-      : {}),
   }
 }
 
@@ -234,7 +240,7 @@ function extractSessionLocatorsFromUiContent(content: Record<string, unknown>): 
 
   const kind = content.kind
   if (kind === 'agent-chat') {
-    if (isNonEmptyString(content.resumeSessionId)) {
+    if (isNonEmptyString(content.resumeSessionId) && isValidClaudeSessionId(content.resumeSessionId)) {
       locators.push({ provider: 'claude', sessionId: content.resumeSessionId })
     }
     return locators
@@ -243,7 +249,12 @@ function extractSessionLocatorsFromUiContent(content: Record<string, unknown>): 
   if (kind !== 'terminal') return locators
 
   const mode = CodingCliProviderSchema.safeParse(content.mode)
-  if (!mode.success || !isNonEmptyString(content.resumeSessionId)) {
+  if (
+    !mode.success
+    || mode.data !== 'claude'
+    || !isNonEmptyString(content.resumeSessionId)
+    || !isValidClaudeSessionId(content.resumeSessionId)
+  ) {
     return locators
   }
 
@@ -359,12 +370,6 @@ function createScreenshotError(code: ScreenshotErrorCode, message: string): Erro
   return err
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
-
-class TerminalCreateAdmissionError extends Error {}
-
 export class WsHandler {
   private readonly config: WsHandlerConfig
   private readonly authToken: string
@@ -404,6 +409,13 @@ export class WsHandler {
   private onTerminalExitBound = (payload: { terminalId?: string }) => {
     if (!payload?.terminalId) return
     this.forgetCreatedRequestIdsForTerminal(payload.terminalId)
+  }
+  private onTerminalStatusBound = (payload: Omit<TerminalStatusMessage, 'type'>) => {
+    if (!payload?.terminalId) return
+    this.broadcast({
+      type: 'terminal.status',
+      ...payload,
+    } satisfies TerminalStatusMessage)
   }
   private sessionRepairListeners?: {
     scanned: (result: SessionScanResult) => void
@@ -529,6 +541,7 @@ export class WsHandler {
       on?: (event: string, listener: (...args: any[]) => void) => void
     }
     registryWithEvents.on?.('terminal.exit', this.onTerminalExitBound)
+    registryWithEvents.on?.('terminal.status', this.onTerminalStatusBound)
     this.wss = new WebSocketServer({
       server,
       path: '/ws',
@@ -682,12 +695,16 @@ export class WsHandler {
     cwd: string | undefined,
     resumeSessionId: string | undefined,
     providerSettings: { model?: string; sandbox?: string; permissionMode?: string } | undefined,
+    terminalId: string,
+    envContext: TerminalEnvContext,
   ) {
     if (!this.codexLaunchPlanner) {
-      throw new Error('Codex terminal launch requires the app-server launch planner.')
+      throw new Error('Codex terminal launch requires the per-terminal app-server sidecar planner.')
     }
     return this.codexLaunchPlanner.planCreate({
       cwd,
+      terminalId,
+      env: buildFreshellTerminalEnv(terminalId, envContext),
       resumeSessionId,
       model: providerSettings?.model,
       sandbox: normalizeCodexSandboxSetting(providerSettings?.sandbox),
@@ -695,10 +712,41 @@ export class WsHandler {
     })
   }
 
-  private assertTerminalCreateAccepted(): void {
-    if (this.closed) {
-      throw new TerminalCreateAdmissionError('Server is shutting down; terminal.create is no longer accepted.')
-    }
+  private createCodexLaunchFactory(
+    providerSettings: { model?: string; sandbox?: string; permissionMode?: string } | undefined,
+  ): CodexLaunchFactory {
+    return async (input) => this.planCodexLaunch(
+      input.cwd,
+      input.resumeSessionId,
+      input.providerSettings ?? providerSettings,
+      input.terminalId,
+      input.envContext ?? {},
+    )
+  }
+
+  private async planCodexLaunchWithRetry(
+    cwd: string | undefined,
+    resumeSessionId: string | undefined,
+    providerSettings: { model?: string; sandbox?: string; permissionMode?: string } | undefined,
+    terminalId: string,
+    envContext: TerminalEnvContext,
+    requestId: string,
+  ): ReturnType<WsHandler['planCodexLaunch']> {
+    return runCodexLaunchWithRetry(
+      () => this.planCodexLaunch(cwd, resumeSessionId, providerSettings, terminalId, envContext),
+      {
+        shouldRetry: (error) => !(error instanceof CodexLaunchConfigError),
+        onFailedAttempt: ({ attempt, delayMs, error }) => {
+          log.warn({
+            err: error,
+            requestId,
+            terminalId,
+            attempt,
+            nextDelayMs: delayMs,
+          }, 'Codex initial launch planning failed; retrying before terminal.create')
+        },
+      },
+    )
   }
 
   private terminalCreateLockKey(
@@ -1003,11 +1051,6 @@ export class WsHandler {
   }
 
   private onConnection(ws: LiveWebSocket, req: http.IncomingMessage) {
-    if (this.closed) {
-      ws.close(CLOSE_CODES.SERVER_SHUTDOWN, 'Server shutting down')
-      return
-    }
-
     if (this.connections.size >= this.config.maxConnections) {
       ws.close(CLOSE_CODES.MAX_CONNECTIONS, 'Too many connections')
       return
@@ -1631,17 +1674,18 @@ export class WsHandler {
 
       // Send terminal inventory so the client knows what's alive
       const terminals = this.registry.list().map((terminal) => {
-        const { resumeSessionId, ...rest } = terminal
+        const sessionRef = buildCanonicalTerminalSessionRef(terminal.mode, terminal.resumeSessionId)
         return {
-          ...rest,
-          ...(resumeSessionId
-            ? {
-                sessionRef: {
-                  provider: terminal.mode,
-                  sessionId: resumeSessionId,
-                },
-              }
-            : {}),
+          terminalId: terminal.terminalId,
+          title: terminal.title,
+          description: terminal.description,
+          mode: terminal.mode,
+          ...(sessionRef ? { sessionRef } : {}),
+          createdAt: terminal.createdAt,
+          lastActivityAt: terminal.lastActivityAt,
+          status: terminal.status,
+          ...(terminal.runtimeStatus ? { runtimeStatus: terminal.runtimeStatus } : {}),
+          cwd: terminal.cwd,
         }
       })
       const terminalMeta = this.terminalMetaListProvider?.() ?? []
@@ -1680,6 +1724,20 @@ export class WsHandler {
         this.sendError(ws, { code: 'INVALID_MESSAGE', message: 'Invalid JSON' })
         return
       }
+      const rawSessionRef = (
+        msg?.sessionRef
+        && typeof msg.sessionRef === 'object'
+        && typeof msg.sessionRef.provider === 'string'
+        && msg.sessionRef.provider.length > 0
+        && typeof msg.sessionRef.sessionId === 'string'
+        && msg.sessionRef.sessionId.length > 0
+      )
+        ? {
+            provider: msg.sessionRef.provider,
+            sessionId: msg.sessionRef.sessionId,
+          }
+        : undefined
+      const rawRestoreRequested = msg?.restore === true
 
       if (msg?.type === 'hello' && msg?.protocolVersion !== WS_PROTOCOL_VERSION) {
         this.sendError(ws, {
@@ -1763,15 +1821,6 @@ export class WsHandler {
         return
       }
 
-      if (this.closed && m.type === 'terminal.create') {
-        this.sendError(ws, {
-          code: 'INTERNAL_ERROR',
-          message: 'Server is shutting down; terminal.create is no longer accepted.',
-          requestId: m.requestId,
-        })
-        return
-      }
-
       switch (m.type) {
       case 'client.diagnostic': {
         if (m.event === 'restore_unavailable') {
@@ -1822,11 +1871,13 @@ export class WsHandler {
         return
       }
       case 'terminal.create': {
-        const requestedSessionRef = m.sessionRef?.provider === m.mode
-          ? m.sessionRef
-          : undefined
+        const requestedSessionRef = (
+          m.sessionRef?.provider === m.mode && typeof m.sessionRef?.sessionId === 'string'
+            ? m.sessionRef
+            : (rawSessionRef?.provider === m.mode ? rawSessionRef : undefined)
+        )
         const canonicalSessionId = requestedSessionRef?.sessionId
-        const restoreRequested = m.restore === true
+        const restoreRequested = m.restore === true || rawRestoreRequested
         const localLiveTerminalId = (
           m.liveTerminal?.serverInstanceId === this.serverInstanceId
           && typeof m.liveTerminal?.terminalId === 'string'
@@ -1857,11 +1908,10 @@ export class WsHandler {
           { minDurationMs: perfConfig.slowTerminalCreateMs, level: 'warn' },
         )
         let terminalId: string | undefined
-        let pendingCodexPlan: CodexLaunchPlan | undefined
         let reused = false
         let error = false
         let rateLimited = false
-        let effectiveResumeSessionId = canonicalSessionId
+        let restoreSessionId = canonicalSessionId
         try {
           await this.withTerminalCreateLock(
             this.terminalCreateLockKey(m.mode as TerminalMode, m.requestId, canonicalSessionId),
@@ -1896,10 +1946,16 @@ export class WsHandler {
                 return true
               }
 
+              const recordHasSessionRef = (record: unknown): boolean => {
+                const maybeRecord = record as { sessionRef?: { sessionId?: unknown }; resumeSessionId?: unknown } | null | undefined
+                return typeof maybeRecord?.sessionRef?.sessionId === 'string'
+                  || typeof maybeRecord?.resumeSessionId === 'string'
+              }
+
               const attachReusedTerminal = async (
                 reusedTerminalId: string,
                 createdAt: number,
-                resumeSessionId?: string,
+                hasSessionRef = false,
               ): Promise<boolean> => {
                 const sent = await sendCreateResult({
                   ws,
@@ -1924,7 +1980,7 @@ export class WsHandler {
                   ...(m.cwd ? { cwd: m.cwd } : {}),
                   mode: m.mode as TerminalMode,
                   reused: true,
-                  hasSessionRef: !!resumeSessionId,
+                  hasSessionRef,
                 })
                 this.broadcastTerminalsChanged()
                 return true
@@ -1939,7 +1995,7 @@ export class WsHandler {
                 }
                 const existing = this.registry.get(existingId)
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
+                  await attachReusedTerminal(existing.terminalId, existing.createdAt, recordHasSessionRef(existing))
                   return
                 }
                 // If it no longer exists, fall through and create a new one.
@@ -1950,7 +2006,7 @@ export class WsHandler {
               if (localLiveTerminalId) {
                 const liveTerminal = this.registry.get(localLiveTerminalId)
                 if (liveTerminal?.status === 'running' && liveTerminal.mode === m.mode) {
-                  await attachReusedTerminal(liveTerminal.terminalId, liveTerminal.createdAt, liveTerminal.resumeSessionId)
+                  await attachReusedTerminal(liveTerminal.terminalId, liveTerminal.createdAt, recordHasSessionRef(liveTerminal))
                   return
                 }
               }
@@ -1971,7 +2027,7 @@ export class WsHandler {
                   )
                 }
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
+                  await attachReusedTerminal(existing.terminalId, existing.createdAt, recordHasSessionRef(existing))
                   return
                 }
               }
@@ -1991,7 +2047,7 @@ export class WsHandler {
                 }
                 const existing = this.registry.get(existingAfterConfigId)
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
+                  await attachReusedTerminal(existing.terminalId, existing.createdAt, recordHasSessionRef(existing))
                   return
                 }
                 state.createdByRequestId.delete(m.requestId)
@@ -2018,7 +2074,7 @@ export class WsHandler {
               if (localLiveTerminalId) {
                 const liveTerminal = this.registry.get(localLiveTerminalId)
                 if (liveTerminal?.status === 'running' && liveTerminal.mode === m.mode) {
-                  await attachReusedTerminal(liveTerminal.terminalId, liveTerminal.createdAt, liveTerminal.resumeSessionId)
+                  await attachReusedTerminal(liveTerminal.terminalId, liveTerminal.createdAt, recordHasSessionRef(liveTerminal))
                   return
                 }
               }
@@ -2039,7 +2095,7 @@ export class WsHandler {
                   )
                 }
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
+                  await attachReusedTerminal(existing.terminalId, existing.createdAt, recordHasSessionRef(existing))
                   return
                 }
               }
@@ -2047,12 +2103,12 @@ export class WsHandler {
               // Session repair is Claude-specific (uses JSONL session files).
               // Other providers (codex, opencode, etc.) don't use the same file
               // structure, so this block correctly remains gated on mode === 'claude'.
-              if (m.mode === 'claude' && effectiveResumeSessionId && isValidClaudeSessionId(effectiveResumeSessionId) && this.sessionRepairService) {
-                const sessionId = effectiveResumeSessionId
+              if (m.mode === 'claude' && restoreSessionId && isValidClaudeSessionId(restoreSessionId) && this.sessionRepairService) {
+                const sessionId = restoreSessionId
                 const cached = this.sessionRepairService.getResult(sessionId)
                 if (cached?.status === 'missing') {
                   log.info({ sessionId, connectionId: ws.connectionId }, 'Session previously marked missing; resume will start fresh')
-                  effectiveResumeSessionId = undefined
+                  restoreSessionId = undefined
                 } else {
                   // Reserve requestId to prevent same-socket duplicate creates during async repair wait.
                   state.createdByRequestId.set(m.requestId, REPAIR_PENDING_SENTINEL)
@@ -2066,7 +2122,7 @@ export class WsHandler {
                     endRepairTimer({ status: result.status })
                     if (result.status === 'missing') {
                       log.info({ sessionId, connectionId: ws.connectionId }, 'Session file missing; resume will start fresh')
-                      effectiveResumeSessionId = undefined
+                      restoreSessionId = undefined
                     }
                   } catch (err) {
                     endRepairTimer({ error: err instanceof Error ? err.message : String(err) })
@@ -2084,7 +2140,7 @@ export class WsHandler {
                 return
               }
 
-              if (m.mode === 'claude' && restoreRequested && !isValidClaudeSessionId(effectiveResumeSessionId)) {
+              if (m.mode === 'claude' && restoreRequested && !isValidClaudeSessionId(restoreSessionId)) {
                 this.sendError(ws, {
                   code: 'RESTORE_UNAVAILABLE',
                   message: 'Claude restore requires a canonical durable session id',
@@ -2107,176 +2163,136 @@ export class WsHandler {
                 requestId: m.requestId,
                 connectionId: ws.connectionId,
                 sessionRef: requestedSessionRef,
-                effectiveResumeSessionId,
+                restoreSessionId,
               }, '[TRACE sessionRef] about to create terminal')
 
               const requestedCodexResumeSessionId = m.mode === 'codex'
-                ? effectiveResumeSessionId
+                ? canonicalSessionId
                 : undefined
-              this.assertTerminalCreateAccepted()
-              const codexPlan = m.mode === 'codex'
-                ? await this.planCodexLaunch(m.cwd, requestedCodexResumeSessionId, providerSettings)
+              let codexPlan: Awaited<ReturnType<WsHandler['planCodexLaunch']>> | undefined
+              const preallocatedTerminalId = nanoid()
+              const terminalEnvContext = { tabId: m.tabId, paneId: m.paneId }
+              const codexLaunchFactory = m.mode === 'codex'
+                ? this.createCodexLaunchFactory(providerSettings)
                 : undefined
-              pendingCodexPlan = codexPlan
+              try {
+                codexPlan = m.mode === 'codex'
+                  ? await this.planCodexLaunchWithRetry(
+                    m.cwd,
+                    requestedCodexResumeSessionId,
+                    providerSettings,
+                    preallocatedTerminalId,
+                    terminalEnvContext,
+                    m.requestId,
+                  )
+                  : undefined
 
-              if (codexPlan) {
-                effectiveResumeSessionId = codexPlan.sessionId
-              }
-              this.assertTerminalCreateAccepted()
-
-              const codexRecovery = codexPlan
-                ? {
-                    planCreate: (input: { cwd?: string; resumeSessionId: string }) =>
-                      this.planCodexLaunch(input.cwd ?? m.cwd, input.resumeSessionId, providerSettings),
-                  }
-                : undefined
-
-              const spawnProviderSettings = (
-                providerSettings
-                  ? {
-                    ...(m.mode === 'codex'
-                      ? {}
-                      : {
-                        permissionMode: providerSettings.permissionMode,
-                        model: providerSettings.model,
-                        sandbox: providerSettings.sandbox,
-                      }),
-                    ...(m.mode === 'opencode'
-                      ? { opencodeServer: await allocateLocalhostPort() }
-                      : {}),
-                    ...(codexPlan ? {
-                      codexAppServer: {
-                        ...codexPlan.remote,
-                        sidecar: codexPlan.sidecar,
-                        recovery: codexRecovery,
-                        deferLifecycleUntilPublished: true,
-                      },
-                    } : {}),
-                  }
-                  : (codexPlan
+                const spawnProviderSettings = (
+                  providerSettings
                     ? {
-                      codexAppServer: {
-                        ...codexPlan.remote,
-                        sidecar: codexPlan.sidecar,
-                        recovery: codexRecovery,
-                        deferLifecycleUntilPublished: true,
-                      },
+                      ...(m.mode === 'codex'
+                        ? {}
+                        : {
+                          permissionMode: providerSettings.permissionMode,
+                          model: providerSettings.model,
+                          sandbox: providerSettings.sandbox,
+                        }),
+                      ...(m.mode === 'opencode'
+                        ? { opencodeServer: await allocateLocalhostPort() }
+                        : {}),
+                      ...(codexPlan ? { codexAppServer: codexPlan.remote } : {}),
                     }
-                    : undefined)
-              )
+                    : (codexPlan
+                      ? { codexAppServer: codexPlan.remote }
+                      : undefined)
+                )
 
-              this.assertTerminalCreateAccepted()
-              const record = this.registry.create({
-                mode: m.mode as TerminalMode,
-                shell: m.shell as 'system' | 'cmd' | 'powershell' | 'wsl',
-                cwd: m.cwd,
-                resumeSessionId: effectiveResumeSessionId,
-                ...(codexPlan
-                  ? {
-                      sessionBindingReason: getCodexSessionBindingReason(m.mode, requestedCodexResumeSessionId),
-                    }
-                  : {}),
-                envContext: { tabId: m.tabId, paneId: m.paneId },
-                providerSettings: spawnProviderSettings,
-              })
-              terminalId = record.terminalId
-              this.assertTerminalCreateAccepted()
-              if (codexPlan) {
-                await codexPlan.sidecar.adopt({ terminalId: record.terminalId, generation: 0 })
-                this.assertTerminalCreateAccepted()
-                if (requestedCodexResumeSessionId) {
-                  await codexPlan.sidecar.waitForLoadedThread(requestedCodexResumeSessionId)
-                  this.assertTerminalCreateAccepted()
+                const record = this.registry.create({
+                  terminalId: preallocatedTerminalId,
+                  mode: m.mode as TerminalMode,
+                  shell: m.shell as 'system' | 'cmd' | 'powershell' | 'wsl',
+                  cwd: m.cwd,
+                  resumeSessionId: restoreSessionId,
+                  ...(requestedCodexResumeSessionId
+                    ? {
+                        sessionBindingReason: getCodexSessionBindingReason(m.mode, requestedCodexResumeSessionId),
+                      }
+                    : {}),
+                  envContext: terminalEnvContext,
+                  providerSettings: spawnProviderSettings,
+                  ...(m.mode === 'codex' ? { codexLaunchBaseProviderSettings: providerSettings } : {}),
+                  ...(codexPlan ? { codexSidecar: codexPlan.sidecar } : {}),
+                  ...(codexLaunchFactory ? { codexLaunchFactory } : {}),
+                })
+                if (m.mode !== 'shell' && typeof m.cwd === 'string' && m.cwd.trim()) {
+                  const recentDirectory = m.cwd.trim()
+                  void configStore.pushRecentDirectory(recentDirectory).catch((err) => {
+                    log.warn({ err, recentDirectory }, 'Failed to record recent directory')
+                  })
                 }
-                assertCodexCreateTerminalRunning(record)
-                this.assertTerminalCreateAccepted()
-                this.registry.publishCodexSidecar?.(record.terminalId)
-                pendingCodexPlan = undefined
-                if (effectiveResumeSessionId) {
+
+                state.createdByRequestId.set(m.requestId, record.terminalId)
+                this.rememberCreatedRequestId(m.requestId, record.terminalId)
+                terminalId = record.terminalId
+
+                const sent = await sendCreateResult({
+                  ws,
+                  requestId: m.requestId,
+                  terminalId: record.terminalId,
+                  createdAt: record.createdAt,
+                })
+                if (!sent) {
+                  // Terminal may still exist even if created delivery failed (for
+                  // example: socket closed after create). Broadcast inventory so
+                  // other clients can discover it.
+                  this.broadcastTerminalsChanged()
+                  return
+                }
+
+                const observedCodexSessionId = m.mode === 'codex'
+                  ? codexPlan?.sessionId ?? requestedCodexResumeSessionId
+                  : undefined
+                if (observedCodexSessionId) {
                   recordSessionLifecycleEvent({
                     kind: 'codex_durable_session_observed',
                     provider: 'codex',
                     terminalId: record.terminalId,
-                    sessionId: effectiveResumeSessionId,
+                    sessionId: observedCodexSessionId,
                     generation: 0,
                     source: 'sidecar',
                   })
                 }
-              }
-              this.assertTerminalCreateAccepted()
-
-              if (m.mode !== 'shell' && typeof m.cwd === 'string' && m.cwd.trim()) {
-                const recentDirectory = m.cwd.trim()
-                void configStore.pushRecentDirectory(recentDirectory).catch((err) => {
-                  log.warn({ err, recentDirectory }, 'Failed to record recent directory')
+                recordSessionLifecycleEvent({
+                  kind: 'terminal_created',
+                  requestId: m.requestId,
+                  connectionId: ws.connectionId || 'unknown',
+                  terminalId: record.terminalId,
+                  ...(m.tabId ? { tabId: m.tabId } : {}),
+                  ...(m.paneId ? { paneId: m.paneId } : {}),
+                  ...(m.cwd ? { cwd: m.cwd } : {}),
+                  mode: m.mode as TerminalMode,
+                  reused: false,
+                  hasSessionRef: !!observedCodexSessionId || !!restoreSessionId || !!requestedSessionRef,
                 })
-              }
 
-              state.createdByRequestId.set(m.requestId, record.terminalId)
-              this.rememberCreatedRequestId(m.requestId, record.terminalId)
-
-              const sent = await sendCreateResult({
-                ws,
-                requestId: m.requestId,
-                terminalId: record.terminalId,
-                createdAt: record.createdAt,
-              })
-              if (!sent) {
-                // Terminal may still exist even if created delivery failed (for
-                // example: socket closed after create). Broadcast inventory so
-                // other clients can discover it.
+                // Notify all clients that list changed
                 this.broadcastTerminalsChanged()
-                return
+              } catch (error) {
+                await codexPlan?.sidecar.shutdown().catch(() => undefined)
+                throw error
               }
-
-              recordSessionLifecycleEvent({
-                kind: 'terminal_created',
-                requestId: m.requestId,
-                connectionId: ws.connectionId || 'unknown',
-                terminalId: record.terminalId,
-                ...(m.tabId ? { tabId: m.tabId } : {}),
-                ...(m.paneId ? { paneId: m.paneId } : {}),
-                ...(m.cwd ? { cwd: m.cwd } : {}),
-                mode: m.mode as TerminalMode,
-                reused: false,
-                hasSessionRef: !!effectiveResumeSessionId,
-              })
-
-              // Notify all clients that list changed
-              this.broadcastTerminalsChanged()
             },
           )
         } catch (err: any) {
           error = true
-          const cleanupErrors: string[] = []
-          const cleanupTerminalId = terminalId ?? terminalIdFromCreateError(err)
-          if (typeof cleanupTerminalId === 'string') {
-            await this.registry.killAndWait(cleanupTerminalId).catch((killErr) => {
-              cleanupErrors.push(`created terminal cleanup failed: ${errorMessage(killErr)}`)
-              log.warn({ err: killErr, terminalId: cleanupTerminalId }, 'terminal.create cleanup failed')
-            })
-          }
-          if (pendingCodexPlan) {
-            await pendingCodexPlan.sidecar.shutdown().catch((shutdownErr) => {
-              cleanupErrors.push(`Codex sidecar cleanup failed: ${errorMessage(shutdownErr)}`)
-              log.warn({ err: shutdownErr }, 'terminal.create pending Codex sidecar cleanup failed')
-            })
-          }
-          const errorMessageText = cleanupErrors.length > 0
-            ? `${err?.message || 'Failed to spawn PTY'}; cleanup failed: ${cleanupErrors.join('; ')}`
-            : err?.message || 'Failed to spawn PTY'
           // Clean up repair sentinel if terminal creation failed
           if (state.createdByRequestId.get(m.requestId) === REPAIR_PENDING_SENTINEL) {
             state.createdByRequestId.delete(m.requestId)
           }
           log.warn({ err, connectionId: ws.connectionId }, 'terminal.create failed')
           this.sendError(ws, {
-            code: err instanceof CodexLaunchConfigError
-              ? 'INVALID_MESSAGE'
-              : err instanceof TerminalCreateAdmissionError
-                ? 'INTERNAL_ERROR'
-                : 'PTY_SPAWN_FAILED',
-            message: errorMessageText,
+            code: err instanceof CodexLaunchConfigError ? 'INVALID_MESSAGE' : 'PTY_SPAWN_FAILED',
+            message: err?.message || 'Failed to spawn PTY',
             requestId: m.requestId,
           })
         } finally {
@@ -2380,7 +2396,7 @@ export class WsHandler {
               terminalId: m.terminalId,
               connectionId: ws.connectionId || 'unknown',
               operation: 'terminal.input',
-              attemptedInputBytes: typeof m.data === 'string' ? Buffer.byteLength(m.data) : 0,
+              attemptedInputBytes: Buffer.byteLength(m.data),
             })
           }
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Terminal not running', terminalId: m.terminalId })
@@ -2405,25 +2421,16 @@ export class WsHandler {
       }
 
       case 'terminal.kill': {
-        let ok: boolean
-        try {
-          ok = await this.registry.killAndWait(m.terminalId)
-        } catch (err) {
-          log.warn({ err, terminalId: m.terminalId, connectionId: ws.connectionId }, 'terminal.kill failed')
-          this.sendError(ws, {
-            code: 'INTERNAL_ERROR',
-            message: `Failed to kill terminal: ${errorMessage(err)}`,
-            terminalId: m.terminalId,
-          })
-          return
-        }
+        const ok = this.registry.kill(m.terminalId)
         if (!ok) {
-          recordSessionLifecycleEvent({
-            kind: 'invalid_terminal_id_without_session_ref',
-            terminalId: m.terminalId,
-            connectionId: ws.connectionId || 'unknown',
-            operation: 'terminal.kill',
-          })
+          if (!this.registry.get(m.terminalId)) {
+            recordSessionLifecycleEvent({
+              kind: 'invalid_terminal_id_without_session_ref',
+              terminalId: m.terminalId,
+              connectionId: ws.connectionId || 'unknown',
+              operation: 'terminal.kill',
+            })
+          }
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Unknown terminalId', terminalId: m.terminalId })
           return
         }
@@ -3337,6 +3344,7 @@ export class WsHandler {
       off?: (event: string, listener: (...args: any[]) => void) => void
     }
     registryWithEvents.off?.('terminal.exit', this.onTerminalExitBound)
+    registryWithEvents.off?.('terminal.status', this.onTerminalStatusBound)
 
     if (this.sessionRepairService && this.sessionRepairListeners) {
       this.sessionRepairService.off('scanned', this.sessionRepairListeners.scanned)

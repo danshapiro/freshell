@@ -61,10 +61,6 @@ export const CodexFsUnwatchParamsSchema = z.object({
   watchId: z.string().min(1),
 })
 
-export const CodexLoadedThreadListResultSchema = z.object({
-  data: z.array(z.string().min(1)),
-})
-
 export const CodexRpcErrorSchema = z.object({
   code: z.number(),
   message: z.string().min(1),
@@ -135,7 +131,6 @@ export type CodexThreadOperationResult = z.infer<typeof CodexThreadOperationResu
 export type CodexFsWatchParams = z.infer<typeof CodexFsWatchParamsSchema>
 export type CodexFsWatchResult = z.infer<typeof CodexFsWatchResultSchema>
 export type CodexFsUnwatchParams = z.infer<typeof CodexFsUnwatchParamsSchema>
-export type CodexLoadedThreadListResult = z.infer<typeof CodexLoadedThreadListResultSchema>
 export type CodexRpcError = z.infer<typeof CodexRpcErrorSchema>
 export type CodexThreadStartedNotification = z.infer<typeof CodexThreadStartedNotificationSchema>
 export type CodexThreadClosedNotification = z.infer<typeof CodexThreadClosedNotificationSchema>
