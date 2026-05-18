@@ -3,7 +3,7 @@ import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } f
 import { nanoid } from 'nanoid'
 import { closePane, initLayout, restoreLayout, removeLayout, updatePaneContent } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
-import type { PaneNode } from './paneTypes'
+import type { PaneContent, PaneNode } from './paneTypes'
 import { findTabIdForSession } from '@/lib/session-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { buildResumeContent } from '@/lib/session-type-utils'
@@ -30,6 +30,23 @@ import { sanitizeTabsAgainstLayouts } from '@/lib/tab-fallback-identity'
 const log = createLogger('TabsSlice')
 
 export type Tombstone = { id: string; deletedAt: number }
+
+function matchesDesiredResumeContentKind(
+  content: PaneContent,
+  desiredResumeContent: ReturnType<typeof buildResumeContent>,
+): boolean {
+  if (desiredResumeContent.kind === 'agent-chat') {
+    return content.kind === 'agent-chat' && content.provider === desiredResumeContent.provider
+  }
+
+  if (desiredResumeContent.kind === 'fresh-agent') {
+    return content.kind === 'fresh-agent'
+      && content.sessionType === desiredResumeContent.sessionType
+      && content.provider === desiredResumeContent.provider
+  }
+
+  return content.kind === 'terminal' && content.mode === desiredResumeContent.mode
+}
 
 export interface TabsState {
   tabs: Tab[]
@@ -580,7 +597,7 @@ export const openSessionTab = createAsyncThunk(
       const layout = state.panes.layouts[tab.id]
       if (!layout) return
 
-      const matchingLeaves: Array<{ id: string; content: any }> = []
+      const matchingLeaves: Array<{ id: string; content: PaneContent }> = []
       const visit = (node: PaneNode) => {
         if (node.type === 'leaf') {
           const content = node.content
@@ -618,13 +635,7 @@ export const openSessionTab = createAsyncThunk(
       const [{ id: paneId, content }] = matchingLeaves
       if (content.kind === 'terminal' && content.terminalId) return
 
-      const needsRepair = desiredResumeContent.kind === 'fresh-agent'
-        ? content.kind !== 'fresh-agent' || content.sessionType !== desiredResumeContent.sessionType
-        : desiredResumeContent.kind === 'agent-chat'
-          ? content.kind !== 'agent-chat' || content.provider !== desiredResumeContent.provider
-          : content.kind !== 'terminal' || content.mode !== desiredResumeContent.mode
-
-      if (!needsRepair) return
+      if (matchesDesiredResumeContentKind(content, desiredResumeContent)) return
 
       dispatch(updatePaneContent({
         tabId: tab.id,
@@ -654,9 +665,7 @@ export const openSessionTab = createAsyncThunk(
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,
-        sessionRef: desiredResumeContent.kind === 'terminal' || desiredResumeContent.kind === 'agent-chat'
-          ? desiredResumeContent.sessionRef
-          : undefined,
+        sessionRef: desiredResumeContent.sessionRef,
         sessionMetadataByKey: buildSessionMetadataByKey(),
       }))
       dispatch(initLayout({
@@ -665,7 +674,7 @@ export const openSessionTab = createAsyncThunk(
           kind: 'terminal',
           mode: resolvedProvider,
           terminalId,
-          sessionRef: desiredResumeContent.kind === 'terminal' ? desiredResumeContent.sessionRef : undefined,
+          sessionRef: desiredResumeContent.sessionRef,
           initialCwd: cwd,
           status: 'running',
         },
@@ -688,7 +697,7 @@ export const openSessionTab = createAsyncThunk(
       }
     }
 
-    // For agent-chat sessions, create a tab then immediately set up agent-chat layout
+    // For chat sessions, create a tab then immediately set up the resolved layout
     // so TabContent's fallback initLayout (which always creates terminal panes) doesn't win
     if (resolveFreshAgentType(resolvedSessionType)) {
       const tabId = nanoid()
@@ -698,7 +707,7 @@ export const openSessionTab = createAsyncThunk(
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,
-        sessionRef: desiredResumeContent.kind === 'agent-chat' ? desiredResumeContent.sessionRef : undefined,
+        sessionRef: desiredResumeContent.sessionRef,
         sessionMetadataByKey: buildSessionMetadataByKey(),
       }))
       dispatch(initLayout({
@@ -715,7 +724,7 @@ export const openSessionTab = createAsyncThunk(
       mode: resolvedProvider,
       codingCliProvider: resolvedProvider,
       initialCwd: cwd,
-      sessionRef: desiredResumeContent.kind === 'terminal' ? desiredResumeContent.sessionRef : undefined,
+      sessionRef: desiredResumeContent.sessionRef,
       sessionMetadataByKey: buildSessionMetadataByKey(),
     }))
     dispatch(initLayout({

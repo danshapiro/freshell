@@ -830,6 +830,58 @@ describe('tabsSlice', () => {
       })
     })
 
+    it('repairs a fresh-agent pane when the stored runtime provider is wrong', async () => {
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+        },
+      })
+
+      store.dispatch(addTab({
+        id: 'tab-1',
+        mode: 'claude',
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_CLAUDE_SESSION_ID,
+        },
+      }))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'codex',
+          resumeSessionId: VALID_CLAUDE_SESSION_ID,
+          sessionRef: {
+            provider: 'claude',
+            sessionId: VALID_CLAUDE_SESSION_ID,
+          },
+        },
+      }))
+
+      await store.dispatch(openSessionTab({
+        sessionId: VALID_CLAUDE_SESSION_ID,
+        provider: 'claude',
+        sessionType: 'freshclaude',
+      }))
+
+      expect(store.getState().tabs.activeTabId).toBe('tab-1')
+      expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          resumeSessionId: VALID_CLAUDE_SESSION_ID,
+          sessionRef: {
+            provider: 'claude',
+            sessionId: VALID_CLAUDE_SESSION_ID,
+          },
+        },
+      })
+    })
+
     it('activates existing tab when terminalId is already attached', async () => {
       const store = configureStore({
         reducer: {
