@@ -79,7 +79,7 @@ vi.mock('../../../server/mcp/config-writer.js', () => ({
 }))
 
 const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
-const OTHER_CLAUDE_SESSION_ID = '6f1c2b3a-4d5e-6f70-8a9b-0c1d2e3f4a5b'
+const OTHER_CLAUDE_SESSION_ID = '6f1c2b3a-4d5e-4f70-8a9b-0c1d2e3f4a5b'
 const TEST_OPENCODE_SERVER = { hostname: '127.0.0.1' as const, port: 4173 }
 
 function expectCodexMcpArgs(args: string[]) {

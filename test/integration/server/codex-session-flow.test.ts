@@ -155,6 +155,18 @@ async function waitForFile(filePath: string, timeoutMs = 3_000): Promise<void> {
   throw new Error(`Timed out waiting for file: ${filePath}`)
 }
 
+async function waitForCondition(
+  predicate: () => Promise<boolean> | boolean,
+  timeoutMs = MESSAGE_TIMEOUT_MS,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  throw new Error('Timed out waiting for condition')
+}
+
 async function waitForPidFile(filePath: string, timeoutMs = 5_000): Promise<number> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {

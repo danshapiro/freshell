@@ -4,6 +4,7 @@ import type { BackgroundTerminal, CodingCliProviderName, WorktreeGrouping } from
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { collectSessionRefsFromTabs } from '@/lib/session-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { getSessionMetadata } from '@/lib/session-metadata'
 import type { SessionListMetadata } from '../types'
 import { getLeafDirectoryName, matchTitleTierMetadata } from '../../../shared/session-title-search.js'
@@ -229,6 +230,23 @@ export function buildSessionItems(
         sessionType: node.content.provider || 'claude',
         title: paneTitle || tab.title,
         cwd: undefined,
+        timestamp: fallbackTimestamp,
+        metadata,
+      })
+      return
+    }
+
+    if (node.content.kind === 'fresh-agent') {
+      const sessionId = node.content.resumeSessionId
+      const runtimeProvider = resolveFreshAgentType(node.content.sessionType)?.runtimeProvider ?? node.content.provider
+      if (!sessionId) return
+      const metadata = getSessionMetadata(tab, runtimeProvider, sessionId)
+      pushFallbackItem({
+        provider: runtimeProvider,
+        sessionId,
+        sessionType: node.content.sessionType || runtimeProvider,
+        title: paneTitle || tab.title,
+        cwd: node.content.initialCwd,
         timestamp: fallbackTimestamp,
         metadata,
       })

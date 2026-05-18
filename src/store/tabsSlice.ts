@@ -7,7 +7,8 @@ import type { PaneNode } from './paneTypes'
 import { findTabIdForSession } from '@/lib/session-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { buildResumeContent } from '@/lib/session-type-utils'
-import { isAgentChatProviderName, getAgentChatProviderConfig, getAgentChatProviderLabel } from '@/lib/agent-chat-utils'
+import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { resolveFreshAgentType, getFreshAgentLabel } from '@/lib/fresh-agent-registry'
 import { recordClosedTabSnapshot, pushReopenEntry, popReopenEntry } from './tabRegistrySlice'
 import { clearDraft } from '@/lib/draft-store'
 import {
@@ -594,9 +595,13 @@ export const openSessionTab = createAsyncThunk(
             && content.mode === resolvedProvider
             && content.resumeSessionId === sessionId
           ) || (
-            content.kind === 'agent-chat'
-            && resolvedProvider === 'claude'
+            (content.kind === 'agent-chat' || content.kind === 'fresh-agent')
             && content.resumeSessionId === sessionId
+            && (
+              content.kind === 'agent-chat'
+                ? resolvedProvider === 'claude'
+                : content.provider === resolvedProvider
+            )
           )
           if (matchesExplicitSessionRef || matchesImplicitSessionRef) {
             matchingLeaves.push({ id: node.id, content })
@@ -613,9 +618,11 @@ export const openSessionTab = createAsyncThunk(
       const [{ id: paneId, content }] = matchingLeaves
       if (content.kind === 'terminal' && content.terminalId) return
 
-      const needsRepair = desiredResumeContent.kind === 'agent-chat'
-        ? content.kind !== 'agent-chat' || content.provider !== desiredResumeContent.provider
-        : content.kind !== 'terminal' || content.mode !== desiredResumeContent.mode
+      const needsRepair = desiredResumeContent.kind === 'fresh-agent'
+        ? content.kind !== 'fresh-agent' || content.sessionType !== desiredResumeContent.sessionType
+        : desiredResumeContent.kind === 'agent-chat'
+          ? content.kind !== 'agent-chat' || content.provider !== desiredResumeContent.provider
+          : content.kind !== 'terminal' || content.mode !== desiredResumeContent.mode
 
       if (!needsRepair) return
 
@@ -683,11 +690,11 @@ export const openSessionTab = createAsyncThunk(
 
     // For agent-chat sessions, create a tab then immediately set up agent-chat layout
     // so TabContent's fallback initLayout (which always creates terminal panes) doesn't win
-    if (isAgentChatProviderName(resolvedSessionType)) {
+    if (resolveFreshAgentType(resolvedSessionType)) {
       const tabId = nanoid()
       dispatch(addTab({
         id: tabId,
-        title: title || getAgentChatProviderLabel(resolvedSessionType),
+        title: title || getFreshAgentLabel(resolvedSessionType),
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,

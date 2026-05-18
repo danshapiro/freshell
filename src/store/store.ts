@@ -15,6 +15,7 @@ import terminalMetaReducer from './terminalMetaSlice'
 import codexActivityReducer from './codexActivitySlice'
 import opencodeActivityReducer from './opencodeActivitySlice'
 import agentChatReducer from './agentChatSlice'
+import freshAgentReducer from './freshAgentSlice'
 import paneRuntimeActivityReducer from './paneRuntimeActivitySlice'
 import { networkReducer } from './networkSlice'
 import tabRegistryReducer from './tabRegistrySlice'
@@ -49,6 +50,7 @@ export const store = configureStore({
     codexActivity: codexActivityReducer,
     opencodeActivity: opencodeActivityReducer,
     agentChat: agentChatReducer,
+    freshAgent: freshAgentReducer,
     paneRuntimeActivity: paneRuntimeActivityReducer,
     network: networkReducer,
     tabRegistry: tabRegistryReducer,

@@ -61,6 +61,7 @@ import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, res
 import { setOpencodeActivitySnapshot, upsertOpencodeActivity, removeOpencodeActivity, resetOpencodeActivity } from '@/store/opencodeActivitySlice'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
+import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import { createLogger } from '@/lib/client-logger'
 import type { LocalSettingsPatch, ServerSettings } from '@shared/settings'
 import { z } from 'zod'
@@ -195,6 +196,7 @@ export default function App() {
       () => { (ws as any).ws?.close() },
       // sendWsMessage: send a raw WS message for test cleanup (e.g., terminal.kill)
       (msg: unknown) => { ws.send(msg) },
+      (msg) => { ws.receiveMessageForTest?.(msg) },
       () => perfAuditBridgeRef.current?.snapshot() ?? null,
     )
     ws.setOutboundMessageObserver?.((msg) => {
@@ -917,7 +919,8 @@ export default function App() {
           dispatch(updateServerStatus({ name: msg.name, serverRunning: false, serverPort: undefined }))
         }
 
-        // SDK message handling (freshclaude pane)
+        handleFreshAgentMessage(dispatch, msg as Record<string, unknown>, ws)
+        // SDK message handling (freshclaude compatibility surface)
         handleSdkMessage(dispatch, msg as Record<string, unknown>, ws)
       })
 

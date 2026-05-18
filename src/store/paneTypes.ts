@@ -6,6 +6,7 @@ import {
 } from '@shared/agent-chat-capabilities'
 import type { SessionLocator as SharedSessionLocator } from '@shared/ws-protocol'
 import type { RestoreError } from '@shared/session-contract'
+import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
 
 export type SessionLocator = SharedSessionLocator
 
@@ -115,6 +116,30 @@ export type AgentChatCreateError = {
   retryable?: boolean
 }
 
+export type FreshAgentPaneContent = {
+  kind: 'fresh-agent'
+  sessionType: FreshAgentSessionType
+  provider: FreshAgentRuntimeProvider
+  sessionId?: string
+  createRequestId: string
+  status: SdkSessionStatus
+  resumeSessionId?: string
+  sessionRef?: SessionLocator
+  /** Runtime-only server locality for same-server matching; never part of canonical durable identity. */
+  serverInstanceId?: string
+  /** Explicit restore failure when no canonical durable target exists. */
+  restoreError?: RestoreError
+  initialCwd?: string
+  createError?: AgentChatCreateError
+  modelSelection?: AgentChatModelSelection
+  model?: string
+  permissionMode?: string
+  sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
+  effort?: string
+  plugins?: string[]
+  settingsDismissed?: boolean
+}
+
 /**
  * Agent chat pane — rich chat UI powered by a configurable provider.
  */
@@ -165,7 +190,7 @@ export type ExtensionPaneContent = {
  * Union type for all pane content types.
  */
 export type PaneContent = TerminalPaneContent | BrowserPaneContent | EditorPaneContent
-  | PickerPaneContent | AgentChatPaneContent | ExtensionPaneContent
+  | PickerPaneContent | FreshAgentPaneContent | AgentChatPaneContent | ExtensionPaneContent
 
 /**
  * Input type for creating terminal panes.
@@ -195,6 +220,11 @@ export type AgentChatPaneInput = Omit<AgentChatPaneContent, 'createRequestId' | 
   status?: SdkSessionStatus
 }
 
+export type FreshAgentPaneInput = Omit<FreshAgentPaneContent, 'createRequestId' | 'status'> & {
+  createRequestId?: string
+  status?: SdkSessionStatus
+}
+
 /**
  * Input type for extension panes.
  * Extension content needs no normalization — passes through unchanged.
@@ -202,7 +232,7 @@ export type AgentChatPaneInput = Omit<AgentChatPaneContent, 'createRequestId' | 
 export type ExtensionPaneInput = ExtensionPaneContent
 
 export type PaneContentInput = TerminalPaneInput | BrowserPaneInput | EditorPaneInput
-  | PickerPaneContent | AgentChatPaneInput | ExtensionPaneInput
+  | PickerPaneContent | FreshAgentPaneInput | AgentChatPaneInput | ExtensionPaneInput
 
 export type PaneRefreshTarget =
   | { kind: 'terminal'; createRequestId: string }

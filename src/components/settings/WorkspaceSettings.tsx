@@ -253,28 +253,37 @@ export default function WorkspaceSettings({
         </SettingsRow>
       </SettingsSection>
 
-      <SettingsSection title="Agent chat" description="Display settings for agent chat panes">
+      <SettingsSection title="Fresh agent" description="Display settings for fresh-agent panes">
         <SettingsRow label="Show thinking">
           <Toggle
-            checked={settings.agentChat?.showThinking ?? false}
+            checked={settings.freshAgent?.showThinking ?? settings.agentChat?.showThinking ?? false}
             onChange={(checked) => {
-              applyLocalSetting({ agentChat: { showThinking: checked } })
+              applyLocalSetting({
+                freshAgent: { showThinking: checked },
+                agentChat: { showThinking: checked },
+              })
             }}
           />
         </SettingsRow>
         <SettingsRow label="Show tools">
           <Toggle
-            checked={settings.agentChat?.showTools ?? false}
+            checked={settings.freshAgent?.showTools ?? settings.agentChat?.showTools ?? false}
             onChange={(checked) => {
-              applyLocalSetting({ agentChat: { showTools: checked } })
+              applyLocalSetting({
+                freshAgent: { showTools: checked },
+                agentChat: { showTools: checked },
+              })
             }}
           />
         </SettingsRow>
         <SettingsRow label="Show timecodes &amp; model">
           <Toggle
-            checked={settings.agentChat?.showTimecodes ?? false}
+            checked={settings.freshAgent?.showTimecodes ?? settings.agentChat?.showTimecodes ?? false}
             onChange={(checked) => {
-              applyLocalSetting({ agentChat: { showTimecodes: checked } })
+              applyLocalSetting({
+                freshAgent: { showTimecodes: checked },
+                agentChat: { showTimecodes: checked },
+              })
             }}
           />
         </SettingsRow>

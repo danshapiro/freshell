@@ -1,5 +1,6 @@
 import type { CodexAppServerRuntime } from './runtime.js'
 import type { CodexThreadLifecycleLossEvent } from './client.js'
+import type { CodexThreadStartParams } from './protocol.js'
 import { waitForAllSettledOrThrow } from '../../shutdown-join.js'
 
 type CodexRuntimeLike = Pick<
@@ -33,6 +34,14 @@ type PlanCreateInput = {
   model?: string
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
   approvalPolicy?: string
+}
+
+export function normalizeCodexApprovalPolicy(value: string | undefined): CodexThreadStartParams['approvalPolicy'] {
+  if (value === undefined || value === 'default') return undefined
+  if (value === 'untrusted' || value === 'on-failure' || value === 'on-request' || value === 'never') {
+    return value
+  }
+  throw new Error(`Codex app-server does not support permission mode "${value}". Choose default, untrusted, on-failure, on-request, or never.`)
 }
 
 function errorMessage(error: unknown): string {
@@ -89,7 +98,7 @@ export class CodexLaunchPlanner {
         cwd: input.cwd,
         model: input.model,
         sandbox: input.sandbox,
-        approvalPolicy: input.approvalPolicy,
+        approvalPolicy: normalizeCodexApprovalPolicy(input.approvalPolicy),
       })
       this.assertAcceptingPlans()
 

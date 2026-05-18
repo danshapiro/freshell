@@ -8,11 +8,13 @@ import PaneDivider from './PaneDivider'
 import TerminalView from '../TerminalView'
 import BrowserPane from './BrowserPane'
 import AgentChatView from '../agent-chat/AgentChatView'
+import FreshAgentView from '../fresh-agent/FreshAgentView'
 import ExtensionPane from './ExtensionPane'
 import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
 import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-utils'
 import { isAgentChatProviderName, getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { clearDraft } from '@/lib/draft-store'
 import { getTerminalActions } from '@/lib/pane-action-registry'
 import { buildPaneRefreshTarget } from '@/lib/pane-utils'
@@ -32,10 +34,15 @@ import { nanoid } from 'nanoid'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import type { ChatSessionState, PendingAgentCreate } from '@/store/agentChatTypes'
+import type { FreshAgentPendingCreate, FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import { normalizeAgentChatEffortOverride, normalizeAgentChatModelSelection } from '@/store/paneTypes'
 import { clearPaneAttention, clearTabAttention } from '@/store/turnCompletionSlice'
 import { clearPendingCreate, removeSession } from '@/store/agentChatSlice'
+import {
+  clearPendingCreate as clearFreshAgentPendingCreate,
+  removeSession as removeFreshAgentSession,
+} from '@/store/freshAgentSlice'
 import { cancelCreate } from '@/lib/sdk-message-handler'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
@@ -52,11 +59,13 @@ const EMPTY_PANE_TITLES: Record<string, string> = {}
 const EMPTY_TERMINAL_META_BY_ID: Record<string, TerminalMetaRecord> = {}
 const EMPTY_PROJECTS: ProjectGroup[] = []
 const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
+const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 const EMPTY_ATTENTION_BY_PANE: Record<string, boolean> = {}
 const EMPTY_PENDING_CREATES: Record<string, PendingAgentCreate> = {}
+const EMPTY_FRESH_AGENT_PENDING_CREATES: Record<string, FreshAgentPendingCreate> = {}
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 const EditorPane = lazy(() => import('./EditorPane'))
 
@@ -166,6 +175,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   )
   const indexedProjects = useAppSelector((s) => s.sessions?.projects ?? EMPTY_PROJECTS)
   const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
+  const freshAgentSessions = useAppSelector((s) => s.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS)
   const codexActivityByTerminalId = useAppSelector(
     (s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID
   )
@@ -188,8 +198,9 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const containerRef = useRef<HTMLDivElement>(null)
   const ws = useMemo(() => getWsClient(), [])
   const snapThreshold = useAppSelector((s) => s.settings?.settings?.panes?.snapThreshold ?? 2)
-  const sdkPendingCreates = useAppSelector(
-    (s) => s.agentChat?.pendingCreates ?? EMPTY_PENDING_CREATES
+  const sdkPendingCreates = useAppSelector((s) => s.agentChat?.pendingCreates ?? EMPTY_PENDING_CREATES)
+  const freshAgentPendingCreates = useAppSelector(
+    (s) => s.freshAgent?.pendingCreates ?? EMPTY_FRESH_AGENT_PENDING_CREATES
   )
 
   // Drag state for snapping: track the original size and accumulated delta
@@ -289,6 +300,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         // No sessionId yet — sdk.created hasn't arrived. Mark the createRequestId as
         // cancelled so the message handler will kill the orphan when it does arrive.
         cancelCreate(content.createRequestId)
+        ws.cancelCreate(content.createRequestId)
       }
       // Clean up Redux state for orphaned pending creates
       if (!content.sessionId && pendingSessionId) {
@@ -296,10 +308,35 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         dispatch(clearPendingCreate({ requestId: content.createRequestId }))
       }
     }
+    if (content.kind === 'fresh-agent') {
+      clearDraft(paneId)
+      const pendingCreate = freshAgentPendingCreates[content.createRequestId]
+      const pendingSessionId = pendingCreate?.sessionId
+      const sessionId = content.sessionId || pendingSessionId
+      if (sessionId) {
+        ws.send({
+          type: 'freshAgent.kill',
+          sessionId,
+          sessionType: content.sessionType,
+          provider: content.provider,
+        })
+      } else {
+        cancelCreate(content.createRequestId)
+        ws.cancelCreate(content.createRequestId)
+      }
+      if (!content.sessionId && pendingSessionId) {
+        dispatch(removeFreshAgentSession({
+          sessionId: pendingSessionId,
+          sessionType: content.sessionType,
+          provider: content.provider,
+        }))
+        dispatch(clearFreshAgentPendingCreate({ requestId: content.createRequestId }))
+      }
+    }
     // Extension panes: V1 leaves server extensions running until freshell shutdown.
     // Future: stop singleton server when its last pane closes.
     dispatch(closePaneWithCleanup({ tabId, paneId }))
-  }, [dispatch, tabId, ws, sdkPendingCreates])
+  }, [dispatch, freshAgentPendingCreates, sdkPendingCreates, tabId, ws])
 
   const handleFocus = useCallback((paneId: string) => {
     if (attentionDismiss === 'click' && attentionByPane[paneId]) {
@@ -377,7 +414,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     const paneTitle = getPaneDisplayTitle(node.content, explicitTitle, extensionEntries)
     const paneStatus = node.content.kind === 'terminal'
       ? node.content.status
-      : node.content.kind === 'agent-chat'
+      : (node.content.kind === 'agent-chat' || node.content.kind === 'fresh-agent')
         ? (node.content.status === 'exited' ? 'exited' : 'running')
         : 'running'
     const isRenaming = renamingPaneId === node.id
@@ -413,12 +450,28 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
           provider: paneProvider,
           initialCwd: paneInitialCwd,
         })
-        : node.content.kind === 'agent-chat'
-          ? resolveFreshClaudeRuntimeMeta(
-            indexedProjects,
-            node.content,
-            node.content.sessionId ? agentChatSessions[node.content.sessionId] : undefined,
+        : (node.content.kind === 'agent-chat' || node.content.kind === 'fresh-agent')
+          ? (
+            node.content.kind === 'agent-chat'
+            || (node.content.kind === 'fresh-agent' && node.content.provider === 'claude')
           )
+            ? resolveFreshClaudeRuntimeMeta(
+              indexedProjects,
+              node.content.kind === 'fresh-agent'
+                ? {
+                    ...node.content,
+                    kind: 'agent-chat',
+                    provider: 'freshclaude',
+                    effort: (
+                      node.content.effort === 'none'
+                      || node.content.effort === 'minimal'
+                      || node.content.effort === 'xhigh'
+                    ) ? undefined : node.content.effort,
+                  }
+                : node.content,
+              node.content.sessionId ? agentChatSessions[node.content.sessionId] : undefined,
+            )
+            : undefined
         : undefined
     const paneMetaLabel =
       paneRuntimeMeta
@@ -437,6 +490,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       opencodeActivityByTerminalId,
       paneRuntimeActivityByPaneId,
       agentChatSessions,
+      freshAgentSessions,
     }).isBusy
 
     const needsAttention = tabAttentionStyle !== 'none' && !!attentionByPane[node.id]
@@ -522,7 +576,10 @@ function PickerWrapper({
   const dispatch = useAppDispatch()
   const settings = useAppSelector((s) => s.settings?.settings)
   const agentChatSettings = useAppSelector(
-    (s) => s.settings?.settings?.agentChat ?? s.settings?.serverSettings?.agentChat
+    (s) => s.settings?.settings?.freshAgent
+      ?? s.settings?.settings?.agentChat
+      ?? s.settings?.serverSettings?.freshAgent
+      ?? s.settings?.serverSettings?.agentChat
   )
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const paneLayout = useAppSelector((s) => s.panes.layouts[tabId])
@@ -545,18 +602,33 @@ function PickerWrapper({
       }
     }
 
-    if (isAgentChatProviderName(type)) {
-      const providerConfig = getAgentChatProviderConfig(type)!
+    const freshAgentType = resolveFreshAgentType(type)
+    if (freshAgentType) {
+      const providerConfig = freshAgentType.runtimeProvider === 'claude' && isAgentChatProviderName(type)
+        ? getAgentChatProviderConfig(type)
+        : undefined
       const providerSettings = agentChatSettings?.providers?.[type]
       return {
-        kind: 'agent-chat',
-        provider: type,
+        kind: 'fresh-agent',
+        sessionType: freshAgentType.sessionType,
+        provider: freshAgentType.runtimeProvider,
         createRequestId: nanoid(),
         status: 'creating',
         modelSelection: normalizeAgentChatModelSelection(providerSettings?.modelSelection),
-        permissionMode: providerSettings?.defaultPermissionMode ?? providerConfig.defaultPermissionMode,
-        effort: normalizeAgentChatEffortOverride(providerSettings?.effort),
-        plugins: agentChatSettings?.defaultPlugins,
+        model: freshAgentType.runtimeProvider === 'codex'
+          ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.model ?? freshAgentType.defaultModel
+          : freshAgentType.defaultModel,
+        permissionMode: providerSettings?.defaultPermissionMode
+          ?? (freshAgentType.runtimeProvider === 'codex'
+            ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.permissionMode
+            : undefined)
+          ?? providerConfig?.defaultPermissionMode
+          ?? freshAgentType.defaultPermissionMode,
+        sandbox: freshAgentType.runtimeProvider === 'codex'
+          ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.sandbox
+          : undefined,
+        effort: normalizeAgentChatEffortOverride(providerSettings?.effort) ?? freshAgentType.defaultEffort,
+        plugins: freshAgentType.runtimeProvider === 'claude' ? agentChatSettings?.defaultPlugins : undefined,
         ...(cwd ? { initialCwd: cwd } : {}),
       }
     }
@@ -624,10 +696,10 @@ function PickerWrapper({
       default:
         throw new Error(`Unsupported pane type: ${String(type)}`)
     }
-  }, [agentChatSettings, extensionEntries])
+  }, [agentChatSettings, extensionEntries, settings?.codingCli?.providers])
 
   const handleSelect = useCallback((type: PanePickerType) => {
-    if (isAgentChatProviderName(type)) {
+    if (resolveFreshAgentType(type)) {
       setStep({ step: 'directory', providerType: type })
       return
     }
@@ -753,7 +825,25 @@ function renderContent(
   if (content.kind === 'agent-chat') {
     return (
       <ErrorBoundary key={paneId} label="Chat">
-        <AgentChatView tabId={tabId} paneId={paneId} paneContent={content} hidden={hidden} />
+        <AgentChatView
+          tabId={tabId}
+          paneId={paneId}
+          paneContent={content}
+          hidden={hidden}
+        />
+      </ErrorBoundary>
+    )
+  }
+
+  if (content.kind === 'fresh-agent') {
+    return (
+      <ErrorBoundary key={paneId} label="Fresh Agent">
+        <FreshAgentView
+          tabId={tabId}
+          paneId={paneId}
+          paneContent={content}
+          hidden={hidden}
+        />
       </ErrorBoundary>
     )
   }

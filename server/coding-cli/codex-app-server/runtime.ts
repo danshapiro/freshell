@@ -14,11 +14,26 @@ import type {
   CodexFsWatchResult,
   CodexInitializeResult,
   CodexThreadHandle,
+  CodexThreadOperationResult,
+  CodexThreadForkParams,
+  CodexThreadReadParams,
+  CodexThreadReadResult,
   CodexThreadResumeParams,
   CodexThreadStartParams,
+  CodexThreadTurnReadParams,
+  CodexThreadTurnReadResult,
+  CodexThreadTurnsListParams,
+  CodexThreadTurnsListResult,
+  CodexTurnInterruptParams,
+  CodexTurnStartParams,
 } from './protocol.js'
 
 type RuntimeStatus = 'running' | 'stopped'
+
+type CodexThreadStartInput =
+  Omit<CodexThreadStartParams, 'experimentalRawEvents' | 'persistExtendedHistory'> & {
+    richClient?: boolean
+  }
 
 export type CodexAppServerRuntimeFailureSource =
   | 'app_server_exit'
@@ -557,21 +572,25 @@ export class CodexAppServerRuntime {
   }
 
   async startThread(
-    params: Omit<CodexThreadStartParams, 'experimentalRawEvents' | 'persistExtendedHistory'>,
-  ): Promise<{ threadId: string; wsUrl: string }> {
+    params: CodexThreadStartInput,
+  ): Promise<CodexThreadOperationResult & { threadId: string; wsUrl: string }> {
     const ready = await this.ensureReady()
+    const result = await this.client!.startThread(params)
     return {
-      ...(await this.client!.startThread(params)),
+      ...result,
+      threadId: result.thread.id,
       wsUrl: ready.wsUrl,
     }
   }
 
   async resumeThread(
     params: Omit<CodexThreadResumeParams, 'persistExtendedHistory'>,
-  ): Promise<{ threadId: string; wsUrl: string }> {
+  ): Promise<CodexThreadOperationResult & { threadId: string; wsUrl: string }> {
     const ready = await this.ensureReady()
+    const result = await this.client!.resumeThread(params)
     return {
-      ...(await this.client!.resumeThread(params)),
+      ...result,
+      threadId: result.thread.id,
       wsUrl: ready.wsUrl,
     }
   }
@@ -579,6 +598,41 @@ export class CodexAppServerRuntime {
   async listLoadedThreads(): Promise<string[]> {
     await this.ensureReady()
     return this.client!.listLoadedThreads()
+  }
+
+  async forkThread(
+    params: CodexThreadForkParams,
+  ): Promise<{ threadId: string; wsUrl: string }> {
+    const ready = await this.ensureReady()
+    return {
+      ...(await this.client!.forkThread(params)),
+      wsUrl: ready.wsUrl,
+    }
+  }
+
+  async readThread(params: CodexThreadReadParams): Promise<CodexThreadReadResult> {
+    await this.ensureReady()
+    return await this.client!.readThread(params)
+  }
+
+  async listThreadTurns(params: CodexThreadTurnsListParams): Promise<CodexThreadTurnsListResult> {
+    await this.ensureReady()
+    return await this.client!.listThreadTurns(params)
+  }
+
+  async readThreadTurn(params: CodexThreadTurnReadParams): Promise<CodexThreadTurnReadResult> {
+    await this.ensureReady()
+    return await this.client!.readThreadTurn(params)
+  }
+
+  async startTurn(params: CodexTurnStartParams): Promise<{ turnId: string }> {
+    await this.ensureReady()
+    return await this.client!.startTurn(params)
+  }
+
+  async interruptTurn(params: CodexTurnInterruptParams): Promise<void> {
+    await this.ensureReady()
+    await this.client!.interruptTurn(params)
   }
 
   async updateOwnershipMetadata(input: {

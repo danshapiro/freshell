@@ -48,12 +48,17 @@ type SdkCreateClientMessage = {
   requestId: string
 }
 
+type FreshAgentCreateClientMessage = {
+  type: 'freshAgent.create'
+  requestId: string
+}
+
 type TerminalAttachClientMessage = {
   type: 'terminal.attach'
   terminalId: string
 }
 
-type CreateClientMessage = TerminalCreateClientMessage | SdkCreateClientMessage
+type CreateClientMessage = TerminalCreateClientMessage | SdkCreateClientMessage | FreshAgentCreateClientMessage
 
 type InFlightCreate = {
   message: CreateClientMessage
@@ -75,7 +80,7 @@ function isTerminalInputMessage(msg: unknown): msg is TerminalInputClientMessage
 function isCreateMessage(msg: unknown): msg is CreateClientMessage {
   if (!msg || typeof msg !== 'object') return false
   const candidate = msg as { type?: unknown; requestId?: unknown }
-  return (candidate.type === 'terminal.create' || candidate.type === 'sdk.create')
+  return (candidate.type === 'terminal.create' || candidate.type === 'sdk.create' || candidate.type === 'freshAgent.create')
     && typeof candidate.requestId === 'string'
     && candidate.requestId.length > 0
 }
@@ -119,6 +124,124 @@ export class WsClient {
   private preReadyCreateQueue = new Map<string, unknown>()
 
   constructor(private url: string) {}
+
+  private clearTrackedCreate(requestId: string): void {
+    this.inFlightCreates.delete(requestId)
+    this.preReadyCreateQueue.delete(requestId)
+  }
+
+  cancelCreate(requestId: string): void {
+    this.clearTrackedCreate(requestId)
+  }
+
+  private handleIncomingMessage(msg: ServerMessage): void {
+    if (msg.type === 'ready') {
+      this._serverInstanceId = typeof msg.serverInstanceId === 'string' && msg.serverInstanceId.trim()
+        ? msg.serverInstanceId
+        : undefined
+      this.clearReadyTimeout()
+      const isReconnect = this.wasConnectedOnce
+      this.wasConnectedOnce = true
+      this._state = 'ready'
+      if (isReconnect) {
+        this.reconnectEpoch += 1
+      }
+
+      if (perfConfig.enabled && this.connectStartedAt !== null) {
+        const durationMs = performance.now() - this.connectStartedAt
+        this.connectStartedAt = null
+        if (durationMs >= perfConfig.wsReadySlowMs) {
+          logClientPerf('perf.ws_ready_slow', {
+            durationMs: Number(durationMs.toFixed(2)),
+            reconnect: isReconnect,
+          }, 'warn')
+        } else {
+          logClientPerf('perf.ws_ready', {
+            durationMs: Number(durationMs.toFixed(2)),
+            reconnect: isReconnect,
+          })
+        }
+      }
+
+      const createRequestIdsFlushed = new Set<string>()
+      for (const [requestId, createMsg] of this.preReadyCreateQueue.entries()) {
+        if (!this.inFlightCreates.has(requestId)) continue
+        this.sendNow(createMsg)
+        createRequestIdsFlushed.add(requestId)
+      }
+      this.preReadyCreateQueue.clear()
+
+      const pendingMessages = isReconnect
+        ? this.pendingMessages.filter((queued) => !isTerminalAttachMessage(queued))
+        : this.pendingMessages
+      this.pendingMessages = []
+
+      for (const next of pendingMessages) {
+        if (!next) continue
+        this.sendNow(next)
+      }
+
+      if (isReconnect) {
+        for (const [requestId, entry] of this.inFlightCreates.entries()) {
+          if (entry.lastResendEpoch === this.reconnectEpoch) continue
+          if (createRequestIdsFlushed.has(requestId)) {
+            entry.lastResendEpoch = this.reconnectEpoch
+            continue
+          }
+          this.sendNow(entry.message)
+          entry.lastResendEpoch = this.reconnectEpoch
+        }
+      }
+
+      if (isReconnect) {
+        this.reconnectHandlers.forEach((h) => h())
+      }
+    }
+
+    if (msg.type === 'terminal.output' && typeof msg.terminalId === 'string') {
+      markTerminalOutputSeen(msg.terminalId)
+    }
+
+    if (
+      msg.type === 'terminal.created'
+      || msg.type === 'sdk.created'
+      || msg.type === 'sdk.create.failed'
+      || msg.type === 'freshAgent.created'
+      || msg.type === 'freshAgent.create.failed'
+    ) {
+      this.clearTrackedCreate(msg.requestId)
+    }
+
+    if (msg.type === 'error' && typeof msg.requestId === 'string') {
+      this.clearTrackedCreate(msg.requestId)
+    }
+
+    if (msg.type === 'error' && msg.code === 'NOT_AUTHENTICATED') {
+      this.clearReadyTimeout()
+      this.intentionalClose = true
+      return
+    }
+
+    if (msg.type === 'error' && msg.code === 'PROTOCOL_MISMATCH') {
+      this.clearReadyTimeout()
+      this.intentionalClose = true
+      return
+    }
+
+    if (perfConfig.enabled) {
+      const start = performance.now()
+      this.messageHandlers.forEach((handler) => handler(msg))
+      const durationMs = performance.now() - start
+      if (durationMs >= perfConfig.wsMessageSlowMs) {
+        logClientPerf('perf.ws_message_handlers_slow', {
+          durationMs: Number(durationMs.toFixed(2)),
+          messageType: msg?.type,
+        }, 'warn')
+      }
+    } else {
+      this.messageHandlers.forEach((handler) => handler(msg))
+    }
+  }
 
   /**
    * Set a provider for additional data to include in the hello message.
@@ -216,119 +339,23 @@ export class WsClient {
           // Ignore invalid JSON
           return
         }
-
+        this.handleIncomingMessage(msg)
         if (msg.type === 'ready') {
-          this._serverInstanceId = typeof msg.serverInstanceId === 'string' && msg.serverInstanceId.trim()
-            ? msg.serverInstanceId
-            : undefined
-          this.clearReadyTimeout()
-          const isReconnect = this.wasConnectedOnce
-          this.wasConnectedOnce = true
-          this._state = 'ready'
-          if (isReconnect) {
-            this.reconnectEpoch += 1
-          }
-
-          if (perfConfig.enabled && this.connectStartedAt !== null) {
-            const durationMs = performance.now() - this.connectStartedAt
-            this.connectStartedAt = null
-            if (durationMs >= perfConfig.wsReadySlowMs) {
-              logClientPerf('perf.ws_ready_slow', {
-                durationMs: Number(durationMs.toFixed(2)),
-                reconnect: isReconnect,
-              }, 'warn')
-            } else {
-              logClientPerf('perf.ws_ready', {
-                durationMs: Number(durationMs.toFixed(2)),
-                reconnect: isReconnect,
-              })
-            }
-          }
-
-          const createRequestIdsFlushed = new Set<string>()
-          for (const [requestId, createMsg] of this.preReadyCreateQueue.entries()) {
-            if (!this.inFlightCreates.has(requestId)) continue
-            this.sendNow(createMsg)
-            createRequestIdsFlushed.add(requestId)
-          }
-          this.preReadyCreateQueue.clear()
-
-          const pendingMessages = isReconnect
-            ? this.pendingMessages.filter((msg) => !isTerminalAttachMessage(msg))
-            : this.pendingMessages
-          this.pendingMessages = []
-
-          for (const next of pendingMessages) {
-            if (!next) continue
-            this.sendNow(next)
-          }
-
-          if (isReconnect) {
-            for (const [requestId, entry] of this.inFlightCreates.entries()) {
-              if (entry.lastResendEpoch === this.reconnectEpoch) continue
-              if (createRequestIdsFlushed.has(requestId)) {
-                entry.lastResendEpoch = this.reconnectEpoch
-                continue
-              }
-              this.sendNow(entry.message)
-              entry.lastResendEpoch = this.reconnectEpoch
-            }
-          }
-
-          if (isReconnect) {
-            this.reconnectHandlers.forEach((h) => h())
-          }
-
           finishResolve()
+          return
         }
-
-        if (msg.type === 'terminal.output' && typeof msg.terminalId === 'string') {
-          markTerminalOutputSeen(msg.terminalId)
-        }
-
-        if (msg.type === 'terminal.created' || msg.type === 'sdk.created' || msg.type === 'sdk.create.failed') {
-          const create = this.inFlightCreates.get(msg.requestId)
-          if (create) {
-            this.inFlightCreates.delete(msg.requestId)
-            this.preReadyCreateQueue.delete(msg.requestId)
-          }
-        }
-
-        if (msg.type === 'error' && typeof msg.requestId === 'string') {
-          this.inFlightCreates.delete(msg.requestId)
-          this.preReadyCreateQueue.delete(msg.requestId)
-        }
-
         if (msg.type === 'error' && msg.code === 'NOT_AUTHENTICATED') {
-          this.clearReadyTimeout()
-          this.intentionalClose = true
           const err = new Error('Authentication failed')
           ;(err as any).wsCloseCode = 4001
           finishReject(err)
           return
         }
-
         if (msg.type === 'error' && msg.code === 'PROTOCOL_MISMATCH') {
           this.clearReadyTimeout()
           this.intentionalClose = true
           const err = new Error('Protocol version mismatch')
           ;(err as any).wsCloseCode = 4010
           finishReject(err)
-          return
-        }
-
-        if (perfConfig.enabled) {
-          const start = performance.now()
-          this.messageHandlers.forEach((handler) => handler(msg))
-          const durationMs = performance.now() - start
-          if (durationMs >= perfConfig.wsMessageSlowMs) {
-            logClientPerf('perf.ws_message_handlers_slow', {
-              durationMs: Number(durationMs.toFixed(2)),
-              messageType: msg?.type,
-            }, 'warn')
-          }
-        } else {
-          this.messageHandlers.forEach((handler) => handler(msg))
         }
       }
 
@@ -558,6 +585,10 @@ export class WsClient {
   onDisconnect(handler: DisconnectHandler): () => void {
     this.disconnectHandlers.add(handler)
     return () => this.disconnectHandlers.delete(handler)
+  }
+
+  receiveMessageForTest(msg: ServerMessage): void {
+    this.handleIncomingMessage(msg)
   }
 
   private sendNow(msg: unknown) {

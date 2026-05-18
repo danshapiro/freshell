@@ -308,6 +308,9 @@ describe('shared settings contract', () => {
       agentChat: {
         defaultPlugins: ['fs'],
       },
+      freshAgent: {
+        defaultPlugins: ['fs'],
+      },
     })
   })
 })

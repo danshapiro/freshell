@@ -117,6 +117,63 @@ describe('crossTabSync', () => {
     expect(store.getState().panes.activePane['tab-1']).toBe('pane-a')
   })
 
+  it('preserves canonical resume identity when cross-tab sync rehydrates a fresh-agent pane', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+
+    store.dispatch(hydratePanes({
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-a',
+          content: {
+            kind: 'fresh-agent',
+              sessionType: 'freshclaude',
+              provider: 'claude',
+              createRequestId: 'req-a',
+              status: 'idle',
+              resumeSessionId: '123e4567-e89b-12d3-a456-426614174000',
+          },
+        } as any,
+      },
+      activePane: { 'tab-1': 'pane-a' },
+      paneTitles: {},
+    }))
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    const remoteRaw = JSON.stringify({
+      version: 3,
+      tabs: { activeTabId: null, tabs: [] },
+      panes: {
+        version: 6,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-a',
+            content: {
+              kind: 'fresh-agent',
+              sessionType: 'freshclaude',
+              provider: 'claude',
+              createRequestId: 'req-a',
+              status: 'idle',
+              resumeSessionId: 'not-a-canonical-id',
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-a' },
+        paneTitles: {},
+      },
+      tombstones: [],
+    })
+
+    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: remoteRaw }))
+
+    const layout = store.getState().panes.layouts['tab-1'] as any
+    expect(layout.content.resumeSessionId).toBe('123e4567-e89b-12d3-a456-426614174000')
+  })
+
   it('dedupes identical persisted payloads delivered via both storage and BroadcastChannel', () => {
     const dispatchSpy = vi.fn()
     const storeLike = {

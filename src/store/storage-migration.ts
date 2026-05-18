@@ -14,22 +14,28 @@
 
 import { createLogger } from '@/lib/client-logger'
 import { clearAuthCookie } from '@/lib/auth'
-import { LAYOUT_SCHEMA_VERSION, PANES_SCHEMA_VERSION, migrateV2ToV3 } from './persistedState'
-import { BROWSER_PREFERENCES_STORAGE_KEY, LAYOUT_STORAGE_KEY } from './storage-keys'
+import { BROWSER_PREFERENCES_STORAGE_KEY } from './storage-keys'
 import {
-  buildRestoreError,
-  migrateLegacyAgentChatDurableState,
-  migrateLegacyTerminalDurableState,
-  sanitizeSessionRef,
-} from '@shared/session-contract'
+  LAYOUT_STORAGE_KEY,
+  PANES_SCHEMA_VERSION,
+  LAYOUT_SCHEMA_VERSION,
+  PANES_STORAGE_KEY,
+  TABS_STORAGE_KEY,
+  migrateV2ToV3,
+  parsePersistedLayoutRaw,
+} from './persistedState'
 
 const log = createLogger('StorageMigration')
 
-const STORAGE_VERSION = 4
+const STORAGE_VERSION = 5
 const STORAGE_VERSION_KEY = 'freshell_version'
 const AUTH_STORAGE_KEY = 'freshell.auth-token'
 const LEGACY_BROWSER_PREFERENCE_KEYS = [
   'freshell.terminal.fontFamily.v1',
+] as const
+const LEGACY_STORAGE_KEYS = [
+  'freshell.tabs.v1',
+  'freshell.panes.v1',
 ] as const
 
 function readStorageVersion(): number {
@@ -39,197 +45,63 @@ function readStorageVersion(): number {
   return Number.isFinite(parsed) ? parsed : 0
 }
 
-function clearFreshellKeysExcept(keep: string[]): void {
-  const keepSet = new Set(keep)
-  for (const key of Object.keys(localStorage)) {
-    if ((key.startsWith('freshell.') || key === STORAGE_VERSION_KEY) && !keepSet.has(key)) {
-      localStorage.removeItem(key)
-    }
-  }
-}
-
-function normalizeLayoutTab(tab: Record<string, unknown>): Record<string, unknown> {
-  const mode = typeof tab.mode === 'string' ? tab.mode : undefined
-  const codingCliProvider = typeof tab.codingCliProvider === 'string' ? tab.codingCliProvider : undefined
-  const provider = codingCliProvider || (mode && mode !== 'shell' ? mode : undefined)
-  const durableState = migrateLegacyTerminalDurableState({
-    provider,
-    sessionRef: tab.sessionRef,
-    resumeSessionId: typeof tab.resumeSessionId === 'string' ? tab.resumeSessionId : undefined,
-  })
-  const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, ...rest } = tab
-  return {
-    ...rest,
-    ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
-  }
-}
-
-function isCodexSessionRef(sessionRef: unknown): sessionRef is { provider: 'codex'; sessionId: string } {
-  return !!sessionRef
-    && typeof sessionRef === 'object'
-    && (sessionRef as { provider?: unknown }).provider === 'codex'
-    && typeof (sessionRef as { sessionId?: unknown }).sessionId === 'string'
-    && (sessionRef as { sessionId: string }).sessionId.length > 0
-}
-
-function normalizeLegacyRecoveryFailedTerminal(
-  content: Record<string, unknown>,
-  durableState: { sessionRef?: unknown },
-): Record<string, unknown> {
-  if (content.kind !== 'terminal' || content.mode !== 'codex' || content.status !== 'recovery_failed') {
-    return content
-  }
-
-  const {
-    terminalId: _terminalId,
-    status: _status,
-    restoreError: _restoreError,
-    ...rest
-  } = content
-  if (isCodexSessionRef(durableState.sessionRef)) {
-    return {
-      ...rest,
-      status: 'creating',
-    }
-  }
-
-  return {
-    ...rest,
-    status: 'error',
-    restoreError: buildRestoreError('invalid_legacy_restore_target'),
-  }
-}
-
-function normalizeLayoutNode(node: unknown): unknown {
-  if (!node || typeof node !== 'object') return node
-  const candidate = node as Record<string, unknown>
-
-  if (candidate.type === 'leaf' && candidate.content && typeof candidate.content === 'object') {
-    const content = candidate.content as Record<string, unknown>
-    if (content.kind === 'terminal') {
-      const durableState = migrateLegacyTerminalDurableState({
-        provider: typeof content.mode === 'string' && content.mode !== 'shell' ? content.mode : undefined,
-        sessionRef: content.sessionRef,
-        resumeSessionId: typeof content.resumeSessionId === 'string' ? content.resumeSessionId : undefined,
-      })
-      const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, restoreError: _legacyRestoreError, ...rest } = content
-      const normalizedRuntime = normalizeLegacyRecoveryFailedTerminal(rest, durableState)
-      const isLegacyRecoveryFailed = (
-        rest.kind === 'terminal'
-        && rest.mode === 'codex'
-        && rest.status === 'recovery_failed'
-      )
-      const normalizedSessionRef = isLegacyRecoveryFailed && !isCodexSessionRef(durableState.sessionRef)
-        ? undefined
-        : durableState.sessionRef
-      return {
-        ...candidate,
-        content: {
-          ...normalizedRuntime,
-          ...(normalizedSessionRef ? { sessionRef: normalizedSessionRef } : {}),
-          ...(!isLegacyRecoveryFailed && durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
-        },
-      }
-    }
-
-    if (content.kind === 'agent-chat') {
-      const durableState = migrateLegacyAgentChatDurableState({
-        sessionRef: content.sessionRef,
-        cliSessionId: typeof content.cliSessionId === 'string' ? content.cliSessionId : undefined,
-        timelineSessionId: typeof content.timelineSessionId === 'string' ? content.timelineSessionId : undefined,
-        resumeSessionId: typeof content.resumeSessionId === 'string' ? content.resumeSessionId : undefined,
-      })
-      const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, restoreError: _legacyRestoreError, ...rest } = content
-      return {
-        ...candidate,
-        content: {
-          ...rest,
-          ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
-          ...(durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
-        },
-      }
-    }
-
-    const sanitizedSessionRef = sanitizeSessionRef(content.sessionRef)
-    if (!sanitizedSessionRef) return node
-
-    const { sessionRef: _legacySessionRef, ...rest } = content
-    return {
-      ...candidate,
-      content: {
-        ...rest,
-        sessionRef: sanitizedSessionRef,
-      },
-    }
-  }
-
-  if (candidate.type === 'split' && Array.isArray(candidate.children) && candidate.children.length === 2) {
-    return {
-      ...candidate,
-      children: [
-        normalizeLayoutNode(candidate.children[0]),
-        normalizeLayoutNode(candidate.children[1]),
-      ],
-    }
-  }
-
-  return node
-}
-
-function migratePersistedLayout(): boolean {
-  const raw = localStorage.getItem(LAYOUT_STORAGE_KEY)
-  if (!raw) return false
-
-  let parsed: any
+function migrateBrowserPreferencesRecord(raw: string): string | undefined {
   try {
-    parsed = JSON.parse(raw)
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    const legacySettings = parsed.settings
+    if (!legacySettings || typeof legacySettings !== 'object' || Array.isArray(legacySettings)) {
+      return undefined
+    }
+    const nextSettings = { ...legacySettings } as Record<string, unknown>
+    if (
+      !Object.prototype.hasOwnProperty.call(nextSettings, 'freshAgent')
+      && Object.prototype.hasOwnProperty.call(nextSettings, 'agentChat')
+    ) {
+      nextSettings.freshAgent = nextSettings.agentChat
+    }
+    return JSON.stringify({
+      ...parsed,
+      settings: nextSettings,
+    })
   } catch {
-    return false
+    return undefined
   }
-
-  if (!parsed || typeof parsed !== 'object' || !parsed.tabs || !parsed.panes) {
-    return false
-  }
-
-  const nextTabs = Array.isArray(parsed.tabs.tabs)
-    ? parsed.tabs.tabs.map((tab: Record<string, unknown>) => normalizeLayoutTab(tab))
-    : []
-  const nextLayouts = parsed.panes.layouts && typeof parsed.panes.layouts === 'object'
-    ? Object.fromEntries(
-      Object.entries(parsed.panes.layouts as Record<string, unknown>).map(([tabId, node]) => [tabId, normalizeLayoutNode(node)]),
-    )
-    : {}
-
-  localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
-    persistedAt: typeof parsed.persistedAt === 'number' ? parsed.persistedAt : Date.now(),
-    version: LAYOUT_SCHEMA_VERSION,
-    tabs: {
-      ...parsed.tabs,
-      activeTabId: parsed.tabs.activeTabId ?? null,
-      tabs: nextTabs,
-    },
-    panes: {
-      version: Math.max(typeof parsed.panes.version === 'number' ? parsed.panes.version : 1, PANES_SCHEMA_VERSION),
-      layouts: nextLayouts,
-      activePane: parsed.panes.activePane ?? {},
-      paneTitles: parsed.panes.paneTitles ?? {},
-      paneTitleSetByUser: parsed.panes.paneTitleSetByUser ?? {},
-    },
-    tombstones: Array.isArray(parsed.tombstones) ? parsed.tombstones : [],
-  }))
-  return true
 }
 
-function preservePersistedLayout(): boolean {
-  if (migratePersistedLayout()) {
-    return true
+function migrateLegacyBrowserPreferenceKeys(): string | undefined {
+  const legacyFont = localStorage.getItem('freshell.terminal.fontFamily.v1')?.trim()
+  if (!legacyFont) {
+    return undefined
   }
 
-  if (!migrateV2ToV3()) {
-    return false
+  return JSON.stringify({
+    settings: {
+      terminal: {
+        fontFamily: legacyFont,
+      },
+    },
+  })
+}
+
+function migrateLayoutRecord(raw: string): string | undefined {
+  const parsed = parsePersistedLayoutRaw(raw)
+  if (!parsed) {
+    return undefined
   }
 
-  return migratePersistedLayout()
+  return JSON.stringify({
+    version: LAYOUT_SCHEMA_VERSION,
+    tabs: parsed.tabs,
+    panes: {
+      version: Math.max(parsed.panes.version, PANES_SCHEMA_VERSION),
+      layouts: parsed.panes.layouts,
+      activePane: parsed.panes.activePane,
+      paneTitles: parsed.panes.paneTitles,
+      paneTitleSetByUser: parsed.panes.paneTitleSetByUser,
+    },
+    tombstones: parsed.tombstones,
+    ...(typeof parsed.persistedAt === 'number' ? { persistedAt: parsed.persistedAt } : {}),
+  })
 }
 
 export function runStorageMigration(): void {
@@ -237,26 +109,48 @@ export function runStorageMigration(): void {
     const currentVersion = readStorageVersion()
     if (currentVersion >= STORAGE_VERSION) return
 
-    const preservedAuthToken = localStorage.getItem(AUTH_STORAGE_KEY)
-    const migratedLayout = preservePersistedLayout()
-    clearFreshellKeysExcept([
-      AUTH_STORAGE_KEY,
-      BROWSER_PREFERENCES_STORAGE_KEY,
-      LAYOUT_STORAGE_KEY,
-      ...LEGACY_BROWSER_PREFERENCE_KEYS,
-    ])
-
-    if (preservedAuthToken) {
-      localStorage.setItem(AUTH_STORAGE_KEY, preservedAuthToken)
-    } else {
+    if (!localStorage.getItem(AUTH_STORAGE_KEY)) {
       clearAuthCookie()
     }
 
+    const existingLayout = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    let hasValidLayout = false
+    if (existingLayout) {
+      const migratedLayout = migrateLayoutRecord(existingLayout)
+      if (migratedLayout) {
+        localStorage.setItem(LAYOUT_STORAGE_KEY, migratedLayout)
+        hasValidLayout = true
+      }
+    }
+    if (!hasValidLayout) {
+      hasValidLayout = !!migrateV2ToV3()
+    } else {
+      localStorage.removeItem(TABS_STORAGE_KEY)
+      localStorage.removeItem(PANES_STORAGE_KEY)
+    }
+
+    const browserPreferences = localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY)
+    if (browserPreferences) {
+      const migratedPreferences = migrateBrowserPreferencesRecord(browserPreferences)
+      if (migratedPreferences) {
+        localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, migratedPreferences)
+      }
+    } else {
+      const migratedPreferences = migrateLegacyBrowserPreferenceKeys()
+      if (migratedPreferences) {
+        localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, migratedPreferences)
+      }
+    }
+
+    for (const key of LEGACY_STORAGE_KEYS) {
+      localStorage.removeItem(key)
+    }
+    for (const key of LEGACY_BROWSER_PREFERENCE_KEYS) {
+      localStorage.removeItem(key)
+    }
+
     localStorage.setItem(STORAGE_VERSION_KEY, String(STORAGE_VERSION))
-    log.info(
-      `Migrated localStorage (version ${currentVersion} → ${STORAGE_VERSION}) ` +
-      `${migratedLayout ? 'while preserving restorable layout state.' : 'without preserved layout state.'}`
-    )
+    log.info(`Migrated localStorage in place (version ${currentVersion} → ${STORAGE_VERSION}).`)
   } catch (err) {
     log.warn('Storage migration failed:', err)
   }

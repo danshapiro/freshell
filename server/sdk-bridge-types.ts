@@ -74,6 +74,7 @@ export interface SdkSessionState {
   cwd?: string
   model?: string
   permissionMode?: string
+  plugins?: string[]
   tools?: Array<{ name: string }>
   status: SdkSessionStatus
   createdAt: number

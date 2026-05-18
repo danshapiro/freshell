@@ -587,6 +587,22 @@ describe('ContextMenuProvider', () => {
     cleanup()
     vi.clearAllMocks()
   })
+
+  it('does not emit selector instability warnings when feature flags are absent', () => {
+    const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const { store } = renderWithProvider(
+        <div data-context={ContextIds.Global}>Global area</div>,
+      )
+
+      store.dispatch({ type: 'test/unrelated' })
+
+      expect(consoleWarnSpy.mock.calls.map((call) => String(call[0])).join('\n')).not.toContain('Selector')
+    } finally {
+      consoleWarnSpy.mockRestore()
+    }
+  })
+
   it('opens menu on right click and dispatches close tab', async () => {
     const user = userEvent.setup()
     const { store } = renderWithProvider(
@@ -874,8 +890,10 @@ describe('ContextMenuProvider', () => {
       expect(newPane).toBeDefined()
       if (newPane?.type === 'leaf') {
         expect(newPane.content).toMatchObject({
-          kind: 'agent-chat',
-          provider: 'freshclaude',
+          kind: 'fresh-agent',
+          provider: 'claude',
+          sessionType: 'freshclaude',
+          resumeSessionId: VALID_SESSION_ID,
           sessionRef: {
             provider: 'claude',
             sessionId: VALID_SESSION_ID,

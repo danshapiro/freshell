@@ -38,7 +38,7 @@ describe('TOOL_DESCRIPTION and INSTRUCTIONS', () => {
     expect(INSTRUCTIONS).toContain('terminal')
     expect(INSTRUCTIONS).toContain('editor')
     expect(INSTRUCTIONS).toContain('browser')
-    expect(INSTRUCTIONS).toContain('agent-chat')
+    expect(INSTRUCTIONS).toContain('fresh-agent')
     expect(INSTRUCTIONS).toContain('picker')
     // Picker warning
     expect(INSTRUCTIONS).toContain('Picker panes are ephemeral')

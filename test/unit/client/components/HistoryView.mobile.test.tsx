@@ -103,7 +103,7 @@ describe('HistoryView mobile behavior', () => {
     expect(screen.getByRole('button', { name: 'Delete session' }).className).toContain('min-h-11')
   })
 
-  it('opens agent-chat sessions with their sessionType instead of falling back to a terminal tab', async () => {
+  it('opens fresh-agent sessions with their sessionType instead of falling back to a terminal tab', async () => {
     const projectPath = '/test/project'
     const store = configureStore({
       reducer: {
@@ -167,8 +167,10 @@ describe('HistoryView mobile behavior', () => {
       expect(layout?.type).toBe('leaf')
       if (layout?.type === 'leaf') {
         expect(layout.content).toMatchObject({
-          kind: 'agent-chat',
-          provider: 'freshclaude',
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          resumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
           sessionRef: {
             provider: 'claude',
             sessionId: '550e8400-e29b-41d4-a716-446655440000',

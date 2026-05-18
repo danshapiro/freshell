@@ -80,6 +80,11 @@ import {
 import { CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
 import { registerStaticClientRoutes } from './static-client-routes.js'
 import { joinCodexShutdownOwners } from './shutdown-join.js'
+import { createFreshAgentProviderRegistry } from './fresh-agent/provider-registry.js'
+import { FreshAgentRuntimeManager } from './fresh-agent/runtime-manager.js'
+import { createFreshAgentRouter } from './fresh-agent/router.js'
+import { createClaudeFreshAgentAdapter } from './fresh-agent/adapters/claude/adapter.js'
+import { createCodexFreshAgentAdapter } from './fresh-agent/adapters/codex/adapter.js'
 
 function compileArgTemplate(
   template: string[] | undefined,
@@ -296,9 +301,40 @@ async function main() {
     getLiveSessionByCliSessionId: (timelineSessionId) => sdkBridge.findLiveSessionByCliSessionId(timelineSessionId),
   })
   sdkBridge = new SdkBridge(agentHistorySource)
+  const claudeFreshAgentTimelineService = createAgentTimelineService({
+    agentHistorySource,
+  })
+  const claudeFreshAgentAdapter = createClaudeFreshAgentAdapter({
+    sdkBridge,
+    agentHistorySource,
+    timelineService: claudeFreshAgentTimelineService,
+  })
 
   const server = http.createServer(app)
+  const codexAppServerRuntime = new CodexAppServerRuntime({ serverInstanceId })
   const codexLaunchPlanner = new CodexLaunchPlanner(() => new CodexAppServerRuntime({ serverInstanceId }))
+  const codexFreshAgentAdapter = createCodexFreshAgentAdapter({
+    runtime: codexAppServerRuntime,
+  })
+  const freshAgentRuntimeManager = new FreshAgentRuntimeManager({
+    registry: createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshclaude',
+        runtimeProvider: 'claude',
+        adapter: claudeFreshAgentAdapter,
+      },
+      {
+        sessionType: 'kilroy',
+        runtimeProvider: 'claude',
+        adapter: claudeFreshAgentAdapter,
+      },
+      {
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+        adapter: codexFreshAgentAdapter,
+      },
+    ]),
+  })
   const wsHandler = new WsHandler(
     server,
     registry,
@@ -328,6 +364,7 @@ async function main() {
       codexActivityListProvider: () => codexActivity.tracker.list(),
       agentHistorySource,
       opencodeActivityListProvider: () => opencodeActivity.tracker.list(),
+      freshAgentRuntimeManager,
     },
   )
   attachProxyUpgradeHandler(server)
@@ -503,10 +540,9 @@ async function main() {
   }))
 
   app.use('/api', createAgentTimelineRouter({
-    service: createAgentTimelineService({
-      agentHistorySource,
-    }),
+    service: claudeFreshAgentTimelineService,
   }))
+  app.use('/api', createFreshAgentRouter({ runtimeManager: freshAgentRuntimeManager }))
 
   app.use('/api', createProjectColorsRouter({ configStore, codingCliIndexer }))
 
