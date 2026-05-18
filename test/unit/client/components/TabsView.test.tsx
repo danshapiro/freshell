@@ -192,7 +192,7 @@ describe('TabsView', () => {
     if (!copiedTab) throw new Error('expected copied tab')
 
     const copiedLayout = store.getState().panes.layouts[copiedTab.id] as any
-    expect(copiedTab.mode).toBe('shell')
+    expect(copiedTab.mode).toBe('claude')
     expect(copiedLayout.content).toMatchObject({
       kind: 'fresh-agent',
       sessionType: 'freshclaude',
