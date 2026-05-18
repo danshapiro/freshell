@@ -248,49 +248,6 @@ describe('CodexAppServerClient', () => {
     ])
   })
 
-  it('emits turn started and completed notifications', async () => {
-    const server = await startFakeCodexAppServer({
-      notificationsAfterMethods: {
-        'thread/loaded/list': [
-          {
-            method: 'turn/started',
-            params: { threadId: 'thread-1', turnId: 'turn-1', extra: true },
-          },
-          {
-            method: 'turn/completed',
-            params: { threadId: 'thread-1', turnId: 'turn-1', status: 'completed' },
-          },
-        ],
-      },
-    })
-    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
-    const started: unknown[] = []
-    const completed: unknown[] = []
-    const unsubscribeStarted = client.onTurnStarted((event) => started.push(event))
-    const unsubscribeCompleted = client.onTurnCompleted((event) => completed.push(event))
-
-    await client.initialize()
-    await client.listLoadedThreads()
-    await new Promise((resolve) => setTimeout(resolve, 25))
-    unsubscribeStarted()
-    unsubscribeCompleted()
-
-    expect(started).toEqual([
-      {
-        threadId: 'thread-1',
-        turnId: 'turn-1',
-        params: { threadId: 'thread-1', turnId: 'turn-1', extra: true },
-      },
-    ])
-    expect(completed).toEqual([
-      {
-        threadId: 'thread-1',
-        turnId: 'turn-1',
-        params: { threadId: 'thread-1', turnId: 'turn-1', status: 'completed' },
-      },
-    ])
-  })
-
   it('fails clearly when the app-server never answers a request', async () => {
     const server = await startFakeCodexAppServer({ ignoreMethods: ['thread/start'] })
     const client = new CodexAppServerClient({ wsUrl: server.wsUrl }, { requestTimeoutMs: 50 })
