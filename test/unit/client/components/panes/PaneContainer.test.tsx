@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import PaneContainer from '@/components/panes/PaneContainer'
@@ -44,6 +44,7 @@ const {
   mockApiPost,
   mockApiPatch,
   saveServerSettingsPatchSpy,
+  editorPaneMockState,
 } = vi.hoisted(() => ({
   mockSend: vi.fn(),
   mockTerminalView: vi.fn(({ tabId, paneId, hidden }: { tabId: string; paneId: string; hidden?: boolean }) => (
@@ -62,6 +63,38 @@ const {
     type: 'settings/saveServerSettingsPatch',
     payload: patch,
   })),
+  editorPaneMockState: (() => {
+    let shouldSuspend = false
+    let resolvePending: (() => void) | null = null
+    let pendingPromise: Promise<void> | null = null
+
+    return {
+      suspendNextRender() {
+        shouldSuspend = true
+        pendingPromise = new Promise((resolve) => {
+          resolvePending = () => {
+            shouldSuspend = false
+            pendingPromise = null
+            resolvePending = null
+            resolve()
+          }
+        })
+      },
+      maybeSuspend() {
+        if (shouldSuspend && pendingPromise) {
+          throw pendingPromise
+        }
+      },
+      resolve() {
+        resolvePending?.()
+      },
+      reset() {
+        shouldSuspend = false
+        pendingPromise = null
+        resolvePending = null
+      },
+    }
+  })(),
 }))
 
 // Mock the ws-client module
@@ -187,6 +220,70 @@ vi.mock('@/components/panes/BrowserPane', () => ({
   },
 }))
 
+vi.mock('@/components/panes/EditorPane', async () => {
+  const React = await import('react')
+  const { useDispatch } = await import('react-redux')
+  const { updatePaneContent } = await import('@/store/panesSlice')
+
+  function MockEditorPane({
+    paneId,
+    tabId,
+    filePath,
+    language,
+    readOnly = false,
+    content,
+    viewMode = 'source',
+    wordWrap = true,
+  }: {
+    paneId: string
+    tabId: string
+    filePath: string | null
+    language: string | null
+    readOnly?: boolean
+    content: string
+    viewMode?: 'source' | 'preview'
+    wordWrap?: boolean
+  }) {
+    editorPaneMockState.maybeSuspend()
+
+    const dispatch = useDispatch()
+
+    return React.createElement(
+      'div',
+      { 'data-testid': 'editor-pane' },
+      React.createElement('textarea', {
+        'data-testid': 'monaco-mock',
+        readOnly: true,
+        value: content,
+        onChange: () => undefined,
+      }),
+      React.createElement(
+        'button',
+        {
+          type: 'button',
+          'aria-label': wordWrap ? 'Disable line wrap' : 'Enable line wrap',
+          onClick: () => dispatch(updatePaneContent({
+            tabId,
+            paneId,
+            content: {
+              kind: 'editor',
+              filePath,
+              language,
+              readOnly,
+              content,
+              viewMode,
+              wordWrap: !wordWrap,
+            },
+          })),
+        },
+        React.createElement('svg', { 'data-testid': 'wrap-text-icon' }),
+      ),
+    )
+  }
+
+  return { default: MockEditorPane }
+})
+
 // Mock Monaco editor
 vi.mock('@monaco-editor/react', () => {
   const MockEditor = ({ value, onChange }: any) => {
@@ -310,6 +407,7 @@ describe('PaneContainer', () => {
     mockApiPost.mockReset()
     mockApiPatch.mockReset()
     saveServerSettingsPatchSpy.mockClear()
+    editorPaneMockState.reset()
     mockApiGet.mockResolvedValue({ directories: [] })
     mockApiPost.mockResolvedValue({ valid: true, resolvedPath: '/resolved/path' })
     mockApiPatch.mockResolvedValue({})
@@ -1274,6 +1372,7 @@ describe('PaneContainer', () => {
         activePane: { 'tab-1': 'pane-1' },
       })
 
+      editorPaneMockState.suspendNextRender()
       renderWithStore(
         <PaneContainer tabId="tab-1" node={node} />,
         store
@@ -1281,6 +1380,9 @@ describe('PaneContainer', () => {
 
       expect(screen.getByTestId('editor-pane-loading')).toBeInTheDocument()
       expect(screen.getByRole('status')).toHaveTextContent('Loading editor...')
+      await act(async () => {
+        editorPaneMockState.resolve()
+      })
       expect(await screen.findByTestId('monaco-mock')).toBeInTheDocument()
     })
 
