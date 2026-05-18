@@ -1,4 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from 'react'
+import { isChunkLoadError, shouldReload } from '@/lib/import-retry'
 
 type ErrorBoundaryProps = {
   children: ReactNode
@@ -30,6 +31,13 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
   }
 
   private handleReset = () => {
+    const err = this.state.error
+    if (err != null && isChunkLoadError(err)) {
+      if (shouldReload()) {
+        window.location.reload()
+        return
+      }
+    }
     this.setState({ hasError: false, error: null })
   }
 

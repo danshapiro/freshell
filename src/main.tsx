@@ -9,11 +9,13 @@ import { initializeAuthToken } from '@/lib/auth'
 import { createClientLogger } from '@/lib/client-logger'
 import { initClientPerfLogging } from '@/lib/perf-logger'
 import { registerServiceWorker } from '@/lib/pwa'
+import { initChunkErrorRecovery } from '@/lib/import-retry'
 
 initializeAuthToken()
 createClientLogger().installConsoleCapture()
 initClientPerfLogging()
 registerServiceWorker()
+initChunkErrorRecovery()
 
 if (import.meta.env.DEV) {
   document.title = 'freshell:dev'

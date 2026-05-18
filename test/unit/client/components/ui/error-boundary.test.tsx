@@ -125,4 +125,101 @@ describe('ErrorBoundary', () => {
     await user.click(screen.getByRole('button', { name: 'Go to Overview' }))
     expect(onNavigate).toHaveBeenCalledTimes(1)
   })
+
+  describe('chunk-load error recovery', () => {
+    const originalReload = window.location.reload
+
+    beforeEach(() => {
+      Object.defineProperty(window, 'location', {
+        value: { ...window.location, reload: vi.fn() },
+        writable: true,
+        configurable: true,
+      })
+      sessionStorage.clear()
+    })
+
+    afterEach(() => {
+      Object.defineProperty(window, 'location', {
+        value: { ...window.location, reload: originalReload },
+        writable: true,
+        configurable: true,
+      })
+    })
+
+    it('reloads the page when Try Again is clicked on a Chrome chunk-load error', async () => {
+      const user = userEvent.setup()
+      const chunkError = new TypeError(
+        'Failed to fetch dynamically imported module: http://192.168.3.50:3001/assets/EditorPane-DAYbRo9B.js'
+      )
+      function BadImport() {
+        throw chunkError
+      }
+      render(
+        <ErrorBoundary label="Editor">
+          <BadImport />
+        </ErrorBoundary>
+      )
+      await user.click(screen.getByRole('button', { name: 'Try Again' }))
+      expect(window.location.reload).toHaveBeenCalled()
+    })
+
+    it('reloads on Firefox-style chunk error', async () => {
+      const user = userEvent.setup()
+      const err = new TypeError(
+        'error loading dynamically imported module: http://localhost/assets/chunk.js'
+      )
+      function BadImport() {
+        throw err
+      }
+      render(
+        <ErrorBoundary>
+          <BadImport />
+        </ErrorBoundary>
+      )
+      await user.click(screen.getByRole('button', { name: 'Try Again' }))
+      expect(window.location.reload).toHaveBeenCalled()
+    })
+
+    it('still resets state for non-chunk errors (no reload)', async () => {
+      const user = userEvent.setup()
+      let shouldThrow = true
+      function ToggleChild() {
+        if (shouldThrow) throw new Error('Regular error')
+        return <div>Recovered</div>
+      }
+      const { container, rerender } = render(
+        <ErrorBoundary>
+          <ToggleChild />
+        </ErrorBoundary>
+      )
+      expect(within(container).getByRole('alert')).toBeInTheDocument()
+      shouldThrow = false
+      await user.click(within(container).getByRole('button', { name: 'Try Again' }))
+      rerender(
+        <ErrorBoundary>
+          <ToggleChild />
+        </ErrorBoundary>
+      )
+      expect(within(container).getByText('Recovered')).toBeInTheDocument()
+      expect(window.location.reload).not.toHaveBeenCalled()
+    })
+
+    it('does not reload if circuit breaker is tripped', async () => {
+      sessionStorage.setItem('freshell.chunk-reload', String(Date.now()))
+      const user = userEvent.setup()
+      const err = new TypeError(
+        'Failed to fetch dynamically imported module: http://localhost/assets/chunk.js'
+      )
+      function BadImport() {
+        throw err
+      }
+      render(
+        <ErrorBoundary>
+          <BadImport />
+        </ErrorBoundary>
+      )
+      await user.click(screen.getByRole('button', { name: 'Try Again' }))
+      expect(window.location.reload).not.toHaveBeenCalled()
+    })
+  })
 })

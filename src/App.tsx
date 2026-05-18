@@ -69,6 +69,7 @@ import { handleSdkMessage } from '@/lib/sdk-message-handler'
 import { createLogger } from '@/lib/client-logger'
 import type { LocalSettingsPatch, ServerSettings } from '@shared/settings'
 import { z } from 'zod'
+import { withChunkErrorRecovery } from '@/lib/import-retry'
 
 const log = createLogger('App')
 
@@ -94,9 +95,9 @@ function ShareQrCode({ url }: { url: string }) {
   return <img src={svgUrl} alt="QR code for access URL" className="w-48 h-48" />
 }
 
-const HistoryView = lazy(() => import('@/components/HistoryView'))
-const SettingsView = lazy(() => import('@/components/SettingsView'))
-const ExtensionsView = lazy(() => import('@/components/ExtensionsView'))
+const HistoryView = lazy(() => withChunkErrorRecovery(import('@/components/HistoryView')))
+const SettingsView = lazy(() => withChunkErrorRecovery(import('@/components/SettingsView')))
+const ExtensionsView = lazy(() => withChunkErrorRecovery(import('@/components/ExtensionsView')))
 
 const SIDEBAR_MIN_WIDTH = 200
 const SIDEBAR_MAX_WIDTH = 500
