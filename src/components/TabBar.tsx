@@ -461,22 +461,22 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         >
           {/* Left scroll arrow -- flex sibling alongside the scroll container */}
           {!multirowTabs && (
-            <button
-              className={cn(
-                'flex-shrink-0 w-7 h-8 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-all duration-150',
-                canScrollLeft ? 'opacity-100' : 'opacity-0 pointer-events-none',
-              )}
-              aria-label="Scroll tabs left"
-              aria-hidden={canScrollLeft ? undefined : true}
-              tabIndex={canScrollLeft ? 0 : -1}
-              onClick={() => handleArrowClick('left')}
-              onPointerDown={() => startHoldScroll('left')}
-              onPointerUp={stopHoldScroll}
-              onPointerLeave={cancelHoldScroll}
-              onPointerCancel={cancelHoldScroll}
-            >
-              <ChevronLeft className="h-4 w-4" />
-            </button>
+          <button
+            className={cn(
+              'flex-shrink-0 w-7 h-8 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-all duration-150',
+              canScrollLeft ? 'opacity-100' : 'opacity-0 pointer-events-none',
+            )}
+            aria-label="Scroll tabs left"
+            aria-hidden={canScrollLeft ? undefined : true}
+            tabIndex={canScrollLeft ? 0 : -1}
+            onClick={() => handleArrowClick('left')}
+            onPointerDown={() => startHoldScroll('left')}
+            onPointerUp={stopHoldScroll}
+            onPointerLeave={cancelHoldScroll}
+            onPointerCancel={cancelHoldScroll}
+          >
+            <ChevronLeft className="h-4 w-4" />
+          </button>
           )}
 
           {/* Scrollable tab strip */}
@@ -505,22 +505,22 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
 
           {/* Right scroll arrow -- flex sibling alongside the scroll container */}
           {!multirowTabs && (
-            <button
-              className={cn(
-                'flex-shrink-0 w-7 h-8 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-all duration-150',
-                canScrollRight ? 'opacity-100' : 'opacity-0 pointer-events-none',
-              )}
-              aria-label="Scroll tabs right"
-              aria-hidden={canScrollRight ? undefined : true}
-              tabIndex={canScrollRight ? 0 : -1}
-              onClick={() => handleArrowClick('right')}
-              onPointerDown={() => startHoldScroll('right')}
-              onPointerUp={stopHoldScroll}
-              onPointerLeave={cancelHoldScroll}
-              onPointerCancel={cancelHoldScroll}
-            >
-              <ChevronRight className="h-4 w-4" />
-            </button>
+          <button
+            className={cn(
+              'flex-shrink-0 w-7 h-8 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-all duration-150',
+              canScrollRight ? 'opacity-100' : 'opacity-0 pointer-events-none',
+            )}
+            aria-label="Scroll tabs right"
+            aria-hidden={canScrollRight ? undefined : true}
+            tabIndex={canScrollRight ? 0 : -1}
+            onClick={() => handleArrowClick('right')}
+            onPointerDown={() => startHoldScroll('right')}
+            onPointerUp={stopHoldScroll}
+            onPointerLeave={cancelHoldScroll}
+            onPointerCancel={cancelHoldScroll}
+          >
+            <ChevronRight className="h-4 w-4" />
+          </button>
           )}
         </SortableContext>
 
