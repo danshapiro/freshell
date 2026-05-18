@@ -1,5 +1,5 @@
-import { describe, expect, it, vi, beforeEach } from 'vitest'
-import { act, render, screen, waitFor } from '@testing-library/react'
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
@@ -8,6 +8,7 @@ import settingsReducer from '@/store/settingsSlice'
 import freshAgentReducer from '@/store/freshAgentSlice'
 import agentChatReducer, { markSessionLost, sessionSnapshotReceived } from '@/store/agentChatSlice'
 import { useAppSelector } from '@/store/hooks'
+import type { PaneNode } from '@/store/paneTypes'
 
 const wsMock = vi.hoisted(() => ({
   send: vi.fn(),
@@ -64,7 +65,15 @@ function StoreBackedFreshAgentView({ tabId, paneId }: { tabId: string; paneId: s
   return <FreshAgentView tabId={tabId} paneId={paneId} paneContent={paneContent} />
 }
 
+function leafContent(layout: PaneNode | undefined) {
+  return layout?.type === 'leaf' ? layout.content : undefined
+}
+
 describe('Fresh-agent lost-session recovery coverage', () => {
+  afterEach(() => {
+    cleanup()
+  })
+
   beforeEach(() => {
     wsMock.send.mockReset()
     wsMock.onMessage.mockReset()
@@ -74,6 +83,7 @@ describe('Fresh-agent lost-session recovery coverage', () => {
   })
 
   it('shows a restoring state for a durable freshclaude resume before recovery completes', async () => {
+    const durableSessionId = '00000000-0000-4000-8000-000000000123'
     const store = createStore()
     store.dispatch(initLayout({
       tabId: 'tab-1',
@@ -92,23 +102,24 @@ describe('Fresh-agent lost-session recovery coverage', () => {
       sessionId: 'dead-session-id',
       latestTurnId: 'turn-1',
       status: 'idle',
-      timelineSessionId: 'cli-session-abc-123',
+      timelineSessionId: durableSessionId,
       revision: 2,
     }))
 
-    render(
+    const view = render(
       <Provider store={store}>
         <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
       </Provider>,
     )
 
     await waitFor(() => {
-      expect(screen.getAllByText(/restoring/i).length).toBeGreaterThan(0)
+      expect(within(view.container).getAllByText(/restoring/i).length).toBeGreaterThan(0)
     })
-    expect(screen.queryByText(/failed to parse url/i)).not.toBeInTheDocument()
+    expect(within(view.container).queryByText(/failed to parse url/i)).not.toBeInTheDocument()
   })
 
   it('recreates a lost freshclaude session with the canonical durable resume id', async () => {
+    const durableSessionId = '00000000-0000-4000-8000-000000000123'
     const store = createStore()
     store.dispatch(initLayout({
       tabId: 'tab-1',
@@ -127,7 +138,7 @@ describe('Fresh-agent lost-session recovery coverage', () => {
       sessionId: 'dead-session-id',
       latestTurnId: 'turn-1',
       status: 'idle',
-      timelineSessionId: 'cli-session-abc-123',
+      timelineSessionId: durableSessionId,
       revision: 2,
     }))
 
@@ -149,7 +160,7 @@ describe('Fresh-agent lost-session recovery coverage', () => {
       expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'freshAgent.create',
         sessionType: 'freshclaude',
-        resumeSessionId: 'cli-session-abc-123',
+        resumeSessionId: durableSessionId,
       }))
     })
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({
@@ -158,7 +169,7 @@ describe('Fresh-agent lost-session recovery coverage', () => {
     }))
   })
 
-  it('falls back to named-resume when no canonical durable id is available', async () => {
+  it('does not recreate from a named-only legacy resume target', async () => {
     const store = createStore()
     store.dispatch(initLayout({
       tabId: 'tab-1',
@@ -182,10 +193,14 @@ describe('Fresh-agent lost-session recovery coverage', () => {
     )
 
     await waitFor(() => {
-      expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
-        type: 'freshAgent.create',
-        resumeSessionId: 'named-only-fallback',
-      }))
+      expect(screen.getByText(/legacy name, not a canonical Claude session id/i)).toBeInTheDocument()
+    })
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.create',
+    }))
+    expect(leafContent(store.getState().panes.layouts['tab-1'])?.restoreError).toEqual({
+      code: 'RESTORE_UNAVAILABLE',
+      reason: 'invalid_legacy_restore_target',
     })
   })
 
