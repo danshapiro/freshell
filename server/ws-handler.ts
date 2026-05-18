@@ -911,6 +911,14 @@ export class WsHandler {
     return undefined
   }
 
+  private clearFreshAgentCreateCachesForSession(sessionId: string): void {
+    for (const [requestId, cached] of this.createdFreshAgentByRequestId.entries()) {
+      if (cached.sessionId === sessionId) {
+        this.createdFreshAgentByRequestId.delete(requestId)
+      }
+    }
+  }
+
   private resolveSdkOwnerSession(ownerKey: string): SdkSessionState | undefined {
     const cachedSessionId = this.sdkSessionByCreateOwnerKey.get(ownerKey)
     if (!cachedSessionId) return undefined
@@ -3209,6 +3217,7 @@ export class WsHandler {
         this.cancelFreshAgentSubscription(state, locator)
         try {
           const success = await manager.kill(locator)
+          this.clearFreshAgentCreateCachesForSession(m.sessionId)
           this.send(ws, {
             type: 'freshAgent.killed',
             sessionId: m.sessionId,
@@ -3714,6 +3723,8 @@ export class WsHandler {
       this.screenshotRequests.delete(requestId)
     }
     this.createdTerminalByRequestId.clear()
+    this.createdFreshAgentByRequestId.clear()
+    this.freshAgentCreateLocks.clear()
 
     // Close all client connections
     for (const ws of this.connections) {

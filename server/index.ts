@@ -311,10 +311,10 @@ async function main() {
   })
 
   const server = http.createServer(app)
-  const codexAppServerRuntime = new CodexAppServerRuntime({ serverInstanceId })
+  const codexFreshAgentRuntime = new CodexAppServerRuntime({ serverInstanceId })
   const codexLaunchPlanner = new CodexLaunchPlanner(() => new CodexAppServerRuntime({ serverInstanceId }))
   const codexFreshAgentAdapter = createCodexFreshAgentAdapter({
-    runtime: codexAppServerRuntime,
+    runtime: codexFreshAgentRuntime,
   })
   const freshAgentRuntimeManager = new FreshAgentRuntimeManager({
     registry: createFreshAgentProviderRegistry([
@@ -850,6 +850,7 @@ async function main() {
       await joinCodexShutdownOwners({
         registry,
         codexLaunchPlanner,
+        codexFreshAgentRuntime,
         terminalShutdownTimeoutMs: 5000,
       })
     } finally {

@@ -35,16 +35,21 @@ type CodexShutdownOwners = {
   codexLaunchPlanner: {
     shutdown(): Promise<void>
   }
+  codexFreshAgentRuntime?: {
+    shutdown(): Promise<void>
+  }
   terminalShutdownTimeoutMs: number
 }
 
 export async function joinCodexShutdownOwners({
   registry,
   codexLaunchPlanner,
+  codexFreshAgentRuntime,
   terminalShutdownTimeoutMs,
 }: CodexShutdownOwners): Promise<void> {
   await waitForAllSettledOrThrow([
     invokeShutdownTask(() => registry.shutdownGracefully(terminalShutdownTimeoutMs)),
     invokeShutdownTask(() => codexLaunchPlanner.shutdown()),
+    ...(codexFreshAgentRuntime ? [invokeShutdownTask(() => codexFreshAgentRuntime.shutdown())] : []),
   ], 'Codex shutdown owners failed.')
 }
