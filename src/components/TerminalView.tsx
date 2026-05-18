@@ -112,6 +112,12 @@ const DEFAULT_MIN_CONTRAST_RATIO = 1
 const MAX_LAST_SENT_VIEWPORT_CACHE_ENTRIES = 200
 const TRUNCATED_REPLAY_BYTES = 128 * 1024
 
+function viewportHydrateReplayOptions(content?: TerminalPaneContent | null): { maxReplayBytes: number } | undefined {
+  return content?.mode === 'opencode'
+    ? undefined
+    : { maxReplayBytes: TRUNCATED_REPLAY_BYTES }
+}
+
 type StartupProbeReplayDiscardState = {
   remainder: string | null
   buffered: string
@@ -1647,7 +1653,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       }
       setIsAttaching(false)
     } else {
-      attachTerminal(tid, 'viewport_hydrate', { clearViewportFirst: true, maxReplayBytes: TRUNCATED_REPLAY_BYTES })
+      attachTerminal(tid, 'viewport_hydrate', {
+        clearViewportFirst: true,
+        ...viewportHydrateReplayOptions(currentContent),
+      })
     }
 
     dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: request.requestId }))
@@ -1696,7 +1705,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           clearViewportFirst: deferred.pendingIntent === 'viewport_hydrate',
           suppressNextMatchingResize: true,
           skipPreAttachFit: true,
-          ...(deferred.pendingIntent === 'viewport_hydrate' ? { maxReplayBytes: TRUNCATED_REPLAY_BYTES } : {}),
+          ...(deferred.pendingIntent === 'viewport_hydrate'
+            ? viewportHydrateReplayOptions(contentRef.current)
+            : undefined),
         })
         return
       }
@@ -2451,7 +2462,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const intent: AttachIntent = deferredAttachStateRef.current.mode === 'live'
             ? 'keepalive_delta'
             : 'viewport_hydrate'
-          attachTerminal(currentTerminalId, intent, intent === 'viewport_hydrate' ? { maxReplayBytes: TRUNCATED_REPLAY_BYTES } : undefined)
+          attachTerminal(currentTerminalId, intent, intent === 'viewport_hydrate'
+            ? viewportHydrateReplayOptions(contentRef.current)
+            : undefined)
         }
       } else {
         deferredAttachStateRef.current = {

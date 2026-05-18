@@ -150,11 +150,19 @@ describe('vitest config', () => {
     }
   })
 
-  it('does not exclude real-provider integration contracts from the default suite', async () => {
+  it('excludes real-provider integration contracts from the default jsdom suite', async () => {
     const configModule = await import('../../vitest.config.ts')
     const config = configModule.default
     const excluded = config.test?.exclude ?? []
 
-    expect(excluded).not.toContain('test/integration/real/**')
+    expect(excluded).toContain('test/integration/real/**')
+  })
+
+  it('runs real-provider integration contracts in the node server suite', async () => {
+    const configModule = await import('../../vitest.server.config.ts')
+    const config = configModule.default
+    const included = config.test?.include ?? []
+
+    expect(included).toContain('test/integration/real/**/*.test.ts')
   })
 })
