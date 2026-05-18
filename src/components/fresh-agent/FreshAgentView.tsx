@@ -9,7 +9,8 @@ import { mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { clearPendingCreateFailure } from '@/store/freshAgentSlice'
 import { handleFreshAgentTransportEvent, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
-import { getPreferredResumeSessionId } from '@/store/persistControl'
+import { getCanonicalDurableSessionId, getPreferredResumeSessionId } from '@/store/persistControl'
+import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import { FreshAgentApprovalBanner } from './FreshAgentApprovalBanner'
@@ -46,6 +47,16 @@ function getStatusLabel(status: FreshAgentPaneContent['status'], restoring: bool
     default:
       return 'Starting session'
   }
+}
+
+function getCanonicalPaneResumeSessionId(pane: FreshAgentPaneContent): string | undefined {
+  if (pane.sessionRef?.provider === 'claude' && isValidClaudeSessionId(pane.sessionRef.sessionId)) {
+    return pane.sessionRef.sessionId
+  }
+  if (isValidClaudeSessionId(pane.resumeSessionId)) {
+    return pane.resumeSessionId
+  }
+  return undefined
 }
 
 function getQuestionAgentLabel(paneContent: FreshAgentPaneContent, descriptorLabel?: string): string {
@@ -171,13 +182,24 @@ export function FreshAgentView({
       restoreTimeoutRef.current = null
     }
     const nextRequestId = nanoid()
+    const canonicalResumeSessionId = getCanonicalDurableSessionId(claudeSession)
+      ?? getCanonicalPaneResumeSessionId(paneContentRef.current)
+    const resumeSessionId = canonicalResumeSessionId
+      ?? getPreferredResumeSessionId(claudeSession)
+      ?? paneContentRef.current.resumeSessionId
     dispatch(updatePaneContent({
       tabId,
       paneId,
       content: {
         ...paneContentRef.current,
         sessionId: undefined,
-        resumeSessionId: getPreferredResumeSessionId(claudeSession) ?? paneContentRef.current.resumeSessionId,
+        resumeSessionId,
+        ...(canonicalResumeSessionId
+          ? {
+              sessionRef: { provider: 'claude', sessionId: canonicalResumeSessionId },
+              restoreError: undefined,
+            }
+          : {}),
         createRequestId: nextRequestId,
         status: 'creating',
         createError: undefined,
@@ -363,16 +385,31 @@ export function FreshAgentView({
   useEffect(() => {
     if (paneContent.provider !== 'claude') return
     if (!paneContent.sessionId) return
-    if (!preferredResumeSessionId || preferredResumeSessionId === paneContent.resumeSessionId) return
+    const canonicalResumeSessionId = getCanonicalDurableSessionId(claudeSession)
+    const shouldUpdateResumeSessionId = Boolean(
+      preferredResumeSessionId && preferredResumeSessionId !== paneContent.resumeSessionId,
+    )
+    const shouldClearRestoreError = Boolean(canonicalResumeSessionId && paneContent.restoreError)
+    if (!shouldUpdateResumeSessionId && !shouldClearRestoreError) return
     dispatch(mergePaneContent({
       tabId,
       paneId,
-      updates: { resumeSessionId: preferredResumeSessionId },
+      updates: {
+        ...(shouldUpdateResumeSessionId ? { resumeSessionId: preferredResumeSessionId } : {}),
+        ...(canonicalResumeSessionId
+          ? {
+              sessionRef: { provider: 'claude', sessionId: canonicalResumeSessionId },
+              restoreError: undefined,
+            }
+          : {}),
+      },
     }))
   }, [
+    claudeSession,
     dispatch,
     paneContent.provider,
     paneContent.resumeSessionId,
+    paneContent.restoreError,
     paneContent.sessionId,
     paneId,
     preferredResumeSessionId,
