@@ -70,7 +70,7 @@ FRESHELL_URL and FRESHELL_TOKEN are already set in your environment.
 ## Key gotchas
 
 - **Tab and pane IDs are ephemeral.** IDs from open-browser, new-tab, and split-pane are valid only within the current session. If the Freshell server restarts or the agent conversation resumes after a disconnect, previously returned IDs may no longer exist. Always call open-browser or list-tabs fresh rather than reusing stale IDs.
-- **Always screenshot with `screenshot({ scope: "tab", target: tabId })` after open-browser.** Network errors, CORS issues, or server problems can cause blank pages. open-browser returns a tabId — use it immediately to screenshot and confirm the page rendered before proceeding.
+- **Always screenshot with \`screenshot({ scope: "tab", target: tabId })\` after open-browser.** Network errors, CORS issues, or server problems can cause blank pages. open-browser returns a tabId — use it immediately to screenshot and confirm the page rendered before proceeding.
 - send-keys: use literal mode (literal: true + keys as a string) for natural-language prompts or multi-word text. Do NOT append "ENTER" as literal text -- send the command with literal:true, then send ["ENTER"] as a separate call in token mode.
 - wait-for with stable (seconds of no output) is more reliable than pattern matching across different CLI providers.
 - Editor panes show "Loading..." until the tab is visited in the browser. When screenshotting multiple tabs, visit each tab first (select-tab), then loop back for screenshots.
@@ -469,7 +469,7 @@ Meta:
 
 ## Screenshot guidance
 
-- **Always screenshot with `screenshot({ scope: "tab", target: tabId })` after open-browser.** Network errors, blank pages, and CORS failures are silent unless you look. open-browser returns a tabId — use it immediately to confirm the page rendered before acting on it.
+- **Always screenshot with \`screenshot({ scope: "tab", target: tabId })\` after open-browser.** Network errors, blank pages, and CORS failures are silent unless you look. open-browser returns a tabId — use it immediately to confirm the page rendered before acting on it.
 - Tab and pane IDs from earlier in a session may become stale after reconnections or server restarts. If screenshot fails to find a tab/pane, call list-tabs or list-panes to get fresh IDs rather than reusing old ones.
 - Use a dedicated canary tab when validating screenshot behavior so live project panes are not contaminated.
 - Close temporary tabs/panes after verification unless user asked to keep them open.

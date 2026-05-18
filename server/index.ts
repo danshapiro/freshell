@@ -47,6 +47,7 @@ import { getNetworkHost } from './get-network-host.js'
 import { PortForwardManager } from './port-forward.js'
 import { parseTrustProxyEnv } from './request-ip.js'
 import { createTabsRegistryStore } from './tabs-registry/store.js'
+import { createTabsSyncRouter } from './tabs-registry/client-retire-router.js'
 import { checkForUpdate, createCachedUpdateChecker } from './updater/version-checker.js'
 import { SessionAssociationCoordinator } from './session-association-coordinator.js'
 import { broadcastTerminalSessionAssociation } from './session-association-broadcast.js'
@@ -189,33 +190,7 @@ async function main() {
   const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders, {}, sessionMetadataStore)
   const codingCliSessionManager = new CodingCliSessionManager(codingCliProviders)
   const tabsRegistryStore = await createTabsRegistryStore()
-
-  app.post('/api/tabs-sync/client-retire', async (req, res) => {
-    const { deviceId, clientInstanceId, snapshotRevision } = req.body ?? {}
-    if (
-      typeof deviceId !== 'string'
-      || deviceId.length === 0
-      || typeof clientInstanceId !== 'string'
-      || clientInstanceId.length === 0
-      || !Number.isInteger(snapshotRevision)
-      || snapshotRevision < 0
-    ) {
-      res.status(400).json({ error: 'Invalid tabs registry retire payload' })
-      return
-    }
-    try {
-      const result = await tabsRegistryStore.retireClientSnapshot({
-        deviceId,
-        clientInstanceId,
-        snapshotRevision,
-      })
-      res.json({ ok: true, accepted: result.accepted })
-    } catch (error) {
-      res.status(400).json({
-        error: error instanceof Error ? error.message : String(error),
-      })
-    }
-  })
+  app.use('/api/tabs-sync', createTabsSyncRouter({ tabsRegistryStore }))
 
   const settings = migrateSettingsSortMode(await configStore.getSettings())
   AI_CONFIG.applySettingsKey(settings.ai?.geminiApiKey)
