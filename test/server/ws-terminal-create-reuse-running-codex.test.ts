@@ -456,7 +456,7 @@ describe('terminal.create reuse running codex terminal', () => {
     }
   })
 
-  it('echoes canonical durable session ids from reused codex terminals via terminal.created', async () => {
+  it('does not echo durable session ids from reused codex terminals via terminal.created', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
@@ -471,15 +471,13 @@ describe('terminal.create reuse running codex terminal', () => {
         sessionRef: { provider: 'codex', sessionId: CODEX_SESSION_ID },
       }))
       const created = await createdPromise
-      expect(created).toMatchObject({
-        effectiveResumeSessionId: CODEX_SESSION_ID,
-      })
+      expect(created).not.toHaveProperty('effectiveResumeSessionId')
     } finally {
       await closeWebSocket(ws)
     }
   })
 
-  it('creates a fresh codex terminal with the sidecar-selected durable session id', async () => {
+  it('creates a fresh codex terminal without persisting a provisional session id', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
@@ -497,9 +495,7 @@ describe('terminal.create reuse running codex terminal', () => {
       const created = await createdPromise
 
       expect(created.terminalId).toBe('term-codex-existing')
-      expect(created).toMatchObject({
-        effectiveResumeSessionId: 'thread-new-1',
-      })
+      expect(created).not.toHaveProperty('effectiveResumeSessionId')
       expect(codexLaunchPlanner.planCreateCalls).toHaveLength(1)
       const planCreate = codexLaunchPlanner.planCreateCalls[0]
       expect(planCreate).toEqual(expect.objectContaining({
@@ -513,7 +509,7 @@ describe('terminal.create reuse running codex terminal', () => {
       expect(registry.createCalls[0]).toMatchObject({
         mode: 'codex',
         cwd: '/repo/worktree',
-        resumeSessionId: 'thread-new-1',
+        resumeSessionId: undefined,
         providerSettings: {
           codexAppServer: {
             wsUrl: CODEX_REMOTE_WS_URL,

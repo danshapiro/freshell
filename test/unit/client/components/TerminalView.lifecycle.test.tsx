@@ -34,23 +34,12 @@ const terminalThemeMocks = vi.hoisted(() => ({
   getTerminalTheme: vi.fn(() => ({})),
 }))
 
-const restoreMocks = vi.hoisted(() => {
-  const freshRecoveryIds = new Map<string, string>()
-  return {
-    consumeTerminalRestoreRequestId: vi.fn(() => false),
-    addTerminalRestoreRequestId: vi.fn(),
-    consumeTerminalFreshRecoveryRequest: vi.fn((id: string) => {
-      const intent = freshRecoveryIds.get(id)
-      if (!intent) return undefined
-      freshRecoveryIds.delete(id)
-      return intent
-    }),
-    addTerminalFreshRecoveryRequestId: vi.fn((id: string, intent: string) => {
-      freshRecoveryIds.set(id, intent)
-    }),
-    resetFreshRecoveryIds: () => freshRecoveryIds.clear(),
-  }
-})
+const restoreMocks = vi.hoisted(() => ({
+  consumeTerminalRestoreRequestId: vi.fn(() => false),
+  addTerminalRestoreRequestId: vi.fn(),
+  consumeTerminalFreshRecoveryRequest: vi.fn(() => undefined),
+  addTerminalFreshRecoveryRequestId: vi.fn(),
+}))
 
 const runtimeMocks = vi.hoisted(() => ({
   instances: [] as Array<{ fit: ReturnType<typeof vi.fn> }>,
@@ -269,9 +258,6 @@ describe('TerminalView lifecycle updates', () => {
     terminalThemeMocks.getTerminalTheme.mockReturnValue({})
     restoreMocks.consumeTerminalRestoreRequestId.mockReset()
     restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(false)
-    restoreMocks.addTerminalFreshRecoveryRequestId.mockClear()
-    restoreMocks.consumeTerminalFreshRecoveryRequest.mockClear()
-    restoreMocks.resetFreshRecoveryIds()
     terminalInstances.length = 0
     runtimeMocks.instances.length = 0
     wsMocks.onMessage.mockImplementation((callback: (msg: any) => void) => {
@@ -2887,7 +2873,7 @@ describe('TerminalView lifecycle updates', () => {
         expect(layout.content.terminalId).toBeUndefined()
       })
 
-      // Verify tab status moved to explicit fresh recovery
+      // Verify tab status moved into explicit fresh recovery rather than a permanent restore error
       const tab = store.getState().tabs.tabs.find(t => t.id === tabId)
       expect(tab?.status).toBe('creating')
 
@@ -2896,10 +2882,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(layout.content.terminalId).toBeUndefined()
       expect(layout.content.serverInstanceId).toBeUndefined()
       expect(layout.content.status).toBe('creating')
-      expect(layout.content.restoreError).toEqual({
-        code: 'RESTORE_UNAVAILABLE',
-        reason: 'dead_live_handle',
-      })
+      expect(layout.content.restoreError).toBeUndefined()
       expect(layout.content.createRequestId).not.toBe('req-clear')
       expect(restoreMocks.addTerminalFreshRecoveryRequestId).toHaveBeenCalledWith(
         layout.content.createRequestId,
