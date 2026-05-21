@@ -182,6 +182,17 @@ describe('Platform API', () => {
 
       delete process.env.KILROY_ENABLED
     })
+
+    it('returns a featureFlags object that keeps kilroy separate from fresh-agent defaults', async () => {
+      const res = await request(app)
+        .get('/api/platform')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+
+      expect(res.status).toBe(200)
+      expect(res.body.featureFlags).toEqual(expect.objectContaining({
+        kilroy: false,
+      }))
+    })
   })
 
   describe('GET /api/version', () => {

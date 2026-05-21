@@ -634,4 +634,62 @@ describe('EditorPane', () => {
       expect(screen.getByTestId('monaco-mock').getAttribute('data-theme')).toBe('vs')
     })
   })
+
+  describe('word wrap', () => {
+    it('renders the wrap toggle button with disable label when wrap is on', () => {
+      render(
+        <Provider store={store}>
+          <EditorPane
+            paneId="pane-1"
+            tabId="tab-1"
+            filePath="/test.ts"
+            language="typescript"
+            readOnly={false}
+            content="const x = 1"
+            viewMode="source"
+          />
+        </Provider>
+      )
+
+      expect(screen.getByRole('button', { name: /disable line wrap/i })).toBeInTheDocument()
+    })
+
+    it('renders the wrap toggle button with enable label when wrap is off', () => {
+      render(
+        <Provider store={store}>
+          <EditorPane
+            paneId="pane-1"
+            tabId="tab-1"
+            filePath="/test.ts"
+            language="typescript"
+            readOnly={false}
+            content="const x = 1"
+            viewMode="source"
+            wordWrap={false}
+          />
+        </Provider>
+      )
+
+      expect(screen.getByRole('button', { name: /enable line wrap/i })).toBeInTheDocument()
+    })
+
+    it('defaults wordWrap to true', () => {
+      render(
+        <Provider store={store}>
+          <EditorPane
+            paneId="pane-1"
+            tabId="tab-1"
+            filePath="/test.ts"
+            language="typescript"
+            readOnly={false}
+            content="const x = 1"
+            viewMode="source"
+          />
+        </Provider>
+      )
+
+      // Defaults to true, so button should say "disable" (can turn it off)
+      expect(screen.getByRole('button', { name: /disable line wrap/i })).toBeInTheDocument()
+    })
+  })
 })

@@ -6,6 +6,8 @@ import {
   migrateLegacyTerminalDurableState,
   sanitizeSessionRef,
 } from '@shared/session-contract'
+import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
+import { migrateLegacyFreshAgentContent } from '@shared/fresh-agent'
 
 export { LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY }
 
@@ -95,11 +97,13 @@ function normalizePersistedTab(tab: Record<string, unknown>): PersistedTab {
     sessionRef: tab.sessionRef,
     resumeSessionId: typeof tab.resumeSessionId === 'string' ? tab.resumeSessionId : undefined,
   })
+  const codexDurability = sanitizeCodexDurabilityRef(tab.codexDurability)
   const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, ...rest } = tab
 
   return {
     ...rest,
     ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
+    ...(codexDurability ? { codexDurability } : {}),
   } as PersistedTab
 }
 
@@ -164,6 +168,7 @@ function normalizeTerminalContent(content: Record<string, unknown>): Record<stri
     ? content.restoreError
     : undefined
   const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, restoreError: _legacyRestoreError, ...rest } = content
+  const codexDurability = sanitizeCodexDurabilityRef(content.codexDurability)
   const isLegacyRecoveryFailed = (
     rest.kind === 'terminal'
     && rest.mode === 'codex'
@@ -180,6 +185,7 @@ function normalizeTerminalContent(content: Record<string, unknown>): Record<stri
   return {
     ...normalizedRuntime,
     ...(normalizedSessionRef ? { sessionRef: normalizedSessionRef } : {}),
+    ...(codexDurability ? { codexDurability } : {}),
     ...(normalizedRestoreError
       ? { restoreError: normalizedRestoreError }
       : {}),
@@ -212,17 +218,47 @@ function normalizeAgentChatContent(content: Record<string, unknown>): Record<str
   }
 }
 
+function normalizeFreshAgentContent(content: Record<string, unknown>): Record<string, unknown> {
+  const durableState = content.provider === 'claude'
+    ? migrateLegacyAgentChatDurableState({
+        sessionRef: content.sessionRef,
+        cliSessionId: typeof content.cliSessionId === 'string' ? content.cliSessionId : undefined,
+        timelineSessionId: typeof content.timelineSessionId === 'string' ? content.timelineSessionId : undefined,
+        resumeSessionId: typeof content.resumeSessionId === 'string' ? content.resumeSessionId : undefined,
+      })
+    : { sessionRef: sanitizeSessionRef(content.sessionRef) }
+  const existingRestoreError = (
+    content.restoreError
+    && typeof content.restoreError === 'object'
+    && (content.restoreError as any).code === 'RESTORE_UNAVAILABLE'
+    && typeof (content.restoreError as any).reason === 'string'
+  )
+    ? content.restoreError
+    : undefined
+  const { sessionRef: _legacySessionRef, restoreError: _legacyRestoreError, ...rest } = content
+
+  return {
+    ...rest,
+    ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
+    ...(('restoreError' in durableState && durableState.restoreError) || existingRestoreError
+      ? { restoreError: ('restoreError' in durableState && durableState.restoreError) || existingRestoreError }
+      : {}),
+  }
+}
+
 function normalizePersistedNode(node: unknown): unknown {
   if (!node || typeof node !== 'object') return node
 
   const candidate = node as Record<string, unknown>
   if (candidate.type === 'leaf' && candidate.content && typeof candidate.content === 'object') {
-    const content = candidate.content as Record<string, unknown>
+    const content = migrateLegacyFreshAgentContent(candidate.content as Record<string, unknown>) as Record<string, unknown>
     let nextContent = content
     if (content.kind === 'terminal') {
       nextContent = normalizeTerminalContent(content)
     } else if (content.kind === 'agent-chat') {
       nextContent = normalizeAgentChatContent(content)
+    } else if (content.kind === 'fresh-agent') {
+      nextContent = normalizeFreshAgentContent(content)
     } else if ('sessionRef' in content) {
       const sanitizedSessionRef = sanitizeSessionRef(content.sessionRef)
       const { sessionRef: _legacySessionRef, ...rest } = content

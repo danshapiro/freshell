@@ -20,6 +20,7 @@ import type {
   WorktreeGrouping,
 } from '@shared/settings'
 import type { CodingCliProviderName, TokenSummary, SessionLocator } from '@shared/ws-protocol'
+import type { CodexDurabilityRef } from '@shared/codex-durability'
 export type { CodingCliProviderName }
 
 // TabMode includes 'shell' for regular terminals, plus all coding CLI providers
@@ -57,6 +58,7 @@ export interface Tab {
   shell?: ShellType
   initialCwd?: string
   sessionRef?: SessionLocator
+  codexDurability?: CodexDurabilityRef
   serverInstanceId?: string
   resumeSessionId?: string     // Legacy migration field; canonical durable identity lives in sessionRef
   sessionMetadataByKey?: Record<string, SessionListMetadata>
@@ -77,6 +79,7 @@ export interface BackgroundTerminal {
   hasClients: boolean
   mode?: TabMode
   sessionRef?: SessionLocator
+  codexDurability?: CodexDurabilityRef
 }
 
 export interface CodingCliSession {

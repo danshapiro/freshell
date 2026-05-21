@@ -10,11 +10,11 @@ import { BROWSER_PREFERENCES_STORAGE_KEY as STORAGE_KEY } from '@/store/storage-
 export const BROWSER_PREFERENCES_STORAGE_KEY = STORAGE_KEY
 
 const LEGACY_TERMINAL_FONT_KEY = 'freshell.terminal.fontFamily.v1'
-const DEFAULT_SEARCH_RANGE_DAYS = 30
+export const DEFAULT_CLOSED_TAB_RETENTION_DAYS = 30
 
 export type BrowserPreferencesRecord = {
   settings?: LocalSettingsPatch
-  tabs?: { searchRangeDays?: number }
+  tabs?: { closedTabRetentionDays?: number; searchRangeDays?: number }
   legacyLocalSettingsSeedApplied?: boolean
 }
 
@@ -45,13 +45,13 @@ function normalizeRecord(value: unknown): BrowserPreferencesRecord {
     normalized.legacyLocalSettingsSeedApplied = true
   }
 
-  if (
-    isRecord(value.tabs)
-    && typeof value.tabs.searchRangeDays === 'number'
-    && Number.isFinite(value.tabs.searchRangeDays)
-    && value.tabs.searchRangeDays >= 1
-  ) {
-    normalized.tabs = { searchRangeDays: Math.floor(value.tabs.searchRangeDays) }
+  if (isRecord(value.tabs)) {
+    const rawRetention = typeof value.tabs.closedTabRetentionDays === 'number'
+      ? value.tabs.closedTabRetentionDays
+      : value.tabs.searchRangeDays
+    if (typeof rawRetention === 'number' && Number.isFinite(rawRetention) && rawRetention >= 1) {
+      normalized.tabs = { closedTabRetentionDays: Math.min(30, Math.floor(rawRetention)) }
+    }
   }
 
   return normalized
@@ -156,18 +156,21 @@ export function patchBrowserPreferencesRecord(patch: BrowserPreferencesRecord): 
     }
   }
 
-  if (
-    isRecord(patch.tabs)
-    && typeof patch.tabs.searchRangeDays === 'number'
-    && Number.isFinite(patch.tabs.searchRangeDays)
-    && patch.tabs.searchRangeDays >= 1
-  ) {
-    next = {
-      ...next,
-      tabs: {
-        ...(current.tabs || {}),
-        searchRangeDays: Math.floor(patch.tabs.searchRangeDays),
-      },
+  if (isRecord(patch.tabs)) {
+    const rawRetention = typeof patch.tabs.closedTabRetentionDays === 'number'
+      ? patch.tabs.closedTabRetentionDays
+      : patch.tabs.searchRangeDays
+    if (typeof rawRetention === 'number' && Number.isFinite(rawRetention) && rawRetention >= 1) {
+      const closedTabRetentionDays = Math.min(30, Math.floor(rawRetention))
+      const currentTabs = { ...(current.tabs || {}) }
+      delete currentTabs.searchRangeDays
+      next = {
+        ...next,
+        tabs: {
+          ...currentTabs,
+          closedTabRetentionDays,
+        },
+      }
     }
   }
 
@@ -210,6 +213,10 @@ export function resolveBrowserPreferenceSettings(record?: BrowserPreferencesReco
   return resolveLocalSettings(record?.settings)
 }
 
+export function getClosedTabRetentionDaysPreference(): number {
+  return loadBrowserPreferencesRecord().tabs?.closedTabRetentionDays ?? DEFAULT_CLOSED_TAB_RETENTION_DAYS
+}
+
 export function getSearchRangeDaysPreference(): number {
-  return loadBrowserPreferencesRecord().tabs?.searchRangeDays ?? DEFAULT_SEARCH_RANGE_DAYS
+  return getClosedTabRetentionDaysPreference()
 }

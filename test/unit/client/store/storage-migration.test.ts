@@ -53,7 +53,7 @@ describe('storage-migration', () => {
     }))
     expect(localStorage.getItem('freshell.tabs.v1')).toBeNull()
     expect(localStorage.getItem('freshell.panes.v1')).toBeNull()
-    expect(localStorage.getItem('freshell_version')).toBe('4')
+    expect(localStorage.getItem('freshell_version')).toBe('5')
   })
 
   it('clears stale freshell-auth cookie when no auth token remains', async () => {
@@ -92,7 +92,7 @@ describe('storage-migration', () => {
     }))
     expect(localStorage.getItem('freshell.terminal.fontFamily.v1')).toBeNull()
     expect(localStorage.getItem('freshell.tabs.v1')).toBeNull()
-    expect(localStorage.getItem('freshell_version')).toBe('4')
+    expect(localStorage.getItem('freshell_version')).toBe('5')
   })
 
   it('preserves restorable layouts and migrates ambiguous resume ids instead of clearing state', async () => {
@@ -158,7 +158,7 @@ describe('storage-migration', () => {
 
     const migratedRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
     expect(migratedRaw).not.toBeNull()
-    expect(localStorage.getItem('freshell_version')).toBe('4')
+    expect(localStorage.getItem('freshell_version')).toBe('5')
 
     const parsed = parsePersistedLayoutRaw(migratedRaw!)
     expect(parsed).not.toBeNull()

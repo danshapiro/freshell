@@ -169,6 +169,11 @@ describe('TabsView', () => {
           payload: {
             provider: 'freshclaude',
             resumeSessionId: '00000000-0000-4000-8000-000000000444',
+            sessionRef: {
+              provider: 'claude',
+              sessionId: '00000000-0000-4000-8000-000000000444',
+              serverInstanceId: 'srv-remote',
+            },
             modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
             permissionMode: 'plan',
             effort: 'turbo',
@@ -193,8 +198,9 @@ describe('TabsView', () => {
 
     const copiedLayout = store.getState().panes.layouts[copiedTab.id] as any
     expect(copiedLayout.content).toMatchObject({
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       resumeSessionId: undefined,
       sessionRef: {
         provider: 'claude',

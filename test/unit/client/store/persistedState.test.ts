@@ -11,6 +11,18 @@ import {
 import { PERSIST_BROADCAST_CHANNEL_NAME } from '../../../../src/store/persistBroadcast'
 import { STORAGE_KEYS } from '../../../../src/store/storage-keys'
 
+const codexDurability = {
+  schemaVersion: 1 as const,
+  state: 'captured_pre_turn' as const,
+  candidate: {
+    provider: 'codex' as const,
+    candidateThreadId: '019e2a0c-7cef-7281-94df-d0d05d7b9ac3',
+    rolloutPath: '/home/user/.codex/sessions/2026/05/14/rollout.jsonl',
+    source: 'thread_started_notification' as const,
+    capturedAt: 1778743920000,
+  },
+}
+
 describe('persistedState parsers', () => {
   it('uses v2 namespaced storage and broadcast keys', () => {
     expect(TABS_STORAGE_KEY).toBe('freshell.tabs.v2')
@@ -40,6 +52,26 @@ describe('persistedState parsers', () => {
       expect(parsed).not.toBeNull()
       expect(parsed!.version).toBe(0)
       expect(parsed!.tabs.tabs[0].id).toBe('t1')
+    })
+
+    it('preserves valid Codex durability state on tabs', () => {
+      const raw = JSON.stringify({
+        version: TABS_SCHEMA_VERSION,
+        tabs: {
+          activeTabId: 't1',
+          tabs: [{
+            id: 't1',
+            title: 'Codex',
+            createdAt: 1,
+            type: 'terminal',
+            mode: 'codex',
+            codexDurability,
+          }],
+        },
+      })
+
+      const parsed = parsePersistedTabsRaw(raw)
+      expect(parsed?.tabs.tabs[0].codexDurability).toEqual(codexDurability)
     })
   })
 
@@ -75,6 +107,33 @@ describe('persistedState parsers', () => {
       expect(parsed).not.toBeNull()
       expect(parsed!.version).toBe(1)
       expect(Object.keys(parsed!.layouts)).toEqual(['tab-1'])
+    })
+
+    it('preserves valid Codex durability state on terminal pane content', () => {
+      const raw = JSON.stringify({
+        version: PANES_SCHEMA_VERSION,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-1',
+              status: 'creating',
+              mode: 'codex',
+              shell: 'system',
+              codexDurability,
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      })
+
+      const parsed = parsePersistedPanesRaw(raw)
+      const content = (parsed!.layouts['tab-1'] as any).content
+      expect(content.codexDurability).toEqual(codexDurability)
     })
 
     it('normalizes legacy Codex recovery_failed panes to creating resume panes', () => {

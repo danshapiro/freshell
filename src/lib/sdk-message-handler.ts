@@ -1,6 +1,7 @@
 import type { AppDispatch } from '@/store/store'
 import type { ChatContentBlock } from '@/store/agentChatTypes'
 import type { QuestionDefinition } from '@/store/agentChatTypes'
+import { consumeCancelledCreate } from '@/lib/create-cancellation'
 import {
   sessionCreated,
   createFailed,
@@ -20,22 +21,7 @@ import {
   markSessionLost,
   removeSession,
 } from '@/store/agentChatSlice'
-
-/**
- * Tracks createRequestIds whose owning pane was closed before sdk.created arrived.
- * When sdk.created arrives for a cancelled ID, we skip session creation and send sdk.kill.
- */
-const cancelledCreateRequestIds = new Set<string>()
-
-/** Mark a createRequestId as cancelled so the arriving sdk.created will be killed. */
-export function cancelCreate(requestId: string): void {
-  cancelledCreateRequestIds.add(requestId)
-}
-
-/** Visible for testing — clear all cancelled creates. */
-export function _resetCancelledCreates(): void {
-  cancelledCreateRequestIds.clear()
-}
+export { cancelCreate, _resetCancelledCreates } from '@/lib/create-cancellation'
 
 interface SdkMessageSink {
   send: (msg: unknown) => void
@@ -52,8 +38,7 @@ export function handleSdkMessage(dispatch: AppDispatch, msg: Record<string, unkn
       const requestId = msg.requestId as string
       const sessionId = msg.sessionId as string
       // If the pane was closed before sdk.created arrived, kill the orphan
-      if (cancelledCreateRequestIds.has(requestId)) {
-        cancelledCreateRequestIds.delete(requestId)
+      if (consumeCancelledCreate(requestId)) {
         ws?.send({ type: 'sdk.kill', sessionId })
         return true
       }

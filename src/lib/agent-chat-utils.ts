@@ -1,5 +1,5 @@
 import type { AgentChatProviderName, AgentChatProviderConfig } from './agent-chat-types'
-import { FreshclaudeIcon, KilroyIcon } from '@/components/icons/provider-icons'
+import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 
 export type { AgentChatProviderName, AgentChatProviderConfig }
 
@@ -11,40 +11,42 @@ export const AGENT_CHAT_PROVIDERS: AgentChatProviderName[] = [
 export const AGENT_CHAT_PROVIDER_CONFIGS: AgentChatProviderConfig[] = [
   {
     name: 'freshclaude',
-    label: 'Freshclaude',
-    codingCliProvider: 'claude',
-    icon: FreshclaudeIcon,
-    providerDefaultModelId: 'opus',
-    defaultPermissionMode: 'bypassPermissions',
-    settingsVisibility: {
-      model: true,
-      permissionMode: true,
-      effort: true,
-      thinking: true,
-      tools: true,
-      timecodes: true,
-    },
-    pickerShortcut: 'A',
+    ...(() => {
+      const entry = resolveFreshAgentType('freshclaude')
+      if (!entry) {
+        throw new Error('Missing fresh-agent registry entry for freshclaude')
+      }
+      return {
+        label: entry.label,
+        codingCliProvider: entry.runtimeProvider,
+        icon: entry.icon,
+        providerDefaultModelId: 'opus',
+        defaultPermissionMode: entry.defaultPermissionMode,
+        settingsVisibility: entry.settingsVisibility,
+        pickerShortcut: entry.pickerShortcut,
+      }
+    })(),
   },
   {
     name: 'kilroy',
-    label: 'Kilroy',
-    codingCliProvider: 'claude',
-    icon: KilroyIcon,
-    providerDefaultModelId: 'opus',
-    defaultPermissionMode: 'bypassPermissions',
-    settingsVisibility: {
-      model: true,
-      permissionMode: true,
-      effort: true,
-      thinking: true,
-      tools: true,
-      timecodes: true,
-    },
-    pickerShortcut: 'K',
-    pickerAfterCli: true,
-    hidden: true,
-    featureFlag: 'kilroy',
+    ...(() => {
+      const entry = resolveFreshAgentType('kilroy')
+      if (!entry) {
+        throw new Error('Missing fresh-agent registry entry for kilroy')
+      }
+      return {
+        label: entry.label,
+        codingCliProvider: entry.runtimeProvider,
+        icon: entry.icon,
+        providerDefaultModelId: 'opus',
+        defaultPermissionMode: entry.defaultPermissionMode,
+        settingsVisibility: entry.settingsVisibility,
+        pickerShortcut: entry.pickerShortcut,
+        pickerAfterCli: entry.pickerAfterCli,
+        hidden: entry.hidden,
+        featureFlag: entry.featureFlag,
+      }
+    })(),
   },
 ]
 

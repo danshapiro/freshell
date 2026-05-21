@@ -22,10 +22,12 @@ import {
   migrateLegacyTerminalDurableState,
   sanitizeSessionRef,
 } from '@shared/session-contract'
+import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
+import { migrateLegacyFreshAgentContent } from '@shared/fresh-agent'
 
 const log = createLogger('StorageMigration')
 
-const STORAGE_VERSION = 4
+const STORAGE_VERSION = 5
 const STORAGE_VERSION_KEY = 'freshell_version'
 const AUTH_STORAGE_KEY = 'freshell.auth-token'
 const LEGACY_BROWSER_PREFERENCE_KEYS = [
@@ -57,10 +59,12 @@ function normalizeLayoutTab(tab: Record<string, unknown>): Record<string, unknow
     sessionRef: tab.sessionRef,
     resumeSessionId: typeof tab.resumeSessionId === 'string' ? tab.resumeSessionId : undefined,
   })
+  const codexDurability = sanitizeCodexDurabilityRef(tab.codexDurability)
   const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, ...rest } = tab
   return {
     ...rest,
     ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
+    ...(codexDurability ? { codexDurability } : {}),
   }
 }
 
@@ -105,7 +109,7 @@ function normalizeLayoutNode(node: unknown): unknown {
   const candidate = node as Record<string, unknown>
 
   if (candidate.type === 'leaf' && candidate.content && typeof candidate.content === 'object') {
-    const content = candidate.content as Record<string, unknown>
+    const content = migrateLegacyFreshAgentContent(candidate.content as Record<string, unknown>) as Record<string, unknown>
     if (content.kind === 'terminal') {
       const durableState = migrateLegacyTerminalDurableState({
         provider: typeof content.mode === 'string' && content.mode !== 'shell' ? content.mode : undefined,
@@ -113,6 +117,7 @@ function normalizeLayoutNode(node: unknown): unknown {
         resumeSessionId: typeof content.resumeSessionId === 'string' ? content.resumeSessionId : undefined,
       })
       const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, restoreError: _legacyRestoreError, ...rest } = content
+      const codexDurability = sanitizeCodexDurabilityRef(content.codexDurability)
       const normalizedRuntime = normalizeLegacyRecoveryFailedTerminal(rest, durableState)
       const isLegacyRecoveryFailed = (
         rest.kind === 'terminal'
@@ -127,6 +132,7 @@ function normalizeLayoutNode(node: unknown): unknown {
         content: {
           ...normalizedRuntime,
           ...(normalizedSessionRef ? { sessionRef: normalizedSessionRef } : {}),
+          ...(codexDurability ? { codexDurability } : {}),
           ...(!isLegacyRecoveryFailed && durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
         },
       }
@@ -146,6 +152,26 @@ function normalizeLayoutNode(node: unknown): unknown {
           ...rest,
           ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
           ...(durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
+        },
+      }
+    }
+
+    if (content.kind === 'fresh-agent') {
+      const durableState = content.provider === 'claude'
+        ? migrateLegacyAgentChatDurableState({
+            sessionRef: content.sessionRef,
+            cliSessionId: typeof content.cliSessionId === 'string' ? content.cliSessionId : undefined,
+            timelineSessionId: typeof content.timelineSessionId === 'string' ? content.timelineSessionId : undefined,
+            resumeSessionId: typeof content.resumeSessionId === 'string' ? content.resumeSessionId : undefined,
+          })
+        : { sessionRef: sanitizeSessionRef(content.sessionRef) }
+      const { sessionRef: _legacySessionRef, restoreError: _legacyRestoreError, ...rest } = content
+      return {
+        ...candidate,
+        content: {
+          ...rest,
+          ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
+          ...('restoreError' in durableState && durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
         },
       }
     }

@@ -47,9 +47,10 @@ import { getNetworkHost } from './get-network-host.js'
 import { PortForwardManager } from './port-forward.js'
 import { parseTrustProxyEnv } from './request-ip.js'
 import { createTabsRegistryStore } from './tabs-registry/store.js'
+import { createTabsSyncRouter } from './tabs-registry/client-retire-router.js'
 import { checkForUpdate, createCachedUpdateChecker } from './updater/version-checker.js'
 import { SessionAssociationCoordinator } from './session-association-coordinator.js'
-import { createTerminalSessionAssociationPublisher } from './session-association-broadcast.js'
+import { broadcastTerminalSessionAssociation } from './session-association-broadcast.js'
 import { collectAppliedSessionAssociations } from './session-association-updates.js'
 import { loadOrCreateServerInstanceId } from './instance-id.js'
 import { createAgentChatCapabilitiesRouter } from './agent-chat-capabilities-router.js'
@@ -73,12 +74,16 @@ import { createAgentHistorySource } from './agent-timeline/history-source.js'
 import { createTerminalViewService } from './terminal-view/service.js'
 import { resolveStartupBanner } from './startup-banner.js'
 import { shouldPromoteSessionTitle } from './session-title-sync.js'
+import { createFreshAgentProviderRegistry } from './fresh-agent/provider-registry.js'
+import { FreshAgentRuntimeManager } from './fresh-agent/runtime-manager.js'
+import { createFreshAgentRouter } from './fresh-agent/router.js'
+import { createClaudeFreshAgentAdapter } from './fresh-agent/adapters/claude/adapter.js'
+import { createCodexFreshAgentAdapter } from './fresh-agent/adapters/codex/adapter.js'
 import {
   CodexAppServerRuntime,
   runCodexStartupReaper,
 } from './coding-cli/codex-app-server/runtime.js'
 import { CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
-import { CodexTerminalSidecar } from './coding-cli/codex-app-server/sidecar.js'
 import { registerStaticClientRoutes } from './static-client-routes.js'
 import { joinCodexShutdownOwners } from './shutdown-join.js'
 
@@ -189,7 +194,8 @@ async function main() {
   const sessionMetadataStore = new SessionMetadataStore(freshellConfigDir)
   const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders, {}, sessionMetadataStore)
   const codingCliSessionManager = new CodingCliSessionManager(codingCliProviders)
-  const tabsRegistryStore = createTabsRegistryStore()
+  const tabsRegistryStore = await createTabsRegistryStore()
+  app.use('/api/tabs-sync', createTabsSyncRouter({ tabsRegistryStore }))
 
   const settings = migrateSettingsSortMode(await configStore.getSettings())
   AI_CONFIG.applySettingsKey(settings.ai?.geminiApiKey)
@@ -197,7 +203,7 @@ async function main() {
   const terminalMetadata = new TerminalMetadataService()
   const layoutStore = new LayoutStore()
   const codexActivity = wireCodexActivityTracker({ registry, codingCliIndexer })
-  let opencodeActivity: ReturnType<typeof createOpencodeActivityIntegration> | undefined
+  const opencodeActivity = createOpencodeActivityIntegration({ registry, opencodeProvider })
 
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
   const serverInstanceId = await loadOrCreateServerInstanceId()
@@ -299,14 +305,34 @@ async function main() {
   sdkBridge = new SdkBridge(agentHistorySource)
 
   const server = http.createServer(app)
-  const codexLaunchPlanner = new CodexLaunchPlanner((input) => new CodexTerminalSidecar({
-    runtime: new CodexAppServerRuntime({
-      serverInstanceId,
-      cwd: input.cwd,
-      commandArgs: input.commandArgs,
-      env: input.env,
-    }),
-  }))
+  const codexFreshAgentRuntime = new CodexAppServerRuntime({ serverInstanceId })
+  const claudeFreshAgentAdapter = createClaudeFreshAgentAdapter({
+    sdkBridge,
+    agentHistorySource,
+  })
+  const codexFreshAgentAdapter = createCodexFreshAgentAdapter({
+    runtime: codexFreshAgentRuntime,
+  })
+  const freshAgentRuntimeManager = new FreshAgentRuntimeManager({
+    registry: createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshclaude',
+        runtimeProvider: 'claude',
+        adapter: claudeFreshAgentAdapter,
+      },
+      {
+        sessionType: 'kilroy',
+        runtimeProvider: 'claude',
+        adapter: claudeFreshAgentAdapter,
+      },
+      {
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+        adapter: codexFreshAgentAdapter,
+      },
+    ]),
+  })
+  const codexLaunchPlanner = new CodexLaunchPlanner(() => new CodexAppServerRuntime({ serverInstanceId }))
   const wsHandler = new WsHandler(
     server,
     registry,
@@ -314,6 +340,7 @@ async function main() {
       codingCliManager: codingCliSessionManager,
       codexLaunchPlanner,
       sdkBridge,
+      freshAgentRuntimeManager,
       sessionRepairService,
       handshakeSnapshotProvider: async () => {
         const currentSettings = migrateSettingsSortMode(await configStore.getSettings())
@@ -335,7 +362,7 @@ async function main() {
       extensionManager,
       codexActivityListProvider: () => codexActivity.tracker.list(),
       agentHistorySource,
-      opencodeActivityListProvider: () => opencodeActivity?.tracker.list() ?? [],
+      opencodeActivityListProvider: () => opencodeActivity.tracker.list(),
     },
   )
   attachProxyUpgradeHandler(server)
@@ -362,6 +389,9 @@ async function main() {
     codexLaunchPlanner,
     assertTerminalCreateAccepted,
   }))
+  app.use('/api', createFreshAgentRouter({
+    runtimeManager: freshAgentRuntimeManager,
+  }))
 
   // --- Extension lifecycle broadcasts ---
   extensionManager.on('server.starting', ({ name }: { name: string }) => {
@@ -383,6 +413,30 @@ async function main() {
   codexActivity.tracker.on('changed', (payload) => {
     wsHandler.broadcastCodexActivityUpdated(payload)
   })
+  opencodeActivity.tracker.on('changed', (payload) => {
+    wsHandler.broadcastOpencodeActivityUpdated(payload)
+  })
+  opencodeActivity.tracker.on('turn.complete', (payload) => {
+    wsHandler.broadcastTerminalTurnComplete({
+      provider: 'opencode',
+      ...payload,
+    })
+  })
+  opencodeActivity.controller.on('associated', ({ terminalId, sessionId }) => {
+    try {
+      broadcastTerminalSessionAssociation({
+        wsHandler,
+        terminalMetadata,
+        broadcastTerminalMetaUpserts,
+        provider: 'opencode',
+        terminalId,
+        sessionId,
+        source: 'opencode_controller',
+      })
+    } catch (err) {
+      log.warn({ err, terminalId, sessionId }, 'Failed to broadcast OpenCode session association')
+    }
+  })
 
   const broadcastTerminalMetaUpserts = (upsert: ReturnType<TerminalMetadataService['list']>) => {
     if (upsert.length === 0) return
@@ -392,12 +446,6 @@ async function main() {
   const broadcastTerminalMetaRemoval = (terminalId: string) => {
     wsHandler.broadcastTerminalMetaUpdated({ upsert: [], remove: [terminalId] })
   }
-
-  const associationPublisher = createTerminalSessionAssociationPublisher({
-    wsHandler,
-    terminalMetadata,
-    broadcastTerminalMetaUpserts,
-  })
 
   const findCodingCliSession = (provider: CodingCliProviderName, sessionId: string): CodingCliSession | undefined => {
     for (const project of codingCliIndexer.getProjects()) {
@@ -411,12 +459,15 @@ async function main() {
 
   await Promise.all(
     registry.list().map(async (terminal) => {
-      await associationPublisher.seedFromTerminal(terminal)
+      await terminalMetadata.seedFromTerminal(terminal)
     }),
   )
 
   registry.on('terminal.created', (record: TerminalRecord) => {
-    void associationPublisher.seedFromTerminal(record)
+    void terminalMetadata.seedFromTerminal(record)
+      .then((upsert) => {
+        if (upsert) broadcastTerminalMetaUpserts([upsert])
+      })
       .catch((err) => {
         log.warn({ err, terminalId: record?.terminalId }, 'Failed to seed terminal metadata')
       })
@@ -425,7 +476,6 @@ async function main() {
   registry.on('terminal.exit', (payload) => {
     const terminalId = (payload as { terminalId?: string })?.terminalId
     if (!terminalId) return
-    associationPublisher.forgetTerminal(terminalId)
     // Retire instead of remove: keeps the provider/sessionId association so
     // rename cascades still work after the terminal process exits.
     if (terminalMetadata.retire(terminalId)) {
@@ -433,52 +483,27 @@ async function main() {
     }
   })
 
-  opencodeActivity = createOpencodeActivityIntegration({
-    registry,
-    opencodeProvider,
-    onActivityChanged: (payload) => {
-      wsHandler.broadcastOpencodeActivityUpdated(payload)
-    },
-    onAssociated: ({ terminalId, sessionId }) => {
-      try {
-        associationPublisher.publish({
-          provider: 'opencode',
-          terminalId,
-          sessionId,
-          source: 'opencode_controller',
-        })
-        codingCliIndexer.scheduleProviderRefresh('opencode', {
-          urgent: true,
-          reason: 'opencode_associated',
-        })
-        log.info({ terminalId, sessionId }, 'OpenCode session associated; scheduled provider refresh')
-      } catch (err) {
-        log.warn({ err, terminalId, sessionId }, 'Failed to broadcast OpenCode session association')
-      }
-    },
-    onTurnComplete: ({ terminalId, sessionId, at }) => {
-      const terminal = registry.get(terminalId)
-      if (
-        !terminal
-        || terminal.mode !== 'opencode'
-        || terminal.status !== 'running'
-        || terminal.resumeSessionId !== sessionId
-      ) {
-        log.warn({ terminalId, sessionId }, 'Suppressed OpenCode turn completion for terminal without current ownership')
-        return
-      }
-      wsHandler.broadcastTerminalTurnComplete({
-        terminalId,
-        provider: 'opencode',
-        sessionId,
-        at,
+  registry.on('terminal.session.bound', (payload) => {
+    const event = payload as {
+      terminalId?: string
+      provider?: CodingCliProviderName
+      sessionId?: string
+    }
+    if (event.provider !== 'codex') return
+    if (!event.terminalId || !event.sessionId) return
+    try {
+      broadcastTerminalSessionAssociation({
+        wsHandler,
+        terminalMetadata,
+        broadcastTerminalMetaUpserts,
+        provider: 'codex',
+        terminalId: event.terminalId,
+        sessionId: event.sessionId,
+        source: 'codex_durability',
       })
-      codingCliIndexer.scheduleProviderRefresh('opencode', {
-        urgent: true,
-        reason: 'opencode_turn_complete',
-      })
-      log.info({ terminalId, sessionId, at }, 'OpenCode turn complete; scheduled provider refresh')
-    },
+    } catch (err) {
+      log.warn({ err, terminalId: event.terminalId, sessionId: event.sessionId }, 'Failed to broadcast Codex session association')
+    }
   })
 
   const applyDebugLogging = (enabled: boolean, source: string) => {
@@ -602,6 +627,7 @@ async function main() {
   // Coding CLI watcher hooks
   codingCliIndexer.onUpdate((projects) => {
     sessionsSync.publish(projects)
+    const associationMetaUpserts: ReturnType<TerminalMetadataService['list']> = []
     const pendingMetadataSync = new Map<string, CodingCliSession>()
     for (const { session, terminalId } of collectAppliedSessionAssociations(associationCoordinator, projects)) {
       log.info({
@@ -611,7 +637,10 @@ async function main() {
         provider: session.provider,
       }, 'session_bind_applied')
       try {
-        associationPublisher.publish({
+        broadcastTerminalSessionAssociation({
+          wsHandler,
+          terminalMetadata,
+          broadcastTerminalMetaUpserts: (upserts) => associationMetaUpserts.push(...upserts),
           provider: session.provider,
           terminalId,
           sessionId: session.sessionId,
@@ -639,6 +668,10 @@ async function main() {
           }
         }
       }
+    }
+
+    if (associationMetaUpserts.length > 0) {
+      broadcastTerminalMetaUpserts(associationMetaUpserts)
     }
 
     if (pendingMetadataSync.size > 0) {
@@ -689,7 +722,10 @@ async function main() {
       sessionId: session.sessionId,
     }, 'session_bind_applied')
     try {
-      associationPublisher.publish({
+      broadcastTerminalSessionAssociation({
+        wsHandler,
+        terminalMetadata,
+        broadcastTerminalMetaUpserts,
         provider: 'claude',
         terminalId,
         sessionId: session.sessionId,
@@ -845,6 +881,7 @@ async function main() {
       await joinCodexShutdownOwners({
         registry,
         codexLaunchPlanner,
+        codexFreshAgentRuntime,
         terminalShutdownTimeoutMs: 5000,
       })
     } finally {
@@ -869,7 +906,7 @@ async function main() {
 
     // 9b. Stop Codex activity tracker listeners and sweep timer
     codexActivity.dispose()
-    opencodeActivity?.dispose()
+    opencodeActivity.dispose()
 
     // 10. Stop session repair service
     await sessionRepairService.stop()

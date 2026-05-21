@@ -37,6 +37,54 @@ describe('shouldKeepClosedTab', () => {
 })
 
 describe('collectPaneSnapshots', () => {
+  it('serializes candidate-only Codex durability state for registry reopen surfaces', () => {
+    const codexDurability = {
+      schemaVersion: 1,
+      state: 'captured_pre_turn',
+      candidate: {
+        provider: 'codex',
+        candidateThreadId: '019e2413-b8d0-7a98-b5fb-2f4af05baf58',
+        rolloutPath: '/home/user/.codex/sessions/2026/05/14/rollout.jsonl',
+        source: 'thread_start_response',
+        capturedAt: 1778764200000,
+      },
+    } as const
+    const node: PaneNode = {
+      type: 'leaf',
+      id: 'pane-codex',
+      content: {
+        kind: 'terminal',
+        createRequestId: 'req-codex',
+        status: 'running',
+        mode: 'codex',
+        shell: 'system',
+        terminalId: 'term-codex',
+        serverInstanceId: 'server-1',
+        codexDurability,
+        initialCwd: '/home/user/code/freshell',
+      },
+    }
+
+    const snapshots = collectPaneSnapshots(node, 'server-1')
+
+    expect(snapshots).toEqual([{
+      paneId: 'pane-codex',
+      kind: 'terminal',
+      title: undefined,
+      payload: {
+        mode: 'codex',
+        shell: 'system',
+        sessionRef: undefined,
+        codexDurability,
+        liveTerminal: {
+          terminalId: 'term-codex',
+          serverInstanceId: 'server-1',
+        },
+        initialCwd: '/home/user/code/freshell',
+      },
+    }])
+  })
+
   it('serializes agent-chat selection strategies and explicit effort overrides', () => {
     const node: PaneNode = {
       type: 'leaf',
@@ -62,12 +110,7 @@ describe('collectPaneSnapshots', () => {
       title: undefined,
       payload: {
         provider: 'freshclaude',
-        resumeSessionId: '00000000-0000-4000-8000-000000000123',
-        sessionRef: {
-          provider: 'claude',
-          sessionId: '00000000-0000-4000-8000-000000000123',
-          serverInstanceId: 'server-1',
-        },
+        sessionRef: undefined,
         initialCwd: undefined,
         modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
         permissionMode: 'default',

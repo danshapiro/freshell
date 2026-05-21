@@ -21,6 +21,7 @@ import { addTab, setActiveTab } from '@/store/tabsSlice'
 import { addPane, initLayout } from '@/store/panesSlice'
 import { setTabRegistryLoading, setTabRegistrySearchRangeDays } from '@/store/tabRegistrySlice'
 import { selectTabsRegistryGroups } from '@/store/selectors/tabsRegistrySelectors'
+import { getCurrentTabRegistryClientInstanceId } from '@/store/tabRegistrySync'
 import { isNonShellMode } from '@/lib/coding-cli-utils'
 import { copyText } from '@/lib/clipboard'
 import { cn } from '@/lib/utils'
@@ -35,6 +36,8 @@ import {
 import type { CodingCliProviderName, TabMode } from '@/store/types'
 import type { AgentChatProviderName } from '@/lib/agent-chat-types'
 import { migrateLegacyAgentChatDurableState } from '@shared/session-contract'
+import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
+import { normalizeFreshAgentSessionType, resolveFreshAgentRuntimeProvider } from '@shared/fresh-agent'
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                             */
@@ -111,11 +114,15 @@ function sanitizePaneSnapshot(
     const mode = (payload.mode as TabMode) || 'shell'
     const sessionRef = resolveSessionRef({ payload })
     const liveTerminal = parseLiveTerminalHandle(payload.liveTerminal, record.serverInstanceId)
+    const codexDurability = mode === 'codex'
+      ? sanitizeCodexDurabilityRef(payload.codexDurability)
+      : undefined
     return {
       kind: 'terminal',
       mode,
       shell: (payload.shell as 'system' | 'cmd' | 'powershell' | 'wsl') || 'system',
       sessionRef,
+      ...(codexDurability ? { codexDurability } : {}),
       terminalId: sameServer ? liveTerminal?.terminalId : undefined,
       serverInstanceId: record.serverInstanceId,
       initialCwd: payload.initialCwd as string | undefined,
@@ -136,6 +143,7 @@ function sanitizePaneSnapshot(
       readOnly: !!payload.readOnly,
       content: '',
       viewMode: (payload.viewMode as 'source' | 'preview') || 'source',
+      wordWrap: payload.wordWrap !== false,
     }
   }
   if (snapshot.kind === 'agent-chat') {
@@ -159,6 +167,41 @@ function sanitizePaneSnapshot(
       plugins: payload.plugins as string[] | undefined,
     }
   }
+  if (snapshot.kind === 'fresh-agent') {
+    const sessionType = normalizeFreshAgentSessionType(payload.sessionType)
+      ?? normalizeFreshAgentSessionType(payload.provider)
+    const provider = (
+      payload.provider === 'claude'
+      || payload.provider === 'codex'
+      || payload.provider === 'opencode'
+    )
+      ? payload.provider
+      : resolveFreshAgentRuntimeProvider(sessionType)
+    if (!sessionType || !provider) return { kind: 'picker' }
+    const resumeSessionId = typeof payload.resumeSessionId === 'string'
+      ? payload.resumeSessionId
+      : undefined
+    const sessionRef = resolveSessionRef({
+      payload,
+      fallbackProvider: provider,
+      fallbackSessionId: resumeSessionId,
+    })
+    return {
+      kind: 'fresh-agent',
+      sessionType,
+      provider,
+      resumeSessionId,
+      ...(sessionRef ? { sessionRef } : {}),
+      serverInstanceId: record.serverInstanceId,
+      initialCwd: payload.initialCwd as string | undefined,
+      model: payload.model as string | undefined,
+      modelSelection: normalizeAgentChatModelSelection(payload.modelSelection, payload.model),
+      permissionMode: payload.permissionMode as string | undefined,
+      sandbox: payload.sandbox as 'read-only' | 'workspace-write' | 'danger-full-access' | undefined,
+      effort: normalizeAgentChatEffortOverride(payload.effort),
+      plugins: payload.plugins as string[] | undefined,
+    }
+  }
   if (snapshot.kind === 'extension') {
     return {
       kind: 'extension',
@@ -177,6 +220,11 @@ function deriveModeFromRecord(record: RegistryTabRecord): TabMode {
     return 'shell'
   }
   if (firstKind === 'agent-chat') return 'claude'
+  if (firstKind === 'fresh-agent') {
+    const provider = record.panes[0]?.payload?.provider
+    if (typeof provider === 'string' && isNonShellMode(provider)) return provider as TabMode
+    return 'claude'
+  }
   return 'shell'
 }
 
@@ -184,7 +232,7 @@ function paneKindIcon(kind: RegistryPaneSnapshot['kind']): LucideIcon {
   if (kind === 'terminal') return TerminalSquare
   if (kind === 'browser') return Globe
   if (kind === 'editor') return FileCode2
-  if (kind === 'agent-chat') return Bot
+  if (kind === 'agent-chat' || kind === 'fresh-agent') return Bot
   return Square
 }
 
@@ -192,7 +240,7 @@ function paneKindColorClass(kind: RegistryPaneSnapshot['kind']): string {
   if (kind === 'terminal') return 'text-foreground/50'
   if (kind === 'browser') return 'text-blue-500'
   if (kind === 'editor') return 'text-emerald-500'
-  if (kind === 'agent-chat' || kind === 'claude-chat') return 'text-amber-500'
+  if (kind === 'agent-chat' || kind === 'fresh-agent' || kind === 'claude-chat') return 'text-amber-500'
   if (kind === 'extension') return 'text-purple-500'
   return 'text-muted-foreground'
 }
@@ -201,7 +249,7 @@ function paneKindLabel(kind: RegistryPaneSnapshot['kind']): string {
   if (kind === 'terminal') return 'Terminal'
   if (kind === 'browser') return 'Browser'
   if (kind === 'editor') return 'Editor'
-  if (kind === 'agent-chat' || kind === 'claude-chat') return 'Agent'
+  if (kind === 'agent-chat' || kind === 'fresh-agent' || kind === 'claude-chat') return 'Agent'
   if (kind === 'extension') return 'Extension'
   return kind
 }
@@ -525,7 +573,8 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     ws.sendTabsSyncQuery({
       requestId: `tabs-range-${Date.now()}`,
       deviceId,
-      rangeDays: searchRangeDays,
+      clientInstanceId: getCurrentTabRegistryClientInstanceId(),
+      closedTabRetentionDays: searchRangeDays,
     })
   }, [dispatch, ws, deviceId, searchRangeDays])
 

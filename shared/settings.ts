@@ -53,7 +53,7 @@ const TERMINAL_LOCAL_KEYS = [
   'osc52Clipboard',
   'renderer',
 ] as const
-const PANES_LOCAL_KEYS = ['snapThreshold', 'iconsOnTabs', 'tabAttentionStyle', 'attentionDismiss', 'sessionOpenMode'] as const
+const PANES_LOCAL_KEYS = ['snapThreshold', 'iconsOnTabs', 'tabAttentionStyle', 'attentionDismiss', 'sessionOpenMode', 'multirowTabs'] as const
 const SIDEBAR_LOCAL_KEYS = [
   'sortMode',
   'worktreeGrouping',
@@ -143,6 +143,11 @@ export type ServerSettings = {
     externalEditor: ExternalEditor
     customEditorCommand?: string
   }
+  freshAgent: {
+    initialSetupDone?: boolean
+    defaultPlugins: string[]
+    providers: Partial<Record<string, AgentChatProviderDefaults>>
+  }
   agentChat: {
     initialSetupDone?: boolean
     defaultPlugins: string[]
@@ -178,6 +183,7 @@ export type LocalSettings = {
     tabAttentionStyle: TabAttentionStyle
     attentionDismiss: AttentionDismiss
     sessionOpenMode: SessionOpenMode
+    multirowTabs: boolean
   }
   sidebar: {
     sortMode: SidebarSortMode
@@ -189,6 +195,11 @@ export type LocalSettings = {
     hideEmptySessions: boolean
     width: number
     collapsed: boolean
+  }
+  freshAgent: {
+    showThinking: boolean
+    showTools: boolean
+    showTimecodes: boolean
   }
   agentChat: {
     showThinking: boolean
@@ -216,6 +227,7 @@ export type ResolvedSettings = {
   codingCli: ServerSettings['codingCli']
   panes: ServerSettings['panes'] & LocalSettings['panes']
   editor: ServerSettings['editor']
+  freshAgent: ServerSettings['freshAgent'] & LocalSettings['freshAgent']
   agentChat: ServerSettings['agentChat'] & LocalSettings['agentChat']
   extensions: ServerSettings['extensions']
   network: ServerSettings['network']
@@ -435,6 +447,9 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
     if (SessionOpenModeSchema.safeParse(patch.panes.sessionOpenMode).success) {
       panes.sessionOpenMode = patch.panes.sessionOpenMode as SessionOpenMode
     }
+    if (typeof patch.panes.multirowTabs === 'boolean') {
+      panes.multirowTabs = patch.panes.multirowTabs as boolean
+    }
     if (Object.keys(panes).length > 0) {
       normalized.panes = panes
     }
@@ -594,6 +609,11 @@ export function buildServerSettingsSchema(validCliProviders?: readonly string[])
       externalEditor: ExternalEditorSchema,
       customEditorCommand: z.string().optional(),
     }).strict(),
+    freshAgent: z.object({
+      initialSetupDone: z.boolean().optional(),
+      defaultPlugins: z.array(z.string()),
+      providers: z.record(z.string(), createAgentChatProviderDefaultsPatchSchema()),
+    }).strict(),
     agentChat: z.object({
       initialSetupDone: z.boolean().optional(),
       defaultPlugins: z.array(z.string()),
@@ -637,6 +657,11 @@ export function buildServerSettingsPatchSchema(validCliProviders?: readonly stri
     editor: z.object({
       externalEditor: ExternalEditorSchema.optional(),
       customEditorCommand: z.string().optional(),
+    }).strict().optional(),
+    freshAgent: z.object({
+      initialSetupDone: z.boolean().optional(),
+      defaultPlugins: z.array(z.string()).optional(),
+      providers: z.record(z.string(), createAgentChatProviderDefaultsPatchSchema()).optional(),
     }).strict().optional(),
     agentChat: z.object({
       initialSetupDone: z.boolean().optional(),
@@ -690,6 +715,10 @@ export function createDefaultServerSettings(options: SettingsDefaultsOptions = {
     editor: {
       externalEditor: 'auto',
     },
+    freshAgent: {
+      defaultPlugins: [],
+      providers: {},
+    },
     agentChat: {
       defaultPlugins: [],
       providers: {},
@@ -723,6 +752,7 @@ export const defaultLocalSettings: LocalSettings = {
     tabAttentionStyle: 'highlight',
     attentionDismiss: 'click',
     sessionOpenMode: 'tab',
+    multirowTabs: false,
   },
   sidebar: {
     sortMode: 'activity',
@@ -734,6 +764,11 @@ export const defaultLocalSettings: LocalSettings = {
     hideEmptySessions: true,
     width: 288,
     collapsed: false,
+  },
+  freshAgent: {
+    showThinking: false,
+    showTools: false,
+    showTimecodes: false,
   },
   agentChat: {
     showThinking: false,
@@ -899,17 +934,23 @@ function sanitizeServerSettingsPatch(patch: ServerSettingsPatch): ServerSettings
     }
   }
 
-  if (isRecord(candidate.agentChat)) {
-    const agentChat: ServerSettingsPatch['agentChat'] = {}
-    if (hasOwn(candidate.agentChat, 'initialSetupDone') && typeof candidate.agentChat.initialSetupDone === 'boolean') {
-      agentChat.initialSetupDone = candidate.agentChat.initialSetupDone
+  const rawFreshAgent = isRecord(candidate.freshAgent)
+    ? candidate.freshAgent
+    : isRecord(candidate.agentChat)
+      ? candidate.agentChat
+      : null
+
+  if (rawFreshAgent) {
+    const freshAgent: ServerSettingsPatch['freshAgent'] = {}
+    if (hasOwn(rawFreshAgent, 'initialSetupDone') && typeof rawFreshAgent.initialSetupDone === 'boolean') {
+      freshAgent.initialSetupDone = rawFreshAgent.initialSetupDone
     }
-    if (hasOwn(candidate.agentChat, 'defaultPlugins') && Array.isArray(candidate.agentChat.defaultPlugins)) {
-      agentChat.defaultPlugins = sanitizeAgentChatPluginPaths(candidate.agentChat.defaultPlugins)
+    if (hasOwn(rawFreshAgent, 'defaultPlugins') && Array.isArray(rawFreshAgent.defaultPlugins)) {
+      freshAgent.defaultPlugins = sanitizeAgentChatPluginPaths(rawFreshAgent.defaultPlugins)
     }
-    if (isRecord(candidate.agentChat.providers)) {
-      const providers: NonNullable<ServerSettingsPatch['agentChat']>['providers'] = {}
-      for (const [providerName, providerPatch] of Object.entries(candidate.agentChat.providers)) {
+    if (isRecord(rawFreshAgent.providers)) {
+      const providers: NonNullable<ServerSettingsPatch['freshAgent']>['providers'] = {}
+      for (const [providerName, providerPatch] of Object.entries(rawFreshAgent.providers)) {
         const normalizedProviderPatchInput = normalizeLegacyAgentChatProviderDefaultsInput(providerPatch)
         const parsed = agentChatProviderDefaultsPatchSchema.safeParse(
           normalizedProviderPatchInput,
@@ -936,11 +977,12 @@ function sanitizeServerSettingsPatch(patch: ServerSettingsPatch): ServerSettings
         }
       }
       if (Object.keys(providers).length > 0) {
-        agentChat.providers = providers
+        freshAgent.providers = providers
       }
     }
-    if (Object.keys(agentChat).length > 0) {
-      sanitized.agentChat = agentChat
+    if (Object.keys(freshAgent).length > 0) {
+      sanitized.freshAgent = freshAgent
+      sanitized.agentChat = freshAgent
     }
   }
 
@@ -1012,9 +1054,9 @@ function normalizeLegacyAgentChatProviderDefaultsInput(
 export function mergeServerSettings(base: ServerSettings, patch: ServerSettingsPatch): ServerSettings {
   const normalizedPatch = sanitizeServerSettingsPatch(patch)
   const codingCliPatch = normalizedPatch.codingCli
-  const agentChatPatch = normalizedPatch.agentChat
-  const normalizedAgentChatPatch = agentChatPatch as Partial<ServerSettings['agentChat']> | undefined
-  const normalizedAgentChatProvidersPatch = agentChatPatch?.providers as Partial<Record<string, AgentChatProviderDefaults>> | undefined
+  const freshAgentPatch = (normalizedPatch.freshAgent ?? normalizedPatch.agentChat) as
+    | Partial<ServerSettings['freshAgent']>
+    | undefined
 
   return {
     ...base,
@@ -1045,12 +1087,19 @@ export function mergeServerSettings(base: ServerSettings, patch: ServerSettingsP
       providers: mergeRecordOfObjects(base.codingCli.providers, codingCliPatch?.providers),
     },
     editor: mergeDefined(base.editor, normalizedPatch.editor),
+    freshAgent: {
+      ...mergeDefined(base.freshAgent, freshAgentPatch),
+      defaultPlugins: hasOwn(freshAgentPatch, 'defaultPlugins')
+        ? sanitizeAgentChatPluginPaths(freshAgentPatch?.defaultPlugins)
+        : base.freshAgent.defaultPlugins,
+      providers: mergeRecordOfObjects(base.freshAgent.providers, freshAgentPatch?.providers),
+    },
     agentChat: {
-      ...mergeDefined(base.agentChat, normalizedAgentChatPatch),
-      defaultPlugins: hasOwn(normalizedAgentChatPatch, 'defaultPlugins')
-        ? sanitizeAgentChatPluginPaths(normalizedAgentChatPatch?.defaultPlugins)
+      ...mergeDefined(base.agentChat, freshAgentPatch),
+      defaultPlugins: hasOwn(freshAgentPatch, 'defaultPlugins')
+        ? sanitizeAgentChatPluginPaths(freshAgentPatch?.defaultPlugins)
         : base.agentChat.defaultPlugins,
-      providers: mergeRecordOfObjects(base.agentChat.providers, normalizedAgentChatProvidersPatch),
+      providers: mergeRecordOfObjects(base.agentChat.providers, freshAgentPatch?.providers),
     },
     extensions: {
       disabled: hasOwn(normalizedPatch.extensions, 'disabled')
@@ -1062,6 +1111,7 @@ export function mergeServerSettings(base: ServerSettings, patch: ServerSettingsP
 }
 
 export function resolveLocalSettings(patch?: LocalSettingsPatch): LocalSettings {
+  const freshAgentPatch = patch?.freshAgent ?? patch?.agentChat
   return {
     ...defaultLocalSettings,
     ...(hasOwn(patch, 'theme') ? { theme: patch?.theme ?? defaultLocalSettings.theme } : {}),
@@ -1073,7 +1123,8 @@ export function resolveLocalSettings(patch?: LocalSettingsPatch): LocalSettings 
       sortMode: normalizeLocalSortMode(patch?.sidebar?.sortMode),
       worktreeGrouping: normalizeWorktreeGrouping(patch?.sidebar?.worktreeGrouping),
     },
-    agentChat: mergeDefined(defaultLocalSettings.agentChat, patch?.agentChat),
+    freshAgent: mergeDefined(defaultLocalSettings.freshAgent, freshAgentPatch),
+    agentChat: mergeDefined(defaultLocalSettings.agentChat, freshAgentPatch),
     notifications: mergeDefined(defaultLocalSettings.notifications, patch?.notifications),
   }
 }
@@ -1114,12 +1165,13 @@ export function mergeLocalSettings(base: LocalSettingsPatch | undefined, patch: 
     next.sidebar = sidebar as LocalSettingsPatch['sidebar']
   }
 
-  const agentChat = mergeDefined(
-    (base?.agentChat || {}) as Record<string, unknown>,
-    patch.agentChat as Record<string, unknown> | undefined,
+  const freshAgent = mergeDefined(
+    (base?.freshAgent || base?.agentChat || {}) as Record<string, unknown>,
+    (patch.freshAgent || patch.agentChat) as Record<string, unknown> | undefined,
   )
-  if (Object.keys(agentChat).length > 0) {
-    next.agentChat = agentChat as LocalSettingsPatch['agentChat']
+  if (Object.keys(freshAgent).length > 0) {
+    next.freshAgent = freshAgent as LocalSettingsPatch['freshAgent']
+    next.agentChat = freshAgent as LocalSettingsPatch['agentChat']
   }
 
   const notifications = mergeDefined(
@@ -1162,6 +1214,12 @@ export function composeResolvedSettings(server: ServerSettings, local: LocalSett
       ...local.panes,
     },
     editor: { ...server.editor },
+    freshAgent: {
+      ...server.freshAgent,
+      defaultPlugins: [...server.freshAgent.defaultPlugins],
+      providers: mergeRecordOfObjects(server.freshAgent.providers),
+      ...local.freshAgent,
+    },
     agentChat: {
       ...server.agentChat,
       defaultPlugins: [...server.agentChat.defaultPlugins],
@@ -1202,8 +1260,15 @@ export function extractLegacyLocalSettingsSeed(
     }
     maybeAssignNested(patch, 'sidebar', sidebarPatch)
   }
-  if (isRecord(raw.agentChat)) {
-    maybeAssignNested(patch, 'agentChat', pickKeys(raw.agentChat, AGENT_CHAT_LOCAL_KEYS))
+  const rawFreshAgentLocal = isRecord(raw.freshAgent)
+    ? raw.freshAgent
+    : isRecord(raw.agentChat)
+      ? raw.agentChat
+      : undefined
+  if (rawFreshAgentLocal) {
+    const freshAgentPatch = pickKeys(rawFreshAgentLocal, AGENT_CHAT_LOCAL_KEYS)
+    maybeAssignNested(patch, 'freshAgent', freshAgentPatch)
+    maybeAssignNested(patch, 'agentChat', freshAgentPatch)
   }
   if (isRecord(raw.notifications)) {
     maybeAssignNested(patch, 'notifications', pickKeys(raw.notifications, ['soundEnabled']))
@@ -1248,11 +1313,18 @@ export function stripLocalSettings(
     }
   }
 
-  if (isRecord(raw.agentChat)) {
-    const strippedAgentChat = omitKeys(raw.agentChat, AGENT_CHAT_LOCAL_KEYS)
-    if (Object.keys(strippedAgentChat).length > 0) {
-      next.agentChat = strippedAgentChat
+  const rawFreshAgent = isRecord(raw.freshAgent)
+    ? raw.freshAgent
+    : isRecord(raw.agentChat)
+      ? raw.agentChat
+      : undefined
+  if (rawFreshAgent) {
+    const strippedFreshAgent = omitKeys(rawFreshAgent, AGENT_CHAT_LOCAL_KEYS)
+    if (Object.keys(strippedFreshAgent).length > 0) {
+      next.freshAgent = strippedFreshAgent
+      next.agentChat = strippedFreshAgent
     } else {
+      delete next.freshAgent
       delete next.agentChat
     }
   }

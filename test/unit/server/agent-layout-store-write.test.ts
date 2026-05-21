@@ -66,6 +66,7 @@ it('lists pane titles from the public pane snapshot', () => {
     },
     activePane: { tab_a: 'pane_1' },
     paneTitles: { tab_a: { pane_1: 'Logs' } },
+    paneTitleSetByUser: { tab_a: { pane_1: true } },
     timestamp: Date.now(),
   }, 'conn-1')
 
@@ -173,6 +174,7 @@ it('swaps pane titles with pane content so title-based targeting stays aligned',
     },
     activePane: { tab_a: 'pane_1' },
     paneTitles: { tab_a: { pane_1: 'Codex', pane_2: 'Editor' } },
+    paneTitleSetByUser: { tab_a: { pane_1: true, pane_2: true } },
     timestamp: Date.now(),
   } as any, 'conn-1')
 

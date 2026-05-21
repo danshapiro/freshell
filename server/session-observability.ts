@@ -35,7 +35,7 @@ export type SessionLifecycleEvent =
     connectionId: string
     mode: TerminalMode
     reason: 'missing_canonical_session_id'
-    restoreRequested: true
+    restoreRequested: boolean
     hasSessionRef: boolean
   })
   | (OptionalUiContext & {
@@ -49,6 +49,24 @@ export type SessionLifecycleEvent =
     hasSessionRef: boolean
   })
   | {
+    kind: 'codex_candidate_pending'
+    provider: 'codex'
+    terminalId: string
+    generation: number
+    tabId?: string
+    paneId?: string
+    cwd?: string
+  }
+  | {
+    kind: 'codex_candidate_captured'
+    provider: 'codex'
+    terminalId: string
+    candidateThreadId: string
+    rolloutPath: string
+    source: string
+    generation: number
+  }
+  | {
     kind: 'codex_durable_session_observed'
     provider: 'codex'
     terminalId: string
@@ -58,11 +76,19 @@ export type SessionLifecycleEvent =
     source: 'sidecar'
   }
   | {
+    kind: 'codex_durable_resume_started'
+    provider: 'codex'
+    terminalId: string
+    sessionId: string
+    generation: number
+    source: 'sidecar'
+  }
+  | {
     kind: 'session_association_broadcast'
     provider: CodingCliProviderName
     terminalId: string
     sessionId: string
-    source: 'indexer_update' | 'claude_new_session' | 'opencode_controller'
+    source: 'indexer_update' | 'claude_new_session' | 'opencode_controller' | 'codex_durability'
   }
   | {
     kind: 'terminal_session_bound'
@@ -119,7 +145,6 @@ function isIncidentEvent(kind: SessionLifecycleEvent['kind']): boolean {
     || kind === 'invalid_terminal_id_without_session_ref'
     || kind === 'client_restore_unavailable'
     || kind === 'restore_unavailable'
-    || kind === 'restore_unavailable_fresh_fallback'
 }
 
 function buildPayload(event: SessionLifecycleEvent): Record<string, unknown> {
@@ -183,6 +208,26 @@ function buildPayload(event: SessionLifecycleEvent): Record<string, unknown> {
         treatedAsFresh: event.treatedAsFresh,
         hasSessionRef: event.hasSessionRef,
       }
+    case 'codex_candidate_pending':
+      return {
+        ...base,
+        provider: event.provider,
+        terminalId: event.terminalId,
+        generation: event.generation,
+        tabId: event.tabId,
+        paneId: event.paneId,
+        cwd: event.cwd,
+      }
+    case 'codex_candidate_captured':
+      return {
+        ...base,
+        provider: event.provider,
+        terminalId: event.terminalId,
+        candidateThreadId: event.candidateThreadId,
+        rolloutPath: event.rolloutPath,
+        source: event.source,
+        generation: event.generation,
+      }
     case 'codex_durable_session_observed':
       return {
         ...base,
@@ -191,6 +236,15 @@ function buildPayload(event: SessionLifecycleEvent): Record<string, unknown> {
         sessionId: event.sessionId,
         generation: event.generation,
         attemptId: event.attemptId,
+        source: event.source,
+      }
+    case 'codex_durable_resume_started':
+      return {
+        ...base,
+        provider: event.provider,
+        terminalId: event.terminalId,
+        sessionId: event.sessionId,
+        generation: event.generation,
         source: event.source,
       }
     case 'session_association_broadcast':

@@ -35,9 +35,13 @@ const selectPaneLastInputAt = (state: RootState) => state.tabRecency?.paneLastIn
 const selectDeviceId = (state: RootState) => state.tabRegistry.deviceId
 const selectDeviceLabel = (state: RootState) => state.tabRegistry.deviceLabel
 const selectServerInstanceId = (state: RootState) => state.connection.serverInstanceId || UNKNOWN_SERVER_INSTANCE_ID
+const selectSameDeviceOpen = (state: RootState) => state.tabRegistry.sameDeviceOpen
 const selectRemoteOpen = (state: RootState) => state.tabRegistry.remoteOpen
 const selectClosed = (state: RootState) => state.tabRegistry.closed
 const selectLocalClosed = (state: RootState) => state.tabRegistry.localClosed
+const selectClosedRetentionDays = (state: RootState) => Math.min(30, Math.max(1, Math.floor(
+  state.tabRegistry.closedTabRetentionDays ?? state.tabRegistry.searchRangeDays ?? 30,
+)))
 
 export const selectLiveLocalTabRecords = createSelector(
   [selectTabs, selectLayouts, selectPaneTitles, selectPaneLastInputAt, selectDeviceId, selectDeviceLabel, selectServerInstanceId],
@@ -67,20 +71,22 @@ export const selectLiveLocalTabRecords = createSelector(
 )
 
 export const selectMergedClosedRecords = createSelector(
-  [selectClosed, selectLocalClosed],
-  (closed, localClosed): RegistryTabRecord[] => {
+  [selectClosed, selectLocalClosed, selectClosedRetentionDays],
+  (closed, localClosed, closedRetentionDays): RegistryTabRecord[] => {
+    const closedCutoff = Date.now() - closedRetentionDays * 24 * 60 * 60 * 1000
     const merged = dedupeByTabKey([
       ...(closed || []),
-      ...Object.values(localClosed || {}),
+      ...Object.values(localClosed || {}).filter((record) => (record.closedAt ?? record.updatedAt) >= closedCutoff),
     ])
     return merged.sort(sortClosedDesc)
   },
 )
 
 export const selectTabsRegistryGroups = createSelector(
-  [selectLiveLocalTabRecords, selectRemoteOpen, selectMergedClosedRecords],
-  (localOpen, remoteOpen, closed) => ({
+  [selectLiveLocalTabRecords, selectSameDeviceOpen, selectRemoteOpen, selectMergedClosedRecords],
+  (localOpen, sameDeviceOpen, remoteOpen, closed) => ({
     localOpen,
+    sameDeviceOpen: [...(sameDeviceOpen || [])].sort(sortUpdatedDesc),
     remoteOpen: [...(remoteOpen || [])].sort(sortUpdatedDesc),
     closed,
   }),

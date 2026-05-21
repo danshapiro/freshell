@@ -65,10 +65,47 @@ function normalizeAgentChatProviderPatchForApi(
   return normalizedProviderPatch
 }
 
+function normalizeAgentProviderDefaultsPatchForApiSection(section: unknown): unknown {
+  if (!isRecord(section) || !isRecord(section.providers)) return section
+  return {
+    ...section,
+    providers: Object.fromEntries(
+      Object.entries(section.providers).map(([providerName, providerPatch]) => [
+        providerName,
+        isRecord(providerPatch) ? normalizeAgentChatProviderPatchForApi(providerPatch) : providerPatch,
+      ]),
+    ),
+  }
+}
+
+function removeUndefinedProperties(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(removeUndefinedProperties)
+  }
+  if (!isRecord(value)) {
+    return value
+  }
+
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([, child]) => child !== undefined)
+      .map(([key, child]) => [key, removeUndefinedProperties(child)]),
+  )
+}
+
 export function normalizeServerSettingsPatchForApi(patch: ServerSettingsPatch): ServerSettingsPatch | Record<string, unknown> {
+  const patchRecord = isRecord(patch) ? patch : {}
+  const hadFreshAgent = Object.prototype.hasOwnProperty.call(patchRecord, 'freshAgent')
+  const hadAgentChat = Object.prototype.hasOwnProperty.call(patchRecord, 'agentChat')
   const normalizedPatch = isRecord(patch)
     ? { ...stripLocalSettings(patch) }
     : {}
+  if (!hadFreshAgent) {
+    delete normalizedPatch.freshAgent
+  }
+  if (!hadAgentChat) {
+    delete normalizedPatch.agentChat
+  }
 
   if (Object.prototype.hasOwnProperty.call(normalizedPatch, 'defaultCwd') && normalizedPatch.defaultCwd == null) {
     normalizedPatch.defaultCwd = ''
@@ -85,18 +122,14 @@ export function normalizeServerSettingsPatchForApi(patch: ServerSettingsPatch): 
     }
   }
 
-  if (isRecord(normalizedPatch.agentChat) && isRecord(normalizedPatch.agentChat.providers)) {
-    normalizedPatch.agentChat = {
-      ...normalizedPatch.agentChat,
-      providers: Object.fromEntries(
-        Object.entries(normalizedPatch.agentChat.providers).map(([providerName, providerPatch]) => (
-          [providerName, isRecord(providerPatch) ? normalizeAgentChatProviderPatchForApi(providerPatch) : providerPatch]
-        )),
-      ),
-    }
+  if (Object.prototype.hasOwnProperty.call(normalizedPatch, 'freshAgent')) {
+    normalizedPatch.freshAgent = normalizeAgentProviderDefaultsPatchForApiSection(normalizedPatch.freshAgent) as any
+  }
+  if (Object.prototype.hasOwnProperty.call(normalizedPatch, 'agentChat')) {
+    normalizedPatch.agentChat = normalizeAgentProviderDefaultsPatchForApiSection(normalizedPatch.agentChat) as any
   }
 
-  return normalizedPatch
+  return removeUndefinedProperties(normalizedPatch) as ServerSettingsPatch | Record<string, unknown>
 }
 
 type SaveServerSettingsGetState = () => { settings: Pick<SettingsState, 'serverSettings'> }

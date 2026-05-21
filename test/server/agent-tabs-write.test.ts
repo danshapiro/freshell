@@ -3,13 +3,10 @@ import express from 'express'
 import request from 'supertest'
 import { createAgentApiRouter } from '../../server/agent-api/router'
 import { FakeCodexLaunchPlanner } from '../helpers/coding-cli/fake-codex-launch-planner.js'
-
-const expectedFreshellToken = process.env.AUTH_TOKEN || ''
-const expectedFreshellUrl = process.env.FRESHELL_URL || 'http://localhost:3001'
+import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../../server/coding-cli/codex-app-server/restore-decision.js'
 
 class FakeRegistry {
   create = vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term_1' }))
-  get = vi.fn()
 }
 
 describe('tab endpoints', () => {
@@ -86,148 +83,6 @@ describe('tab endpoints', () => {
     }))
   })
 
-  it('opens an existing terminal in a new tab when it is detached', async () => {
-    const app = express()
-    app.use(express.json())
-    const registry = new FakeRegistry()
-    registry.get.mockReturnValue({
-      terminalId: 'term_1',
-      title: 'Detached shell',
-      mode: 'shell',
-      status: 'running',
-      cwd: '/workspace',
-    })
-    const createTab = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
-    const attachPaneContent = vi.fn()
-    const broadcastUiCommandWithReplay = vi.fn()
-    const layoutStore = {
-      createTab,
-      attachPaneContent,
-      findPaneByTerminalId: vi.fn(() => undefined),
-    }
-    app.use('/api', createAgentApiRouter({
-      layoutStore,
-      registry,
-      wsHandler: { broadcastUiCommandWithReplay },
-    }))
-
-    const res = await request(app)
-      .post('/api/terminals/term_1/open')
-      .send({ name: 'Work shell' })
-
-    expect(res.status).toBe(200)
-    expect(createTab).toHaveBeenCalledWith({ title: 'Work shell' })
-    expect(attachPaneContent).toHaveBeenCalledWith('tab_1', 'pane_1', {
-      kind: 'terminal',
-      terminalId: 'term_1',
-      status: 'running',
-      mode: 'shell',
-      initialCwd: '/workspace',
-    })
-    expect(attachPaneContent.mock.calls[0]?.[2]).not.toHaveProperty('resumeSessionId')
-    expect(broadcastUiCommandWithReplay).toHaveBeenCalledWith({
-      command: 'tab.create',
-      payload: expect.objectContaining({
-        id: 'tab_1',
-        paneId: 'pane_1',
-        terminalId: 'term_1',
-        title: 'Work shell',
-      }),
-    })
-    expect(res.body.data).toMatchObject({
-      tabId: 'tab_1',
-      paneId: 'pane_1',
-      terminalId: 'term_1',
-      reused: false,
-    })
-  })
-
-  it('opens detached coding terminals with canonical sessionRef payloads', async () => {
-    const app = express()
-    app.use(express.json())
-    const registry = new FakeRegistry()
-    registry.get.mockReturnValue({
-      terminalId: 'term_1',
-      title: 'Detached Claude',
-      mode: 'claude',
-      status: 'running',
-      cwd: '/workspace',
-      resumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
-    })
-    const createTab = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
-    const attachPaneContent = vi.fn()
-    const broadcastUiCommandWithReplay = vi.fn()
-    const layoutStore = {
-      createTab,
-      attachPaneContent,
-      findPaneByTerminalId: vi.fn(() => undefined),
-    }
-    app.use('/api', createAgentApiRouter({
-      layoutStore,
-      registry,
-      wsHandler: { broadcastUiCommandWithReplay },
-    }))
-
-    const res = await request(app)
-      .post('/api/terminals/term_1/open')
-      .send({})
-
-    const sessionRef = { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' }
-    expect(res.status).toBe(200)
-    expect(attachPaneContent).toHaveBeenCalledWith('tab_1', 'pane_1', expect.objectContaining({
-      kind: 'terminal',
-      terminalId: 'term_1',
-      sessionRef,
-    }))
-    expect(attachPaneContent.mock.calls[0]?.[2]).not.toHaveProperty('resumeSessionId')
-    expect(broadcastUiCommandWithReplay).toHaveBeenCalledWith({
-      command: 'tab.create',
-      payload: expect.objectContaining({
-        sessionRef,
-      }),
-    })
-    expect(broadcastUiCommandWithReplay.mock.calls[0]?.[0]?.payload).not.toHaveProperty('resumeSessionId')
-  })
-
-  it('selects the existing pane when opening an already-attached terminal', async () => {
-    const app = express()
-    app.use(express.json())
-    const registry = new FakeRegistry()
-    registry.get.mockReturnValue({ terminalId: 'term_1', title: 'Shell', mode: 'shell', status: 'running' })
-    const selectPane = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
-    const broadcastUiCommand = vi.fn()
-    const broadcastUiCommandWithReplay = vi.fn()
-    const layoutStore = {
-      findPaneByTerminalId: vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' })),
-      selectPane,
-    }
-    app.use('/api', createAgentApiRouter({
-      layoutStore,
-      registry,
-      wsHandler: { broadcastUiCommand, broadcastUiCommandWithReplay },
-    }))
-
-    const res = await request(app).post('/api/terminals/term_1/open').send({})
-
-    expect(res.status).toBe(200)
-    expect(selectPane).toHaveBeenCalledWith('tab_1', 'pane_1')
-    expect(broadcastUiCommandWithReplay).toHaveBeenCalledWith({
-      command: 'tab.select',
-      payload: { id: 'tab_1' },
-    })
-    expect(broadcastUiCommandWithReplay).toHaveBeenCalledWith({
-      command: 'pane.select',
-      payload: { tabId: 'tab_1', paneId: 'pane_1' },
-    })
-    expect(broadcastUiCommand).not.toHaveBeenCalled()
-    expect(res.body.data).toMatchObject({
-      tabId: 'tab_1',
-      paneId: 'pane_1',
-      terminalId: 'term_1',
-      reused: true,
-    })
-  })
-
   it('creates terminal tabs from canonical sessionRef without mirroring legacy resumeSessionId payloads', async () => {
     const app = express()
     app.use(express.json())
@@ -277,10 +132,7 @@ describe('tab endpoints', () => {
     app.use(express.json())
     const registry = new FakeRegistry()
     const codexLaunchPlanner = new FakeCodexLaunchPlanner()
-    const createTab = vi.fn((input: { tabId: string; paneId: string }) => ({
-      tabId: input.tabId,
-      paneId: input.paneId,
-    }))
+    const createTab = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
     const layoutStore = {
       createTab,
       attachPaneContent: vi.fn(),
@@ -304,23 +156,12 @@ describe('tab endpoints', () => {
       model: undefined,
       resumeSessionId: undefined,
       sandbox: undefined,
-      terminalId: expect.any(String),
-      env: expect.objectContaining({
-        FRESHELL: '1',
-        FRESHELL_TERMINAL_ID: expect.any(String),
-        FRESHELL_TOKEN: expectedFreshellToken,
-        FRESHELL_URL: expectedFreshellUrl,
-      }),
     }))
-    expect(planCreate.env.FRESHELL_TERMINAL_ID).toBe(planCreate.terminalId)
-    expect(planCreate.env.FRESHELL_TAB_ID).toBe(createTab.mock.calls[0]?.[0]?.tabId)
-    expect(planCreate.env.FRESHELL_PANE_ID).toBe(createTab.mock.calls[0]?.[0]?.paneId)
     expect(registry.create).toHaveBeenCalledWith(expect.objectContaining({
       mode: 'codex',
-      terminalId: planCreate.terminalId,
-      codexSidecar: codexLaunchPlanner.sidecar,
       providerSettings: expect.objectContaining({
         codexAppServer: expect.objectContaining({
+          sidecar: codexLaunchPlanner.sidecar,
           wsUrl: expect.any(String),
         }),
       }),
@@ -331,12 +172,12 @@ describe('tab endpoints', () => {
     const app = express()
     app.use(express.json())
     const registry = new FakeRegistry()
-    const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    const codexLaunchPlanner = new FakeCodexLaunchPlanner({
+      sessionId: 'thread-canonical',
+      remote: { wsUrl: 'ws://127.0.0.1:43123' },
+    })
     codexLaunchPlanner.failNext(2)
-    const createTab = vi.fn((input: { tabId: string; paneId: string }) => ({
-      tabId: input.tabId,
-      paneId: input.paneId,
-    }))
+    const createTab = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
     const layoutStore = {
       createTab,
       attachPaneContent: vi.fn(),
@@ -396,10 +237,7 @@ describe('tab endpoints', () => {
       throw new Error('spawn failed')
     })
     const codexLaunchPlanner = new FakeCodexLaunchPlanner()
-    const createTab = vi.fn((input: { tabId: string; paneId: string }) => ({
-      tabId: input.tabId,
-      paneId: input.paneId,
-    }))
+    const createTab = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
     const closeTab = vi.fn()
     const layoutStore = {
       createTab,
@@ -419,7 +257,7 @@ describe('tab endpoints', () => {
     expect(res.body).toEqual({ status: 'error', message: 'spawn failed' })
     expect(codexLaunchPlanner.planCreateCalls).toHaveLength(1)
     expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
-    expect(closeTab).toHaveBeenCalledWith(createTab.mock.calls[0]?.[0]?.tabId)
+    expect(closeTab).toHaveBeenCalledWith('tab_1')
   })
 
   it('rejects invalid Codex sandbox values with a 400 before spawning', async () => {
@@ -454,6 +292,342 @@ describe('tab endpoints', () => {
     expect(codexLaunchPlanner.planCreateCalls).toEqual([])
     expect(createTab).not.toHaveBeenCalled()
     expect(registry.create).not.toHaveBeenCalled()
+  })
+
+  it('rejects Codex tab creation without planning when shutdown admission closes while reading settings', async () => {
+    const app = express()
+    app.use(express.json())
+    let acceptingCreates = true
+    const registry = {
+      create: vi.fn(() => {
+        throw new Error('registry.create should not run')
+      }),
+      killAndWait: vi.fn(async () => true),
+    }
+    const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    const layoutStore = {
+      createTab: vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' })),
+      attachPaneContent: vi.fn(),
+      selectTab: () => ({}),
+      renameTab: () => ({}),
+      closeTab: () => ({}),
+      hasTab: () => true,
+      selectNextTab: () => ({ tabId: 'tab_1' }),
+      selectPrevTab: () => ({ tabId: 'tab_1' }),
+    }
+    const configStore = {
+      getSettings: vi.fn(async () => {
+        acceptingCreates = false
+        return { codingCli: { providers: { codex: {} } } }
+      }),
+    }
+    app.use('/api', createAgentApiRouter({
+      layoutStore,
+      registry,
+      configStore,
+      codexLaunchPlanner,
+      assertTerminalCreateAccepted: () => {
+        if (!acceptingCreates) {
+          throw new Error('Server is shutting down; terminal creation is not accepted.')
+        }
+      },
+    }))
+
+    const res = await request(app).post('/api/tabs').send({ mode: 'codex', name: 'shutdown before planning' })
+
+    expect(res.status).toBe(500)
+    expect(res.body.message).toContain('Server is shutting down')
+    expect(configStore.getSettings).toHaveBeenCalledTimes(1)
+    expect(codexLaunchPlanner.planCreateCalls).toEqual([])
+    expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(0)
+    expect(registry.create).not.toHaveBeenCalled()
+    expect(registry.killAndWait).not.toHaveBeenCalled()
+    expect(layoutStore.createTab).not.toHaveBeenCalled()
+    expect(layoutStore.attachPaneContent).not.toHaveBeenCalled()
+  })
+
+  it('kills the created Codex terminal when tab creation fails after registry.create', async () => {
+    const app = express()
+    app.use(express.json())
+    const registry = {
+      create: vi.fn(() => ({ terminalId: 'term_1' })),
+      killAndWait: vi.fn(async () => true),
+    }
+    const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    vi.spyOn(codexLaunchPlanner.sidecar, 'adopt').mockRejectedValue(new Error('adopt failed after tab create'))
+    const layoutStore = {
+      createTab: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+      attachPaneContent: vi.fn(),
+      selectTab: () => ({}),
+      renameTab: () => ({}),
+      closeTab: () => ({}),
+      hasTab: () => true,
+      selectNextTab: () => ({ tabId: 'tab_1' }),
+      selectPrevTab: () => ({ tabId: 'tab_1' }),
+    }
+    app.use('/api', createAgentApiRouter({ layoutStore, registry, codexLaunchPlanner }))
+
+    const res = await request(app).post('/api/tabs').send({ mode: 'codex', name: 'resume tab' })
+
+    expect(res.status).toBe(500)
+    expect(res.body.message).toBe('adopt failed after tab create')
+    expect(registry.killAndWait).toHaveBeenCalledWith('term_1')
+    expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
+    expect(layoutStore.attachPaneContent).not.toHaveBeenCalled()
+  })
+
+  it('kills the inserted Codex terminal when registry.create fails after insertion', async () => {
+    const app = express()
+    app.use(express.json())
+    const createError = new Error('terminal.created listener failed') as Error & { terminalId?: string }
+    createError.terminalId = 'term_inserted'
+    const registry = {
+      create: vi.fn(() => {
+        throw createError
+      }),
+      killAndWait: vi.fn(async () => true),
+    }
+    const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    const layoutStore = {
+      createTab: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+      attachPaneContent: vi.fn(),
+      selectTab: () => ({}),
+      renameTab: () => ({}),
+      closeTab: () => ({}),
+      hasTab: () => true,
+      selectNextTab: () => ({ tabId: 'tab_1' }),
+      selectPrevTab: () => ({ tabId: 'tab_1' }),
+    }
+    app.use('/api', createAgentApiRouter({ layoutStore, registry, codexLaunchPlanner }))
+
+    const res = await request(app).post('/api/tabs').send({ mode: 'codex', name: 'emit failure tab' })
+
+    expect(res.status).toBe(500)
+    expect(res.body.message).toBe('terminal.created listener failed')
+    expect(registry.killAndWait).toHaveBeenCalledWith('term_inserted')
+    expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
+    expect(layoutStore.attachPaneContent).not.toHaveBeenCalled()
+  })
+
+  it('rejects raw Codex resume ids instead of fresh-creating tabs', async () => {
+    const app = express()
+    app.use(express.json())
+    const registry = {
+      create: vi.fn(),
+      killAndWait: vi.fn(async () => true),
+    }
+    const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    const layoutStore = {
+      createTab: vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' })),
+      attachPaneContent: vi.fn(),
+      selectTab: () => ({}),
+      renameTab: () => ({}),
+      closeTab: () => ({}),
+      hasTab: () => true,
+      selectNextTab: () => ({ tabId: 'tab_1' }),
+      selectPrevTab: () => ({ tabId: 'tab_1' }),
+    }
+    app.use('/api', createAgentApiRouter({ layoutStore, registry, codexLaunchPlanner }))
+
+    const res = await request(app).post('/api/tabs').send({
+      mode: 'codex',
+      name: 'resume tab',
+      resumeSessionId: 'thread-resume-exits',
+    })
+
+    expect(res.status).toBe(400)
+    expect(res.body).toEqual({
+      status: 'error',
+      message: INVALID_RAW_CODEX_RESUME_MESSAGE,
+    })
+    expect(codexLaunchPlanner.planCreateCalls).toEqual([])
+    expect(registry.create).not.toHaveBeenCalled()
+    expect(registry.killAndWait).not.toHaveBeenCalled()
+    expect(layoutStore.createTab).not.toHaveBeenCalled()
+    expect(layoutStore.attachPaneContent).not.toHaveBeenCalled()
+  })
+
+  it('uses canonical Codex sessionRef as the durable resume path', async () => {
+    const app = express()
+    app.use(express.json())
+    const terminal = { terminalId: 'term_codex_canonical', status: 'running' }
+    const registry = {
+      create: vi.fn(() => terminal),
+      killAndWait: vi.fn(async () => true),
+    }
+    const codexLaunchPlanner = new FakeCodexLaunchPlanner({
+      sessionId: 'thread-canonical',
+      remote: { wsUrl: 'ws://127.0.0.1:43123' },
+    })
+    const layoutStore = {
+      createTab: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+      attachPaneContent: vi.fn(),
+      selectTab: () => ({}),
+      renameTab: () => ({}),
+      closeTab: () => ({}),
+      hasTab: () => true,
+      selectNextTab: () => ({ tabId: 'tab_1' }),
+      selectPrevTab: () => ({ tabId: 'tab_1' }),
+    }
+    app.use('/api', createAgentApiRouter({ layoutStore, registry, codexLaunchPlanner }))
+
+    const sessionRef = { provider: 'codex', sessionId: 'thread-canonical' }
+    const res = await request(app).post('/api/tabs').send({
+      mode: 'codex',
+      name: 'resume tab',
+      sessionRef,
+    })
+
+    expect(res.status).toBe(200)
+    expect(codexLaunchPlanner.planCreateCalls[0]).toEqual(expect.objectContaining({
+      resumeSessionId: 'thread-canonical',
+    }))
+    expect(registry.create).toHaveBeenCalledWith(expect.objectContaining({
+      mode: 'codex',
+      resumeSessionId: 'thread-canonical',
+    }))
+    expect(layoutStore.attachPaneContent).toHaveBeenCalledWith('tab_1', 'pane_1', expect.objectContaining({
+      sessionRef,
+    }))
+    expect(layoutStore.attachPaneContent.mock.calls[0]?.[2]).not.toHaveProperty('resumeSessionId')
+  })
+
+  it('kills the created Codex terminal without waiting for readiness when shutdown admission closes after adoption', async () => {
+    const app = express()
+    app.use(express.json())
+    let acceptingCreates = true
+    const terminal = { terminalId: 'term_shutdown_after_adopt', status: 'running' }
+    const registry = {
+      create: vi.fn(() => terminal),
+      killAndWait: vi.fn(async () => true),
+      publishCodexSidecar: vi.fn(),
+    }
+    const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    const originalAdopt = codexLaunchPlanner.sidecar.adopt.bind(codexLaunchPlanner.sidecar)
+    vi.spyOn(codexLaunchPlanner.sidecar, 'adopt').mockImplementation(async (input) => {
+      await originalAdopt(input)
+      acceptingCreates = false
+    })
+    const layoutStore = {
+      createTab: vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' })),
+      attachPaneContent: vi.fn(),
+      selectTab: () => ({}),
+      renameTab: () => ({}),
+      closeTab: () => ({}),
+      hasTab: () => true,
+      selectNextTab: () => ({ tabId: 'tab_1' }),
+      selectPrevTab: () => ({ tabId: 'tab_1' }),
+    }
+    app.use('/api', createAgentApiRouter({
+      layoutStore,
+      registry,
+      codexLaunchPlanner,
+      assertTerminalCreateAccepted: () => {
+        if (!acceptingCreates) {
+          throw new Error('Server is shutting down; terminal creation is not accepted.')
+        }
+      },
+    }))
+
+    const res = await request(app).post('/api/tabs').send({
+      mode: 'codex',
+      name: 'resume tab',
+      sessionRef: { provider: 'codex', sessionId: 'thread-resume-shutdown' },
+    })
+
+    expect(res.status).toBe(500)
+    expect(res.body.message).toContain('Server is shutting down')
+    expect(codexLaunchPlanner.sidecar.adoptCalls).toEqual([{ terminalId: 'term_shutdown_after_adopt', generation: 0 }])
+    expect(registry.publishCodexSidecar).not.toHaveBeenCalled()
+    expect(registry.killAndWait).toHaveBeenCalledWith('term_shutdown_after_adopt')
+    expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
+    expect(layoutStore.attachPaneContent).not.toHaveBeenCalled()
+  })
+
+  it('rejects Codex tab creation when shutdown admission closes after planning', async () => {
+    const app = express()
+    app.use(express.json())
+    let acceptingCreates = true
+    const registry = {
+      create: vi.fn(() => ({ terminalId: 'term_1', status: 'running' })),
+      killAndWait: vi.fn(async () => true),
+    }
+    const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    const originalPlanCreate = codexLaunchPlanner.planCreate.bind(codexLaunchPlanner)
+    vi.spyOn(codexLaunchPlanner, 'planCreate').mockImplementation(async (input) => {
+      const plan = await originalPlanCreate(input)
+      acceptingCreates = false
+      return plan
+    })
+    const layoutStore = {
+      createTab: vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' })),
+      attachPaneContent: vi.fn(),
+      selectTab: () => ({}),
+      renameTab: () => ({}),
+      closeTab: () => ({}),
+      hasTab: () => true,
+      selectNextTab: () => ({ tabId: 'tab_1' }),
+      selectPrevTab: () => ({ tabId: 'tab_1' }),
+    }
+    app.use('/api', createAgentApiRouter({
+      layoutStore,
+      registry,
+      codexLaunchPlanner,
+      assertTerminalCreateAccepted: () => {
+        if (!acceptingCreates) {
+          throw new Error('Server is shutting down; terminal creation is not accepted.')
+        }
+      },
+    }))
+
+    const res = await request(app).post('/api/tabs').send({ mode: 'codex', name: 'shutdown after plan' })
+
+    expect(res.status).toBe(500)
+    expect(res.body.message).toContain('Server is shutting down')
+    expect(registry.create).not.toHaveBeenCalled()
+    expect(registry.killAndWait).not.toHaveBeenCalled()
+    expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
+    expect(layoutStore.attachPaneContent).not.toHaveBeenCalled()
+  })
+
+  it('kills the created Codex terminal when shutdown admission closes before adoption', async () => {
+    const app = express()
+    app.use(express.json())
+    const registry = {
+      create: vi.fn(() => ({ terminalId: 'term_1', status: 'running' })),
+      killAndWait: vi.fn(async () => true),
+    }
+    const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    const layoutStore = {
+      createTab: vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' })),
+      attachPaneContent: vi.fn(),
+      selectTab: () => ({}),
+      renameTab: () => ({}),
+      closeTab: () => ({}),
+      hasTab: () => true,
+      selectNextTab: () => ({ tabId: 'tab_1' }),
+      selectPrevTab: () => ({ tabId: 'tab_1' }),
+    }
+    app.use('/api', createAgentApiRouter({
+      layoutStore,
+      registry,
+      codexLaunchPlanner,
+      assertTerminalCreateAccepted: () => {
+        if (registry.create.mock.calls.length > 0) {
+          throw new Error('Server is shutting down; terminal creation is not accepted.')
+        }
+      },
+    }))
+
+    const res = await request(app).post('/api/tabs').send({ mode: 'codex', name: 'shutdown before adopt' })
+
+    expect(res.status).toBe(500)
+    expect(res.body.message).toContain('Server is shutting down')
+    expect(registry.create).toHaveBeenCalledTimes(1)
+    expect(codexLaunchPlanner.sidecar.adoptCalls).toEqual([])
+    expect(registry.killAndWait).toHaveBeenCalledWith('term_1')
+    expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
+    expect(layoutStore.attachPaneContent).not.toHaveBeenCalled()
   })
 
   it('rejects blank tab rename payloads', async () => {

@@ -857,6 +857,11 @@ describe('State Edge Cases', () => {
             defaultPlugins: ['fs'],
             providers: {},
           },
+          freshAgent: {
+            ...defaultSettings.freshAgent,
+            defaultPlugins: ['fs'],
+            providers: {},
+          },
           extensions: {
             ...defaultSettings.extensions,
           },

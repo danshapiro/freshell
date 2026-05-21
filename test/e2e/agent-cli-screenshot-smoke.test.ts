@@ -45,7 +45,7 @@ function createFakeRegistry() {
 
   const input = vi.fn((terminalId: string, data: unknown) => {
     const record = records.get(terminalId)
-    if (!record || record.status !== 'running') return false
+    if (!record || record.status !== 'running') return { status: 'not_running' }
 
     const text = String(data ?? '')
     for (const ch of text) {
@@ -61,7 +61,7 @@ function createFakeRegistry() {
       }
       record._pendingInput += ch
     }
-    return true
+    return { status: 'written' }
   })
 
   const get = (terminalId: string) => records.get(terminalId)

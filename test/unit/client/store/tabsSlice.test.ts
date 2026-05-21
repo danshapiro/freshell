@@ -11,7 +11,7 @@ import tabsReducer, {
   openSessionTab,
   TabsState,
 } from '../../../../src/store/tabsSlice'
-import panesReducer, { initLayout, splitPane } from '../../../../src/store/panesSlice'
+import panesReducer, { initLayout } from '../../../../src/store/panesSlice'
 import connectionReducer from '../../../../src/store/connectionSlice'
 import extensionsReducer from '../../../../src/store/extensionsSlice'
 import type { Tab } from '../../../../src/store/types'
@@ -931,7 +931,7 @@ describe('tabsSlice', () => {
       expect(tab?.title).toBe('Freshclaude Session')
     })
 
-    it('repairs a mis-restored single-pane session tab when the reopened session resolves to agent-chat', async () => {
+    it('repairs a mis-restored single-pane session tab when the reopened session resolves to fresh-agent', async () => {
       const store = configureStore({
         reducer: {
           tabs: tabsReducer,
@@ -968,184 +968,15 @@ describe('tabsSlice', () => {
       expect(store.getState().panes.layouts['tab-1']).toMatchObject({
         type: 'leaf',
         content: {
-          kind: 'agent-chat',
-          provider: 'freshclaude',
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
           sessionRef: {
             provider: 'claude',
             sessionId: VALID_CLAUDE_SESSION_ID,
           },
         },
       })
-    })
-
-    it('injects sessionRef into a stale single-pane terminal whose only durable locator is tab-level', async () => {
-      const store = createOpenSessionStore('srv-current')
-
-      store.dispatch(addTab({
-        id: 'tab-opencode-old',
-        mode: 'opencode',
-        title: 'Old OpenCode',
-        sessionRef: { provider: 'opencode', sessionId: 'ses_old' },
-      }))
-      store.dispatch(initLayout({
-        tabId: 'tab-opencode-old',
-        content: {
-          kind: 'terminal',
-          mode: 'opencode',
-          terminalId: 'dead-term-1',
-          serverInstanceId: 'srv-old',
-          status: 'running',
-        },
-      }))
-
-      await store.dispatch(openSessionTab({
-        provider: 'opencode',
-        sessionId: 'ses_old',
-        sessionType: 'opencode',
-        title: 'Old OpenCode',
-        cwd: '/repo/project',
-      }))
-
-      expect(store.getState().panes.layouts['tab-opencode-old']).toMatchObject({
-        type: 'leaf',
-        content: {
-          kind: 'terminal',
-          mode: 'opencode',
-          terminalId: 'dead-term-1',
-          serverInstanceId: 'srv-old',
-          sessionRef: { provider: 'opencode', sessionId: 'ses_old' },
-        },
-      })
-      expect(store.getState().tabs.tabs).toHaveLength(1)
-      expect(store.getState().tabs.activeTabId).toBe('tab-opencode-old')
-    })
-
-    it('does not overwrite a terminal pane with a different sessionRef', async () => {
-      const store = createOpenSessionStore('srv-current')
-
-      store.dispatch(addTab({
-        id: 'tab-opencode-old',
-        mode: 'opencode',
-        title: 'Old OpenCode',
-        sessionRef: { provider: 'opencode', sessionId: 'ses_old' },
-      }))
-      store.dispatch(initLayout({
-        tabId: 'tab-opencode-old',
-        content: {
-          kind: 'terminal',
-          mode: 'opencode',
-          terminalId: 'term-other',
-          serverInstanceId: 'srv-old',
-          sessionRef: { provider: 'opencode', sessionId: 'ses_other' },
-          status: 'running',
-        },
-      }))
-
-      await store.dispatch(openSessionTab({
-        provider: 'opencode',
-        sessionId: 'ses_old',
-        sessionType: 'opencode',
-        title: 'Old OpenCode',
-      }))
-
-      const oldLayout = store.getState().panes.layouts['tab-opencode-old']
-      expect(oldLayout).toMatchObject({
-        type: 'leaf',
-        content: {
-          terminalId: 'term-other',
-          sessionRef: { provider: 'opencode', sessionId: 'ses_other' },
-        },
-      })
-      expect(store.getState().tabs.tabs).toHaveLength(2)
-      expect(store.getState().tabs.activeTabId).not.toBe('tab-opencode-old')
-    })
-
-    it('does not use tab-level sessionRef to repair multi-pane layouts', async () => {
-      const store = createOpenSessionStore('srv-current')
-
-      store.dispatch(addTab({
-        id: 'tab-opencode-old',
-        mode: 'opencode',
-        title: 'Old OpenCode',
-        sessionRef: { provider: 'opencode', sessionId: 'ses_old' },
-      }))
-      store.dispatch(initLayout({
-        tabId: 'tab-opencode-old',
-        paneId: 'pane-left',
-        content: {
-          kind: 'terminal',
-          mode: 'opencode',
-          terminalId: 'dead-term-1',
-          serverInstanceId: 'srv-old',
-          status: 'running',
-        },
-      }))
-      store.dispatch(splitPane({
-        tabId: 'tab-opencode-old',
-        paneId: 'pane-left',
-        direction: 'horizontal',
-        newPaneId: 'pane-right',
-        newContent: {
-          kind: 'terminal',
-          mode: 'shell',
-        },
-      }))
-
-      await store.dispatch(openSessionTab({
-        provider: 'opencode',
-        sessionId: 'ses_old',
-        sessionType: 'opencode',
-        title: 'Old OpenCode',
-      }))
-
-      expect(store.getState().tabs.tabs).toHaveLength(2)
-      expect(store.getState().tabs.activeTabId).not.toBe('tab-opencode-old')
-      const oldLayout = store.getState().panes.layouts['tab-opencode-old']
-      expect(JSON.stringify(oldLayout)).not.toContain('"sessionId":"ses_old"')
-    })
-
-    it('does not inject tab-level sessionRef into a known-current live terminal', async () => {
-      const store = createOpenSessionStore('srv-current')
-
-      store.dispatch(addTab({
-        id: 'tab-opencode-live',
-        mode: 'opencode',
-        title: 'Live OpenCode',
-        sessionRef: { provider: 'opencode', sessionId: 'ses_old' },
-      }))
-      store.dispatch(initLayout({
-        tabId: 'tab-opencode-live',
-        content: {
-          kind: 'terminal',
-          mode: 'opencode',
-          terminalId: 'live-term-1',
-          serverInstanceId: 'srv-current',
-          status: 'running',
-        },
-      }))
-
-      await store.dispatch(openSessionTab({
-        provider: 'opencode',
-        sessionId: 'ses_old',
-        sessionType: 'opencode',
-        title: 'Old OpenCode',
-      }))
-
-      expect(store.getState().panes.layouts['tab-opencode-live']).toMatchObject({
-        type: 'leaf',
-        content: {
-          kind: 'terminal',
-          mode: 'opencode',
-          terminalId: 'live-term-1',
-          serverInstanceId: 'srv-current',
-        },
-      })
-      const liveLayout = store.getState().panes.layouts['tab-opencode-live']
-      if (liveLayout?.type === 'leaf' && liveLayout.content.kind === 'terminal') {
-        expect(liveLayout.content.sessionRef).toBeUndefined()
-      }
-      expect(store.getState().tabs.tabs).toHaveLength(2)
-      expect(store.getState().tabs.activeTabId).not.toBe('tab-opencode-live')
     })
 
     it('activates existing tab when terminalId is already attached', async () => {

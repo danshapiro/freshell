@@ -75,6 +75,9 @@ vi.mock('lucide-react', () => ({
   Code: ({ className }: { className?: string }) => (
     <svg data-testid="code-icon" className={className} />
   ),
+  WrapText: ({ className }: { className?: string }) => (
+    <svg data-testid="wrap-text-icon" className={className} />
+  ),
   Circle: ({ className }: { className?: string }) => (
     <svg data-testid="circle-icon" className={className} />
   ),

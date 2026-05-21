@@ -22,17 +22,13 @@ import panesReducer, { initLayout } from '@/store/panesSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import settingsReducer from '@/store/settingsSlice'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
-import type { AgentChatPaneContent } from '@/store/paneTypes'
+import type { AgentChatPaneContent, FreshAgentPaneContent, PaneContent } from '@/store/paneTypes'
 import type { PaneNode } from '@/store/paneTypes'
 
 // jsdom doesn't implement scrollIntoView
 beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn()
 })
-
-const DURABLE_SESSION_ID = '00000000-0000-4000-8000-000000000201'
-const DURABLE_SESSION_ID_ALT = '00000000-0000-4000-8000-000000000202'
-const DURABLE_SHELL_SESSION_ID = '00000000-0000-4000-8000-000000000203'
 
 const wsSend = vi.fn()
 const getAgentTimelinePage = vi.fn()
@@ -146,15 +142,25 @@ const RELOAD_PANE: AgentChatPaneContent = {
 
 const RELOAD_PANE_WITH_CANONICAL_RESUME: AgentChatPaneContent = {
   ...RELOAD_PANE,
-  sessionRef: {
-    provider: 'claude',
-    sessionId: '00000000-0000-4000-8000-000000000321',
-  },
+  resumeSessionId: '00000000-0000-4000-8000-000000000321',
 }
 
 const RELOAD_PANE_WITH_NAMED_RESUME: AgentChatPaneContent = {
   ...RELOAD_PANE,
   resumeSessionId: 'named-resume-token',
+}
+
+function normalizeAgentChatPaneContent(content: PaneContent | undefined): AgentChatPaneContent | undefined {
+  if (!content) return undefined
+  if (content.kind === 'agent-chat') return content
+  if (content.kind !== 'fresh-agent') return undefined
+  if (content.sessionType !== 'freshclaude' && content.sessionType !== 'kilroy') return undefined
+  const migrated: FreshAgentPaneContent = content
+  return {
+    ...migrated,
+    kind: 'agent-chat',
+    provider: migrated.sessionType,
+  }
 }
 
 describe('AgentChatView reload/restore behavior', () => {
@@ -208,7 +214,7 @@ describe('AgentChatView reload/restore behavior', () => {
     })
   })
 
-  it('does not attach through a named legacy resumeSessionId before the canonical durable id exists', () => {
+  it('includes the named resumeSessionId when attaching a persisted pane before the canonical durable id exists', () => {
     const store = makeStore()
     render(
       <Provider store={store}>
@@ -223,6 +229,7 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(wsSend).toHaveBeenCalledWith({
       type: 'sdk.attach',
       sessionId: 'sess-reload-1',
+      resumeSessionId: 'named-resume-token',
     })
   })
 
@@ -289,9 +296,7 @@ describe('AgentChatView reload/restore behavior', () => {
 
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
-        ? root.content
-        : undefined
+      const content = root?.type === 'leaf' ? normalizeAgentChatPaneContent(root.content) : undefined
       if (!content) return null
       return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
     }
@@ -360,9 +365,7 @@ describe('AgentChatView reload/restore behavior', () => {
 
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
-        ? root.content
-        : undefined
+      const content = root?.type === 'leaf' ? normalizeAgentChatPaneContent(root.content) : undefined
       if (!content) return null
       return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
     }
@@ -398,9 +401,7 @@ describe('AgentChatView reload/restore behavior', () => {
 
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
-        ? root.content
-        : undefined
+      const content = root?.type === 'leaf' ? normalizeAgentChatPaneContent(root.content) : undefined
       if (!content) return null
       return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
     }
@@ -454,9 +455,7 @@ describe('AgentChatView reload/restore behavior', () => {
 
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
-        ? root.content
-        : undefined
+      const content = root?.type === 'leaf' ? normalizeAgentChatPaneContent(root.content) : undefined
       if (!content) return null
       return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
     }
@@ -494,9 +493,7 @@ describe('AgentChatView reload/restore behavior', () => {
 
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
-        ? root.content
-        : undefined
+      const content = root?.type === 'leaf' ? normalizeAgentChatPaneContent(root.content) : undefined
       if (!content) return null
       return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
     }
@@ -554,9 +551,7 @@ describe('AgentChatView reload/restore behavior', () => {
 
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
-        ? root.content
-        : undefined
+      const content = root?.type === 'leaf' ? normalizeAgentChatPaneContent(root.content) : undefined
       if (!content) return null
       return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
     }
@@ -846,7 +841,7 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionId: 'sess-reload-1',
       latestTurnId: 'turn-2',
       status: 'idle',
-      timelineSessionId: DURABLE_SESSION_ID,
+      timelineSessionId: '00000000-0000-4000-8000-000000000101',
       revision: 12,
     }))
 
@@ -862,14 +857,14 @@ describe('AgentChatView reload/restore behavior', () => {
       expect(attachCalls[1]?.[0]).toEqual({
         type: 'sdk.attach',
         sessionId: 'sess-reload-1',
-        resumeSessionId: DURABLE_SESSION_ID,
+        resumeSessionId: '00000000-0000-4000-8000-000000000101',
       })
     })
   })
 
   it('clears stale hydrated timeline content and waits for a fresh snapshot before rereading after a stale restore retry', async () => {
     getAgentTimelinePage.mockResolvedValue({
-      sessionId: 'cli-sess-1',
+      sessionId: '00000000-0000-4000-8000-000000000101',
       items: [],
       nextCursor: null,
       revision: 13,
@@ -880,14 +875,14 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionId: 'sess-reload-1',
       latestTurnId: 'turn-2',
       status: 'idle',
-      timelineSessionId: 'cli-sess-1',
+      timelineSessionId: '00000000-0000-4000-8000-000000000101',
       revision: 12,
     }))
     store.dispatch(timelinePageReceived({
       sessionId: 'sess-reload-1',
       items: [
         makeTimelineItem('turn-2', 'assistant', 'Old stale summary', {
-          sessionId: 'cli-sess-1',
+          sessionId: '00000000-0000-4000-8000-000000000101',
           ordinal: 2,
           timestamp: '2026-03-10T10:01:00.000Z',
         }),
@@ -897,7 +892,7 @@ describe('AgentChatView reload/restore behavior', () => {
       replace: true,
       bodies: {
         'turn-2': makeTimelineTurn('turn-2', 'assistant', 'Old hydrated body', {
-          sessionId: 'cli-sess-1',
+          sessionId: '00000000-0000-4000-8000-000000000101',
           ordinal: 2,
           timestamp: '2026-03-10T10:01:00.000Z',
         }),
@@ -945,7 +940,7 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionId: 'sess-reload-1',
       latestTurnId: 'turn-2',
       status: 'idle',
-      timelineSessionId: 'cli-sess-1',
+      timelineSessionId: '00000000-0000-4000-8000-000000000101',
       revision: 12,
     }))
 
@@ -960,7 +955,7 @@ describe('AgentChatView reload/restore behavior', () => {
         sessionId: 'sess-reload-1',
         items: [
           makeTimelineItem('turn-2', 'user', 'Hydrated summary', {
-            sessionId: 'cli-sess-1',
+            sessionId: '00000000-0000-4000-8000-000000000101',
             ordinal: 2,
             timestamp: '2026-03-10T10:01:00.000Z',
           }),
@@ -972,7 +967,7 @@ describe('AgentChatView reload/restore behavior', () => {
       store.dispatch(turnBodyReceived({
         sessionId: 'sess-reload-1',
         turn: makeTimelineTurn('turn-2', 'user', 'Hydrated body', {
-          sessionId: 'cli-sess-1',
+      sessionId: '00000000-0000-4000-8000-000000000101',
           ordinal: 2,
           timestamp: '2026-03-10T10:01:00.000Z',
         }),
@@ -986,7 +981,7 @@ describe('AgentChatView reload/restore behavior', () => {
     await act(async () => {
       await store.dispatch(loadAgentTurnBody({
         sessionId: 'sess-reload-1',
-        timelineSessionId: 'cli-sess-1',
+        timelineSessionId: '00000000-0000-4000-8000-000000000101',
         turnId: 'turn-7',
       }))
     })
@@ -1082,15 +1077,20 @@ describe('AgentChatView reload/restore behavior', () => {
     })
   })
 
-  it('uses canonical timelineSessionId from sdk.session.snapshot for visible restore hydration', async () => {
-    getAgentTimelinePage.mockResolvedValue({ sessionId: DURABLE_SESSION_ID, items: [], nextCursor: null, revision: 1 })
+  it('uses timelineSessionId from sdk.session.snapshot for visible restore hydration', async () => {
+    getAgentTimelinePage.mockResolvedValue({
+      sessionId: '00000000-0000-4000-8000-000000000101',
+      items: [],
+      nextCursor: null,
+      revision: 1,
+    })
 
     const store = makeStore()
     store.dispatch(sessionSnapshotReceived({
       sessionId: 'sess-reload-1',
       latestTurnId: 'turn-2',
       status: 'idle',
-      timelineSessionId: DURABLE_SESSION_ID,
+      timelineSessionId: '00000000-0000-4000-8000-000000000101',
       revision: 2,
     }))
 
@@ -1102,7 +1102,7 @@ describe('AgentChatView reload/restore behavior', () => {
 
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
-        DURABLE_SESSION_ID,
+        '00000000-0000-4000-8000-000000000101',
         expect.objectContaining({ includeBodies: true, revision: 2 }),
         expect.anything(),
       )
@@ -1170,22 +1170,22 @@ describe('AgentChatView reload/restore behavior', () => {
         sessionId: 'sdk-sess-1',
         latestTurnId: 'turn-2',
         status: 'idle',
-        timelineSessionId: DURABLE_SESSION_ID_ALT,
+      timelineSessionId: '00000000-0000-4000-8000-000000000201',
         revision: 2,
       }))
     })
 
     expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't1', 'p1')?.sessionRef).toEqual({
       provider: 'claude',
-      sessionId: DURABLE_SESSION_ID_ALT,
+      sessionId: '00000000-0000-4000-8000-000000000201',
     })
     const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't1')
-    expect(tab?.resumeSessionId).toBeUndefined()
     expect(tab?.sessionRef).toEqual({
       provider: 'claude',
-      sessionId: DURABLE_SESSION_ID_ALT,
+      sessionId: '00000000-0000-4000-8000-000000000201',
     })
-    expect(tab?.sessionMetadataByKey?.[`claude:${DURABLE_SESSION_ID_ALT}`]).toEqual(expect.objectContaining({
+    expect(tab?.resumeSessionId).toBeUndefined()
+    expect(tab?.sessionMetadataByKey?.['claude:00000000-0000-4000-8000-000000000201']).toEqual(expect.objectContaining({
       sessionType: 'freshclaude',
       firstUserMessage: 'Continue from the old tab',
     }))
@@ -1225,23 +1225,23 @@ describe('AgentChatView reload/restore behavior', () => {
         sessionId: 'sdk-shell-1',
         latestTurnId: 'turn-2',
         status: 'idle',
-        timelineSessionId: DURABLE_SHELL_SESSION_ID,
+      timelineSessionId: '00000000-0000-4000-8000-000000000202',
         revision: 2,
       }))
     })
 
     expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-shell', 'p1')?.sessionRef).toEqual({
       provider: 'claude',
-      sessionId: DURABLE_SHELL_SESSION_ID,
+      sessionId: '00000000-0000-4000-8000-000000000202',
     })
     const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't-shell')
-    expect(tab?.resumeSessionId).toBeUndefined()
     expect(tab?.sessionRef).toEqual({
       provider: 'claude',
-      sessionId: DURABLE_SHELL_SESSION_ID,
+      sessionId: '00000000-0000-4000-8000-000000000202',
     })
+    expect(tab?.resumeSessionId).toBeUndefined()
     expect(tab?.codingCliProvider).toBe('claude')
-    expect(tab?.sessionMetadataByKey?.[`claude:${DURABLE_SHELL_SESSION_ID}`]).toEqual(expect.objectContaining({
+    expect(tab?.sessionMetadataByKey?.['claude:00000000-0000-4000-8000-000000000202']).toEqual(expect.objectContaining({
       sessionType: 'freshclaude',
       firstUserMessage: 'Continue from shell fallback',
     }))
@@ -1382,13 +1382,14 @@ describe('AgentChatView reload/restore behavior', () => {
         sessionId: 'sdk-meta-upgrade-1',
         latestTurnId: 'turn-2',
         status: 'idle',
+        timelineSessionId: 'named-resume',
         revision: 1,
       }))
     })
 
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
-        'sdk-meta-upgrade-1',
+        'named-resume',
         expect.objectContaining({ includeBodies: true, revision: 1 }),
         expect.anything(),
       )
@@ -1464,11 +1465,11 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionId: canonicalSessionId,
     })
     const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't-meta')
-    expect(tab?.resumeSessionId).toBeUndefined()
     expect(tab?.sessionRef).toEqual({
       provider: 'claude',
       sessionId: canonicalSessionId,
     })
+    expect(tab?.resumeSessionId).toBeUndefined()
     expect(tab?.sessionMetadataByKey?.['claude:00000000-0000-4000-8000-000000000321']).toEqual(expect.objectContaining({
       sessionType: 'freshclaude',
       firstUserMessage: 'Continue from metadata upgrade',
@@ -1529,7 +1530,7 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionId: 'sdk-sess-1',
       latestTurnId: 'turn-2',
       status: 'running',
-      timelineSessionId: 'cli-sess-1',
+      timelineSessionId: '00000000-0000-4000-8000-000000000101',
       streamingActive: true,
       streamingText: 'partial reply',
     }))
@@ -1550,7 +1551,7 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionId: 'sdk-sess-running',
       latestTurnId: 'turn-2',
       status: 'running',
-      timelineSessionId: 'cli-sess-running',
+      timelineSessionId: '00000000-0000-4000-8000-000000000301',
       streamingActive: true,
       streamingText: 'partial reply',
     }))
@@ -1566,7 +1567,7 @@ describe('AgentChatView reload/restore behavior', () => {
     act(() => {
       store.dispatch(sessionInit({
         sessionId: 'sdk-sess-running',
-        cliSessionId: 'cli-sess-running',
+        cliSessionId: '00000000-0000-4000-8000-000000000301',
         model: 'claude-opus-4-6',
       }))
     })
@@ -1584,7 +1585,7 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionId: 'sdk-sess-2',
       latestTurnId: 'turn-3',
       status: 'running',
-      timelineSessionId: 'cli-sess-2',
+      timelineSessionId: '00000000-0000-4000-8000-000000000102',
       streamingActive: false,
       streamingText: 'partial reply',
     }))
@@ -1878,8 +1879,8 @@ function getPaneContent(store: ReturnType<typeof makeStore>, tabId: string, pane
   const root = store.getState().panes.layouts[tabId]
   if (!root) return undefined
   function find(node: PaneNode): AgentChatPaneContent | undefined {
-    if (node.type === 'leaf' && node.id === paneId && node.content.kind === 'agent-chat') {
-      return node.content
+    if (node.type === 'leaf' && node.id === paneId) {
+      return normalizeAgentChatPaneContent(node.content)
     }
     if (node.type === 'split') {
       return find(node.children[0]) || find(node.children[1])
@@ -1919,17 +1920,18 @@ describe('AgentChatView server-restart recovery', () => {
       store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sdk-sess-1' }))
       store.dispatch(sessionInit({
         sessionId: 'sdk-sess-1',
-        cliSessionId: DURABLE_SESSION_ID_ALT,
+        cliSessionId: '00000000-0000-4000-8000-000000000201',
         model: 'claude-opus-4-6',
       }))
     })
 
-    // Pane content should now have canonical sessionRef persisted
+    // Pane content should now have the durable Claude sessionRef persisted.
     const content = getPaneContent(store, 't1', 'p1')
     expect(content?.sessionRef).toEqual({
       provider: 'claude',
-      sessionId: DURABLE_SESSION_ID_ALT,
+      sessionId: '00000000-0000-4000-8000-000000000201',
     })
+    expect(content?.resumeSessionId).toBeUndefined()
   })
 
   it('does not reset the pane or send sdk.create when restore remains pending past the legacy timeout window', () => {
@@ -2001,9 +2003,7 @@ describe('AgentChatView server-restart recovery', () => {
 
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
-        ? root.content
-        : undefined
+      const content = root?.type === 'leaf' ? normalizeAgentChatPaneContent(root.content) : undefined
       if (!content) return null
       return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
     }
@@ -2068,9 +2068,7 @@ describe('AgentChatView server-restart recovery', () => {
 
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
-        ? root.content
-        : undefined
+      const content = root?.type === 'leaf' ? normalizeAgentChatPaneContent(root.content) : undefined
       if (!content) return null
       return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
     }

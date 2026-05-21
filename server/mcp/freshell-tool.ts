@@ -8,6 +8,7 @@
 import { z } from 'zod'
 import { createApiClient, resolveConfig, type ApiClient } from './http-client.js'
 import { translateKeys } from '../cli/keys.js'
+import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../coding-cli/codex-app-server/restore-decision.js'
 
 // Lazy-initialized client -- created on first use so env vars are read at call time.
 let _client: ApiClient | undefined
@@ -46,15 +47,16 @@ FRESHELL_URL and FRESHELL_TOKEN are already set in your environment.
 ## Mental model
 
 - Tabs contain pane trees (splits). Panes contain content.
-- Pane kinds: terminal, editor, browser, agent-chat (Claude/Codex/etc.), picker (transient).
+- Pane kinds: terminal, editor, browser, fresh-agent (Claude/Codex/etc.), agent-chat (legacy), picker (transient).
 - **Picker panes are ephemeral.** A freshly-created tab without mode/browser/editor starts as a picker pane while the user chooses what to launch. Once they select, the picker is replaced by the real pane with a **new pane ID**. Never target a picker pane for splits or mutations -- use mode/browser/editor params on new-tab/split-pane to skip the picker entirely.
 - Typical workflow: new-tab -> send-keys -> wait-for -> capture-pane/screenshot.
 
 ## Choosing the right action
 
 - **split-pane vs new-tab:** When the user says "pane", "split", "alongside", "next to", or "side by side", use split-pane. Use new-tab only when the user explicitly says "tab", "window", or "new [thing]" with no spatial reference. When unsure, split-pane is the safer default -- it keeps work in one tab.
+- **split-pane defaults to side-by-side (left/right):** By default, split-pane splits horizontally to create left/right panes. Use direction: "vertical" when you want stacked (top/bottom) panes instead.
 - **Prefer specialized pane types:** Do NOT open a terminal to run cat/vim/nano/curl/wget when a dedicated pane type is a better fit.
-  - "open/edit/show a file" -> split-pane({ editor: "/absolute/path" }) or new-tab({ editor: "/absolute/path" })
+  - "open/edit/show a file" -> split-pane({ editor: "/absolute/path" }) or new-tab({ editor: "/absolute/path" }). Use the editor pane type for any file that can be displayed as text (source code, markdown, configs, logs, etc.). The editor renders files with syntax highlighting. Only open a terminal to edit a file when you need to run interactive commands; for passive file viewing, prefer the editor pane.
   - "open/show a URL" or "view a webpage" -> split-pane({ browser: "https://..." }) or open-browser({ url: "https://..." })
   - "run a command" or "use a CLI tool" -> split-pane({ mode: "shell" }) or new-tab({ mode: "shell" })
 - **Sending text:** Always use literal: true with send-keys for natural-language prompts or multi-word text. Token mode (default) treats special words like ENTER as control sequences and mangles prose. Do NOT append the word "ENTER" as literal text -- use keys: ["ENTER"] as a separate send-keys call instead.
@@ -246,7 +248,7 @@ async function handleDisplay(format: string, target?: string): Promise<string> {
 // ---------------------------------------------------------------------------
 
 const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> = {
-  'new-tab':         { required: [],                          optional: ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'prompt'] },
+  'new-tab':         { required: [],                          optional: ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'sessionRef', 'prompt'] },
   'list-tabs':       { required: [],                          optional: [] },
   'select-tab':      { required: ['target'],                  optional: [] },
   'kill-tab':        { required: ['target'],                  optional: [] },
@@ -254,14 +256,14 @@ const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> 
   'has-tab':         { required: ['target'],                  optional: [] },
   'next-tab':        { required: [],                          optional: [] },
   'prev-tab':        { required: [],                          optional: [] },
-  'split-pane':      { required: [],                          optional: ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor'] },
+  'split-pane':      { required: [],                          optional: ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'sessionRef'] },
   'list-panes':      { required: [],                          optional: ['target'] },
   'select-pane':     { required: ['target'],                  optional: [] },
   'rename-pane':     { required: ['name'],                    optional: ['target'] },
   'kill-pane':       { required: ['target'],                  optional: [] },
   'resize-pane':     { required: ['target'],                  optional: ['x', 'y', 'sizes'] },
   'swap-pane':       { required: ['target', 'with'],          optional: [] },
-  'respawn-pane':    { required: ['target'],                  optional: ['mode', 'shell', 'cwd'] },
+  'respawn-pane':    { required: ['target'],                  optional: ['mode', 'shell', 'cwd', 'resume', 'sessionRef'] },
   'send-keys':       { required: [],                          optional: ['target', 'keys', 'literal'] },
   'capture-pane':    { required: [],                          optional: ['target', 'S', 'J', 'e'] },
   'wait-for':        { required: [],                          optional: ['target', 'pattern', 'stable', 'exit', 'prompt', 'timeout'] },
@@ -279,6 +281,8 @@ const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> 
   'health':          { required: [],                          optional: [] },
   'help':            { required: [],                          optional: [] },
 }
+
+const RAW_CODEX_RESUME_HINT = 'Use sessionRef: { provider: "codex", sessionId } after Codex identity is durable.'
 
 const COMMON_CONFUSIONS: Record<string, Record<string, string>> = {
   'new-tab': {
@@ -309,6 +313,29 @@ function validateParams(action: string, params: Record<string, unknown> | undefi
   }
 }
 
+function isCodexSessionRef(value: unknown): boolean {
+  return !!value
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && (value as { provider?: unknown }).provider === 'codex'
+    && typeof (value as { sessionId?: unknown }).sessionId === 'string'
+    && (value as { sessionId: string }).sessionId.length > 0
+}
+
+function rejectRawCodexResume(
+  mode: unknown,
+  resume: unknown,
+  sessionRef: unknown,
+): { error: string; hint: string } | undefined {
+  if (mode === 'codex' && typeof resume === 'string' && resume.length > 0 && !isCodexSessionRef(sessionRef)) {
+    return {
+      error: INVALID_RAW_CODEX_RESUME_MESSAGE,
+      hint: RAW_CODEX_RESUME_HINT,
+    }
+  }
+  return undefined
+}
+
 // ---------------------------------------------------------------------------
 // Action router
 // ---------------------------------------------------------------------------
@@ -321,7 +348,7 @@ User says...                  | Action                | Key param
 ────────────────────────────────────────────────────────────────────────
 "open a pane / split"         | split-pane            | (no target = split your own pane)
 "open a tab / window"         | new-tab               |
-"open/edit/show a file"       | split-pane            | editor: "/absolute/path"
+"open/edit/view a text file"   | split-pane            | editor: "/absolute/path" (for any text file)
 "open/show a URL"             | split-pane            | browser: "https://..."
 "view a webpage (new tab)"    | open-browser          | url: "https://..."
 "run a command"               | split-pane            | mode: "shell"
@@ -335,7 +362,7 @@ Rules:
 ## Command reference
 
 Tab commands:
-  new-tab         Create a tab with a terminal pane (default). Params: name?, mode?, shell?, cwd?, browser?, editor?, resume?, prompt?
+  new-tab         Create a tab with a terminal pane (default). Params: name?, mode?, shell?, cwd?, browser?, editor?, resume?, sessionRef?, prompt?
                   mode values: shell (default), claude, codex, kimi, opencode, or any supported CLI.
                   prompt: text to send to the terminal after creation (via send-keys with literal mode).
                   To open a URL in a browser pane, use 'open-browser' instead.
@@ -349,8 +376,8 @@ Tab commands:
   prev-tab        Switch to the previous tab.
 
 Pane commands:
-  split-pane      Split a pane. Params: target?, direction (horizontal|vertical, default vertical), mode?, shell?, cwd?, browser?, editor?
-                  Omit target to split your own pane (the pane where this MCP server was spawned). Returns { paneId, tabId }.
+  split-pane      Split a pane. Params: target?, direction? (horizontal=left/right, vertical=top/bottom; defaults to horizontal = left/right), mode?, shell?, cwd?, browser?, editor?, resume?, sessionRef?
+                   Omit target to split your own pane (the pane where this MCP server was spawned). Returns { paneId, tabId }.
   list-panes      List panes. Params: target? (tab ID or title to filter by). Returns { panes: [...] }.
   select-pane     Activate a pane. Params: target (pane ID or index)
   kill-pane       Close a pane. Params: target
@@ -358,7 +385,7 @@ Pane commands:
                   Omit target to rename the caller pane (or the tab's active pane as fallback).
   resize-pane     Resize a pane. Params: target, x? (1-99), y? (1-99)
   swap-pane       Swap two panes. Params: target, with (other pane ID)
-  respawn-pane    Restart a pane's terminal. Params: target, mode?, shell?, cwd?
+  respawn-pane    Restart a pane's terminal. Params: target, mode?, shell?, cwd?, resume?, sessionRef?
 
 Terminal I/O:
   send-keys       Send input to a pane. Params: target, keys, literal?
@@ -431,7 +458,11 @@ Meta:
     freshell({ action: "wait-for", params: { target: paneId, stable: 8, timeout: 1800 } })
     freshell({ action: "capture-pane", params: { target: paneId, S: -120 } })
 
-## Playbook: open file in editor pane
+## Playbook: open file in editor pane (for text files)
+
+  // Use the editor pane type for any file that can be displayed as text:
+  // source code, markdown, config files, logs, CSVs, etc.
+  // The editor renders with syntax highlighting and line numbers.
 
   // Split current pane with editor (preferred)
   freshell({ action: "split-pane", params: { editor: "/absolute/path/to/README.md" } })
@@ -540,10 +571,12 @@ async function routeAction(
   switch (action) {
     // -- Tab actions --
     case 'new-tab': {
-      const { name, mode, shell, cwd, browser, editor, resume, prompt, ...rest } = params || {}
-      const sessionRef = typeof mode === 'string' && typeof resume === 'string'
+      const { name, mode, shell, cwd, browser, editor, resume, sessionRef: explicitSessionRef, prompt, ...rest } = params || {}
+      const codexResumeError = rejectRawCodexResume(mode, resume, explicitSessionRef)
+      if (codexResumeError) return codexResumeError
+      const sessionRef = explicitSessionRef ?? (typeof mode === 'string' && mode !== 'codex' && typeof resume === 'string'
         ? { provider: mode, sessionId: resume }
-        : undefined
+        : undefined)
       const tabResult = await c.post('/api/tabs', {
         name,
         mode,
@@ -559,7 +592,10 @@ async function routeAction(
         const data = unwrapData(tabResult)
         const paneId = data?.paneId
         if (paneId) {
-          await c.post(`/api/panes/${encodeURIComponent(paneId)}/send-keys`, { data: `${prompt}\r` })
+          await c.post(`/api/panes/${encodeURIComponent(paneId)}/send-keys`, {
+            data: `${prompt}\r`,
+            ...(mode === 'codex' ? { waitForCodexIdentity: true } : {}),
+          })
         }
       }
       return tabResult
@@ -602,9 +638,14 @@ async function routeAction(
       const resolved = await resolvePaneTarget(rawTarget)
       if (!resolved.pane) return { error: resolved.message || 'No pane found', hint: "Run action 'list-panes' to see available panes." }
       const paneId = resolved.pane.id
-      const { direction, browser, editor, mode, shell, cwd, target: _t, ...rest } = params || {}
+      const { direction, browser, editor, mode, shell, cwd, target: _t, resume, sessionRef, ...rest } = params || {}
+      const codexResumeError = rejectRawCodexResume(mode, resume, sessionRef)
+      if (codexResumeError) return codexResumeError
+      const effectiveSessionRef = sessionRef ?? (typeof mode === 'string' && mode !== 'codex' && typeof resume === 'string'
+        ? { provider: mode, sessionId: resume }
+        : undefined)
       return c.post(`/api/panes/${encodeURIComponent(paneId)}/split`, {
-        direction, browser, editor, mode, shell, cwd, ...rest,
+        direction, browser, editor, mode, shell, cwd, ...(effectiveSessionRef ? { sessionRef: effectiveSessionRef } : {}), ...rest,
       })
     }
     case 'list-panes': {
@@ -646,8 +687,13 @@ async function routeAction(
     }
     case 'respawn-pane': {
       const target = requireParam(params, 'target')
-      const { mode, shell, cwd } = params || {}
-      return c.post(`/api/panes/${encodeURIComponent(target)}/respawn`, { mode, shell, cwd })
+      const { mode, shell, cwd, resume, sessionRef } = params || {}
+      const codexResumeError = rejectRawCodexResume(mode, resume, sessionRef)
+      if (codexResumeError) return codexResumeError
+      const effectiveSessionRef = sessionRef ?? (typeof mode === 'string' && mode !== 'codex' && typeof resume === 'string'
+        ? { provider: mode, sessionId: resume }
+        : undefined)
+      return c.post(`/api/panes/${encodeURIComponent(target)}/respawn`, { mode, shell, cwd, sessionRef: effectiveSessionRef })
     }
 
     // -- Terminal I/O --

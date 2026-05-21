@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type-utils'
+import { CodexIcon } from '@/components/icons/provider-icons'
 
 describe('resolveSessionTypeConfig', () => {
   it('returns claude config for "claude"', () => {
@@ -20,6 +21,12 @@ describe('resolveSessionTypeConfig', () => {
     expect(config.icon).toBeDefined()
   })
 
+  it('returns the registry-backed Codex icon for "freshcodex"', () => {
+    const config = resolveSessionTypeConfig('freshcodex')
+    expect(config.label).toBe('Freshcodex')
+    expect(config.icon).toBe(CodexIcon)
+  })
+
   it('returns kilroy config for "kilroy"', () => {
     const config = resolveSessionTypeConfig('kilroy')
     expect(config.label).toBe('Kilroy')
@@ -34,39 +41,41 @@ describe('resolveSessionTypeConfig', () => {
 })
 
 describe('buildResumeContent', () => {
-  it('returns agent-chat content for freshclaude sessionType', () => {
+  it('returns fresh-agent content for freshclaude sessionType', () => {
     const content = buildResumeContent({
       sessionType: 'freshclaude',
       sessionId: 'abc-123',
       cwd: '/home/user/project',
     })
-    expect(content.kind).toBe('agent-chat')
-    if (content.kind !== 'agent-chat') throw new Error('expected agent-chat')
-    expect(content.provider).toBe('freshclaude')
+    expect(content.kind).toBe('fresh-agent')
+    if (content.kind !== 'fresh-agent') throw new Error('expected fresh-agent')
+    expect(content.sessionType).toBe('freshclaude')
+    expect(content.provider).toBe('claude')
+    expect(content.resumeSessionId).toBe('abc-123')
     expect(content.sessionRef).toEqual({
       provider: 'claude',
       sessionId: 'abc-123',
     })
-    expect(content.resumeSessionId).toBeUndefined()
     expect(content.initialCwd).toBe('/home/user/project')
     expect(content.modelSelection).toBeUndefined()
     expect(content.permissionMode).toBe('bypassPermissions') // default from provider config
     expect(content.effort).toBeUndefined()
   })
 
-  it('returns agent-chat content for kilroy sessionType', () => {
+  it('returns fresh-agent content for kilroy sessionType', () => {
     const content = buildResumeContent({
       sessionType: 'kilroy',
       sessionId: 'xyz-789',
     })
-    expect(content.kind).toBe('agent-chat')
-    if (content.kind !== 'agent-chat') throw new Error('expected agent-chat')
-    expect(content.provider).toBe('kilroy')
+    expect(content.kind).toBe('fresh-agent')
+    if (content.kind !== 'fresh-agent') throw new Error('expected fresh-agent')
+    expect(content.sessionType).toBe('kilroy')
+    expect(content.provider).toBe('claude')
+    expect(content.resumeSessionId).toBe('xyz-789')
     expect(content.sessionRef).toEqual({
       provider: 'claude',
       sessionId: 'xyz-789',
     })
-    expect(content.resumeSessionId).toBeUndefined()
   })
 
   it('returns terminal content for claude sessionType', () => {
@@ -147,12 +156,12 @@ describe('buildResumeContent', () => {
     expect('liveTerminal' in content).toBe(false)
   })
 
-  it('agent-chat panes have no terminalId', () => {
+  it('fresh-agent panes have no terminalId', () => {
     const content = buildResumeContent({
       sessionType: 'freshclaude',
       sessionId: 'abc-123',
     })
-    expect(content.kind).toBe('agent-chat')
+    expect(content.kind).toBe('fresh-agent')
     expect('terminalId' in content).toBe(false)
   })
 
@@ -166,8 +175,8 @@ describe('buildResumeContent', () => {
         effort: 'turbo',
       },
     })
-    expect(content.kind).toBe('agent-chat')
-    if (content.kind !== 'agent-chat') throw new Error('expected agent-chat')
+    expect(content.kind).toBe('fresh-agent')
+    if (content.kind !== 'fresh-agent') throw new Error('expected fresh-agent')
     expect(content.modelSelection).toEqual({ kind: 'tracked', modelId: 'opus[1m]' })
     expect(content.permissionMode).toBe('default')
     expect(content.effort).toBe('turbo')
@@ -178,8 +187,8 @@ describe('buildResumeContent', () => {
       sessionType: 'freshclaude',
       sessionId: 'abc-123',
     })
-    expect(content.kind).toBe('agent-chat')
-    if (content.kind !== 'agent-chat') throw new Error('expected agent-chat')
+    expect(content.kind).toBe('fresh-agent')
+    if (content.kind !== 'fresh-agent') throw new Error('expected fresh-agent')
     expect(content.effort).toBeUndefined()
   })
 

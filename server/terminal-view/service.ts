@@ -4,6 +4,7 @@ import {
   type TerminalDirectoryQuery,
 } from '../../shared/read-models.js'
 import type { SessionLocator } from '../../shared/ws-protocol.js'
+import type { CodexDurabilityRef } from '../../shared/codex-durability.js'
 import { TerminalViewMirror } from './mirror.js'
 import type {
   TerminalDirectoryItem,
@@ -25,6 +26,8 @@ type TerminalListRecord = {
   description?: string
   mode: TerminalMode
   resumeSessionId?: string
+  sessionRef?: SessionLocator
+  codexDurability?: CodexDurabilityRef
   createdAt: number
   lastActivityAt: number
   status: 'running' | 'exited'
@@ -138,12 +141,15 @@ function buildSessionRef(mode: TerminalMode, resumeSessionId?: string): SessionL
 }
 
 function buildDirectoryItem(terminal: TerminalListRecord): TerminalDirectoryItem {
+  const sessionRef = terminal.sessionRef
+    ?? (terminal.mode === 'codex' ? undefined : buildSessionRef(terminal.mode, terminal.resumeSessionId))
   return {
     terminalId: terminal.terminalId,
     title: terminal.title,
     description: terminal.description,
     mode: terminal.mode,
-    sessionRef: buildSessionRef(terminal.mode, terminal.resumeSessionId),
+    sessionRef,
+    codexDurability: terminal.codexDurability,
     createdAt: terminal.createdAt,
     lastActivityAt: terminal.lastActivityAt,
     status: terminal.status,

@@ -270,6 +270,43 @@ describe('createContentForType with ext: prefix', () => {
     }
   })
 
+  it('creates fresh-agent content for freshclaude selections', async () => {
+    const node = createPickerNode('pane-1')
+    const store = createStore(
+      { layouts: { 'tab-1': node }, activePane: { 'tab-1': 'pane-1' } },
+      [],
+      {},
+      {
+        status: 'ready',
+        platform: 'linux',
+        availableClis: { claude: true },
+      },
+    )
+
+    render(
+      <Provider store={store}>
+        <PaneContainer tabId="tab-1" node={node} />
+      </Provider>,
+    )
+
+    const container = getPickerContainer()
+    fireEvent.keyDown(container, { key: 'a' })
+    fireEvent.transitionEnd(container)
+    const input = screen.getByLabelText('Starting directory for Freshclaude')
+    fireEvent.change(input, { target: { value: '/workspace/project' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    await waitFor(() => {
+      const state = store.getState().panes
+      const paneContent = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
+      expect(paneContent).toMatchObject({
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+      })
+    })
+  })
+
   it('does not include cwd or createRequestId in extension content', () => {
     const extension: ClientExtensionEntry = {
       name: 'simple-ext',
@@ -349,9 +386,10 @@ describe('createContentForType with ext: prefix', () => {
     await waitFor(() => {
       const state = store.getState().panes
       const paneContent = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
-      expect(paneContent.kind).toBe('agent-chat')
-      if (paneContent.kind === 'agent-chat') {
-        expect(paneContent.provider).toBe('freshclaude')
+      expect(paneContent.kind).toBe('fresh-agent')
+      if (paneContent.kind === 'fresh-agent') {
+        expect(paneContent.sessionType).toBe('freshclaude')
+        expect(paneContent.provider).toBe('claude')
         expect(paneContent.plugins).toEqual(['planner', 'sandbox'])
         expect(paneContent.modelSelection).toEqual({ kind: 'tracked', modelId: 'opus[1m]' })
         expect(paneContent.permissionMode).toBe('default')

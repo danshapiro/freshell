@@ -214,9 +214,11 @@ const agentChatSlice = createSlice({
     }>) {
       const session = ensureSession(state, action.payload.sessionId)
       const previousRestoreQueryId = getRestoreQueryId(session)
-      const nextTimelineSessionId = isValidClaudeSessionId(action.payload.timelineSessionId)
+      const payloadTimelineSessionId = typeof action.payload.timelineSessionId === 'string'
+        && action.payload.timelineSessionId.trim().length > 0
         ? action.payload.timelineSessionId
         : undefined
+      const nextTimelineSessionId = payloadTimelineSessionId ?? session.timelineSessionId
       const nextRestoreQueryId = getRestoreQueryId({
         cliSessionId: session.cliSessionId,
         timelineSessionId: nextTimelineSessionId ?? session.timelineSessionId,
