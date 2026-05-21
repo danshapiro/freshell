@@ -7,7 +7,7 @@ describe('visible-first audit scenarios', () => {
     expect(AUDIT_SCENARIOS.map((scenario) => scenario.id)).toEqual([
       'auth-required-cold-boot',
       'terminal-cold-boot',
-      'agent-chat-cold-boot',
+      'fresh-agent-cold-boot',
       'sidebar-search-large-corpus',
       'terminal-reconnect-backlog',
       'offscreen-tab-selection',
@@ -22,7 +22,7 @@ describe('visible-first audit scenarios', () => {
       '/api/bootstrap',
       '/api/terminals/:terminalId/viewport',
     ])
-    expect(scenarioMap.get('agent-chat-cold-boot')?.allowedApiRouteIdsBeforeReady).toEqual([
+    expect(scenarioMap.get('fresh-agent-cold-boot')?.allowedApiRouteIdsBeforeReady).toEqual([
       '/api/bootstrap',
       '/api/agent-sessions/:sessionId/timeline',
     ])

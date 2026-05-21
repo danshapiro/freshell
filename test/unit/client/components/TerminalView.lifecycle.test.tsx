@@ -2490,6 +2490,38 @@ describe('TerminalView lifecycle updates', () => {
     expect(writelnCalls.some((s: string) => s.includes('Terminal exited'))).toBe(true)
   })
 
+  it('shows feedback when Codex input is blocked by the restore identity gate', async () => {
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      terminalId: 'term-codex',
+      status: 'running',
+      mode: 'codex',
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.input.blocked',
+        terminalId: 'term-codex',
+        reason: 'codex_identity_pending',
+      })
+    })
+
+    const term = terminalInstances[0]
+    expect(term.writeln).toHaveBeenCalledWith(
+      expect.stringContaining('Input not sent: Codex is still saving restore state. Try again in a moment.'),
+    )
+  })
+
   it('mirrors canonical durable identity to pane and tab on terminal.session.associated', async () => {
     const tabId = 'tab-session-assoc'
     const paneId = 'pane-session-assoc'
@@ -3098,25 +3130,29 @@ describe('TerminalView lifecycle updates', () => {
     async function renderTerminalHarness(opts?: {
       status?: 'creating' | 'running'
       terminalId?: string
+      mode?: TerminalPaneContent['mode']
       hidden?: boolean
       clearSends?: boolean
       requestId?: string
       ackInitialAttach?: boolean
       refreshOnMount?: boolean
+      sessionRef?: TerminalPaneContent['sessionRef']
     }) {
       const tabId = 'tab-v2-stream'
       const paneId = 'pane-v2-stream'
       const requestId = opts?.requestId ?? 'req-v2-stream'
       const initialStatus = opts?.status ?? 'running'
       const terminalId = opts?.terminalId
+      const mode = opts?.mode ?? 'shell'
 
       const paneContent: TerminalPaneContent = {
         kind: 'terminal',
         createRequestId: requestId,
         status: initialStatus,
-        mode: 'shell',
+        mode,
         shell: 'system',
         ...(terminalId ? { terminalId } : {}),
+        ...(opts?.sessionRef ? { sessionRef: opts.sessionRef } : {}),
       }
 
       const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
@@ -3133,12 +3169,13 @@ describe('TerminalView lifecycle updates', () => {
           tabs: {
             tabs: [{
               id: tabId,
-              mode: 'shell',
+              mode,
               status: initialStatus,
-              title: 'Shell',
+              title: mode === 'opencode' ? 'OpenCode' : 'Shell',
               titleSetByUser: false,
               createRequestId: requestId,
               ...(terminalId ? { terminalId } : {}),
+              ...(opts?.sessionRef ? { sessionRef: opts.sessionRef } : {}),
             }],
             activeTabId: tabId,
           },
@@ -3984,6 +4021,27 @@ describe('TerminalView lifecycle updates', () => {
       }))
     })
 
+    it('does not cap OpenCode viewport hydration replay for restored running terminals', async () => {
+      const { terminalId } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-opencode-restored',
+        mode: 'opencode',
+        clearSends: false,
+      })
+
+      const attach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+
+      expect(attach).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      })
+      expect(attach).not.toHaveProperty('maxReplayBytes')
+    })
+
     it('revealing a hidden running pane sends a viewport attach with sinceSeq=0', async () => {
       const { store, tabId, paneId, terminalId, rerender } = await renderTerminalHarness({
         status: 'running',
@@ -4009,6 +4067,107 @@ describe('TerminalView lifecycle updates', () => {
       })
       expect(attach?.sinceSeq).toBe(0)
       expect(attach?.attachRequestId).toBeTruthy()
+    })
+
+    it('recreates a restored OpenCode pane when visible viewport hydration cannot replay startup output', async () => {
+      const sessionRef = { provider: 'opencode', sessionId: 'ses_focus_replay_gap' } as const
+      const addedRestoreIds = new Set<string>()
+      restoreMocks.addTerminalRestoreRequestId.mockImplementation((id: string) => {
+        addedRestoreIds.add(id)
+      })
+      restoreMocks.consumeTerminalRestoreRequestId.mockImplementation((id: string) => {
+        if (addedRestoreIds.has(id)) {
+          addedRestoreIds.delete(id)
+          return true
+        }
+        return false
+      })
+
+      const { store, tabId, paneId, terminalId, rerender } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-opencode-focus-gap',
+        mode: 'opencode',
+        hidden: true,
+        clearSends: false,
+        requestId: 'req-opencode-focus-gap',
+        sessionRef,
+      })
+
+      wsMocks.send.mockClear()
+
+      rerender(
+        <Provider store={store}>
+          <TerminalViewFromStore tabId={tabId} paneId={paneId} hidden={false} />
+        </Provider>,
+      )
+
+      let attach: any
+      await waitFor(() => {
+        attach = wsMocks.send.mock.calls
+          .map(([msg]) => msg)
+          .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+        expect(attach?.attachRequestId).toBeTruthy()
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 120,
+          replayFromSeq: 42,
+          replayToSeq: 120,
+          attachRequestId: attach.attachRequestId,
+        })
+      })
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 1,
+          toSeq: 41,
+          reason: 'replay_window_exceeded',
+          attachRequestId: attach.attachRequestId,
+        } as any)
+      })
+
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith({
+          type: 'terminal.kill',
+          terminalId,
+        })
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.exit',
+          terminalId,
+          exitCode: 0,
+        })
+      })
+
+      let replacementRequestId: string | undefined
+      await waitFor(() => {
+        const layout = store.getState().panes.layouts[tabId]
+        expect(layout?.type).toBe('leaf')
+        if (layout?.type !== 'leaf' || layout.content.kind !== 'terminal') {
+          throw new Error('expected terminal pane')
+        }
+        expect(layout.content.terminalId).toBeUndefined()
+        expect(layout.content.status).toBe('creating')
+        expect(layout.content.sessionRef).toEqual(sessionRef)
+        replacementRequestId = layout.content.createRequestId
+        expect(replacementRequestId).not.toBe('req-opencode-focus-gap')
+      })
+
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'terminal.create',
+          requestId: replacementRequestId,
+          mode: 'opencode',
+          sessionRef,
+          restore: true,
+        }))
+      })
     })
 
     it('does not send terminal.resize when an already-live terminal is hidden and revealed with unchanged geometry', async () => {

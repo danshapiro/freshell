@@ -17,6 +17,7 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
         mode: content.mode,
         shell: content.shell,
         sessionRef: content.sessionRef,
+        codexDurability: content.mode === 'codex' ? content.codexDurability : undefined,
         liveTerminal: content.terminalId
           ? {
               terminalId: content.terminalId,
@@ -36,28 +37,30 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
         language: content.language,
         readOnly: content.readOnly,
         viewMode: content.viewMode,
+        wordWrap: content.wordWrap,
       }
     case 'agent-chat':
-      {
-        const sessionRef = content.sessionRef
-          || (content.resumeSessionId
-            ? {
-                provider: 'claude',
-                sessionId: content.resumeSessionId,
-                serverInstanceId,
-              }
-            : undefined)
-        return {
-          provider: content.provider,
-          sessionId: content.sessionId,
-          resumeSessionId: content.resumeSessionId,
-          sessionRef,
-          initialCwd: content.initialCwd,
-          modelSelection: content.modelSelection,
-          permissionMode: content.permissionMode,
-          effort: content.effort,
-          plugins: content.plugins,
-        }
+      return {
+        provider: content.provider,
+        sessionRef: content.sessionRef,
+        initialCwd: content.initialCwd,
+        modelSelection: content.modelSelection,
+        permissionMode: content.permissionMode,
+        effort: content.effort,
+        plugins: content.plugins,
+      }
+    case 'fresh-agent':
+      return {
+        provider: content.provider,
+        sessionType: content.sessionType,
+        sessionRef: content.sessionRef,
+        initialCwd: content.initialCwd,
+        model: content.provider === 'codex' ? content.model : undefined,
+        modelSelection: content.provider === 'claude' ? content.modelSelection : undefined,
+        permissionMode: content.permissionMode,
+        sandbox: content.sandbox,
+        effort: content.effort,
+        plugins: content.plugins,
       }
     case 'extension':
       return {

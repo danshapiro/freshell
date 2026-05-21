@@ -61,6 +61,19 @@ function resolveSessionTitle(
   return normalizeTitle(parsedTitle) || normalizeTitle(previousTitle) || normalizeTitle(storedTitle)
 }
 
+function getSessionWatchGlobs(providers: CodingCliProvider[]): string[] {
+  const globs: string[] = []
+  for (const provider of providers) {
+    const providerGlobs = provider.getSessionGlob()
+    if (Array.isArray(providerGlobs)) {
+      globs.push(...providerGlobs)
+    } else {
+      globs.push(providerGlobs)
+    }
+  }
+  return Array.from(new Set(globs))
+}
+
 // Byte pattern for a text user message (content is a string, not a tool_result array).
 const USER_TEXT_PATTERN = Buffer.from('"role":"user","content":"')
 
@@ -396,7 +409,7 @@ export class CodingCliSessionIndexer {
   }
 
   private startSessionWatcher(providers: CodingCliProvider[]) {
-    const globs = providers.map((p) => p.getSessionGlob())
+    const globs = getSessionWatchGlobs(providers)
     logger.info({ globs, debounceMs: this.debounceMs, throttleMs: this.throttleMs }, 'Starting coding CLI sessions watcher')
 
     this.watcher = chokidar.watch(globs, {

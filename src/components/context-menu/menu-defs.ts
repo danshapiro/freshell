@@ -594,7 +594,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     ]
   }
 
-  if (target.kind === 'agent-chat') {
+  if (target.kind === 'agent-chat' || target.kind === 'fresh-agent') {
     const selection = window.getSelection()
     const hasSelection = !!(selection && selection.toString().trim())
 

@@ -123,6 +123,21 @@ describe('run-standard-tests', () => {
       })
     })
 
+    it('routes real provider integration paths to the server suite only', () => {
+      expect(createStandardTestPlan({
+        availableParallelism: 32,
+        ci: false,
+        forwardedArgs: ['test/integration/real/coding-cli-session-contract.test.ts'],
+      })).toEqual({
+        mode: 'desktop',
+        stages: [
+          [
+            { name: 'server', configPath: 'vitest.server.config.ts', maxWorkers: '3', priority: 'background' },
+          ],
+        ],
+      })
+    })
+
     it('routes electron-targeted paths to the electron suite only', () => {
       expect(createStandardTestPlan({
         availableParallelism: 32,

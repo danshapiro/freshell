@@ -18,6 +18,7 @@ import {
   serializePersistableTabRecency,
   type TabRecencyState,
 } from './tabRecencySlice'
+import { migrateLegacyFreshAgentContent } from '@shared/fresh-agent'
 
 
 const log = createLogger('PanesPersist')
@@ -140,11 +141,27 @@ function migratePaneContent(content: any): any {
   if (!content || typeof content !== 'object') {
     return content
   }
+  content = migrateLegacyFreshAgentContent(content)
   if (content.kind === 'agent-chat') {
     const { model: _legacyModel, ...rest } = content
     return {
       ...rest,
       modelSelection: normalizeAgentChatModelSelection(content.modelSelection, content.model),
+      effort: normalizeAgentChatEffortOverride(content.effort),
+    }
+  }
+  if (content.kind === 'fresh-agent') {
+    const { model: legacyModel, modelSelection: legacyModelSelection, ...rest } = content
+    if (content.provider === 'codex') {
+      return {
+        ...rest,
+        ...(typeof legacyModel === 'string' ? { model: legacyModel } : {}),
+        effort: normalizeAgentChatEffortOverride(content.effort),
+      }
+    }
+    return {
+      ...rest,
+      modelSelection: normalizeAgentChatModelSelection(legacyModelSelection, legacyModel),
       effort: normalizeAgentChatEffortOverride(content.effort),
     }
   }
@@ -183,17 +200,21 @@ function stripEditorContent(content: any): any {
 
 function stripTransientSessionFields(content: any): any {
   if (!content || typeof content !== 'object') return content
-  if (content.kind !== 'terminal' && content.kind !== 'agent-chat') return content
+  if (content.kind !== 'terminal' && content.kind !== 'agent-chat' && content.kind !== 'fresh-agent') return content
 
   const sessionRef = sanitizeSessionRef(content.sessionRef)
   const {
     resumeSessionId: _resumeSessionId,
     sessionRef: _legacySessionRef,
+    sessionId: _sessionId,
     ...rest
   } = content
 
   return {
     ...rest,
+    ...(content.kind === 'fresh-agent' && !sessionRef && typeof content.serverInstanceId === 'string' && typeof content.sessionId === 'string'
+      ? { sessionId: content.sessionId }
+      : {}),
     ...(sessionRef ? { sessionRef } : {}),
   }
 }

@@ -292,6 +292,7 @@ describe('Codex activity exact subset wiring', () => {
       mode: 'codex',
       cwd: '/repo/project',
     })
+    registry.releaseCodexInputGateForTest(canonical.terminalId)
     registry.get(canonical.terminalId)!.resumeSessionId = 'codex-session-repair-pending'
     registry.emit('terminal.session.bound', {
       terminalId: canonical.terminalId,
@@ -353,6 +354,7 @@ describe('Codex activity exact subset wiring', () => {
     })
 
     const term = registry.create({ mode: 'codex', cwd: '/repo/project' })
+    registry.releaseCodexInputGateForTest(term.terminalId)
     registry.setResumeSessionId(term.terminalId, 'codex-session-2')
 
     vi.setSystemTime(2_000)

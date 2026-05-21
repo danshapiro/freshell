@@ -1,13 +1,14 @@
 import { describe, it, expect, vi, afterEach, beforeAll, beforeEach } from 'vitest'
+import { useRef } from 'react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 
 import AgentChatView from '@/components/agent-chat/AgentChatView'
 import agentChatReducer from '@/store/agentChatSlice'
-import panesReducer, { initLayout } from '@/store/panesSlice'
+import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
-import type { AgentChatPaneContent } from '@/store/paneTypes'
+import type { AgentChatPaneContent, FreshAgentPaneContent } from '@/store/paneTypes'
 import {
   AGENT_CHAT_CAPABILITY_CACHE_TTL_MS,
   AGENT_CHAT_PROVIDER_DEFAULT_OPTION_VALUE,
@@ -47,7 +48,10 @@ vi.mock('@/store/settingsThunks', () => ({
   }),
 }))
 
-function makeStore(preloadedAgentChat: Record<string, unknown> = {}) {
+function makeStore(
+  preloadedAgentChat: Record<string, unknown> = {},
+  paneContent?: AgentChatPaneContent,
+) {
   return configureStore({
     reducer: {
       agentChat: agentChatReducer,
@@ -73,6 +77,24 @@ function makeStore(preloadedAgentChat: Record<string, unknown> = {}) {
         capabilitiesByProvider: {},
         ...preloadedAgentChat,
       },
+      panes: {
+        layouts: paneContent
+          ? {
+              t1: {
+                type: 'leaf' as const,
+                id: 'p1',
+                content: paneContent,
+              },
+            }
+          : {},
+        activePane: paneContent ? { t1: 'p1' } : {},
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      },
     },
   })
 }
@@ -89,15 +111,15 @@ function renderStoreBackedPane(
   paneContent: AgentChatPaneContent,
   preloadedAgentChat: Record<string, unknown> = {},
 ) {
-  const store = makeStore(preloadedAgentChat)
-  store.dispatch(initLayout({ tabId: 't1', paneId: 'p1', content: paneContent }))
+  const store = makeStore(preloadedAgentChat, paneContent)
 
   function Wrapper() {
+    const lastLegacyContentRef = useRef(paneContent)
     const root = useSelector((state: ReturnType<typeof store.getState>) => state.panes.layouts.t1)
-    const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
-      ? root.content
-      : undefined
-    if (!content) return null
+    const content = root?.type === 'leaf'
+      ? coerceLegacyAgentChatPaneContent(root.content, lastLegacyContentRef.current)
+      : lastLegacyContentRef.current
+    lastLegacyContentRef.current = content
     return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
   }
 
@@ -110,12 +132,44 @@ function renderStoreBackedPane(
   return store
 }
 
+function coerceLegacyAgentChatPaneContent(
+  content: unknown,
+  fallback: AgentChatPaneContent,
+): AgentChatPaneContent {
+  if (content && typeof content === 'object' && (content as { kind?: unknown }).kind === 'agent-chat') {
+    return content as AgentChatPaneContent
+  }
+  if (content && typeof content === 'object' && (content as { kind?: unknown }).kind === 'fresh-agent') {
+    const freshContent = content as FreshAgentPaneContent
+    return {
+      ...fallback,
+      sessionId: freshContent.sessionId,
+      createRequestId: freshContent.createRequestId,
+      status: freshContent.status,
+      resumeSessionId: freshContent.resumeSessionId,
+      sessionRef: freshContent.sessionRef,
+      serverInstanceId: freshContent.serverInstanceId,
+      restoreError: freshContent.restoreError,
+      initialCwd: freshContent.initialCwd,
+      createError: freshContent.createError,
+      modelSelection: freshContent.modelSelection,
+      permissionMode: freshContent.permissionMode,
+      effort: freshContent.effort,
+      plugins: freshContent.plugins,
+      settingsDismissed: freshContent.settingsDismissed,
+      kind: 'agent-chat',
+      provider: freshContent.sessionType === 'kilroy' ? 'kilroy' : 'freshclaude',
+    }
+  }
+  return fallback
+}
+
 function getRenderedPaneContent(store: ReturnType<typeof makeStore>): AgentChatPaneContent {
   const root = store.getState().panes.layouts.t1
-  if (root?.type !== 'leaf' || root.content.kind !== 'agent-chat') {
+  if (root?.type !== 'leaf') {
     throw new Error('Expected an agent chat pane at t1/p1')
   }
-  return root.content
+  return coerceLegacyAgentChatPaneContent(root.content, BASE_PANE)
 }
 
 function freshFetchedAt(): number {

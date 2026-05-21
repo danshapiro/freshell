@@ -100,6 +100,19 @@ export class LayoutStore {
       }
     }
 
+    if (content.kind === 'fresh-agent') {
+      switch (content.sessionType) {
+        case 'freshclaude':
+          return 'Freshclaude'
+        case 'freshcodex':
+          return 'Freshcodex'
+        case 'kilroy':
+          return 'Kilroy'
+        default:
+          return 'Fresh Agent'
+      }
+    }
+
     if (content.kind === 'extension') {
       return typeof content.extensionName === 'string' && content.extensionName
         ? content.extensionName
@@ -145,6 +158,12 @@ export class LayoutStore {
   updateFromUi(snapshot: UiSnapshot, connectionId: string) {
     this.snapshot = snapshot
     this.sourceConnectionId = connectionId
+    for (const tab of snapshot.tabs) {
+      const leaves = this.collectLeaves(snapshot.layouts?.[tab.id], [])
+      for (const leaf of leaves) {
+        this.seedPaneTitle(tab.id, leaf.id, leaf.content)
+      }
+    }
   }
 
   getSourceConnectionId() {
@@ -265,7 +284,7 @@ export class LayoutStore {
       return { kind: 'browser', url: opts.browser, devToolsOpen: false }
     }
     if (opts.editor) {
-      return { kind: 'editor', filePath: opts.editor, language: null, readOnly: false, content: '', viewMode: 'source' }
+      return { kind: 'editor', filePath: opts.editor, language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true }
     }
     return { kind: 'terminal', terminalId: opts.terminalId }
   }

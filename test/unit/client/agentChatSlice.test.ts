@@ -506,7 +506,7 @@ describe('agentChatSlice', () => {
 
     expect(state.sessions['sdk-live']).toMatchObject({
       historyLoaded: true,
-      timelineSessionId: undefined,
+      timelineSessionId: 'named-resume',
       timelineRevision: 1,
     })
 

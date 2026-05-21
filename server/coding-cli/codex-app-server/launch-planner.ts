@@ -1,132 +1,268 @@
-import { CodexTerminalSidecar } from './sidecar.js'
-import { generateMcpInjection } from '../../mcp/config-writer.js'
-import type { TerminalEnvContext } from '../../terminal-registry.js'
+import type { CodexAppServerRuntime } from './runtime.js'
+import type { CodexThreadLifecycleEvent, CodexThreadLifecycleLossEvent, CodexTurnEvent } from './client.js'
+import { waitForAllSettledOrThrow } from '../../shutdown-join.js'
+import {
+  CodexRemoteProxy,
+  type CodexRemoteProxyCandidate,
+  type CodexRemoteProxyRepairTrigger,
+} from './remote-proxy.js'
+
+type CodexRuntimeLike = Pick<
+  CodexAppServerRuntime,
+  | 'ensureReady'
+  | 'shutdown'
+  | 'updateOwnershipMetadata'
+  | 'onThreadLifecycleLoss'
+  | 'onFsChanged'
+  | 'watchPath'
+  | 'unwatchPath'
+>
+
+export type CodexLaunchSidecar = {
+  adopt(input: { terminalId: string; generation: number }): Promise<void>
+  markCandidatePersisted?(): void
+  onCandidate?(handler: (candidate: CodexRemoteProxyCandidate) => void): () => void
+  onTurnStarted?(handler: (event: CodexTurnEvent) => void): () => void
+  onTurnCompleted?(handler: (event: CodexTurnEvent) => void): () => void
+  onRepairTrigger?(handler: (event: CodexRemoteProxyRepairTrigger) => void): () => void
+  onFsChanged?(handler: (event: { watchId: string; changedPaths: string[] }) => void): () => void
+  onThreadLifecycle?(handler: (event: CodexThreadLifecycleEvent) => void): () => void
+  onLifecycleLoss?(handler: (event: CodexThreadLifecycleLossEvent) => void): () => void
+  watchPath?(targetPath: string, watchId: string): Promise<{ path: string }>
+  unwatchPath?(watchId: string): Promise<void>
+  shutdown(): Promise<void>
+}
 
 export type CodexLaunchPlan = {
   sessionId?: string
   remote: {
     wsUrl: string
-    processPid?: number
   }
-  sidecar: Pick<CodexTerminalSidecar, 'attachTerminal' | 'shutdown'>
+  sidecar: CodexLaunchSidecar
+}
+
+export type CodexSidecarTeardownError = Error & {
+  codexSidecarTeardownFailed: true
 }
 
 type PlanCreateInput = {
   cwd?: string
-  terminalId: string
-  env: NodeJS.ProcessEnv
   resumeSessionId?: string
   model?: string
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
   approvalPolicy?: string
 }
 
-export type CodexLaunchFactoryInput = {
-  terminalId: string
-  cwd?: string
-  envContext?: TerminalEnvContext
-  resumeSessionId?: string
-  providerSettings?: {
-    model?: string
-    sandbox?: string
-    permissionMode?: string
-  }
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
-export type CodexLaunchFactory = (input: CodexLaunchFactoryInput) => Promise<CodexLaunchPlan>
-
-type CodexLaunchRetryOptions = {
-  onFailedAttempt?: (input: { attempt: number; delayMs: number; error: Error }) => void
-  shouldRetry?: (error: Error) => boolean
+function codexSidecarTeardownError(message: string, cause: unknown): CodexSidecarTeardownError {
+  const error = new Error(message) as CodexSidecarTeardownError
+  error.codexSidecarTeardownFailed = true
+  error.cause = cause
+  return error
 }
 
-const INITIAL_LAUNCH_RETRY_DELAYS_MS = [0, 250, 1000, 2000, 5000] as const
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-export async function runCodexLaunchWithRetry<T>(
-  launch: (attempt: number) => Promise<T>,
-  options: CodexLaunchRetryOptions = {},
-): Promise<T> {
-  let lastError: Error | undefined
-
-  for (let index = 0; index < INITIAL_LAUNCH_RETRY_DELAYS_MS.length; index += 1) {
-    const attempt = index + 1
-    const delayMs = INITIAL_LAUNCH_RETRY_DELAYS_MS[index]
-    if (delayMs > 0) {
-      await sleep(delayMs)
-    }
-    try {
-      return await launch(attempt)
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error))
-      if (options.shouldRetry && !options.shouldRetry(lastError)) {
-        throw lastError
-      }
-      if (attempt < INITIAL_LAUNCH_RETRY_DELAYS_MS.length) {
-        options.onFailedAttempt?.({ attempt, delayMs: INITIAL_LAUNCH_RETRY_DELAYS_MS[index + 1], error: lastError })
-      }
-    }
-  }
-
-  throw lastError ?? new Error('Codex launch failed before a terminal record could be created.')
-}
-
-type SidecarCreateInput = PlanCreateInput & {
-  commandArgs: string[]
-}
-
-function appServerMcpTarget(): 'unix' | 'windows' {
-  return process.platform === 'win32' ? 'windows' : 'unix'
+export function isCodexSidecarTeardownError(error: unknown): error is CodexSidecarTeardownError {
+  return (error as { codexSidecarTeardownFailed?: boolean } | null | undefined)?.codexSidecarTeardownFailed === true
 }
 
 export class CodexLaunchPlanner {
-  constructor(
-    private readonly createSidecar: (input: SidecarCreateInput) => Pick<CodexTerminalSidecar, 'ensureReady' | 'attachTerminal' | 'shutdown'>
-      = (input) => new CodexTerminalSidecar({
-        cwd: input.cwd,
-        commandArgs: input.commandArgs,
-        env: input.env,
-      }),
-  ) {}
+  private readonly activeSidecars = new Set<CodexLaunchSidecar>()
+  private readonly failedSidecarShutdowns = new Set<CodexLaunchSidecar>()
+  private readonly runtimeFactory: () => CodexRuntimeLike
+  private shutdownStarted = false
+  private shutdownPromise: Promise<void> | null = null
+
+  constructor(runtimeOrFactory: CodexRuntimeLike | (() => CodexRuntimeLike)) {
+    this.runtimeFactory = typeof runtimeOrFactory === 'function'
+      ? runtimeOrFactory
+      : () => runtimeOrFactory
+  }
 
   async planCreate(input: PlanCreateInput): Promise<CodexLaunchPlan> {
-    const sidecar = this.createSidecar({
-      ...input,
-      commandArgs: generateMcpInjection('codex', input.terminalId, input.cwd, appServerMcpTarget()).args,
-    })
-    let ready: Awaited<ReturnType<typeof sidecar.ensureReady>>
-    try {
-      ready = await sidecar.ensureReady()
-    } catch (error) {
-      await sidecar.shutdown().catch(() => undefined)
-      throw error
-    }
+    this.assertAcceptingPlans()
+    await this.retryFailedSidecarShutdownsBeforePlan()
+    this.assertAcceptingPlans()
 
-    if (input.resumeSessionId) {
+    const runtime = this.runtimeFactory()
+    let proxy: CodexRemoteProxy | undefined
+    const sidecar = this.createSidecar(runtime, () => proxy)
+    this.activeSidecars.add(sidecar)
+
+    try {
+      if (input.resumeSessionId) {
+        const ready = await runtime.ensureReady(input.cwd)
+        proxy = new CodexRemoteProxy({
+          upstreamWsUrl: ready.wsUrl,
+          requireCandidatePersistence: false,
+        })
+        const proxyReady = await proxy.start()
+        this.assertAcceptingPlans()
+        return {
+          sessionId: input.resumeSessionId,
+          remote: {
+            wsUrl: proxyReady.wsUrl,
+          },
+          sidecar,
+        }
+      }
+
+      const ready = await runtime.ensureReady(input.cwd)
+      proxy = new CodexRemoteProxy({ upstreamWsUrl: ready.wsUrl })
+      const proxyReady = await proxy.start()
+      this.assertAcceptingPlans()
+
       return {
-        sessionId: input.resumeSessionId,
         remote: {
-          wsUrl: ready.wsUrl,
-          processPid: ready.processPid,
+          wsUrl: proxyReady.wsUrl,
         },
         sidecar,
       }
-    }
-
-    return {
-      remote: {
-        wsUrl: ready.wsUrl,
-        processPid: ready.processPid,
-      },
-      sidecar,
+    } catch (error) {
+      try {
+        await sidecar.shutdown()
+      } catch (shutdownError) {
+        throw codexSidecarTeardownError(
+          `Codex launch sidecar teardown failed after planning error: ${errorMessage(shutdownError)}`,
+          shutdownError,
+        )
+      }
+      throw error
     }
   }
 
   async shutdown(): Promise<void> {
-    // Sidecars transfer to TerminalRegistry ownership immediately after create.
-    // Unowned planning failures are shut down by the create call sites.
+    this.shutdownStarted = true
+    if (this.shutdownPromise) {
+      await this.shutdownPromise
+      return
+    }
+    const attempt = waitForAllSettledOrThrow(
+      [...this.activeSidecars].map((sidecar) => Promise.resolve().then(() => sidecar.shutdown())),
+      'Codex launch planner shutdown failed.',
+    )
+    this.shutdownPromise = attempt
+    try {
+      await attempt
+    } finally {
+      if (this.shutdownPromise === attempt) {
+        this.shutdownPromise = null
+      }
+    }
+  }
+
+  private assertAcceptingPlans(): void {
+    if (this.shutdownStarted) {
+      throw new Error('Codex launch planner is shutting down; new Codex launch plans are not accepted.')
+    }
+  }
+
+  private async retryFailedSidecarShutdownsBeforePlan(): Promise<void> {
+    const failedSidecars = [...this.failedSidecarShutdowns]
+      .filter((sidecar) => this.activeSidecars.has(sidecar))
+    if (failedSidecars.length === 0) return
+
+    try {
+      await waitForAllSettledOrThrow(
+        failedSidecars.map((sidecar) => sidecar.shutdown()),
+        'Codex launch planner failed to clear blocked sidecar shutdowns.',
+      )
+    } catch (error) {
+      throw codexSidecarTeardownError(
+        `Codex launch planner cannot create a new plan while sidecar teardown is blocked: ${errorMessage(error)}`,
+        error,
+      )
+    }
+  }
+
+  private createSidecar(runtime: CodexRuntimeLike, getProxy: () => CodexRemoteProxy | undefined): CodexLaunchSidecar {
+    let shutdownPromise: Promise<void> | null = null
+    let shutdownAttemptStarted = false
+    let shutdownSucceeded = false
+    let notifyShutdownStarted!: () => void
+    const shutdownStarted = new Promise<void>((resolve) => {
+      notifyShutdownStarted = resolve
+    })
+    const assertAdoptable = () => {
+      if (this.shutdownStarted || shutdownAttemptStarted) {
+        throw new Error('Codex launch sidecar is shutting down; it cannot be adopted.')
+      }
+    }
+    const assertActive = () => {
+      if (this.shutdownStarted || shutdownAttemptStarted) {
+        throw new Error('Codex launch sidecar is shutting down; remote operations stopped.')
+      }
+    }
+    const sidecar: CodexLaunchSidecar = {
+      adopt: async ({ terminalId, generation }) => {
+        assertAdoptable()
+        await runtime.updateOwnershipMetadata({ terminalId, generation })
+        assertAdoptable()
+        this.activeSidecars.delete(sidecar)
+        this.failedSidecarShutdowns.delete(sidecar)
+      },
+      markCandidatePersisted: () => getProxy()?.markCandidatePersisted(),
+      onCandidate: (handler) => getProxy()?.onCandidate(handler) ?? (() => undefined),
+      onTurnStarted: (handler) => getProxy()?.onTurnStarted(handler) ?? (() => undefined),
+      onTurnCompleted: (handler) => getProxy()?.onTurnCompleted(handler) ?? (() => undefined),
+      onRepairTrigger: (handler) => getProxy()?.onRepairTrigger(handler) ?? (() => undefined),
+      onFsChanged: (handler) => runtime.onFsChanged(handler),
+      onThreadLifecycle: (handler) => getProxy()?.onThreadLifecycle(handler) ?? (() => undefined),
+      onLifecycleLoss: (handler) => {
+        const unsubRuntime = runtime.onThreadLifecycleLoss(handler)
+        const unsubProxy = getProxy()?.onLifecycleLoss(handler)
+        return () => {
+          unsubRuntime()
+          unsubProxy?.()
+        }
+      },
+      watchPath: async (targetPath, watchId) => {
+        assertActive()
+        const result = await runtime.watchPath(targetPath, watchId)
+        assertActive()
+        return result
+      },
+      unwatchPath: async (watchId) => {
+        assertActive()
+        await runtime.unwatchPath(watchId)
+        assertActive()
+      },
+      shutdown: async () => {
+        if (shutdownSucceeded) return
+        if (shutdownPromise) {
+          await shutdownPromise
+          return
+        }
+        if (!shutdownAttemptStarted) {
+          shutdownAttemptStarted = true
+          notifyShutdownStarted()
+        }
+        const attempt = Promise.resolve()
+          .then(async () => {
+            await getProxy()?.close()
+            await runtime.shutdown()
+          })
+          .then(() => {
+            shutdownSucceeded = true
+            this.activeSidecars.delete(sidecar)
+            this.failedSidecarShutdowns.delete(sidecar)
+          })
+          .catch((error) => {
+            this.failedSidecarShutdowns.add(sidecar)
+            throw error
+          })
+        shutdownPromise = attempt
+        try {
+          await attempt
+        } finally {
+          if (shutdownPromise === attempt) {
+            shutdownPromise = null
+          }
+        }
+      },
+    }
+    return sidecar
   }
 }

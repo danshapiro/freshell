@@ -6,12 +6,14 @@ import { useAppSelector } from '@/store/hooks'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { getCliProviderConfigs, type CodingCliProviderConfig } from '@/lib/coding-cli-utils'
 import { getVisibleAgentChatConfigs, type AgentChatProviderName } from '@/lib/agent-chat-utils'
+import { FRESH_AGENT_REGISTRY } from '@/lib/fresh-agent-registry'
 import { ProviderIcon } from '@/components/icons/provider-icons'
 import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import type { ClientExtensionEntry } from '@shared/extension-types'
+import type { FreshAgentSessionType } from '@shared/fresh-agent'
 
-export type PanePickerType = 'shell' | 'cmd' | 'powershell' | 'wsl' | 'browser' | 'editor' | AgentChatProviderName | CodingCliProviderName | `ext:${string}`
+export type PanePickerType = 'shell' | 'cmd' | 'powershell' | 'wsl' | 'browser' | 'editor' | AgentChatProviderName | FreshAgentSessionType | CodingCliProviderName | `ext:${string}`
 
 type IconComponent = ComponentType<{ className?: string } & SVGProps<SVGSVGElement>>
 
@@ -113,7 +115,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
 
     // Agent chat options: only show if underlying CLI is available, enabled, and not hidden by feature flag
     const visibleAgentChatConfigs = getVisibleAgentChatConfigs(featureFlags)
-    const allAgentChatOptions: PickerOption[] = visibleAgentChatConfigs
+    const agentChatOptions: PickerOption[] = visibleAgentChatConfigs
       .filter((config) => availableClis[config.codingCliProvider] && enabledProviders.includes(config.codingCliProvider) && !disabledExtensions.includes(config.codingCliProvider))
       .map((config) => ({
         type: config.name as PanePickerType,
@@ -122,9 +124,22 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
         shortcut: config.pickerShortcut,
         afterCli: config.pickerAfterCli,
       }))
+    const otherFreshAgentOptions: PickerOption[] = FRESH_AGENT_REGISTRY
+      .filter((entry) => !visibleAgentChatConfigs.some((config) => config.name === entry.sessionType))
+      .filter((entry) => !entry.disabled)
+      .filter((entry) => !entry.hidden || featureFlags[entry.featureFlag ?? entry.sessionType] === true)
+      .filter((entry) => availableClis[entry.runtimeProvider] && enabledProviders.includes(entry.runtimeProvider) && !disabledExtensions.includes(entry.runtimeProvider))
+      .map((entry) => ({
+        type: entry.sessionType as PanePickerType,
+        label: entry.label,
+        icon: entry.icon,
+        shortcut: entry.pickerShortcut,
+        afterCli: entry.pickerAfterCli,
+      }))
 
-    const agentChatBefore = allAgentChatOptions.filter((o) => !o.afterCli)
-    const agentChatAfter = allAgentChatOptions.filter((o) => o.afterCli)
+    const allFreshAgentOptions = [...agentChatOptions, ...otherFreshAgentOptions]
+    const agentChatBefore = allFreshAgentOptions.filter((o) => !o.afterCli)
+    const agentChatAfter = allFreshAgentOptions.filter((o) => o.afterCli)
 
     // Extension options from the registry (exclude CLI extensions and disabled extensions)
     const extensionOptions: PickerOption[] = extensionEntries

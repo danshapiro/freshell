@@ -377,7 +377,7 @@ describe('WsHandler agent history source DI', () => {
               messages: [],
               model: 'claude-sonnet-4-20250514',
               cwd: '/tmp',
-              resumeSessionId: '01234567-89ab-cdef-0123-456789abcdef',
+              resumeSessionId: '01234567-89ab-4def-8123-456789abcdef',
               streamingActive: false,
               streamingText: '',
               pendingPermissions: new Map(),
@@ -394,7 +394,7 @@ describe('WsHandler agent history source DI', () => {
         messages: [],
         model: 'claude-sonnet-4-20250514',
         cwd: '/tmp',
-        resumeSessionId: '01234567-89ab-cdef-0123-456789abcdef',
+        resumeSessionId: '01234567-89ab-4def-8123-456789abcdef',
         streamingActive: false,
         streamingText: '',
       })),
@@ -423,12 +423,12 @@ describe('WsHandler agent history source DI', () => {
       type: 'sdk.create',
       requestId: 'req-module',
       cwd: '/tmp',
-      resumeSessionId: '01234567-89ab-cdef-0123-456789abcdef',
+      resumeSessionId: '01234567-89ab-4def-8123-456789abcdef',
     }))
 
     await waitForMessage(ws, (d) => d.type === 'sdk.session.snapshot')
 
-    expect(moduleLoadSessionHistoryMock).toHaveBeenCalledWith('01234567-89ab-cdef-0123-456789abcdef')
+    expect(moduleLoadSessionHistoryMock).toHaveBeenCalledWith('01234567-89ab-4def-8123-456789abcdef')
 
     ws.close()
   })

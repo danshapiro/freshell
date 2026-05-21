@@ -260,6 +260,91 @@ describe('CodingCliSessionIndexer', () => {
     ])
   })
 
+  it('refreshes direct-provider sessions when any returned watch path changes', async () => {
+    const opencodeDir = path.join(tempDir, 'opencode')
+    const dbPath = path.join(opencodeDir, 'opencode.db')
+    const walPath = `${dbPath}-wal`
+    await fsp.mkdir(opencodeDir, { recursive: true })
+    await fsp.writeFile(dbPath, 'stub')
+
+    let directSessions = [{
+      provider: 'opencode' as const,
+      sessionId: 'initial-opencode-session',
+      projectPath: '/project/a',
+      cwd: '/project/a',
+      title: 'Initial OpenCode Session',
+      lastActivityAt: 1_700_000_000_000,
+      createdAt: 1_699_999_000_000,
+    }]
+
+    const provider = makeProvider([], {
+      name: 'opencode',
+      displayName: 'OpenCode',
+      homeDir: opencodeDir,
+      getSessionGlob: () => [dbPath, walPath],
+      getSessionRoots: () => [dbPath],
+      listSessionFiles: async () => [],
+      listSessionsDirect: async () => directSessions,
+    })
+
+    vi.mocked(configStore.snapshot).mockResolvedValue({
+      sessionOverrides: {},
+      settings: {
+        codingCli: {
+          enabledProviders: ['opencode'],
+          providers: {},
+        },
+      },
+    })
+
+    const indexer = new CodingCliSessionIndexer([provider], {
+      debounceMs: 50,
+      throttleMs: 0,
+      fullScanIntervalMs: 0,
+    })
+
+    await indexer.start()
+
+    try {
+      expect(vi.mocked(chokidar.watch)).toHaveBeenCalledWith([dbPath, walPath], {
+        ignoreInitial: true,
+      })
+
+      expect(indexer.getProjects()[0].sessions.map((session) => session.sessionId)).toEqual([
+        'initial-opencode-session',
+      ])
+
+      directSessions = [
+        {
+          provider: 'opencode' as const,
+          sessionId: 'new-opencode-session',
+          projectPath: '/project/a',
+          cwd: '/project/a',
+          title: 'New OpenCode Session',
+          lastActivityAt: 1_700_000_010_000,
+          createdAt: 1_700_000_005_000,
+        },
+        ...directSessions,
+      ]
+
+      ;((indexer as unknown as {
+        watcher: { emit: (event: string, payload: unknown) => boolean } | null
+      }).watcher)?.emit('change', walPath)
+
+      await vi.waitFor(
+        () => {
+          expect(indexer.getProjects()[0].sessions.map((session) => session.sessionId)).toEqual([
+            'new-opencode-session',
+            'initial-opencode-session',
+          ])
+        },
+        { timeout: 5000, interval: 100 },
+      )
+    } finally {
+      await indexer.stop()
+    }
+  })
+
   it('preserves parsed codex task event snapshots from bounded snippets without extra reads', async () => {
     const sessionFile = path.join(tempDir, 'sessions', 'rollout-task-events.jsonl')
     await fsp.mkdir(path.dirname(sessionFile), { recursive: true })

@@ -9,7 +9,8 @@
 import { z } from 'zod'
 import type { ClientExtensionEntry } from './extension-types.js'
 import type { ServerSettings } from './settings.js'
-import { LiveTerminalHandleSchema, SessionRefSchema } from './session-contract.js'
+import { LiveTerminalHandleSchema, SessionRefSchema, type RestoreError } from './session-contract.js'
+import { CodexDurabilityRefSchema, type CodexDurabilityRef } from './codex-durability.js'
 
 // ──────────────────────────────────────────────────────────────
 // Shared enums and helpers
@@ -33,7 +34,7 @@ export const ErrorCode = z.enum([
 
 export type ErrorCode = z.infer<typeof ErrorCode>
 
-export const WS_PROTOCOL_VERSION = 4 as const
+export const WS_PROTOCOL_VERSION = 5 as const
 
 export const ShellSchema = z.enum(['system', 'cmd', 'powershell', 'wsl'])
 
@@ -228,11 +229,20 @@ export const TerminalCreateSchema = z.object({
   shell: ShellSchema.default('system'),
   cwd: z.string().optional(),
   sessionRef: SessionLocatorSchema.optional(),
+  codexDurability: CodexDurabilityRefSchema.optional(),
   liveTerminal: LiveTerminalHandleSchema.optional(),
   restore: z.boolean().optional(),
   recoveryIntent: z.literal('fresh_after_restore_unavailable').optional(),
   tabId: z.string().min(1).optional(),
   paneId: z.string().min(1).optional(),
+}).strict()
+
+export const TerminalCodexCandidatePersistedSchema = z.object({
+  type: z.literal('terminal.codex.candidate.persisted'),
+  terminalId: z.string().min(1),
+  candidateThreadId: z.string().min(1),
+  rolloutPath: z.string().min(1),
+  capturedAt: z.number().int().nonnegative(),
 }).strict()
 
 export const TerminalAttachIntentSchema = z.enum([
@@ -310,7 +320,7 @@ export const UiScreenshotResultSchema = z.object({
   changedFocus: z.boolean().optional(),
   restoredFocus: z.boolean().optional(),
   error: z.string().optional(),
-})
+}).strict()
 
 // Coding CLI session schemas
 export const CodingCliCreateSchema = z.object({
@@ -405,7 +415,91 @@ export const SdkQuestionRespondSchema = z.object({
   answers: z.record(z.string(), z.string()),
 })
 
+export const FreshAgentCreateSchema = z.object({
+  type: z.literal('freshAgent.create'),
+  requestId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']).optional(),
+  cwd: z.string().optional(),
+  resumeSessionId: z.string().optional(),
+  model: z.string().optional(),
+  permissionMode: z.string().optional(),
+  sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+  sessionRef: z.object({ provider: z.string().min(1), sessionId: z.string().min(1) }).optional(),
+  modelSelection: z.object({ kind: z.string().min(1), modelId: z.string().min(1) }).optional().or(z.null()),
+  effort: z.string().trim().min(1).optional(),
+  plugins: z.array(z.string()).optional(),
+})
+
+export const FreshAgentAttachSchema = z.object({
+  type: z.literal('freshAgent.attach'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  resumeSessionId: z.string().optional(),
+})
+
+export const FreshAgentSendSchema = z.object({
+  type: z.literal('freshAgent.send'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  text: z.string().min(1),
+  images: z.array(z.object({
+    mediaType: z.string(),
+    data: z.string(),
+  })).optional(),
+})
+
+export const FreshAgentInterruptSchema = z.object({
+  type: z.literal('freshAgent.interrupt'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+})
+
+export const FreshAgentApprovalRespondSchema = z.object({
+  type: z.literal('freshAgent.approval.respond'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  requestId: z.union([z.string().min(1), z.number().int()]),
+  decision: z.record(z.string(), z.unknown()),
+})
+
+export const FreshAgentQuestionRespondSchema = z.object({
+  type: z.literal('freshAgent.question.respond'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  requestId: z.union([z.string().min(1), z.number().int()]),
+  answers: z.record(z.string(), z.string()),
+})
+
+export const FreshAgentKillSchema = z.object({
+  type: z.literal('freshAgent.kill'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+})
+
+export const FreshAgentForkSchema = z.object({
+  type: z.literal('freshAgent.fork'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  input: z.record(z.string(), z.unknown()).optional(),
+})
+
 export const BrowserSdkMessageSchema = z.discriminatedUnion('type', [
+  FreshAgentCreateSchema,
+  FreshAgentAttachSchema,
+  FreshAgentSendSchema,
+  FreshAgentInterruptSchema,
+  FreshAgentApprovalRespondSchema,
+  FreshAgentQuestionRespondSchema,
+  FreshAgentKillSchema,
+  FreshAgentForkSchema,
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
@@ -426,6 +520,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   PingSchema,
   ClientDiagnosticSchema,
   TerminalCreateSchema,
+  TerminalCodexCandidatePersistedSchema,
   TerminalAttachSchema,
   TerminalDetachSchema,
   TerminalInputSchema,
@@ -438,6 +533,14 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   CodingCliCreateSchema,
   CodingCliInputSchema,
   CodingCliKillSchema,
+  FreshAgentCreateSchema,
+  FreshAgentAttachSchema,
+  FreshAgentSendSchema,
+  FreshAgentInterruptSchema,
+  FreshAgentApprovalRespondSchema,
+  FreshAgentQuestionRespondSchema,
+  FreshAgentKillSchema,
+  FreshAgentForkSchema,
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
@@ -485,7 +588,8 @@ export type TerminalCreatedMessage = {
   requestId: string
   terminalId: string
   createdAt: number
-  effectiveResumeSessionId?: string
+  clearCodexDurability?: boolean
+  restoreError?: RestoreError
 }
 
 export type TerminalAttachReadyMessage = {
@@ -546,6 +650,18 @@ export type TerminalSessionAssociatedMessage = {
   sessionRef: SessionLocator
 }
 
+export type TerminalCodexDurabilityUpdatedMessage = {
+  type: 'terminal.codex.durability.updated'
+  terminalId: string
+  durability: CodexDurabilityRef
+}
+
+export type TerminalInputBlockedMessage = {
+  type: 'terminal.input.blocked'
+  terminalId: string
+  reason: 'codex_identity_pending' | 'codex_identity_capture_timeout' | 'codex_identity_unavailable' | 'codex_recovery_pending'
+}
+
 export type TerminalsChangedMessage = {
   type: 'terminals.changed'
   revision: number
@@ -602,16 +718,31 @@ export type ConfigFallbackMessage = {
 
 export type TabsSyncAckMessage = {
   type: 'tabs.sync.ack'
-  updated: number
+  accepted: boolean
+  openRecords: number
+  closedRecords: number
+}
+
+export type TabsSyncSnapshotOpenRecord = Record<string, unknown> & {
+  deviceId: string
+  deviceLabel: string
+  clientInstanceId: string
+}
+
+export type TabsSyncSnapshotClosedRecord = Record<string, unknown> & {
+  deviceId: string
+  deviceLabel: string
 }
 
 export type TabsSyncSnapshotMessage = {
   type: 'tabs.sync.snapshot'
   requestId: string
   data: {
-    localOpen: unknown[]
-    remoteOpen: unknown[]
-    closed: unknown[]
+    localOpen: TabsSyncSnapshotOpenRecord[]
+    sameDeviceOpen: TabsSyncSnapshotOpenRecord[]
+    remoteOpen: TabsSyncSnapshotOpenRecord[]
+    closed: TabsSyncSnapshotClosedRecord[]
+    devices: Array<{ deviceId: string; deviceLabel: string; lastSeenAt: number }>
   }
 }
 
@@ -690,6 +821,12 @@ export type SdkRestoreFailureCode =
   | 'RESTORE_DIVERGED'
   | 'RESTORE_STALE_REVISION'
 
+export type FreshAgentServerMessage =
+  | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
+  | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean }
+  | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
+  | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean }
+
 export type SdkServerMessage =
   | { type: 'sdk.created'; requestId: string; sessionId: string }
   | {
@@ -765,6 +902,7 @@ export type TerminalInventoryMessage = {
     status: 'running' | 'exited'
     runtimeStatus?: 'running' | 'recovering'
     cwd?: string
+    codexDurability?: CodexDurabilityRef
   }>
   terminalMeta: TerminalMetaRecord[]
 }
@@ -784,6 +922,8 @@ export type ServerMessage =
   | TerminalOutputGapMessage
   | TerminalTitleUpdatedMessage
   | TerminalSessionAssociatedMessage
+  | TerminalCodexDurabilityUpdatedMessage
+  | TerminalInputBlockedMessage
   | TerminalsChangedMessage
   | TerminalMetaUpdatedMessage
   | TerminalInventoryMessage
@@ -806,6 +946,7 @@ export type ServerMessage =
   | CodingCliExitMessage
   | CodingCliStderrMessage
   | CodingCliKilledMessage
+  | FreshAgentServerMessage
   | SdkServerMessage
   | ExtensionRegistryMessage
   | ExtensionServerStartingMessage

@@ -3,7 +3,7 @@ import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } f
 import { nanoid } from 'nanoid'
 import { closePane, initLayout, restoreLayout, removeLayout, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
-import type { PaneNode } from './paneTypes'
+import type { PaneContent, PaneNode } from './paneTypes'
 import { findTabIdForSession } from '@/lib/session-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { buildResumeContent } from '@/lib/session-type-utils'
@@ -29,6 +29,23 @@ import { sanitizeTabsAgainstLayouts } from '@/lib/tab-fallback-identity'
 const log = createLogger('TabsSlice')
 
 export type Tombstone = { id: string; deletedAt: number }
+
+function matchesDesiredResumeContentKind(
+  content: PaneContent,
+  desiredResumeContent: ReturnType<typeof buildResumeContent>,
+): boolean {
+  if (desiredResumeContent.kind === 'agent-chat') {
+    return content.kind === 'agent-chat' && content.provider === desiredResumeContent.provider
+  }
+
+  if (desiredResumeContent.kind === 'fresh-agent') {
+    return content.kind === 'fresh-agent'
+      && content.sessionType === desiredResumeContent.sessionType
+      && content.provider === desiredResumeContent.provider
+  }
+
+  return content.kind === 'terminal' && content.mode === desiredResumeContent.mode
+}
 
 export interface TabsState {
   tabs: Tab[]
@@ -524,7 +541,7 @@ export const reopenClosedTab = createAsyncThunk(
 export const openSessionTab = createAsyncThunk(
   'tabs/openSessionTab',
   async (
-    { sessionId, title, cwd, provider, sessionType, terminalId, forceNew, firstUserMessage, isSubagent, isNonInteractive, hasTitle }: {
+    { sessionId, title, cwd, provider, sessionType, terminalId, forceNew, firstUserMessage, isSubagent, isNonInteractive, hasTitle, liveTerminalOnly }: {
       sessionId: string
       title?: string
       cwd?: string
@@ -537,6 +554,8 @@ export const openSessionTab = createAsyncThunk(
       isNonInteractive?: boolean
       /** Only sync title into an existing tab when the session title is a real rename (not a synthesized fallback). */
       hasTitle?: boolean
+      /** Live-only fallback terminals are not durable provider sessions yet. */
+      liveTerminalOnly?: boolean
     },
     { dispatch, getState }
   ) => {
@@ -576,81 +595,12 @@ export const openSessionTab = createAsyncThunk(
       }))
     }
 
-    const targetSessionRef = sanitizeSessionRef({ provider: resolvedProvider, sessionId })
-
-    const isTargetSessionRef = (sessionRef: unknown) => {
-      const sanitized = sanitizeSessionRef(sessionRef)
-      return Boolean(
-        sanitized
-        && sanitized.provider === resolvedProvider
-        && sanitized.sessionId === sessionId,
-      )
-    }
-
-    const hasNonEmptyResumeSessionId = (content: unknown) => (
-      typeof (content as { resumeSessionId?: unknown }).resumeSessionId === 'string'
-      && ((content as { resumeSessionId: string }).resumeSessionId.trim().length > 0)
-    )
-
-    const paneHasOwnDurableIdentity = (content: unknown) => (
-      Boolean(sanitizeSessionRef((content as { sessionRef?: unknown }).sessionRef))
-      || hasNonEmptyResumeSessionId(content)
-    )
-
-    const collectLeafNodes = (node: PaneNode): Array<Extract<PaneNode, { type: 'leaf' }>> => {
-      if (node.type === 'leaf') return [node]
-      return [
-        ...collectLeafNodes(node.children[0]),
-        ...collectLeafNodes(node.children[1]),
-      ]
-    }
-
-    const isKnownCurrentLiveTerminal = (content: unknown) => {
-      if (!localServerInstanceId) return false
-      const terminalContent = content as {
-        kind?: unknown
-        terminalId?: unknown
-        serverInstanceId?: unknown
-      }
-      return terminalContent.kind === 'terminal'
-        && typeof terminalContent.terminalId === 'string'
-        && terminalContent.terminalId.length > 0
-        && typeof terminalContent.serverInstanceId === 'string'
-        && terminalContent.serverInstanceId === localServerInstanceId
-    }
-
-    const findStaleSinglePaneTabFallback = (): Tab | undefined => {
-      if (!targetSessionRef || desiredResumeContent.kind !== 'terminal') return undefined
-
-      for (const tab of state.tabs.tabs) {
-        if (!isTargetSessionRef(tab.sessionRef)) continue
-        const layout = state.panes.layouts[tab.id]
-        if (!layout) continue
-
-        const leaves = collectLeafNodes(layout)
-        if (leaves.length !== 1) continue
-
-        const [{ content }] = leaves
-        if (content.kind !== 'terminal') continue
-        if (content.mode !== desiredResumeContent.mode) continue
-        if (paneHasOwnDurableIdentity(content)) continue
-        if (isKnownCurrentLiveTerminal(content)) continue
-
-        return tab
-      }
-
-      return undefined
-    }
-
-    const repairExistingTabLayout = (
-      tab: Tab | undefined,
-      options: { tabFallbackMissingPaneLocator?: boolean } = {},
-    ) => {
+    const repairExistingTabLayout = (tab: Tab | undefined) => {
       if (!tab) return
       const layout = state.panes.layouts[tab.id]
       if (!layout) return
 
-      const matchingLeaves: Array<{ id: string; content: any }> = []
+      const matchingLeaves: Array<{ id: string; content: PaneContent }> = []
       const visit = (node: PaneNode) => {
         if (node.type === 'leaf') {
           const content = node.content
@@ -668,6 +618,10 @@ export const openSessionTab = createAsyncThunk(
             content.kind === 'agent-chat'
             && resolvedProvider === 'claude'
             && content.resumeSessionId === sessionId
+          ) || (
+            content.kind === 'fresh-agent'
+            && content.provider === resolvedProvider
+            && content.resumeSessionId === sessionId
           )
           if (matchesExplicitSessionRef || matchesImplicitSessionRef) {
             matchingLeaves.push({ id: node.id, content })
@@ -680,74 +634,11 @@ export const openSessionTab = createAsyncThunk(
 
       visit(layout)
 
-      let selectedLeaves = matchingLeaves
-      if (selectedLeaves.length === 0 && options.tabFallbackMissingPaneLocator) {
-        const leaves = collectLeafNodes(layout)
-        if (leaves.length === 1) {
-          const [{ id, content }] = leaves
-          if (
-            targetSessionRef
-            && desiredResumeContent.kind === 'terminal'
-            && content.kind === 'terminal'
-            && content.mode === desiredResumeContent.mode
-            && !paneHasOwnDurableIdentity(content)
-            && !isKnownCurrentLiveTerminal(content)
-          ) {
-            selectedLeaves = [{ id, content }]
-          }
-        }
-      }
-
-      if (selectedLeaves.length !== 1) return
-      const [{ id: paneId, content }] = selectedLeaves
-      const paneOwnsTarget = matchingLeaves.some((leaf) => leaf.id === paneId)
-      const tabFallbackMissingPaneLocator = Boolean(options.tabFallbackMissingPaneLocator && !paneOwnsTarget)
-
-      if (
-        targetSessionRef
-        && desiredResumeContent.kind === 'terminal'
-        && content.kind === 'terminal'
-        && content.mode === desiredResumeContent.mode
-        && (paneOwnsTarget || tabFallbackMissingPaneLocator)
-      ) {
-        const existingSessionRef = sanitizeSessionRef(content.sessionRef)
-        const resumeSessionId = typeof content.resumeSessionId === 'string'
-          ? content.resumeSessionId.trim()
-          : ''
-        const hasDifferentSessionRef = Boolean(
-          existingSessionRef
-          && (
-            existingSessionRef.provider !== targetSessionRef.provider
-            || existingSessionRef.sessionId !== targetSessionRef.sessionId
-          ),
-        )
-        const hasDifferentResumeSessionId = Boolean(resumeSessionId && resumeSessionId !== sessionId)
-        if (hasDifferentSessionRef || hasDifferentResumeSessionId) return
-
-        if (
-          !existingSessionRef
-          || existingSessionRef.provider !== targetSessionRef.provider
-          || existingSessionRef.sessionId !== targetSessionRef.sessionId
-        ) {
-          dispatch(updatePaneContent({
-            tabId: tab.id,
-            paneId,
-            content: {
-              ...content,
-              sessionRef: targetSessionRef,
-            },
-          }))
-        }
-        return
-      }
-
+      if (matchingLeaves.length !== 1) return
+      const [{ id: paneId, content }] = matchingLeaves
       if (content.kind === 'terminal' && content.terminalId) return
 
-      const needsRepair = desiredResumeContent.kind === 'agent-chat'
-        ? content.kind !== 'agent-chat' || content.provider !== desiredResumeContent.provider
-        : content.kind !== 'terminal' || content.mode !== desiredResumeContent.mode
-
-      if (!needsRepair) return
+      if (matchesDesiredResumeContentKind(content, desiredResumeContent)) return
 
       dispatch(updatePaneContent({
         tabId: tab.id,
@@ -783,9 +674,7 @@ export const openSessionTab = createAsyncThunk(
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,
-        sessionRef: desiredResumeContent.kind === 'terminal' || desiredResumeContent.kind === 'agent-chat'
-          ? desiredResumeContent.sessionRef
-          : undefined,
+        sessionRef: desiredResumeContent.sessionRef,
         sessionMetadataByKey: buildSessionMetadataByKey(),
       }))
       dispatch(initLayout({
@@ -795,7 +684,7 @@ export const openSessionTab = createAsyncThunk(
           mode: resolvedProvider,
           terminalId,
           serverInstanceId: localServerInstanceId,
-          sessionRef: desiredResumeContent.kind === 'terminal' ? desiredResumeContent.sessionRef : undefined,
+          sessionRef: liveTerminalOnly ? undefined : desiredResumeContent.sessionRef,
           initialCwd: cwd,
           status: 'running',
         },
@@ -809,19 +698,14 @@ export const openSessionTab = createAsyncThunk(
         { provider: resolvedProvider, sessionId },
         localServerInstanceId,
       )
-      const staleSinglePaneFallbackTab = existingTabId ? undefined : findStaleSinglePaneTabFallback()
-      const tabToOpen = existingTabId
-        ? state.tabs.tabs.find((tab) => tab.id === existingTabId)
-        : staleSinglePaneFallbackTab
-      if (tabToOpen) {
-        const selectedExistingTabId = existingTabId ?? tabToOpen.id
-        const usingStaleSinglePaneFallback = !existingTabId && staleSinglePaneFallbackTab?.id === tabToOpen.id
-        updateExistingTabMetadata(tabToOpen)
-        if (title && hasTitle && title !== tabToOpen.title && !tabToOpen.titleSetByUser) {
-          dispatch(updateTab({ id: tabToOpen.id, updates: { title } }))
+      if (existingTabId) {
+        const existingTab = state.tabs.tabs.find((tab) => tab.id === existingTabId)
+        updateExistingTabMetadata(existingTab)
+        if (existingTab && title && hasTitle && title !== existingTab.title && !existingTab.titleSetByUser) {
+          dispatch(updateTab({ id: existingTab.id, updates: { title } }))
         }
         if (hasTitle && title) {
-          const layout = state.panes.layouts[selectedExistingTabId]
+          const layout = state.panes.layouts[existingTabId]
           if (layout) {
             const syncPaneTitles = (node: PaneNode) => {
               if (node.type === 'leaf') {
@@ -834,10 +718,11 @@ export const openSessionTab = createAsyncThunk(
                   && sessionRef.sessionId === sessionId
                 const matchesImplicitRef = (
                   (content.kind === 'terminal' && content.mode === resolvedProvider && content.resumeSessionId === sessionId) ||
-                  (content.kind === 'agent-chat' && resolvedProvider === 'claude' && content.resumeSessionId === sessionId)
+                  (content.kind === 'agent-chat' && resolvedProvider === 'claude' && content.resumeSessionId === sessionId) ||
+                  (content.kind === 'fresh-agent' && content.provider === resolvedProvider && content.resumeSessionId === sessionId)
                 )
                 if (matchesExplicitRef || matchesImplicitRef) {
-                  dispatch(updatePaneTitle({ tabId: selectedExistingTabId, paneId: node.id, title, setByUser: false }))
+                  dispatch(updatePaneTitle({ tabId: existingTabId, paneId: node.id, title, setByUser: false }))
                 }
                 return
               }
@@ -847,15 +732,13 @@ export const openSessionTab = createAsyncThunk(
             syncPaneTitles(layout)
           }
         }
-        repairExistingTabLayout(tabToOpen, {
-          tabFallbackMissingPaneLocator: usingStaleSinglePaneFallback,
-        })
-        dispatch(setActiveTab(selectedExistingTabId))
+        repairExistingTabLayout(existingTab)
+        dispatch(setActiveTab(existingTabId))
         return
       }
     }
 
-    // For agent-chat sessions, create a tab then immediately set up agent-chat layout
+    // For chat sessions, create a tab then immediately set up the resolved layout
     // so TabContent's fallback initLayout (which always creates terminal panes) doesn't win
     if (isAgentChatProviderName(resolvedSessionType)) {
       const tabId = nanoid()
@@ -865,7 +748,7 @@ export const openSessionTab = createAsyncThunk(
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,
-        sessionRef: desiredResumeContent.kind === 'agent-chat' ? desiredResumeContent.sessionRef : undefined,
+        sessionRef: desiredResumeContent.sessionRef,
         sessionMetadataByKey: buildSessionMetadataByKey(),
       }))
       dispatch(initLayout({
@@ -882,7 +765,7 @@ export const openSessionTab = createAsyncThunk(
       mode: resolvedProvider,
       codingCliProvider: resolvedProvider,
       initialCwd: cwd,
-      sessionRef: desiredResumeContent.kind === 'terminal' ? desiredResumeContent.sessionRef : undefined,
+      sessionRef: desiredResumeContent.sessionRef,
       sessionMetadataByKey: buildSessionMetadataByKey(),
     }))
     dispatch(initLayout({

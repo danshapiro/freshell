@@ -314,6 +314,69 @@ describe('WsClient.connect', () => {
     expect(secondCreates).toEqual(['sdk-reconnect-create-1'])
   })
 
+  it('resends an in-flight freshAgent.create once after reconnect until freshAgent.created arrives', async () => {
+    const c = new WsClient('ws://example/ws')
+    c.send({
+      type: 'freshAgent.create',
+      requestId: 'fresh-agent-reconnect-create-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      cwd: '/tmp/project',
+    } as any)
+
+    const p1 = c.connect()
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p1
+    MockWebSocket.instances[0]._close(1006, 'drop-after-fresh-agent-create')
+
+    const p2 = c.connect()
+    MockWebSocket.instances[1]._open()
+    MockWebSocket.instances[1]._message({ type: 'ready' })
+    await p2
+
+    const secondCreates = MockWebSocket.instances[1].sent
+      .map((x) => JSON.parse(x))
+      .filter((m) => m.type === 'freshAgent.create')
+      .map((m) => m.requestId)
+    expect(secondCreates).toEqual(['fresh-agent-reconnect-create-1'])
+  })
+
+  it('clears freshAgent.create reconnect tracking when freshAgent.created arrives', async () => {
+    const c = new WsClient('ws://example/ws')
+    c.send({
+      type: 'freshAgent.create',
+      requestId: 'fresh-agent-created-before-reconnect',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      cwd: '/tmp/project',
+    } as any)
+
+    const p1 = c.connect()
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p1
+    MockWebSocket.instances[0]._message({
+      type: 'freshAgent.created',
+      requestId: 'fresh-agent-created-before-reconnect',
+      sessionId: 'codex-thread-created-before-reconnect',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      runtimeProvider: 'codex',
+    })
+    MockWebSocket.instances[0]._close(1006, 'drop-after-fresh-agent-created')
+
+    const p2 = c.connect()
+    MockWebSocket.instances[1]._open()
+    MockWebSocket.instances[1]._message({ type: 'ready' })
+    await p2
+
+    const resent = MockWebSocket.instances[1].sent
+      .map((x) => JSON.parse(x))
+      .filter((m) => m.type === 'freshAgent.create' && m.requestId === 'fresh-agent-created-before-reconnect')
+    expect(resent).toHaveLength(0)
+  })
+
   it('clears sdk.create reconnect tracking when sdk.create.failed arrives', async () => {
     const c = new WsClient('ws://example/ws')
     c.send({
@@ -343,6 +406,73 @@ describe('WsClient.connect', () => {
     const resent = MockWebSocket.instances[1].sent
       .map((x) => JSON.parse(x))
       .filter((m) => m.type === 'sdk.create' && m.requestId === 'sdk-create-failed-before-reconnect')
+    expect(resent).toHaveLength(0)
+  })
+
+  it('clears freshAgent.create reconnect tracking when freshAgent.create.failed arrives', async () => {
+    const c = new WsClient('ws://example/ws')
+    c.send({
+      type: 'freshAgent.create',
+      requestId: 'fresh-agent-create-failed-before-reconnect',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      cwd: '/tmp/project',
+    } as any)
+
+    const p1 = c.connect()
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p1
+    MockWebSocket.instances[0]._message({
+      type: 'freshAgent.create.failed',
+      requestId: 'fresh-agent-create-failed-before-reconnect',
+      code: 'FRESH_AGENT_CREATE_FAILED',
+      message: 'failed before reconnect',
+      retryable: true,
+    })
+    MockWebSocket.instances[0]._close(1006, 'drop-after-fresh-agent-create-failed')
+
+    const p2 = c.connect()
+    MockWebSocket.instances[1]._open()
+    MockWebSocket.instances[1]._message({ type: 'ready' })
+    await p2
+
+    const resent = MockWebSocket.instances[1].sent
+      .map((x) => JSON.parse(x))
+      .filter((m) => m.type === 'freshAgent.create' && m.requestId === 'fresh-agent-create-failed-before-reconnect')
+    expect(resent).toHaveLength(0)
+  })
+
+  it('does not flush or resend a cancelled freshAgent.create', async () => {
+    const c = new WsClient('ws://example/ws')
+    c.send({
+      type: 'freshAgent.create',
+      requestId: 'fresh-agent-cancelled-before-connect',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      cwd: '/tmp/project',
+    } as any)
+    c.cancelCreate('fresh-agent-cancelled-before-connect')
+
+    const p1 = c.connect()
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p1
+
+    const firstSent = MockWebSocket.instances[0].sent
+      .map((x) => JSON.parse(x))
+      .filter((m) => m.type === 'freshAgent.create' && m.requestId === 'fresh-agent-cancelled-before-connect')
+    expect(firstSent).toHaveLength(0)
+
+    MockWebSocket.instances[0]._close(1006, 'drop-after-cancelled-create')
+    const p2 = c.connect()
+    MockWebSocket.instances[1]._open()
+    MockWebSocket.instances[1]._message({ type: 'ready' })
+    await p2
+
+    const resent = MockWebSocket.instances[1].sent
+      .map((x) => JSON.parse(x))
+      .filter((m) => m.type === 'freshAgent.create' && m.requestId === 'fresh-agent-cancelled-before-connect')
     expect(resent).toHaveLength(0)
   })
 

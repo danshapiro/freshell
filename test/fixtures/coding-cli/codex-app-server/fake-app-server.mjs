@@ -1,8 +1,22 @@
 #!/usr/bin/env node
 
+import { WebSocketServer } from 'ws'
+import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
-import { WebSocketServer } from 'ws'
+
+if (process.argv[2] === 'fake-native-child') {
+  process.on('SIGTERM', () => {
+    if (process.env.FAKE_CODEX_NATIVE_CHILD_IGNORE_SIGTERM === '1') {
+      return
+    }
+    process.exit(0)
+  })
+
+  setInterval(() => undefined, 1_000)
+  process.stdin.resume()
+  await new Promise(() => undefined)
+}
 
 function parseListenUrl(argv) {
   const listenIndex = argv.indexOf('--listen')
@@ -40,7 +54,7 @@ function getThreadHandle(threadId) {
 
 function ensureDurableArtifact(threadId) {
   const thread = getThreadHandle(threadId)
-  const codexHome = process.env.CODEX_HOME || '/tmp/fake-codex-home'
+  const codexHome = getCodexHome()
   const now = new Date()
   const sessionDir = path.dirname(thread.path)
   fs.mkdirSync(sessionDir, { recursive: true })
@@ -82,6 +96,43 @@ function writeBytes(stream, totalBytes, chunkSize = 16 * 1024) {
   })
 }
 
+function makeTurn(id = 'turn-1') {
+  return {
+    id,
+    status: 'completed',
+    items: [{
+      type: 'agentMessage',
+      id: `${id}:item-0`,
+      text: 'Fixture turn',
+      phase: null,
+      memoryCitation: null,
+    }],
+    error: null,
+    startedAt: 1770000001,
+    completedAt: 1770000002,
+    durationMs: 1000,
+  }
+}
+
+function makeThread(id, params = {}) {
+  const handle = getThreadHandle(id)
+  return {
+    id,
+    sessionId: id,
+    preview: 'Fixture turn',
+    ephemeral: false,
+    modelProvider: 'openai',
+    createdAt: 1770000000,
+    updatedAt: 1770000007,
+    status: { type: 'idle' },
+    cwd: params.cwd ?? process.cwd(),
+    cliVersion: 'codex-cli 0.129.0',
+    source: 'appServer',
+    turns: params.includeTurns ? [makeTurn()] : [],
+    path: handle.path,
+  }
+}
+
 function successResult(method, params) {
   if (method === 'initialize') {
     return {
@@ -92,37 +143,46 @@ function successResult(method, params) {
     }
   }
   if (method === 'thread/start') {
+    const threadId = behavior.threadStartThreadId || 'thread-new-1'
+    const rolloutPath = behavior.threadStartRolloutPath || behavior.rolloutPath
+    const thread = makeThread(threadId, params)
+    if (rolloutPath) thread.path = rolloutPath
+    if (typeof behavior.threadStartEphemeral === 'boolean') {
+      thread.ephemeral = behavior.threadStartEphemeral
+    }
     return {
-      thread: getThreadHandle('thread-new-1'),
+      thread,
       cwd: params?.cwd ?? process.cwd(),
       model: 'fixture-model',
       modelProvider: 'openai',
       instructionSources: [],
       approvalPolicy: 'never',
       approvalsReviewer: 'user',
-      sandbox: {
-        type: 'dangerFullAccess',
-      },
+      sandbox: params?.sandbox ?? 'danger-full-access',
     }
   }
   if (method === 'thread/resume') {
     const threadId = params?.threadId || 'thread-new-1'
+    const rolloutPath = behavior.threadResumeRolloutPath || behavior.rolloutPath
+    const thread = makeThread(threadId, params)
+    if (rolloutPath) thread.path = rolloutPath
+    if (typeof behavior.threadResumeEphemeral === 'boolean') {
+      thread.ephemeral = behavior.threadResumeEphemeral
+    }
     return {
-      thread: getThreadHandle(threadId),
+      thread,
       cwd: params?.cwd ?? process.cwd(),
       model: 'fixture-model',
       modelProvider: 'openai',
       instructionSources: [],
       approvalPolicy: 'never',
       approvalsReviewer: 'user',
-      sandbox: {
-        type: 'dangerFullAccess',
-      },
+      sandbox: params?.sandbox ?? 'danger-full-access',
     }
   }
   if (method === 'turn/start') {
     return {
-      thread: getThreadHandle(params?.threadId || 'thread-new-1'),
+      turn: makeTurn('turn-1'),
     }
   }
   if (method === 'fs/watch') {
@@ -133,7 +193,36 @@ function successResult(method, params) {
   if (method === 'fs/unwatch') {
     return {}
   }
+  if (method === 'thread/read') {
+    return {
+      thread: makeThread(params?.threadId, {
+        ...params,
+        includeTurns: params?.includeTurns === true,
+      }),
+    }
+  }
+  if (method === 'thread/loaded/list') {
+    return {
+      data: behavior.loadedThreadIds || [],
+    }
+  }
   return {}
+}
+
+function maybeWriteRolloutForMethod(method, params) {
+  const spec = behavior.writeRolloutOnMethods?.[method]
+  if (!spec?.path) return
+  const threadId = spec.threadId || params?.threadId || behavior.threadStartThreadId || 'thread-new-1'
+  fs.mkdirSync(path.dirname(spec.path), { recursive: true })
+  const line = JSON.stringify(spec.record || {
+    type: 'session_meta',
+    payload: { id: threadId },
+  }) + '\n'
+  if (spec.append) {
+    fs.appendFileSync(spec.path, line, 'utf8')
+  } else {
+    fs.writeFileSync(spec.path, line, 'utf8')
+  }
 }
 
 const listenUrl = parseListenUrl(process.argv.slice(2))
@@ -157,10 +246,28 @@ const threadClosedAfterMethodsOnce = new Set(behavior.threadClosedAfterMethodsOn
 const url = new URL(listenUrl)
 const host = url.hostname
 const port = Number(url.port)
-const watches = new Map()
-const activeThreadIds = new Set()
+
+let nativeChild
+if (behavior.spawnNativeChild) {
+  nativeChild = spawn(process.execPath, [new URL(import.meta.url).pathname, 'fake-native-child'], {
+    env: {
+      ...process.env,
+      FAKE_CODEX_NATIVE_CHILD_IGNORE_SIGTERM: behavior.nativeChildIgnoresSigterm ? '1' : '',
+    },
+    stdio: 'ignore',
+  })
+  nativeChild.unref()
+  if (behavior.nativePidFile) {
+    fs.writeFileSync(behavior.nativePidFile, `${nativeChild.pid}\n`, 'utf8')
+  }
+  if (behavior.exitAfterSpawningNative) {
+    process.exit(Number(behavior.exitAfterSpawningNativeCode ?? 42))
+  }
+}
 
 const wss = new WebSocketServer({ host, port })
+const watches = new Map()
+const activeThreadIds = new Set()
 
 function broadcastNotification(method, params) {
   const payload = JSON.stringify({
@@ -176,13 +283,29 @@ function broadcastNotification(method, params) {
 }
 
 function emitConfiguredNotifications(method) {
-  const notifications = behavior.notifyAfterMethodsOnce?.[method]
-  if (!Array.isArray(notifications) || notifications.length === 0) {
+  const onceNotifications = behavior.notifyAfterMethodsOnce?.[method]
+  if (Array.isArray(onceNotifications) && onceNotifications.length > 0) {
+    delete behavior.notifyAfterMethodsOnce[method]
+    for (const notification of onceNotifications) {
+      broadcastNotification(notification.method, notification.params)
+    }
+  }
+
+  for (const notification of behavior.notificationsAfterMethods?.[method] || []) {
+    socketSafeBroadcast(notification)
+  }
+}
+
+function socketSafeBroadcast(notification) {
+  if (notification?.method) {
+    broadcastNotification(notification.method, notification.params)
     return
   }
-  delete behavior.notifyAfterMethodsOnce[method]
-  for (const notification of notifications) {
-    broadcastNotification(notification.method, notification.params)
+  const payload = JSON.stringify(notification)
+  for (const client of wss.clients) {
+    if (client.readyState === 1) {
+      client.send(payload)
+    }
   }
 }
 
@@ -243,8 +366,16 @@ function claimCrossProcessCloseSocketOnce(method) {
 
 wss.on('connection', (socket) => {
   let initialized = false
+  let initializedNotification = false
   socket.on('message', (raw) => {
     const message = JSON.parse(raw.toString())
+    if (!Object.prototype.hasOwnProperty.call(message, 'id')) {
+      if (message.method === 'initialized') {
+        initializedNotification = true
+        initialized = true
+      }
+      return
+    }
     if (behavior.requireJsonRpc && message.jsonrpc !== '2.0') {
       socket.send(JSON.stringify({
         id: message.id,
@@ -255,9 +386,23 @@ wss.on('connection', (socket) => {
       }))
       return
     }
+    if (behavior.rejectJsonRpc && Object.prototype.hasOwnProperty.call(message, 'jsonrpc')) {
+      socket.send(JSON.stringify({
+        id: message.id,
+        error: {
+          code: -32600,
+          message: 'Expected Codex app-server request envelope without jsonrpc',
+        },
+      }))
+      return
+    }
     const method = message.method
 
-    if (behavior.requireInitializeBeforeOtherMethods && method !== 'initialize' && !initialized) {
+    if (
+      behavior.requireInitializeBeforeOtherMethods
+      && method !== 'initialize'
+      && (!initialized || (behavior.requireInitializedNotification && !initializedNotification))
+    ) {
       socket.send(JSON.stringify({
         id: message.id,
         error: {
@@ -306,6 +451,7 @@ wss.on('connection', (socket) => {
         result,
       }))
       appendThreadOperation(method, message.params, result)
+      maybeWriteRolloutForMethod(method, message.params)
       if (method === 'initialize') {
         initialized = true
       }
@@ -382,5 +528,17 @@ process.on('SIGTERM', () => {
   if (process.env.FAKE_CODEX_APP_SERVER_IGNORE_SIGTERM === '1') {
     return
   }
-  wss.close(() => process.exit(0))
+  if (behavior.signalFileOnSigterm) {
+    fs.writeFileSync(behavior.signalFileOnSigterm, `${process.pid}\n`, 'utf8')
+  }
+  if (!behavior.wrapperLeavesNativeOnSigterm) {
+    nativeChild?.kill('SIGTERM')
+  }
+  const exit = () => wss.close(() => process.exit(0))
+  const delayExitMs = Number(behavior.delayExitOnSigtermMs || 0)
+  if (delayExitMs > 0) {
+    setTimeout(exit, delayExitMs)
+    return
+  }
+  exit()
 })

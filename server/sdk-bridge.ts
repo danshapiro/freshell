@@ -114,6 +114,7 @@ export class SdkBridge extends EventEmitter {
   private cloneSessionState(state: SdkSessionState): SdkSessionState {
     return {
       ...state,
+      plugins: state.plugins ? [...state.plugins] : undefined,
       tools: state.tools ? state.tools.map((tool) => ({ ...tool })) : undefined,
       messages: state.messages.map((message) => ({
         ...message,
@@ -167,6 +168,7 @@ export class SdkBridge extends EventEmitter {
       cwd: options.cwd,
       model: options.model,
       permissionMode: options.permissionMode,
+      plugins: options.plugins ? sanitizeAgentChatPluginPaths(options.plugins) : undefined,
       status: 'starting',
       createdAt: Date.now(),
       messages: [],

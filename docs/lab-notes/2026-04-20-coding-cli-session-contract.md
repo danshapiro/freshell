@@ -37,7 +37,7 @@ The implementation plan file is dated `2026-04-19` because the design work was w
     "codex": {
       "executable": "codex",
       "resolvedPath": "/home/user/.npm-global/bin/codex",
-      "version": "codex-cli 0.128.0",
+      "version": "codex-cli 0.130.0",
       "freshRemoteBootstrapCommand": "codex --remote <ws>",
       "freshRemoteBootstrapEventsBeforeUserTurn": [
         "connection",
@@ -60,8 +60,11 @@ The implementation plan file is dated `2026-04-19` because the design work was w
       ],
       "remoteResumeBootstrapFollowupMethods": [
         "account/rateLimits/read",
+        "command/exec",
+        "hooks/list",
         "skills/list",
-        "skills/list"
+        "skills/list",
+        "thread/goal/get"
       ],
       "freshRemoteAllocatesThreadBeforeUserTurn": true,
       "shellSnapshotGlob": ".codex/shell_snapshots/*.sh",
@@ -81,7 +84,7 @@ The implementation plan file is dated `2026-04-19` because the design work was w
       "executable": "claude",
       "resolvedPath": "/home/user/bin/claude",
       "isolatedBinaryPath": "/home/user/.local/bin/claude",
-      "version": "2.1.132 (Claude Code)",
+      "version": "2.1.140 (Claude Code)",
       "exactIdCommandTemplate": "HOME=<temp-home> /home/user/.local/bin/claude --bare --dangerously-skip-permissions -p --session-id <uuid> <prompt>",
       "namedResumeCommandTemplate": "HOME=<temp-home> /home/user/.local/bin/claude --bare --dangerously-skip-permissions -p --resume <title-or-uuid> [--name <title>] <prompt>",
       "transcriptGlob": ".claude/projects/*/<uuid>.jsonl",
@@ -139,10 +142,10 @@ command -v codex
 # /home/user/.npm-global/bin/codex
 
 codex --version
-# codex-cli 0.128.0
+# codex-cli 0.130.0
 ```
 
-This 2026-05-03 version refresh supersedes the older `codex-cli 0.125.0` capture. The current version of record on this machine is `codex-cli 0.128.0`.
+This 2026-05-14 version refresh supersedes the older `codex-cli 0.128.0` capture. The current version of record on this machine is `codex-cli 0.130.0`.
 
 Fresh remote bootstrap was probed with a loopback websocket stub and:
 
@@ -161,7 +164,7 @@ Before any user turn, the CLI opened a connection and issued:
 
 That proves fresh `codex --remote` allocates a thread during bootstrap, before the first user turn, but that thread allocation is not yet the durable contract Freshell may persist.
 
-The remote resume form was re-proved through a websocket proxy in front of the real app-server. Before any user turn, `codex --remote <ws> --no-alt-screen resume <sessionId>` issued the stable prefix through `thread/resume`, and then the follow-up `skills/list` and `account/rateLimits/read` calls. The trailing post-resume follow-up order was observed to vary between reruns on the same binary, so only the stable prefix plus the required follow-up method set is treated as contract.
+The remote resume form was re-proved through a websocket proxy in front of the real app-server. Before any user turn, `codex --remote <ws> --no-alt-screen resume <sessionId>` issued the stable prefix through `thread/resume`, and then the follow-up `account/rateLimits/read`, `command/exec`, `hooks/list`, `skills/list`, and `thread/goal/get` calls. The trailing post-resume follow-up order was observed to vary between reruns on the same binary, so only the stable prefix plus the required follow-up method set is treated as contract.
 
 Real provider-owned durability was re-proved against the app-server websocket with:
 
@@ -230,6 +233,19 @@ Allowed Freshell behavior:
 - Freshell may only persist canonical Codex identity after the durable `.jsonl` artifact exists at the provider-reported `thread.path`.
 - Freshell must not treat the bootstrap `thread/start` id as durable restore identity.
 
+### 2026-05-14 Codex restore decision addendum
+
+The `da2e0076` refactor added a design constraint that belongs with the provider contract: deterministic Codex restore needs one typed create/restore decision path, not only a correct rollout proof reader. Restore-like entry points must make the same decision about canonical `sessionRef`, captured candidate proof, live attach after proof failure, fresh create, and legacy raw resume. Keeping those choices local to each caller risks separate restore semantics.
+
+Design-level change recorded from `/home/user/code/freshell/.worktrees/codex-stability-implementation-20260514`: `/home/user/code/freshell/.worktrees/codex-stability-implementation-20260514/server/coding-cli/codex-app-server/restore-decision.ts` now owns `planCodexCreateRestoreDecision` and `resolveCodexCreateRestoreDecision`, and `/home/user/code/freshell/.worktrees/codex-stability-implementation-20260514/server/ws-handler.ts` routes Codex `terminal.create` and reopen handling through it. This is a narrow centralization, not a claim that every surface is done.
+
+Follow-up constraints:
+
+- Move exact live-candidate matching into the central module or make its typed input contract require enough live candidate identity for the module to verify `candidateThreadId` and `rolloutPath`.
+- Remove or replace `legacy_raw_resume_passthrough`; raw resume should not remain a durable restore identity path.
+- Extend the same decision path to REST, MCP, CLI, and any future restore-like surface instead of maintaining parallel semantics.
+- Add surface matrix tests so coverage proves all entry points use the same restore decisions, not just the decision module and the current websocket route.
+
 ## Claude
 
 Version and binaries:
@@ -239,10 +255,8 @@ command -v claude
 # /home/user/bin/claude
 
 claude --version
-# 2.1.132 (Claude Code)
+# 2.1.140 (Claude Code)
 ```
-
-This Claude Code version line was refreshed on `2026-05-06`; the behavior observations below remain from the `2026-04-26` real-provider proof.
 
 The wrapper at `/home/user/bin/claude` shells out to `/home/user/.local/bin/claude`. The isolated probes used the actual binary and overrode `HOME` to keep persistence inside the probe temp root.
 

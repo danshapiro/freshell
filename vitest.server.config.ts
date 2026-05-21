@@ -27,6 +27,7 @@ export default defineConfig({
       'test/unit/server/**/*.test.ts',
       'test/unit/visible-first/**/*.test.ts',
       'test/integration/server/**/*.test.ts',
+      'test/integration/real/**/*.test.ts',
       'test/integration/session-repair.test.ts',
       'test/integration/session-search-e2e.test.ts',
       'test/integration/extension-system.test.ts',

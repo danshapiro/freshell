@@ -74,6 +74,7 @@ type OpencodeFacts = {
   canonicalIdentity: 'session-id'
   runEventSessionIdMatchesDbId: boolean
   busyStatusUsesAuthoritativeSessionId: boolean
+  attachFormatJsonEmitsEvents: boolean
   titleOnResumeMutatesStoredTitle: boolean
   sessionSubcommands: string[]
 }
@@ -213,7 +214,7 @@ async function listFilesRecursive(rootDir: string): Promise<string[]> {
 async function waitForHttpJson(url: string, timeoutMs = 30_000): Promise<unknown> {
   return waitFor(`HTTP JSON at ${url}`, async () => {
     try {
-      const response = await fetch(url)
+      const response = await fetchWithTimeout(url)
       if (!response.ok) {
         return undefined
       }
@@ -222,6 +223,16 @@ async function waitForHttpJson(url: string, timeoutMs = 30_000): Promise<unknown
       return undefined
     }
   }, timeoutMs, 200)
+}
+
+async function fetchWithTimeout(url: string, timeoutMs = 2_000): Promise<Response> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(url, { signal: controller.signal })
+  } finally {
+    clearTimeout(timeout)
+  }
 }
 
 function parseJsonLines(text: string): unknown[] {
@@ -514,23 +525,32 @@ export class ProbeWorkspace {
       stderr += chunk
     })
 
+    const exitPromise = new Promise<ExitSummary>((resolve, reject) => {
+      child.once('error', reject)
+      child.once('close', (code, signal) => {
+        resolve({
+          code,
+          signal,
+        })
+      })
+    })
+
     const waitForExit = (timeoutMs = 30_000) =>
       new Promise<ExitSummary>((resolve, reject) => {
         const timeout = setTimeout(() => {
           reject(new Error(`Timed out waiting for process ${command} (${child.pid}) to exit.`))
         }, timeoutMs)
 
-        child.once('error', (error) => {
-          clearTimeout(timeout)
-          reject(error)
-        })
-        child.once('close', (code, signal) => {
-          clearTimeout(timeout)
-          resolve({
-            code,
-            signal,
-          })
-        })
+        exitPromise.then(
+          (summary) => {
+            clearTimeout(timeout)
+            resolve(summary)
+          },
+          (error) => {
+            clearTimeout(timeout)
+            reject(error)
+          },
+        )
       })
 
     const stop = async () => {
@@ -1099,9 +1119,9 @@ export async function captureCodexBootstrapEvents(
   })
 
   try {
-    await waitFor('Codex bootstrap thread/start', async () => {
-      return events.includes('thread/start') ? true : undefined
-    }, 30_000, 100)
+    await waitFor('Codex bootstrap model/list', async () => {
+      return events.includes('model/list') ? true : undefined
+    }, 30_000, 100).catch(() => undefined)
     return [...events]
   } finally {
     await remote.stop().catch(() => undefined)
@@ -1268,11 +1288,15 @@ export async function waitForFileSizeIncrease(filePath: string, previousSize: nu
 }
 
 export async function fetchJson(url: string): Promise<any> {
-  const response = await fetch(url)
+  const response = await fetchWithTimeout(url)
   if (!response.ok) {
     throw new Error(`Expected a successful response from ${url}, received ${response.status}.`)
   }
   return response.json()
+}
+
+export async function waitForJsonResponse(url: string): Promise<any> {
+  return waitForHttpJson(url)
 }
 
 export async function waitForHttpBusyStatus(url: string, sessionId: string): Promise<Record<string, { type: string }>> {

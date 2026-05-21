@@ -8,7 +8,6 @@ import {
   type PaneContentInput,
   type PaneNode,
   type PaneRefreshRequest,
-  type RestoreFallbackAttempt,
 } from './paneTypes'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { matchesDerivedPaneTitle } from '@/lib/pane-title'
@@ -19,7 +18,9 @@ import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { createLogger } from '@/lib/client-logger'
 import { patchBrowserPreferencesRecord } from '@/lib/browser-preferences'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
-import { RestoreErrorSchema, sanitizeSessionRef } from '@shared/session-contract'
+import { RestoreErrorSchema, migrateLegacyAgentChatDurableState, sanitizeSessionRef } from '@shared/session-contract'
+import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
+import { migrateLegacyFreshAgentContent } from '@shared/fresh-agent'
 
 
 const log = createLogger('PanesSlice')
@@ -30,7 +31,7 @@ type HydratePanesMeta = {
 }
 
 function buildPreservedSessionRef(
-  localContent: Extract<PaneContent, { kind: 'terminal' | 'agent-chat' }>,
+  localContent: Extract<PaneContent, { kind: 'terminal' | 'agent-chat' | 'fresh-agent' }>,
   _preservedResumeSessionId?: string,
 ) {
   return sanitizeSessionRef(localContent.sessionRef)
@@ -43,6 +44,7 @@ function normalizePaneContent(
   input: PaneContentInput | PaneContent,
   previous?: PaneContent,
 ): PaneContent {
+  input = migrateLegacyFreshAgentContent(input as any) as PaneContentInput | PaneContent
   if (input.kind === 'terminal') {
     const mode = typeof input.mode === 'string' ? input.mode : 'shell'
     const inputResumeSessionId = typeof input.resumeSessionId === 'string'
@@ -50,6 +52,7 @@ function normalizePaneContent(
       : undefined
     const resumeSessionId = inputResumeSessionId
     const sessionRef = sanitizeSessionRef(input.sessionRef)
+    const codexDurability = sanitizeCodexDurabilityRef(input.codexDurability)
     const restoreError = RestoreErrorSchema.safeParse((input as { restoreError?: unknown }).restoreError)
     return {
       kind: 'terminal',
@@ -62,6 +65,7 @@ function normalizePaneContent(
       shell: typeof input.shell === 'string' ? input.shell : 'system',
       resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
+      ...(codexDurability ? { codexDurability } : {}),
       serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
       ...(restoreError.success ? { restoreError: restoreError.data } : {}),
       initialCwd: typeof input.initialCwd === 'string' ? input.initialCwd : undefined,
@@ -78,6 +82,42 @@ function normalizePaneContent(
           : previousBrowserInstanceId || nanoid(),
       url: typeof input.url === 'string' ? input.url : '',
       devToolsOpen: typeof input.devToolsOpen === 'boolean' ? input.devToolsOpen : false,
+    }
+  }
+  if (input.kind === 'fresh-agent') {
+    const durableState = input.provider === 'claude'
+      ? migrateLegacyAgentChatDurableState({
+          sessionRef: input.sessionRef,
+          resumeSessionId: typeof input.resumeSessionId === 'string' ? input.resumeSessionId : undefined,
+        })
+      : { sessionRef: sanitizeSessionRef(input.sessionRef) }
+    const sessionRef = durableState.sessionRef
+    const restoreError = RestoreErrorSchema.safeParse((input as { restoreError?: unknown }).restoreError)
+    return {
+      kind: 'fresh-agent',
+      sessionType: input.sessionType,
+      provider: input.provider,
+      sessionId: input.sessionId,
+      createRequestId: input.createRequestId || nanoid(),
+      status: input.status || 'creating',
+      resumeSessionId: input.resumeSessionId,
+      ...(sessionRef ? { sessionRef } : {}),
+      serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
+      ...(restoreError.success
+        ? { restoreError: restoreError.data }
+        : ('restoreError' in durableState && durableState.restoreError ? { restoreError: durableState.restoreError } : {})),
+      initialCwd: input.initialCwd,
+      createError: input.createError,
+      modelSelection: normalizeAgentChatModelSelection(
+        (input as { modelSelection?: unknown }).modelSelection,
+        (input as { model?: unknown }).model,
+      ),
+      model: input.model,
+      permissionMode: input.permissionMode,
+      sandbox: input.sandbox,
+      effort: normalizeAgentChatEffortOverride(input.effort),
+      plugins: input.plugins,
+      settingsDismissed: input.settingsDismissed,
     }
   }
   if (input.kind === 'agent-chat') {
@@ -112,12 +152,14 @@ function normalizePaneContent(
   return input
 }
 
-function shouldPreferLocalAgentChatPaneDuringHydration(
+function shouldPreferLocalAgentPaneDuringHydration(
   localContent: PaneContent,
   incomingContent: PaneContent,
   meta: HydratePanesMeta | undefined,
 ): boolean {
-  if (localContent.kind !== 'agent-chat' || incomingContent.kind !== 'agent-chat') {
+  const localIsAgentPane = localContent.kind === 'agent-chat' || localContent.kind === 'fresh-agent'
+  const incomingIsAgentPane = incomingContent.kind === 'agent-chat' || incomingContent.kind === 'fresh-agent'
+  if (!localIsAgentPane || !incomingIsAgentPane || localContent.kind !== incomingContent.kind) {
     return false
   }
 
@@ -603,11 +645,14 @@ function mergeTerminalState(
       }
     }
 
-    // Agent-chat panes: prefer local sessionId and status when the local state
+    // Agent panes: prefer local sessionId and status when the local state
     // is more advanced. The persist debounce means incoming (from localStorage)
     // can be stale — e.g. status 'starting' when local has already reached 'connected'.
-    if (incoming.content?.kind === 'agent-chat' && local.content?.kind === 'agent-chat') {
-      if (shouldPreferLocalAgentChatPaneDuringHydration(local.content, incoming.content, meta)) {
+    if (
+      (incoming.content?.kind === 'agent-chat' || incoming.content?.kind === 'fresh-agent')
+      && incoming.content?.kind === local.content?.kind
+    ) {
+      if (shouldPreferLocalAgentPaneDuringHydration(local.content, incoming.content, meta)) {
         return local
       }
       if (incoming.content.createRequestId === local.content.createRequestId) {
@@ -969,7 +1014,6 @@ export const panesSlice = createSlice({
         if (state.paneTitleSetByUser?.[tabId]?.[paneId]) {
           delete state.paneTitleSetByUser[tabId][paneId]
         }
-        clearRestoreFallbackAttemptForPane(state, tabId, paneId)
 
         // Clear zoom if the zoomed pane was closed
         if (state.zoomedPane?.[tabId] === paneId) {
@@ -1180,7 +1224,6 @@ export const panesSlice = createSlice({
       if (state.paneTitleSetByUser?.[tabId]?.[paneId]) {
         delete state.paneTitleSetByUser[tabId][paneId]
       }
-      clearRestoreFallbackAttemptForPane(state, tabId, paneId)
 
       reconcileRefreshRequestsForTab(state, tabId)
     },
@@ -1286,7 +1329,7 @@ export const panesSlice = createSlice({
 
       function restartContent(node: PaneNode): PaneNode {
         if (node.type === 'leaf') {
-          if (node.id !== paneId || node.content.kind !== 'agent-chat') {
+          if (node.id !== paneId || (node.content.kind !== 'agent-chat' && node.content.kind !== 'fresh-agent')) {
             return node
           }
           return {
@@ -1381,38 +1424,6 @@ export const panesSlice = createSlice({
       const request = state.refreshRequestsByPane?.[tabId]?.[paneId]
       if (!request || request.requestId !== requestId) return
       clearPaneRefreshRequest(state, tabId, paneId)
-    },
-
-    recordRestoreFallbackAttempt: (
-      state,
-      action: PayloadAction<{ tabId: string; paneId: string } & RestoreFallbackAttempt>
-    ) => {
-      const { tabId, paneId, staleTerminalId, requestId, reason } = action.payload
-      if (!state.restoreFallbackAttemptsByPane) state.restoreFallbackAttemptsByPane = {}
-      if (!state.restoreFallbackAttemptsByPane[tabId]) state.restoreFallbackAttemptsByPane[tabId] = {}
-      state.restoreFallbackAttemptsByPane[tabId][paneId] = {
-        staleTerminalId,
-        requestId,
-        reason,
-      }
-    },
-
-    clearRestoreFallbackAttempt: (
-      state,
-      action: PayloadAction<{ tabId: string; paneId: string }>
-    ) => {
-      clearRestoreFallbackAttemptForPane(state, action.payload.tabId, action.payload.paneId)
-    },
-
-    clearRestoreFallbackAttemptsForTab: (
-      state,
-      action: PayloadAction<{ tabId: string }>
-    ) => {
-      delete state.restoreFallbackAttemptsByPane?.[action.payload.tabId]
-    },
-
-    clearAllRestoreFallbackAttempts: (state) => {
-      state.restoreFallbackAttemptsByPane = {}
     },
 
     removeLayout: (
@@ -1577,7 +1588,6 @@ export const panesSlice = createSlice({
             const staleTerminalId = node.content.terminalId
             const nextRequestId = nanoid()
             node.content.terminalId = undefined
-            node.content.serverInstanceId = undefined
             node.content.status = 'creating'
             node.content.createRequestId = nextRequestId
             if (!sanitizeSessionRef(node.content.sessionRef)) {
@@ -1632,10 +1642,6 @@ export const {
   requestPaneRefresh,
   requestTabRefresh,
   consumePaneRefreshRequest,
-  recordRestoreFallbackAttempt,
-  clearRestoreFallbackAttempt,
-  clearRestoreFallbackAttemptsForTab,
-  clearAllRestoreFallbackAttempts,
   removeLayout,
   hydratePanes,
   updatePaneTitle,

@@ -13,6 +13,7 @@ type OpencodeSessionRow = {
   createdAt: number
   lastActivityAt: number
   projectPath: string | null
+  hasThreeViewsMarker?: number | null
 }
 
 type OpencodeSessionSchema = {
@@ -56,6 +57,12 @@ function toValidTimestamp(value: unknown): number | undefined {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+const THREE_VIEWS_MARKER_SQL_PATTERN = '%<freshell-session-metadata origin=3-views%'
+
+function toSqliteBoolean(value: unknown): boolean {
+  return value === true || value === 1
 }
 
 export class OpencodeProvider implements CodingCliProvider {
@@ -159,14 +166,31 @@ export class OpencodeProvider implements CodingCliProvider {
           s.title AS title,
           s.time_created AS createdAt,
           s.time_updated AS lastActivityAt,
-          p.worktree AS projectPath
+          p.worktree AS projectPath,
+          (
+            EXISTS (
+              SELECT 1
+              FROM part pa
+              WHERE pa.session_id = s.id
+                AND pa.data LIKE ?
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM message m
+              WHERE m.session_id = s.id
+                AND m.data LIKE ?
+            )
+          ) AS hasThreeViewsMarker
         FROM session s
         LEFT JOIN project p
           ON p.id = s.project_id
         WHERE s.time_archived IS NULL
           ${rootFilter}
         ORDER BY s.time_updated DESC
-      `).all() as OpencodeSessionRow[]
+      `).all(
+        THREE_VIEWS_MARKER_SQL_PATTERN,
+        THREE_VIEWS_MARKER_SQL_PATTERN,
+      ) as OpencodeSessionRow[]
 
       if (rows.length === 0) {
         this.logDatabaseStateOnce('info', 'empty_db', 'OpenCode sessions database has no active root sessions', {
@@ -179,6 +203,7 @@ export class OpencodeProvider implements CodingCliProvider {
       for (const row of rows) {
         if (typeof row.cwd !== 'string' || !row.cwd) continue
         const projectPath = row.projectPath || await resolveGitRepoRoot(row.cwd)
+        const isThreeViewsSession = toSqliteBoolean(row.hasThreeViewsMarker)
         sessions.push({
           provider: this.name,
           sessionId: row.sessionId,
@@ -187,6 +212,8 @@ export class OpencodeProvider implements CodingCliProvider {
           title: typeof row.title === 'string' ? row.title : undefined,
           lastActivityAt: toValidTimestamp(row.lastActivityAt) ?? Date.now(),
           createdAt: toValidTimestamp(row.createdAt),
+          isSubagent: isThreeViewsSession || undefined,
+          isNonInteractive: isThreeViewsSession || undefined,
         })
       }
       return sessions
@@ -329,9 +356,8 @@ export class OpencodeProvider implements CodingCliProvider {
     return schema
   }
 
-  getSessionGlob(): string {
-    const [dbPath, walPath] = this.getWatchedDatabasePaths()
-    return `{${dbPath},${walPath}}`
+  getSessionGlob(): string[] {
+    return this.getWatchedDatabasePaths()
   }
 
   getSessionRoots(): string[] {

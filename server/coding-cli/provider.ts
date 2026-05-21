@@ -18,7 +18,7 @@ export interface CodingCliProvider {
   readonly homeDir: string
 
   listSessionsDirect?(): Promise<CodingCliSession[]>
-  getSessionGlob(): string
+  getSessionGlob(): string | string[]
   getSessionRoots(): string[]
   getSessionWatchBases?(): string[]
   listSessionFiles(): Promise<string[]>

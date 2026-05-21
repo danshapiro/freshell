@@ -54,8 +54,8 @@ function baseSeed(tabsRaw: string, panesRaw: string): StorageSeed {
 }
 
 export function buildAgentChatBrowserStorageSeed(): StorageSeed {
-  const tabId = 'tab-agent-chat'
-  const paneId = 'pane-agent-chat'
+  const tabId = 'tab-fresh-agent'
+  const paneId = 'pane-fresh-agent'
 
   return baseSeed(
     buildTabsPayload({
@@ -63,8 +63,8 @@ export function buildAgentChatBrowserStorageSeed(): StorageSeed {
       tabs: [
         {
           id: tabId,
-          title: 'Agent Chat Audit',
-          createRequestId: 'tab-agent-chat',
+          title: 'Fresh Agent Audit',
+          createRequestId: 'tab-fresh-agent',
         },
       ],
     }),
@@ -74,10 +74,11 @@ export function buildAgentChatBrowserStorageSeed(): StorageSeed {
           type: 'leaf',
           id: paneId,
           content: {
-            kind: 'agent-chat',
-            provider: 'freshclaude',
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
             sessionId: VISIBLE_FIRST_LONG_HISTORY_SESSION_ID,
-            createRequestId: 'agent-chat-audit-create',
+            createRequestId: 'fresh-agent-audit-create',
             status: 'idle',
             resumeSessionId: VISIBLE_FIRST_LONG_HISTORY_SESSION_ID,
           },
@@ -88,7 +89,7 @@ export function buildAgentChatBrowserStorageSeed(): StorageSeed {
       },
       paneTitles: {
         [tabId]: {
-          [paneId]: 'Agent Chat Audit',
+          [paneId]: 'Fresh Agent Audit',
         },
       },
     }),
@@ -139,8 +140,8 @@ export function buildTerminalBrowserStorageSeed(): StorageSeed {
 export function buildOffscreenTabBrowserStorageSeed(): StorageSeed {
   const terminalTabId = 'tab-terminal'
   const terminalPaneId = 'pane-terminal'
-  const agentChatTabId = 'tab-heavy-agent-chat'
-  const agentChatPaneId = 'pane-heavy-agent-chat'
+  const agentChatTabId = 'tab-heavy-fresh-agent'
+  const agentChatPaneId = 'pane-heavy-fresh-agent'
 
   return baseSeed(
     buildTabsPayload({
@@ -153,8 +154,8 @@ export function buildOffscreenTabBrowserStorageSeed(): StorageSeed {
         },
         {
           id: agentChatTabId,
-          title: 'Background Agent Chat',
-          createRequestId: 'tab-heavy-agent-chat',
+          title: 'Background Fresh Agent',
+          createRequestId: 'tab-heavy-fresh-agent',
         },
       ],
     }),
@@ -175,10 +176,11 @@ export function buildOffscreenTabBrowserStorageSeed(): StorageSeed {
           type: 'leaf',
           id: agentChatPaneId,
           content: {
-            kind: 'agent-chat',
-            provider: 'freshclaude',
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
             sessionId: VISIBLE_FIRST_LONG_HISTORY_SESSION_ID,
-            createRequestId: 'agent-chat-heavy-create',
+            createRequestId: 'fresh-agent-heavy-create',
             status: 'idle',
             resumeSessionId: VISIBLE_FIRST_LONG_HISTORY_SESSION_ID,
           },
@@ -193,7 +195,7 @@ export function buildOffscreenTabBrowserStorageSeed(): StorageSeed {
           [terminalPaneId]: 'Terminal Audit',
         },
         [agentChatTabId]: {
-          [agentChatPaneId]: 'Background Agent Chat',
+          [agentChatPaneId]: 'Background Fresh Agent',
         },
       },
     }),

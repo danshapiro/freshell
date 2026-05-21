@@ -50,4 +50,31 @@ describe('UiLayoutSyncSchema', () => {
 
     expect(parsed.success).toBe(false)
   })
+
+  it('accepts fresh-agent pane payloads in synchronized layouts', () => {
+    const parsed = UiLayoutSyncSchema.safeParse({
+      type: 'ui.layout.sync',
+      tabs: [{ id: 'tab_a', title: 'alpha' }],
+      activeTabId: 'tab_a',
+      layouts: {
+        tab_a: {
+          type: 'leaf',
+          id: 'pane_a',
+          content: {
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-1',
+            status: 'idle',
+          },
+        },
+      },
+      activePane: { tab_a: 'pane_a' },
+      paneTitles: {},
+      paneTitleSetByUser: {},
+      timestamp: Date.now(),
+    })
+
+    expect(parsed.success).toBe(true)
+  })
 })

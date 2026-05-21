@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import type { SidebarSessionItem } from '@/store/selectors/sidebarSelectors'
-import type { ProjectGroup, CodingCliSession } from '@/store/types'
+import type { ProjectGroup, CodingCliSession, BackgroundTerminal } from '@/store/types'
 
 import {
   buildSessionItems,
@@ -390,6 +390,163 @@ describe('sidebarSelectors', () => {
           hasTitle: false,
           cwd: '/tmp/restored-project',
           isFallback: true,
+        }),
+      ])
+    })
+
+    it('shows running Codex terminals with captured identity as non-restorable live rows', () => {
+      const terminals: BackgroundTerminal[] = [
+        {
+          terminalId: 'term-codex-a',
+          title: 'Codex CLI',
+          createdAt: 2_000,
+          lastActivityAt: 2_100,
+          status: 'running',
+          hasClients: true,
+          cwd: '/repo',
+          mode: 'codex',
+          codexDurability: {
+            schemaVersion: 1,
+            state: 'captured_pre_turn',
+            candidate: {
+              provider: 'codex',
+              candidateThreadId: 'thread-candidate',
+              rolloutPath: '/home/user/.codex/sessions/rollout.jsonl',
+              source: 'thread_start_response',
+              capturedAt: 2_000,
+            },
+          },
+        },
+        {
+          terminalId: 'term-codex-b',
+          title: 'Codex CLI',
+          createdAt: 2_050,
+          lastActivityAt: 2_200,
+          status: 'running',
+          hasClients: false,
+          cwd: '/repo',
+          mode: 'codex',
+          codexDurability: {
+            schemaVersion: 1,
+            state: 'captured_pre_turn',
+            candidate: {
+              provider: 'codex',
+              candidateThreadId: 'thread-candidate',
+              rolloutPath: '/home/user/.codex/sessions/rollout.jsonl',
+              source: 'thread_start_response',
+              capturedAt: 2_000,
+            },
+          },
+        },
+      ]
+
+      const items = buildSessionItems([], emptyTabs, emptyPanes, terminals, emptyActivity)
+
+      expect(items).toEqual([
+        expect.objectContaining({
+          sessionId: 'thread-candidate',
+          provider: 'codex',
+          title: 'Codex CLI',
+          cwd: '/repo',
+          hasTab: false,
+          isRunning: true,
+          runningTerminalId: 'term-codex-a',
+          runningTerminalIds: ['term-codex-a', 'term-codex-b'],
+          isRestorable: false,
+          codexDurabilityState: 'captured_pre_turn',
+          isFallback: true,
+        }),
+      ])
+    })
+
+    it('shows durable Codex terminal identity as restorable even before the server window includes history', () => {
+      const terminals: BackgroundTerminal[] = [
+        {
+          terminalId: 'term-codex-durable',
+          title: 'Codex CLI',
+          createdAt: 2_000,
+          lastActivityAt: 2_100,
+          status: 'running',
+          hasClients: true,
+          cwd: '/repo',
+          mode: 'codex',
+          codexDurability: {
+            schemaVersion: 1,
+            state: 'durable',
+            durableThreadId: 'thread-durable',
+            candidate: {
+              provider: 'codex',
+              candidateThreadId: 'thread-durable',
+              rolloutPath: '/home/user/.codex/sessions/rollout.jsonl',
+              source: 'thread_start_response',
+              capturedAt: 2_000,
+            },
+            turnCompletedAt: 2_050,
+          },
+        },
+      ]
+
+      const items = buildSessionItems([], emptyTabs, emptyPanes, terminals, emptyActivity)
+
+      expect(items).toEqual([
+        expect.objectContaining({
+          sessionId: 'thread-durable',
+          provider: 'codex',
+          hasTab: false,
+          isRunning: true,
+          runningTerminalId: 'term-codex-durable',
+          isRestorable: true,
+          codexDurabilityState: 'durable',
+        }),
+      ])
+    })
+
+    it('shows persisted Codex pane identity without treating it as a durable resume target', () => {
+      const tabs = [
+        { id: 'tab-codex', title: 'Current Codex', mode: 'codex', createdAt: 2_000 },
+      ] as any
+      const panes = {
+        layouts: {
+          'tab-codex': {
+            type: 'leaf',
+            id: 'pane-codex',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              status: 'running',
+              createRequestId: 'req-codex',
+              initialCwd: '/repo',
+              codexDurability: {
+                schemaVersion: 1,
+                state: 'captured_pre_turn',
+                candidate: {
+                  provider: 'codex',
+                  candidateThreadId: 'thread-pre-durable',
+                  rolloutPath: '/home/user/.codex/sessions/rollout.jsonl',
+                  source: 'restored_client_state',
+                  capturedAt: 2_000,
+                },
+              },
+            },
+          },
+        },
+        activePane: {
+          'tab-codex': 'pane-codex',
+        },
+      } as any
+
+      const items = buildSessionItems([], tabs, panes, emptyTerminals, emptyActivity)
+
+      expect(items).toEqual([
+        expect.objectContaining({
+          sessionId: 'thread-pre-durable',
+          provider: 'codex',
+          title: 'Current Codex',
+          cwd: '/repo',
+          hasTab: true,
+          isRunning: false,
+          isRestorable: false,
+          codexDurabilityState: 'captured_pre_turn',
         }),
       ])
     })

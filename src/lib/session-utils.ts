@@ -3,6 +3,7 @@
  */
 
 import { isNonShellMode } from '@/lib/coding-cli-utils'
+import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { PaneContent, PaneNode } from '@/store/paneTypes'
 import type { RootState } from '@/store/store'
 import type { CodingCliProviderName } from '@/store/types'
@@ -83,6 +84,13 @@ function extractExplicitSessionLocator(content: PaneContent): {
   return sanitizeSessionLocator(explicit)
 }
 
+function extractCodexDurabilityLocator(content: PaneContent): SessionMatchLocator | undefined {
+  if (content.kind !== 'terminal' || content.mode !== 'codex') return undefined
+  const sessionId = content.codexDurability?.durableThreadId
+    ?? content.codexDurability?.candidate?.candidateThreadId
+  return sessionId ? { provider: 'codex', sessionId } : undefined
+}
+
 function extractSessionLocatorServerInstanceHint(content: PaneContent): string | undefined {
   return isNonEmptyString((content as { serverInstanceId?: unknown }).serverInstanceId)
     ? (content as { serverInstanceId: string }).serverInstanceId
@@ -119,9 +127,20 @@ function extractSessionLocators(content: PaneContent): Array<{
     locators.push({ provider: 'claude', sessionId })
     return dedupeBy(locators, locatorIdentity)
   }
+  if (content.kind === 'fresh-agent') {
+    const sessionId = content.resumeSessionId
+    const provider = resolveFreshAgentType(content.sessionType)?.runtimeProvider ?? content.provider
+    if (!sessionId || !provider) return dedupeBy(locators, locatorIdentity)
+    locators.push({ provider, sessionId })
+    return dedupeBy(locators, locatorIdentity)
+  }
   if (content.kind !== 'terminal') return dedupeBy(locators, locatorIdentity)
   if (content.mode === 'shell') return dedupeBy(locators, locatorIdentity)
   if (!isNonShellMode(content.mode)) return dedupeBy(locators, locatorIdentity)
+  const codexDurabilityLocator = extractCodexDurabilityLocator(content)
+  if (codexDurabilityLocator) {
+    locators.push(codexDurabilityLocator)
+  }
   const sessionId = content.resumeSessionId
   if (!sessionId || content.mode !== 'claude' || !isValidClaudeSessionId(sessionId)) {
     return dedupeBy(locators, locatorIdentity)
@@ -136,6 +155,11 @@ function buildTabFallbackLocator(tab: RootState['tabs']['tabs'][number]): Sessio
     return explicitSessionRef
   }
   const provider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
+  if (provider === 'codex') {
+    const sessionId = tab.codexDurability?.durableThreadId
+      ?? tab.codexDurability?.candidate?.candidateThreadId
+    if (sessionId) return sanitizeSessionLocator({ provider, sessionId })
+  }
   const sessionId = tab.resumeSessionId
   if (provider !== 'claude' || !sessionId || !isValidClaudeSessionId(sessionId)) return undefined
   return sanitizeSessionLocator({ provider, sessionId })
@@ -353,6 +377,11 @@ export function findTabIdForSession(
   return selectBestSessionMatch(candidates, sanitizedTarget, localServerInstanceId)?.tabId
 }
 
+/**
+ * Find the tab and pane that contain a specific session.
+ * Walks all tabs' pane trees looking for a pane (terminal, agent-chat, or fresh-agent) matching the provider + sessionId.
+ * Falls back to tab-level resumeSessionId when no layout exists (early boot/rehydration).
+ */
 export function findPaneForSession(
   state: RootState,
   target: SessionMatchLocator,

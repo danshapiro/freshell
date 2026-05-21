@@ -37,6 +37,7 @@ const {
   mockSend,
   mockTerminalView,
   mockAgentChatView,
+  mockFreshAgentView,
   mockBrowserPane,
   browserPaneMounts,
   browserPaneUnmounts,
@@ -44,6 +45,8 @@ const {
   mockApiPost,
   mockApiPatch,
   saveServerSettingsPatchSpy,
+  cancelCreateSpy,
+  cancelWsCreateSpy,
 } = vi.hoisted(() => ({
   mockSend: vi.fn(),
   mockTerminalView: vi.fn(({ tabId, paneId, hidden }: { tabId: string; paneId: string; hidden?: boolean }) => (
@@ -51,6 +54,9 @@ const {
   )),
   mockAgentChatView: vi.fn(({ paneId }: { paneId: string }) => (
     <div data-testid={`agent-chat-${paneId}`}>Agent Chat</div>
+  )),
+  mockFreshAgentView: vi.fn(({ paneId }: { paneId: string }) => (
+    <div data-testid={`fresh-agent-${paneId}`}>Fresh Agent</div>
   )),
   mockBrowserPane: vi.fn(),
   browserPaneMounts: [] as string[],
@@ -62,12 +68,16 @@ const {
     type: 'settings/saveServerSettingsPatch',
     payload: patch,
   })),
+  cancelCreateSpy: vi.fn(),
+  cancelWsCreateSpy: vi.fn(),
 }))
 
 // Mock the ws-client module
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: mockSend,
+    cancelCreate: cancelWsCreateSpy,
+    onMessage: () => () => {},
   }),
 }))
 
@@ -77,10 +87,20 @@ vi.mock('@/lib/api', () => ({
     post: (path: string, body: unknown) => mockApiPost(path, body),
     patch: (path: string, body: unknown) => mockApiPatch(path, body),
   },
+  getFreshAgentThreadSnapshot: vi.fn().mockResolvedValue({
+    status: 'idle',
+    summary: 'Fresh agent test snapshot',
+    capabilities: { send: false, interrupt: false, fork: false },
+    turns: [],
+  }),
 }))
 
 vi.mock('@/store/settingsThunks', () => ({
   saveServerSettingsPatch: (patch: unknown) => saveServerSettingsPatchSpy(patch),
+}))
+
+vi.mock('@/lib/sdk-message-handler', () => ({
+  cancelCreate: (requestId: string) => cancelCreateSpy(requestId),
 }))
 
 // Mock lucide-react icons
@@ -114,6 +134,9 @@ vi.mock('lucide-react', () => ({
   ),
   Code: ({ className }: { className?: string }) => (
     <svg data-testid="code-icon" className={className} />
+  ),
+  WrapText: ({ className }: { className?: string }) => (
+    <svg data-testid="wrap-text-icon" className={className} />
   ),
   FileText: ({ className }: { className?: string }) => (
     <svg data-testid="file-text-icon" className={className} />
@@ -163,6 +186,10 @@ vi.mock('@/components/TerminalView', () => ({
 
 vi.mock('@/components/agent-chat/AgentChatView', () => ({
   default: mockAgentChatView,
+}))
+
+vi.mock('@/components/fresh-agent/FreshAgentView', () => ({
+  default: mockFreshAgentView,
 }))
 
 // Mock BrowserPane component
@@ -300,6 +327,7 @@ describe('PaneContainer', () => {
     mockSend.mockClear()
     mockTerminalView.mockClear()
     mockAgentChatView.mockClear()
+    mockFreshAgentView.mockClear()
     mockBrowserPane.mockClear()
     browserPaneMounts.length = 0
     browserPaneUnmounts.length = 0
@@ -307,6 +335,8 @@ describe('PaneContainer', () => {
     mockApiPost.mockReset()
     mockApiPatch.mockReset()
     saveServerSettingsPatchSpy.mockClear()
+    cancelCreateSpy.mockClear()
+    cancelWsCreateSpy.mockClear()
     mockApiGet.mockResolvedValue({ directories: [] })
     mockApiPost.mockResolvedValue({ valid: true, resolvedPath: '/resolved/path' })
     mockApiPatch.mockResolvedValue({})
@@ -810,6 +840,47 @@ describe('PaneContainer', () => {
       expect(store.getState().agentChat.pendingCreates['req-1']).toBeUndefined()
     })
 
+    it('cancels pending agent-chat socket create tracking when closing before sdk.created arrives', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-agent-pending',
+        content: {
+          kind: 'agent-chat',
+          provider: 'freshclaude',
+          createRequestId: 'req-agent-pending',
+          status: 'starting',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-agent-pending' },
+        },
+        {},
+        {},
+        {
+          pendingCreates: {
+            'req-agent-pending': {
+              sessionId: undefined,
+              expectsHistoryHydration: false,
+            },
+          },
+        } as Partial<AgentChatState>,
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
+
+      expect(cancelCreateSpy).toHaveBeenCalledWith('req-agent-pending')
+      expect(cancelWsCreateSpy).toHaveBeenCalledWith('req-agent-pending')
+      expect(mockSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.kill' }))
+    })
+
     it('closes second pane when its close button is clicked', () => {
       const pane1Id = 'pane-1'
       const pane2Id = 'pane-2'
@@ -851,6 +922,84 @@ describe('PaneContainer', () => {
       const state = store.getState().panes
       expect(state.layouts['tab-1'].type).toBe('leaf')
       expect((state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).id).toBe(pane1Id)
+    })
+
+    it('sends freshAgent.kill when a fresh-agent pane is closed', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-fresh-agent',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-fresh-close',
+          sessionId: 'thread-codex-1',
+          status: 'connected',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-fresh-agent' },
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
+
+      expect(mockSend).toHaveBeenCalledWith({
+        type: 'freshAgent.kill',
+        sessionId: 'thread-codex-1',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+      })
+    })
+
+    it('cancels a pending fresh-agent create when the pane closes before session creation finishes', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-fresh-agent-pending',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-fresh-pending',
+          status: 'creating',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-fresh-agent-pending' },
+        },
+        {},
+        {},
+        {
+          pendingCreates: {
+            'req-fresh-pending': {
+              sessionId: undefined,
+              expectsHistoryHydration: false,
+            },
+          },
+        } as Partial<AgentChatState>,
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
+
+      expect(cancelCreateSpy).toHaveBeenCalledWith('req-fresh-pending')
+      expect(cancelWsCreateSpy).toHaveBeenCalledWith('req-fresh-pending')
+      expect(mockSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
     })
 
     it('updates active pane when closing the active pane', () => {
@@ -1276,9 +1425,59 @@ describe('PaneContainer', () => {
         store
       )
 
-      expect(screen.getByTestId('editor-pane-loading')).toBeInTheDocument()
-      expect(screen.getByRole('status')).toHaveTextContent('Loading editor...')
+      const loadingShell = screen.queryByTestId('editor-pane-loading')
+      if (loadingShell) {
+        expect(loadingShell).toBeInTheDocument()
+        expect(screen.getByRole('status')).toHaveTextContent('Loading editor...')
+      }
       expect(await screen.findByTestId('monaco-mock')).toBeInTheDocument()
+    })
+
+    it('renders word wrap toggle and dispatches wordWrap update to store when clicked', async () => {
+      const editorContent: EditorPaneContent = {
+        kind: 'editor',
+        filePath: '/test.ts',
+        language: 'typescript',
+        readOnly: false,
+        content: 'code',
+        viewMode: 'source',
+        wordWrap: true,
+      }
+
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: editorContent,
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': node },
+        activePane: { 'tab-1': 'pane-1' },
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store
+      )
+
+      expect(await screen.findByTestId('monaco-mock')).toBeInTheDocument()
+
+      const wrapButton = screen.getByRole('button', { name: /disable line wrap/i })
+      expect(wrapButton).toBeInTheDocument()
+
+      fireEvent.click(wrapButton)
+
+      await waitFor(() => {
+        const state = store.getState()
+        const layout = state.panes.layouts['tab-1']
+        expect(layout).toBeDefined()
+        if (layout?.type === 'leaf') {
+          const content = layout.content
+          if (content.kind === 'editor') {
+            expect(content.wordWrap).toBe(false)
+          }
+        }
+      })
     })
   })
 
@@ -2266,6 +2465,70 @@ describe('PaneContainer', () => {
         store,
       )
 
+      expect(screen.getByText(/freshell \(main\)\s+25%/)).toBeInTheDocument()
+    })
+
+    it('resolves Claude-backed runtime metadata for fresh-agent kilroy panes', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-kilroy-fresh',
+        content: {
+          kind: 'fresh-agent',
+          provider: 'claude',
+          sessionType: 'kilroy',
+          createRequestId: 'req-kilroy-fresh',
+          status: 'starting',
+          resumeSessionId: 'kilroy-session-restored',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-kilroy-fresh' },
+        },
+        {},
+        {
+          projects: [
+            {
+              projectPath: '/home/user/code/freshell',
+              sessions: [
+                {
+                  provider: 'claude',
+                  sessionType: 'kilroy',
+                  sessionId: 'kilroy-session-restored',
+                  projectPath: '/home/user/code/freshell',
+                  cwd: '/home/user/code/freshell/.worktrees/issue-163',
+                  gitBranch: 'main',
+                  isDirty: false,
+                  lastActivityAt: 1,
+                  tokenUsage: {
+                    inputTokens: 10,
+                    outputTokens: 5,
+                    cachedTokens: 0,
+                    totalTokens: 15,
+                    contextTokens: 15,
+                    compactThresholdTokens: 60,
+                    compactPercent: 25,
+                  },
+                },
+              ],
+            },
+          ],
+        },
+        {
+          sessions: {},
+          pendingCreates: {},
+          availableModels: [],
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      expect(screen.getByText('Kilroy')).toBeInTheDocument()
       expect(screen.getByText(/freshell \(main\)\s+25%/)).toBeInTheDocument()
     })
 

@@ -34,13 +34,21 @@ describe('tabs view search range loading', () => {
     cleanup()
   })
 
-  it('requests older history only when user expands search range', () => {
+  it('updates the registered retention range without issuing an untracked direct query', () => {
+    const initialTabRegistry = tabRegistryReducer(undefined, { type: '@@INIT' })
     const store = configureStore({
       reducer: {
         tabs: tabsReducer,
         panes: panesReducer,
         tabRegistry: tabRegistryReducer,
         connection: connectionReducer,
+      },
+      preloadedState: {
+        tabRegistry: {
+          ...initialTabRegistry,
+          closedTabRetentionDays: 1,
+          searchRangeDays: 1,
+        },
       },
     })
 
@@ -53,10 +61,10 @@ describe('tabs view search range loading', () => {
     expect(wsMock.sendTabsSyncQuery).not.toHaveBeenCalled()
 
     fireEvent.change(screen.getByLabelText('Closed range filter'), {
-      target: { value: '90' },
+      target: { value: '30' },
     })
-    expect(wsMock.sendTabsSyncQuery).toHaveBeenCalledTimes(1)
-    expect(wsMock.sendTabsSyncQuery.mock.calls[0][0].rangeDays).toBe(90)
+    expect(wsMock.sendTabsSyncQuery).not.toHaveBeenCalled()
+    expect(store.getState().tabRegistry.closedTabRetentionDays).toBe(30)
   })
 
   it('hydrates the closed range filter from browser preferences on reload', async () => {
@@ -83,6 +91,6 @@ describe('tabs view search range loading', () => {
       </Provider>,
     )
 
-    expect(screen.getByLabelText('Closed range filter')).toHaveValue('90')
+    expect(screen.getByLabelText('Closed range filter')).toHaveValue('30')
   })
 })

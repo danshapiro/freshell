@@ -242,7 +242,7 @@ describe('real Codex app-server durable readiness contract', () => {
       await actor.initialize()
 
       const resumed = await actor.resumeThread({ threadId: durableThreadId, cwd: process.cwd() })
-      expect(resumed.thread.id).toBe(durableThreadId)
+      expect(resumed.threadId).toBe(durableThreadId)
 
       const readiness = await waitForLifecycle(
         lifecycle,

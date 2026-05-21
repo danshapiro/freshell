@@ -7,6 +7,7 @@ import { resolveConfig } from './config.js'
 import { resolveTarget } from './targets.js'
 import { runCommand as sendKeysCommand } from './commands/sendKeys.js'
 import { partitionSendKeysArgs } from './send-keys-args.js'
+import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../coding-cli/codex-app-server/restore-decision.js'
 
 type Flags = Record<string, string | boolean>
 
@@ -105,6 +106,45 @@ function resolveRenameArgs(
 const isTruthy = (value: unknown) => value === true || value === 'true' || value === '1' || value === 'yes'
 
 const unwrap = (response: any) => (response && typeof response === 'object' && 'data' in response ? response.data : response)
+
+function rejectRawCodexResume(mode: unknown, resumeSessionId: unknown): boolean {
+  if (mode === 'codex' && typeof resumeSessionId === 'string' && resumeSessionId.length > 0) {
+    writeError(INVALID_RAW_CODEX_RESUME_MESSAGE)
+    process.exitCode = 1
+    return true
+  }
+  return false
+}
+
+type CliSessionRef = { provider: string; sessionId: string }
+
+function resolveSessionRefFlag(mode: unknown, raw: unknown): { rejected: boolean; sessionRef?: CliSessionRef } {
+  if (raw === undefined) return { rejected: false }
+  if (typeof raw !== 'string' || raw.trim().length === 0) {
+    writeError('--session-ref must use provider:sessionId syntax.')
+    process.exitCode = 1
+    return { rejected: true }
+  }
+  const separator = raw.indexOf(':')
+  if (separator <= 0 || separator === raw.length - 1) {
+    writeError('--session-ref must use provider:sessionId syntax.')
+    process.exitCode = 1
+    return { rejected: true }
+  }
+  const provider = raw.slice(0, separator).trim()
+  const sessionId = raw.slice(separator + 1).trim()
+  if (!provider || !sessionId) {
+    writeError('--session-ref must use provider:sessionId syntax.')
+    process.exitCode = 1
+    return { rejected: true }
+  }
+  if (typeof mode !== 'string' || mode !== provider) {
+    writeError('--session-ref provider must match --mode.')
+    process.exitCode = 1
+    return { rejected: true }
+  }
+  return { rejected: false, sessionRef: { provider, sessionId } }
+}
 
 async function fetchTabs(client: ReturnType<typeof createHttpClient>): Promise<{ tabs: TabSummary[]; activeTabId?: string | null }> {
   const res = await client.get('/api/tabs')
@@ -311,12 +351,27 @@ async function main() {
       const browser = getFlag(flags, 'browser') as string | undefined
       const editor = getFlag(flags, 'editor') as string | undefined
       const resumeSessionId = getFlag(flags, 'resume') as string | undefined
+      const sessionRefResult = resolveSessionRefFlag(mode, getFlag(flags, 'session-ref'))
       const prompt = getFlag(flags, 'prompt') as string | undefined
+      if (rejectRawCodexResume(mode, resumeSessionId)) return
+      if (sessionRefResult.rejected) return
 
-      const res = await client.post('/api/tabs', { name, mode, shell, cwd, browser, editor, resumeSessionId })
+      const res = await client.post('/api/tabs', {
+        name,
+        mode,
+        shell,
+        cwd,
+        browser,
+        editor,
+        resumeSessionId,
+        ...(sessionRefResult.sessionRef ? { sessionRef: sessionRefResult.sessionRef } : {}),
+      })
       const data = unwrap(res)
       if (prompt && data?.paneId) {
-        await client.post(`/api/panes/${encodeURIComponent(data.paneId)}/send-keys`, { data: `${prompt}\r` })
+        await client.post(`/api/panes/${encodeURIComponent(data.paneId)}/send-keys`, {
+          data: `${prompt}\r`,
+          ...(mode === 'codex' ? { waitForCodexIdentity: true } : {}),
+        })
       }
       writeJson(res)
       return
@@ -405,6 +460,10 @@ async function main() {
       const mode = getFlag(flags, 'mode') as string | undefined
       const shell = getFlag(flags, 'shell') as string | undefined
       const cwd = getFlag(flags, 'cwd') as string | undefined
+      const resumeSessionId = getFlag(flags, 'resume') as string | undefined
+      const sessionRefResult = resolveSessionRefFlag(mode, getFlag(flags, 'session-ref'))
+      if (rejectRawCodexResume(mode, resumeSessionId)) return
+      if (sessionRefResult.rejected) return
 
       const resolved = await resolvePaneTarget(client, target)
       if (!resolved.pane?.id) {
@@ -420,6 +479,8 @@ async function main() {
         mode,
         shell,
         cwd,
+        resumeSessionId,
+        ...(sessionRefResult.sessionRef ? { sessionRef: sessionRefResult.sessionRef } : {}),
       })
       writeJson(res)
       return
@@ -536,13 +597,23 @@ async function main() {
       const mode = getFlag(flags, 'mode') as string | undefined
       const shell = getFlag(flags, 'shell') as string | undefined
       const cwd = getFlag(flags, 'cwd') as string | undefined
+      const resumeSessionId = getFlag(flags, 'resume') as string | undefined
+      const sessionRefResult = resolveSessionRefFlag(mode, getFlag(flags, 'session-ref'))
+      if (rejectRawCodexResume(mode, resumeSessionId)) return
+      if (sessionRefResult.rejected) return
       const resolved = await resolvePaneTarget(client, target)
       if (!resolved.pane?.id) {
         writeError(resolved.message || 'pane not found')
         process.exitCode = 1
         return
       }
-      const res = await client.post(`/api/panes/${encodeURIComponent(resolved.pane.id)}/respawn`, { mode, shell, cwd })
+      const res = await client.post(`/api/panes/${encodeURIComponent(resolved.pane.id)}/respawn`, {
+        mode,
+        shell,
+        cwd,
+        resumeSessionId,
+        ...(sessionRefResult.sessionRef ? { sessionRef: sessionRefResult.sessionRef } : {}),
+      })
       writeJson(res)
       return
     }

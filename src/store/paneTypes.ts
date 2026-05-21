@@ -6,6 +6,8 @@ import {
 } from '@shared/agent-chat-capabilities'
 import type { SessionLocator as SharedSessionLocator } from '@shared/ws-protocol'
 import type { RestoreError } from '@shared/session-contract'
+import type { CodexDurabilityRef } from '@shared/codex-durability'
+import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
 
 export type SessionLocator = SharedSessionLocator
 
@@ -60,6 +62,8 @@ export type TerminalPaneContent = {
   resumeSessionId?: string
   /** Portable session reference for cross-device tab snapshots */
   sessionRef?: SessionLocator
+  /** Non-canonical Codex restore durability state and proof metadata. */
+  codexDurability?: CodexDurabilityRef
   /** Runtime-only server locality for same-server matching; never part of canonical durable identity. */
   serverInstanceId?: string
   /** Explicit restore failure when no canonical durable target exists. */
@@ -97,6 +101,8 @@ export type EditorPaneContent = {
   content: string
   /** View mode: source editor or rendered preview */
   viewMode: 'source' | 'preview'
+  /** Line wrap toggle (default true) */
+  wordWrap: boolean
 }
 
 /**
@@ -113,6 +119,30 @@ export type AgentChatCreateError = {
   code: string
   message: string
   retryable?: boolean
+}
+
+export type FreshAgentPaneContent = {
+  kind: 'fresh-agent'
+  sessionType: FreshAgentSessionType
+  provider: FreshAgentRuntimeProvider
+  sessionId?: string
+  createRequestId: string
+  status: SdkSessionStatus
+  resumeSessionId?: string
+  sessionRef?: SessionLocator
+  /** Runtime-only server locality for same-server matching; never part of canonical durable identity. */
+  serverInstanceId?: string
+  /** Explicit restore failure when no canonical durable target exists. */
+  restoreError?: RestoreError
+  initialCwd?: string
+  createError?: AgentChatCreateError
+  modelSelection?: AgentChatModelSelection
+  model?: string
+  permissionMode?: string
+  sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
+  effort?: string
+  plugins?: string[]
+  settingsDismissed?: boolean
 }
 
 /**
@@ -165,7 +195,7 @@ export type ExtensionPaneContent = {
  * Union type for all pane content types.
  */
 export type PaneContent = TerminalPaneContent | BrowserPaneContent | EditorPaneContent
-  | PickerPaneContent | AgentChatPaneContent | ExtensionPaneContent
+  | PickerPaneContent | FreshAgentPaneContent | AgentChatPaneContent | ExtensionPaneContent
 
 /**
  * Input type for creating terminal panes.
@@ -195,6 +225,11 @@ export type AgentChatPaneInput = Omit<AgentChatPaneContent, 'createRequestId' | 
   status?: SdkSessionStatus
 }
 
+export type FreshAgentPaneInput = Omit<FreshAgentPaneContent, 'createRequestId' | 'status'> & {
+  createRequestId?: string
+  status?: SdkSessionStatus
+}
+
 /**
  * Input type for extension panes.
  * Extension content needs no normalization — passes through unchanged.
@@ -202,7 +237,7 @@ export type AgentChatPaneInput = Omit<AgentChatPaneContent, 'createRequestId' | 
 export type ExtensionPaneInput = ExtensionPaneContent
 
 export type PaneContentInput = TerminalPaneInput | BrowserPaneInput | EditorPaneInput
-  | PickerPaneContent | AgentChatPaneInput | ExtensionPaneInput
+  | PickerPaneContent | FreshAgentPaneInput | AgentChatPaneInput | ExtensionPaneInput
 
 export type PaneRefreshTarget =
   | { kind: 'terminal'; createRequestId: string }
@@ -261,8 +296,7 @@ export interface PanesState {
    */
   refreshRequestsByPane: Record<string, Record<string, PaneRefreshRequest>>
   /**
-   * Ephemeral one-shot fresh recovery markers for restored terminals whose
-   * live backend handle disappeared before a durable session identity existed.
+   * Ephemeral one-shot fresh recovery guards keyed by tab and pane id.
    * Must never be persisted.
    */
   restoreFallbackAttemptsByPane: Record<string, Record<string, RestoreFallbackAttempt>>
