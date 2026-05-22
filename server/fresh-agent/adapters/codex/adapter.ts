@@ -54,6 +54,7 @@ type CodexRuntimePort = {
     threadId: string
     cursor?: string
     limit?: number
+    itemsView?: 'notLoaded' | 'summary' | 'full'
   }) => Promise<Record<string, any>>
   readThreadTurn: (input: { threadId: string; turnId: string; revision?: number }) => Promise<Record<string, any>>
 }
@@ -268,6 +269,7 @@ export function createCodexFreshAgentAdapter(deps: {
         threadId: thread.threadId,
         cursor: typeof query.cursor === 'string' ? query.cursor : undefined,
         limit: typeof query.limit === 'number' ? query.limit : undefined,
+        itemsView: 'full',
       })
       return normalizeCodexTurnPage({
         threadId: thread.threadId,

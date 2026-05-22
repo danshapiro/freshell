@@ -61,7 +61,7 @@ describe('Codex generated schema traceability', () => {
     expect(CODEX_RUNTIME_LEAF_VALUES.askForApproval).not.toContain('bypassPermissions')
   })
 
-  it('records that codex-cli 0.129.0 has no generated thread/turns/list method', () => {
+  it('records that codex-cli 0.129.0 stable schema has no generated thread/turns/list method', () => {
     expect(CODEX_CLIENT_REQUEST_METHODS).not.toContain('thread/turns/list')
   })
 })

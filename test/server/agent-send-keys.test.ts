@@ -54,6 +54,46 @@ it('rejects blocked Codex input instead of reporting success', async () => {
   expect(res.body.message).toBe('Codex restore identity could not be captured before input could be accepted.')
 })
 
+it('rejects lifecycle-loss-pending Codex input instead of reporting success', async () => {
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: { resolvePaneToTerminal: () => 'term_1' },
+    registry: {
+      input: () => ({
+        status: 'blocked_codex_lifecycle_loss_pending',
+        terminalId: 'term_1',
+      }),
+    },
+  }))
+
+  const res = await request(app).post('/api/panes/p1/send-keys').send({ data: 'ls\r' })
+
+  expect(res.status).toBe(409)
+  expect(res.body.status).toBe('error')
+  expect(res.body.message).toBe('Codex worker lifecycle loss is still being resolved.')
+})
+
+it('rejects clean-exit-decision-pending Codex input instead of reporting success', async () => {
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: { resolvePaneToTerminal: () => 'term_1' },
+    registry: {
+      input: () => ({
+        status: 'blocked_codex_clean_exit_decision_pending',
+        terminalId: 'term_1',
+      }),
+    },
+  }))
+
+  const res = await request(app).post('/api/panes/p1/send-keys').send({ data: 'ls\r' })
+
+  expect(res.status).toBe(409)
+  expect(res.body.status).toBe('error')
+  expect(res.body.message).toBe('Codex clean exit state is still being resolved.')
+})
+
 it('waits for Codex identity capture before sending a seeded prompt when requested', async () => {
   const events = new EventEmitter()
   let identityReady = false

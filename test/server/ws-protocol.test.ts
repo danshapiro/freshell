@@ -1175,6 +1175,56 @@ describe('ws protocol', () => {
     }
   })
 
+  it('terminal.input reports Codex lifecycle-loss proof as blocked input', async () => {
+    const { ws, close } = await createAuthenticatedConnection()
+
+    const terminalId = await createTerminal(ws, 'create-for-codex-lifecycle-loss-input')
+    const originalInput = registry.input.bind(registry)
+    registry.input = vi.fn(() => ({
+      status: 'blocked_codex_lifecycle_loss_pending',
+      terminalId,
+    })) as any
+
+    try {
+      ws.send(JSON.stringify({ type: 'terminal.input', terminalId, data: 'test' }))
+
+      const blocked = await waitForMessage(ws, (msg) => msg.type === 'terminal.input.blocked')
+      expect(blocked).toEqual({
+        type: 'terminal.input.blocked',
+        terminalId,
+        reason: 'codex_lifecycle_loss_pending',
+      })
+    } finally {
+      registry.input = originalInput as any
+      await close()
+    }
+  })
+
+  it('terminal.input reports Codex clean-exit decision as blocked input', async () => {
+    const { ws, close } = await createAuthenticatedConnection()
+
+    const terminalId = await createTerminal(ws, 'create-for-codex-clean-exit-decision-input')
+    const originalInput = registry.input.bind(registry)
+    registry.input = vi.fn(() => ({
+      status: 'blocked_codex_clean_exit_decision_pending',
+      terminalId,
+    })) as any
+
+    try {
+      ws.send(JSON.stringify({ type: 'terminal.input', terminalId, data: 'test' }))
+
+      const blocked = await waitForMessage(ws, (msg) => msg.type === 'terminal.input.blocked')
+      expect(blocked).toEqual({
+        type: 'terminal.input.blocked',
+        terminalId,
+        reason: 'codex_clean_exit_decision_pending',
+      })
+    } finally {
+      registry.input = originalInput as any
+      await close()
+    }
+  })
+
   it('terminal.resize changes terminal dimensions', async () => {
     const { ws, close } = await createAuthenticatedConnection()
 

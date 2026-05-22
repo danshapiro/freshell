@@ -3124,6 +3124,32 @@ export class WsHandler {
           })
           return
         }
+        if (result.status === 'blocked_codex_clean_exit_decision_pending') {
+          log.debug({
+            terminalId: m.terminalId,
+            connectionId: ws.connectionId,
+            attemptedInputBytes: Buffer.byteLength(m.data, 'utf8'),
+          }, 'Codex terminal input blocked while clean exit state is being resolved')
+          this.send(ws, {
+            type: 'terminal.input.blocked',
+            terminalId: m.terminalId,
+            reason: 'codex_clean_exit_decision_pending',
+          })
+          return
+        }
+        if (result.status === 'blocked_codex_lifecycle_loss_pending') {
+          log.debug({
+            terminalId: m.terminalId,
+            connectionId: ws.connectionId,
+            attemptedInputBytes: Buffer.byteLength(m.data, 'utf8'),
+          }, 'Codex terminal input blocked while lifecycle loss is being resolved')
+          this.send(ws, {
+            type: 'terminal.input.blocked',
+            terminalId: m.terminalId,
+            reason: 'codex_lifecycle_loss_pending',
+          })
+          return
+        }
         if (result.status !== 'written') {
           if (result.status === 'no_terminal') {
             recordSessionLifecycleEvent({

@@ -266,6 +266,58 @@ describe('Codex session resilience flow', () => {
     expect(contentFor(store, tabId).status).toBe('exited')
   })
 
+  it('keeps a clean Codex exit final across reconnect instead of requesting recovery', async () => {
+    const { store, tabId, paneId, paneContent } = createStore()
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(messageHandler).not.toBeNull())
+    await waitFor(() => expect(reconnectHandler).not.toBeNull())
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.created',
+        requestId: 'req-codex-resilience',
+        terminalId: 'term-codex-clean-exit',
+        createdAt: Date.now(),
+      })
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId: 'term-codex-clean-exit',
+        attachRequestId: latestAttachRequestId('term-codex-clean-exit'),
+        headSeq: 0,
+        replayFromSeq: 0,
+        replayToSeq: 0,
+      })
+      messageHandler!({
+        type: 'terminal.exit',
+        terminalId: 'term-codex-clean-exit',
+        exitCode: 0,
+      })
+    })
+
+    expect(contentFor(store, tabId).terminalId).toBeUndefined()
+    expect(contentFor(store, tabId).status).toBe('exited')
+    wsMocks.send.mockClear()
+
+    act(() => {
+      reconnectHandler!()
+    })
+
+    expect(contentFor(store, tabId).status).toBe('exited')
+    expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'terminal.create',
+    }))
+    expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'terminal.attach',
+      terminalId: 'term-codex-clean-exit',
+    }))
+  })
+
   it('keeps recovering status through reattach until the server reports running', async () => {
     const { store, tabId, paneId, paneContent } = createStore()
 

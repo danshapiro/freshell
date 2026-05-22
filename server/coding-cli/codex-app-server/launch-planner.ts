@@ -1,5 +1,11 @@
 import type { CodexAppServerRuntime } from './runtime.js'
 import type { CodexThreadLifecycleEvent, CodexThreadLifecycleLossEvent, CodexTurnEvent } from './client.js'
+import type {
+  CodexThreadTurnReadParams,
+  CodexThreadTurnReadResult,
+  CodexThreadTurnsListParams,
+  CodexThreadTurnsListResult,
+} from './protocol.js'
 import { waitForAllSettledOrThrow } from '../../shutdown-join.js'
 import {
   CodexRemoteProxy,
@@ -16,6 +22,8 @@ type CodexRuntimeLike = Pick<
   | 'onFsChanged'
   | 'watchPath'
   | 'unwatchPath'
+  | 'readThreadTurn'
+  | 'listThreadTurns'
 >
 
 export type CodexLaunchSidecar = {
@@ -28,6 +36,8 @@ export type CodexLaunchSidecar = {
   onFsChanged?(handler: (event: { watchId: string; changedPaths: string[] }) => void): () => void
   onThreadLifecycle?(handler: (event: CodexThreadLifecycleEvent) => void): () => void
   onLifecycleLoss?(handler: (event: CodexThreadLifecycleLossEvent) => void): () => void
+  listThreadTurns?(params: CodexThreadTurnsListParams): Promise<CodexThreadTurnsListResult>
+  readThreadTurn?(params: CodexThreadTurnReadParams): Promise<CodexThreadTurnReadResult>
   watchPath?(targetPath: string, watchId: string): Promise<{ path: string }>
   unwatchPath?(watchId: string): Promise<void>
   shutdown(): Promise<void>
@@ -217,6 +227,14 @@ export class CodexLaunchPlanner {
           unsubRuntime()
           unsubProxy?.()
         }
+      },
+      readThreadTurn: (params) => {
+        assertActive()
+        return runtime.readThreadTurn(params)
+      },
+      listThreadTurns: (params) => {
+        assertActive()
+        return runtime.listThreadTurns(params)
       },
       watchPath: async (targetPath, watchId) => {
         assertActive()

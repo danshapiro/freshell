@@ -33,6 +33,7 @@ import {
   type CodexRpcError,
   type CodexThreadHandle,
   type CodexThreadOperationResult,
+  type CodexThreadPageParams,
   type CodexThreadReadParams,
   type CodexThreadReadResult,
   type CodexThreadForkParams,
@@ -63,6 +64,18 @@ type PendingRequest = {
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000
 const LOSS_STATUSES = new Set(['notLoaded', 'systemError'])
+
+class CodexAppServerRpcError extends Error {
+  constructor(
+    readonly method: string,
+    readonly code: number,
+    message: string,
+    readonly data?: unknown,
+  ) {
+    super(`Codex app-server ${method} failed: ${message}`)
+    this.name = 'CodexAppServerRpcError'
+  }
+}
 
 type CodexThreadStartInput =
   Omit<CodexThreadStartParams, 'experimentalRawEvents' | 'persistExtendedHistory'> & {
@@ -238,45 +251,174 @@ export class CodexAppServerClient {
 
   async listThreadTurns(params: CodexThreadTurnsListParams): Promise<CodexThreadTurnsListResult> {
     const parsedParams = CodexThreadPageParamsSchema.parse(params)
-    const result = await this.request('thread/read', {
-      threadId: parsedParams.threadId,
-      includeTurns: true,
-    })
-    const parsedThread = CodexThreadReadResultSchema.safeParse(result)
-    if (!parsedThread.success) {
-      throw new Error('Codex app-server returned an invalid thread/read payload.')
+    if (this.isThreadReadFallbackCursor(parsedParams.cursor)) {
+      return await this.listThreadTurnsViaThreadRead(parsedParams, new Error('thread/read fallback cursor'))
     }
-    const turns = parsedThread.data.thread.turns.slice(0, parsedParams.limit)
-    const parsed = CodexThreadTurnsListResultSchema.safeParse({
-      revision: Math.max(0, Math.trunc(parsedThread.data.thread.updatedAt)),
-      nextCursor: null,
-      backwardsCursor: null,
-      turns,
-      bodies: Object.fromEntries(turns.map((turn) => [turn.id, turn])),
-    })
+    try {
+      return await this.requestThreadTurnsList(parsedParams)
+    } catch (error) {
+      if (!this.canFallbackToThreadRead(parsedParams, error)) {
+        throw error
+      }
+      return await this.listThreadTurnsViaThreadRead(parsedParams, error)
+    }
+  }
+
+  async readThreadTurn(params: CodexThreadTurnReadParams): Promise<CodexThreadTurnReadResult> {
+    let cursor: string | undefined
+    let observedListRevision: number | undefined
+    try {
+      for (;;) {
+        const page = await this.requestThreadTurnsList({
+          threadId: params.threadId,
+          limit: 50,
+          sortDirection: 'desc',
+          itemsView: 'full',
+          ...(cursor ? { cursor } : {}),
+        })
+        if (page.revision !== undefined && observedListRevision === undefined) {
+          observedListRevision = page.revision
+        } else if (page.revision !== undefined && page.revision !== observedListRevision) {
+          throw new Error('Codex app-server thread turn list revision changed while paging thread turns.')
+        }
+        if (params.revision !== undefined && page.revision !== params.revision) {
+          throw new Error('Codex app-server thread turn list revision does not match requested revision.')
+        }
+        const turn = page.turns.find((candidate) => candidate.id === params.turnId)
+        if (turn) {
+          const revision = params.revision ?? observedListRevision
+          const parsedTurn = CodexThreadTurnReadResultSchema.safeParse({
+            ...turn,
+            turnId: turn.id,
+            revision,
+          })
+          if (!parsedTurn.success) {
+            throw new Error('Codex app-server returned an invalid synthesized thread turn body.')
+          }
+          return parsedTurn.data
+        }
+        if (!page.nextCursor) break
+        cursor = page.nextCursor
+      }
+    } catch (error) {
+      if (!this.isThreadTurnsListUnavailableError(error)) throw error
+      return await this.readThreadTurnViaThreadRead(params)
+    }
+    throw new Error(`Codex app-server thread ${params.threadId} does not contain turn ${params.turnId}.`)
+  }
+
+  private async requestThreadTurnsList(params: CodexThreadPageParams): Promise<CodexThreadTurnsListResult> {
+    const result = await this.request('thread/turns/list', params)
+    const parsed = CodexThreadTurnsListResultSchema.safeParse(result)
     if (!parsed.success) {
-      throw new Error('Codex app-server returned an invalid synthesized thread turn page.')
+      throw new Error('Codex app-server returned an invalid thread/turns/list payload.')
     }
     return parsed.data
   }
 
-  async readThreadTurn(params: CodexThreadTurnReadParams): Promise<CodexThreadTurnReadResult> {
-    const page = await this.listThreadTurns({
-      threadId: params.threadId,
-    })
-    const turn = page.turns.find((candidate) => candidate.id === params.turnId)
+  private async readThreadTurnViaThreadRead(params: CodexThreadTurnReadParams): Promise<CodexThreadTurnReadResult> {
+    const snapshot = await this.readThread({ threadId: params.threadId, includeTurns: true })
+    const snapshotRevision = Number.isFinite(snapshot.thread.updatedAt)
+      ? Math.max(0, Math.trunc(snapshot.thread.updatedAt))
+      : undefined
+    if (params.revision !== undefined && snapshotRevision !== params.revision) {
+      throw new Error('Codex app-server thread/read revision does not match requested revision.')
+    }
+    const revision = params.revision ?? snapshotRevision
+    const turn = (snapshot.thread.turns ?? []).find((candidate) => candidate.id === params.turnId)
     if (!turn) {
       throw new Error(`Codex app-server thread ${params.threadId} does not contain turn ${params.turnId}.`)
     }
     const parsedTurn = CodexThreadTurnReadResultSchema.safeParse({
       ...turn,
       turnId: turn.id,
-      revision: params.revision ?? page.revision,
+      revision,
     })
     if (!parsedTurn.success) {
-      throw new Error('Codex app-server returned an invalid synthesized thread turn body.')
+      throw new Error('Codex app-server returned an invalid synthesized thread turn body from thread/read fallback.')
     }
     return parsedTurn.data
+  }
+
+  private async listThreadTurnsViaThreadRead(
+    params: CodexThreadPageParams,
+    cause: unknown,
+  ): Promise<CodexThreadTurnsListResult> {
+    const fallbackCursor = this.parseThreadReadFallbackCursor(params.cursor)
+    const snapshot = await this.readThread({ threadId: params.threadId, includeTurns: true })
+    const rawTurns = snapshot.thread.turns ?? []
+    const orderedTurns = params.sortDirection === 'asc'
+      ? rawTurns.slice()
+      : rawTurns.slice().reverse()
+    const revision = Number.isFinite(snapshot.thread.updatedAt)
+      ? Math.max(0, Math.trunc(snapshot.thread.updatedAt))
+      : 0
+    if (fallbackCursor.revision !== undefined && fallbackCursor.revision !== revision) {
+      throw new Error('Codex app-server thread/read fallback snapshot changed while paging thread turns.')
+    }
+    const offset = fallbackCursor.offset
+    const limit = params.limit ?? orderedTurns.length
+    const turns = orderedTurns.slice(offset, offset + limit).map((turn) => {
+      if (params.itemsView === 'notLoaded') {
+        return { ...turn, itemsView: 'notLoaded' as const, items: [] }
+      }
+      if (params.itemsView === 'summary') {
+        return {
+          ...turn,
+          itemsView: 'summary' as const,
+          items: turn.items.map((item) => ({
+            type: item.type,
+            id: item.id,
+            summary: this.summarizeThreadItem(item),
+          })),
+        }
+      }
+      return { ...turn, itemsView: 'full' as const }
+    })
+    const nextOffset = offset + turns.length
+    const parsed = CodexThreadTurnsListResultSchema.safeParse({
+      revision,
+      nextCursor: nextOffset < orderedTurns.length ? this.formatThreadReadFallbackCursor(revision, nextOffset) : null,
+      backwardsCursor: null,
+      turns,
+      bodies: Object.fromEntries(turns.map((turn) => [turn.id, turn])),
+    })
+    if (!parsed.success) {
+      throw new Error(`Codex app-server thread/turns/list fallback returned an invalid payload after paging failed: ${cause instanceof Error ? cause.message : String(cause)}`)
+    }
+    return parsed.data
+  }
+
+  private parseThreadReadFallbackCursor(cursor: string | undefined): { offset: number; revision?: number } {
+    if (!cursor) return { offset: 0 }
+    const match = cursor.match(/^thread-read:(\d+):(\d+)$/)
+    if (!match) {
+      throw new Error(`Codex app-server thread/turns/list is unavailable and thread/read fallback cannot honor opaque cursor "${cursor}".`)
+    }
+    return { revision: Number(match[1]), offset: Number(match[2]) }
+  }
+
+  private formatThreadReadFallbackCursor(revision: number, offset: number): string {
+    return `thread-read:${revision}:${offset}`
+  }
+
+  private summarizeThreadItem(item: { type: string; summary?: unknown; text?: unknown; command?: unknown }): string {
+    if (typeof item.summary === 'string') return item.summary
+    if (typeof item.text === 'string') return item.text
+    if (typeof item.command === 'string') return item.command
+    return item.type
+  }
+
+  private canFallbackToThreadRead(params: CodexThreadPageParams, error: unknown): boolean {
+    if (!this.isThreadTurnsListUnavailableError(error)) return false
+    if (params.cursor && !this.isThreadReadFallbackCursor(params.cursor)) {
+      throw new Error(`Codex app-server thread/turns/list is unavailable and thread/read fallback cannot honor opaque cursor "${params.cursor}".`)
+    }
+    return true
+  }
+
+  private isThreadReadFallbackCursor(cursor: string | undefined): boolean {
+    return typeof cursor === 'string' && /^thread-read:\d+:\d+$/.test(cursor)
   }
 
   async startTurn(params: CodexTurnStartParams): Promise<{ turnId: string }> {
@@ -495,7 +637,7 @@ export class CodexAppServerClient {
     if (!pending) return
     clearTimeout(pending.timeout)
     this.pendingRequests.delete(failure.data.id)
-    pending.reject(new Error(this.formatRpcError(pending.method, failure.data.error)))
+    pending.reject(this.formatRpcError(pending.method, failure.data.error))
   }
 
   private handleNotification(notification: { method: string; params?: unknown }): void {
@@ -666,8 +808,16 @@ export class CodexAppServerClient {
     socket.send(JSON.stringify(payload))
   }
 
-  private formatRpcError(method: string, error: CodexRpcError): string {
-    return `Codex app-server ${method} failed: ${error.message}`
+  private isThreadTurnsListUnavailableError(error: unknown): boolean {
+    if (error instanceof CodexAppServerRpcError) {
+      return error.method === 'thread/turns/list' && error.code === -32601
+    }
+    const message = error instanceof Error ? error.message : String(error)
+    return /\b(method not found|unknown method|not implemented|unsupported method)\b/i.test(message)
+  }
+
+  private formatRpcError(method: string, error: CodexRpcError): Error {
+    return new CodexAppServerRpcError(method, error.code, error.message, error.data)
   }
 
   private hasIdField(value: unknown): boolean {

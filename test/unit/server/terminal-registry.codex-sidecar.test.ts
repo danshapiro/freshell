@@ -1272,6 +1272,69 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     expect(currentSidecar.shutdown).toHaveBeenCalledTimes(1)
   })
 
+  it('treats proxy repair triggers before initial Codex publication as a create failure instead of recovery', async () => {
+    const registry = new TerminalRegistry()
+    const currentSidecar = createFakeSidecar()
+    const planCreate = vi.fn(async () => ({
+      sessionId: 'thread-1',
+      remote: { wsUrl: 'ws://127.0.0.1:43124' },
+      sidecar: createFakeSidecar(),
+    }))
+    const term = registry.create({
+      mode: 'codex',
+      resumeSessionId: 'thread-1',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar: currentSidecar,
+          recovery: { planCreate, retryDelayMs: 0 },
+          deferLifecycleUntilPublished: true,
+        },
+      } as any,
+    })
+
+    currentSidecar.emitRepairTrigger({ kind: 'proxy_close' })
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    expect(planCreate).not.toHaveBeenCalled()
+    expect(() => registry.publishCodexSidecar(term.terminalId)).toThrow(
+      'Codex app-server reported lifecycle loss before terminal create completed.',
+    )
+    await expect(registry.killAndWait(term.terminalId)).resolves.toBe(true)
+    expect(currentSidecar.shutdown).toHaveBeenCalledTimes(1)
+  })
+
+  it('treats a clean PTY exit before initial Codex publication as a create failure instead of recovery', async () => {
+    const registry = new TerminalRegistry()
+    const currentSidecar = createFakeSidecar()
+    const planCreate = vi.fn(async () => ({
+      sessionId: 'thread-1',
+      remote: { wsUrl: 'ws://127.0.0.1:43124' },
+      sidecar: createFakeSidecar(),
+    }))
+    const term = registry.create({
+      mode: 'codex',
+      resumeSessionId: 'thread-1',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar: currentSidecar,
+          recovery: { planCreate, retryDelayMs: 0 },
+          deferLifecycleUntilPublished: true,
+        },
+      } as any,
+    })
+
+    mockPtyProcess.instances[0]._emitExit(0)
+    await vi.waitFor(() => expect(registry.get(term.terminalId)?.status).toBe('exited'))
+
+    expect(planCreate).not.toHaveBeenCalled()
+    expect(() => registry.publishCodexSidecar(term.terminalId)).toThrow(
+      'Codex terminal PTY exited before create completed.',
+    )
+    expect(currentSidecar.shutdown).toHaveBeenCalledTimes(1)
+  })
+
   it('starts durable recovery only after deferred initial Codex publication succeeds', async () => {
     const registry = new TerminalRegistry()
     const currentSidecar = createFakeSidecar()

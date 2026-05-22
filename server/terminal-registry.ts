@@ -53,6 +53,8 @@ const DEFAULT_MAX_PENDING_SNAPSHOT_CHARS = 512 * 1024
 const OUTPUT_FLUSH_MS = Number(process.env.OUTPUT_FLUSH_MS || process.env.MOBILE_OUTPUT_FLUSH_MS || 40)
 const MAX_OUTPUT_BUFFER_CHARS = Number(process.env.MAX_OUTPUT_BUFFER_CHARS || process.env.MAX_MOBILE_OUTPUT_BUFFER_CHARS || 256 * 1024)
 const MAX_OUTPUT_FRAME_CHARS = Math.max(1, Number(process.env.MAX_OUTPUT_FRAME_CHARS || 8192))
+const CODEX_CLEAN_EXIT_RECENT_INPUT_GRACE_MS = Math.max(0, Number(process.env.CODEX_CLEAN_EXIT_RECENT_INPUT_GRACE_MS || 750))
+const CODEX_CLEAN_EXIT_LIFECYCLE_LOSS_GRACE_MS = Math.max(0, Number(process.env.CODEX_CLEAN_EXIT_LIFECYCLE_LOSS_GRACE_MS || 2000))
 const perfConfig = getPerfConfig()
 
 // TerminalMode is now a wider type -- any string is valid as a mode name.
@@ -478,6 +480,8 @@ export type TerminalRecord = {
     | 'watchPath'
     | 'unwatchPath'
     | 'markCandidatePersisted'
+    | 'readThreadTurn'
+    | 'listThreadTurns'
   >
   codexSidecarLifecycleUnsubscribe?: () => void
   codexSidecarLifecyclePublished?: boolean
@@ -489,13 +493,23 @@ export type TerminalRecord = {
     inFlight?: Promise<void>
     rerunRequested?: boolean
   }
+  codexActiveTurn?: CodexTurnEvent
+  codexUnconfirmedInputAt?: number
+  codexUnconfirmedInputSource?: 'resume' | 'input'
   codexInputGate?: { state: 'identity_pending' }
   codexRecovery?: CodexRecoveryOptions
   codexRecoveryAttempt?: Promise<void>
+  codexRecoveryAttemptSerial?: number
+  codexLifecycleLossProofPending?: boolean
+  codexCleanExitDecisionPending?: boolean
   codexRecoveryRetry?: { timer: NodeJS.Timeout; resolve: () => void }
   codexRecoveryBlockedError?: Error
   codexRecoveryFinalClose?: boolean
   codexRecoveryRetiringPty?: pty.IPty
+  codexHandledPtyExits?: WeakSet<pty.IPty>
+  codexPendingCleanExitFinalizer?: {
+    timer: NodeJS.Timeout
+  }
 }
 
 export type TerminalInputResult =
@@ -504,6 +518,8 @@ export type TerminalInputResult =
   | { status: 'blocked_codex_identity_capture_timeout'; terminalId: string }
   | { status: 'blocked_codex_identity_unavailable'; terminalId: string; reason?: string }
   | { status: 'blocked_codex_recovery_pending'; terminalId: string }
+  | { status: 'blocked_codex_clean_exit_decision_pending'; terminalId: string }
+  | { status: 'blocked_codex_lifecycle_loss_pending'; terminalId: string }
   | { status: 'no_terminal' }
   | { status: 'not_running' }
 
@@ -1261,6 +1277,7 @@ export class TerminalRegistry extends EventEmitter {
     record: TerminalRecord,
     event: { exitCode: number; signal?: number },
   ): void {
+    this.clearCodexPendingCleanExitFinalizer(record)
     this.markCodexRecoveryFinalClose(record)
     record.status = 'exited'
     record.exitCode = event.exitCode
@@ -1420,6 +1437,12 @@ export class TerminalRegistry extends EventEmitter {
         : undefined,
       codexSidecarGeneration: opts.mode === 'codex' ? 0 : undefined,
       codexDurability: initialCodexDurability,
+      codexUnconfirmedInputAt: opts.mode === 'codex' && resumeForBinding && (opts.sessionBindingReason ?? 'resume') === 'resume'
+        ? createdAt
+        : undefined,
+      codexUnconfirmedInputSource: opts.mode === 'codex' && resumeForBinding && (opts.sessionBindingReason ?? 'resume') === 'resume'
+        ? 'resume'
+        : undefined,
       codexInputGate: opts.mode === 'codex' && !resumeForBinding
         ? { state: 'identity_pending' }
         : undefined,
@@ -1437,8 +1460,8 @@ export class TerminalRegistry extends EventEmitter {
             lastInputBytes: undefined,
             lastInputToOutputMs: undefined,
             maxInputToOutputMs: 0,
-	          }
-	        : undefined,
+          }
+        : undefined,
     }
 
     this.registerCodexSidecarLifecycle(record)
@@ -1513,7 +1536,9 @@ export class TerminalRegistry extends EventEmitter {
     })
 
     ptyProc.onExit((e) => {
-      if (record.codexRecoveryRetiringPty === ptyProc) {
+      if (this.hasHandledPtyExit(record, ptyProc)) return
+      this.markHandledPtyExit(record, ptyProc)
+      if (!record.codexRecoveryFinalClose && record.codexRecoveryRetiringPty === ptyProc) {
         return
       }
       if (record.pty !== ptyProc) {
@@ -1523,24 +1548,63 @@ export class TerminalRegistry extends EventEmitter {
         return
       }
       const finishExit = () => {
-        if (this.startCodexDurableRecovery(record, {
-          source: 'pty_exit',
-          exitCode: e.exitCode,
-          signal: e.signal,
-        })) {
+        if (
+          this.shouldRecoverCodexPtyExit(record, e)
+          && this.startCodexDurableRecovery(record, {
+            source: 'pty_exit',
+            exitCode: e.exitCode,
+            signal: e.signal,
+          })
+        ) {
           return
         }
-        this.finishTerminalPtyExit(record, e)
+        if (!this.scheduleCodexCleanExitFinalizer(record, ptyProc, e)) {
+          this.finishTerminalPtyExit(record, e)
+        }
+      }
+      const finishExitAfterActiveTurnCheck = () => {
+        if (!this.shouldCheckCodexActiveTurnBeforeCleanExit(record, e)) {
+          finishExit()
+          return
+        }
+        record.codexCleanExitDecisionPending = true
+        const recoverySerial = record.codexRecoveryAttemptSerial ?? 0
+        void (async () => {
+          try {
+            const shouldRecover = await this.shouldRecoverCleanCodexExitForActiveTurn(record)
+            if ((record.codexRecoveryAttemptSerial ?? 0) !== recoverySerial) return
+            if (record.pty !== ptyProc || record.status === 'exited') return
+            if (record.codexRecoveryAttempt || record.codexLifecycleLossProofPending) return
+            if (
+              shouldRecover
+              && this.startCodexDurableRecovery(record, {
+                source: 'pty_exit',
+                exitCode: e.exitCode,
+                signal: e.signal,
+              })
+            ) {
+              return
+            }
+            if (!this.scheduleCodexCleanExitFinalizer(record, ptyProc, e)) {
+              this.finishTerminalPtyExit(record, e)
+            }
+          } finally {
+            if (this.terminals.get(record.terminalId) === record && !record.codexPendingCleanExitFinalizer) {
+              record.codexCleanExitDecisionPending = undefined
+            }
+          }
+        })()
       }
       if (this.needsCodexFinalDurabilityProof(record)) {
+        if (record.codexLifecycleLossProofPending) return
         void (async () => {
           await this.proveCodexBeforeFinalLoss(record, 'pty_exit')
           if (record.pty !== ptyProc || record.status === 'exited') return
-          finishExit()
+          finishExitAfterActiveTurnCheck()
         })()
         return
       }
-      finishExit()
+      finishExitAfterActiveTurnCheck()
     })
 
     this.terminals.set(terminalId, record)
@@ -1592,14 +1656,17 @@ export class TerminalRegistry extends EventEmitter {
       record.codexSidecarLifecycleUnsubscribe = undefined
       return
     }
+    const isCurrentSidecar = () => this.terminals.get(record.terminalId)?.codexSidecar === sidecar
 
     const unsubscribers: Array<() => void> = []
     const lifecycleUnsubscribe = sidecar.onLifecycleLoss?.((event) => {
+      if (!isCurrentSidecar()) return
       this.handleCodexLifecycleLoss(record.terminalId, event)
     })
     if (lifecycleUnsubscribe) unsubscribers.push(lifecycleUnsubscribe)
 
     const candidateUnsubscribe = sidecar.onCandidate?.((candidate) => {
+      if (!isCurrentSidecar()) return
       void this.persistCodexCandidate(record.terminalId, candidate).catch((err) => {
         logger.error({ err, terminalId: record.terminalId }, 'Failed to persist Codex restore identity')
         void this.failCodexFreshIdentity(record.terminalId, 'candidate_persist_failed').catch((failErr) => {
@@ -1610,6 +1677,7 @@ export class TerminalRegistry extends EventEmitter {
     if (candidateUnsubscribe) unsubscribers.push(candidateUnsubscribe)
 
     const turnStartedUnsubscribe = sidecar.onTurnStarted?.((event) => {
+      if (!isCurrentSidecar()) return
       void this.handleCodexTurnStarted(record.terminalId, event).catch((err) => {
         logger.error({ err, terminalId: record.terminalId }, 'Failed to update Codex turn-start durability state')
       })
@@ -1617,6 +1685,7 @@ export class TerminalRegistry extends EventEmitter {
     if (turnStartedUnsubscribe) unsubscribers.push(turnStartedUnsubscribe)
 
     const turnCompletedUnsubscribe = sidecar.onTurnCompleted?.((event) => {
+      if (!isCurrentSidecar()) return
       void this.handleCodexTurnCompleted(record.terminalId, event).catch((err) => {
         logger.error({ err, terminalId: record.terminalId }, 'Failed to proof Codex rollout after turn completion')
       })
@@ -1624,10 +1693,15 @@ export class TerminalRegistry extends EventEmitter {
     if (turnCompletedUnsubscribe) unsubscribers.push(turnCompletedUnsubscribe)
 
     const repairUnsubscribe = sidecar.onRepairTrigger?.((event) => {
+      if (!isCurrentSidecar()) return
       if (event.kind === 'candidate_capture_timeout') {
         void this.failCodexFreshIdentity(record.terminalId, 'candidate_capture_timeout').catch((err) => {
           logger.error({ err, terminalId: record.terminalId }, 'Failed to mark Codex terminal non-restorable after candidate capture timeout')
         })
+        return
+      }
+      if (event.kind === 'proxy_close' || event.kind === 'proxy_error') {
+        this.handleCodexLifecycleLoss(record.terminalId, event)
         return
       }
       this.requestCodexDurabilityProof(record.terminalId, `repair:${event.kind}`)
@@ -1635,6 +1709,7 @@ export class TerminalRegistry extends EventEmitter {
     if (repairUnsubscribe) unsubscribers.push(repairUnsubscribe)
 
     const fsChangedUnsubscribe = sidecar.onFsChanged?.((event) => {
+      if (!isCurrentSidecar()) return
       this.handleCodexRolloutFsChanged(record.terminalId, event)
     })
     if (fsChangedUnsubscribe) unsubscribers.push(fsChangedUnsubscribe)
@@ -1704,8 +1779,16 @@ export class TerminalRegistry extends EventEmitter {
   }
 
   private codexCandidateMatches(record: TerminalRecord, threadId: string | undefined): boolean {
+    if (!threadId) return false
     const candidateThreadId = record.codexDurability?.candidate?.candidateThreadId
-    return !!candidateThreadId && candidateThreadId === threadId
+    return record.resumeSessionId === threadId || candidateThreadId === threadId
+  }
+
+  private getCodexRecoveryThreadId(record: TerminalRecord): string | undefined {
+    const durableThreadId = record.codexDurability?.state === 'durable'
+      ? record.codexDurability.durableThreadId
+      : undefined
+    return durableThreadId ?? record.resumeSessionId ?? record.codexDurability?.candidate?.candidateThreadId
   }
 
   private buildCodexDurabilityRef(candidate: CodexRemoteProxyCandidate, capturedAt: number): CodexDurabilityRef | undefined {
@@ -1916,6 +1999,9 @@ export class TerminalRegistry extends EventEmitter {
     const record = this.terminals.get(terminalId)
     if (!record || record.status !== 'running') return
     if (!this.codexCandidateMatches(record, event.threadId)) return
+    record.codexActiveTurn = event
+    record.codexUnconfirmedInputAt = undefined
+    record.codexUnconfirmedInputSource = undefined
     if (!record.codexDurability?.candidate || record.codexDurability.state === 'durable') return
 
     const durability: CodexDurabilityRef = {
@@ -1935,6 +2021,17 @@ export class TerminalRegistry extends EventEmitter {
     const record = this.terminals.get(terminalId)
     if (!record || record.status !== 'running') return
     if (!this.codexCandidateMatches(record, event.threadId)) return
+    const completedActiveTurn = (
+      record.codexActiveTurn?.threadId === event.threadId
+      && !!record.codexActiveTurn.turnId
+      && !!event.turnId
+      && record.codexActiveTurn.turnId === event.turnId
+    )
+    if (completedActiveTurn) {
+      record.codexActiveTurn = undefined
+      record.codexUnconfirmedInputAt = undefined
+      record.codexUnconfirmedInputSource = undefined
+    }
     if (!record.codexDurability?.candidate || record.codexDurability.state === 'durable') return
 
     const completedAt = Date.now()
@@ -2186,13 +2283,13 @@ export class TerminalRegistry extends EventEmitter {
     if (!record) {
       throw new Error(`Cannot publish Codex sidecar for missing terminal ${terminalId}.`)
     }
-    if (!record.codexSidecar) return
     if (record.codexSidecarPrePublicationLoss !== undefined) {
       throw new Error('Codex app-server reported lifecycle loss before terminal create completed.')
     }
     if (record.status !== 'running') {
       throw new Error('Codex terminal PTY exited before create completed.')
     }
+    if (!record.codexSidecar) return
     record.codexSidecarLifecyclePublished = true
   }
 
@@ -2214,29 +2311,37 @@ export class TerminalRegistry extends EventEmitter {
       : undefined
     if (
       typeof eventThreadId === 'string'
-      && record.resumeSessionId
-      && eventThreadId !== record.resumeSessionId
+      && (record.resumeSessionId || record.codexDurability?.candidate?.candidateThreadId)
+      && !this.codexCandidateMatches(record, eventThreadId)
     ) {
       return
     }
 
+    this.clearCodexPendingCleanExitFinalizer(record)
+
     if (!record.resumeSessionId || !record.codexRecovery) {
+      if (record.codexLifecycleLossProofPending) return
       void (async () => {
-        await this.proveCodexBeforeFinalLoss(record, 'lifecycle_loss')
-        if (record.status !== 'running') return
-        if (record.resumeSessionId && record.codexRecovery) {
-          if (!this.startCodexDurableRecovery(record, { source: 'lifecycle_loss', event })) {
-            this.closeCodexTerminalAfterBlockedLifecycleLoss(record, event)
+        record.codexLifecycleLossProofPending = true
+        try {
+          await this.proveCodexBeforeFinalLoss(record, 'lifecycle_loss')
+          if (record.status !== 'running') return
+          if (record.resumeSessionId && record.codexRecovery) {
+            if (!this.startCodexDurableRecovery(record, { source: 'lifecycle_loss', event })) {
+              this.closeCodexTerminalAfterBlockedLifecycleLoss(record, event)
+            }
+            return
           }
-          return
+          logger.warn(
+            { terminalId, event },
+            'Codex app-server reported terminal lifecycle loss without durable recovery; closing terminal',
+          )
+          await this.killAndWait(terminalId).catch((err) => {
+            logger.error({ err, terminalId }, 'Failed to close terminal after Codex app-server lifecycle loss')
+          })
+        } finally {
+          record.codexLifecycleLossProofPending = false
         }
-        logger.warn(
-          { terminalId, event },
-          'Codex app-server reported terminal lifecycle loss without durable recovery; closing terminal',
-        )
-        await this.killAndWait(terminalId).catch((err) => {
-          logger.error({ err, terminalId }, 'Failed to close terminal after Codex app-server lifecycle loss')
-        })
       })()
       return
     }
@@ -2274,7 +2379,11 @@ export class TerminalRegistry extends EventEmitter {
       { terminalId: record.terminalId, trigger, resumeSessionId: record.resumeSessionId },
       'Codex durable terminal lost its live worker; starting durable recovery',
     )
-    const attempt = this.runCodexRecoveryLoop(record.terminalId)
+    record.codexRecoveryAttemptSerial = (record.codexRecoveryAttemptSerial ?? 0) + 1
+    record.codexRecoveryRetiringPty = record.pty
+    let attempt!: Promise<void>
+    attempt = Promise.resolve()
+      .then(() => this.runCodexRecoveryLoop(record.terminalId))
       .catch((err) => {
         logger.error({ err, terminalId: record.terminalId }, 'Codex durable recovery loop failed')
         if (record.codexRecoveryBlockedError && this.terminals.get(record.terminalId) === record && record.status === 'running') {
@@ -2296,6 +2405,189 @@ export class TerminalRegistry extends EventEmitter {
       })
     record.codexRecoveryAttempt = attempt
     return true
+  }
+
+  private isCleanPtyExit(event: { exitCode: number; signal?: number }): boolean {
+    return event.exitCode === 0 && (!event.signal || event.signal === 0)
+  }
+
+  private clearCodexPendingCleanExitFinalizer(record: TerminalRecord): void {
+    const pending = record.codexPendingCleanExitFinalizer
+    if (!pending) return
+    clearTimeout(pending.timer)
+    record.codexPendingCleanExitFinalizer = undefined
+    record.codexCleanExitDecisionPending = undefined
+  }
+
+  private shouldDelayCodexCleanExitForLifecycleLoss(record: TerminalRecord, event: { exitCode: number; signal?: number }): boolean {
+    return record.mode === 'codex'
+      && this.isCleanPtyExit(event)
+      && !!record.resumeSessionId
+      && !!record.codexRecovery
+      && record.codexSidecarLifecyclePublished === true
+      && !record.codexRecoveryAttempt
+      && !record.codexLifecycleLossProofPending
+      && !record.codexRecoveryFinalClose
+  }
+
+  private scheduleCodexCleanExitFinalizer(
+    record: TerminalRecord,
+    ptyProc: pty.IPty,
+    event: { exitCode: number; signal?: number },
+  ): boolean {
+    if (!this.shouldDelayCodexCleanExitForLifecycleLoss(record, event)) return false
+    this.clearCodexPendingCleanExitFinalizer(record)
+    record.codexCleanExitDecisionPending = true
+    const timer = setTimeout(() => {
+      if (record.codexPendingCleanExitFinalizer?.timer !== timer) return
+      record.codexPendingCleanExitFinalizer = undefined
+      record.codexCleanExitDecisionPending = undefined
+      if (this.terminals.get(record.terminalId) !== record) return
+      if (record.pty !== ptyProc || record.status === 'exited') return
+      if (record.codexRecoveryAttempt || record.codexLifecycleLossProofPending) return
+      this.finishTerminalPtyExit(record, event)
+    }, CODEX_CLEAN_EXIT_LIFECYCLE_LOSS_GRACE_MS)
+    timer.unref?.()
+    record.codexPendingCleanExitFinalizer = { timer }
+    return true
+  }
+
+  private hasHandledPtyExit(record: TerminalRecord, ptyProc: pty.IPty): boolean {
+    return record.codexHandledPtyExits?.has(ptyProc) ?? false
+  }
+
+  private markHandledPtyExit(record: TerminalRecord, ptyProc: pty.IPty): void {
+    record.codexHandledPtyExits ??= new WeakSet()
+    record.codexHandledPtyExits.add(ptyProc)
+  }
+
+  private shouldCheckCodexActiveTurnBeforeCleanExit(record: TerminalRecord, event: { exitCode: number; signal?: number }): boolean {
+    return this.isCleanPtyExit(event)
+      && !record.codexRecoveryAttempt
+      && !record.codexLifecycleLossProofPending
+      && !!this.getCodexRecoveryThreadId(record)
+      && (
+        !!record.codexActiveTurn
+        || record.codexUnconfirmedInputAt !== undefined
+      )
+  }
+
+  private async shouldRecoverCleanCodexExitForActiveTurn(record: TerminalRecord): Promise<boolean> {
+    const initialSnapshot = record.codexActiveTurn
+      ? { turn: record.codexActiveTurn, reliable: true }
+      : await this.findCurrentCodexActiveTurn(record)
+    let turn = initialSnapshot.turn
+    if (!turn) {
+      if (!initialSnapshot.reliable) return true
+      const delayedSnapshot = await this.waitForRecentCodexInputVisibility(record)
+      turn = delayedSnapshot.turn
+      if (!turn) return !delayedSnapshot.reliable
+    }
+
+    if (!turn.turnId) {
+      const currentSnapshot = await this.findCurrentCodexActiveTurn(record)
+      turn = currentSnapshot.turn
+      if (!turn) return !currentSnapshot.reliable
+    }
+
+    if (!turn.turnId || (!record.codexSidecar?.listThreadTurns && !record.codexSidecar?.readThreadTurn)) {
+      return true
+    }
+
+    try {
+      const latestTurnStatus = await this.readCodexTurnStatusForCleanExit(record, turn.threadId, turn.turnId)
+      if (latestTurnStatus === 'inProgress') return true
+      record.codexActiveTurn = undefined
+      record.codexUnconfirmedInputAt = undefined
+      const currentSnapshot = await this.findCurrentCodexActiveTurn(record)
+      if (currentSnapshot.turn) return true
+      return !currentSnapshot.reliable
+    } catch (err) {
+      logger.warn({
+        err,
+        terminalId: record.terminalId,
+        threadId: turn.threadId,
+        turnId: turn.turnId,
+      }, 'Failed to read Codex active turn before clean PTY exit recovery decision')
+      return true
+    }
+  }
+
+  private async readCodexTurnStatusForCleanExit(
+    record: TerminalRecord,
+    threadId: string,
+    turnId: string,
+  ): Promise<string | undefined> {
+    if (record.codexSidecar?.listThreadTurns) {
+      let cursor: string | undefined
+      for (;;) {
+        const page = await record.codexSidecar.listThreadTurns({
+          threadId,
+          limit: 50,
+          sortDirection: 'desc',
+          itemsView: 'notLoaded',
+          ...(cursor ? { cursor } : {}),
+        })
+        const turn = page.turns.find((candidate) => candidate.id === turnId)
+        if (turn) return turn.status
+        if (!page.nextCursor) return undefined
+        cursor = page.nextCursor
+      }
+    }
+
+    const turn = await record.codexSidecar!.readThreadTurn!({ threadId, turnId })
+    return turn.status
+  }
+
+  private async waitForRecentCodexInputVisibility(record: TerminalRecord): Promise<{ turn?: CodexTurnEvent; reliable: boolean }> {
+    if (record.codexUnconfirmedInputAt === undefined) return { reliable: true }
+    if (!record.codexSidecar?.listThreadTurns) return { reliable: true }
+    const elapsedMs = Date.now() - record.codexUnconfirmedInputAt
+    const remainingMs = CODEX_CLEAN_EXIT_RECENT_INPUT_GRACE_MS - elapsedMs
+    if (remainingMs <= 0) return { reliable: record.codexUnconfirmedInputSource !== 'input' }
+
+    logger.debug({
+      terminalId: record.terminalId,
+      elapsedMs,
+      graceMs: CODEX_CLEAN_EXIT_RECENT_INPUT_GRACE_MS,
+    }, 'Waiting briefly for recent Codex input to appear in turn listing before clean PTY exit decision')
+    await new Promise<void>((resolve) => setTimeout(resolve, remainingMs))
+    const snapshot = await this.findCurrentCodexActiveTurn(record)
+    return snapshot
+  }
+
+  private async findCurrentCodexActiveTurn(record: TerminalRecord): Promise<{ turn?: CodexTurnEvent; reliable: boolean }> {
+    const threadId = this.getCodexRecoveryThreadId(record)
+    if (!threadId || !record.codexSidecar?.listThreadTurns) return { reliable: true }
+
+    try {
+      const page = await record.codexSidecar.listThreadTurns({
+        threadId,
+        limit: 50,
+        sortDirection: 'desc',
+        itemsView: 'notLoaded',
+      })
+      const inProgress = page.turns.find((turn) => turn.status === 'inProgress')
+      if (!inProgress) return { reliable: true }
+      const event: CodexTurnEvent = {
+        threadId,
+        turnId: inProgress.id,
+        params: {},
+      }
+      record.codexActiveTurn = event
+      return { turn: event, reliable: true }
+    } catch (err) {
+      logger.warn({
+        err,
+        terminalId: record.terminalId,
+        threadId,
+      }, 'Failed to list Codex turns before clean PTY exit recovery decision')
+      return { reliable: false }
+    }
+  }
+
+  private shouldRecoverCodexPtyExit(record: TerminalRecord, event: { exitCode: number; signal?: number }): boolean {
+    return Boolean(record.codexRecoveryAttempt || record.codexLifecycleLossProofPending) || !this.isCleanPtyExit(event)
   }
 
   private canContinueCodexRecovery(record: TerminalRecord | undefined, resumeSessionId?: string): record is TerminalRecord {
@@ -2403,6 +2695,7 @@ export class TerminalRegistry extends EventEmitter {
 
   private markCodexRecoveryFinalClose(record: TerminalRecord): void {
     record.codexRecoveryFinalClose = true
+    this.clearCodexPendingCleanExitFinalizer(record)
     const retry = record.codexRecoveryRetry
     if (retry) {
       retry.resolve()
@@ -2508,6 +2801,7 @@ export class TerminalRegistry extends EventEmitter {
       record.codexSidecarGeneration = generation
       this.registerCodexSidecarLifecycle(record)
       record.codexRecoveryRetiringPty = undefined
+      record.codexRecoveryAttempt = undefined
       published = true
 
       try {
@@ -2614,33 +2908,74 @@ export class TerminalRegistry extends EventEmitter {
     })
 
     ptyProc.onExit((event) => {
+      if (this.hasHandledPtyExit(record, ptyProc)) return
+      this.markHandledPtyExit(record, ptyProc)
       if (candidate) {
         candidate.exited = true
         candidate.exitCode = event.exitCode
       }
-      if (record.codexRecoveryRetiringPty === ptyProc) {
+      if (!record.codexRecoveryFinalClose && record.codexRecoveryRetiringPty === ptyProc) {
         return
       }
       if (record.pty !== ptyProc || record.status === 'exited') return
       const finishExit = () => {
-        if (this.startCodexDurableRecovery(record, {
-          source: 'pty_exit',
-          exitCode: event.exitCode,
-          signal: event.signal,
-        })) {
+        if (
+          this.shouldRecoverCodexPtyExit(record, event)
+          && this.startCodexDurableRecovery(record, {
+            source: 'pty_exit',
+            exitCode: event.exitCode,
+            signal: event.signal,
+          })
+        ) {
           return
         }
-        this.finishTerminalPtyExit(record, event)
+        if (!this.scheduleCodexCleanExitFinalizer(record, ptyProc, event)) {
+          this.finishTerminalPtyExit(record, event)
+        }
+      }
+      const finishExitAfterActiveTurnCheck = () => {
+        if (!this.shouldCheckCodexActiveTurnBeforeCleanExit(record, event)) {
+          finishExit()
+          return
+        }
+        record.codexCleanExitDecisionPending = true
+        const recoverySerial = record.codexRecoveryAttemptSerial ?? 0
+        void (async () => {
+          try {
+            const shouldRecover = await this.shouldRecoverCleanCodexExitForActiveTurn(record)
+            if ((record.codexRecoveryAttemptSerial ?? 0) !== recoverySerial) return
+            if (record.pty !== ptyProc || record.status === 'exited') return
+            if (record.codexRecoveryAttempt || record.codexLifecycleLossProofPending) return
+            if (
+              shouldRecover
+              && this.startCodexDurableRecovery(record, {
+                source: 'pty_exit',
+                exitCode: event.exitCode,
+                signal: event.signal,
+              })
+            ) {
+              return
+            }
+            if (!this.scheduleCodexCleanExitFinalizer(record, ptyProc, event)) {
+              this.finishTerminalPtyExit(record, event)
+            }
+          } finally {
+            if (this.terminals.get(record.terminalId) === record && !record.codexPendingCleanExitFinalizer) {
+              record.codexCleanExitDecisionPending = undefined
+            }
+          }
+        })()
       }
       if (this.needsCodexFinalDurabilityProof(record)) {
+        if (record.codexLifecycleLossProofPending) return
         void (async () => {
           await this.proveCodexBeforeFinalLoss(record, 'pty_exit')
           if (record.pty !== ptyProc || record.status === 'exited') return
-          finishExit()
+          finishExitAfterActiveTurnCheck()
         })()
         return
       }
-      finishExit()
+      finishExitAfterActiveTurnCheck()
     })
   }
 
@@ -2692,15 +3027,21 @@ export class TerminalRegistry extends EventEmitter {
       }
     }
     if (term.status !== 'running') return { status: 'not_running' }
+    if (term.codexRecoveryAttempt) {
+      return { status: 'blocked_codex_recovery_pending', terminalId }
+    }
+    if (term.codexCleanExitDecisionPending) {
+      return { status: 'blocked_codex_clean_exit_decision_pending', terminalId }
+    }
+    if (term.codexLifecycleLossProofPending) {
+      return { status: 'blocked_codex_lifecycle_loss_pending', terminalId }
+    }
     if (term.codexInputGate?.state === 'identity_pending') {
       if (isCodexStartupTerminalControlInput(data)) {
         term.pty.write(data)
         return { status: 'written' }
       }
       return { status: 'blocked_codex_identity_pending', terminalId }
-    }
-    if (term.codexRecoveryAttempt) {
-      return { status: 'blocked_codex_recovery_pending', terminalId }
     }
     const now = Date.now()
     term.lastActivityAt = now
@@ -2713,6 +3054,10 @@ export class TerminalRegistry extends EventEmitter {
       if (term.perf.pendingInputAt === undefined) {
         term.perf.pendingInputAt = now
       }
+    }
+    if (term.mode === 'codex') {
+      term.codexUnconfirmedInputAt = now
+      term.codexUnconfirmedInputSource = 'input'
     }
     term.pty.write(data)
     this.emit('terminal.input.raw', {

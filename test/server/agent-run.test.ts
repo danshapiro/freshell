@@ -246,6 +246,62 @@ it('reports Codex recovery-pending input rejection for /api/run', async () => {
   expect(registry.killAndWait).toHaveBeenCalledWith('term1')
 })
 
+it('reports Codex lifecycle-loss-pending input rejection for /api/run', async () => {
+  const registry = {
+    create: vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term1' })),
+    input: vi.fn(() => ({ status: 'blocked_codex_lifecycle_loss_pending', terminalId: 'term1' })),
+    killAndWait: vi.fn(async () => true),
+  }
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      createTab: () => ({ tabId: 't1', paneId: 'p1' }),
+      closeTab: vi.fn(),
+      attachPaneContent: () => {},
+    },
+    registry,
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
+
+  expect(res.status).toBe(500)
+  expect(res.body.message).toBe('Codex worker lifecycle loss is still being resolved.')
+  expect(registry.input).toHaveBeenCalledTimes(1)
+  expect(registry.killAndWait).toHaveBeenCalledWith('term1')
+})
+
+it('reports Codex clean-exit-decision-pending input rejection for /api/run', async () => {
+  const registry = {
+    create: vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term1' })),
+    input: vi.fn(() => ({ status: 'blocked_codex_clean_exit_decision_pending', terminalId: 'term1' })),
+    killAndWait: vi.fn(async () => true),
+  }
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      createTab: () => ({ tabId: 't1', paneId: 'p1' }),
+      closeTab: vi.fn(),
+      attachPaneContent: () => {},
+    },
+    registry,
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
+
+  expect(res.status).toBe(500)
+  expect(res.body.message).toBe('Codex clean exit state is still being resolved.')
+  expect(registry.input).toHaveBeenCalledTimes(1)
+  expect(registry.killAndWait).toHaveBeenCalledWith('term1')
+})
+
 it('shuts down the pending Codex sidecar when /api/run fails after planning', async () => {
   const registry = {
     create: vi.fn(() => {

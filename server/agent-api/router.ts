@@ -198,6 +198,12 @@ function terminalInputFailureMessage(result: Exclude<TerminalInputResult, { stat
   if (result.status === 'blocked_codex_recovery_pending') {
     return 'Codex durable recovery is still in progress.'
   }
+  if (result.status === 'blocked_codex_clean_exit_decision_pending') {
+    return 'Codex clean exit state is still being resolved.'
+  }
+  if (result.status === 'blocked_codex_lifecycle_loss_pending') {
+    return 'Codex worker lifecycle loss is still being resolved.'
+  }
   return 'Terminal is not running.'
 }
 

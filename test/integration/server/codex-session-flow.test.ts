@@ -636,6 +636,243 @@ describe('Codex Session Flow Integration', () => {
     }
   })
 
+  it('keeps a real durable Codex PTY clean exit final without recovery replacement', async () => {
+    const testDir = await fsp.mkdtemp(path.join(tempDir, 'clean-exit-final-'))
+    const metadataDir = path.join(testDir, 'metadata')
+    const launchLogPath = path.join(testDir, 'codex-launches.jsonl')
+    await fsp.mkdir(metadataDir, { recursive: true })
+
+    const previousLaunchLog = process.env.FAKE_CODEX_LAUNCH_LOG
+    process.env.FAKE_CODEX_LAUNCH_LOG = launchLogPath
+
+    const oldRuntime = new CodexAppServerRuntime({
+      command: process.execPath,
+      commandArgs: [FAKE_APP_SERVER_PATH],
+      metadataDir,
+      serverInstanceId: 'srv-codex-clean-exit-old',
+      env: {
+        FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
+          loadedThreadIds: ['thread-existing-1'],
+        }),
+      },
+    })
+    const replacementRuntime = new CodexAppServerRuntime({
+      command: process.execPath,
+      commandArgs: [FAKE_APP_SERVER_PATH],
+      metadataDir,
+      serverInstanceId: 'srv-codex-clean-exit-replacement',
+      env: {
+        FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
+          loadedThreadIds: ['thread-existing-1'],
+        }),
+      },
+    })
+    runtimes.add(oldRuntime)
+    runtimes.add(replacementRuntime)
+    const oldPlanner = new CodexLaunchPlanner(oldRuntime)
+    const replacementPlanner = new CodexLaunchPlanner(replacementRuntime)
+    let terminalId: string | undefined
+
+    try {
+      const oldPlan = await oldPlanner.planCreate({ resumeSessionId: 'thread-existing-1' })
+      const recovery = {
+        planCreate: vi.fn(() => replacementPlanner.planCreate({ resumeSessionId: 'thread-existing-1' })),
+        retryDelayMs: 0,
+      }
+      const term = registry.create({
+        mode: 'codex',
+        resumeSessionId: 'thread-existing-1',
+        cwd: tempDir,
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: oldPlan.remote.wsUrl,
+            sidecar: oldPlan.sidecar,
+            recovery,
+          },
+        } as any,
+      })
+      terminalId = term.terminalId
+      const exited = new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          cleanup()
+          reject(new Error('Timed out waiting for clean Codex PTY exit'))
+        }, MESSAGE_TIMEOUT_MS)
+        const cleanup = () => {
+          clearTimeout(timeout)
+          registry.off('terminal.exit', onExit)
+        }
+        const onExit = (event: { terminalId: string; exitCode?: number }) => {
+          if (event.terminalId !== term.terminalId) return
+          try {
+            expect(event.exitCode).toBe(0)
+            cleanup()
+            resolve()
+          } catch (err) {
+            cleanup()
+            reject(err)
+          }
+        }
+        registry.on('terminal.exit', onExit)
+      })
+      await oldPlan.sidecar.adopt({ terminalId: term.terminalId, generation: 0 })
+      await waitForJsonLine(launchLogPath, (line) => line.pid === term.pty.pid)
+      await exited
+
+      expect(recovery.planCreate).not.toHaveBeenCalled()
+      expect(registry.get(term.terminalId)?.status).toBe('exited')
+      expect(registry.get(term.terminalId)?.exitCode).toBe(0)
+    } finally {
+      if (terminalId) {
+        await registry.killAndWait(terminalId).catch(() => undefined)
+      }
+      await replacementPlanner.shutdown().catch(() => undefined)
+      await oldPlanner.shutdown().catch(() => undefined)
+      await replacementRuntime.shutdown().catch(() => undefined)
+      await oldRuntime.shutdown().catch(() => undefined)
+      runtimes.delete(oldRuntime)
+      runtimes.delete(replacementRuntime)
+      if (previousLaunchLog === undefined) delete process.env.FAKE_CODEX_LAUNCH_LOG
+      else process.env.FAKE_CODEX_LAUNCH_LOG = previousLaunchLog
+      await fsp.rm(testDir, { recursive: true, force: true })
+    }
+  })
+
+  it('recovers a real durable Codex PTY that exits 0 after SIGTERM during an active turn', async () => {
+    const testDir = await fsp.mkdtemp(path.join(tempDir, 'sigterm-active-turn-'))
+    const metadataDir = path.join(testDir, 'metadata')
+    const launchLogPath = path.join(testDir, 'codex-launches.jsonl')
+    const remoteLogPath = path.join(testDir, 'codex-remote.jsonl')
+    await fsp.mkdir(metadataDir, { recursive: true })
+
+    const previousConnectRemote = process.env.FAKE_CODEX_CONNECT_REMOTE
+    const previousRemoteLog = process.env.FAKE_CODEX_REMOTE_LOG
+    const previousStayAlive = process.env.FAKE_CODEX_STAY_ALIVE
+    const previousLaunchLog = process.env.FAKE_CODEX_LAUNCH_LOG
+    const previousBehavior = process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR
+    process.env.FAKE_CODEX_CONNECT_REMOTE = '1'
+    process.env.FAKE_CODEX_REMOTE_LOG = remoteLogPath
+    process.env.FAKE_CODEX_STAY_ALIVE = '1'
+    process.env.FAKE_CODEX_LAUNCH_LOG = launchLogPath
+    process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR = JSON.stringify({
+      threadStartThreadId: 'thread-existing-1',
+      loadedThreadIds: ['thread-existing-1'],
+      threadTurns: [{
+        id: 'turn-1',
+        status: 'inProgress',
+        items: [],
+        error: null,
+        startedAt: 1770000001,
+        completedAt: null,
+        durationMs: null,
+      }],
+      notificationsAfterMethods: {
+        'turn/start': [{
+          method: 'turn/started',
+          params: {
+            threadId: 'thread-existing-1',
+            turnId: 'turn-1',
+          },
+        }],
+      },
+    })
+
+    const oldRuntime = new CodexAppServerRuntime({
+      command: process.execPath,
+      commandArgs: [FAKE_APP_SERVER_PATH],
+      metadataDir,
+      serverInstanceId: 'srv-codex-sigterm-active-old',
+    })
+    const replacementRuntime = new CodexAppServerRuntime({
+      command: process.execPath,
+      commandArgs: [FAKE_APP_SERVER_PATH],
+      metadataDir,
+      serverInstanceId: 'srv-codex-sigterm-active-replacement',
+    })
+    runtimes.add(oldRuntime)
+    runtimes.add(replacementRuntime)
+    const oldPlanner = new CodexLaunchPlanner(oldRuntime)
+    const replacementPlanner = new CodexLaunchPlanner(replacementRuntime)
+    let terminalId: string | undefined
+    let oldPtyPid: number | undefined
+
+    try {
+      const oldPlan = await oldPlanner.planCreate({ resumeSessionId: 'thread-existing-1' })
+      const recovery = {
+        planCreate: vi.fn(() => replacementPlanner.planCreate({ resumeSessionId: 'thread-existing-1' })),
+        retryDelayMs: 0,
+      }
+      const term = registry.create({
+        mode: 'codex',
+        resumeSessionId: 'thread-existing-1',
+        cwd: tempDir,
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: oldPlan.remote.wsUrl,
+            sidecar: oldPlan.sidecar,
+            recovery,
+          },
+        } as any,
+      })
+      terminalId = term.terminalId
+      oldPtyPid = term.pty.pid
+      await oldPlan.sidecar.adopt({ terminalId: term.terminalId, generation: 0 })
+      await waitForJsonLine(remoteLogPath, (line) => (
+        line.pid === oldPtyPid
+        && line.message?.result?.thread?.id === 'thread-existing-1'
+      ))
+
+      expect(registry.input(term.terminalId, 'start active turn\n')).toEqual({ status: 'written' })
+      await vi.waitFor(() => {
+        expect((registry.get(term.terminalId) as any)?.codexActiveTurn).toMatchObject({
+          threadId: 'thread-existing-1',
+          turnId: 'turn-1',
+        })
+      })
+
+      process.kill(oldPtyPid, 'SIGTERM')
+
+      await vi.waitFor(() => expect(recovery.planCreate).toHaveBeenCalledTimes(1))
+      const replacementLaunch = await waitForJsonLine(
+        launchLogPath,
+        (line) => line.pid !== oldPtyPid && Array.isArray(line.args) && line.args.includes('thread-existing-1'),
+      )
+      await vi.waitFor(() => {
+        const latest = registry.get(term.terminalId)
+        expect(latest?.status).toBe('running')
+        expect(latest?.pty.pid).toBe(replacementLaunch.pid)
+        expect(latest?.exitCode).toBeUndefined()
+      })
+    } finally {
+      if (oldPtyPid && await isProcessAlive(oldPtyPid)) {
+        try {
+          process.kill(oldPtyPid, 'SIGKILL')
+        } catch {
+          // Best-effort cleanup for a fake PTY process that can outlive the assertion window under parallel load.
+        }
+      }
+      if (terminalId) {
+        await registry.killAndWait(terminalId).catch(() => undefined)
+      }
+      await replacementPlanner.shutdown().catch(() => undefined)
+      await oldPlanner.shutdown().catch(() => undefined)
+      await replacementRuntime.shutdown().catch(() => undefined)
+      await oldRuntime.shutdown().catch(() => undefined)
+      runtimes.delete(oldRuntime)
+      runtimes.delete(replacementRuntime)
+      if (previousConnectRemote === undefined) delete process.env.FAKE_CODEX_CONNECT_REMOTE
+      else process.env.FAKE_CODEX_CONNECT_REMOTE = previousConnectRemote
+      if (previousRemoteLog === undefined) delete process.env.FAKE_CODEX_REMOTE_LOG
+      else process.env.FAKE_CODEX_REMOTE_LOG = previousRemoteLog
+      if (previousStayAlive === undefined) delete process.env.FAKE_CODEX_STAY_ALIVE
+      else process.env.FAKE_CODEX_STAY_ALIVE = previousStayAlive
+      if (previousLaunchLog === undefined) delete process.env.FAKE_CODEX_LAUNCH_LOG
+      else process.env.FAKE_CODEX_LAUNCH_LOG = previousLaunchLog
+      if (previousBehavior === undefined) delete process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR
+      else process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR = previousBehavior
+      await fsp.rm(testDir, { recursive: true, force: true })
+    }
+  })
+
   it('retires the previous wrapper/native app-server during recovery replacement and routes later input only to the replacement', async () => {
     const testDir = await fsp.mkdtemp(path.join(tempDir, 'recovery-retire-'))
     const metadataDir = path.join(testDir, 'metadata')

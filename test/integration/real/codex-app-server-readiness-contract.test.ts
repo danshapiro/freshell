@@ -213,7 +213,15 @@ describe('real Codex app-server durable readiness contract', () => {
       })
       await creationClient.waitForNotification(
         (notification) => notification.method === 'turn/completed'
-          && notification.params?.threadId === durableThreadId,
+        && notification.params?.threadId === durableThreadId,
+      )
+      await creationClient.request('turn/start', {
+        threadId: durableThreadId,
+        input: [{ type: 'text', text: 'Reply with exactly: freshell-readiness-contract-page-two' }],
+      })
+      await creationClient.waitForNotification(
+        (notification) => notification.method === 'turn/completed'
+        && notification.params?.threadId === durableThreadId,
       )
       await waitForSessionArtifact(codexHome, durableThreadId)
     } finally {
@@ -243,6 +251,47 @@ describe('real Codex app-server durable readiness contract', () => {
 
       const resumed = await actor.resumeThread({ threadId: durableThreadId, cwd: process.cwd() })
       expect(resumed.threadId).toBe(durableThreadId)
+      const newestTurnPage = await actor.listThreadTurns({
+        threadId: durableThreadId,
+        limit: 1,
+        sortDirection: 'desc',
+        itemsView: 'full',
+      })
+      expect(newestTurnPage.turns).toEqual([expect.objectContaining({
+        id: expect.any(String),
+        itemsView: 'full',
+      })])
+      expect(newestTurnPage.nextCursor).toEqual(expect.any(String))
+      const newestMetadataPage = await actor.listThreadTurns({
+        threadId: durableThreadId,
+        limit: 1,
+        sortDirection: 'desc',
+        itemsView: 'notLoaded',
+      })
+      expect(newestMetadataPage.turns).toEqual([expect.objectContaining({
+        id: newestTurnPage.turns[0]!.id,
+        itemsView: 'notLoaded',
+        items: [],
+      })])
+      const olderTurnPage = await actor.listThreadTurns({
+        threadId: durableThreadId,
+        limit: 1,
+        sortDirection: 'desc',
+        cursor: newestTurnPage.nextCursor ?? undefined,
+        itemsView: 'full',
+      })
+      expect(olderTurnPage.turns).toEqual([expect.objectContaining({
+        id: expect.any(String),
+        itemsView: 'full',
+      })])
+      expect(olderTurnPage.turns[0]!.id).not.toBe(newestTurnPage.turns[0]!.id)
+      await expect(actor.readThreadTurn({
+        threadId: durableThreadId,
+        turnId: olderTurnPage.turns[0]!.id,
+      })).resolves.toMatchObject({
+        id: olderTurnPage.turns[0]!.id,
+        itemsView: 'full',
+      })
 
       const readiness = await waitForLifecycle(
         lifecycle,

@@ -100,6 +100,7 @@ function makeTurn(id = 'turn-1') {
   return {
     id,
     status: 'completed',
+    itemsView: 'full',
     items: [{
       type: 'agentMessage',
       id: `${id}:item-0`,
@@ -111,6 +112,24 @@ function makeTurn(id = 'turn-1') {
     startedAt: 1770000001,
     completedAt: 1770000002,
     durationMs: 1000,
+  }
+}
+
+function projectTurnItemsView(turn, itemsView = 'summary') {
+  if (itemsView === 'full') {
+    return { ...turn, itemsView: 'full' }
+  }
+  if (itemsView === 'notLoaded') {
+    return { ...turn, itemsView: 'notLoaded', items: [] }
+  }
+  return {
+    ...turn,
+    itemsView: 'summary',
+    items: turn.items.map((item) => ({
+      type: item.type,
+      id: item.id,
+      summary: item.summary ?? item.text ?? item.command ?? item.type,
+    })),
   }
 }
 
@@ -130,6 +149,32 @@ function makeThread(id, params = {}) {
     source: 'appServer',
     turns: params.includeTurns ? [makeTurn()] : [],
     path: handle.path,
+  }
+}
+
+function makeThreadTurnsPage(params = {}) {
+  const configuredTurns = Array.isArray(behavior.threadTurns)
+    ? behavior.threadTurns
+    : [makeTurn()]
+  const orderedTurns = params.sortDirection === 'asc'
+    ? configuredTurns.slice()
+    : configuredTurns.slice().reverse()
+  const offset = typeof params.cursor === 'string' && /^\d+$/.test(params.cursor)
+    ? Number(params.cursor)
+    : 0
+  const limit = Number.isInteger(params.limit) && params.limit > 0
+    ? params.limit
+    : orderedTurns.length
+  const turns = orderedTurns
+    .slice(offset, offset + limit)
+    .map((turn) => projectTurnItemsView(turn, params.itemsView))
+  const nextOffset = offset + turns.length
+  return {
+    revision: 1770000007,
+    data: turns,
+    nextCursor: nextOffset < orderedTurns.length ? String(nextOffset) : null,
+    backwardsCursor: null,
+    bodies: Object.fromEntries(turns.map((turn) => [turn.id, turn])),
   }
 }
 
@@ -200,6 +245,9 @@ function successResult(method, params) {
         includeTurns: params?.includeTurns === true,
       }),
     }
+  }
+  if (method === 'thread/turns/list') {
+    return makeThreadTurnsPage(params)
   }
   if (method === 'thread/loaded/list') {
     return {

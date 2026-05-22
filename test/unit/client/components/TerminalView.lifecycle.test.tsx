@@ -2522,6 +2522,70 @@ describe('TerminalView lifecycle updates', () => {
     )
   })
 
+  it('shows feedback when Codex input is blocked by lifecycle-loss proof', async () => {
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      terminalId: 'term-codex',
+      status: 'running',
+      mode: 'codex',
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.input.blocked',
+        terminalId: 'term-codex',
+        reason: 'codex_lifecycle_loss_pending',
+      })
+    })
+
+    const term = terminalInstances[0]
+    expect(term.writeln).toHaveBeenCalledWith(
+      expect.stringContaining('Input not sent: Codex is resolving a worker disconnect. Try again in a moment.'),
+    )
+  })
+
+  it('shows feedback when Codex input is blocked by clean-exit state resolution', async () => {
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      terminalId: 'term-codex',
+      status: 'running',
+      mode: 'codex',
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.input.blocked',
+        terminalId: 'term-codex',
+        reason: 'codex_clean_exit_decision_pending',
+      })
+    })
+
+    const term = terminalInstances[0]
+    expect(term.writeln).toHaveBeenCalledWith(
+      expect.stringContaining('Input not sent: Codex is checking whether the session is still active. Try again in a moment.'),
+    )
+  })
+
   it('mirrors canonical durable identity to pane and tab on terminal.session.associated', async () => {
     const tabId = 'tab-session-assoc'
     const paneId = 'pane-session-assoc'

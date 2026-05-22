@@ -104,6 +104,7 @@ describe('Codex fresh-agent adapter', () => {
 
   it('reads snapshots and turns from the official Codex thread APIs', async () => {
     const durableTurn = makeCodexTurn('turn-1')
+    const expectedFullItem = expect.objectContaining({ kind: 'text', text: 'Codex summary' })
     const runtime = {
       startThread: vi.fn(),
       resumeThread: vi.fn(),
@@ -131,11 +132,13 @@ describe('Codex fresh-agent adapter', () => {
     expect(runtime.readThread).toHaveBeenCalledWith({ threadId: 'thread-new-1', includeTurns: true })
     await expect(adapter.getTurnPage?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-new-1' }, { revision: 7 })).resolves.toMatchObject({
       revision: 7,
-      turns: [{ id: 'turn-1', turnId: 'turn-1' }],
+      turns: [{ id: 'turn-1', turnId: 'turn-1', items: [expectedFullItem] }],
+      bodies: { 'turn-1': expect.objectContaining({ items: [expectedFullItem] }) },
     })
     await expect(adapter.getTurnBody?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-new-1', turnId: 'turn-1' }, 7)).resolves.toMatchObject({
       turnId: 'turn-1',
       revision: 7,
+      items: [expectedFullItem],
     })
   })
 

@@ -132,6 +132,8 @@ type TerminalInputBlockedReason =
   | 'codex_identity_capture_timeout'
   | 'codex_identity_unavailable'
   | 'codex_recovery_pending'
+  | 'codex_clean_exit_decision_pending'
+  | 'codex_lifecycle_loss_pending'
 
 function shouldSuppressNativeTouchScroll(term: Terminal): boolean {
   return term.buffer.active.type === 'alternate' && term.modes.mouseTrackingMode !== 'none'
@@ -143,6 +145,10 @@ function terminalInputBlockedNotice(reason: TerminalInputBlockedReason): string 
       return 'Input not sent: Codex is still saving restore state. Try again in a moment.'
     case 'codex_recovery_pending':
       return 'Input not sent: Codex is still reconnecting. Try again in a moment.'
+    case 'codex_clean_exit_decision_pending':
+      return 'Input not sent: Codex is checking whether the session is still active. Try again in a moment.'
+    case 'codex_lifecycle_loss_pending':
+      return 'Input not sent: Codex is resolving a worker disconnect. Try again in a moment.'
     case 'codex_identity_capture_timeout':
       return 'Input not sent: Codex did not provide restore state before startup timed out. Start a new Codex pane or resume inside Codex.'
     case 'codex_identity_unavailable':

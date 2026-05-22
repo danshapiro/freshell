@@ -102,6 +102,7 @@ export const CodexThreadStatusSchema = z.discriminatedUnion('type', [
 ])
 
 export const CodexTurnStatusSchema = z.enum(['completed', 'interrupted', 'failed', 'inProgress'])
+export const CodexThreadItemsViewSchema = z.enum(['notLoaded', 'summary', 'full'])
 
 export const CodexSessionSourceSchema = z.union([
   z.enum(['cli', 'vscode', 'exec', 'appServer', 'unknown']),
@@ -136,6 +137,7 @@ export const CodexThreadItemSchema = z.object({
 export const CodexTurnSchema = z.object({
   id: z.string().min(1),
   items: z.array(CodexThreadItemSchema),
+  itemsView: CodexThreadItemsViewSchema.optional(),
   status: CodexTurnStatusSchema,
   error: z.unknown().nullable().optional().default(null),
   startedAt: z.number().nullable().optional().default(null),
@@ -262,15 +264,30 @@ export const CodexThreadPageParamsSchema = z.object({
   cursor: z.string().min(1).optional(),
   limit: z.number().int().positive().optional(),
   sortDirection: z.enum(['asc', 'desc']).optional(),
+  itemsView: CodexThreadItemsViewSchema.optional(),
 }).strict()
 
-export const CodexThreadTurnsListResultSchema = z.object({
+export const CodexThreadTurnsListResultSchema = z.preprocess((value) => {
+  if (
+    value
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && 'data' in value
+    && !('turns' in value)
+  ) {
+    return {
+      ...value,
+      turns: (value as { data: unknown }).data,
+    }
+  }
+  return value
+}, z.object({
   revision: z.number().int().nonnegative().optional(),
   nextCursor: z.string().nullable().optional().default(null),
   backwardsCursor: z.string().nullable().optional().default(null),
   turns: z.array(CodexTurnSchema),
   bodies: z.record(z.string(), CodexTurnSchema).optional(),
-}).passthrough()
+}).passthrough())
 
 export const CodexThreadTurnReadParamsSchema = z.object({
   threadId: z.string().min(1),

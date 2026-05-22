@@ -93,7 +93,7 @@ export const CODEX_CLIENT_REQUEST_TRACEABILITY: readonly CodexTraceEntry<CodexCl
       ? 'test/unit/server/coding-cli/codex-app-server/client.test.ts'
       : 'test/unit/server/coding-cli/codex-app-server/schema-traceability.test.ts',
     notes: name === 'thread/read'
-      ? 'codex-cli 0.129.0 does not expose thread/turns/list; page work must be built from generated methods or a later schema.'
+      ? 'codex-cli 0.129.0 stable schema does not expose experimental thread/turns/list; Freshell opts into the experimental runtime method, falls back to thread/read when it is unavailable, and covers both paths with tests.'
       : undefined,
   }))
 
