@@ -19,11 +19,7 @@ function getTurnLabel(turn: FreshAgentTurn): string {
 export function FreshAgentTranscript({ turns }: { turns: FreshAgentTurn[] }) {
   return (
     <div className="flex flex-1 flex-col gap-3 overflow-y-auto px-3 py-3" data-context="fresh-agent-transcript">
-      {turns.length === 0 ? (
-        <div className="rounded-lg border border-dashed border-border/60 px-4 py-6 text-sm text-muted-foreground">
-          No transcript available yet.
-        </div>
-      ) : turns.map((turn) => {
+      {turns.map((turn) => {
         const isUser = turn.role === 'user'
         return (
           <article
