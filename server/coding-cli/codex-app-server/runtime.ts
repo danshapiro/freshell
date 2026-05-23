@@ -498,20 +498,12 @@ export const reapOrphanedCodexAppServerSidecarsOnStartup = runCodexStartupReaper
 
 export function assertCodexStartupReaperSucceeded(result: ReapOrphanedSidecarsResult): void {
   const failedOwnershipIds = [...new Set(result.failedOwnershipIds)]
-  const skippedActiveOwnershipIds = [...new Set(result.skippedActiveOwnershipIds)]
-  if (failedOwnershipIds.length === 0 && skippedActiveOwnershipIds.length === 0) return
+  if (failedOwnershipIds.length === 0) return
 
   const reasons: string[] = []
-  if (failedOwnershipIds.length > 0) {
-    reasons.push(
-      `failed to reap ${failedOwnershipIds.length} ownership record(s): ${failedOwnershipIds.join(', ')}`,
-    )
-  }
-  if (skippedActiveOwnershipIds.length > 0) {
-    reasons.push(
-      `found ${skippedActiveOwnershipIds.length} active ownership record(s) requiring manual resolution: ${skippedActiveOwnershipIds.join(', ')}`,
-    )
-  }
+  reasons.push(
+    `failed to reap ${failedOwnershipIds.length} ownership record(s): ${failedOwnershipIds.join(', ')}`,
+  )
 
   throw new Error(
     `Codex app-server startup reaper blocked startup: ${reasons.join('; ')}. `
