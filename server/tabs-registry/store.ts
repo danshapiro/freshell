@@ -4,6 +4,7 @@ import fsp from 'fs/promises'
 import path from 'path'
 import { z } from 'zod'
 import { getFreshellConfigDir } from '../freshell-home.js'
+import { logger } from '../logger.js'
 import { TabRegistryRecordSchema, type RegistryTabRecord } from './types.js'
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -11,6 +12,37 @@ const MINUTE_MS = 60 * 1000
 const DEFAULT_CLOSED_RETENTION_DAYS = 30
 const DEFAULT_OPEN_SNAPSHOT_TTL_MINUTES = 30
 const DEFAULT_DEVICE_DISPLAY_TTL_DAYS = 7
+const log = logger.child({ component: 'tabs-registry-store' })
+
+class InvalidCompactTabsRegistryStateError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message)
+    this.name = 'InvalidCompactTabsRegistryStateError'
+    this.cause = options?.cause
+  }
+}
+
+function getErrorCode(error: unknown): string | undefined {
+  return error && typeof error === 'object' && 'code' in error && typeof (error as { code?: unknown }).code === 'string'
+    ? (error as { code: string }).code
+    : undefined
+}
+
+function isOperationalFsError(error: unknown): boolean {
+  const code = getErrorCode(error)
+  return code === 'EACCES'
+    || code === 'EPERM'
+    || code === 'EIO'
+    || code === 'EMFILE'
+    || code === 'ENFILE'
+    || code === 'ENOMEM'
+    || code === 'ETIMEDOUT'
+    || code === 'EBUSY'
+}
+
+function invalidCompactState(message: string, cause?: unknown): InvalidCompactTabsRegistryStateError {
+  return new InvalidCompactTabsRegistryStateError(message, { cause })
+}
 
 type ObjectRef = {
   path: string
@@ -622,8 +654,25 @@ export class TabsRegistryStore {
 
     const compactManifestPath = path.join(resolvedRoot, 'v1', 'manifest.json')
     if (fs.existsSync(compactManifestPath)) {
-      const { state, manifestRevision, manifestObjectRefs } = await TabsRegistryStore.loadCompactState(resolvedRoot, caps)
-      return new TabsRegistryStore(resolvedRoot, state, manifestRevision, options, manifestObjectRefs)
+      try {
+        const { state, manifestRevision, manifestObjectRefs } = await TabsRegistryStore.loadCompactState(resolvedRoot, caps)
+        return new TabsRegistryStore(resolvedRoot, state, manifestRevision, options, manifestObjectRefs)
+      } catch (error) {
+        if (!(error instanceof InvalidCompactTabsRegistryStateError)) {
+          throw error
+        }
+        const archivedManifestPath = await TabsRegistryStore.archiveInvalidCompactManifest(compactManifestPath)
+        log.warn({
+          err: error,
+          manifestPath: compactManifestPath,
+          archivedManifestPath,
+          event: 'tabs_registry_compact_state_recovered',
+        }, 'Tabs registry compact state was invalid; archived manifest and started with an empty registry')
+        const state = emptyState(now(), options.defaultClosedRetentionDays ?? DEFAULT_CLOSED_RETENTION_DAYS)
+        const store = new TabsRegistryStore(resolvedRoot, state, 0, options)
+        await store.commitState(state)
+        return store
+      }
     }
 
     const legacyPath = path.join(resolvedRoot, 'tabs-registry.jsonl')
@@ -664,35 +713,58 @@ export class TabsRegistryStore {
       }
       manifest = ManifestSchema.parse(JSON.parse(rawManifest))
     } catch (error) {
-      throw new Error(`Tabs registry compact state manifest is invalid: ${error instanceof Error ? error.message : String(error)}`)
+      if (getErrorCode(error) === 'ENOENT' || isOperationalFsError(error)) {
+        throw error
+      }
+      throw invalidCompactState(`Tabs registry compact state manifest is invalid: ${error instanceof Error ? error.message : String(error)}`, error)
     }
 
     const readObject = async <T>(ref: ObjectRef, schema: z.ZodType<T>, maxBytes: number): Promise<T> => {
       if (ref.bytes > maxBytes) {
-        throw new Error(`Tabs registry compact state object ${ref.path} exceeds ${formatBytes(maxBytes)}`)
+        throw invalidCompactState(`Tabs registry compact state object ${ref.path} exceeds ${formatBytes(maxBytes)}`)
       }
       const absolute = path.join(rootDir, 'v1', ref.path)
-      const stat = await fsp.stat(absolute)
-      if (stat.size !== ref.bytes) {
-        throw new Error(`Tabs registry compact state object size mismatch: ${ref.path}`)
+      let stat: fs.Stats
+      try {
+        stat = await fsp.stat(absolute)
+      } catch (error) {
+        if (isOperationalFsError(error)) {
+          throw error
+        }
+        throw invalidCompactState(`Tabs registry compact state object ${ref.path} is unavailable: ${error instanceof Error ? error.message : String(error)}`, error)
       }
-      const raw = await fsp.readFile(absolute, 'utf-8')
+      if (stat.size !== ref.bytes) {
+        throw invalidCompactState(`Tabs registry compact state object size mismatch: ${ref.path}`)
+      }
+      let raw: string
+      try {
+        raw = await fsp.readFile(absolute, 'utf-8')
+      } catch (error) {
+        if (isOperationalFsError(error)) {
+          throw error
+        }
+        throw invalidCompactState(`Tabs registry compact state object ${ref.path} could not be read: ${error instanceof Error ? error.message : String(error)}`, error)
+      }
       const bytes = Buffer.byteLength(raw, 'utf-8')
       const digest = sha256(raw)
       if (bytes !== ref.bytes || digest !== ref.sha256) {
-        throw new Error(`Tabs registry compact state object failed hash validation: ${ref.path}`)
+        throw invalidCompactState(`Tabs registry compact state object failed hash validation: ${ref.path}`)
       }
-      return schema.parse(JSON.parse(raw))
+      try {
+        return schema.parse(JSON.parse(raw))
+      } catch (error) {
+        throw invalidCompactState(`Tabs registry compact state object ${ref.path} is invalid: ${error instanceof Error ? error.message : String(error)}`, error)
+      }
     }
 
     const validateManifestRefsBeforeRead = (manifest: TabsRegistryManifestV1): void => {
       const openRefs = Object.values(manifest.openSnapshots)
       if (openRefs.length > caps.maxClientSnapshotRefs) {
-        throw new Error(`Tabs registry can retain at most ${caps.maxClientSnapshotRefs} client snapshots`)
+        throw invalidCompactState(`Tabs registry can retain at most ${caps.maxClientSnapshotRefs} client snapshots`)
       }
       for (const ref of openRefs) {
         if (ref.bytes > caps.maxSerializedClientSnapshotObjectBytes) {
-          throw new Error(`Tabs registry compact state object ${ref.path} exceeds ${formatBytes(caps.maxSerializedClientSnapshotObjectBytes)}`)
+          throw invalidCompactState(`Tabs registry compact state object ${ref.path} exceeds ${formatBytes(caps.maxSerializedClientSnapshotObjectBytes)}`)
         }
       }
       const fixedRefs: Array<[ObjectRef, number]> = [
@@ -702,13 +774,13 @@ export class TabsRegistryStore {
       ]
       for (const [ref, maxBytes] of fixedRefs) {
         if (ref.bytes > maxBytes) {
-          throw new Error(`Tabs registry compact state object ${ref.path} exceeds ${formatBytes(maxBytes)}`)
+          throw invalidCompactState(`Tabs registry compact state object ${ref.path} exceeds ${formatBytes(maxBytes)}`)
         }
       }
       const referencedBytes = [...openRefs, manifest.clientRevisions, manifest.closedTombstones, manifest.devices]
         .reduce((sum, ref) => sum + ref.bytes, 0)
       if (referencedBytes > caps.maxCompactStateBytes) {
-        throw new Error(`Tabs registry compact state exceeds ${formatBytes(caps.maxCompactStateBytes)}`)
+        throw invalidCompactState(`Tabs registry compact state exceeds ${formatBytes(caps.maxCompactStateBytes)}`)
       }
     }
 
@@ -745,8 +817,17 @@ export class TabsRegistryStore {
         },
       }
     } catch (error) {
-      throw new Error(`Tabs registry compact state is invalid: ${error instanceof Error ? error.message : String(error)}`)
+      if (!(error instanceof InvalidCompactTabsRegistryStateError) && isOperationalFsError(error)) {
+        throw error
+      }
+      throw invalidCompactState(`Tabs registry compact state is invalid: ${error instanceof Error ? error.message : String(error)}`, error)
     }
+  }
+
+  private static async archiveInvalidCompactManifest(manifestPath: string): Promise<string> {
+    const archivedManifestPath = `${manifestPath}.invalid-${archiveTimestamp(new Date())}`
+    await fsp.rename(manifestPath, archivedManifestPath)
+    return archivedManifestPath
   }
 
   private static async migrateLegacyJsonl(

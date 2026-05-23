@@ -36,7 +36,6 @@ type CodexRuntimePort = {
     model?: string
     sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
     approvalPolicy?: 'untrusted' | 'on-failure' | 'on-request' | 'never'
-    excludeTurns?: boolean
   }) => Promise<{ threadId: string; wsUrl: string }>
   resumeThread: (input: {
     threadId: string
@@ -48,6 +47,7 @@ type CodexRuntimePort = {
   forkThread?: (input: CodexThreadForkParams) => Promise<{ threadId: string; wsUrl: string }>
   startTurn?: (input: CodexTurnStartParams) => Promise<{ turnId: string }>
   interruptTurn?: (input: CodexTurnInterruptParams) => Promise<void>
+  shutdown?: () => Promise<void>
   onThreadLifecycle?: (handler: (event: CodexThreadLifecycleEvent) => void) => () => void
   readThread: (input: { threadId: string; includeTurns?: boolean }) => Promise<Record<string, any>>
   listThreadTurns: (input: {
@@ -86,6 +86,19 @@ function toCodexSandboxPolicy(value: FreshAgentCreateRequest['sandbox'] | undefi
       return { type: 'workspaceWrite' }
     default:
       throw new Error(`Freshcodex does not support sandbox "${String(value)}".`)
+  }
+}
+
+function toCodexResumeInput(
+  threadId: string,
+  settings?: Partial<FreshAgentCreateRequest>,
+): Parameters<CodexRuntimePort['resumeThread']>[0] {
+  return {
+    threadId,
+    ...(settings?.cwd !== undefined ? { cwd: settings.cwd } : {}),
+    ...(settings?.model !== undefined ? { model: settings.model } : {}),
+    ...(settings?.sandbox !== undefined ? { sandbox: settings.sandbox } : {}),
+    ...(settings?.permissionMode !== undefined ? { approvalPolicy: toCodexApprovalPolicy(settings.permissionMode) } : {}),
   }
 }
 
@@ -128,24 +141,153 @@ function makeCodexStatusEvent(sessionId: string, status: unknown, revision?: num
   }
 }
 
+function isCodexIncludeTurnsUnavailable(error: unknown): boolean {
+  return error instanceof Error
+    && error.message.includes('includeTurns is unavailable before first user message')
+}
+
+function findActiveTurnId(rawSnapshot: Record<string, any>): string | undefined {
+  const turns = Array.isArray(rawSnapshot.thread?.turns) ? rawSnapshot.thread.turns : []
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    const turn = turns[index]
+    if (!turn || typeof turn !== 'object' || Array.isArray(turn)) continue
+    const record = turn as Record<string, unknown>
+    if (record.status === 'inProgress' && typeof record.id === 'string' && record.id.length > 0) {
+      return record.id
+    }
+  }
+  return undefined
+}
+
 export function createCodexFreshAgentAdapter(deps: {
-  runtime: CodexRuntimePort
+  runtime?: CodexRuntimePort
+  runtimeFactory?: () => CodexRuntimePort
 }): FreshAgentRuntimeAdapter {
   const activeTurnByThread = new Map<string, string>()
-  const settingsByThread = new Map<string, FreshAgentCreateRequest>()
+  const settingsByThread = new Map<string, Partial<FreshAgentCreateRequest>>()
+  const runtimeByThread = new Map<string, CodexRuntimePort>()
+  const threadIdsByRuntime = new Map<CodexRuntimePort, Set<string>>()
+  const ownedRuntimes = new Set<CodexRuntimePort>()
+  const runtimeResumeByThread = new Map<string, Promise<CodexRuntimePort>>()
+  const runtimeResumeGenerationByThread = new Map<string, number>()
+  const modelByTurnByThread = new Map<string, Map<string, string>>()
+
+  const rememberRuntimeThread = (threadId: string, runtime: CodexRuntimePort) => {
+    runtimeByThread.set(threadId, runtime)
+    const threadIds = threadIdsByRuntime.get(runtime) ?? new Set<string>()
+    threadIds.add(threadId)
+    threadIdsByRuntime.set(runtime, threadIds)
+  }
+
+  const forgetRuntimeThread = (threadId: string): CodexRuntimePort | undefined => {
+    const runtime = runtimeByThread.get(threadId)
+    runtimeByThread.delete(threadId)
+    if (!runtime) return undefined
+    const threadIds = threadIdsByRuntime.get(runtime)
+    threadIds?.delete(threadId)
+    if (threadIds && threadIds.size === 0) {
+      threadIdsByRuntime.delete(runtime)
+    }
+    return runtime
+  }
+
+  const allocateRuntime = () => {
+    if (deps.runtimeFactory) {
+      const runtime = deps.runtimeFactory()
+      ownedRuntimes.add(runtime)
+      return { runtime, owned: true }
+    }
+    if (deps.runtime) return { runtime: deps.runtime, owned: false }
+    throw new Error('Codex fresh-agent adapter requires a runtime or runtimeFactory.')
+  }
+
+  const getExistingRuntime = (sessionId: string): CodexRuntimePort | undefined => {
+    return runtimeByThread.get(sessionId) ?? deps.runtime
+  }
+
+  const requireRuntime = (sessionId: string): CodexRuntimePort => {
+    const runtime = runtimeByThread.get(sessionId) ?? deps.runtime
+    if (!runtime) {
+      throw new Error(`Codex app-server runtime is not available for freshcodex session ${sessionId}.`)
+    }
+    return runtime
+  }
+
+  const ensureRuntime = async (sessionId: string, settings?: Partial<FreshAgentCreateRequest>): Promise<CodexRuntimePort> => {
+    const existing = getExistingRuntime(sessionId)
+    if (existing) return existing
+    const inflight = runtimeResumeByThread.get(sessionId)
+    if (inflight) return inflight
+
+    const { runtime, owned } = allocateRuntime()
+    const resumeGeneration = runtimeResumeGenerationByThread.get(sessionId) ?? 0
+    let resumePromise: Promise<CodexRuntimePort> | undefined
+    let runtimeDiscarded = false
+    const discardOwnedRuntime = async () => {
+      if (!owned || runtimeDiscarded) return
+      runtimeDiscarded = true
+      ownedRuntimes.delete(runtime)
+      await runtime.shutdown?.().catch(() => undefined)
+    }
+    resumePromise = (async () => {
+      try {
+        const resumed = await runtime.resumeThread(toCodexResumeInput(sessionId, settings))
+        if ((runtimeResumeGenerationByThread.get(sessionId) ?? 0) !== resumeGeneration) {
+          await discardOwnedRuntime()
+          throw new Error(`Codex app-server runtime resume was cancelled for freshcodex session ${sessionId}.`)
+        }
+        rememberRuntimeThread(resumed.threadId, runtime)
+        if (settings) {
+          settingsByThread.set(resumed.threadId, settings)
+        }
+        return runtime
+      } catch (error) {
+        await discardOwnedRuntime()
+        throw error
+      } finally {
+        if (resumePromise && runtimeResumeByThread.get(sessionId) === resumePromise) {
+          runtimeResumeByThread.delete(sessionId)
+        }
+      }
+    })()
+    runtimeResumeByThread.set(sessionId, resumePromise)
+    return resumePromise
+  }
+
+  const releaseRuntime = async (sessionId: string) => {
+    const runtime = runtimeByThread.get(sessionId)
+    runtimeByThread.delete(sessionId)
+    const threadIds = runtime ? threadIdsByRuntime.get(runtime) : undefined
+    threadIds?.delete(sessionId)
+    if (!runtime || !ownedRuntimes.has(runtime)) return
+    if ((threadIds?.size ?? 0) > 0) return
+    await runtime.shutdown?.()
+    ownedRuntimes.delete(runtime)
+    threadIdsByRuntime.delete(runtime)
+  }
 
   return {
     runtimeProvider: 'codex',
 
     async create(input: FreshAgentCreateRequest) {
       toCodexReasoningEffort(input.effort)
-      const started = await deps.runtime.startThread({
-        cwd: input.cwd,
-        model: input.model,
-        sandbox: input.sandbox,
-        approvalPolicy: toCodexApprovalPolicy(input.permissionMode),
-        excludeTurns: true,
-      })
+      const { runtime, owned } = allocateRuntime()
+      let started: { threadId: string; wsUrl: string }
+      try {
+        started = await runtime.startThread({
+          cwd: input.cwd,
+          model: input.model,
+          sandbox: input.sandbox,
+          approvalPolicy: toCodexApprovalPolicy(input.permissionMode),
+        })
+      } catch (error) {
+        if (owned) {
+          ownedRuntimes.delete(runtime)
+          await runtime.shutdown?.().catch(() => undefined)
+        }
+        throw error
+      }
+      rememberRuntimeThread(started.threadId, runtime)
       settingsByThread.set(started.threadId, input)
       return { sessionId: started.threadId, sessionRef: { provider: 'codex', sessionId: started.threadId } }
     },
@@ -155,22 +297,34 @@ export function createCodexFreshAgentAdapter(deps: {
         throw new Error('Codex rich resume requires resumeSessionId')
       }
       toCodexReasoningEffort(input.effort)
-      const resumed = await deps.runtime.resumeThread({
-        threadId: input.resumeSessionId,
-        cwd: input.cwd,
-        model: input.model,
-        sandbox: input.sandbox,
-        approvalPolicy: toCodexApprovalPolicy(input.permissionMode),
-      })
+      const { runtime, owned } = allocateRuntime()
+      let resumed: { threadId: string; wsUrl: string }
+      try {
+        resumed = await runtime.resumeThread({
+          threadId: input.resumeSessionId,
+          cwd: input.cwd,
+          model: input.model,
+          sandbox: input.sandbox,
+          approvalPolicy: toCodexApprovalPolicy(input.permissionMode),
+        })
+      } catch (error) {
+        if (owned) {
+          ownedRuntimes.delete(runtime)
+          await runtime.shutdown?.().catch(() => undefined)
+        }
+        throw error
+      }
+      rememberRuntimeThread(resumed.threadId, runtime)
       settingsByThread.set(resumed.threadId, input)
       return { sessionId: resumed.threadId, sessionRef: { provider: 'codex', sessionId: resumed.threadId } }
     },
 
-    subscribe(sessionId, listener) {
-      if (!deps.runtime.onThreadLifecycle) {
+    async subscribe(sessionId, listener) {
+      const runtime = await ensureRuntime(sessionId)
+      if (!runtime.onThreadLifecycle) {
         throw new Error('Codex app-server runtime does not support thread lifecycle subscriptions.')
       }
-      return deps.runtime.onThreadLifecycle((event) => {
+      return runtime.onThreadLifecycle((event) => {
         if (event.kind === 'thread_started') {
           if (event.thread.id !== sessionId) return
           listener(makeCodexStatusEvent(sessionId, event.thread.status, event.thread.updatedAt))
@@ -179,6 +333,7 @@ export function createCodexFreshAgentAdapter(deps: {
         if (event.kind === 'thread_closed') {
           if (event.threadId !== sessionId) return
           activeTurnByThread.delete(sessionId)
+          void releaseRuntime(sessionId).catch(() => undefined)
           listener({
             type: 'sdk.status',
             sessionId,
@@ -196,14 +351,18 @@ export function createCodexFreshAgentAdapter(deps: {
     },
 
     async send(sessionId, input) {
-      if (!deps.runtime.startTurn) {
-        throw new Error('Codex app-server runtime does not support turn/start.')
-      }
-      const settings = {
+      const settings: Partial<FreshAgentCreateRequest> = {
         ...settingsByThread.get(sessionId),
         ...input.settings,
       }
-      const turn = await deps.runtime.startTurn({
+      const runtime = await ensureRuntime(sessionId, Object.keys(settings).length > 0 ? settings : undefined)
+      if (Object.keys(settings).length > 0) {
+        settingsByThread.set(sessionId, settings)
+      }
+      if (!runtime.startTurn) {
+        throw new Error('Codex app-server runtime does not support turn/start.')
+      }
+      const turn = await runtime.startTurn({
         threadId: sessionId,
         input: toCodexUserInput(input.text, input.images),
         cwd: settings.cwd,
@@ -213,26 +372,46 @@ export function createCodexFreshAgentAdapter(deps: {
         effort: toCodexReasoningEffort(settings.effort),
       })
       activeTurnByThread.set(sessionId, turn.turnId)
+      if (settings.model) {
+        const modelByTurn = modelByTurnByThread.get(sessionId) ?? new Map<string, string>()
+        modelByTurn.set(turn.turnId, settings.model)
+        modelByTurnByThread.set(sessionId, modelByTurn)
+      }
     },
 
     async interrupt(sessionId) {
-      if (!deps.runtime.interruptTurn) {
+      const runtime = await ensureRuntime(sessionId, settingsByThread.get(sessionId))
+      if (!runtime.interruptTurn) {
         throw new Error('Codex app-server runtime does not support turn/interrupt.')
       }
-      const turnId = activeTurnByThread.get(sessionId)
+      let turnId = activeTurnByThread.get(sessionId)
+      if (!turnId) {
+        try {
+          const rawSnapshot = await runtime.readThread({ threadId: sessionId, includeTurns: true })
+          turnId = findActiveTurnId(rawSnapshot)
+          if (turnId) {
+            activeTurnByThread.set(sessionId, turnId)
+          }
+        } catch (error) {
+          if (!isCodexIncludeTurnsUnavailable(error)) {
+            throw error
+          }
+        }
+      }
       if (!turnId) {
         throw new Error(`No active Codex turn is tracked for ${sessionId}.`)
       }
-      await deps.runtime.interruptTurn({ threadId: sessionId, turnId })
+      await runtime.interruptTurn({ threadId: sessionId, turnId })
       activeTurnByThread.delete(sessionId)
     },
 
     async fork(sessionId, input) {
-      if (!deps.runtime.forkThread) {
+      const settings = settingsByThread.get(sessionId)
+      const runtime = await ensureRuntime(sessionId, settings)
+      if (!runtime.forkThread) {
         throw new Error('Codex app-server runtime does not support thread/fork.')
       }
-      const settings = settingsByThread.get(sessionId)
-      return await deps.runtime.forkThread({
+      const forked = await runtime.forkThread({
         threadId: sessionId,
         cwd: typeof input?.cwd === 'string' ? input.cwd : settings?.cwd,
         model: typeof input?.model === 'string' ? input.model : settings?.model,
@@ -242,16 +421,46 @@ export function createCodexFreshAgentAdapter(deps: {
         ),
         excludeTurns: true,
       })
+      if (forked && typeof forked.threadId === 'string') {
+        rememberRuntimeThread(forked.threadId, runtime)
+        settingsByThread.set(forked.threadId, {
+          ...(settings ?? { requestId: '', sessionType: 'freshcodex' }),
+          ...(typeof input?.cwd === 'string' ? { cwd: input.cwd } : {}),
+          ...(typeof input?.model === 'string' ? { model: input.model } : {}),
+          ...(typeof input?.sandbox === 'string' ? { sandbox: input.sandbox as FreshAgentCreateRequest['sandbox'] } : {}),
+          ...(typeof input?.permissionMode === 'string' ? { permissionMode: input.permissionMode } : {}),
+        })
+      }
+      return forked
     },
 
     async getSnapshot(thread, revision) {
-      const rawSnapshot = await deps.runtime.readThread({ threadId: thread.threadId, includeTurns: true })
+      const runtime = await ensureRuntime(thread.threadId)
+      let rawSnapshot: Record<string, any>
+      try {
+        rawSnapshot = await runtime.readThread({ threadId: thread.threadId, includeTurns: true })
+      } catch (error) {
+        if (!isCodexIncludeTurnsUnavailable(error)) {
+          throw error
+        }
+        rawSnapshot = await runtime.readThread({ threadId: thread.threadId, includeTurns: false })
+      }
       const rawThreadTurns: unknown[] = Array.isArray(rawSnapshot.thread?.turns)
         ? rawSnapshot.thread.turns
         : []
+      const activeTurnId = findActiveTurnId(rawSnapshot)
+      if (activeTurnId) {
+        activeTurnByThread.set(thread.threadId, activeTurnId)
+      } else if (normalizeCodexThreadStatus(rawSnapshot.thread?.status) !== 'running') {
+        activeTurnByThread.delete(thread.threadId)
+      }
       const rawTurns = rawThreadTurns
         .filter((turn): turn is Record<string, unknown> => !!turn && typeof turn === 'object' && !Array.isArray(turn))
-        .map((turn, index) => normalizeCodexTurn(turn, index))
+        .map((turn, index) => normalizeCodexTurn(turn, index, {
+          model: typeof turn.id === 'string'
+            ? modelByTurnByThread.get(thread.threadId)?.get(turn.id)
+            : undefined,
+        }))
       return normalizeCodexThreadSnapshot({
         threadId: thread.threadId,
         revision: Number(rawSnapshot.thread?.updatedAt ?? revision ?? 0),
@@ -264,7 +473,8 @@ export function createCodexFreshAgentAdapter(deps: {
     },
 
     async getTurnPage(thread, query) {
-      const rawPage = await deps.runtime.listThreadTurns({
+      const runtime = await ensureRuntime(thread.threadId)
+      const rawPage = await runtime.listThreadTurns({
         threadId: thread.threadId,
         cursor: typeof query.cursor === 'string' ? query.cursor : undefined,
         limit: typeof query.limit === 'number' ? query.limit : undefined,
@@ -273,11 +483,13 @@ export function createCodexFreshAgentAdapter(deps: {
         threadId: thread.threadId,
         revision: Number(rawPage.revision ?? query.revision ?? 0),
         rawPage,
+        modelByTurn: modelByTurnByThread.get(thread.threadId),
       })
     },
 
     async getTurnBody(thread, revision) {
-      const rawTurn = await deps.runtime.readThreadTurn({
+      const runtime = await ensureRuntime(thread.threadId)
+      const rawTurn = await runtime.readThreadTurn({
         threadId: thread.threadId,
         turnId: thread.turnId,
         revision,
@@ -286,7 +498,33 @@ export function createCodexFreshAgentAdapter(deps: {
         threadId: thread.threadId,
         revision,
         rawTurn,
+        model: typeof rawTurn.id === 'string'
+          ? modelByTurnByThread.get(thread.threadId)?.get(rawTurn.id)
+          : undefined,
       })
+    },
+
+    async kill(sessionId) {
+      activeTurnByThread.delete(sessionId)
+      settingsByThread.delete(sessionId)
+      runtimeResumeGenerationByThread.set(sessionId, (runtimeResumeGenerationByThread.get(sessionId) ?? 0) + 1)
+      runtimeResumeByThread.delete(sessionId)
+      modelByTurnByThread.delete(sessionId)
+      await releaseRuntime(sessionId)
+      return true
+    },
+
+    async shutdown() {
+      const runtimes = [...ownedRuntimes]
+      ownedRuntimes.clear()
+      runtimeByThread.clear()
+      threadIdsByRuntime.clear()
+      runtimeResumeByThread.clear()
+      runtimeResumeGenerationByThread.clear()
+      activeTurnByThread.clear()
+      settingsByThread.clear()
+      modelByTurnByThread.clear()
+      await Promise.all(runtimes.map((runtime) => runtime.shutdown?.()))
     },
   }
 }

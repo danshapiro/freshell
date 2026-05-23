@@ -75,6 +75,25 @@ describe('shared settings contract', () => {
     }).success).toBe(true)
   })
 
+  it('accepts Freshcodex directory persistence when keyed by the Codex runtime provider', () => {
+    const schema = buildServerSettingsPatchSchema(['claude', 'codex', 'opencode'])
+
+    expect(schema.safeParse({
+      codingCli: {
+        providers: {
+          codex: { cwd: '/workspace/freshcodex' },
+        },
+      },
+    }).success).toBe(true)
+    expect(schema.safeParse({
+      codingCli: {
+        providers: {
+          freshcodex: { cwd: '/workspace/freshcodex' },
+        },
+      },
+    }).success).toBe(false)
+  })
+
   it('rejects representative local-only fields in the server patch schema', () => {
     const schema = buildServerSettingsPatchSchema()
 

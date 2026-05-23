@@ -10,6 +10,7 @@ import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
 import { initLayout } from '@/store/panesSlice'
 import { useAppSelector } from '@/store/hooks'
 import { sessionInit, setSessionStatus } from '@/store/agentChatSlice'
+import type { PaneNode } from '@/store/paneTypes'
 
 const wsMock = vi.hoisted(() => ({
   send: vi.fn(),
@@ -275,20 +276,24 @@ describe('FreshAgentView', () => {
 
   it('sends, interrupts, and forks through fresh-agent WS actions when the capability is available', async () => {
     const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-2',
+        sessionId: 'thread-1',
+        status: 'idle',
+        initialCwd: '/repo',
+        model: 'gpt-5-codex',
+      },
+    }))
+
     render(
       <Provider store={store}>
-        <FreshAgentView
-          tabId="tab-1"
-          paneId="pane-1"
-          paneContent={{
-            kind: 'fresh-agent',
-            sessionType: 'freshcodex',
-            provider: 'codex',
-            createRequestId: 'req-2',
-            sessionId: 'thread-1',
-            status: 'running',
-          }}
-        />
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
       </Provider>,
     )
 
@@ -297,6 +302,13 @@ describe('FreshAgentView', () => {
     })
 
     wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('combobox', { name: 'Model' }), {
+      target: { value: 'gpt-5.4-mini' },
+    })
+    await waitFor(() => {
+      expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue('gpt-5.4-mini')
+    })
 
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
       target: { value: 'Ship it' },
@@ -309,6 +321,10 @@ describe('FreshAgentView', () => {
       sessionType: 'freshcodex',
       provider: 'codex',
       text: 'Ship it',
+      settings: {
+        cwd: '/repo',
+        model: 'gpt-5.4-mini',
+      },
     })
 
     fireEvent.click(screen.getByRole('button', { name: 'Interrupt' }))
@@ -322,10 +338,155 @@ describe('FreshAgentView', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Fork' }))
     expect(wsMock.send).toHaveBeenCalledWith({
       type: 'freshAgent.fork',
+      requestId: 'req-2',
       sessionId: 'thread-1',
       sessionType: 'freshcodex',
       provider: 'codex',
     })
+  })
+
+  it('keeps a configured custom Freshcodex model selectable', async () => {
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            createRequestId: 'req-custom-model',
+            sessionId: 'thread-1',
+            status: 'idle',
+            model: 'custom-codex-model',
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Codex summary')).toBeInTheDocument()
+    })
+
+    expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue('custom-codex-model')
+    expect(screen.getByRole('option', { name: 'custom-codex-model' })).toBeInTheDocument()
+  })
+
+  it('switches the pane to the forked Freshcodex thread when the server reports fork success', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      onMessage = handler
+      return () => {}
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-2',
+        sessionId: 'thread-1',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(onMessage).toBeTypeOf('function')
+    })
+
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.forked',
+        requestId: 'req-2',
+        parentSessionId: 'thread-1',
+        sessionId: 'thread-forked',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        runtimeProvider: 'codex',
+      })
+    })
+
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', 'thread-forked', expect.any(Object))
+    })
+    const layout = store.getState().panes.layouts['tab-1']
+    expect(layout?.type).toBe('leaf')
+    if (layout?.type !== 'leaf' || layout.content.kind !== 'fresh-agent') {
+      throw new Error('Expected fresh-agent leaf')
+    }
+    expect(layout.content.sessionId).toBe('thread-forked')
+    expect(layout.content.sessionRef).toEqual({ provider: 'codex', sessionId: 'thread-forked' })
+    expect(layout.content.createRequestId).not.toBe('req-2')
+    expect(wsMock.send).toHaveBeenCalledWith({
+      type: 'freshAgent.kill',
+      sessionId: 'thread-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    })
+  })
+
+  it('ignores Freshcodex fork responses for a different pane request', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      onMessage = handler
+      return () => {}
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-this-pane',
+        sessionId: 'thread-1',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(onMessage).toBeTypeOf('function')
+    })
+    wsMock.send.mockClear()
+
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.forked',
+        requestId: 'req-other-pane',
+        parentSessionId: 'thread-1',
+        sessionId: 'thread-forked',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        runtimeProvider: 'codex',
+      })
+    })
+
+    const layout = store.getState().panes.layouts['tab-1']
+    expect(layout?.type).toBe('leaf')
+    if (layout?.type !== 'leaf' || layout.content.kind !== 'fresh-agent') {
+      throw new Error('Expected fresh-agent leaf')
+    }
+    expect(layout.content.sessionId).toBe('thread-1')
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.kill',
+      sessionId: 'thread-1',
+    }))
   })
 
   it('keeps an established freshclaude pane interactive after remount when snapshot loading is unavailable', async () => {
@@ -524,8 +685,10 @@ describe('FreshAgentView', () => {
     expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'freshAgent.create',
       requestId: 'req-sessionref-only',
+      resumeSessionId: 'codex-thread-recover',
       sessionRef: { provider: 'codex', sessionId: 'codex-thread-recover' },
     }))
+    expect(apiMock.getFreshAgentThreadSnapshot).not.toHaveBeenCalled()
 
     const onMessage = wsMock.onMessage.mock.calls[0]?.[0]
     onMessage({
@@ -546,6 +709,46 @@ describe('FreshAgentView', () => {
       expect(leaf.content.status).toBe('connected')
     })
     unmount()
+  })
+
+  it('surfaces a missing Freshcodex rollout as a restore error instead of replacing the thread', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockRejectedValueOnce(new Error('no rollout found for thread id codex-thread-missing'))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-missing-rollout',
+        status: 'idle',
+        sessionId: 'codex-thread-missing',
+        resumeSessionId: 'codex-thread-missing',
+        sessionRef: { provider: 'codex', sessionId: 'codex-thread-missing' },
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      const leaf = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content.kind).toBe('fresh-agent')
+      if (leaf.content.kind === 'fresh-agent') {
+        expect(leaf.content.restoreError).toEqual({ code: 'RESTORE_UNAVAILABLE', reason: 'durable_artifact_missing' })
+        expect(leaf.content.resumeSessionId).toBe('codex-thread-missing')
+        expect(leaf.content.sessionRef).toBeUndefined()
+        expect(leaf.content.status).toBe('idle')
+      }
+    })
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.create',
+      requestId: expect.not.stringMatching(/^req-missing-rollout$/),
+    }))
   })
 
   it('clears stale restoreError when a valid sessionRef appears', async () => {

@@ -95,6 +95,69 @@ describe('FreshAgentRuntimeManager', () => {
     })
   })
 
+  it('routes creates with matching sessionRef through adapter.resume', async () => {
+    const codexAdapter = {
+      create: vi.fn().mockResolvedValue({ sessionId: 'codex-session-created' }),
+      resume: vi.fn().mockResolvedValue({ sessionId: 'thread-existing-1' }),
+    }
+    const registry = createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+        adapter: codexAdapter as any,
+      },
+    ])
+    const manager = new FreshAgentRuntimeManager({ registry })
+
+    const resumed = await manager.create({
+      requestId: 'req-session-ref',
+      sessionType: 'freshcodex',
+      sessionRef: { provider: 'codex', sessionId: 'thread-existing-1' },
+    })
+
+    expect(codexAdapter.resume).toHaveBeenCalledWith(expect.objectContaining({
+      sessionType: 'freshcodex',
+      resumeSessionId: 'thread-existing-1',
+      sessionRef: { provider: 'codex', sessionId: 'thread-existing-1' },
+    }))
+    expect(codexAdapter.create).not.toHaveBeenCalled()
+    expect(resumed).toEqual({
+      sessionId: 'thread-existing-1',
+      sessionType: 'freshcodex',
+      runtimeProvider: 'codex',
+    })
+  })
+
+  it('tracks forked child sessions immediately', async () => {
+    const codexAdapter = {
+      create: vi.fn().mockResolvedValue({ sessionId: 'thread-parent-1' }),
+      fork: vi.fn().mockResolvedValue({ threadId: 'thread-child-1' }),
+      send: vi.fn().mockResolvedValue(undefined),
+    }
+    const registry = createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+        adapter: codexAdapter as any,
+      },
+    ])
+    const manager = new FreshAgentRuntimeManager({ registry })
+    await manager.create({ requestId: 'req-parent', sessionType: 'freshcodex' })
+
+    await expect(manager.fork({
+      sessionId: 'thread-parent-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    })).resolves.toEqual({ threadId: 'thread-child-1' })
+    await manager.send({
+      sessionId: 'thread-child-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    }, { text: 'hello' })
+
+    expect(codexAdapter.send).toHaveBeenCalledWith('thread-child-1', { text: 'hello' })
+  })
+
   it('routes freshAgent.kill through the tracked adapter and removes the session', async () => {
     const claudeAdapter = {
       create: vi.fn().mockResolvedValue({ sessionId: 'claude-session-1' }),

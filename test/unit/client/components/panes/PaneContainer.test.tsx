@@ -1585,7 +1585,10 @@ describe('PaneContainer', () => {
 
     function createStoreWithClaude(
       node: PaneNode,
-      providerSettings?: { cwd?: string; permissionMode?: 'default' | 'plan' | 'acceptEdits' | 'bypassPermissions' }
+      providerSettings?: { cwd?: string; permissionMode?: 'default' | 'plan' | 'acceptEdits' | 'bypassPermissions' },
+      providerSettingsByName?: Record<string, { cwd?: string; permissionMode?: string; model?: string }>,
+      enabledProviders: string[] = ['claude'],
+      availableClis: Record<string, boolean> = { claude: true },
     ) {
       return configureStore({
         reducer: {
@@ -1617,7 +1620,7 @@ describe('PaneContainer', () => {
           connection: {
             status: 'ready' as const,
             platform: 'linux',
-            availableClis: { claude: true },
+            availableClis,
           },
           settings: {
             settings: {
@@ -1635,8 +1638,8 @@ describe('PaneContainer', () => {
               sidebar: { sortMode: 'activity' as const, showProjectBadges: true, width: 288, collapsed: false },
               panes: { defaultNewPane: 'ask' as const },
               codingCli: {
-                enabledProviders: ['claude'] as any[],
-                providers: providerSettings ? { claude: providerSettings } : {},
+                enabledProviders: enabledProviders as any[],
+                providers: providerSettingsByName ?? (providerSettings ? { claude: providerSettings } : {}),
               },
               logging: { debug: false },
             },
@@ -1704,6 +1707,60 @@ describe('PaneContainer', () => {
         codingCli: { providers: { claude: { permissionMode: 'plan', cwd: '/home/user/new-project' } } },
       })
       expect(mockApiPatch).not.toHaveBeenCalledWith('/api/settings', expect.anything())
+    })
+
+    it('persists Freshcodex directory under the Codex runtime provider key', async () => {
+      const node = createPickerNode('pane-1')
+      const store = createStoreWithClaude(node, undefined, undefined, ['claude', 'codex'], { claude: true, codex: true })
+      mockApiPost.mockResolvedValueOnce({ valid: true, resolvedPath: '/home/user/freshcodex-project' })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: 'Freshcodex' }))
+      fireEvent.transitionEnd(getPickerContainer())
+
+      const input = screen.getByLabelText('Starting directory for Freshcodex')
+      fireEvent.change(input, { target: { value: '/home/user/freshcodex-project' } })
+      fireEvent.keyDown(input, { key: 'Enter' })
+
+      await waitFor(() => {
+        const state = store.getState().panes
+        const paneContent = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
+        expect(paneContent.kind).toBe('fresh-agent')
+        if (paneContent.kind === 'fresh-agent') {
+          expect(paneContent.sessionType).toBe('freshcodex')
+          expect(paneContent.provider).toBe('codex')
+          expect(paneContent.initialCwd).toBe('/home/user/freshcodex-project')
+        }
+      })
+
+      expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+        codingCli: { providers: { codex: { cwd: '/home/user/freshcodex-project' } } },
+      })
+      expect(saveServerSettingsPatchSpy).not.toHaveBeenCalledWith(expect.objectContaining({
+        codingCli: { providers: expect.objectContaining({ freshcodex: expect.anything() }) },
+      }))
+    })
+
+    it('preloads Freshcodex directory from the Codex runtime provider key', () => {
+      const node = createPickerNode('pane-1')
+      const store = createStoreWithClaude(node, undefined, {
+        codex: { cwd: '/home/user/saved-codex-cwd' },
+        freshcodex: { cwd: '/home/user/wrong-freshcodex-cwd' },
+      }, ['claude', 'codex'], { claude: true, codex: true })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: 'Freshcodex' }))
+      fireEvent.transitionEnd(getPickerContainer())
+
+      expect(screen.getByLabelText('Starting directory for Freshcodex')).toHaveValue('/home/user/saved-codex-cwd')
     })
 
     it('returns to pane type picker when back is clicked in directory picker', () => {

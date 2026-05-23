@@ -22,6 +22,10 @@ import { FreshAgentDiffPanel } from './FreshAgentDiffPanel'
 import { FreshAgentSidebar } from './FreshAgentSidebar'
 
 const EARLY_STATES = new Set(['creating', 'starting'])
+const CODEX_MODEL_OPTIONS = [
+  { value: 'gpt-5-codex', label: 'GPT-5 Codex' },
+  { value: 'gpt-5.4-mini', label: 'GPT-5.4 Mini' },
+] as const
 
 function isStatusRegression(current: string, next: string): boolean {
   return !EARLY_STATES.has(current) && EARLY_STATES.has(next)
@@ -72,6 +76,14 @@ function getQuestionAgentLabel(paneContent: FreshAgentPaneContent, descriptorLab
     default:
       return descriptorLabel ?? 'Fresh Agent'
   }
+}
+
+function isUnmaterializedCodexThreadError(error: unknown): boolean {
+  return !!error
+    && typeof error === 'object'
+    && 'message' in error
+    && typeof (error as { message?: unknown }).message === 'string'
+    && (error as { message: string }).message.includes('no rollout found for thread id')
 }
 
 function getRestoreErrorMessage(reason: RestoreErrorReason): string {
@@ -142,7 +154,6 @@ export function FreshAgentView({
   const paneContentRef = useRef(paneContent)
   paneContentRef.current = paneContent
   const snapshotSessionId = paneContent.sessionId
-    ?? (paneContent.sessionRef?.provider === paneContent.provider ? paneContent.sessionRef.sessionId : undefined)
   const restoreTimeoutRef = useRef<number | null>(null)
   const createSentRef = useRef(false)
   const preferredResumeSessionId = getPreferredResumeSessionId(claudeSession) ?? paneContent.resumeSessionId
@@ -184,7 +195,8 @@ export function FreshAgentView({
     sessionType: content.sessionType,
     provider: content.provider,
     cwd: content.initialCwd,
-    resumeSessionId: content.resumeSessionId,
+    resumeSessionId: content.resumeSessionId
+      ?? (content.sessionRef?.provider === content.provider ? content.sessionRef.sessionId : undefined),
     sessionRef: content.sessionRef,
     modelSelection: content.modelSelection,
     model: content.model,
@@ -344,9 +356,44 @@ export function FreshAgentView({
         })
         setSnapshotRefreshNonce((value) => value + 1)
       }
+      if (
+        message.type === 'freshAgent.forked'
+        && message.requestId === paneContent.createRequestId
+        && message.parentSessionId === paneContent.sessionId
+        && message.sessionType === paneContent.sessionType
+        && message.provider === paneContent.provider
+        && typeof message.sessionId === 'string'
+      ) {
+        if (message.sessionId !== paneContent.sessionId) {
+          sendFreshAgentMessage({
+            type: 'freshAgent.kill',
+            sessionId: paneContent.sessionId,
+            sessionType: paneContent.sessionType,
+            provider: paneContent.provider,
+          })
+        }
+        setSnapshot(null)
+        dispatch(updatePaneContent({
+          tabId,
+          paneId,
+          content: {
+            ...paneContentRef.current,
+            createRequestId: nanoid(),
+            sessionId: message.sessionId,
+            sessionRef: {
+              provider: paneContent.provider,
+              sessionId: message.sessionId,
+            },
+            resumeSessionId: message.sessionId,
+            status: 'connected',
+            createError: undefined,
+            restoreError: undefined,
+          },
+        }))
+      }
     })
     return unsubscribe
-  }, [dispatch, paneContent, paneContent.createRequestId, paneId, tabId, ws])
+  }, [dispatch, paneContent, paneContent.createRequestId, paneId, sendFreshAgentMessage, tabId, ws])
 
   useEffect(() => {
     if (!snapshotSessionId) return
@@ -379,6 +426,25 @@ export function FreshAgentView({
         if (error instanceof Error && error.name === 'AbortError') return
         if (paneContent.provider === 'claude' && claudeSession) {
           setLoadError(null)
+          return
+        }
+        if (paneContent.provider === 'codex' && isUnmaterializedCodexThreadError(error)) {
+          const fresh = paneContentRef.current
+          setLoadError(null)
+          setSnapshot(null)
+          dispatch(updatePaneContent({
+            tabId,
+            paneId,
+            content: {
+              ...fresh,
+              sessionId: undefined,
+              sessionRef: undefined,
+              createRequestId: nanoid(),
+              status: 'idle',
+              createError: undefined,
+              restoreError: buildRestoreError('durable_artifact_missing'),
+            },
+          }))
           return
         }
         setLoadError(error instanceof Error ? error.message : 'Failed to load session')
@@ -515,6 +581,10 @@ export function FreshAgentView({
       ? null
       : (paneContent.restoreError ? getRestoreErrorMessage(paneContent.restoreError.reason) : null)
     const visibleLoadError = visibleRestoreFailure || visiblePaneRestoreFailure || isRestoring ? null : loadError
+    const codexModelValue = paneContent.model ?? 'gpt-5-codex'
+    const codexModelOptions = CODEX_MODEL_OPTIONS.some((option) => option.value === codexModelValue)
+      ? CODEX_MODEL_OPTIONS
+      : [{ value: codexModelValue, label: codexModelValue }, ...CODEX_MODEL_OPTIONS]
 
     return (
       <div className="flex h-full min-h-0 flex-col" data-context="fresh-agent" data-session-id={paneContent.sessionId}>
@@ -527,6 +597,29 @@ export function FreshAgentView({
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
               <span>{statusLabel}</span>
               {typeof totalTokens === 'number' ? <span>{totalTokens} tokens</span> : null}
+              {paneContent.provider === 'codex' ? (
+                <label className="flex items-center gap-1">
+                  <span className="sr-only">Model</span>
+                  <select
+                    aria-label="Model"
+                    className="rounded border border-border/70 bg-background px-2 py-1 text-xs"
+                    value={codexModelValue}
+                    disabled={effectiveStatus === 'running' || effectiveStatus === 'compacting'}
+                    onChange={(event) => {
+                      const nextModel = event.target.value
+                      dispatch(mergePaneContent({
+                        tabId,
+                        paneId,
+                        updates: { model: nextModel },
+                      }))
+                    }}
+                  >
+                    {codexModelOptions.map((option) => (
+                      <option key={option.value} value={option.value}>{option.label}</option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
               <button
                 type="button"
                 className="rounded border border-border/70 px-2 py-1 disabled:opacity-50"
@@ -551,6 +644,7 @@ export function FreshAgentView({
                   if (!paneContent.sessionId || !canFork) return
                   sendFreshAgentMessage({
                     type: 'freshAgent.fork',
+                    requestId: paneContent.createRequestId,
                     sessionId: paneContent.sessionId,
                     sessionType: paneContent.sessionType,
                     provider: paneContent.provider,
@@ -670,6 +764,13 @@ export function FreshAgentView({
                   sessionType: paneContent.sessionType,
                   provider: paneContent.provider,
                   text,
+                  settings: {
+                    ...(paneContent.initialCwd ? { cwd: paneContent.initialCwd } : {}),
+                    ...(paneContent.model ? { model: paneContent.model } : {}),
+                    ...(paneContent.permissionMode ? { permissionMode: paneContent.permissionMode } : {}),
+                    ...(paneContent.sandbox ? { sandbox: paneContent.sandbox } : {}),
+                    ...(paneContent.effort ? { effort: paneContent.effort } : {}),
+                  },
                 })
               }}
             />

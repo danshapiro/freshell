@@ -724,7 +724,8 @@ function PickerWrapper({
 
     // Save the selected directory for the provider
     const agentConfig = getAgentChatProviderConfig(providerType)
-    const settingsKey = (agentConfig ? agentConfig.codingCliProvider : providerType) as CodingCliProviderName
+    const freshAgentConfig = resolveFreshAgentType(providerType)
+    const settingsKey = (agentConfig?.codingCliProvider ?? freshAgentConfig?.runtimeProvider ?? providerType) as CodingCliProviderName
     const existingProviderSettings = settings?.codingCli?.providers?.[settingsKey] || {}
     const patch = {
       codingCli: { providers: { [settingsKey]: { ...existingProviderSettings, cwd } } },
@@ -739,8 +740,9 @@ function PickerWrapper({
   if (step.step === 'directory') {
     const providerType = step.providerType
     const agentConfig = getAgentChatProviderConfig(providerType)
-    const providerLabel = agentConfig ? agentConfig.label : getProviderLabel(providerType, extensionEntries)
-    const settingsKey = (agentConfig ? agentConfig.codingCliProvider : providerType) as CodingCliProviderName
+    const freshAgentConfig = resolveFreshAgentType(providerType)
+    const providerLabel = agentConfig ? agentConfig.label : (freshAgentConfig?.label ?? getProviderLabel(providerType, extensionEntries))
+    const settingsKey = (agentConfig?.codingCliProvider ?? freshAgentConfig?.runtimeProvider ?? providerType) as CodingCliProviderName
     const globalDefault = settings?.codingCli?.providers?.[settingsKey]?.cwd
     const defaultCwd = tabPref.defaultCwd ?? globalDefault
     return (

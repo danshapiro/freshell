@@ -67,10 +67,13 @@ export class FreshAgentRuntimeManager {
 
   async create(input: FreshAgentCreateRequest): Promise<FreshAgentCreateResult> {
     const registration = this.requireRegistration(input.sessionType, input.provider)
+    const resumeSessionId = input.resumeSessionId
+      ?? (input.sessionRef?.provider === registration.runtimeProvider ? input.sessionRef.sessionId : undefined)
+    const createInput = resumeSessionId ? { ...input, resumeSessionId } : input
 
-    const created = input.resumeSessionId && registration.adapter.resume
-      ? await registration.adapter.resume(input)
-      : await registration.adapter.create(input)
+    const created = resumeSessionId && registration.adapter.resume
+      ? await registration.adapter.resume(createInput)
+      : await registration.adapter.create(createInput)
     this.sessions.set(this.key({
       sessionType: input.sessionType,
       provider: registration.runtimeProvider,
@@ -168,7 +171,19 @@ export class FreshAgentRuntimeManager {
     if (!record.adapter.fork) {
       throw new FreshAgentUnsupportedCapabilityError(`Fork is not supported for ${record.sessionType}`)
     }
-    return await record.adapter.fork(locator.sessionId, input)
+    const forked = await record.adapter.fork(locator.sessionId, input)
+    const forkedRecord = forked && typeof forked === 'object' ? forked as Record<string, unknown> : {}
+    const forkedSessionId = typeof forkedRecord.threadId === 'string'
+      ? forkedRecord.threadId
+      : (typeof forkedRecord.sessionId === 'string' ? forkedRecord.sessionId : undefined)
+    if (forkedSessionId) {
+      this.sessions.set(this.key({
+        sessionType: locator.sessionType,
+        provider: locator.provider,
+        sessionId: forkedSessionId,
+      }), record)
+    }
+    return forked
   }
 
   async answerQuestion(locator: FreshAgentSessionLocator, requestId: FreshAgentRequestId, answers: Record<string, string>) {

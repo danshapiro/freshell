@@ -3587,7 +3587,7 @@ export class WsHandler {
         }
         const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
         try {
-          await manager.send(locator, { text: m.text, images: m.images })
+          await manager.send(locator, { text: m.text, images: m.images, settings: m.settings })
         } catch (error) {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error) })
         }
@@ -3647,7 +3647,28 @@ export class WsHandler {
         }
         const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
         try {
-          await manager.fork(locator, m.input)
+          const forked = await manager.fork(locator, m.input)
+          const forkedRecord = forked && typeof forked === 'object' ? forked as Record<string, unknown> : {}
+          const forkedSessionId = typeof forkedRecord.threadId === 'string'
+            ? forkedRecord.threadId
+            : (typeof forkedRecord.sessionId === 'string' ? forkedRecord.sessionId : undefined)
+          if (forkedSessionId) {
+            this.send(ws, {
+              type: 'freshAgent.forked',
+              requestId: m.requestId,
+              parentSessionId: m.sessionId,
+              sessionId: forkedSessionId,
+              sessionType: m.sessionType,
+              provider: m.provider,
+              runtimeProvider: m.provider,
+              sessionRef: { provider: m.provider, sessionId: forkedSessionId },
+            })
+            this.ensureFreshAgentSubscription(ws, state, {
+              sessionId: forkedSessionId,
+              sessionType: m.sessionType,
+              provider: m.provider,
+            })
+          }
         } catch (error) {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error) })
         }

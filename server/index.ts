@@ -305,14 +305,18 @@ async function main() {
   sdkBridge = new SdkBridge(agentHistorySource)
 
   const server = http.createServer(app)
-  const codexFreshAgentRuntime = new CodexAppServerRuntime({ serverInstanceId })
   const claudeFreshAgentAdapter = createClaudeFreshAgentAdapter({
     sdkBridge,
     agentHistorySource,
   })
   const codexFreshAgentAdapter = createCodexFreshAgentAdapter({
-    runtime: codexFreshAgentRuntime,
+    runtimeFactory: () => new CodexAppServerRuntime({ serverInstanceId }),
   })
+  const codexFreshAgentRuntime = {
+    shutdown: async () => {
+      await codexFreshAgentAdapter.shutdown?.()
+    },
+  }
   const freshAgentRuntimeManager = new FreshAgentRuntimeManager({
     registry: createFreshAgentProviderRegistry([
       {

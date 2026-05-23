@@ -156,18 +156,81 @@ function normalizeCodexItem(turnId: string, item: Record<string, unknown>, index
   }
 }
 
-export function normalizeCodexTurn(rawTurn: Record<string, unknown>, ordinal = 0): FreshAgentTurn {
+function inferCodexTurnRole(rawItems: Record<string, unknown>[]): FreshAgentTurn['role'] {
+  if (rawItems.some((item) => item.type === 'agentMessage' || item.type === 'reasoning' || item.type === 'plan')) {
+    return 'assistant'
+  }
+  if (rawItems.some((item) => item.type === 'userMessage')) {
+    return 'user'
+  }
+  if (rawItems.some((item) => (
+    item.type === 'commandExecution'
+    || item.type === 'fileChange'
+    || item.type === 'mcpToolCall'
+    || item.type === 'dynamicToolCall'
+    || item.type === 'collabAgentToolCall'
+    || item.type === 'webSearch'
+    || item.type === 'imageView'
+    || item.type === 'imageGeneration'
+  ))) {
+    return 'tool'
+  }
+  return undefined
+}
+
+function readCodexTurnError(rawTurn: Record<string, unknown>): string | undefined {
+  const error = rawTurn.error
+  if (!error) return undefined
+  if (typeof error === 'string') return error
+  if (typeof error === 'object' && !Array.isArray(error)) {
+    const record = error as Record<string, unknown>
+    if (typeof record.message === 'string') return record.message
+    if (typeof record.error === 'string') return record.error
+  }
+  return String(error)
+}
+
+export function normalizeCodexTurn(
+  rawTurn: Record<string, unknown>,
+  ordinal = 0,
+  options: { model?: string } = {},
+): FreshAgentTurn {
   const turnId = String(rawTurn.id ?? `turn:${ordinal}`)
+  const model = typeof rawTurn.model === 'string' && rawTurn.model.length > 0
+    ? rawTurn.model
+    : options.model
   const rawItems = Array.isArray(rawTurn.items)
     ? rawTurn.items.filter((item): item is Record<string, unknown> => !!item && typeof item === 'object' && !Array.isArray(item))
     : []
   const items = rawItems.flatMap((item, index) => normalizeCodexItem(turnId, item, index))
+  const hasAssistantOutput = rawItems.some((item) => item.type === 'agentMessage' || item.type === 'reasoning' || item.type === 'plan')
+  const turnError = readCodexTurnError(rawTurn)
+  if (turnError) {
+    items.push({
+      id: `${turnId}:error`,
+      kind: 'text',
+      text: `Codex turn failed: ${turnError}`,
+    })
+  } else if (
+    rawTurn.status === 'completed'
+    && rawItems.some((item) => item.type === 'userMessage')
+    && rawItems.every((item) => item.type === 'userMessage')
+    && !hasAssistantOutput
+  ) {
+    items.push({
+      id: `${turnId}:empty-response`,
+      kind: 'text',
+      text: 'Codex completed this turn without recording an assistant response.',
+    })
+  }
   const firstText = items.find((item): item is Extract<FreshAgentTranscriptItem, { kind: 'text' }> => item.kind === 'text')
   return {
     id: turnId,
     turnId,
     ordinal,
     source: 'durable',
+    role: inferCodexTurnRole(rawItems),
+    ...(model ? { model } : {}),
     summary: firstText?.text.slice(0, 140) ?? '',
     items,
   }
@@ -177,10 +240,14 @@ export function normalizeCodexTurnPage(input: {
   threadId: string
   revision: number
   rawPage: { turns?: unknown[]; nextCursor?: string | null; backwardsCursor?: string | null }
+  model?: string
+  modelByTurn?: Map<string, string>
 }) {
   const turns = (Array.isArray(input.rawPage.turns) ? input.rawPage.turns : [])
     .filter((turn): turn is Record<string, unknown> => !!turn && typeof turn === 'object' && !Array.isArray(turn))
-    .map((turn, index) => normalizeCodexTurn(turn, index))
+    .map((turn, index) => normalizeCodexTurn(turn, index, {
+      model: (typeof turn.id === 'string' ? input.modelByTurn?.get(turn.id) : undefined) ?? input.model,
+    }))
 
   return FreshAgentTurnPageSchema.parse({
     sessionType: 'freshcodex',
@@ -198,9 +265,10 @@ export function normalizeCodexTurnBody(input: {
   threadId: string
   revision: number
   rawTurn: Record<string, unknown>
+  model?: string
 }) {
   return FreshAgentTurnBodySchema.parse({
-    ...normalizeCodexTurn(input.rawTurn),
+    ...normalizeCodexTurn(input.rawTurn, 0, { model: input.model }),
     sessionType: 'freshcodex',
     provider: 'codex',
     threadId: input.threadId,

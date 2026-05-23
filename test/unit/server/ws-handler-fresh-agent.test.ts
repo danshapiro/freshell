@@ -248,6 +248,10 @@ describe('WsHandler fresh-agent routing', () => {
 
     try {
       const ws = await connectAndAuth(server)
+      const seenMessages: any[] = []
+      ws.on('message', (data) => {
+        seenMessages.push(JSON.parse(data.toString()))
+      })
 
       ws.send(JSON.stringify({
         type: 'freshAgent.create',
@@ -266,6 +270,7 @@ describe('WsHandler fresh-agent routing', () => {
         sessionType: 'freshcodex',
         provider: 'codex',
         text: 'Ship it',
+        settings: { cwd: '/repo', model: 'gpt-5.4-mini', effort: 'low' },
       }))
       ws.send(JSON.stringify({
         type: 'freshAgent.interrupt',
@@ -291,6 +296,7 @@ describe('WsHandler fresh-agent routing', () => {
       }))
       ws.send(JSON.stringify({
         type: 'freshAgent.fork',
+        requestId: 'fork-req-1',
         sessionId: 'codex-session-2',
         sessionType: 'freshcodex',
         provider: 'codex',
@@ -304,12 +310,28 @@ describe('WsHandler fresh-agent routing', () => {
 
       await vi.waitFor(() => {
         const locator = { sessionId: 'codex-session-2', sessionType: 'freshcodex', provider: 'codex' }
-        expect(runtimeManager.send).toHaveBeenCalledWith(locator, { text: 'Ship it', images: undefined })
+        expect(runtimeManager.send).toHaveBeenCalledWith(locator, {
+          text: 'Ship it',
+          images: undefined,
+          settings: { cwd: '/repo', model: 'gpt-5.4-mini', effort: 'low' },
+        })
         expect(runtimeManager.interrupt).toHaveBeenCalledWith(locator)
         expect(runtimeManager.resolveApproval).toHaveBeenCalledWith(locator, 'approval-1', { behavior: 'allow', updatedInput: {} })
         expect(runtimeManager.answerQuestion).toHaveBeenCalledWith(locator, 'question-1', { proceed: 'yes' })
         expect(runtimeManager.fork).toHaveBeenCalledWith(locator, undefined)
+        expect(runtimeManager.subscribe).toHaveBeenCalledWith(
+          { sessionId: 'forked-session', sessionType: 'freshcodex', provider: 'codex' },
+          expect.any(Function),
+        )
         expect(runtimeManager.kill).toHaveBeenCalledWith(locator)
+        expect(seenMessages).toContainEqual(expect.objectContaining({
+          type: 'freshAgent.forked',
+          requestId: 'fork-req-1',
+          parentSessionId: 'codex-session-2',
+          sessionId: 'forked-session',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+        }))
       })
     } finally {
       handler.close()

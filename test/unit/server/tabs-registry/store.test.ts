@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { promises as fs } from 'fs'
 import os from 'os'
 import path from 'path'
@@ -146,6 +146,69 @@ describe('TabsRegistryStore compact state', () => {
       snapshotRevision: 2,
       records: [{ ...record, tabName: 'different' }],
     })).rejects.toThrow(/duplicate snapshot revision/i)
+  })
+
+  it('archives an invalid compact manifest and starts with an empty recoverable registry', async () => {
+    await replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      records: [
+        makeRecord({ tabKey: 'local:a', tabId: 'a', deviceId: 'local-device', deviceLabel: 'local', tabName: 'A' }),
+      ],
+    })
+    const manifestPath = path.join(tempDir, 'v1', 'manifest.json')
+    const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8')) as {
+      openSnapshots: Record<string, { path: string }>
+    }
+    const missingRef = Object.values(manifest.openSnapshots)[0]
+    expect(missingRef).toBeDefined()
+    await fs.rm(path.join(tempDir, 'v1', missingRef!.path))
+
+    store = await createTabsRegistryStore(tempDir, { now: () => now })
+
+    const result = await store.query({
+      deviceId: 'local-device',
+      clientInstanceId: 'window-a',
+      closedTabRetentionDays: 30,
+    })
+    expect(result.localOpen).toEqual([])
+    const entries = await fs.readdir(path.join(tempDir, 'v1'))
+    expect(entries.some((entry) => entry.startsWith('manifest.json.invalid-'))).toBe(true)
+    await expect(fs.stat(manifestPath)).resolves.toBeDefined()
+  })
+
+  it('does not archive compact state for operational object read failures', async () => {
+    await replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      records: [
+        makeRecord({ tabKey: 'local:a', tabId: 'a', deviceId: 'local-device', deviceLabel: 'local', tabName: 'A' }),
+      ],
+    })
+    const manifestPath = path.join(tempDir, 'v1', 'manifest.json')
+    const originalReadFile = fs.readFile.bind(fs)
+    const readFileSpy = vi.spyOn(fs, 'readFile').mockImplementation(async (file, ...args) => {
+      if (String(file).includes(`${path.sep}v1${path.sep}objects${path.sep}`)) {
+        const error = new Error('temporary permission failure') as NodeJS.ErrnoException
+        error.code = 'EACCES'
+        throw error
+      }
+      return await originalReadFile(file, ...args)
+    })
+
+    try {
+      await expect(createTabsRegistryStore(tempDir, { now: () => now })).rejects.toThrow(/temporary permission failure/)
+    } finally {
+      readFileSpy.mockRestore()
+    }
+
+    const entries = await fs.readdir(path.join(tempDir, 'v1'))
+    expect(entries.some((entry) => entry.startsWith('manifest.json.invalid-'))).toBe(false)
+    await expect(fs.stat(manifestPath)).resolves.toBeDefined()
   })
 
   it('rejects same-revision retries whose closed tombstones differ from the committed push', async () => {

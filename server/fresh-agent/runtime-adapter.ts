@@ -54,4 +54,5 @@ export interface FreshAgentRuntimeAdapter {
   getSnapshot?(thread: FreshAgentThreadLocator, revision?: number): Promise<unknown>
   getTurnPage?(thread: FreshAgentThreadLocator, query: Record<string, unknown>): Promise<unknown>
   getTurnBody?(thread: FreshAgentThreadLocator & { turnId: string }, revision: number): Promise<unknown>
+  shutdown?(): Promise<void> | void
 }

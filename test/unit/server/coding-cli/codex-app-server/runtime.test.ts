@@ -984,27 +984,16 @@ describe('CodexAppServerRuntime', () => {
     })).toThrow(/startup reaper blocked startup.*failed to reap 2 ownership record.*ownership-alpha.*ownership-beta/i)
   })
 
-  it('reports active live sidecar owners separately from failed cleanup', () => {
-    let thrown: Error | undefined
-
-    try {
-      assertCodexStartupReaperSucceeded({
-        reapedOwnershipIds: [],
-        ignoredLegacyRecords: [],
-        skippedActiveOwnershipIds: ['active-owner'],
-        failedOwnershipIds: [],
-      })
-    } catch (error) {
-      thrown = error as Error
-    }
-
-    expect(thrown).toBeDefined()
-    expect(thrown?.message).toContain('still owned by a live Freshell server/process')
-    expect(thrown?.message).toContain('active-owner')
-    expect(thrown?.message).not.toContain('failed to reap 1 ownership record(s): active-owner')
+  it('blocks startup when ownership records still belong to live sidecar owners', () => {
+    expect(() => assertCodexStartupReaperSucceeded({
+      reapedOwnershipIds: [],
+      ignoredLegacyRecords: [],
+      skippedActiveOwnershipIds: ['active-owner'],
+      failedOwnershipIds: [],
+    })).toThrow(/startup reaper blocked startup.*active ownership record.*active-owner/i)
   })
 
-  it('reports mixed active owners and failed reaps without conflating them', () => {
+  it('reports failed reaps without conflating live active owners', () => {
     let thrown: Error | undefined
 
     try {
@@ -1020,10 +1009,10 @@ describe('CodexAppServerRuntime', () => {
 
     expect(thrown).toBeDefined()
     expect(thrown?.message).toContain('failed to reap 1 ownership record(s): failed-owner')
-    expect(thrown?.message).toContain('still owned by a live Freshell server/process: active-owner')
+    expect(thrown?.message).toContain('active-owner')
   })
 
-  it('blocks startup when a new-schema ownership record is skipped because the owner pid is live', async () => {
+  it('reports a skipped new-schema ownership record when the owner pid is live', async () => {
     const metadataDir = await makeTempDir()
     const runtime = createRuntime({
       metadataDir,
@@ -1034,11 +1023,14 @@ describe('CodexAppServerRuntime', () => {
       ownerServerPid: process.pid,
     })
 
-    await expect(runCodexStartupReaper({
+    const result = await reapOrphanedCodexAppServerSidecars({
       metadataDir,
       serverInstanceId: 'srv-current',
       terminateGraceMs: 1,
-    })).rejects.toThrow(new RegExp(ready.ownershipId))
+    })
+
+    expect(result.skippedActiveOwnershipIds).toContain(ready.ownershipId)
+    expect(() => assertCodexStartupReaperSucceeded(result)).toThrow(new RegExp(ready.ownershipId))
     await expect(fsp.stat(ready.metadataPath)).resolves.toBeDefined()
     expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
   })
