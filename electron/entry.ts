@@ -9,6 +9,7 @@
 //        (or via electron-builder's packaged app)
 
 import { app, BrowserWindow, globalShortcut, ipcMain, Tray, Menu, nativeImage } from 'electron'
+import fs from 'fs'
 import path from 'path'
 import os from 'os'
 import http from 'http'
@@ -156,8 +157,9 @@ async function main(): Promise<void> {
     },
     createTray: () => {
       const iconName = process.platform === 'win32' ? 'tray-icon-win.ico' : 'tray-icon.png'
-      const iconPath = isDev
-        ? path.join(__dirname, '..', '..', 'assets', 'electron', iconName)
+      const devIconPath = path.join(__dirname, '..', '..', '..', 'assets', 'electron', iconName)
+      const iconPath = isDev || fs.existsSync(devIconPath)
+        ? devIconPath
         : path.join(process.resourcesPath!, 'assets', iconName)
 
       createTray(
