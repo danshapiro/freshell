@@ -40,12 +40,45 @@ export const FRESHCODEX_MODEL_OPTIONS = [
   { value: 'gpt-5.4-flash', label: 'GPT-5.4 Flash' },
   { value: 'gpt-5.3-codex-spark', label: 'GPT-5.3 Codex Spark' },
 ] as const
+export const FRESH_AGENT_THINKING_OPTIONS_BY_PROVIDER = {
+  claude: [
+    { value: 'low', label: 'Low' },
+    { value: 'medium', label: 'Medium' },
+    { value: 'high', label: 'High' },
+    { value: 'max', label: 'Maximum' },
+  ],
+  codex: [
+    { value: 'none', label: 'None' },
+    { value: 'minimal', label: 'Minimal' },
+    { value: 'low', label: 'Low' },
+    { value: 'medium', label: 'Medium' },
+    { value: 'high', label: 'High' },
+    { value: 'xhigh', label: 'Maximum' },
+  ],
+  opencode: [
+    { value: 'low', label: 'Low' },
+    { value: 'medium', label: 'Medium' },
+    { value: 'high', label: 'High' },
+    { value: 'max', label: 'Maximum' },
+  ],
+} as const
 
 export function normalizeFreshcodexModel(model: string | undefined): string {
   if (model && FRESHCODEX_MODEL_OPTIONS.some((option) => option.value === model)) {
     return model
   }
   return FRESHCODEX_DEFAULT_MODEL
+}
+
+export function normalizeFreshAgentEffort(provider: FreshAgentRuntimeProvider, effort: string | undefined): string | undefined {
+  const options = FRESH_AGENT_THINKING_OPTIONS_BY_PROVIDER[provider] ?? []
+  if (effort && options.some((option) => option.value === effort)) {
+    return effort
+  }
+  if (provider === 'codex') return FRESHCODEX_DEFAULT_EFFORT
+  if (provider === 'claude') return 'max'
+  if (provider === 'opencode') return 'max'
+  return undefined
 }
 
 export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [

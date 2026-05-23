@@ -361,7 +361,8 @@ describe('CodexAppServerRuntime', () => {
     const runtime = createRuntime({
       metadataDir,
       serverInstanceId: 'srv-runtime-test',
-      processIdentityReader: async () => {
+      processIdentityReader: async (pid) => {
+        if (pid === process.pid) return readWrapperIdentityForTest(pid)
         identityLookupStarted()
         return identityReleased
       },
@@ -397,6 +398,7 @@ describe('CodexAppServerRuntime', () => {
       startupAttemptLimit: 1,
       startupAttemptTimeoutMs: 500,
       processIdentityReader: async (pid) => {
+        if (pid === process.pid) return readWrapperIdentityForTest(pid)
         identityReadAttempts += 1
         if (identityReadAttempts === 1) {
           return { commandLine: [], cwd: null, startTimeTicks: null }
@@ -1021,6 +1023,7 @@ describe('CodexAppServerRuntime', () => {
     const ready = await runtime.ensureReady()
     await markOwnershipRecordStale(ready.metadataPath, {
       ownerServerPid: process.pid,
+      ownerServerIdentity: await readWrapperIdentityForTest(process.pid),
     })
 
     const result = await reapOrphanedCodexAppServerSidecars({
@@ -1031,6 +1034,35 @@ describe('CodexAppServerRuntime', () => {
 
     expect(result.skippedActiveOwnershipIds).toContain(ready.ownershipId)
     expect(() => assertCodexStartupReaperSucceeded(result)).not.toThrow()
+    await expect(fsp.stat(ready.metadataPath)).resolves.toBeDefined()
+    expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
+  })
+
+  it('does not treat a live reused owner pid as active without matching owner identity', async () => {
+    const metadataDir = await makeTempDir()
+    const runtime = createRuntime({
+      metadataDir,
+      serverInstanceId: 'srv-previous',
+    })
+    const ready = await runtime.ensureReady()
+    await markOwnershipRecordStale(ready.metadataPath, {
+      ownerServerPid: process.pid,
+      ownerServerIdentity: {
+        commandLine: ['different-process'],
+        cwd: '/tmp/different-process',
+        startTimeTicks: 1,
+      },
+    })
+
+    const result = await reapOrphanedCodexAppServerSidecars({
+      metadataDir,
+      serverInstanceId: 'srv-current',
+      terminateGraceMs: 1,
+    })
+
+    expect(result.skippedActiveOwnershipIds).not.toContain(ready.ownershipId)
+    expect(result.failedOwnershipIds).toContain(ready.ownershipId)
+    expect(() => assertCodexStartupReaperSucceeded(result)).toThrow(new RegExp(ready.ownershipId))
     await expect(fsp.stat(ready.metadataPath)).resolves.toBeDefined()
     expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
   })

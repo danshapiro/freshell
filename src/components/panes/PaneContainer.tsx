@@ -14,7 +14,7 @@ import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
 import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-utils'
 import { isAgentChatProviderName, getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
-import { normalizeFreshcodexModel, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
+import { normalizeFreshAgentEffort, normalizeFreshcodexModel, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { clearDraft } from '@/lib/draft-store'
 import { getTerminalActions } from '@/lib/pane-action-registry'
 import { buildPaneRefreshTarget } from '@/lib/pane-utils'
@@ -628,7 +628,10 @@ function PickerWrapper({
         sandbox: freshAgentType.runtimeProvider === 'codex'
           ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.sandbox
           : undefined,
-        effort: normalizeAgentChatEffortOverride(providerSettings?.effort) ?? freshAgentType.defaultEffort,
+        effort: normalizeFreshAgentEffort(
+          freshAgentType.runtimeProvider,
+          normalizeAgentChatEffortOverride(providerSettings?.effort),
+        ) ?? freshAgentType.defaultEffort,
         plugins: freshAgentType.runtimeProvider === 'claude' ? agentChatSettings?.defaultPlugins : undefined,
         ...(cwd ? { initialCwd: cwd } : {}),
       }

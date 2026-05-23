@@ -9,8 +9,9 @@ import { mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { clearPendingCreateFailure } from '@/store/freshAgentSlice'
 import { handleFreshAgentTransportEvent, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import {
-  FRESHCODEX_DEFAULT_EFFORT,
+  FRESH_AGENT_THINKING_OPTIONS_BY_PROVIDER,
   FRESHCODEX_MODEL_OPTIONS,
+  normalizeFreshAgentEffort,
   normalizeFreshcodexModel,
   resolveFreshAgentType,
 } from '@/lib/fresh-agent-registry'
@@ -27,28 +28,6 @@ import { FreshAgentDiffPanel } from './FreshAgentDiffPanel'
 import { FreshAgentSidebar } from './FreshAgentSidebar'
 
 const EARLY_STATES = new Set(['creating', 'starting'])
-const FRESH_AGENT_THINKING_OPTIONS_BY_PROVIDER = {
-  claude: [
-    { value: 'low', label: 'Low' },
-    { value: 'medium', label: 'Medium' },
-    { value: 'high', label: 'High' },
-    { value: 'max', label: 'Maximum' },
-  ],
-  codex: [
-    { value: 'none', label: 'None' },
-    { value: 'minimal', label: 'Minimal' },
-    { value: 'low', label: 'Low' },
-    { value: 'medium', label: 'Medium' },
-    { value: 'high', label: 'High' },
-    { value: 'xhigh', label: 'Maximum' },
-  ],
-  opencode: [
-    { value: 'low', label: 'Low' },
-    { value: 'medium', label: 'Medium' },
-    { value: 'high', label: 'High' },
-    { value: 'max', label: 'Maximum' },
-  ],
-} as const
 
 function getEffectiveFreshAgentModel(content: FreshAgentPaneContent): string | undefined {
   if (content.provider === 'codex') {
@@ -58,11 +37,7 @@ function getEffectiveFreshAgentModel(content: FreshAgentPaneContent): string | u
 }
 
 function getEffectiveFreshAgentEffort(content: FreshAgentPaneContent): string | undefined {
-  if (content.effort) return content.effort
-  if (content.provider === 'codex') return FRESHCODEX_DEFAULT_EFFORT
-  if (content.provider === 'claude') return 'max'
-  if (content.provider === 'opencode') return 'max'
-  return undefined
+  return normalizeFreshAgentEffort(content.provider, content.effort)
 }
 
 function isStatusRegression(current: string, next: string): boolean {

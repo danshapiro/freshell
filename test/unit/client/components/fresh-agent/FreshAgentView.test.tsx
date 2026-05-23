@@ -377,6 +377,62 @@ describe('FreshAgentView', () => {
     expect(screen.queryByRole('radio', { name: 'custom-codex-model' })).not.toBeInTheDocument()
   })
 
+  it('normalizes stale Freshcodex thinking effort before create and send', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-stale-effort',
+        status: 'creating',
+        effort: 'max',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.create',
+      requestId: 'req-stale-effort',
+      effort: 'xhigh',
+    }))
+
+    const onMessage = wsMock.onMessage.mock.calls[0]?.[0]
+    expect(onMessage).toBeTypeOf('function')
+    act(() => {
+      onMessage({
+        type: 'freshAgent.created',
+        requestId: 'req-stale-effort',
+        sessionId: 'thread-stale-effort',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        runtimeProvider: 'codex',
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByRole('combobox', { name: 'Thinking level' })).toHaveValue('xhigh')
+    })
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'reply ok' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.send',
+      settings: expect.objectContaining({ effort: 'xhigh' }),
+    }))
+  })
+
   it('switches the pane to the forked Freshcodex thread when the server reports fork success', async () => {
     const store = createStore()
     let onMessage: ((message: Record<string, unknown>) => void) | undefined

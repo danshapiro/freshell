@@ -1586,9 +1586,10 @@ describe('PaneContainer', () => {
     function createStoreWithClaude(
       node: PaneNode,
       providerSettings?: { cwd?: string; permissionMode?: 'default' | 'plan' | 'acceptEdits' | 'bypassPermissions' },
-      providerSettingsByName?: Record<string, { cwd?: string; permissionMode?: string; model?: string }>,
+      providerSettingsByName?: Record<string, { cwd?: string; permissionMode?: string; model?: string; effort?: string }>,
       enabledProviders: string[] = ['claude'],
       availableClis: Record<string, boolean> = { claude: true },
+      freshAgentProviderSettingsByName?: Record<string, { effort?: string }>,
     ) {
       return configureStore({
         reducer: {
@@ -1640,6 +1641,9 @@ describe('PaneContainer', () => {
               codingCli: {
                 enabledProviders: enabledProviders as any[],
                 providers: providerSettingsByName ?? (providerSettings ? { claude: providerSettings } : {}),
+              },
+              freshAgent: {
+                providers: freshAgentProviderSettingsByName ?? {},
               },
               logging: { debug: false },
             },
@@ -1745,6 +1749,40 @@ describe('PaneContainer', () => {
       expect(saveServerSettingsPatchSpy).not.toHaveBeenCalledWith(expect.objectContaining({
         codingCli: { providers: expect.objectContaining({ freshcodex: expect.anything() }) },
       }))
+    })
+
+    it('normalizes stale Freshcodex effort from provider settings when creating a pane', async () => {
+      const node = createPickerNode('pane-1')
+      const store = createStoreWithClaude(
+        node,
+        undefined,
+        undefined,
+        ['claude', 'codex'],
+        { claude: true, codex: true },
+        { freshcodex: { effort: 'max' } },
+      )
+      mockApiPost.mockResolvedValueOnce({ valid: true, resolvedPath: '/home/user/freshcodex-project' })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: 'Freshcodex' }))
+      fireEvent.transitionEnd(getPickerContainer())
+
+      const input = screen.getByLabelText('Starting directory for Freshcodex')
+      fireEvent.change(input, { target: { value: '/home/user/freshcodex-project' } })
+      fireEvent.keyDown(input, { key: 'Enter' })
+
+      await waitFor(() => {
+        const state = store.getState().panes
+        const paneContent = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
+        expect(paneContent.kind).toBe('fresh-agent')
+        if (paneContent.kind === 'fresh-agent') {
+          expect(paneContent.effort).toBe('xhigh')
+        }
+      })
     })
 
     it('preloads Freshcodex directory from the Codex runtime provider key', () => {

@@ -46,6 +46,7 @@ export type CodexSidecarOwnershipMetadata = {
   ownershipId: string
   serverInstanceId: string
   ownerServerPid: number
+  ownerServerIdentity?: WrapperIdentity
   terminalId: string | null
   generation: number | null
   wsUrl: string
@@ -199,14 +200,18 @@ function isCompleteWrapperIdentity(identity: WrapperIdentity | null): identity i
     && Number.isFinite(identity.startTimeTicks)
 }
 
-function wrapperIdentityMatches(record: CodexSidecarOwnershipMetadata, current: WrapperIdentity | null): boolean {
+function processIdentityMatches(expected: WrapperIdentity | undefined, current: WrapperIdentity | null): boolean {
   if (!current) return false
-  const expected = record.wrapperIdentity
+  if (!expected) return false
   if (expected.startTimeTicks === null || current.startTimeTicks === null) return false
   if (expected.startTimeTicks !== current.startTimeTicks) return false
   if (expected.cwd === null || current.cwd === null || expected.cwd !== current.cwd) return false
   if (expected.commandLine.length === 0 || expected.commandLine.length !== current.commandLine.length) return false
   return expected.commandLine.every((arg, index) => arg === current.commandLine[index])
+}
+
+function wrapperIdentityMatches(record: CodexSidecarOwnershipMetadata, current: WrapperIdentity | null): boolean {
+  return processIdentityMatches(record.wrapperIdentity, current)
 }
 
 function emptyWrapperIdentity(): WrapperIdentity {
@@ -225,6 +230,12 @@ async function isPidAlive(pid: number): Promise<boolean> {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code !== 'ESRCH'
   }
+}
+
+async function isOwnerServerProcess(metadata: CodexSidecarOwnershipMetadata): Promise<boolean> {
+  if (!metadata.ownerServerIdentity) return false
+  const currentIdentity = await readProcessIdentity(metadata.ownerServerPid)
+  return processIdentityMatches(metadata.ownerServerIdentity, currentIdentity)
 }
 
 async function processHasOwnershipEnv(pid: number, ownershipId: string): Promise<boolean> {
@@ -464,7 +475,11 @@ export async function reapOrphanedCodexAppServerSidecars(
     const metadata = parsed.metadata
 
     if (await isPidAlive(metadata.ownerServerPid)) {
-      result.skippedActiveOwnershipIds.push(metadata.ownershipId)
+      if (await isOwnerServerProcess(metadata)) {
+        result.skippedActiveOwnershipIds.push(metadata.ownershipId)
+      } else {
+        result.failedOwnershipIds.push(metadata.ownershipId)
+      }
       continue
     }
 
@@ -822,11 +837,17 @@ export class CodexAppServerRuntime {
           throw new Error('Codex app-server sidecar spawn did not expose a wrapper PID.')
         }
 
+        const ownerServerIdentity = await this.processIdentityReader(process.pid)
+        if (!isCompleteWrapperIdentity(ownerServerIdentity)) {
+          throw new Error(`Codex app-server owner identity could not be completely read for PID ${process.pid}.`)
+        }
+
         const ownership = this.createOwnershipRecord({
           ownershipId,
           wsUrl,
           wrapperPid: child.pid,
           processGroupId: child.pid,
+          ownerServerIdentity,
         })
         this.ownership = ownership
         attemptOwnership = ownership
@@ -927,6 +948,7 @@ export class CodexAppServerRuntime {
     wsUrl: string
     wrapperPid: number
     processGroupId: number
+    ownerServerIdentity: WrapperIdentity
   }): ActiveOwnership {
     const now = new Date().toISOString()
     const metadata: CodexSidecarOwnershipMetadata = {
@@ -934,6 +956,7 @@ export class CodexAppServerRuntime {
       ownershipId: input.ownershipId,
       serverInstanceId: this.serverInstanceId,
       ownerServerPid: process.pid,
+      ownerServerIdentity: input.ownerServerIdentity,
       terminalId: null,
       generation: null,
       wsUrl: input.wsUrl,

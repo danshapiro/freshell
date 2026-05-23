@@ -60,12 +60,13 @@ function isPaneContentShape(content: unknown): boolean {
     case 'picker':
       return true
     case 'fresh-agent': {
-      const isFreshAgentEffortValid = content.provider === 'claude'
-        ? (content.effort === undefined || (typeof content.effort === 'string' && content.effort.length > 0))
-        : (content.effort === undefined
-          || content.effort === 'none' || content.effort === 'minimal' || content.effort === 'low'
-          || content.effort === 'medium' || content.effort === 'high' || content.effort === 'xhigh'
-          || content.effort === 'max')
+      const isFreshAgentEffortValid = content.effort === undefined
+        || (
+          content.provider === 'codex'
+            ? (content.effort === 'none' || content.effort === 'minimal' || content.effort === 'low'
+              || content.effort === 'medium' || content.effort === 'high' || content.effort === 'xhigh')
+            : (content.effort === 'low' || content.effort === 'medium' || content.effort === 'high' || content.effort === 'max')
+        )
       const hasSessionRef = content.sessionRef !== undefined
         && (typeof content.sessionRef === 'object' || !!(content.sessionRef as object))
       const hasRestoreError = content.restoreError !== undefined
