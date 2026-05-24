@@ -12,14 +12,10 @@ export function createRequestAbortSignal(req: Request, res: Response): AbortSign
 
   const cleanup = () => {
     req.off('aborted', abort)
-    req.off('close', abort)
-    res.off('close', abort)
     res.off('finish', cleanup)
   }
 
   req.once('aborted', abort)
-  req.once('close', abort)
-  res.once('close', abort)
   res.once('finish', cleanup)
 
   return controller.signal

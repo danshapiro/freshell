@@ -148,7 +148,7 @@ describe('TabsRegistryStore compact state', () => {
     })).rejects.toThrow(/duplicate snapshot revision/i)
   })
 
-  it('rejects an invalid compact manifest without serving an empty registry', async () => {
+  it('archives a compact manifest that references a missing object and starts empty', async () => {
     await replace(store, {
       deviceId: 'local-device',
       deviceLabel: 'local',
@@ -166,11 +166,62 @@ describe('TabsRegistryStore compact state', () => {
     expect(missingRef).toBeDefined()
     await fs.rm(path.join(tempDir, 'v1', missingRef!.path))
 
-    await expect(createTabsRegistryStore(tempDir, { now: () => now })).rejects.toThrow(/compact state.*invalid|unavailable/i)
+    const restarted = await createTabsRegistryStore(tempDir, { now: () => now })
+    expect(restarted.count()).toBe(0)
 
     const entries = await fs.readdir(path.join(tempDir, 'v1'))
-    expect(entries.some((entry) => entry.startsWith('manifest.json.invalid-'))).toBe(false)
-    await expect(fs.stat(manifestPath)).resolves.toBeDefined()
+    expect(entries.some((entry) => entry.startsWith('manifest.json.invalid-'))).toBe(true)
+    await expect(fs.stat(manifestPath)).rejects.toThrow(/ENOENT/)
+  })
+
+  it('keeps superseded compact objects so overlapping restart processes cannot publish missing refs', async () => {
+    const recordA = makeRecord({ tabKey: 'local:a', tabId: 'a', deviceId: 'local-device', deviceLabel: 'local', tabName: 'A' })
+    await replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      records: [recordA],
+    })
+    const firstManifest = JSON.parse(await fs.readFile(path.join(tempDir, 'v1', 'manifest.json'), 'utf8')) as {
+      openSnapshots: Record<string, { path: string }>
+    }
+    const originalSnapshotRef = Object.values(firstManifest.openSnapshots)[0]
+    expect(originalSnapshotRef).toBeDefined()
+
+    const overlappingRestart = await createTabsRegistryStore(tempDir, { now: () => now })
+    await replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 2,
+      records: [makeRecord({
+        tabKey: 'local:b',
+        tabId: 'b',
+        deviceId: 'local-device',
+        deviceLabel: 'local',
+        tabName: 'B',
+        revision: 2,
+        updatedAt: NOW,
+      })],
+    })
+
+    await expect(fs.stat(path.join(tempDir, 'v1', originalSnapshotRef!.path))).resolves.toBeDefined()
+    await replace(overlappingRestart, {
+      deviceId: 'other-device',
+      deviceLabel: 'other',
+      clientInstanceId: 'window-b',
+      snapshotRevision: 1,
+      records: [makeRecord({
+        tabKey: 'other:c',
+        tabId: 'c',
+        deviceId: 'other-device',
+        deviceLabel: 'other',
+        tabName: 'C',
+      })],
+    })
+
+    await expect(createTabsRegistryStore(tempDir, { now: () => now })).resolves.toBeDefined()
   })
 
   it('does not archive compact state for operational object read failures', async () => {

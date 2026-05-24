@@ -83,11 +83,11 @@ describe('GET /api/bootstrap', () => {
     expect(res.body.configFallback).toEqual({ reason: 'read_error', backupExists: true })
   })
 
-  it('routes bootstrap through the critical read-model lane', async () => {
-    const schedule = vi.fn(async ({ lane, signal, run }: { lane: string; signal: AbortSignal; run: (signal: AbortSignal) => Promise<unknown> }) => {
+  it('routes bootstrap through the critical read-model lane without binding first paint to request aborts', async () => {
+    const schedule = vi.fn(async ({ lane, signal, run }: { lane: string; signal?: AbortSignal; run: (signal: AbortSignal) => Promise<unknown> }) => {
       expect(lane).toBe('critical')
-      expect(signal).toBeInstanceOf(AbortSignal)
-      return run(signal)
+      expect(signal).toBeUndefined()
+      return run(new AbortController().signal)
     })
     const appWithScheduler = createTestApp({
       readModelScheduler: { schedule },

@@ -26,6 +26,15 @@ function getErrorCode(error: unknown): string | undefined {
     : undefined
 }
 
+function hasErrorCode(error: unknown, code: string): boolean {
+  let current: unknown = error
+  while (current && typeof current === 'object') {
+    if (getErrorCode(current) === code) return true
+    current = 'cause' in current ? (current as { cause?: unknown }).cause : undefined
+  }
+  return false
+}
+
 function isOperationalFsError(error: unknown): boolean {
   const code = getErrorCode(error)
   return code === 'EACCES'
@@ -40,6 +49,15 @@ function isOperationalFsError(error: unknown): boolean {
 
 function invalidCompactState(message: string, cause?: unknown): InvalidCompactTabsRegistryStateError {
   return new InvalidCompactTabsRegistryStateError(message, { cause })
+}
+
+function writeStructuredWarning(event: string, details: Record<string, unknown>): void {
+  console.warn(JSON.stringify({
+    severity: 'warn',
+    component: 'tabs-registry-store',
+    event,
+    ...details,
+  }))
 }
 
 type ObjectRef = {
@@ -652,8 +670,19 @@ export class TabsRegistryStore {
 
     const compactManifestPath = path.join(resolvedRoot, 'v1', 'manifest.json')
     if (fs.existsSync(compactManifestPath)) {
-      const { state, manifestRevision, manifestObjectRefs } = await TabsRegistryStore.loadCompactState(resolvedRoot, caps)
-      return new TabsRegistryStore(resolvedRoot, state, manifestRevision, options, manifestObjectRefs)
+      try {
+        const { state, manifestRevision, manifestObjectRefs } = await TabsRegistryStore.loadCompactState(resolvedRoot, caps)
+        return new TabsRegistryStore(resolvedRoot, state, manifestRevision, options, manifestObjectRefs)
+      } catch (error) {
+        if (!(error instanceof InvalidCompactTabsRegistryStateError) || !hasErrorCode(error, 'ENOENT')) {
+          throw error
+        }
+        await TabsRegistryStore.archiveCompactManifest(resolvedRoot, now())
+        writeStructuredWarning('compact_manifest_archived_missing_object', {
+          manifestPath: compactManifestPath,
+          reason: error.message,
+        })
+      }
     }
 
     const legacyPath = path.join(resolvedRoot, 'tabs-registry.jsonl')
@@ -674,6 +703,18 @@ export class TabsRegistryStore {
       0,
       options,
     )
+  }
+
+  private static async archiveCompactManifest(rootDir: string, timestampMs: number): Promise<void> {
+    const manifestPath = path.join(rootDir, 'v1', 'manifest.json')
+    const archivePath = path.join(rootDir, 'v1', `manifest.json.invalid-${archiveTimestamp(new Date(timestampMs))}`)
+    try {
+      await fsp.rename(manifestPath, archivePath)
+      await bestEffortFsyncDir(path.dirname(manifestPath))
+    } catch (error) {
+      if (getErrorCode(error) === 'ENOENT') return
+      throw error
+    }
   }
 
   private static async loadCompactState(rootDir: string, caps: TabsRegistryCaps): Promise<{
@@ -1007,22 +1048,8 @@ export class TabsRegistryStore {
   }
 
   private async garbageCollectObjects(manifest: TabsRegistryManifestV1): Promise<void> {
-    const referenced = new Set<string>([
-      manifest.closedTombstones.path,
-      manifest.devices.path,
-      manifest.clientRevisions.path,
-      ...Object.values(manifest.openSnapshots).map((ref) => ref.path),
-    ])
-    const objectsDir = path.join(this.rootDir, 'v1', 'objects')
     const tmpDir = path.join(this.rootDir, 'v1', 'tmp')
-    await fsp.mkdir(objectsDir, { recursive: true })
     await fsp.mkdir(tmpDir, { recursive: true })
-    for (const file of await fsp.readdir(objectsDir)) {
-      const relative = `objects/${file}`
-      if (!referenced.has(relative)) {
-        await fsp.rm(path.join(objectsDir, file), { force: true })
-      }
-    }
     for (const file of await fsp.readdir(tmpDir)) {
       await fsp.rm(path.join(tmpDir, file), { force: true, recursive: true })
     }

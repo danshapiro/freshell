@@ -29,6 +29,7 @@ import {
 // Ensure DOM is clean even if another test file forgot cleanup.
 beforeEach(() => {
   cleanup()
+  sessionStorage.clear()
 })
 
 afterEach(() => {
@@ -154,8 +155,11 @@ vi.mock('@/components/OverviewView', () => ({
 }))
 
 vi.mock('@/components/SetupWizard', () => ({
-  SetupWizard: ({ initialStep }: { initialStep?: number }) => (
-    <div data-testid="mock-setup-wizard" data-initial-step={initialStep}>Setup Wizard (step {initialStep ?? 1})</div>
+  SetupWizard: ({ initialStep, onComplete }: { initialStep?: number; onComplete?: () => void }) => (
+    <div data-testid="mock-setup-wizard" data-initial-step={initialStep}>
+      Setup Wizard (step {initialStep ?? 1})
+      <button type="button" onClick={() => onComplete?.()}>Close setup wizard</button>
+    </div>
   ),
 }))
 
@@ -398,6 +402,67 @@ describe('App Component - Share Button', () => {
 
     expect(await screen.findByTestId('mock-setup-wizard')).toBeInTheDocument()
     expect(screen.getByTestId('mock-setup-wizard').dataset.initialStep).toBe('1')
+  })
+
+  it('does not auto-reopen setup wizard after the first-run wizard is dismissed', async () => {
+    const store = createTestStore()
+    const unconfiguredStatus = makeNetworkStatus({
+      configured: false,
+      host: '0.0.0.0',
+      remoteAccessEnabled: false,
+    })
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/version') return Promise.resolve(makeVersionInfo())
+      if (typeof url === 'string' && url.startsWith('/api/sessions')) return Promise.resolve([])
+      if (url === '/api/network/status') return Promise.resolve(unconfiguredStatus)
+      return Promise.resolve({})
+    })
+
+    act(() => {
+      store.dispatch(setNetworkStatus(unconfiguredStatus))
+    })
+
+    renderApp(store)
+
+    expect(await screen.findByTestId('mock-setup-wizard')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Close setup wizard' }))
+    await waitFor(() => {
+      expect(screen.queryByTestId('mock-setup-wizard')).not.toBeInTheDocument()
+    })
+
+    act(() => {
+      store.dispatch(setNetworkStatus({ ...unconfiguredStatus }))
+    })
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('mock-setup-wizard')).not.toBeInTheDocument()
+    })
+  })
+
+  it('does not late-open setup wizard after the user starts interacting before status resolves', async () => {
+    const store = createTestStore({
+      status: makeNetworkStatus({
+        configured: true,
+        host: '127.0.0.1',
+      }),
+    })
+    renderApp(store)
+
+    fireEvent.pointerDown(screen.getByTitle('Go settings'))
+
+    act(() => {
+      store.dispatch(setNetworkStatus(makeNetworkStatus({
+        configured: false,
+        host: '0.0.0.0',
+        remoteAccessEnabled: false,
+      })))
+    })
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('mock-setup-wizard')).not.toBeInTheDocument()
+    })
   })
 
   it('opens setup wizard at step 2 when configured but localhost-only', async () => {

@@ -173,7 +173,7 @@ describe('tabs registry compact persistence', () => {
     expect(result.devices.map((device) => device.deviceId)).toContain('local-device')
   })
 
-  it('ignores orphaned object and temp files on startup and garbage-collects them after commit', async () => {
+  it('ignores orphaned object files on startup and cleans temp files after commit', async () => {
     const writer = await createTabsRegistryStore(tempDir, { now: () => now })
     await writer.replaceClientSnapshot({
       deviceId: 'local-device',
@@ -208,7 +208,7 @@ describe('tabs registry compact persistence', () => {
         makeRecord({ tabKey: 'local:open-2', tabId: 'open-2', deviceId: 'local-device', deviceLabel: 'local' }),
       ],
     })
-    await expect(fs.stat(orphanPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fs.stat(orphanPath)).resolves.toBeDefined()
     await expect(fs.stat(tmpPath)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 

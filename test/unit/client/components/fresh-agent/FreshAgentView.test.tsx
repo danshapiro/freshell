@@ -501,11 +501,11 @@ describe('FreshAgentView', () => {
     )
 
     fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
-    fireEvent.change(screen.getByRole('combobox', { name: 'Model' }), {
-      target: { value: 'gpt-5.4-flash' },
-    })
+    expect(screen.queryByRole('combobox', { name: 'Model' })).not.toBeInTheDocument()
+    expect(screen.getByRole('radiogroup', { name: 'Model' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('radio', { name: 'GPT-5.4 Flash' }))
     await waitFor(() => {
-      expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue('gpt-5.4-flash')
+      expect(screen.getByRole('radio', { name: 'GPT-5.4 Flash' })).toBeChecked()
     })
 
     const thinking = screen.getByRole('combobox', { name: 'Thinking level' })
@@ -550,14 +550,13 @@ describe('FreshAgentView', () => {
     )
 
     fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
-    expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue('opencode-go/deepseek-v4-flash')
+    expect(screen.queryByRole('combobox', { name: 'Model' })).not.toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: 'DeepSeek V4 Flash' })).toBeChecked()
     expect(screen.getByRole('combobox', { name: 'Thinking level' })).toHaveValue('max')
 
-    fireEvent.change(screen.getByRole('combobox', { name: 'Model' }), {
-      target: { value: 'opencode-go/glm-5.1' },
-    })
+    fireEvent.click(screen.getByRole('radio', { name: 'GLM 5.1' }))
     await waitFor(() => {
-      expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue('opencode-go/glm-5.1')
+      expect(screen.getByRole('radio', { name: 'GLM 5.1' })).toBeChecked()
     })
     fireEvent.change(screen.getByRole('combobox', { name: 'Thinking level' }), {
       target: { value: 'high' },

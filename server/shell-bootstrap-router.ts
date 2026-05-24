@@ -1,7 +1,6 @@
 import { Router } from 'express'
 import { MAX_BOOTSTRAP_PAYLOAD_BYTES, type BootstrapPayload } from '../shared/read-models.js'
 import { setResponsePerfContext } from './request-logger.js'
-import { createRequestAbortSignal } from './read-models/request-abort.js'
 import {
   defaultReadModelScheduler,
   isReadModelAbortError,
@@ -26,12 +25,10 @@ export function createShellBootstrapRouter(deps: ShellBootstrapRouterDeps): Rout
   const router = Router()
   const readModelScheduler = deps.readModelScheduler ?? defaultReadModelScheduler
 
-  router.get('/bootstrap', async (req, res) => {
-    const signal = createRequestAbortSignal(req, res)
+  router.get('/bootstrap', async (_req, res) => {
     try {
       const payload = await readModelScheduler.schedule({
         lane: 'critical',
-        signal,
         run: async (scheduledSignal) => {
           const settings = await deps.getSettings()
           const legacyLocalSettingsSeed = deps.getLegacyLocalSettingsSeed
@@ -96,7 +93,7 @@ export function createShellBootstrapRouter(deps: ShellBootstrapRouterDeps): Rout
       })
       res.json(payload)
     } catch (error) {
-      if (signal.aborted || isReadModelAbortError(error)) {
+      if (isReadModelAbortError(error)) {
         return
       }
       res.status(500).json({ error: 'Bootstrap failed' })

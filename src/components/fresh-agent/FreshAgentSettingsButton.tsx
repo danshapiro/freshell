@@ -94,33 +94,45 @@ export function FreshAgentSettingsButton({
         >
           <div className="space-y-3">
             {modelOptions.length > 0 ? (
-              <label className="block space-y-1">
-                <span className="font-medium">Model</span>
-                <select
-                  aria-label="Model"
-                  className="w-full rounded border border-border/70 bg-background px-2 py-1 text-xs"
-                  value={modelValue}
-                  disabled={settingsDisabled}
-                  onChange={(event) => {
-                    const nextModel = event.target.value
-                    const nextEffort = normalizeFreshAgentEffort(
-                      paneContent.sessionType,
-                      paneContent.provider,
-                      nextModel,
-                      paneContent.effort,
-                    )
-                    dispatch(mergePaneContent({
-                      tabId,
-                      paneId,
-                      updates: { model: nextModel, effort: nextEffort },
-                    }))
-                  }}
-                >
+              <fieldset className="space-y-1">
+                <legend className="font-medium">Model</legend>
+                <div className="space-y-1" role="radiogroup" aria-label="Model">
                   {modelOptions.map((option) => (
-                    <option key={option.value} value={option.value}>{option.label}</option>
+                    <label
+                      key={option.value}
+                      className={cn(
+                        'flex cursor-pointer items-center gap-2 rounded border border-border/60 px-2 py-1 transition-colors',
+                        modelValue === option.value ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/50',
+                        settingsDisabled && 'cursor-not-allowed opacity-60 hover:bg-transparent',
+                      )}
+                    >
+                      <input
+                        type="radio"
+                        className="h-3 w-3"
+                        name={`fresh-agent-model-${tabId}-${paneId}`}
+                        value={option.value}
+                        checked={modelValue === option.value}
+                        disabled={settingsDisabled}
+                        onChange={() => {
+                          const nextModel = option.value
+                          const nextEffort = normalizeFreshAgentEffort(
+                            paneContent.sessionType,
+                            paneContent.provider,
+                            nextModel,
+                            paneContent.effort,
+                          )
+                          dispatch(mergePaneContent({
+                            tabId,
+                            paneId,
+                            updates: { model: nextModel, effort: nextEffort },
+                          }))
+                        }}
+                      />
+                      <span>{option.label}</span>
+                    </label>
                   ))}
-                </select>
-              </label>
+                </div>
+              </fieldset>
             ) : null}
 
             {thinkingOptions.length > 0 ? (

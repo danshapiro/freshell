@@ -166,6 +166,21 @@ describe('SetupWizard', () => {
     await waitFor(() => expect(onComplete).toHaveBeenCalled())
   })
 
+  it('dismisses immediately when "No" is clicked, even while saving the preference', () => {
+    mockPost.mockReturnValue(new Promise(() => {}))
+    const onComplete = vi.fn()
+    const store = createTestStore()
+    render(
+      <Provider store={store}>
+        <SetupWizard onComplete={onComplete} />
+      </Provider>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /no/i }))
+
+    expect(onComplete).toHaveBeenCalledTimes(1)
+  })
+
   it('has dialog role with aria-modal', () => {
     const store = createTestStore()
     render(

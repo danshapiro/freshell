@@ -68,6 +68,7 @@ import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import { createLogger } from '@/lib/client-logger'
+import { hasDismissedAutoSetupWizard, markAutoSetupWizardDismissed } from '@/lib/setup-wizard-dismissal'
 import type { LocalSettingsPatch, ServerSettings } from '@shared/settings'
 import { z } from 'zod'
 import { withChunkErrorRecovery } from '@/lib/import-retry'
@@ -217,6 +218,8 @@ export default function App() {
   const [showSetupWizard, setShowSetupWizard] = useState(false)
   const [configFallback, setConfigFallback] = useState<ConfigFallbackInfo | null>(null)
   const [wizardInitialStep, setWizardInitialStep] = useState<1 | 2>(1)
+  const setupWizardAutoShownRef = useRef(false)
+  const setupWizardUserInteractedRef = useRef(false)
   const [copied, setCopied] = useState(false)
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null)
   const [pendingFirewallCommand, setPendingFirewallCommand] = useState<{ tabId: string; command: string } | null>(null)
@@ -291,6 +294,18 @@ export default function App() {
   useEffect(() => {
     isMobileRef.current = isMobile
   }, [isMobile])
+
+  useEffect(() => {
+    const markUserInteracted = () => {
+      setupWizardUserInteractedRef.current = true
+    }
+    window.addEventListener('pointerdown', markUserInteracted, { capture: true })
+    window.addEventListener('keydown', markUserInteracted, { capture: true })
+    return () => {
+      window.removeEventListener('pointerdown', markUserInteracted, { capture: true })
+      window.removeEventListener('keydown', markUserInteracted, { capture: true })
+    }
+  }, [])
 
   // Sidebar width from settings (or local state during drag)
   const sidebarWidth = settings.sidebar?.width ?? 288
@@ -485,7 +500,7 @@ export default function App() {
         if (bootstrapDataLoading) return true
         bootstrapDataLoading = true
         try {
-          const bootstrapData = await api.get<{
+          type BootstrapData = {
             settings?: ServerSettings
             legacyLocalSettingsSeed?: LocalSettingsPatch
             platform?: BootstrapPlatformInfo
@@ -493,7 +508,26 @@ export default function App() {
               reason?: unknown
               backupExists?: unknown
             }
-          }>('/api/bootstrap')
+          }
+          let bootstrapData: BootstrapData | undefined
+          let lastBootstrapError: unknown
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            try {
+              bootstrapData = await api.get<BootstrapData>('/api/bootstrap')
+              break
+            } catch (err) {
+              lastBootstrapError = err
+              const isTransientFetchFailure = err instanceof TypeError && /failed to fetch/i.test(err.message)
+              if (attempt === 0 && isTransientFetchFailure && !cancelled) {
+                await new Promise((resolve) => setTimeout(resolve, 150))
+                continue
+              }
+              throw err
+            }
+          }
+          if (!bootstrapData) {
+            throw lastBootstrapError ?? new Error('Bootstrap data unavailable')
+          }
           if (!cancelled) {
             if (bootstrapData.legacyLocalSettingsSeed) {
               const currentPreferences = loadBrowserPreferencesRecord()
@@ -1059,7 +1093,15 @@ export default function App() {
 
   // Auto-show setup wizard on first run (unconfigured + localhost)
   useEffect(() => {
-    if (networkStatus && !networkStatus.configured && !isRemoteAccessEnabledStatus(networkStatus)) {
+    if (
+      networkStatus
+      && !setupWizardAutoShownRef.current
+      && !setupWizardUserInteractedRef.current
+      && !hasDismissedAutoSetupWizard()
+      && !networkStatus.configured
+      && !isRemoteAccessEnabledStatus(networkStatus)
+    ) {
+      setupWizardAutoShownRef.current = true
       setWizardInitialStep(1)
       setShowSetupWizard(true)
     }
@@ -1466,6 +1508,8 @@ npm run serve`}</pre>
           onNavigate={setView}
           onFirewallTerminal={setPendingFirewallCommand}
           onComplete={() => {
+            markAutoSetupWizardDismissed()
+            setupWizardAutoShownRef.current = true
             setShowSetupWizard(false)
             dispatch(fetchNetworkStatus())
           }}

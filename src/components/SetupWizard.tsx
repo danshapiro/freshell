@@ -9,6 +9,7 @@ import {
 } from '@/lib/firewall-configure'
 import { ensureShareUrlToken, isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { getAuthToken } from '@/lib/auth'
+import { markAutoSetupWizardDismissed } from '@/lib/setup-wizard-dismissal'
 import {
   SETUP_WIZARD_AUTO_ADVANCE_DELAY_MS,
   SETUP_WIZARD_COPY_RESET_DELAY_MS,
@@ -216,12 +217,13 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
 
   const handleNo = useCallback(async () => {
     setError(null)
+    markAutoSetupWizardDismissed()
+    onComplete()
     try {
       await dispatch(configureNetwork({
         host: '127.0.0.1',
         configured: true,
       })).unwrap()
-      onComplete()
     } catch (err: any) {
       setError(err?.message || 'Failed to save preference')
     }
