@@ -44,9 +44,11 @@ export interface FreshAgentRuntimeAdapter {
   readonly runtimeProvider: FreshAgentRuntimeProvider
   create(input: FreshAgentCreateRequest): Promise<{ sessionId: string; sessionRef?: { provider: string; sessionId: string } }>
   resume?(input: FreshAgentCreateRequest): Promise<{ sessionId: string; sessionRef?: { provider: string; sessionId: string } }>
+  attach?(locator: FreshAgentSessionLocator): Promise<{ sessionId: string; sessionRef?: { provider: string; sessionId: string } }> | { sessionId: string; sessionRef?: { provider: string; sessionId: string } }
   subscribe?(sessionId: string, listener: (message: unknown) => void): Promise<() => void> | (() => void)
   send?(sessionId: string, input: { text: string; images?: FreshAgentInputImage[]; settings?: FreshAgentCreateRequest }): Promise<void> | void
   interrupt?(sessionId: string): Promise<void> | void
+  compact?(sessionId: string, input?: { instructions?: string }): Promise<void> | void
   kill?(sessionId: string): Promise<boolean> | boolean
   fork?(sessionId: string, input?: Record<string, unknown>): Promise<unknown> | unknown
   answerQuestion?(sessionId: string, requestId: FreshAgentRequestId, answers: Record<string, string>): Promise<void> | void

@@ -12,12 +12,17 @@ import {
 import {
   FRESHCODEX_DEFAULT_EFFORT,
   FRESHCODEX_DEFAULT_MODEL,
+  FRESHOPENCODE_DEFAULT_EFFORT,
+  FRESHOPENCODE_DEFAULT_MODEL,
 } from '@/lib/fresh-agent-models'
 export {
   FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE,
   FRESHCODEX_DEFAULT_EFFORT,
   FRESHCODEX_DEFAULT_MODEL,
   FRESHCODEX_MODEL_OPTIONS,
+  FRESHOPENCODE_DEFAULT_EFFORT,
+  FRESHOPENCODE_DEFAULT_MODEL,
+  FRESHOPENCODE_MODEL_OPTIONS,
   getFreshAgentThinkingOptions,
   normalizeFreshAgentEffort,
   normalizeFreshAgentModel,
@@ -111,9 +116,9 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     runtimeProvider: 'opencode',
     label: 'Freshopencode',
     icon: OpencodeIcon,
-    defaultModel: 'opencode',
+    defaultModel: FRESHOPENCODE_DEFAULT_MODEL,
     defaultPermissionMode: 'bypassPermissions',
-    defaultEffort: 'max',
+    defaultEffort: FRESHOPENCODE_DEFAULT_EFFORT,
     settingsVisibility: {
       model: true,
       permissionMode: true,
@@ -124,7 +129,6 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     },
     pickerShortcut: 'O',
     pickerAfterCli: true,
-    disabled: true,
   },
 ] as const
 

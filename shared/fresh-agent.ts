@@ -59,7 +59,6 @@ export const FRESH_AGENT_DESCRIPTORS: readonly FreshAgentDescriptor[] = [
     sessionType: 'freshopencode',
     runtimeProvider: 'opencode',
     label: 'Freshopencode',
-    disabled: true,
   },
 ] as const
 

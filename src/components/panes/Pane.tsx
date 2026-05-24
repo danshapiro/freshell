@@ -95,6 +95,8 @@ export default function Pane({
       {showHeader && (
         <div>
           <PaneHeader
+            tabId={tabId}
+            paneId={paneId}
             title={title}
             metaLabel={metaLabel}
             metaTooltip={metaTooltip}

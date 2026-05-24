@@ -5,8 +5,11 @@ import { getTerminalStatusIconClassName } from '@/lib/terminal-status-indicator'
 import type { TerminalStatus } from '@/store/types'
 import type { PaneContent } from '@/store/paneTypes'
 import PaneIcon from '@/components/icons/PaneIcon'
+import FreshAgentSettingsButton from '@/components/fresh-agent/FreshAgentSettingsButton'
 
 interface PaneHeaderProps {
+  tabId?: string
+  paneId?: string
   title: string
   metaLabel?: string
   metaTooltip?: string
@@ -30,6 +33,8 @@ interface PaneHeaderProps {
 }
 
 export default function PaneHeader({
+  tabId = '',
+  paneId = '',
   title,
   metaLabel,
   metaTooltip,
@@ -136,6 +141,14 @@ export default function PaneHeader({
           >
             <RefreshCw className="h-[18px] w-[18px] sm:h-3 sm:w-3" />
           </button>
+        )}
+
+        {content.kind === 'fresh-agent' && (
+          <FreshAgentSettingsButton
+            tabId={tabId}
+            paneId={paneId}
+            paneContent={content}
+          />
         )}
 
         {onToggleZoom && (

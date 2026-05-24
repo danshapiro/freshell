@@ -177,6 +177,9 @@ vi.mock('lucide-react', () => ({
   RefreshCw: ({ className }: { className?: string }) => (
     <svg data-testid="refresh-icon" className={className} />
   ),
+  Settings: ({ className }: { className?: string }) => (
+    <svg data-testid="settings-icon" className={className} />
+  ),
 }))
 
 // Mock TerminalView component to avoid xterm.js dependencies
@@ -1786,6 +1789,41 @@ describe('PaneContainer', () => {
       })
     })
 
+    it('enables Freshopencode from the picker with OpenCode defaults', async () => {
+      const node = createPickerNode('pane-1')
+      const store = createStoreWithClaude(node, undefined, undefined, ['claude', 'opencode'], { claude: true, opencode: true })
+      mockApiPost.mockResolvedValueOnce({ valid: true, resolvedPath: '/home/user/freshopencode-project' })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: 'Freshopencode' }))
+      fireEvent.transitionEnd(getPickerContainer())
+
+      const input = screen.getByLabelText('Starting directory for Freshopencode')
+      fireEvent.change(input, { target: { value: '/home/user/freshopencode-project' } })
+      fireEvent.keyDown(input, { key: 'Enter' })
+
+      await waitFor(() => {
+        const state = store.getState().panes
+        const paneContent = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
+        expect(paneContent.kind).toBe('fresh-agent')
+        if (paneContent.kind === 'fresh-agent') {
+          expect(paneContent.sessionType).toBe('freshopencode')
+          expect(paneContent.provider).toBe('opencode')
+          expect(paneContent.initialCwd).toBe('/home/user/freshopencode-project')
+          expect(paneContent.model).toBe('opencode-go/deepseek-v4-flash')
+          expect(paneContent.effort).toBe('max')
+        }
+      })
+
+      expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+        codingCli: { providers: { opencode: { cwd: '/home/user/freshopencode-project' } } },
+      })
+    })
+
     it('preloads Freshcodex directory from the Codex runtime provider key', () => {
       const node = createPickerNode('pane-1')
       const store = createStoreWithClaude(node, undefined, {
@@ -2793,6 +2831,33 @@ describe('PaneContainer', () => {
       expect(screen.queryByTitle('Refresh pane')).toBeNull()
     })
 
+    it('renders refresh button for fresh-agent pane with a session id', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'fresh-req-1',
+          sessionId: 'fresh-session-1',
+          status: 'idle',
+        },
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': node },
+        activePane: { 'tab-1': 'pane-1' },
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      expect(screen.getByTitle('Refresh pane')).toBeInTheDocument()
+    })
+
     it('clicking refresh button dispatches requestPaneRefresh to Redux store', () => {
       const node: PaneNode = {
         type: 'leaf',
@@ -2819,6 +2884,41 @@ describe('PaneContainer', () => {
       expect(tabRequests?.['pane-1'].target).toEqual({
         kind: 'terminal',
         createRequestId: 'cr-1',
+      })
+    })
+
+    it('clicking fresh-agent refresh queues a fresh-agent refresh target', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'fresh-req-1',
+          sessionId: 'fresh-session-1',
+          status: 'idle',
+        },
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': node },
+        activePane: { 'tab-1': 'pane-1' },
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByTitle('Refresh pane'))
+
+      expect(store.getState().panes.refreshRequestsByPane?.['tab-1']?.['pane-1'].target).toEqual({
+        kind: 'fresh-agent',
+        createRequestId: 'fresh-req-1',
+        sessionId: 'fresh-session-1',
+        sessionType: 'freshcodex',
+        provider: 'codex',
       })
     })
   })

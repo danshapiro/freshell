@@ -14,6 +14,8 @@ export type FreshAgentModelOption = {
 
 export const FRESHCODEX_DEFAULT_MODEL = 'gpt-5.5'
 export const FRESHCODEX_DEFAULT_EFFORT = 'xhigh'
+export const FRESHOPENCODE_DEFAULT_MODEL = 'opencode-go/deepseek-v4-flash'
+export const FRESHOPENCODE_DEFAULT_EFFORT = 'max'
 
 export const FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE = {
   freshclaude: [
@@ -54,15 +56,22 @@ export const FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE = {
   ],
   freshopencode: [
     {
-      value: 'opencode',
-      label: 'Opencode',
-      thinkingEfforts: ['low', 'medium', 'high', 'max'],
-      defaultEffort: 'max',
+      value: FRESHOPENCODE_DEFAULT_MODEL,
+      label: 'DeepSeek V4 Flash',
+      thinkingEfforts: ['minimal', 'low', 'medium', 'high', 'max'],
+      defaultEffort: FRESHOPENCODE_DEFAULT_EFFORT,
+    },
+    {
+      value: 'opencode-go/glm-5.1',
+      label: 'GLM 5.1',
+      thinkingEfforts: ['minimal', 'low', 'medium', 'high', 'max'],
+      defaultEffort: FRESHOPENCODE_DEFAULT_EFFORT,
     },
   ],
 } as const satisfies Record<FreshAgentSessionType, readonly FreshAgentModelOption[]>
 
 export const FRESHCODEX_MODEL_OPTIONS = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE.freshcodex
+export const FRESHOPENCODE_MODEL_OPTIONS = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE.freshopencode
 
 function defaultModelForSession(sessionType: FreshAgentSessionType): FreshAgentModelOption | undefined {
   return FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE[sessionType]?.[0]
@@ -89,7 +98,11 @@ export function normalizeFreshAgentModel(
   if (provider === 'codex') {
     return normalizeFreshcodexModel(model)
   }
-  return model ?? defaultModelForSession(sessionType)?.value
+  if (provider === 'opencode') {
+    const options = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE[sessionType] ?? []
+    return options.find((candidate) => candidate.value === model)?.value ?? defaultModelForSession(sessionType)?.value
+  }
+  return model
 }
 
 export function getFreshAgentThinkingOptions(

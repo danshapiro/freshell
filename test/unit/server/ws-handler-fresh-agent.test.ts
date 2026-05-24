@@ -340,6 +340,53 @@ describe('WsHandler fresh-agent routing', () => {
     }
   })
 
+  it('routes freshAgent.compact through the runtime manager', async () => {
+    const runtimeManager = {
+      create: vi.fn().mockResolvedValue({
+        sessionId: 'codex-session-compact',
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+      }),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+      compact: vi.fn().mockResolvedValue(undefined),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const ws = await connectAndAuth(server)
+      ws.send(JSON.stringify({
+        type: 'freshAgent.create',
+        requestId: 'req-compact',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.create).toHaveBeenCalled()
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.compact',
+        sessionId: 'codex-session-compact',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        instructions: 'keep findings',
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.compact).toHaveBeenCalledWith({
+          sessionId: 'codex-session-compact',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+        }, { instructions: 'keep findings' })
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
   it('attaches a persisted fresh-agent session and forwards live adapter events over freshAgent.event', async () => {
     const listeners = new Map<string, (message: unknown) => void>()
     const runtimeManager = {

@@ -242,6 +242,13 @@ export type PaneContentInput = TerminalPaneInput | BrowserPaneInput | EditorPane
 export type PaneRefreshTarget =
   | { kind: 'terminal'; createRequestId: string }
   | { kind: 'browser'; browserInstanceId: string }
+  | {
+    kind: 'fresh-agent'
+    createRequestId: string
+    sessionId?: string
+    sessionType: FreshAgentPaneContent['sessionType']
+    provider: FreshAgentPaneContent['provider']
+  }
 
 export interface PaneRefreshRequest {
   requestId: string

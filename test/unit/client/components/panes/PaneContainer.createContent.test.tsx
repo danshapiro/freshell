@@ -355,7 +355,7 @@ describe('createContentForType with ext: prefix', () => {
             freshclaude: {
               modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
               defaultPermissionMode: 'default',
-              effort: 'turbo',
+              effort: 'max',
             },
           },
         },
@@ -393,7 +393,7 @@ describe('createContentForType with ext: prefix', () => {
         expect(paneContent.plugins).toEqual(['planner', 'sandbox'])
         expect(paneContent.modelSelection).toEqual({ kind: 'tracked', modelId: 'opus[1m]' })
         expect(paneContent.permissionMode).toBe('default')
-        expect(paneContent.effort).toBe('turbo')
+        expect(paneContent.effort).toBe('max')
       }
     })
   })

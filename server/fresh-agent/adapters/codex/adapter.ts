@@ -47,6 +47,7 @@ type CodexRuntimePort = {
   }) => Promise<{ threadId: string; wsUrl: string }>
   forkThread?: (input: CodexThreadForkParams) => Promise<{ threadId: string; wsUrl: string }>
   startTurn?: (input: CodexTurnStartParams) => Promise<{ turnId: string }>
+  compactThread?: (input: { threadId: string; instructions?: string }) => Promise<void>
   interruptTurn?: (input: CodexTurnInterruptParams) => Promise<void>
   shutdown?: () => Promise<void>
   onThreadLifecycle?: (handler: (event: CodexThreadLifecycleEvent) => void) => () => void
@@ -419,6 +420,29 @@ export function createCodexFreshAgentAdapter(deps: {
       }
       await runtime.interruptTurn({ threadId: sessionId, turnId })
       activeTurnByThread.delete(sessionId)
+    },
+
+    async compact(sessionId, input) {
+      const settings = settingsByThread.get(sessionId)
+      const runtime = await ensureRuntime(sessionId, settings)
+      if (runtime.compactThread) {
+        await runtime.compactThread({ threadId: sessionId, instructions: input?.instructions })
+        return
+      }
+      if (!runtime.startTurn) {
+        throw new Error('Codex app-server runtime does not support thread compaction.')
+      }
+      const text = input?.instructions ? `/compact ${input.instructions}` : '/compact'
+      const turn = await runtime.startTurn({
+        threadId: sessionId,
+        input: toCodexUserInput(text, undefined),
+        cwd: settings?.cwd,
+        approvalPolicy: toCodexApprovalPolicy(settings?.permissionMode),
+        sandboxPolicy: toCodexSandboxPolicy(settings?.sandbox),
+        model: settings?.model,
+        effort: toCodexReasoningEffort(settings?.effort),
+      })
+      activeTurnByThread.set(sessionId, turn.turnId)
     },
 
     async fork(sessionId, input) {

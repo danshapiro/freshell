@@ -465,6 +465,14 @@ export const FreshAgentInterruptSchema = z.object({
   provider: z.enum(['claude', 'codex', 'opencode']),
 })
 
+export const FreshAgentCompactSchema = z.object({
+  type: z.literal('freshAgent.compact'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  instructions: z.string().trim().min(1).optional(),
+})
+
 export const FreshAgentApprovalRespondSchema = z.object({
   type: z.literal('freshAgent.approval.respond'),
   sessionId: z.string().min(1),
@@ -504,6 +512,7 @@ export const BrowserSdkMessageSchema = z.discriminatedUnion('type', [
   FreshAgentAttachSchema,
   FreshAgentSendSchema,
   FreshAgentInterruptSchema,
+  FreshAgentCompactSchema,
   FreshAgentApprovalRespondSchema,
   FreshAgentQuestionRespondSchema,
   FreshAgentKillSchema,
@@ -545,6 +554,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   FreshAgentAttachSchema,
   FreshAgentSendSchema,
   FreshAgentInterruptSchema,
+  FreshAgentCompactSchema,
   FreshAgentApprovalRespondSchema,
   FreshAgentQuestionRespondSchema,
   FreshAgentKillSchema,

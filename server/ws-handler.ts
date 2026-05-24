@@ -81,6 +81,7 @@ import {
   FreshAgentAttachSchema,
   FreshAgentSendSchema,
   FreshAgentInterruptSchema,
+  FreshAgentCompactSchema,
   FreshAgentApprovalRespondSchema,
   FreshAgentQuestionRespondSchema,
   FreshAgentKillSchema,
@@ -118,6 +119,7 @@ type FreshAgentRuntimeManagerLike = {
   subscribe?: (locator: any, listener: (message: unknown) => void) => Promise<() => void> | (() => void)
   send?: (locator: any, input: any) => Promise<void> | void
   interrupt?: (locator: any) => Promise<void> | void
+  compact?: (locator: any, input?: { instructions?: string }) => Promise<void> | void
   resolveApproval?: (locator: any, requestId: string | number, decision: Record<string, unknown>) => Promise<void> | void
   answerQuestion?: (locator: any, requestId: string | number, answers: Record<string, string>) => Promise<void> | void
   kill?: (locator: any) => Promise<boolean> | boolean
@@ -636,6 +638,7 @@ export class WsHandler {
       FreshAgentAttachSchema,
       FreshAgentSendSchema,
       FreshAgentInterruptSchema,
+      FreshAgentCompactSchema,
       FreshAgentApprovalRespondSchema,
       FreshAgentQuestionRespondSchema,
       FreshAgentKillSchema,
@@ -3629,6 +3632,21 @@ export class WsHandler {
         const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
         try {
           await manager.interrupt(locator)
+        } catch (error) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error) })
+        }
+        return
+      }
+
+      case 'freshAgent.compact': {
+        const manager = this.freshAgentRuntimeManager
+        if (!manager?.compact) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: this.freshAgentUnavailableMessage() })
+          return
+        }
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        try {
+          await manager.compact(locator, { instructions: m.instructions })
         } catch (error) {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error) })
         }

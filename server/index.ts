@@ -79,6 +79,7 @@ import { FreshAgentRuntimeManager } from './fresh-agent/runtime-manager.js'
 import { createFreshAgentRouter } from './fresh-agent/router.js'
 import { createClaudeFreshAgentAdapter } from './fresh-agent/adapters/claude/adapter.js'
 import { createCodexFreshAgentAdapter } from './fresh-agent/adapters/codex/adapter.js'
+import { createOpencodeFreshAgentAdapter } from './fresh-agent/adapters/opencode/adapter.js'
 import {
   CodexAppServerRuntime,
   runCodexStartupReaper,
@@ -312,6 +313,7 @@ async function main() {
   const codexFreshAgentAdapter = createCodexFreshAgentAdapter({
     runtimeFactory: () => new CodexAppServerRuntime({ serverInstanceId }),
   })
+  const opencodeFreshAgentAdapter = createOpencodeFreshAgentAdapter()
   const codexFreshAgentRuntime = {
     shutdown: async () => {
       await codexFreshAgentAdapter.shutdown?.()
@@ -333,6 +335,11 @@ async function main() {
         sessionType: 'freshcodex',
         runtimeProvider: 'codex',
         adapter: codexFreshAgentAdapter,
+      },
+      {
+        sessionType: 'freshopencode',
+        runtimeProvider: 'opencode',
+        adapter: opencodeFreshAgentAdapter,
       },
     ]),
   })

@@ -7,10 +7,14 @@ import settingsReducer from '@/store/settingsSlice'
 import freshAgentReducer from '@/store/freshAgentSlice'
 import agentChatReducer from '@/store/agentChatSlice'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
-import { initLayout } from '@/store/panesSlice'
+import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
+import { initLayout, requestPaneRefresh } from '@/store/panesSlice'
 import { useAppSelector } from '@/store/hooks'
 import { sessionInit, setSessionStatus } from '@/store/agentChatSlice'
 import type { PaneNode } from '@/store/paneTypes'
+
+const CLAUDE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440000'
+const CLAUDE_RESTORE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440001'
 
 const wsMock = vi.hoisted(() => ({
   send: vi.fn(),
@@ -77,6 +81,23 @@ function StoreBackedFreshAgentView({
   return <FreshAgentView tabId={tabId} paneId={paneId} paneContent={paneContent} />
 }
 
+function StoreBackedFreshAgentSettingsButton({
+  tabId,
+  paneId,
+}: {
+  tabId: string
+  paneId: string
+}) {
+  const paneContent = useAppSelector((state) => {
+    const layout = state.panes.layouts[tabId]
+    if (!layout || layout.type !== 'leaf' || layout.id !== paneId || layout.content.kind !== 'fresh-agent') {
+      throw new Error(`Missing fresh-agent pane ${paneId}`)
+    }
+    return layout.content
+  })
+  return <FreshAgentSettingsButton tabId={tabId} paneId={paneId} paneContent={paneContent} />
+}
+
 beforeEach(() => {
   wsMock.send.mockReset()
   wsMock.onMessage.mockReset()
@@ -133,7 +154,7 @@ describe('FreshAgentView', () => {
             sessionType: 'freshclaude',
             provider: 'claude',
             createRequestId: 'req-1',
-            sessionId: 'claude-thread-1',
+            sessionId: CLAUDE_THREAD_ID,
             status: 'connected',
           }}
         />
@@ -141,7 +162,7 @@ describe('FreshAgentView', () => {
     )
 
     await waitFor(() => {
-      expect(screen.getByText('Claude summary')).toBeInTheDocument()
+      expect(screen.getByRole('alert', { name: /permission request for bash/i })).toBeInTheDocument()
     })
     expect(screen.queryByText('agent:freshclaude')).not.toBeInTheDocument()
 
@@ -155,7 +176,7 @@ describe('FreshAgentView', () => {
 
     expect(wsMock.send).toHaveBeenCalledWith({
       type: 'freshAgent.approval.respond',
-      sessionId: 'claude-thread-1',
+      sessionId: CLAUDE_THREAD_ID,
       sessionType: 'freshclaude',
       provider: 'claude',
       requestId: 'approval-1',
@@ -163,7 +184,7 @@ describe('FreshAgentView', () => {
     })
     expect(wsMock.send).toHaveBeenCalledWith({
       type: 'freshAgent.question.respond',
-      sessionId: 'claude-thread-1',
+      sessionId: CLAUDE_THREAD_ID,
       sessionType: 'freshclaude',
       provider: 'claude',
       requestId: 'question-1',
@@ -218,9 +239,10 @@ describe('FreshAgentView', () => {
     )
 
     await waitFor(() => {
-      expect(screen.getByText('Codex summary')).toBeInTheDocument()
+      expect(screen.getByText('Codex turn')).toBeInTheDocument()
     })
-    expect(screen.getByRole('button', { name: 'Fork' })).toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'Interrupt' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Fork' })).not.toBeInTheDocument()
     expect(screen.getByText('README.md')).toBeInTheDocument()
     expect(screen.getByText(/feature\/x/)).toBeInTheDocument()
     expect(screen.getByText('Review')).toBeInTheDocument()
@@ -276,7 +298,7 @@ describe('FreshAgentView', () => {
     })
   })
 
-  it('sends, interrupts, and forks through fresh-agent WS actions when the capability is available', async () => {
+  it('sends through fresh-agent WS actions with pane settings when available', async () => {
     const store = createStore()
     store.dispatch(initLayout({
       tabId: 'tab-1',
@@ -289,7 +311,7 @@ describe('FreshAgentView', () => {
         sessionId: 'thread-1',
         status: 'idle',
         initialCwd: '/repo',
-        model: 'gpt-5-codex',
+        model: 'gpt-5.3-codex-spark',
       },
     }))
 
@@ -300,19 +322,13 @@ describe('FreshAgentView', () => {
     )
 
     await waitFor(() => {
-      expect(screen.getByText('Codex summary')).toBeInTheDocument()
+      expect(screen.getByText('Codex turn')).toBeInTheDocument()
     })
 
     wsMock.send.mockClear()
 
-    expect(screen.getByRole('radio', { name: 'GPT-5.5' })).toBeChecked()
-    expect(screen.getByRole('radio', { name: 'GPT-5.4 Flash' })).not.toBeChecked()
-    expect(screen.getByRole('combobox', { name: 'Thinking level' })).toHaveValue('xhigh')
-    expect(screen.getByRole('option', { name: 'xhigh' })).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('radio', { name: 'GPT-5.3 Codex Spark' }))
-    await waitFor(() => {
-      expect(screen.getByRole('radio', { name: 'GPT-5.3 Codex Spark' })).toBeChecked()
-    })
+    expect(screen.queryByRole('radio', { name: 'GPT-5.5' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: 'Thinking level' })).not.toBeInTheDocument()
 
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
       target: { value: 'Ship it' },
@@ -332,25 +348,136 @@ describe('FreshAgentView', () => {
       },
     })
 
-    fireEvent.click(screen.getByRole('button', { name: 'Interrupt' }))
+    expect(screen.queryByRole('button', { name: 'Interrupt' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Fork' })).not.toBeInTheDocument()
+  })
+
+  it('shows provider slash commands from the command menu without hidden aliases', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-slash-menu',
+        sessionId: 'thread-slash-menu',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Slash commands' })).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Slash commands' }))
+
+    expect(screen.getByRole('menu', { name: 'Slash commands' })).toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: /\/new/i })).toHaveTextContent('Start a new conversation')
+    expect(screen.getByRole('menuitem', { name: /\/compact/i })).toHaveTextContent('compact')
+    expect(screen.queryByText('/reset')).not.toBeInTheDocument()
+    expect(screen.queryByText('/compress')).not.toBeInTheDocument()
+  })
+
+  it('runs slash command aliases without listing them', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-reset-alias',
+        sessionId: 'thread-reset-alias',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(screen.getByText('Codex turn')).toBeInTheDocument())
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: '/reset' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
     expect(wsMock.send).toHaveBeenCalledWith({
-      type: 'freshAgent.interrupt',
-      sessionId: 'thread-1',
+      type: 'freshAgent.kill',
+      sessionId: 'thread-reset-alias',
       sessionType: 'freshcodex',
       provider: 'codex',
     })
+    await waitFor(() => {
+      expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'freshAgent.create',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+      }))
+    })
 
-    fireEvent.click(screen.getByRole('button', { name: 'Fork' }))
+    const leaf = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+    expect(leaf.content.kind).toBe('fresh-agent')
+    if (leaf.content.kind === 'fresh-agent') {
+      expect(leaf.content.sessionId).toBeUndefined()
+      expect(leaf.content.resumeSessionId).toBeUndefined()
+      expect(leaf.content.createRequestId).not.toBe('req-reset-alias')
+      expect(leaf.content.status).toBe('creating')
+    }
+  })
+
+  it('dispatches slash compact with optional instructions over the fresh-agent channel', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-compact',
+        sessionId: 'freshopencode-req-compact',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled())
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: '/compact keep implementation notes' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
     expect(wsMock.send).toHaveBeenCalledWith({
-      type: 'freshAgent.fork',
-      requestId: 'req-2',
-      sessionId: 'thread-1',
-      sessionType: 'freshcodex',
-      provider: 'codex',
+      type: 'freshAgent.compact',
+      sessionId: 'freshopencode-req-compact',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      instructions: 'keep implementation notes',
     })
   })
 
-  it('uses the selected Freshcodex model thinking substrings verbatim', async () => {
+  it('lets Freshcodex settings choose model and thinking substrings verbatim from the gear popover', async () => {
     const store = createStore()
     store.dispatch(initLayout({
       tabId: 'tab-1',
@@ -369,17 +496,16 @@ describe('FreshAgentView', () => {
 
     render(
       <Provider store={store}>
-        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        <StoreBackedFreshAgentSettingsButton tabId="tab-1" paneId="pane-1" />
       </Provider>,
     )
 
-    await waitFor(() => {
-      expect(screen.getByText('Codex summary')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+    fireEvent.change(screen.getByRole('combobox', { name: 'Model' }), {
+      target: { value: 'gpt-5.4-flash' },
     })
-
-    fireEvent.click(screen.getByRole('radio', { name: 'GPT-5.4 Flash' }))
     await waitFor(() => {
-      expect(screen.getByRole('radio', { name: 'GPT-5.4 Flash' })).toBeChecked()
+      expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue('gpt-5.4-flash')
     })
 
     const thinking = screen.getByRole('combobox', { name: 'Thinking level' })
@@ -387,19 +513,144 @@ describe('FreshAgentView', () => {
     expect(screen.queryByRole('option', { name: 'xhigh' })).not.toBeInTheDocument()
     expect(screen.getByRole('option', { name: 'high' })).toBeInTheDocument()
 
-    wsMock.send.mockClear()
-    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
-      target: { value: 'reply ok' },
-    })
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const layout = store.getState().panes.layouts['tab-1']
+    expect(layout?.type).toBe('leaf')
+    expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.model : null).toBe('gpt-5.4-flash')
+    expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.effort : null).toBe('high')
+  })
 
-    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'freshAgent.send',
-      settings: expect.objectContaining({
-        model: 'gpt-5.4-flash',
-        effort: 'high',
-      }),
+  it('lets Freshopencode settings choose model and thinking controls from the gear popover', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-opencode',
+        sessionId: 'freshopencode-req-opencode',
+        status: 'idle',
+        initialCwd: '/repo',
+        model: 'opencode-go/deepseek-v4-flash',
+        effort: 'max',
+      },
     }))
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'idle',
+      summary: 'OpenCode summary',
+      capabilities: { send: true, interrupt: true, fork: false },
+      turns: [],
+    })
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentSettingsButton tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+    expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue('opencode-go/deepseek-v4-flash')
+    expect(screen.getByRole('combobox', { name: 'Thinking level' })).toHaveValue('max')
+
+    fireEvent.change(screen.getByRole('combobox', { name: 'Model' }), {
+      target: { value: 'opencode-go/glm-5.1' },
+    })
+    await waitFor(() => {
+      expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue('opencode-go/glm-5.1')
+    })
+    fireEvent.change(screen.getByRole('combobox', { name: 'Thinking level' }), {
+      target: { value: 'high' },
+    })
+
+    const layout = store.getState().panes.layouts['tab-1']
+    expect(layout?.type).toBe('leaf')
+    expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.model : null)
+      .toBe('opencode-go/glm-5.1')
+    expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.effort : null).toBe('high')
+  })
+
+  it('promotes Freshopencode placeholders to durable OpenCode session ids from snapshots', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      sessionId: 'ses_real_opencode_1',
+      status: 'idle',
+      summary: 'OpenCode summary',
+      capabilities: { send: true, interrupt: true, fork: false },
+      turns: [],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-opencode',
+        sessionId: 'freshopencode-req-opencode',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      const paneContent = (store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
+      expect(paneContent.kind).toBe('fresh-agent')
+      if (paneContent.kind === 'fresh-agent') {
+        expect(paneContent.sessionId).toBe('ses_real_opencode_1')
+        expect(paneContent.sessionRef).toEqual({ provider: 'opencode', sessionId: 'ses_real_opencode_1' })
+        expect(paneContent.resumeSessionId).toBe('ses_real_opencode_1')
+      }
+    })
+  })
+
+  it('refreshes an existing fresh-agent pane by reattaching and reloading the snapshot', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-refresh',
+        sessionId: 'thread-refresh',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', 'thread-refresh', expect.any(Object))
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockClear()
+    wsMock.send.mockClear()
+
+    store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' }))
+
+    await waitFor(() => {
+      expect(wsMock.send).toHaveBeenCalledWith({
+        type: 'freshAgent.attach',
+        sessionId: 'thread-refresh',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        resumeSessionId: 'thread-refresh',
+      })
+    })
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', 'thread-refresh', expect.any(Object))
+    })
+    expect(store.getState().panes.refreshRequestsByPane?.['tab-1']?.['pane-1']).toBeUndefined()
   })
 
   it('normalizes obsolete Freshcodex models to the default radio option', async () => {
@@ -423,10 +674,11 @@ describe('FreshAgentView', () => {
     )
 
     await waitFor(() => {
-      expect(screen.getByText('Codex summary')).toBeInTheDocument()
+      expect(screen.getByText('Codex turn')).toBeInTheDocument()
     })
 
-    expect(screen.getByRole('radio', { name: 'GPT-5.5' })).toBeChecked()
+    expect(screen.getByText('Codex turn')).toBeInTheDocument()
+    expect(screen.queryByRole('radio', { name: 'GPT-5.5' })).not.toBeInTheDocument()
     expect(screen.queryByRole('radio', { name: 'custom-codex-model' })).not.toBeInTheDocument()
   })
 
@@ -470,9 +722,7 @@ describe('FreshAgentView', () => {
       })
     })
 
-    await waitFor(() => {
-      expect(screen.getByRole('combobox', { name: 'Thinking level' })).toHaveValue('xhigh')
-    })
+    await waitFor(() => expect(screen.getByText('Codex turn')).toBeInTheDocument())
     wsMock.send.mockClear()
 
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
@@ -629,7 +879,7 @@ describe('FreshAgentView', () => {
     )
 
     await waitFor(() => {
-      expect(screen.getByText('Ready')).toBeInTheDocument()
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
     })
     expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
     expect(screen.queryByText(/failed to parse url/i)).not.toBeInTheDocument()
@@ -644,7 +894,7 @@ describe('FreshAgentView', () => {
     )
 
     await waitFor(() => {
-      expect(screen.getByText('Ready')).toBeInTheDocument()
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
     })
     expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.create' }))
@@ -696,7 +946,10 @@ describe('FreshAgentView', () => {
     })
 
     await waitFor(() => {
-      expect(screen.getAllByText(/restoring/i).length).toBeGreaterThan(0)
+      const layout = store.getState().panes.layouts['tab-1']
+      expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent'
+        ? layout.content.resumeSessionId
+        : null).toBe(durableSessionId)
     })
     expect(screen.queryByText(/failed to parse url/i)).not.toBeInTheDocument()
 
@@ -740,9 +993,9 @@ describe('FreshAgentView', () => {
             sessionType: 'freshclaude',
             provider: 'claude',
             createRequestId: 'req-error',
-            sessionId: 'claude-thread-restore',
+            sessionId: CLAUDE_RESTORE_THREAD_ID,
             status: 'idle',
-            resumeSessionId: 'claude-thread-restore',
+            resumeSessionId: CLAUDE_RESTORE_THREAD_ID,
           }}
         />
       </Provider>,
@@ -941,7 +1194,9 @@ describe('FreshAgentView', () => {
       const leaf = state.panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
       expect(leaf.content.sessionId).toBe('runtime-sdk-session-id')
       expect(leaf.content.sessionRef).toBeUndefined()
+      expect(leaf.content.resumeSessionId).toBeUndefined()
     })
+    expect(apiMock.getFreshAgentThreadSnapshot).not.toHaveBeenCalled()
   })
 
   it('does not clobber newer modelSelection when freshAgent.created arrives late', async () => {

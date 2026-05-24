@@ -140,6 +140,14 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
       )
     },
 
+    compact(sessionId, input) {
+      const suffix = input?.instructions ? ` ${input.instructions.trim()}` : ''
+      mapMissingResult(
+        deps.sdkBridge.sendUserMessage(sessionId, `/compact${suffix}`),
+        `Claude session ${sessionId} is not available`,
+      )
+    },
+
     kill(sessionId) {
       return deps.sdkBridge.killSession(sessionId)
     },

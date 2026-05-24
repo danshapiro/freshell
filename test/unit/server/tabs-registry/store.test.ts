@@ -148,7 +148,7 @@ describe('TabsRegistryStore compact state', () => {
     })).rejects.toThrow(/duplicate snapshot revision/i)
   })
 
-  it('archives an invalid compact manifest and starts with an empty recoverable registry', async () => {
+  it('rejects an invalid compact manifest without serving an empty registry', async () => {
     await replace(store, {
       deviceId: 'local-device',
       deviceLabel: 'local',
@@ -166,16 +166,10 @@ describe('TabsRegistryStore compact state', () => {
     expect(missingRef).toBeDefined()
     await fs.rm(path.join(tempDir, 'v1', missingRef!.path))
 
-    store = await createTabsRegistryStore(tempDir, { now: () => now })
+    await expect(createTabsRegistryStore(tempDir, { now: () => now })).rejects.toThrow(/compact state.*invalid|unavailable/i)
 
-    const result = await store.query({
-      deviceId: 'local-device',
-      clientInstanceId: 'window-a',
-      closedTabRetentionDays: 30,
-    })
-    expect(result.localOpen).toEqual([])
     const entries = await fs.readdir(path.join(tempDir, 'v1'))
-    expect(entries.some((entry) => entry.startsWith('manifest.json.invalid-'))).toBe(true)
+    expect(entries.some((entry) => entry.startsWith('manifest.json.invalid-'))).toBe(false)
     await expect(fs.stat(manifestPath)).resolves.toBeDefined()
   })
 

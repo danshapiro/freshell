@@ -91,19 +91,24 @@ export class FreshAgentRuntimeManager {
     }
   }
 
-  attach(input: FreshAgentSessionLocator): FreshAgentCreateResult {
+  async attach(input: FreshAgentSessionLocator): Promise<FreshAgentCreateResult> {
     const registration = this.requireRegistration(input.sessionType, input.provider)
+    const attached = registration.adapter.attach
+      ? await registration.adapter.attach(input)
+      : { sessionId: input.sessionId }
+    const sessionId = attached.sessionId
 
-    this.sessions.set(this.key(input), {
+    this.sessions.set(this.key({ ...input, sessionId }), {
       sessionType: input.sessionType,
       runtimeProvider: registration.runtimeProvider,
       adapter: registration.adapter,
     })
 
     return {
-      sessionId: input.sessionId,
+      sessionId,
       sessionType: input.sessionType,
       runtimeProvider: registration.runtimeProvider,
+      sessionRef: attached.sessionRef,
     }
   }
 
@@ -152,6 +157,14 @@ export class FreshAgentRuntimeManager {
       throw new FreshAgentUnsupportedCapabilityError(`Interrupt is not supported for ${record.sessionType}`)
     }
     await record.adapter.interrupt(locator.sessionId)
+  }
+
+  async compact(locator: FreshAgentSessionLocator, input?: { instructions?: string }) {
+    const record = this.requireSession(locator)
+    if (!record.adapter.compact) {
+      throw new FreshAgentUnsupportedCapabilityError(`Compact is not supported for ${record.sessionType}`)
+    }
+    await record.adapter.compact(locator.sessionId, input)
   }
 
   async kill(locator: FreshAgentSessionLocator): Promise<boolean> {

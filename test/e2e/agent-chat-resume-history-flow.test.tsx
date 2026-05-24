@@ -128,7 +128,7 @@ describe('fresh-agent resume history flow', () => {
       expect(getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
         'freshclaude',
         'claude',
-        'sdk-sess-1',
+        canonicalSessionId,
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
     })
@@ -221,6 +221,7 @@ describe('fresh-agent resume history flow', () => {
       turns: [],
     })
 
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000991'
     const store = makeStore()
     store.dispatch(initLayout({
       tabId: 't1',
@@ -230,8 +231,8 @@ describe('fresh-agent resume history flow', () => {
         sessionType: 'freshclaude',
         provider: 'claude',
         createRequestId: 'req-approval',
-        sessionId: 'freshclaude-session-1',
-        resumeSessionId: 'freshclaude-session-1',
+        sessionId: canonicalSessionId,
+        resumeSessionId: canonicalSessionId,
         status: 'idle',
       } satisfies FreshAgentPaneContent,
     }))
@@ -253,7 +254,7 @@ describe('fresh-agent resume history flow', () => {
 
     expect(wsSend).toHaveBeenCalledWith({
       type: 'freshAgent.approval.respond',
-      sessionId: 'freshclaude-session-1',
+      sessionId: canonicalSessionId,
       sessionType: 'freshclaude',
       provider: 'claude',
       requestId: 'approval-1',
@@ -261,7 +262,7 @@ describe('fresh-agent resume history flow', () => {
     })
     expect(wsSend).toHaveBeenCalledWith({
       type: 'freshAgent.question.respond',
-      sessionId: 'freshclaude-session-1',
+      sessionId: canonicalSessionId,
       sessionType: 'freshclaude',
       provider: 'claude',
       requestId: 'question-1',

@@ -5,20 +5,20 @@ import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { getWsClient } from '@/lib/ws-client'
 import { getFreshAgentThreadSnapshot } from '@/lib/api'
-import { mergePaneContent, updatePaneContent } from '@/store/panesSlice'
+import { consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { clearPendingCreateFailure } from '@/store/freshAgentSlice'
 import { handleFreshAgentTransportEvent, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import {
-  FRESHCODEX_MODEL_OPTIONS,
-  getFreshAgentThinkingOptions,
   normalizeFreshAgentEffort,
   normalizeFreshAgentModel,
   resolveFreshAgentType,
 } from '@/lib/fresh-agent-registry'
+import { paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { getCanonicalDurableSessionId, getPreferredResumeSessionId } from '@/store/persistControl'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
+import { getFreshAgentSlashCommands, type FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
 import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
 import { FreshAgentApprovalBanner } from './FreshAgentApprovalBanner'
 import FreshAgentQuestionBanner from './FreshAgentQuestionBanner'
@@ -41,29 +41,6 @@ function isStatusRegression(current: string, next: string): boolean {
   return !EARLY_STATES.has(current) && EARLY_STATES.has(next)
 }
 
-function getStatusLabel(status: FreshAgentPaneContent['status'], restoring: boolean): string {
-  if (restoring) return 'Restoring'
-  switch (status) {
-    case 'connected':
-      return 'Connected'
-    case 'idle':
-      return 'Ready'
-    case 'running':
-      return 'Running'
-    case 'compacting':
-      return 'Compacting'
-    case 'creating':
-    case 'starting':
-      return 'Starting session'
-    case 'exited':
-      return 'Exited'
-    case 'create-failed':
-      return 'Create failed'
-    default:
-      return 'Starting session'
-  }
-}
-
 function getCanonicalPaneResumeSessionId(pane: FreshAgentPaneContent): string | undefined {
   if (pane.sessionRef?.provider === 'claude' && isValidClaudeSessionId(pane.sessionRef.sessionId)) {
     return pane.sessionRef.sessionId
@@ -71,7 +48,20 @@ function getCanonicalPaneResumeSessionId(pane: FreshAgentPaneContent): string | 
   if (isValidClaudeSessionId(pane.resumeSessionId)) {
     return pane.resumeSessionId
   }
+  if (pane.provider === 'claude' && isValidClaudeSessionId(pane.sessionId)) {
+    return pane.sessionId
+  }
   return undefined
+}
+
+function getCreatedResumeSessionId(
+  current: FreshAgentPaneContent,
+  message: { sessionId: string; sessionRef?: { provider: string; sessionId: string } },
+): string | undefined {
+  if (current.resumeSessionId) return current.resumeSessionId
+  if (message.sessionRef?.provider === current.provider) return message.sessionRef.sessionId
+  if (current.provider === 'claude' && !isValidClaudeSessionId(message.sessionId)) return undefined
+  return message.sessionId
 }
 
 function getQuestionAgentLabel(paneContent: FreshAgentPaneContent, descriptorLabel?: string): string {
@@ -157,16 +147,21 @@ export function FreshAgentView({
     })
     return state.freshAgent.sessions[sessionKey] ?? state.agentChat.sessions[paneContent.sessionId]
   })
+  const refreshRequest = useAppSelector((state) => state.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
   const [snapshot, setSnapshot] = useState<FreshAgentSnapshot | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [snapshotRefreshNonce, setSnapshotRefreshNonce] = useState(0)
   const descriptor = resolveFreshAgentType(paneContent.sessionType)
+  const slashCommands = useMemo(() => getFreshAgentSlashCommands(paneContent.sessionType), [paneContent.sessionType])
   const paneContentRef = useRef(paneContent)
   paneContentRef.current = paneContent
-  const snapshotSessionId = paneContent.sessionId
   const restoreTimeoutRef = useRef<number | null>(null)
   const createSentRef = useRef(false)
+  const handledRefreshRequestIdRef = useRef<string | null>(null)
   const preferredResumeSessionId = getPreferredResumeSessionId(claudeSession) ?? paneContent.resumeSessionId
+  const snapshotThreadId = paneContent.provider === 'claude'
+    ? getCanonicalDurableSessionId(claudeSession) ?? getCanonicalPaneResumeSessionId(paneContent)
+    : paneContent.sessionId
   const hasRestoreFailure = Boolean(
     paneContent.provider === 'claude'
       && paneContent.sessionId
@@ -215,6 +210,85 @@ export function FreshAgentView({
     effort: getEffectiveFreshAgentEffort(content),
     plugins: content.plugins,
   } as const), [])
+
+  const startNewConversation = useCallback(() => {
+    const current = paneContentRef.current
+    if (current.sessionId) {
+      sendFreshAgentMessage({
+        type: 'freshAgent.kill',
+        sessionId: current.sessionId,
+        sessionType: current.sessionType,
+        provider: current.provider,
+      })
+    }
+    setSnapshot(null)
+    setLoadError(null)
+    dispatch(updatePaneContent({
+      tabId,
+      paneId,
+      content: {
+        ...current,
+        createRequestId: nanoid(),
+        sessionId: undefined,
+        sessionRef: undefined,
+        resumeSessionId: undefined,
+        restoreError: undefined,
+        createError: undefined,
+        status: 'creating',
+      },
+    }))
+  }, [dispatch, paneId, sendFreshAgentMessage, tabId])
+
+  const runSlashCommand = useCallback((command: FreshAgentSlashCommand, args: string) => {
+    const current = paneContentRef.current
+    if (command.action === 'new') {
+      startNewConversation()
+      return
+    }
+    if (command.action === 'compact') {
+      if (!current.sessionId) return
+      sendFreshAgentMessage({
+        type: 'freshAgent.compact',
+        sessionId: current.sessionId,
+        sessionType: current.sessionType,
+        provider: current.provider,
+        ...(args ? { instructions: args } : {}),
+      })
+    }
+  }, [sendFreshAgentMessage, startNewConversation])
+
+  useEffect(() => {
+    if (!refreshRequest) return
+    if (handledRefreshRequestIdRef.current === refreshRequest.requestId) return
+    const current = paneContentRef.current
+    if (!paneRefreshTargetMatchesContent(refreshRequest.target, current)) return
+
+    handledRefreshRequestIdRef.current = refreshRequest.requestId
+    setSnapshot(null)
+    setLoadError(null)
+
+    if (current.sessionId) {
+      sendFreshAgentMessage({
+        type: 'freshAgent.attach',
+        sessionId: current.sessionId,
+        sessionType: current.sessionType,
+        provider: current.provider,
+        resumeSessionId: current.resumeSessionId,
+      })
+      setSnapshotRefreshNonce((value) => value + 1)
+    } else if (!hidden && (current.status === 'creating' || current.status === 'starting')) {
+      createSentRef.current = true
+      registerFreshAgentCreate(dispatch, current.createRequestId, {
+        sessionType: current.sessionType,
+        provider: current.provider,
+        resumeSessionId: current.resumeSessionId,
+        sessionRef: current.sessionRef,
+      })
+      sendFreshAgentMessage(buildCreateMessage(current))
+    }
+
+    dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: refreshRequest.requestId }))
+  }, [buildCreateMessage, dispatch, hidden, paneId, refreshRequest, sendFreshAgentMessage, tabId])
 
   const triggerRecovery = useCallback(() => {
     if (restoreTimeoutRef.current !== null) {
@@ -319,17 +393,18 @@ export function FreshAgentView({
     if (typeof ws.onMessage !== 'function') return
     const unsubscribe = ws.onMessage((message) => {
       if (message.type === 'freshAgent.created' && message.requestId === paneContentRef.current.createRequestId) {
+        const current = paneContentRef.current
         dispatch(updatePaneContent({
           tabId,
           paneId,
           content: {
-            ...paneContentRef.current,
+            ...current,
             sessionId: message.sessionId,
-            sessionRef: message.sessionRef ?? paneContentRef.current.sessionRef,
-            resumeSessionId: paneContentRef.current.resumeSessionId
-              ?? (message.sessionRef?.provider === paneContentRef.current.provider
-                ? message.sessionRef.sessionId
-                : message.sessionId),
+            sessionRef: message.sessionRef ?? current.sessionRef,
+            resumeSessionId: getCreatedResumeSessionId(current, {
+              sessionId: message.sessionId,
+              sessionRef: message.sessionRef,
+            }),
             status: 'connected',
             createError: undefined,
             restoreError: undefined,
@@ -406,11 +481,11 @@ export function FreshAgentView({
   }, [dispatch, paneContent, paneContent.createRequestId, paneId, sendFreshAgentMessage, tabId, ws])
 
   useEffect(() => {
-    if (!snapshotSessionId) return
+    if (!snapshotThreadId) return
     if (paneContent.provider === 'claude' && claudeSession?.lost) return
     const controller = new AbortController()
     setLoadError(null)
-    const sessionId = snapshotSessionId
+    const sessionId = snapshotThreadId
     const provider = paneContent.provider
     void getFreshAgentThreadSnapshot(paneContent.sessionType, provider, sessionId, { signal: controller.signal })
       .then((next) => {
@@ -418,8 +493,19 @@ export function FreshAgentView({
         setSnapshot(resolved)
         const fresh = paneContentRef.current
         const nextStatus = (resolved.status as FreshAgentPaneContent['status']) ?? fresh.status
-        const nextResumeSessionId = fresh.resumeSessionId ?? sessionId
-        if (nextStatus === fresh.status && nextResumeSessionId === fresh.resumeSessionId) {
+        const snapshotSessionRef = provider === 'opencode' && resolved.sessionId && resolved.sessionId !== sessionId
+          ? { provider, sessionId: resolved.sessionId }
+          : undefined
+        const nextSessionId = snapshotSessionRef?.sessionId ?? fresh.sessionId
+        const nextSessionRef = snapshotSessionRef ?? fresh.sessionRef
+        const nextResumeSessionId = snapshotSessionRef?.sessionId ?? fresh.resumeSessionId ?? sessionId
+        if (
+          nextStatus === fresh.status
+          && nextSessionId === fresh.sessionId
+          && nextResumeSessionId === fresh.resumeSessionId
+          && nextSessionRef?.provider === fresh.sessionRef?.provider
+          && nextSessionRef?.sessionId === fresh.sessionRef?.sessionId
+        ) {
           return
         }
         dispatch(updatePaneContent({
@@ -427,6 +513,8 @@ export function FreshAgentView({
           paneId,
           content: {
             ...fresh,
+            sessionId: nextSessionId,
+            sessionRef: nextSessionRef,
             status: nextStatus,
             resumeSessionId: nextResumeSessionId,
           },
@@ -470,7 +558,7 @@ export function FreshAgentView({
     paneContent.status,
     paneContent.sessionType,
     paneId,
-    snapshotSessionId,
+    snapshotThreadId,
     snapshotRefreshNonce,
     tabId,
   ])
@@ -572,18 +660,7 @@ export function FreshAgentView({
       && !hasRestoreFailure
       && !['creating', 'starting', 'create-failed', 'exited'].includes(effectiveStatus)
     )
-    const canInterrupt = snapshot?.capabilities?.interrupt === true || (
-      paneContent.provider === 'claude'
-      && Boolean(paneContent.sessionId)
-      && ['connected', 'running', 'idle', 'compacting'].includes(effectiveStatus)
-    )
-    const canFork = snapshot?.capabilities?.fork === true
-    const totalTokens = snapshot?.tokenUsage?.totalTokens
-    const statusLabel = getStatusLabel(effectiveStatus, isRestoring)
     const questionAgentLabel = getQuestionAgentLabel(paneContent, descriptor?.label)
-    const summaryText = isRestoring
-      ? 'Restoring session'
-      : snapshot?.summary || paneContent.sessionId || statusLabel
     const visibleRestoreFailure = paneContent.provider === 'claude'
       ? claudeSession?.restoreFailureMessage
       : null
@@ -591,116 +668,20 @@ export function FreshAgentView({
       ? null
       : (paneContent.restoreError ? getRestoreErrorMessage(paneContent.restoreError.reason) : null)
     const visibleLoadError = visibleRestoreFailure || visiblePaneRestoreFailure || isRestoring ? null : loadError
-    const activeModel = getEffectiveFreshAgentModel(paneContent)
-    const codexModelValue = activeModel ?? ''
-    const thinkingOptions = getFreshAgentThinkingOptions(paneContent.sessionType, paneContent.provider, activeModel)
-    const thinkingValue = getEffectiveFreshAgentEffort(paneContent) ?? ''
 
     return (
       <div className="flex h-full min-h-0 flex-col" data-context="fresh-agent" data-session-id={paneContent.sessionId}>
-        <div className="border-b border-border/60 px-3 py-3">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <div className="text-sm font-semibold">{descriptor?.label ?? 'Fresh Agent'}</div>
-              <div className="text-xs text-muted-foreground">{summaryText}</div>
-            </div>
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <span>{statusLabel}</span>
-              {typeof totalTokens === 'number' ? <span>{totalTokens} tokens</span> : null}
-              {paneContent.provider === 'codex' ? (
-                <fieldset
-                  className="flex items-center gap-2"
-                  disabled={effectiveStatus === 'running' || effectiveStatus === 'compacting'}
-                >
-                  <legend className="sr-only">Model</legend>
-                  {FRESHCODEX_MODEL_OPTIONS.map((option) => (
-                    <label key={option.value} className="flex items-center gap-1">
-                      <input
-                        type="radio"
-                        name={`${paneId}-freshcodex-model`}
-                        value={option.value}
-                        checked={codexModelValue === option.value}
-                        onChange={() => {
-                          const nextEffort = normalizeFreshAgentEffort(
-                            paneContent.sessionType,
-                            paneContent.provider,
-                            option.value,
-                            paneContent.effort,
-                          )
-                          dispatch(mergePaneContent({
-                            tabId,
-                            paneId,
-                            updates: { model: option.value, effort: nextEffort },
-                          }))
-                        }}
-                      />
-                      <span>{option.label}</span>
-                    </label>
-                  ))}
-                </fieldset>
-              ) : null}
-              {thinkingOptions.length > 0 ? (
-                <label className="flex items-center gap-1">
-                  <span>Thinking</span>
-                  <select
-                    aria-label="Thinking level"
-                    className="rounded border border-border/70 bg-background px-2 py-1 text-xs"
-                    value={thinkingValue}
-                    disabled={effectiveStatus === 'running' || effectiveStatus === 'compacting'}
-                    onChange={(event) => {
-                      const nextEffort = event.target.value
-                      dispatch(mergePaneContent({
-                        tabId,
-                        paneId,
-                        updates: { effort: nextEffort },
-                      }))
-                    }}
-                  >
-                    {thinkingOptions.map((option) => (
-                      <option key={option.value} value={option.value}>{option.label}</option>
-                    ))}
-                  </select>
-                </label>
-              ) : null}
-              <button
-                type="button"
-                className="rounded border border-border/70 px-2 py-1 disabled:opacity-50"
-                disabled={!canInterrupt || !paneContent.sessionId}
-                onClick={() => {
-                  if (!paneContent.sessionId || !canInterrupt) return
-                  sendFreshAgentMessage({
-                    type: 'freshAgent.interrupt',
-                    sessionId: paneContent.sessionId,
-                    sessionType: paneContent.sessionType,
-                    provider: paneContent.provider,
-                  })
-                }}
-              >
-                Interrupt
-              </button>
-              <button
-                type="button"
-                className="rounded border border-border/70 px-2 py-1 disabled:opacity-50"
-                disabled={!canFork || !paneContent.sessionId}
-                onClick={() => {
-                  if (!paneContent.sessionId || !canFork) return
-                  sendFreshAgentMessage({
-                    type: 'freshAgent.fork',
-                    requestId: paneContent.createRequestId,
-                    sessionId: paneContent.sessionId,
-                    sessionType: paneContent.sessionType,
-                    provider: paneContent.provider,
-                  })
-                }}
-              >
-                Fork
-              </button>
-            </div>
-          </div>
-        </div>
         <div className="flex min-h-0 flex-1">
           <div className="flex min-h-0 flex-1 flex-col">
             <div className="space-y-2 px-3 pt-3">
+              {isRestoring ? (
+                <FreshAgentApprovalBanner text="Restoring session..." />
+              ) : null}
+              {snapshot?.summary ? (
+                <div className="rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
+                  {snapshot.summary}
+                </div>
+              ) : null}
               {pendingCreateFailure || paneContent.createError ? (
                 <div className="flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm">
                   <FreshAgentApprovalBanner text={(pendingCreateFailure ?? paneContent.createError)?.message ?? 'Create failed'} />
@@ -798,6 +779,8 @@ export function FreshAgentView({
             <FreshAgentTranscript turns={turns} />
             <FreshAgentComposer
               disabled={!canSend || !paneContent.sessionId}
+              commands={slashCommands}
+              onCommand={runSlashCommand}
               onSend={(text) => {
                 if (!paneContent.sessionId || !canSend) return
                 sendFreshAgentMessage({
@@ -835,7 +818,9 @@ export function FreshAgentView({
     loadError,
     paneContent,
     pendingCreateFailure,
+    runSlashCommand,
     snapshot,
+    slashCommands,
   ])
 
   useEffect(() => {

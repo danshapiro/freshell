@@ -79,6 +79,17 @@ export function buildPaneRefreshTarget(content: PaneContent): PaneRefreshTarget 
       ? { kind: 'browser', browserInstanceId: content.browserInstanceId }
       : null
   }
+  if (content.kind === 'fresh-agent') {
+    return content.sessionId || content.status === 'creating' || content.status === 'starting'
+      ? {
+        kind: 'fresh-agent',
+        createRequestId: content.createRequestId,
+        sessionId: content.sessionId,
+        sessionType: content.sessionType,
+        provider: content.provider,
+      }
+      : null
+  }
   return null
 }
 
@@ -94,8 +105,16 @@ export function paneRefreshTargetMatchesContent(
       && content.createRequestId === target.createRequestId
   }
 
-  return content.kind === 'browser'
+  if (target.kind === 'browser') {
+    return content.kind === 'browser'
     && typeof content.url === 'string'
     && !!content.url.trim()
     && content.browserInstanceId === target.browserInstanceId
+  }
+
+  return content.kind === 'fresh-agent'
+    && content.createRequestId === target.createRequestId
+    && content.sessionType === target.sessionType
+    && content.provider === target.provider
+    && (!target.sessionId || content.sessionId === target.sessionId)
 }

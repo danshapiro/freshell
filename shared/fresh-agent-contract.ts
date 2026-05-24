@@ -35,7 +35,7 @@ export const FreshAgentTokenUsageSchema = z.object({
 export const FreshAgentSettingsSchema = z.object({
   model: z.string().min(1).optional(),
   permissionMode: z.string().min(1).optional(),
-  effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']).optional(),
+  effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']).optional(),
   plugins: z.array(z.string()).optional(),
 }).strict()
 

@@ -4,7 +4,6 @@ import fsp from 'fs/promises'
 import path from 'path'
 import { z } from 'zod'
 import { getFreshellConfigDir } from '../freshell-home.js'
-import { logger } from '../logger.js'
 import { TabRegistryRecordSchema, type RegistryTabRecord } from './types.js'
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -12,7 +11,6 @@ const MINUTE_MS = 60 * 1000
 const DEFAULT_CLOSED_RETENTION_DAYS = 30
 const DEFAULT_OPEN_SNAPSHOT_TTL_MINUTES = 30
 const DEFAULT_DEVICE_DISPLAY_TTL_DAYS = 7
-const log = logger.child({ component: 'tabs-registry-store' })
 
 class InvalidCompactTabsRegistryStateError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
@@ -654,25 +652,8 @@ export class TabsRegistryStore {
 
     const compactManifestPath = path.join(resolvedRoot, 'v1', 'manifest.json')
     if (fs.existsSync(compactManifestPath)) {
-      try {
-        const { state, manifestRevision, manifestObjectRefs } = await TabsRegistryStore.loadCompactState(resolvedRoot, caps)
-        return new TabsRegistryStore(resolvedRoot, state, manifestRevision, options, manifestObjectRefs)
-      } catch (error) {
-        if (!(error instanceof InvalidCompactTabsRegistryStateError)) {
-          throw error
-        }
-        const archivedManifestPath = await TabsRegistryStore.archiveInvalidCompactManifest(compactManifestPath)
-        log.warn({
-          err: error,
-          manifestPath: compactManifestPath,
-          archivedManifestPath,
-          event: 'tabs_registry_compact_state_recovered',
-        }, 'Tabs registry compact state was invalid; archived manifest and started with an empty registry')
-        const state = emptyState(now(), options.defaultClosedRetentionDays ?? DEFAULT_CLOSED_RETENTION_DAYS)
-        const store = new TabsRegistryStore(resolvedRoot, state, 0, options)
-        await store.commitState(state)
-        return store
-      }
+      const { state, manifestRevision, manifestObjectRefs } = await TabsRegistryStore.loadCompactState(resolvedRoot, caps)
+      return new TabsRegistryStore(resolvedRoot, state, manifestRevision, options, manifestObjectRefs)
     }
 
     const legacyPath = path.join(resolvedRoot, 'tabs-registry.jsonl')
@@ -822,12 +803,6 @@ export class TabsRegistryStore {
       }
       throw invalidCompactState(`Tabs registry compact state is invalid: ${error instanceof Error ? error.message : String(error)}`, error)
     }
-  }
-
-  private static async archiveInvalidCompactManifest(manifestPath: string): Promise<string> {
-    const archivedManifestPath = `${manifestPath}.invalid-${archiveTimestamp(new Date())}`
-    await fsp.rename(manifestPath, archivedManifestPath)
-    return archivedManifestPath
   }
 
   private static async migrateLegacyJsonl(
