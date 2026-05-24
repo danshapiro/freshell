@@ -548,5 +548,37 @@ describe("logger", () => {
       },
       TEST_TIMEOUT_MS,
     )
+
+    it(
+      "emits debug stream warnings through a warn-capable diagnostic logger",
+      async () => {
+        const chunks: string[] = []
+        const dest = new Writable({
+          write(chunk, _encoding, callback) {
+            chunks.push(chunk.toString())
+            callback()
+          },
+        })
+        const pino = (await import("pino")).default
+        const { EventEmitter } = await import("events")
+        const { attachDebugStreamWarnings } = await import("../../../server/logger")
+        const stream = new EventEmitter()
+        const diagnosticLogger = pino({ level: "warn" }, dest)
+
+        attachDebugStreamWarnings(stream as any, diagnosticLogger, "/tmp/freshell-debug.jsonl")
+        stream.emit("warning", new Error("rotation warning"))
+        stream.emit("error", new Error("second warning"))
+        await new Promise((resolve) => setTimeout(resolve, 50))
+
+        const lines = chunks.join("").split("\n").filter(Boolean)
+        expect(lines).toHaveLength(1)
+        expect(JSON.parse(lines[0])).toEqual(expect.objectContaining({
+          event: "warning",
+          filePath: "/tmp/freshell-debug.jsonl",
+          msg: "Debug log stream issue",
+        }))
+      },
+      TEST_TIMEOUT_MS,
+    )
   })
 })

@@ -249,7 +249,7 @@ function createConsoleStream(shouldPrettyPrint: boolean): DestinationStream {
   return pretty
 }
 
-function attachDebugStreamWarnings(
+export function attachDebugStreamWarnings(
   stream: RotatingFileStream,
   consoleLogger: pino.Logger,
   filePath: string,
@@ -272,6 +272,7 @@ export function createLogger(destination?: DestinationStream) {
   const shouldPrettyPrint = env !== 'production' && env !== 'test'
   const consoleStream = createConsoleStream(shouldPrettyPrint)
   const consoleLogger = pino(createPinoOptions({ level: DEFAULT_CONSOLE_LOG_LEVEL }), consoleStream)
+  const consoleDiagnosticLogger = pino(createPinoOptions({ level: 'warn' }), consoleStream)
   const streams: Array<{ stream: DestinationStream; level: LevelWithSilent }> = [
     { stream: consoleStream, level: DEFAULT_CONSOLE_LOG_LEVEL },
   ]
@@ -290,7 +291,7 @@ export function createLogger(destination?: DestinationStream) {
       const debugInstance = resolveDebugInstanceTag()
       const debugStream = createDebugFileStream(debugLogPath)
       streams.push({ stream: debugStream, level: 'debug' })
-      attachDebugStreamWarnings(debugStream, consoleLogger, debugLogPath)
+      attachDebugStreamWarnings(debugStream, consoleDiagnosticLogger, debugLogPath)
       resolvedDebugLog = {
         filePath: debugLogPath,
         debugMode,
