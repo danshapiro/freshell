@@ -1,6 +1,13 @@
-import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent } from '../store/paneTypes'
+import type {
+  PaneNode,
+  PaneContent,
+  TerminalPaneContent,
+  BrowserPaneContent,
+  FreshAgentPaneContent,
+} from '../store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import { getProviderLabel, isNonShellMode } from './coding-cli-utils'
+import { getFreshAgentLabel } from './fresh-agent-registry'
 
 /**
  * Collect all leaf pane contents in tree order (left-to-right, top-to-bottom).
@@ -15,6 +22,13 @@ function collectContents(node: PaneNode): PaneContent[] {
  */
 function isCli(content: PaneContent): content is TerminalPaneContent {
   return content.kind === 'terminal' && isNonShellMode(content.mode)
+}
+
+/**
+ * Check if content is a FreshAgent pane.
+ */
+function isFreshAgent(content: PaneContent): content is FreshAgentPaneContent {
+  return content.kind === 'fresh-agent'
 }
 
 /**
@@ -76,8 +90,9 @@ function extractLastDirSegment(path: string): string | null {
 /**
  * Derives a tab name from pane layout content using priority order:
  * 1. First CLI instance (claude or codex mode terminal)
- * 2. First browser
- * 3. First shell terminal (using last directory segment of initialCwd)
+ * 2. First FreshAgent pane (last directory segment of initialCwd, then agent label)
+ * 3. First browser
+ * 4. First shell terminal (using last directory segment of initialCwd)
  */
 export function deriveTabName(layout: PaneNode, extensions?: ClientExtensionEntry[]): string {
   const contents = collectContents(layout)
@@ -88,7 +103,17 @@ export function deriveTabName(layout: PaneNode, extensions?: ClientExtensionEntr
     return getProviderLabel(cli.mode, extensions)
   }
 
-  // Priority 2: First browser
+  // Priority 2: First FreshAgent pane
+  const freshAgent = contents.find(isFreshAgent)
+  if (freshAgent) {
+    if (freshAgent.initialCwd) {
+      const segment = extractLastDirSegment(freshAgent.initialCwd)
+      if (segment) return segment
+    }
+    return getFreshAgentLabel(freshAgent.sessionType)
+  }
+
+  // Priority 3: First browser
   const browser = contents.find(isBrowser)
   if (browser) {
     if (!browser.url) return 'Browser'
@@ -96,7 +121,7 @@ export function deriveTabName(layout: PaneNode, extensions?: ClientExtensionEntr
     return hostname || 'Browser'
   }
 
-  // Priority 3: First shell terminal
+  // Priority 4: First shell terminal
   const shell = contents.find(isShellTerminal)
   if (shell) {
     if (!shell.initialCwd) return 'Shell'
@@ -104,7 +129,7 @@ export function deriveTabName(layout: PaneNode, extensions?: ClientExtensionEntr
     return segment || 'Shell'
   }
 
-  // Priority 4: Picker (when all panes are pickers)
+  // Priority 5: Picker (when all panes are pickers)
   const hasOnlyPickers = contents.every(isPicker)
   if (hasOnlyPickers && contents.length > 0) {
     return 'New Tab'

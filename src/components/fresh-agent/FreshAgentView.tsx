@@ -5,7 +5,8 @@ import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { getWsClient } from '@/lib/ws-client'
 import { getFreshAgentThreadSnapshot } from '@/lib/api'
-import { consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
+import { consumePaneRefreshRequest, mergePaneContent, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
+import { updateTab } from '@/store/tabsSlice'
 import { clearPendingCreateFailure } from '@/store/freshAgentSlice'
 import { handleFreshAgentTransportEvent, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import {
@@ -20,10 +21,11 @@ import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import { getFreshAgentSlashCommands, type FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
 import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
+import { extractTitleFromMessage } from '@shared/title-utils'
 import { FreshAgentApprovalBanner } from './FreshAgentApprovalBanner'
 import FreshAgentQuestionBanner from './FreshAgentQuestionBanner'
 import { FreshAgentTranscript } from './FreshAgentTranscript'
-import { FreshAgentComposer } from './FreshAgentComposer'
+import { FreshAgentComposer, type FreshAgentComposerHandle } from './FreshAgentComposer'
 import { FreshAgentDiffPanel } from './FreshAgentDiffPanel'
 import { FreshAgentSidebar } from './FreshAgentSidebar'
 
@@ -138,6 +140,8 @@ export function FreshAgentView({
   const pendingCreateFailure = useAppSelector(
     (state) => state.freshAgent?.pendingCreateFailures?.[paneContent.createRequestId],
   )
+  const currentTab = useAppSelector((state) => state.tabs?.tabs?.find((tab) => tab.id === tabId))
+  const tabTitleSetByUser = currentTab?.titleSetByUser ?? false
   const claudeSession = useAppSelector((state) => {
     if (paneContent.provider !== 'claude' || !paneContent.sessionId) return undefined
     const sessionKey = makeFreshAgentSessionKey({
@@ -154,9 +158,21 @@ export function FreshAgentView({
   const descriptor = resolveFreshAgentType(paneContent.sessionType)
   const slashCommands = useMemo(() => getFreshAgentSlashCommands(paneContent.sessionType), [paneContent.sessionType])
   const paneContentRef = useRef(paneContent)
+  const composerRef = useRef<FreshAgentComposerHandle | null>(null)
   paneContentRef.current = paneContent
   const restoreTimeoutRef = useRef<number | null>(null)
   const createSentRef = useRef(false)
+  // Auto-title state tracks four things:
+  // 1. whether this mounted pane has already consumed first-message auto-title,
+  // 2. whether we observed a fresh conversation boundary in this mount,
+  // 3. the last create boundary we saw, and
+  // 4. the last stable/effective conversation identity so retries, restores, and materialization
+  //    can preserve latch state for the same conversation instead of reopening it.
+  const autoTitleSentRef = useRef(false)
+  const autoTitleFreshBoundaryRef = useRef(false)
+  const autoTitleCreateRequestIdRef = useRef(paneContent.createRequestId)
+  const autoTitleDurableIdentityRef = useRef<string | null>(null)
+  const autoTitleIdentityRef = useRef<string | null>(null)
   const handledRefreshRequestIdRef = useRef<string | null>(null)
   const preferredResumeSessionId = getPreferredResumeSessionId(claudeSession) ?? paneContent.resumeSessionId
   const snapshotThreadId = paneContent.provider === 'claude'
@@ -177,6 +193,49 @@ export function FreshAgentView({
       && claudeSession?.historyLoaded !== true
       && !hasRestoreFailure,
   )
+  const hasUserTurns = useMemo(() => snapshot?.turns.some((turn) => turn.role === 'user') ?? false, [snapshot?.turns])
+  const autoTitleDurableIdentity = useMemo(() => {
+    const paneSessionRefId = paneContent.sessionRef?.provider === paneContent.provider
+      ? paneContent.sessionRef.sessionId
+      : undefined
+    const stableSnapshotThreadId = snapshotThreadId
+      && (
+        snapshotThreadId !== paneContent.sessionId
+        || (!paneSessionRefId && !preferredResumeSessionId && !paneContent.resumeSessionId)
+      )
+        ? snapshotThreadId
+        : undefined
+    return paneSessionRefId
+      ?? preferredResumeSessionId
+      ?? paneContent.resumeSessionId
+      ?? stableSnapshotThreadId
+      ?? null
+  }, [
+    paneContent.provider,
+    paneContent.resumeSessionId,
+    paneContent.sessionId,
+    paneContent.sessionRef,
+    preferredResumeSessionId,
+    snapshotThreadId,
+  ])
+  const autoTitleIdentity = useMemo(() => {
+    const stableIdentity = autoTitleDurableIdentity
+      ?? paneContent.sessionId
+      ?? paneContent.createRequestId
+    return `${paneContent.sessionType}:${paneContent.provider}:${stableIdentity}`
+  }, [
+    autoTitleDurableIdentity,
+    paneContent.createRequestId,
+    paneContent.provider,
+    paneContent.sessionId,
+    paneContent.sessionType,
+  ])
+  const [snapshotAutoTitleIdentity, setSnapshotAutoTitleIdentity] = useState<string | null>(null)
+  const hasCurrentSnapshot = snapshot !== null && snapshotAutoTitleIdentity === autoTitleIdentity
+  const snapshotConfirmsNoUserTurns = hasCurrentSnapshot && !hasUserTurns
+  const snapshotConfirmsUserTurns = hasCurrentSnapshot && hasUserTurns
+  const currentAutoTitleIdentityRef = useRef(autoTitleIdentity)
+  currentAutoTitleIdentityRef.current = autoTitleIdentity
 
   const sendFreshAgentMessage = useCallback((message: Record<string, unknown>) => {
     const suppressed = typeof window !== 'undefined'
@@ -193,6 +252,58 @@ export function FreshAgentView({
     prevCreateRequestIdRef.current = paneContent.createRequestId
     createSentRef.current = false
   }
+
+  useEffect(() => {
+    if (autoTitleCreateRequestIdRef.current !== paneContent.createRequestId) {
+      const previousAutoTitleIdentity = autoTitleIdentityRef.current
+      const previousDurableIdentity = autoTitleDurableIdentityRef.current
+      autoTitleCreateRequestIdRef.current = paneContent.createRequestId
+      autoTitleDurableIdentityRef.current = autoTitleDurableIdentity
+      autoTitleIdentityRef.current = autoTitleIdentity
+      if (
+        previousAutoTitleIdentity === autoTitleIdentity
+        || (autoTitleDurableIdentity && previousDurableIdentity === autoTitleDurableIdentity)
+      ) {
+        autoTitleFreshBoundaryRef.current = autoTitleFreshBoundaryRef.current || snapshotConfirmsNoUserTurns
+        autoTitleSentRef.current = autoTitleSentRef.current || snapshotConfirmsUserTurns
+      } else {
+        autoTitleFreshBoundaryRef.current = true
+        autoTitleSentRef.current = false
+        setSnapshotAutoTitleIdentity(null)
+      }
+      return
+    }
+    if (autoTitleIdentityRef.current === null) {
+      autoTitleDurableIdentityRef.current = autoTitleDurableIdentity
+      autoTitleIdentityRef.current = autoTitleIdentity
+      autoTitleFreshBoundaryRef.current = !paneContent.sessionId
+        && (paneContent.status === 'creating' || paneContent.status === 'starting')
+      autoTitleSentRef.current = snapshotConfirmsUserTurns
+      return
+    }
+    if (autoTitleIdentityRef.current !== autoTitleIdentity) {
+      autoTitleDurableIdentityRef.current = autoTitleDurableIdentity
+      autoTitleIdentityRef.current = autoTitleIdentity
+      autoTitleFreshBoundaryRef.current = autoTitleFreshBoundaryRef.current || snapshotConfirmsNoUserTurns
+      autoTitleSentRef.current = autoTitleSentRef.current || snapshotConfirmsUserTurns
+      return
+    }
+    if (snapshotConfirmsNoUserTurns && !autoTitleSentRef.current) {
+      autoTitleFreshBoundaryRef.current = true
+    }
+    if (snapshotConfirmsUserTurns) {
+      autoTitleFreshBoundaryRef.current = false
+      autoTitleSentRef.current = true
+    }
+  }, [
+    autoTitleDurableIdentity,
+    autoTitleIdentity,
+    paneContent.createRequestId,
+    paneContent.sessionId,
+    paneContent.status,
+    snapshotConfirmsNoUserTurns,
+    snapshotConfirmsUserTurns,
+  ])
 
   const buildCreateMessage = useCallback((content: FreshAgentPaneContent) => ({
     type: 'freshAgent.create',
@@ -487,10 +598,26 @@ export function FreshAgentView({
     setLoadError(null)
     const sessionId = snapshotThreadId
     const provider = paneContent.provider
+    const requestCreateRequestId = paneContent.createRequestId
+    const requestAutoTitleIdentity = autoTitleIdentity
+    const isStaleSnapshotRequest = () => (
+      paneContentRef.current.createRequestId !== requestCreateRequestId
+      || currentAutoTitleIdentityRef.current !== requestAutoTitleIdentity
+    )
     void getFreshAgentThreadSnapshot(paneContent.sessionType, provider, sessionId, { signal: controller.signal })
       .then((next) => {
+        if (isStaleSnapshotRequest()) return
         const resolved = next as FreshAgentSnapshot
+        const resolvedHasUserTurns = resolved.turns.some((turn) => turn.role === 'user')
+        if (!resolvedHasUserTurns && !autoTitleSentRef.current) {
+          autoTitleFreshBoundaryRef.current = true
+        }
+        if (resolvedHasUserTurns) {
+          autoTitleFreshBoundaryRef.current = false
+          autoTitleSentRef.current = true
+        }
         setSnapshot(resolved)
+        setSnapshotAutoTitleIdentity(requestAutoTitleIdentity)
         const fresh = paneContentRef.current
         const nextStatus = (resolved.status as FreshAgentPaneContent['status']) ?? fresh.status
         const snapshotSessionRef = provider === 'opencode' && resolved.sessionId && resolved.sessionId !== sessionId
@@ -522,6 +649,7 @@ export function FreshAgentView({
       })
       .catch((error: unknown) => {
         if (error instanceof Error && error.name === 'AbortError') return
+        if (isStaleSnapshotRequest()) return
         if (paneContent.provider === 'claude' && claudeSession) {
           setLoadError(null)
           return
@@ -558,6 +686,7 @@ export function FreshAgentView({
     paneContent.status,
     paneContent.sessionType,
     paneId,
+    autoTitleIdentity,
     snapshotThreadId,
     snapshotRefreshNonce,
     tabId,
@@ -660,6 +789,11 @@ export function FreshAgentView({
       && !hasRestoreFailure
       && !['creating', 'starting', 'create-failed', 'exited'].includes(effectiveStatus)
     )
+    const canInterrupt = snapshot?.capabilities?.interrupt === true || (
+      paneContent.provider === 'claude'
+      && Boolean(paneContent.sessionId)
+      && ['connected', 'running', 'idle', 'compacting'].includes(effectiveStatus)
+    )
     const questionAgentLabel = getQuestionAgentLabel(paneContent, descriptor?.label)
     const visibleRestoreFailure = paneContent.provider === 'claude'
       ? claudeSession?.restoreFailureMessage
@@ -668,11 +802,26 @@ export function FreshAgentView({
       ? null
       : (paneContent.restoreError ? getRestoreErrorMessage(paneContent.restoreError.reason) : null)
     const visibleLoadError = visibleRestoreFailure || visiblePaneRestoreFailure || isRestoring ? null : loadError
+    const sendInterrupt = () => {
+      if (!paneContent.sessionId || !canInterrupt) return
+      sendFreshAgentMessage({
+        type: 'freshAgent.interrupt',
+        sessionId: paneContent.sessionId,
+        sessionType: paneContent.sessionType,
+        provider: paneContent.provider,
+      })
+    }
 
     return (
       <div className="flex h-full min-h-0 flex-col" data-context="fresh-agent" data-session-id={paneContent.sessionId}>
         <div className="flex min-h-0 flex-1">
-          <div className="flex min-h-0 flex-1 flex-col">
+          <div
+            className="flex min-h-0 flex-1 flex-col"
+            onClick={(event) => {
+              if (event.target !== event.currentTarget) return
+              composerRef.current?.focus()
+            }}
+          >
             <div className="space-y-2 px-3 pt-3">
               {isRestoring ? (
                 <FreshAgentApprovalBanner text="Restoring session..." />
@@ -778,11 +927,28 @@ export function FreshAgentView({
             </div>
             <FreshAgentTranscript turns={turns} />
             <FreshAgentComposer
+              ref={composerRef}
               disabled={!canSend || !paneContent.sessionId}
+              storageKey={`fresh-agent-draft:${paneContent.sessionType}:${paneContent.sessionId ?? paneContent.createRequestId}`}
+              canInterrupt={canInterrupt && Boolean(paneContent.sessionId)}
+              onInterrupt={sendInterrupt}
               commands={slashCommands}
               onCommand={runSlashCommand}
               onSend={(text) => {
                 if (!paneContent.sessionId || !canSend) return
+                const isFirstMessage = !autoTitleSentRef.current
+                  && (autoTitleFreshBoundaryRef.current || snapshotConfirmsNoUserTurns)
+                if (isFirstMessage) {
+                  autoTitleFreshBoundaryRef.current = false
+                  autoTitleSentRef.current = true
+                  const title = extractTitleFromMessage(text)
+                  if (title) {
+                    dispatch(updatePaneTitle({ tabId, paneId, title, setByUser: false }))
+                    if (!tabTitleSetByUser) {
+                      dispatch(updateTab({ id: tabId, updates: { title } }))
+                    }
+                  }
+                }
                 sendFreshAgentMessage({
                   type: 'freshAgent.send',
                   sessionId: paneContent.sessionId,
@@ -819,8 +985,13 @@ export function FreshAgentView({
     paneContent,
     pendingCreateFailure,
     runSlashCommand,
+    snapshotConfirmsNoUserTurns,
     snapshot,
     slashCommands,
+    dispatch,
+    paneId,
+    tabId,
+    tabTitleSetByUser,
   ])
 
   useEffect(() => {

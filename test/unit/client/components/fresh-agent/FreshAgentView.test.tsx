@@ -6,11 +6,13 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import freshAgentReducer from '@/store/freshAgentSlice'
 import agentChatReducer from '@/store/agentChatSlice'
+import tabsReducer from '@/store/tabsSlice'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
-import { initLayout, requestPaneRefresh } from '@/store/panesSlice'
+import { initLayout, requestPaneRefresh, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
 import { useAppSelector } from '@/store/hooks'
 import { sessionInit, setSessionStatus } from '@/store/agentChatSlice'
+import { updateTab } from '@/store/tabsSlice'
 import type { PaneNode } from '@/store/paneTypes'
 
 const CLAUDE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440000'
@@ -41,13 +43,14 @@ vi.mock('@/lib/api', async () => {
   }
 })
 
-function createStore() {
+function createStore(tabTitleSetByUser = false) {
   return configureStore({
     reducer: {
       panes: panesReducer,
       settings: settingsReducer,
       freshAgent: freshAgentReducer,
       agentChat: agentChatReducer,
+      tabs: tabsReducer,
     },
     preloadedState: {
       panes: {
@@ -59,6 +62,21 @@ function createStore() {
         renameRequestPaneId: null,
         zoomedPane: {},
         refreshRequestsByPane: {},
+      },
+      tabs: {
+        tabs: [{
+          id: 'tab-1',
+          createRequestId: 'tab-1',
+          title: tabTitleSetByUser ? 'Pinned title' : 'Tab 1',
+          titleSetByUser: tabTitleSetByUser,
+          status: 'running',
+          mode: 'shell',
+          shell: 'system',
+          createdAt: Date.now(),
+        }],
+        activeTabId: 'tab-1',
+        renameRequestTabId: null,
+        tombstones: [],
       },
     },
   })
@@ -96,6 +114,20 @@ function StoreBackedFreshAgentSettingsButton({
     return layout.content
   })
   return <FreshAgentSettingsButton tabId={tabId} paneId={paneId} paneContent={paneContent} />
+}
+
+function getFreshAgentSessionId() {
+  return document.querySelector('[data-context="fresh-agent"]')?.getAttribute('data-session-id')
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
 }
 
 beforeEach(() => {
@@ -322,7 +354,7 @@ describe('FreshAgentView', () => {
     )
 
     await waitFor(() => {
-      expect(screen.getByText('Codex turn')).toBeInTheDocument()
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
     })
 
     wsMock.send.mockClear()
@@ -350,6 +382,882 @@ describe('FreshAgentView', () => {
 
     expect(screen.queryByRole('button', { name: 'Interrupt' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Fork' })).not.toBeInTheDocument()
+  })
+
+  it('auto-titles the fresh-agent pane and tab from the first user message', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-auto-title',
+        sessionId: 'thread-auto-title',
+        status: 'idle',
+        initialCwd: '/home/dan/code/freshell',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Codex turn')).toBeInTheDocument()
+    })
+
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Research tab naming behavior\nUse existing code paths.' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const state = store.getState()
+    expect(state.panes.paneTitles?.['tab-1']?.['pane-1']).toBe('Research tab naming behavior')
+    expect(state.panes.paneTitleSetByUser?.['tab-1']?.['pane-1'] ?? false).toBe(false)
+    expect(state.tabs.tabs.find((tab) => tab.id === 'tab-1')?.title).toBe('Research tab naming behavior')
+    expect(state.tabs.tabs.find((tab) => tab.id === 'tab-1')?.titleSetByUser).toBe(false)
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.send',
+      text: 'Research tab naming behavior\nUse existing code paths.',
+    }))
+  })
+
+  it('does not replace a user-set tab title when auto-titling the first fresh-agent message', async () => {
+    const store = createStore(true)
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-auto-title-user-tab',
+        sessionId: 'thread-auto-title-user-tab',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Codex turn')).toBeInTheDocument()
+    })
+
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Do not override my tab title' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const state = store.getState()
+    expect(state.panes.paneTitles?.['tab-1']?.['pane-1']).toBe('Do not override my tab title')
+    expect(state.tabs.tabs.find((tab) => tab.id === 'tab-1')?.title).toBe('Pinned title')
+    expect(state.tabs.tabs.find((tab) => tab.id === 'tab-1')?.titleSetByUser).toBe(true)
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.send',
+      text: 'Do not override my tab title',
+    }))
+  })
+
+  it('auto-titles a freshly created freshclaude conversation after freshAgent.created before snapshot history exists', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('Snapshot not ready yet'))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-claude-created-auto-title',
+        status: 'creating',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    const onMessage = wsMock.onMessage.mock.calls[0]?.[0]
+    expect(onMessage).toBeTypeOf('function')
+    act(() => {
+      onMessage({
+        type: 'freshAgent.created',
+        requestId: 'req-claude-created-auto-title',
+        sessionId: 'claude-live-session-1',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        runtimeProvider: 'claude',
+      })
+    })
+
+    await waitFor(() => {
+      expect(getFreshAgentSessionId()).toBe('claude-live-session-1')
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Fresh Claude title' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const state = store.getState()
+    expect(state.panes.paneTitles?.['tab-1']?.['pane-1']).toBe('Fresh Claude title')
+    expect(state.tabs.tabs.find((tab) => tab.id === 'tab-1')?.title).toBe('Fresh Claude title')
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.send',
+      sessionId: 'claude-live-session-1',
+      text: 'Fresh Claude title',
+    }))
+  })
+
+  it('auto-titles after freshopencode materializes to a live session id before follow-up snapshot lands', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce({
+        sessionId: 'ses_real_materialized_1',
+        status: 'idle',
+        summary: 'OpenCode summary',
+        capabilities: { send: true, interrupt: true, fork: false },
+        turns: [],
+      })
+      .mockImplementationOnce(() => new Promise(() => {}))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-opencode-materialize-auto-title',
+        sessionId: 'freshopencode-req-materialize',
+        sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-materialize' },
+        resumeSessionId: 'freshopencode-req-materialize',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(getFreshAgentSessionId()).toBe('ses_real_materialized_1')
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Materialized OpenCode title' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const state = store.getState()
+    expect(state.panes.paneTitles?.['tab-1']?.['pane-1']).toBe('Materialized OpenCode title')
+    expect(state.tabs.tabs.find((tab) => tab.id === 'tab-1')?.title).toBe('Materialized OpenCode title')
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.send',
+      sessionId: 'ses_real_materialized_1',
+      text: 'Materialized OpenCode title',
+    }))
+  })
+
+  it('keeps the first auto-title when two sends happen before snapshot user turns arrive', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-auto-title-race',
+        sessionId: 'thread-auto-title-race',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Codex turn')).toBeInTheDocument()
+    })
+
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'First title' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Second title' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const state = store.getState()
+    expect(state.panes.paneTitles?.['tab-1']?.['pane-1']).toBe('First title')
+    expect(state.tabs.tabs.find((tab) => tab.id === 'tab-1')?.title).toBe('First title')
+    expect(wsMock.send.mock.calls).toEqual(expect.arrayContaining([
+      [expect.objectContaining({ type: 'freshAgent.send', text: 'First title' })],
+      [expect.objectContaining({ type: 'freshAgent.send', text: 'Second title' })],
+    ]))
+  })
+
+  it('does not reopen auto-title when the live session handle changes for the same conversation', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-auto-title-restore',
+        sessionId: 'live-session-1',
+        sessionRef: { provider: 'claude', sessionId: CLAUDE_THREAD_ID },
+        resumeSessionId: CLAUDE_THREAD_ID,
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Codex turn')).toBeInTheDocument()
+    })
+
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'First durable title' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    act(() => {
+      store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          createRequestId: 'req-auto-title-restore',
+          sessionId: 'live-session-2',
+          sessionRef: { provider: 'claude', sessionId: CLAUDE_THREAD_ID },
+          resumeSessionId: CLAUDE_THREAD_ID,
+          status: 'idle',
+        },
+      }))
+    })
+    await waitFor(() => {
+      expect(getFreshAgentSessionId()).toBe('live-session-2')
+    })
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Second durable title' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const state = store.getState()
+    expect(state.panes.paneTitles?.['tab-1']?.['pane-1']).toBe('First durable title')
+    expect(state.tabs.tabs.find((tab) => tab.id === 'tab-1')?.title).toBe('First durable title')
+    expect(wsMock.send.mock.calls).toEqual(expect.arrayContaining([
+      [expect.objectContaining({ type: 'freshAgent.send', sessionId: 'live-session-1', text: 'First durable title' })],
+      [expect.objectContaining({ type: 'freshAgent.send', sessionId: 'live-session-2', text: 'Second durable title' })],
+    ]))
+  })
+
+  it('does not reopen auto-title when a live-only freshclaude pane gains durable identity', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-auto-title-refinement-bootstrap',
+        status: 'creating',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    wsMock.send.mockClear()
+
+    act(() => {
+      store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          createRequestId: 'req-auto-title-refinement',
+          sessionId: 'live-session-refine-1',
+          status: 'idle',
+        },
+      }))
+    })
+    await waitFor(() => {
+      expect(getFreshAgentSessionId()).toBe('live-session-refine-1')
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'First refined title' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    act(() => {
+      store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          createRequestId: 'req-auto-title-refinement',
+          sessionId: 'live-session-refine-2',
+          sessionRef: { provider: 'claude', sessionId: CLAUDE_THREAD_ID },
+          resumeSessionId: CLAUDE_THREAD_ID,
+          status: 'idle',
+        },
+      }))
+    })
+    await waitFor(() => {
+      expect(getFreshAgentSessionId()).toBe('live-session-refine-2')
+    })
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Second refined title' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const state = store.getState()
+    expect(state.panes.paneTitles?.['tab-1']?.['pane-1']).toBe('First refined title')
+    expect(state.tabs.tabs.find((tab) => tab.id === 'tab-1')?.title).toBe('First refined title')
+    expect(wsMock.send.mock.calls).toEqual(expect.arrayContaining([
+      [expect.objectContaining({ type: 'freshAgent.send', sessionId: 'live-session-refine-1', text: 'First refined title' })],
+      [expect.objectContaining({ type: 'freshAgent.send', sessionId: 'live-session-refine-2', text: 'Second refined title' })],
+    ]))
+  })
+
+  it('does not reopen auto-title when freshopencode materializes a live session id for the same durable thread', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-opencode-auto-title',
+        sessionId: 'freshopencode-req-1',
+        sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-1' },
+        resumeSessionId: 'freshopencode-req-1',
+        status: 'idle',
+      },
+    }))
+
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      sessionId: 'freshopencode-req-1',
+      status: 'idle',
+      summary: 'OpenCode summary',
+      capabilities: { send: true, interrupt: true, fork: false },
+      turns: [{ id: 'turn-1', role: 'assistant', items: [{ id: 'item-1', kind: 'text', text: 'Codex turn' }] }],
+    })
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Codex turn')).toBeInTheDocument()
+    })
+
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'First opencode title' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    act(() => {
+      store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          createRequestId: 'req-opencode-auto-title',
+          sessionId: 'ses_real_1',
+          sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-1' },
+          resumeSessionId: 'freshopencode-req-1',
+          status: 'idle',
+        },
+      }))
+    })
+    await waitFor(() => {
+      expect(getFreshAgentSessionId()).toBe('ses_real_1')
+    })
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Second opencode title' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const state = store.getState()
+    expect(state.panes.paneTitles?.['tab-1']?.['pane-1']).toBe('First opencode title')
+    expect(state.tabs.tabs.find((tab) => tab.id === 'tab-1')?.title).toBe('First opencode title')
+    expect(wsMock.send.mock.calls).toEqual(expect.arrayContaining([
+      [expect.objectContaining({ type: 'freshAgent.send', sessionId: 'freshopencode-req-1', text: 'First opencode title' })],
+      [expect.objectContaining({ type: 'freshAgent.send', sessionId: 'ses_real_1', text: 'Second opencode title' })],
+    ]))
+  })
+
+  it('resets auto-title for a genuinely new conversation in the same pane', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-old-conversation',
+        sessionId: 'thread-old-conversation',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Codex turn')).toBeInTheDocument()
+    })
+
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Old title' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    act(() => {
+      store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-new-conversation',
+          sessionId: 'thread-new-conversation',
+          status: 'idle',
+        },
+      }))
+    })
+    await waitFor(() => {
+      expect(getFreshAgentSessionId()).toBe('thread-new-conversation')
+    })
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'New title' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const state = store.getState()
+    expect(state.panes.paneTitles?.['tab-1']?.['pane-1']).toBe('New title')
+    expect(state.tabs.tabs.find((tab) => tab.id === 'tab-1')?.title).toBe('New title')
+    expect(wsMock.send.mock.calls).toEqual(expect.arrayContaining([
+      [expect.objectContaining({ type: 'freshAgent.send', sessionId: 'thread-old-conversation', text: 'Old title' })],
+      [expect.objectContaining({ type: 'freshAgent.send', sessionId: 'thread-new-conversation', text: 'New title' })],
+    ]))
+  })
+
+  it('does not reopen auto-title when createRequestId changes but full effective identity stays the same', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-same-identity-old',
+        sessionId: 'thread-same-identity',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Codex turn')).toBeInTheDocument()
+    })
+
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Codex same identity title' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    act(() => {
+      store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-same-identity-new',
+          sessionId: 'thread-same-identity',
+          status: 'idle',
+        },
+      }))
+    })
+    await waitFor(() => {
+      expect(getFreshAgentSessionId()).toBe('thread-same-identity')
+    })
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Should not replace codex same identity title' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const state = store.getState()
+    expect(state.panes.paneTitles?.['tab-1']?.['pane-1']).toBe('Codex same identity title')
+    expect(state.tabs.tabs.find((tab) => tab.id === 'tab-1')?.title).toBe('Codex same identity title')
+    expect(wsMock.send.mock.calls).toEqual(expect.arrayContaining([
+      [expect.objectContaining({ type: 'freshAgent.send', sessionId: 'thread-same-identity', text: 'Codex same identity title' })],
+      [expect.objectContaining({ type: 'freshAgent.send', sessionId: 'thread-same-identity', text: 'Should not replace codex same identity title' })],
+    ]))
+  })
+
+  it('does not reopen auto-title when createRequestId changes but durable identity stays the same', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-same-durable-old',
+        sessionId: 'live-same-durable-1',
+        sessionRef: { provider: 'claude', sessionId: CLAUDE_THREAD_ID },
+        resumeSessionId: CLAUDE_THREAD_ID,
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Codex turn')).toBeInTheDocument()
+    })
+
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Durable title' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    act(() => {
+      store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          createRequestId: 'req-same-durable-new',
+          sessionId: 'live-same-durable-2',
+          sessionRef: { provider: 'claude', sessionId: CLAUDE_THREAD_ID },
+          resumeSessionId: CLAUDE_THREAD_ID,
+          status: 'idle',
+        },
+      }))
+    })
+    await waitFor(() => {
+      expect(getFreshAgentSessionId()).toBe('live-same-durable-2')
+    })
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Should not replace durable title' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const state = store.getState()
+    expect(state.panes.paneTitles?.['tab-1']?.['pane-1']).toBe('Durable title')
+    expect(state.tabs.tabs.find((tab) => tab.id === 'tab-1')?.title).toBe('Durable title')
+    expect(wsMock.send.mock.calls).toEqual(expect.arrayContaining([
+      [expect.objectContaining({ type: 'freshAgent.send', sessionId: 'live-same-durable-1', text: 'Durable title' })],
+      [expect.objectContaining({ type: 'freshAgent.send', sessionId: 'live-same-durable-2', text: 'Should not replace durable title' })],
+    ]))
+  })
+
+  it('resets auto-title for a new conversation even if the stale prior snapshot had user turns', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'idle',
+      summary: 'Codex summary',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [
+        { id: 'turn-user-1', role: 'user', items: [{ id: 'item-user-1', kind: 'text', text: 'Old user turn' }] },
+        { id: 'turn-assistant-1', role: 'assistant', items: [{ id: 'item-assistant-1', kind: 'text', text: 'Old assistant turn' }] },
+      ],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-stale-snapshot-old',
+        sessionId: 'thread-stale-snapshot-old',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Old assistant turn')).toBeInTheDocument()
+    })
+
+    wsMock.send.mockClear()
+
+    act(() => {
+      store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-stale-snapshot-new',
+          sessionId: 'thread-stale-snapshot-new',
+          status: 'idle',
+        },
+      }))
+    })
+    await waitFor(() => {
+      expect(getFreshAgentSessionId()).toBe('thread-stale-snapshot-new')
+    })
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'New stale-safe title' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const state = store.getState()
+    expect(state.panes.paneTitles?.['tab-1']?.['pane-1']).toBe('New stale-safe title')
+    expect(state.tabs.tabs.find((tab) => tab.id === 'tab-1')?.title).toBe('New stale-safe title')
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.send',
+      sessionId: 'thread-stale-snapshot-new',
+      text: 'New stale-safe title',
+    }))
+  })
+
+  it('ignores a late stale snapshot with user turns after switching to a new conversation', async () => {
+    const store = createStore()
+    const staleSnapshot = createDeferred<{
+      status: string
+      summary: string
+      capabilities: { send: boolean; interrupt: boolean; fork: boolean }
+      turns: Array<{ id: string; role: 'user' | 'assistant'; items: Array<{ id: string; kind: 'text'; text: string }> }>
+    }>()
+    apiMock.getFreshAgentThreadSnapshot
+      .mockImplementationOnce(() => staleSnapshot.promise as any)
+      .mockImplementationOnce(() => new Promise(() => {}))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-stale-old',
+        sessionId: 'sess-stale-old',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(getFreshAgentSessionId()).toBe('sess-stale-old')
+    })
+
+    act(() => {
+      store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          createRequestId: 'req-stale-new',
+          sessionId: 'sess-stale-new',
+          status: 'idle',
+        },
+      }))
+    })
+    await waitFor(() => {
+      expect(getFreshAgentSessionId()).toBe('sess-stale-new')
+    })
+
+    await act(async () => {
+      staleSnapshot.resolve({
+        status: 'idle',
+        summary: 'Old snapshot',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [
+          { id: 'turn-old-user', role: 'user', items: [{ id: 'item-old-user', kind: 'text', text: 'Old user turn' }] },
+          { id: 'turn-old-assistant', role: 'assistant', items: [{ id: 'item-old-assistant', kind: 'text', text: 'Old assistant turn' }] },
+        ],
+      })
+      await Promise.resolve()
+    })
+
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'New conversation title after stale race' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const state = store.getState()
+    expect(state.panes.paneTitles?.['tab-1']?.['pane-1']).toBe('New conversation title after stale race')
+    expect(state.tabs.tabs.find((tab) => tab.id === 'tab-1')?.title).toBe('New conversation title after stale race')
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.send',
+      sessionId: 'sess-stale-new',
+      text: 'New conversation title after stale race',
+    }))
+  })
+
+  it('ignores a late stale codex snapshot failure after switching to a new conversation', async () => {
+    const store = createStore()
+    const staleSnapshot = createDeferred<never>()
+    apiMock.getFreshAgentThreadSnapshot
+      .mockImplementationOnce(() => staleSnapshot.promise as any)
+      .mockImplementationOnce(() => new Promise(() => {}))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-stale-codex-old',
+        sessionId: 'thread-stale-codex-old',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(getFreshAgentSessionId()).toBe('thread-stale-codex-old')
+    })
+
+    act(() => {
+      store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-stale-codex-new',
+          sessionId: 'thread-stale-codex-new',
+          status: 'idle',
+        },
+      }))
+    })
+    await waitFor(() => {
+      expect(getFreshAgentSessionId()).toBe('thread-stale-codex-new')
+    })
+
+    await act(async () => {
+      staleSnapshot.reject(new Error('no rollout found for thread id thread-stale-codex-old'))
+      await Promise.resolve()
+    })
+
+    const layout = store.getState().panes.layouts['tab-1']
+    expect(layout?.type).toBe('leaf')
+    if (layout?.type !== 'leaf' || layout.content.kind !== 'fresh-agent') {
+      throw new Error('Expected fresh-agent leaf')
+    }
+    expect(layout.content.sessionId).toBe('thread-stale-codex-new')
+    expect(layout.content.restoreError).toBeUndefined()
+    expect(screen.queryByText(/durable artifact/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/no rollout found for thread id/i)).not.toBeInTheDocument()
   })
 
   it('shows provider slash commands from the command menu without hidden aliases', async () => {
@@ -898,6 +1806,101 @@ describe('FreshAgentView', () => {
     expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.create' }))
     expect(screen.queryByText(/failed to parse url/i)).not.toBeInTheDocument()
+  })
+
+  it('does not auto-title an established freshclaude pane when snapshot history is unavailable', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('Failed to parse URL from /api/fresh-agent/threads/claude/sess-1'))
+    store.dispatch(sessionInit({
+      sessionId: 'sess-1',
+      cliSessionId: 'cli-abc',
+      model: 'claude-opus-4-6',
+    }))
+    store.dispatch(setSessionStatus({ sessionId: 'sess-1', status: 'idle' }))
+    store.dispatch(updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-1', title: 'Existing title', setByUser: false }))
+
+    const paneContent = {
+      kind: 'fresh-agent' as const,
+      sessionType: 'freshclaude' as const,
+      provider: 'claude' as const,
+      createRequestId: 'req-established-no-snapshot',
+      sessionId: 'sess-1',
+      status: 'idle' as const,
+      resumeSessionId: 'cli-abc',
+    }
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={paneContent} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Do not retitle this established chat' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const state = store.getState()
+    expect(state.panes.paneTitles?.['tab-1']?.['pane-1']).toBe('Existing title')
+    expect(state.tabs.tabs.find((tab) => tab.id === 'tab-1')?.title).toBe('Tab 1')
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.send',
+      sessionId: 'sess-1',
+      text: 'Do not retitle this established chat',
+    }))
+  })
+
+  it('does not auto-title a live-only established freshclaude pane when snapshot history is unavailable', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('Failed to parse URL from /api/fresh-agent/threads/claude/sess-live-only'))
+    store.dispatch(sessionInit({
+      sessionId: 'sess-live-only',
+      model: 'claude-opus-4-6',
+    }))
+    store.dispatch(setSessionStatus({ sessionId: 'sess-live-only', status: 'idle' }))
+    store.dispatch(updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-1', title: 'Existing live-only pane title', setByUser: false }))
+    store.dispatch(updateTab({ id: 'tab-1', updates: { title: 'Existing live-only tab title' } }))
+
+    const paneContent = {
+      kind: 'fresh-agent' as const,
+      sessionType: 'freshclaude' as const,
+      provider: 'claude' as const,
+      createRequestId: 'req-live-only-established',
+      sessionId: 'sess-live-only',
+      status: 'idle' as const,
+    }
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={paneContent} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Do not retitle this live-only established chat' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const state = store.getState()
+    expect(state.panes.paneTitles?.['tab-1']?.['pane-1']).toBe('Existing live-only pane title')
+    expect(state.tabs.tabs.find((tab) => tab.id === 'tab-1')?.title).toBe('Existing live-only tab title')
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.send',
+      sessionId: 'sess-live-only',
+      text: 'Do not retitle this live-only established chat',
+    }))
   })
 
   it('recreates a lost freshclaude session through fresh-agent transport events with the durable resume id', async () => {

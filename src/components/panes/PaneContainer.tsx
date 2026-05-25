@@ -594,6 +594,13 @@ function PickerWrapper({
     | { step: 'directory'; providerType: PanePickerType }
   >({ step: 'type' })
 
+  const getRuntimeSettingsKey = useCallback((providerType: PanePickerType): CodingCliProviderName => {
+    const freshAgentType = resolveFreshAgentType(providerType)
+    if (freshAgentType) return freshAgentType.runtimeProvider as CodingCliProviderName
+    const agentConfig = getAgentChatProviderConfig(providerType)
+    return (agentConfig ? agentConfig.codingCliProvider : providerType) as CodingCliProviderName
+  }, [])
+
   const createContentForType = useCallback((type: PanePickerType, cwd?: string): PaneContent => {
     if (typeof type === 'string' && type.startsWith('ext:')) {
       const extensionName = type.slice(4)
@@ -610,13 +617,10 @@ function PickerWrapper({
         ? getAgentChatProviderConfig(type)
         : undefined
       const providerSettings = agentChatSettings?.providers?.[type]
-      const model = normalizeFreshAgentModel(
-        freshAgentType.sessionType,
-        freshAgentType.runtimeProvider,
-        freshAgentType.runtimeProvider === 'codex'
-          ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.model
-          : freshAgentType.defaultModel,
-      )
+      const configuredModel = freshAgentType.runtimeProvider === 'codex' || freshAgentType.runtimeProvider === 'opencode'
+        ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.model ?? freshAgentType.defaultModel
+        : freshAgentType.defaultModel
+      const model = normalizeFreshAgentModel(freshAgentType.sessionType, freshAgentType.runtimeProvider, configuredModel) ?? configuredModel
       return {
         kind: 'fresh-agent',
         sessionType: freshAgentType.sessionType,
@@ -638,7 +642,7 @@ function PickerWrapper({
           freshAgentType.sessionType,
           freshAgentType.runtimeProvider,
           model,
-          normalizeAgentChatEffortOverride(providerSettings?.effort),
+          normalizeAgentChatEffortOverride(providerSettings?.effort) ?? freshAgentType.defaultEffort,
         ) ?? freshAgentType.defaultEffort,
         plugins: freshAgentType.runtimeProvider === 'claude' ? agentChatSettings?.defaultPlugins : undefined,
         ...(cwd ? { initialCwd: cwd } : {}),
@@ -734,15 +738,13 @@ function PickerWrapper({
     dispatch(updatePaneContent({ tabId, paneId, content: newContent }))
 
     // Save the selected directory for the provider
-    const agentConfig = getAgentChatProviderConfig(providerType)
-    const freshAgentConfig = resolveFreshAgentType(providerType)
-    const settingsKey = (agentConfig?.codingCliProvider ?? freshAgentConfig?.runtimeProvider ?? providerType) as CodingCliProviderName
+    const settingsKey = getRuntimeSettingsKey(providerType)
     const existingProviderSettings = settings?.codingCli?.providers?.[settingsKey] || {}
     const patch = {
       codingCli: { providers: { [settingsKey]: { ...existingProviderSettings, cwd } } },
     }
     void dispatch(saveServerSettingsPatch(patch))
-  }, [createContentForType, dispatch, paneId, settings, step, tabId])
+  }, [createContentForType, dispatch, getRuntimeSettingsKey, paneId, settings, step, tabId])
 
   const handleCancel = useCallback(() => {
     dispatch(closePaneWithCleanup({ tabId, paneId }))
@@ -751,15 +753,15 @@ function PickerWrapper({
   if (step.step === 'directory') {
     const providerType = step.providerType
     const agentConfig = getAgentChatProviderConfig(providerType)
-    const freshAgentConfig = resolveFreshAgentType(providerType)
-    const providerLabel = agentConfig ? agentConfig.label : (freshAgentConfig?.label ?? getProviderLabel(providerType, extensionEntries))
-    const settingsKey = (agentConfig?.codingCliProvider ?? freshAgentConfig?.runtimeProvider ?? providerType) as CodingCliProviderName
+    const freshAgentType = resolveFreshAgentType(providerType)
+    const providerLabel = agentConfig ? agentConfig.label : getProviderLabel(providerType, extensionEntries)
+    const settingsKey = getRuntimeSettingsKey(providerType)
     const globalDefault = settings?.codingCli?.providers?.[settingsKey]?.cwd
     const defaultCwd = tabPref.defaultCwd ?? globalDefault
     return (
       <DirectoryPicker
         providerType={providerType}
-        providerLabel={providerLabel}
+        providerLabel={freshAgentType?.label ?? providerLabel}
         defaultCwd={defaultCwd}
         tabDirectories={tabPref.tabDirectories}
         globalDefault={globalDefault}

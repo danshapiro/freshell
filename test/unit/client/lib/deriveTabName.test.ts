@@ -53,4 +53,37 @@ describe('deriveTabName', () => {
 
     expect(deriveTabName(layout)).toBe('Codex')
   })
+
+  it('returns the last working-directory segment for a fresh-agent pane', () => {
+    const layout: PaneNode = {
+      type: 'leaf',
+      id: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        status: 'idle',
+        createRequestId: 'req-1',
+        initialCwd: '/home/dan/code/freshell',
+      },
+    }
+
+    expect(deriveTabName(layout, mockExtensions)).toBe('freshell')
+  })
+
+  it('falls back to the fresh-agent label when there is no working directory', () => {
+    const layout: PaneNode = {
+      type: 'leaf',
+      id: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        status: 'idle',
+        createRequestId: 'req-1',
+      },
+    }
+
+    expect(deriveTabName(layout, mockExtensions)).toBe('Freshopencode')
+  })
 })

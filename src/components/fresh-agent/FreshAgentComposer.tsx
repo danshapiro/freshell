@@ -1,12 +1,28 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
-import { Command } from 'lucide-react'
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from 'react'
+import { Command, Send, Square } from 'lucide-react'
 import type { FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
 
 type FreshAgentComposerProps = {
   disabled?: boolean
+  storageKey?: string
   onSend?: (value: string) => void
+  onInterrupt?: () => void
+  canInterrupt?: boolean
   commands?: readonly FreshAgentSlashCommand[]
   onCommand?: (command: FreshAgentSlashCommand, args: string) => void
+}
+
+export type FreshAgentComposerHandle = {
+  focus: () => void
 }
 
 type MenuMode = 'chat' | 'browse'
@@ -25,18 +41,28 @@ function parseSlashCommand(value: string): { name: string; args: string } | null
   return { name: match[1].toLowerCase(), args: match[2]?.trim() ?? '' }
 }
 
-export function FreshAgentComposer({
+export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgentComposerProps>(function FreshAgentComposer({
   disabled = false,
+  storageKey,
   onSend,
+  onInterrupt,
+  canInterrupt = false,
   commands = [],
   onCommand,
-}: FreshAgentComposerProps) {
-  const [text, setText] = useState('')
+}, ref) {
+  const [text, setText] = useState(() => {
+    if (!storageKey || typeof window === 'undefined') return ''
+    return window.sessionStorage.getItem(storageKey) ?? ''
+  })
   const [menuMode, setMenuMode] = useState<MenuMode | null>(null)
   const [filter, setFilter] = useState('')
   const [highlightedIndex, setHighlightedIndex] = useState(0)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const filterRef = useRef<HTMLInputElement | null>(null)
+
+  useImperativeHandle(ref, () => ({
+    focus: () => textareaRef.current?.focus(),
+  }), [])
 
   const chatPrefix = getCommandPrefix(text)
   const activeFilter = menuMode === 'chat' ? (chatPrefix ?? '') : filter.toLowerCase()
@@ -44,6 +70,22 @@ export function FreshAgentComposer({
     const normalizedFilter = activeFilter.replace(/^\//, '')
     return commands.filter((command) => command.name.includes(normalizedFilter))
   }, [activeFilter, commands])
+
+  useEffect(() => {
+    if (!storageKey || typeof window === 'undefined') return
+    if (text) {
+      window.sessionStorage.setItem(storageKey, text)
+    } else {
+      window.sessionStorage.removeItem(storageKey)
+    }
+  }, [storageKey, text])
+
+  useEffect(() => {
+    const textarea = textareaRef.current
+    if (!textarea) return
+    textarea.style.height = 'auto'
+    textarea.style.height = `${Math.min(180, Math.max(40, textarea.scrollHeight))}px`
+  }, [text])
 
   useEffect(() => {
     setHighlightedIndex(0)
@@ -208,8 +250,10 @@ export function FreshAgentComposer({
           name="message"
           aria-label="Chat message input"
           disabled={disabled}
-          rows={2}
+          rows={1}
           value={text}
+          placeholder={disabled ? 'Read-only session' : 'Send a message'}
+          className="max-h-44 min-h-[40px] flex-1 resize-none rounded-md border border-border/70 bg-background px-3 py-2 text-sm outline-none"
           onChange={(event) => setText(event.target.value)}
           onKeyDown={(event) => {
             if (handleMenuKeyDown(event)) return
@@ -217,10 +261,22 @@ export function FreshAgentComposer({
               event.preventDefault()
               sendText()
             }
+            if (event.key === 'Escape' && canInterrupt) {
+              event.preventDefault()
+              onInterrupt?.()
+            }
           }}
-          placeholder={disabled ? 'Read-only session' : 'Send a message'}
-          className="min-h-[52px] flex-1 resize-none rounded-md border border-border/70 bg-background px-3 py-2 text-sm outline-none"
         />
+        {canInterrupt ? (
+          <button
+            type="button"
+            onClick={onInterrupt}
+            className="inline-flex h-10 w-10 items-center justify-center rounded-md border border-border bg-background text-sm transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+            aria-label="Stop"
+          >
+            <Square className="h-4 w-4" />
+          </button>
+        ) : null}
         <button
           type="button"
           disabled={disabled || commands.length === 0}
@@ -237,11 +293,12 @@ export function FreshAgentComposer({
         <button
           type="submit"
           disabled={disabled}
-          className="rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50"
+          className="inline-flex h-10 w-10 items-center justify-center rounded-md bg-primary text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50"
+          aria-label="Send"
         >
-          Send
+          <Send className="h-4 w-4" />
         </button>
       </div>
     </form>
   )
-}
+})

@@ -154,8 +154,9 @@ function makeCodexStatusEvent(sessionId: string, status: unknown, revision?: num
 }
 
 function isCodexIncludeTurnsUnavailable(error: unknown): boolean {
-  return error instanceof Error
-    && error.message.includes('includeTurns is unavailable before first user message')
+  if (!(error instanceof Error)) return false
+  return error.message.includes('includeTurns is unavailable before first user message')
+    || error.message.includes('not materialized yet')
 }
 
 function findActiveTurnId(rawSnapshot: Record<string, any>): string | undefined {

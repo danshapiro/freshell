@@ -294,6 +294,53 @@ describe('TabBar tab title derivation', () => {
     expect(screen.getByText('freshell')).toBeInTheDocument()
   })
 
+  it('derives the visible tab title from a fresh-agent working directory', () => {
+    const store = createStore(
+      {
+        tabs: [
+          {
+            id: 'tab-1',
+            createRequestId: 'tab-1',
+            title: 'Tab 1',
+            titleSetByUser: false,
+            status: 'running',
+            mode: 'shell',
+            shell: 'system',
+            createdAt: Date.now(),
+          },
+        ],
+        activeTabId: 'tab-1',
+      },
+      {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'fresh-agent',
+              sessionType: 'freshcodex',
+              provider: 'codex',
+              createRequestId: 'req-1',
+              status: 'idle',
+              initialCwd: '/home/dan/code/freshell',
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+      },
+    )
+
+    render(
+      <Provider store={store}>
+        <TabBar />
+      </Provider>,
+    )
+
+    expect(screen.getByText('freshell')).toBeInTheDocument()
+    expect(screen.queryByText('Tab 1')).not.toBeInTheDocument()
+    expect(screen.queryByText('Freshcodex')).not.toBeInTheDocument()
+  })
+
   it('prefers CLI over browser when both exist', () => {
     const store = createStore(
       {

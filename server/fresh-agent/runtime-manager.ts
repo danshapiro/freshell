@@ -185,15 +185,19 @@ export class FreshAgentRuntimeManager {
       throw new FreshAgentUnsupportedCapabilityError(`Fork is not supported for ${record.sessionType}`)
     }
     const forked = await record.adapter.fork(locator.sessionId, input)
-    const forkedRecord = forked && typeof forked === 'object' ? forked as Record<string, unknown> : {}
-    const forkedSessionId = typeof forkedRecord.threadId === 'string'
-      ? forkedRecord.threadId
-      : (typeof forkedRecord.sessionId === 'string' ? forkedRecord.sessionId : undefined)
-    if (forkedSessionId) {
+    const forkedRecord = forked && typeof forked === 'object' && !Array.isArray(forked)
+      ? forked as { sessionId?: unknown; threadId?: unknown }
+      : undefined
+    const childSessionId = typeof forkedRecord?.sessionId === 'string'
+      ? forkedRecord.sessionId
+      : typeof forkedRecord?.threadId === 'string'
+        ? forkedRecord.threadId
+        : undefined
+    if (childSessionId) {
       this.sessions.set(this.key({
         sessionType: locator.sessionType,
-        provider: locator.provider,
-        sessionId: forkedSessionId,
+        provider: record.runtimeProvider,
+        sessionId: childSessionId,
       }), record)
     }
     return forked
