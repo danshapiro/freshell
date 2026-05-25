@@ -215,6 +215,39 @@ export function createFilesRouter(deps: FilesRouterDeps): Router {
     return res.json({ valid: ok, resolvedPath })
   })
 
+  router.post('/mkdir', validatePath, async (req, res) => {
+    const pathInput = req.body?.path
+    if (!pathInput || typeof pathInput !== 'string') {
+      return res.status(400).json({ error: 'path is required' })
+    }
+
+    const trimmed = pathInput.trim()
+    if (!trimmed) {
+      return res.status(400).json({ error: 'path is required' })
+    }
+
+    const { normalizedPath, flavor } = normalizeUserPath(trimmed)
+    const resolvedFsPath = await toFilesystemPath(normalizedPath, flavor)
+
+    try {
+      const existing = await fsp.stat(resolvedFsPath).catch(() => null)
+      if (existing) {
+        if (existing.isDirectory()) {
+          return res.json({ created: true, existed: true, resolvedPath: normalizedPath })
+        }
+        return res.status(409).json({ error: 'Path exists but is not a directory' })
+      }
+
+      await fsp.mkdir(resolvedFsPath, { recursive: true })
+      return res.json({ created: true, existed: false, resolvedPath: normalizedPath })
+    } catch (err: any) {
+      if (err.code === 'EACCES' || err.code === 'EPERM') {
+        return res.status(403).json({ error: 'Permission denied' })
+      }
+      return res.status(500).json({ error: err.message })
+    }
+  })
+
   router.post('/open', validatePath, async (req, res) => {
     const { path: filePath, reveal, line, column } = req.body || {}
     if (!filePath) {

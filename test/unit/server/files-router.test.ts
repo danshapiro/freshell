@@ -429,4 +429,113 @@ describe('files-router path validation', () => {
       expect(res.body.error).toBe('Path not allowed')
     })
   })
+
+  describe('POST /api/files/mkdir', () => {
+    it('creates a new directory', async () => {
+      mockGetSettings.mockResolvedValue({ allowedFilePaths: undefined })
+      mockStat.mockRejectedValueOnce({ code: 'ENOENT' })
+      mockMkdir.mockResolvedValueOnce(undefined)
+
+      const res = await request(app)
+        .post('/api/files/mkdir')
+        .send({ path: '/home/user/new-project' })
+
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({ created: true, existed: false, resolvedPath: expect.any(String) })
+    })
+
+    it('returns existed:true when directory already exists', async () => {
+      mockGetSettings.mockResolvedValue({ allowedFilePaths: undefined })
+      mockStat.mockResolvedValueOnce({ isDirectory: () => true })
+
+      const res = await request(app)
+        .post('/api/files/mkdir')
+        .send({ path: '/home/user/existing' })
+
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({ created: true, existed: true, resolvedPath: expect.any(String) })
+      expect(mockMkdir).not.toHaveBeenCalled()
+    })
+
+    it('returns 409 when path exists as a file', async () => {
+      mockGetSettings.mockResolvedValue({ allowedFilePaths: undefined })
+      mockStat.mockResolvedValueOnce({ isDirectory: () => false })
+
+      const res = await request(app)
+        .post('/api/files/mkdir')
+        .send({ path: '/home/user/file.txt' })
+
+      expect(res.status).toBe(409)
+      expect(res.body.error).toBe('Path exists but is not a directory')
+    })
+
+    it('returns 403 when path is outside allowed directories', async () => {
+      mockGetSettings.mockResolvedValue({ allowedFilePaths: ['/home/user/projects'] })
+
+      const res = await request(app)
+        .post('/api/files/mkdir')
+        .send({ path: '/etc/evil' })
+
+      expect(res.status).toBe(403)
+      expect(res.body.error).toBe('Path not allowed')
+    })
+
+    it('creates directory inside allowed directory', async () => {
+      mockGetSettings.mockResolvedValue({ allowedFilePaths: ['/home/user/projects'] })
+      mockStat.mockRejectedValueOnce({ code: 'ENOENT' })
+      mockMkdir.mockResolvedValueOnce(undefined)
+
+      const res = await request(app)
+        .post('/api/files/mkdir')
+        .send({ path: '/home/user/projects/subdir' })
+
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({ created: true, existed: false, resolvedPath: expect.any(String) })
+    })
+
+    it('returns 400 when path is missing', async () => {
+      const res = await request(app)
+        .post('/api/files/mkdir')
+        .send({})
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('path is required')
+    })
+
+    it('returns 400 when path is empty', async () => {
+      const res = await request(app)
+        .post('/api/files/mkdir')
+        .send({ path: '   ' })
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('path is required')
+    })
+
+    it('expands tilde in path', async () => {
+      mockGetSettings.mockResolvedValue({ allowedFilePaths: undefined })
+      mockStat.mockRejectedValueOnce({ code: 'ENOENT' })
+      mockMkdir.mockResolvedValueOnce(undefined)
+
+      const homeDir = os.homedir()
+      const res = await request(app)
+        .post('/api/files/mkdir')
+        .send({ path: '~/new-project' })
+
+      expect(res.status).toBe(200)
+      expect(mockMkdir).toHaveBeenCalledWith(path.join(homeDir, 'new-project'), { recursive: true })
+    })
+
+    it('returns 403 when permission is denied', async () => {
+      mockGetSettings.mockResolvedValue({ allowedFilePaths: undefined })
+      mockStat.mockRejectedValueOnce({ code: 'ENOENT' })
+      mockMkdir.mockRejectedValueOnce(Object.assign(new Error('Permission denied'), { code: 'EACCES' }))
+
+      const res = await request(app)
+        .post('/api/files/mkdir')
+        .send({ path: '/root/cant-create' })
+
+      expect(res.status).toBe(403)
+      expect(res.body.error).toBe('Permission denied')
+    })
+  })
 })
