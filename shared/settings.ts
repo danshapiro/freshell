@@ -144,11 +144,13 @@ export type ServerSettings = {
     customEditorCommand?: string
   }
   freshAgent: {
+    enabled: boolean
     initialSetupDone?: boolean
     defaultPlugins: string[]
     providers: Partial<Record<string, AgentChatProviderDefaults>>
   }
   agentChat: {
+    enabled: boolean
     initialSetupDone?: boolean
     defaultPlugins: string[]
     providers: Partial<Record<string, AgentChatProviderDefaults>>
@@ -284,6 +286,39 @@ function mergeRecordOfObjects<T extends Record<string, unknown>>(
   for (const [key, value] of Object.entries(patch || {})) {
     merged[key] = mergeOwnKeys((merged[key] || {}) as T, value || {})
   }
+  return merged
+}
+
+function mergeFreshAgentAliasObjects(
+  agentChatInput: Record<string, unknown> | null | undefined,
+  freshAgentInput: Record<string, unknown> | null | undefined,
+): Record<string, unknown> | null {
+  if (!agentChatInput && !freshAgentInput) {
+    return null
+  }
+
+  const merged: Record<string, unknown> = { ...(agentChatInput || {}), ...(freshAgentInput || {}) }
+  const rawAgentChatProviders = agentChatInput && isRecord(agentChatInput.providers)
+    ? agentChatInput.providers
+    : null
+  const rawFreshAgentProviders = freshAgentInput && isRecord(freshAgentInput.providers)
+    ? freshAgentInput.providers
+    : null
+
+  if (rawAgentChatProviders || rawFreshAgentProviders) {
+    const providers: Record<string, unknown> = {}
+    for (const [providerName, providerPatch] of Object.entries(rawAgentChatProviders || {})) {
+      providers[providerName] = providerPatch
+    }
+    for (const [providerName, providerPatch] of Object.entries(rawFreshAgentProviders || {})) {
+      const existingProviderPatch = providers[providerName]
+      providers[providerName] = isRecord(existingProviderPatch) && isRecord(providerPatch)
+        ? { ...existingProviderPatch, ...providerPatch }
+        : providerPatch
+    }
+    merged.providers = providers
+  }
+
   return merged
 }
 
@@ -610,11 +645,13 @@ export function buildServerSettingsSchema(validCliProviders?: readonly string[])
       customEditorCommand: z.string().optional(),
     }).strict(),
     freshAgent: z.object({
+      enabled: z.boolean(),
       initialSetupDone: z.boolean().optional(),
       defaultPlugins: z.array(z.string()),
       providers: z.record(z.string(), createAgentChatProviderDefaultsPatchSchema()),
     }).strict(),
     agentChat: z.object({
+      enabled: z.boolean(),
       initialSetupDone: z.boolean().optional(),
       defaultPlugins: z.array(z.string()),
       providers: z.record(z.string(), createAgentChatProviderDefaultsSchema()),
@@ -659,11 +696,13 @@ export function buildServerSettingsPatchSchema(validCliProviders?: readonly stri
       customEditorCommand: z.string().optional(),
     }).strict().optional(),
     freshAgent: z.object({
+      enabled: z.coerce.boolean().optional(),
       initialSetupDone: z.boolean().optional(),
       defaultPlugins: z.array(z.string()).optional(),
       providers: z.record(z.string(), createAgentChatProviderDefaultsPatchSchema()).optional(),
     }).strict().optional(),
     agentChat: z.object({
+      enabled: z.coerce.boolean().optional(),
       initialSetupDone: z.boolean().optional(),
       defaultPlugins: z.array(z.string()).optional(),
       providers: z.record(z.string(), createAgentChatProviderDefaultsPatchSchema()).optional(),
@@ -716,10 +755,12 @@ export function createDefaultServerSettings(options: SettingsDefaultsOptions = {
       externalEditor: 'auto',
     },
     freshAgent: {
+      enabled: false,
       defaultPlugins: [],
       providers: {},
     },
     agentChat: {
+      enabled: false,
       defaultPlugins: [],
       providers: {},
     },
@@ -934,14 +975,15 @@ function sanitizeServerSettingsPatch(patch: ServerSettingsPatch): ServerSettings
     }
   }
 
-  const rawFreshAgent = isRecord(candidate.freshAgent)
-    ? candidate.freshAgent
-    : isRecord(candidate.agentChat)
-      ? candidate.agentChat
-      : null
+  const rawAgentChatInput = isRecord(candidate.agentChat) ? candidate.agentChat : null
+  const rawFreshAgentInput = isRecord(candidate.freshAgent) ? candidate.freshAgent : null
+  const rawFreshAgent = mergeFreshAgentAliasObjects(rawAgentChatInput, rawFreshAgentInput)
 
   if (rawFreshAgent) {
     const freshAgent: ServerSettingsPatch['freshAgent'] = {}
+    if (hasOwn(rawFreshAgent, 'enabled')) {
+      freshAgent.enabled = !!rawFreshAgent.enabled
+    }
     if (hasOwn(rawFreshAgent, 'initialSetupDone') && typeof rawFreshAgent.initialSetupDone === 'boolean') {
       freshAgent.initialSetupDone = rawFreshAgent.initialSetupDone
     }
@@ -1260,11 +1302,10 @@ export function extractLegacyLocalSettingsSeed(
     }
     maybeAssignNested(patch, 'sidebar', sidebarPatch)
   }
-  const rawFreshAgentLocal = isRecord(raw.freshAgent)
-    ? raw.freshAgent
-    : isRecord(raw.agentChat)
-      ? raw.agentChat
-      : undefined
+  const rawFreshAgentLocal = mergeFreshAgentAliasObjects(
+    isRecord(raw.agentChat) ? raw.agentChat : null,
+    isRecord(raw.freshAgent) ? raw.freshAgent : null,
+  )
   if (rawFreshAgentLocal) {
     const freshAgentPatch = pickKeys(rawFreshAgentLocal, AGENT_CHAT_LOCAL_KEYS)
     maybeAssignNested(patch, 'freshAgent', freshAgentPatch)
@@ -1313,11 +1354,10 @@ export function stripLocalSettings(
     }
   }
 
-  const rawFreshAgent = isRecord(raw.freshAgent)
-    ? raw.freshAgent
-    : isRecord(raw.agentChat)
-      ? raw.agentChat
-      : undefined
+  const rawFreshAgent = mergeFreshAgentAliasObjects(
+    isRecord(raw.agentChat) ? raw.agentChat : null,
+    isRecord(raw.freshAgent) ? raw.freshAgent : null,
+  )
   if (rawFreshAgent) {
     const strippedFreshAgent = omitKeys(rawFreshAgent, AGENT_CHAT_LOCAL_KEYS)
     if (Object.keys(strippedFreshAgent).length > 0) {

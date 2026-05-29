@@ -94,6 +94,55 @@ describe('shared settings contract', () => {
     }).success).toBe(false)
   })
 
+  it('defaults fresh clients off and accepts a server-backed enable switch', () => {
+    const defaults = createDefaultServerSettings({ loggingDebug: false })
+
+    expect(defaults.freshAgent.enabled).toBe(false)
+    expect(defaults.agentChat.enabled).toBe(false)
+
+    const parsed = buildServerSettingsPatchSchema().parse({
+      freshAgent: { enabled: true },
+    })
+    expect(parsed.freshAgent?.enabled).toBe(true)
+
+    const merged = mergeServerSettings(defaults, {
+      freshAgent: { enabled: true },
+    })
+    expect(merged.freshAgent.enabled).toBe(true)
+    expect(merged.agentChat.enabled).toBe(true)
+  })
+
+  it('merges freshAgent and agentChat alias patches before sanitizing', () => {
+    const merged = mergeServerSettings(createDefaultServerSettings({ loggingDebug: false }), {
+      freshAgent: {
+        enabled: true,
+        providers: {
+          freshclaude: { effort: 'max' },
+        },
+      },
+      agentChat: {
+        defaultPlugins: ['planner'],
+        providers: {
+          freshclaude: {
+            modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+          },
+        },
+      },
+    })
+
+    expect(merged.freshAgent).toMatchObject({
+      enabled: true,
+      defaultPlugins: ['planner'],
+      providers: {
+        freshclaude: {
+          modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+          effort: 'max',
+        },
+      },
+    })
+    expect(merged.agentChat).toEqual(merged.freshAgent)
+  })
+
   it('rejects representative local-only fields in the server patch schema', () => {
     const schema = buildServerSettingsPatchSchema()
 

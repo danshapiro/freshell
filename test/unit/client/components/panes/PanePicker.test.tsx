@@ -58,6 +58,7 @@ function createStore(overrides?: {
   enabledProviders?: string[]
   extensions?: ClientExtensionEntry[]
   featureFlags?: Record<string, boolean>
+  freshClientsEnabled?: boolean
 }) {
   return configureStore({
     reducer: {
@@ -99,6 +100,12 @@ function createStore(overrides?: {
           codingCli: {
             enabledProviders: (overrides?.enabledProviders ?? []) as any[],
             providers: {},
+          },
+          freshAgent: {
+            enabled: overrides?.freshClientsEnabled ?? false,
+          },
+          agentChat: {
+            enabled: overrides?.freshClientsEnabled ?? false,
           },
           logging: { debug: false },
         },
@@ -227,6 +234,7 @@ describe('PanePicker', () => {
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
         extensions: defaultCliExtensions,
+        freshClientsEnabled: true,
       })
       const buttons = screen.getAllByRole('button')
       const labels = buttons.map(b => b.getAttribute('aria-label'))
@@ -246,6 +254,7 @@ describe('PanePicker', () => {
         enabledProviders: ['claude', 'codex'],
         extensions: defaultCliExtensions,
         featureFlags: { kilroy: true },
+        freshClientsEnabled: true,
       })
       const buttons = screen.getAllByRole('button')
       const labels = buttons.map(b => b.getAttribute('aria-label'))
@@ -259,6 +268,34 @@ describe('PanePicker', () => {
       expect(labels[5]).toBe('Editor')
       expect(labels[6]).toBe('Browser')
       expect(labels[7]).toBe('Shell')
+    })
+
+    it('hides all fresh clients by default even when their CLIs are available and enabled', () => {
+      renderPicker({
+        availableClis: { claude: true, codex: true, opencode: true },
+        enabledProviders: ['claude', 'codex', 'opencode'],
+        extensions: [...defaultCliExtensions, mockOpencodeExt],
+        featureFlags: { kilroy: true },
+      })
+
+      expect(screen.queryByRole('button', { name: 'Freshclaude' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Freshcodex' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Freshopencode' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Kilroy' })).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Claude CLI' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Codex CLI' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'OpenCode' })).toBeInTheDocument()
+    })
+
+    it('shows Freshopencode when fresh clients and OpenCode are enabled', () => {
+      renderPicker({
+        availableClis: { opencode: true },
+        enabledProviders: ['opencode'],
+        extensions: [mockOpencodeExt],
+        freshClientsEnabled: true,
+      })
+
+      expect(screen.getByRole('button', { name: 'Freshopencode' })).toBeInTheDocument()
     })
 
     it('shows only non-CLI options when no CLIs are available', () => {
@@ -599,6 +636,7 @@ describe('PanePicker', () => {
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
         extensions: defaultCliExtensions,
+        freshClientsEnabled: true,
       })
 
       const rows = screen.getAllByTestId('pane-picker-option-row')

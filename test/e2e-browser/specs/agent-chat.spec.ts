@@ -87,13 +87,31 @@ test.describe('Agent Chat', () => {
         payload: { claude: true },
       })
       harness?.dispatch({
-        type: 'settings/updateSettingsLocal',
+        type: 'settings/previewServerSettingsPatch',
         payload: {
           codingCli: {
             enabledProviders: ['claude'],
           },
+          freshAgent: {
+            enabled: true,
+          },
+          agentChat: {
+            enabled: true,
+          },
         },
       })
+    })
+  }
+
+  async function suppressFreshAgentNetworkForActivePane(page: any) {
+    await page.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      const state = harness?.getState()
+      const tabId = state?.tabs?.activeTabId
+      const paneId = tabId ? state?.panes?.activePane?.[tabId] : null
+      if (paneId) {
+        harness?.setAgentChatNetworkEffectsSuppressed(paneId, true)
+      }
     })
   }
 
@@ -171,6 +189,7 @@ test.describe('Agent Chat', () => {
 
     await harness.clearSentWsMessages()
     const picker = await openPanePicker(page)
+    await suppressFreshAgentNetworkForActivePane(page)
     await picker.getByRole('button', { name: /^Freshclaude$/i }).click({ force: true })
     await confirmFreshclaudeDirectory(page, serverInfo.homeDir)
 
@@ -195,9 +214,9 @@ test.describe('Agent Chat', () => {
 
     await expect.poll(async () => {
       const sent = await harness.getSentWsMessages()
-      return sent.find((msg: any) => msg?.type === 'sdk.create') ?? null
+      return sent.find((msg: any) => msg?.type === 'freshAgent.create') ?? null
     }).toMatchObject({
-      type: 'sdk.create',
+      type: 'freshAgent.create',
       model: 'opus',
     })
   })
@@ -242,14 +261,15 @@ test.describe('Agent Chat', () => {
 
     await harness.clearSentWsMessages()
     const picker = await openPanePicker(page)
+    await suppressFreshAgentNetworkForActivePane(page)
     await picker.getByRole('button', { name: /^Freshclaude$/i }).click({ force: true })
     await confirmFreshclaudeDirectory(page, serverInfo.homeDir)
 
     await expect.poll(async () => {
       const sent = await harness.getSentWsMessages()
-      return sent.find((msg: any) => msg?.type === 'sdk.create') ?? null
+      return sent.find((msg: any) => msg?.type === 'freshAgent.create') ?? null
     }).toMatchObject({
-      type: 'sdk.create',
+      type: 'freshAgent.create',
       model: 'opus',
     })
 

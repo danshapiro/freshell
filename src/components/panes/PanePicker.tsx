@@ -101,6 +101,9 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
   const featureFlags = useAppSelector((s) => s.connection?.featureFlags ?? EMPTY_FEATURE_FLAGS)
   const enabledProviders = useAppSelector((s) => s.settings?.settings?.codingCli?.enabledProviders ?? EMPTY_ENABLED_PROVIDERS)
   const disabledExtensions = useAppSelector((s) => s.settings?.settings?.extensions?.disabled ?? EMPTY_ENABLED_PROVIDERS)
+  const freshClientsEnabled = useAppSelector((s) => (
+    s.settings?.settings?.freshAgent?.enabled ?? s.settings?.settings?.agentChat?.enabled ?? false
+  ))
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
 
   const options = useMemo(() => {
@@ -114,7 +117,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
     const shellOptions = isWindowsLike(platform) ? windowsShellOptions : [shellOption]
 
     // Agent chat options: only show if underlying CLI is available, enabled, and not hidden by feature flag
-    const visibleAgentChatConfigs = getVisibleAgentChatConfigs(featureFlags)
+    const visibleAgentChatConfigs = freshClientsEnabled ? getVisibleAgentChatConfigs(featureFlags) : []
     const agentChatOptions: PickerOption[] = visibleAgentChatConfigs
       .filter((config) => availableClis[config.codingCliProvider] && enabledProviders.includes(config.codingCliProvider) && !disabledExtensions.includes(config.codingCliProvider))
       .map((config) => ({
@@ -124,18 +127,20 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
         shortcut: config.pickerShortcut,
         afterCli: config.pickerAfterCli,
       }))
-    const otherFreshAgentOptions: PickerOption[] = FRESH_AGENT_REGISTRY
-      .filter((entry) => !visibleAgentChatConfigs.some((config) => config.name === entry.sessionType))
-      .filter((entry) => !entry.disabled)
-      .filter((entry) => !entry.hidden || featureFlags[entry.featureFlag ?? entry.sessionType] === true)
-      .filter((entry) => availableClis[entry.runtimeProvider] && enabledProviders.includes(entry.runtimeProvider) && !disabledExtensions.includes(entry.runtimeProvider))
-      .map((entry) => ({
-        type: entry.sessionType as PanePickerType,
-        label: entry.label,
-        icon: entry.icon,
-        shortcut: entry.pickerShortcut,
-        afterCli: entry.pickerAfterCli,
-      }))
+    const otherFreshAgentOptions: PickerOption[] = freshClientsEnabled
+      ? FRESH_AGENT_REGISTRY
+          .filter((entry) => !visibleAgentChatConfigs.some((config) => config.name === entry.sessionType))
+          .filter((entry) => !entry.disabled)
+          .filter((entry) => !entry.hidden || featureFlags[entry.featureFlag ?? entry.sessionType] === true)
+          .filter((entry) => availableClis[entry.runtimeProvider] && enabledProviders.includes(entry.runtimeProvider) && !disabledExtensions.includes(entry.runtimeProvider))
+          .map((entry) => ({
+            type: entry.sessionType as PanePickerType,
+            label: entry.label,
+            icon: entry.icon,
+            shortcut: entry.pickerShortcut,
+            afterCli: entry.pickerAfterCli,
+          }))
+      : []
 
     const allFreshAgentOptions = [...agentChatOptions, ...otherFreshAgentOptions]
     const agentChatBefore = allFreshAgentOptions.filter((o) => !o.afterCli)
@@ -153,7 +158,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
 
     // Order: agent chat (before), CLIs, agent chat (after), Editor, Browser, Shell(s), Extensions
     return [...agentChatBefore, ...cliOptions, ...agentChatAfter, ...nonShellOptions, ...shellOptions, ...extensionOptions]
-  }, [platform, availableClis, featureFlags, enabledProviders, disabledExtensions, extensionEntries])
+  }, [platform, availableClis, featureFlags, enabledProviders, disabledExtensions, freshClientsEnabled, extensionEntries])
 
   const [focusedIndex, setFocusedIndex] = useState<number | null>(null)
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null)

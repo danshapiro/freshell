@@ -1199,7 +1199,7 @@ describe('ConfigStore', () => {
     })
 
     it('defaultSettings includes empty agentChat providers', () => {
-      expect(defaultSettings.agentChat).toEqual({ defaultPlugins: [], providers: {} })
+      expect(defaultSettings.agentChat).toEqual({ enabled: false, defaultPlugins: [], providers: {} })
     })
 
     it('migrates legacy flat freshclaude settings to agentChat.providers.freshclaude on load', async () => {

@@ -7,13 +7,20 @@ async function enableClaudeAndCodex(page: any) {
       type: 'connection/setAvailableClis',
       payload: { claude: true, codex: true },
     })
-    harness?.dispatch({
-      type: 'settings/updateSettingsLocal',
-      payload: {
-        codingCli: {
-          enabledProviders: ['claude', 'codex'],
-        },
+    const patchPayload = {
+      codingCli: {
+        enabledProviders: ['claude', 'codex'],
       },
+      freshAgent: {
+        enabled: true,
+      },
+      agentChat: {
+        enabled: true,
+      },
+    }
+    harness?.dispatch({
+      type: 'settings/previewServerSettingsPatch',
+      payload: patchPayload,
     })
   })
 }
@@ -34,6 +41,31 @@ async function getActiveLeaf(harness: any) {
 }
 
 test.describe('Fresh Agent', () => {
+  test('pane picker hides fresh clients by default even when their CLIs are enabled', async ({ freshellPage, page, terminal }) => {
+    await terminal.waitForTerminal()
+    await page.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      harness?.dispatch({
+        type: 'connection/setAvailableClis',
+        payload: { claude: true, codex: true, opencode: true },
+      })
+      harness?.dispatch({
+        type: 'settings/previewServerSettingsPatch',
+        payload: {
+          codingCli: {
+            enabledProviders: ['claude', 'codex', 'opencode'],
+          },
+        },
+      })
+    })
+
+    await openPanePicker(page)
+    await expect(page.getByRole('button', { name: /^Freshclaude$/i })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: /^Freshcodex$/i })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: /^Freshopencode$/i })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: /^Kilroy$/i })).toHaveCount(0)
+  })
+
   test('pane picker shows Freshclaude and Freshcodex when their CLIs are enabled', async ({ freshellPage, page, terminal }) => {
     await terminal.waitForTerminal()
     await enableClaudeAndCodex(page)
@@ -46,7 +78,7 @@ test.describe('Fresh Agent', () => {
   test('freshclaude banners render through the fresh-agent pane surface and answer over WS', async ({ freshellPage, page, harness, terminal }) => {
     await terminal.waitForTerminal()
     const { tabId, paneId } = await getActiveLeaf(harness)
-    const sessionId = 'freshclaude-thread-1'
+    const sessionId = '33333333-3333-4333-8333-333333333333'
 
     await page.route(`**/api/fresh-agent/threads/freshclaude/claude/${sessionId}*`, async (route) => {
       await route.fulfill({
@@ -118,6 +150,7 @@ test.describe('Fresh Agent', () => {
             provider: 'claude',
             createRequestId: 'req-e2e-permission',
             sessionId: currentSessionId,
+            sessionRef: { provider: 'claude', sessionId: currentSessionId },
             resumeSessionId: currentSessionId,
             status: 'idle',
             settingsDismissed: true,
@@ -218,7 +251,7 @@ test.describe('Fresh Agent', () => {
     }, activePaneId)
     await page.getByRole('button', { name: /^Freshcodex$/i }).click()
     await page.getByRole('option').first().click()
-    await expect(page.locator('[data-context="fresh-agent"]').getByText('Starting session', { exact: true }).first()).toBeVisible()
+    await expect(page.getByRole('group', { name: /pane: freshcodex/i }).last()).toBeVisible()
 
     await page.evaluate(({ currentTabId, currentPaneId }) => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({
@@ -232,6 +265,7 @@ test.describe('Fresh Agent', () => {
             provider: 'codex',
             createRequestId: 'req-codex-browser',
             sessionId: 'thread-codex',
+            sessionRef: { provider: 'codex', sessionId: 'thread-codex' },
             resumeSessionId: 'thread-codex',
             status: 'connected',
           },
@@ -249,6 +283,9 @@ test.describe('Fresh Agent', () => {
     await expect(page.getByText('pending')).toBeVisible()
     await expect(page.getByText('thread-parent-1')).toBeVisible()
 
+    await page.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
+    })
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await harness.waitForHarness()
     await harness.waitForConnection()

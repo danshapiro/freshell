@@ -263,6 +263,21 @@ export default function WorkspaceSettings({
       </SettingsSection>
 
       <SettingsSection title="Fresh agent" description="Display settings for fresh-agent panes">
+        <SettingsRow
+          label="Enable fresh clients (experimental)"
+          description="Show Freshclaude, Freshcodex, Freshopencode, and feature-flagged fresh clients in the pane picker."
+        >
+          <Toggle
+            checked={settings.freshAgent?.enabled ?? settings.agentChat?.enabled ?? false}
+            onChange={(checked) => {
+              applyServerSetting({
+                freshAgent: { enabled: checked },
+                agentChat: { enabled: checked },
+              })
+            }}
+            aria-label="Enable fresh clients (experimental)"
+          />
+        </SettingsRow>
         <SettingsRow label="Show thinking">
           <Toggle
             checked={settings.freshAgent?.showThinking ?? settings.agentChat?.showThinking ?? false}

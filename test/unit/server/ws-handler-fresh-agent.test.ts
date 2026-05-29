@@ -2,11 +2,34 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import http from 'http'
 import WebSocket from 'ws'
 
+vi.mock('../../../server/config-store.js', () => ({
+  configStore: {
+    snapshot: vi.fn(),
+    pushRecentDirectory: vi.fn().mockResolvedValue([]),
+  },
+}))
+
 import { WsHandler } from '../../../server/ws-handler.js'
 import { TerminalRegistry } from '../../../server/terminal-registry.js'
+import { configStore } from '../../../server/config-store.js'
+import { createDefaultServerSettings } from '../../../shared/settings.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 const TEST_AUTH_TOKEN = 'testtoken-testtoken'
+
+function makeUserConfig(freshClientsEnabled: boolean) {
+  const settings = createDefaultServerSettings({ loggingDebug: false })
+  settings.freshAgent.enabled = freshClientsEnabled
+  settings.agentChat.enabled = freshClientsEnabled
+  return {
+    version: 1 as const,
+    settings,
+    sessionOverrides: {},
+    terminalOverrides: {},
+    projectColors: {},
+    recentDirectories: [],
+  }
+}
 
 describe('WsHandler fresh-agent routing', () => {
   let originalAuthToken: string | undefined
@@ -14,6 +37,7 @@ describe('WsHandler fresh-agent routing', () => {
   beforeEach(() => {
     originalAuthToken = process.env.AUTH_TOKEN
     process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
+    vi.mocked(configStore.snapshot).mockResolvedValue(makeUserConfig(true))
   })
 
   async function createServer(options: Record<string, unknown> = {}) {
@@ -94,6 +118,50 @@ describe('WsHandler fresh-agent routing', () => {
     }
   })
 
+  it('rejects freshAgent.create without touching the runtime manager when fresh clients are disabled', async () => {
+    vi.mocked(configStore.snapshot).mockResolvedValue(makeUserConfig(false))
+    const runtimeManager = {
+      create: vi.fn().mockResolvedValue({
+        sessionId: 'codex-session-disabled',
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+      }),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const ws = await connectAndAuth(server)
+      const seenMessages: any[] = []
+      ws.on('message', (data) => {
+        seenMessages.push(JSON.parse(data.toString()))
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.create',
+        requestId: 'req-disabled',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        cwd: '/workspace',
+      }))
+
+      await vi.waitFor(() => {
+        expect(seenMessages).toContainEqual(expect.objectContaining({
+          type: 'freshAgent.create.failed',
+          requestId: 'req-disabled',
+          code: 'FRESH_CLIENTS_DISABLED',
+          message: 'Fresh clients are disabled',
+          retryable: true,
+        }))
+        expect(runtimeManager.create).not.toHaveBeenCalled()
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
   it('replays duplicate freshAgent.create request ids without creating duplicate runtime sessions', async () => {
     const runtimeManager = {
       create: vi.fn().mockResolvedValue({
@@ -146,6 +214,60 @@ describe('WsHandler fresh-agent routing', () => {
             runtimeProvider: 'codex',
           }),
         ])
+        expect(runtimeManager.create).toHaveBeenCalledTimes(1)
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('replays duplicate freshAgent.create request ids even after fresh clients are disabled', async () => {
+    const runtimeManager = {
+      create: vi.fn().mockResolvedValue({
+        sessionId: 'codex-session-idempotent-disabled',
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+      }),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const ws = await connectAndAuth(server)
+      const seenMessages: any[] = []
+      ws.on('message', (data) => {
+        seenMessages.push(JSON.parse(data.toString()))
+      })
+
+      const createMessage = {
+        type: 'freshAgent.create',
+        requestId: 'req-idempotent-disabled',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        cwd: '/workspace',
+      }
+
+      ws.send(JSON.stringify(createMessage))
+      await vi.waitFor(() => {
+        expect(seenMessages.filter((message) => message.type === 'freshAgent.created')).toHaveLength(1)
+      })
+
+      vi.mocked(configStore.snapshot).mockResolvedValue(makeUserConfig(false))
+      ws.send(JSON.stringify(createMessage))
+
+      await vi.waitFor(() => {
+        const created = seenMessages.filter((message) => message.type === 'freshAgent.created')
+        expect(created).toHaveLength(2)
+        expect(created[1]).toEqual(expect.objectContaining({
+          requestId: 'req-idempotent-disabled',
+          sessionId: 'codex-session-idempotent-disabled',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          runtimeProvider: 'codex',
+        }))
+        expect(seenMessages.some((message) => message.type === 'freshAgent.create.failed')).toBe(false)
         expect(runtimeManager.create).toHaveBeenCalledTimes(1)
       })
     } finally {

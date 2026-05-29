@@ -1646,7 +1646,13 @@ describe('PaneContainer', () => {
                 providers: providerSettingsByName ?? (providerSettings ? { claude: providerSettings } : {}),
               },
               freshAgent: {
+                enabled: true,
                 providers: freshAgentProviderSettingsByName ?? {},
+              },
+              agentChat: {
+                enabled: true,
+                defaultPlugins: [],
+                providers: {},
               },
               logging: { debug: false },
             },

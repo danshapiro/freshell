@@ -18,10 +18,16 @@ test.describe('Settings', () => {
         payload: { claude: true },
       })
       harness?.dispatch({
-        type: 'settings/updateSettingsLocal',
+        type: 'settings/previewServerSettingsPatch',
         payload: {
           codingCli: {
             enabledProviders: ['claude'],
+          },
+          freshAgent: {
+            enabled: true,
+          },
+          agentChat: {
+            enabled: true,
           },
         },
       })
@@ -44,6 +50,18 @@ test.describe('Settings', () => {
     const picker = page.getByRole('toolbar', { name: /pane type picker/i }).last()
     await expect(picker).toBeVisible({ timeout: 10_000 })
     return picker
+  }
+
+  async function suppressFreshAgentNetworkForActivePane(page: any) {
+    await page.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      const state = harness?.getState()
+      const tabId = state?.tabs?.activeTabId
+      const paneId = tabId ? state?.panes?.activePane?.[tabId] : null
+      if (paneId) {
+        harness?.setAgentChatNetworkEffectsSuppressed(paneId, true)
+      }
+    })
   }
 
   async function openFreshclaudeSettings(page: any) {
@@ -324,12 +342,13 @@ test.describe('Settings', () => {
 
     await harness.clearSentWsMessages()
     const picker = await openPanePicker(page)
+    await suppressFreshAgentNetworkForActivePane(page)
     await picker.getByRole('button', { name: /^Freshclaude$/i }).click({ force: true })
     await confirmFreshclaudeDirectory(page, serverInfo.homeDir)
 
     await expect.poll(async () => {
       const sent = await harness.getSentWsMessages()
-      const create = sent.find((message: any) => message?.type === 'sdk.create')
+      const create = sent.find((message: any) => message?.type === 'freshAgent.create')
       return create
         ? {
             model: create.model ?? null,
@@ -412,6 +431,7 @@ test.describe('Settings', () => {
 
     await harness.clearSentWsMessages()
     const picker = await openPanePicker(page)
+    await suppressFreshAgentNetworkForActivePane(page)
     await picker.getByRole('button', { name: /^Freshclaude$/i }).click({ force: true })
     await confirmFreshclaudeDirectory(page, serverInfo.homeDir)
 
@@ -420,7 +440,7 @@ test.describe('Settings', () => {
     await expect(createFailedAlert).toContainText('Probe failed upstream')
     await expect.poll(async () => {
       const sent = await harness.getSentWsMessages()
-      return sent.filter((message: any) => message?.type === 'sdk.create').length
+      return sent.filter((message: any) => message?.type === 'freshAgent.create').length
     }).toBe(0)
 
     const dialog = await openFreshclaudeSettings(page)
@@ -433,7 +453,7 @@ test.describe('Settings', () => {
 
     await expect.poll(async () => {
       const sent = await harness.getSentWsMessages()
-      const create = sent.find((message: any) => message?.type === 'sdk.create')
+      const create = sent.find((message: any) => message?.type === 'freshAgent.create')
       return create
         ? {
             model: create.model ?? null,

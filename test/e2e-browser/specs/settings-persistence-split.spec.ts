@@ -59,10 +59,16 @@ async function enableFreshclaude(page: any): Promise<void> {
       payload: { claude: true },
     })
     harness?.dispatch({
-      type: 'settings/updateSettingsLocal',
+      type: 'settings/previewServerSettingsPatch',
       payload: {
         codingCli: {
           enabledProviders: ['claude'],
+        },
+        freshAgent: {
+          enabled: true,
+        },
+        agentChat: {
+          enabled: true,
         },
       },
     })
@@ -132,9 +138,22 @@ async function confirmFreshclaudeDirectory(page: any, cwd: string) {
   await directoryInput.waitFor({ state: 'hidden', timeout: 10_000 })
 }
 
+async function suppressFreshAgentNetworkForActivePane(page: any): Promise<void> {
+  await page.evaluate(() => {
+    const harness = window.__FRESHELL_TEST_HARNESS__
+    const state = harness?.getState()
+    const tabId = state?.tabs?.activeTabId
+    const paneId = tabId ? state?.panes?.activePane?.[tabId] : null
+    if (paneId) {
+      harness?.setAgentChatNetworkEffectsSuppressed(paneId, true)
+    }
+  })
+}
+
 async function createFreshclaudePane(page: any, cwd: string): Promise<void> {
   const initialCount = await page.getByRole('group', { name: /pane: freshclaude/i }).count()
   const picker = await openPanePicker(page)
+  await suppressFreshAgentNetworkForActivePane(page)
   await picker.getByRole('button', { name: /^Freshclaude$/i }).click({ force: true })
   await confirmFreshclaudeDirectory(page, cwd)
   await expect.poll(async () => (
@@ -325,7 +344,7 @@ test.describe('Settings Persistence Split', () => {
 
     await expect.poll(async () => {
       const sent = await getSentWsMessages(page)
-      const create = sent.find((message) => message?.type === 'sdk.create')
+      const create = sent.find((message) => message?.type === 'freshAgent.create')
       return create
         ? {
             model: create.model ?? null,
@@ -357,7 +376,7 @@ test.describe('Settings Persistence Split', () => {
 
     await expect.poll(async () => {
       const sent = await getSentWsMessages(page)
-      const create = sent.find((message) => message?.type === 'sdk.create')
+      const create = sent.find((message) => message?.type === 'freshAgent.create')
       return create
         ? {
             model: create.model ?? null,
@@ -435,7 +454,7 @@ test.describe('Settings Persistence Split', () => {
 
     await expect.poll(async () => {
       const sent = await getSentWsMessages(page)
-      const create = sent.find((message) => message?.type === 'sdk.create')
+      const create = sent.find((message) => message?.type === 'freshAgent.create')
       return create
         ? {
             model: create.model ?? null,
@@ -470,7 +489,7 @@ test.describe('Settings Persistence Split', () => {
 
     await expect.poll(async () => {
       const sent = await getSentWsMessages(page)
-      const create = sent.find((message) => message?.type === 'sdk.create')
+      const create = sent.find((message) => message?.type === 'freshAgent.create')
       return create
         ? {
             model: create.model ?? null,
@@ -550,7 +569,7 @@ test.describe('Settings Persistence Split', () => {
 
     await expect.poll(async () => {
       const sent = await getSentWsMessages(page)
-      const create = sent.find((message) => message?.type === 'sdk.create')
+      const create = sent.find((message) => message?.type === 'freshAgent.create')
       return create
         ? {
             model: create.model ?? null,
@@ -625,7 +644,7 @@ test.describe('Settings Persistence Split', () => {
     await expect(page.getByText('Selected model claude-opus-4-6 is no longer available.')).toBeVisible()
     await expect.poll(async () => {
       const sent = await getSentWsMessages(page)
-      return sent.filter((message) => message?.type === 'sdk.create').length
+      return sent.filter((message) => message?.type === 'freshAgent.create').length
     }).toBe(0)
 
     const dialog = await openFreshclaudeSettings(page)
@@ -709,7 +728,7 @@ test.describe('Settings Persistence Split', () => {
 
     await expect.poll(async () => {
       const sent = await getSentWsMessages(page)
-      const create = sent.find((message) => message?.type === 'sdk.create')
+      const create = sent.find((message) => message?.type === 'freshAgent.create')
       return create
         ? {
             model: create.model ?? null,

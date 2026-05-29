@@ -6,6 +6,7 @@ import {
   renderSettingsView,
   switchSettingsTab,
 } from './settings-view-test-utils'
+import { api } from '@/lib/api'
 
 vi.mock('@/lib/api', () => ({
   api: {
@@ -21,7 +22,10 @@ installSettingsViewHooks({ fakeTimers: true, mockFonts: true })
 
 function getToggle(labelText: string) {
   const label = screen.getByText(labelText)
-  const row = label.closest('div[class*="flex"]')
+  let row: HTMLElement | null = label.parentElement
+  while (row && !row.querySelector('[role="switch"]')) {
+    row = row.parentElement
+  }
   if (!row) throw new Error(`Row with label "${labelText}" not found`)
   return row.querySelector('[role="switch"]') as HTMLElement
 }
@@ -36,11 +40,12 @@ describe('SettingsView fresh agent settings', () => {
     expect(screen.getByText('Display settings for fresh-agent panes')).toBeInTheDocument()
   })
 
-  it('renders Show thinking, Show tools, and Show timecodes toggles', () => {
+  it('renders the enable switch, Show thinking, Show tools, and Show timecodes toggles', () => {
     const store = createSettingsViewStore()
     renderSettingsView(store)
     switchSettingsTab('Workspace')
 
+    expect(getToggle('Enable fresh clients (experimental)')).toBeInTheDocument()
     expect(getToggle('Show thinking')).toBeInTheDocument()
     expect(getToggle('Show tools')).toBeInTheDocument()
     expect(getToggle('Show timecodes & model')).toBeInTheDocument()
@@ -51,6 +56,7 @@ describe('SettingsView fresh agent settings', () => {
     renderSettingsView(store)
     switchSettingsTab('Workspace')
 
+    expect(getToggle('Enable fresh clients (experimental)')).toHaveAttribute('aria-checked', 'false')
     expect(getToggle('Show thinking')).toHaveAttribute('aria-checked', 'false')
     expect(getToggle('Show tools')).toHaveAttribute('aria-checked', 'false')
     expect(getToggle('Show timecodes & model')).toHaveAttribute('aria-checked', 'false')
@@ -66,6 +72,26 @@ describe('SettingsView fresh agent settings', () => {
     expect(getToggle('Show thinking')).toHaveAttribute('aria-checked', 'true')
     expect(getToggle('Show tools')).toHaveAttribute('aria-checked', 'true')
     expect(getToggle('Show timecodes & model')).toHaveAttribute('aria-checked', 'true')
+  })
+
+  it('toggling Enable fresh clients updates server-backed settings', async () => {
+    const store = createSettingsViewStore()
+    renderSettingsView(store)
+    switchSettingsTab('Workspace')
+
+    fireEvent.click(getToggle('Enable fresh clients (experimental)'))
+
+    expect(store.getState().settings.settings.freshAgent.enabled).toBe(true)
+    expect(store.getState().settings.settings.agentChat.enabled).toBe(true)
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(api.patch).toHaveBeenCalledWith('/api/settings', {
+      freshAgent: { enabled: true },
+      agentChat: { enabled: true },
+    })
   })
 
   it('toggling Show thinking updates the store to true', () => {

@@ -285,6 +285,32 @@ describe('FreshAgentView', () => {
     expect(screen.getByRole('region', { name: /question from codex/i })).toHaveTextContent('Codex has a question')
   })
 
+  it('loads a non-Claude fresh-agent snapshot from durable sessionRef after persistence strips sessionId', async () => {
+    const store = createStore()
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            createRequestId: 'req-restored-codex',
+            sessionRef: { provider: 'codex', sessionId: 'thread-from-ref' },
+            status: 'connected',
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', 'thread-from-ref', expect.any(Object))
+    })
+    expect(await screen.findByText('Codex turn')).toBeInTheDocument()
+  })
+
   it('acquires a session id for a new non-Claude fresh-agent pane after freshAgent.created', async () => {
     const store = createStore()
     store.dispatch(initLayout({
@@ -2078,6 +2104,56 @@ describe('FreshAgentView', () => {
       expect(leaf.content.status).toBe('connected')
     })
     unmount()
+  })
+
+  it('allows retrying a disabled fresh-client create after settings change', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-disabled-create',
+        status: 'creating',
+        sessionRef: { provider: 'codex', sessionId: 'codex-thread-disabled' },
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    const onMessage = wsMock.onMessage.mock.calls[0]?.[0]
+    act(() => {
+      onMessage({
+        type: 'freshAgent.create.failed',
+        requestId: 'req-disabled-create',
+        code: 'FRESH_CLIENTS_DISABLED',
+        message: 'Fresh clients are disabled',
+        retryable: true,
+      })
+    })
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Retry' }))
+
+    await waitFor(() => {
+      const leaf = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content.kind).toBe('fresh-agent')
+      if (leaf.content.kind === 'fresh-agent') {
+        expect(leaf.content.status).toBe('creating')
+        expect(leaf.content.createError).toBeUndefined()
+        expect(leaf.content.createRequestId).not.toBe('req-disabled-create')
+        expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'freshAgent.create',
+          requestId: leaf.content.createRequestId,
+          resumeSessionId: 'codex-thread-disabled',
+        }))
+      }
+    })
   })
 
   it('surfaces a missing Freshcodex rollout as a restore error instead of replacing the thread', async () => {

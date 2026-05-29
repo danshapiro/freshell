@@ -1325,6 +1325,10 @@ export class WsHandler {
     return 'Fresh Agent runtime is not enabled'
   }
 
+  private freshClientsEnabled(settings?: ServerSettings): boolean {
+    return settings?.freshAgent?.enabled ?? settings?.agentChat?.enabled ?? false
+  }
+
   private sendFreshAgentSubscriptionError(ws: LiveWebSocket, locator: FreshAgentLocator, error: unknown): void {
     this.safeSend(ws, this.freshAgentEventMessage(locator, {
       type: 'sdk.error',
@@ -3523,6 +3527,18 @@ export class WsHandler {
               sessionId: cached.sessionId,
               sessionType: cached.sessionType,
               provider: cached.runtimeProvider,
+            })
+            return
+          }
+
+          const cfg = await awaitConfig()
+          if (!this.freshClientsEnabled(cfg.settings)) {
+            this.send(ws, {
+              type: 'freshAgent.create.failed',
+              requestId: m.requestId,
+              code: 'FRESH_CLIENTS_DISABLED',
+              message: 'Fresh clients are disabled',
+              retryable: true,
             })
             return
           }

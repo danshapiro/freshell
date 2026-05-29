@@ -56,6 +56,21 @@ function getCanonicalPaneResumeSessionId(pane: FreshAgentPaneContent): string | 
   return undefined
 }
 
+function getFreshAgentSnapshotThreadId(
+  pane: FreshAgentPaneContent,
+  claudeSession: Parameters<typeof getCanonicalDurableSessionId>[0],
+): string | undefined {
+  if (pane.provider === 'claude') {
+    return getCanonicalDurableSessionId(claudeSession) ?? getCanonicalPaneResumeSessionId(pane)
+  }
+  if (EARLY_STATES.has(pane.status)) {
+    // While a new session is still being created, avoid reading an older durable ref.
+    return pane.sessionId
+  }
+  return pane.sessionId
+    ?? (pane.sessionRef?.provider === pane.provider ? pane.sessionRef.sessionId : undefined)
+}
+
 function getCreatedResumeSessionId(
   current: FreshAgentPaneContent,
   message: { sessionId: string; sessionRef?: { provider: string; sessionId: string } },
@@ -175,9 +190,7 @@ export function FreshAgentView({
   const autoTitleIdentityRef = useRef<string | null>(null)
   const handledRefreshRequestIdRef = useRef<string | null>(null)
   const preferredResumeSessionId = getPreferredResumeSessionId(claudeSession) ?? paneContent.resumeSessionId
-  const snapshotThreadId = paneContent.provider === 'claude'
-    ? getCanonicalDurableSessionId(claudeSession) ?? getCanonicalPaneResumeSessionId(paneContent)
-    : paneContent.sessionId
+  const snapshotThreadId = getFreshAgentSnapshotThreadId(paneContent, claudeSession)
   const hasRestoreFailure = Boolean(
     paneContent.provider === 'claude'
       && paneContent.sessionId

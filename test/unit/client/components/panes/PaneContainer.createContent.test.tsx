@@ -275,7 +275,11 @@ describe('createContentForType with ext: prefix', () => {
     const store = createStore(
       { layouts: { 'tab-1': node }, activePane: { 'tab-1': 'pane-1' } },
       [],
-      {},
+      {
+        codingCli: { enabledProviders: ['claude'] },
+        freshAgent: { enabled: true },
+        agentChat: { enabled: true },
+      },
       {
         status: 'ready',
         platform: 'linux',
@@ -350,6 +354,7 @@ describe('createContentForType with ext: prefix', () => {
           providers: { claude: { cwd: '/workspace/default' } },
         },
         agentChat: {
+          enabled: true,
           defaultPlugins: ['planner', 'sandbox'],
           providers: {
             freshclaude: {
@@ -359,6 +364,7 @@ describe('createContentForType with ext: prefix', () => {
             },
           },
         },
+        freshAgent: { enabled: true },
       },
       {
         status: 'ready',
