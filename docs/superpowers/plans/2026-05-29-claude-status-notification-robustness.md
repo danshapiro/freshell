@@ -207,7 +207,7 @@ Expected: FAIL — `countTrackerTurnCompleteSignals` and `isSubmitInput` are not
 
 After the `createTurnCompleteSignalParserState` function (declared at line 17; insert below its closing brace, ~line 19), add:
 ```ts
-const CONTROL_CHAR_RE = /[ --]/
+const CONTROL_CHAR_RE = /[\u0000-\u001f\u007f-\u009f]/
 
 function isIgnorableLeadingTurnCompleteChar(ch: string): boolean {
   return ch !== TURN_COMPLETE_SIGNAL && (
