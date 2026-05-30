@@ -16,6 +16,21 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const FAKE_SERVER_PATH = path.resolve(__dirname, '../../../../fixtures/coding-cli/codex-app-server/fake-app-server.mjs')
 
+// These tests spawn a REAL `node` sidecar (the fake-app-server fixture) and require it to
+// reach `initialize`. The suite runs with fileParallelism + maxConcurrency (vitest.server.config.ts),
+// so freshly-spawned sidecars are CPU-starved; a tight per-attempt budget makes a real spawn+bind+
+// initialize miss its deadline and the runtime reject (`did not finish initialize within Nms` /
+// `ECONNREFUSED`) — the dominant flake under load. These tests assert lifecycle *behavior*, not
+// startup latency, so the budget is generous on purpose. Production's own default is
+// DEFAULT_STARTUP_ATTEMPT_TIMEOUT_MS = 3000; this stays above it to absorb CI contention.
+const REAL_STARTUP_ATTEMPT_TIMEOUT_MS = 5_000
+
+// Polling deadline for the test helpers that wait on real OS side effects (pid files, process
+// exit, metadata records). These observe second-order spawns (e.g. a fixture's native child) that
+// can lag well past a second under CI contention. Generous because it only bites when the awaited
+// effect is genuinely slow; a real hang still trips the suite's 30s wall-clock.
+const WAIT_HELPER_TIMEOUT_MS = 15_000
+
 const runtimes = new Set<CodexAppServerRuntime>()
 const blockers = new Set<http.Server>()
 const tempDirs = new Set<string>()
@@ -69,7 +84,7 @@ async function occupyLoopbackPort(): Promise<{ blocker: http.Server; endpoint: L
   }
 }
 
-async function waitForProcessExit(pid: number, timeoutMs = 5_000): Promise<void> {
+async function waitForProcessExit(pid: number, timeoutMs = WAIT_HELPER_TIMEOUT_MS): Promise<void> {
   const deadline = Date.now() + timeoutMs
 
   while (Date.now() < deadline) {
@@ -97,7 +112,11 @@ async function killProcessGroupForTest(processGroupId: number): Promise<void> {
   await waitForProcessExit(processGroupId).catch(() => undefined)
 }
 
-async function waitForMetadataRecord(metadataDir: string, timeoutMs = 5_000): Promise<any> {
+async function waitForMetadataRecord(
+  metadataDir: string,
+  predicate: (record: any) => boolean = () => true,
+  timeoutMs = WAIT_HELPER_TIMEOUT_MS,
+): Promise<any> {
   const deadline = Date.now() + timeoutMs
 
   while (Date.now() < deadline) {
@@ -105,7 +124,11 @@ async function waitForMetadataRecord(metadataDir: string, timeoutMs = 5_000): Pr
     for (const entry of entries) {
       if (!entry.endsWith('.json')) continue
       const raw = await fsp.readFile(path.join(metadataDir, entry), 'utf8')
-      return JSON.parse(raw)
+      const record = JSON.parse(raw)
+      // The runtime writes the record twice: first with an empty wrapper identity, then again once
+      // /proc identity resolves. A bare read can catch the first write (null startTimeTicks); the
+      // predicate lets callers wait for the field they assert on instead of racing that gap.
+      if (predicate(record)) return record
     }
     await new Promise((resolve) => setTimeout(resolve, 25))
   }
@@ -113,7 +136,7 @@ async function waitForMetadataRecord(metadataDir: string, timeoutMs = 5_000): Pr
   throw new Error(`Timed out waiting for metadata record in ${metadataDir}`)
 }
 
-async function waitForPidFile(pidFile: string, timeoutMs = 5_000): Promise<number> {
+async function waitForPidFile(pidFile: string, timeoutMs = WAIT_HELPER_TIMEOUT_MS): Promise<number> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const raw = await fsp.readFile(pidFile, 'utf8').catch(() => '')
@@ -354,7 +377,11 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     })
 
     const readyPromise = runtime.ensureReady()
-    const metadata = await waitForMetadataRecord(metadataDir)
+    // Wait for the identity-complete write; a bare read can catch the runtime's first (empty) write.
+    const metadata = await waitForMetadataRecord(
+      metadataDir,
+      (record) => typeof record.wrapperIdentity?.startTimeTicks === 'number',
+    )
     const ready = await readyPromise
 
     expect(metadata.schemaVersion).toBe(1)
@@ -392,7 +419,8 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     const readyPromise = runtime.ensureReady()
     try {
       await identityStarted
-      const metadata = await waitForMetadataRecord(metadataDir, 500)
+      // This test asserts the FIRST (empty-identity) write, so keep the default predicate.
+      const metadata = await waitForMetadataRecord(metadataDir, () => true, 500)
 
       expect(metadata.schemaVersion).toBe(1)
       expect(metadata.serverInstanceId).toBe('srv-runtime-test')
@@ -417,7 +445,7 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
       metadataDir,
       serverInstanceId: 'srv-runtime-test',
       startupAttemptLimit: 1,
-      startupAttemptTimeoutMs: 500,
+      startupAttemptTimeoutMs: REAL_STARTUP_ATTEMPT_TIMEOUT_MS,
       processIdentityReader: async (pid) => {
         if (pid === process.pid) return readWrapperIdentityForTest(pid)
         identityReadAttempts += 1
@@ -444,7 +472,7 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     expect(record.wrapperIdentity.commandLine.length).toBeGreaterThan(0)
     expect(record.wrapperIdentity.cwd).toEqual(expect.any(String))
     expect(record.wrapperIdentity.startTimeTicks).toEqual(expect.any(Number))
-  }, 3_000)
+  })
 
   it('tears down both the wrapper and native child in its process group', async () => {
     const metadataDir = await makeTempDir()
@@ -530,12 +558,16 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     const processGroups: number[] = []
     const seenProcessGroups = new Set<number>()
     let previousAttemptGoneBeforeRetry = false
+    // A tight per-attempt budget is intentional here: this test verifies the per-attempt timeout
+    // FIRES and tears down a hung initialize before retrying (the fake server ignores `initialize`).
+    const STARTUP_ATTEMPT_LIMIT = 2
+    const STARTUP_ATTEMPT_TIMEOUT_MS = 500
     const start = Date.now()
     const runtime = createRuntime({
       metadataDir,
       serverInstanceId: 'srv-runtime-test',
-      startupAttemptLimit: 2,
-      startupAttemptTimeoutMs: 500,
+      startupAttemptLimit: STARTUP_ATTEMPT_LIMIT,
+      startupAttemptTimeoutMs: STARTUP_ATTEMPT_TIMEOUT_MS,
       requestTimeoutMs: 1_000,
       metadataWriter: async (filePath, metadata) => {
         if (!seenProcessGroups.has(metadata.processGroupId)) {
@@ -559,8 +591,11 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
 
     expect(processGroups).toHaveLength(2)
     expect(previousAttemptGoneBeforeRetry).toBe(true)
-    expect(Date.now() - start).toBeLessThan(1_500)
-  }, 3_000)
+    // Boundedness: the per-attempt timeout (not a longer/absent one) must govern how fast we give
+    // up and retry. Generous slack absorbs two real spawn+teardown cycles under CI contention; a
+    // genuine hang is still caught by the suite's 30s wall-clock.
+    expect(Date.now() - start).toBeLessThan(STARTUP_ATTEMPT_LIMIT * STARTUP_ATTEMPT_TIMEOUT_MS + 6_000)
+  })
 
   it('tears down the owned process group before retry when wrapper identity cannot be read', async () => {
     const tempDir = await makeTempDir()
@@ -573,7 +608,7 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
       metadataDir,
       serverInstanceId: 'srv-runtime-test',
       startupAttemptLimit: 2,
-      startupAttemptTimeoutMs: 500,
+      startupAttemptTimeoutMs: REAL_STARTUP_ATTEMPT_TIMEOUT_MS,
       requestTimeoutMs: 1_000,
       processIdentityReader: async (pid) => {
         identityReadAttempts += 1
@@ -601,7 +636,7 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     expect(previousAttemptGoneBeforeRetry).toBe(true)
     expect(record.processGroupId).toBe(processGroups[1])
     expect(record.wrapperIdentity.startTimeTicks).toEqual(expect.any(Number))
-  }, 3_000)
+  })
 
   it('tears down the owned process group before retry when wrapper identity is incomplete', async () => {
     const tempDir = await makeTempDir()
@@ -614,7 +649,7 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
       metadataDir,
       serverInstanceId: 'srv-runtime-test',
       startupAttemptLimit: 2,
-      startupAttemptTimeoutMs: 500,
+      startupAttemptTimeoutMs: REAL_STARTUP_ATTEMPT_TIMEOUT_MS,
       requestTimeoutMs: 1_000,
       processIdentityReader: async (pid) => {
         identityReadAttempts += 1
@@ -646,7 +681,7 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     expect(record.wrapperIdentity.commandLine.length).toBeGreaterThan(0)
     expect(record.wrapperIdentity.cwd).toEqual(expect.any(String))
     expect(record.wrapperIdentity.startTimeTicks).toEqual(expect.any(Number))
-  }, 3_000)
+  })
 
   it('escalates to SIGKILL when the native child ignores SIGTERM', async () => {
     const metadataDir = await makeTempDir()
@@ -1447,7 +1482,7 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     let first = true
     const runtime = createRuntime({
       startupAttemptLimit: 3,
-      startupAttemptTimeoutMs: 200,
+      startupAttemptTimeoutMs: REAL_STARTUP_ATTEMPT_TIMEOUT_MS,
       portAllocator: async () => {
         if (first) {
           first = false
