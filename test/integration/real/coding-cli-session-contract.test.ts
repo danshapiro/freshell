@@ -84,6 +84,13 @@ async function claudeAvailability(): Promise<ProviderProbeAvailability> {
   const binary = binaryAvailability(claudeBinary)
   if (!binary.ready) return binary
 
+  if (!(await pathExists(note.providers.claude.isolatedBinaryPath))) {
+    return {
+      ready: false,
+      reason: `Skipping Claude real-provider contracts: missing lab-note isolated binary ${note.providers.claude.isolatedBinaryPath}.`,
+    }
+  }
+
   if (!(await pathExists(path.join(os.homedir(), '.claude', '.credentials.json')))) {
     return {
       ready: false,
