@@ -18,6 +18,114 @@ export function createTurnCompleteSignalParserState(): TurnCompleteSignalParserS
   return { inOsc: false, inCsi: false, inDcs: false, pendingEsc: false }
 }
 
+const CONTROL_CHAR_RE = /[\u0000-\u001f\u007f-\u009f]/
+
+function isIgnorableLeadingTurnCompleteChar(ch: string): boolean {
+  return ch !== TURN_COMPLETE_SIGNAL && (
+    /\s/.test(ch)
+    || CONTROL_CHAR_RE.test(ch)
+  )
+}
+
+/**
+ * Counts only turn-complete BELs that are "tracker-eligible": a BEL that is
+ * either leading (no visible output before it in the chunk) or has no visible
+ * output after it. A BEL sandwiched between visible output (a stray bell from
+ * a sub-tool) is NOT counted. OSC/DCS/CSI-enclosed BELs are skipped.
+ */
+export function countTrackerTurnCompleteSignals(
+  data: string,
+  state: TurnCompleteSignalParserState,
+): number {
+  let inOsc = state.inOsc
+  let pendingEsc = state.pendingEsc
+  let inCsi = state.inCsi
+  let inDcs = state.inDcs
+  let sawVisibleOutput = false
+  const candidates: Array<{ leadingEligible: boolean; hasVisibleAfter: boolean }> = []
+
+  const markVisibleOutput = () => {
+    sawVisibleOutput = true
+    for (const candidate of candidates) {
+      candidate.hasVisibleAfter = true
+    }
+  }
+
+  for (const ch of data) {
+    if (pendingEsc) {
+      if (inOsc && ch === '\\') {
+        inOsc = false
+      } else if (inDcs && ch === '\\') {
+        inDcs = false
+      } else if (!inOsc && !inDcs && ch === ']') {
+        inOsc = true
+      } else if (!inOsc && !inDcs && ch === '[') {
+        inCsi = true
+      } else if (!inOsc && !inDcs && ch === 'P') {
+        inDcs = true
+      }
+      pendingEsc = false
+      continue
+    }
+
+    if (ch === ESC) {
+      pendingEsc = true
+      continue
+    }
+
+    if (inOsc) {
+      if (ch === TURN_COMPLETE_SIGNAL || ch === C1_ST) {
+        inOsc = false
+      }
+      continue
+    }
+
+    if (inDcs) {
+      if (ch === C1_ST) {
+        inDcs = false
+      }
+      continue
+    }
+
+    if (inCsi) {
+      if (ch >= '@' && ch <= '~') {
+        inCsi = false
+      }
+      continue
+    }
+
+    if (ch === C1_CSI) {
+      inCsi = true
+      continue
+    }
+    if (ch === C1_DCS) {
+      inDcs = true
+      continue
+    }
+    if (ch === C1_OSC) {
+      inOsc = true
+      continue
+    }
+    if (ch === TURN_COMPLETE_SIGNAL) {
+      candidates.push({
+        leadingEligible: !sawVisibleOutput,
+        hasVisibleAfter: false,
+      })
+      continue
+    }
+    if (isIgnorableLeadingTurnCompleteChar(ch)) {
+      continue
+    }
+    markVisibleOutput()
+  }
+
+  return candidates.filter((candidate) => candidate.leadingEligible || !candidate.hasVisibleAfter).length
+}
+
+export function isSubmitInput(data: string): boolean {
+  return /^(?:\r\n|\r|\n)+$/.test(data)
+}
+
 function supportsTurnSignal(mode: TurnCompleteSignalMode): boolean {
   return mode === 'claude' || mode === 'codex'
 }

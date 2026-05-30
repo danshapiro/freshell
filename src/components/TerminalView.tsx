@@ -16,7 +16,7 @@ import { consumePaneRefreshRequest, splitPane, updatePaneContent, updatePaneTitl
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
 import { recordPaneTabActivity } from '@/store/tabRecencySlice'
 import { updateSettingsLocal } from '@/store/settingsSlice'
-import { clearPaneRuntimeActivity, setPaneRuntimeActivity } from '@/store/paneRuntimeActivitySlice'
+import { clearPaneRuntimeActivity } from '@/store/paneRuntimeActivitySlice'
 import { recordTurnComplete, clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
 import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTerminalSearch } from '@/store/terminalDirectoryThunks'
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
@@ -108,9 +108,6 @@ export const RATE_LIMIT_RETRY_BASE_MS = 2000
 export const RATE_LIMIT_RETRY_MAX_MS = 12000
 const MOBILE_KEYBAR_HEIGHT_PX = 40
 const MOBILE_KEY_REPEAT_INITIAL_DELAY_MS = 320
-function isClaudeTurnSubmit(data: string): boolean {
-  return data.includes('\r') || data.includes('\n')
-}
 const MOBILE_KEY_REPEAT_INTERVAL_MS = 70
 const TAP_MULTI_INTERVAL_MS = 350
 const TAP_MAX_DISTANCE_PX = 24
@@ -423,7 +420,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const lastTapPointRef = useRef<{ x: number; y: number } | null>(null)
   const tapCountRef = useRef(0)
   const terminalFirstOutputMarkedRef = useRef(false)
-  const turnCompletedSinceLastInputRef = useRef(true)
   const lastInputBlockedNoticeRef = useRef<{ reason: TerminalInputBlockedReason; at: number } | null>(null)
 
   // Extract terminal-specific fields (safe because we check kind later)
@@ -636,14 +632,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       if (hasPaneAttentionRef.current) {
         dispatch(clearPaneAttention({ paneId }))
       }
-    }
-    if (contentRef.current?.mode === 'claude' && isClaudeTurnSubmit(data)) {
-      turnCompletedSinceLastInputRef.current = false
-      dispatch(setPaneRuntimeActivity({
-        paneId: paneIdRef.current,
-        source: 'terminal',
-        phase: 'pending',
-      }))
     }
     ws.send({ type: 'terminal.input', terminalId: tid, data })
   }, [dispatch, tabId, paneId, ws])
@@ -1027,30 +1015,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const osc = extractOsc52Events(startup.cleaned, osc52ParserRef.current)
     const { cleaned, count } = extractTurnCompleteSignals(osc.cleaned, mode, turnCompleteSignalStateRef.current)
 
-    if (count > 0 && tid) {
+    if (count > 0 && tid && mode !== 'claude') {
       dispatch(recordTurnComplete({
         tabId,
         paneId: paneIdRef.current,
         terminalId: tid,
         at: Date.now(),
-      }))
-      if (mode === 'claude') {
-        dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
-        turnCompletedSinceLastInputRef.current = true
-      }
-    }
-
-    if (
-      mode === 'claude'
-      && cleaned
-      && count === 0
-      && !seqStateRef.current.pendingReplay
-      && !turnCompletedSinceLastInputRef.current
-    ) {
-      dispatch(setPaneRuntimeActivity({
-        paneId: paneIdRef.current,
-        source: 'terminal',
-        phase: 'working',
       }))
     }
 

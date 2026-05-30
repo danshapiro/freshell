@@ -7,13 +7,13 @@ import settingsReducer from './settingsSlice'
 import codingCliReducer from './codingCliSlice'
 import panesReducer from './panesSlice'
 import sessionActivityReducer from './sessionActivitySlice'
-import terminalActivityReducer from './terminalActivitySlice'
 import terminalDirectoryReducer from './terminalDirectorySlice'
 import tabRecencyReducer from './tabRecencySlice'
 
 import turnCompletionReducer from './turnCompletionSlice'
 import terminalMetaReducer from './terminalMetaSlice'
 import codexActivityReducer from './codexActivitySlice'
+import claudeActivityReducer from './claudeActivitySlice'
 import opencodeActivityReducer from './opencodeActivitySlice'
 import agentChatReducer from './agentChatSlice'
 import freshAgentReducer from './freshAgentSlice'
@@ -47,13 +47,13 @@ export const store = configureStore({
     codingCli: codingCliReducer,
     panes: panesReducer,
     sessionActivity: sessionActivityReducer,
-    terminalActivity: terminalActivityReducer,
     terminalDirectory: terminalDirectoryReducer,
     tabRecency: tabRecencyReducer,
 
     turnCompletion: turnCompletionReducer,
     terminalMeta: terminalMetaReducer,
     codexActivity: codexActivityReducer,
+    claudeActivity: claudeActivityReducer,
     opencodeActivity: opencodeActivityReducer,
     agentChat: agentChatReducer,
     freshAgent: freshAgentReducer,

@@ -124,7 +124,6 @@ function createStore(settingsOverride?: Partial<AppSettings>) {
       connection: { status: 'connected' as const, error: null },
       turnCompletion: {
         seq: 0,
-        lastEvent: null,
         pendingEvents: [],
         attentionByTab: {},
         attentionByPane: {},

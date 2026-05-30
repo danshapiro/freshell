@@ -825,7 +825,7 @@ describe('TerminalView lifecycle updates', () => {
         },
         settings: createSettingsState(),
         connection: { status: 'connected', error: null },
-        turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+        turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
       },
     })
 
@@ -864,9 +864,9 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     expect(terminalInstances[0].write.mock.calls.some((call) => call[0] === 'helloworld')).toBe(true)
-    expect(store.getState().turnCompletion.lastEvent?.tabId).toBe(tabId)
-    expect(store.getState().turnCompletion.lastEvent?.paneId).toBe(paneId)
-    expect(store.getState().turnCompletion.lastEvent?.terminalId).toBe(terminalId)
+    expect(store.getState().turnCompletion.pendingEvents.at(-1)?.tabId).toBe(tabId)
+    expect(store.getState().turnCompletion.pendingEvents.at(-1)?.paneId).toBe(paneId)
+    expect(store.getState().turnCompletion.pendingEvents.at(-1)?.terminalId).toBe(terminalId)
     expect(store.getState().turnCompletion.pendingEvents).toHaveLength(1)
   })
 
@@ -915,7 +915,7 @@ describe('TerminalView lifecycle updates', () => {
         },
         settings: createSettingsState(),
         connection: { status: 'connected', error: null },
-        turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+        turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
       },
     })
 
@@ -954,7 +954,7 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     expect(terminalInstances[0].write.mock.calls.some((call) => call[0] === '\x1b]0;New title\x07')).toBe(true)
-    expect(store.getState().turnCompletion.lastEvent).toBeNull()
+    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
   })
 
   it('tracks claude terminal runtime activity from submit to output to turn completion', async () => {
@@ -1004,7 +1004,7 @@ describe('TerminalView lifecycle updates', () => {
         },
         settings: createSettingsState(),
         connection: { status: 'connected', error: null },
-        turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+        turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
         paneRuntimeActivity: { byPaneId: {} },
       },
     })
@@ -1029,10 +1029,7 @@ describe('TerminalView lifecycle updates', () => {
       onData?.('\r')
     })
 
-    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
-      source: 'terminal',
-      phase: 'pending',
-    })
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
 
     const initialAttach = wsMocks.send.mock.calls
       .map(([msg]) => msg)
@@ -1058,10 +1055,7 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
-    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
-      source: 'terminal',
-      phase: 'working',
-    })
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
 
     act(() => {
       messageHandler!({
@@ -1074,6 +1068,103 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
+    // Claude turn completion is now server-owned (terminal.turn.complete broadcast).
+    // The client must NOT mint a turn-complete from a replayable scrollback BEL.
+    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+  })
+
+  it('does not record a Claude turn-complete from replayed scrollback BEL', async () => {
+    const tabId = 'tab-claude-replay-bel'
+    const paneId = 'pane-claude-replay-bel'
+    const terminalId = 'term-claude-replay-bel'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-claude-replay-bel',
+      status: 'running',
+      mode: 'claude',
+      shell: 'system',
+      terminalId,
+      resumeSessionId: '44444444-4444-4444-8444-444444444444',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+        turnCompletion: turnCompletionReducer,
+        paneRuntimeActivity: paneRuntimeActivityReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'claude',
+            status: 'running',
+            title: 'Claude',
+            titleSetByUser: false,
+            terminalId,
+            resumeSessionId: '44444444-4444-4444-8444-444444444444',
+            createRequestId: 'req-claude-replay-bel',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null },
+        turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
+        paneRuntimeActivity: { byPaneId: {} },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+    await waitFor(() => {
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+
+    // Attach with a replay window so the following output frame is replayed scrollback.
+    const initialAttach = wsMocks.send.mock.calls
+      .map(([msg]) => msg)
+      .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+    act(() => {
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId,
+        headSeq: 0,
+        replayFromSeq: 1,
+        replayToSeq: 1,
+        attachRequestId: initialAttach?.attachRequestId,
+      })
+    })
+
+    // A replayed scrollback BEL must NOT mint a client-side turn-complete.
+    act(() => {
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: 1,
+        seqEnd: 1,
+        data: '\x07',
+      })
+    })
+
+    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
   })
 
   it('does not re-enter working state when claude output arrives after turn completion BEL', async () => {
@@ -1123,7 +1214,7 @@ describe('TerminalView lifecycle updates', () => {
         },
         settings: createSettingsState(),
         connection: { status: 'connected', error: null },
-        turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+        turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
         paneRuntimeActivity: { byPaneId: {} },
       },
     })
@@ -1149,10 +1240,7 @@ describe('TerminalView lifecycle updates', () => {
       onData?.('\r')
     })
 
-    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
-      source: 'terminal',
-      phase: 'pending',
-    })
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
 
     // Complete attach handshake
     const initialAttach = wsMocks.send.mock.calls
@@ -1180,10 +1268,7 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
-    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
-      source: 'terminal',
-      phase: 'working',
-    })
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
 
     // Step 3: Turn completion BEL -> cleared
     act(() => {
@@ -1260,7 +1345,7 @@ describe('TerminalView lifecycle updates', () => {
         },
         settings: createSettingsState(),
         connection: { status: 'connected', error: null },
-        turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+        turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
         paneRuntimeActivity: { byPaneId: {} },
       },
     })
@@ -1286,10 +1371,7 @@ describe('TerminalView lifecycle updates', () => {
       onData?.('\r')
     })
 
-    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
-      source: 'terminal',
-      phase: 'pending',
-    })
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
 
     const initialAttach = wsMocks.send.mock.calls
       .map(([msg]) => msg)
@@ -1315,10 +1397,7 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
-    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
-      source: 'terminal',
-      phase: 'working',
-    })
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
 
     act(() => {
       messageHandler!({
@@ -1350,10 +1429,7 @@ describe('TerminalView lifecycle updates', () => {
       onData?.('\r')
     })
 
-    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
-      source: 'terminal',
-      phase: 'pending',
-    })
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
 
     // New output after second submit -> should set working again
     act(() => {
@@ -1366,10 +1442,7 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
-    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
-      source: 'terminal',
-      phase: 'working',
-    })
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
   })
 
   it('does not show working state for initial prompt output before any user input', async () => {
@@ -1419,7 +1492,7 @@ describe('TerminalView lifecycle updates', () => {
         },
         settings: createSettingsState(),
         connection: { status: 'connected', error: null },
-        turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+        turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
         paneRuntimeActivity: { byPaneId: {} },
       },
     })
@@ -1550,7 +1623,7 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     expect(terminalInstances[0].write.mock.calls.some((call) => call[0] === 'hello\x07world')).toBe(true)
-    expect(store.getState().turnCompletion.lastEvent).toBeNull()
+    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
   })
 
   it('sends a viewport attach after terminal.created without issuing a second resize', async () => {
@@ -3057,7 +3130,7 @@ describe('TerminalView lifecycle updates', () => {
             status: connectionStatus,
             error: null,
           },
-          turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+          turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
         },
       })
 
@@ -3129,7 +3202,7 @@ describe('TerminalView lifecycle updates', () => {
             status: 'ready',
             error: null,
           },
-          turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+          turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
         },
       })
 
@@ -4647,7 +4720,7 @@ describe('TerminalView lifecycle updates', () => {
             },
           }),
           connection: { status: 'connected', error: null },
-          turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {}, attentionByPane: {} },
+          turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {}, attentionByPane: {} },
         },
       })
       return { tabId, paneId, paneContent, store }
@@ -4680,7 +4753,7 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       expect(term.write).not.toHaveBeenCalled()
-      expect(store.getState().turnCompletion.lastEvent).toBeNull()
+      expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
     })
 
     it('ignores legacy terminal.snapshot frames', async () => {
@@ -4719,7 +4792,7 @@ describe('TerminalView lifecycle updates', () => {
 
       expect(term.clear).not.toHaveBeenCalled()
       expect(term.write).not.toHaveBeenCalled()
-      expect(store.getState().turnCompletion.lastEvent).toBeNull()
+      expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
     })
   })
 })

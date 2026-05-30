@@ -233,7 +233,7 @@ function createStore(attentionDismiss: AttentionDismiss = 'click') {
       },
       turnCompletion: {
         seq: 0,
-        lastEvent: null,
+        lastAtByTerminalId: {},
         pendingEvents: [],
         attentionByTab: {},
         attentionByPane: {},

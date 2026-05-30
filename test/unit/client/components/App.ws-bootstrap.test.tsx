@@ -244,7 +244,7 @@ function createStore(options?: {
       extensions: { entries: [] },
       turnCompletion: {
         seq: 0,
-        lastEvent: null,
+        lastAtByTerminalId: {},
         pendingEvents: [],
         attentionByTab: {},
         attentionByPane: {},
@@ -1099,13 +1099,10 @@ describe('App WS bootstrap recovery', () => {
     })
 
     await waitFor(() => {
-      expect(store.getState().turnCompletion.lastEvent).toMatchObject({
-        tabId: 'tab-opencode',
-        paneId: 'pane-opencode',
-        terminalId: 'term-opencode',
-        at: 1234,
-      })
+      expect(store.getState().turnCompletion.attentionByPane['pane-opencode']).toBe(true)
     })
+    expect(store.getState().turnCompletion.attentionByTab['tab-opencode']).toBe(true)
+    expect(store.getState().turnCompletion.lastAtByTerminalId['term-opencode']).toBe(1234)
     expect(store.getState().turnCompletion.seq).toBe(1)
   })
 
@@ -1193,13 +1190,10 @@ describe('App WS bootstrap recovery', () => {
     })
 
     await waitFor(() => {
-      expect(store.getState().turnCompletion.lastEvent).toMatchObject({
-        tabId: 'tab-active',
-        paneId: 'pane-active',
-        terminalId: 'term-opencode',
-        at: 5678,
-      })
+      expect(store.getState().turnCompletion.attentionByPane['pane-active']).toBe(true)
     })
+    expect(store.getState().turnCompletion.attentionByTab['tab-active']).toBe(true)
+    expect(store.getState().turnCompletion.lastAtByTerminalId['term-opencode']).toBe(5678)
     expect(store.getState().turnCompletion.seq).toBe(1)
   })
 

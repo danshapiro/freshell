@@ -68,7 +68,6 @@ function createStore(layout: PaneNode, opts?: { paneTitleSetByUser?: Record<stri
       },
       turnCompletion: {
         seq: 0,
-        lastEvent: null,
         pendingEvents: [],
         attentionByTab: {},
         attentionByPane: {},

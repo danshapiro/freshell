@@ -105,7 +105,6 @@ function renderHarness(options: RenderHarnessOptions = {}) {
       },
       turnCompletion: {
         seq: 0,
-        lastEvent: null,
         pendingEvents: [],
         attentionByTab: {},
         attentionByPane: {},

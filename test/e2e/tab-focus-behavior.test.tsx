@@ -134,7 +134,6 @@ function createStore(activeTabId: string = 'tab-1') {
       },
       turnCompletion: {
         seq: 0,
-        lastEvent: null,
         pendingEvents: [],
         attentionByTab: {},
       },
@@ -311,7 +310,6 @@ describe('tab focus behavior (e2e)', () => {
         },
         turnCompletion: {
           seq: 0,
-          lastEvent: null,
           pendingEvents: [],
           attentionByTab: {},
         },

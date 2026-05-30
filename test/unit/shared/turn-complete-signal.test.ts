@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import {
   TURN_COMPLETE_SIGNAL,
+  countTrackerTurnCompleteSignals,
   createTurnCompleteSignalParserState,
   extractTurnCompleteSignals,
+  isSubmitInput,
 } from '../../../shared/turn-complete-signal'
 
 describe('shared turn-complete signal parser', () => {
@@ -65,5 +67,34 @@ describe('shared turn-complete signal parser', () => {
 
     expect(first).toEqual({ cleaned: '\x1bP', count: 0 })
     expect(second).toEqual({ cleaned: `qpayload${TURN_COMPLETE_SIGNAL}\x1b\\done`, count: 1 })
+  })
+})
+
+describe('isSubmitInput', () => {
+  it('treats a whole-payload newline as submit', () => {
+    expect(isSubmitInput('\r')).toBe(true)
+    expect(isSubmitInput('\n')).toBe(true)
+    expect(isSubmitInput('\r\n')).toBe(true)
+    expect(isSubmitInput('\n\n')).toBe(true)
+  })
+  it('does not treat newline-containing text as submit', () => {
+    expect(isSubmitInput('hello\nworld')).toBe(false)
+    expect(isSubmitInput('line1\r\nline2\r\n')).toBe(false)
+    expect(isSubmitInput('\x1b[200~paste\nmore\x1b[201~')).toBe(false)
+  })
+})
+
+describe('countTrackerTurnCompleteSignals', () => {
+  it('counts a leading-eligible BEL', () => {
+    const state = createTurnCompleteSignalParserState()
+    expect(countTrackerTurnCompleteSignals('\x07', state)).toBe(1)
+  })
+  it('ignores a BEL embedded between visible output', () => {
+    const state = createTurnCompleteSignalParserState()
+    expect(countTrackerTurnCompleteSignals('output\x07more output', state)).toBe(0)
+  })
+  it('ignores an OSC title terminator BEL', () => {
+    const state = createTurnCompleteSignalParserState()
+    expect(countTrackerTurnCompleteSignals('\x1b]0;title\x07', state)).toBe(0)
   })
 })

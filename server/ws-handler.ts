@@ -18,6 +18,7 @@ import { isValidClaudeSessionId } from './claude-session-id.js'
 import type { SdkBridge } from './sdk-bridge.js'
 import { createAgentHistorySource, type AgentHistorySource } from './agent-timeline/history-source.js'
 import type {
+  ClaudeActivityRecord,
   CodexActivityRecord,
   OpencodeActivityRecord,
   SdkServerMessage,
@@ -50,6 +51,9 @@ import {
   CodingCliProviderSchema,
   SessionLocatorSchema,
   TerminalMetaUpdatedSchema,
+  ClaudeActivityListResponseSchema,
+  ClaudeActivityListSchema,
+  ClaudeActivityUpdatedSchema,
   CodexActivityListResponseSchema,
   CodexActivityListSchema,
   CodexActivityUpdatedSchema,
@@ -168,6 +172,7 @@ export type WsHandlerOptions = {
   layoutStore?: LayoutStore
   extensionManager?: ExtensionManager
   codexActivityListProvider?: () => CodexActivityRecord[]
+  claudeActivityListProvider?: () => ClaudeActivityRecord[]
   agentHistorySource?: AgentHistorySource
   opencodeActivityListProvider?: () => OpencodeActivityRecord[]
   freshAgentRuntimeManager?: FreshAgentRuntimeManagerLike
@@ -483,6 +488,7 @@ export class WsHandler {
   private handshakeSnapshotProvider?: HandshakeSnapshotProvider
   private terminalMetaListProvider?: () => TerminalMeta[]
   private codexActivityListProvider?: () => CodexActivityRecord[]
+  private claudeActivityListProvider?: () => ClaudeActivityRecord[]
   private opencodeActivityListProvider?: () => OpencodeActivityRecord[]
   private tabsRegistryStore?: TabsRegistryStore
   private layoutStore?: LayoutStore
@@ -540,6 +546,7 @@ export class WsHandler {
     this.handshakeSnapshotProvider = options.handshakeSnapshotProvider
     this.terminalMetaListProvider = options.terminalMetaListProvider
     this.codexActivityListProvider = options.codexActivityListProvider
+    this.claudeActivityListProvider = options.claudeActivityListProvider
     this.opencodeActivityListProvider = options.opencodeActivityListProvider
     this.tabsRegistryStore = options.tabsRegistryStore
     this.layoutStore = options.layoutStore
@@ -627,6 +634,7 @@ export class WsHandler {
       TerminalResizeSchema,
       TerminalKillSchema,
       CodexActivityListSchema,
+      ClaudeActivityListSchema,
       OpencodeActivityListSchema,
       TabsSyncPushSchema,
       TabsSyncQuerySchema,
@@ -3269,6 +3277,26 @@ export class WsHandler {
         return
       }
 
+      case 'claude.activity.list': {
+        const terminals = this.claudeActivityListProvider ? this.claudeActivityListProvider() : []
+        const response = ClaudeActivityListResponseSchema.safeParse({
+          type: 'claude.activity.list.response',
+          requestId: m.requestId,
+          terminals,
+        })
+        if (!response.success) {
+          log.warn({ issues: response.error.issues }, 'Invalid claude.activity.list.response payload')
+          this.sendError(ws, {
+            code: 'INTERNAL_ERROR',
+            message: 'Claude activity unavailable',
+            requestId: m.requestId,
+          })
+          return
+        }
+        this.send(ws, response.data)
+        return
+      }
+
       case 'tabs.sync.push': {
         if (!this.tabsRegistryStore) {
           this.sendError(ws, {
@@ -4376,6 +4404,21 @@ export class WsHandler {
 
     if (!parsed.success) {
       log.warn({ issues: parsed.error.issues }, 'Invalid opencode.activity.updated payload')
+      return
+    }
+
+    this.broadcastAuthenticated(parsed.data)
+  }
+
+  broadcastClaudeActivityUpdated(msg: { upsert?: ClaudeActivityRecord[]; remove?: string[] }): void {
+    const parsed = ClaudeActivityUpdatedSchema.safeParse({
+      type: 'claude.activity.updated',
+      upsert: msg.upsert || [],
+      remove: msg.remove || [],
+    })
+
+    if (!parsed.success) {
+      log.warn({ issues: parsed.error.issues }, 'Invalid claude.activity.updated payload')
       return
     }
 

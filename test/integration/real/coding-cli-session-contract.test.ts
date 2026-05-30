@@ -345,7 +345,7 @@ describe.sequential('coding cli real provider session contract', () => {
     }, 30_000)
 
     it('creates UUID-backed transcripts and treats names as mutable metadata only', async () => {
-      requireAvailableBinary(claudeBinary, claudeProbe)
+      const claudePath = requireAvailableBinary(claudeBinary, claudeProbe)
       const workspace = await ProbeWorkspace.create('claude-contract')
       const exactSessionId = '44444444-4444-4444-8444-444444444444'
       const namedSessionId = '55555555-5555-4555-8555-555555555555'
@@ -353,9 +353,8 @@ describe.sequential('coding cli real provider session contract', () => {
         await seedClaudeHome(workspace)
 
         const exactCreate = await workspace.spawnProcess(
-          note.providers.claude.isolatedBinaryPath,
+          claudePath,
           [
-            '--bare',
             '--dangerously-skip-permissions',
             '-p',
             '--session-id',
@@ -378,9 +377,8 @@ describe.sequential('coding cli real provider session contract', () => {
           )
 
           const namedCreate = await workspace.spawnProcess(
-            note.providers.claude.isolatedBinaryPath,
+            claudePath,
             [
-              '--bare',
               '--dangerously-skip-permissions',
               '-p',
               '--session-id',
@@ -399,9 +397,8 @@ describe.sequential('coding cli real provider session contract', () => {
           expect(namedCreate.stdout().trim()).toBe('named-create-ok')
 
           const namedResume = await workspace.spawnProcess(
-            note.providers.claude.isolatedBinaryPath,
+            claudePath,
             [
-              '--bare',
               '--dangerously-skip-permissions',
               '-p',
               '--resume',
@@ -418,9 +415,8 @@ describe.sequential('coding cli real provider session contract', () => {
           expect(namedResume.stdout().trim()).toBe('named-resume-ok')
 
           const rename = await workspace.spawnProcess(
-            note.providers.claude.isolatedBinaryPath,
+            claudePath,
             [
-              '--bare',
               '--dangerously-skip-permissions',
               '-p',
               '--resume',
@@ -446,9 +442,8 @@ describe.sequential('coding cli real provider session contract', () => {
           expect(transcriptLines.some((line) => line.includes('"agentName":"probe-name-two"'))).toBe(true)
 
           const oldTitleResume = await workspace.spawnProcess(
-            note.providers.claude.isolatedBinaryPath,
+            claudePath,
             [
-              '--bare',
               '--dangerously-skip-permissions',
               '-p',
               '--resume',
@@ -466,9 +461,8 @@ describe.sequential('coding cli real provider session contract', () => {
           expect(oldTitleResume.stderr()).toContain(note.providers.claude.oldTitleErrorFragment)
 
           const newTitleResume = await workspace.spawnProcess(
-            note.providers.claude.isolatedBinaryPath,
+            claudePath,
             [
-              '--bare',
               '--dangerously-skip-permissions',
               '-p',
               '--resume',

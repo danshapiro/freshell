@@ -164,7 +164,7 @@ function createStore(policy: 'ask' | 'always' | 'never') {
       },
       settings: createSettingsState(policy),
       connection: { status: 'ready' as const, error: null },
-      turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {}, attentionByPane: {} },
+      turnCompletion: { seq: 0, pendingEvents: [], attentionByTab: {}, attentionByPane: {} },
     } as any,
   })
 

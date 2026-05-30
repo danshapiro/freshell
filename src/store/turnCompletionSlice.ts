@@ -11,7 +11,7 @@ export type TurnCompleteEvent = TurnCompletePayload & { seq: number }
 
 export interface TurnCompletionState {
   seq: number
-  lastEvent: TurnCompleteEvent | null
+  lastAtByTerminalId: Record<string, number>
   pendingEvents: TurnCompleteEvent[]
   attentionByTab: Record<string, boolean>
   attentionByPane: Record<string, boolean>
@@ -19,7 +19,7 @@ export interface TurnCompletionState {
 
 const initialState: TurnCompletionState = {
   seq: 0,
-  lastEvent: null,
+  lastAtByTerminalId: {},
   pendingEvents: [],
   attentionByTab: {},
   attentionByPane: {},
@@ -30,13 +30,14 @@ const turnCompletionSlice = createSlice({
   initialState,
   reducers: {
     recordTurnComplete(state, action: PayloadAction<TurnCompletePayload>) {
+      const { terminalId, at } = action.payload
+      if (state.lastAtByTerminalId[terminalId] === at) return
+      state.lastAtByTerminalId[terminalId] = at
       state.seq += 1
-      const event = {
+      state.pendingEvents.push({
         ...action.payload,
         seq: state.seq,
-      }
-      state.lastEvent = event
-      state.pendingEvents.push(event)
+      })
     },
     consumeTurnCompleteEvents(state, action: PayloadAction<{ throughSeq: number }>) {
       const { throughSeq } = action.payload

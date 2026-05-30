@@ -9,6 +9,11 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import codexActivityReducer from '@/store/codexActivitySlice'
+import claudeActivityReducer, {
+  resetClaudeActivity,
+  setClaudeActivitySnapshot,
+  upsertClaudeActivity,
+} from '@/store/claudeActivitySlice'
 import opencodeActivityReducer, {
   removeOpencodeActivity,
   upsertOpencodeActivity,
@@ -17,7 +22,6 @@ import agentChatReducer, { removePermission } from '@/store/agentChatSlice'
 import type { AgentChatState } from '@/store/agentChatTypes'
 import paneRuntimeActivityReducer, {
   clearPaneRuntimeActivity,
-  setPaneRuntimeActivity,
   type PaneRuntimeActivityState,
 } from '@/store/paneRuntimeActivitySlice'
 import type {
@@ -133,6 +137,7 @@ function renderHarness(options: RenderHarnessOptions) {
       settings: settingsReducer,
       turnCompletion: turnCompletionReducer,
       codexActivity: codexActivityReducer,
+      claudeActivity: claudeActivityReducer,
       opencodeActivity: opencodeActivityReducer,
       agentChat: agentChatReducer,
       paneRuntimeActivity: paneRuntimeActivityReducer,
@@ -163,12 +168,17 @@ function renderHarness(options: RenderHarnessOptions) {
       },
       turnCompletion: {
         seq: 0,
-        lastEvent: null,
         pendingEvents: [],
         attentionByTab: {},
         attentionByPane: {},
       },
       codexActivity: {
+        byTerminalId: {},
+        lastSnapshotSeq: 0,
+        liveMutationSeqByTerminalId: {},
+        removedMutationSeqByTerminalId: {},
+      },
+      claudeActivity: {
         byTerminalId: {},
         lastSnapshotSeq: 0,
         liveMutationSeqByTerminalId: {},
@@ -300,7 +310,7 @@ describe('pane activity indicator flow (e2e)', () => {
     expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
   })
 
-  it('keeps claude terminals non-blue while pending, blue while working, and clears on idle', () => {
+  it('keeps claude terminals non-blue when idle and blue while the server marks them busy', () => {
     const pane: TerminalPaneContent = {
       kind: 'terminal',
       createRequestId: 'req-claude',
@@ -318,15 +328,6 @@ describe('pane activity indicator flow (e2e)', () => {
         terminalId: 'term-claude',
         resumeSessionId: '11111111-1111-4111-8111-111111111111',
       },
-      paneRuntimeActivity: {
-        byPaneId: {
-          'pane-activity': {
-            source: 'terminal',
-            phase: 'pending',
-            updatedAt: 1,
-          },
-        },
-      },
     })
 
     const paneHeader = screen.getByRole('banner', { name: 'Pane: Activity Pane' })
@@ -334,11 +335,8 @@ describe('pane activity indicator flow (e2e)', () => {
     expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
 
     act(() => {
-      store.dispatch(setPaneRuntimeActivity({
-        paneId: 'pane-activity',
-        source: 'terminal',
-        phase: 'working',
-        updatedAt: 2,
+      store.dispatch(upsertClaudeActivity({
+        terminals: [{ terminalId: 'term-claude', phase: 'busy', updatedAt: 1 }],
       }))
     })
 
@@ -346,11 +344,63 @@ describe('pane activity indicator flow (e2e)', () => {
     expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
 
     act(() => {
-      store.dispatch(clearPaneRuntimeActivity({ paneId: 'pane-activity' }))
+      store.dispatch(upsertClaudeActivity({
+        terminals: [{ terminalId: 'term-claude', phase: 'idle', updatedAt: 2 }],
+      }))
     })
 
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
     expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+  })
+
+  it('keeps a claude pane blue across a transport reconnect (rehydrates busy from the server snapshot)', () => {
+    const pane: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-claude',
+      status: 'running',
+      mode: 'claude',
+      shell: 'system',
+      terminalId: 'term-claude',
+      resumeSessionId: '11111111-1111-4111-8111-111111111111',
+    }
+
+    const { store } = renderHarness({
+      pane,
+      tab: {
+        mode: 'claude',
+        terminalId: 'term-claude',
+        resumeSessionId: '11111111-1111-4111-8111-111111111111',
+      },
+    })
+
+    const paneHeader = screen.getByRole('banner', { name: 'Pane: Activity Pane' })
+
+    // Mid-turn: the server marks the claude terminal busy -> blue.
+    act(() => {
+      store.dispatch(upsertClaudeActivity({
+        terminals: [{ terminalId: 'term-claude', phase: 'busy', updatedAt: 1 }],
+      }))
+    })
+
+    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+
+    // Transport reconnect: the App clears the overlay (resetClaudeActivityOverlay ->
+    // resetClaudeActivity) then re-requests claude.activity.list and applies the
+    // server's snapshot reply. The terminal is still busy server-side, so the pane
+    // must rehydrate BLUE rather than getting stuck green.
+    act(() => {
+      store.dispatch(resetClaudeActivity())
+    })
+    act(() => {
+      store.dispatch(setClaudeActivitySnapshot({
+        terminals: [{ terminalId: 'term-claude', phase: 'busy', updatedAt: 1 }],
+        requestSeq: 1,
+      }))
+    })
+
+    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
   })
 
   it('shows OpenCode terminals blue only for exact terminal busy activity and clears on removal', () => {

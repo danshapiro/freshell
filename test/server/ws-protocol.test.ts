@@ -3,6 +3,13 @@ import http from 'http'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
 import {
+  ClaudeActivityRecordSchema,
+  ClaudeActivityListResponseSchema,
+  ClaudeActivityUpdatedSchema,
+  ClaudeActivityListSchema,
+  TerminalTurnCompleteSchema,
+} from '../../shared/ws-protocol.js'
+import {
   FakeCodexLaunchPlanner,
   FakeCodexLaunchSidecar,
   DEFAULT_CODEX_REMOTE_WS_URL,
@@ -1672,5 +1679,21 @@ describe('ws protocol', () => {
       .rejects.toThrow('No screenshot-capable UI client connected')
 
     await closeWebSocket(ws)
+  })
+})
+
+describe('claude activity protocol', () => {
+  it('accepts a claude activity record with idle/busy phase', () => {
+    expect(ClaudeActivityRecordSchema.safeParse({ terminalId: 't1', phase: 'busy', updatedAt: 1 }).success).toBe(true)
+    expect(ClaudeActivityRecordSchema.safeParse({ terminalId: 't1', phase: 'pending', updatedAt: 1 }).success).toBe(false)
+  })
+  it('accepts claude.activity.list request and response and updated', () => {
+    expect(ClaudeActivityListSchema.safeParse({ type: 'claude.activity.list', requestId: 'r1' }).success).toBe(true)
+    expect(ClaudeActivityListResponseSchema.safeParse({ type: 'claude.activity.list.response', requestId: 'r1', terminals: [] }).success).toBe(true)
+    expect(ClaudeActivityUpdatedSchema.safeParse({ type: 'claude.activity.updated', upsert: [], remove: ['t1'] }).success).toBe(true)
+  })
+  it('terminal.turn.complete accepts provider claude and optional sessionId', () => {
+    expect(TerminalTurnCompleteSchema.safeParse({ type: 'terminal.turn.complete', terminalId: 't1', provider: 'claude', at: 1 }).success).toBe(true)
+    expect(TerminalTurnCompleteSchema.safeParse({ type: 'terminal.turn.complete', terminalId: 't1', provider: 'opencode', sessionId: 's1', at: 1 }).success).toBe(true)
   })
 })

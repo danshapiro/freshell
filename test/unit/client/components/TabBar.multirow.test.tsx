@@ -82,7 +82,7 @@ function createStore(options: { tabs: Tab[]; activeTabId: string | null; multiro
         settings: composeResolvedSettings(serverSettings, localSettings),
         loaded: true,
       },
-      turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+      turnCompletion: { seq: 0, pendingEvents: [], attentionByTab: {} },
     },
   })
 }

@@ -21,11 +21,11 @@ describe('turnCompletionSlice', () => {
       recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-9', terminalId: 'term-2', at: 123 })
     )
 
-    expect(state.lastEvent?.seq).toBe(1)
-    expect(state.lastEvent?.tabId).toBe('tab-2')
-    expect(state.lastEvent?.paneId).toBe('pane-9')
-    expect(state.lastEvent?.terminalId).toBe('term-2')
-    expect(state.lastEvent?.at).toBe(123)
+    expect(state.pendingEvents.at(-1)?.seq).toBe(1)
+    expect(state.pendingEvents.at(-1)?.tabId).toBe('tab-2')
+    expect(state.pendingEvents.at(-1)?.paneId).toBe('pane-9')
+    expect(state.pendingEvents.at(-1)?.terminalId).toBe('term-2')
+    expect(state.pendingEvents.at(-1)?.at).toBe(123)
     expect(state.pendingEvents).toHaveLength(1)
     expect(state.pendingEvents[0]?.seq).toBe(1)
   })
@@ -40,11 +40,23 @@ describe('turnCompletionSlice', () => {
       recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-2', terminalId: 'term-2', at: 200 })
     )
 
-    expect(state.lastEvent?.seq).toBe(2)
+    expect(state.pendingEvents.at(-1)?.seq).toBe(2)
     expect(state.seq).toBe(2)
     expect(state.pendingEvents).toHaveLength(2)
     expect(state.pendingEvents[0]?.seq).toBe(1)
     expect(state.pendingEvents[1]?.seq).toBe(2)
+  })
+
+  it('ignores a duplicate turn-complete with the same terminalId and at', () => {
+    let state = reducer(undefined, recordTurnComplete({ tabId: 'tab1', paneId: 'p1', terminalId: 't1', at: 5000 }))
+    state = reducer(state, recordTurnComplete({ tabId: 'tab1', paneId: 'p1', terminalId: 't1', at: 5000 }))
+    expect(state.pendingEvents).toHaveLength(1)
+  })
+
+  it('records distinct turns for the same terminal at different times', () => {
+    let state = reducer(undefined, recordTurnComplete({ tabId: 'tab1', paneId: 'p1', terminalId: 't1', at: 5000 }))
+    state = reducer(state, recordTurnComplete({ tabId: 'tab1', paneId: 'p1', terminalId: 't1', at: 6000 }))
+    expect(state.pendingEvents).toHaveLength(2)
   })
 
   it('consumes pending events up through the handled sequence', () => {
@@ -84,7 +96,7 @@ describe('turnCompletionSlice', () => {
     const state = reducer(undefined, clearTabAttention({ tabId: 'tab-1' }))
     const initial: TurnCompletionState = {
       seq: 0,
-      lastEvent: null,
+      lastAtByTerminalId: {},
       pendingEvents: [],
       attentionByTab: {},
       attentionByPane: {},
@@ -158,7 +170,6 @@ describe('turnCompletionSlice', () => {
           settings: { settings: defaultSettings, loaded: true },
           turnCompletion: {
             seq: 0,
-            lastEvent: null,
             pendingEvents: [],
             attentionByTab: { 'tab-1': true },
             attentionByPane: { 'pane-1': true, 'pane-2': true },

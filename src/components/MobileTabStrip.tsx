@@ -9,6 +9,7 @@ import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
+const EMPTY_CLAUDE_ACTIVITY_BY_ID = {}
 const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
 const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
@@ -27,6 +28,7 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
   const paneLayouts = useAppSelector((s) => s.panes.layouts)
   const paneTitles = useAppSelector((s) => s.panes.paneTitles)
   const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
+  const claudeActivityByTerminalId = useAppSelector((s) => s.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID)
   const opencodeActivityByTerminalId = useAppSelector((s) => s.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID)
   const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
   const freshAgentSessions = useAppSelector((s) => s.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS)
@@ -46,6 +48,7 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
       tab: activeTab,
       paneLayouts,
       codexActivityByTerminalId,
+      claudeActivityByTerminalId,
       opencodeActivityByTerminalId,
       paneRuntimeActivityByPaneId,
       agentChatSessions,

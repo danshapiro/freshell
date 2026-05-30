@@ -140,6 +140,7 @@ const EMPTY_LAYOUTS: Record<string, never> = {}
 const EMPTY_PANE_TITLES: Record<string, Record<string, string>> = {}
 const EMPTY_ATTENTION: Record<string, boolean> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
+const EMPTY_CLAUDE_ACTIVITY_BY_ID = {}
 const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
 const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
@@ -163,6 +164,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   const attentionByTab = useAppSelector((s) => s.turnCompletion?.attentionByTab) ?? EMPTY_ATTENTION
   const attentionByPane = useAppSelector((s) => s.turnCompletion?.attentionByPane) ?? EMPTY_ATTENTION
   const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
+  const claudeActivityByTerminalId = useAppSelector((s) => s.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID)
   const opencodeActivityByTerminalId = useAppSelector((s) => s.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID)
   const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
   const freshAgentSessions = useAppSelector((s) => s.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS)
@@ -223,11 +225,12 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     tab,
     paneLayouts: paneLayouts as Record<string, PaneNode | undefined>,
     codexActivityByTerminalId,
+    claudeActivityByTerminalId,
     opencodeActivityByTerminalId,
     paneRuntimeActivityByPaneId,
     agentChatSessions,
     freshAgentSessions,
-  }), [agentChatSessions, codexActivityByTerminalId, freshAgentSessions, opencodeActivityByTerminalId, paneLayouts, paneRuntimeActivityByPaneId])
+  }), [agentChatSessions, claudeActivityByTerminalId, codexActivityByTerminalId, freshAgentSessions, opencodeActivityByTerminalId, paneLayouts, paneRuntimeActivityByPaneId])
 
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')

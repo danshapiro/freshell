@@ -61,6 +61,7 @@ import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from 
 import { clearDeadTerminals } from '@/store/panesSlice'
 import { addTerminalFreshRecoveryRequestId, addTerminalRestoreRequestId } from '@/lib/terminal-restore'
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
+import { setClaudeActivitySnapshot, upsertClaudeActivity, removeClaudeActivity, resetClaudeActivity } from '@/store/claudeActivitySlice'
 import { setOpencodeActivitySnapshot, upsertOpencodeActivity, removeOpencodeActivity, resetOpencodeActivity } from '@/store/opencodeActivitySlice'
 import { recordTurnComplete } from '@/store/turnCompletionSlice'
 import { selectTabPaneByTerminalId } from '@/store/selectors/paneTerminalSelectors'
@@ -232,8 +233,10 @@ export default function App() {
   const mainContentRef = useRef<HTMLDivElement>(null)
   const userOpenedSidebarOnMobileRef = useRef(false)
   const codexActivityListRequestSeqRef = useRef(new Map<string, number>())
+  const claudeActivityListRequestSeqRef = useRef(new Map<string, number>())
   const opencodeActivityListRequestSeqRef = useRef(new Map<string, number>())
   const codexActivityOrderRef = useRef(0)
+  const claudeActivityOrderRef = useRef(0)
   const opencodeActivityOrderRef = useRef(0)
   const copiedResetTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const fullscreenTouchStartYRef = useRef<number | null>(null)
@@ -486,6 +489,7 @@ export default function App() {
         if (!isApiUnauthorizedError(err)) return false
         if (!cancelled) {
           resetCodexActivityOverlay()
+          resetClaudeActivityOverlay()
           dispatch(setStatus('disconnected'))
           dispatch(setError('Authentication failed'))
         }
@@ -671,6 +675,16 @@ export default function App() {
         })
       }
 
+      const requestClaudeActivityList = () => {
+        const requestId = `claude-activity-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+        const requestSeq = ++claudeActivityOrderRef.current
+        claudeActivityListRequestSeqRef.current.set(requestId, requestSeq)
+        ws.send({
+          type: 'claude.activity.list',
+          requestId,
+        })
+      }
+
       const requestOpencodeActivityList = () => {
         const requestId = `opencode-activity-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
         const requestSeq = ++opencodeActivityOrderRef.current
@@ -686,6 +700,11 @@ export default function App() {
         dispatch(resetCodexActivity())
       }
 
+      const resetClaudeActivityOverlay = () => {
+        claudeActivityListRequestSeqRef.current.clear()
+        dispatch(resetClaudeActivity())
+      }
+
       const resetOpencodeActivityOverlay = () => {
         opencodeActivityListRequestSeqRef.current.clear()
         dispatch(resetOpencodeActivity())
@@ -698,6 +717,7 @@ export default function App() {
       stopWsDisconnectSync = wsWithOptionalDisconnect.onDisconnect?.(() => {
         if (cancelled) return
         resetCodexActivityOverlay()
+        resetClaudeActivityOverlay()
         resetOpencodeActivityOverlay()
         dispatch(setStatus('disconnected'))
       }) ?? null
@@ -792,6 +812,7 @@ export default function App() {
           // If the initial connect attempt failed before ready, WsClient may still auto-reconnect.
           // Treat 'ready' as the source of truth for connection status.
           resetCodexActivityOverlay()
+          resetClaudeActivityOverlay()
           resetOpencodeActivityOverlay()
           dispatch(setError(undefined))
           dispatch(setStatus('ready'))
@@ -809,6 +830,7 @@ export default function App() {
           // from this bootstrap cycle is still safe for enabling follow-up refreshes.
           promoteRecentHttpSessionsBaseline()
           requestCodexActivityList()
+          requestClaudeActivityList()
           requestOpencodeActivityList()
           lastSessionsRevision = -1
           void recoverMissingStartupState()
@@ -919,6 +941,35 @@ export default function App() {
           const remove = Array.isArray(msg.remove) ? msg.remove : []
           if (remove.length > 0) {
             dispatch(removeCodexActivity({
+              terminalIds: remove,
+              mutationSeq,
+            }))
+          }
+        }
+        if (msg.type === 'claude.activity.list.response') {
+          const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''
+          if (!requestId) return
+          const requestSeq = claudeActivityListRequestSeqRef.current.get(requestId)
+          claudeActivityListRequestSeqRef.current.delete(requestId)
+          if (requestSeq === undefined) return
+          dispatch(setClaudeActivitySnapshot({
+            terminals: msg.terminals || [],
+            requestSeq,
+          }))
+        }
+        if (msg.type === 'claude.activity.updated') {
+          const mutationSeq = ++claudeActivityOrderRef.current
+          const upsert = Array.isArray(msg.upsert) ? msg.upsert : []
+          if (upsert.length > 0) {
+            dispatch(upsertClaudeActivity({
+              terminals: upsert,
+              mutationSeq,
+            }))
+          }
+
+          const remove = Array.isArray(msg.remove) ? msg.remove : []
+          if (remove.length > 0) {
+            dispatch(removeClaudeActivity({
               terminalIds: remove,
               mutationSeq,
             }))
@@ -1045,6 +1096,7 @@ export default function App() {
         }
         lastReadyServerInstanceId = ws.serverInstanceId
         resetCodexActivityOverlay()
+        resetClaudeActivityOverlay()
         resetOpencodeActivityOverlay()
         dispatch(setError(undefined))
         dispatch(setStatus('ready'))
@@ -1055,6 +1107,7 @@ export default function App() {
 
         if (!cancelled) {
           requestCodexActivityList()
+          requestClaudeActivityList()
           requestOpencodeActivityList()
         }
         void recoverMissingStartupState()
@@ -1069,6 +1122,7 @@ export default function App() {
       } catch (err: any) {
         if (!cancelled) {
           resetCodexActivityOverlay()
+          resetClaudeActivityOverlay()
           resetOpencodeActivityOverlay()
           dispatch(setStatus('disconnected'))
           dispatch(setError(err?.message || 'WebSocket connection failed'))

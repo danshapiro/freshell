@@ -62,6 +62,7 @@ const EMPTY_PROJECTS: ProjectGroup[] = []
 const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
 const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
+const EMPTY_CLAUDE_ACTIVITY_BY_ID = {}
 const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 const EMPTY_ATTENTION_BY_PANE: Record<string, boolean> = {}
@@ -179,6 +180,9 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const freshAgentSessions = useAppSelector((s) => s.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS)
   const codexActivityByTerminalId = useAppSelector(
     (s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID
+  )
+  const claudeActivityByTerminalId = useAppSelector(
+    (s) => s.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID
   )
   const opencodeActivityByTerminalId = useAppSelector(
     (s) => s.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID
@@ -489,6 +493,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       tabMode: tab?.mode,
       isOnlyPane,
       codexActivityByTerminalId,
+      claudeActivityByTerminalId,
       opencodeActivityByTerminalId,
       paneRuntimeActivityByPaneId,
       agentChatSessions,

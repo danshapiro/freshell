@@ -67,7 +67,7 @@ function createStore(initialState: { tabs: Tab[]; activeTabId: string | null }) 
       codingCli: { sessions: {}, pendingRequests: {} },
       panes: { layouts: {}, activePane: {}, paneTitles: {} },
       settings: { settings: defaultSettings, loaded: true },
-      turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+      turnCompletion: { seq: 0, pendingEvents: [], attentionByTab: {} },
     },
   })
 }

@@ -189,7 +189,7 @@ function createStore(options: {
       },
       settings: { settings: defaultSettings, status: 'loaded' },
       connection: { status: 'ready', error: null },
-      turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {}, attentionByPane: {} },
+      turnCompletion: { seq: 0, pendingEvents: [], attentionByTab: {}, attentionByPane: {} },
     } as any,
   })
 }

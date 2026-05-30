@@ -129,11 +129,32 @@ export const OpencodeActivityUpdatedSchema = z.object({
   remove: z.array(z.string().min(1)),
 })
 
+export const ClaudeActivityRecordSchema = z.object({
+  terminalId: z.string().min(1),
+  sessionId: z.string().optional(),
+  phase: z.enum(['idle', 'busy']),
+  updatedAt: z.number().int().nonnegative(),
+})
+
+export type ClaudeActivityRecord = z.infer<typeof ClaudeActivityRecordSchema>
+
+export const ClaudeActivityListResponseSchema = z.object({
+  type: z.literal('claude.activity.list.response'),
+  requestId: z.string().min(1),
+  terminals: z.array(ClaudeActivityRecordSchema),
+})
+
+export const ClaudeActivityUpdatedSchema = z.object({
+  type: z.literal('claude.activity.updated'),
+  upsert: z.array(ClaudeActivityRecordSchema),
+  remove: z.array(z.string().min(1)),
+})
+
 export const TerminalTurnCompleteSchema = z.object({
   type: z.literal('terminal.turn.complete'),
   terminalId: z.string().min(1),
-  provider: z.literal('opencode'),
-  sessionId: z.string().min(1),
+  provider: z.enum(['opencode', 'claude']),
+  sessionId: z.string().min(1).optional(),
   at: z.number().int().nonnegative(),
 })
 
@@ -292,6 +313,11 @@ export const CodexActivityListSchema = z.object({
 
 export const OpencodeActivityListSchema = z.object({
   type: z.literal('opencode.activity.list'),
+  requestId: z.string().min(1),
+})
+
+export const ClaudeActivityListSchema = z.object({
+  type: z.literal('claude.activity.list'),
   requestId: z.string().min(1),
 })
 
@@ -545,6 +571,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   TerminalKillSchema,
   CodexActivityListSchema,
   OpencodeActivityListSchema,
+  ClaudeActivityListSchema,
   UiLayoutSyncSchema,
   UiScreenshotResultSchema,
   CodingCliCreateSchema,
@@ -694,6 +721,9 @@ export type CodexActivityUpdatedMessage = z.infer<typeof CodexActivityUpdatedSch
 export type OpencodeActivityListResponseMessage = z.infer<typeof OpencodeActivityListResponseSchema>
 
 export type OpencodeActivityUpdatedMessage = z.infer<typeof OpencodeActivityUpdatedSchema>
+
+export type ClaudeActivityListResponseMessage = z.infer<typeof ClaudeActivityListResponseSchema>
+export type ClaudeActivityUpdatedMessage = z.infer<typeof ClaudeActivityUpdatedSchema>
 
 export type TerminalTurnCompleteMessage = z.infer<typeof TerminalTurnCompleteSchema>
 
@@ -950,6 +980,8 @@ export type ServerMessage =
   | CodexActivityUpdatedMessage
   | OpencodeActivityListResponseMessage
   | OpencodeActivityUpdatedMessage
+  | ClaudeActivityListResponseMessage
+  | ClaudeActivityUpdatedMessage
   | TerminalTurnCompleteMessage
   | SessionsChangedMessage
   | SettingsUpdatedMessage

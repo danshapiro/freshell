@@ -73,7 +73,7 @@ function createStore(activeTabId = 'tab-1', attentionDismiss: AttentionDismiss =
       },
       turnCompletion: {
         seq: 0,
-        lastEvent: null,
+        lastAtByTerminalId: {},
         pendingEvents: [],
         attentionByTab: {},
         attentionByPane: {},

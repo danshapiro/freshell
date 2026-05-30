@@ -24,6 +24,7 @@ describe('pane activity', () => {
         'term-live': { terminalId: 'term-live', phase: 'busy', updatedAt: 10 },
       },
       opencodeActivityByTerminalId: {},
+      claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       agentChatSessions: {},
     })).toMatchObject({ isBusy: true, source: 'codex' })
@@ -37,6 +38,7 @@ describe('pane activity', () => {
         'term-live': { terminalId: 'term-live', phase: 'pending', updatedAt: 10 },
       },
       opencodeActivityByTerminalId: {},
+      claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       agentChatSessions: {},
     }).isBusy).toBe(false)
@@ -50,6 +52,7 @@ describe('pane activity', () => {
         'term-foreign': { terminalId: 'term-foreign', phase: 'busy', updatedAt: 10 },
       },
       opencodeActivityByTerminalId: {},
+      claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       agentChatSessions: {},
     }).isBusy).toBe(false)
@@ -74,6 +77,7 @@ describe('pane activity', () => {
       opencodeActivityByTerminalId: {
         'term-live': { terminalId: 'term-live', phase: 'busy', updatedAt: 10 },
       },
+      claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       agentChatSessions: {},
     })).toMatchObject({ isBusy: true, source: 'opencode' })
@@ -86,6 +90,7 @@ describe('pane activity', () => {
       opencodeActivityByTerminalId: {
         'term-foreign': { terminalId: 'term-foreign', phase: 'busy', updatedAt: 10 },
       },
+      claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       agentChatSessions: {},
     }).isBusy).toBe(false)
@@ -151,13 +156,10 @@ describe('pane activity', () => {
       paneLayouts,
       codexActivityByTerminalId: {},
       opencodeActivityByTerminalId: {},
-      paneRuntimeActivityByPaneId: {
-        'pane-claude': {
-          source: 'terminal',
-          phase: 'working',
-          updatedAt: 1,
-        },
+      claudeActivityByTerminalId: {
+        'term-claude': { terminalId: 'term-claude', phase: 'busy', updatedAt: 1 },
       },
+      paneRuntimeActivityByPaneId: {},
       agentChatSessions: {
         'sdk-1': {
           sessionId: 'sdk-1',
@@ -212,6 +214,7 @@ describe('pane activity', () => {
       },
       codexActivityByTerminalId: {},
       opencodeActivityByTerminalId: {},
+      claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       agentChatSessions: {
         'sdk-restore-1': {
@@ -264,6 +267,7 @@ describe('pane activity', () => {
       },
       codexActivityByTerminalId: {},
       opencodeActivityByTerminalId: {},
+      claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       agentChatSessions: {
         'sdk-restore-2': {
@@ -334,6 +338,7 @@ describe('pane activity', () => {
           updatedAt: 1,
         },
       },
+      claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       agentChatSessions: {},
     })
@@ -378,10 +383,39 @@ describe('pane activity', () => {
           updatedAt: 1,
         },
       },
+      claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       agentChatSessions: {},
     })
 
     expect(busySessionKeys).toEqual([])
+  })
+
+  it('treats a claude terminal as busy when the server record is busy', () => {
+    const result = resolvePaneActivity({
+      paneId: 'p1',
+      content: { kind: 'terminal', createRequestId: 'c1', status: 'running', mode: 'claude', terminalId: 't1' } as any,
+      isOnlyPane: true,
+      codexActivityByTerminalId: {},
+      opencodeActivityByTerminalId: {},
+      claudeActivityByTerminalId: { t1: { terminalId: 't1', phase: 'busy', updatedAt: 1 } },
+      paneRuntimeActivityByPaneId: {},
+      agentChatSessions: {},
+    })
+    expect(result).toEqual({ isBusy: true, source: 'claude-terminal' })
+  })
+
+  it('treats a claude terminal as idle when the server record is idle or absent', () => {
+    const base = {
+      paneId: 'p1',
+      content: { kind: 'terminal', createRequestId: 'c1', status: 'running', mode: 'claude', terminalId: 't1' } as any,
+      isOnlyPane: true,
+      codexActivityByTerminalId: {},
+      opencodeActivityByTerminalId: {},
+      paneRuntimeActivityByPaneId: {},
+      agentChatSessions: {},
+    }
+    expect(resolvePaneActivity({ ...base, claudeActivityByTerminalId: { t1: { terminalId: 't1', phase: 'idle', updatedAt: 1 } } }).isBusy).toBe(false)
+    expect(resolvePaneActivity({ ...base, claudeActivityByTerminalId: {} }).isBusy).toBe(false)
   })
 })

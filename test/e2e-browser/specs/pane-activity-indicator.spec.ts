@@ -182,16 +182,17 @@ test.describe('Pane Activity Indicator', () => {
     await expectChromeBlue(page, tabId, false)
   })
 
-  test('claude terminals transition from pending to blue working and back on completion', async ({ freshellPage, page, harness, terminal }) => {
+  test('claude terminals go blue while the server marks them busy and clear on idle', async ({ freshellPage, page, harness, terminal }) => {
     await terminal.waitForTerminal()
     const { tabId, paneId } = await getActiveLeaf(harness)
     const claudeSessionId = '11111111-1111-4111-8111-111111111111'
+    const claudeTerminalId = 'term-e2e-claude'
 
     await page.evaluate((currentPaneId: string) => {
       window.__FRESHELL_TEST_HARNESS__?.setTerminalNetworkEffectsSuppressed(currentPaneId, true)
     }, paneId)
 
-    await page.evaluate(({ currentTabId, currentPaneId, currentSessionId }) => {
+    await page.evaluate(({ currentTabId, currentPaneId, currentSessionId, currentTerminalId }) => {
       const harness = window.__FRESHELL_TEST_HARNESS__
       harness?.dispatch({
         type: 'tabs/updateTab',
@@ -199,7 +200,7 @@ test.describe('Pane Activity Indicator', () => {
           id: currentTabId,
           updates: {
             mode: 'claude',
-            terminalId: undefined,
+            terminalId: currentTerminalId,
             resumeSessionId: currentSessionId,
           },
         },
@@ -215,6 +216,7 @@ test.describe('Pane Activity Indicator', () => {
             status: 'running',
             mode: 'claude',
             shell: 'system',
+            terminalId: currentTerminalId,
             resumeSessionId: currentSessionId,
           },
         },
@@ -223,42 +225,30 @@ test.describe('Pane Activity Indicator', () => {
       currentTabId: tabId,
       currentPaneId: paneId,
       currentSessionId: claudeSessionId,
+      currentTerminalId: claudeTerminalId,
     })
 
     await expectChromeBlue(page, tabId, false)
 
-    await page.evaluate((currentPaneId: string) => {
+    await page.evaluate((currentTerminalId: string) => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({
-        type: 'paneRuntimeActivity/setPaneRuntimeActivity',
+        type: 'claudeActivity/upsertClaudeActivity',
         payload: {
-          paneId: currentPaneId,
-          source: 'terminal',
-          phase: 'pending',
+          terminals: [{ terminalId: currentTerminalId, phase: 'busy', updatedAt: 1 }],
         },
       })
-    }, paneId)
-
-    await expectChromeBlue(page, tabId, false)
-
-    await page.evaluate((currentPaneId: string) => {
-      window.__FRESHELL_TEST_HARNESS__?.dispatch({
-        type: 'paneRuntimeActivity/setPaneRuntimeActivity',
-        payload: {
-          paneId: currentPaneId,
-          source: 'terminal',
-          phase: 'working',
-        },
-      })
-    }, paneId)
+    }, claudeTerminalId)
 
     await expectChromeBlue(page, tabId, true)
 
-    await page.evaluate((currentPaneId: string) => {
+    await page.evaluate((currentTerminalId: string) => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({
-        type: 'paneRuntimeActivity/clearPaneRuntimeActivity',
-        payload: { paneId: currentPaneId },
+        type: 'claudeActivity/upsertClaudeActivity',
+        payload: {
+          terminals: [{ terminalId: currentTerminalId, phase: 'idle', updatedAt: 2 }],
+        },
       })
-    }, paneId)
+    }, claudeTerminalId)
 
     await expectChromeBlue(page, tabId, false)
   })
