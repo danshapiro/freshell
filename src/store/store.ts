@@ -13,6 +13,7 @@ import tabRecencyReducer from './tabRecencySlice'
 import turnCompletionReducer from './turnCompletionSlice'
 import terminalMetaReducer from './terminalMetaSlice'
 import codexActivityReducer from './codexActivitySlice'
+import claudeActivityReducer from './claudeActivitySlice'
 import opencodeActivityReducer from './opencodeActivitySlice'
 import agentChatReducer from './agentChatSlice'
 import freshAgentReducer from './freshAgentSlice'
@@ -52,6 +53,7 @@ export const store = configureStore({
     turnCompletion: turnCompletionReducer,
     terminalMeta: terminalMetaReducer,
     codexActivity: codexActivityReducer,
+    claudeActivity: claudeActivityReducer,
     opencodeActivity: opencodeActivityReducer,
     agentChat: agentChatReducer,
     freshAgent: freshAgentReducer,
