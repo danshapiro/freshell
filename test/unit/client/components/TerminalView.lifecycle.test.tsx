@@ -1029,10 +1029,7 @@ describe('TerminalView lifecycle updates', () => {
       onData?.('\r')
     })
 
-    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
-      source: 'terminal',
-      phase: 'pending',
-    })
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
 
     const initialAttach = wsMocks.send.mock.calls
       .map(([msg]) => msg)
@@ -1058,10 +1055,7 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
-    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
-      source: 'terminal',
-      phase: 'working',
-    })
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
 
     act(() => {
       messageHandler!({
@@ -1149,10 +1143,7 @@ describe('TerminalView lifecycle updates', () => {
       onData?.('\r')
     })
 
-    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
-      source: 'terminal',
-      phase: 'pending',
-    })
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
 
     // Complete attach handshake
     const initialAttach = wsMocks.send.mock.calls
@@ -1180,10 +1171,7 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
-    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
-      source: 'terminal',
-      phase: 'working',
-    })
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
 
     // Step 3: Turn completion BEL -> cleared
     act(() => {
@@ -1286,10 +1274,7 @@ describe('TerminalView lifecycle updates', () => {
       onData?.('\r')
     })
 
-    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
-      source: 'terminal',
-      phase: 'pending',
-    })
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
 
     const initialAttach = wsMocks.send.mock.calls
       .map(([msg]) => msg)
@@ -1315,10 +1300,7 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
-    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
-      source: 'terminal',
-      phase: 'working',
-    })
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
 
     act(() => {
       messageHandler!({
@@ -1350,10 +1332,7 @@ describe('TerminalView lifecycle updates', () => {
       onData?.('\r')
     })
 
-    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
-      source: 'terminal',
-      phase: 'pending',
-    })
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
 
     // New output after second submit -> should set working again
     act(() => {
@@ -1366,10 +1345,7 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
-    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
-      source: 'terminal',
-      phase: 'working',
-    })
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
   })
 
   it('does not show working state for initial prompt output before any user input', async () => {
