@@ -14,7 +14,52 @@ test.describe('Fresh Agent Mobile', () => {
       window.__FRESHELL_TEST_HARNESS__?.setAgentChatNetworkEffectsSuppressed(currentPaneId, true)
     }, paneId)
 
-    await page.evaluate(({ currentTabId, currentPaneId }) => {
+    const sessionId = '55555555-5555-4555-8555-555555555555'
+
+    await page.route(`**/api/fresh-agent/threads/freshclaude/claude/${sessionId}*`, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          threadId: sessionId,
+          sessionId,
+          revision: 1,
+          latestTurnId: null,
+          status: 'idle',
+          capabilities: {
+            send: true,
+            interrupt: true,
+            approvals: true,
+            questions: true,
+            fork: false,
+          },
+          settings: {
+            model: 'claude-opus-4-6',
+            permissionMode: 'default',
+            plugins: [],
+          },
+          tokenUsage: {
+            inputTokens: 0,
+            outputTokens: 0,
+            totalTokens: 0,
+            costUsd: 0,
+          },
+          pendingApprovals: [],
+          pendingQuestions: [],
+          turns: [],
+          extensions: {
+            claude: {
+              liveSessionId: sessionId,
+              cliSessionId: sessionId,
+            },
+          },
+        }),
+      })
+    })
+
+    await page.evaluate(({ currentTabId, currentPaneId, currentSessionId }) => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({
         type: 'panes/updatePaneContent',
         payload: {
@@ -25,27 +70,15 @@ test.describe('Fresh Agent Mobile', () => {
             sessionType: 'freshclaude',
             provider: 'claude',
             createRequestId: 'req-mobile',
-            sessionId: 'sdk-mobile',
-            resumeSessionId: '55555555-5555-4555-8555-555555555555',
+            sessionId: currentSessionId,
+            sessionRef: { provider: 'claude', sessionId: currentSessionId },
+            resumeSessionId: currentSessionId,
             status: 'idle',
             settingsDismissed: true,
           },
         },
       })
-    }, { currentTabId: tabId, currentPaneId: paneId })
-
-    await harness.receiveWsMessage({
-      type: 'sdk.created',
-      requestId: 'req-mobile',
-      sessionId: 'sdk-mobile',
-    })
-    await harness.receiveWsMessage({
-      type: 'sdk.session.init',
-      sessionId: 'sdk-mobile',
-      cliSessionId: '55555555-5555-4555-8555-555555555555',
-      model: 'claude-opus-4-6',
-      cwd: '/workspace/mobile',
-    })
+    }, { currentTabId: tabId, currentPaneId: paneId, currentSessionId: sessionId })
 
     await expect(page.getByRole('textbox', { name: 'Chat message input' })).toBeVisible()
 

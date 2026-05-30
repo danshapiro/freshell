@@ -1,5 +1,51 @@
 import { test, expect } from '../helpers/fixtures.js'
 
+async function routeFreshClaudeSnapshot(page: any, sessionId: string, overrides: Record<string, unknown> = {}) {
+  await page.route(`**/api/fresh-agent/threads/freshclaude/claude/${sessionId}*`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        threadId: sessionId,
+        sessionId,
+        revision: 1,
+        latestTurnId: null,
+        status: 'idle',
+        capabilities: {
+          send: true,
+          interrupt: true,
+          approvals: true,
+          questions: true,
+          fork: false,
+        },
+        settings: {
+          model: 'claude-opus-4-6',
+          permissionMode: 'default',
+          plugins: [],
+        },
+        tokenUsage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+          costUsd: 0,
+        },
+        pendingApprovals: [],
+        pendingQuestions: [],
+        turns: [],
+        extensions: {
+          claude: {
+            liveSessionId: sessionId,
+            cliSessionId: sessionId,
+          },
+        },
+        ...overrides,
+      }),
+    })
+  })
+}
+
 test.describe('Mobile Viewport', () => {
   test.use({ viewport: { width: 390, height: 844 } }) // iPhone 14 size
 
@@ -63,7 +109,7 @@ test.describe('Mobile Viewport', () => {
     await expect(prevTab).toBeVisible({ timeout: 3_000 })
   })
 
-  test('agent chat composer and region are visible on mobile viewport', async ({ freshellPage, page, harness, terminal }) => {
+  test('fresh-agent composer and region are visible on mobile viewport', async ({ freshellPage, page, harness, terminal }) => {
     await terminal.waitForTerminal()
 
     // Get the active leaf pane
@@ -73,42 +119,31 @@ test.describe('Mobile Viewport', () => {
     expect(layout?.type).toBe('leaf')
     const paneId = layout.id as string
 
-    // Suppress network effects and inject agent-chat pane content via Redux
+    // Suppress network effects and inject fresh-agent pane content via Redux
     await page.evaluate((currentPaneId: string) => {
       window.__FRESHELL_TEST_HARNESS__?.setAgentChatNetworkEffectsSuppressed(currentPaneId, true)
     }, paneId)
 
-    const sessionId = 'sdk-e2e-mobile-chat'
-    const cliSessionId = '44444444-4444-4444-8444-444444444444'
+    const sessionId = '44444444-4444-4444-8444-444444444444'
+    await routeFreshClaudeSnapshot(page, sessionId)
 
-    await page.evaluate(({ currentTabId, currentPaneId, currentSessionId, currentCliSessionId }) => {
+    await page.evaluate(({ currentTabId, currentPaneId, currentSessionId }) => {
       const harness = window.__FRESHELL_TEST_HARNESS__
-      harness?.dispatch({
-        type: 'agentChat/sessionCreated',
-        payload: {
-          requestId: 'req-e2e-mobile-chat',
-          sessionId: currentSessionId,
-        },
-      })
-      harness?.dispatch({
-        type: 'agentChat/sessionInit',
-        payload: {
-          sessionId: currentSessionId,
-          cliSessionId: currentCliSessionId,
-        },
-      })
       harness?.dispatch({
         type: 'panes/updatePaneContent',
         payload: {
           tabId: currentTabId,
           paneId: currentPaneId,
           content: {
-            kind: 'agent-chat',
-            provider: 'freshclaude',
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
             createRequestId: 'req-e2e-mobile-chat',
             sessionId: currentSessionId,
-            resumeSessionId: currentCliSessionId,
+            sessionRef: { provider: 'claude', sessionId: currentSessionId },
+            resumeSessionId: currentSessionId,
             status: 'idle',
+            settingsDismissed: true,
           },
         },
       })
@@ -116,19 +151,18 @@ test.describe('Mobile Viewport', () => {
       currentTabId: tabId!,
       currentPaneId: paneId,
       currentSessionId: sessionId,
-      currentCliSessionId: cliSessionId,
     })
 
-    // Verify the chat region is visible
-    const region = page.getByRole('region', { name: /chat/i })
-    await expect(region).toBeVisible({ timeout: 10_000 })
+    // Verify the fresh-agent pane is visible
+    const pane = page.getByRole('group', { name: /pane: freshclaude/i }).last()
+    await expect(pane).toBeVisible({ timeout: 10_000 })
 
     // Verify the send button is visible and interactable
-    const sendBtn = page.getByRole('button', { name: /send message/i })
+    const sendBtn = pane.getByRole('button', { name: /^send$/i })
     await expect(sendBtn).toBeVisible()
 
     // Verify the chat input is visible
-    const input = page.getByRole('textbox', { name: /chat message input/i })
+    const input = pane.getByRole('textbox', { name: /chat message input/i })
     await expect(input).toBeVisible()
   })
 
@@ -147,50 +181,34 @@ test.describe('Mobile Viewport', () => {
       window.__FRESHELL_TEST_HARNESS__?.setAgentChatNetworkEffectsSuppressed(currentPaneId, true)
     }, paneId)
 
-    const sessionId = 'sdk-e2e-mobile-perm'
-    const cliSessionId = '55555555-5555-4555-8555-555555555555'
+    const sessionId = '55555555-5555-4555-8555-555555555555'
+    await routeFreshClaudeSnapshot(page, sessionId, {
+      status: 'running',
+      pendingApprovals: [{
+        requestId: 'perm-e2e-mobile',
+        toolName: 'Bash',
+        input: { command: 'echo mobile-permission-test' },
+      }],
+    })
 
-    // Inject agent-chat pane with a pending permission request
-    await page.evaluate(({ currentTabId, currentPaneId, currentSessionId, currentCliSessionId }) => {
+    // Inject fresh-agent pane with a pending permission request from its snapshot
+    await page.evaluate(({ currentTabId, currentPaneId, currentSessionId }) => {
       const harness = window.__FRESHELL_TEST_HARNESS__
-      harness?.dispatch({
-        type: 'agentChat/sessionCreated',
-        payload: {
-          requestId: 'req-e2e-mobile-perm',
-          sessionId: currentSessionId,
-        },
-      })
-      harness?.dispatch({
-        type: 'agentChat/sessionInit',
-        payload: {
-          sessionId: currentSessionId,
-          cliSessionId: currentCliSessionId,
-        },
-      })
-      harness?.dispatch({
-        type: 'agentChat/addPermissionRequest',
-        payload: {
-          sessionId: currentSessionId,
-          requestId: 'perm-e2e-mobile',
-          subtype: 'can_use_tool',
-          tool: {
-            name: 'Bash',
-            input: { command: 'echo mobile-permission-test' },
-          },
-        },
-      })
       harness?.dispatch({
         type: 'panes/updatePaneContent',
         payload: {
           tabId: currentTabId,
           paneId: currentPaneId,
           content: {
-            kind: 'agent-chat',
-            provider: 'freshclaude',
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
             createRequestId: 'req-e2e-mobile-perm',
             sessionId: currentSessionId,
-            resumeSessionId: currentCliSessionId,
+            sessionRef: { provider: 'claude', sessionId: currentSessionId },
+            resumeSessionId: currentSessionId,
             status: 'running',
+            settingsDismissed: true,
           },
         },
       })
@@ -198,7 +216,6 @@ test.describe('Mobile Viewport', () => {
       currentTabId: tabId!,
       currentPaneId: paneId,
       currentSessionId: sessionId,
-      currentCliSessionId: cliSessionId,
     })
 
     // Verify the permission banner is visible on mobile
@@ -212,18 +229,22 @@ test.describe('Mobile Viewport', () => {
     await expect(allowBtn).toBeVisible()
     await expect(denyBtn).toBeVisible()
 
-    // Click Allow and verify the sdk.permission.respond WS message is sent
+    // Click Allow and verify the fresh-agent approval response WS message is sent
     await harness.clearSentWsMessages()
     await allowBtn.click()
 
     await expect.poll(async () => {
       const sent = await harness.getSentWsMessages()
-      return sent.find((msg: any) => msg?.type === 'sdk.permission.respond') ?? null
+      return sent.find((msg: any) => msg?.type === 'freshAgent.approval.respond') ?? null
     }).toMatchObject({
-      type: 'sdk.permission.respond',
+      type: 'freshAgent.approval.respond',
       sessionId,
+      sessionType: 'freshclaude',
+      provider: 'claude',
       requestId: 'perm-e2e-mobile',
-      behavior: 'allow',
+      decision: {
+        behavior: 'allow',
+      },
     })
   })
 

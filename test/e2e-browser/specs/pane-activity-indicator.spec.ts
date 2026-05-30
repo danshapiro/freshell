@@ -89,32 +89,40 @@ test.describe('Pane Activity Indicator', () => {
     await page.evaluate(({ currentTabId, currentPaneId, currentSessionId, currentCliSessionId }) => {
       const harness = window.__FRESHELL_TEST_HARNESS__
       harness?.dispatch({
-        type: 'agentChat/sessionCreated',
+        type: 'freshAgent/sessionCreated',
         payload: {
           requestId: 'req-e2e-fresh',
           sessionId: currentSessionId,
+          sessionType: 'freshclaude',
+          provider: 'claude',
         },
       })
       harness?.dispatch({
-        type: 'agentChat/sessionInit',
+        type: 'freshAgent/sessionInit',
         payload: {
           sessionId: currentSessionId,
+          sessionType: 'freshclaude',
+          provider: 'claude',
           cliSessionId: currentCliSessionId,
         },
       })
       harness?.dispatch({
-        type: 'agentChat/setSessionStatus',
+        type: 'freshAgent/setSessionStatus',
         payload: {
           sessionId: currentSessionId,
+          sessionType: 'freshclaude',
+          provider: 'claude',
           status: 'running',
         },
       })
       harness?.dispatch({
-        type: 'agentChat/addPermissionRequest',
+        type: 'freshAgent/addPermissionRequest',
         payload: {
           sessionId: currentSessionId,
+          sessionType: 'freshclaude',
+          provider: 'claude',
           requestId: 'perm-e2e',
-          subtype: 'can_use_tool',
+          toolName: 'Bash',
         },
       })
       harness?.dispatch({
@@ -123,12 +131,15 @@ test.describe('Pane Activity Indicator', () => {
           tabId: currentTabId,
           paneId: currentPaneId,
           content: {
-            kind: 'agent-chat',
-            provider: 'freshclaude',
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
             createRequestId: 'req-e2e-fresh',
             sessionId: currentSessionId,
+            sessionRef: { provider: 'claude', sessionId: currentCliSessionId },
             resumeSessionId: currentCliSessionId,
             status: 'running',
+            settingsDismissed: true,
           },
         },
       })
@@ -144,9 +155,11 @@ test.describe('Pane Activity Indicator', () => {
     await page.evaluate((currentSessionId: string) => {
       const harness = window.__FRESHELL_TEST_HARNESS__
       harness?.dispatch({
-        type: 'agentChat/removePermission',
+        type: 'freshAgent/removePermission',
         payload: {
           sessionId: currentSessionId,
+          sessionType: 'freshclaude',
+          provider: 'claude',
           requestId: 'perm-e2e',
         },
       })
@@ -156,9 +169,11 @@ test.describe('Pane Activity Indicator', () => {
 
     await page.evaluate((currentSessionId: string) => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({
-        type: 'agentChat/setSessionStatus',
+        type: 'freshAgent/setSessionStatus',
         payload: {
           sessionId: currentSessionId,
+          sessionType: 'freshclaude',
+          provider: 'claude',
           status: 'idle',
         },
       })
