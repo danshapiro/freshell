@@ -176,6 +176,7 @@ describe('shared settings contract', () => {
 
     expect(resolved.terminal.fontFamily).toBe('Fira Code')
     expect(resolved.terminal.scrollback).toBe(10000)
+    expect(resolved.safety.autoKillIdleMinutes).toBe(15)
     expect(resolved.sidebar.sortMode).toBe('project')
     expect(resolved.agentChat.defaultPlugins).toEqual([])
   })

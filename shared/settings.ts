@@ -725,7 +725,7 @@ export function createDefaultServerSettings(options: SettingsDefaultsOptions = {
       debug: options.loggingDebug ?? false,
     },
     safety: {
-      autoKillIdleMinutes: 180,
+      autoKillIdleMinutes: 15,
     },
     terminal: {
       scrollback: 10000,

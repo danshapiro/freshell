@@ -115,7 +115,7 @@ npm run test:vitest -- ...  # Repo-owned direct Vitest path for focused passthro
 
 **WebSocket Protocol:** Schema-validated messages using Zod. Handshake flow: client sends `hello` with token → server validates → sends `ready`. Message types include `terminal.create/input/resize/detach/attach` and broadcasts like `sessions.updated`.
 
-**PTY Lifecycle:** Each terminal has a unique ID. Server maintains 64KB scrollback buffer. On attach, client receives buffer snapshot then streams new output. On detach, process continues running (background session). Configurable idle timeout (180 mins default).
+**PTY Lifecycle:** Each terminal has a unique ID. Server maintains 64KB scrollback buffer. On attach, client receives buffer snapshot then streams new output. On detach, process continues running (background session). Configurable idle timeout (15 mins default).
 
 **Claude Session Discovery:** Watches `~/.claude/projects/*/sessions/*.jsonl` for new files. Parses JSONL streams to extract messages, groups by project path.
 

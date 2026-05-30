@@ -498,9 +498,9 @@ export default function SafetySettings({
         <SettingsRow label="Auto-kill idle (minutes)">
           <RangeSlider
             value={settings.safety.autoKillIdleMinutes}
-            min={10}
+            min={5}
             max={720}
-            step={10}
+            step={5}
             format={(v) => String(v)}
             onChange={(v) => {
               applyServerSetting({ safety: { autoKillIdleMinutes: v } })

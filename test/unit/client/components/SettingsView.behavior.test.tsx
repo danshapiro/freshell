@@ -327,7 +327,7 @@ describe('SettingsView behavior sections', () => {
       const autoKillSlider = getSlider((slider) => {
         const min = slider.getAttribute('min')
         const max = slider.getAttribute('max')
-        return min === '10' && max === '720'
+        return min === '5' && max === '720'
       })
 
       fireEvent.change(autoKillSlider, { target: { value: '300' } })
