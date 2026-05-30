@@ -65,6 +65,8 @@ export default function DirectoryPicker({
   const [activeIndex, setActiveIndex] = useState(-1)
   const [error, setError] = useState<string | null>(null)
   const [isValidating, setIsValidating] = useState(false)
+  const [isCreating, setIsCreating] = useState(false)
+  const createRequestIdRef = useRef(0)
 
   const pathMode = useMemo(() => isPathInput(inputValue), [inputValue])
 
@@ -198,6 +200,40 @@ export default function DirectoryPicker({
     }
   }, [inputValue, onConfirm])
 
+  const handleCreate = useCallback(async () => {
+    const nextPath = inputValue.trim()
+    if (!nextPath) {
+      setError('directory not found')
+      return
+    }
+
+    setError(null)
+    setIsCreating(true)
+    createRequestIdRef.current += 1
+    const createId = createRequestIdRef.current
+
+    try {
+      const result = await api.post<{ created: boolean; existed?: boolean; resolvedPath?: string }>('/api/files/mkdir', { path: nextPath })
+      if (createRequestIdRef.current !== createId) return
+      onConfirm(result.resolvedPath || nextPath)
+    } catch (error) {
+      if (createRequestIdRef.current !== createId) return
+      if (isApiError(error) && error.status === 403) {
+        setError(error.message === 'Permission denied' ? 'permission denied' : 'path not allowed')
+        return
+      }
+      if (isApiError(error) && error.status === 409) {
+        setError('path exists but is not a directory')
+        return
+      }
+      setError('could not create directory')
+    } finally {
+      if (createRequestIdRef.current === createId) {
+        setIsCreating(false)
+      }
+    }
+  }, [inputValue, onConfirm])
+
   const handleInputKeyDown = useCallback((event: KeyboardEvent<HTMLInputElement>) => {
     if (event.key === 'Escape') {
       event.preventDefault()
@@ -231,6 +267,10 @@ export default function DirectoryPicker({
 
     if (event.key === 'Enter') {
       event.preventDefault()
+      if (event.shiftKey) {
+        void handleCreate()
+        return
+      }
       const selected = activeIndex >= 0 ? suggestions[activeIndex] : undefined
       void handleConfirm(selected || inputValue)
     }
@@ -238,6 +278,13 @@ export default function DirectoryPicker({
 
   const hasSuggestions = suggestions.length > 0
   const activeDescendant = hasSuggestions && activeIndex >= 0 ? `${listboxId}-option-${activeIndex}` : undefined
+
+  const trimmedInput = inputValue.trim()
+  const isKnownDirectory = useMemo(() => {
+    if (!trimmedInput) return false
+    return candidates.includes(trimmedInput) || suggestions.includes(trimmedInput)
+  }, [trimmedInput, candidates, suggestions])
+  const showCreateButton = trimmedInput && !isKnownDirectory
 
   return (
     <div className="h-full w-full p-4 flex items-center justify-center">
@@ -263,6 +310,7 @@ export default function DirectoryPicker({
             setInputValue(event.target.value)
             setActiveIndex(-1)
             setError(null)
+            setIsCreating(false)
           }}
           onKeyDown={handleInputKeyDown}
           role="combobox"
@@ -278,6 +326,19 @@ export default function DirectoryPicker({
           placeholder="e.g. ~/projects/my-app"
           spellCheck={false}
         />
+
+        {showCreateButton && (
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => { void handleCreate() }}
+              disabled={isCreating}
+              className="text-xs px-3 py-1.5 rounded border bg-primary text-primary-foreground hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-ring disabled:opacity-50"
+            >
+              {isCreating ? 'Creating...' : 'Create directory'}
+            </button>
+          </div>
+        )}
 
         {hasSuggestions ? (
           <ul

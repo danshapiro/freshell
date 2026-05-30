@@ -247,4 +247,167 @@ describe('DirectoryPicker', () => {
       expect(input).toHaveValue('/code/tab-preferred')
     })
   })
+
+  describe('create directory button', () => {
+    it('shows create button when input is not empty', async () => {
+      mockApiGet.mockResolvedValueOnce({ directories: [] })
+      renderDirectoryPicker({ defaultCwd: '' })
+
+      const input = screen.getByLabelText('Starting directory for Claude')
+      fireEvent.change(input, { target: { value: '/tmp/new-dir' } })
+
+      expect(screen.getByRole('button', { name: 'Create directory' })).toBeInTheDocument()
+    })
+
+    it('hides create button when input is empty', () => {
+      mockApiGet.mockResolvedValueOnce({ directories: [] })
+      renderDirectoryPicker({ defaultCwd: '' })
+
+      expect(screen.queryByRole('button', { name: 'Create directory' })).not.toBeInTheDocument()
+    })
+
+    it('creates directory and confirms on success', async () => {
+      mockApiGet.mockResolvedValueOnce({ directories: [] })
+      mockApiPost.mockResolvedValueOnce({ created: true, resolvedPath: '/tmp/new-dir' })
+      const { onConfirm } = renderDirectoryPicker({ defaultCwd: '' })
+
+      const input = screen.getByLabelText('Starting directory for Claude')
+      fireEvent.change(input, { target: { value: '/tmp/new-dir' } })
+
+      const createButton = screen.getByRole('button', { name: 'Create directory' })
+      fireEvent.click(createButton)
+
+      await waitFor(() => {
+        expect(mockApiPost).toHaveBeenCalledWith('/api/files/mkdir', { path: '/tmp/new-dir' })
+      })
+      expect(onConfirm).toHaveBeenCalledWith('/tmp/new-dir')
+    })
+
+    it('shows creating state while request is in flight', async () => {
+      mockApiGet.mockResolvedValueOnce({ directories: [] })
+      let resolveMkdir: (value: unknown) => void
+      mockApiPost.mockReturnValueOnce(new Promise((resolve) => { resolveMkdir = resolve }))
+      renderDirectoryPicker({ defaultCwd: '' })
+
+      const input = screen.getByLabelText('Starting directory for Claude')
+      fireEvent.change(input, { target: { value: '/tmp/new-project' } })
+
+      const createButton = screen.getByRole('button', { name: 'Create directory' })
+      fireEvent.click(createButton)
+
+      expect(screen.getByRole('button', { name: 'Creating...' })).toBeDisabled()
+
+      resolveMkdir!({ created: true, resolvedPath: '/tmp/new-project' })
+    })
+
+    it('shows error when path is not allowed', async () => {
+      mockApiGet.mockResolvedValueOnce({ directories: [] })
+      mockApiPost.mockRejectedValueOnce({ status: 403, message: 'Path not allowed' })
+      renderDirectoryPicker({ defaultCwd: '' })
+
+      const input = screen.getByLabelText('Starting directory for Claude')
+      fireEvent.change(input, { target: { value: '/etc/hosts' } })
+
+      const createButton = screen.getByRole('button', { name: 'Create directory' })
+      fireEvent.click(createButton)
+
+      expect(await screen.findByText('path not allowed')).toBeInTheDocument()
+    })
+
+    it('shows error when path exists as a file', async () => {
+      mockApiGet.mockResolvedValueOnce({ directories: [] })
+      mockApiPost.mockRejectedValueOnce({ status: 409 })
+      renderDirectoryPicker({ defaultCwd: '' })
+
+      const input = screen.getByLabelText('Starting directory for Claude')
+      fireEvent.change(input, { target: { value: '/tmp/existing-file' } })
+
+      const createButton = screen.getByRole('button', { name: 'Create directory' })
+      fireEvent.click(createButton)
+
+      expect(await screen.findByText('path exists but is not a directory')).toBeInTheDocument()
+    })
+
+    it('shows generic error when creation fails', async () => {
+      mockApiGet.mockResolvedValueOnce({ directories: [] })
+      mockApiPost.mockRejectedValueOnce(new Error('Network error'))
+      renderDirectoryPicker({ defaultCwd: '' })
+
+      const input = screen.getByLabelText('Starting directory for Claude')
+      fireEvent.change(input, { target: { value: '/tmp/will-fail' } })
+
+      const createButton = screen.getByRole('button', { name: 'Create directory' })
+      fireEvent.click(createButton)
+
+      expect(await screen.findByText('could not create directory')).toBeInTheDocument()
+    })
+
+    it('ignores stale create responses', async () => {
+      mockApiGet.mockResolvedValueOnce({ directories: [] })
+      let resolveFirst: (value: unknown) => void
+      let resolveSecond: (value: unknown) => void
+      mockApiPost
+        .mockReturnValueOnce(new Promise((resolve) => { resolveFirst = resolve }))
+        .mockReturnValueOnce(new Promise((resolve) => { resolveSecond = resolve }))
+      const { onConfirm } = renderDirectoryPicker({ defaultCwd: '' })
+
+      const input = screen.getByLabelText('Starting directory for Claude')
+
+      fireEvent.change(input, { target: { value: '/tmp/dir-a' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Create directory' }))
+
+      fireEvent.change(input, { target: { value: '/tmp/dir-b' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Create directory' }))
+
+      resolveFirst!({ created: true, resolvedPath: '/tmp/dir-a' })
+      await Promise.resolve()
+
+      resolveSecond!({ created: true, resolvedPath: '/tmp/dir-b' })
+      await waitFor(() => {
+        expect(onConfirm).toHaveBeenCalledWith('/tmp/dir-b')
+      })
+      expect(onConfirm).toHaveBeenCalledTimes(1)
+    })
+
+    it('hides create button when path matches a known candidate', async () => {
+      mockApiGet.mockResolvedValueOnce({ directories: ['/tmp/existing'] })
+      renderDirectoryPicker({ defaultCwd: '' })
+
+      const input = screen.getByLabelText('Starting directory for Claude')
+      fireEvent.change(input, { target: { value: '/tmp/existing' } })
+
+      await waitFor(() => {
+        expect(screen.queryByRole('button', { name: 'Create directory' })).not.toBeInTheDocument()
+      })
+    })
+
+    it('shows permission denied error for OS permission failures', async () => {
+      mockApiGet.mockResolvedValueOnce({ directories: [] })
+      mockApiPost.mockRejectedValueOnce({ status: 403, message: 'Permission denied' })
+      renderDirectoryPicker({ defaultCwd: '' })
+
+      const input = screen.getByLabelText('Starting directory for Claude')
+      fireEvent.change(input, { target: { value: '/root/denied' } })
+
+      const createButton = screen.getByRole('button', { name: 'Create directory' })
+      fireEvent.click(createButton)
+
+      expect(await screen.findByText('permission denied')).toBeInTheDocument()
+    })
+
+    it('triggers create on Shift+Enter', async () => {
+      mockApiGet.mockResolvedValueOnce({ directories: [] })
+      mockApiPost.mockResolvedValueOnce({ created: true, resolvedPath: '/tmp/shift-enter' })
+      const { onConfirm } = renderDirectoryPicker({ defaultCwd: '' })
+
+      const input = screen.getByLabelText('Starting directory for Claude')
+      fireEvent.change(input, { target: { value: '/tmp/shift-enter' } })
+      fireEvent.keyDown(input, { key: 'Enter', shiftKey: true })
+
+      await waitFor(() => {
+        expect(mockApiPost).toHaveBeenCalledWith('/api/files/mkdir', { path: '/tmp/shift-enter' })
+      })
+      expect(onConfirm).toHaveBeenCalledWith('/tmp/shift-enter')
+    })
+  })
 })
