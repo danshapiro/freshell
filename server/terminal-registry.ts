@@ -98,12 +98,6 @@ const FALLBACK_CODING_CLI_COMMAND_SPECS: Array<[string, CodingCliCommandSpec]> =
     defaultCommand: 'opencode',
     resumeArgs: (sessionId: string) => ['--session', sessionId],
     modelArgs: (model: string) => ['--model', model],
-    permissionModeEnvVar: 'OPENCODE_PERMISSION',
-    permissionModeEnvValues: {
-      plan: '{"edit":"ask","bash":"ask"}',
-      acceptEdits: '{"edit":"allow","bash":"ask"}',
-      bypassPermissions: '{"edit":"allow","bash":"allow"}',
-    },
   }],
   ['gemini', {
     label: 'Gemini',
