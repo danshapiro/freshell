@@ -368,5 +368,46 @@ describe('DirectoryPicker', () => {
       })
       expect(onConfirm).toHaveBeenCalledTimes(1)
     })
+
+    it('hides create button when path matches a known candidate', async () => {
+      mockApiGet.mockResolvedValueOnce({ directories: ['/tmp/existing'] })
+      renderDirectoryPicker({ defaultCwd: '' })
+
+      const input = screen.getByLabelText('Starting directory for Claude')
+      fireEvent.change(input, { target: { value: '/tmp/existing' } })
+
+      await waitFor(() => {
+        expect(screen.queryByRole('button', { name: 'Create directory' })).not.toBeInTheDocument()
+      })
+    })
+
+    it('shows permission denied error for OS permission failures', async () => {
+      mockApiGet.mockResolvedValueOnce({ directories: [] })
+      mockApiPost.mockRejectedValueOnce({ status: 403, message: 'Permission denied' })
+      renderDirectoryPicker({ defaultCwd: '' })
+
+      const input = screen.getByLabelText('Starting directory for Claude')
+      fireEvent.change(input, { target: { value: '/root/denied' } })
+
+      const createButton = screen.getByRole('button', { name: 'Create directory' })
+      fireEvent.click(createButton)
+
+      expect(await screen.findByText('permission denied')).toBeInTheDocument()
+    })
+
+    it('triggers create on Shift+Enter', async () => {
+      mockApiGet.mockResolvedValueOnce({ directories: [] })
+      mockApiPost.mockResolvedValueOnce({ created: true, resolvedPath: '/tmp/shift-enter' })
+      const { onConfirm } = renderDirectoryPicker({ defaultCwd: '' })
+
+      const input = screen.getByLabelText('Starting directory for Claude')
+      fireEvent.change(input, { target: { value: '/tmp/shift-enter' } })
+      fireEvent.keyDown(input, { key: 'Enter', shiftKey: true })
+
+      await waitFor(() => {
+        expect(mockApiPost).toHaveBeenCalledWith('/api/files/mkdir', { path: '/tmp/shift-enter' })
+      })
+      expect(onConfirm).toHaveBeenCalledWith('/tmp/shift-enter')
+    })
   })
 })

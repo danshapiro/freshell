@@ -219,7 +219,7 @@ export default function DirectoryPicker({
     } catch (error) {
       if (createRequestIdRef.current !== createId) return
       if (isApiError(error) && error.status === 403) {
-        setError('path not allowed')
+        setError(error.message === 'Permission denied' ? 'permission denied' : 'path not allowed')
         return
       }
       if (isApiError(error) && error.status === 409) {
@@ -267,6 +267,10 @@ export default function DirectoryPicker({
 
     if (event.key === 'Enter') {
       event.preventDefault()
+      if (event.shiftKey) {
+        void handleCreate()
+        return
+      }
       const selected = activeIndex >= 0 ? suggestions[activeIndex] : undefined
       void handleConfirm(selected || inputValue)
     }
@@ -274,6 +278,13 @@ export default function DirectoryPicker({
 
   const hasSuggestions = suggestions.length > 0
   const activeDescendant = hasSuggestions && activeIndex >= 0 ? `${listboxId}-option-${activeIndex}` : undefined
+
+  const trimmedInput = inputValue.trim()
+  const isKnownDirectory = useMemo(() => {
+    if (!trimmedInput) return false
+    return candidates.includes(trimmedInput) || suggestions.includes(trimmedInput)
+  }, [trimmedInput, candidates, suggestions])
+  const showCreateButton = trimmedInput && !isKnownDirectory
 
   return (
     <div className="h-full w-full p-4 flex items-center justify-center">
@@ -316,7 +327,7 @@ export default function DirectoryPicker({
           spellCheck={false}
         />
 
-        {inputValue.trim() && (
+        {showCreateButton && (
           <div className="flex items-center gap-2">
             <button
               type="button"

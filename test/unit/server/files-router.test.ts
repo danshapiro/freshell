@@ -433,7 +433,6 @@ describe('files-router path validation', () => {
   describe('POST /api/files/mkdir', () => {
     it('creates a new directory', async () => {
       mockGetSettings.mockResolvedValue({ allowedFilePaths: undefined })
-      mockStat.mockRejectedValueOnce({ code: 'ENOENT' })
       mockMkdir.mockResolvedValueOnce(undefined)
 
       const res = await request(app)
@@ -446,6 +445,7 @@ describe('files-router path validation', () => {
 
     it('returns existed:true when directory already exists', async () => {
       mockGetSettings.mockResolvedValue({ allowedFilePaths: undefined })
+      mockMkdir.mockRejectedValueOnce({ code: 'EEXIST' })
       mockStat.mockResolvedValueOnce({ isDirectory: () => true })
 
       const res = await request(app)
@@ -454,11 +454,11 @@ describe('files-router path validation', () => {
 
       expect(res.status).toBe(200)
       expect(res.body).toEqual({ created: true, existed: true, resolvedPath: expect.any(String) })
-      expect(mockMkdir).not.toHaveBeenCalled()
     })
 
     it('returns 409 when path exists as a file', async () => {
       mockGetSettings.mockResolvedValue({ allowedFilePaths: undefined })
+      mockMkdir.mockRejectedValueOnce({ code: 'EEXIST' })
       mockStat.mockResolvedValueOnce({ isDirectory: () => false })
 
       const res = await request(app)
@@ -482,7 +482,6 @@ describe('files-router path validation', () => {
 
     it('creates directory inside allowed directory', async () => {
       mockGetSettings.mockResolvedValue({ allowedFilePaths: ['/home/user/projects'] })
-      mockStat.mockRejectedValueOnce({ code: 'ENOENT' })
       mockMkdir.mockResolvedValueOnce(undefined)
 
       const res = await request(app)
@@ -513,7 +512,6 @@ describe('files-router path validation', () => {
 
     it('expands tilde in path', async () => {
       mockGetSettings.mockResolvedValue({ allowedFilePaths: undefined })
-      mockStat.mockRejectedValueOnce({ code: 'ENOENT' })
       mockMkdir.mockResolvedValueOnce(undefined)
 
       const homeDir = os.homedir()
@@ -527,7 +525,6 @@ describe('files-router path validation', () => {
 
     it('returns 403 when permission is denied', async () => {
       mockGetSettings.mockResolvedValue({ allowedFilePaths: undefined })
-      mockStat.mockRejectedValueOnce({ code: 'ENOENT' })
       mockMkdir.mockRejectedValueOnce(Object.assign(new Error('Permission denied'), { code: 'EACCES' }))
 
       const res = await request(app)
@@ -536,6 +533,30 @@ describe('files-router path validation', () => {
 
       expect(res.status).toBe(403)
       expect(res.body.error).toBe('Permission denied')
+    })
+
+    it('returns 409 when a parent path component is a file (ENOTDIR)', async () => {
+      mockGetSettings.mockResolvedValue({ allowedFilePaths: undefined })
+      mockMkdir.mockRejectedValueOnce(Object.assign(new Error('Not a directory'), { code: 'ENOTDIR' }))
+
+      const res = await request(app)
+        .post('/api/files/mkdir')
+        .send({ path: '/tmp/file.txt/subdir' })
+
+      expect(res.status).toBe(409)
+      expect(res.body.error).toBe('Path exists but is not a directory')
+    })
+
+    it('returns 500 with generic error for unexpected failures', async () => {
+      mockGetSettings.mockResolvedValue({ allowedFilePaths: undefined })
+      mockMkdir.mockRejectedValueOnce(Object.assign(new Error('No space left on device'), { code: 'ENOSPC' }))
+
+      const res = await request(app)
+        .post('/api/files/mkdir')
+        .send({ path: '/tmp/full' })
+
+      expect(res.status).toBe(500)
+      expect(res.body.error).toBe('No space left on device')
     })
   })
 })

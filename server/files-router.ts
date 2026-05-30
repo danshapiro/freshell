@@ -230,17 +230,19 @@ export function createFilesRouter(deps: FilesRouterDeps): Router {
     const resolvedFsPath = await toFilesystemPath(normalizedPath, flavor)
 
     try {
-      const existing = await fsp.stat(resolvedFsPath).catch(() => null)
-      if (existing) {
-        if (existing.isDirectory()) {
+      await fsp.mkdir(resolvedFsPath, { recursive: true })
+      return res.json({ created: true, existed: false, resolvedPath: normalizedPath })
+    } catch (err: any) {
+      if (err.code === 'EEXIST') {
+        const stat = await fsp.stat(resolvedFsPath).catch(() => null)
+        if (stat?.isDirectory()) {
           return res.json({ created: true, existed: true, resolvedPath: normalizedPath })
         }
         return res.status(409).json({ error: 'Path exists but is not a directory' })
       }
-
-      await fsp.mkdir(resolvedFsPath, { recursive: true })
-      return res.json({ created: true, existed: false, resolvedPath: normalizedPath })
-    } catch (err: any) {
+      if (err.code === 'ENOTDIR') {
+        return res.status(409).json({ error: 'Path exists but is not a directory' })
+      }
       if (err.code === 'EACCES' || err.code === 'EPERM') {
         return res.status(403).json({ error: 'Permission denied' })
       }
