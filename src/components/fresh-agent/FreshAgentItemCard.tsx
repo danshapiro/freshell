@@ -1,4 +1,4 @@
-import { memo, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Check, ChevronRight, Loader2, X } from 'lucide-react'
 import DiffView from '@/components/agent-chat/DiffView'
 import { getToolPreview } from '@/components/agent-chat/tool-preview'
