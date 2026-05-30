@@ -411,7 +411,7 @@ describe('ExtensionManager', () => {
           command: 'opencode',
           resumeArgs: ['--session', '{{sessionId}}'],
           modelArgs: ['--model', '{{model}}'],
-          permissionModeEnvVar: 'OPENCODE_PERMISSION',
+          permissionModeEnvVar: 'AGENT_PERMISSION_MODE',
           permissionModeValues: {
             plan: '{"edit":"ask","bash":"ask"}',
           },

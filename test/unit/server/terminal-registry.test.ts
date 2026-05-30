@@ -1059,26 +1059,36 @@ describe('buildSpawnSpec Unix paths', () => {
       expect(spec.env.GOOGLE_GENERATIVE_AI_API_KEY).toBe('gemini-key')
     })
 
-    it('maps OpenCode plan permission mode to OPENCODE_PERMISSION env', () => {
+    it('does not set OPENCODE_PERMISSION for OpenCode when permission mode is provided', () => {
       delete process.env.OPENCODE_CMD
 
       const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system', undefined, {
-        permissionMode: 'plan',
+        permissionMode: 'bypassPermissions',
         opencodeServer: TEST_OPENCODE_SERVER,
       })
 
-      expect(spec.env.OPENCODE_PERMISSION).toBe('{"edit":"ask","bash":"ask"}')
+      expect(spec.env).not.toHaveProperty('OPENCODE_PERMISSION')
+      expect(spec.args).not.toContain('--permission-mode')
+      expect(spec.args).toContain('--hostname')
+      expect(spec.args).toContain('127.0.0.1')
+      expect(spec.args).toContain('--port')
+      expect(spec.args).toContain(String(TEST_OPENCODE_SERVER.port))
     })
 
-    it('maps OpenCode acceptEdits permission mode to OPENCODE_PERMISSION env', () => {
+    it('keeps OpenCode model and resume behavior while ignoring permission mode', () => {
       delete process.env.OPENCODE_CMD
 
-      const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system', undefined, {
-        permissionMode: 'acceptEdits',
+      const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system', 'ses_existing', {
+        permissionMode: 'plan',
+        model: 'openai/gpt-5-mini',
         opencodeServer: TEST_OPENCODE_SERVER,
       })
 
-      expect(spec.env.OPENCODE_PERMISSION).toBe('{"edit":"allow","bash":"ask"}')
+      expect(spec.env).not.toHaveProperty('OPENCODE_PERMISSION')
+      expect(spec.args).toContain('--session')
+      expect(spec.args).toContain('ses_existing')
+      expect(spec.args).not.toContain('--model')
+      expect(spec.args).not.toContain('openai/gpt-5-mini')
     })
 
     it('scrubs inherited OpenCode server auth env for managed TUI endpoints', () => {

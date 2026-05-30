@@ -39,6 +39,10 @@ function getEffectiveFreshAgentEffort(content: FreshAgentPaneContent): string | 
   return normalizeFreshAgentEffort(content.sessionType, content.provider, getEffectiveFreshAgentModel(content), content.effort)
 }
 
+function getEffectiveFreshAgentPermissionMode(content: FreshAgentPaneContent): string | undefined {
+  return content.provider === 'opencode' ? undefined : content.permissionMode
+}
+
 function isStatusRegression(current: string, next: string): boolean {
   return !EARLY_STATES.has(current) && EARLY_STATES.has(next)
 }
@@ -329,7 +333,7 @@ export function FreshAgentView({
     sessionRef: content.sessionRef,
     modelSelection: content.modelSelection,
     model: getEffectiveFreshAgentModel(content),
-    permissionMode: content.permissionMode,
+    ...(getEffectiveFreshAgentPermissionMode(content) ? { permissionMode: getEffectiveFreshAgentPermissionMode(content) } : {}),
     sandbox: content.sandbox,
     effort: getEffectiveFreshAgentEffort(content),
     plugins: content.plugins,
@@ -971,7 +975,7 @@ export function FreshAgentView({
                   settings: {
                     ...(paneContent.initialCwd ? { cwd: paneContent.initialCwd } : {}),
                     ...(getEffectiveFreshAgentModel(paneContent) ? { model: getEffectiveFreshAgentModel(paneContent) } : {}),
-                    ...(paneContent.permissionMode ? { permissionMode: paneContent.permissionMode } : {}),
+                    ...(getEffectiveFreshAgentPermissionMode(paneContent) ? { permissionMode: getEffectiveFreshAgentPermissionMode(paneContent) } : {}),
                     ...(paneContent.sandbox ? { sandbox: paneContent.sandbox } : {}),
                     ...(getEffectiveFreshAgentEffort(paneContent) ? { effort: getEffectiveFreshAgentEffort(paneContent) } : {}),
                   },

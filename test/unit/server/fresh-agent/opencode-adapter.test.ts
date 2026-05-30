@@ -66,7 +66,7 @@ const exportedSession = {
 describe('OpenCode fresh-agent adapter', () => {
   it('creates a placeholder and materializes it on first send with model and effort', async () => {
     const { spawnFn, calls } = makeSpawn({
-      'run reply ok --format json --dangerously-skip-permissions --model opencode-go/deepseek-v4-flash --variant max': {
+      'run reply ok --format json --model opencode-go/deepseek-v4-flash --variant max': {
         stdout: '{"type":"step_start","sessionID":"ses_real_1"}\n{"type":"text","part":{"text":"ok"}}\n',
       },
       'export ses_real_1': {
@@ -96,7 +96,6 @@ describe('OpenCode fresh-agent adapter', () => {
       'reply ok',
       '--format',
       'json',
-      '--dangerously-skip-permissions',
       '--model',
       'opencode-go/deepseek-v4-flash',
       '--variant',
@@ -123,10 +122,10 @@ describe('OpenCode fresh-agent adapter', () => {
 
   it('continues a materialized session on later sends', async () => {
     const { spawnFn, calls } = makeSpawn({
-      'run first --format json --dangerously-skip-permissions --model opencode-go/glm-5.1 --variant high': {
+      'run first --format json --model opencode-go/glm-5.1 --variant high': {
         stdout: '{"type":"step_start","sessionID":"ses_real_2"}\n',
       },
-      'run second --format json --dangerously-skip-permissions --session ses_real_2 --model opencode-go/glm-5.1 --variant high': {
+      'run second --format json --session ses_real_2 --model opencode-go/glm-5.1 --variant high': {
         stdout: '{"type":"step_start","sessionID":"ses_real_2"}\n',
       },
     })
@@ -152,10 +151,10 @@ describe('OpenCode fresh-agent adapter', () => {
       info: { ...exportedSession.info, id: 'ses_restored_1' },
     }
     const { spawnFn, calls } = makeSpawn({
-      'run reply ok --format json --dangerously-skip-permissions --session ses_restored_1': {
+      'run reply ok --format json --session ses_restored_1': {
         stdout: '{"type":"step_start","sessionID":"ses_restored_1"}\n',
       },
-      'run /compact keep decisions --format json --dangerously-skip-permissions --session ses_restored_1': {
+      'run /compact keep decisions --format json --session ses_restored_1': {
         stdout: '{"type":"step_start","sessionID":"ses_restored_1"}\n',
       },
       'export ses_restored_1': {
@@ -177,7 +176,6 @@ describe('OpenCode fresh-agent adapter', () => {
       'reply ok',
       '--format',
       'json',
-      '--dangerously-skip-permissions',
       '--session',
       'ses_restored_1',
     ])
@@ -186,7 +184,6 @@ describe('OpenCode fresh-agent adapter', () => {
       '/compact keep decisions',
       '--format',
       'json',
-      '--dangerously-skip-permissions',
       '--session',
       'ses_restored_1',
     ])
@@ -207,7 +204,7 @@ describe('OpenCode fresh-agent adapter', () => {
 
   it('accepts partial per-turn settings from the client send path', async () => {
     const { spawnFn, calls } = makeSpawn({
-      'run reply ok --format json --dangerously-skip-permissions --model opencode-go/deepseek-v4-flash --variant high': {
+      'run reply ok --format json --model opencode-go/deepseek-v4-flash --variant high': {
         stdout: '{"type":"step_start","sessionID":"ses_real_3"}\n',
       },
     })
@@ -233,7 +230,6 @@ describe('OpenCode fresh-agent adapter', () => {
       'reply ok',
       '--format',
       'json',
-      '--dangerously-skip-permissions',
       '--model',
       'opencode-go/deepseek-v4-flash',
       '--variant',

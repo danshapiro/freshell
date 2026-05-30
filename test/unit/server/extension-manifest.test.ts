@@ -83,7 +83,7 @@ describe('ExtensionManifestSchema', () => {
         modelArgs: ['--model', '{{model}}'],
         sandboxArgs: ['--sandbox', '{{sandbox}}'],
         permissionModeArgs: ['--permission-mode', '{{permissionMode}}'],
-        permissionModeEnvVar: 'OPENCODE_PERMISSION',
+        permissionModeEnvVar: 'AGENT_PERMISSION_MODE',
         permissionModeValues: {
           plan: '{"edit":"ask","bash":"ask"}',
         },

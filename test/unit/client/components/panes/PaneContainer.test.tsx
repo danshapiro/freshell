@@ -1822,6 +1822,7 @@ describe('PaneContainer', () => {
           expect(paneContent.initialCwd).toBe('/home/user/freshopencode-project')
           expect(paneContent.model).toBe('opencode-go/deepseek-v4-flash')
           expect(paneContent.effort).toBe('max')
+          expect(paneContent.permissionMode).toBeUndefined()
         }
       })
 

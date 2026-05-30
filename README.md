@@ -118,6 +118,8 @@ Freshell indexes local session history and can launch terminals for these coding
 Enable/disable providers and set defaults in the Settings UI or via `~/.freshell/config.json`.
 OpenCode sessions are discovered directly from OpenCode's local session database, so existing OpenCode work can be resumed from freshell without importing anything manually.
 
+OpenCode permissions are controlled by the OpenCode configuration for the OS user running freshell. Freshell does not set `OPENCODE_PERMISSION` or pass `--dangerously-skip-permissions` for OpenCode sessions; OS filesystem permissions remain the hard boundary.
+
 ## Tech Stack
 
 - **Frontend**: React 18, Redux Toolkit, Tailwind CSS, xterm.js, Monaco Editor, Zod, lucide-react

@@ -410,6 +410,87 @@ describe('FreshAgentView', () => {
     expect(screen.queryByRole('button', { name: 'Fork' })).not.toBeInTheDocument()
   })
 
+  it('does not transmit stale Freshopencode permissionMode on create or send', async () => {
+    const creatingStore = createStore()
+    creatingStore.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-opencode-policy',
+        status: 'creating',
+        initialCwd: '/repo',
+        model: 'opencode-go/deepseek-v4-flash',
+        effort: 'max',
+        permissionMode: 'bypassPermissions',
+      },
+    }))
+
+    render(
+      <Provider store={creatingStore}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    const createMessage = wsMock.send.mock.calls
+      .map(([message]) => message)
+      .find((message) => message?.type === 'freshAgent.create')
+    expect(createMessage).toBeDefined()
+    expect(createMessage).not.toHaveProperty('permissionMode')
+
+    cleanup()
+    wsMock.send.mockClear()
+
+    const sendingStore = createStore()
+    sendingStore.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-opencode-send-policy',
+        sessionId: 'freshopencode-req-opencode-send-policy',
+        status: 'idle',
+        initialCwd: '/repo',
+        model: 'opencode-go/deepseek-v4-flash',
+        effort: 'max',
+        permissionMode: 'bypassPermissions',
+      },
+    }))
+
+    render(
+      <Provider store={sendingStore}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Use local OpenCode policy' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(wsMock.send).toHaveBeenCalledWith({
+      type: 'freshAgent.send',
+      sessionId: 'freshopencode-req-opencode-send-policy',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      text: 'Use local OpenCode policy',
+      settings: {
+        cwd: '/repo',
+        model: 'opencode-go/deepseek-v4-flash',
+        effort: 'max',
+      },
+    })
+  })
+
   it('auto-titles the fresh-agent pane and tab from the first user message', async () => {
     const store = createStore()
     store.dispatch(initLayout({

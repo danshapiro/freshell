@@ -65,6 +65,9 @@ export function buildResumeContent(opts: {
   if (freshAgentType) {
     const agentConfig = getAgentChatProviderConfig(opts.sessionType)
     const ps = opts.agentChatProviderSettings
+    const permissionMode = freshAgentType.settingsVisibility.permissionMode === false
+      ? undefined
+      : ps?.defaultPermissionMode ?? agentConfig?.defaultPermissionMode ?? freshAgentType.defaultPermissionMode
     return {
       kind: 'fresh-agent',
       sessionType: freshAgentType.sessionType,
@@ -77,7 +80,7 @@ export function buildResumeContent(opts: {
       initialCwd: opts.cwd,
       modelSelection: ps?.modelSelection,
       model: freshAgentType.defaultModel,
-      permissionMode: ps?.defaultPermissionMode ?? agentConfig?.defaultPermissionMode ?? freshAgentType.defaultPermissionMode,
+      ...(permissionMode ? { permissionMode } : {}),
       effort: ps?.effort,
     }
   }

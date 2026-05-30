@@ -62,6 +62,29 @@ describe('buildResumeContent', () => {
     expect(content.effort).toBeUndefined()
   })
 
+  it('returns freshopencode resume content without a Freshell permission mode', () => {
+    const content = buildResumeContent({
+      sessionType: 'freshopencode',
+      sessionId: 'ses_opencode_123',
+      cwd: '/home/user/project',
+      agentChatProviderSettings: {
+        defaultPermissionMode: 'bypassPermissions',
+      },
+    })
+
+    expect(content.kind).toBe('fresh-agent')
+    if (content.kind !== 'fresh-agent') throw new Error('expected fresh-agent')
+    expect(content.sessionType).toBe('freshopencode')
+    expect(content.provider).toBe('opencode')
+    expect(content.resumeSessionId).toBe('ses_opencode_123')
+    expect(content.sessionRef).toEqual({
+      provider: 'opencode',
+      sessionId: 'ses_opencode_123',
+    })
+    expect(content.initialCwd).toBe('/home/user/project')
+    expect(content.permissionMode).toBeUndefined()
+  })
+
   it('returns fresh-agent content for kilroy sessionType', () => {
     const content = buildResumeContent({
       sessionType: 'kilroy',

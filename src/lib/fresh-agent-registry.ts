@@ -117,11 +117,11 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     label: 'Freshopencode',
     icon: OpencodeIcon,
     defaultModel: FRESHOPENCODE_DEFAULT_MODEL,
-    defaultPermissionMode: 'bypassPermissions',
+    defaultPermissionMode: 'default',
     defaultEffort: FRESHOPENCODE_DEFAULT_EFFORT,
     settingsVisibility: {
       model: true,
-      permissionMode: true,
+      permissionMode: false,
       effort: true,
       thinking: true,
       tools: true,

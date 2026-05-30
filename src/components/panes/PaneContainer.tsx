@@ -621,6 +621,14 @@ function PickerWrapper({
         ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.model ?? freshAgentType.defaultModel
         : freshAgentType.defaultModel
       const model = normalizeFreshAgentModel(freshAgentType.sessionType, freshAgentType.runtimeProvider, configuredModel) ?? configuredModel
+      const permissionMode = freshAgentType.settingsVisibility.permissionMode === false
+        ? undefined
+        : providerSettings?.defaultPermissionMode
+          ?? (freshAgentType.runtimeProvider === 'codex'
+            ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.permissionMode
+            : undefined)
+          ?? providerConfig?.defaultPermissionMode
+          ?? freshAgentType.defaultPermissionMode
       return {
         kind: 'fresh-agent',
         sessionType: freshAgentType.sessionType,
@@ -629,12 +637,7 @@ function PickerWrapper({
         status: 'creating',
         modelSelection: normalizeAgentChatModelSelection(providerSettings?.modelSelection),
         model,
-        permissionMode: providerSettings?.defaultPermissionMode
-          ?? (freshAgentType.runtimeProvider === 'codex'
-            ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.permissionMode
-            : undefined)
-          ?? providerConfig?.defaultPermissionMode
-          ?? freshAgentType.defaultPermissionMode,
+        ...(permissionMode ? { permissionMode } : {}),
         sandbox: freshAgentType.runtimeProvider === 'codex'
           ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.sandbox
           : undefined,

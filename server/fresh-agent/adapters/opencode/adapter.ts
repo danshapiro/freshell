@@ -163,7 +163,6 @@ export function createOpencodeFreshAgentAdapter(options: {
       text,
       '--format',
       'json',
-      '--dangerously-skip-permissions',
       ...(state.realSessionId ? ['--session', state.realSessionId] : []),
       ...(model ? ['--model', model] : []),
       ...(effort ? ['--variant', effort] : []),

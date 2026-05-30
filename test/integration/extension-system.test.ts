@@ -211,4 +211,18 @@ describe('Extension system integration', () => {
       scrollInputPolicy: 'fallbackToCursorKeysWhenAltScreenMouseCapture',
     })
   })
+
+  it('builtin OpenCode extension does not expose Freshell permission controls', () => {
+    const builtinDir = path.resolve(process.cwd(), 'extensions')
+    mgr.scan([builtinDir])
+
+    const opencode = mgr.toClientRegistry().find((entry) => entry.name === 'opencode')
+
+    expect(opencode).toBeDefined()
+    expect(opencode?.label).toBe('OpenCode')
+    expect(opencode?.category).toBe('cli')
+    expect(opencode?.cli?.supportsResume).toBe(true)
+    expect(opencode?.cli?.supportsModel).toBe(true)
+    expect(opencode?.cli?.supportsPermissionMode).toBeFalsy()
+  })
 })
