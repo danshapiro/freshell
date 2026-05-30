@@ -8,7 +8,7 @@ import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-l
 import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed, timingSafeCompare } from './auth.js'
 import { modeSupportsResume, terminalIdFromCreateError } from './terminal-registry.js'
 import type { TerminalRecord, TerminalRegistry, TerminalMode } from './terminal-registry.js'
-import { configStore, type ConfigReadError } from './config-store.js'
+import { configStore, type ConfigReadError, type UserConfig } from './config-store.js'
 import type { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import type { ProjectGroup } from './coding-cli/types.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
@@ -4498,5 +4498,25 @@ export class WsHandler {
 }
 
 async function awaitConfig() {
-  return await configStore.snapshot()
+  const timeoutMs = process.env.CONFIG_LOAD_TIMEOUT_MS
+    ? Number(process.env.CONFIG_LOAD_TIMEOUT_MS)
+    : 15_000
+  try {
+    return await Promise.race([
+      configStore.snapshot(),
+      new Promise<never>((_resolve, reject) =>
+        setTimeout(() => reject(new Error('Config snapshot timed out')), timeoutMs),
+      ),
+    ])
+  } catch (err) {
+    logger.warn({ err }, 'Config snapshot failed or timed out; using defaults')
+    return {
+      version: 1 as const,
+      settings: {} as UserConfig['settings'],
+      sessionOverrides: {},
+      terminalOverrides: {},
+      projectColors: {},
+      recentDirectories: [],
+    }
+  }
 }
