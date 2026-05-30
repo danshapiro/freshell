@@ -34,6 +34,31 @@ async function getActiveLeaf(harness: any) {
   return { tabId: tabId!, paneId: layout.id as string }
 }
 
+async function suppressFreshAgentNetworkForActivePane(page: any) {
+  await page.evaluate(() => {
+    const harness = window.__FRESHELL_TEST_HARNESS__
+    const state = harness?.getState()
+    const tabId = state?.tabs?.activeTabId
+    const paneId = tabId ? state?.panes?.activePane?.[tabId] : null
+    if (paneId) {
+      harness?.setAgentChatNetworkEffectsSuppressed(paneId, true)
+    }
+  })
+}
+
+async function openFreshAgentSettings(page: any, paneName: RegExp) {
+  const pane = page.getByRole('group', { name: paneName }).last()
+  await expect(pane).toBeVisible({ timeout: 10_000 })
+
+  const dialog = pane.getByRole('dialog', { name: 'Agent settings' })
+  if (!(await dialog.isVisible().catch(() => false))) {
+    await pane.getByRole('button', { name: /^agent settings$/i }).click()
+  }
+
+  await expect(dialog).toBeVisible({ timeout: 10_000 })
+  return dialog
+}
+
 test.describe('Fresh Agent', () => {
   test('pane picker hides fresh clients by default even when their CLIs are enabled', async ({ freshellPage, page, terminal }) => {
     await terminal.waitForTerminal()
@@ -67,6 +92,38 @@ test.describe('Fresh Agent', () => {
     await openPanePicker(page)
     await expect(page.getByRole('button', { name: /^Freshclaude$/i })).toBeVisible()
     await expect(page.getByRole('button', { name: /^Freshcodex$/i })).toBeVisible()
+  })
+
+  test('freshclaude settings use FreshAgent model defaults and create payload', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
+    await terminal.waitForTerminal()
+    await enableClaudeAndCodex(page)
+
+    await harness.clearSentWsMessages()
+    const picker = await openPanePicker(page)
+    await suppressFreshAgentNetworkForActivePane(page)
+    await picker.getByRole('button', { name: /^Freshclaude$/i }).click({ force: true })
+    await page.getByRole('option').first().click()
+
+    const dialog = await openFreshAgentSettings(page, /pane: freshclaude/i)
+    await expect(dialog.getByRole('radio', { name: 'Claude Opus 4.6' })).toBeChecked()
+
+    const thinking = dialog.getByRole('combobox', { name: /^Thinking level$/i })
+    const thinkingOptions = await thinking.locator('option').evaluateAll(
+      (options) => options.map((option) => option.textContent),
+    )
+    expect(thinkingOptions).toEqual(['low', 'medium', 'high', 'max'])
+    await expect(thinking).toHaveValue('max')
+
+    await expect.poll(async () => {
+      const sent = await harness.getSentWsMessages()
+      return sent.find((message: any) => message?.type === 'freshAgent.create') ?? null
+    }).toMatchObject({
+      type: 'freshAgent.create',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'claude-opus-4-6',
+      effort: 'max',
+    })
   })
 
   test('freshclaude banners render through the fresh-agent pane surface and answer over WS', async ({ freshellPage, page, harness, terminal }) => {
