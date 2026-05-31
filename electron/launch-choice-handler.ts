@@ -1,6 +1,7 @@
 import { normalizeServerUrl } from './launch-discovery.js'
 import { validateLaunchPort, validateRemoteLaunchUrl } from './launch-chooser/chooser-logic.js'
-import type { DesktopConfig, ForcedLaunch, LaunchChoice, LaunchChoiceResult } from './types.js'
+import { LaunchChoiceSchema } from './types.js'
+import type { DesktopConfig, ForcedLaunch, LaunchChoiceResult } from './types.js'
 
 export interface ChooseLaunchOptionHandlerOptions {
   patchDesktopConfig: (patch: Partial<DesktopConfig>) => Promise<DesktopConfig | void>
@@ -27,10 +28,18 @@ export interface ChooseLaunchOptionHandlerOptions {
 }
 
 export function createChooseLaunchOptionHandler(options: ChooseLaunchOptionHandlerOptions) {
-  return async (event: unknown, choice: LaunchChoice): Promise<LaunchChoiceResult> => {
+  return async (event: unknown, rawChoice: unknown): Promise<LaunchChoiceResult> => {
     if (options.isAllowedSender && !options.isAllowedSender(event)) {
       return { ok: false, error: 'Unexpected launch request.' }
     }
+
+    // The payload comes from a renderer over IPC, so validate its shape at
+    // runtime — TypeScript's union does not survive the boundary.
+    const parsed = LaunchChoiceSchema.safeParse(rawChoice)
+    if (!parsed.success) {
+      return { ok: false, error: 'Invalid launch request.' }
+    }
+    const choice = parsed.data
 
     if (choice.kind === 'remote' || choice.kind === 'connect') {
       if (!choice.url) {
@@ -80,6 +89,13 @@ export function createChooseLaunchOptionHandler(options: ChooseLaunchOptionHandl
 
       await options.restartMain({ kind: 'connect', url, token })
       return { ok: true }
+    }
+
+    // Defensive default: the schema only allows connect/remote/start-local, and
+    // connect/remote are handled above, so anything else is rejected outright
+    // rather than silently treated as start-local.
+    if (choice.kind !== 'start-local') {
+      return { ok: false, error: 'Invalid launch request.' }
     }
 
     const port = choice.port ?? options.getCurrentPort()

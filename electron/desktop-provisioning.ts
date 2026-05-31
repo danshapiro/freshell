@@ -15,9 +15,10 @@ export interface ParsedProvisioning {
 }
 
 /**
- * Parse `KEY=value` lines. The value keeps every character after the first
- * `=` (so tokens may contain `=`, `"`, or `\`) and is trimmed of surrounding
- * whitespace. Unknown or malformed lines are ignored.
+ * Parse `KEY=value` lines. The value keeps every character after the first `=`
+ * verbatim (so a token may contain `=`, `"`, `\`, or meaningful surrounding
+ * whitespace); only the line ending is stripped, by the split. The key is
+ * trimmed for tolerance. Unknown or malformed lines are ignored.
  */
 export function parseProvisioning(content: string): ParsedProvisioning {
   const result: ParsedProvisioning = {}
@@ -25,7 +26,7 @@ export function parseProvisioning(content: string): ParsedProvisioning {
     const idx = line.indexOf('=')
     if (idx === -1) continue
     const key = line.slice(0, idx).trim()
-    const value = line.slice(idx + 1).trim()
+    const value = line.slice(idx + 1)
     if (key === 'FRESHELL_REMOTE_URL') result.remoteUrl = value
     else if (key === 'FRESHELL_TOKEN') result.remoteToken = value
   }

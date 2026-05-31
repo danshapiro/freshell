@@ -376,4 +376,41 @@ describe('launch choice handler', () => {
     expect(result.ok).toBe(false)
     expect(restartMain).not.toHaveBeenCalled()
   })
+
+  it('rejects an unknown launch kind instead of falling through to start-local', async () => {
+    const patchDesktopConfig = vi.fn().mockResolvedValue(undefined)
+    const restartMain = vi.fn().mockResolvedValue(undefined)
+    const handler = createChooseLaunchOptionHandler({
+      patchDesktopConfig,
+      restartMain,
+      getCurrentPort: () => 3001,
+    })
+
+    const result = await handler({}, {
+      kind: 'bogus',
+      port: 3050,
+      alwaysAskOnLaunch: false,
+      remember: true,
+    } as never)
+
+    expect(result.ok).toBe(false)
+    expect(patchDesktopConfig).not.toHaveBeenCalled()
+    expect(restartMain).not.toHaveBeenCalled()
+  })
+
+  it('returns a controlled error (does not throw) for a non-object payload', async () => {
+    const patchDesktopConfig = vi.fn().mockResolvedValue(undefined)
+    const restartMain = vi.fn().mockResolvedValue(undefined)
+    const handler = createChooseLaunchOptionHandler({
+      patchDesktopConfig,
+      restartMain,
+      getCurrentPort: () => 3001,
+    })
+
+    const result = await handler({}, null as never)
+
+    expect(result.ok).toBe(false)
+    expect(patchDesktopConfig).not.toHaveBeenCalled()
+    expect(restartMain).not.toHaveBeenCalled()
+  })
 })
