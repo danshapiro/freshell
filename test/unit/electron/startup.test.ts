@@ -846,6 +846,19 @@ describe('runStartup', () => {
       expect(mockWindow.loadURL).toHaveBeenCalledWith('http://localhost:3001?token=test-auth-token-abc')
     })
 
+    it('URL-encodes the auth token so metacharacters survive the renderer round-trip', async () => {
+      // The renderer reads the token back via URLSearchParams.get, so a raw
+      // token containing +, &, #, or a trailing space must be percent-encoded
+      // or it would be corrupted (and the app would load unauthenticated).
+      const mockWindow = createMockWindow()
+      const ctx = createDefaultContext({
+        createBrowserWindow: vi.fn().mockReturnValue(mockWindow),
+        readEnvToken: vi.fn().mockResolvedValue('a+b&c#d '),
+      })
+      await runStartup(ctx)
+      expect(mockWindow.loadURL).toHaveBeenCalledWith('http://localhost:3001?token=a%2Bb%26c%23d%20')
+    })
+
     it('appends ?token= to URL for daemon mode', async () => {
       const mockWindow = createMockWindow()
       const ctx = createDefaultContext({

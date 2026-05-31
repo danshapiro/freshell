@@ -136,7 +136,10 @@ async function loadMainWindow(
     },
   })
 
-  const loadUrl = authToken ? `${serverUrl}?token=${authToken}` : serverUrl
+  // Percent-encode the token: the renderer reads it back via URLSearchParams,
+  // so a raw token containing +, &, #, or whitespace would otherwise be
+  // corrupted and the app would load unauthenticated.
+  const loadUrl = authToken ? `${serverUrl}?token=${encodeURIComponent(authToken)}` : serverUrl
   await window.loadURL(loadUrl)
   window.show()
 
