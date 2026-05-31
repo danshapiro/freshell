@@ -82,5 +82,20 @@ describe('desktop provisioning', () => {
       expect(patchDesktopConfig).not.toHaveBeenCalled()
       expect(deleteFile).toHaveBeenCalledWith(provisionPath)
     })
+
+    it('does not throw and best-effort clears the file when reading it fails (locked/dir/perms)', async () => {
+      const patchDesktopConfig = vi.fn()
+      const deleteFile = vi.fn()
+      const applied = await applyProvisioningFile(provisionPath, {
+        readFile: () => {
+          throw new Error('EISDIR: illegal operation on a directory')
+        },
+        deleteFile,
+        patchDesktopConfig,
+      })
+      expect(applied).toBe(true)
+      expect(patchDesktopConfig).not.toHaveBeenCalled()
+      expect(deleteFile).toHaveBeenCalledWith(provisionPath)
+    })
   })
 })

@@ -274,6 +274,9 @@ async function main(): Promise<void> {
   ipcMain.removeHandler('choose-launch-option')
 
   let pendingLaunchChooser: { candidates: LaunchServerCandidate[]; reason: string } | undefined
+  // webContents id of the launch chooser window, so choose-launch-option only
+  // honors requests originating from it (the API is exposed to every window).
+  let chooserWebContentsId: number | undefined
 
   // Register the complete-setup handler before runStartup so it is available
   // when the wizard renderer calls it via the preload API.
@@ -302,6 +305,10 @@ async function main(): Promise<void> {
     patchDesktopConfig,
     getCurrentPort: () => desktopConfig.port,
     validateServerAuth: (url: string, token: string) => ctx.fetchAuthenticated?.(`${url}/api/settings`, token) ?? Promise.resolve(false),
+    isAllowedSender: (event) => {
+      const senderId = (event as { sender?: { id?: number } }).sender?.id
+      return chooserWebContentsId !== undefined && senderId === chooserWebContentsId
+    },
     restartMain: async (forced: ForcedLaunch) => {
       pendingForcedLaunch = forced
       wizardPhase = true
@@ -357,6 +364,8 @@ async function main(): Promise<void> {
         contextIsolation: true,
       },
     })
+    // Only this window may drive choose-launch-option (see isAllowedSender).
+    chooserWebContentsId = chooserWin.webContents.id
 
     if (isDev) {
       await chooserWin.loadURL('http://localhost:5175')

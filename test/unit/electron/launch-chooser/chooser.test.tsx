@@ -121,4 +121,19 @@ describe('LaunchChooser', () => {
     expect((await screen.findByRole('alert')).textContent).toContain('between 1024 and 65535')
     expect(chooseLaunchOption).not.toHaveBeenCalled()
   })
+
+  it('refuses to start a local server on a port already used by a detected local server', async () => {
+    const { chooseLaunchOption } = installDesktopApi({
+      candidates: [localCandidate({ id: 'l', url: 'http://localhost:3001', label: 'localhost:3001' })],
+    })
+
+    render(<LaunchChooser />)
+
+    // Wait for candidates to load; default port (3001) matches the detected server.
+    await screen.findByRole('button', { name: 'Connect to localhost:3001' })
+    fireEvent.click(screen.getByRole('button', { name: 'Start local' }))
+
+    expect((await screen.findByRole('alert')).textContent).toContain('already in use')
+    expect(chooseLaunchOption).not.toHaveBeenCalled()
+  })
 })
