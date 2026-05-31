@@ -307,4 +307,73 @@ describe('launch choice handler', () => {
     expect(patchDesktopConfig).not.toHaveBeenCalled()
     expect(restartMain).not.toHaveBeenCalled()
   })
+
+  it('rejects start-local when the chosen port is already in use (authoritative main-process check)', async () => {
+    const patchDesktopConfig = vi.fn().mockResolvedValue(undefined)
+    const restartMain = vi.fn().mockResolvedValue(undefined)
+    const isPortAvailable = vi.fn().mockResolvedValue(false)
+    const handler = createChooseLaunchOptionHandler({
+      patchDesktopConfig,
+      restartMain,
+      getCurrentPort: () => 3001,
+      isPortAvailable,
+    })
+
+    const result = await handler({}, {
+      kind: 'start-local',
+      port: 3001,
+      alwaysAskOnLaunch: false,
+      remember: true,
+    })
+
+    expect(result.ok).toBe(false)
+    expect(isPortAvailable).toHaveBeenCalledWith(3001)
+    expect(patchDesktopConfig).not.toHaveBeenCalled()
+    expect(restartMain).not.toHaveBeenCalled()
+  })
+
+  it('starts local when the chosen port is available', async () => {
+    const patchDesktopConfig = vi.fn().mockResolvedValue(undefined)
+    const restartMain = vi.fn().mockResolvedValue(undefined)
+    const isPortAvailable = vi.fn().mockResolvedValue(true)
+    const handler = createChooseLaunchOptionHandler({
+      patchDesktopConfig,
+      restartMain,
+      getCurrentPort: () => 3001,
+      isPortAvailable,
+    })
+
+    const result = await handler({}, {
+      kind: 'start-local',
+      port: 3050,
+      alwaysAskOnLaunch: false,
+      remember: true,
+    })
+
+    expect(result).toEqual({ ok: true })
+    expect(isPortAvailable).toHaveBeenCalledWith(3050)
+    expect(restartMain).toHaveBeenCalledWith({ kind: 'start-local', port: 3050 })
+  })
+
+  it('refuses start-local when port availability cannot be determined', async () => {
+    const patchDesktopConfig = vi.fn().mockResolvedValue(undefined)
+    const restartMain = vi.fn().mockResolvedValue(undefined)
+    const isPortAvailable = vi.fn().mockRejectedValue(new Error('probe failed'))
+    const handler = createChooseLaunchOptionHandler({
+      patchDesktopConfig,
+      restartMain,
+      getCurrentPort: () => 3001,
+      isPortAvailable,
+    })
+
+    const result = await handler({}, {
+      kind: 'start-local',
+      port: 3050,
+      alwaysAskOnLaunch: false,
+      remember: true,
+    })
+
+    expect(result.ok).toBe(false)
+    expect(restartMain).not.toHaveBeenCalled()
+  })
 })

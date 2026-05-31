@@ -18,6 +18,12 @@ export interface ChooseLaunchOptionHandlerOptions {
    * window, so without this an untrusted renderer could force a launch.
    */
   isAllowedSender?: (event: unknown) => boolean
+  /**
+   * Authoritative (main-process) check that nothing is already listening on a
+   * "Start local" port before we close the chooser and spawn. The renderer
+   * guard is only advisory (stale candidate list, races, crafted requests).
+   */
+  isPortAvailable?: (port: number) => Promise<boolean>
 }
 
 export function createChooseLaunchOptionHandler(options: ChooseLaunchOptionHandlerOptions) {
@@ -80,6 +86,21 @@ export function createChooseLaunchOptionHandler(options: ChooseLaunchOptionHandl
     const portError = validateLaunchPort(port)
     if (portError) {
       return { ok: false, error: portError }
+    }
+
+    // Authoritatively confirm the port is free before closing the chooser and
+    // spawning. If we cannot determine availability, refuse rather than risk
+    // spawning onto an occupied port (which could load the wrong process).
+    if (options.isPortAvailable) {
+      let available = false
+      try {
+        available = await options.isPortAvailable(port)
+      } catch {
+        available = false
+      }
+      if (!available) {
+        return { ok: false, error: `Port ${port} is already in use. Choose a different port, or connect to that server.` }
+      }
     }
 
     if (choice.remember) {
