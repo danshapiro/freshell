@@ -261,4 +261,50 @@ describe('launch choice handler', () => {
     expect(patchDesktopConfig).not.toHaveBeenCalled()
     expect(restartMain).not.toHaveBeenCalled()
   })
+
+  it('rejects a connect choice whose URL is not http(s), even when auth is skipped', async () => {
+    const patchDesktopConfig = vi.fn().mockResolvedValue(undefined)
+    const restartMain = vi.fn().mockResolvedValue(undefined)
+    const handler = createChooseLaunchOptionHandler({
+      patchDesktopConfig,
+      restartMain,
+      getCurrentPort: () => 3001,
+    })
+
+    const result = await handler({}, {
+      kind: 'connect',
+      url: 'file:///etc/passwd',
+      requiresAuth: false,
+      alwaysAskOnLaunch: false,
+      remember: false,
+    })
+
+    expect(result.ok).toBe(false)
+    expect(patchDesktopConfig).not.toHaveBeenCalled()
+    expect(restartMain).not.toHaveBeenCalled()
+  })
+
+  it('rejects choices from a sender that is not the launch chooser window', async () => {
+    const patchDesktopConfig = vi.fn().mockResolvedValue(undefined)
+    const restartMain = vi.fn().mockResolvedValue(undefined)
+    const handler = createChooseLaunchOptionHandler({
+      patchDesktopConfig,
+      restartMain,
+      getCurrentPort: () => 3001,
+      isAllowedSender: () => false,
+    })
+
+    const result = await handler({}, {
+      kind: 'connect',
+      url: 'http://localhost:3001',
+      token: 'tok',
+      requiresAuth: true,
+      alwaysAskOnLaunch: false,
+      remember: true,
+    })
+
+    expect(result.ok).toBe(false)
+    expect(patchDesktopConfig).not.toHaveBeenCalled()
+    expect(restartMain).not.toHaveBeenCalled()
+  })
 })

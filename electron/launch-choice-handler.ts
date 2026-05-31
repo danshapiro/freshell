@@ -1,5 +1,5 @@
 import { normalizeServerUrl } from './launch-discovery.js'
-import { validateLaunchPort } from './launch-chooser/chooser-logic.js'
+import { validateLaunchPort, validateRemoteLaunchUrl } from './launch-chooser/chooser-logic.js'
 import type { DesktopConfig, ForcedLaunch, LaunchChoice, LaunchChoiceResult } from './types.js'
 
 export interface ChooseLaunchOptionHandlerOptions {
@@ -12,16 +12,32 @@ export interface ChooseLaunchOptionHandlerOptions {
   restartMain: (forced: ForcedLaunch) => Promise<void> | void
   getCurrentPort: () => number
   validateServerAuth?: (url: string, token: string) => Promise<boolean>
+  /**
+   * Defense-in-depth: reject choices from any renderer other than the launch
+   * chooser window. `choose-launch-option` is exposed via preload to every
+   * window, so without this an untrusted renderer could force a launch.
+   */
+  isAllowedSender?: (event: unknown) => boolean
 }
 
 export function createChooseLaunchOptionHandler(options: ChooseLaunchOptionHandlerOptions) {
-  return async (_event: unknown, choice: LaunchChoice): Promise<LaunchChoiceResult> => {
+  return async (event: unknown, choice: LaunchChoice): Promise<LaunchChoiceResult> => {
+    if (options.isAllowedSender && !options.isAllowedSender(event)) {
+      return { ok: false, error: 'Unexpected launch request.' }
+    }
+
     if (choice.kind === 'remote' || choice.kind === 'connect') {
       if (!choice.url) {
         return { ok: false, error: 'Choose a server URL.' }
       }
 
       const url = normalizeServerUrl(choice.url)
+      // Validate the scheme server-side (not just in the renderer) so a crafted
+      // choice can never make the app load a file:// or other non-web URL.
+      const urlError = validateRemoteLaunchUrl(url)
+      if (urlError) {
+        return { ok: false, error: urlError }
+      }
       const token = choice.token?.trim()
       if (choice.requiresAuth !== false) {
         if (!token) {

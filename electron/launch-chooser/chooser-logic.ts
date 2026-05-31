@@ -38,6 +38,27 @@ export function validateLaunchPort(port: number): string | null {
   return null
 }
 
+/**
+ * The port a *local* candidate server listens on, or null if the candidate is
+ * remote or its URL cannot be parsed. Used to stop "Start local" from spawning
+ * onto a port already served by a detected local Freshell.
+ */
+export function localCandidatePort(url: string): number | null {
+  try {
+    const parsed = new URL(url)
+    const isLocal =
+      parsed.hostname === 'localhost' ||
+      parsed.hostname === '127.0.0.1' ||
+      parsed.hostname === '[::1]' ||
+      parsed.hostname === '::1'
+    if (!isLocal) return null
+    if (parsed.port) return Number(parsed.port)
+    return parsed.protocol === 'https:' ? 443 : 80
+  } catch {
+    return null
+  }
+}
+
 export function buildConnectChoice(input: {
   url: string
   token?: string

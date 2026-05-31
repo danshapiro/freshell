@@ -5,6 +5,7 @@ import {
   buildRemoteChoice,
   buildStartLocalChoice,
   formatLaunchReason,
+  localCandidatePort,
   validateLaunchPort,
   validateRemoteLaunchUrl,
 } from './chooser-logic.js'
@@ -89,6 +90,11 @@ export function LaunchChooser() {
     const portError = validateLaunchPort(port)
     if (portError) {
       setError(portError)
+      return
+    }
+    const occupied = candidates.find((candidate) => localCandidatePort(candidate.url) === port)
+    if (occupied) {
+      setError(`Port ${port} is already in use by ${candidateLabel(occupied)}. Choose a different port, or connect to that server.`)
       return
     }
     await choose(buildStartLocalChoice({ port, alwaysAskOnLaunch, remember }))

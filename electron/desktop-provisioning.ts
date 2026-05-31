@@ -48,7 +48,17 @@ export async function applyProvisioningFile(
   provisionPath: string,
   deps: ProvisioningDeps,
 ): Promise<boolean> {
-  const content = deps.readFile(provisionPath)
+  let content: string | undefined
+  try {
+    content = deps.readFile(provisionPath)
+  } catch {
+    // The file exists but is unreadable (locked, a directory, bad perms).
+    // It must not brick startup, and it must not wedge every launch, so make a
+    // best-effort attempt to clear it and bail.
+    deps.deleteFile(provisionPath)
+    return true
+  }
+
   if (content === undefined) return false
 
   try {
@@ -62,7 +72,7 @@ export async function applyProvisioningFile(
       })
     }
   } catch {
-    // A malformed provision file must not brick startup; fall through to delete.
+    // A malformed provision file or persist failure must not brick startup.
   } finally {
     deps.deleteFile(provisionPath)
   }

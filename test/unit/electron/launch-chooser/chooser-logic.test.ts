@@ -4,6 +4,7 @@ import {
   buildRemoteChoice,
   buildStartLocalChoice,
   formatLaunchReason,
+  localCandidatePort,
   validateLaunchPort,
   validateRemoteLaunchUrl,
 } from '../../../../electron/launch-chooser/chooser-logic.js'
@@ -76,5 +77,14 @@ describe('launch chooser logic', () => {
     for (const port of [0, 80, 1023, 65536, 70000, -1, Number.NaN, 3001.5]) {
       expect(validateLaunchPort(port)).toContain('between 1024 and 65535')
     }
+  })
+
+  it('extracts the port of localhost candidates and ignores remote ones', () => {
+    expect(localCandidatePort('http://localhost:3001')).toBe(3001)
+    expect(localCandidatePort('http://127.0.0.1:4000')).toBe(4000)
+    expect(localCandidatePort('https://localhost')).toBe(443)
+    expect(localCandidatePort('http://localhost')).toBe(80)
+    expect(localCandidatePort('http://10.0.0.5:3001')).toBeNull()
+    expect(localCandidatePort('not-a-url')).toBeNull()
   })
 })
