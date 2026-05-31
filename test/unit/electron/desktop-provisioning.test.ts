@@ -18,6 +18,10 @@ describe('desktop provisioning', () => {
       expect(parseProvisioning('FRESHELL_TOKEN=a=b=c').remoteToken).toBe('a=b=c')
     })
 
+    it('preserves leading/trailing whitespace in the value (raw preservation)', () => {
+      expect(parseProvisioning('FRESHELL_TOKEN=  spaced-token  ').remoteToken).toBe('  spaced-token  ')
+    })
+
     it('ignores unrelated or malformed lines', () => {
       expect(parseProvisioning('# comment\nNOPE\nFRESHELL_REMOTE_URL=http://h:3001')).toEqual({
         remoteUrl: 'http://h:3001',
