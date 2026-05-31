@@ -122,9 +122,11 @@ describe('LaunchChooser', () => {
     expect(chooseLaunchOption).not.toHaveBeenCalled()
   })
 
-  it('refuses to start a local server on a port already used by a detected local server', async () => {
-    const { chooseLaunchOption } = installDesktopApi({
+  it('submits "Start local" and lets the main process decide, even when a candidate occupies that port', async () => {
+    const chooseLaunchOption = vi.fn().mockResolvedValue({ ok: true })
+    installDesktopApi({
       candidates: [localCandidate({ id: 'l', url: 'http://localhost:3001', label: 'localhost:3001' })],
+      chooseLaunchOption,
     })
 
     render(<LaunchChooser />)
@@ -133,7 +135,12 @@ describe('LaunchChooser', () => {
     await screen.findByRole('button', { name: 'Connect to localhost:3001' })
     fireEvent.click(screen.getByRole('button', { name: 'Start local' }))
 
-    expect((await screen.findByRole('alert')).textContent).toContain('already in use')
-    expect(chooseLaunchOption).not.toHaveBeenCalled()
+    // The renderer no longer second-guesses occupancy from a stale snapshot;
+    // it submits and the authoritative main-process check is the decider.
+    await waitFor(() =>
+      expect(chooseLaunchOption).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: 'start-local', port: 3001 }),
+      ),
+    )
   })
 })
