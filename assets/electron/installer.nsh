@@ -31,18 +31,14 @@
 
   ${if} $0 != ""
   ${andIf} $1 != ""
+    ; Write raw values to a line-based provisioning file rather than JSON: NSIS
+    ; has no string-escaping, so a URL or token containing a quote or backslash
+    ; would corrupt hand-written JSON. The app converts this into a properly
+    ; serialized desktop.json on first launch (see electron/desktop-provisioning.ts).
     CreateDirectory "$PROFILE\.freshell"
-    FileOpen $2 "$PROFILE\.freshell\desktop.json" w
-    FileWrite $2 "{$\r$\n"
-    FileWrite $2 "  $\"serverMode$\": $\"remote$\",$\r$\n"
-    FileWrite $2 "  $\"port$\": 3001,$\r$\n"
-    FileWrite $2 "  $\"remoteUrl$\": $\"$0$\",$\r$\n"
-    FileWrite $2 "  $\"remoteToken$\": $\"$1$\",$\r$\n"
-    FileWrite $2 "  $\"globalHotkey$\": $\"CommandOrControl+`$\",$\r$\n"
-    FileWrite $2 "  $\"startOnLogin$\": false,$\r$\n"
-    FileWrite $2 "  $\"minimizeToTray$\": true,$\r$\n"
-    FileWrite $2 "  $\"setupCompleted$\": true$\r$\n"
-    FileWrite $2 "}$\r$\n"
+    FileOpen $2 "$PROFILE\.freshell\desktop.provision" w
+    FileWrite $2 "FRESHELL_REMOTE_URL=$0$\r$\n"
+    FileWrite $2 "FRESHELL_TOKEN=$1$\r$\n"
     FileClose $2
   ${endIf}
 !macroend

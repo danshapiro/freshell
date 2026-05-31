@@ -90,4 +90,35 @@ describe('LaunchChooser', () => {
     expect((await screen.findByRole('alert')).textContent).toContain('Enter a token for the remote server')
     expect(chooseLaunchOption).not.toHaveBeenCalled()
   })
+
+  it('pre-fills the remote URL from the saved configuration', async () => {
+    window.freshellDesktop = {
+      getLaunchOptions: vi.fn().mockResolvedValue({
+        candidates: [],
+        reason: 'saved-remote-unreachable',
+        alwaysAskOnLaunch: false,
+        port: 3001,
+        remoteUrl: 'http://10.0.0.5:3001',
+      }),
+      chooseLaunchOption: vi.fn().mockResolvedValue(undefined),
+    }
+
+    render(<LaunchChooser />)
+
+    const urlInput = (await screen.findByLabelText('URL')) as HTMLInputElement
+    await waitFor(() => expect(urlInput.value).toBe('http://10.0.0.5:3001'))
+  })
+
+  it('rejects an out-of-range local port before sending a choice', async () => {
+    const { chooseLaunchOption } = installDesktopApi({ candidates: [] })
+
+    render(<LaunchChooser />)
+
+    const portInput = await screen.findByLabelText('Port')
+    fireEvent.change(portInput, { target: { value: '80' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Start local' }))
+
+    expect((await screen.findByRole('alert')).textContent).toContain('between 1024 and 65535')
+    expect(chooseLaunchOption).not.toHaveBeenCalled()
+  })
 })

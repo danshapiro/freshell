@@ -264,8 +264,10 @@ test.describe('Launch chooser', () => {
     const chooser = await app.firstWindow()
     await chooser.waitForLoadState('domcontentloaded')
 
-    await chooser.getByRole('checkbox', { name: 'Always ask on launch' }).uncheck()
-    await chooser.getByRole('button', { name: 'Connect', exact: true }).first().click()
+    // The candidate button's accessible name is "Connect to <label|url>".
+    // Selecting it must connect this launch even with "Always ask on launch"
+    // still checked — that is exactly the forced-launch behavior under test.
+    await chooser.getByRole('button', { name: /^Connect to / }).first().click()
     const mainPage = await waitForWindowUrl(app, /http:\/\/localhost:3001/, 60_000)
     await mainPage.waitForLoadState('domcontentloaded')
 

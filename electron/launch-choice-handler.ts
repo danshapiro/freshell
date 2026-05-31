@@ -1,9 +1,15 @@
 import { normalizeServerUrl } from './launch-discovery.js'
-import type { DesktopConfig, LaunchChoice, LaunchChoiceResult } from './types.js'
+import { validateLaunchPort } from './launch-chooser/chooser-logic.js'
+import type { DesktopConfig, ForcedLaunch, LaunchChoice, LaunchChoiceResult } from './types.js'
 
 export interface ChooseLaunchOptionHandlerOptions {
   patchDesktopConfig: (patch: Partial<DesktopConfig>) => Promise<DesktopConfig | void>
-  restartMain: () => Promise<void> | void
+  /**
+   * Restart the launch flow, forcing the just-chosen action so it is honored
+   * this launch regardless of saved config, `alwaysAskOnLaunch`, or
+   * re-discovered servers.
+   */
+  restartMain: (forced: ForcedLaunch) => Promise<void> | void
   getCurrentPort: () => number
   validateServerAuth?: (url: string, token: string) => Promise<boolean>
 }
@@ -35,23 +41,43 @@ export function createChooseLaunchOptionHandler(options: ChooseLaunchOptionHandl
         }
       }
 
+      // "Remember this choice" gates whether the server selection is saved as
+      // the new default. The always-ask preference is standalone and always
+      // persisted so the user can leave (or stay in) the chooser next launch.
+      if (choice.remember) {
+        await options.patchDesktopConfig({
+          serverMode: 'remote',
+          remoteUrl: url,
+          remoteToken: token,
+          alwaysAskOnLaunch: choice.alwaysAskOnLaunch,
+          setupCompleted: true,
+        })
+      } else {
+        await options.patchDesktopConfig({ alwaysAskOnLaunch: choice.alwaysAskOnLaunch })
+      }
+
+      await options.restartMain({ kind: 'connect', url, token })
+      return { ok: true }
+    }
+
+    const port = choice.port ?? options.getCurrentPort()
+    const portError = validateLaunchPort(port)
+    if (portError) {
+      return { ok: false, error: portError }
+    }
+
+    if (choice.remember) {
       await options.patchDesktopConfig({
-        serverMode: 'remote',
-        remoteUrl: url,
-        remoteToken: token,
+        serverMode: 'app-bound',
+        port,
         alwaysAskOnLaunch: choice.alwaysAskOnLaunch,
         setupCompleted: true,
       })
     } else {
-      await options.patchDesktopConfig({
-        serverMode: 'app-bound',
-        port: choice.port ?? options.getCurrentPort(),
-        alwaysAskOnLaunch: choice.alwaysAskOnLaunch,
-        setupCompleted: true,
-      })
+      await options.patchDesktopConfig({ alwaysAskOnLaunch: choice.alwaysAskOnLaunch })
     }
 
-    await options.restartMain()
+    await options.restartMain({ kind: 'start-local', port })
     return { ok: true }
   }
 }
