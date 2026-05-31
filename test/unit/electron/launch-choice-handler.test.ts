@@ -143,4 +143,122 @@ describe('launch choice handler', () => {
     })
     expect(restartMain).toHaveBeenCalled()
   })
+
+  it('forwards the chosen connection to restartMain so it is honored this launch', async () => {
+    const patchDesktopConfig = vi.fn().mockResolvedValue(undefined)
+    const restartMain = vi.fn().mockResolvedValue(undefined)
+    const handler = createChooseLaunchOptionHandler({
+      patchDesktopConfig,
+      restartMain,
+      getCurrentPort: () => 3001,
+    })
+
+    await handler({}, {
+      kind: 'connect',
+      url: 'http://localhost:3001',
+      token: 'tok',
+      requiresAuth: true,
+      alwaysAskOnLaunch: true,
+      remember: true,
+    })
+
+    expect(restartMain).toHaveBeenCalledWith({
+      kind: 'connect',
+      url: 'http://localhost:3001',
+      token: 'tok',
+    })
+  })
+
+  it('forwards the chosen local port to restartMain so it is honored this launch', async () => {
+    const patchDesktopConfig = vi.fn().mockResolvedValue(undefined)
+    const restartMain = vi.fn().mockResolvedValue(undefined)
+    const handler = createChooseLaunchOptionHandler({
+      patchDesktopConfig,
+      restartMain,
+      getCurrentPort: () => 3001,
+    })
+
+    await handler({}, {
+      kind: 'start-local',
+      port: 3009,
+      alwaysAskOnLaunch: false,
+      remember: true,
+    })
+
+    expect(restartMain).toHaveBeenCalledWith({ kind: 'start-local', port: 3009 })
+  })
+
+  it('does not persist the server selection when remember is false (connect)', async () => {
+    const patchDesktopConfig = vi.fn().mockResolvedValue(undefined)
+    const restartMain = vi.fn().mockResolvedValue(undefined)
+    const validateServerAuth = vi.fn().mockResolvedValue(true)
+    const handler = createChooseLaunchOptionHandler({
+      patchDesktopConfig,
+      restartMain,
+      getCurrentPort: () => 3001,
+      validateServerAuth,
+    })
+
+    const result = await handler({}, {
+      kind: 'connect',
+      url: 'http://localhost:3001',
+      token: 'tok',
+      requiresAuth: true,
+      alwaysAskOnLaunch: false,
+      remember: false,
+    })
+
+    expect(result).toEqual({ ok: true })
+    // Only the standalone always-ask preference is persisted, not the server selection.
+    expect(patchDesktopConfig).toHaveBeenCalledWith({ alwaysAskOnLaunch: false })
+    expect(restartMain).toHaveBeenCalledWith({
+      kind: 'connect',
+      url: 'http://localhost:3001',
+      token: 'tok',
+    })
+  })
+
+  it('does not persist app-bound mode when remember is false (start-local)', async () => {
+    const patchDesktopConfig = vi.fn().mockResolvedValue(undefined)
+    const restartMain = vi.fn().mockResolvedValue(undefined)
+    const handler = createChooseLaunchOptionHandler({
+      patchDesktopConfig,
+      restartMain,
+      getCurrentPort: () => 3001,
+    })
+
+    const result = await handler({}, {
+      kind: 'start-local',
+      port: 3005,
+      alwaysAskOnLaunch: true,
+      remember: false,
+    })
+
+    expect(result).toEqual({ ok: true })
+    expect(patchDesktopConfig).toHaveBeenCalledWith({ alwaysAskOnLaunch: true })
+    expect(restartMain).toHaveBeenCalledWith({ kind: 'start-local', port: 3005 })
+  })
+
+  it('rejects an out-of-range start-local port before persisting or restarting', async () => {
+    const patchDesktopConfig = vi.fn().mockResolvedValue(undefined)
+    const restartMain = vi.fn().mockResolvedValue(undefined)
+    const handler = createChooseLaunchOptionHandler({
+      patchDesktopConfig,
+      restartMain,
+      getCurrentPort: () => 3001,
+    })
+
+    for (const port of [0, 80, 70000]) {
+      const result = await handler({}, {
+        kind: 'start-local',
+        port,
+        alwaysAskOnLaunch: false,
+        remember: true,
+      })
+      expect(result.ok).toBe(false)
+    }
+
+    expect(patchDesktopConfig).not.toHaveBeenCalled()
+    expect(restartMain).not.toHaveBeenCalled()
+  })
 })

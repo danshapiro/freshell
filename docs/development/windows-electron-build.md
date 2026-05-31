@@ -18,9 +18,10 @@ on the wrong platform.
 - Node.js (matching `engines.node`, currently `>=22.5.0`) and npm.
 - Visual Studio Build Tools with the **Desktop development with C++** workload,
   and Python 3 — required for `node-gyp` to compile `node-pty`.
-- `curl`, `tar`, and `unzip` on `PATH` — `scripts/prepare-bundled-node.ts` shells
-  out to them to download the standalone Node binary and headers. Windows 10+
-  ships `curl`/`tar`; `unzip` is provided by Git for Windows (`usr/bin`).
+- No extra download tools are needed: `scripts/prepare-bundled-node.ts` fetches
+  the standalone Node binary and headers over Node's own `http`/`https` and
+  extracts them with the bundled `tar` and `extract-zip` packages (not external
+  `curl`/`tar`/`unzip`).
 
 ## Option A — from a native Windows shell
 

@@ -55,6 +55,14 @@ export interface LaunchChoice {
   remember: boolean
 }
 
+/**
+ * An explicit launch selection that must be honored for the current launch,
+ * independent of saved config, `alwaysAskOnLaunch`, or re-discovered servers.
+ */
+export type ForcedLaunch =
+  | { kind: 'connect'; url: string; token?: string }
+  | { kind: 'start-local'; port: number }
+
 export type LaunchChoiceResult =
   | { ok: true }
   | { ok: false; error: string }

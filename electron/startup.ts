@@ -2,7 +2,7 @@ import path from 'path'
 import { buildLocalProbeUrls, discoverLocalServers, normalizeServerUrl } from './launch-discovery.js'
 import { chooseLaunchAction } from './launch-policy.js'
 import { resolveCandidateToken } from './token-resolver.js'
-import type { DesktopConfig, LaunchServerCandidate } from './types.js'
+import type { DesktopConfig, ForcedLaunch, LaunchServerCandidate } from './types.js'
 import type { DaemonManager } from './daemon/daemon-manager.js'
 import type { ServerSpawner } from './server-spawner.js'
 import type { HotkeyManager } from './hotkey.js'
@@ -46,6 +46,11 @@ export interface StartupContext {
   /** Read AUTH_TOKEN from the .env file in configDir. Returns undefined if not found. */
   readEnvToken?: (envPath: string) => Promise<string | undefined>
   discoverLaunchCandidates?: () => Promise<LaunchServerCandidate[]>
+  /**
+   * An explicit chooser selection to honor for this launch. When set, startup
+   * skips discovery and policy and performs exactly this action.
+   */
+  forcedLaunch?: ForcedLaunch
 }
 
 export type StartupResult =
@@ -182,11 +187,68 @@ async function loadMainWindow(
   return { type: 'main', serverUrl, window, updateCheckTimer }
 }
 
+async function startAppBoundServer(ctx: StartupContext, port: number): Promise<string> {
+  if (ctx.isDev) {
+    await ctx.serverSpawner.start({
+      spawn: {
+        mode: 'dev',
+        tsxPath: 'npx',
+        serverSourceEntry: 'server/index.ts',
+      },
+      port,
+      envFile: path.join(ctx.configDir, '.env'),
+      configDir: ctx.configDir,
+    })
+    return 'http://localhost:5173'
+  }
+
+  if (!ctx.resourcesPath) {
+    throw new Error('resourcesPath is required for production app-bound mode')
+  }
+  const resourcesPath = ctx.resourcesPath
+  await ctx.serverSpawner.start({
+    spawn: {
+      mode: 'production',
+      nodeBinary: path.join(resourcesPath, 'bundled-node', 'bin', ctx.platform === 'win32' ? 'node.exe' : 'node'),
+      serverEntry: path.join(resourcesPath, 'server', 'index.js'),
+      nativeModulesDir: path.join(resourcesPath, 'bundled-node', 'native-modules'),
+      serverNodeModulesDir: path.join(resourcesPath, 'server-node-modules'),
+    },
+    port,
+    envFile: path.join(ctx.configDir, '.env'),
+    configDir: ctx.configDir,
+  })
+  return `http://localhost:${port}`
+}
+
+/**
+ * Perform exactly the action the user selected in the chooser, bypassing
+ * discovery and policy. This is what makes a chooser selection authoritative
+ * for the launch regardless of `alwaysAskOnLaunch` or detected servers.
+ */
+async function executeForcedLaunch(ctx: StartupContext, forced: ForcedLaunch): Promise<StartupResult> {
+  if (forced.kind === 'connect') {
+    return loadMainWindow(ctx, normalizeServerUrl(forced.url), forced.token)
+  }
+
+  // start-local: spawn a fresh bundled server on the chosen port. Its auth
+  // token comes from the local .env, never from a saved remote token.
+  const serverUrl = await startAppBoundServer(ctx, forced.port)
+  const authToken = ctx.readEnvToken
+    ? await ctx.readEnvToken(path.join(ctx.configDir, '.env'))
+    : undefined
+  return loadMainWindow(ctx, serverUrl, authToken)
+}
+
 export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
-  const { desktopConfig, isDev, port } = ctx
+  const { desktopConfig, port } = ctx
 
   if (!desktopConfig.setupCompleted) {
     return { type: 'wizard' }
+  }
+
+  if (ctx.forcedLaunch) {
+    return executeForcedLaunch(ctx, ctx.forcedLaunch)
   }
 
   const discoverCandidates = ctx.discoverLaunchCandidates ?? (() => defaultDiscoverLaunchCandidates(ctx))
@@ -235,37 +297,7 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
       break
     }
     case 'app-bound': {
-      if (isDev) {
-        await ctx.serverSpawner.start({
-          spawn: {
-            mode: 'dev',
-            tsxPath: 'npx',
-            serverSourceEntry: 'server/index.ts',
-          },
-          port,
-          envFile: path.join(ctx.configDir, '.env'),
-          configDir: ctx.configDir,
-        })
-        serverUrl = 'http://localhost:5173'
-      } else {
-        if (!ctx.resourcesPath) {
-          throw new Error('resourcesPath is required for production app-bound mode')
-        }
-        const resourcesPath = ctx.resourcesPath
-        await ctx.serverSpawner.start({
-          spawn: {
-            mode: 'production',
-            nodeBinary: path.join(resourcesPath, 'bundled-node', 'bin', ctx.platform === 'win32' ? 'node.exe' : 'node'),
-            serverEntry: path.join(resourcesPath, 'server', 'index.js'),
-            nativeModulesDir: path.join(resourcesPath, 'bundled-node', 'native-modules'),
-            serverNodeModulesDir: path.join(resourcesPath, 'server-node-modules'),
-          },
-          port,
-          envFile: path.join(ctx.configDir, '.env'),
-          configDir: ctx.configDir,
-        })
-        serverUrl = `http://localhost:${port}`
-      }
+      serverUrl = await startAppBoundServer(ctx, port)
       break
     }
     case 'remote': {
