@@ -35,6 +35,7 @@ import { createWizardWindow } from './setup-wizard/wizard-window.js'
 import { createChooseLaunchOptionHandler } from './launch-choice-handler.js'
 import { buildLaunchOptions } from './launch-options.js'
 import { applyProvisioningFile } from './desktop-provisioning.js'
+import isPortReachable from 'is-port-reachable'
 import type { ForcedLaunch, LaunchServerCandidate } from './types.js'
 
 const isDev = process.env.ELECTRON_DEV === '1'
@@ -309,6 +310,8 @@ async function main(): Promise<void> {
       const senderId = (event as { sender?: { id?: number } }).sender?.id
       return chooserWebContentsId !== undefined && senderId === chooserWebContentsId
     },
+    isPortAvailable: async (port: number) =>
+      !(await isPortReachable(port, { host: 'localhost', timeout: 1500 })),
     restartMain: async (forced: ForcedLaunch) => {
       pendingForcedLaunch = forced
       wizardPhase = true
