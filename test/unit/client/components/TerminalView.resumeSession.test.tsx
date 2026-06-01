@@ -240,6 +240,93 @@ describe('TerminalView durable session contract', () => {
     })
   })
 
+  it('persists canonical sessionRef from terminal.created when the server replays it', async () => {
+    const tabId = 'tab-opencode'
+    const paneId = 'pane-opencode'
+    let messageHandler: ((msg: any) => void) | null = null
+
+    wsMocks.onMessage.mockImplementation((handler: (msg: any) => void) => {
+      messageHandler = handler
+      return () => {}
+    })
+
+    const sessionRef = {
+      provider: 'opencode',
+      sessionId: 'ses_root_created_replay',
+    }
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-created-replay',
+      status: 'creating',
+      mode: 'opencode',
+      shell: 'system',
+      initialCwd: '/tmp',
+    }
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'opencode',
+            status: 'running',
+            title: 'OpenCode',
+            titleSetByUser: false,
+            createRequestId: 'req-created-replay',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: { settings: defaultSettings, status: 'loaded' },
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.create',
+        requestId: 'req-created-replay',
+      }))
+    })
+
+    messageHandler?.({
+      type: 'terminal.created',
+      requestId: 'req-created-replay',
+      terminalId: 'term-created-replay',
+      sessionRef,
+    })
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts[tabId]
+      if (layout?.type !== 'leaf') throw new Error('unexpected layout')
+      if (layout.content.kind !== 'terminal') throw new Error('unexpected content')
+      expect(layout.content.terminalId).toBe('term-created-replay')
+      expect(layout.content.sessionRef).toEqual(sessionRef)
+      expect(layout.content.resumeSessionId).toBeUndefined()
+
+      const tab = store.getState().tabs.tabs.find((entry) => entry.id === tabId)
+      expect(tab?.sessionRef).toEqual(sessionRef)
+      expect(tab?.resumeSessionId).toBeUndefined()
+    })
+  })
+
   it('persists canonical durable sessionRef only after terminal.session.associated', async () => {
     const tabId = 'tab-1'
     const paneId = 'pane-1'

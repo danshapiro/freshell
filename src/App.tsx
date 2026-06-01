@@ -60,6 +60,7 @@ import { updateSettingsLocal } from '@/store/settingsSlice'
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
 import { clearDeadTerminals } from '@/store/panesSlice'
 import { addTerminalFreshRecoveryRequestId, addTerminalRestoreRequestId } from '@/lib/terminal-restore'
+import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
 import { setClaudeActivitySnapshot, upsertClaudeActivity, removeClaudeActivity, resetClaudeActivity } from '@/store/claudeActivitySlice'
 import { setOpencodeActivitySnapshot, upsertOpencodeActivity, removeOpencodeActivity, resetOpencodeActivity } from '@/store/opencodeActivitySlice'
@@ -855,6 +856,20 @@ export default function App() {
         if (terminalInvalidationHandler.handle(msg as any)) {
           return
         }
+        if (
+          (msg.type === 'terminal.session.associated'
+            || msg.type === 'terminal.created'
+            || msg.type === 'terminal.attach.ready')
+          && typeof (msg as any).terminalId === 'string'
+          && (msg as any).sessionRef
+        ) {
+          reconcileTerminalSessionAssociation({
+            dispatch,
+            getState: appStore.getState,
+            terminalId: (msg as any).terminalId,
+            sessionRef: (msg as any).sessionRef,
+          })
+        }
         if (msg.type === 'terminal.inventory') {
           const terminals = Array.isArray(msg.terminals) ? msg.terminals : []
           const terminalMeta = Array.isArray(msg.terminalMeta) ? msg.terminalMeta : []
@@ -871,6 +886,16 @@ export default function App() {
               && !(typeof record?.updatedAt === 'number' && record.updatedAt > terminalMetaRequestedAt)
             ))
             .map(([terminalId]) => terminalId)
+          for (const terminal of terminals) {
+            if (terminal?.terminalId && terminal?.sessionRef) {
+              reconcileTerminalSessionAssociation({
+                dispatch,
+                getState: appStore.getState,
+                terminalId: terminal.terminalId,
+                sessionRef: terminal.sessionRef,
+              })
+            }
+          }
           const liveIds = terminals
             .filter((t: any) => t.status === 'running')
             .map((t: any) => t.terminalId as string)

@@ -935,6 +935,176 @@ describe('App WS bootstrap recovery', () => {
     })
   })
 
+  it('recovers an OpenCode sessionRef from inventory before clearing a stale live handle', async () => {
+    const store = createStore({
+      tabs: [{
+        id: 'tab-opencode-refresh',
+        mode: 'opencode',
+        status: 'running',
+        resumeSessionId: 'legacy-title-like-id',
+      }],
+      panes: {
+        layouts: {
+          'tab-opencode-refresh': {
+            type: 'leaf',
+            id: 'pane-opencode-refresh',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-opencode-old',
+              status: 'running',
+              mode: 'opencode',
+              shell: 'system',
+              terminalId: 'term-opencode-old',
+              resumeSessionId: 'legacy-title-like-id',
+              serverInstanceId: 'srv-old',
+            },
+          },
+        },
+        activePane: { 'tab-opencode-refresh': 'pane-opencode-refresh' },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).toBeTypeOf('function')
+    })
+
+    const sessionRef = {
+      provider: 'opencode',
+      sessionId: 'ses_root_inventory_refresh_restore',
+    }
+
+    act(() => {
+      messageHandler?.({
+        type: 'terminal.inventory',
+        terminals: [{
+          terminalId: 'term-opencode-old',
+          title: 'OpenCode',
+          mode: 'opencode',
+          createdAt: 1_000,
+          lastActivityAt: 1_700,
+          status: 'running',
+          sessionRef,
+        }],
+        terminalMeta: [],
+      })
+    })
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts['tab-opencode-refresh']
+      if (!layout || layout.type !== 'leaf') throw new Error('expected leaf layout')
+      const content = layout.content
+      if (content.kind !== 'terminal') throw new Error('expected terminal pane')
+
+      expect(content.terminalId).toBe('term-opencode-old')
+      expect(content.status).toBe('running')
+      expect(content.createRequestId).toBe('req-opencode-old')
+      expect(content.sessionRef).toEqual(sessionRef)
+      expect(content.resumeSessionId).toBeUndefined()
+      expect(store.getState().tabs.tabs.find((tab) => tab.id === 'tab-opencode-refresh')?.sessionRef).toEqual(sessionRef)
+      expect(store.getState().tabs.tabs.find((tab) => tab.id === 'tab-opencode-refresh')?.resumeSessionId).toBeUndefined()
+    })
+
+    act(() => {
+      messageHandler?.({
+        type: 'terminal.inventory',
+        terminals: [],
+        terminalMeta: [],
+      })
+    })
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts['tab-opencode-refresh']
+      if (!layout || layout.type !== 'leaf') throw new Error('expected leaf layout')
+      const content = layout.content
+      if (content.kind !== 'terminal') throw new Error('expected terminal pane')
+
+      expect(content.terminalId).toBeUndefined()
+      expect(content.status).toBe('creating')
+      expect(content.createRequestId).not.toBe('req-opencode-old')
+      expect(content.sessionRef).toEqual(sessionRef)
+      expect(content.resumeSessionId).toBeUndefined()
+      expect(store.getState().panes.restoreFallbackAttemptsByPane?.['tab-opencode-refresh']?.['pane-opencode-refresh']).toBeUndefined()
+      expect(terminalRestoreMocks.addTerminalRestoreRequestId).toHaveBeenCalledWith(content.createRequestId)
+      expect(terminalRestoreMocks.addTerminalFreshRecoveryRequestId).not.toHaveBeenCalledWith(
+        content.createRequestId,
+        'fresh_after_restore_unavailable',
+      )
+    })
+  })
+
+  it.each(['terminal.session.associated', 'terminal.attach.ready'] as const)(
+    'persists OpenCode sessionRef from %s without TerminalView mounted',
+    async (type) => {
+      const store = createStore({
+        tabs: [{ id: 'tab-opencode-associated', mode: 'opencode', status: 'running' }],
+        panes: {
+          layouts: {
+            'tab-opencode-associated': {
+              type: 'leaf',
+              id: 'pane-opencode-associated',
+              content: {
+                kind: 'terminal',
+                createRequestId: 'req-opencode-associated',
+                status: 'running',
+                mode: 'opencode',
+                shell: 'system',
+                terminalId: 'term-opencode-associated',
+              },
+            },
+          },
+          activePane: { 'tab-opencode-associated': 'pane-opencode-associated' },
+        },
+      })
+
+      render(
+        <Provider store={store}>
+          <App />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(messageHandler).toBeTypeOf('function')
+      })
+
+      const sessionRef = {
+        provider: 'opencode',
+        sessionId: `ses_root_${type.replaceAll('.', '_')}`,
+      }
+
+      act(() => {
+        messageHandler?.(type === 'terminal.session.associated'
+          ? {
+              type,
+              terminalId: 'term-opencode-associated',
+              sessionRef,
+            }
+          : {
+              type,
+              terminalId: 'term-opencode-associated',
+              headSeq: 0,
+              replayFromSeq: 1,
+              replayToSeq: 0,
+              sessionRef,
+            })
+      })
+
+      await waitFor(() => {
+        const layout = store.getState().panes.layouts['tab-opencode-associated']
+        if (!layout || layout.type !== 'leaf') throw new Error('expected leaf layout')
+        const content = layout.content
+        if (content.kind !== 'terminal') throw new Error('expected terminal pane')
+        expect(content.sessionRef).toEqual(sessionRef)
+        expect(store.getState().tabs.tabs.find((tab) => tab.id === 'tab-opencode-associated')?.sessionRef).toEqual(sessionRef)
+      })
+    },
+  )
+
   it('mounts with legacy ws clients that do not implement onDisconnect', async () => {
     const store = createStore()
     const originalOnDisconnect = wsMocks.onDisconnect

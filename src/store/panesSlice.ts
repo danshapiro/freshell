@@ -564,6 +564,10 @@ function clearRestoreFallbackAttemptForPane(state: PanesState, tabId: string, pa
   }
 }
 
+function sessionRefsEqual(left?: { provider?: string; sessionId?: string }, right?: { provider?: string; sessionId?: string }): boolean {
+  return left?.provider === right?.provider && left?.sessionId === right?.sessionId
+}
+
 function reconcileRefreshRequestsForTab(state: PanesState, tabId: string) {
   const tabRequests = state.refreshRequestsByPane?.[tabId]
   if (!tabRequests) return
@@ -1575,6 +1579,52 @@ export const panesSlice = createSlice({
       }
     },
 
+    reconcileTerminalSessionRefByTerminalId: (
+      state,
+      action: PayloadAction<{ terminalId: string; sessionRef: unknown }>
+    ) => {
+      const terminalId = action.payload.terminalId
+      const sessionRef = sanitizeSessionRef(action.payload.sessionRef)
+      if (!terminalId || !sessionRef) return
+
+      function reconcileNode(node: PaneNode, tabId: string): void {
+        if (node.type === 'leaf') {
+          const content = node.content
+          if (
+            content.kind !== 'terminal'
+            || content.terminalId !== terminalId
+          ) {
+            return
+          }
+
+          if (!sessionRefsEqual(content.sessionRef, sessionRef)) {
+            content.sessionRef = sessionRef
+          }
+          content.resumeSessionId = undefined
+          if (
+            sessionRef.provider === 'codex'
+            && !(
+              content.codexDurability?.state === 'durable'
+              && (
+                content.codexDurability.durableThreadId === sessionRef.sessionId
+                || content.codexDurability.candidate?.candidateThreadId === sessionRef.sessionId
+              )
+            )
+          ) {
+            content.codexDurability = undefined
+          }
+          clearRestoreFallbackAttemptForPane(state, tabId, node.id)
+          return
+        }
+        reconcileNode(node.children[0], tabId)
+        reconcileNode(node.children[1], tabId)
+      }
+
+      for (const [tabId, layout] of Object.entries(state.layouts)) {
+        reconcileNode(layout, tabId)
+      }
+    },
+
     clearDeadTerminals: (state, action: PayloadAction<{ liveTerminalIds: string[] }>) => {
       const liveSet = new Set(action.payload.liveTerminalIds)
 
@@ -1646,6 +1696,7 @@ export const {
   hydratePanes,
   updatePaneTitle,
   updatePaneTitleByTerminalId,
+  reconcileTerminalSessionRefByTerminalId,
   requestPaneRename,
   clearPaneRenameRequest,
   toggleZoom,
