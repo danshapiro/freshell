@@ -1,6 +1,6 @@
 import WebSocket from 'ws'
 import type { LiveWebSocket } from '../ws-handler.js'
-import type { TerminalRegistry } from '../terminal-registry.js'
+import { buildTerminalSessionRef, type TerminalRegistry } from '../terminal-registry.js'
 import { logger } from '../logger.js'
 import { logTerminalStreamPerfEvent, type TerminalStreamPerfEvent } from '../perf-logger.js'
 import type { TerminalOutputRawEvent } from './registry-events.js'
@@ -187,6 +187,7 @@ export class TerminalStreamBroker {
         })
       }
 
+      const sessionRef = buildTerminalSessionRef(record)
       if (!this.safeSend(ws, {
         type: 'terminal.attach.ready',
         terminalId,
@@ -194,6 +195,7 @@ export class TerminalStreamBroker {
         replayFromSeq,
         replayToSeq,
         ...(attachment.activeAttachRequestId ? { attachRequestId: attachment.activeAttachRequestId } : {}),
+        ...(sessionRef ? { sessionRef } : {}),
       })) {
         return
       }

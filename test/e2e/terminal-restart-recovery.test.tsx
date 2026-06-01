@@ -3,7 +3,7 @@ import { cleanup, render, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer from '@/store/tabsSlice'
-import panesReducer, { clearDeadTerminals } from '@/store/panesSlice'
+import panesReducer, { clearDeadTerminals, reconcileTerminalSessionRefByTerminalId } from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import { useAppSelector } from '@/store/hooks'
@@ -334,6 +334,59 @@ describe('terminal restart recovery (e2e)', () => {
 
     await waitFor(() => {
       expect(sentMessages().filter((msg) => msg?.type === 'terminal.create')).toHaveLength(0)
+    })
+  })
+
+  it('restores an OpenCode pane after inventory recovers a missing sessionRef before stale-handle cleanup', async () => {
+    const paneId = 'pane-codex'
+    const layout: PaneNode = {
+      type: 'leaf',
+      id: paneId,
+      content: {
+        kind: 'terminal',
+        createRequestId: 'req-opencode-old',
+        status: 'running',
+        mode: 'opencode',
+        shell: 'system',
+        terminalId: 'term-opencode-old',
+        serverInstanceId: 'srv-old',
+      } satisfies TerminalPaneContent,
+    }
+    const store = createStore(layout)
+
+    render(
+      <Provider store={store}>
+        <TerminalViewFromStore tabId="tab-restart" paneId={paneId} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(sentMessages().some((msg) => msg?.type === 'terminal.attach' && msg.terminalId === 'term-opencode-old')).toBe(true)
+    })
+
+    wsHarness.send.mockClear()
+    store.dispatch(reconcileTerminalSessionRefByTerminalId({
+      terminalId: 'term-opencode-old',
+      sessionRef: {
+        provider: 'opencode',
+        sessionId: 'ses_root_recovered_before_dead_clear',
+      },
+    }))
+    store.dispatch(clearDeadTerminals({ liveTerminalIds: [] }))
+    registerRecoveryRequestsFromState(store)
+
+    await waitFor(() => {
+      const create = sentMessages().find((msg) => msg?.type === 'terminal.create')
+      expect(create).toMatchObject({
+        type: 'terminal.create',
+        mode: 'opencode',
+        restore: true,
+        sessionRef: {
+          provider: 'opencode',
+          sessionId: 'ses_root_recovered_before_dead_clear',
+        },
+      })
+      expect(create).not.toHaveProperty('recoveryIntent')
     })
   })
 })

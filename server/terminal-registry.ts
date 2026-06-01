@@ -9,6 +9,7 @@ import { EventEmitter } from 'events'
 import { logger } from './logger.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
 import type { ServerSettings } from '../shared/settings.js'
+import type { SessionLocator } from '../shared/ws-protocol.js'
 import {
   CODEX_DURABILITY_SCHEMA_VERSION,
   type CodexCandidateSource,
@@ -130,6 +131,29 @@ export function registerCodingCliCommands(specs: Map<string, CodingCliCommandSpe
 export function modeSupportsResume(mode: TerminalMode): boolean {
   if (mode === 'shell') return false
   return !!codingCliCommands.get(mode)?.resumeArgs
+}
+
+type TerminalSessionRefSource = Pick<TerminalRecord, 'mode' | 'resumeSessionId'> & {
+  codexDurability?: CodexDurabilityRef
+}
+
+export function buildTerminalSessionRef(record: TerminalSessionRefSource): SessionLocator | undefined {
+  if (!modeSupportsResume(record.mode as TerminalMode)) return undefined
+  if (!record.resumeSessionId) return undefined
+  if (
+    record.mode === 'codex'
+    && (
+      record.codexDurability?.state !== 'durable'
+      || record.codexDurability.durableThreadId !== record.resumeSessionId
+    )
+  ) {
+    return undefined
+  }
+
+  return {
+    provider: record.mode as CodingCliProviderName,
+    sessionId: record.resumeSessionId,
+  }
 }
 
 type ProviderTarget = 'unix' | 'windows'
@@ -3295,14 +3319,7 @@ export class TerminalRegistry extends EventEmitter {
       description: t.description,
       mode: t.mode,
       resumeSessionId: t.resumeSessionId,
-      sessionRef: modeSupportsResume(t.mode)
-        && t.resumeSessionId
-        && (t.mode !== 'codex' || (
-          t.codexDurability?.state === 'durable'
-          && t.codexDurability.durableThreadId === t.resumeSessionId
-        ))
-        ? { provider: t.mode as CodingCliProviderName, sessionId: t.resumeSessionId }
-        : undefined,
+      sessionRef: buildTerminalSessionRef(t),
       createdAt: t.createdAt,
       lastActivityAt: t.lastActivityAt,
       status: t.status,

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { isLinuxPath, getSystemShell, escapeCmdExe, buildSpawnSpec, TerminalRegistry, isWsl, isWindowsLike, modeSupportsResume } from '../../../server/terminal-registry'
+import { isLinuxPath, getSystemShell, escapeCmdExe, buildSpawnSpec, TerminalRegistry, isWsl, isWindowsLike, modeSupportsResume, buildTerminalSessionRef } from '../../../server/terminal-registry'
 import { isValidClaudeSessionId } from '../../../server/claude-session-id'
+import { CODEX_DURABILITY_SCHEMA_VERSION } from '../../../shared/codex-durability'
 import * as fs from 'fs'
 import os from 'os'
 import {
@@ -74,6 +75,70 @@ vi.mock('../../../server/mcp/config-writer.js', () => ({
 const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 const OTHER_CLAUDE_SESSION_ID = '6f1c2b3a-4d5e-4f70-8a9b-0c1d2e3f4a5b'
 const TEST_OPENCODE_SERVER = { hostname: '127.0.0.1' as const, port: 4173 }
+
+describe('buildTerminalSessionRef', () => {
+  it('exposes non-Codex resumable provider session refs from resumeSessionId', () => {
+    expect(buildTerminalSessionRef({
+      mode: 'opencode',
+      resumeSessionId: 'ses_root_unit_helper',
+    })).toEqual({
+      provider: 'opencode',
+      sessionId: 'ses_root_unit_helper',
+    })
+  })
+
+  it('exposes Codex session refs only after durable proof matches the resume id', () => {
+    expect(buildTerminalSessionRef({
+      mode: 'codex',
+      resumeSessionId: 'thread-durable',
+      codexDurability: {
+        schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+        state: 'durable',
+        durableThreadId: 'thread-durable',
+      },
+    })).toEqual({
+      provider: 'codex',
+      sessionId: 'thread-durable',
+    })
+
+    expect(buildTerminalSessionRef({
+      mode: 'codex',
+      resumeSessionId: 'thread-durable',
+      codexDurability: {
+        schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+        state: 'durable',
+        durableThreadId: 'thread-other',
+      },
+    })).toBeUndefined()
+
+    expect(buildTerminalSessionRef({
+      mode: 'codex',
+      resumeSessionId: 'thread-durable',
+      codexDurability: {
+        schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+        state: 'proof_checking',
+        candidate: {
+          provider: 'codex',
+          candidateThreadId: 'thread-durable',
+          rolloutPath: '/tmp/codex-rollout.jsonl',
+          source: 'restored_client_state',
+          capturedAt: 1,
+        },
+      },
+    })).toBeUndefined()
+  })
+
+  it('does not expose session refs for shell or records without a resume id', () => {
+    expect(buildTerminalSessionRef({
+      mode: 'shell',
+      resumeSessionId: 'ignored',
+    })).toBeUndefined()
+
+    expect(buildTerminalSessionRef({
+      mode: 'opencode',
+    })).toBeUndefined()
+  })
+})
 
 function expectCodexMcpArgs(args: string[]) {
   expect(args).toContain('tui.notification_method=bel')

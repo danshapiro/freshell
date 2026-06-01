@@ -231,6 +231,10 @@ function withCurrentAttachRequestId<T extends { type?: string; terminalId?: stri
   return { ...msg, attachRequestId }
 }
 
+function sentMessages() {
+  return wsMocks.send.mock.calls.map(([msg]) => msg)
+}
+
 describe('TerminalView lifecycle updates', () => {
   let messageHandler: ((msg: any) => void) | null = null
   let reconnectHandler: (() => void) | null = null
@@ -2142,6 +2146,103 @@ describe('TerminalView lifecycle updates', () => {
       expect(createCalls.length).toBeGreaterThanOrEqual(1)
       expect(createCalls[0][0].restore).toBe(true)
     })
+  })
+
+  it('uses sessionRef replayed by terminal.attach.ready for an immediate invalid-terminal reconnect', async () => {
+    const tabId = 'tab-opencode-attach-ready-replay'
+    const paneId = 'pane-opencode-attach-ready-replay'
+    const sessionRef = {
+      provider: 'opencode',
+      sessionId: 'ses_root_attach_ready_replay',
+    }
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-opencode-attach-ready-replay',
+      status: 'running',
+      mode: 'opencode',
+      shell: 'system',
+      terminalId: 'term-opencode-attach-ready-replay',
+      serverInstanceId: 'srv-old',
+      initialCwd: '/repo/project',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'opencode',
+            status: 'running',
+            title: 'OpenCode',
+            titleSetByUser: false,
+            terminalId: 'term-opencode-attach-ready-replay',
+            createRequestId: 'req-opencode-attach-ready-replay',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-new' },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalViewFromStore tabId={tabId} paneId={paneId} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(sentMessages().some((msg) => (
+        msg?.type === 'terminal.attach'
+        && msg.terminalId === 'term-opencode-attach-ready-replay'
+      ))).toBe(true)
+    })
+
+    restoreMocks.addTerminalRestoreRequestId.mockClear()
+    restoreMocks.addTerminalFreshRecoveryRequestId.mockClear()
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId: 'term-opencode-attach-ready-replay',
+        headSeq: 0,
+        replayFromSeq: 1,
+        replayToSeq: 0,
+        sessionRef,
+      })
+      messageHandler!({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'Unknown terminalId',
+        terminalId: 'term-opencode-attach-ready-replay',
+      })
+    })
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts[tabId]
+      if (layout?.type !== 'leaf') throw new Error('unexpected layout')
+      if (layout.content.kind !== 'terminal') throw new Error('unexpected content')
+      expect(layout.content.terminalId).toBeUndefined()
+      expect(layout.content.status).toBe('creating')
+      expect(layout.content.sessionRef).toEqual(sessionRef)
+      expect(layout.content.createRequestId).not.toBe('req-opencode-attach-ready-replay')
+      expect(restoreMocks.addTerminalRestoreRequestId).toHaveBeenCalledWith(layout.content.createRequestId)
+    })
+    expect(restoreMocks.addTerminalFreshRecoveryRequestId).not.toHaveBeenCalled()
   })
 
   it('does not reconnect when a restored launch fails before the first attach completes', async () => {
