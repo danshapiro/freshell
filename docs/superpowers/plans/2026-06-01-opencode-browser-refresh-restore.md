@@ -293,6 +293,8 @@ with:
 await attachReusedTerminal(existing)
 ```
 
+Update all six existing call sites in `server/ws-handler.ts` the same way, including the live Codex proof branches that currently pass `decision.sessionId` or `live.resumeSessionId`. The new helper always derives the replayed identity from the current `TerminalRecord`; do not pass a session id separately.
+
 For newly created terminals, send:
 
 ```ts
@@ -422,9 +424,32 @@ it('recovers an OpenCode sessionRef from inventory before clearing a stale live 
         mode: 'opencode',
         createdAt: 1_000,
         lastActivityAt: 1_700,
-        status: 'exited',
+        status: 'running',
         sessionRef,
       }],
+      terminalMeta: [],
+    })
+  })
+
+  await waitFor(() => {
+    const layout = store.getState().panes.layouts['tab-opencode-refresh']
+    if (!layout || layout.type !== 'leaf') throw new Error('expected leaf layout')
+    const content = layout.content
+    if (content.kind !== 'terminal') throw new Error('expected terminal pane')
+
+    expect(content.terminalId).toBe('term-opencode-old')
+    expect(content.status).toBe('running')
+    expect(content.createRequestId).toBe('req-opencode-old')
+    expect(content.sessionRef).toEqual(sessionRef)
+    expect(content.resumeSessionId).toBeUndefined()
+    expect(store.getState().tabs.tabs.find((tab) => tab.id === 'tab-opencode-refresh')?.sessionRef).toEqual(sessionRef)
+    expect(store.getState().tabs.tabs.find((tab) => tab.id === 'tab-opencode-refresh')?.resumeSessionId).toBeUndefined()
+  })
+
+  act(() => {
+    messageHandler?.({
+      type: 'terminal.inventory',
+      terminals: [],
       terminalMeta: [],
     })
   })
@@ -440,8 +465,6 @@ it('recovers an OpenCode sessionRef from inventory before clearing a stale live 
     expect(content.createRequestId).not.toBe('req-opencode-old')
     expect(content.sessionRef).toEqual(sessionRef)
     expect(content.resumeSessionId).toBeUndefined()
-    expect(store.getState().tabs.tabs.find((tab) => tab.id === 'tab-opencode-refresh')?.sessionRef).toEqual(sessionRef)
-    expect(store.getState().tabs.tabs.find((tab) => tab.id === 'tab-opencode-refresh')?.resumeSessionId).toBeUndefined()
     expect(store.getState().panes.restoreFallbackAttemptsByPane?.['tab-opencode-refresh']?.['pane-opencode-refresh']).toBeUndefined()
     expect(terminalRestoreMocks.addTerminalRestoreRequestId).toHaveBeenCalledWith(content.createRequestId)
     expect(terminalRestoreMocks.addTerminalFreshRecoveryRequestId).not.toHaveBeenCalledWith(
@@ -649,6 +672,28 @@ function isSinglePaneTerminalMatch(layout: PaneNode | undefined, terminalId: str
   )
 }
 
+function sessionRefsEqual(left?: SessionRef, right?: SessionRef): boolean {
+  return left?.provider === right?.provider && left?.sessionId === right?.sessionId
+}
+
+function terminalPaneNeedsDurableIdentityUpdate(content: TerminalPaneContent, sessionRef: SessionRef): boolean {
+  if (!sessionRefsEqual(content.sessionRef, sessionRef)) return true
+  if (typeof content.resumeSessionId === 'string') return true
+  if (
+    sessionRef.provider === 'codex'
+    && !(
+      content.codexDurability?.state === 'durable'
+      && (
+        content.codexDurability.durableThreadId === sessionRef.sessionId
+        || content.codexDurability.candidate?.candidateThreadId === sessionRef.sessionId
+      )
+    )
+  ) {
+    return content.codexDurability !== undefined
+  }
+  return false
+}
+
 export function reconcileTerminalSessionAssociation({
   dispatch,
   getState,
@@ -665,25 +710,27 @@ export function reconcileTerminalSessionAssociation({
   if (!sessionRef) return false
 
   const state = getState()
-  const matchedTabs: Array<{ tabId: string; content: TerminalPaneContent }> = []
+  let matchedAnyPane = false
+  let shouldFlush = false
+  const matchedSinglePaneTabs: Array<{ tabId: string; content: TerminalPaneContent }> = []
   for (const [tabId, layout] of Object.entries(state.panes.layouts)) {
     const matches: Array<{ paneId: string; content: TerminalPaneContent }> = []
     collectMatchingTerminalPanes(layout, terminalId, matches)
-    if (matches.length > 0 && isSinglePaneTerminalMatch(layout, terminalId)) {
-      matchedTabs.push({ tabId, content: matches[0].content })
+    if (matches.length === 0) continue
+    matchedAnyPane = true
+    if (matches.some(({ content }) => terminalPaneNeedsDurableIdentityUpdate(content, sessionRef))) {
+      shouldFlush = true
+    }
+    if (isSinglePaneTerminalMatch(layout, terminalId)) {
+      matchedSinglePaneTabs.push({ tabId, content: matches[0].content })
     }
   }
 
-  const hasAnyPaneMatch = matchedTabs.length > 0 || Object.values(state.panes.layouts).some((layout) => {
-    const matches: Array<{ paneId: string; content: TerminalPaneContent }> = []
-    collectMatchingTerminalPanes(layout, terminalId, matches)
-    return matches.length > 0
-  })
-  if (!hasAnyPaneMatch) return false
+  if (!matchedAnyPane) return false
 
   dispatch(reconcileTerminalSessionRefByTerminalId({ terminalId, sessionRef }))
 
-  for (const { tabId, content } of matchedTabs) {
+  for (const { tabId, content } of matchedSinglePaneTabs) {
     const tab = state.tabs.tabs.find((candidate) => candidate.id === tabId)
     if (!tab) continue
     const durableIdentityUpdate = buildTerminalDurableSessionRefUpdate({
@@ -709,6 +756,7 @@ export function reconcileTerminalSessionAssociation({
         : {}),
     }
     if (Object.keys(tabUpdates).length > 0) {
+      shouldFlush = true
       dispatch(updateTab({
         id: tab.id,
         updates: tabUpdates,
@@ -716,12 +764,14 @@ export function reconcileTerminalSessionAssociation({
     }
   }
 
-  dispatch(flushPersistedLayoutNow())
+  if (shouldFlush) {
+    dispatch(flushPersistedLayoutNow())
+  }
   return true
 }
 ```
 
-The refactor step below will simplify the duplicate `hasAnyPaneMatch` walk after the first green test pass.
+The helper computes `shouldFlush` before dispatching the panes reducer so repeated `terminal.attach.ready` messages that replay an already-persisted `sessionRef` do not force redundant synchronous layout writes.
 
 - [ ] **Step 6: Use the helper in App WebSocket handling**
 
@@ -841,17 +891,110 @@ Replace the current `terminal.session.associated` block with:
 
 Remove the now-unused `buildTerminalDurableSessionRefUpdate` import from `TerminalView.tsx`.
 
-- [ ] **Step 8: Run focused client tests**
+- [ ] **Step 8: Add the TerminalView terminal.created assertion**
+
+In `test/unit/client/components/TerminalView.resumeSession.test.tsx`, keep the existing "keeps terminal.created live-only until an explicit terminal.session.associated arrives" test unchanged for messages with no `sessionRef`. Add this assertion in the same describe block:
+
+```tsx
+it('persists canonical sessionRef from terminal.created when the server replays it', async () => {
+  const tabId = 'tab-opencode'
+  const paneId = 'pane-opencode'
+  let messageHandler: ((msg: any) => void) | null = null
+
+  wsMocks.onMessage.mockImplementation((handler: (msg: any) => void) => {
+    messageHandler = handler
+    return () => {}
+  })
+
+  const sessionRef = {
+    provider: 'opencode',
+    sessionId: 'ses_root_created_replay',
+  }
+  const paneContent: TerminalPaneContent = {
+    kind: 'terminal',
+    createRequestId: 'req-created-replay',
+    status: 'creating',
+    mode: 'opencode',
+    shell: 'system',
+    initialCwd: '/tmp',
+  }
+  const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+  const store = configureStore({
+    reducer: {
+      tabs: tabsReducer,
+      panes: panesReducer,
+      settings: settingsReducer,
+      connection: connectionReducer,
+    },
+    preloadedState: {
+      tabs: {
+        tabs: [{
+          id: tabId,
+          mode: 'opencode',
+          status: 'running',
+          title: 'OpenCode',
+          titleSetByUser: false,
+          createRequestId: 'req-created-replay',
+        }],
+        activeTabId: tabId,
+      },
+      panes: {
+        layouts: { [tabId]: root },
+        activePane: { [tabId]: paneId },
+        paneTitles: {},
+      },
+      settings: { settings: defaultSettings, status: 'loaded' },
+      connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
+    },
+  })
+
+  render(
+    <Provider store={store}>
+      <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+    </Provider>,
+  )
+
+  await waitFor(() => {
+    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'terminal.create',
+      requestId: 'req-created-replay',
+    }))
+  })
+
+  messageHandler?.({
+    type: 'terminal.created',
+    requestId: 'req-created-replay',
+    terminalId: 'term-created-replay',
+    sessionRef,
+  })
+
+  await waitFor(() => {
+    const layout = store.getState().panes.layouts[tabId]
+    if (layout?.type !== 'leaf') throw new Error('unexpected layout')
+    if (layout.content.kind !== 'terminal') throw new Error('unexpected content')
+    expect(layout.content.terminalId).toBe('term-created-replay')
+    expect(layout.content.sessionRef).toEqual(sessionRef)
+    expect(layout.content.resumeSessionId).toBeUndefined()
+
+    const tab = store.getState().tabs.tabs.find((entry) => entry.id === tabId)
+    expect(tab?.sessionRef).toEqual(sessionRef)
+    expect(tab?.resumeSessionId).toBeUndefined()
+  })
+})
+```
+
+- [ ] **Step 9: Run focused client tests**
 
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/components/App.ws-bootstrap.test.tsx test/unit/client/components/TerminalView.resumeSession.test.tsx --run -t "OpenCode sessionRef|terminal.session.associated|terminal.created live-only|persists canonical durable sessionRef"
+npm run test:vitest -- test/unit/client/components/App.ws-bootstrap.test.tsx test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx --run -t "OpenCode sessionRef|terminal.session.associated|terminal.created live-only|terminal.created when the server replays it|persists canonical durable sessionRef|shows feedback when Codex input is blocked"
 ```
 
 Expected: PASS.
 
-- [ ] **Step 9: Commit client reconciliation work**
+- [ ] **Step 10: Commit client reconciliation work**
 
 Run:
 
@@ -968,7 +1111,7 @@ Expected: PASS.
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/components/App.ws-bootstrap.test.tsx test/unit/client/components/TerminalView.resumeSession.test.tsx test/e2e/terminal-restart-recovery.test.tsx --run -t "OpenCode sessionRef|terminal.session.associated|terminal.created live-only|persists canonical durable sessionRef|inventory recovers a missing sessionRef|registers regenerated restart request ids"
+npm run test:vitest -- test/unit/client/components/App.ws-bootstrap.test.tsx test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/e2e/terminal-restart-recovery.test.tsx test/e2e/codex-refresh-rehydrate-flow.test.tsx --run -t "OpenCode sessionRef|terminal.session.associated|terminal.created live-only|terminal.created when the server replays it|persists canonical durable sessionRef|inventory recovers a missing sessionRef|registers regenerated restart request ids|restores the same Codex session after a refresh"
 ```
 
 Expected: PASS.
