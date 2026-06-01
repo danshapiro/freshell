@@ -1586,6 +1586,7 @@ export const panesSlice = createSlice({
       const terminalId = action.payload.terminalId
       const sessionRef = sanitizeSessionRef(action.payload.sessionRef)
       if (!terminalId || !sessionRef) return
+      const canonicalSessionRef = sessionRef
 
       function reconcileNode(node: PaneNode, tabId: string): void {
         if (node.type === 'leaf') {
@@ -1597,16 +1598,16 @@ export const panesSlice = createSlice({
             return
           }
 
-          if (!sessionRefsEqual(content.sessionRef, sessionRef)) {
-            content.sessionRef = sessionRef
+          if (!sessionRefsEqual(content.sessionRef, canonicalSessionRef)) {
+            content.sessionRef = canonicalSessionRef
           }
           content.resumeSessionId = undefined
           if (!(
-            sessionRef.provider === 'codex'
+            canonicalSessionRef.provider === 'codex'
             && content.codexDurability?.state === 'durable'
             && (
-              content.codexDurability.durableThreadId === sessionRef.sessionId
-              || content.codexDurability.candidate?.candidateThreadId === sessionRef.sessionId
+              content.codexDurability.durableThreadId === canonicalSessionRef.sessionId
+              || content.codexDurability.candidate?.candidateThreadId === canonicalSessionRef.sessionId
             )
           )) {
             content.codexDurability = undefined
