@@ -158,7 +158,7 @@ export type TerminalAttachReadyMessage = {
 
 - [ ] **Step 4: Add the server sessionRef helper**
 
-In `server/terminal-registry.ts`, add `SessionLocator` to the existing shared protocol type imports if needed:
+In `server/terminal-registry.ts`, add this type import:
 
 ```ts
 import type { SessionLocator } from '../shared/ws-protocol.js'
@@ -200,6 +200,53 @@ sessionRef: buildTerminalSessionRef(t),
 ```
 
 This should be behavior-preserving for inventory: OpenCode/Claude records with `resumeSessionId` expose `sessionRef`; Codex still exposes it only after durable proof.
+
+Add `buildTerminalSessionRef` to the existing `test/unit/server/terminal-registry.test.ts` import from `../../../server/terminal-registry`, then add focused unit coverage for the helper:
+
+```ts
+describe('buildTerminalSessionRef', () => {
+  it('exposes non-Codex resumable provider session refs from resumeSessionId', () => {
+    expect(buildTerminalSessionRef({
+      mode: 'opencode',
+      resumeSessionId: 'ses_root_unit_helper',
+    })).toEqual({
+      provider: 'opencode',
+      sessionId: 'ses_root_unit_helper',
+    })
+  })
+
+  it('exposes Codex session refs only after durable proof matches the resume id', () => {
+    expect(buildTerminalSessionRef({
+      mode: 'codex',
+      resumeSessionId: 'thread-codex-durable',
+      codexDurability: {
+        schemaVersion: 1,
+        state: 'durable',
+        durableThreadId: 'thread-codex-durable',
+      },
+    })).toEqual({
+      provider: 'codex',
+      sessionId: 'thread-codex-durable',
+    })
+
+    expect(buildTerminalSessionRef({
+      mode: 'codex',
+      resumeSessionId: 'thread-codex-unproved',
+      codexDurability: {
+        schemaVersion: 1,
+        state: 'captured_pre_turn',
+        candidate: {
+          provider: 'codex',
+          candidateThreadId: 'thread-codex-unproved',
+          rolloutPath: '/tmp/codex-rollout.json',
+          capturedAt: 1,
+          source: 'thread_start_response',
+        },
+      },
+    })).toBeUndefined()
+  })
+})
+```
 
 - [ ] **Step 6: Include sessionRef in terminal.created**
 
@@ -306,7 +353,8 @@ const sent = await sendCreateResult({
 In `server/terminal-stream/broker.ts`, import:
 
 ```ts
-import { buildTerminalSessionRef, type TerminalRegistry } from '../terminal-registry.js'
+import { buildTerminalSessionRef } from '../terminal-registry.js'
+import type { TerminalRegistry } from '../terminal-registry.js'
 ```
 
 Before sending `terminal.attach.ready`, compute:
@@ -334,7 +382,7 @@ this.safeSend(ws, {
 Run:
 
 ```bash
-npm run test:vitest -- test/server/ws-protocol.test.ts test/unit/server/terminal-registry.test.ts --run -t "replays OpenCode sessionRef|list\\(\\) returns resumeSessionId|terminal.attach accepts paired viewport payload"
+npm run test:vitest -- test/server/ws-protocol.test.ts test/unit/server/terminal-registry.test.ts --run -t "replays OpenCode sessionRef|buildTerminalSessionRef|terminal.attach accepts paired viewport payload"
 ```
 
 Expected: PASS.
@@ -878,6 +926,23 @@ Replace the current `terminal.session.associated` block with:
               sessionRef: msg.sessionRef,
             })
           }
+          if (reconciled && contentRef.current) {
+            const current = contentRef.current
+            const nextCodexDurability = msg.sessionRef.provider === 'codex'
+              && current.codexDurability?.state === 'durable'
+              && (
+                current.codexDurability.durableThreadId === msg.sessionRef.sessionId
+                || current.codexDurability.candidate?.candidateThreadId === msg.sessionRef.sessionId
+              )
+              ? current.codexDurability
+              : undefined
+            contentRef.current = {
+              ...current,
+              sessionRef: msg.sessionRef,
+              resumeSessionId: undefined,
+              ...(msg.sessionRef.provider === 'codex' ? { codexDurability: nextCodexDurability } : {}),
+            }
+          }
         }
 ```
 
@@ -1119,9 +1184,9 @@ npm run check
 
 Expected: PASS except for the known user-accepted OpenCode real-provider DB-row flake only if it recurs in broad verification.
 
-- [ ] **Step 4: Refactor duplicated traversal if needed**
+- [ ] **Step 4: Confirm traversal is single-pass**
 
-If `src/lib/terminal-session-association.ts` has duplicate tree walks after implementation, replace them with one pass:
+Ensure `src/lib/terminal-session-association.ts` keeps one tree walk when collecting matching panes:
 
 ```ts
 const matchedByTab: Array<{ tabId: string; singlePane: boolean; content: TerminalPaneContent }> = []
