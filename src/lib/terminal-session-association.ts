@@ -47,16 +47,14 @@ function sessionRefsEqual(left?: SessionRef, right?: SessionRef): boolean {
 function terminalPaneNeedsDurableIdentityUpdate(content: TerminalPaneContent, sessionRef: SessionRef): boolean {
   if (!sessionRefsEqual(content.sessionRef, sessionRef)) return true
   if (typeof content.resumeSessionId === 'string') return true
-  if (
+  if (!(
     sessionRef.provider === 'codex'
-    && !(
-      content.codexDurability?.state === 'durable'
-      && (
-        content.codexDurability.durableThreadId === sessionRef.sessionId
-        || content.codexDurability.candidate?.candidateThreadId === sessionRef.sessionId
-      )
+    && content.codexDurability?.state === 'durable'
+    && (
+      content.codexDurability.durableThreadId === sessionRef.sessionId
+      || content.codexDurability.candidate?.candidateThreadId === sessionRef.sessionId
     )
-  ) {
+  )) {
     return content.codexDurability !== undefined
   }
   return false
@@ -121,7 +119,7 @@ export function reconcileTerminalSessionAssociation({
       : undefined
     const tabUpdates = {
       ...(durableIdentityUpdate?.tabUpdates ?? {}),
-      ...(sessionRef.provider === 'codex' && tab.codexDurability !== nextTabCodexDurability
+      ...(tab.codexDurability !== nextTabCodexDurability
         ? { codexDurability: nextTabCodexDurability }
         : {}),
     }

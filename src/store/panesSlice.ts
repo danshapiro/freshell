@@ -1601,16 +1601,14 @@ export const panesSlice = createSlice({
             content.sessionRef = sessionRef
           }
           content.resumeSessionId = undefined
-          if (
+          if (!(
             sessionRef.provider === 'codex'
-            && !(
-              content.codexDurability?.state === 'durable'
-              && (
-                content.codexDurability.durableThreadId === sessionRef.sessionId
-                || content.codexDurability.candidate?.candidateThreadId === sessionRef.sessionId
-              )
+            && content.codexDurability?.state === 'durable'
+            && (
+              content.codexDurability.durableThreadId === sessionRef.sessionId
+              || content.codexDurability.candidate?.candidateThreadId === sessionRef.sessionId
             )
-          ) {
+          )) {
             content.codexDurability = undefined
           }
           clearRestoreFallbackAttemptForPane(state, tabId, node.id)

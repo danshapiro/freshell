@@ -1042,7 +1042,16 @@ describe('App WS bootstrap recovery', () => {
     'persists OpenCode sessionRef from %s without TerminalView mounted',
     async (type) => {
       const store = createStore({
-        tabs: [{ id: 'tab-opencode-associated', mode: 'opencode', status: 'running' }],
+        tabs: [{
+          id: 'tab-opencode-associated',
+          mode: 'opencode',
+          status: 'running',
+          codexDurability: {
+            schemaVersion: 1,
+            state: 'durable',
+            durableThreadId: 'stale-codex-thread',
+          },
+        }],
         panes: {
           layouts: {
             'tab-opencode-associated': {
@@ -1055,6 +1064,11 @@ describe('App WS bootstrap recovery', () => {
                 mode: 'opencode',
                 shell: 'system',
                 terminalId: 'term-opencode-associated',
+                codexDurability: {
+                  schemaVersion: 1,
+                  state: 'durable',
+                  durableThreadId: 'stale-codex-thread',
+                },
               },
             },
           },
@@ -1100,7 +1114,9 @@ describe('App WS bootstrap recovery', () => {
         const content = layout.content
         if (content.kind !== 'terminal') throw new Error('expected terminal pane')
         expect(content.sessionRef).toEqual(sessionRef)
+        expect(content.codexDurability).toBeUndefined()
         expect(store.getState().tabs.tabs.find((tab) => tab.id === 'tab-opencode-associated')?.sessionRef).toEqual(sessionRef)
+        expect(store.getState().tabs.tabs.find((tab) => tab.id === 'tab-opencode-associated')?.codexDurability).toBeUndefined()
       })
     },
   )
