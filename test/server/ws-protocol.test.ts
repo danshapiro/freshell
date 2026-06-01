@@ -22,6 +22,7 @@ vi.setConfig({ testTimeout: TEST_TIMEOUT_MS, hookTimeout: HOOK_TIMEOUT_MS })
 // Mock the config-store module before importing ws-handler
 const mockConfigStore = vi.hoisted(() => ({
   snapshot: vi.fn(),
+  pushRecentDirectory: vi.fn(),
 }))
 
 vi.mock('../../server/config-store', () => ({
@@ -346,6 +347,8 @@ describe('ws protocol', () => {
     // Clear registry state between tests
     mockConfigStore.snapshot.mockReset()
     mockConfigStore.snapshot.mockResolvedValue(defaultConfigSnapshot())
+    mockConfigStore.pushRecentDirectory.mockReset()
+    mockConfigStore.pushRecentDirectory.mockResolvedValue(undefined)
     registry.records.clear()
     registry.createCalls = []
     registry.inputCalls = []
@@ -1010,6 +1013,59 @@ describe('ws protocol', () => {
     ws.send(JSON.stringify({ type: 'terminal.attach', terminalId, intent: 'viewport_hydrate', cols: 120, rows: 40, sinceSeq: 0 }))
     const ready = await waitForMessage(ws, (m) => m.type === 'terminal.attach.ready' && m.terminalId === terminalId)
     expect(ready.terminalId).toBe(terminalId)
+    await close()
+  })
+
+  it('replays OpenCode sessionRef on terminal.created and terminal.attach.ready for restored terminals', async () => {
+    const { ws, close } = await createAuthenticatedConnection()
+    const requestId = 'req-opencode-restored-session-ref'
+    const sessionRef = {
+      provider: 'opencode',
+      sessionId: 'ses_root_browser_refresh_restore',
+    }
+
+    ws.send(JSON.stringify({
+      type: 'terminal.create',
+      requestId,
+      mode: 'opencode',
+      restore: true,
+      sessionRef,
+      cwd: '/repo/project',
+    }))
+
+    const created = await waitForMessage(
+      ws,
+      (msg) => msg.type === 'terminal.created' && msg.requestId === requestId,
+      5000,
+    )
+
+    expect(created).toMatchObject({
+      type: 'terminal.created',
+      requestId,
+      sessionRef,
+    })
+
+    ws.send(JSON.stringify({
+      type: 'terminal.attach',
+      terminalId: created.terminalId,
+      intent: 'viewport_hydrate',
+      cols: 120,
+      rows: 40,
+      sinceSeq: 0,
+    }))
+
+    const ready = await waitForMessage(
+      ws,
+      (msg) => msg.type === 'terminal.attach.ready' && msg.terminalId === created.terminalId,
+      5000,
+    )
+
+    expect(ready).toMatchObject({
+      type: 'terminal.attach.ready',
+      terminalId: created.terminalId,
+      sessionRef,
+    })
+
     await close()
   })
 

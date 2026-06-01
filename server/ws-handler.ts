@@ -6,7 +6,7 @@ import { logger } from './logger.js'
 import { recordSessionLifecycleEvent } from './session-observability.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
 import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed, timingSafeCompare } from './auth.js'
-import { modeSupportsResume, terminalIdFromCreateError } from './terminal-registry.js'
+import { buildTerminalSessionRef, modeSupportsResume, terminalIdFromCreateError } from './terminal-registry.js'
 import type { TerminalRecord, TerminalRegistry, TerminalMode } from './terminal-registry.js'
 import { configStore, type ConfigReadError, type UserConfig } from './config-store.js'
 import type { CodingCliSessionManager } from './coding-cli/session-manager.js'
@@ -2417,9 +2417,7 @@ export class WsHandler {
               const sendCreateResult = async (opts: {
                 ws: LiveWebSocket
                 requestId: string
-                terminalId: string
-                createdAt: number
-                effectiveResumeSessionId?: string
+                record: TerminalRecord
                 clearCodexDurability?: boolean
                 restoreError?: RestoreError
               }): Promise<boolean> => {
@@ -2427,11 +2425,13 @@ export class WsHandler {
                   return false
                 }
 
+                const sessionRef = buildTerminalSessionRef(opts.record)
                 this.send(opts.ws, {
                   type: 'terminal.created',
                   requestId: opts.requestId,
-                  terminalId: opts.terminalId,
-                  createdAt: opts.createdAt,
+                  terminalId: opts.record.terminalId,
+                  createdAt: opts.record.createdAt,
+                  ...(sessionRef ? { sessionRef } : {}),
                   ...(opts.clearCodexDurability ? { clearCodexDurability: true } : {}),
                   ...(opts.restoreError ? { restoreError: opts.restoreError } : {}),
                 })
@@ -2439,35 +2439,32 @@ export class WsHandler {
               }
 
               const attachReusedTerminal = async (
-                reusedTerminalId: string,
-                createdAt: number,
-                resumeSessionId?: string,
+                record: TerminalRecord,
               ): Promise<boolean> => {
                 const sent = await sendCreateResult({
                   ws,
                   requestId: m.requestId,
-                  terminalId: reusedTerminalId,
-                  createdAt,
-                  effectiveResumeSessionId: resumeSessionId,
+                  record,
                 })
                 if (!sent) {
                   return false
                 }
-                state.createdByRequestId.set(m.requestId, reusedTerminalId)
-                this.rememberCreatedRequestId(m.requestId, reusedTerminalId)
-                terminalId = reusedTerminalId
+                state.createdByRequestId.set(m.requestId, record.terminalId)
+                this.rememberCreatedRequestId(m.requestId, record.terminalId)
+                terminalId = record.terminalId
                 reused = true
+                const sessionRef = buildTerminalSessionRef(record)
                 recordSessionLifecycleEvent({
                   kind: 'terminal_created',
                   requestId: m.requestId,
                   connectionId: ws.connectionId || 'unknown',
-                  terminalId: reusedTerminalId,
+                  terminalId: record.terminalId,
                   ...(m.tabId ? { tabId: m.tabId } : {}),
                   ...(m.paneId ? { paneId: m.paneId } : {}),
                   ...(m.cwd ? { cwd: m.cwd } : {}),
                   mode: m.mode as TerminalMode,
                   reused: true,
-                  hasSessionRef: !!resumeSessionId,
+                  hasSessionRef: !!sessionRef,
                 })
                 this.broadcastTerminalsChanged()
                 return true
@@ -2526,7 +2523,7 @@ export class WsHandler {
                 }
                 const existing = this.registry.get(existingId)
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
+                  await attachReusedTerminal(existing)
                   return
                 }
                 // If it no longer exists, fall through and create a new one.
@@ -2602,7 +2599,7 @@ export class WsHandler {
                         state: 'durable',
                         durableThreadId: decision.sessionId,
                       })
-                      await attachReusedTerminal(live.terminalId, live.createdAt, decision.sessionId)
+                      await attachReusedTerminal(live)
                       broadcastCodexSessionAssociated(live.terminalId, decision.sessionId)
                       return
                     }
@@ -2637,7 +2634,7 @@ export class WsHandler {
                       'restore_proof_failed_attached_live',
                     )
                   }
-                  await attachReusedTerminal(live.terminalId, live.createdAt, live.resumeSessionId)
+                  await attachReusedTerminal(live)
                   return
                 } else if (decision.kind === 'proof_failed_fresh_create') {
                   const { candidate, proof } = decision
@@ -2661,7 +2658,7 @@ export class WsHandler {
               if (!codexDurabilityForDecision?.candidate) {
                 const live = requestedLiveTerminal()
                 if (live) {
-                  await attachReusedTerminal(live.terminalId, live.createdAt, live.resumeSessionId)
+                  await attachReusedTerminal(live)
                   return
                 }
               }
@@ -2686,7 +2683,7 @@ export class WsHandler {
                     codexDurabilityStoreRecordToDeleteOnSuccessfulUse,
                     'restore_proof_succeeded_attached_existing',
                   )
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
+                  await attachReusedTerminal(existing)
                   return
                 }
               }
@@ -2706,7 +2703,7 @@ export class WsHandler {
                 }
                 const existing = this.registry.get(existingAfterConfigId)
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
+                  await attachReusedTerminal(existing)
                   return
                 }
                 state.createdByRequestId.delete(m.requestId)
@@ -2750,7 +2747,7 @@ export class WsHandler {
                     codexDurabilityStoreRecordToDeleteOnSuccessfulUse,
                     'restore_proof_succeeded_attached_existing',
                   )
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
+                  await attachReusedTerminal(existing)
                   return
                 }
               }
@@ -2913,9 +2910,7 @@ export class WsHandler {
               const sent = await sendCreateResult({
                 ws,
                 requestId: m.requestId,
-                terminalId: record.terminalId,
-                createdAt: record.createdAt,
-                effectiveResumeSessionId,
+                record,
                 clearCodexDurability: clearCodexDurabilityOnCreate,
                 restoreError: restoreErrorOnCreate,
               })

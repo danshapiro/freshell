@@ -633,6 +633,7 @@ export type TerminalCreatedMessage = {
   requestId: string
   terminalId: string
   createdAt: number
+  sessionRef?: SessionLocator
   clearCodexDurability?: boolean
   restoreError?: RestoreError
 }
@@ -644,6 +645,7 @@ export type TerminalAttachReadyMessage = {
   replayFromSeq: number
   replayToSeq: number
   attachRequestId?: string
+  sessionRef?: SessionLocator
 }
 
 export type TerminalDetachedMessage = {
