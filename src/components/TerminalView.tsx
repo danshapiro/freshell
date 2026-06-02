@@ -156,10 +156,6 @@ type TerminalInputBlockedReason =
   | 'codex_clean_exit_decision_pending'
   | 'codex_lifecycle_loss_pending'
 
-function shouldSuppressNativeTouchScroll(term: Terminal): boolean {
-  return term.buffer.active.type === 'alternate' && term.modes.mouseTrackingMode !== 'none'
-}
-
 function terminalInputBlockedNotice(reason: TerminalInputBlockedReason): string {
   switch (reason) {
     case 'codex_identity_pending':
@@ -782,8 +778,27 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const rawLines = touchScrollAccumulatorRef.current / TOUCH_SCROLL_PIXELS_PER_LINE
     const lines = rawLines > 0 ? Math.floor(rawLines) : Math.ceil(rawLines)
     if (lines !== 0) {
-      if (!translateScrollLinesToInput(term, lines) && !shouldSuppressNativeTouchScroll(term)) {
-        term.scrollLines(lines)
+      const policy = providerBehaviorRef.current.scrollInputPolicy
+      if (!translateScrollLinesToInput(term, lines)) {
+        const el = term.element
+        if (policy === 'native' && el && term.buffer.active.type === 'alternate' && term.modes.mouseTrackingMode !== 'none') {
+          // Dispatch synthetic wheel events so xterm.js handles them natively
+          // (sends mouse-wheel CSI sequences to the PTY).
+          const absLines = Math.abs(lines)
+          const scrollDirection = lines < 0 ? -1 : 1
+          for (let i = 0; i < absLines; i++) {
+            el.dispatchEvent(new WheelEvent('wheel', {
+              bubbles: true,
+              cancelable: true,
+              clientX: touch.clientX,
+              clientY: touch.clientY,
+              deltaY: scrollDirection,
+              deltaMode: WheelEvent.DOM_DELTA_LINE,
+            }))
+          }
+        } else {
+          term.scrollLines(lines)
+        }
       }
 
       touchScrollAccumulatorRef.current -= lines * TOUCH_SCROLL_PIXELS_PER_LINE

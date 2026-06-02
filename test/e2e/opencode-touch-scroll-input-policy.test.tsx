@@ -20,6 +20,7 @@ const wsMocks = vi.hoisted(() => ({
 
 let latestTerminal: {
   scrollLines: ReturnType<typeof vi.fn>
+  element: HTMLElement | null
 } | null = null
 
 vi.mock('@/lib/ws-client', () => ({
@@ -75,6 +76,7 @@ vi.mock('@xterm/xterm', () => {
     reset = vi.fn()
     scrollToBottom = vi.fn()
     scrollLines = vi.fn()
+    element: HTMLElement | null = null
 
     constructor() {
       latestTerminal = this
@@ -177,7 +179,7 @@ describe('opencode touch scroll input policy (e2e)', () => {
     ;(globalThis as any).setMobileForTest(false)
   })
 
-  it('does not translate touch scroll for opencode providers when policy is native', async () => {
+  it('dispatches synthetic wheel events for opencode providers when policy is native', async () => {
     const { store, tabId, paneId, paneContent } = createStore('opencode', [opencodeExtensionWithBehaviorHint])
 
     const { getByTestId } = render(
@@ -192,6 +194,14 @@ describe('opencode touch scroll input policy (e2e)', () => {
       expect(latestTerminal).not.toBeNull()
     })
 
+    // Set up a mock element for dispatchEvent
+    const mockEl = document.createElement('div')
+    const dispatchSpy = vi.fn()
+    mockEl.dispatchEvent = dispatchSpy
+    if (latestTerminal) {
+      latestTerminal.element = mockEl
+    }
+
     wsMocks.send.mockClear()
 
     fireEvent.touchStart(container, {
@@ -201,13 +211,23 @@ describe('opencode touch scroll input policy (e2e)', () => {
       touches: [{ clientX: 20, clientY: 100 }],
     })
 
-    expect(latestTerminal?.scrollLines).not.toHaveBeenCalled()
+    // Should dispatch synthetic wheel events to the terminal element
+    expect(dispatchSpy).toHaveBeenCalledTimes(1)
+    const wheelEvent = dispatchSpy.mock.calls[0][0] as WheelEvent
+    expect(wheelEvent).toBeInstanceOf(WheelEvent)
+    expect(wheelEvent.deltaY).toBe(1)
+    expect(wheelEvent.deltaMode).toBe(WheelEvent.DOM_DELTA_LINE)
+    expect(wheelEvent.clientX).toBe(20)
+    expect(wheelEvent.clientY).toBe(100)
+    // Should NOT send cursor key sequences
     expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({
       type: 'terminal.input',
     }))
+    // Should NOT call scrollLines (alt buffer has no scrollback)
+    expect(latestTerminal?.scrollLines).not.toHaveBeenCalled()
   })
 
-  it('skips scrollLines in alt screen for non-opted-in providers', async () => {
+  it('dispatches synthetic wheel events for shell providers in alt screen with mouse tracking', async () => {
     const { store, tabId, paneId, paneContent } = createStore('shell')
 
     const { getByTestId } = render(
@@ -222,6 +242,14 @@ describe('opencode touch scroll input policy (e2e)', () => {
       expect(latestTerminal).not.toBeNull()
     })
 
+    // Set up a mock element for dispatchEvent
+    const mockEl = document.createElement('div')
+    const dispatchSpy = vi.fn()
+    mockEl.dispatchEvent = dispatchSpy
+    if (latestTerminal) {
+      latestTerminal.element = mockEl
+    }
+
     wsMocks.send.mockClear()
 
     fireEvent.touchStart(container, {
@@ -231,9 +259,19 @@ describe('opencode touch scroll input policy (e2e)', () => {
       touches: [{ clientX: 20, clientY: 100 }],
     })
 
-    expect(latestTerminal?.scrollLines).not.toHaveBeenCalled()
+    // Shell providers default to native policy, so they should dispatch wheel events
+    expect(dispatchSpy).toHaveBeenCalledTimes(1)
+    const wheelEvent = dispatchSpy.mock.calls[0][0] as WheelEvent
+    expect(wheelEvent).toBeInstanceOf(WheelEvent)
+    expect(wheelEvent.deltaY).toBe(1)
+    expect(wheelEvent.deltaMode).toBe(WheelEvent.DOM_DELTA_LINE)
+    expect(wheelEvent.clientX).toBe(20)
+    expect(wheelEvent.clientY).toBe(100)
+    // Should NOT send cursor key sequences
     expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({
       type: 'terminal.input',
     }))
+    // Should NOT call scrollLines (alt buffer has no scrollback)
+    expect(latestTerminal?.scrollLines).not.toHaveBeenCalled()
   })
 })
