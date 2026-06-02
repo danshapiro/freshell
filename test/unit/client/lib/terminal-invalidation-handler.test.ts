@@ -178,4 +178,48 @@ describe('createTerminalInvalidationHandler', () => {
     await vi.advanceTimersByTimeAsync(50)
     expect(refresh.fetchTerminalDirectoryWindow).toHaveBeenCalledTimes(1)
   })
+
+  it('contains background-refresh dispatch failures instead of leaking an unhandled rejection', async () => {
+    vi.useFakeTimers()
+    const refresh = createRefreshDoubles()
+    const refreshError = new Error('refresh failed')
+    // Mirror the real store: dispatching the refresh thunks returns a promise
+    // that rejects, because fetchTerminalDirectoryWindow / the active-window
+    // refresh re-throw on API failure. The handler dispatches them
+    // fire-and-forget from a timer, so it must contain the rejection — otherwise
+    // a transient background-refresh failure becomes an unhandled rejection that
+    // crashes the whole vitest run (and is silently uncaught in production).
+    const dispatch = vi.fn((action: unknown) => {
+      if (action === refresh.terminalDirectoryRefreshThunk || action === refresh.activeSessionWindowRefreshThunk) {
+        return Promise.reject(refreshError)
+      }
+      return undefined
+    })
+    const onRefreshError = vi.fn()
+    const handler = createTerminalInvalidationHandler({
+      dispatch,
+      upsertTerminalMeta,
+      removeTerminalMeta,
+      patchSessionRunningStateFromTerminalMeta,
+      queueActiveSessionWindowRefresh: refresh.queueActiveSessionWindowRefresh,
+      fetchTerminalDirectoryWindow: refresh.fetchTerminalDirectoryWindow,
+      setTimeout: globalThis.setTimeout,
+      clearTimeout: globalThis.clearTimeout,
+      refreshDelayMs: 50,
+      onRefreshError,
+    })
+
+    handler.handle({ type: 'terminals.changed', revision: 12 })
+    await vi.advanceTimersByTimeAsync(50)
+    // Let the contained .catch() handlers settle.
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(onRefreshError).toHaveBeenCalledTimes(2)
+    // Each rejection is tagged with which refresh failed so a shared
+    // onRefreshError can log an accurate label instead of mislabeling a
+    // session-window failure as a terminal-directory one.
+    expect(onRefreshError).toHaveBeenCalledWith(refreshError, 'terminal-directory')
+    expect(onRefreshError).toHaveBeenCalledWith(refreshError, 'session-window')
+  })
 })

@@ -693,14 +693,18 @@ export function FreshAgentView({
         setLoadError(error instanceof Error ? error.message : 'Failed to load session')
       })
     return () => controller.abort()
+    // Depend only on what identifies *which* snapshot to load. This effect
+    // dispatches updatePaneContent to persist its own resolved resumeSessionId/
+    // status; listing the whole paneContent object (or those output fields) made
+    // that self-update retrigger the effect, firing a redundant second fetch for
+    // the same session. Current values for non-identity fields are read live via
+    // paneContentRef.current inside the effect.
   }, [
     claudeSession?.lost,
     dispatch,
-    paneContent,
     paneContent.provider,
-    paneContent.resumeSessionId,
+    paneContent.createRequestId,
     paneContent.sessionId,
-    paneContent.status,
     paneContent.sessionType,
     paneId,
     autoTitleIdentity,

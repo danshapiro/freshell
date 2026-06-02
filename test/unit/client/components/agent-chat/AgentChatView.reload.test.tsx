@@ -62,6 +62,22 @@ vi.mock('@/lib/api', async () => {
   }
 })
 
+// Render markdown bodies synchronously. The real LazyMarkdown wraps MarkdownRenderer
+// in React.lazy + Suspense, so the first assistant-message render shows a fallback
+// <p> that the lazy chunk later replaces with the real node. Tests that capture the
+// fallback node via `await findByText(...)` and then assert `toBeInTheDocument()` race
+// that swap (the captured node detaches), producing an order-dependent flake. Mocking
+// LazyMarkdown to render MarkdownRenderer directly removes the swap. Matches the mock
+// used by the other agent-chat tests (MessageBubble, tool-coalesce, agent-chat-polish-flow).
+vi.mock('@/components/markdown/LazyMarkdown', async () => {
+  const { MarkdownRenderer } = await import('@/components/markdown/MarkdownRenderer')
+  return {
+    LazyMarkdown: ({ content }: { content: string }) => (
+      <MarkdownRenderer content={content} />
+    ),
+  }
+})
+
 function makeStore() {
   return configureStore({
     reducer: {
@@ -1891,6 +1907,19 @@ function getPaneContent(store: ReturnType<typeof makeStore>, tabId: string, pane
 }
 
 describe('AgentChatView server-restart recovery', () => {
+  // Reset the timeline API mocks before each test. Without this, a test's
+  // mockResolvedValueOnce queue leaks into the next test under shuffled order
+  // (e.g. one test consuming another's "Revision N body" page), producing an
+  // order-dependent flake. Mirrors the reset in the first describe's beforeEach.
+  beforeEach(() => {
+    localStorage.clear()
+    getAgentTimelinePage.mockReset()
+    getAgentTurnBody.mockReset()
+    getAgentChatCapabilities.mockReset()
+    setSessionMetadata.mockReset()
+    setSessionMetadata.mockResolvedValue(undefined)
+  })
+
   afterEach(() => {
     cleanup()
     wsSend.mockClear()

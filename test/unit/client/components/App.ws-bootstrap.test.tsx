@@ -1556,6 +1556,57 @@ describe('App WS bootstrap recovery', () => {
     })
   })
 
+  it('contains a failing queued session-window refresh from a sessions.changed broadcast instead of leaking an unhandled rejection', async () => {
+    // Regression: the sessions.changed handler dispatched queueActiveSessionWindowRefresh()
+    // fire-and-forget with no .catch(). That thunk re-throws when it falls through to
+    // fetchSessionWindow() without committed window data (e.g. a sessions.changed before the
+    // sidebar window commits, or after a failed direct fetch retry), so a transient refresh
+    // failure leaked an unhandled rejection that fails the whole test run even though every
+    // test "passed" — the same failure class the terminal.inventory site already contains.
+    const store = createStore()
+
+    // Reject every snapshot fetch. The bootstrap sidebar load fails but is contained by
+    // ensureSidebarSessionsWindow (so no window ever commits -> hasCommittedWindow stays
+    // false), and the queued refresh then takes the re-throwing fetchSessionWindow branch.
+    fetchSidebarSessionsSnapshot.mockRejectedValue(new Error('window snapshot unavailable'))
+
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason) }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      render(
+        <Provider store={store}>
+          <App />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(messageHandler).toBeTypeOf('function')
+      })
+
+      act(() => {
+        messageHandler?.({ type: 'sessions.changed', revision: 1 })
+      })
+
+      // The queued refresh actually ran and failed (proves the path is exercised, not vacuous).
+      await waitFor(() => {
+        expect(store.getState().sessions.windows.sidebar?.error).toBe('window snapshot unavailable')
+      })
+
+      // Give Node a chance to surface any unhandled rejection from the fire-and-forget dispatch.
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+
+      expect(
+        unhandled.filter(
+          (reason) => reason instanceof Error && reason.message.includes('window snapshot unavailable'),
+        ),
+      ).toHaveLength(0)
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+
   it('ignores legacy sessions.patch messages when bootstrapping against an already-ready socket', async () => {
     const baselineProjects = [
       {

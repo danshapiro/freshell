@@ -1153,6 +1153,59 @@ describe('FreshAgentView', () => {
     ]))
   })
 
+  it('fetches the initial snapshot once and does not refetch from its own pane update', async () => {
+    const store = createStore()
+    // First fetch returns a distinct snapshot; the default mockResolvedValue
+    // ("Codex turn") would answer any *second* fetch. The snapshot-load effect
+    // persists resumeSessionId via updatePaneContent, and if that self-update
+    // retriggers the effect, the redundant second fetch overwrites the loaded
+    // content with the default — a wasteful double network request in production
+    // and an order-dependent flake in tests.
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'idle',
+      summary: 'Codex summary',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [
+        { id: 'turn-user-1', role: 'user', items: [{ id: 'item-user-1', kind: 'text', text: 'Loaded user turn' }] },
+        { id: 'turn-assistant-1', role: 'assistant', items: [{ id: 'item-assistant-1', kind: 'text', text: 'Loaded assistant turn' }] },
+      ],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-single-fetch',
+        sessionId: 'thread-single-fetch',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    // Wait until the effect has persisted resumeSessionId back into pane content
+    // (the self-update that previously retriggered the effect).
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts['tab-1']
+      const resumeSessionId = layout?.type === 'leaf' && layout.content.kind === 'fresh-agent'
+        ? layout.content.resumeSessionId
+        : undefined
+      expect(resumeSessionId).toBe('thread-single-fetch')
+    })
+    // Let any spurious self-triggered refetch run before asserting.
+    await act(async () => { await Promise.resolve() })
+
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+    // The loaded snapshot stays rendered (not overwritten by a second fetch).
+    expect(screen.getByText('Loaded assistant turn')).toBeInTheDocument()
+  })
+
   it('resets auto-title for a new conversation even if the stale prior snapshot had user turns', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
