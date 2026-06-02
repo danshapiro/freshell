@@ -31,7 +31,6 @@ const hostname = argValue('--hostname') || '127.0.0.1'
 const port = Number(argValue('--port'))
 const sessionArg = argValue('--session')
 const sessionEventGatePath = process.env.FAKE_OPENCODE_SESSION_EVENT_GATE_PATH
-const sessionEventDelayMs = Number(process.env.FAKE_OPENCODE_SESSION_EVENT_DELAY_MS || '100')
 
 if (!Number.isInteger(port) || port <= 0 || port > 65535) {
   process.stdout.write('fake opencode: no server port requested\n')
@@ -150,7 +149,7 @@ function scheduleSessionEvents(res) {
     return
   }
 
-  setTimeout(() => emitSessionEvents(res), Number.isFinite(sessionEventDelayMs) ? Math.max(0, sessionEventDelayMs) : 100)
+  setTimeout(() => emitSessionEvents(res), 100)
 }
 
 const server = http.createServer((req, res) => {

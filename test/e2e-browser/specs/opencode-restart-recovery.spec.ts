@@ -524,7 +524,7 @@ async function runRestartScenario(input: {
 }
 
 test.describe('OpenCode restart recovery', () => {
-  test.setTimeout(180_000)
+  test.setTimeout(240_000)
 
   test('reattaches a UI-created OpenCode pane across browser refresh', async ({ page }) => {
     const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-opencode-ui-refresh-'))

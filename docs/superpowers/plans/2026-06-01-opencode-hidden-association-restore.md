@@ -6,7 +6,7 @@
 
 **Current State:** The production reconciliation code from PR #380 is already merged into `origin/main`. Do not recreate it. This plan implements and lands the missing browser-level regression coverage that proves the real failure red on a pre-fix base and green on the current branch.
 
-**Architecture:** The server remains authoritative for terminal-to-session ownership. The browser reconciles every authoritative `{ terminalId, sessionRef }` association from WebSocket events and `/api/terminals` inventory into pane layout and single-pane tab metadata, then flushes durable layout state. Hidden panes must be reconciled even when `TerminalView` is unmounted.
+**Architecture:** The server remains authoritative for terminal-to-session ownership. The browser reconciles every authoritative `{ terminalId, sessionRef }` association from WebSocket events, including the `terminal.inventory` WebSocket message, into pane layout and single-pane tab metadata, then flushes durable layout state. Hidden panes must be reconciled even when `TerminalView` is unmounted.
 
 **Tech Stack:** React 18, Redux Toolkit, TypeScript, WebSocket messages, Playwright browser E2E, Node fake OpenCode fixture.
 
@@ -124,14 +124,13 @@ File: `test/e2e-browser/fixtures/fake-opencode.cjs`
 
 ```js
 const sessionEventGatePath = process.env.FAKE_OPENCODE_SESSION_EVENT_GATE_PATH
-const sessionEventDelayMs = Number(process.env.FAKE_OPENCODE_SESSION_EVENT_DELAY_MS || '100')
 ```
 
 - [ ] Add `emitSessionEvents(res)` and `scheduleSessionEvents(res)` near the SSE event-client setup.
 
 Required behavior:
 
-- Without `FAKE_OPENCODE_SESSION_EVENT_GATE_PATH`, preserve existing behavior and emit `session.created` plus `session.idle` after a short delay.
+- Without `FAKE_OPENCODE_SESSION_EVENT_GATE_PATH`, preserve existing behavior and emit `session.created` plus `session.idle` after the original 100ms delay.
 - With `FAKE_OPENCODE_SESSION_EVENT_GATE_PATH`, poll for that file and emit events only after it exists.
 - If the response is destroyed before release, stop polling.
 - Append one audit event when the session events are emitted:
