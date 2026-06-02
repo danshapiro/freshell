@@ -9,6 +9,7 @@ import { TestServer } from '../helpers/test-server.js'
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const fakeOpencodeSource = path.resolve(__dirname, '../fixtures/fake-opencode.cjs')
+const TAB_REGISTRY_SYNC_INTERVAL_MS = 5000
 
 type RestartMode = 'graceful' | 'kill'
 
@@ -54,6 +55,7 @@ function createServerOptions(input: {
   auditLogPath: string
   logsDir: string
   sharedOpencodeDataDir: string
+  fakeOpencodeSessionEventGatePath?: string
   port?: number
   token?: string
 }) {
@@ -64,6 +66,7 @@ function createServerOptions(input: {
     env: {
       PATH: `${input.binDir}${path.delimiter}${process.env.PATH ?? ''}`,
       FAKE_OPENCODE_AUDIT_LOG: input.auditLogPath,
+      ...(input.fakeOpencodeSessionEventGatePath ? { FAKE_OPENCODE_SESSION_EVENT_GATE_PATH: input.fakeOpencodeSessionEventGatePath } : {}),
       FRESHELL_LOG_DIR: input.logsDir,
     },
   }
@@ -104,6 +107,26 @@ async function addTerminalTab(page: any, input: {
       },
     })
   }, input)
+}
+
+async function addOpenCodeTabThroughUi(page: any, cwd: string): Promise<string> {
+  await page.locator('[data-context="tab-add"]').click()
+  const picker = page.getByRole('toolbar', { name: /pane type picker/i }).last()
+  await expect(picker).toBeVisible({ timeout: 15_000 })
+  await picker.getByRole('button', { name: /^OpenCode$/i }).click()
+
+  const directoryInput = page.getByLabel(/^Starting directory for OpenCode$/i)
+  await expect(directoryInput).toBeVisible({ timeout: 15_000 })
+  await directoryInput.fill(cwd)
+  await directoryInput.press('Enter')
+
+  return page.evaluate(() => {
+    const tabId = window.__FRESHELL_TEST_HARNESS__?.getState()?.tabs?.activeTabId
+    if (typeof tabId !== 'string' || !tabId) {
+      throw new Error('No active tab after creating OpenCode tab through UI')
+    }
+    return tabId
+  })
 }
 
 async function getPaneSnapshots(page: any, tabIds: string[]): Promise<PaneSnapshot[]> {
@@ -253,6 +276,39 @@ async function waitForRestoreLaunches(
 
   const restoreLaunches = latestAuditEvents.filter((event) => event.event === 'launch' && event.sessionArg)
   return { auditEvents: latestAuditEvents, restoreLaunches }
+}
+
+async function waitForInitialOpenCodeLaunch(auditLogPath: string): Promise<FakeAuditEvent> {
+  let latestAuditEvents: FakeAuditEvent[] = []
+  await expect.poll(async () => {
+    latestAuditEvents = await readAuditEvents(auditLogPath)
+    const launch = latestAuditEvents.find((event) =>
+      event.event === 'launch'
+      && !event.sessionArg
+      && typeof event.rootSessionId === 'string'
+    )
+    return launch?.rootSessionId
+  }, { timeout: 15_000 }).toMatch(/^ses_root_/)
+
+  const launch = latestAuditEvents.find((event) =>
+    event.event === 'launch'
+    && !event.sessionArg
+    && typeof event.rootSessionId === 'string'
+  )
+  if (!launch?.rootSessionId) {
+    throw new Error(`Missing initial OpenCode launch audit: ${JSON.stringify(latestAuditEvents, null, 2)}`)
+  }
+  return launch
+}
+
+async function waitForSessionEventsEmitted(auditLogPath: string, sessionId: string): Promise<void> {
+  await expect.poll(async () => {
+    const events = await readAuditEvents(auditLogPath)
+    return events.some((event) =>
+      event.event === 'session_events_emitted'
+      && event.rootSessionId === sessionId
+    )
+  }, { timeout: 15_000 }).toBe(true)
 }
 
 async function waitForStdinAudit(
@@ -469,6 +525,386 @@ async function runRestartScenario(input: {
 
 test.describe('OpenCode restart recovery', () => {
   test.setTimeout(180_000)
+
+  test('reattaches a UI-created OpenCode pane across browser refresh', async ({ page }) => {
+    const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-opencode-ui-refresh-'))
+    const binDir = path.join(sharedRoot, 'bin')
+    const logsDir = path.join(sharedRoot, 'logs')
+    const auditLogPath = path.join(sharedRoot, 'fake-opencode-audit.jsonl')
+    const sharedOpencodeDataDir = path.join(sharedRoot, 'opencode-data')
+    await installFakeOpencode(binDir)
+
+    const server = new TestServer(createServerOptions({
+      binDir,
+      auditLogPath,
+      logsDir,
+      sharedOpencodeDataDir,
+    }))
+
+    try {
+      const info = await server.start()
+      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+
+      const harness = new TestHarness(page)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+
+      for (let index = 1; index <= 13; index += 1) {
+        const shellTab = {
+          tabId: `tab-ui-refresh-shell-${index}`,
+          paneId: `pane-ui-refresh-shell-${index}`,
+          requestId: `req-ui-refresh-shell-${index}`,
+          mode: 'shell' as const,
+          title: `UI Refresh Shell ${index}`,
+        }
+        await addTerminalTab(page, shellTab)
+        await waitForRunningTerminals(page, [shellTab.tabId])
+      }
+
+      const tabId = await addOpenCodeTabThroughUi(page, info.homeDir)
+      const [beforeRefresh] = await waitForOpenCodeSessions(page, [tabId])
+      expect(beforeRefresh.sessionRef?.provider).toBe('opencode')
+      expect(beforeRefresh.sessionRef?.sessionId).toBeTruthy()
+      expect(beforeRefresh.terminalId).toBeTruthy()
+      await sendInputToTerminals(page, [beforeRefresh], 'ui-before-refresh')
+      await waitForStdinAudit(auditLogPath, [{
+        tabId,
+        sessionId: beforeRefresh.sessionRef!.sessionId,
+      }], 'ui-before-refresh')
+
+      await harness.clearSentWsMessages()
+      await page.reload({ waitUntil: 'domcontentloaded' })
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+
+      await page.waitForFunction(({ expectedTabId, expectedTerminalId, expectedSessionId }) => {
+        const state = window.__FRESHELL_TEST_HARNESS__?.getState()
+        const tabExists = state?.tabs?.tabs?.some((candidate: any) => candidate.id === expectedTabId)
+        const findTerminal = (node: any): any => {
+          if (!node) return undefined
+          if (node.type === 'leaf' && node.content?.kind === 'terminal') return node.content
+          if (node.type === 'split') return findTerminal(node.children?.[0]) ?? findTerminal(node.children?.[1])
+          return undefined
+        }
+        const content = findTerminal(state?.panes?.layouts?.[expectedTabId])
+        return tabExists
+          && content?.mode === 'opencode'
+          && content.status === 'running'
+          && content.terminalId === expectedTerminalId
+          && content.sessionRef?.provider === 'opencode'
+          && content.sessionRef.sessionId === expectedSessionId
+      }, {
+        expectedTabId: tabId,
+        expectedTerminalId: beforeRefresh.terminalId,
+        expectedSessionId: beforeRefresh.sessionRef!.sessionId,
+      }, { timeout: 30_000 })
+
+      const [afterRefresh] = await getPaneSnapshots(page, [tabId])
+      await sendInputToTerminals(page, [afterRefresh], 'ui-after-refresh')
+      await waitForStdinAudit(auditLogPath, [{
+        tabId,
+        sessionId: beforeRefresh.sessionRef!.sessionId,
+      }], 'ui-after-refresh')
+    } finally {
+      await server.stop().catch(() => {})
+      await fsp.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test('recovers a hidden OpenCode sessionRef when association lands while the browser is closed', async ({ page }) => {
+    const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-opencode-hidden-refresh-'))
+    const binDir = path.join(sharedRoot, 'bin')
+    const logsDir = path.join(sharedRoot, 'logs')
+    const auditLogPath = path.join(sharedRoot, 'fake-opencode-audit.jsonl')
+    const sharedOpencodeDataDir = path.join(sharedRoot, 'opencode-data')
+    const sessionEventGatePath = path.join(sharedRoot, 'release-opencode-session-events')
+    await installFakeOpencode(binDir)
+
+    const server = new TestServer(createServerOptions({
+      binDir,
+      auditLogPath,
+      logsDir,
+      sharedOpencodeDataDir,
+      fakeOpencodeSessionEventGatePath: sessionEventGatePath,
+    }))
+
+    let restorePage: typeof page | undefined
+    try {
+      const info = await server.start()
+      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+
+      const harness = new TestHarness(page)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+
+      const opencodeTab = {
+        tabId: 'tab-hidden-opencode-refresh',
+        paneId: 'pane-hidden-opencode-refresh',
+        requestId: 'req-hidden-opencode-refresh',
+        mode: 'opencode' as const,
+        title: 'Hidden OpenCode Refresh',
+      }
+      await addTerminalTab(page, opencodeTab)
+      const [beforeAssociation] = await waitForRunningTerminals(page, [opencodeTab.tabId])
+      expect(beforeAssociation.mode).toBe('opencode')
+      expect(beforeAssociation.terminalId).toBeTruthy()
+      expect(beforeAssociation.sessionRef).toBeUndefined()
+      const launch = await waitForInitialOpenCodeLaunch(auditLogPath)
+      const expectedSessionId = launch.rootSessionId!
+
+      await sendInputToTerminals(page, [beforeAssociation], 'hidden-before-refresh')
+      await waitForStdinAudit(auditLogPath, [{
+        tabId: opencodeTab.tabId,
+        sessionId: expectedSessionId,
+      }], 'hidden-before-refresh')
+
+      const shellTab = {
+        tabId: 'tab-hidden-refresh-shell',
+        paneId: 'pane-hidden-refresh-shell',
+        requestId: 'req-hidden-refresh-shell',
+        mode: 'shell' as const,
+        title: 'Hidden Refresh Shell',
+      }
+      await addTerminalTab(page, shellTab)
+      await waitForRunningTerminals(page, [shellTab.tabId])
+
+      const persistedRaw = await page.evaluate(({ layoutKey }) => {
+        const harness = window.__FRESHELL_TEST_HARNESS__
+        if (!harness) throw new Error('Freshell test harness is not installed')
+        harness.dispatch({ type: 'persist/flushNow' })
+        const raw = window.localStorage.getItem(layoutKey)
+        if (!raw) throw new Error(`Missing persisted layout ${layoutKey}`)
+        return raw
+      }, { layoutKey: 'freshell.layout.v3' })
+      const persistedBeforeClose = JSON.parse(persistedRaw)
+      expect(persistedBeforeClose.tabs?.activeTabId).toBe(shellTab.tabId)
+      expect(persistedBeforeClose.tabs?.tabs?.find((tab: any) => tab.id === opencodeTab.tabId)?.sessionRef).toBeUndefined()
+      expect(persistedBeforeClose.panes?.layouts?.[opencodeTab.tabId]?.content?.sessionRef).toBeUndefined()
+
+      const context = page.context()
+      await page.close()
+      await fsp.writeFile(sessionEventGatePath, 'release\n', 'utf8')
+      await waitForSessionEventsEmitted(auditLogPath, expectedSessionId)
+      await expect.poll(async () => {
+        const response = await fetch(`${info.baseUrl}/api/terminals`, {
+          headers: { 'x-auth-token': info.token },
+        })
+        if (!response.ok) return undefined
+        const terminals = await response.json() as any[]
+        return terminals.find((terminal) =>
+          terminal.terminalId === beforeAssociation.terminalId
+        )?.sessionRef
+      }, { timeout: 15_000 }).toEqual({
+        provider: 'opencode',
+        sessionId: expectedSessionId,
+      })
+
+      restorePage = await context.newPage()
+      await restorePage.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+
+      const restoreHarness = new TestHarness(restorePage)
+      await restoreHarness.waitForHarness()
+      await restoreHarness.waitForConnection()
+
+      await restorePage.waitForFunction(({ tabId, shellTabId, expectedTerminalId, expectedSessionId }) => {
+        const state = window.__FRESHELL_TEST_HARNESS__?.getState()
+        const findTerminal = (node: any): any => {
+          if (!node) return undefined
+          if (node.type === 'leaf' && node.content?.kind === 'terminal') return node.content
+          if (node.type === 'split') return findTerminal(node.children?.[0]) ?? findTerminal(node.children?.[1])
+          return undefined
+        }
+        const tab = state?.tabs?.tabs?.find((candidate: any) => candidate.id === tabId)
+        const content = findTerminal(state?.panes?.layouts?.[tabId])
+        return state?.tabs?.activeTabId === shellTabId
+          && tab?.sessionRef?.provider === 'opencode'
+          && tab.sessionRef.sessionId === expectedSessionId
+          && content?.mode === 'opencode'
+          && content.terminalId === expectedTerminalId
+          && content.sessionRef?.provider === 'opencode'
+          && content.sessionRef.sessionId === expectedSessionId
+      }, {
+        tabId: opencodeTab.tabId,
+        shellTabId: shellTab.tabId,
+        expectedTerminalId: beforeAssociation.terminalId,
+        expectedSessionId,
+      }, { timeout: 30_000 })
+
+      await expect.poll(async () => {
+        const messages = await restoreHarness.getSentWsMessages()
+        return messages.some((message: any) =>
+          message?.type === 'tabs.sync.push'
+          && Array.isArray(message.records)
+          && message.records.some((record: any) =>
+            record.tabId === opencodeTab.tabId
+            && record.status === 'open'
+            && record.panes?.some((pane: any) =>
+              pane.payload?.sessionRef?.provider === 'opencode'
+              && pane.payload.sessionRef.sessionId === expectedSessionId
+            )
+          )
+        )
+      }, { timeout: TAB_REGISTRY_SYNC_INTERVAL_MS + 10_000 }).toBe(true)
+
+      await restorePage.locator(`[data-context="tab"][data-tab-id="${opencodeTab.tabId}"]`).click()
+      const [afterRefresh] = await waitForOpenCodeSessions(restorePage, [opencodeTab.tabId])
+      expect(afterRefresh.terminalId).toBe(beforeAssociation.terminalId)
+      expect(afterRefresh.sessionRef).toEqual({
+        provider: 'opencode',
+        sessionId: expectedSessionId,
+      })
+      await sendInputToTerminals(restorePage, [afterRefresh], 'hidden-after-refresh')
+      await waitForStdinAudit(auditLogPath, [{
+        tabId: opencodeTab.tabId,
+        sessionId: expectedSessionId,
+      }], 'hidden-after-refresh')
+    } finally {
+      await restorePage?.close().catch(() => {})
+      await server.stop().catch(() => {})
+      await fsp.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test('preserves an associated OpenCode pane across browser refresh', async ({ page }) => {
+    const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-opencode-refresh-'))
+    const binDir = path.join(sharedRoot, 'bin')
+    const logsDir = path.join(sharedRoot, 'logs')
+    const auditLogPath = path.join(sharedRoot, 'fake-opencode-audit.jsonl')
+    const sharedOpencodeDataDir = path.join(sharedRoot, 'opencode-data')
+    await installFakeOpencode(binDir)
+
+    const server = new TestServer(createServerOptions({
+      binDir,
+      auditLogPath,
+      logsDir,
+      sharedOpencodeDataDir,
+    }))
+
+    try {
+      const info = await server.start()
+      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+
+      const harness = new TestHarness(page)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+
+      for (let index = 1; index <= 13; index += 1) {
+        const shellTab = {
+          tabId: `tab-refresh-shell-${index}`,
+          paneId: `pane-refresh-shell-${index}`,
+          requestId: `req-refresh-shell-${index}`,
+          mode: 'shell' as const,
+          title: `Refresh Shell ${index}`,
+        }
+        await addTerminalTab(page, shellTab)
+        await waitForRunningTerminals(page, [shellTab.tabId])
+      }
+
+      const tab = {
+        tabId: 'tab-opencode-refresh',
+        paneId: 'pane-opencode-refresh',
+        requestId: 'req-opencode-refresh',
+        mode: 'opencode' as const,
+        title: 'OpenCode Refresh',
+      }
+      await addTerminalTab(page, tab)
+
+      const [beforeRefresh] = await waitForOpenCodeSessions(page, [tab.tabId])
+      expect(beforeRefresh.sessionRef?.provider).toBe('opencode')
+      expect(beforeRefresh.sessionRef?.sessionId).toBeTruthy()
+      await sendInputToTerminals(page, [beforeRefresh], 'before-refresh')
+      await waitForStdinAudit(auditLogPath, [{
+        tabId: tab.tabId,
+        sessionId: beforeRefresh.sessionRef!.sessionId,
+      }], 'before-refresh')
+
+      await harness.clearSentWsMessages()
+      await page.reload({ waitUntil: 'domcontentloaded' })
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+
+      await page.waitForFunction(({ tabId, expectedSessionId }) => {
+        const state = window.__FRESHELL_TEST_HARNESS__?.getState()
+        const tabExists = state?.tabs?.tabs?.some((candidate: any) => candidate.id === tabId)
+        const findTerminal = (node: any): any => {
+          if (!node) return undefined
+          if (node.type === 'leaf' && node.content?.kind === 'terminal') return node.content
+          if (node.type === 'split') return findTerminal(node.children?.[0]) ?? findTerminal(node.children?.[1])
+          return undefined
+        }
+        const content = findTerminal(state?.panes?.layouts?.[tabId])
+        return tabExists
+          && content?.mode === 'opencode'
+          && content.sessionRef?.provider === 'opencode'
+          && content.sessionRef.sessionId === expectedSessionId
+          && typeof content.terminalId === 'string'
+      }, {
+        tabId: tab.tabId,
+        expectedSessionId: beforeRefresh.sessionRef!.sessionId,
+      }, { timeout: 30_000 })
+
+      const deadline = Date.now() + TAB_REGISTRY_SYNC_INTERVAL_MS + 10_000
+      let observedPushCount = 0
+      while (Date.now() < deadline) {
+        const snapshot = await page.evaluate(({ tabId, expectedSessionId }) => {
+          const harness = window.__FRESHELL_TEST_HARNESS__
+          const state = harness?.getState()
+          const findTerminal = (node: any): any => {
+            if (!node) return undefined
+            if (node.type === 'leaf' && node.content?.kind === 'terminal') return node.content
+            if (node.type === 'split') return findTerminal(node.children?.[0]) ?? findTerminal(node.children?.[1])
+            return undefined
+          }
+          const content = findTerminal(state?.panes?.layouts?.[tabId])
+          const pushes = (harness?.getSentWsMessages?.() ?? [])
+            .filter((message: any) => message?.type === 'tabs.sync.push')
+          const badPush = pushes.find((message: any) =>
+            !Array.isArray(message.records)
+            || !message.records.some((record: any) =>
+              record.tabId === tabId
+              && record.status === 'open'
+              && record.panes?.some((pane: any) =>
+                pane.payload?.sessionRef?.provider === 'opencode'
+                && pane.payload.sessionRef.sessionId === expectedSessionId
+              )
+            )
+          )
+          return {
+            tabIds: state?.tabs?.tabs?.map((candidate: any) => candidate.id) ?? [],
+            hasLayout: !!state?.panes?.layouts?.[tabId],
+            mode: content?.mode,
+            terminalId: content?.terminalId,
+            sessionRef: content?.sessionRef,
+            pushCount: pushes.length,
+            badPush,
+          }
+        }, {
+          tabId: tab.tabId,
+          expectedSessionId: beforeRefresh.sessionRef!.sessionId,
+        })
+
+        observedPushCount = snapshot.pushCount
+        if (
+          !snapshot.tabIds.includes(tab.tabId)
+          || !snapshot.hasLayout
+          || snapshot.mode !== 'opencode'
+          || snapshot.sessionRef?.provider !== 'opencode'
+          || snapshot.sessionRef.sessionId !== beforeRefresh.sessionRef!.sessionId
+          || typeof snapshot.terminalId !== 'string'
+          || snapshot.badPush
+        ) {
+          throw new Error(`OpenCode refresh tab/session was not stable: ${JSON.stringify(snapshot, null, 2)}`)
+        }
+
+        await page.waitForTimeout(250)
+      }
+
+      expect(observedPushCount).toBeGreaterThan(0)
+    } finally {
+      await server.stop().catch(() => {})
+      await fsp.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
 
   test('restores surviving OpenCode panes after graceful server restart and leaves a closed pane closed', async ({ page }) => {
     await runRestartScenario({
