@@ -98,6 +98,7 @@ import {
   providerUsesExtensionTerminalBehavior,
   scrollLinesToCursorKeys,
   shouldTranslateScrollToCursorKeys,
+  type ScrollInputPolicy,
 } from '@/lib/terminal-behavior'
 import { buildRestoreError, sanitizeSessionRef } from '@shared/session-contract'
 
@@ -156,7 +157,10 @@ type TerminalInputBlockedReason =
   | 'codex_clean_exit_decision_pending'
   | 'codex_lifecycle_loss_pending'
 
-function shouldSuppressNativeTouchScroll(term: Terminal): boolean {
+function shouldSuppressNativeTouchScroll(term: Terminal, _scrollInputPolicy: ScrollInputPolicy): boolean {
+  // For 'native' policy, never suppress — we dispatch synthetic wheel events
+  // to the terminal element so xterm.js handles them natively.
+  if (_scrollInputPolicy === 'native') return false
   return term.buffer.active.type === 'alternate' && term.modes.mouseTrackingMode !== 'none'
 }
 
@@ -782,8 +786,25 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const rawLines = touchScrollAccumulatorRef.current / TOUCH_SCROLL_PIXELS_PER_LINE
     const lines = rawLines > 0 ? Math.floor(rawLines) : Math.ceil(rawLines)
     if (lines !== 0) {
-      if (!translateScrollLinesToInput(term, lines) && !shouldSuppressNativeTouchScroll(term)) {
-        term.scrollLines(lines)
+      const policy = providerBehaviorRef.current.scrollInputPolicy
+      if (!translateScrollLinesToInput(term, lines) && !shouldSuppressNativeTouchScroll(term, policy)) {
+        const el = term.element
+        if (policy === 'native' && el && term.buffer.active.type === 'alternate' && term.modes.mouseTrackingMode !== 'none') {
+          // Dispatch synthetic wheel events so xterm.js handles them natively
+          // (sends mouse-wheel CSI sequences to the PTY).
+          const absLines = Math.abs(lines)
+          const deltaY = lines < 0 ? -1 : 1
+          for (let i = 0; i < absLines; i++) {
+            el.dispatchEvent(new WheelEvent('wheel', {
+              bubbles: true,
+              cancelable: true,
+              deltaY,
+              deltaMode: WheelEvent.DOM_DELTA_LINE,
+            }))
+          }
+        } else {
+          term.scrollLines(lines)
+        }
       }
 
       touchScrollAccumulatorRef.current -= lines * TOUCH_SCROLL_PIXELS_PER_LINE

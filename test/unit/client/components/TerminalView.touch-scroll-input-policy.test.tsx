@@ -20,6 +20,8 @@ const wsMocks = vi.hoisted(() => ({
 
 let latestTerminal: {
   scrollLines: ReturnType<typeof vi.fn>
+  element: HTMLElement | null
+  dispatchEvent: ReturnType<typeof vi.fn>
 } | null = null
 
 vi.mock('@/lib/ws-client', () => ({
@@ -75,6 +77,8 @@ vi.mock('@xterm/xterm', () => {
     reset = vi.fn()
     scrollToBottom = vi.fn()
     scrollLines = vi.fn()
+    element: HTMLElement | null = null
+    dispatchEvent = vi.fn()
 
     constructor() {
       latestTerminal = this
@@ -177,8 +181,67 @@ describe('TerminalView touch scroll input policy', () => {
     ;(globalThis as any).setMobileForTest(false)
   })
 
-  it('does not translate touch scrolling for opencode providers when policy is native', async () => {
+  it('dispatches synthetic wheel events for opencode providers when policy is native', async () => {
     const { store, tabId, paneId, paneContent } = createStore('opencode', [opencodeExtensionWithBehaviorHint])
+
+    const { getByTestId } = render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>,
+    )
+
+    const container = getByTestId('terminal-xterm-container')
+
+    await waitFor(() => {
+      expect(latestTerminal).not.toBeNull()
+    })
+
+    // Set up a mock element for dispatchEvent
+    const mockEl = document.createElement('div')
+    const dispatchSpy = vi.fn()
+    mockEl.dispatchEvent = dispatchSpy
+    if (latestTerminal) {
+      latestTerminal.element = mockEl
+    }
+
+    wsMocks.send.mockClear()
+
+    fireEvent.touchStart(container, {
+      touches: [{ clientX: 20, clientY: 120 }],
+    })
+    // 20px exceeds the current 18px-per-line threshold, so this should emit one wheel event.
+    fireEvent.touchMove(container, {
+      touches: [{ clientX: 20, clientY: 100 }],
+    })
+
+    // Should dispatch synthetic wheel events to the terminal element
+    expect(dispatchSpy).toHaveBeenCalled()
+    const wheelEvent = dispatchSpy.mock.calls.find((call) => call[0] instanceof WheelEvent)
+    expect(wheelEvent).toBeTruthy()
+    // Should NOT send cursor key sequences
+    expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'terminal.input',
+    }))
+    // Should NOT call scrollLines (alt buffer has no scrollback)
+    expect(latestTerminal?.scrollLines).not.toHaveBeenCalled()
+  })
+
+  it('sends cursor key sequences for fallbackToCursorKeysWhenAltScreenMouseCapture policy', async () => {
+    const extensionWithFallback: ClientExtensionEntry = {
+      name: 'opencode',
+      version: '1.0.0',
+      label: 'OpenCode',
+      description: 'OpenCode CLI agent',
+      category: 'cli',
+      cli: {
+        terminalBehavior: {
+          preferredRenderer: 'canvas',
+          scrollInputPolicy: 'fallbackToCursorKeysWhenAltScreenMouseCapture',
+        },
+      },
+    }
+
+    const { store, tabId, paneId, paneContent } = createStore('opencode', [extensionWithFallback])
 
     const { getByTestId } = render(
       <Provider store={store}>
@@ -197,12 +260,52 @@ describe('TerminalView touch scroll input policy', () => {
     fireEvent.touchStart(container, {
       touches: [{ clientX: 20, clientY: 120 }],
     })
-    // 20px exceeds the current 18px-per-line threshold, so this should emit one down-arrow sequence.
     fireEvent.touchMove(container, {
       touches: [{ clientX: 20, clientY: 100 }],
     })
 
+    // Should send cursor key sequences (down arrow for positive scroll)
+    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'terminal.input',
+      data: '\u001b[B',
+    }))
+    // Should NOT dispatch wheel events
     expect(latestTerminal?.scrollLines).not.toHaveBeenCalled()
+  })
+
+  it('calls scrollLines for shell providers in normal buffer', async () => {
+    // Mock terminal in normal buffer
+    const { store, tabId, paneId, paneContent } = createStore('shell', [])
+
+    const { getByTestId } = render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>,
+    )
+
+    const container = getByTestId('terminal-xterm-container')
+
+    await waitFor(() => {
+      expect(latestTerminal).not.toBeNull()
+    })
+
+    // Switch to normal buffer
+    if (latestTerminal) {
+      latestTerminal.buffer = { active: { type: 'normal' as const } }
+    }
+
+    wsMocks.send.mockClear()
+
+    fireEvent.touchStart(container, {
+      touches: [{ clientX: 20, clientY: 120 }],
+    })
+    fireEvent.touchMove(container, {
+      touches: [{ clientX: 20, clientY: 100 }],
+    })
+
+    // Should call scrollLines for normal buffer
+    expect(latestTerminal?.scrollLines).toHaveBeenCalled()
+    // Should NOT send input sequences
     expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({
       type: 'terminal.input',
     }))

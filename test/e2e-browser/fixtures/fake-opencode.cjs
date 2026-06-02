@@ -30,6 +30,7 @@ if (process.argv.includes('--version') || process.argv.includes('version')) {
 const hostname = argValue('--hostname') || '127.0.0.1'
 const port = Number(argValue('--port'))
 const sessionArg = argValue('--session')
+const sessionEventGatePath = process.env.FAKE_OPENCODE_SESSION_EVENT_GATE_PATH
 
 if (!Number.isInteger(port) || port <= 0 || port > 65535) {
   process.stdout.write('fake opencode: no server port requested\n')
@@ -107,6 +108,50 @@ process.stdin.on('data', (data) => {
 })
 
 const eventClients = new Set()
+
+function emitSessionEvents(res) {
+  if (res.destroyed) return
+  appendAudit({
+    event: 'session_events_emitted',
+    rootSessionId,
+    childSessionId,
+  })
+  res.write(`data: ${JSON.stringify({
+    type: 'session.created',
+    properties: {
+      sessionID: childSessionId,
+      info: {
+        id: childSessionId,
+        parentID: rootSessionId,
+      },
+    },
+  })}\n\n`)
+  res.write(`data: ${JSON.stringify({
+    type: 'session.idle',
+    properties: {
+      sessionID: childSessionId,
+    },
+  })}\n\n`)
+}
+
+function scheduleSessionEvents(res) {
+  if (sessionEventGatePath) {
+    const interval = setInterval(() => {
+      if (res.destroyed) {
+        clearInterval(interval)
+        return
+      }
+      if (!fs.existsSync(sessionEventGatePath)) return
+      clearInterval(interval)
+      emitSessionEvents(res)
+    }, 50)
+    interval.unref?.()
+    return
+  }
+
+  setTimeout(() => emitSessionEvents(res), 100)
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url || '/', `http://${hostname}:${port}`)
   if (url.pathname === '/global/health') {
@@ -137,25 +182,7 @@ const server = http.createServer((req, res) => {
     })
     eventClients.add(res)
     res.write(`data: ${JSON.stringify({ type: 'server.connected', properties: {} })}\n\n`)
-    setTimeout(() => {
-      if (res.destroyed) return
-      res.write(`data: ${JSON.stringify({
-        type: 'session.created',
-        properties: {
-          sessionID: childSessionId,
-          info: {
-            id: childSessionId,
-            parentID: rootSessionId,
-          },
-        },
-      })}\n\n`)
-      res.write(`data: ${JSON.stringify({
-        type: 'session.idle',
-        properties: {
-          sessionID: childSessionId,
-        },
-      })}\n\n`)
-    }, 100)
+    scheduleSessionEvents(res)
     req.on('close', () => {
       eventClients.delete(res)
     })
