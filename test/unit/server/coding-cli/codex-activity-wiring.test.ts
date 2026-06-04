@@ -59,7 +59,7 @@ describe('wireCodexActivityTracker', () => {
       phase: 'idle',
       lastClearedAt: 1_200,
     })
-    expect(completions).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_200 }])
+    expect(completions).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_200, completionSeq: 1 }])
 
     dispose()
   })
