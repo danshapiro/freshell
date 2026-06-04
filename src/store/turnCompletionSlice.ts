@@ -31,7 +31,11 @@ const turnCompletionSlice = createSlice({
   reducers: {
     recordTurnComplete(state, action: PayloadAction<TurnCompletePayload>) {
       const { terminalId, at } = action.payload
-      if (state.lastAtByTerminalId[terminalId] === at) return
+      // Monotonic, replay-safe dedupe: only record a completion strictly newer
+      // than the last seen for this terminal. A replayed/stale completion with an
+      // older-or-equal `at` is ignored so scrollback replay cannot re-green.
+      const last = state.lastAtByTerminalId[terminalId]
+      if (last !== undefined && at <= last) return
       state.lastAtByTerminalId[terminalId] = at
       state.seq += 1
       state.pendingEvents.push({

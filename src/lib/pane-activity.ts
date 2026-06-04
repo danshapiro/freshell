@@ -34,7 +34,7 @@ function isBrowserBusy(record: PaneRuntimeActivityRecord | undefined): boolean {
     && (record.phase === 'loading' || record.phase === 'forwarding')
 }
 
-function resolveAgentChatSessionKey(
+export function resolveAgentChatSessionKey(
   content: AgentChatPaneContent,
   session: ChatSessionState | undefined,
 ): string | undefined {
@@ -50,7 +50,7 @@ function resolveAgentChatSessionKey(
   return `${provider}:${sessionId}`
 }
 
-function resolveFreshAgentSessionKey(
+export function resolveFreshAgentSessionKey(
   content: FreshAgentPaneContent,
   session: FreshAgentSessionState | undefined,
 ): string | undefined {
@@ -65,7 +65,7 @@ function resolveFreshAgentSessionKey(
   return `${provider}:${sessionId}`
 }
 
-function isAgentChatBusy(
+export function isAgentChatBusy(
   content: AgentChatPaneContent,
   session: ChatSessionState | undefined,
 ): boolean {
@@ -82,7 +82,7 @@ function isAgentChatBusy(
   return status === 'running'
 }
 
-function isFreshAgentBusy(
+export function isFreshAgentBusy(
   content: FreshAgentPaneContent,
   session: FreshAgentSessionState | undefined,
 ): boolean {

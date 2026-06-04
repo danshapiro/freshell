@@ -59,6 +59,23 @@ describe('turnCompletionSlice', () => {
     expect(state.pendingEvents).toHaveLength(2)
   })
 
+  it('ignores an older/equal turn-complete for a terminal (monotonic, replay-safe)', () => {
+    let state = reducer(undefined, recordTurnComplete({ tabId: 'tab1', paneId: 'p1', terminalId: 't1', at: 5000 }))
+    // A replayed/stale completion with an older `at` must NOT re-record (would re-green on replay).
+    state = reducer(state, recordTurnComplete({ tabId: 'tab1', paneId: 'p1', terminalId: 't1', at: 4000 }))
+    state = reducer(state, recordTurnComplete({ tabId: 'tab1', paneId: 'p1', terminalId: 't1', at: 5000 }))
+    expect(state.pendingEvents).toHaveLength(1)
+    // A strictly newer completion still records.
+    state = reducer(state, recordTurnComplete({ tabId: 'tab1', paneId: 'p1', terminalId: 't1', at: 5001 }))
+    expect(state.pendingEvents).toHaveLength(2)
+  })
+
+  it('keys monotonic dedupe per terminalId (sessionKey strings allowed for SDK panes)', () => {
+    let state = reducer(undefined, recordTurnComplete({ tabId: 'T', paneId: 'p1', terminalId: 'claude:abc', at: 10 }))
+    state = reducer(state, recordTurnComplete({ tabId: 'T', paneId: 'p2', terminalId: 'codex:def', at: 10 }))
+    expect(state.pendingEvents).toHaveLength(2)
+  })
+
   it('consumes pending events up through the handled sequence', () => {
     let state = reducer(
       undefined,
