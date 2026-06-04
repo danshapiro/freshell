@@ -1,6 +1,8 @@
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
 import type { Tab } from '@/store/types'
 import type { RegistryPaneSnapshot, RegistryTabRecord } from '@/store/tabRegistryTypes'
+import type { ClientExtensionEntry } from '@shared/extension-types'
+import { getTabDisplayTitle } from '@/lib/tab-title'
 
 const FIVE_MINUTES_MS = 5 * 60 * 1000
 
@@ -98,6 +100,7 @@ type SnapshotRecordInput = {
   layout: PaneNode
   serverInstanceId: string
   paneTitles?: Record<string, string>
+  extensions?: ClientExtensionEntry[]
   deviceId: string
   deviceLabel: string
   updatedAt: number
@@ -112,7 +115,8 @@ export function buildOpenTabRegistryRecord(input: SnapshotRecordInput): Registry
     serverInstanceId: input.serverInstanceId,
     deviceId: input.deviceId,
     deviceLabel: input.deviceLabel,
-    tabName: input.tab.title || 'Untitled',
+    // Canonical display title so the archive matches the tab bar.
+    tabName: getTabDisplayTitle(input.tab, input.layout, input.paneTitles, input.extensions) || 'Untitled',
     status: 'open',
     revision: input.revision,
     createdAt: input.tab.createdAt || input.updatedAt,
@@ -131,7 +135,8 @@ export function buildClosedTabRegistryRecord(input: SnapshotRecordInput): Regist
     serverInstanceId: input.serverInstanceId,
     deviceId: input.deviceId,
     deviceLabel: input.deviceLabel,
-    tabName: input.tab.title || 'Untitled',
+    // Canonical display title so the archive matches the tab bar.
+    tabName: getTabDisplayTitle(input.tab, input.layout, input.paneTitles, input.extensions) || 'Untitled',
     status: 'closed',
     revision: input.revision,
     createdAt: input.tab.createdAt || input.updatedAt,

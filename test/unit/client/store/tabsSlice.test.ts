@@ -665,6 +665,20 @@ describe('tabsSlice', () => {
       expect(state.tabs.activeTabId).toBe('foreign-tab')
     })
 
+    it('seeds a new coding-agent tab title with the working-directory basename', async () => {
+      const store = createOpenSessionStore()
+
+      await store.dispatch(openSessionTab({
+        provider: 'claude',
+        cwd: '/home/dan/code/freshell',
+        terminalId: 'term-new',
+        forceNew: true,
+      }))
+
+      const tab = store.getState().tabs.tabs.at(-1)
+      expect(tab?.title).toBe('freshell')
+    })
+
     it('activates the first canonical match before websocket ready when multiple tabs share the durable session identity', async () => {
       const store = createOpenSessionStore()
 

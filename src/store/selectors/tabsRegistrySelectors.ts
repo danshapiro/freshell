@@ -35,6 +35,7 @@ const selectPaneLastInputAt = (state: RootState) => state.tabRecency?.paneLastIn
 const selectDeviceId = (state: RootState) => state.tabRegistry.deviceId
 const selectDeviceLabel = (state: RootState) => state.tabRegistry.deviceLabel
 const selectServerInstanceId = (state: RootState) => state.connection.serverInstanceId || UNKNOWN_SERVER_INSTANCE_ID
+const selectExtensionEntries = (state: RootState) => state.extensions?.entries
 const selectSameDeviceOpen = (state: RootState) => state.tabRegistry.sameDeviceOpen
 const selectRemoteOpen = (state: RootState) => state.tabRegistry.remoteOpen
 const selectClosed = (state: RootState) => state.tabRegistry.closed
@@ -44,8 +45,8 @@ const selectClosedRetentionDays = (state: RootState) => Math.min(30, Math.max(1,
 )))
 
 export const selectLiveLocalTabRecords = createSelector(
-  [selectTabs, selectLayouts, selectPaneTitles, selectPaneLastInputAt, selectDeviceId, selectDeviceLabel, selectServerInstanceId],
-  (tabs, layouts, paneTitles, paneLastInputAt, deviceId, deviceLabel, serverInstanceId): RegistryTabRecord[] => {
+  [selectTabs, selectLayouts, selectPaneTitles, selectPaneLastInputAt, selectDeviceId, selectDeviceLabel, selectServerInstanceId, selectExtensionEntries],
+  (tabs, layouts, paneTitles, paneLastInputAt, deviceId, deviceLabel, serverInstanceId, extensions): RegistryTabRecord[] => {
     const records: RegistryTabRecord[] = []
     for (const tab of tabs) {
       const layout = layouts[tab.id]
@@ -60,6 +61,7 @@ export const selectLiveLocalTabRecords = createSelector(
         layout,
         serverInstanceId,
         paneTitles: paneTitles[tab.id],
+        extensions,
         deviceId,
         deviceLabel,
         revision: 0,

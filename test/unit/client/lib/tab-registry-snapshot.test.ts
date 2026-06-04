@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { shouldKeepClosedTab, collectPaneSnapshots } from '@/lib/tab-registry-snapshot'
+import { shouldKeepClosedTab, collectPaneSnapshots, buildOpenTabRegistryRecord } from '@/lib/tab-registry-snapshot'
+import { getTabDisplayTitle } from '@/lib/tab-title'
 import type { PaneNode } from '@/store/paneTypes'
 
 describe('shouldKeepClosedTab', () => {
@@ -213,5 +214,27 @@ describe('collectPaneSnapshots', () => {
 
       expect(snapshots[0].title).toBe('My Extension Pane')
     })
+  })
+})
+
+describe('tab registry record name alignment', () => {
+  it('uses the canonical display title for tabName, not the raw stored tab.title', () => {
+    const layout: PaneNode = {
+      type: 'leaf',
+      id: 'p1',
+      content: { kind: 'terminal', mode: 'claude', status: 'running', createRequestId: 'r' },
+    }
+    const tab = { id: 't1', createRequestId: 'r', title: 'Tab 1', status: 'running', mode: 'claude' } as never
+    const paneTitles = { p1: 'my-project' }
+
+    const record = buildOpenTabRegistryRecord({
+      tab, layout, serverInstanceId: 'srv', paneTitles,
+      deviceId: 'd', deviceLabel: 'D', updatedAt: 1, revision: 0,
+    })
+
+    // The archive panel must show the same name as the tab bar (canonical),
+    // not the raw stored 'Tab 1'.
+    expect(record.tabName).toBe('my-project')
+    expect(record.tabName).toBe(getTabDisplayTitle(tab, layout, paneTitles))
   })
 })
