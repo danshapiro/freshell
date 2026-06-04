@@ -96,3 +96,24 @@ A good build should show:
   server runtime — absent in broken cross-builds).
 - `release/win-unpacked/resources/server-node-modules/node-pty/prebuilds/win32-x64/conpty.node`
   exists.
+
+## Continuous integration and the merge gate
+
+Two GitHub Actions workflows are relevant to this feature:
+
+- **Typecheck Client** (`.github/workflows/typecheck-client.yml`) runs
+  `npm run typecheck:client` on Ubuntu for every pull request and every push to
+  `main`. This is the **only required status check** in the `main` branch
+  ruleset — it is what gates merging.
+- **Electron Build** (`.github/workflows/electron-build.yml`) runs the full
+  `npm test` suite and `npm run electron:build` on a `macos-latest` /
+  `ubuntu-latest` / `windows-latest` matrix, uploading the installers as
+  artifacts. It triggers only on `v*` tags and on pull requests that touch
+  electron-relevant paths (`electron/**`, `electron-builder.yml`,
+  `scripts/prepare-bundled-node.ts`, `scripts/bundled-node-version.json`).
+
+Because the branch ruleset lists only `typecheck-client` as required (with zero
+required approvals), the Electron Build matrix is **informational, not
+merge-blocking**: a PR can be merged while those jobs are still running or
+non-green. Treat the matrix as a cross-platform smoke signal and read its logs
+before relying on a build, rather than as a hard gate.
