@@ -48,7 +48,7 @@
 - `src/store/turnCompletionAttention.ts` *(new)* — shared selector: map a sessionKey → `{tabId, paneId}`; export a `clearAttentionForPane` thunk. (Task 1, 10)
 - `src/hooks/useTurnCompletionNotifications.ts` — keep marking; clear-effect stays background-only per `attentionDismiss`. (Task 10)
 - `src/hooks/useAgentSessionTurnCompletion.ts` *(new)* — listens to fresh-agent + agent-chat status edges and pending-permission edges → `recordTurnComplete`. (Task 3)
-- `src/lib/pane-activity.ts` — codex `pending`→blue; `session==null`→not busy; export busy helpers. (Task 11)
+- `src/lib/pane-activity.ts` — **export** `isFreshAgentBusy`, `isAgentChatBusy`, `resolveFreshAgentSessionKey`, `resolveAgentChatSessionKey` (all module-local today); codex `pending`→blue; `session==null`→not busy. (Task 1, 3, 11)
 - `src/lib/turn-complete-signal.ts` — drop gemini/kimi from normalizer. (Task 9)
 - `src/components/TerminalView.tsx` — codex out of client gate; `sendInput` synthetic flag; real-engagement clear. (Task 2, 10)
 - `src/components/panes/PaneContainer.tsx` — `handleFocus` clears tab+pane on any in-tab pane focus, both modes. (Task 10)
@@ -157,7 +157,9 @@ it('returns null when no pane owns the sessionKey', () => {
 
 - [ ] **Step 5: Run red.**
 
-- [ ] **Step 6: Impl `src/store/turnCompletionAttention.ts`** — reuse the existing key builders from `pane-activity.ts` (`resolveFreshAgentSessionKey`, `resolveAgentChatSessionKey`) and `collectPaneEntries` to scan `state.panes.layouts`. Return `{ tabId, paneId } | null`. Match `content.kind === 'fresh-agent'` / `'agent-chat'` whose computed sessionKey equals the argument. (Mirror `selectTabPaneByTerminalId` in `src/store/selectors/paneTerminalSelectors.ts`.)
+- [ ] **Step 6: Impl `src/store/turnCompletionAttention.ts`** — export `resolveFreshAgentSessionKey`/`resolveAgentChatSessionKey` from `pane-activity.ts` (currently module-local) and reuse them + `collectPaneEntries` to scan `state.panes.layouts`. Return `{ tabId, paneId } | null`. Match `content.kind === 'fresh-agent'` / `'agent-chat'` whose computed sessionKey equals the argument. (Mirror `selectTabPaneByTerminalId` in `src/store/selectors/paneTerminalSelectors.ts`.)
+
+  > **TWO KEY NAMESPACES (load-bearing finding `sessionkey-shapes-match`):** the **dedupe/selector key** used for `recordTurnComplete.terminalId` and `selectPaneBySessionKey` is `provider:sessionId` (what `resolveFreshAgentSessionKey`/`resolveAgentChatSessionKey` return). The fresh-agent **slice-lookup key** (to read `state.freshAgent[...]`) is a *different* string: `makeFreshAgentSessionKey({sessionType, provider, sessionId})` (`freshAgentSlice.ts:36-38`). The Task-3 hook must read slice state via `makeFreshAgentSessionKey` (fresh-agent) / `sessionId` (agent-chat), but compute the dedupe + pane-selector key via `resolveFreshAgentSessionKey`/`resolveAgentChatSessionKey` (`provider:sessionId`). The test fixtures (`'claude:abc'`) are the `provider:sessionId` form. Mixing these silently returns `null` → no green for fresh-agent.
 
 - [ ] **Step 7: Run green.**
 
@@ -198,30 +200,38 @@ expect(events).toHaveLength(1)
 
 - [ ] **Step 2: Run red.**
 
-- [ ] **Step 3: Impl — emit inside the real busy/pending→idle transitions.** Add a private completion-collection mirroring claude. The clean insertion point: `transitionAfterTurnClear` (busy→idle) and `transitionPendingAfterTurnClear` (pending-with-real-submit→idle) — the two transitions that represent a user-visible turn ending. Do **not** emit from the `*LatentTurnClear` paths (association clears that never showed busy). Collect into an instance buffer flushed after `commitState`:
+- [ ] **Step 3: Impl — emit once per real turn-END, with cross-source dedupe.** Add a private completion buffer mirroring claude, BUT two load-bearing findings change the naive design:
+
+  **(a) Emit only on the →idle branch, not "top of transition" (`codex-transitions-not-exactly-one-turn`).** `transitionAfterTurnClear` (`:323-343`) and `transitionPendingAfterTurnClear` (`:361-379`) BOTH re-arm to `phase='pending'` when `hasQueuedSubmit(state)` is true (back-to-back submits). A completion fired there would green mid-multi-turn. So record the completion **only when the transition resolves to `phase==='idle'`** (i.e. after the transition runs, check `state.phase==='idle'`), not unconditionally at the top.
+
+  **(b) Per-turn dedupe across THREE emit sources (`codex-jsonl-bel-no-double` + onTurnCompleted).** Live BEL (`noteOutput`), JSONL reconcile (`reconcileProjects`), and the sidecar `onTurnCompleted` (Task 11) can all clear the same logical turn. Dedupe on a per-turn identity = the `acceptedStartAt`/`pendingSubmitAt` of the turn being cleared. Track `lastEmittedTurnKey` per state; only emit if the cleared turn's key differs from the last emitted.
 
 ```ts
+export type CodexTurnCompleteEvent = { terminalId: string; sessionId?: string; at: number }
 private pendingCompletions: CodexTurnCompleteEvent[] = []
 
-private recordCompletion(state: CodexTerminalActivity, at: number): void {
+// turnKey = the start identity of the turn that is ending (acceptedStartAt, else pendingSubmitAt).
+private maybeRecordCompletion(state: CodexTerminalActivity, turnKey: number | undefined, at: number): void {
+  if (turnKey === undefined) return
+  if (state.phase !== 'idle') return            // re-armed to pending → not a turn END
+  if (state.lastEmittedTurnKey === turnKey) return  // already emitted by another source
+  state.lastEmittedTurnKey = turnKey
   this.pendingCompletions.push({
     terminalId: state.terminalId,
     ...(state.sessionId ? { sessionId: state.sessionId } : {}),
     at,
   })
 }
-// call this.recordCompletion(state, at) at the top of transitionAfterTurnClear and
-// transitionPendingAfterTurnClear (before mutating phase).
-// Flush after every commitState in noteOutput / reconcileProjects / onTurnCompleted:
 private flushCompletions(): void {
   if (this.pendingCompletions.length === 0) return
-  const out = this.pendingCompletions
-  this.pendingCompletions = []
+  const out = this.pendingCompletions; this.pendingCompletions = []
   for (const c of out) this.emit('turn.complete', c)
 }
 ```
 
-Define `export type CodexTurnCompleteEvent = { terminalId: string; sessionId?: string; at: number }`. Ensure `noteOutput` calls `this.flushCompletions()` after `this.commitState(...)`, and `reconcileProjects` calls it after the loop. **Dedup note:** once a live BEL clears the turn (phase→idle, `acceptedStartAt` undefined), a later JSONL reconcile cannot re-run the transition, so the JSONL backstop never double-emits within a turn.
+  Capture `turnKey = state.acceptedStartAt ?? state.pendingSubmitAt` BEFORE the transition mutates state, run the transition, then `maybeRecordCompletion(state, turnKey, at)`. Do **not** emit from the `*LatentTurnClear` paths (association clears that never showed busy). Add `lastEmittedTurnKey?: number` to `CodexTerminalActivity`. Flush after `commitState` in `noteOutput`, after the loop in `reconcileProjects`, and in `onTurnCompleted` (Task 11). **Pending-decay does NOT emit** (`codex-pending-decay-no-emit`): a `pending` that decays via `expireState` without a BEL/task_completed/onTurnCompleted is a no-op submit, and correctly produces no green.
+
+- [ ] **Step 3b: Failing test — back-to-back submits emit exactly one completion per turn, none on the re-arm.** Submit, busy, submit-again (queued), BEL → assert one `turn.complete`; second BEL after the queued turn finishes → second `turn.complete`. And: a turn cleared by live BEL is NOT re-emitted when a later `reconcileProjects` sees the JSONL completion (same `turnKey`).
 
 - [ ] **Step 4: Run green (unit).**
 
@@ -308,12 +318,15 @@ act(() => store.dispatch(removePermissionRequest({ sessionKey: 'claude:abc', id:
 
 Persist a per-terminal pending-attention marker server-side so a completion that lands during a disconnect window is delivered (once) on reconnect.
 
+> **TRANSPORT CORRECTION (load-bearing `no-unified-ready-activity-snapshot` + `monotonic-at-vs-seq-interaction`):** there is **no** single activity snapshot at `ready`. The client requests three independent provider lists on connect (`*.activity.list` → `*.activity.list.response`, handled `App.tsx:945-1031`). So durable completions **piggyback on each provider's existing `*.activity.list.response`** as a `pendingTurnCompletions` field, plus a NEW `terminal.turn.complete.ack` message. Idempotency MUST key on the server `seq` (the monotonic `at` guard from Task 1 can drop a legitimately-redelivered completion whose `at` equals one already seen, because `lastAtByTerminalId` survives the reconnect). The durable-apply helper tracks applied `seq` per terminalId and re-applies any unseen seq directly (bypassing/seed-updating the `at` guard).
+
 **Files:**
 - Modify: `server/coding-cli/claude-activity-tracker.ts`, `codex-activity-tracker.ts`, `opencode-activity-tracker.ts` (record `turnCompleteSeq` + `lastTurnCompletedAt`; expose unacked completions)
-- Modify: `server/index.ts` / `server/ws-handler.ts` (include unacked completions in the activity snapshot delivered at/after `ready`)
-- Modify: `shared/ws-protocol.ts` (snapshot carries `pendingTurnCompletions: { terminalId, provider, at, seq }[]`)
-- Modify: `src/App.tsx` (on snapshot, dispatch `recordTurnComplete` once per unseen seq; send an ack)
-- Test: tracker unit (marker survives idle until acked), ws-handler/integration (completion during disconnect delivered once on reconnect; ack clears it)
+- Modify: `server/ws-handler.ts` (attach `pendingTurnCompletions` to each `*.activity.list.response`; handle `terminal.turn.complete.ack`)
+- Modify: `shared/ws-protocol.ts` (each `*.activity.list.response` gains `pendingTurnCompletions?: { terminalId, at, seq }[]`; add `TerminalTurnCompleteAckSchema { completions: { terminalId, seq }[] }`)
+- Modify: `src/App.tsx` (in the three `*.activity.list.response` handlers, dispatch `recordTurnComplete` once per unseen `seq`, then send the ack)
+- Modify: `src/store/turnCompletionSlice.ts` (add `appliedSeqByTerminalId` + an `applyDurableCompletion` reducer that is seq-idempotent, independent of the `at` guard)
+- Test: tracker unit (marker survives idle until acked), ws-handler/integration (completion during disconnect delivered once on reconnect; ack clears it; same `at` redelivery still fires once via seq)
 
 - [ ] **Step 1: Failing tracker test** — a completion increments `turnCompleteSeq`; `listPendingCompletions()` returns it; after `acknowledgeCompletion(terminalId, seq)` it is gone; for opencode the marker is **not** deleted when the busy record is removed on idle.
 
@@ -321,28 +334,30 @@ Persist a per-terminal pending-attention marker server-side so a completion that
 
 - [ ] **Step 3: Impl** — give each tracker a small `Map<terminalId, { seq, at }>` of unacked completions, incremented wherever `turn.complete` is emitted; `listPendingCompletions()` and `acknowledgeCompletion()` methods. Store it **outside** the busy-record map (so opencode idle-remove doesn't drop it).
 
-- [ ] **Step 4: Failing integration test** — client A connects, codex/claude/opencode turn completes while A is the only client and is then disconnected; client B (or A reconnecting) authenticates and the post-`ready` snapshot includes the unacked completion; client dispatches exactly one `recordTurnComplete`; after the client acks, a second reconnect does not re-deliver.
+- [ ] **Step 4: Failing integration test** — client A connects, codex/claude/opencode turn completes while A is the only client and is then disconnected; client B (or A reconnecting) authenticates, requests the provider list, and the `*.activity.list.response` includes the unacked completion; client dispatches exactly one `applyDurableCompletion`; after the client acks, a second list-request does not re-deliver. Also: a redelivered completion whose `at` equals one already applied still fires once on a fresh client (seq-based), and is dropped on the same client (already-applied seq).
 
-- [ ] **Step 5: Impl snapshot + ack** — extend the activity snapshot path to include `pendingTurnCompletions`. On the client, after applying, send `{ type: 'terminal.turn.complete.ack', completions: [{terminalId, seq}] }`; server calls `acknowledgeCompletion`. Idempotent via seq + the Task-1 monotonic `at` guard.
+- [ ] **Step 5: Impl piggyback + ack** — attach `pendingTurnCompletions` to each `*.activity.list.response`; client applies via seq-idempotent `applyDurableCompletion`, then sends `{ type: 'terminal.turn.complete.ack', completions: [{terminalId, seq}] }`; server calls `acknowledgeCompletion`.
 
 - [ ] **Step 6: Run green.**
 
 - [ ] **Step 7: Commit** — `fix(status): durable turn-complete across reconnect (claude/codex/opencode)`.
 
-> **Checkpoint:** This is the most cross-cutting task. If the ack/snapshot protocol balloons, prefer the lighter alternative noted in the investigation — a short-lived (30–60s) server-side replay queue delivered to any client authenticating within the grace window — but the persisted-marker is preferred. Decide before writing the protocol; do not do both.
+> **Checkpoint:** This is the most cross-cutting task and its transport surface is real (new ack message + 3 response fields + a seq-idempotent reducer). If it balloons during execution, fall back to the lighter alternative — a short-lived (30–60s) server-side replay queue delivered on (re)auth — but the persisted-marker + piggyback is preferred. Decide before writing the protocol; do not do both.
 
 ---
 
 ## Task 5: opencode deadman + idle-read watchdog (RC-4)
 
-**Files:**
-- Modify: `server/coding-cli/opencode-activity-tracker.ts` (add `lastObservedAt`, `expire(at)` removing busy records past `OPENCODE_BUSY_DEADMAN_MS` ~120_000)
-- Modify: `server/coding-cli/opencode-activity-wiring.ts` (5s sweep via injectable `setIntervalFn`/`clearIntervalFn`, cleared in `dispose`; idle-read watchdog in `consumeEvents`)
-- Test: tracker unit (stale record removed by `expire`), wiring unit (sweep scheduled/cleared; watchdog reconnects on read stall)
+> **PLACEMENT CORRECTION (load-bearing `opencode-tracker-no-deadman-no-interval`):** the tracker has NO `expire`/`lastObservedAt`, its constructor injects only `setTimeoutFn`/`clearTimeoutFn`/`now`/`random`, and `consumeEvents` is a **private tracker method**. The wiring (`wireOpencodeActivityTracker`) has NO `setIntervalFn`/`clearIntervalFn` param (unlike the claude/codex wirings). So: `expire`+`lastObservedAt`+the read-stall watchdog all live IN THE TRACKER; the interval injection is ADDED to the wiring (mirroring claude/codex wirings).
 
-- [ ] **Step 1: Failing test** — a `busy` record whose `lastObservedAt` is older than the deadman is removed by `expire(now)`; refreshed on any SSE/snapshot observation.
+**Files:**
+- Modify: `server/coding-cli/opencode-activity-tracker.ts` (add `lastObservedAt` to each record refreshed on every SSE/snapshot observation; add public `expire(at)` that `removeRecord`s busy records older than `OPENCODE_BUSY_DEADMAN_MS` ~120_000 — opencode has no `idle` phase; add the read-stall watchdog inside the private `consumeEvents`)
+- Modify: `server/coding-cli/opencode-activity-wiring.ts` (add injectable `setIntervalFn`/`clearIntervalFn` params mirroring `codex-activity-wiring.ts`; schedule a 5s `tracker.expire(now())` sweep; clear it in `dispose`)
+- Test: tracker unit (stale record removed by `expire`; watchdog reconnect on read stall), wiring unit (sweep scheduled with injected interval and cleared on dispose)
+
+- [ ] **Step 1: Failing test** — a `busy` record whose `lastObservedAt` is older than the deadman is removed by `expire(now)`; refreshed on any SSE/snapshot observation; the wiring schedules `expire` via the injected interval and clears it on dispose.
 - [ ] **Step 2: Run red.**
-- [ ] **Step 3: Impl** deadman + sweep mirroring claude/codex (`expire` removes the record since opencode has no `idle` phase). Add a watchdog in `consumeEvents` that aborts/reconnects the read cycle if no bytes within a bounded interval, resetting on **any** received SSE block (not just status events) so a genuinely long turn isn't torn down.
+- [ ] **Step 3: Impl** deadman + sweep mirroring claude/codex (`expire` **removes** the record). Add the watchdog in the tracker's `consumeEvents` (using the injected `setTimeoutFn`) that aborts/reconnects the read cycle if no bytes within a bounded interval, resetting on **any** received SSE block (not just status events) so a genuinely long turn isn't torn down.
 - [ ] **Step 4: Run green.**
 - [ ] **Step 5: Commit** — `fix(status): opencode busy deadman + idle-read watchdog (no stuck blue)`.
 
@@ -350,24 +365,29 @@ Persist a per-terminal pending-attention marker server-side so a completion that
 
 ## Task 6: SDK idle broadcast on natural end + error (RC-4)
 
+> **BUSY = `streamingActive || status==='running'` (load-bearing `sdk-status-idle-doesnt-clear-streaming`):** `setSessionStatus` sets `status` ONLY; it does not clear `streamingActive` (`agentChatSlice.ts:371-377`, `freshAgentSlice.ts:277-281`). So broadcasting `sdk.status: idle` alone will NOT clear blue if `streamingActive` is stuck. The client handler for `sdk.status: 'idle'` (and the `sessionError` reset) MUST also clear `streamingActive`.
+
 **Files:**
 - Modify: `server/sdk-bridge.ts` (`consumeStream`: natural-end else-branch ~`:343-350` and catch ~`:322-328` broadcast `{ type: 'sdk.status', sessionId, status: 'idle' }` after setting `state.status='idle'`)
-- Modify: `src/store/agentChatSlice.ts` (`sessionError` clears `streamingActive`, resets `running`→`idle` for non-`RESTORE_*` codes), `src/store/freshAgentSlice.ts` (same)
-- Test: server unit (bridge broadcasts status/idle on natural end without `result`, and on error), client unit (`sessionError` leaves status non-running; no green/sound — error ≠ completion)
+- Modify: `src/lib/sdk-message-handler.ts` + `src/lib/fresh-agent-ws.ts` (on `sdk.status: 'idle'`, dispatch a reducer that clears `streamingActive` in addition to setting status — extend `setSessionStatus` to clear `streamingActive` when status is a terminal/idle value, or add `markSessionIdle`)
+- Modify: `src/store/agentChatSlice.ts` (`sessionError` clears `streamingActive`, resets `running`→`idle` for non-`RESTORE_*` codes; idle-status path clears `streamingActive`), `src/store/freshAgentSlice.ts` (same)
+- Test: server unit (bridge broadcasts status/idle on natural end without `result`, and on error), client unit (`sdk.status idle` and `sessionError` both leave `isAgentChatBusy`/`isFreshAgentBusy` false — i.e. `streamingActive` cleared AND status non-running; `pendingEvents` unchanged — error ≠ completion)
 
 - [ ] **Step 1: Failing server test** — after a stream ends without a `result` message, and after a thrown error, the bridge broadcasts an idle status.
 - [ ] **Step 2: Run red → impl → green.**
-- [ ] **Step 3: Failing client test** — `sessionError` (non-RESTORE) clears `streamingActive` and sets `idle`; `isAgentChatBusy`/`isFreshAgentBusy` return false; `pendingEvents` unchanged (no spurious green).
+- [ ] **Step 3: Failing client test** — handling `sdk.status: 'idle'` clears `streamingActive` so `isFreshAgentBusy`/`isAgentChatBusy` return false; `sessionError` (non-RESTORE) clears `streamingActive` and sets `idle`; `pendingEvents` unchanged (no spurious green).
 - [ ] **Step 4: Run red → impl → green.**
-- [ ] **Step 5: Commit** — `fix(status): clear SDK blue on natural stream-end and error`.
+- [ ] **Step 5: Commit** — `fix(status): clear SDK blue (streamingActive+status) on stream-end and error`.
 
 ---
 
 ## Task 7: opencode association-gated completion (RC-3, decision 3)
 
+> **DECISION (load-bearing `reject-has-no-reason-param` + `reject-snapshot-branches-exist`):** `rejectOpencodeAssociation`/`rejectSessionAssociation` take only `{sessionId}` — plumbing a `reason` through controller→tracker→reducer is a 4-signature change. Per decision 3 ("do it right, bounded"), use **terminal-scoped reject-all-emits**: on reject of an `awaitingAssociation`, emit `turnComplete` with `sessionId` **omitted** (greens by terminalId without asserting ownership — avoids false-green attribution AND avoids the multi-file reason plumbing). Also: the SNAPSHOT `knownBusy`→quiet branch (`:322-328`) does NOT emit `turnComplete` today (only the SSE-idle `knownBusy`→quiet at `:230-242` does), so this is a NEW emit, not a reuse.
+
 **Files:**
-- Modify: `server/coding-cli/opencode-ownership-reducer.ts` — (a) reject path (`:447-461`): when `awaitingAssociation` for the same session, also emit `turnComplete` (terminal-scoped: omit sessionId, OR suppress only for `session_already_owned` by plumbing `reason`); (b) `reduceSnapshot` candidate→quiet (`:342-360`): transition to `awaitingAssociation` + `requestAssociation` instead of emitting only `activityRemove`; `knownBusy`→quiet may emit `turnComplete` directly.
-- Test: `test/unit/server/coding-cli/opencode-ownership-reducer.test.ts` — reject emits/suppresses per reason; the existing "never emits turn completion from snapshots" test is replaced with association-gated assertions; disconnect-gap first-turn (candidate busy → stream drop → reconnect snapshot empty → requestAssociation → confirm → turnComplete).
+- Modify: `server/coding-cli/opencode-ownership-reducer.ts` — (a) reject path (`:447-461`): when `awaitingAssociation` for the same session, also emit a **terminal-scoped** `turnComplete` (omit `sessionId`); (b) `reduceSnapshot` candidate→quiet (`:342-348`): transition to `awaitingAssociation` + `requestAssociation` instead of emitting only `activityRemove`; (c) `reduceSnapshot` `knownBusy`→quiet (`:322-328`): add a direct `turnComplete` emit (the sessionId is trusted there).
+- Test: `test/unit/server/coding-cli/opencode-ownership-reducer.test.ts` — reject emits a terminal-scoped turnComplete; the existing "never emits turn completion from snapshots" test is replaced with association-gated assertions for candidate and a direct emit for knownBusy; disconnect-gap first-turn (candidate busy → stream drop → reconnect snapshot empty → requestAssociation → confirm → turnComplete).
 
 - [ ] **Step 1: Failing reducer tests** (reject + snapshot association-gated).
 - [ ] **Step 2: Run red → impl → green.**
@@ -391,14 +411,16 @@ Persist a per-terminal pending-attention marker server-side so a completion that
 
 ## Task 9: De-advertise gemini/kimi (RC-1, decision 4)
 
-**Files:**
-- Modify: `src/lib/turn-complete-signal.ts` — remove `case 'gemini'` / `case 'kimi'` from `normalizeTurnCompleteSignalMode` so they fall to `'shell'`, agreeing with shared `supportsTurnSignal` (claude/codex only).
-- Modify: `AGENTS.md` (or `docs/`) — document gemini/kimi terminal modes as status-inert (no blue/green/sound) pending a real turn-complete signal.
-- Test: `test/unit/client/lib/turn-complete-signal.test.ts` — `extractTurnCompleteSignals('…\x07', 'gemini')` returns `count: 0`; same for `'kimi'`.
+> **NOTE (load-bearing `gemini-kimi-already-count-zero`):** `extractTurnCompleteSignals(..., 'gemini')` already returns `count: 0` because shared `supportsTurnSignal` is claude/codex-only. So removing the normalizer branches changes NO turn-complete behavior — it's a consistency/clarity refactor (stop the client implying a capability the shared gate rejects) + docs. The meaningful test is on the normalizer's mapping, so **export `normalizeTurnCompleteSignalMode`** and assert it.
 
-- [ ] **Step 1: Failing test** (gemini/kimi → count 0).
+**Files:**
+- Modify: `src/lib/turn-complete-signal.ts` — `export` `normalizeTurnCompleteSignalMode`; remove `case 'gemini'` / `case 'kimi'` so they fall to `'shell'`, agreeing with shared `supportsTurnSignal`.
+- Modify: `AGENTS.md` (or `docs/`) — document gemini/kimi terminal modes as status-inert (no blue/green/sound) pending a real turn-complete signal.
+- Test: `test/unit/client/lib/turn-complete-signal.test.ts` — `normalizeTurnCompleteSignalMode('gemini') === 'shell'` and `'kimi' === 'shell'` (post-change), while `'claude'`/`'codex'`/`'opencode'` are preserved. (Not a tautology: it pins the normalizer↔`supportsTurnSignal` contract.)
+
+- [ ] **Step 1: Failing test** — normalizer maps gemini/kimi → `'shell'` (currently returns `'gemini'`/`'kimi'` → red).
 - [ ] **Step 2: Run red → impl → green.**
-- [ ] **Step 3: Commit** — `fix(status): stop advertising gemini/kimi as status-capable`.
+- [ ] **Step 3: Commit** — `refactor(status): de-advertise gemini/kimi (normalizer↔supportsTurnSignal consistency)`.
 
 ---
 
@@ -427,11 +449,11 @@ Keep marking green (incl. active+idle). Make a **pane click** and a **real keyst
 
 - [ ] **Step 4: Run red.**
 
-- [ ] **Step 5: Impl**:
-  - `PaneContainer.handleFocus`: on focus, if the tab/pane has attention, `dispatch(clearPaneAttention({paneId}))` and `dispatch(clearTabAttention({tabId}))` — unconditionally (remove the `attentionDismiss==='click'` gate and the "only if this pane has attention" gate). Then `setActivePane`.
-  - `TerminalView.tsx`: add `sendInput(data, opts?: { synthetic?: boolean })`; pass `synthetic: true` from scroll-translation (`translateScrollLinesToInput`) and DECRQM auto-replies. For `term.onData` (real user typing), clear attention (pane+tab) when `data` contains a printable char (`/[^\x00-\x1f\x7f]/`) or CR/LF — in **both** modes. Remove the `attentionDismiss==='type'`-only gating for this clear.
-  - `FreshAgentView.tsx`: on send/submit of a real message, dispatch the same clear for its pane+tab.
-  - `TabItem.tsx`: `StatusDot` → `busy ? 'fill-blue-500' : getTerminalStatusDotClassName(status)` (drop `&& status==='running'`).
+- [ ] **Step 5: Impl** (load-bearing `sendinput-no-synthetic-clears-any-data-type-mode` + `tabitem-double-running-gate`):
+  - `PaneContainer.handleFocus` (`:346-352`): on focus, if the tab/pane has attention, `dispatch(clearPaneAttention({paneId}))` and `dispatch(clearTabAttention({tabId}))` — unconditionally (remove BOTH the `attentionDismiss==='click'` gate and the "only if this pane has attention" gate). Then `setActivePane`.
+  - `TerminalView.tsx`: the attention-clear currently lives INSIDE `sendInput` (`:662-676`, `'type'`-mode, any data), which is also called by scroll-translation (`:691`) and startup/DECRQM auto-replies (`:1081`). **Move the clear OUT of `sendInput`** into the `term.onData` handler (`:1426-1427`, real user typing): clear pane+tab attention when `data` contains a printable char (`/[^\x00-\x1f\x7f]/`) or CR/LF — in **both** modes. `sendInput` keeps a `{ synthetic?: boolean }` option only if still needed for other logic; the key change is that synthetic callers no longer clear because the clear no longer lives in `sendInput`.
+  - `FreshAgentView.tsx`: on send/submit of a real message, dispatch the same pane+tab clear.
+  - `TabItem.tsx`: drop `&& tab.status==='running'` at **BOTH** sites — the `StatusDot` internal (`:18`) AND the call site (`:72`) — so `busy ? 'fill-blue-500' : getTerminalStatusDotClassName(status)`.
 
 - [ ] **Step 6: Run green.**
 
@@ -443,7 +465,7 @@ Keep marking green (incl. active+idle). Make a **pane click** and a **real keyst
 
 **Files:**
 - Modify: `server/coding-cli/codex-activity-tracker.ts` — add `onTurnStarted(terminalId, at)` → `promoteBusy` immediately; `onTurnCompleted(terminalId, at)` → clear + emit turn.complete (reuses Task 2 emit). `reconcileProjects` stays as fallback.
-- Modify: `server/coding-cli/codex-activity-wiring.ts` (+ `server/terminal-registry.ts` `handleCodexTurnStarted` ~`:2016` / `onTurnStarted` wiring ~`:1697`) — feed the sidecar turn events into the tracker (currently received but not wired to the tracker).
+- Modify: `server/terminal-registry.ts` — tap the sidecar turn events **at the subscription callback (`:1697-1711`)**, calling `codexActivity.tracker.onTurnStarted/onTurnCompleted` there, BEFORE/independent of the durability early-returns inside `handleCodexTurnStarted`/`handleCodexTurnCompleted` (`:2023`, `:2053`) — otherwise `durable` sessions get no instant blue (load-bearing `codex-turn-event-gating`). The sidecar is present for terminal-mode codex (`codex-sidecar-turn-events-terminal-mode`); `reconcileProjects` stays as the fallback for any path without it.
 - Modify: `src/lib/pane-activity.ts` — codex branch returns busy for `phase === 'busy' || phase === 'pending'` (A). Ensure no-op pending decays to idle quickly (server sweep already flips pending→idle; verify the decay path so blue can't linger long-term).
 - Modify: `src/lib/pane-activity.ts` — `isFreshAgentBusy`/`isAgentChatBusy`: when `session == null`, return `false` (do not treat persisted `content.status` as live busy → kills reload blue flash).
 - Tests: codex tracker (`onTurnStarted` promotes busy instantly; `onTurnCompleted` emits turn.complete; no-op submit pending decays to idle → blue clears), pane-activity (`pending`→busy; `session==null`→not busy)
@@ -519,4 +541,19 @@ Manual acceptance checklist:
 
 **3. Type consistency:** `recordTurnComplete` keeps `{tabId,paneId,terminalId,at}` (SDK passes sessionKey as `terminalId`); `CodexTurnCompleteEvent` mirrors `ClaudeTurnCompleteEvent`; `provider` enum gains `'codex'` everywhere `TerminalTurnComplete` is used.
 
-**Known assumptions to validate in load-bearing:** (a) codex `onTurnStarted`/`onTurnCompleted` sidecar events exist and reach `terminal-registry.ts` for **terminal-mode** codex (not just fresh-codex); (b) emitting codex turn.complete from `transitionAfterTurnClear` + `transitionPendingAfterTurnClear` is exactly-once-per-turn and never double-fires with the JSONL reconcile or `onTurnCompleted`; (c) the durable-completion `at`/`seq` dedupe interacts correctly with the Task-1 monotonic guard across reconnect; (d) `selectPaneBySessionKey` key construction matches what the SDK slices actually store; (e) the no-op codex `pending` decays fast enough that A never yields a long-lived false-blue.
+## Load-bearing findings (resolved — validated by direct code inspection)
+
+All assumptions were validated by reading the actual code (the cheapest reliable method). Resolutions are folded into the tasks above:
+
+- **`sessionkey-shapes-match` (high):** fresh-agent slice-lookup key = `makeFreshAgentSessionKey(...)`; dedupe/selector key = `provider:sessionId`. Two namespaces — see Task 1 Step 6 callout.
+- **`codex-transitions-not-exactly-one-turn` + `codex-jsonl-bel-no-double` (high):** both clear-transitions re-arm to `pending` on queued submits, and there are 3 emit sources (BEL, JSONL, sidecar `onTurnCompleted`). Resolved by `maybeRecordCompletion` (emit only on →idle, per-turn dedupe via `lastEmittedTurnKey`) — Task 2 Step 3.
+- **`codex-pending-decay-no-emit` (medium):** pending decay does NOT emit — correct (no-op submits shouldn't green) — Task 2 Step 3.
+- **`codex-turn-event-gating` / `…-terminal-mode` (medium):** tap sidecar events at the subscription, before durability gates — Task 11.
+- **`sdk-status-idle-doesnt-clear-streaming` (high):** busy reads `streamingActive`; idle path must clear it — Task 6 callout.
+- **`no-unified-ready-activity-snapshot` + `monotonic-at-vs-seq-interaction` (high):** no ready-snapshot; piggyback on `*.activity.list.response` + ack; seq-based idempotency — Task 4 callout.
+- **`opencode-tracker-no-deadman-no-interval` (high):** `expire`/`lastObservedAt`/watchdog live in the tracker; interval injection added to the wiring — Task 5 callout.
+- **`reject-has-no-reason-param` (medium):** terminal-scoped reject-all-emits (omit sessionId); snapshot `knownBusy` needs a new emit — Task 7 callout.
+- **`gemini-kimi-already-count-zero` (low):** count already 0; Task 9 is a consistency refactor + docs; test the normalizer mapping — Task 9 callout.
+- **`sendinput-no-synthetic-clears-any-data-type-mode` + `tabitem-double-running-gate` (medium/low):** move clear into `term.onData`; edit both TabItem sites — Task 10 Step 5.
+- **`exports-missing-in-pane-activity` (low):** export 4 functions from `pane-activity.ts` — file map updated.
+- **`terminalid-only-dedupe-downstream`, `codex-tracker-has-no-turn-events`, `turn-complete-schema-provider-enum`, `opencode-record-removed-on-idle`, `authfail-handler-missing-opencode-reset` (confirmed):** the plan's assumptions hold as written.
