@@ -9,7 +9,7 @@ type HydrationEntry = {
 
 type HydrationQueue = {
   /** Register a tab that needs background hydration. */
-  register: (entry: HydrationEntry) => void
+  register: (entry: HydrationEntry, options?: { queueIfStarted?: boolean }) => void
   /** Unregister a tab (e.g., on unmount). */
   unregister: (paneId: string) => void
   /** Signal that the active tab's initial hydration is complete. Starts the queue. */
@@ -63,9 +63,13 @@ export function createHydrationQueue(): HydrationQueue {
   }
 
   return {
-    register(entry) {
+    register(entry, options) {
       if (disposed) return
       entries.set(entry.paneId, entry)
+      if (options?.queueIfStarted && started && activePane !== entry.paneId && !queue.includes(entry.paneId)) {
+        queue.push(entry.paneId)
+        advance()
+      }
     },
 
     unregister(paneId) {

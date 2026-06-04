@@ -19,3 +19,13 @@ export const TERMINAL_STREAM_RETRY_FLUSH_MS = Math.max(
   1,
   Number(process.env.TERMINAL_STREAM_RETRY_FLUSH_MS || 50),
 )
+
+export const TERMINAL_BACKGROUND_BUFFERED_PAUSE_BYTES = Math.max(
+  1024,
+  Number(process.env.TERMINAL_BACKGROUND_BUFFERED_PAUSE_BYTES || 512 * 1024),
+)
+
+export const TERMINAL_BACKGROUND_RETRY_FLUSH_MS = Math.max(
+  1,
+  Number(process.env.TERMINAL_BACKGROUND_RETRY_FLUSH_MS || 100),
+)

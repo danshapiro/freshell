@@ -37,6 +37,11 @@ import {
 } from '@/lib/terminal-restore'
 import { isTerminalPasteShortcut } from '@/lib/terminal-input-policy'
 import { clearTerminalCursor, loadTerminalCursor, saveTerminalCursor } from '@/lib/terminal-cursor'
+import {
+  resolveRevealAttachPlan,
+  type DeferredAttachReason,
+  type TerminalAttachPriority,
+} from '@/lib/terminal-attach-policy'
 import { paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import {
@@ -265,6 +270,7 @@ type DeferredAttachState = {
   mode: 'none' | 'waiting_for_geometry' | 'attaching' | 'live'
   pendingIntent: AttachIntent | null
   pendingSinceSeq: number
+  pendingReason: DeferredAttachReason
 }
 
 type LaunchAttemptState = {
@@ -470,6 +476,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const requestIdRef = useRef<string>(terminalContent?.createRequestId || '')
   const terminalIdRef = useRef<string | undefined>(terminalContent?.terminalId)
   const seqStateRef = useRef<AttachSeqState>(createAttachSeqState())
+  const renderedSeqRef = useRef(0)
+  const hasTrustedSurfaceRef = useRef(false)
   const attachCounterRef = useRef(0)
   const currentAttachRef = useRef<{
     requestId: string
@@ -497,6 +505,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     mode: 'none',
     pendingIntent: null,
     pendingSinceSeq: 0,
+    pendingReason: 'initial_hydrate',
   })
   const contentRef = useRef<TerminalPaneContent | null>(terminalContent)
   const providerBehaviorRef = useRef(providerBehavior)
@@ -504,20 +513,27 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const handledRefreshRequestIdRef = useRef<string | null>(null)
   const hasMountedRefreshEffectRef = useRef(false)
 
-  const applySeqState = useCallback((
-    nextState: AttachSeqState,
-    options?: { terminalId?: string; persistCursor?: boolean },
-  ) => {
-    const previousLastSeq = seqStateRef.current.lastSeq
+  const applySeqState = useCallback((nextState: AttachSeqState) => {
     seqStateRef.current = nextState
-    if (
-      options?.persistCursor
-      && options.terminalId
-      && nextState.lastSeq > 0
-      && nextState.lastSeq > previousLastSeq
-    ) {
-      saveTerminalCursor(options.terminalId, nextState.lastSeq)
+  }, [])
+
+  const resetRenderedSurface = useCallback((seq = 0) => {
+    renderedSeqRef.current = Math.max(0, Math.floor(Number.isFinite(seq) ? seq : 0))
+    hasTrustedSurfaceRef.current = false
+  }, [])
+
+  const markRenderedSeq = useCallback((terminalId: string | undefined, seq: number) => {
+    if (!terminalId || !Number.isFinite(seq)) return
+    const renderedSeq = Math.max(0, Math.floor(seq))
+    if (renderedSeq <= renderedSeqRef.current) {
+      if (renderedSeq > 0) {
+        hasTrustedSurfaceRef.current = true
+      }
+      return
     }
+    renderedSeqRef.current = renderedSeq
+    hasTrustedSurfaceRef.current = true
+    saveTerminalCursor(terminalId, renderedSeq)
   }, [])
 
   // Keep refs in sync with props
@@ -535,6 +551,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       }
       terminalIdRef.current = terminalContent.terminalId
       if (terminalContent.terminalId !== prevTerminalId) {
+        resetRenderedSurface()
         forgetSentViewport(prevTerminalId)
         const cachedViewport = terminalContent.terminalId
           ? lastSentViewportByTerminal.get(terminalContent.terminalId)
@@ -550,7 +567,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       requestIdRef.current = terminalContent.createRequestId
       contentRef.current = terminalContent
     }
-  }, [terminalContent, paneId, applySeqState])
+  }, [terminalContent, paneId, applySeqState, resetRenderedSurface])
 
   // Register terminal buffer accessor with test harness (for E2E tests).
   // Uses xterm.js Terminal.buffer.active API which works with all renderers
@@ -1050,6 +1067,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     mode: TerminalPaneContent['mode'],
     tid: string | undefined,
     allowReplies: boolean,
+    onRendered?: () => void,
   ) => {
     const startup = extractTerminalStartupProbes(raw, startupProbeStateRef.current, {
       foreground: resolvedThemeRef.current.foreground,
@@ -1076,7 +1094,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     }
 
     if (cleaned) {
-      enqueueTerminalWrite(cleaned)
+      enqueueTerminalWrite(cleaned, onRendered)
+    } else {
+      onRendered?.()
     }
 
     for (const event of osc.events) {
@@ -1604,6 +1624,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       mode: 'live',
       pendingIntent: null,
       pendingSinceSeq: 0,
+      pendingReason: 'initial_hydrate',
     }
     const queue = getHydrationQueue()
     if (hiddenRef.current) {
@@ -1612,6 +1633,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       queue.onActiveTabReady(tabId, tabOrderRef.current)
     }
   }, [paneId, tabId])
+
+  const registerForBackgroundHydration = useCallback((options?: { queueIfStarted?: boolean }) => {
+    if (hydrationRegisteredRef.current) return
+    hydrationRegisteredRef.current = true
+    const setBgTriggered = setBackgroundHydrationTriggered
+    getHydrationQueue().register({
+      tabId,
+      paneId: paneIdRef.current,
+      trigger: () => setBgTriggered(true),
+    }, options)
+  }, [tabId])
 
   const isCurrentAttachMessage = useCallback((msg: {
     type: string
@@ -1642,6 +1674,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       suppressNextMatchingResize?: boolean
       skipPreAttachFit?: boolean
       maxReplayBytes?: number
+      priority?: TerminalAttachPriority
+      sinceSeq?: number
     },
   ) => {
     if (suppressNetworkEffects) return
@@ -1660,14 +1694,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     setIsAttaching(true)
     setTruncatedHistoryGap(null)
 
-    const persistedSeq = loadTerminalCursor(tid)
-    const deltaSeq = Math.max(seqStateRef.current.lastSeq, persistedSeq)
+    const renderedSeq = hasTrustedSurfaceRef.current ? renderedSeqRef.current : 0
+    const deltaSeq = Math.max(0, Math.floor(opts?.sinceSeq ?? renderedSeq))
     const sinceSeq = intent === 'viewport_hydrate' ? 0 : deltaSeq
 
     // Startup probes must not leak across attach generations.
     resetStartupProbeParser()
 
     if (intent === 'viewport_hydrate') {
+      resetRenderedSurface()
       if (opts?.clearViewportFirst) {
         try {
           termRef.current?.clear()
@@ -1685,6 +1720,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       mode: 'attaching',
       pendingIntent: intent,
       pendingSinceSeq: sinceSeq,
+      pendingReason: opts?.priority === 'background' ? 'background_catchup' : 'initial_hydrate',
     }
 
     const attachRequestId = `${paneIdRef.current}:${++attachCounterRef.current}:${nanoid(6)}`
@@ -1708,11 +1744,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       rows,
       sinceSeq,
       attachRequestId,
+      priority: opts?.priority ?? 'foreground',
       ...(opts?.maxReplayBytes ? { maxReplayBytes: opts.maxReplayBytes } : {}),
     })
     rememberSentViewport(tid, cols, rows)
     lastSentViewportRef.current = { terminalId: tid, cols, rows }
-  }, [suppressNetworkEffects, ws, applySeqState, resetStartupProbeParser])
+  }, [suppressNetworkEffects, ws, applySeqState, resetRenderedSurface, resetStartupProbeParser])
 
   const runRefreshAttach = useCallback((request: PaneRefreshRequest | null | undefined) => {
     if (suppressNetworkEffects) return false
@@ -1733,6 +1770,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         mode: 'waiting_for_geometry',
         pendingIntent: 'viewport_hydrate',
         pendingSinceSeq: 0,
+        pendingReason: 'explicit_refresh',
       }
       setIsAttaching(false)
     } else {
@@ -1784,11 +1822,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           hydrationRegisteredRef.current = false
         }
         getHydrationQueue().onActiveTabChanged(tabId, tabOrderRef.current)
-        attachTerminal(tid, deferred.pendingIntent, {
-          clearViewportFirst: deferred.pendingIntent === 'viewport_hydrate',
+        const revealPlan = resolveRevealAttachPlan({
+          pendingIntent: deferred.pendingIntent,
+          pendingReason: deferred.pendingReason,
+          hasTrustedSurface: hasTrustedSurfaceRef.current,
+          renderedSeq: renderedSeqRef.current,
+        })
+        attachTerminal(tid, revealPlan.intent, {
+          clearViewportFirst: revealPlan.clearViewportFirst,
+          priority: revealPlan.priority,
+          ...(typeof revealPlan.sinceSeq === 'number' ? { sinceSeq: revealPlan.sinceSeq } : {}),
           suppressNextMatchingResize: true,
           skipPreAttachFit: true,
-          ...(deferred.pendingIntent === 'viewport_hydrate'
+          ...(revealPlan.intent === 'viewport_hydrate'
             ? viewportHydrateReplayOptions(contentRef.current)
             : undefined),
         })
@@ -1796,7 +1842,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       }
       requestTerminalLayout({ fit: true, resize: true })
     }
-  }, [hidden, isTerminal, requestTerminalLayout, attachTerminal])
+  }, [hidden, isTerminal, paneId, requestTerminalLayout, tabId, attachTerminal])
 
   // Background hydration: triggered by the hydration queue for hidden tabs
   useEffect(() => {
@@ -1804,7 +1850,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     setBackgroundHydrationTriggered(false)
     const tid = terminalIdRef.current
     if (!tid || !hiddenRef.current) return
-    attachTerminal(tid, 'viewport_hydrate', { clearViewportFirst: true })
+    if (hasTrustedSurfaceRef.current && renderedSeqRef.current > 0) {
+      attachTerminal(tid, 'keepalive_delta', {
+        clearViewportFirst: false,
+        priority: 'background',
+        sinceSeq: renderedSeqRef.current,
+      })
+      return
+    }
+    attachTerminal(tid, 'viewport_hydrate', {
+      clearViewportFirst: true,
+      priority: 'background',
+      ...viewportHydrateReplayOptions(contentRef.current),
+    })
   }, [backgroundHydrationTriggered, attachTerminal])
 
   // Create or attach to backend terminal
@@ -1924,6 +1982,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         mode: 'none',
         pendingIntent: null,
         pendingSinceSeq: 0,
+        pendingReason: 'initial_hydrate',
       }
       setIsAttaching(false)
       setTruncatedHistoryGap(null)
@@ -1971,6 +2030,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         mode: 'none',
         pendingIntent: null,
         pendingSinceSeq: 0,
+        pendingReason: 'initial_hydrate',
       }
       setIsAttaching(true)
       setTruncatedHistoryGap(null)
@@ -2000,6 +2060,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           mode: 'none',
           pendingIntent: null,
           pendingSinceSeq: 0,
+          pendingReason: 'initial_hydrate',
         }
         dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
         if (terminalId) {
@@ -2066,6 +2127,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
           if (tid && frameDecision.freshReset) {
             clearTerminalCursor(tid)
+            resetRenderedSurface()
           }
           let raw = msg.data || ''
           const mode = contentRef.current?.mode || 'shell'
@@ -2088,7 +2150,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             startupProbeStateRef.current = replayDiscard.resumeState
           }
           raw = replayDiscard.raw
-          handleTerminalOutput(raw, mode, tid, !frameOverlapsReplay)
+          const completedAttachOnFrame = !frameDecision.state.pendingReplay
+            && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
+          const completeRenderedFrame = () => {
+            markRenderedSeq(tid, frameDecision.state.lastSeq)
+            if (completedAttachOnFrame) {
+              setIsAttaching(false)
+              markAttachComplete()
+            }
+          }
+          handleTerminalOutput(raw, mode, tid, !frameOverlapsReplay, completeRenderedFrame)
+          if (completedAttachOnFrame && frameOverlapsReplay) {
+            resetStartupProbeParser({ discardReplayRemainder: true })
+          }
           if (
             raw.length > 0
             && !terminalFirstOutputMarkedRef.current
@@ -2103,16 +2177,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             })
             terminalFirstOutputMarkedRef.current = true
           }
-          applySeqState(frameDecision.state, { terminalId: tid, persistCursor: true })
-          const completedAttachOnFrame = !frameDecision.state.pendingReplay
-            && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
-          if (completedAttachOnFrame) {
-            if (frameOverlapsReplay) {
-              resetStartupProbeParser({ discardReplayRemainder: true })
-            }
-            setIsAttaching(false)
-            markAttachComplete()
-          }
+          applySeqState(frameDecision.state)
         }
 
         if (msg.type === 'terminal.output.gap' && msg.terminalId === tid) {
@@ -2157,7 +2222,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           }
           const previousSeqState = seqStateRef.current
           const nextSeqState = onOutputGap(previousSeqState, { fromSeq: msg.fromSeq, toSeq: msg.toSeq })
-          applySeqState(nextSeqState, { terminalId: tid, persistCursor: true })
+          applySeqState(nextSeqState)
+          markRenderedSeq(tid, nextSeqState.lastSeq)
           const completedAttachOnGap = !nextSeqState.pendingReplay
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           if (completedAttachOnGap) {
@@ -2206,10 +2272,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             replayFromSeq: msg.replayFromSeq,
             replayToSeq: msg.replayToSeq,
           })
-          applySeqState(nextSeqState, {
-            terminalId: tid,
-            persistCursor: !nextSeqState.pendingReplay,
-          })
+          applySeqState(nextSeqState)
           setIsAttaching(Boolean(nextSeqState.pendingReplay))
           if (!nextSeqState.pendingReplay) {
             markAttachComplete()
@@ -2291,6 +2354,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               mode: 'waiting_for_geometry',
               pendingIntent: 'viewport_hydrate',
               pendingSinceSeq: 0,
+              pendingReason: 'terminal_created',
             }
             setIsAttaching(false)
           } else {
@@ -2336,6 +2400,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             mode: 'none',
             pendingIntent: null,
             pendingSinceSeq: 0,
+            pendingReason: 'initial_hydrate',
           }
           dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
           clearTerminalCursor(tid)
@@ -2535,6 +2600,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
                 mode: 'none',
                 pendingIntent: null,
                 pendingSinceSeq: 0,
+                pendingReason: 'initial_hydrate',
               }
               applySeqState(createAttachSeqState())
               updateContent({
@@ -2575,6 +2641,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               mode: 'none',
               pendingIntent: null,
               pendingSinceSeq: 0,
+              pendingReason: 'initial_hydrate',
             }
             applySeqState(createAttachSeqState())
             updateContent({
@@ -2602,9 +2669,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         })
         if (!tid) return
         if (hiddenRef.current) {
-          deferredAttachStateRef.current = deferredAttachStateRef.current.mode === 'live'
-            ? { mode: 'waiting_for_geometry', pendingIntent: 'transport_reconnect', pendingSinceSeq: seqStateRef.current.lastSeq }
-            : { mode: 'waiting_for_geometry', pendingIntent: 'viewport_hydrate', pendingSinceSeq: 0 }
+          const canResumeFromRenderedSurface = hasTrustedSurfaceRef.current && renderedSeqRef.current > 0
+          deferredAttachStateRef.current = deferredAttachStateRef.current.mode === 'live' || canResumeFromRenderedSurface
+            ? {
+                mode: 'waiting_for_geometry',
+                pendingIntent: 'transport_reconnect',
+                pendingSinceSeq: renderedSeqRef.current,
+                pendingReason: 'transport_reconnect',
+              }
+            : {
+                mode: 'waiting_for_geometry',
+                pendingIntent: 'viewport_hydrate',
+                pendingSinceSeq: 0,
+                pendingReason: 'hidden_reveal',
+              }
+          registerForBackgroundHydration({ queueIfStarted: canResumeFromRenderedSurface })
           return
         }
         attachTerminal(tid, 'transport_reconnect')
@@ -2634,21 +2713,24 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
       if (currentTerminalId) {
         if (hiddenRef.current) {
-          deferredAttachStateRef.current = deferredAttachStateRef.current.mode === 'live'
-            ? { mode: 'waiting_for_geometry', pendingIntent: 'transport_reconnect', pendingSinceSeq: seqStateRef.current.lastSeq }
-            : { mode: 'waiting_for_geometry', pendingIntent: 'viewport_hydrate', pendingSinceSeq: 0 }
+          const canResumeFromRenderedSurface = hasTrustedSurfaceRef.current && renderedSeqRef.current > 0
+          deferredAttachStateRef.current = deferredAttachStateRef.current.mode === 'live' || canResumeFromRenderedSurface
+            ? {
+                mode: 'waiting_for_geometry',
+                pendingIntent: 'transport_reconnect',
+                pendingSinceSeq: renderedSeqRef.current,
+                pendingReason: 'transport_reconnect',
+              }
+            : {
+                mode: 'waiting_for_geometry',
+                pendingIntent: 'viewport_hydrate',
+                pendingSinceSeq: 0,
+                pendingReason: 'hidden_reveal',
+              }
           setIsAttaching(false)
 
           // Register with hydration queue for progressive background hydration
-          if (!hydrationRegisteredRef.current && deferredAttachStateRef.current.pendingIntent === 'viewport_hydrate') {
-            hydrationRegisteredRef.current = true
-            const setBgTriggered = setBackgroundHydrationTriggered
-            getHydrationQueue().register({
-              tabId,
-              paneId: paneIdRef.current,
-              trigger: () => setBgTriggered(true),
-            })
-          }
+          registerForBackgroundHydration()
         } else {
           const intent: AttachIntent = deferredAttachStateRef.current.mode === 'live'
             ? 'keepalive_delta'
@@ -2662,6 +2744,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           mode: 'none',
           pendingIntent: null,
           pendingSinceSeq: 0,
+          pendingReason: 'initial_hydrate',
         }
         sendCreate(createRequestId)
       }
@@ -2705,7 +2788,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     dispatch,
     handleTerminalOutput,
     attachTerminal,
+    markRenderedSeq,
     markAttachComplete,
+    registerForBackgroundHydration,
+    resetRenderedSurface,
     resetStartupProbeParser,
     runRefreshAttach,
     syncContentRefWithSessionAssociation,

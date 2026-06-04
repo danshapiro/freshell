@@ -7,6 +7,8 @@ import type { TerminalOutputRawEvent } from './registry-events.js'
 import { ClientOutputQueue, isGapEvent, type GapEvent } from './client-output-queue.js'
 import { ReplayRing, type ReplayFrame } from './replay-ring.js'
 import {
+  TERMINAL_BACKGROUND_BUFFERED_PAUSE_BYTES,
+  TERMINAL_BACKGROUND_RETRY_FLUSH_MS,
   TERMINAL_STREAM_BATCH_MAX_BYTES,
   TERMINAL_STREAM_RETRY_FLUSH_MS,
   TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES,
@@ -21,6 +23,7 @@ const CODING_CLI_MIN_REPLAY_RING_MAX_BYTES = Number(
 
 type PerfLevel = 'debug' | 'info' | 'warn' | 'error'
 type AttachIntent = 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect'
+type AttachPriority = 'foreground' | 'background'
 type PerfEventLogger = (
   event: TerminalStreamPerfEvent,
   context: Record<string, unknown>,
@@ -84,6 +87,7 @@ export class TerminalStreamBroker {
     sinceSeq: number | undefined,
     attachRequestId?: string,
     maxReplayBytes?: number,
+    priority: AttachPriority = 'foreground',
   ): Promise<'attached' | 'duplicate' | 'missing'> {
     const normalizedSinceSeq = sinceSeq === undefined || sinceSeq === 0 ? 0 : sinceSeq
     let result: 'attached' | 'duplicate' | 'missing' = 'attached'
@@ -127,7 +131,9 @@ export class TerminalStreamBroker {
       }
 
       attachment.mode = 'attaching'
+      attachment.priority = priority
       attachment.activeAttachRequestId = attachRequestId
+      attachment.replayCursor = null
       attachment.attachStaging = []
       attachment.queue.clear()
 
@@ -236,25 +242,17 @@ export class TerminalStreamBroker {
         }
       }
 
-      for (const frame of replayFrames) {
-        if (!this.sendFrame(ws, terminalId, frame, attachment.activeAttachRequestId)) return
-        attachment.lastSeq = Math.max(attachment.lastSeq, frame.seqEnd)
-      }
-
       const staged = attachment.attachStaging.filter((frame) => frame.seqStart > replayToSeq)
       attachment.attachStaging = []
+      attachment.replayCursor = replayFrames.length > 0
+        ? { nextSeq: replayFromSeq, toSeq: replayToSeq }
+        : null
       for (const frame of staged) {
-        if (!this.sendFrame(ws, terminalId, frame, attachment.activeAttachRequestId)) return
-        attachment.lastSeq = Math.max(attachment.lastSeq, frame.seqEnd)
+        attachment.queue.enqueue(frame)
       }
 
       attachment.mode = 'live'
-      const residual = attachment.attachStaging.filter((frame) => frame.seqStart > attachment.lastSeq)
-      attachment.attachStaging = []
-      for (const frame of residual) {
-        attachment.queue.enqueue(frame)
-      }
-      if (attachment.queue.pendingBytes() > 0) {
+      if (attachment.replayCursor || attachment.queue.pendingBytes() > 0) {
         this.scheduleFlush(terminalId, attachment)
       }
     })
@@ -357,7 +355,9 @@ export class TerminalStreamBroker {
       attachment = {
         ws,
         mode: 'live',
+        priority: 'foreground',
         queue: new ClientOutputQueue(),
+        replayCursor: null,
         attachStaging: [],
         lastSeq: 0,
         flushTimer: null,
@@ -421,9 +421,26 @@ export class TerminalStreamBroker {
         this.detach(terminalId, ws)
         return
       }
-      if (attachment.queue.pendingBytes() > 0) {
+      if (this.hasPendingAttachmentOutput(attachment)) {
         this.scheduleFlush(terminalId, attachment, TERMINAL_STREAM_RETRY_FLUSH_MS)
       }
+      return
+    }
+
+    const wsBuffered = ws.bufferedAmount as number | undefined
+    if (
+      attachment.priority === 'background'
+      && typeof wsBuffered === 'number'
+      && wsBuffered > TERMINAL_BACKGROUND_BUFFERED_PAUSE_BYTES
+    ) {
+      if (this.hasPendingAttachmentOutput(attachment)) {
+        this.scheduleFlush(terminalId, attachment, TERMINAL_BACKGROUND_RETRY_FLUSH_MS)
+      }
+      return
+    }
+
+    if (attachment.replayCursor) {
+      this.flushReplayCursor(terminalId, attachment)
       return
     }
 
@@ -469,6 +486,63 @@ export class TerminalStreamBroker {
     if (attachment.queue.pendingBytes() > 0) {
       this.scheduleFlush(terminalId, attachment)
     }
+  }
+
+  private flushReplayCursor(terminalId: string, attachment: BrokerClientAttachment): void {
+    const cursor = attachment.replayCursor
+    if (!cursor) return
+
+    const terminalState = this.terminals.get(terminalId)
+    if (!terminalState) {
+      attachment.replayCursor = null
+      return
+    }
+
+    const attachRequestId = attachment.activeAttachRequestId
+    const replay = terminalState.replayRing.replayBatchSince(
+      cursor.nextSeq - 1,
+      TERMINAL_STREAM_BATCH_MAX_BYTES,
+      cursor.toSeq,
+    )
+
+    if (replay.missedFromSeq !== undefined) {
+      const replayFromSeq = replay.frames.length > 0
+        ? replay.frames[0].seqStart
+        : Math.min(cursor.toSeq + 1, terminalState.replayRing.headSeq() + 1)
+      const missedToSeq = Math.min(cursor.toSeq, replayFromSeq - 1)
+      if (missedToSeq >= replay.missedFromSeq) {
+        if (!this.sendReplayGap(
+          attachment.ws,
+          terminalId,
+          replay.missedFromSeq,
+          missedToSeq,
+          attachRequestId,
+        )) return
+        attachment.lastSeq = Math.max(attachment.lastSeq, missedToSeq)
+        cursor.nextSeq = missedToSeq + 1
+      }
+    }
+
+    for (const frame of replay.frames) {
+      if (!this.sendFrame(attachment.ws, terminalId, frame, attachRequestId)) return
+      attachment.lastSeq = Math.max(attachment.lastSeq, frame.seqEnd)
+      cursor.nextSeq = frame.seqEnd + 1
+    }
+
+    if (cursor.nextSeq > cursor.toSeq || replay.frames.length === 0) {
+      attachment.replayCursor = null
+    }
+
+    if (this.hasPendingAttachmentOutput(attachment)) {
+      const replayFlushDelay = attachment.priority === 'foreground'
+        ? 0
+        : TERMINAL_STREAM_RETRY_FLUSH_MS
+      this.scheduleFlush(terminalId, attachment, replayFlushDelay)
+    }
+  }
+
+  private hasPendingAttachmentOutput(attachment: BrokerClientAttachment): boolean {
+    return Boolean(attachment.replayCursor) || attachment.queue.pendingBytes() > 0
   }
 
   private catastrophicBlocked(terminalId: string, attachment: BrokerClientAttachment): boolean {
@@ -555,6 +629,31 @@ export class TerminalStreamBroker {
       fromSeq: gap.fromSeq,
       toSeq: gap.toSeq,
       reason: gap.reason,
+      ...(attachRequestId ? { attachRequestId } : {}),
+    })
+  }
+
+  private sendReplayGap(
+    ws: LiveWebSocket,
+    terminalId: string,
+    fromSeq: number,
+    toSeq: number,
+    attachRequestId?: string,
+  ): boolean {
+    this.perfEventLogger('terminal_stream_gap', {
+      terminalId,
+      connectionId: ws.connectionId,
+      fromSeq,
+      toSeq,
+      reason: 'replay_window_exceeded',
+    }, 'warn')
+
+    return this.safeSend(ws, {
+      type: 'terminal.output.gap',
+      terminalId,
+      fromSeq,
+      toSeq,
+      reason: 'replay_window_exceeded',
       ...(attachRequestId ? { attachRequestId } : {}),
     })
   }

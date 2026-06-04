@@ -15,6 +15,7 @@ import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { useAppSelector } from '@/store/hooks'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import { __resetTerminalCursorCacheForTests } from '@/lib/terminal-cursor'
+import { resetHydrationQueueForTests } from '@/lib/hydration-queue'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { TERMINAL_CURSOR_STORAGE_KEY } from '@/store/storage-keys'
 import {
@@ -80,7 +81,9 @@ vi.mock('@xterm/xterm', () => {
     open = vi.fn()
     loadAddon = vi.fn()
     registerLinkProvider = vi.fn(() => ({ dispose: vi.fn() }))
-    write = vi.fn()
+    write = vi.fn((_data: string, onWritten?: () => void) => {
+      onWritten?.()
+    })
     writeln = vi.fn()
     clear = vi.fn()
     dispose = vi.fn()
@@ -245,6 +248,7 @@ describe('TerminalView lifecycle updates', () => {
     clearLocalStorageForTest()
     __resetTerminalCursorCacheForTests()
     __resetLastSentViewportCacheForTests()
+    resetHydrationQueueForTests()
     resetPersistedLayoutCacheForTests()
     resetPersistFlushListenersForTests()
     latestAttachRequestIdByTerminal.clear()
@@ -289,6 +293,7 @@ describe('TerminalView lifecycle updates', () => {
     vi.unstubAllGlobals()
     clearLocalStorageForTest()
     __resetTerminalCursorCacheForTests()
+    resetHydrationQueueForTests()
     delete window.__FRESHELL_TEST_HARNESS__
     requestAnimationFrameSpy?.mockRestore()
     cancelAnimationFrameSpy?.mockRestore()
@@ -4083,7 +4088,7 @@ describe('TerminalView lifecycle updates', () => {
       }))
     })
 
-    it('keeps reconnect attach on high-water cursor when reconnect fires during remount hydration', async () => {
+    it('keeps reconnect attach at zero during remount hydration until a rendered surface is trusted', async () => {
       setLocalStorageItemForTest(TERMINAL_CURSOR_STORAGE_KEY, JSON.stringify({
         'term-v2-reconnect-during-hydration': {
           seq: 11,
@@ -4121,12 +4126,12 @@ describe('TerminalView lifecycle updates', () => {
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'terminal.attach',
         terminalId,
-        sinceSeq: 11,
+        sinceSeq: 0,
         attachRequestId: expect.any(String),
       }))
     })
 
-    it('keeps viewport replay output when reconnect attach starts before the viewport replay arrives', async () => {
+    it('does not trust persisted high-water when reconnect starts before viewport replay renders', async () => {
       setLocalStorageItemForTest(TERMINAL_CURSOR_STORAGE_KEY, JSON.stringify({
         'term-v2-overlapping-attach-ready': {
           seq: 12,
@@ -4146,9 +4151,10 @@ describe('TerminalView lifecycle updates', () => {
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'terminal.attach',
         terminalId,
-        sinceSeq: 12,
+        sinceSeq: 0,
         attachRequestId: expect.any(String),
       }))
+      const reconnectAttachRequestId = latestAttachRequestIdForTerminal(terminalId)
 
       act(() => {
         messageHandler!({
@@ -4157,6 +4163,7 @@ describe('TerminalView lifecycle updates', () => {
           headSeq: 12,
           replayFromSeq: 1,
           replayToSeq: 12,
+          attachRequestId: reconnectAttachRequestId,
         })
         messageHandler!({
           type: 'terminal.output',
@@ -4164,6 +4171,7 @@ describe('TerminalView lifecycle updates', () => {
           seqStart: 1,
           seqEnd: 1,
           data: 'history-1',
+          attachRequestId: reconnectAttachRequestId,
         })
         messageHandler!({
           type: 'terminal.output',
@@ -4171,6 +4179,7 @@ describe('TerminalView lifecycle updates', () => {
           seqStart: 6,
           seqEnd: 6,
           data: 'history-6',
+          attachRequestId: reconnectAttachRequestId,
         })
         messageHandler!({
           type: 'terminal.output',
@@ -4178,6 +4187,7 @@ describe('TerminalView lifecycle updates', () => {
           seqStart: 12,
           seqEnd: 12,
           data: 'history-12',
+          attachRequestId: reconnectAttachRequestId,
         })
       })
 
@@ -4187,7 +4197,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(writes).toContain('history-12')
     })
 
-    it('preserves persisted high-water when a hydration replay starts at sequence 1', async () => {
+    it('uses rendered replay high-water when persisted cursor is ahead of a fresh hydrate', async () => {
       setLocalStorageItemForTest(TERMINAL_CURSOR_STORAGE_KEY, JSON.stringify({
         'term-v2-seq-reset': {
           seq: 12,
@@ -4207,7 +4217,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'terminal.attach',
         terminalId,
-        sinceSeq: 12,
+        sinceSeq: 3,
         attachRequestId: expect.any(String),
       }))
     })
@@ -4280,7 +4290,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(attach).not.toHaveProperty('maxReplayBytes')
     })
 
-    it('revealing a hidden running pane sends a viewport attach with sinceSeq=0', async () => {
+    it('revealing an untrusted hidden running pane sends a viewport attach with sinceSeq=0', async () => {
       const { store, tabId, paneId, terminalId, rerender } = await renderTerminalHarness({
         status: 'running',
         terminalId: 'term-bootstrap-gap',
@@ -4305,6 +4315,129 @@ describe('TerminalView lifecycle updates', () => {
       })
       expect(attach?.sinceSeq).toBe(0)
       expect(attach?.attachRequestId).toBeTruthy()
+    })
+
+    it('revealing a trusted hidden running pane reconnects from rendered high-water without clearing', async () => {
+      const { store, tabId, paneId, terminalId, rerender, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-warm-reveal-rendered',
+        clearSends: false,
+      })
+
+      const initialAttachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      expect(initialAttachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 0,
+          replayFromSeq: 1,
+          replayToSeq: 0,
+          attachRequestId: initialAttachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 3,
+          data: 'rendered-before-hide',
+          attachRequestId: initialAttachRequestId,
+        })
+      })
+
+      expect(term.write.mock.calls.map(([data]: [string]) => data).join('')).toContain('rendered-before-hide')
+      wsMocks.send.mockClear()
+      term.clear.mockClear()
+
+      const readPaneContent = () => {
+        const layout = store.getState().panes.layouts[tabId]
+        return layout && layout.type === 'leaf' && layout.content.kind === 'terminal' ? layout.content : null
+      }
+      const renderVisibility = (isHidden: boolean) => (
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={readPaneContent()!} hidden={isHidden} />
+        </Provider>
+      )
+
+      rerender(
+        renderVisibility(true),
+      )
+      reconnectHandler?.()
+
+      rerender(
+        renderVisibility(false),
+      )
+
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'terminal.attach',
+          terminalId,
+          intent: 'transport_reconnect',
+          sinceSeq: 3,
+          priority: 'foreground',
+          attachRequestId: expect.any(String),
+        }))
+      })
+      expect(term.clear).not.toHaveBeenCalled()
+    })
+
+    it('background hydrates a trusted hidden reconnect from rendered high-water with background priority', async () => {
+      const { store, tabId, paneId, terminalId, rerender, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-background-rendered',
+        clearSends: false,
+      })
+
+      const initialAttachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      expect(initialAttachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 0,
+          replayFromSeq: 1,
+          replayToSeq: 0,
+          attachRequestId: initialAttachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 3,
+          data: 'rendered-before-background',
+          attachRequestId: initialAttachRequestId,
+        })
+      })
+
+      expect(term.write.mock.calls.map(([data]: [string]) => data).join('')).toContain('rendered-before-background')
+      wsMocks.send.mockClear()
+
+      const readPaneContent = () => {
+        const layout = store.getState().panes.layouts[tabId]
+        return layout && layout.type === 'leaf' && layout.content.kind === 'terminal' ? layout.content : null
+      }
+      rerender(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={readPaneContent()!} hidden />
+        </Provider>,
+      )
+
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'terminal.attach',
+          terminalId,
+          intent: 'keepalive_delta',
+          sinceSeq: 3,
+          priority: 'background',
+          attachRequestId: expect.any(String),
+        }))
+      })
     })
 
     it('recreates a restored OpenCode pane when visible viewport hydration cannot replay startup output', async () => {
@@ -4735,7 +4868,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(writes).toContain('LIVE')
     })
 
-    it('updates attach sequence from terminal.attach.ready after terminal.created (broker no-replay sentinel)', async () => {
+    it('does not trust terminal.attach.ready head sequence until output renders', async () => {
       const { requestId, term } = await renderTerminalHarness({ status: 'creating' })
 
       act(() => {
@@ -4767,7 +4900,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'terminal.attach',
         terminalId: 'term-v2-created',
-        sinceSeq: 7,
+        sinceSeq: 0,
         attachRequestId: expect.any(String),
       }))
     })

@@ -272,6 +272,11 @@ export const TerminalAttachIntentSchema = z.enum([
   'transport_reconnect',
 ])
 
+export const TerminalAttachPrioritySchema = z.enum([
+  'foreground',
+  'background',
+])
+
 export const TerminalAttachSchema = z.object({
   type: z.literal('terminal.attach'),
   terminalId: z.string().min(1),
@@ -279,6 +284,7 @@ export const TerminalAttachSchema = z.object({
   maxReplayBytes: z.number().int().positive().optional(),
   attachRequestId: z.string().min(1).optional(),
   intent: TerminalAttachIntentSchema,
+  priority: TerminalAttachPrioritySchema.optional(),
   cols: z.number().int().min(2).max(1000),
   rows: z.number().int().min(2).max(500),
 })
