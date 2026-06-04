@@ -14,6 +14,8 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - Always work in a worktree (in \.worktrees\)
 - Before creating a new worktree, ensure the repo-supported test suite is green on the intended base. If the suite is not green, pause before creating the worktree and notify the user with the failing command and failure summary.
 - New behavior changes start on a worktree branch from `origin/main` and are submitted as PRs to `origin/main`; local `dev` only consumes PR heads.
+- Everything goes through a PR — never push behavior changes directly to `origin/main`.
+- Merge PRs once their required checks pass; self-merging your own PRs is the norm. The only exception is a PR the user has said needs someone else to approve it first — leave those unmerged.
 - Many agents may be working in the worktree at the same time. If you see activity from other agents (for example test runs or file changes), respect it.
 - Specific user instructions override ALL other instructions, including the above, and including superpowers or skills
 - Server uses NodeNext/ESM; relative imports must include `.js` extensions
@@ -40,7 +42,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - If applying a PR to `dev` needs semantic conflict resolution, stop and fix the PR branch or create a replacement PR. Do not hide behavior changes in a local-only `dev` merge commit.
 - Never run `git merge` directly on `main`.
 - Never reset, force-push, or fast-forward local `main` during ordinary work. If the user explicitly asks to refresh the mirror, first verify Freshell is self-hosting from `dev` and local `main` has no work to preserve.
-- We cannot approve our own PRs. `dev` may contain unapproved pending work, but `origin/main` changes still require independent review.
+- Self-merge is the norm: once a PR's required checks pass, merge it rather than waiting for outside review. `dev` may carry pending PR heads that haven't merged yet, which is fine. The only PRs to leave unmerged are ones the user has flagged as needing someone else's approval first.
 
 ## Process Safety (CRITICAL)
 
