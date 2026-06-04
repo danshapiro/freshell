@@ -6,7 +6,7 @@ import { nanoid } from 'nanoid'
 import { broadcastPersistedRaw } from './persistBroadcast'
 import { isWellFormedPaneTree } from './paneTreeValidation.js'
 import { PANES_SCHEMA_VERSION, LAYOUT_SCHEMA_VERSION, parsePersistedLayoutRaw } from './persistedState.js'
-import { LAYOUT_STORAGE_KEY, PANES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from './storage-keys'
+import { LAYOUT_STORAGE_KEY, PANES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY, TURN_COMPLETION_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 import { flushPersistedLayoutNow } from './persistControl'
 import { sanitizeSessionRef } from '@shared/session-contract'
@@ -19,6 +19,7 @@ import {
   type TabRecencyState,
 } from './tabRecencySlice'
 import { migrateLegacyFreshAgentContent } from '@shared/fresh-agent'
+import type { TurnCompletionState } from './turnCompletionSlice'
 
 
 const log = createLogger('PanesPersist')
@@ -434,6 +435,7 @@ type PersistState = {
   tabs?: TabsState
   panes?: PanesState
   tabRecency?: TabRecencyState
+  turnCompletion?: TurnCompletionState
 }
 
 export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
@@ -441,6 +443,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
   let panesDirty = false
   let tabRecencyDirty = false
   let tabRecencyPruneDirty = false
+  let turnCompletionDirty = false
   let flushTimer: ReturnType<typeof setTimeout> | null = null
 
   const canUseStorage = () => typeof localStorage !== 'undefined'
@@ -448,7 +451,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
   const flush = () => {
     flushTimer = null
     if (!canUseStorage()) return
-    if (!tabsDirty && !panesDirty && !tabRecencyDirty) return
+    if (!tabsDirty && !panesDirty && !tabRecencyDirty && !turnCompletionDirty) return
 
     const state = store.getState()
 
@@ -522,6 +525,17 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
         localStorage.setItem(TAB_RECENCY_STORAGE_KEY, rawTabRecency)
         broadcastPersistedRaw(TAB_RECENCY_STORAGE_KEY, rawTabRecency)
       }
+
+      if (turnCompletionDirty) {
+        const rawTurnCompletion = JSON.stringify({
+          version: 1,
+          attentionByTab: state.turnCompletion?.attentionByTab ?? {},
+          attentionByPane: state.turnCompletion?.attentionByPane ?? {},
+          lastAppliedCompletionSeqByTerminalId: state.turnCompletion?.lastAppliedCompletionSeqByTerminalId ?? {},
+        })
+        localStorage.setItem(TURN_COMPLETION_STORAGE_KEY, rawTurnCompletion)
+        broadcastPersistedRaw(TURN_COMPLETION_STORAGE_KEY, rawTurnCompletion)
+      }
     } catch (err) {
       log.error('Failed to save to localStorage:', err)
     }
@@ -530,6 +544,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
     panesDirty = false
     tabRecencyDirty = false
     tabRecencyPruneDirty = false
+    turnCompletionDirty = false
   }
 
   const scheduleFlush = () => {
@@ -565,6 +580,11 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
       const tabsChanged = state.tabs !== previousState.tabs
       const panesChanged = state.panes !== previousState.panes
       const tabRecencyChanged = state.tabRecency !== previousState.tabRecency
+      const turnCompletionChanged = (
+        state.turnCompletion?.attentionByTab !== previousState.turnCompletion?.attentionByTab
+        || state.turnCompletion?.attentionByPane !== previousState.turnCompletion?.attentionByPane
+        || state.turnCompletion?.lastAppliedCompletionSeqByTerminalId !== previousState.turnCompletion?.lastAppliedCompletionSeqByTerminalId
+      )
 
       if (a.type.startsWith('tabs/') && tabsChanged) {
         tabsDirty = true
@@ -579,6 +599,10 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
         if (a.type === prunePaneTabActivityToLiveTerminalPanes.type) {
           tabRecencyPruneDirty = true
         }
+        scheduleFlush()
+      }
+      if (turnCompletionChanged) {
+        turnCompletionDirty = true
         scheduleFlush()
       }
     }

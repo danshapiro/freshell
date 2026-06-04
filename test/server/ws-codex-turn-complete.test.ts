@@ -115,11 +115,12 @@ describe('ws codex turn.complete (server-authoritative)', () => {
   it('wires a real tracker so codex turn.complete fires once per turn and not on reattach/replay', async () => {
     // Wire the tracker EXACTLY as server/index.ts does.
     const tracker = new CodexActivityTracker()
-    const onTurnComplete = (payload: { terminalId: string; at: number; sessionId?: string }) => {
+    const onTurnComplete = (payload: { terminalId: string; at: number; sessionId?: string; completionSeq: number }) => {
       wsHandler.broadcastTerminalTurnComplete({
         provider: 'codex',
         terminalId: payload.terminalId,
         at: payload.at,
+        completionSeq: payload.completionSeq,
         ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
       })
     }
@@ -154,6 +155,7 @@ describe('ws codex turn.complete (server-authoritative)', () => {
       terminalId: 't1',
       sessionId: 's1',
       at: 3_000,
+      completionSeq: 1,
     })
     expect(turnCompletes).toHaveLength(1)
 

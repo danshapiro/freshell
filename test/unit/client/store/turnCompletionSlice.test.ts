@@ -13,6 +13,7 @@ import panesReducer from '@/store/panesSlice'
 import tabsReducer, { closePaneWithCleanup, closeTab } from '@/store/tabsSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import type { PaneNode } from '@/store/paneTypes'
+import { applyServerCompletion } from '@/store/turnCompletionThunks'
 
 describe('turnCompletionSlice', () => {
   it('records latest event with sequence id', () => {
@@ -76,6 +77,92 @@ describe('turnCompletionSlice', () => {
     expect(state.pendingEvents).toHaveLength(2)
   })
 
+  it('dedupes server completions by per-terminal completionSeq while keeping local pending-event seq separate', () => {
+    let state = reducer(
+      undefined,
+      recordTurnComplete({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        terminalId: 'term-1',
+        at: 1_000,
+        completionSeq: 7,
+      }),
+    )
+
+    expect(state.pendingEvents).toEqual([{
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      terminalId: 'term-1',
+      at: 1_000,
+      completionSeq: 7,
+      seq: 1,
+    }])
+    expect(state.lastAppliedCompletionSeqByTerminalId?.['term-1']).toBe(7)
+
+    state = reducer(
+      state,
+      recordTurnComplete({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        terminalId: 'term-1',
+        at: 1_100,
+        completionSeq: 7,
+      }),
+    )
+    state = reducer(
+      state,
+      recordTurnComplete({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        terminalId: 'term-1',
+        at: 1_200,
+        completionSeq: 6,
+      }),
+    )
+
+    expect(state.pendingEvents).toHaveLength(1)
+    expect(state.seq).toBe(1)
+
+    state = reducer(
+      state,
+      recordTurnComplete({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        terminalId: 'term-1',
+        at: 1_300,
+        completionSeq: 8,
+      }),
+    )
+
+    expect(state.pendingEvents).toHaveLength(2)
+    expect(state.pendingEvents[1]?.seq).toBe(2)
+    expect(state.lastAppliedCompletionSeqByTerminalId?.['term-1']).toBe(8)
+  })
+
+  it('drops a server completion that is already covered by rehydrated completionSeq state', () => {
+    const state = reducer(
+      {
+        seq: 0,
+        lastAtByTerminalId: {},
+        lastAppliedCompletionSeqByTerminalId: { 'term-1': 9 },
+        pendingEvents: [],
+        attentionByTab: {},
+        attentionByPane: {},
+      },
+      recordTurnComplete({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        terminalId: 'term-1',
+        at: 1_000,
+        completionSeq: 9,
+      }),
+    )
+
+    expect(state.pendingEvents).toEqual([])
+    expect(state.seq).toBe(0)
+    expect(state.lastAppliedCompletionSeqByTerminalId?.['term-1']).toBe(9)
+  })
+
   it('consumes pending events up through the handled sequence', () => {
     let state = reducer(
       undefined,
@@ -114,6 +201,7 @@ describe('turnCompletionSlice', () => {
     const initial: TurnCompletionState = {
       seq: 0,
       lastAtByTerminalId: {},
+      lastAppliedCompletionSeqByTerminalId: {},
       pendingEvents: [],
       attentionByTab: {},
       attentionByPane: {},
@@ -188,6 +276,8 @@ describe('turnCompletionSlice', () => {
           turnCompletion: {
             seq: 0,
             pendingEvents: [],
+            lastAtByTerminalId: {},
+            lastAppliedCompletionSeqByTerminalId: {},
             attentionByTab: { 'tab-1': true },
             attentionByPane: { 'pane-1': true, 'pane-2': true },
           },
@@ -238,6 +328,100 @@ describe('turnCompletionSlice', () => {
       await store.dispatch(closeTab('tab-1'))
       // Unrelated tab's attention is untouched
       expect(store.getState().turnCompletion.attentionByTab['tab-99']).toBe(true)
+    })
+  })
+
+  describe('applyServerCompletion thunk', () => {
+    function createTerminalStore(terminalId = 'term-1') {
+      const now = Date.now()
+      return configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+          settings: settingsReducer,
+          turnCompletion: reducer,
+        },
+        preloadedState: {
+          tabs: {
+            tabs: [{ id: 'tab-1', createRequestId: 'req-1', title: 'Tab 1', status: 'running' as const, mode: 'opencode' as const, shell: 'system' as const, createdAt: now }],
+            activeTabId: 'tab-1',
+            renameRequestTabId: null,
+          },
+          panes: {
+            layouts: {
+              'tab-1': {
+                type: 'leaf' as const,
+                id: 'pane-1',
+                content: {
+                  kind: 'terminal' as const,
+                  createRequestId: 'cr-1',
+                  status: 'running' as const,
+                  mode: 'opencode' as const,
+                  shell: 'system' as const,
+                  terminalId,
+                },
+              },
+            },
+            activePane: { 'tab-1': 'pane-1' },
+            paneTitles: {},
+            paneTitleSetByUser: {},
+            renameRequestTabId: null,
+            renameRequestPaneId: null,
+            zoomedPane: {},
+            refreshRequestsByPane: {},
+          },
+          settings: { settings: defaultSettings, loaded: true },
+          turnCompletion: {
+            seq: 0,
+            lastAtByTerminalId: {},
+            lastAppliedCompletionSeqByTerminalId: {},
+            pendingEvents: [],
+            attentionByTab: {},
+            attentionByPane: {},
+          },
+        },
+      })
+    }
+
+    it('resolves the owning pane and applies a newer server completion once', () => {
+      const store = createTerminalStore()
+
+      store.dispatch(applyServerCompletion({
+        provider: 'opencode',
+        terminalId: 'term-1',
+        at: 1_000,
+        completionSeq: 3,
+      }) as any)
+      store.dispatch(applyServerCompletion({
+        provider: 'opencode',
+        terminalId: 'term-1',
+        at: 1_100,
+        completionSeq: 3,
+      }) as any)
+
+      expect(store.getState().turnCompletion.pendingEvents).toEqual([{
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        terminalId: 'term-1',
+        at: 1_000,
+        completionSeq: 3,
+        seq: 1,
+      }])
+      expect(store.getState().turnCompletion.lastAppliedCompletionSeqByTerminalId?.['term-1']).toBe(3)
+    })
+
+    it('does not consume server completionSeq when no pane owns the terminal yet', () => {
+      const store = createTerminalStore('term-owned')
+
+      store.dispatch(applyServerCompletion({
+        provider: 'codex',
+        terminalId: 'term-missing',
+        at: 1_000,
+        completionSeq: 1,
+      }) as any)
+
+      expect(store.getState().turnCompletion.pendingEvents).toEqual([])
+      expect(store.getState().turnCompletion.lastAppliedCompletionSeqByTerminalId?.['term-missing']).toBeUndefined()
     })
   })
 })

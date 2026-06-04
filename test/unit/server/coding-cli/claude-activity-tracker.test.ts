@@ -40,7 +40,12 @@ describe('ClaudeActivityTracker', () => {
     tracker.noteOutput({ terminalId: 't1', data: '\x07', at: 3000 })
     expect(tracker.getActivity('t1')?.phase).toBe('idle')
     expect(completions).toHaveLength(1)
-    expect(completions[0]).toMatchObject({ terminalId: 't1', at: 3000 })
+    expect(completions[0]).toMatchObject({ terminalId: 't1', at: 3000, completionSeq: 1 })
+    expect(tracker.listLatestCompletions()).toEqual([{
+      terminalId: 't1',
+      at: 3000,
+      completionSeq: 1,
+    }])
   })
 
   it('ignores a BEL while idle (false-positive guard)', () => {
@@ -70,6 +75,12 @@ describe('ClaudeActivityTracker', () => {
     tracker.noteOutput({ terminalId: 't1', data: '\x07', at: 4000 })
     expect(tracker.getActivity('t1')?.phase).toBe('idle')
     expect(completions).toHaveLength(2)
+    expect(completions.map((completion) => completion.completionSeq)).toEqual([1, 2])
+    expect(tracker.listLatestCompletions()).toEqual([{
+      terminalId: 't1',
+      at: 4000,
+      completionSeq: 2,
+    }])
   })
 
   it('self-heals a stuck-busy terminal after the deadman', () => {

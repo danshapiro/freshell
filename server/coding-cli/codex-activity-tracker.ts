@@ -6,6 +6,7 @@ import {
   isSubmitInput,
   type TurnCompleteSignalParserState,
 } from '../../shared/turn-complete-signal.js'
+import type { TerminalTurnCompletionSnapshot } from '../../shared/ws-protocol.js'
 import type {
   CodexTurnCompletedEvent,
   CodexTurnStartedEvent,
@@ -50,6 +51,7 @@ export type CodexTurnCompleteEvent = {
   terminalId: string
   sessionId?: string
   at: number
+  completionSeq: number
 }
 
 export type CodexActivityChange = {
@@ -93,6 +95,8 @@ function buildProjectIndex(projects: ProjectGroup[]): Map<string, CodingCliSessi
 
 export class CodexActivityTracker extends EventEmitter {
   private readonly states = new Map<string, CodexTerminalActivity>()
+  private readonly completionSeqByTerminalId = new Map<string, number>()
+  private readonly latestCompletions = new Map<string, TerminalTurnCompletionSnapshot>()
   private pendingCompletions: CodexTurnCompleteEvent[] = []
 
   list(): CodexActivityRecord[] {
@@ -101,6 +105,10 @@ export class CodexActivityTracker extends EventEmitter {
 
   getActivity(terminalId: string): CodexTerminalActivity | undefined {
     return this.states.get(terminalId)
+  }
+
+  listLatestCompletions(): TerminalTurnCompletionSnapshot[] {
+    return Array.from(this.latestCompletions.values())
   }
 
   isPromptBlocked(terminalId: string, at?: number): boolean {
@@ -436,11 +444,11 @@ export class CodexActivityTracker extends EventEmitter {
     if (state.phase !== 'idle') return
     if (state.lastEmittedTurnKey === turnKey) return
     state.lastEmittedTurnKey = turnKey
-    this.pendingCompletions.push({
+    this.pendingCompletions.push(this.recordTurnCompletion({
       terminalId: state.terminalId,
       ...(state.sessionId ? { sessionId: state.sessionId } : {}),
       at,
-    })
+    }))
   }
 
   private flushCompletions(): void {
@@ -449,6 +457,24 @@ export class CodexActivityTracker extends EventEmitter {
     this.pendingCompletions = []
     for (const completion of out) {
       this.emit('turn.complete', completion)
+    }
+  }
+
+  private recordTurnCompletion(input: {
+    terminalId: string
+    sessionId?: string
+    at: number
+  }): CodexTurnCompleteEvent {
+    const completionSeq = (this.completionSeqByTerminalId.get(input.terminalId) ?? 0) + 1
+    this.completionSeqByTerminalId.set(input.terminalId, completionSeq)
+    this.latestCompletions.set(input.terminalId, {
+      terminalId: input.terminalId,
+      at: input.at,
+      completionSeq,
+    })
+    return {
+      ...input,
+      completionSeq,
     }
   }
 

@@ -65,8 +65,7 @@ import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-asso
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
 import { setClaudeActivitySnapshot, upsertClaudeActivity, removeClaudeActivity, resetClaudeActivity } from '@/store/claudeActivitySlice'
 import { setOpencodeActivitySnapshot, upsertOpencodeActivity, removeOpencodeActivity, resetOpencodeActivity } from '@/store/opencodeActivitySlice'
-import { recordTurnComplete } from '@/store/turnCompletionSlice'
-import { selectTabPaneByTerminalId } from '@/store/selectors/paneTerminalSelectors'
+import { applyServerCompletion } from '@/store/turnCompletionThunks'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
@@ -955,6 +954,14 @@ export default function App() {
             terminals: msg.terminals || [],
             requestSeq,
           }))
+          for (const completion of msg.latestTurnCompletions || []) {
+            dispatch(applyServerCompletion({
+              provider: 'codex',
+              terminalId: completion.terminalId,
+              at: completion.at,
+              completionSeq: completion.completionSeq,
+            }) as any)
+          }
         }
         if (msg.type === 'codex.activity.updated') {
           const mutationSeq = ++codexActivityOrderRef.current
@@ -984,6 +991,14 @@ export default function App() {
             terminals: msg.terminals || [],
             requestSeq,
           }))
+          for (const completion of msg.latestTurnCompletions || []) {
+            dispatch(applyServerCompletion({
+              provider: 'claude',
+              terminalId: completion.terminalId,
+              at: completion.at,
+              completionSeq: completion.completionSeq,
+            }) as any)
+          }
         }
         if (msg.type === 'claude.activity.updated') {
           const mutationSeq = ++claudeActivityOrderRef.current
@@ -1013,6 +1028,14 @@ export default function App() {
             terminals: msg.terminals || [],
             requestSeq,
           }))
+          for (const completion of msg.latestTurnCompletions || []) {
+            dispatch(applyServerCompletion({
+              provider: 'opencode',
+              terminalId: completion.terminalId,
+              at: completion.at,
+              completionSeq: completion.completionSeq,
+            }) as any)
+          }
         }
         if (msg.type === 'opencode.activity.updated') {
           const mutationSeq = ++opencodeActivityOrderRef.current
@@ -1035,16 +1058,14 @@ export default function App() {
         if (msg.type === 'terminal.turn.complete') {
           const terminalId = typeof msg.terminalId === 'string' ? msg.terminalId : ''
           const at = typeof msg.at === 'number' ? msg.at : Date.now()
-          if (terminalId) {
-            const location = selectTabPaneByTerminalId(appStore.getState(), terminalId)
-            if (location) {
-              dispatch(recordTurnComplete({
-                tabId: location.tabId,
-                paneId: location.paneId,
-                terminalId,
-                at,
-              }))
-            }
+          const completionSeq = typeof msg.completionSeq === 'number' ? msg.completionSeq : undefined
+          if (terminalId && completionSeq !== undefined) {
+            dispatch(applyServerCompletion({
+              provider: msg.provider,
+              terminalId,
+              at,
+              completionSeq,
+            }) as any)
           }
         }
         if (msg.type === 'terminal.exit') {

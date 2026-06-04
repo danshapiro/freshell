@@ -1010,7 +1010,12 @@ describe('CodexActivityTracker', () => {
       tracker.reconcileProjects(createProjects(createSession('session-1', { latestTaskStartedAt: 1_150 })), 1_200)
       tracker.noteOutput({ terminalId: 'term-1', data: '\x07', at: 1_250 })
 
-      expect(events).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_250 }])
+      expect(events).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_250, completionSeq: 1 }])
+      expect(tracker.listLatestCompletions()).toEqual([{
+        terminalId: 'term-1',
+        at: 1_250,
+        completionSeq: 1,
+      }])
     })
 
     it('promotes busy from app-server turn started and clears from turn completed', () => {
@@ -1035,7 +1040,7 @@ describe('CodexActivityTracker', () => {
         lastSeenTaskCompletedAt: 1_200,
       })
       expect(tracker.getActivity('term-1')?.acceptedStartAt).toBeUndefined()
-      expect(events).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_200 }])
+      expect(events).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_200, completionSeq: 1 }])
     })
 
     it('does not double-emit when app-server completion is followed by BEL and JSONL completion', () => {
@@ -1051,7 +1056,7 @@ describe('CodexActivityTracker', () => {
         latestTaskCompletedAt: 1_220,
       })), 1_300)
 
-      expect(events).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_200 }])
+      expect(events).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_200, completionSeq: 1 }])
       expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'idle' })
     })
 
@@ -1068,7 +1073,7 @@ describe('CodexActivityTracker', () => {
         lastClearedAt: 1_200,
         lastSeenTaskCompletedAt: 1_200,
       })
-      expect(events).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_200 }])
+      expect(events).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_200, completionSeq: 1 }])
     })
 
     it('does not emit completion when a no-op pending submit decays to idle', () => {
@@ -1103,7 +1108,7 @@ describe('CodexActivityTracker', () => {
       tracker.reconcileProjects(createProjects(createSession('session-1', { latestTaskStartedAt: 1_150 })), 1_200)
       tracker.reconcileProjects(createProjects(createSession('session-1', { latestTaskStartedAt: 1_150, latestTaskCompletedAt: 1_175 })), 1_300)
 
-      expect(events).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_300 }])
+      expect(events).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_300, completionSeq: 1 }])
     })
 
     it('does not double-emit when a live BEL clears the turn and a later reconcile sees the JSONL completion', () => {
@@ -1133,7 +1138,7 @@ describe('CodexActivityTracker', () => {
       tracker.reconcileProjects(createProjects(createSession('session-1', { latestTaskStartedAt: 1_410 })), 1_450)
       tracker.noteOutput({ terminalId: 'term-1', data: '\x07', at: 1_500 })
 
-      expect(events).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_500 }])
+      expect(events).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_500, completionSeq: 1 }])
     })
   })
 })

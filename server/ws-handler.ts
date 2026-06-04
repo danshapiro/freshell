@@ -23,6 +23,7 @@ import type {
   OpencodeActivityRecord,
   SdkServerMessage,
   SdkSessionStatus,
+  TerminalTurnCompletionSnapshot,
   TerminalTurnCompleteMessage,
 } from '../shared/ws-protocol.js'
 import type { ExtensionManager } from './extension-manager.js'
@@ -173,8 +174,11 @@ export type WsHandlerOptions = {
   extensionManager?: ExtensionManager
   codexActivityListProvider?: () => CodexActivityRecord[]
   claudeActivityListProvider?: () => ClaudeActivityRecord[]
+  codexLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
+  claudeLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
   agentHistorySource?: AgentHistorySource
   opencodeActivityListProvider?: () => OpencodeActivityRecord[]
+  opencodeLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
   freshAgentRuntimeManager?: FreshAgentRuntimeManagerLike
 }
 
@@ -490,6 +494,9 @@ export class WsHandler {
   private codexActivityListProvider?: () => CodexActivityRecord[]
   private claudeActivityListProvider?: () => ClaudeActivityRecord[]
   private opencodeActivityListProvider?: () => OpencodeActivityRecord[]
+  private codexLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
+  private claudeLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
+  private opencodeLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
   private tabsRegistryStore?: TabsRegistryStore
   private layoutStore?: LayoutStore
   private extensionManager?: ExtensionManager
@@ -548,6 +555,9 @@ export class WsHandler {
     this.codexActivityListProvider = options.codexActivityListProvider
     this.claudeActivityListProvider = options.claudeActivityListProvider
     this.opencodeActivityListProvider = options.opencodeActivityListProvider
+    this.codexLatestTurnCompletionsProvider = options.codexLatestTurnCompletionsProvider
+    this.claudeLatestTurnCompletionsProvider = options.claudeLatestTurnCompletionsProvider
+    this.opencodeLatestTurnCompletionsProvider = options.opencodeLatestTurnCompletionsProvider
     this.tabsRegistryStore = options.tabsRegistryStore
     this.layoutStore = options.layoutStore
     this.extensionManager = options.extensionManager
@@ -3235,10 +3245,12 @@ export class WsHandler {
 
       case 'codex.activity.list': {
         const terminals = this.codexActivityListProvider ? this.codexActivityListProvider() : []
+        const latestTurnCompletions = this.codexLatestTurnCompletionsProvider ? this.codexLatestTurnCompletionsProvider() : []
         const response = CodexActivityListResponseSchema.safeParse({
           type: 'codex.activity.list.response',
           requestId: m.requestId,
           terminals,
+          latestTurnCompletions,
         })
         if (!response.success) {
           log.warn({ issues: response.error.issues }, 'Invalid codex.activity.list.response payload')
@@ -3255,10 +3267,12 @@ export class WsHandler {
 
       case 'opencode.activity.list': {
         const terminals = this.opencodeActivityListProvider ? this.opencodeActivityListProvider() : []
+        const latestTurnCompletions = this.opencodeLatestTurnCompletionsProvider ? this.opencodeLatestTurnCompletionsProvider() : []
         const response = OpencodeActivityListResponseSchema.safeParse({
           type: 'opencode.activity.list.response',
           requestId: m.requestId,
           terminals,
+          latestTurnCompletions,
         })
         if (!response.success) {
           log.warn({ issues: response.error.issues }, 'Invalid opencode.activity.list.response payload')
@@ -3275,10 +3289,12 @@ export class WsHandler {
 
       case 'claude.activity.list': {
         const terminals = this.claudeActivityListProvider ? this.claudeActivityListProvider() : []
+        const latestTurnCompletions = this.claudeLatestTurnCompletionsProvider ? this.claudeLatestTurnCompletionsProvider() : []
         const response = ClaudeActivityListResponseSchema.safeParse({
           type: 'claude.activity.list.response',
           requestId: m.requestId,
           terminals,
+          latestTurnCompletions,
         })
         if (!response.success) {
           log.warn({ issues: response.error.issues }, 'Invalid claude.activity.list.response payload')

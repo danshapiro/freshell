@@ -6,6 +6,7 @@ import {
   isSubmitInput,
   type TurnCompleteSignalParserState,
 } from '../../shared/turn-complete-signal.js'
+import type { TerminalTurnCompletionSnapshot } from '../../shared/ws-protocol.js'
 
 export const CLAUDE_BUSY_DEADMAN_MS = 120_000
 export const CLAUDE_ACTIVITY_SWEEP_MS = 5_000
@@ -23,6 +24,7 @@ export type ClaudeTurnCompleteEvent = {
   terminalId: string
   sessionId?: string
   at: number
+  completionSeq: number
 }
 
 export type ClaudeActivityChange = {
@@ -57,6 +59,8 @@ type ClaudeTerminalActivity = {
  */
 export class ClaudeActivityTracker extends EventEmitter {
   private readonly states = new Map<string, ClaudeTerminalActivity>()
+  private readonly completionSeqByTerminalId = new Map<string, number>()
+  private readonly latestCompletions = new Map<string, TerminalTurnCompletionSnapshot>()
   private readonly log?: TrackerLogger
 
   constructor(input: { log?: TrackerLogger } = {}) {
@@ -71,6 +75,10 @@ export class ClaudeActivityTracker extends EventEmitter {
   getActivity(terminalId: string): ClaudeActivityRecord | undefined {
     const state = this.states.get(terminalId)
     return state ? this.toRecord(state) : undefined
+  }
+
+  listLatestCompletions(): TerminalTurnCompletionSnapshot[] {
+    return Array.from(this.latestCompletions.values())
   }
 
   trackTerminal(input: { terminalId: string; sessionId?: string; at: number }): void {
@@ -141,11 +149,11 @@ export class ClaudeActivityTracker extends EventEmitter {
     for (let i = 0; i < clearCount; i += 1) {
       if (state.inFlight <= 0) break
       state.inFlight -= 1
-      completions.push({
+      completions.push(this.recordTurnCompletion({
         terminalId: state.terminalId,
         ...(state.sessionId ? { sessionId: state.sessionId } : {}),
         at: input.at,
-      })
+      }))
     }
     state.lastObservedAt = input.at
     if (completions.length > 0) {
@@ -155,6 +163,24 @@ export class ClaudeActivityTracker extends EventEmitter {
     this.commitState(state, previous)
     for (const completion of completions) {
       this.emit('turn.complete', completion)
+    }
+  }
+
+  private recordTurnCompletion(input: {
+    terminalId: string
+    sessionId?: string
+    at: number
+  }): ClaudeTurnCompleteEvent {
+    const completionSeq = (this.completionSeqByTerminalId.get(input.terminalId) ?? 0) + 1
+    this.completionSeqByTerminalId.set(input.terminalId, completionSeq)
+    this.latestCompletions.set(input.terminalId, {
+      terminalId: input.terminalId,
+      at: input.at,
+      completionSeq,
+    })
+    return {
+      ...input,
+      completionSeq,
     }
   }
 

@@ -6,6 +6,7 @@ export const STORAGE_KEYS = {
   terminalCursor: 'freshell.terminal-cursors.v1',
   browserPreferences: 'freshell.browser-preferences.v1',
   tabRecency: 'freshell.tab-recency.v1',
+  turnCompletion: 'freshell.turn-completion.v1',
   deviceId: 'freshell.device-id.v2',
   deviceLabel: 'freshell.device-label.v2',
   deviceLabelCustom: 'freshell.device-label-custom.v2',
@@ -24,6 +25,7 @@ export const SESSION_ACTIVITY_STORAGE_KEY = STORAGE_KEYS.sessionActivity
 export const TERMINAL_CURSOR_STORAGE_KEY = STORAGE_KEYS.terminalCursor
 export const BROWSER_PREFERENCES_STORAGE_KEY = STORAGE_KEYS.browserPreferences
 export const TAB_RECENCY_STORAGE_KEY = STORAGE_KEYS.tabRecency
+export const TURN_COMPLETION_STORAGE_KEY = STORAGE_KEYS.turnCompletion
 export const DEVICE_ID_STORAGE_KEY = STORAGE_KEYS.deviceId
 export const DEVICE_LABEL_STORAGE_KEY = STORAGE_KEYS.deviceLabel
 export const DEVICE_LABEL_CUSTOM_STORAGE_KEY = STORAGE_KEYS.deviceLabelCustom

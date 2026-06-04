@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events'
 import { z } from 'zod'
+import type { TerminalTurnCompletionSnapshot } from '../../shared/ws-protocol.js'
 import type { OpencodeServerEndpoint } from '../local-port.js'
 import { logger } from '../logger.js'
 import type { OpencodeRootResolution } from './providers/opencode.js'
@@ -46,6 +47,7 @@ export type OpencodeTurnCompleteEvent = {
   terminalId: string
   sessionId: string
   at: number
+  completionSeq: number
 }
 
 const SessionIdleStatusSchema = z.object({
@@ -202,6 +204,8 @@ const defaultResolveOpencodeSessionRoots = async (
 
 export class OpencodeActivityTracker extends EventEmitter {
   private readonly records = new Map<string, OpencodeActivityRecord>()
+  private readonly completionSeqByTerminalId = new Map<string, number>()
+  private readonly latestCompletions = new Map<string, TerminalTurnCompletionSnapshot>()
   private readonly monitors = new Map<string, MonitorState>()
   private readonly childSessionIds = new Map<string, Set<string>>()
   private readonly sessionRootsByTerminal = new Map<string, Map<string, string>>()
@@ -248,6 +252,10 @@ export class OpencodeActivityTracker extends EventEmitter {
 
   getActivity(terminalId: string): OpencodeActivityRecord | undefined {
     return this.records.get(terminalId)
+  }
+
+  listLatestCompletions(): TerminalTurnCompletionSnapshot[] {
+    return Array.from(this.latestCompletions.values())
   }
 
   expire(at = this.now()): void {
@@ -627,11 +635,11 @@ export class OpencodeActivityTracker extends EventEmitter {
         continue
       }
       if (action.kind === 'turnComplete') {
-        this.emit('turn.complete', {
+        this.emit('turn.complete', this.recordTurnCompletion({
           terminalId,
           sessionId: action.sessionId,
           at: action.at,
-        } satisfies OpencodeTurnCompleteEvent)
+        }))
         continue
       }
       if (action.kind === 'warnAmbiguous') {
@@ -640,6 +648,24 @@ export class OpencodeActivityTracker extends EventEmitter {
           sessionIds: action.sessionIds,
         }, 'OpenCode endpoint reported ambiguous session ownership; suppressing durable adoption.')
       }
+    }
+  }
+
+  private recordTurnCompletion(input: {
+    terminalId: string
+    sessionId: string
+    at: number
+  }): OpencodeTurnCompleteEvent {
+    const completionSeq = (this.completionSeqByTerminalId.get(input.terminalId) ?? 0) + 1
+    this.completionSeqByTerminalId.set(input.terminalId, completionSeq)
+    this.latestCompletions.set(input.terminalId, {
+      terminalId: input.terminalId,
+      at: input.at,
+      completionSeq,
+    })
+    return {
+      ...input,
+      completionSeq,
     }
   }
 

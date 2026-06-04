@@ -1745,11 +1745,17 @@ describe('claude activity protocol', () => {
   })
   it('accepts claude.activity.list request and response and updated', () => {
     expect(ClaudeActivityListSchema.safeParse({ type: 'claude.activity.list', requestId: 'r1' }).success).toBe(true)
-    expect(ClaudeActivityListResponseSchema.safeParse({ type: 'claude.activity.list.response', requestId: 'r1', terminals: [] }).success).toBe(true)
+    expect(ClaudeActivityListResponseSchema.safeParse({
+      type: 'claude.activity.list.response',
+      requestId: 'r1',
+      terminals: [],
+      latestTurnCompletions: [{ terminalId: 't1', at: 1, completionSeq: 1 }],
+    }).success).toBe(true)
     expect(ClaudeActivityUpdatedSchema.safeParse({ type: 'claude.activity.updated', upsert: [], remove: ['t1'] }).success).toBe(true)
   })
-  it('terminal.turn.complete accepts provider claude and optional sessionId', () => {
-    expect(TerminalTurnCompleteSchema.safeParse({ type: 'terminal.turn.complete', terminalId: 't1', provider: 'claude', at: 1 }).success).toBe(true)
-    expect(TerminalTurnCompleteSchema.safeParse({ type: 'terminal.turn.complete', terminalId: 't1', provider: 'opencode', sessionId: 's1', at: 1 }).success).toBe(true)
+  it('terminal.turn.complete requires provider-scoped completionSeq and accepts optional sessionId', () => {
+    expect(TerminalTurnCompleteSchema.safeParse({ type: 'terminal.turn.complete', terminalId: 't1', provider: 'claude', at: 1 }).success).toBe(false)
+    expect(TerminalTurnCompleteSchema.safeParse({ type: 'terminal.turn.complete', terminalId: 't1', provider: 'claude', at: 1, completionSeq: 1 }).success).toBe(true)
+    expect(TerminalTurnCompleteSchema.safeParse({ type: 'terminal.turn.complete', terminalId: 't1', provider: 'opencode', sessionId: 's1', at: 1, completionSeq: 1 }).success).toBe(true)
   })
 })

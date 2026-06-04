@@ -92,6 +92,11 @@ describe('ws codex activity protocol', () => {
     phase: 'busy',
     updatedAt: 1234,
   }]
+  const latestTurnCompletions = [{
+    terminalId: 'term-1',
+    at: 4321,
+    completionSeq: 2,
+  }]
 
   beforeAll(async () => {
     process.env.NODE_ENV = 'test'
@@ -105,7 +110,10 @@ describe('ws codex activity protocol', () => {
     wsHandler = new WsHandler(
       server,
       new FakeRegistry() as any,
-      { codexActivityListProvider: () => sampleActivity as any },
+      {
+        codexActivityListProvider: () => sampleActivity as any,
+        codexLatestTurnCompletionsProvider: () => latestTurnCompletions,
+      },
     )
     port = await listen(server)
   })
@@ -128,6 +136,7 @@ describe('ws codex activity protocol', () => {
     )
 
     expect(response.terminals).toEqual(sampleActivity)
+    expect(response.latestTurnCompletions).toEqual(latestTurnCompletions)
     ws.close()
   })
 

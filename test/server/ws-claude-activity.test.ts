@@ -93,6 +93,11 @@ describe('ws claude activity protocol', () => {
     phase: 'busy',
     updatedAt: 1234,
   }]
+  const latestTurnCompletions = [{
+    terminalId: 'term-1',
+    at: 4321,
+    completionSeq: 2,
+  }]
 
   beforeAll(async () => {
     process.env.NODE_ENV = 'test'
@@ -106,7 +111,10 @@ describe('ws claude activity protocol', () => {
     wsHandler = new WsHandler(
       server,
       new FakeRegistry() as any,
-      { claudeActivityListProvider: () => sampleActivity as any },
+      {
+        claudeActivityListProvider: () => sampleActivity as any,
+        claudeLatestTurnCompletionsProvider: () => latestTurnCompletions,
+      },
     )
     port = await listen(server)
   })
@@ -129,6 +137,7 @@ describe('ws claude activity protocol', () => {
     )
 
     expect(response.terminals).toEqual(sampleActivity)
+    expect(response.latestTurnCompletions).toEqual(latestTurnCompletions)
     ws.close()
   })
 
@@ -198,6 +207,7 @@ describe('ws claude activity protocol', () => {
       provider: 'claude',
       terminalId: 'term-claude',
       at: 1234,
+      completionSeq: 1,
     })
 
     const completed = await waitForMessage(authenticated, (msg) => msg.type === 'terminal.turn.complete')
@@ -206,6 +216,7 @@ describe('ws claude activity protocol', () => {
       provider: 'claude',
       terminalId: 'term-claude',
       at: 1234,
+      completionSeq: 1,
     })
 
     await expect(expectNoMatchingMessage(unauthenticated, (msg) => msg.type === 'terminal.turn.complete')).resolves.toBeUndefined()
@@ -217,11 +228,12 @@ describe('ws claude activity protocol', () => {
   it('wires a real tracker so claude turn.complete fires once per turn and not on reattach/replay', async () => {
     // Wire the tracker to the handler EXACTLY as server/index.ts does.
     const tracker = new ClaudeActivityTracker()
-    const onTurnComplete = (payload: { terminalId: string; at: number; sessionId?: string }) => {
+    const onTurnComplete = (payload: { terminalId: string; at: number; sessionId?: string; completionSeq: number }) => {
       wsHandler.broadcastTerminalTurnComplete({
         provider: 'claude',
         terminalId: payload.terminalId,
         at: payload.at,
+        completionSeq: payload.completionSeq,
         ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
       })
     }
@@ -254,6 +266,7 @@ describe('ws claude activity protocol', () => {
       provider: 'claude',
       terminalId: 't1',
       at: 3000,
+      completionSeq: 1,
     })
     expect(turnCompletes).toHaveLength(1)
 

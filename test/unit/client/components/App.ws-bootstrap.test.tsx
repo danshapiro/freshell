@@ -245,6 +245,7 @@ function createStore(options?: {
       turnCompletion: {
         seq: 0,
         lastAtByTerminalId: {},
+        lastAppliedCompletionSeqByTerminalId: {},
         pendingEvents: [],
         attentionByTab: {},
         attentionByPane: {},
@@ -1281,6 +1282,7 @@ describe('App WS bootstrap recovery', () => {
         provider: 'opencode',
         sessionId: 'session-opencode',
         at: 1234,
+        completionSeq: 5,
       })
     })
 
@@ -1289,7 +1291,116 @@ describe('App WS bootstrap recovery', () => {
     })
     expect(store.getState().turnCompletion.attentionByTab['tab-opencode']).toBe(true)
     expect(store.getState().turnCompletion.lastAtByTerminalId['term-opencode']).toBe(1234)
+    expect(store.getState().turnCompletion.lastAppliedCompletionSeqByTerminalId?.['term-opencode']).toBe(5)
     expect(store.getState().turnCompletion.seq).toBe(1)
+  })
+
+  it('applies latest turn completions from activity list responses once across reconnect refreshes', async () => {
+    const store = createStore({
+      tabs: [{
+        id: 'tab-opencode',
+        createRequestId: 'req-opencode',
+        title: 'OpenCode',
+        status: 'running',
+        mode: 'opencode',
+        shell: 'system',
+        terminalId: 'term-opencode',
+        createdAt: 1,
+      }],
+      panes: {
+        layouts: {
+          'tab-opencode': {
+            type: 'leaf',
+            id: 'pane-opencode',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-opencode',
+              status: 'running',
+              mode: 'opencode',
+              shell: 'system',
+              terminalId: 'term-opencode',
+              initialCwd: '/workspace',
+            },
+          },
+        },
+        activePane: {
+          'tab-opencode': 'pane-opencode',
+        },
+      },
+    })
+    wsMocks.isReady = true
+    wsMocks.serverInstanceId = 'srv-preconnected-opencode-latest-completion'
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(store.getState().connection.status).toBe('ready')
+      expect(wsMocks.send.mock.calls.some(([payload]) => payload?.type === 'opencode.activity.list')).toBe(true)
+    })
+
+    const firstRequestId = wsMocks.send.mock.calls
+      .map(([payload]) => payload)
+      .filter((payload) => payload?.type === 'opencode.activity.list')
+      .at(-1)?.requestId as string
+
+    act(() => {
+      messageHandler?.({
+        type: 'opencode.activity.list.response',
+        requestId: firstRequestId,
+        terminals: [],
+        latestTurnCompletions: [{
+          terminalId: 'term-opencode',
+          at: 2_000,
+          completionSeq: 7,
+        }],
+      })
+    })
+
+    await waitFor(() => {
+      expect(store.getState().turnCompletion.attentionByPane['pane-opencode']).toBe(true)
+    })
+    expect(store.getState().turnCompletion.lastAppliedCompletionSeqByTerminalId?.['term-opencode']).toBe(7)
+    expect(store.getState().turnCompletion.seq).toBe(1)
+
+    act(() => {
+      messageHandler?.({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-preconnected-opencode-latest-completion',
+      })
+    })
+
+    await waitFor(() => {
+      const opencodeRequests = wsMocks.send.mock.calls
+        .map(([payload]) => payload)
+        .filter((payload) => payload?.type === 'opencode.activity.list')
+      expect(opencodeRequests.length).toBeGreaterThanOrEqual(2)
+    })
+    const secondRequestId = wsMocks.send.mock.calls
+      .map(([payload]) => payload)
+      .filter((payload) => payload?.type === 'opencode.activity.list')
+      .at(-1)?.requestId as string
+
+    act(() => {
+      messageHandler?.({
+        type: 'opencode.activity.list.response',
+        requestId: secondRequestId,
+        terminals: [],
+        latestTurnCompletions: [{
+          terminalId: 'term-opencode',
+          at: 2_000,
+          completionSeq: 7,
+        }],
+      })
+    })
+
+    expect(store.getState().turnCompletion.seq).toBe(1)
+    expect(store.getState().turnCompletion.attentionByPane['pane-opencode']).toBe(true)
+    expect(store.getState().turnCompletion.lastAppliedCompletionSeqByTerminalId?.['term-opencode']).toBe(7)
   })
 
   it('records OpenCode turn completion against the active tab when a terminal is duplicated', async () => {
@@ -1372,6 +1483,7 @@ describe('App WS bootstrap recovery', () => {
         provider: 'opencode',
         sessionId: 'session-opencode',
         at: 5678,
+        completionSeq: 6,
       })
     })
 
@@ -1380,6 +1492,7 @@ describe('App WS bootstrap recovery', () => {
     })
     expect(store.getState().turnCompletion.attentionByTab['tab-active']).toBe(true)
     expect(store.getState().turnCompletion.lastAtByTerminalId['term-opencode']).toBe(5678)
+    expect(store.getState().turnCompletion.lastAppliedCompletionSeqByTerminalId?.['term-opencode']).toBe(6)
     expect(store.getState().turnCompletion.seq).toBe(1)
   })
 

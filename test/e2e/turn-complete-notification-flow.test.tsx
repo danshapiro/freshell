@@ -1,7 +1,7 @@
 import { useEffect } from 'react'
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react'
-import { Provider, useStore } from 'react-redux'
+import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import TabBar from '@/components/TabBar'
@@ -11,8 +11,8 @@ import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
-import turnCompletionReducer, { recordTurnComplete } from '@/store/turnCompletionSlice'
-import { selectTabPaneByTerminalId } from '@/store/selectors/paneTerminalSelectors'
+import turnCompletionReducer from '@/store/turnCompletionSlice'
+import { applyServerCompletion } from '@/store/turnCompletionThunks'
 import { getWsClient } from '@/lib/ws-client'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import type { Tab, AttentionDismiss } from '@/store/types'
@@ -124,18 +124,18 @@ class MockResizeObserver {
   unobserve = vi.fn()
 }
 
-function emitCodexTurnComplete(terminalId = 'term-2', at = 1000) {
+function emitCodexTurnComplete(terminalId = 'term-2', at = 1000, completionSeq = 1) {
   wsMocks.emitMessage({
     type: 'terminal.turn.complete',
     terminalId,
     provider: 'codex',
     at,
+    completionSeq,
   })
 }
 
 function Harness() {
   const dispatch = useAppDispatch()
-  const store = useStore<any>()
   useTurnCompletionNotifications()
 
   useEffect(() => {
@@ -143,16 +143,16 @@ function Harness() {
       if (msg.type !== 'terminal.turn.complete') return
       const terminalId = typeof msg.terminalId === 'string' ? msg.terminalId : ''
       if (!terminalId) return
-      const location = selectTabPaneByTerminalId(store.getState(), terminalId)
-      if (!location) return
-      dispatch(recordTurnComplete({
-        tabId: location.tabId,
-        paneId: location.paneId,
+      const completionSeq = typeof msg.completionSeq === 'number' ? msg.completionSeq : undefined
+      if (completionSeq === undefined) return
+      dispatch(applyServerCompletion({
+        provider: msg.provider,
         terminalId,
         at: typeof msg.at === 'number' ? msg.at : Date.now(),
-      }))
+        completionSeq,
+      }) as any)
     })
-  }, [dispatch, store])
+  }, [dispatch])
 
   const tabs = useAppSelector((state) => state.tabs.tabs)
   const activeTabId = useAppSelector((state) => state.tabs.activeTabId)

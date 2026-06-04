@@ -176,6 +176,7 @@ describe('OpencodeActivityTracker', () => {
       terminalId: 'term-oc',
       sessionId: 'session-oc',
       at: expect.any(Number),
+      completionSeq: 1,
     }])
 
     tracker.dispose()
@@ -222,8 +223,14 @@ describe('OpencodeActivityTracker', () => {
       terminalId: 'term-oc',
       sessionId: 'session-oc',
       at: expect.any(Number),
+      completionSeq: 1,
     }])
     expect(tracker.list()).toEqual([])
+    expect(tracker.listLatestCompletions()).toEqual([{
+      terminalId: 'term-oc',
+      at: expect.any(Number),
+      completionSeq: 1,
+    }])
 
     tracker.dispose()
   })

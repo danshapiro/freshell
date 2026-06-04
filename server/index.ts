@@ -374,9 +374,12 @@ async function main() {
       layoutStore,
       extensionManager,
       codexActivityListProvider: () => codexActivity.tracker.list(),
+      codexLatestTurnCompletionsProvider: () => codexActivity.tracker.listLatestCompletions(),
       claudeActivityListProvider: () => claudeActivity.tracker.list(),
+      claudeLatestTurnCompletionsProvider: () => claudeActivity.tracker.listLatestCompletions(),
       agentHistorySource,
       opencodeActivityListProvider: () => opencodeActivity.tracker.list(),
+      opencodeLatestTurnCompletionsProvider: () => opencodeActivity.tracker.listLatestCompletions(),
     },
   )
   attachProxyUpgradeHandler(server)
@@ -432,6 +435,7 @@ async function main() {
       provider: 'codex',
       terminalId: payload.terminalId,
       at: payload.at,
+      completionSeq: payload.completionSeq,
       ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
     })
   })
@@ -452,6 +456,7 @@ async function main() {
       provider: 'claude',
       terminalId: payload.terminalId,
       at: payload.at,
+      completionSeq: payload.completionSeq,
       ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
     })
   })

@@ -96,10 +96,19 @@ export const CodexActivityRecordSchema = z.object({
 
 export type CodexActivityRecord = z.infer<typeof CodexActivityRecordSchema>
 
+export const TerminalTurnCompletionSnapshotSchema = z.object({
+  terminalId: z.string().min(1),
+  at: z.number().int().nonnegative(),
+  completionSeq: z.number().int().positive(),
+})
+
+export type TerminalTurnCompletionSnapshot = z.infer<typeof TerminalTurnCompletionSnapshotSchema>
+
 export const CodexActivityListResponseSchema = z.object({
   type: z.literal('codex.activity.list.response'),
   requestId: z.string().min(1),
   terminals: z.array(CodexActivityRecordSchema),
+  latestTurnCompletions: z.array(TerminalTurnCompletionSnapshotSchema).optional(),
 })
 
 export const CodexActivityUpdatedSchema = z.object({
@@ -121,6 +130,7 @@ export const OpencodeActivityListResponseSchema = z.object({
   type: z.literal('opencode.activity.list.response'),
   requestId: z.string().min(1),
   terminals: z.array(OpencodeActivityRecordSchema),
+  latestTurnCompletions: z.array(TerminalTurnCompletionSnapshotSchema).optional(),
 })
 
 export const OpencodeActivityUpdatedSchema = z.object({
@@ -142,6 +152,7 @@ export const ClaudeActivityListResponseSchema = z.object({
   type: z.literal('claude.activity.list.response'),
   requestId: z.string().min(1),
   terminals: z.array(ClaudeActivityRecordSchema),
+  latestTurnCompletions: z.array(TerminalTurnCompletionSnapshotSchema).optional(),
 })
 
 export const ClaudeActivityUpdatedSchema = z.object({
@@ -156,6 +167,7 @@ export const TerminalTurnCompleteSchema = z.object({
   provider: z.enum(['opencode', 'claude', 'codex']),
   sessionId: z.string().min(1).optional(),
   at: z.number().int().nonnegative(),
+  completionSeq: z.number().int().positive(),
 })
 
 // ──────────────────────────────────────────────────────────────

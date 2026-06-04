@@ -92,6 +92,11 @@ describe('ws opencode activity protocol', () => {
     phase: 'busy',
     updatedAt: 1234,
   }]
+  const latestTurnCompletions = [{
+    terminalId: 'term-opencode-1',
+    at: 4321,
+    completionSeq: 2,
+  }]
   const liveOnlyActivity = [{
     terminalId: 'term-opencode-live-only',
     phase: 'busy',
@@ -112,6 +117,7 @@ describe('ws opencode activity protocol', () => {
       new FakeRegistry() as any,
       {
         opencodeActivityListProvider: () => sampleActivity as any,
+        opencodeLatestTurnCompletionsProvider: () => latestTurnCompletions,
       },
     )
     port = await listen(server)
@@ -135,6 +141,7 @@ describe('ws opencode activity protocol', () => {
     )
 
     expect(response.terminals).toEqual(sampleActivity)
+    expect(response.latestTurnCompletions).toEqual(latestTurnCompletions)
     ws.close()
   })
 
@@ -225,6 +232,7 @@ describe('ws opencode activity protocol', () => {
       provider: 'opencode',
       sessionId: 'session-opencode-1',
       at: 1234,
+      completionSeq: 1,
     })
 
     const completed = await waitForMessage(authenticated, (msg) => msg.type === 'terminal.turn.complete')
@@ -234,6 +242,7 @@ describe('ws opencode activity protocol', () => {
       provider: 'opencode',
       sessionId: 'session-opencode-1',
       at: 1234,
+      completionSeq: 1,
     })
 
     await expect(expectNoMatchingMessage(unauthenticated, (msg) => msg.type === 'terminal.turn.complete')).resolves.toBeUndefined()
