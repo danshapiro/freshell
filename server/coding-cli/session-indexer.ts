@@ -917,8 +917,19 @@ export class CodingCliSessionIndexer {
     let sessions: CodingCliSession[] = []
     try {
       sessions = await provider.listSessionsDirect()
-    } catch (err) {
-      logger.warn({ err, provider: provider.name }, 'Could not list provider sessions directly')
+    } catch {
+      // A direct-listing failure is transient (e.g. the off-thread worker failed),
+      // NOT "no sessions". Preserve this provider's existing direct-cache entries so
+      // neither the local prune (below) nor the full-scan global prune deletes them.
+      // Log at debug with only the provider name — the provider already emitted a
+      // sanitized one-time detail via logDatabaseStateOnce, and logging `err` here
+      // would re-leak paths/messages and spam once per failed refresh.
+      logger.debug({ provider: provider.name }, 'Direct provider listing failed; preserving cached sessions')
+      for (const cacheKey of this.fileCache.keys()) {
+        if (this.isDirectCacheKey(cacheKey) && this.fileCache.get(cacheKey)?.provider === provider.name) {
+          seenKeys.add(cacheKey)
+        }
+      }
       return seenKeys
     }
 

@@ -5,16 +5,10 @@ import { logger } from '../../logger.js'
 import type { CodingCliProvider } from '../provider.js'
 import type { CodingCliSession, NormalizedEvent, ParsedSessionMeta } from '../types.js'
 import { resolveGitRepoRoot } from '../utils.js'
-
-type OpencodeSessionRow = {
-  sessionId: string
-  cwd: string
-  title: string
-  createdAt: number
-  lastActivityAt: number
-  projectPath: string | null
-  hasThreeViewsMarker?: number | null
-}
+import { createWorkerListingRunner, type OpencodeListingQueryRunner } from './opencode-listing-runner.js'
+import { THREE_VIEWS_MARKER_SQL_PATTERN } from './opencode-listing-query.js'
+export { THREE_VIEWS_MARKER_SQL_PATTERN } from './opencode-listing-query.js'
+export type { OpencodeSessionRow } from './opencode-listing-query.js'
 
 type OpencodeSessionSchema = {
   hasParentId: boolean
@@ -59,19 +53,25 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-const THREE_VIEWS_MARKER_SQL_PATTERN = '%<freshell-session-metadata origin=3-views%'
-
 function toSqliteBoolean(value: unknown): boolean {
   return value === true || value === 1
 }
+
+export type OpencodeProviderOptions = { queryRunner?: OpencodeListingQueryRunner }
 
 export class OpencodeProvider implements CodingCliProvider {
   readonly name = 'opencode' as const
   readonly displayName = 'OpenCode'
   private sessionSchemaCache?: OpencodeSessionSchema
   private readonly loggedDatabaseStates = new Set<string>()
+  private readonly queryRunner: OpencodeListingQueryRunner
 
-  constructor(readonly homeDir: string = defaultOpencodeDataHome()) {}
+  constructor(
+    readonly homeDir: string = defaultOpencodeDataHome(),
+    options: OpencodeProviderOptions = {},
+  ) {
+    this.queryRunner = options.queryRunner ?? createWorkerListingRunner()
+  }
 
   private getDatabasePath(): string {
     return path.join(this.homeDir, 'opencode.db')
@@ -139,9 +139,11 @@ export class OpencodeProvider implements CodingCliProvider {
       return []
     }
 
-    let sqlite: typeof import('node:sqlite')
+    // Availability probe (cheap; cached). Preserves the exact sqlite_unavailable
+    // behavior even though the heavy query runs off-thread. Same Node => same
+    // availability inside the worker.
     try {
-      sqlite = await import('node:sqlite')
+      await import('node:sqlite')
     } catch (err) {
       this.logDatabaseStateOnce('warn', 'sqlite_unavailable', 'node:sqlite unavailable — OpenCode sessions will not appear. Upgrade to Node 22.5+ to enable.', {
         error: err,
@@ -150,81 +152,46 @@ export class OpencodeProvider implements CodingCliProvider {
       return []
     }
 
-    let db: InstanceType<typeof sqlite.DatabaseSync> | undefined
-    let phase: 'open' | 'schema' | 'query' | 'map' = 'open'
+    let result
     try {
-      db = new sqlite.DatabaseSync(dbPath, { readOnly: true })
-      this.configureReadOnlyDatabase(db)
-      phase = 'schema'
-      const schema = this.inspectSessionSchema(db)
-      const rootFilter = schema.hasParentId ? 'AND s.parent_id IS NULL' : ''
-      phase = 'query'
-      const rows = db.prepare(`
-        SELECT
-          s.id AS sessionId,
-          s.directory AS cwd,
-          s.title AS title,
-          s.time_created AS createdAt,
-          s.time_updated AS lastActivityAt,
-          p.worktree AS projectPath,
-          (
-            EXISTS (
-              SELECT 1
-              FROM part pa
-              WHERE pa.session_id = s.id
-                AND pa.data LIKE ?
-            )
-            OR EXISTS (
-              SELECT 1
-              FROM message m
-              WHERE m.session_id = s.id
-                AND m.data LIKE ?
-            )
-          ) AS hasThreeViewsMarker
-        FROM session s
-        LEFT JOIN project p
-          ON p.id = s.project_id
-        WHERE s.time_archived IS NULL
-          ${rootFilter}
-        ORDER BY s.time_updated DESC
-      `).all(
-        THREE_VIEWS_MARKER_SQL_PATTERN,
-        THREE_VIEWS_MARKER_SQL_PATTERN,
-      ) as OpencodeSessionRow[]
-
-      if (rows.length === 0) {
-        this.logDatabaseStateOnce('info', 'empty_db', 'OpenCode sessions database has no active root sessions', {
-          extra: { rowCount: 0 },
-        })
-      }
-
-      phase = 'map'
-      const sessions: CodingCliSession[] = []
-      for (const row of rows) {
-        if (typeof row.cwd !== 'string' || !row.cwd) continue
-        const projectPath = row.projectPath || await resolveGitRepoRoot(row.cwd)
-        const isThreeViewsSession = toSqliteBoolean(row.hasThreeViewsMarker)
-        sessions.push({
-          provider: this.name,
-          sessionId: row.sessionId,
-          projectPath,
-          cwd: row.cwd,
-          title: typeof row.title === 'string' ? row.title : undefined,
-          lastActivityAt: toValidTimestamp(row.lastActivityAt) ?? Date.now(),
-          createdAt: toValidTimestamp(row.createdAt),
-          isSubagent: isThreeViewsSession || undefined,
-          isNonInteractive: isThreeViewsSession || undefined,
-        })
-      }
-      return sessions
+      // The heavy open+schema+marker query runs OFF the event loop (worker thread).
+      result = await this.queryRunner({ dbPath, markerPattern: THREE_VIEWS_MARKER_SQL_PATTERN })
     } catch (err) {
-      this.logDatabaseStateOnce('warn', this.classifyDatabaseFailure(phase), 'Failed to read OpenCode sessions database', {
-        error: err,
-      })
-      return []
-    } finally {
-      db?.close()
+      // A worker/read failure is transient infrastructure failure, NOT "no sessions".
+      // Log once (sanitized) and re-throw: refreshDirectProvider catches this and
+      // returns early WITHOUT pruning, preserving the previously-listed OpenCode
+      // sessions. Returning [] here would make the indexer prune the whole sidebar.
+      this.logDatabaseStateOnce('warn', 'read_error', 'Failed to read OpenCode sessions database', { error: err })
+      throw err
     }
+
+    if (result.schemaMissingParentId) {
+      this.logDatabaseStateOnce('warn', 'schema_missing_parent_id', 'OpenCode session schema does not expose parent_id; treating sessions as flat roots')
+    }
+    if (result.rows.length === 0) {
+      this.logDatabaseStateOnce('info', 'empty_db', 'OpenCode sessions database has no active root sessions', {
+        extra: { rowCount: 0 },
+      })
+    }
+
+    const sessions: CodingCliSession[] = []
+    for (const row of result.rows) {
+      if (typeof row.cwd !== 'string' || !row.cwd) continue
+      const projectPath = row.projectPath || await resolveGitRepoRoot(row.cwd)
+      const isThreeViewsSession = toSqliteBoolean(row.hasThreeViewsMarker)
+      sessions.push({
+        provider: this.name,
+        sessionId: row.sessionId,
+        projectPath,
+        cwd: row.cwd,
+        title: typeof row.title === 'string' ? row.title : undefined,
+        lastActivityAt: toValidTimestamp(row.lastActivityAt) ?? Date.now(),
+        createdAt: toValidTimestamp(row.createdAt),
+        isSubagent: isThreeViewsSession || undefined,
+        isNonInteractive: isThreeViewsSession || undefined,
+      })
+    }
+    return sessions
   }
 
   async resolveOpencodeSessionRoots(sessionIds: readonly string[]): Promise<OpencodeRootResolution> {

@@ -132,6 +132,7 @@ vi.mock('node:sqlite', () => ({
 }))
 
 import { OpencodeProvider } from '../../../../server/coding-cli/providers/opencode'
+import { inProcessListingRunner } from '../../../../server/coding-cli/providers/opencode-listing-runner'
 
 describe('OpencodeProvider', () => {
   let tempDir: string
@@ -191,7 +192,7 @@ describe('OpencodeProvider', () => {
       ],
     })
 
-    const provider = new OpencodeProvider(tempDir)
+    const provider = new OpencodeProvider(tempDir, { queryRunner: inProcessListingRunner })
     const sessions = await provider.listSessionsDirect()
 
     expect(provider.getSessionGlob()).toEqual([dbPath, walPath])
@@ -211,7 +212,7 @@ describe('OpencodeProvider', () => {
   })
 
   it('watches OpenCode sqlite database and WAL but not SHM', () => {
-    const provider = new OpencodeProvider(tempDir)
+    const provider = new OpencodeProvider(tempDir, { queryRunner: inProcessListingRunner })
     const dbPath = path.join(tempDir, 'opencode.db')
     const walPath = `${dbPath}-wal`
 
@@ -221,7 +222,7 @@ describe('OpencodeProvider', () => {
   })
 
   it('logs missing OpenCode database as unavailable, not as a successful empty session list', async () => {
-    const provider = new OpencodeProvider(tempDir)
+    const provider = new OpencodeProvider(tempDir, { queryRunner: inProcessListingRunner })
 
     await expect(provider.listSessionsDirect()).resolves.toEqual([])
 
@@ -240,9 +241,10 @@ describe('OpencodeProvider', () => {
     const dbPath = path.join(tempDir, 'opencode.db')
     await fsp.writeFile(dbPath, 'fake sqlite file', 'utf8')
     FakeDatabaseSync.failOpenOnce(new Error('bad sqlite'))
-    const provider = new OpencodeProvider(tempDir)
+    const provider = new OpencodeProvider(tempDir, { queryRunner: inProcessListingRunner })
 
-    await expect(provider.listSessionsDirect()).resolves.toEqual([])
+    // A worker/read failure now THROWS (so the indexer preserves the prior sidebar).
+    await expect(provider.listSessionsDirect()).rejects.toThrow()
 
     expect(loggerMock.warn).toHaveBeenCalledWith(expect.objectContaining({
       provider: 'opencode',
@@ -250,12 +252,37 @@ describe('OpencodeProvider', () => {
       dbFile: 'opencode.db',
       pathSanitized: true,
       errorName: 'Error',
-      messageClass: 'sqlite_open_failed',
+      // open/schema/query phases collapse to a single read_error class once the
+      // open happens inside the worker; intent (distinct from empty_db) preserved.
+      messageClass: 'read_error',
     }), 'Failed to read OpenCode sessions database')
     const serializedCalls = JSON.stringify(loggerMock.warn.mock.calls)
     expect(serializedCalls).not.toContain(tempDir)
     expect(serializedCalls).not.toContain(os.tmpdir())
     expect(serializedCalls).not.toContain('bad sqlite')
+  })
+
+  it('throws (does not return []) when the listing runner fails, and logs read_error', async () => {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-opencode-fail-'))
+    await fsp.writeFile(path.join(dir, 'opencode.db'), '') // make access() succeed
+    const failingRunner = vi.fn().mockRejectedValue(new Error('worker exploded'))
+    const provider = new OpencodeProvider(dir, { queryRunner: failingRunner })
+    await expect(provider.listSessionsDirect()).rejects.toThrow('worker exploded')
+    expect(failingRunner).toHaveBeenCalledOnce()
+    expect(loggerMock.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ messageClass: 'read_error' }),
+      'Failed to read OpenCode sessions database',
+    )
+    await fsp.rm(dir, { recursive: true, force: true })
+  })
+
+  it('still returns [] (not throw) for a genuinely empty database', async () => {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-opencode-empty-'))
+    await fsp.writeFile(path.join(dir, 'opencode.db'), '')
+    const emptyRunner = vi.fn().mockResolvedValue({ rows: [], schemaMissingParentId: false })
+    const provider = new OpencodeProvider(dir, { queryRunner: emptyRunner })
+    await expect(provider.listSessionsDirect()).resolves.toEqual([])
+    await fsp.rm(dir, { recursive: true, force: true })
   })
 
   it('logs an empty OpenCode database as empty, not broken', async () => {
@@ -265,7 +292,7 @@ describe('OpencodeProvider', () => {
       projects: [],
       sessions: [],
     })
-    const provider = new OpencodeProvider(tempDir)
+    const provider = new OpencodeProvider(tempDir, { queryRunner: inProcessListingRunner })
 
     await expect(provider.listSessionsDirect()).resolves.toEqual([])
 
@@ -308,7 +335,7 @@ describe('OpencodeProvider', () => {
       ],
     })
 
-    const provider = new OpencodeProvider(tempDir)
+    const provider = new OpencodeProvider(tempDir, { queryRunner: inProcessListingRunner })
     const resolved = await provider.resolveOpencodeSessionRoots(['child_session'])
 
     expect(resolved.rootsBySessionId.get('child_session')).toBe('root_session')
@@ -345,7 +372,7 @@ describe('OpencodeProvider', () => {
     })
     FakeDatabaseSync.failRootQueryOnce(new Error('database is locked'))
 
-    const provider = new OpencodeProvider(tempDir)
+    const provider = new OpencodeProvider(tempDir, { queryRunner: inProcessListingRunner })
     const resolved = await provider.resolveOpencodeSessionRoots(['child_session'])
 
     expect(resolved.rootsBySessionId.get('child_session')).toBe('root_session')
@@ -378,7 +405,7 @@ describe('OpencodeProvider', () => {
       ],
     })
 
-    const provider = new OpencodeProvider(tempDir)
+    const provider = new OpencodeProvider(tempDir, { queryRunner: inProcessListingRunner })
     const resolved = await provider.resolveOpencodeSessionRoots(['flat_session'])
     const sessions = await provider.listSessionsDirect()
 
