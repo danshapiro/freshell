@@ -122,7 +122,8 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
   height: 2px; background: hsl(var(--background));
 }
 .tab-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-.tab-dot.running { background: hsl(var(--success)); }
+.tab-dot.busy, .tab-dot.running { background: var(--t-blue); }
+.tab-dot.attention { background: hsl(var(--success)); }
 .tab-dot.idle { background: hsl(var(--muted-foreground) / .4); }
 .tab-icons { display: flex; gap: 2px; align-items: center; }
 .tab-icons .icon-xs { width: 12px; height: 12px; color: hsl(var(--muted-foreground)); }
@@ -472,7 +473,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
           <span class="tab-close"><i data-lucide="x" class="icon-xs"></i></span>
         </div>
         <div class="tab" data-tab="claude">
-          <span class="tab-dot running"></span>
+          <span class="tab-dot busy"></span>
           <span class="tab-label">Claude Code</span>
           <span class="tab-close"><i data-lucide="x" class="icon-xs"></i></span>
         </div>
@@ -491,8 +492,8 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
           <span class="tab-close"><i data-lucide="x" class="icon-xs"></i></span>
         </div>
         <div class="tab" data-tab="start">
-          <span class="tab-dot running"></span>
-          <span class="tab-label">Get Started</span>
+          <span class="tab-dot attention"></span>
+          <span class="tab-label">Fresh Agent</span>
           <span class="tab-close"><i data-lucide="x" class="icon-xs"></i></span>
         </div>
         <!-- Arrow buttons (< >) appear at edges when tabs overflow. Not shown in this mock since tabs fit. -->

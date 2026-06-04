@@ -129,6 +129,8 @@ npm run test:vitest -- ...  # Repo-owned direct Vitest path for focused passthro
 
 **Pane System:** Tabs contain pane layouts (tree structure of splits). Each pane owns its terminal lifecycle via `createRequestId` and `terminalId`. When splitting panes, each new pane gets its own `createRequestId`, ensuring independent backend terminals. Pane content types: `terminal` (with mode, shell, status) and `browser` (with URL, devtools state).
 
+**Agent Status Indicators:** Blue/busy status is derived from provider activity slices through `resolvePaneActivity`; green/needs-attention and the idle sound flow through `recordTurnComplete` and `useTurnCompletionNotifications`. Terminal Codex turn-complete is server-authoritative via `terminal.turn.complete`, matching Claude and OpenCode. Gemini and Kimi terminal modes are status-inert until their CLIs expose a reliable turn-complete signal.
+
 ### Data Flow
 
 1. Browser loads → fetches settings from `/api/settings` and sessions from `/api/sessions`

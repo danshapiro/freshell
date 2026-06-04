@@ -89,8 +89,6 @@ export function FreshAgentSettingsButton({
           className="absolute right-0 top-full z-50 mt-1 w-64 rounded-md border border-border bg-card p-3 text-xs text-foreground shadow-lg"
           role="dialog"
           aria-label="Agent settings"
-          onMouseDown={(event) => event.stopPropagation()}
-          onClick={(event) => event.stopPropagation()}
         >
           <div className="space-y-3">
             {modelOptions.length > 0 ? (
