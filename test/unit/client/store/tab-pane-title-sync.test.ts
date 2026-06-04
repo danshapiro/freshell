@@ -112,6 +112,41 @@ describe('tab-pane title sync for single-pane tabs', () => {
       expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('Ops Desk')
     })
 
+    it('freezes the renamed pane against later automatic title updates', () => {
+      const store = createStore()
+      store.dispatch(addTab({ title: 'Original', mode: 'claude' }))
+      const tabId = store.getState().tabs.tabs[0].id
+      store.dispatch(initLayout({
+        tabId,
+        content: { kind: 'terminal', mode: 'claude', terminalId: 'term-1' },
+      }))
+      const paneId = (store.getState().panes.layouts[tabId] as Extract<PaneNode, { type: 'leaf' }>).id
+
+      store.dispatch(applyPaneRename({ tabId, paneId, title: 'My Name' }))
+      expect(store.getState().panes.paneTitleSetByUser?.[tabId]?.[paneId]).toBe(true)
+
+      // A later automatic (setByUser:false) update must NOT change the frozen pane.
+      store.dispatch(updatePaneTitle({ tabId, paneId, title: 'Auto Override', setByUser: false }))
+      expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('My Name')
+    })
+
+    it('freezes the only pane when a single-pane tab is renamed', () => {
+      const store = createStore()
+      store.dispatch(addTab({ title: 'Original', mode: 'claude' }))
+      const tabId = store.getState().tabs.tabs[0].id
+      store.dispatch(initLayout({
+        tabId,
+        content: { kind: 'terminal', mode: 'claude', terminalId: 'term-2' },
+      }))
+      const paneId = (store.getState().panes.layouts[tabId] as Extract<PaneNode, { type: 'leaf' }>).id
+
+      store.dispatch(applyTabRename({ tabId, title: 'Ops Desk' }))
+      expect(store.getState().panes.paneTitleSetByUser?.[tabId]?.[paneId]).toBe(true)
+
+      store.dispatch(updatePaneTitle({ tabId, paneId, title: 'Auto Override', setByUser: false }))
+      expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('Ops Desk')
+    })
+
     it('renaming a multi-pane tab does not rewrite existing pane titles', () => {
       const store = createStore()
 

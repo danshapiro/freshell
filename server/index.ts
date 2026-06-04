@@ -25,7 +25,9 @@ import { createOpencodeActivityIntegration } from './coding-cli/opencode-activit
 import { claudeProvider } from './coding-cli/providers/claude.js'
 import { codexProvider } from './coding-cli/providers/codex.js'
 import { opencodeProvider } from './coding-cli/providers/opencode.js'
-import { type CodingCliProviderName, type CodingCliSession } from './coding-cli/types.js'
+import { makeSessionKey, type CodingCliProviderName, type CodingCliSession } from './coding-cli/types.js'
+import { computeSessionTitleSync } from './auto-title.js'
+import { generateAiSessionTitle } from './ai-title.js'
 import { TerminalMetadataService } from './terminal-metadata-service.js'
 import { migrateLegacyDefaultEnabledProviders, migrateSettingsSortMode } from './settings-migrate.js'
 import { createFilesRouter } from './files-router.js'
@@ -75,7 +77,6 @@ import { createAgentTimelineRouter } from './agent-timeline/router.js'
 import { createAgentHistorySource } from './agent-timeline/history-source.js'
 import { createTerminalViewService } from './terminal-view/service.js'
 import { resolveStartupBanner } from './startup-banner.js'
-import { shouldPromoteSessionTitle } from './session-title-sync.js'
 import { createFreshAgentProviderRegistry } from './fresh-agent/provider-registry.js'
 import { FreshAgentRuntimeManager } from './fresh-agent/runtime-manager.js'
 import { createFreshAgentRouter } from './fresh-agent/router.js'
@@ -649,6 +650,8 @@ async function main() {
   }
 
   // Coding CLI watcher hooks
+  // Sessions with an in-flight Gemini auto-title request (one-shot per session).
+  const pendingAiTitles = new Set<string>()
   codingCliIndexer.onUpdate((projects) => {
     sessionsSync.publish(projects)
     const associationMetaUpserts: ReturnType<TerminalMetadataService['list']> = []
@@ -680,16 +683,8 @@ async function main() {
         const matchingTerminals = registry.findTerminalsBySession(session.provider, session.sessionId, session.cwd)
         for (const term of matchingTerminals) {
           pendingMetadataSync.set(term.terminalId, session)
-
-          // Auto-update terminal titles based on session data
-          if (session.title && shouldPromoteSessionTitle(term.title, session.provider)) {
-            registry.updateTitle(term.terminalId, session.title)
-            wsHandler.broadcast({
-              type: 'terminal.title.updated',
-              terminalId: term.terminalId,
-              title: session.title,
-            })
-          }
+          // Terminal title alignment is handled by the coding-agent auto-name
+          // pass below (it pushes the canonical session name to live terminals).
         }
       }
     }
@@ -712,6 +707,88 @@ async function main() {
         log.warn({ err }, 'Failed to sync terminal metadata from coding-cli index updates')
       })
     }
+
+    // Auto-name active coding-agent sessions and keep their live terminals
+    // aligned with the canonical (server-override) name. Seeds the working-
+    // directory placeholder, finalizes from the first message when AI is off,
+    // triggers Gemini when a key is set, and pushes the canonical name to any
+    // out-of-sync terminal (regardless of whether its current title is a
+    // default label). Bounded to sessions with a live terminal so we never
+    // persist overrides for historical sessions; the ladder makes repeat
+    // passes idempotent and a finalized name is never auto-changed.
+    void (async () => {
+      const settings = await configStore.getSettings()
+      const aiWillAutoName = AI_CONFIG.enabled() && (settings.sidebar?.autoGenerateTitles ?? true)
+      let changed = false
+      for (const project of projects) {
+        for (const session of project.sessions) {
+          try {
+          const matching = registry.findTerminalsBySession(session.provider, session.sessionId, session.cwd)
+          if (matching.length === 0) continue
+          const key = makeSessionKey(session.provider, session.sessionId)
+          const existing = await configStore.getSessionOverride(key)
+          const sync = computeSessionTitleSync({
+            sessionTitle: session.title,
+            override: existing,
+            cwd: session.cwd,
+            firstUserMessage: session.firstUserMessage,
+            aiWillAutoName,
+            terminals: matching.map((t) => ({ terminalId: t.terminalId, title: t.title })),
+          })
+
+          if (sync.overridePatch?.titleOverride) {
+            await configStore.patchSessionOverride(key, sync.overridePatch)
+            session.title = sync.overridePatch.titleOverride
+            changed = true
+          }
+
+          if (sync.canonicalTitle) {
+            for (const terminalId of sync.terminalIdsToUpdate) {
+              registry.updateTitle(terminalId, sync.canonicalTitle)
+              wsHandler.broadcast({ type: 'terminal.title.updated', terminalId, title: sync.canonicalTitle })
+              changed = true
+            }
+          }
+
+          // Gemini auto-naming for terminal-backed coding agents (SDK panes
+          // finalize via the client). One-shot per session; the in-flight set
+          // guards against concurrent passes re-issuing the API call.
+          if (sync.shouldGenerateAi && session.firstUserMessage && !pendingAiTitles.has(key)) {
+            pendingAiTitles.add(key)
+            const aiInput = {
+              key,
+              firstMessage: session.firstUserMessage,
+              provider: session.provider,
+              sessionId: session.sessionId,
+              cwd: session.cwd,
+              customPrompt: settings.ai?.titlePrompt,
+            }
+            void (async () => {
+              try {
+                const aiTitle = await generateAiSessionTitle(aiInput.firstMessage, aiInput.customPrompt)
+                if (!aiTitle) return
+                await configStore.patchSessionOverride(aiInput.key, { titleOverride: aiTitle, titleSource: 'ai' })
+                for (const term of registry.findTerminalsBySession(aiInput.provider, aiInput.sessionId, aiInput.cwd)) {
+                  registry.updateTitle(term.terminalId, aiTitle)
+                  wsHandler.broadcast({ type: 'terminal.title.updated', terminalId: term.terminalId, title: aiTitle })
+                }
+                await codingCliIndexer.refresh()
+              } catch (err) {
+                log.warn({ err }, 'Gemini auto-title failed')
+              } finally {
+                pendingAiTitles.delete(aiInput.key)
+              }
+            })()
+          }
+          } catch (err) {
+            log.warn({ err, sessionId: session.sessionId }, 'Failed to auto-name a coding-agent session')
+          }
+        }
+      }
+      if (changed) sessionsSync.publish(projects)
+    })().catch((err) => {
+      log.warn({ err }, 'Failed to auto-name coding-agent sessions from index updates')
+    })
   })
 
   // Fast-path session association for newly discovered Claude sessions.

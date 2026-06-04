@@ -7,7 +7,9 @@ import { CodingCliProviderSchema } from '../shared/ws-protocol.js'
 import { logger } from './logger.js'
 import { setResponsePerfContext } from './request-logger.js'
 import { cascadeSessionRenameToTerminal } from './rename-cascade.js'
-import { AI_CONFIG, PROMPTS } from './ai-prompts.js'
+import { AI_CONFIG } from './ai-prompts.js'
+import { generateAiSessionTitle } from './ai-title.js'
+import { extractTitleFromMessage } from '../shared/title-utils.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
 import type { SessionMetadataStore } from './session-metadata-store.js'
 import { DEFAULT_CLI_PROVIDER_NAMES } from './platform.js'
@@ -168,35 +170,35 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
       return res.status(400).json({ error: 'firstMessage is required' })
     }
 
+    // No Gemini key: finalize from the first user message instead of failing.
+    // Uses the same (default) length as the client first-message title so the
+    // persisted name matches and there is no visible flip.
     if (!AI_CONFIG.enabled()) {
-      return res.status(503).json({ error: 'AI not configured', source: 'none' })
+      const fallback = extractTitleFromMessage(firstMessage)
+      if (!fallback) {
+        return res.json({ title: null, source: 'none' })
+      }
+      const result = await configStore.patchSessionOverride(compositeKey, {
+        titleOverride: fallback,
+        titleSource: 'first-message',
+      })
+      await codingCliIndexer.refresh()
+      return res.json({ title: result.titleOverride, source: result.titleSource })
     }
 
     try {
       const settings = await configStore.getSettings()
-      const { generateText } = await import('ai')
-      const { google } = await import('@ai-sdk/google')
-      const promptConfig = PROMPTS.sessionTitle
-      const model = google(promptConfig.model)
-      const prompt = promptConfig.build(firstMessage, settings.ai?.titlePrompt)
-
-      const result = await generateText({
-        model,
-        prompt,
-        maxOutputTokens: promptConfig.maxOutputTokens,
-      })
-
-      const title = (result.text || '').trim().slice(0, 80)
+      const title = await generateAiSessionTitle(firstMessage, settings.ai?.titlePrompt)
       if (!title) {
         return res.json({ title: null, source: 'none' })
       }
 
-      await configStore.patchSessionOverride(compositeKey, {
+      const stored = await configStore.patchSessionOverride(compositeKey, {
         titleOverride: title,
         titleSource: 'ai',
       })
       await codingCliIndexer.refresh()
-      res.json({ title, source: 'ai' })
+      res.json({ title: stored.titleOverride, source: stored.titleSource })
     } catch (err: any) {
       log.warn({ err }, 'AI title generation failed')
       res.json({ title: null, source: 'none', error: err.message })

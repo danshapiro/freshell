@@ -8,6 +8,7 @@ import type {
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import { getProviderLabel, isNonShellMode } from './coding-cli-utils'
 import { getFreshAgentLabel } from './fresh-agent-registry'
+import { basenameSegment } from '@shared/path-basename'
 
 /**
  * Collect all leaf pane contents in tree order (left-to-right, top-to-bottom).
@@ -69,27 +70,8 @@ function extractHostname(url: string): string | null {
 }
 
 /**
- * Extract last directory segment from a path.
- * Handles both Unix and Windows paths.
- */
-function extractLastDirSegment(path: string): string | null {
-  // Remove trailing slashes
-  const trimmed = path.replace(/[\\/]+$/, '')
-
-  // Handle root paths
-  if (trimmed === '' && path.startsWith('/')) return '/'
-  if (/^[A-Za-z]:$/.test(trimmed)) return trimmed + '\\'
-
-  // Split by both forward and back slashes
-  const segments = trimmed.split(/[\\/]/)
-  const last = segments[segments.length - 1]
-
-  return last || null
-}
-
-/**
  * Derives a tab name from pane layout content using priority order:
- * 1. First CLI instance (claude or codex mode terminal)
+ * 1. First CLI instance (coding-agent terminal: working-directory basename, then provider label)
  * 2. First FreshAgent pane (last directory segment of initialCwd, then agent label)
  * 3. First browser
  * 4. First shell terminal (using last directory segment of initialCwd)
@@ -97,9 +79,13 @@ function extractLastDirSegment(path: string): string | null {
 export function deriveTabName(layout: PaneNode, extensions?: ClientExtensionEntry[]): string {
   const contents = collectContents(layout)
 
-  // Priority 1: First CLI instance
+  // Priority 1: First CLI instance — coding agents name by working directory
   const cli = contents.find(isCli)
   if (cli) {
+    if (cli.initialCwd) {
+      const segment = basenameSegment(cli.initialCwd)
+      if (segment) return segment
+    }
     return getProviderLabel(cli.mode, extensions)
   }
 
@@ -107,7 +93,7 @@ export function deriveTabName(layout: PaneNode, extensions?: ClientExtensionEntr
   const freshAgent = contents.find(isFreshAgent)
   if (freshAgent) {
     if (freshAgent.initialCwd) {
-      const segment = extractLastDirSegment(freshAgent.initialCwd)
+      const segment = basenameSegment(freshAgent.initialCwd)
       if (segment) return segment
     }
     return getFreshAgentLabel(freshAgent.sessionType)
@@ -125,7 +111,7 @@ export function deriveTabName(layout: PaneNode, extensions?: ClientExtensionEntr
   const shell = contents.find(isShellTerminal)
   if (shell) {
     if (!shell.initialCwd) return 'Shell'
-    const segment = extractLastDirSegment(shell.initialCwd)
+    const segment = basenameSegment(shell.initialCwd)
     return segment || 'Shell'
   }
 

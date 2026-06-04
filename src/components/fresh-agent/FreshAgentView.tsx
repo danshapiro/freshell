@@ -5,8 +5,7 @@ import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { getWsClient } from '@/lib/ws-client'
 import { getFreshAgentThreadSnapshot } from '@/lib/api'
-import { consumePaneRefreshRequest, mergePaneContent, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
-import { updateTab } from '@/store/tabsSlice'
+import { consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { clearPendingCreateFailure } from '@/store/freshAgentSlice'
 import { handleFreshAgentTransportEvent, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import {
@@ -21,7 +20,7 @@ import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import { getFreshAgentSlashCommands, type FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
 import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
-import { extractTitleFromMessage } from '@shared/title-utils'
+import { finalizeCodingAgentSessionName } from '@/store/codingAgentNaming'
 import { FreshAgentApprovalBanner } from './FreshAgentApprovalBanner'
 import FreshAgentQuestionBanner from './FreshAgentQuestionBanner'
 import { FreshAgentTranscript } from './FreshAgentTranscript'
@@ -958,13 +957,13 @@ export function FreshAgentView({
                 if (isFirstMessage) {
                   autoTitleFreshBoundaryRef.current = false
                   autoTitleSentRef.current = true
-                  const title = extractTitleFromMessage(text)
-                  if (title) {
-                    dispatch(updatePaneTitle({ tabId, paneId, title, setByUser: false }))
-                    if (!tabTitleSetByUser) {
-                      dispatch(updateTab({ id: tabId, updates: { title } }))
-                    }
-                  }
+                  dispatch(finalizeCodingAgentSessionName({
+                    tabId,
+                    paneId,
+                    provider: paneContent.provider,
+                    sessionId: paneContent.sessionId,
+                    firstMessage: text,
+                  }))
                 }
                 sendFreshAgentMessage({
                   type: 'freshAgent.send',

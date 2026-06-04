@@ -1,6 +1,7 @@
 import { configStore } from './config-store.js'
 import { makeSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
+import type { TitleSource } from '../shared/title-source.js'
 
 /**
  * Find a terminal whose coding CLI session matches the given provider+sessionId.
@@ -22,11 +23,12 @@ export function findTerminalForSession(
 export async function cascadeTerminalRenameToSession(
   meta: TerminalMeta | undefined,
   titleOverride: string,
+  titleSource: TitleSource = 'user',
 ): Promise<void> {
   if (!meta?.provider || !meta.sessionId) return
 
   const compositeKey = makeSessionKey(meta.provider as CodingCliProviderName, meta.sessionId)
-  await configStore.patchSessionOverride(compositeKey, { titleOverride })
+  await configStore.patchSessionOverride(compositeKey, { titleOverride, titleSource })
 }
 
 /**

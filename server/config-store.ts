@@ -12,6 +12,7 @@ import {
   type ServerSettings,
   type ServerSettingsPatch,
 } from '../shared/settings.js'
+import { canUpgradeTitle, type TitleSource } from '../shared/title-source.js'
 
 /**
  * Simple promise-based mutex to serialize write operations.
@@ -38,7 +39,7 @@ export type AppSettingsPatch = ServerSettingsPatch
 
 export type SessionOverride = {
   titleOverride?: string
-  titleSource?: 'user' | 'ai'
+  titleSource?: TitleSource
   summaryOverride?: string
   deleted?: boolean
   archived?: boolean
@@ -480,7 +481,22 @@ export class ConfigStore {
     return this.writeMutex.acquire(async () => {
       const cfg = await this.loadForWrite()
       const existing = cfg.sessionOverrides[sessionId] || {}
-      const next = { ...existing, ...patch }
+      const next: SessionOverride = { ...existing, ...patch }
+      // Title-source ladder: a sourced title write only lands if its source may
+      // upgrade the existing one (user > ai > first-message > legacy > dir).
+      // When it cannot, keep the existing title+source but still apply every
+      // other field in the patch (archived, deleted, summary, ...).
+      if (patch.titleOverride !== undefined && patch.titleSource !== undefined) {
+        if (!canUpgradeTitle(existing.titleSource, patch.titleSource)) {
+          next.titleOverride = existing.titleOverride
+          next.titleSource = existing.titleSource
+        }
+      }
+      // Skip the full-config write + backup when nothing actually changed
+      // (e.g. a ladder-rejected title-only patch resolves to the existing value).
+      if (JSON.stringify(next) === JSON.stringify(existing)) {
+        return next
+      }
       const updated: UserConfig = {
         ...cfg,
         sessionOverrides: { ...cfg.sessionOverrides, [sessionId]: next },

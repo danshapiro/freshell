@@ -68,4 +68,50 @@ describe('derivePaneTitle', () => {
     }
     expect(derivePaneTitle(content)).toBe('Freshclaude')
   })
+
+  it('returns the working-directory basename for a CLI terminal with initialCwd', () => {
+    const content: PaneContent = {
+      kind: 'terminal',
+      mode: 'claude',
+      status: 'running',
+      createRequestId: 'test',
+      initialCwd: '/home/dan/code/freshell',
+    }
+    expect(derivePaneTitle(content)).toBe('freshell')
+  })
+
+  it('returns the working-directory basename for a fresh-agent pane with initialCwd', () => {
+    const content: PaneContent = {
+      kind: 'fresh-agent',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      status: 'idle',
+      createRequestId: 'test',
+      initialCwd: '/home/dan/code/freshell',
+    }
+    expect(derivePaneTitle(content)).toBe('freshell')
+  })
+
+  it('returns the working-directory basename for an agent-chat pane with initialCwd', () => {
+    const content: PaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'test',
+      status: 'idle',
+      initialCwd: '/home/dan/code/freshell',
+    }
+    expect(derivePaneTitle(content)).toBe('freshell')
+  })
+
+  it('does NOT use initialCwd for a shell terminal (scope guard: shells keep their shell-type label)', () => {
+    const content: PaneContent = {
+      kind: 'terminal',
+      mode: 'shell',
+      shell: 'wsl',
+      status: 'running',
+      createRequestId: 'test',
+      initialCwd: '/home/dan/code/freshell',
+    }
+    expect(derivePaneTitle(content)).toBe('WSL')
+  })
 })

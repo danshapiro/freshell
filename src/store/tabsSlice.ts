@@ -6,6 +6,7 @@ import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import type { PaneContent, PaneNode } from './paneTypes'
 import { findTabIdForSession } from '@/lib/session-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
+import { basenameSegment } from '@shared/path-basename'
 import { buildResumeContent } from '@/lib/session-type-utils'
 import { isAgentChatProviderName, getAgentChatProviderConfig, getAgentChatProviderLabel } from '@/lib/agent-chat-utils'
 import { recordClosedTabSnapshot, pushReopenEntry, popReopenEntry } from './tabRegistrySlice'
@@ -114,6 +115,20 @@ function pickHydratedTabWinner(localTab: Tab, remoteTab: Tab, meta: HydrateTabsM
   }
 
   return (localTab.updatedAt ?? 0) > (remoteTab.updatedAt ?? 0) ? localTab : remoteTab
+}
+
+/**
+ * A user-set tab name (an explicit rename) must survive a cross-device merge
+ * even when the other device's tab is more recent: user always wins, otherwise
+ * the recency winner's title stands. Auto names (dir / first-message / Gemini)
+ * are reconciled server-side via the session override, so the client only needs
+ * to keep an explicit rename sticky here.
+ */
+function reconcileHydratedTabTitle(localTab: Tab, remoteTab: Tab, winner: Tab): Tab {
+  if (winner.titleSetByUser) return winner
+  const userSide = localTab.titleSetByUser ? localTab : remoteTab.titleSetByUser ? remoteTab : null
+  if (!userSide) return winner
+  return { ...winner, title: userSide.title, titleSetByUser: true }
 }
 
 function deriveTabSessionRef(tab: Tab) {
@@ -355,7 +370,8 @@ export const tabsSlice = createSlice({
         const localTab = localById.get(remoteTab.id)
         if (localTab) {
           const winningTab = pickHydratedTabWinner(localTab, remoteTab, meta)
-          merged.push(protectCanonicalFallbackIdentity(localTab, remoteTab, winningTab))
+          const titledTab = reconcileHydratedTabTitle(localTab, remoteTab, winningTab)
+          merged.push(protectCanonicalFallbackIdentity(localTab, remoteTab, titledTab))
         } else {
           merged.push(remoteTab)
         }
@@ -471,6 +487,7 @@ export const closeTab = createAsyncThunk(
           layout,
           serverInstanceId,
           paneTitles: stateBeforeClose.panes.paneTitles[tabId],
+          extensions: stateBeforeClose.extensions?.entries,
           deviceId: tabRegistryState.deviceId,
           deviceLabel: tabRegistryState.deviceLabel,
           revision: 0,
@@ -669,7 +686,8 @@ export const openSessionTab = createAsyncThunk(
       const tabId = nanoid()
       dispatch(addTab({
         id: tabId,
-        title: title || getProviderLabel(resolvedProvider, extensions),
+        // Coding agents name by working directory; provider label is the fallback.
+        title: title || (cwd ? basenameSegment(cwd) : null) || getProviderLabel(resolvedProvider, extensions),
         status: 'running',
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
@@ -744,7 +762,7 @@ export const openSessionTab = createAsyncThunk(
       const tabId = nanoid()
       dispatch(addTab({
         id: tabId,
-        title: title || getAgentChatProviderLabel(resolvedSessionType),
+        title: title || (cwd ? basenameSegment(cwd) : null) || getAgentChatProviderLabel(resolvedSessionType),
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,
@@ -761,7 +779,7 @@ export const openSessionTab = createAsyncThunk(
     const tabId = nanoid()
     dispatch(addTab({
       id: tabId,
-      title: title || getProviderLabel(resolvedProvider, extensions),
+      title: title || (cwd ? basenameSegment(cwd) : null) || getProviderLabel(resolvedProvider, extensions),
       mode: resolvedProvider,
       codingCliProvider: resolvedProvider,
       initialCwd: cwd,
