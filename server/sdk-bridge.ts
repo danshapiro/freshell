@@ -341,12 +341,15 @@ export class SdkBridge extends EventEmitter {
         })
         this.sessions.delete(sessionId)
       } else {
-        // Stream ended naturally (SDK query completed). Session state stays for
-        // display but process resources are cleaned up so sendUserMessage/
-        // subscribe/interrupt correctly return false instead of silently
-        // pushing into a dead queue.
+        // Stream ended (naturally OR via the error catch above, since wasAborted
+        // is false in both). Session state stays for display but process resources
+        // are cleaned up so sendUserMessage/subscribe/interrupt correctly return
+        // false instead of silently pushing into a dead queue. Broadcast an explicit
+        // idle status so the client clears blue (busy = streamingActive || running);
+        // a natural end / error previously left the pane stuck blue.
         if (state) state.status = 'idle'
-        log.debug({ sessionId }, 'SDK query stream ended naturally')
+        this.broadcastToSession(sessionId, { type: 'sdk.status', sessionId, status: 'idle' })
+        log.debug({ sessionId }, 'SDK query stream ended')
       }
 
       // Always clean up process resources (input stream + process entry).

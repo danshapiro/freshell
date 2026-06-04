@@ -278,6 +278,12 @@ const freshAgentSlice = createSlice({
       const session = resolveOrEnsureSession(state, action.payload, action.payload.status)
       if (!session) return
       session.status = action.payload.status
+      // A terminal/idle status ends the turn: clear streaming too, else busy stays
+      // true (isFreshAgentBusy = streamingActive || running) and the pane is stuck
+      // blue after a natural stream-end / sdk.status:idle broadcast.
+      if (action.payload.status === 'idle' || action.payload.status === 'exited') {
+        session.streamingActive = false
+      }
     },
 
     setAvailableModels(state, action: PayloadAction<Array<{ value: string; displayName: string; description: string }>>) {
@@ -318,6 +324,13 @@ const freshAgentSlice = createSlice({
         session.timelineLoading = false
         session.restoreFailureCode = action.payload.code
         session.restoreFailureMessage = action.payload.message
+      } else {
+        // A hard (non-restore) error ends the turn: clear streaming + drop an
+        // active 'running'/'starting' status to idle so the pane does not stay blue.
+        session.streamingActive = false
+        if (session.status === 'running' || session.status === 'starting') {
+          session.status = 'idle'
+        }
       }
     },
 

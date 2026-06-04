@@ -205,6 +205,34 @@ describe('SdkBridge', () => {
     })
   })
 
+  describe('stream-end / error idle status', () => {
+    it('broadcasts sdk.status idle to a live subscriber when the stream ends naturally', async () => {
+      // Hold the stream open so we can subscribe BEFORE it ends (as the live client
+      // does), then release it to trigger the natural-end branch.
+      mockKeepStreamOpen = true
+      mockMessages.length = 0
+      const received: any[] = []
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+      mockStreamEndResolve?.() // release -> natural end
+      await new Promise((r) => setTimeout(r, 100))
+      expect(received.some((m) => m.type === 'sdk.status' && m.status === 'idle')).toBe(true)
+      expect(bridge.getSession(session.sessionId)?.status).toBe('idle')
+    })
+
+    it('resets session status to idle (clearing blue) when the stream throws', async () => {
+      // The error catch broadcasts sdk.error, then the shared finally else-branch runs
+      // (wasAborted is false) — setting status idle and broadcasting sdk.status idle,
+      // exactly as the natural-end case above. Here we assert the state reset.
+      mockKeepStreamOpen = false
+      mockMessages.length = 0
+      mockStreamError = new Error('boom')
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      await new Promise((r) => setTimeout(r, 100))
+      expect(bridge.getSession(session.sessionId)?.status).toBe('idle')
+    })
+  })
+
   describe('SDK message translation', () => {
     it('translates system init to sdk.session.init', async () => {
       mockKeepStreamOpen = true

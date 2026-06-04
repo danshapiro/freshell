@@ -374,6 +374,12 @@ const agentChatSlice = createSlice({
     }>) {
       const session = ensureSession(state, action.payload.sessionId)
       session.status = action.payload.status
+      // A terminal/idle status ends the turn: clear the streaming flag too, else
+      // busy stays true (isAgentChatBusy = streamingActive || running) and the pane
+      // is stuck blue after a natural stream-end / sdk.status:idle broadcast.
+      if (action.payload.status === 'idle' || action.payload.status === 'exited') {
+        session.streamingActive = false
+      }
     },
 
     turnResult(state, action: PayloadAction<{
@@ -461,6 +467,13 @@ const agentChatSlice = createSlice({
       session.lastError = action.payload.message
       if (isRestoreFailureCode(action.payload.code)) {
         markTerminalRestoreFailure(session, action.payload.code, action.payload.message)
+      } else {
+        // A hard (non-restore) error ends the turn: clear streaming + drop an
+        // active 'running'/'starting' status to idle so the pane does not stay blue.
+        session.streamingActive = false
+        if (session.status === 'running' || session.status === 'starting') {
+          session.status = 'idle'
+        }
       }
     },
 

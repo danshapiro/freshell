@@ -1,10 +1,44 @@
 import { describe, expect, it } from 'vitest'
+import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import reducer, {
   createFailed,
   registerPendingCreate,
   sessionCreated,
+  sessionError,
   sessionInit,
+  sessionSnapshotReceived,
+  setSessionStatus,
 } from '@/store/freshAgentSlice'
+
+describe('freshAgentSlice busy/streaming clearing', () => {
+  const loc = { sessionId: 'abc', sessionType: 'freshclaude' as const, provider: 'claude' as const }
+  const key = makeFreshAgentSessionKey(loc)
+
+  function streaming() {
+    return reducer(undefined, sessionSnapshotReceived({ ...loc, latestTurnId: null, status: 'running', streamingActive: true }))
+  }
+
+  it('setSessionStatus(idle) clears streamingActive so the pane does not stay blue', () => {
+    let state = streaming()
+    expect(state.sessions[key].streamingActive).toBe(true)
+    state = reducer(state, setSessionStatus({ ...loc, status: 'idle' }))
+    expect(state.sessions[key].streamingActive).toBe(false)
+    expect(state.sessions[key].status).toBe('idle')
+  })
+
+  it('sessionError (non-RESTORE) clears streamingActive and resets running -> idle', () => {
+    let state = streaming()
+    state = reducer(state, sessionError({ ...loc, message: 'boom' }))
+    expect(state.sessions[key].streamingActive).toBe(false)
+    expect(state.sessions[key].status).toBe('idle')
+  })
+
+  it('sessionError (RESTORE_*) does NOT reset running/streaming (restore path preserved)', () => {
+    let state = streaming()
+    state = reducer(state, sessionError({ ...loc, message: 'restore failed', code: 'RESTORE_TIMEOUT' }))
+    expect(state.sessions[key].status).toBe('running')
+  })
+})
 
 describe('freshAgentSlice', () => {
   it('tracks pending creates and resolves them into sessions', () => {
