@@ -2,6 +2,7 @@ import type { PaneContent } from '@/store/paneTypes'
 import { getProviderLabel, isNonShellMode } from '@/lib/coding-cli-utils'
 import { getAgentChatProviderLabel } from '@/lib/agent-chat-utils'
 import { getFreshAgentLabel } from '@/lib/fresh-agent-registry'
+import { basenameSegment } from '@/lib/path-basename'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
 /**
@@ -21,11 +22,13 @@ export function derivePaneTitle(content: PaneContent, extensions?: ClientExtensi
   }
 
   if (content.kind === 'agent-chat') {
-    return getAgentChatProviderLabel(content.provider)
+    const segment = content.initialCwd ? basenameSegment(content.initialCwd) : null
+    return segment ?? getAgentChatProviderLabel(content.provider)
   }
 
   if (content.kind === 'fresh-agent') {
-    return getFreshAgentLabel(content.sessionType)
+    const segment = content.initialCwd ? basenameSegment(content.initialCwd) : null
+    return segment ?? getFreshAgentLabel(content.sessionType)
   }
 
   if (content.kind === 'browser') {
@@ -42,9 +45,10 @@ export function derivePaneTitle(content: PaneContent, extensions?: ClientExtensi
     return content.extensionName
   }
 
-  // Terminal content
+  // Terminal content — coding-agent (non-shell) terminals name by working directory
   if (isNonShellMode(content.mode)) {
-    return getProviderLabel(content.mode, extensions)
+    const segment = content.initialCwd ? basenameSegment(content.initialCwd) : null
+    return segment ?? getProviderLabel(content.mode, extensions)
   }
 
   // Shell mode - use shell type if specified

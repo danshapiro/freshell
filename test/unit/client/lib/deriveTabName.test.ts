@@ -86,4 +86,35 @@ describe('deriveTabName', () => {
 
     expect(deriveTabName(layout, mockExtensions)).toBe('Freshopencode')
   })
+
+  it('returns the working-directory basename for a CLI (claude) terminal with initialCwd', () => {
+    const layout: PaneNode = {
+      type: 'leaf',
+      id: 'pane-1',
+      content: {
+        kind: 'terminal',
+        mode: 'claude',
+        status: 'running',
+        createRequestId: 'req-1',
+        initialCwd: '/home/dan/code/freshell',
+      },
+    }
+
+    expect(deriveTabName(layout, mockExtensions)).toBe('freshell')
+  })
+
+  it('falls back to the provider label for a CLI terminal without initialCwd', () => {
+    const layout: PaneNode = {
+      type: 'leaf',
+      id: 'pane-1',
+      content: {
+        kind: 'terminal',
+        mode: 'codex',
+        status: 'running',
+        createRequestId: 'req-1',
+      },
+    }
+
+    expect(deriveTabName(layout, mockExtensions)).toBe('Codex CLI')
+  })
 })
