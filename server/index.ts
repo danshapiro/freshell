@@ -427,6 +427,14 @@ async function main() {
   codexActivity.tracker.on('changed', (payload) => {
     wsHandler.broadcastCodexActivityUpdated(payload)
   })
+  codexActivity.tracker.on('turn.complete', (payload) => {
+    wsHandler.broadcastTerminalTurnComplete({
+      provider: 'codex',
+      terminalId: payload.terminalId,
+      at: payload.at,
+      ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
+    })
+  })
   claudeActivity.tracker.on('changed', (payload) => {
     wsHandler.broadcastClaudeActivityUpdated(payload)
   })

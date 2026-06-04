@@ -994,4 +994,73 @@ describe('CodexActivityTracker', () => {
     expect(tracker.isPromptBlocked('term-pending', 1_100 + PENDING_SNAPSHOT_GRACE_MS + 1)).toBe(false)
     expect(tracker.getActivity('term-pending')).toMatchObject({ phase: 'idle' })
   })
+
+  describe('turn.complete emission (server-authoritative)', () => {
+    function collectCompletions(tracker: CodexActivityTracker): Array<{ terminalId: string; sessionId?: string; at: number }> {
+      const events: Array<{ terminalId: string; sessionId?: string; at: number }> = []
+      tracker.on('turn.complete', (e) => events.push(e))
+      return events
+    }
+
+    it('emits one turn.complete when a busy turn clears via a live BEL', () => {
+      const tracker = new CodexActivityTracker()
+      const events = collectCompletions(tracker)
+      tracker.bindTerminal({ terminalId: 'term-1', sessionId: 'session-1', reason: 'association', session: createSession('session-1'), at: 1_000 })
+      tracker.noteInput({ terminalId: 'term-1', data: '\r', at: 1_100 })
+      tracker.reconcileProjects(createProjects(createSession('session-1', { latestTaskStartedAt: 1_150 })), 1_200)
+      tracker.noteOutput({ terminalId: 'term-1', data: '\x07', at: 1_250 })
+
+      expect(events).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_250 }])
+    })
+
+    it('does not emit on a stray BEL while idle', () => {
+      const tracker = new CodexActivityTracker()
+      const events = collectCompletions(tracker)
+      tracker.bindTerminal({ terminalId: 'term-1', sessionId: 'session-1', reason: 'association', session: createSession('session-1'), at: 1_000 })
+      tracker.noteOutput({ terminalId: 'term-1', data: '\x07', at: 1_250 })
+
+      expect(events).toHaveLength(0)
+    })
+
+    it('emits once when the JSONL task_complete clears a busy turn and the BEL was missed', () => {
+      const tracker = new CodexActivityTracker()
+      const events = collectCompletions(tracker)
+      tracker.bindTerminal({ terminalId: 'term-1', sessionId: 'session-1', reason: 'association', session: createSession('session-1'), at: 1_000 })
+      tracker.noteInput({ terminalId: 'term-1', data: '\r', at: 1_100 })
+      tracker.reconcileProjects(createProjects(createSession('session-1', { latestTaskStartedAt: 1_150 })), 1_200)
+      tracker.reconcileProjects(createProjects(createSession('session-1', { latestTaskStartedAt: 1_150, latestTaskCompletedAt: 1_175 })), 1_300)
+
+      expect(events).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_300 }])
+    })
+
+    it('does not double-emit when a live BEL clears the turn and a later reconcile sees the JSONL completion', () => {
+      const tracker = new CodexActivityTracker()
+      const events = collectCompletions(tracker)
+      tracker.bindTerminal({ terminalId: 'term-1', sessionId: 'session-1', reason: 'association', session: createSession('session-1'), at: 1_000 })
+      tracker.noteInput({ terminalId: 'term-1', data: '\r', at: 1_100 })
+      tracker.reconcileProjects(createProjects(createSession('session-1', { latestTaskStartedAt: 1_150 })), 1_200)
+      tracker.noteOutput({ terminalId: 'term-1', data: '\x07', at: 1_250 })
+      tracker.reconcileProjects(createProjects(createSession('session-1', { latestTaskStartedAt: 1_150, latestTaskCompletedAt: 1_175 })), 1_300)
+
+      expect(events).toHaveLength(1)
+    })
+
+    it('emits exactly one completion at final idle for back-to-back queued submits (none on the re-arm)', () => {
+      const tracker = new CodexActivityTracker()
+      const events = collectCompletions(tracker)
+      tracker.bindTerminal({ terminalId: 'term-1', sessionId: 'session-1', reason: 'association', session: createSession('session-1'), at: 1_000 })
+      tracker.noteInput({ terminalId: 'term-1', data: '\r', at: 1_100 })
+      tracker.reconcileProjects(createProjects(createSession('session-1', { latestTaskStartedAt: 1_150 })), 1_200)
+      // queue a second submit while busy
+      tracker.noteInput({ terminalId: 'term-1', data: '\r', at: 1_300 })
+      // first turn's BEL clears turn1 but re-arms to pending (turn2 queued) → NO completion yet
+      tracker.noteOutput({ terminalId: 'term-1', data: '\x07', at: 1_400 })
+      expect(events).toHaveLength(0)
+      // turn2 starts, then finishes → final idle → exactly one completion
+      tracker.reconcileProjects(createProjects(createSession('session-1', { latestTaskStartedAt: 1_410 })), 1_450)
+      tracker.noteOutput({ terminalId: 'term-1', data: '\x07', at: 1_500 })
+
+      expect(events).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_500 }])
+    })
+  })
 })

@@ -153,7 +153,7 @@ export const ClaudeActivityUpdatedSchema = z.object({
 export const TerminalTurnCompleteSchema = z.object({
   type: z.literal('terminal.turn.complete'),
   terminalId: z.string().min(1),
-  provider: z.enum(['opencode', 'claude']),
+  provider: z.enum(['opencode', 'claude', 'codex']),
   sessionId: z.string().min(1).optional(),
   at: z.number().int().nonnegative(),
 })

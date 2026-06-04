@@ -789,7 +789,7 @@ describe('TerminalView lifecycle updates', () => {
     expect(terminalInstances[0].focus).not.toHaveBeenCalled()
   })
 
-  it('records turn completion and strips BEL from codex output', async () => {
+  it('strips BEL from codex output but does not record a client-side turn completion (server-authoritative)', async () => {
     const tabId = 'tab-codex-bell'
     const paneId = 'pane-codex-bell'
     const terminalId = 'term-codex-bell'
@@ -872,11 +872,100 @@ describe('TerminalView lifecycle updates', () => {
       data: 'hello\x07world',
     })
 
+    // BEL is still stripped from the rendered output...
     expect(terminalInstances[0].write.mock.calls.some((call) => call[0] === 'helloworld')).toBe(true)
-    expect(store.getState().turnCompletion.pendingEvents.at(-1)?.tabId).toBe(tabId)
-    expect(store.getState().turnCompletion.pendingEvents.at(-1)?.paneId).toBe(paneId)
-    expect(store.getState().turnCompletion.pendingEvents.at(-1)?.terminalId).toBe(terminalId)
-    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(1)
+    // ...but codex turn completion is now server-owned (terminal.turn.complete broadcast),
+    // so the client must NOT mint a turn-complete from the live BEL.
+    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+  })
+
+  it('does not record a codex turn-complete from replayed scrollback BEL', async () => {
+    const tabId = 'tab-codex-replay'
+    const paneId = 'pane-codex-replay'
+    const terminalId = 'term-codex-replay'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-codex-replay',
+      status: 'running',
+      mode: 'codex',
+      shell: 'system',
+      terminalId,
+      initialCwd: '/tmp',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+        turnCompletion: turnCompletionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'codex',
+            status: 'running',
+            title: 'Codex',
+            titleSetByUser: false,
+            terminalId,
+            createRequestId: 'req-codex-replay',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null },
+        turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+    await waitFor(() => {
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+    const initialAttach = wsMocks.send.mock.calls
+      .map(([msg]) => msg)
+      .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+    act(() => {
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId,
+        headSeq: 1,
+        replayFromSeq: 1,
+        replayToSeq: 1,
+        attachRequestId: initialAttach?.attachRequestId,
+      })
+    })
+
+    // A replayed scrollback frame containing a completion BEL must NOT mint a turn-complete.
+    act(() => {
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: 1,
+        seqEnd: 1,
+        data: '\x07',
+      })
+    })
+
+    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
   })
 
   it('preserves OSC title BEL terminators and does not record turn completion', async () => {

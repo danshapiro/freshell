@@ -1085,7 +1085,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const osc = extractOsc52Events(startup.cleaned, osc52ParserRef.current)
     const { cleaned, count } = extractTurnCompleteSignals(osc.cleaned, mode, turnCompleteSignalStateRef.current)
 
-    if (count > 0 && tid && mode !== 'claude') {
+    // claude and codex turn-completion are server-authoritative (terminal.turn.complete
+    // broadcast). The client must not mint a completion from output (live or replayed)
+    // for those modes — only opencode/other modes still use the client BEL path.
+    if (count > 0 && tid && mode !== 'claude' && mode !== 'codex') {
       dispatch(recordTurnComplete({
         tabId,
         paneId: paneIdRef.current,
