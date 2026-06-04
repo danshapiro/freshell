@@ -323,7 +323,10 @@ function reduceSnapshot(
     if (busySessionIds.length === 0) {
       return {
         state: { kind: 'quiet', knownSessionId: state.sessionId },
-        actions: [{ kind: 'activityRemove', at: observation.at }],
+        actions: [
+          { kind: 'activityRemove', at: observation.at },
+          { kind: 'turnComplete', sessionId: state.sessionId, at: observation.at },
+        ],
       }
     }
     if (busySessionIds.length === 1 && busySessionIds[0] === state.sessionId) {
@@ -342,8 +345,18 @@ function reduceSnapshot(
   if (state.kind === 'candidate') {
     if (busySessionIds.length === 0) {
       return {
-        state: { kind: 'quiet', knownSessionId: state.previousKnownSessionId },
-        actions: [{ kind: 'activityRemove', at: observation.at }],
+        state: {
+          kind: 'awaitingAssociation',
+          sessionId: state.sessionId,
+          previousKnownSessionId: state.previousKnownSessionId,
+          cycleId: state.cycleId,
+          streamId: state.streamId,
+          completedAt: observation.at,
+        },
+        actions: [
+          { kind: 'activityRemove', at: observation.at },
+          { kind: 'requestAssociation', sessionId: state.sessionId },
+        ],
       }
     }
     if (busySessionIds.length === 1 && busySessionIds[0] === state.sessionId) {

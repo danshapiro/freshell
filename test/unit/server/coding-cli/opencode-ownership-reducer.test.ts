@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   confirmOpencodeAssociation,
   createOpencodeOwnershipState,
+  rejectOpencodeAssociation,
   reduceOpencodeOwnership,
 } from '../../../../server/coding-cli/opencode-ownership-reducer'
 
@@ -96,6 +97,9 @@ describe('opencode ownership reducer', () => {
       { kind: 'activityRemove', at: 30 },
       { kind: 'turnComplete', sessionId: 'session-a', at: 30 },
     ])
+    expect(result.actions).not.toContainEqual(expect.objectContaining({
+      kind: 'requestAssociation',
+    }))
   })
 
   it('treats competing candidate sessions as durable ambiguity and blocks third-session adoption until quiet', () => {
@@ -231,7 +235,7 @@ describe('opencode ownership reducer', () => {
     expect(result.actions).toEqual([{ kind: 'activityRemove', at: 21 }])
   })
 
-  it('never emits turn completion from snapshots', () => {
+  it('emits direct completion when a known busy snapshot becomes idle', () => {
     let state = createOpencodeOwnershipState('session-a')
 
     let result = reduceOpencodeOwnership(state, {
@@ -257,10 +261,86 @@ describe('opencode ownership reducer', () => {
       kind: 'quiet',
       knownSessionId: 'session-a',
     })
-    expect(result.actions).toEqual([{ kind: 'activityRemove', at: 20 }])
+    expect(result.actions).toEqual([
+      { kind: 'activityRemove', at: 20 },
+      { kind: 'turnComplete', sessionId: 'session-a', at: 20 },
+    ])
+  })
+
+  it('routes snapshot-idle candidates through association while clearing blue activity', () => {
+    let state = createOpencodeOwnershipState()
+
+    let result = reduceOpencodeOwnership(state, {
+      kind: 'snapshot',
+      cycleId: 1,
+      streamId: 1,
+      statuses: {
+        'session-a': { type: 'busy' },
+      },
+      at: 10,
+    })
+    state = result.state
+
+    result = reduceOpencodeOwnership(state, {
+      kind: 'snapshot',
+      cycleId: 2,
+      streamId: 2,
+      statuses: {},
+      at: 20,
+    })
+    state = result.state
+
+    expect(result.state).toEqual({
+      kind: 'awaitingAssociation',
+      sessionId: 'session-a',
+      previousKnownSessionId: undefined,
+      cycleId: 1,
+      streamId: 1,
+      completedAt: 20,
+    })
+    expect(result.actions).toEqual([
+      { kind: 'activityRemove', at: 20 },
+      { kind: 'requestAssociation', sessionId: 'session-a' },
+    ])
     expect(result.actions).not.toContainEqual(expect.objectContaining({
       kind: 'turnComplete',
     }))
+
+    result = confirmOpencodeAssociation(state, { sessionId: 'session-a' })
+    expect(result.actions).toEqual([
+      { kind: 'turnComplete', sessionId: 'session-a', at: 20 },
+    ])
+  })
+
+  it('does not emit completion when candidate association is rejected', () => {
+    let state = createOpencodeOwnershipState()
+
+    let result = reduceOpencodeOwnership(state, {
+      kind: 'snapshot',
+      cycleId: 1,
+      streamId: 1,
+      statuses: {
+        'session-a': { type: 'busy' },
+      },
+      at: 10,
+    })
+    state = result.state
+
+    result = reduceOpencodeOwnership(state, {
+      kind: 'snapshot',
+      cycleId: 2,
+      streamId: 2,
+      statuses: {},
+      at: 20,
+    })
+
+    result = rejectOpencodeAssociation(result.state, { sessionId: 'session-a' })
+
+    expect(result.state).toEqual({
+      kind: 'quiet',
+      knownSessionId: undefined,
+    })
+    expect(result.actions).toEqual([])
   })
 
   it('requests association for a snapshot-seeded candidate that idles on the same live stream', () => {
