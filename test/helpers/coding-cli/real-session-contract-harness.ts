@@ -822,6 +822,54 @@ export async function startCodexAppServer(
   }
 }
 
+export async function startOpencodeServe(
+  workspace: ProbeWorkspace,
+  opencodePath: string,
+  runEnv: NodeJS.ProcessEnv,
+  healthPath: string,
+): Promise<{
+  baseUrl: string
+  port: number
+  process: TrackedProcess
+  health: unknown
+}> {
+  const endpoint = await allocateLocalhostPort()
+  const baseUrl = `http://${endpoint.hostname}:${endpoint.port}`
+  const processHandle = await workspace.spawnProcess(
+    opencodePath,
+    ['serve', '--hostname', endpoint.hostname, '--port', String(endpoint.port)],
+    {
+      env: runEnv,
+    },
+  )
+
+  // Fail fast (with the serve process's own error) if it cannot bind the port,
+  // rather than silently attaching to a stranger already listening on it or
+  // waiting out the full health-check timeout.
+  const health = await waitFor(`OpenCode serve ${baseUrl}`, async () => {
+    const stderr = processHandle.stderr()
+    if (/ServeError|Failed to start server|EADDRINUSE/i.test(stderr)) {
+      throw new Error(`OpenCode serve could not start on ${baseUrl}: ${stderr.trim()}`)
+    }
+    try {
+      const response = await fetchWithTimeout(`${baseUrl}${healthPath}`)
+      if (!response.ok) {
+        return undefined
+      }
+      return await response.json()
+    } catch {
+      return undefined
+    }
+  }, 30_000, 200)
+
+  return {
+    baseUrl,
+    port: endpoint.port,
+    process: processHandle,
+    health,
+  }
+}
+
 export class CodexRpcProbeClient {
   private readonly socket: WebSocket
   private readonly pendingRequests = new Map<number, PendingRpcRequest>()

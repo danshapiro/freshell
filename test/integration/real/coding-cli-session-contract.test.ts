@@ -22,11 +22,11 @@ import {
   seedCodexHome,
   seedOpencodeHomes,
   startCodexAppServer,
+  startOpencodeServe,
   waitForCodexSessionArtifact,
   waitForCodexShellSnapshot,
   waitForFileSizeIncrease,
   waitForAnyHttpBusyStatus,
-  waitForHttpHealthy,
   waitForJsonResponse,
   waitForJsonLine,
   waitForOpencodeDbSession,
@@ -528,18 +528,14 @@ describe.sequential('coding cli real provider session contract', () => {
           const firstDbRow = await waitForOpencodeDbSession(homes.dbPath, firstSessionId)
           expect(firstDbRow.id).toBe(firstSessionId)
 
-          const servePort = 46123
-        const serve = await workspace.spawnProcess(
-          opencodePath,
-            ['serve', '--hostname', '127.0.0.1', '--port', String(servePort)],
-            {
-              env: runEnv,
-            },
+          const { baseUrl, process: serve, health } = await startOpencodeServe(
+            workspace,
+            opencodePath,
+            runEnv,
+            note.providers.opencode.globalHealthPath,
           )
 
-          const healthUrl = `http://127.0.0.1:${servePort}${note.providers.opencode.globalHealthPath}`
-          const statusUrl = `http://127.0.0.1:${servePort}${note.providers.opencode.sessionStatusPath}`
-          const health = await waitForHttpHealthy(healthUrl)
+          const statusUrl = `${baseUrl}${note.providers.opencode.sessionStatusPath}`
           expect(health).toEqual({
             healthy: true,
             version: opencodeBinary.version,
@@ -555,7 +551,7 @@ describe.sequential('coding cli real provider session contract', () => {
               'json',
               '--dangerously-skip-permissions',
               '--attach',
-              `http://127.0.0.1:${servePort}`,
+              baseUrl,
             ],
             {
               env: runEnv,

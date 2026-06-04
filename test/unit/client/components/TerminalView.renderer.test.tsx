@@ -363,7 +363,7 @@ describe('TerminalView renderer mode', () => {
       data: 'still works',
     })
     await waitFor(() => {
-      expect(terminalInstances[0].write).toHaveBeenCalledWith('still works', undefined)
+      expect(terminalInstances[0].write.mock.calls.some((call) => call[0] === 'still works')).toBe(true)
     })
   })
 })

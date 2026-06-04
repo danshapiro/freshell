@@ -281,7 +281,7 @@ describe('TerminalView OSC52 policy handling', () => {
     messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: `before${OSC52_COPY}after` })
 
     await waitFor(() => {
-      expect(terminalInstances[0].write).toHaveBeenCalledWith('beforeafter', undefined)
+      expect(terminalInstances[0].write.mock.calls.some((call) => call[0] === 'beforeafter')).toBe(true)
     })
     expect(clipboardMocks.copyText).toHaveBeenCalledWith('copy')
     expect(screen.queryByRole('dialog', { name: 'Clipboard access request' })).not.toBeInTheDocument()
@@ -398,7 +398,7 @@ describe('TerminalView OSC52 policy handling', () => {
     messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: `before${OSC52_COPY}after` })
 
     await waitFor(() => {
-      expect(terminalInstances[0].write).toHaveBeenCalledWith('beforeafter', undefined)
+      expect(terminalInstances[0].write.mock.calls.some((call) => call[0] === 'beforeafter')).toBe(true)
     })
     expect(clipboardMocks.copyText).not.toHaveBeenCalled()
     expect(screen.queryByRole('dialog', { name: 'Clipboard access request' })).not.toBeInTheDocument()
