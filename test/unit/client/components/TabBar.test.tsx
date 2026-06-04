@@ -331,7 +331,7 @@ describe('TabBar', () => {
       expect(idleIcon?.getAttribute('class') ?? '').not.toContain('text-blue-500')
     })
 
-    it('does not show blue icon when the exact record is only pending', () => {
+    it('shows blue icon when the exact record is pending', () => {
       const tab = createTab({
         id: 'tab-codex',
         title: 'Codex Pending',
@@ -373,7 +373,7 @@ describe('TabBar', () => {
       const blueIcons = within(tabElement).getAllByTestId('pane-icon')
         .filter((icon) => icon.getAttribute('class')?.includes('text-blue-500'))
 
-      expect(blueIcons).toHaveLength(0)
+      expect(blueIcons).toHaveLength(1)
     })
 
     it('shows no activity when pane has no terminalId during rehydrate gap', () => {

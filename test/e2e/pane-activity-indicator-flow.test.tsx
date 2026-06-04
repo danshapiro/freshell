@@ -20,10 +20,13 @@ import opencodeActivityReducer, {
 } from '@/store/opencodeActivitySlice'
 import agentChatReducer, { removePermission } from '@/store/agentChatSlice'
 import type { AgentChatState } from '@/store/agentChatTypes'
+import freshAgentReducer from '@/store/freshAgentSlice'
+import type { FreshAgentState } from '@/store/freshAgentTypes'
 import paneRuntimeActivityReducer, {
   clearPaneRuntimeActivity,
   type PaneRuntimeActivityState,
 } from '@/store/paneRuntimeActivitySlice'
+import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type {
   AgentChatPaneContent,
   BrowserPaneContent,
@@ -103,6 +106,7 @@ type RenderHarnessOptions = {
   paneTitle?: string
   paneRuntimeActivity?: PaneRuntimeActivityState
   agentChat?: AgentChatState
+  freshAgent?: FreshAgentState
   settingsOverrides?: Record<string, unknown>
 }
 
@@ -140,6 +144,7 @@ function renderHarness(options: RenderHarnessOptions) {
       claudeActivity: claudeActivityReducer,
       opencodeActivity: opencodeActivityReducer,
       agentChat: agentChatReducer,
+      freshAgent: freshAgentReducer,
       paneRuntimeActivity: paneRuntimeActivityReducer,
     },
     preloadedState: {
@@ -195,6 +200,12 @@ function renderHarness(options: RenderHarnessOptions) {
         pendingCreates: {},
         availableModels: [],
       },
+      freshAgent: options.freshAgent ?? {
+        sessions: {},
+        pendingCreates: {},
+        pendingCreateFailures: {},
+        availableModels: [],
+      },
       paneRuntimeActivity: options.paneRuntimeActivity ?? {
         byPaneId: {},
       },
@@ -214,7 +225,11 @@ function renderHarness(options: RenderHarnessOptions) {
 }
 
 function getVisibleSinglePaneTab() {
-  return screen.getByLabelText('Activity Pane')
+  const tab = screen
+    .getAllByLabelText('Activity Pane')
+    .find((element) => element.getAttribute('data-context') === 'tab')
+  if (!tab) throw new Error('Activity Pane tab not found')
+  return tab
 }
 
 describe('pane activity indicator flow (e2e)', () => {
@@ -592,6 +607,31 @@ describe('pane activity indicator flow (e2e)', () => {
           },
         },
       } as AgentChatState,
+      freshAgent: {
+        sessions: {
+          [makeFreshAgentSessionKey({ sessionType: 'freshclaude', provider: 'claude', sessionId: 'sess-1' })]: {
+            sessionKey: makeFreshAgentSessionKey({ sessionType: 'freshclaude', provider: 'claude', sessionId: 'sess-1' }),
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            sessionId: 'sess-1',
+            threadId: 'sess-1',
+            status: 'running',
+            turns: [],
+            timelineItems: [],
+            timelineBodies: {},
+            streamingText: '',
+            streamingActive: false,
+            pendingPermissions: {},
+            pendingQuestions: {},
+            totalCostUsd: 0,
+            totalInputTokens: 0,
+            totalOutputTokens: 0,
+          },
+        },
+        pendingCreates: {},
+        pendingCreateFailures: {},
+        availableModels: [],
+      },
     })
 
     render(
