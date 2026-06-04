@@ -493,6 +493,7 @@ export default function App() {
         if (!cancelled) {
           resetCodexActivityOverlay()
           resetClaudeActivityOverlay()
+          resetOpencodeActivityOverlay()
           dispatch(setStatus('disconnected'))
           dispatch(setError('Authentication failed'))
         }
