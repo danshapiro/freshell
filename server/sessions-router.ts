@@ -170,10 +170,10 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
     }
 
     // No Gemini key: finalize from the first user message instead of failing.
-    // Uses the same maxLen (200) as the transcript parser so the persisted
-    // name matches and there is no visible flip.
+    // Uses the same (default) length as the client first-message title so the
+    // persisted name matches and there is no visible flip.
     if (!AI_CONFIG.enabled()) {
-      const fallback = extractTitleFromMessage(firstMessage, 200)
+      const fallback = extractTitleFromMessage(firstMessage)
       if (!fallback) {
         return res.json({ title: null, source: 'none' })
       }

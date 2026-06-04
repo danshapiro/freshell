@@ -17,8 +17,8 @@ import type { SessionOverride } from './config-store.js'
  *   override exists yet. When AI auto-naming is ON we deliberately leave the
  *   dir placeholder in place so the Gemini path can finalize it as 'ai'.
  *
- * The maxLen matches the provider transcript parser (200) so the persisted
- * first-message name equals the parsed title and there is no visible flip.
+ * The first-message name uses the same default length as the client and the
+ * generate-title route so the displayed name never disagrees across surfaces.
  */
 export function computeAutoTitlePatch(input: {
   cwd?: string
@@ -32,7 +32,7 @@ export function computeAutoTitlePatch(input: {
 
   const first = firstUserMessage?.trim()
   if (first && !aiWillAutoName) {
-    const title = extractTitleFromMessage(firstUserMessage as string, 200)
+    const title = extractTitleFromMessage(firstUserMessage as string)
     if (title) return { titleOverride: title, titleSource: 'first-message' }
   }
 
