@@ -4,7 +4,7 @@ import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import type { Tab } from '@/store/types'
 
 describe('pane activity', () => {
-  it('keeps Codex exact-match semantics and only treats busy as blue', () => {
+  it('keeps Codex exact-match semantics and treats busy and pending as blue', () => {
     const content: TerminalPaneContent = {
       kind: 'terminal',
       createRequestId: 'req-codex',
@@ -41,7 +41,7 @@ describe('pane activity', () => {
       claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       agentChatSessions: {},
-    }).isBusy).toBe(false)
+    })).toMatchObject({ isBusy: true, source: 'codex' })
 
     expect(resolvePaneActivity({
       paneId: 'pane-1',
@@ -51,6 +51,48 @@ describe('pane activity', () => {
       codexActivityByTerminalId: {
         'term-foreign': { terminalId: 'term-foreign', phase: 'busy', updatedAt: 10 },
       },
+      opencodeActivityByTerminalId: {},
+      claudeActivityByTerminalId: {},
+      paneRuntimeActivityByPaneId: {},
+      agentChatSessions: {},
+    }).isBusy).toBe(false)
+  })
+
+  it('does not show fresh-agent / agent-chat as busy when no live session exists (no reload blue-flash)', () => {
+    const freshContent = {
+      kind: 'fresh-agent',
+      createRequestId: 'cr',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      sessionId: 'abc',
+      status: 'running', // stale persisted status — must NOT drive blue without a live session
+    } as never
+
+    expect(resolvePaneActivity({
+      paneId: 'p',
+      content: freshContent,
+      isOnlyPane: true,
+      codexActivityByTerminalId: {},
+      opencodeActivityByTerminalId: {},
+      claudeActivityByTerminalId: {},
+      paneRuntimeActivityByPaneId: {},
+      agentChatSessions: {},
+      freshAgentSessions: {},
+    }).isBusy).toBe(false)
+
+    const chatContent = {
+      kind: 'agent-chat',
+      createRequestId: 'cr',
+      provider: 'claude',
+      sessionId: 'xyz',
+      status: 'running',
+    } as never
+
+    expect(resolvePaneActivity({
+      paneId: 'p',
+      content: chatContent,
+      isOnlyPane: true,
+      codexActivityByTerminalId: {},
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},

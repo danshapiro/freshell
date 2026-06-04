@@ -69,7 +69,11 @@ export function isAgentChatBusy(
   content: AgentChatPaneContent,
   session: ChatSessionState | undefined,
 ): boolean {
-  const status = session?.status ?? content.status
+  // No live session => not busy. The persisted content.status (which can be a
+  // stale 'running'/'compacting' from before a reload) must NOT drive blue, or
+  // the pane flashes blue on restore until the session hydrates (~1-2s).
+  if (session == null) return false
+  const status = session.status
   if (status === 'compacting') return true
 
   const hasWaitingItems = session != null && (
@@ -86,7 +90,10 @@ export function isFreshAgentBusy(
   content: FreshAgentPaneContent,
   session: FreshAgentSessionState | undefined,
 ): boolean {
-  const status = session?.status ?? content.status
+  // No live session => not busy (see isAgentChatBusy: avoids reload blue-flash
+  // from a stale persisted content.status).
+  if (session == null) return false
+  const status = session.status
   if (status === 'compacting') return true
   const hasWaitingItems = session != null && (
     Object.keys(session.pendingPermissions).length > 0
@@ -166,7 +173,11 @@ export function resolvePaneActivity(input: {
         terminalId: input.content.terminalId,
         isOnlyPane: input.isOnlyPane,
       })
-      return record?.phase === 'busy'
+      // Render 'pending' (submit accepted, task_started not yet observed) as blue
+      // too, for instant onset feedback (decision 5A). 'pending' decays quickly to
+      // idle if no turn actually starts, so a no-op submit can only flash blue
+      // briefly — never a long-lived false-blue.
+      return record?.phase === 'busy' || record?.phase === 'pending'
         ? { isBusy: true, source: 'codex' }
         : IDLE_PANE_ACTIVITY
     }
