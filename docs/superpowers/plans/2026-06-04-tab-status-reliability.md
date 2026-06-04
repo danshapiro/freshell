@@ -231,7 +231,7 @@ private flushCompletions(): void {
 
   Capture `turnKey = state.acceptedStartAt ?? state.pendingSubmitAt` BEFORE the transition mutates state, run the transition, then `maybeRecordCompletion(state, turnKey, at)`. Do **not** emit from the `*LatentTurnClear` paths (association clears that never showed busy). Add `lastEmittedTurnKey?: number` to `CodexTerminalActivity`. Flush after `commitState` in `noteOutput`, after the loop in `reconcileProjects`, and in `onTurnCompleted` (Task 11). **Pending-decay does NOT emit** (`codex-pending-decay-no-emit`): a `pending` that decays via `expireState` without a BEL/task_completed/onTurnCompleted is a no-op submit, and correctly produces no green.
 
-- [ ] **Step 3b: Failing test — back-to-back submits emit exactly one completion per turn, none on the re-arm.** Submit, busy, submit-again (queued), BEL → assert one `turn.complete`; second BEL after the queued turn finishes → second `turn.complete`. And: a turn cleared by live BEL is NOT re-emitted when a later `reconcileProjects` sees the JSONL completion (same `turnKey`).
+- [ ] **Step 3b: Failing test — back-to-back submits emit exactly ONE completion at final idle (Fresh-Eyes #1, round 2).** Because a clear with a queued submit re-arms to `pending` (`codex-activity-tracker.ts:330-337`, `:366-372`) — agent is still busy with the queued turn — the emit-on-`idle`-only rule correctly produces **no** completion on that intermediate re-arm. Sequence: submit1→busy, submit2 (queued), BEL clears turn1 → re-arms to `pending` (turn2) → **0 completions** (agent still busy); turn2 `task_started`→busy, BEL clears turn2 → `idle` → **1 completion total**. Assert exactly one `turn.complete` across the whole sequence, fired at final idle. And: a turn cleared by live BEL is NOT re-emitted when a later `reconcileProjects` sees the JSONL completion (same `turnKey`).
 
 - [ ] **Step 4: Run green (unit).**
 
@@ -243,13 +243,12 @@ codexActivity.tracker.on('turn.complete', (payload) => {
     provider: 'codex',
     terminalId: payload.terminalId,
     at: payload.at,
-    seq: payload.seq, // Task 4: monotonic seq for replay-safe dedupe
     ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
   })
 })
 ```
 
-(The `seq` field is added in Task 4 to the tracker payload, the WS schema, and the App.tsx handler — which dispatches `applyServerCompletion` (seq-gated), not `recordTurnComplete`. Mirror the same `seq` addition for the claude/opencode broadcasts at `server/index.ts:436-449`.)
+> **ORDERING (Fresh-Eyes #2, round 2):** Task 2 broadcasts WITHOUT `seq` — identical in shape to the existing claude/opencode broadcasts (`server/index.ts:436-449`) — and the client handles codex exactly like claude/opencode today (`App.tsx` live handler → `recordTurnComplete`). So Task 2 is self-consistent and commits green on its own. The `seq` field (and the switch to the seq-gated `applyServerCompletion` thunk) is added **later in Task 4** for ALL three providers at once. This keeps each task's "run green + commit" valid.
 
 - [ ] **Step 6: Update the existing codex client-completion test (Fresh-Eyes #8).** `test/unit/client/components/TerminalView.lifecycle.test.tsx:792-879` currently asserts a **live** codex BEL records a client-side turn completion. After codex leaves the client gate, that behavior is gone — **rewrite** that test to assert codex BEL no longer records a client-side completion (the server path now owns it), so the suite stays green. Then add the NEW replay test below.
 
@@ -300,8 +299,10 @@ expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
 act(() => store.dispatch(addPermissionRequest({ sessionId: 'abc', sessionType: 'freshclaude', provider: 'claude', requestId: 'perm1', /* ...request fields */ })))
 expect(store.getState().turnCompletion.attentionByPane['P']).toBe(true)  // waiting-for-approval green
 
-// resolving the permission does NOT auto-clear here (see Step 4): green clears via engage
-act(() => store.dispatch(removePermissionRequest({ sessionId: 'abc', requestId: 'perm1' })))
+// resolving uses the REAL action name `removePermission` (Fresh-Eyes #4, round 2):
+//   fresh-agent removePermission({sessionId, sessionType, provider, requestId}); agent-chat removePermission({sessionId, requestId}).
+// Does NOT auto-clear here (see Step 4): green clears via engage.
+act(() => store.dispatch(removePermission({ sessionId: 'abc', sessionType: 'freshclaude', provider: 'claude', requestId: 'perm1' })))
 ```
 
 - [ ] **Step 3: Run red.**
@@ -329,21 +330,22 @@ Deliver a completion that lands during a disconnect/refresh window **exactly onc
 > **DESIGN (Fresh-Eyes #1 + load-bearing `no-unified-ready-activity-snapshot`/`monotonic-at-vs-seq-interaction`):** The naive ack design double-notifies: the **live** `terminal.turn.complete` has no `seq`/ack, so a client that heard a live completion, played sound, then refreshes, would receive the still-unacked marker and play again (`App.tsx:1032-1044` records live with no seq; `:800-835` re-requests all lists every `ready`). Fix with a **seq + client-persisted-state** model, no ack message:
 > 1. Each tracker assigns a **monotonic `seq`** per completion and keeps only the **latest completion per terminalId** (`{seq, at}` — bounded, no queue).
 > 2. The **live** `terminal.turn.complete` carries `seq`. Each `*.activity.list.response` carries `latestTurnCompletions: {terminalId, at, seq}[]` (latest per terminal).
-> 3. The client applies a completion (green+sound, push `pendingEvents`) **only if `seq > lastAppliedSeqByTerminalId[terminalId]`**, then updates that map. Both the live handler and the list-response handler go through this same seq-gated reducer (`applyServerCompletion`).
+> 3. A **thunk** `applyServerCompletion({terminalId, provider, at, seq})` (NOT a slice reducer — Fresh-Eyes #3, round 2: `TurnCompleteEvent` requires `tabId`+`paneId` which only the caller can resolve) does: read `state.turnCompletion.lastAppliedSeqByTerminalId[terminalId]`; if `seq` is not newer, no-op; else resolve the pane via `selectTabPaneByTerminalId` (as the live handler already does at `App.tsx:1036`) and dispatch `recordTurnComplete({ tabId, paneId, terminalId, at, seq })`. `recordTurnComplete` gains an **optional `seq`**: when present it dedupes on `seq` (recording `lastAppliedSeqByTerminalId`) instead of the `at` guard. If no pane currently owns the terminal (detached/no layout), skip — there is nothing to green; a later list-response re-offers it once a pane exists. Both the live `terminal.turn.complete` handler and the three `*.activity.list.response` handlers call this same thunk.
 > 4. **Persist** `lastAppliedSeqByTerminalId` **and** `attentionByTab`/`attentionByPane` to localStorage (via `persistMiddleware`). On refresh, the client rehydrates the applied seq (so the list-response's same-seq latest is `<=` lastApplied → no replay) AND the green attention (so it stays shown). On a true disconnect, the missed completion's `seq` is `> lastApplied` → applied once. No ack, no client→server state push.
 
 **Files:**
 - Modify: `server/coding-cli/claude-activity-tracker.ts`, `codex-activity-tracker.ts`, `opencode-activity-tracker.ts` (assign monotonic `seq` per completion; keep `latestCompletion[terminalId]={seq,at}` **outside** the busy-record map so opencode idle-remove doesn't drop it; `listLatestCompletions()`)
 - Modify: `shared/ws-protocol.ts` (`TerminalTurnCompleteSchema` gains `seq`; each `*.activity.list.response` gains `latestTurnCompletions?: { terminalId, at, seq }[]`)
 - Modify: `server/ws-handler.ts` (`broadcastTerminalTurnComplete` includes `seq`; attach `latestTurnCompletions` to each `*.activity.list.response`)
-- Modify: `src/store/turnCompletionSlice.ts` (add `lastAppliedSeqByTerminalId`; add `applyServerCompletion` reducer = seq-gated apply; mark attention + applied-seq for persistence)
+- Modify: `src/store/turnCompletionSlice.ts` (add `lastAppliedSeqByTerminalId`; extend `recordTurnComplete` payload with optional `seq` → when present, dedupe on `seq` and record applied seq; mark attention + applied-seq for persistence)
+- Create: `src/store/turnCompletionThunks.ts` (or co-locate) — `applyServerCompletion({terminalId, provider, at, seq})` thunk: seq-gate against state, resolve pane via `selectTabPaneByTerminalId`, dispatch `recordTurnComplete({tabId, paneId, terminalId, at, seq})`
 - Modify: `src/store/persistMiddleware.ts` (persist+rehydrate the `turnCompletion` attention + `lastAppliedSeqByTerminalId`)
-- Modify: `src/App.tsx` (the live `terminal.turn.complete` handler and the three `*.activity.list.response` handlers both dispatch `applyServerCompletion`)
+- Modify: `src/App.tsx` (the live `terminal.turn.complete` handler and the three `*.activity.list.response` handlers both dispatch the `applyServerCompletion` thunk)
 - Test: tracker unit (seq monotonic; latest survives idle-remove), slice unit (seq-gated apply is idempotent; rehydrated seq suppresses replay), ws-handler/integration (completion during disconnect delivered once on reconnect; a client that heard it live does NOT replay after refresh)
 
 - [ ] **Step 1: Failing tracker test** — completion increments a monotonic `seq`; `listLatestCompletions()` returns the latest per terminal; the latest is **not** dropped when the opencode busy record is removed on idle.
 - [ ] **Step 2: Run red → impl → green.**
-- [ ] **Step 3: Failing slice test** — `applyServerCompletion({terminalId, at, seq})` pushes a pending event and sets `lastAppliedSeqByTerminalId`; a second call with the same (or lower) `seq` is a no-op; after rehydrating `lastAppliedSeqByTerminalId` from persistence, a same-seq apply is dropped (no replay).
+- [ ] **Step 3: Failing slice + thunk tests** — (slice) `recordTurnComplete({tabId,paneId,terminalId,at,seq})` pushes a pending event and sets `lastAppliedSeqByTerminalId`; a second dispatch with same/lower `seq` is a no-op; with `lastAppliedSeqByTerminalId` pre-seeded (rehydrated), a same-seq dispatch is dropped. (thunk) `applyServerCompletion` resolves the pane via `selectTabPaneByTerminalId` and dispatches `recordTurnComplete` with the resolved `tabId/paneId`; when no pane owns the terminal it dispatches nothing.
 - [ ] **Step 4: Run red → impl → green.**
 - [ ] **Step 5: Failing integration test** — (a) codex/claude/opencode turn completes while the only client is disconnected; on reconnect the `*.activity.list.response` carries `latestTurnCompletions`, client applies exactly one (green+sound). (b) A client that heard the live completion (seq applied + persisted) then refreshes: the list-response's same-seq latest does NOT re-fire (no double sound), and green is restored from persisted attention.
 - [ ] **Step 6: Impl** the live `seq`, list-response attachment, seq-gated `applyServerCompletion`, and persistence. Run green.
@@ -393,8 +395,8 @@ Deliver a completion that lands during a disconnect/refresh window **exactly onc
 > **DECISION (Fresh-Eyes #4 + #5):** Do **NOT** emit on the reject path. `bindSession` failure includes `session_already_owned` (`opencode-session-controller.ts:110-118`, `terminal-registry.ts:3764-3775` — another terminal owns the session); emitting a terminal-scoped completion there would **false-green** the candidate after ownership was explicitly denied (and the real owner emits its own). Also the reject types require a `sessionId: string` (`opencode-ownership-reducer.ts:73-77`, `opencode-activity-tracker.ts:41-45`), so omitting it would not compile. A rejected association means "this is not your turn" → **no green is the correct outcome** (a missed-green at worst, never a false-green). The fix is purely the **snapshot→association-gated** path: candidate idles route through `awaitingAssociation`+`requestAssociation`, and only the controller-driven **confirm** emits `turnComplete` (with the real `sessionId`). The SNAPSHOT `knownBusy`→quiet branch (`:322-328`) does NOT emit today (only SSE-idle `knownBusy`→quiet at `:230-242` does), so that direct emit (sessionId trusted) is the only other addition.
 
 **Files:**
-- Modify: `server/coding-cli/opencode-ownership-reducer.ts` — (a) `reduceSnapshot` candidate→quiet (`:342-348`): transition to `awaitingAssociation` + `requestAssociation` instead of emitting only `activityRemove` (the existing controller confirm/reject then decides green); (b) `reduceSnapshot` `knownBusy`→quiet (`:322-328`): add a direct `turnComplete` emit (sessionId trusted). **No reject-path change.**
-- Test: `test/unit/server/coding-cli/opencode-ownership-reducer.test.ts` — the existing "never emits turn completion from snapshots" test is replaced with: candidate snapshot-idle → `requestAssociation` (no direct turnComplete); `knownBusy` snapshot-idle → direct turnComplete; reject of an awaiting association → NO turnComplete (no false-green); disconnect-gap first-turn (candidate busy → stream drop → reconnect snapshot empty → requestAssociation → **confirm** → turnComplete).
+- Modify: `server/coding-cli/opencode-ownership-reducer.ts` — (a) `reduceSnapshot` candidate→quiet (`:342-348`): transition to `awaitingAssociation` and emit **BOTH `activityRemove` AND `requestAssociation`** (Fresh-Eyes #6, round 2: keep `activityRemove` to clear blue — the controller's later `turnComplete` does NOT remove the activity record (`opencode-activity-tracker.ts:595`), so dropping `activityRemove` here would leave the pane stuck blue), mirroring the SSE-idle `reduceIdle` candidate branch (`:214-227`); (b) `reduceSnapshot` `knownBusy`→quiet (`:322-328`): keep `activityRemove` and add a direct `turnComplete` emit (sessionId trusted). **No reject-path change.**
+- Test: `test/unit/server/coding-cli/opencode-ownership-reducer.test.ts` — the existing "never emits turn completion from snapshots" test is replaced with: candidate snapshot-idle → **`activityRemove` + `requestAssociation`** (no direct turnComplete, blue cleared); `knownBusy` snapshot-idle → `activityRemove` + direct turnComplete; reject of an awaiting association → NO turnComplete (no false-green); disconnect-gap first-turn (candidate busy → stream drop → reconnect snapshot empty → `activityRemove`+requestAssociation → **confirm** → turnComplete).
 
 - [ ] **Step 1: Failing reducer tests** (snapshot association-gated; reject emits nothing).
 - [ ] **Step 2: Run red → impl → green.**
@@ -445,23 +447,26 @@ Keep marking green (incl. active+idle). Make a **pane click** and a **real keyst
 - Keep: `src/hooks/useTurnCompletionNotifications.ts` clear-effect as background-tab/`attentionDismiss` behavior (no change to active-tab marking; the existing persistence test stays valid per decision 1)
 - Tests: PaneContainer (any in-tab pane focus clears tab+pane, both modes), TerminalView (printable/Enter clears; arrow/synthetic does not), TabItem (multi-pane busy + tab.status='exited' → blue), FreshAgentView + AgentChatView (submit clears attention)
 
-- [ ] **Step 1: Failing test — handleFocus clears tab+pane on any in-tab pane focus (both modes)**
+- [ ] **Step 1: Failing test — handleFocus clears tab + ALL panes on any in-tab pane focus (both modes)**
 
 ```tsx
-// click mode: pane-B completed (tab green), click pane-A → clearTabAttention dispatched
-// type mode: same — clicking a pane always dismisses its tab's green
+// pane-B completed → attentionByPane['B'] and attentionByTab['T'] set.
+// Focus pane-A → assert clearTabAttention('T') AND clearPaneAttention('B') (and 'A') dispatched.
+// Repeat for both attentionDismiss modes (click and type).
 ```
+
+- [ ] **Step 1b: Failing test — permission/question response clears attention**: a backgrounded fresh-agent/agent-chat pane in waiting-for-approval (green); invoking the approve/deny (or answer) handler dispatches clearPaneAttention+clearTabAttention for that pane's tab (Fresh-Eyes #8).
 
 - [ ] **Step 2: Failing test — TabItem single dot**: multi-pane tab, `iconsOnTabs=false`, `busyPaneIds` non-empty, `tab.status='exited'` → dot is `fill-blue-500`.
 
-- [ ] **Step 3: Failing test — type-mode engagement gating**: `sendInput('x')` clears; `sendInput('\x1b[A')` (arrow) does not; `sendInput(data, { synthetic: true })` does not.
+- [ ] **Step 3: Failing test — real-engagement gating (via `term.onData`)**: feeding `term.onData('x')` clears attention; `'\r'` (Enter) clears; `'\x1b[A'` (arrow) does NOT clear; `'\x1b[200~paste\x1b[201~'` clears (paste); and a `sendInput(data, { synthetic: true })` from scroll-translation/DECRQM does NOT clear (it no longer routes through the clear path). Cover both `attentionDismiss` modes.
 
 - [ ] **Step 4: Run red.**
 
 - [ ] **Step 5: Impl** (load-bearing `sendinput-no-synthetic-clears-any-data-type-mode` + `tabitem-double-running-gate`):
-  - `PaneContainer.handleFocus` (`:346-352`): on focus, if the tab/pane has attention, `dispatch(clearPaneAttention({paneId}))` and `dispatch(clearTabAttention({tabId}))` — unconditionally (remove BOTH the `attentionDismiss==='click'` gate and the "only if this pane has attention" gate). Then `setActivePane`.
-  - `TerminalView.tsx`: the attention-clear currently lives INSIDE `sendInput` (`:662-676`, `'type'`-mode, any data), which is also called by scroll-translation (`:691`) and startup/DECRQM auto-replies (`:1081`). **Move the clear OUT of `sendInput`** into the `term.onData` handler (`:1426-1427`, real user typing): clear pane+tab attention when `data` contains a printable char (`/[^\x00-\x1f\x7f]/`) or CR/LF — in **both** modes. `sendInput` keeps a `{ synthetic?: boolean }` option only if still needed for other logic; the key change is that synthetic callers no longer clear because the clear no longer lives in `sendInput`.
-  - `FreshAgentView.tsx` AND `AgentChatView.tsx`/`ChatComposer.tsx`: on send/submit of a real message, dispatch the same pane+tab clear (both SDK surfaces — Fresh-Eyes #2).
+  - `PaneContainer.handleFocus` (`:346-352`): on focus, clear the **tab AND every pane in that tab** — not just the focused pane (Fresh-Eyes #7, round 2: pane headers render from `attentionByPane[node.id]` at `:503`; clearing only the focused pane leaves a sibling pane's header green after the user has visited the tab). Collect the tab's pane IDs from its layout (`collectPaneEntries`) and `dispatch(clearPaneAttention({paneId}))` for each, plus `dispatch(clearTabAttention({tabId}))` — unconditionally (remove BOTH the `attentionDismiss==='click'` gate and the "only if this pane has attention" gate). Then `setActivePane`. (Rationale: focusing any pane means the user is viewing the tab; a split shows all panes, so all are "seen".)
+  - `TerminalView.tsx`: the attention-clear currently lives INSIDE `sendInput` (`:662-676`, `'type'`-mode, any data), which is also called by scroll-translation (`:691`) and startup/DECRQM auto-replies (`:1081`). **Move the clear OUT of `sendInput`** into the `term.onData` handler (`:1426-1427`, real user typing). **Predicate (Fresh-Eyes #5, round 2 — arrows must NOT clear):** a bare arrow/cursor key is `\x1b[A`/`\x1b[B`/`\x1b OA`… which contains printable `[`/`A`, so a naive "has printable char" test wrongly clears. Instead, **strip recognized ANSI escape sequences** (CSI `\x1b[…final`, SS3 `\x1bO…`, OSC) from `data` first, then clear pane+tab attention iff the remainder contains a printable char (`[^\x00-\x1f\x7f]`) or a CR/LF — in **both** modes. So `\x1b[A` → strips to `''` → no clear; `x` → clear; `\r` → clear; a bracketed paste `\x1b[200~text\x1b[201~` → strips markers → `text` → clear (paste is engagement). `sendInput` keeps a `{ synthetic?: boolean }` option only if still needed elsewhere; synthetic callers no longer clear because the clear no longer lives in `sendInput`.
+  - `FreshAgentView.tsx` AND `AgentChatView.tsx`/`ChatComposer.tsx`: dispatch the same tab+all-panes clear on (a) send/submit of a real message, AND (b) **permission/question response handlers** — approve/deny/answer (Fresh-Eyes #8, round 2: those are child-button activations that bypass `Pane`'s mousedown/keydown focus at `Pane.tsx:64`, so a keyboard approval would otherwise leave waiting-for-approval green stuck; `FreshAgentView.tsx:890` and `AgentChatView.tsx:773` only send the response today). Responding to a permission/question IS engagement → clear that pane's tab green.
   - `TabItem.tsx`: drop `&& tab.status==='running'` at **BOTH** sites — the `StatusDot` internal (`:18`) AND the call site (`:72`) — so `busy ? 'fill-blue-500' : getTerminalStatusDotClassName(status)`.
 
 - [ ] **Step 6: Run green.**
@@ -573,3 +578,9 @@ All assumptions were validated by reading the actual code (the cheapest reliable
 GPT/codex independent review (FAILED → corrected) surfaced 9 blocking defects, all folded in:
 
 1. **Durable double-notify** — live `terminal.turn.complete` had no `seq`; redesigned Task 4 around live-path `seq` + client-persisted `lastAppliedSeqByTerminalId` + persisted attention (no ack message). 2. **Task 10 omitted agent-chat** clear-on-engage → added `AgentChatView`/`ChatComposer`. 3. **Pending-permission status-based auto-clear could stick green** → removed; rely on engage-clear. 4. **opencode reject-all false-greens `session_already_owned`** + 5. **wouldn't compile (sessionId required)** → dropped reject-path emit; snapshot→association-gated confirm only. 6. **Task 11 registry→tracker dependency missing** → route via a new registry event consumed by `wireCodexActivityTracker`. 7. **Claude resume seeding had no unresolved-turn source (false-blue)** → cut seeding; kept ordering-only. 8. **Task 2 broke `TerminalView.lifecycle.test.tsx:792-879`** → added a step to rewrite it. 9. **Task 3 red-test used nonexistent action payloads** → corrected to real `addPermissionRequest` shapes.
+
+## Fresh Eyes round 2 corrections (applied)
+
+Second GPT/codex review (FAILED → corrected) found 8 deeper defects, all folded in:
+
+1. **Task 2 emit-on-idle vs back-to-back test contradiction** → Step 3b rewritten: queued submits emit exactly ONE completion at final idle, none on the re-arm. 2. **Task 2 used `seq` before Task 4 adds it** → Task 2 broadcasts seq-less (like claude/opencode); Task 4 adds `seq` to all three. 3. **`applyServerCompletion` reducer can't build a `tabId/paneId` event** → made it a thunk that resolves the pane + seq-gates, dispatching `recordTurnComplete` (now with optional `seq`). 4. **`removePermissionRequest` doesn't exist** → real name `removePermission`. 5. **arrow key `\x1b[A` contains printable `[A`** → strip ANSI escapes before the printable/CR-LF test. 6. **candidate-idle dropped `activityRemove` → stuck blue** → keep `activityRemove` + add `requestAssociation`. 7. **clearing only the focused pane left a sibling pane green** → clear the tab AND all panes of the tab on focus. 8. **keyboard permission approval bypasses pane focus** → permission/question response handlers also clear attention.
