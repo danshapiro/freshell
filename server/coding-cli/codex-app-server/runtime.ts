@@ -163,13 +163,29 @@ function parseProcStat(stat: string): { pgrp: number; startTimeTicks: number } |
   return { pgrp, startTimeTicks }
 }
 
-async function getProcessGroupId(pid: number | 'self'): Promise<number | null> {
+type ProcessGroupIdResult =
+  | { kind: 'value'; processGroupId: number }
+  | { kind: 'gone' }
+  | { kind: 'unreadable' }
+
+async function readProcessGroupIdResult(pid: number | 'self'): Promise<ProcessGroupIdResult> {
+  let stat: string
   try {
-    const stat = await fsp.readFile(`/proc/${pid}/stat`, 'utf8')
-    return parseProcStat(stat)?.pgrp ?? null
-  } catch {
-    return null
+    stat = await fsp.readFile(`/proc/${pid}/stat`, 'utf8')
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT' || code === 'ESRCH') return { kind: 'gone' }
+    return { kind: 'unreadable' }
   }
+  const parsed = parseProcStat(stat)
+  // Present but unparseable: we cannot prove the process group, so it is unprovable, not "gone".
+  if (!parsed) return { kind: 'unreadable' }
+  return { kind: 'value', processGroupId: parsed.pgrp }
+}
+
+async function getProcessGroupId(pid: number | 'self'): Promise<number | null> {
+  const result = await readProcessGroupIdResult(pid)
+  return result.kind === 'value' ? result.processGroupId : null
 }
 
 async function readProcessIdentity(pid: number): Promise<WrapperIdentity | null> {
@@ -238,27 +254,49 @@ async function isOwnerServerProcess(metadata: CodexSidecarOwnershipMetadata): Pr
   return processIdentityMatches(metadata.ownerServerIdentity, currentIdentity)
 }
 
-async function processHasOwnershipEnv(pid: number, ownershipId: string): Promise<boolean> {
+type OwnershipProof = 'match' | 'no-match' | 'unreadable' | 'gone'
+
+async function readProcessOwnershipProof(pid: number, ownershipId: string): Promise<OwnershipProof> {
   try {
     const raw = await fsp.readFile(`/proc/${pid}/environ`)
     return raw.toString('utf8').split('\0').includes(`FRESHELL_CODEX_SIDECAR_ID=${ownershipId}`)
-  } catch {
-    return false
+      ? 'match'
+      : 'no-match'
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    // The process vanished mid-scan: it carries no live ownership, so it is not evidence either way.
+    if (code === 'ENOENT' || code === 'ESRCH') return 'gone'
+    // Any other failure (e.g. EACCES) means we could not read the proof — absence of evidence, not
+    // evidence of absence. We must not treat that as "not ours".
+    return 'unreadable'
   }
 }
 
-async function processGroupMembers(processGroupId: number): Promise<number[]> {
+async function scanProcessGroupMembers(
+  processGroupId: number,
+): Promise<{ members: number[]; sawUnreadable: boolean }> {
   const entries = await fsp.readdir('/proc')
   const members: number[] = []
+  let sawUnreadable = false
 
   await Promise.all(entries.map(async (entry) => {
     if (!/^\d+$/.test(entry)) return
     const pid = Number(entry)
-    const pgrp = await getProcessGroupId(pid)
-    if (pgrp === processGroupId) members.push(pid)
+    const result = await readProcessGroupIdResult(pid)
+    if (result.kind === 'value') {
+      if (result.processGroupId === processGroupId) members.push(pid)
+    } else if (result.kind === 'unreadable') {
+      // A process we could not classify might be one of our members — stay conservative.
+      sawUnreadable = true
+    }
+    // 'gone' → exited mid-scan; ignore.
   }))
 
-  return members.sort((a, b) => a - b)
+  return { members: members.sort((a, b) => a - b), sawUnreadable }
+}
+
+async function processGroupMembers(processGroupId: number): Promise<number[]> {
+  return (await scanProcessGroupMembers(processGroupId)).members
 }
 
 async function isProcessGroupGone(processGroupId: number): Promise<boolean> {
@@ -271,30 +309,110 @@ async function isProcessGroupGone(processGroupId: number): Promise<boolean> {
   return false
 }
 
-async function verifyOwnedProcessGroup(metadata: CodexSidecarOwnershipMetadata): Promise<boolean> {
-  if (await isProcessGroupGone(metadata.processGroupId)) return true
+type OwnedProcessGroupStatus = 'gone' | 'self' | 'owned' | 'foreign' | 'indeterminate'
 
-  const currentProcessGroupId = await getProcessGroupId('self')
-  if (currentProcessGroupId !== null && metadata.processGroupId === currentProcessGroupId) {
-    return false
+async function classifyOwnedProcessGroup(
+  metadata: CodexSidecarOwnershipMetadata,
+): Promise<OwnedProcessGroupStatus> {
+  if (await isProcessGroupGone(metadata.processGroupId)) return 'gone'
+
+  // /proc/self/stat is normally always readable, but stay tri-state for consistency: if we cannot
+  // read our own process group, we cannot rule out that this PGID is the server's own group, so
+  // refuse conservatively rather than risk signaling ourselves.
+  const selfResult = await readProcessGroupIdResult('self')
+  if (selfResult.kind === 'unreadable') return 'indeterminate'
+  if (selfResult.kind === 'value' && metadata.processGroupId === selfResult.processGroupId) {
+    return 'self'
   }
 
-  const wrapperProcessGroupId = await getProcessGroupId(metadata.wrapperPid)
-  if (wrapperProcessGroupId === metadata.processGroupId) {
+  // Tri-state wrapper read: 'gone' means the wrapper genuinely left the group; 'unreadable' means we
+  // could not prove where it is, which must stay conservative (NOT "left the group").
+  const wrapperResult = await readProcessGroupIdResult(metadata.wrapperPid)
+  const wrapperInGroup =
+    wrapperResult.kind === 'value' && wrapperResult.processGroupId === metadata.processGroupId
+  if (wrapperInGroup) {
     const currentWrapperIdentity = await readProcessIdentity(metadata.wrapperPid)
     if (wrapperIdentityMatches(metadata, currentWrapperIdentity)) {
-      return true
+      return 'owned'
     }
   }
 
-  const members = await processGroupMembers(metadata.processGroupId)
+  const { members, sawUnreadable } = await scanProcessGroupMembers(metadata.processGroupId)
+  let sawUnprovable = sawUnreadable || wrapperResult.kind === 'unreadable'
   for (const pid of members) {
-    if (await processHasOwnershipEnv(pid, metadata.ownershipId)) {
-      return true
-    }
+    const proof = await readProcessOwnershipProof(pid, metadata.ownershipId)
+    if (proof === 'match') return 'owned'
+    if (proof === 'unreadable') sawUnprovable = true
   }
 
-  return false
+  // Cannot prove the group is not ours — stay conservative and never disown/kill it:
+  //  - wrapper still resident but its identity no longer matches, or
+  //  - the wrapper read, member enumeration, or a member's ownership proof was unreadable.
+  if (wrapperInGroup || sawUnprovable) return 'indeterminate'
+
+  // Wrapper has provably left the group and every readable member is provably not ours: our sidecar
+  // is gone and the PGID is foreign (reused). The ownership record is stale.
+  return 'foreign'
+}
+
+async function unlinkOwnershipMetadata(ownership: ActiveOwnership): Promise<void> {
+  await fsp.unlink(ownership.metadataPath).catch((error) => {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error
+  })
+}
+
+async function disownStaleOwnership(ownership: ActiveOwnership, when: string): Promise<true> {
+  const { metadata } = ownership
+  logger.info(
+    {
+      ownershipId: metadata.ownershipId,
+      terminalId: metadata.terminalId,
+      generation: metadata.generation,
+      wsUrl: metadata.wsUrl,
+      wrapperPid: metadata.wrapperPid,
+      processGroupId: metadata.processGroupId,
+      serverInstanceId: metadata.serverInstanceId,
+    },
+    `Codex app-server sidecar process group is no longer owned (${when}); cleaning up stale ownership record without signaling`,
+  )
+  await unlinkOwnershipMetadata(ownership)
+  return true
+}
+
+// Single dispatch for every non-`owned` classification, so the decision (and its safety guarantees)
+// is identical everywhere teardown re-classifies. Returns the teardown result for a terminal status,
+// or `null` for `owned` (meaning: the caller may signal). `gone` is a silent success (the normal
+// clean-shutdown case); `foreign` cleans up with an info log; `self`/`indeterminate` refuse.
+async function concludeIfNotOwned(
+  ownership: ActiveOwnership,
+  status: OwnedProcessGroupStatus,
+  when: string,
+): Promise<boolean | null> {
+  const { metadata } = ownership
+  if (status === 'gone') {
+    await unlinkOwnershipMetadata(ownership)
+    return true
+  }
+  if (status === 'foreign') {
+    return disownStaleOwnership(ownership, when)
+  }
+  if (status === 'self' || status === 'indeterminate') {
+    logger.error(
+      {
+        ownershipId: metadata.ownershipId,
+        terminalId: metadata.terminalId,
+        generation: metadata.generation,
+        wsUrl: metadata.wsUrl,
+        wrapperPid: metadata.wrapperPid,
+        processGroupId: metadata.processGroupId,
+        serverInstanceId: metadata.serverInstanceId,
+      },
+      `Refusing to signal Codex app-server sidecar because its process-group ownership is not verified (${when})`,
+    )
+    return false
+  }
+  return null // 'owned' — the caller may signal
 }
 
 function signalProcessGroup(processGroupId: number, signal: NodeJS.Signals): void {
@@ -321,41 +439,20 @@ async function teardownOwnedProcessGroup(
   terminateGraceMs: number,
 ): Promise<boolean> {
   const { metadata } = ownership
-  if (!(await verifyOwnedProcessGroup(metadata))) {
-    logger.error(
-      {
-        ownershipId: metadata.ownershipId,
-        terminalId: metadata.terminalId,
-        generation: metadata.generation,
-        wsUrl: metadata.wsUrl,
-        wrapperPid: metadata.wrapperPid,
-        processGroupId: metadata.processGroupId,
-        serverInstanceId: metadata.serverInstanceId,
-      },
-      'Refusing to tear down Codex app-server sidecar because ownership could not be verified',
-    )
-    return false
-  }
 
-  if (!(await isProcessGroupGone(metadata.processGroupId))) {
-    signalProcessGroup(metadata.processGroupId, 'SIGTERM')
-  }
+  // Gate the SIGTERM on a FRESH ownership classification rather than mere liveness: a PGID that was
+  // reused after the sidecar exited classifies as `foreign`/`gone`, so it is never signaled. This
+  // narrows — but cannot fully close — the residual classify->process.kill window inherent to any
+  // PGID-targeted signal.
+  const beforeTerm = await concludeIfNotOwned(ownership, await classifyOwnedProcessGroup(metadata), 'before SIGTERM')
+  if (beforeTerm !== null) return beforeTerm
+  signalProcessGroup(metadata.processGroupId, 'SIGTERM')
+
   if (!(await waitForProcessGroupGone(metadata.processGroupId, terminateGraceMs))) {
-    if (!(await verifyOwnedProcessGroup(metadata))) {
-      logger.error(
-        {
-          ownershipId: metadata.ownershipId,
-          terminalId: metadata.terminalId,
-          generation: metadata.generation,
-          wsUrl: metadata.wsUrl,
-          wrapperPid: metadata.wrapperPid,
-          processGroupId: metadata.processGroupId,
-          serverInstanceId: metadata.serverInstanceId,
-        },
-        'Refusing SIGKILL for Codex app-server sidecar because ownership changed during shutdown',
-      )
-      return false
-    }
+    // Re-verify ownership before escalating: if it exited during the grace window and the PGID was
+    // reused, this re-classifies as `gone`/`foreign` and we never SIGKILL a non-owned group.
+    const beforeKill = await concludeIfNotOwned(ownership, await classifyOwnedProcessGroup(metadata), 'before SIGKILL')
+    if (beforeKill !== null) return beforeKill
     signalProcessGroup(metadata.processGroupId, 'SIGKILL')
   }
 
@@ -377,10 +474,7 @@ async function teardownOwnedProcessGroup(
     return false
   }
 
-  await fsp.unlink(ownership.metadataPath).catch((error) => {
-    const code = (error as NodeJS.ErrnoException).code
-    if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error
-  })
+  await unlinkOwnershipMetadata(ownership)
   return true
 }
 
@@ -1138,10 +1232,7 @@ export class CodexAppServerRuntime {
     }
 
     if (await isProcessGroupGone(ownership.metadata.processGroupId)) {
-      await fsp.unlink(ownership.metadataPath).catch((error) => {
-        const code = (error as NodeJS.ErrnoException).code
-        if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error
-      })
+      await unlinkOwnershipMetadata(ownership)
       if (this.ownership === ownership) {
         this.ownership = null
       }

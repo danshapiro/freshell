@@ -812,7 +812,7 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     await killProcessGroupForTest(ready.processGroupId)
   })
 
-  it('does not use matching wrapper identity to authorize teardown of a different process group', async () => {
+  it('cleans up the stale record and refuses to signal when ownership moved to a different process group', async () => {
     const firstRuntime = createRuntime({
       metadataDir: await makeTempDir(),
       serverInstanceId: 'srv-runtime-test',
@@ -828,9 +828,16 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
       firstReady = await firstRuntime.ensureReady()
       secondReady = await secondRuntime.ensureReady()
       const ownership = (firstRuntime as any).ownership
+      const firstMetadataPath = ownership.metadataPath as string
+      // Our wrapper is no longer in this group and nothing in it carries our ownership env:
+      // the sidecar is effectively gone and the PGID is foreign.
       ownership.metadata.processGroupId = secondReady.processGroupId
 
-      await expect(firstRuntime.shutdown()).rejects.toThrow(/could not be verified|failed|ownership/i)
+      // Foreign ownership: shutdown resolves, cleans up our stale record, and never signals the
+      // foreign group.
+      await firstRuntime.shutdown()
+
+      await expect(fsp.stat(firstMetadataPath)).rejects.toMatchObject({ code: 'ENOENT' })
       expect(await isProcessGroupAlive(secondReady.processGroupId)).toBe(true)
       expect(await isProcessGroupAlive(firstReady.processGroupId)).toBe(true)
     } finally {
@@ -840,6 +847,54 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
       if (secondReady) await killProcessGroupForTest(secondReady.processGroupId)
     }
   })
+
+  it('cleans up the stale record at the SIGKILL gate when ownership changes during shutdown', async () => {
+    const firstRuntime = createRuntime({
+      metadataDir: await makeTempDir(),
+      serverInstanceId: 'srv-runtime-test',
+    })
+    const secondRuntime = createRuntime({
+      metadataDir: await makeTempDir(),
+      serverInstanceId: 'srv-runtime-test',
+    })
+    let firstReady: Awaited<ReturnType<CodexAppServerRuntime['ensureReady']>> | undefined
+    let secondReady: Awaited<ReturnType<CodexAppServerRuntime['ensureReady']>> | undefined
+    const originalKill = process.kill.bind(process)
+    let killSpy: ReturnType<typeof vi.spyOn> | undefined
+
+    try {
+      firstReady = await firstRuntime.ensureReady()
+      secondReady = await secondRuntime.ensureReady()
+      const ownership = (firstRuntime as any).ownership
+      const firstMetadataPath = ownership.metadataPath as string
+      const ownedGroup = firstReady.processGroupId
+      const foreignGroup = secondReady.processGroupId
+
+      // Ownership is valid at the first gate. When the runtime SIGTERMs the owned group, swallow the
+      // signal (so the owned group survives the 1s grace window and we reach the SIGKILL gate) and
+      // move ownership to a live foreign group, so the recheck classifies `foreign`. Liveness probes
+      // (signal 0) and every other signal pass through unchanged.
+      killSpy = vi.spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+        if (pid === -ownedGroup && signal === 'SIGTERM') {
+          ownership.metadata.processGroupId = foreignGroup
+          return true
+        }
+        return originalKill(pid as any, signal as any)
+      }) as typeof process.kill)
+
+      await firstRuntime.shutdown()
+
+      await expect(fsp.stat(firstMetadataPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(await isProcessGroupAlive(foreignGroup)).toBe(true)
+      expect(await isProcessGroupAlive(ownedGroup)).toBe(true)
+    } finally {
+      killSpy?.mockRestore()
+      runtimes.delete(firstRuntime)
+      runtimes.delete(secondRuntime)
+      if (firstReady) await killProcessGroupForTest(firstReady.processGroupId)
+      if (secondReady) await killProcessGroupForTest(secondReady.processGroupId)
+    }
+  }, 20_000)
 
   it('does not use wrapper start ticks alone when command line and cwd no longer match', async () => {
     const metadataDir = await makeTempDir()
