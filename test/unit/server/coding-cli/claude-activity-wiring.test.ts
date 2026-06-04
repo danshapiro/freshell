@@ -83,4 +83,26 @@ describe('wireClaudeActivityTracker', () => {
 
     dispose()
   })
+
+  it('records the session when terminal.session.bound fires BEFORE terminal.created (production order)', () => {
+    const registry = new FakeRegistry()
+    const { tracker, dispose } = wireClaudeActivityTracker({
+      registry: registry as any,
+      now: () => 1000,
+      setIntervalFn: (() => 0 as any),
+      clearIntervalFn: (() => {}),
+    })
+
+    // Production emits 'terminal.session.bound' BEFORE 'terminal.created'. The wiring
+    // must not lose the binding: the record should exist with its sessionId.
+    registry.emit('terminal.session.bound', { provider: 'claude', terminalId: 't1', sessionId: 's-1' })
+    expect(tracker.getActivity('t1')?.sessionId).toBe('s-1')
+
+    // A later terminal.created for the same terminal does not clobber the binding.
+    registry.emit('terminal.created', { terminalId: 't1', mode: 'claude', status: 'running' })
+    expect(tracker.getActivity('t1')?.sessionId).toBe('s-1')
+    expect(tracker.getActivity('t1')?.phase).toBe('idle')
+
+    dispose()
+  })
 })

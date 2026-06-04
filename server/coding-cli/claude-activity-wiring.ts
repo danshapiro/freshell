@@ -46,6 +46,11 @@ export function wireClaudeActivityTracker(input: {
   }
   const onBound = (event: TerminalSessionBoundEvent) => {
     if (event.provider !== 'claude') return
+    // Production emits 'terminal.session.bound' BEFORE 'terminal.created', so a plain
+    // bindSession would be a no-op (no record yet) and drop the sessionId. Ensure the
+    // record exists with its sessionId first (trackTerminal is idempotent and updates
+    // the sessionId on an existing record); a later 'terminal.created' won't clobber it.
+    tracker.trackTerminal({ terminalId: event.terminalId, sessionId: event.sessionId, at: now() })
     tracker.bindSession({ terminalId: event.terminalId, sessionId: event.sessionId, at: now() })
   }
   const onInput = (event: TerminalInputRawEvent) => {
