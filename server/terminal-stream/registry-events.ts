@@ -28,3 +28,13 @@ export type TerminalSessionUnboundEvent = {
   sessionId: string
   reason: SessionUnbindReason
 }
+
+export type CodexTurnStartedEvent = {
+  terminalId: string
+  at: number
+}
+
+export type CodexTurnCompletedEvent = {
+  terminalId: string
+  at: number
+}

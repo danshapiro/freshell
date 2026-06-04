@@ -4,6 +4,8 @@ import {
 } from './codex-activity-tracker.js'
 import type { ProjectGroup } from './types.js'
 import type {
+  CodexTurnCompletedEvent,
+  CodexTurnStartedEvent,
   TerminalInputRawEvent,
   TerminalOutputRawEvent,
   TerminalSessionBoundEvent,
@@ -69,6 +71,14 @@ export function wireCodexActivityTracker(input: {
     tracker.noteOutput({ terminalId: event.terminalId, data: event.data, at: event.at })
   }
 
+  const onTurnStarted = (event: CodexTurnStartedEvent) => {
+    tracker.onTurnStarted(event)
+  }
+
+  const onTurnCompleted = (event: CodexTurnCompletedEvent) => {
+    tracker.onTurnCompleted(event)
+  }
+
   const onExit = (event: { terminalId: string }) => {
     tracker.noteExit({ terminalId: event.terminalId, at: now() })
   }
@@ -77,6 +87,8 @@ export function wireCodexActivityTracker(input: {
   registry.on('terminal.session.unbound', onUnbound)
   registry.on('terminal.input.raw', onInput)
   registry.on('terminal.output.raw', onOutput)
+  registry.on('codex.turn.started', onTurnStarted)
+  registry.on('codex.turn.completed', onTurnCompleted)
   registry.on('terminal.exit', onExit)
 
   const stopIndexerUpdates = codingCliIndexer.onUpdate((projects) => {
@@ -95,6 +107,8 @@ export function wireCodexActivityTracker(input: {
       registry.off('terminal.session.unbound', onUnbound)
       registry.off('terminal.input.raw', onInput)
       registry.off('terminal.output.raw', onOutput)
+      registry.off('codex.turn.started', onTurnStarted)
+      registry.off('codex.turn.completed', onTurnCompleted)
       registry.off('terminal.exit', onExit)
       stopIndexerUpdates()
       clearIntervalFn(sweepTimer)

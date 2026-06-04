@@ -6,7 +6,11 @@ import {
   isSubmitInput,
   type TurnCompleteSignalParserState,
 } from '../../shared/turn-complete-signal.js'
-import type { SessionBindingReason } from '../terminal-stream/registry-events.js'
+import type {
+  CodexTurnCompletedEvent,
+  CodexTurnStartedEvent,
+  SessionBindingReason,
+} from '../terminal-stream/registry-events.js'
 import type { CodingCliSession, ProjectGroup } from './types.js'
 
 export const PENDING_SUBMIT_GATE_MS = 6000
@@ -218,6 +222,33 @@ export class CodexActivityTracker extends EventEmitter {
       if (!this.consumeTurnCompleteSignal(state, input.at)) {
         break
       }
+    }
+    this.commitState(state, previous)
+    this.flushCompletions()
+  }
+
+  onTurnStarted(input: CodexTurnStartedEvent): void {
+    const state = this.states.get(input.terminalId)
+    if (!state) return
+
+    const previous = this.toRecord(state)
+    state.lastSeenTaskStartedAt = maxDefined(state.lastSeenTaskStartedAt, input.at)
+    this.promoteBusy(state, input.at, input.at)
+    this.commitState(state, previous)
+  }
+
+  onTurnCompleted(input: CodexTurnCompletedEvent): void {
+    const state = this.states.get(input.terminalId)
+    if (!state) return
+
+    const previous = this.toRecord(state)
+    state.lastSeenTaskCompletedAt = maxDefined(state.lastSeenTaskCompletedAt, input.at)
+    if (state.phase === 'pending' && state.pendingSubmitAt !== undefined) {
+      this.transitionPendingAfterTurnClear(state, input.at)
+    } else if (state.acceptedStartAt !== undefined) {
+      this.transitionAfterTurnClear(state, input.at)
+    } else if (state.latentAcceptedStartAt !== undefined) {
+      this.transitionAfterLatentTurnClear(state, input.at)
     }
     this.commitState(state, previous)
     this.flushCompletions()

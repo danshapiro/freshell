@@ -313,6 +313,48 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     })
   })
 
+  it('emits Codex turn activity events before durability early returns', () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(4_200)
+    try {
+      const registry = new TerminalRegistry()
+      const sidecar = createFakeSidecar()
+      const term = registry.create({
+        mode: 'codex',
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
+          },
+        } as any,
+      })
+      const record = registry.get(term.terminalId)!
+      record.resumeSessionId = 'thread-durable'
+      record.codexDurability = {
+        schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+        state: 'durable',
+        durableThreadId: 'thread-durable',
+      }
+
+      const turnEvents: unknown[] = []
+      registry.on('codex.turn.started', (event) => turnEvents.push({ type: 'started', event }))
+      registry.on('codex.turn.completed', (event) => turnEvents.push({ type: 'completed', event }))
+
+      sidecar.emitTurnStarted({ threadId: 'thread-durable', turnId: 'turn-1', params: {} })
+      sidecar.emitTurnCompleted({ threadId: 'thread-durable', turnId: 'turn-1', params: {} })
+
+      expect(turnEvents).toEqual([
+        { type: 'started', event: { terminalId: term.terminalId, at: 4_200 } },
+        { type: 'completed', event: { terminalId: term.terminalId, at: 4_200 } },
+      ])
+      expect(record.codexDurability).toMatchObject({
+        state: 'durable',
+        durableThreadId: 'thread-durable',
+      })
+    } finally {
+      now.mockRestore()
+    }
+  })
+
   it('deletes the transient Codex durability store record when the terminal is killed', async () => {
     const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
     try {

@@ -22,6 +22,8 @@ import type { LoopbackServerEndpoint } from './local-port.js'
 import { makeSessionKey, parseSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
 import { SessionBindingAuthority, type BindResult } from './session-binding-authority.js'
 import type {
+  CodexTurnCompletedEvent,
+  CodexTurnStartedEvent,
   SessionBindingReason,
   SessionUnbindReason,
   TerminalInputRawEvent,
@@ -1696,6 +1698,10 @@ export class TerminalRegistry extends EventEmitter {
 
     const turnStartedUnsubscribe = sidecar.onTurnStarted?.((event) => {
       if (!isCurrentSidecar()) return
+      this.emit('codex.turn.started', {
+        terminalId: record.terminalId,
+        at: Date.now(),
+      } satisfies CodexTurnStartedEvent)
       void this.handleCodexTurnStarted(record.terminalId, event).catch((err) => {
         logger.error({ err, terminalId: record.terminalId }, 'Failed to update Codex turn-start durability state')
       })
@@ -1704,6 +1710,10 @@ export class TerminalRegistry extends EventEmitter {
 
     const turnCompletedUnsubscribe = sidecar.onTurnCompleted?.((event) => {
       if (!isCurrentSidecar()) return
+      this.emit('codex.turn.completed', {
+        terminalId: record.terminalId,
+        at: Date.now(),
+      } satisfies CodexTurnCompletedEvent)
       void this.handleCodexTurnCompleted(record.terminalId, event).catch((err) => {
         logger.error({ err, terminalId: record.terminalId }, 'Failed to proof Codex rollout after turn completion')
       })

@@ -1013,6 +1013,79 @@ describe('CodexActivityTracker', () => {
       expect(events).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_250 }])
     })
 
+    it('promotes busy from app-server turn started and clears from turn completed', () => {
+      const tracker = new CodexActivityTracker()
+      const events = collectCompletions(tracker)
+      tracker.bindTerminal({ terminalId: 'term-1', sessionId: 'session-1', reason: 'association', session: createSession('session-1'), at: 1_000 })
+
+      tracker.onTurnStarted({ terminalId: 'term-1', at: 1_100 })
+
+      expect(tracker.getActivity('term-1')).toMatchObject({
+        phase: 'busy',
+        acceptedStartAt: 1_100,
+        lastSeenTaskStartedAt: 1_100,
+      })
+      expect(tracker.isPromptBlocked('term-1')).toBe(true)
+
+      tracker.onTurnCompleted({ terminalId: 'term-1', at: 1_200 })
+
+      expect(tracker.getActivity('term-1')).toMatchObject({
+        phase: 'idle',
+        lastClearedAt: 1_200,
+        lastSeenTaskCompletedAt: 1_200,
+      })
+      expect(tracker.getActivity('term-1')?.acceptedStartAt).toBeUndefined()
+      expect(events).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_200 }])
+    })
+
+    it('does not double-emit when app-server completion is followed by BEL and JSONL completion', () => {
+      const tracker = new CodexActivityTracker()
+      const events = collectCompletions(tracker)
+      tracker.bindTerminal({ terminalId: 'term-1', sessionId: 'session-1', reason: 'association', session: createSession('session-1'), at: 1_000 })
+
+      tracker.onTurnStarted({ terminalId: 'term-1', at: 1_100 })
+      tracker.onTurnCompleted({ terminalId: 'term-1', at: 1_200 })
+      tracker.noteOutput({ terminalId: 'term-1', data: '\x07', at: 1_250 })
+      tracker.reconcileProjects(createProjects(createSession('session-1', {
+        latestTaskStartedAt: 1_100,
+        latestTaskCompletedAt: 1_220,
+      })), 1_300)
+
+      expect(events).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_200 }])
+      expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'idle' })
+    })
+
+    it('clears a pending submit from app-server completion even when turn started was missed', () => {
+      const tracker = new CodexActivityTracker()
+      const events = collectCompletions(tracker)
+      tracker.bindTerminal({ terminalId: 'term-1', sessionId: 'session-1', reason: 'association', session: createSession('session-1'), at: 1_000 })
+      tracker.noteInput({ terminalId: 'term-1', data: '\r', at: 1_100 })
+
+      tracker.onTurnCompleted({ terminalId: 'term-1', at: 1_200 })
+
+      expect(tracker.getActivity('term-1')).toMatchObject({
+        phase: 'idle',
+        lastClearedAt: 1_200,
+        lastSeenTaskCompletedAt: 1_200,
+      })
+      expect(events).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_200 }])
+    })
+
+    it('does not emit completion when a no-op pending submit decays to idle', () => {
+      const tracker = new CodexActivityTracker()
+      const events = collectCompletions(tracker)
+      tracker.bindTerminal({ terminalId: 'term-1', sessionId: 'session-1', reason: 'association', session: createSession('session-1'), at: 1_000 })
+      tracker.noteInput({ terminalId: 'term-1', data: '\r', at: 1_100 })
+
+      tracker.expire(1_100 + PENDING_SNAPSHOT_GRACE_MS + 1)
+
+      expect(tracker.getActivity('term-1')).toMatchObject({
+        phase: 'idle',
+        pendingSubmitAt: undefined,
+      })
+      expect(events).toEqual([])
+    })
+
     it('does not emit on a stray BEL while idle', () => {
       const tracker = new CodexActivityTracker()
       const events = collectCompletions(tracker)
