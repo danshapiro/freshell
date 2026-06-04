@@ -3,6 +3,7 @@ import os from 'os'
 import fsp from 'fs/promises'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { OpencodeProvider } from '../../../../server/coding-cli/providers/opencode'
+import { inProcessListingRunner } from '../../../../server/coding-cli/providers/opencode-listing-runner'
 
 vi.unmock('node:sqlite')
 
@@ -143,7 +144,7 @@ describe('OpencodeProvider SQLite marker detection', () => {
       db.close()
     }
 
-    const provider = new OpencodeProvider(tempDir)
+    const provider = new OpencodeProvider(tempDir, { queryRunner: inProcessListingRunner })
     const sessions = await provider.listSessionsDirect()
 
     expect(sessions).toEqual([
