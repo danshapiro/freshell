@@ -74,7 +74,49 @@ export class ReplayRing {
       ? normalizedSinceSeq + 1
       : undefined
 
-    const frames = this.frames.filter((frame) => frame.seqEnd > normalizedSinceSeq)
+    const frames = this.frames.slice(this.firstFrameIndexAfter(normalizedSinceSeq))
+    return { frames, missedFromSeq }
+  }
+
+  replayBatchSince(
+    sinceSeq: number | undefined,
+    maxBytes: number,
+    toSeq?: number,
+  ): { frames: ReplayFrame[]; missedFromSeq?: number } {
+    const normalizedSinceSeq = sinceSeq === undefined || sinceSeq === 0 ? 0 : sinceSeq
+    const normalizedMaxBytes = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : 0
+    const normalizedToSeq = typeof toSeq === 'number' && Number.isFinite(toSeq)
+      ? Math.max(0, Math.floor(toSeq))
+      : Number.POSITIVE_INFINITY
+
+    if (this.frames.length === 0) {
+      if (normalizedSinceSeq < this.head) {
+        return { frames: [], missedFromSeq: normalizedSinceSeq + 1 }
+      }
+      return { frames: [] }
+    }
+
+    const tail = this.frames[0].seqStart
+    const missedFromSeq = normalizedSinceSeq < tail - 1
+      ? normalizedSinceSeq + 1
+      : undefined
+    const frames: ReplayFrame[] = []
+    let budget = normalizedMaxBytes
+
+    if (budget <= 0) {
+      return { frames, missedFromSeq }
+    }
+
+    const startIndex = this.firstFrameIndexAfter(normalizedSinceSeq)
+    for (let i = startIndex; i < this.frames.length; i += 1) {
+      const frame = this.frames[i]
+      if (frame.seqStart > normalizedToSeq) break
+      if (frame.bytes > budget && frames.length > 0) break
+      frames.push(frame)
+      budget -= frame.bytes
+      if (budget <= 0) break
+    }
+
     return { frames, missedFromSeq }
   }
 
@@ -95,6 +137,20 @@ export class ReplayRing {
       if (!removed) break
       this.totalBytes -= removed.bytes
     }
+  }
+
+  private firstFrameIndexAfter(seq: number): number {
+    let low = 0
+    let high = this.frames.length
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2)
+      if (this.frames[mid].seqEnd <= seq) {
+        low = mid + 1
+      } else {
+        high = mid
+      }
+    }
+    return low
   }
 
   private decodeUtf8Fatal(bytes: Uint8Array): string | null {

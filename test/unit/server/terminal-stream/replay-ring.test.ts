@@ -53,6 +53,21 @@ describe('ReplayRing', () => {
     expect(replay.frames[1].seqEnd).toBe(3)
   })
 
+  it('returns bounded replay batches without materializing the full replay window', () => {
+    const ring = new ReplayRing(1024)
+    ring.append('aa')
+    ring.append('bb')
+    ring.append('cc')
+    ring.append('dd')
+
+    const firstBatch = ring.replayBatchSince(0, 4, 4)
+    expect(firstBatch.frames.map((f) => f.data)).toEqual(['aa', 'bb'])
+    expect(firstBatch.missedFromSeq).toBeUndefined()
+
+    const secondBatch = ring.replayBatchSince(firstBatch.frames.at(-1)?.seqEnd, 4, 4)
+    expect(secondBatch.frames.map((f) => f.data)).toEqual(['cc', 'dd'])
+  })
+
   it('reports replay miss when requested sequence is older than tail', () => {
     const ring = new ReplayRing(2)
     ring.append('1')

@@ -3023,6 +3023,7 @@ export class WsHandler {
           m.sinceSeq,
           m.attachRequestId,
           m.maxReplayBytes,
+          m.priority ?? 'foreground',
         )
         if (attachResult === 'missing') {
           const latestRecord = this.registry.get(m.terminalId)

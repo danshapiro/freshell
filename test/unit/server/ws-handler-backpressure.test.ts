@@ -426,6 +426,157 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
+  it('streams attach replay through the flush queue instead of synchronously dumping every replay frame', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-replay-batched')
+
+    const wsSeed = createMockWs()
+    await broker.attach(wsSeed as any, 'term-replay-batched', 'viewport_hydrate', 80, 24, 0, 'seed-attach')
+
+    for (let i = 1; i <= 20; i += 1) {
+      registry.emit('terminal.output.raw', {
+        terminalId: 'term-replay-batched',
+        data: `frame-${i};`,
+        at: Date.now(),
+      })
+    }
+
+    const wsReplay = createMockWs()
+    await broker.attach(wsReplay as any, 'term-replay-batched', 'transport_reconnect', 80, 24, 0, 'replay-attach')
+
+    const outputsBeforeFlush = wsReplay.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .filter((payload) => payload?.type === 'terminal.output')
+    expect(outputsBeforeFlush).toHaveLength(0)
+
+    vi.advanceTimersByTime(5)
+
+    const outputsAfterFlush = wsReplay.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .filter((payload) => payload?.type === 'terminal.output')
+    expect(outputsAfterFlush.length).toBeGreaterThan(0)
+    expect(outputsAfterFlush.map((payload) => String(payload.data)).join('')).toContain('frame-20;')
+
+    broker.close()
+  })
+
+  it('drains foreground replay batches without the background pacing delay', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-foreground-replay')
+
+    const wsSeed = createMockWs()
+    await broker.attach(wsSeed as any, 'term-foreground-replay', 'viewport_hydrate', 80, 24, 0, 'seed-attach')
+
+    const chunk = 'x'.repeat(Math.floor(MAX_REALTIME_MESSAGE_BYTES / 2))
+    for (let i = 1; i <= 4; i += 1) {
+      registry.emit('terminal.output.raw', {
+        terminalId: 'term-foreground-replay',
+        data: `foreground-frame-${i};${chunk}`,
+        at: Date.now(),
+      })
+    }
+
+    const wsReplay = createMockWs()
+    await broker.attach(wsReplay as any, 'term-foreground-replay', 'transport_reconnect', 80, 24, 0, 'foreground-attach')
+    for (let i = 0; i < 4; i += 1) {
+      vi.advanceTimersByTime(1)
+    }
+
+    const outputs = wsReplay.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .filter((payload) => payload?.type === 'terminal.output')
+    expect(outputs.map((payload) => String(payload.data)).join('')).toContain('foreground-frame-4;')
+
+    broker.close()
+  })
+
+  it('pauses background replay when socket bufferedAmount is above the background threshold without closing', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-background-paused')
+
+    const wsSeed = createMockWs()
+    await broker.attach(wsSeed as any, 'term-background-paused', 'viewport_hydrate', 80, 24, 0, 'seed-attach')
+    for (let i = 1; i <= 10; i += 1) {
+      registry.emit('terminal.output.raw', {
+        terminalId: 'term-background-paused',
+        data: `hidden-frame-${i};`,
+        at: Date.now(),
+      })
+    }
+
+    const wsReplay = createMockWs({ bufferedAmount: 768 * 1024 })
+    const closeSpy = vi.spyOn(wsReplay, 'close')
+    await broker.attach(
+      wsReplay as any,
+      'term-background-paused',
+      'keepalive_delta',
+      80,
+      24,
+      0,
+      'background-attach',
+      undefined,
+      'background',
+    )
+
+    vi.advanceTimersByTime(100)
+
+    const outputsWhileBlocked = wsReplay.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .filter((payload) => payload?.type === 'terminal.output')
+    expect(outputsWhileBlocked).toHaveLength(0)
+    expect(closeSpy).not.toHaveBeenCalled()
+
+    wsReplay.bufferedAmount = 0
+    vi.advanceTimersByTime(100)
+
+    const outputsAfterDrain = wsReplay.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .filter((payload) => payload?.type === 'terminal.output')
+    expect(outputsAfterDrain.length).toBeGreaterThan(0)
+    expect(outputsAfterDrain.map((payload) => String(payload.data)).join('')).toContain('hidden-frame-10;')
+    expect(closeSpy).not.toHaveBeenCalled()
+
+    broker.close()
+  })
+
+  it('foreground attach on the same terminal can drain after a paused background attach', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-promoted')
+
+    const wsSeed = createMockWs()
+    await broker.attach(wsSeed as any, 'term-promoted', 'viewport_hydrate', 80, 24, 0, 'seed-attach')
+    for (let i = 1; i <= 12; i += 1) {
+      registry.emit('terminal.output.raw', {
+        terminalId: 'term-promoted',
+        data: `promoted-frame-${i};`,
+        at: Date.now(),
+      })
+    }
+
+    const ws = createMockWs({ bufferedAmount: 768 * 1024 })
+    await broker.attach(ws as any, 'term-promoted', 'keepalive_delta', 80, 24, 0, 'background-attach', undefined, 'background')
+    vi.advanceTimersByTime(100)
+    expect(ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .filter((payload) => payload?.type === 'terminal.output')).toHaveLength(0)
+
+    await broker.attach(ws as any, 'term-promoted', 'transport_reconnect', 80, 24, 0, 'foreground-attach', undefined, 'foreground')
+    vi.advanceTimersByTime(5)
+
+    const outputs = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .filter((payload) => payload?.type === 'terminal.output')
+    expect(outputs.length).toBeGreaterThan(0)
+    expect(outputs.every((payload) => payload.attachRequestId === 'foreground-attach')).toBe(true)
+    expect(outputs.map((payload) => String(payload.data)).join('')).toContain('promoted-frame-12;')
+
+    broker.close()
+  })
+
   it('emits terminal_stream_replay_hit, terminal_stream_queue_pressure, and terminal_stream_gap on overflow', async () => {
     const registry = new FakeBrokerRegistry()
     const perfSpy = vi.fn()
@@ -491,6 +642,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
 
     const wsReplay = createMockWs()
     await broker.attach(wsReplay as any, 'term-replay-budget', 'viewport_hydrate', 80, 24, 0)
+    vi.advanceTimersByTime(5)
 
     const payloads = wsReplay.send.mock.calls
       .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
@@ -522,6 +674,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
 
     const wsReplay = createMockWs()
     await broker.attach(wsReplay as any, 'term-coding-floor', 'viewport_hydrate', 80, 24, 0)
+    vi.advanceTimersByTime(5)
 
     const payloads = wsReplay.send.mock.calls
       .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
@@ -553,6 +706,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
 
     const wsReplay = createMockWs()
     await broker.attach(wsReplay as any, 'term-oversized-tail', 'viewport_hydrate', 80, 24, 0)
+    vi.advanceTimersByTime(5)
 
     const payloads = wsReplay.send.mock.calls
       .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
