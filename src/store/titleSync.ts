@@ -2,7 +2,7 @@ import type { AppDispatch, RootState } from './store'
 import { updatePaneTitle } from './panesSlice'
 import { updateTab } from './tabsSlice'
 import { api } from '@/lib/api'
-import { shouldSyncRenameToServer } from '@/lib/rename-utils'
+import { isCodingAgentContent } from '@/lib/coding-agent-detection'
 import type { PaneContent, PaneNode } from './paneTypes'
 
 type TitleSyncThunk = (dispatch: AppDispatch, getState: () => RootState) => void
@@ -28,9 +28,11 @@ function findPaneContent(node: PaneNode | undefined, paneId: string): PaneConten
  * applied, so server failures must not block the UI.
  */
 function syncRenameToServer(content: PaneContent | null, title: string): void {
-  if (!content) return
+  if (!content || !isCodingAgentContent(content)) return
   if (content.kind === 'terminal') {
-    if (content.terminalId && shouldSyncRenameToServer(content.mode, content.terminalId)) {
+    // Any non-shell (coding-agent) terminal, including user-installed extension
+    // CLIs, cascades via the terminals API to its session override.
+    if (content.terminalId) {
       void api.patch(`/api/terminals/${encodeURIComponent(content.terminalId)}`, { titleOverride: title }).catch(() => {})
     }
     return

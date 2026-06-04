@@ -492,6 +492,11 @@ export class ConfigStore {
           next.titleSource = existing.titleSource
         }
       }
+      // Skip the full-config write + backup when nothing actually changed
+      // (e.g. a ladder-rejected title-only patch resolves to the existing value).
+      if (JSON.stringify(next) === JSON.stringify(existing)) {
+        return next
+      }
       const updated: UserConfig = {
         ...cfg,
         sessionOverrides: { ...cfg.sessionOverrides, [sessionId]: next },

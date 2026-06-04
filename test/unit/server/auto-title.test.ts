@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { computeAutoTitlePatch } from '../../../server/auto-title'
+import { computeAutoTitlePatch, computeSessionTitleSync } from '../../../server/auto-title'
 
 describe('computeAutoTitlePatch', () => {
   it('seeds the dir placeholder when there is no override and no first message yet', () => {
@@ -73,5 +73,64 @@ describe('computeAutoTitlePatch', () => {
 
   it('returns null when there is nothing to do (no cwd, no first message)', () => {
     expect(computeAutoTitlePatch({ existing: undefined, aiWillAutoName: false })).toBeNull()
+  })
+})
+
+describe('computeSessionTitleSync', () => {
+  const term = (terminalId: string, title?: string) => ({ terminalId, title })
+
+  it('seeds dir and pushes it to a default-titled terminal', () => {
+    const r = computeSessionTitleSync({
+      sessionTitle: 'Claude', override: undefined, cwd: '/home/dan/code/freshell',
+      firstUserMessage: undefined, aiWillAutoName: false, terminals: [term('t1', 'Claude')],
+    })
+    expect(r.overridePatch).toEqual({ titleOverride: 'freshell', titleSource: 'dir' })
+    expect(r.canonicalTitle).toBe('freshell')
+    expect(r.terminalIdsToUpdate).toEqual(['t1'])
+    expect(r.shouldGenerateAi).toBe(false)
+  })
+
+  it('upgrades dir -> first-message and pushes to a terminal already showing the dir name', () => {
+    const r = computeSessionTitleSync({
+      sessionTitle: 'freshell', override: { titleOverride: 'freshell', titleSource: 'dir' },
+      cwd: '/home/dan/code/freshell', firstUserMessage: 'Fix the login bug',
+      aiWillAutoName: false, terminals: [term('t1', 'freshell')],
+    })
+    expect(r.overridePatch).toEqual({ titleOverride: 'Fix the login bug', titleSource: 'first-message' })
+    expect(r.canonicalTitle).toBe('Fix the login bug')
+    expect(r.terminalIdsToUpdate).toEqual(['t1'])
+  })
+
+  it('pushes an already-finalized (e.g. manual ai) override to a stale terminal without re-writing it', () => {
+    const r = computeSessionTitleSync({
+      sessionTitle: 'AI Name', override: { titleOverride: 'AI Name', titleSource: 'ai' },
+      cwd: '/x/proj', firstUserMessage: 'whatever', aiWillAutoName: false,
+      terminals: [term('t1', 'freshell')],
+    })
+    expect(r.overridePatch).toBeNull()
+    expect(r.canonicalTitle).toBe('AI Name')
+    expect(r.terminalIdsToUpdate).toEqual(['t1'])
+    expect(r.shouldGenerateAi).toBe(false)
+  })
+
+  it('leaves the dir placeholder and flags AI generation when a key is set', () => {
+    const r = computeSessionTitleSync({
+      sessionTitle: 'freshell', override: { titleOverride: 'freshell', titleSource: 'dir' },
+      cwd: '/home/dan/code/freshell', firstUserMessage: 'Add a logout button',
+      aiWillAutoName: true, terminals: [term('t1', 'freshell')],
+    })
+    expect(r.overridePatch).toBeNull()
+    expect(r.canonicalTitle).toBe('freshell')
+    expect(r.terminalIdsToUpdate).toEqual([])
+    expect(r.shouldGenerateAi).toBe(true)
+  })
+
+  it('does not flag AI generation once the name is finalized', () => {
+    const r = computeSessionTitleSync({
+      sessionTitle: 'My Name', override: { titleOverride: 'My Name', titleSource: 'user' },
+      cwd: '/x', firstUserMessage: 'hi', aiWillAutoName: true, terminals: [term('t1', 'My Name')],
+    })
+    expect(r.shouldGenerateAi).toBe(false)
+    expect(r.terminalIdsToUpdate).toEqual([])
   })
 })

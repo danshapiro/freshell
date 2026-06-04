@@ -7,7 +7,8 @@ import { CodingCliProviderSchema } from '../shared/ws-protocol.js'
 import { logger } from './logger.js'
 import { setResponsePerfContext } from './request-logger.js'
 import { cascadeSessionRenameToTerminal } from './rename-cascade.js'
-import { AI_CONFIG, PROMPTS } from './ai-prompts.js'
+import { AI_CONFIG } from './ai-prompts.js'
+import { generateAiSessionTitle } from './ai-title.js'
 import { extractTitleFromMessage } from '../shared/title-utils.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
 import type { SessionMetadataStore } from './session-metadata-store.js'
@@ -187,19 +188,7 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
 
     try {
       const settings = await configStore.getSettings()
-      const { generateText } = await import('ai')
-      const { google } = await import('@ai-sdk/google')
-      const promptConfig = PROMPTS.sessionTitle
-      const model = google(promptConfig.model)
-      const prompt = promptConfig.build(firstMessage, settings.ai?.titlePrompt)
-
-      const result = await generateText({
-        model,
-        prompt,
-        maxOutputTokens: promptConfig.maxOutputTokens,
-      })
-
-      const title = (result.text || '').trim().slice(0, 80)
+      const title = await generateAiSessionTitle(firstMessage, settings.ai?.titlePrompt)
       if (!title) {
         return res.json({ title: null, source: 'none' })
       }

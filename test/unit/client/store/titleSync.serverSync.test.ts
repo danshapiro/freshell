@@ -37,6 +37,12 @@ describe('rename server sync (alignment)', () => {
     expect(apiMocks.patch).not.toHaveBeenCalled()
   })
 
+  it('syncs a user-installed extension CLI terminal rename (any non-shell mode)', () => {
+    const { store, tabId, paneId } = storeWith({ kind: 'terminal', mode: 'my-custom-cli', terminalId: 'term-ext' })
+    store.dispatch(applyPaneRename({ tabId, paneId, title: 'Ext Project' }))
+    expect(apiMocks.patch).toHaveBeenCalledWith('/api/terminals/term-ext', { titleOverride: 'Ext Project' })
+  })
+
   it('syncs a fresh-agent rename to the sessions API by composite key', () => {
     const { store, tabId, paneId } = storeWith({
       kind: 'fresh-agent', sessionType: 'claude', provider: 'claude', sessionId: 'sess-7', createRequestId: 'r', status: 'idle',

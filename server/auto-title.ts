@@ -43,3 +43,46 @@ export function computeAutoTitlePatch(input: {
 
   return null
 }
+
+/**
+ * Decide how to keep an active coding-agent session's live terminals aligned
+ * with its canonical name.
+ *
+ * The server session override is the single source of truth. The canonical
+ * title is the override (after this pass's dir/first-message write) or the
+ * already-applyOverride'd session title (which includes a manual 'ai' or 'user'
+ * override). Terminals whose title differs from the canonical name must be
+ * pushed so the tab/pane stay aligned with the sidebar — regardless of whether
+ * the terminal's current title is a default provider label. This replaces the
+ * label-based promotion gate, which froze the terminal once its title became
+ * the (non-default) working-directory basename.
+ */
+export function computeSessionTitleSync(input: {
+  sessionTitle?: string
+  override?: SessionOverride
+  cwd?: string
+  firstUserMessage?: string
+  aiWillAutoName: boolean
+  terminals: Array<{ terminalId: string; title?: string }>
+}): {
+  overridePatch: SessionOverride | null
+  canonicalTitle?: string
+  terminalIdsToUpdate: string[]
+  shouldGenerateAi: boolean
+} {
+  const { sessionTitle, override, cwd, firstUserMessage, aiWillAutoName, terminals } = input
+
+  const overridePatch = computeAutoTitlePatch({ cwd, firstUserMessage, existing: override, aiWillAutoName })
+  const canonicalTitle = overridePatch?.titleOverride ?? sessionTitle
+
+  const terminalIdsToUpdate = canonicalTitle
+    ? terminals.filter((t) => t.title !== canonicalTitle).map((t) => t.terminalId)
+    : []
+
+  const shouldGenerateAi =
+    aiWillAutoName &&
+    !!firstUserMessage?.trim() &&
+    !isFinalizedTitleSource(override?.titleSource)
+
+  return { overridePatch, canonicalTitle, terminalIdsToUpdate, shouldGenerateAi }
+}
