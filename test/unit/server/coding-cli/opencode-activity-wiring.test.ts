@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createOpencodeActivityIntegration } from '../../../../server/coding-cli/opencode-activity-integration.js'
 import { wireOpencodeActivityTracker } from '../../../../server/coding-cli/opencode-activity-wiring.js'
+import { OPENCODE_ACTIVITY_SWEEP_MS } from '../../../../server/coding-cli/opencode-activity-tracker.js'
 
 function createJsonResponse(body: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(body), {
@@ -71,6 +72,44 @@ describe('wireOpencodeActivityTracker', () => {
     } finally {
       wired.dispose()
     }
+  })
+
+  it('schedules a stale-activity sweep and clears it on dispose', () => {
+    const terminal = {
+      terminalId: 'term-opencode-1',
+      mode: 'opencode',
+      status: 'running',
+      resumeSessionId: undefined,
+      opencodeServer: { hostname: '127.0.0.1', port: 32123 },
+    }
+    const registry = makeRegistry(terminal)
+    const intervalHandles: Array<{ run: () => void; delayMs: number }> = []
+    const setIntervalFn = vi.fn((run: () => void, delayMs?: number) => {
+      const handle = { run, delayMs: delayMs ?? 0 }
+      intervalHandles.push(handle)
+      return handle as unknown as ReturnType<typeof setInterval>
+    })
+    const clearIntervalFn = vi.fn()
+    const now = vi.fn(() => 456)
+    const wired = wireOpencodeActivityTracker({
+      registry,
+      now,
+      setIntervalFn,
+      clearIntervalFn,
+    })
+    const expireSpy = vi.spyOn(wired.tracker, 'expire')
+
+    try {
+      expect(setIntervalFn).toHaveBeenCalledTimes(1)
+      expect(intervalHandles[0]?.delayMs).toBe(OPENCODE_ACTIVITY_SWEEP_MS)
+
+      intervalHandles[0]?.run()
+      expect(expireSpy).toHaveBeenCalledWith(456)
+    } finally {
+      wired.dispose()
+    }
+
+    expect(clearIntervalFn).toHaveBeenCalledWith(intervalHandles[0])
   })
 
   it('uses the production provider resolver before binding OpenCode activity to a durable session', async () => {

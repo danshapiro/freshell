@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  OPENCODE_BUSY_DEADMAN_MS,
+  OPENCODE_EVENT_READ_STALL_MS,
   OPENCODE_HEALTH_POLL_MS,
   OPENCODE_RECONNECT_BASE_MS,
   OpencodeActivityTracker,
@@ -40,6 +42,29 @@ function createRawSseResponse(blocks: string[]) {
   }), {
     headers: { 'content-type': 'text/event-stream' },
   })
+}
+
+function createControlledSseResponse() {
+  const encoder = new TextEncoder()
+  let streamController: ReadableStreamDefaultController<Uint8Array> | undefined
+  const response = new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      streamController = controller
+    },
+  }), {
+    headers: { 'content-type': 'text/event-stream' },
+  })
+
+  return {
+    response,
+    enqueue(event: unknown) {
+      if (!streamController) throw new Error('SSE stream not started')
+      streamController.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`))
+    },
+    close() {
+      streamController?.close()
+    },
+  }
 }
 
 describe('OpencodeActivityTracker', () => {
@@ -88,12 +113,12 @@ describe('OpencodeActivityTracker', () => {
     await vi.advanceTimersByTimeAsync(OPENCODE_HEALTH_POLL_MS)
 
     expect(changes).toContainEqual({
-      upsert: [{
+      upsert: [expect.objectContaining({
         terminalId: 'term-oc',
         sessionId: 'session-oc',
         phase: 'busy',
         updatedAt: expect.any(Number),
-      }],
+      })],
       remove: [],
     })
 
@@ -319,6 +344,121 @@ describe('OpencodeActivityTracker', () => {
     tracker.dispose()
   })
 
+  it('expires stale busy records and refreshes lastObservedAt on later SSE observations', async () => {
+    vi.useFakeTimers()
+    let clock = 0
+    let controlled: ReturnType<typeof createControlledSseResponse> | undefined
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/global/health')) {
+        return createJsonResponse({ ok: true })
+      }
+      if (url.endsWith('/session/status')) {
+        return createJsonResponse({
+          'session-oc': { type: 'busy' },
+        })
+      }
+      if (url.endsWith('/event')) {
+        controlled = createControlledSseResponse()
+        return controlled.response
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    })
+
+    const tracker = new OpencodeActivityTracker({
+      fetchImpl: fetchImpl as typeof fetch,
+      now: () => clock,
+      random: () => 0,
+    })
+    const changes: Array<{ upsert: unknown[]; remove: string[] }> = []
+    tracker.on('changed', (payload) => changes.push(payload))
+
+    tracker.trackTerminal({ terminalId: 'term-oc', endpoint: TEST_ENDPOINT })
+    await vi.advanceTimersByTimeAsync(0)
+
+    controlled?.enqueue({ type: 'server.connected', properties: {} })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(tracker.list()).toEqual([expect.objectContaining({
+      terminalId: 'term-oc',
+      sessionId: 'session-oc',
+      phase: 'busy',
+      updatedAt: 0,
+      lastObservedAt: 0,
+    })])
+
+    clock = OPENCODE_BUSY_DEADMAN_MS - 1
+    controlled?.enqueue({
+      type: 'session.status',
+      properties: {
+        sessionID: 'session-oc',
+        status: { type: 'busy' },
+      },
+    })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(tracker.list()).toEqual([expect.objectContaining({
+      terminalId: 'term-oc',
+      lastObservedAt: OPENCODE_BUSY_DEADMAN_MS - 1,
+    })])
+
+    clock = OPENCODE_BUSY_DEADMAN_MS + 1
+    tracker.expire(clock)
+    expect(tracker.list()).toHaveLength(1)
+
+    clock = (OPENCODE_BUSY_DEADMAN_MS * 2) + 1
+    tracker.expire(clock)
+    expect(changes).toContainEqual({
+      upsert: [],
+      remove: ['term-oc'],
+    })
+    expect(tracker.list()).toEqual([])
+
+    tracker.dispose()
+  })
+
+  it('reconnects when the event stream stops yielding bytes', async () => {
+    vi.useFakeTimers()
+    let eventCalls = 0
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/global/health')) {
+        return createJsonResponse({ ok: true })
+      }
+      if (url.endsWith('/session/status')) {
+        return createJsonResponse({})
+      }
+      if (url.endsWith('/event')) {
+        eventCalls += 1
+        return eventCalls === 1
+          ? createControlledSseResponse().response
+          : createSseResponse([{ type: 'server.connected', properties: {} }])
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    })
+
+    const log = { warn: vi.fn() }
+    const tracker = new OpencodeActivityTracker({
+      fetchImpl: fetchImpl as typeof fetch,
+      log,
+      random: () => 0,
+    })
+
+    tracker.trackTerminal({ terminalId: 'term-oc', endpoint: TEST_ENDPOINT })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(eventCalls).toBe(1)
+
+    await vi.advanceTimersByTimeAsync(OPENCODE_EVENT_READ_STALL_MS + OPENCODE_RECONNECT_BASE_MS)
+
+    expect(eventCalls).toBe(2)
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ terminalId: 'term-oc' }),
+      'OpenCode activity tracker cycle failed; retrying.',
+    )
+
+    tracker.dispose()
+  })
+
   it('removes busy state when session.status reports idle for the tracked session', async () => {
     vi.useFakeTimers()
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
@@ -361,12 +501,12 @@ describe('OpencodeActivityTracker', () => {
     await vi.advanceTimersByTimeAsync(0)
 
     expect(changes).toContainEqual({
-      upsert: [{
+      upsert: [expect.objectContaining({
         terminalId: 'term-oc',
         sessionId: 'session-oc',
         phase: 'busy',
         updatedAt: expect.any(Number),
-      }],
+      })],
       remove: [],
     })
     expect(changes).toContainEqual({
@@ -505,12 +645,12 @@ describe('OpencodeActivityTracker', () => {
     await vi.advanceTimersByTimeAsync(0)
 
     expect(changes).toContainEqual({
-      upsert: [{
+      upsert: [expect.objectContaining({
         terminalId: 'term-oc',
         sessionId: 'session-oc',
         phase: 'busy',
         updatedAt: expect.any(Number),
-      }],
+      })],
       remove: [],
     })
     expect(changes).toContainEqual({
@@ -562,12 +702,12 @@ describe('OpencodeActivityTracker', () => {
     await vi.advanceTimersByTimeAsync(0)
 
     expect(changes).toContainEqual({
-      upsert: [{
+      upsert: [expect.objectContaining({
         terminalId: 'term-oc',
         sessionId: 'session-oc',
         phase: 'busy',
         updatedAt: expect.any(Number),
-      }],
+      })],
       remove: [],
     })
     expect(changes).toContainEqual({
@@ -650,12 +790,12 @@ describe('OpencodeActivityTracker', () => {
     await vi.advanceTimersByTimeAsync(0)
 
     expect(changes).toContainEqual({
-      upsert: [{
+      upsert: [expect.objectContaining({
         terminalId: 'term-opencode-1',
         sessionId: 'root_session',
         phase: 'busy',
         updatedAt: expect.any(Number),
-      }],
+      })],
       remove: [],
     })
     expect(resolveOpencodeSessionRoots).toHaveBeenCalledTimes(1)
@@ -839,12 +979,12 @@ describe('OpencodeActivityTracker', () => {
 
     const upserts = changes.filter(c => c.upsert.length > 0)
     expect(upserts).toContainEqual({
-      upsert: [{
+      upsert: [expect.objectContaining({
         terminalId: 'term-oc',
         sessionId: 'parent-1',
         phase: 'busy',
         updatedAt: expect.any(Number),
-      }],
+      })],
       remove: [],
     })
 
@@ -895,12 +1035,12 @@ describe('OpencodeActivityTracker', () => {
     await vi.advanceTimersByTimeAsync(0)
 
     expect(changes).toContainEqual({
-      upsert: [{
+      upsert: [expect.objectContaining({
         terminalId: 'term-oc',
         sessionId: 'parent-1',
         phase: 'busy',
         updatedAt: expect.any(Number),
-      }],
+      })],
       remove: [],
     })
 

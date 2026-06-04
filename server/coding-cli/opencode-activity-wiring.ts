@@ -1,4 +1,4 @@
-import { OpencodeActivityTracker } from './opencode-activity-tracker.js'
+import { OPENCODE_ACTIVITY_SWEEP_MS, OpencodeActivityTracker } from './opencode-activity-tracker.js'
 import type {
   OpencodeActivityChange,
   OpencodeTurnCompleteEvent,
@@ -33,20 +33,28 @@ export function wireOpencodeActivityTracker(input: {
   now?: () => number
   setTimeoutFn?: typeof setTimeout
   clearTimeoutFn?: typeof clearTimeout
+  setIntervalFn?: typeof setInterval
+  clearIntervalFn?: typeof clearInterval
   random?: () => number
   resolveOpencodeSessionRoots?: (sessionIds: readonly string[]) => Promise<OpencodeRootResolution>
   onActivityChanged?: (payload: OpencodeActivityChange) => void
   onAssociated?: (payload: OpencodeSessionAssociatedEvent) => void
   onTurnComplete?: (payload: OpencodeTurnCompleteEvent) => void
 }) {
+  const now = input.now ?? (() => Date.now())
+  const setIntervalFn = input.setIntervalFn ?? setInterval
+  const clearIntervalFn = input.clearIntervalFn ?? clearInterval
   const tracker = new OpencodeActivityTracker({
     fetchImpl: input.fetchImpl,
-    now: input.now,
+    now,
     setTimeoutFn: input.setTimeoutFn,
     clearTimeoutFn: input.clearTimeoutFn,
     random: input.random,
     resolveOpencodeSessionRoots: input.resolveOpencodeSessionRoots,
   })
+  const sweepTimer = setIntervalFn(() => {
+    tracker.expire(now())
+  }, OPENCODE_ACTIVITY_SWEEP_MS)
   if (input.onActivityChanged) {
     tracker.on('changed', input.onActivityChanged)
   }
@@ -95,6 +103,7 @@ export function wireOpencodeActivityTracker(input: {
     dispose(): void {
       input.registry.off('terminal.created', onCreated)
       input.registry.off('terminal.exit', onExit)
+      clearIntervalFn(sweepTimer)
       if (input.onActivityChanged) {
         tracker.off('changed', input.onActivityChanged)
       }
