@@ -116,6 +116,20 @@ function pickHydratedTabWinner(localTab: Tab, remoteTab: Tab, meta: HydrateTabsM
   return (localTab.updatedAt ?? 0) > (remoteTab.updatedAt ?? 0) ? localTab : remoteTab
 }
 
+/**
+ * A user-set tab name (an explicit rename) must survive a cross-device merge
+ * even when the other device's tab is more recent: user always wins, otherwise
+ * the recency winner's title stands. Auto names (dir / first-message / Gemini)
+ * are reconciled server-side via the session override, so the client only needs
+ * to keep an explicit rename sticky here.
+ */
+function reconcileHydratedTabTitle(localTab: Tab, remoteTab: Tab, winner: Tab): Tab {
+  if (winner.titleSetByUser) return winner
+  const userSide = localTab.titleSetByUser ? localTab : remoteTab.titleSetByUser ? remoteTab : null
+  if (!userSide) return winner
+  return { ...winner, title: userSide.title, titleSetByUser: true }
+}
+
 function deriveTabSessionRef(tab: Tab) {
   const explicitSessionRef = sanitizeSessionRef(tab.sessionRef)
   if (explicitSessionRef) return explicitSessionRef
@@ -355,7 +369,8 @@ export const tabsSlice = createSlice({
         const localTab = localById.get(remoteTab.id)
         if (localTab) {
           const winningTab = pickHydratedTabWinner(localTab, remoteTab, meta)
-          merged.push(protectCanonicalFallbackIdentity(localTab, remoteTab, winningTab))
+          const titledTab = reconcileHydratedTabTitle(localTab, remoteTab, winningTab)
+          merged.push(protectCanonicalFallbackIdentity(localTab, remoteTab, titledTab))
         } else {
           merged.push(remoteTab)
         }

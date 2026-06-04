@@ -502,6 +502,50 @@ describe('tabsSlice', () => {
       expect(tab.status).toBe('creating')
       expect(tab.sessionRef).toEqual({ provider: 'codex', sessionId: 'thread-durable-1' })
     })
+
+    it('keeps a user-set tab name when a more-recent remote tab is not user-set', () => {
+      const seeded = tabsReducer(initialState, hydrateTabs({
+        tabs: [{
+          id: 't1', createRequestId: 't1', title: 'My Name', titleSetByUser: true,
+          status: 'running', mode: 'claude', createdAt: 1,
+        } as any],
+        activeTabId: 't1',
+      }))
+
+      const merged = tabsReducer(seeded, hydrateTabs({
+        tabs: [{
+          id: 't1', createRequestId: 't1', title: 'Claude', titleSetByUser: false,
+          status: 'running', mode: 'claude', createdAt: 1,
+        } as any],
+        activeTabId: 't1',
+        meta: { localLayoutPersistedAt: 100, remoteLayoutPersistedAt: 200 },
+      }))
+
+      const tab = merged.tabs.find((t) => t.id === 't1')
+      expect(tab?.title).toBe('My Name')
+      expect(tab?.titleSetByUser).toBe(true)
+    })
+
+    it('takes the more-recent remote name when neither side is user-set', () => {
+      const seeded = tabsReducer(initialState, hydrateTabs({
+        tabs: [{
+          id: 't2', createRequestId: 't2', title: 'old-dir', titleSetByUser: false,
+          status: 'running', mode: 'claude', createdAt: 1,
+        } as any],
+        activeTabId: 't2',
+      }))
+
+      const merged = tabsReducer(seeded, hydrateTabs({
+        tabs: [{
+          id: 't2', createRequestId: 't2', title: 'new-dir', titleSetByUser: false,
+          status: 'running', mode: 'claude', createdAt: 1,
+        } as any],
+        activeTabId: 't2',
+        meta: { localLayoutPersistedAt: 100, remoteLayoutPersistedAt: 200 },
+      }))
+
+      expect(merged.tabs.find((t) => t.id === 't2')?.title).toBe('new-dir')
+    })
   })
 
   describe('closeTab with multiple panes', () => {
