@@ -10,13 +10,15 @@ import {
 export { TURN_COMPLETE_SIGNAL, createTurnCompleteSignalParserState }
 export type { TurnCompleteSignalParserState }
 
-function normalizeTurnCompleteSignalMode(mode: TabMode): TurnCompleteSignalMode {
+// gemini/kimi are intentionally NOT mapped here: the shared `supportsTurnSignal`
+// gate only recognizes claude/codex, so a gemini/kimi pass-through implied a
+// turn-complete capability that never existed. They normalize to 'shell' (status
+// inert) until their CLIs expose a real turn-complete signal.
+export function normalizeTurnCompleteSignalMode(mode: TabMode): TurnCompleteSignalMode {
   switch (mode) {
     case 'claude':
     case 'codex':
     case 'opencode':
-    case 'gemini':
-    case 'kimi':
       return mode
     default:
       return 'shell'

@@ -2,8 +2,22 @@ import { describe, it, expect } from 'vitest'
 import {
   createTurnCompleteSignalParserState,
   extractTurnCompleteSignals,
+  normalizeTurnCompleteSignalMode,
   TURN_COMPLETE_SIGNAL,
 } from '@/lib/turn-complete-signal'
+
+describe('normalizeTurnCompleteSignalMode', () => {
+  it('preserves the turn-signal-capable modes', () => {
+    expect(normalizeTurnCompleteSignalMode('claude')).toBe('claude')
+    expect(normalizeTurnCompleteSignalMode('codex')).toBe('codex')
+    expect(normalizeTurnCompleteSignalMode('opencode')).toBe('opencode')
+  })
+
+  it('maps gemini/kimi to shell (status-inert; agrees with supportsTurnSignal)', () => {
+    expect(normalizeTurnCompleteSignalMode('gemini')).toBe('shell')
+    expect(normalizeTurnCompleteSignalMode('kimi')).toBe('shell')
+  })
+})
 
 describe('extractTurnCompleteSignals', () => {
   it('extracts BEL for codex and strips it from output', () => {
