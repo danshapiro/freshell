@@ -3,8 +3,8 @@
  * Handles both Unix and Windows separators, trailing slashes, the Unix root,
  * and Windows drive roots. Returns null when no meaningful segment exists.
  *
- * Extracted verbatim from deriveTabName so tab titles, pane titles, and any
- * future caller share one implementation of the edge cases.
+ * Shared by the client (tab/pane title derivation) and the server (dir-name
+ * placeholder for coding-agent session overrides) so the edge cases live once.
  */
 export function basenameSegment(path: string): string | null {
   // Remove trailing slashes

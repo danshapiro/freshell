@@ -8,7 +8,7 @@ import type {
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import { getProviderLabel, isNonShellMode } from './coding-cli-utils'
 import { getFreshAgentLabel } from './fresh-agent-registry'
-import { basenameSegment } from './path-basename'
+import { basenameSegment } from '@shared/path-basename'
 
 /**
  * Collect all leaf pane contents in tree order (left-to-right, top-to-bottom).

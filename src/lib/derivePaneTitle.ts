@@ -2,7 +2,7 @@ import type { PaneContent } from '@/store/paneTypes'
 import { getProviderLabel, isNonShellMode } from '@/lib/coding-cli-utils'
 import { getAgentChatProviderLabel } from '@/lib/agent-chat-utils'
 import { getFreshAgentLabel } from '@/lib/fresh-agent-registry'
-import { basenameSegment } from '@/lib/path-basename'
+import { basenameSegment } from '@shared/path-basename'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
 /**

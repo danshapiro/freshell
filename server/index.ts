@@ -25,7 +25,8 @@ import { createOpencodeActivityIntegration } from './coding-cli/opencode-activit
 import { claudeProvider } from './coding-cli/providers/claude.js'
 import { codexProvider } from './coding-cli/providers/codex.js'
 import { opencodeProvider } from './coding-cli/providers/opencode.js'
-import { type CodingCliProviderName, type CodingCliSession } from './coding-cli/types.js'
+import { makeSessionKey, type CodingCliProviderName, type CodingCliSession } from './coding-cli/types.js'
+import { computeAutoTitlePatch } from './auto-title.js'
 import { TerminalMetadataService } from './terminal-metadata-service.js'
 import { migrateLegacyDefaultEnabledProviders, migrateSettingsSortMode } from './settings-migrate.js'
 import { createFilesRouter } from './files-router.js'
@@ -712,6 +713,47 @@ async function main() {
         log.warn({ err }, 'Failed to sync terminal metadata from coding-cli index updates')
       })
     }
+
+    // Auto-name active coding-agent sessions: seed the working-directory
+    // placeholder and, when AI auto-naming is off, finalize from the first
+    // user message. Bounded to sessions with a live terminal so we never
+    // persist overrides for historical sessions. The ladder makes repeat
+    // passes idempotent, and a finalized name is never touched.
+    void (async () => {
+      const settings = await configStore.getSettings()
+      const aiWillAutoName = AI_CONFIG.enabled() && (settings.sidebar?.autoGenerateTitles ?? true)
+      let changed = false
+      for (const project of projects) {
+        for (const session of project.sessions) {
+          const matching = registry.findTerminalsBySession(session.provider, session.sessionId, session.cwd)
+          if (matching.length === 0) continue
+          const key = makeSessionKey(session.provider, session.sessionId)
+          const existing = await configStore.getSessionOverride(key)
+          const patch = computeAutoTitlePatch({
+            cwd: session.cwd,
+            firstUserMessage: session.firstUserMessage,
+            existing,
+            aiWillAutoName,
+          })
+          if (!patch?.titleOverride) continue
+          await configStore.patchSessionOverride(key, patch)
+          session.title = patch.titleOverride
+          for (const term of matching) {
+            if (!shouldPromoteSessionTitle(term.title, session.provider)) continue
+            registry.updateTitle(term.terminalId, patch.titleOverride)
+            wsHandler.broadcast({
+              type: 'terminal.title.updated',
+              terminalId: term.terminalId,
+              title: patch.titleOverride,
+            })
+          }
+          changed = true
+        }
+      }
+      if (changed) sessionsSync.publish(projects)
+    })().catch((err) => {
+      log.warn({ err }, 'Failed to auto-name coding-agent sessions from index updates')
+    })
   })
 
   // Fast-path session association for newly discovered Claude sessions.
