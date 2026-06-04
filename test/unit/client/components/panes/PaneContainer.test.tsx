@@ -2124,7 +2124,7 @@ describe('PaneContainer', () => {
       expect(store.getState().turnCompletion.attentionByTab).toEqual({})
     })
 
-    it('does not clear attention in type mode', () => {
+    it('clears attention in type mode', () => {
       const store = createAttentionStore({
         activePane: 'pane-1',
         attentionPanes: ['pane-2'],
@@ -2141,9 +2141,9 @@ describe('PaneContainer', () => {
       const secondTerminal = screen.getByTestId('terminal-pane-2')
       fireEvent.mouseDown(secondTerminal)
 
-      // In type mode, clicking should NOT clear attention
-      expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
-      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
+      // Pane focus is real engagement, so it clears attention in both modes.
+      expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBeUndefined()
+      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBeUndefined()
     })
   })
 
