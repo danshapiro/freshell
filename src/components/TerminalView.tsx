@@ -36,6 +36,7 @@ import {
   type TerminalFreshRecoveryIntent,
 } from '@/lib/terminal-restore'
 import { isTerminalPasteShortcut } from '@/lib/terminal-input-policy'
+import { terminalFollowsOscTitle } from '@/lib/terminal-title-policy'
 import { clearTerminalCursor, loadTerminalCursor, saveTerminalCursor } from '@/lib/terminal-cursor'
 import {
   resolveRevealAttachPlan,
@@ -1587,6 +1588,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     if (!term) return
 
     const disposable = term.onTitleChange((rawTitle: string) => {
+      // Only shell terminals follow the program's OSC window title. Coding-agent
+      // terminals are named from the server session (working dir / first message
+      // / Gemini) and must stay stable, so they ignore OSC titles entirely.
+      if (!terminalFollowsOscTitle(contentRef.current?.mode)) return
       // Strip prefix noise (spinners, status chars) - everything before first letter
       const match = rawTitle.match(/[a-zA-Z]/)
       if (!match) return // No letters = all noise, ignore
@@ -2417,9 +2422,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const exitTab = tabRef.current
           if (exitTab) {
             const code = typeof msg.exitCode === 'number' ? msg.exitCode : undefined
-            // Only modify title if user hasn't manually set it
+            // Only shell terminals get the "(exit N)" suffix, and only when the
+            // user hasn't manually set the title. Coding-agent terminals keep
+            // their stable session name on exit.
             const updates: { status: 'exited'; title?: string } = { status: 'exited' }
-            if (!exitTab.titleSetByUser) {
+            if (!exitTab.titleSetByUser && terminalFollowsOscTitle(contentRef.current?.mode)) {
               updates.title = exitTab.title + (code !== undefined ? ` (exit ${code})` : '')
             }
             dispatch(updateTab({ id: exitTab.id, updates }))
