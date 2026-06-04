@@ -45,7 +45,7 @@ describe('rename-cascade', () => {
       expect(configStore.patchSessionOverride).toHaveBeenCalledOnce()
       expect(configStore.patchSessionOverride).toHaveBeenCalledWith(
         'claude:abc-123',
-        { titleOverride: 'My Custom Title' },
+        { titleOverride: 'My Custom Title', titleSource: 'user' },
       )
     })
 
