@@ -113,7 +113,35 @@ vi.mock('@xterm/xterm/css/xterm.css', () => ({}))
 import TerminalView, {
   __getLastSentViewportCacheSizeForTests,
   __resetLastSentViewportCacheForTests,
+  isEngagementInput,
 } from '@/components/TerminalView'
+
+describe('isEngagementInput (real-keystroke detection)', () => {
+  it('treats printable characters and Enter as engagement', () => {
+    expect(isEngagementInput('x')).toBe(true)
+    expect(isEngagementInput('hello')).toBe(true)
+    expect(isEngagementInput('\r')).toBe(true)
+    expect(isEngagementInput('\n')).toBe(true)
+  })
+
+  it('does NOT treat bare arrow / cursor escape sequences as engagement', () => {
+    expect(isEngagementInput('\x1b[A')).toBe(false) // up
+    expect(isEngagementInput('\x1b[B')).toBe(false) // down
+    expect(isEngagementInput('\x1b[C')).toBe(false) // right
+    expect(isEngagementInput('\x1b[D')).toBe(false) // left
+    expect(isEngagementInput('\x1bOA')).toBe(false) // application cursor up
+    expect(isEngagementInput('\x1b[1;5C')).toBe(false) // ctrl+right
+  })
+
+  it('treats a bracketed paste (printable content) as engagement', () => {
+    expect(isEngagementInput('\x1b[200~pasted text\x1b[201~')).toBe(true)
+  })
+
+  it('does not treat lone control bytes as engagement', () => {
+    expect(isEngagementInput('\x00')).toBe(false)
+    expect(isEngagementInput('\x1b')).toBe(false)
+  })
+})
 
 function TerminalViewFromStore({ tabId, paneId, hidden }: { tabId: string; paneId: string; hidden?: boolean }) {
   const paneContent = useAppSelector((state) => {

@@ -10,7 +10,8 @@
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import { collectPaneEntries } from '@/lib/pane-utils'
 import { resolveAgentChatSessionKey, resolveFreshAgentSessionKey } from '@/lib/pane-activity'
-import type { RootState } from './store'
+import { clearPaneAttention, clearTabAttention } from './turnCompletionSlice'
+import type { AppDispatch, RootState } from './store'
 
 export function selectPaneBySessionKey(
   state: RootState,
@@ -47,3 +48,25 @@ export function selectPaneBySessionKey(
 
   return null
 }
+
+/**
+ * Dismiss a tab's green attention: clear the tab flag AND every pane in the tab
+ * that still carries attention (not just the active pane). Single source of truth
+ * for "the user visited this tab" clearing — used by pane focus, tab-switch, and
+ * the tab-bar click. No-op when the tab has no attention.
+ */
+export function dismissTabGreen(tabId: string) {
+  return (dispatch: AppDispatch, getState: () => RootState): void => {
+    const tc = getState().turnCompletion
+    if (!tc?.attentionByTab?.[tabId]) return
+    dispatch(clearTabAttention({ tabId }))
+    const layout = getState().panes?.layouts?.[tabId]
+    if (!layout) return
+    for (const entry of collectPaneEntries(layout)) {
+      if (tc.attentionByPane?.[entry.paneId]) {
+        dispatch(clearPaneAttention({ paneId: entry.paneId }))
+      }
+    }
+  }
+}
+

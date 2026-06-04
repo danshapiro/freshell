@@ -57,7 +57,19 @@ function createStore(activeTabId = 'tab-1', attentionDismiss: AttentionDismiss =
         renameRequestTabId: null,
       },
       panes: {
-        layouts: {},
+        layouts: {
+          'tab-1': { type: 'leaf', id: 'pane-1', content: { kind: 'terminal', createRequestId: 'cr-1', status: 'running', mode: 'shell' } },
+          'tab-2': {
+            type: 'split',
+            id: 'split-2',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              { type: 'leaf', id: 'pane-2', content: { kind: 'terminal', createRequestId: 'cr-2', status: 'running', mode: 'shell' } },
+              { type: 'leaf', id: 'pane-3', content: { kind: 'terminal', createRequestId: 'cr-3', status: 'running', mode: 'shell' } },
+            ],
+          },
+        },
         activePane: {
           'tab-1': 'pane-1',
           'tab-2': 'pane-2',
@@ -365,15 +377,17 @@ describe('useTurnCompletionNotifications', () => {
       </Provider>
     )
 
-    // Background tab completes
+    // Background split tab completes on the NON-active pane (pane-3) as well as pane-2.
     act(() => {
       store.dispatch(recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-2', terminalId: 'term-2', at: 100 }))
+      store.dispatch(recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-3', terminalId: 'term-3', at: 100 }))
     })
 
     await waitFor(() => {
       expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
     })
     expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
+    expect(store.getState().turnCompletion.attentionByPane['pane-3']).toBe(true)
 
     // Simulate switching to tab-2 (as TabBar click would)
     act(() => {
@@ -383,6 +397,8 @@ describe('useTurnCompletionNotifications', () => {
     await waitFor(() => {
       expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBeUndefined()
     })
+    // BOTH panes clear on switch-in — not just the active one (Fresh-Eyes round 3).
     expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBeUndefined()
+    expect(store.getState().turnCompletion.attentionByPane['pane-3']).toBeUndefined()
   })
 })

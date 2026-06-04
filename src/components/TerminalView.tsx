@@ -17,7 +17,8 @@ import { updateSessionActivity } from '@/store/sessionActivitySlice'
 import { recordPaneTabActivity } from '@/store/tabRecencySlice'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 import { clearPaneRuntimeActivity } from '@/store/paneRuntimeActivitySlice'
-import { recordTurnComplete, clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
+import { recordTurnComplete } from '@/store/turnCompletionSlice'
+import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTerminalSearch } from '@/store/terminalDirectoryThunks'
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
@@ -358,6 +359,20 @@ function resolveMobileToolbarInput(keyId: Exclude<MobileToolbarKeyId, 'ctrl'>, c
   throw new Error(`Unsupported mobile toolbar key: ${unreachableKey}`)
 }
 
+// Real user engagement = a printable character or Enter, NOT a bare navigation /
+// escape sequence. Strips recognized ANSI escapes first so an arrow key (ESC [ A,
+// which contains the printable bytes "[A") does not count as engagement.
+export function isEngagementInput(data: string): boolean {
+  /* eslint-disable no-control-regex -- intentionally matching ANSI/control bytes */
+  const stripped = data
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '') // CSI ... final (incl. bracketed-paste markers)
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '') // OSC ... BEL/ST
+    .replace(/\x1bO[@-~]/g, '') // SS3 application cursor / function keys
+    .replace(/\x1b[@-Z\\-_]/g, '') // other 2-byte escapes
+  return /[^\x00-\x1f\x7f]/.test(stripped) || /[\r\n]/.test(stripped)
+  /* eslint-enable no-control-regex */
+}
+
 function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps) {
   const dispatch = useAppDispatch()
   const appStore = useAppStore()
@@ -373,10 +388,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const refreshRequest = useAppSelector((s) => s.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
   const connectionErrorCode = useAppSelector((s) => s.connection.lastErrorCode)
   const settings = useAppSelector((s) => s.settings.settings)
-  const hasAttention = useAppSelector((s) => !!s.turnCompletion?.attentionByTab?.[tabId])
-  const hasAttentionRef = useRef(hasAttention)
-  const hasPaneAttention = useAppSelector((s) => !!s.turnCompletion?.attentionByPane?.[paneId])
-  const hasPaneAttentionRef = useRef(hasPaneAttention)
 
   // All hooks MUST be called before any conditional returns
   const ws = useMemo(() => getWsClient(), [])
@@ -433,7 +444,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const osc52QueueRef = useRef<Osc52Event[]>([])
   const warnExternalLinksRef = useRef(settings.terminal.warnExternalLinks)
   const debugRef = useRef(!!settings.logging?.debug)
-  const attentionDismissRef = useRef(settings.panes?.attentionDismiss ?? 'click')
   const touchActiveRef = useRef(false)
   const touchSelectionModeRef = useRef(false)
   const touchStartYRef = useRef(0)
@@ -628,10 +638,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   }, [pendingOsc52Event])
 
   // Sync during render (not in useEffect) so refs always have latest values
-  hasAttentionRef.current = hasAttention
-  hasPaneAttentionRef.current = hasPaneAttention
   paneLastInputAtRef.current = paneLastInputAt
-  attentionDismissRef.current = settings.panes?.attentionDismiss ?? 'click'
   debugRef.current = !!settings.logging?.debug
   refreshRequestRef.current = refreshRequest
   providerBehaviorRef.current = providerBehavior
@@ -659,21 +666,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     lastSessionActivityAtRef.current = 0
   }, [terminalContent?.resumeSessionId])
 
+  // Attention clearing is NOT done here: sendInput is shared by synthetic callers
+  // (scroll-translation, DECRQM/startup auto-replies) that must not dismiss green.
+  // Real-engagement clearing lives in the term.onData handler (see clearAttentionOnEngagement).
   const sendInput = useCallback((data: string) => {
     const tid = terminalIdRef.current
     if (!tid) return
-    // In 'type' mode, clear attention when user sends input.
-    // In 'click' mode, attention is cleared by the notification hook on tab switch.
-    if (attentionDismissRef.current === 'type') {
-      if (hasAttentionRef.current) {
-        dispatch(clearTabAttention({ tabId }))
-      }
-      if (hasPaneAttentionRef.current) {
-        dispatch(clearPaneAttention({ paneId }))
-      }
-    }
     ws.send({ type: 'terminal.input', terminalId: tid, data })
-  }, [dispatch, tabId, paneId, ws])
+  }, [ws])
 
   const translateScrollLinesToInput = useCallback((term: Terminal, lines: number): boolean => {
     if (!terminalIdRef.current || lines === 0) return false
@@ -1428,6 +1428,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
     term.onData((data) => {
       sendInput(data)
+      // Decision 1: a real keystroke (printable / Enter) dismisses this tab's green
+      // in BOTH attentionDismiss modes. Bare arrows / synthetic sequences do not.
+      if (isEngagementInput(data)) {
+        dispatch(dismissTabGreen(tabId))
+      }
       const currentTab = tabRef.current
       const currentContent = contentRef.current
       if (currentTab) {

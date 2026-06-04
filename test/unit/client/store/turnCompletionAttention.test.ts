@@ -1,7 +1,52 @@
 import { describe, it, expect } from 'vitest'
-import { selectPaneBySessionKey } from '@/store/turnCompletionAttention'
+import { configureStore } from '@reduxjs/toolkit'
+import turnCompletionReducer, { markTabAttention, markPaneAttention } from '@/store/turnCompletionSlice'
+import { dismissTabGreen, selectPaneBySessionKey } from '@/store/turnCompletionAttention'
 import type { RootState } from '@/store/store'
 import type { PaneNode } from '@/store/paneTypes'
+
+describe('dismissTabGreen', () => {
+  const splitLayout: PaneNode = {
+    type: 'split',
+    id: 'split',
+    direction: 'horizontal',
+    sizes: [50, 50],
+    children: [
+      { type: 'leaf', id: 'pane-1', content: { kind: 'terminal', createRequestId: 'c1', status: 'running', mode: 'shell' } },
+      { type: 'leaf', id: 'pane-2', content: { kind: 'terminal', createRequestId: 'c2', status: 'running', mode: 'shell' } },
+    ],
+  }
+
+  function makeStore() {
+    return configureStore({
+      reducer: {
+        panes: () => ({ layouts: { T: splitLayout }, activePane: {} } as never),
+        turnCompletion: turnCompletionReducer,
+      },
+    })
+  }
+
+  it('clears the tab and EVERY pane with attention (not just the active pane)', () => {
+    const store = makeStore()
+    store.dispatch(markTabAttention({ tabId: 'T' }))
+    store.dispatch(markPaneAttention({ paneId: 'pane-1' }))
+    store.dispatch(markPaneAttention({ paneId: 'pane-2' }))
+
+    store.dispatch(dismissTabGreen('T') as never)
+
+    expect(store.getState().turnCompletion.attentionByTab['T']).toBeUndefined()
+    expect(store.getState().turnCompletion.attentionByPane['pane-1']).toBeUndefined()
+    expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBeUndefined()
+  })
+
+  it('is a no-op when the tab has no attention', () => {
+    const store = makeStore()
+    store.dispatch(markPaneAttention({ paneId: 'pane-9' }))
+    store.dispatch(dismissTabGreen('T') as never)
+    // unrelated pane attention untouched (tab had no flag -> early return)
+    expect(store.getState().turnCompletion.attentionByPane['pane-9']).toBe(true)
+  })
+})
 
 function stateWithLayout(layout: PaneNode): RootState {
   return {

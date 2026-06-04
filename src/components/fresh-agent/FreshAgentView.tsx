@@ -7,6 +7,7 @@ import { getWsClient } from '@/lib/ws-client'
 import { getFreshAgentThreadSnapshot } from '@/lib/api'
 import { consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { clearPendingCreateFailure } from '@/store/freshAgentSlice'
+import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { handleFreshAgentTransportEvent, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import {
   normalizeFreshAgentEffort,
@@ -888,6 +889,7 @@ export function FreshAgentView({
                       : undefined,
                   }}
                   onAllow={() => {
+                    dispatch(dismissTabGreen(tabId))
                     if (!paneContent.sessionId) return
                     sendFreshAgentMessage({
                       type: 'freshAgent.approval.respond',
@@ -899,6 +901,7 @@ export function FreshAgentView({
                     })
                   }}
                   onDeny={() => {
+                    dispatch(dismissTabGreen(tabId))
                     if (!paneContent.sessionId) return
                     sendFreshAgentMessage({
                       type: 'freshAgent.approval.respond',
@@ -926,6 +929,7 @@ export function FreshAgentView({
                   }}
                   providerLabel={questionAgentLabel}
                   onAnswer={(answers) => {
+                    dispatch(dismissTabGreen(tabId))
                     if (!paneContent.sessionId) return
                     sendFreshAgentMessage({
                       type: 'freshAgent.question.respond',
@@ -951,6 +955,7 @@ export function FreshAgentView({
               commands={slashCommands}
               onCommand={runSlashCommand}
               onSend={(text) => {
+                dispatch(dismissTabGreen(tabId))
                 if (!paneContent.sessionId || !canSend) return
                 const isFirstMessage = !autoTitleSentRef.current
                   && (autoTitleFreshBoundaryRef.current || snapshotConfirmsNoUserTurns)

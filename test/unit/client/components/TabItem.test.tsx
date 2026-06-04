@@ -113,6 +113,14 @@ describe('TabItem', () => {
     expect(el?.className).toContain('bg-muted')
   })
 
+  it('shows a blue single dot when a pane is busy even if the aggregate tab.status is not running', () => {
+    // Multi-pane tab where last-writer-wins tab.status is 'exited' but a pane is
+    // still busy. The single dot must reflect busy (blue), not the clobbered status.
+    render(<TabItem {...defaultProps} tab={createTab({ status: 'exited' })} paneEntries={[]} iconsOnTabs={false} busy={true} />)
+    const dot = screen.getByTestId('circle-icon')
+    expect(dot.getAttribute('class')).toContain('fill-blue-500')
+  })
+
   it('uses a muted status dot for creating tabs when pane icons are unavailable', () => {
     render(<TabItem {...defaultProps} tab={createTab({ status: 'creating' })} paneEntries={[]} iconsOnTabs={false} />)
     const dot = screen.getByTestId('circle-icon')

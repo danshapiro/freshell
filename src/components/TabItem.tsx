@@ -15,7 +15,10 @@ type TabPaneEntry = {
 }
 
 function StatusDot({ status, busy }: { status: TerminalStatus; busy?: boolean }) {
-  return <Circle className={cn('h-2 w-2', busy && status === 'running' ? 'fill-blue-500 text-blue-500' : getTerminalStatusDotClassName(status))} />
+  // `busy` is already the authoritative per-pane busy aggregate (busyPaneIds);
+  // do NOT AND it with the last-writer-wins tab.status, which a sibling pane's
+  // 'exited' can clobber and wrongly suppress blue.
+  return <Circle className={cn('h-2 w-2', busy ? 'fill-blue-500 text-blue-500' : getTerminalStatusDotClassName(status))} />
 }
 
 const MAX_TAB_ICONS = 6
@@ -69,7 +72,7 @@ export default function TabItem({
 
   const renderIcons = () => {
     if (!iconsOnTabs || !paneEntries || paneEntries.length === 0) {
-      return <StatusDot status={tab.status} busy={busy && tab.status === 'running'} />
+      return <StatusDot status={tab.status} busy={busy} />
     }
 
     const visible = paneEntries.slice(0, MAX_TAB_ICONS)

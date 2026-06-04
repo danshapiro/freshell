@@ -38,7 +38,7 @@ import type { ChatSessionState, PendingAgentCreate } from '@/store/agentChatType
 import type { FreshAgentPendingCreate, FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import { normalizeAgentChatEffortOverride, normalizeAgentChatModelSelection } from '@/store/paneTypes'
-import { clearPaneAttention, clearTabAttention } from '@/store/turnCompletionSlice'
+import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { clearPendingCreate, removeSession } from '@/store/agentChatSlice'
 import {
   clearPendingCreate as clearFreshAgentPendingCreate,
@@ -197,9 +197,6 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const tabAttentionStyle = useAppSelector(
     (s) => s.settings?.settings?.panes?.tabAttentionStyle ?? 'highlight'
   )
-  const attentionDismiss = useAppSelector(
-    (s) => s.settings?.settings?.panes?.attentionDismiss ?? 'click'
-  )
   const containerRef = useRef<HTMLDivElement>(null)
   const ws = useMemo(() => getWsClient(), [])
   const snapThreshold = useAppSelector((s) => s.settings?.settings?.panes?.snapThreshold ?? 2)
@@ -344,12 +341,12 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   }, [dispatch, freshAgentPendingCreates, sdkPendingCreates, tabId, ws])
 
   const handleFocus = useCallback((paneId: string) => {
-    if (attentionDismiss === 'click' && attentionByPane[paneId]) {
-      dispatch(clearPaneAttention({ paneId }))
-      dispatch(clearTabAttention({ tabId }))
-    }
+    // Decision 1: visiting any pane of the tab (a click into it) dismisses the
+    // tab's green AND every pane's green in that tab, in BOTH attentionDismiss
+    // modes. (attentionDismiss governs only background-tab navigation clearing.)
+    dispatch(dismissTabGreen(tabId))
     dispatch(setActivePane({ tabId, paneId }))
-  }, [dispatch, tabId, attentionDismiss, attentionByPane])
+  }, [dispatch, tabId])
 
   const handleToggleZoom = useCallback((paneId: string) => {
     dispatch(toggleZoom({ tabId, paneId }))

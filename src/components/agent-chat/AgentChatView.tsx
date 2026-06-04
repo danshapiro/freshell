@@ -4,6 +4,7 @@ import type { AgentChatPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updatePaneContent, mergePaneContent, restartAgentChatCreate } from '@/store/panesSlice'
 import { updateTab } from '@/store/tabsSlice'
+import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import {
   addUserMessage,
   clearPendingCreate,
@@ -737,6 +738,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   }, [])
 
   const handleSend = useCallback((text: string) => {
+    dispatch(dismissTabGreen(tabId))
     if (!paneContent.sessionId) return
 
     // Auto-name the session from the first user message. The server decides
@@ -771,22 +773,25 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   }, [dispatch, paneId, tabId])
 
   const handlePermissionAllow = useCallback((requestId: string) => {
+    dispatch(dismissTabGreen(tabId))
     if (!paneContent.sessionId) return
     dispatch(removePermission({ sessionId: paneContent.sessionId, requestId }))
     ws.send({ type: 'sdk.permission.respond', sessionId: paneContent.sessionId, requestId, behavior: 'allow' })
-  }, [paneContent.sessionId, dispatch, ws])
+  }, [paneContent.sessionId, dispatch, ws, tabId])
 
   const handlePermissionDeny = useCallback((requestId: string) => {
+    dispatch(dismissTabGreen(tabId))
     if (!paneContent.sessionId) return
     dispatch(removePermission({ sessionId: paneContent.sessionId, requestId }))
     ws.send({ type: 'sdk.permission.respond', sessionId: paneContent.sessionId, requestId, behavior: 'deny' })
-  }, [paneContent.sessionId, dispatch, ws])
+  }, [paneContent.sessionId, dispatch, ws, tabId])
 
   const handleQuestionAnswer = useCallback((requestId: string, answers: Record<string, string>) => {
+    dispatch(dismissTabGreen(tabId))
     if (!paneContent.sessionId) return
     dispatch(removeQuestion({ sessionId: paneContent.sessionId, requestId }))
     ws.send({ type: 'sdk.question.respond', sessionId: paneContent.sessionId, requestId, answers })
-  }, [paneContent.sessionId, dispatch, ws])
+  }, [paneContent.sessionId, dispatch, ws, tabId])
 
   const handleContainerPointerUp = useCallback((e: React.PointerEvent) => {
     // Don't steal focus from interactive elements or text selections

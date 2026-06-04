@@ -2,7 +2,7 @@ import { ChevronLeft, ChevronRight, PanelLeft, Plus } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, closeTab, setActiveTab, reorderTabs, clearTabRenameRequest } from '@/store/tabsSlice'
-import { clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
+import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { getWsClient } from '@/lib/ws-client'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { collectPaneEntries, collectTerminalIds } from '@/lib/pane-utils'
@@ -162,7 +162,6 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   const paneLayouts = useAppSelector((s) => s.panes?.layouts) ?? EMPTY_LAYOUTS
   const paneTitles = useAppSelector((s) => s.panes?.paneTitles) ?? EMPTY_PANE_TITLES
   const attentionByTab = useAppSelector((s) => s.turnCompletion?.attentionByTab) ?? EMPTY_ATTENTION
-  const attentionByPane = useAppSelector((s) => s.turnCompletion?.attentionByPane) ?? EMPTY_ATTENTION
   const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
   const claudeActivityByTerminalId = useAppSelector((s) => s.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID)
   const opencodeActivityByTerminalId = useAppSelector((s) => s.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID)
@@ -171,7 +170,6 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   const paneRuntimeActivityByPaneId = useAppSelector(
     (s) => s.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID
   )
-  const activePaneMap = useAppSelector((s) => s.panes?.activePane)
   const attentionDismiss = useAppSelector((s) => s.settings?.settings?.panes?.attentionDismiss ?? 'click')
   const iconsOnTabs = useAppSelector((s) => s.settings?.settings?.panes?.iconsOnTabs ?? true)
   const tabAttentionStyle = useAppSelector((s) => s.settings?.settings?.panes?.tabAttentionStyle ?? 'highlight')
@@ -331,12 +329,10 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
           dispatch(closeTab(tab.id))
         }}
         onClick={() => {
-          if (attentionDismiss === 'click' && attentionByTab[tab.id]) {
-            dispatch(clearTabAttention({ tabId: tab.id }))
-            const activePaneId = activePaneMap?.[tab.id]
-            if (activePaneId && attentionByPane[activePaneId]) {
-              dispatch(clearPaneAttention({ paneId: activePaneId }))
-            }
+          // Clicking a tab in 'click' mode dismisses its green and ALL its panes'
+          // green (decision 1 / Fresh-Eyes round 3). No-op if the tab has none.
+          if (attentionDismiss === 'click') {
+            dispatch(dismissTabGreen(tab.id))
           }
           dispatch(setActiveTab(tab.id))
         }}
@@ -348,9 +344,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     )
   }, [
     activeId,
-    activePaneMap,
     activeTabId,
-    attentionByPane,
     attentionByTab,
     attentionDismiss,
     dispatch,
