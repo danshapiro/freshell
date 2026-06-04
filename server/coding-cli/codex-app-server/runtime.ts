@@ -320,8 +320,11 @@ async function classifyOwnedProcessGroup(
   // read our own process group, we cannot rule out that this PGID is the server's own group, so
   // refuse conservatively rather than risk signaling ourselves.
   const selfResult = await readProcessGroupIdResult('self')
-  if (selfResult.kind === 'unreadable') return 'indeterminate'
-  if (selfResult.kind === 'value' && metadata.processGroupId === selfResult.processGroupId) {
+  // Any non-'value' self read (unreadable, or the normally-unreachable 'gone') stays conservative: we
+  // cannot rule out that this PGID is the server's own group, so refuse rather than risk signaling
+  // ourselves. This keeps the tri-state contract total over the discriminated union.
+  if (selfResult.kind !== 'value') return 'indeterminate'
+  if (metadata.processGroupId === selfResult.processGroupId) {
     return 'self'
   }
 
@@ -412,7 +415,27 @@ async function concludeIfNotOwned(
     )
     return false
   }
-  return null // 'owned' — the caller may signal
+  if (status === 'owned') return null // the caller may signal
+
+  // Exhaustiveness guard. With the current union this is unreachable, but it makes any future
+  // OwnedProcessGroupStatus a compile error here (so a new, more-uncertain status cannot silently
+  // fall through to signaling) and, if somehow reached at runtime, fails CLOSED: never signal a group
+  // we could not classify.
+  const _exhaustive: never = status
+  logger.error(
+    {
+      ownershipId: metadata.ownershipId,
+      terminalId: metadata.terminalId,
+      generation: metadata.generation,
+      wsUrl: metadata.wsUrl,
+      wrapperPid: metadata.wrapperPid,
+      processGroupId: metadata.processGroupId,
+      serverInstanceId: metadata.serverInstanceId,
+      status: _exhaustive,
+    },
+    `Refusing to signal Codex app-server sidecar for an unknown ownership status (${when})`,
+  )
+  return false
 }
 
 function signalProcessGroup(processGroupId: number, signal: NodeJS.Signals): void {

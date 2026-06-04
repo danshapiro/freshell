@@ -896,6 +896,54 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     }
   }, 20_000)
 
+  it('disowns the stale record when the wrapper PID is gone and the PGID was reused by a foreign group', async () => {
+    const firstRuntime = createRuntime({
+      metadataDir: await makeTempDir(),
+      serverInstanceId: 'srv-runtime-test',
+    })
+    const secondRuntime = createRuntime({
+      metadataDir: await makeTempDir(),
+      serverInstanceId: 'srv-runtime-test',
+    })
+    let firstReady: Awaited<ReturnType<CodexAppServerRuntime['ensureReady']>> | undefined
+    let secondReady: Awaited<ReturnType<CodexAppServerRuntime['ensureReady']>> | undefined
+    let readFileSpy: ReturnType<typeof vi.spyOn> | undefined
+
+    try {
+      firstReady = await firstRuntime.ensureReady()
+      secondReady = await secondRuntime.ensureReady()
+      const ownership = (firstRuntime as any).ownership
+      const firstMetadataPath = ownership.metadataPath as string
+      // Canonical production case: the sidecar process EXITED (its /proc/<wrapperPid>/stat reads
+      // ENOENT, so the wrapper read classifies `gone`) and the recorded PGID was REUSED by a live,
+      // unrelated group. This pins the `wrapperResult.kind === 'gone'` -> `foreign` branch — distinct
+      // from the wrapper-in-a-different-live-group branch every other foreign test exercises.
+      const goneWrapperStatPath = `/proc/${firstReady.processPid}/stat`
+      ownership.metadata.processGroupId = secondReady.processGroupId
+      const originalReadFile = fsp.readFile.bind(fsp)
+      readFileSpy = vi.spyOn(fsp, 'readFile').mockImplementation(((target: any, options?: any) => {
+        if (String(target) === goneWrapperStatPath) {
+          const error = new Error('no such process') as NodeJS.ErrnoException
+          error.code = 'ENOENT'
+          return Promise.reject(error) as any
+        }
+        return originalReadFile(target, options as any) as any
+      }) as typeof fsp.readFile)
+
+      await firstRuntime.shutdown()
+
+      await expect(fsp.stat(firstMetadataPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(await isProcessGroupAlive(secondReady.processGroupId)).toBe(true)
+      expect(await isProcessGroupAlive(firstReady.processGroupId)).toBe(true)
+    } finally {
+      readFileSpy?.mockRestore()
+      runtimes.delete(firstRuntime)
+      runtimes.delete(secondRuntime)
+      if (firstReady) await killProcessGroupForTest(firstReady.processGroupId)
+      if (secondReady) await killProcessGroupForTest(secondReady.processGroupId)
+    }
+  }, 20_000)
+
   it('does not use wrapper start ticks alone when command line and cwd no longer match', async () => {
     const metadataDir = await makeTempDir()
     const runtime = createRuntime({
@@ -981,6 +1029,40 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
         const error = new Error('permission denied') as NodeJS.ErrnoException
         error.code = 'EACCES'
         return Promise.reject(error) as any
+      }
+      return originalReadFile(target, options as any) as any
+    }) as typeof fsp.readFile)
+
+    try {
+      await expect(runtime.shutdown()).rejects.toThrow(/could not be verified|failed|ownership/i)
+      await expect(fsp.stat(metadataPath)).resolves.toBeDefined()
+      expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
+    } finally {
+      readFileSpy.mockRestore()
+      runtimes.delete(runtime)
+      await killProcessGroupForTest(ready.processGroupId)
+    }
+  }, 20_000)
+
+  it('refuses to disown and keeps the record when the wrapper stat is present but unparseable', async () => {
+    const metadataDir = await makeTempDir()
+    const runtime = createRuntime({
+      metadataDir,
+      serverInstanceId: 'srv-runtime-test',
+    })
+    const ready = await runtime.ensureReady()
+    const ownership = (runtime as any).ownership
+    const metadataPath = ownership.metadataPath as string
+    // No member can positively match (bogus id), and the wrapper's /proc/<pid>/stat is present but
+    // unparseable. That must classify `unreadable` (NOT `gone`) so the group stays `indeterminate`
+    // and is never disowned — guarding the present-but-unparseable branch distinct from EACCES.
+    ownership.metadata.ownershipId = 'no-such-ownership-id'
+    const wrapperStatPath = `/proc/${ready.processPid}/stat`
+    const originalReadFile = fsp.readFile.bind(fsp)
+    const readFileSpy = vi.spyOn(fsp, 'readFile').mockImplementation(((target: any, options?: any) => {
+      if (String(target) === wrapperStatPath) {
+        // Non-empty but missing the ')' delimiter parseProcStat requires -> parse returns null.
+        return Promise.resolve('garbage proc stat without a close paren') as any
       }
       return originalReadFile(target, options as any) as any
     }) as typeof fsp.readFile)
