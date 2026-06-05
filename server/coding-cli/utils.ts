@@ -334,6 +334,22 @@ export function isSystemContext(text: string): boolean {
   return false
 }
 
+const USER_CONTEXT_TAGS = new Set([
+  'environment_context',
+  'system_context',
+  'system',
+  'context',
+  'instructions',
+  'user_instructions',
+  'permissions',
+  'collaboration_mode',
+  'skills_instructions',
+])
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 /**
  * Extract the actual user request from IDE-formatted context messages.
  * IDE context messages follow this format:
@@ -361,4 +377,53 @@ export function extractFromIdeContext(text: string): string | undefined {
   }
 
   return undefined
+}
+
+/**
+ * Returns only text authored as the user's task/request, excluding context that
+ * coding CLIs serialize as role:"user" records.
+ */
+export function extractUserAuthoredText(text: string): string | undefined {
+  const trimmed = text.trim()
+  if (!trimmed) return undefined
+
+  const ideRequest = extractFromIdeContext(trimmed)
+  if (ideRequest) return ideRequest
+
+  if (!isSystemContext(trimmed)) {
+    const cleaned = trimmed.replace(/<\/?image[^>]*>/g, '').trim()
+    return cleaned || undefined
+  }
+
+  let rest = trimmed
+  let removedStructuredBlock = false
+  for (;;) {
+    const before = rest
+    rest = rest.trim()
+
+    const agentsHeader = rest.match(/^#\s*AGENTS(?:\.md)? instructions[^\n]*(?:\n|$)/i)
+    if (agentsHeader) {
+      rest = rest.slice(agentsHeader[0].length)
+      continue
+    }
+
+    const xmlOpen = rest.match(/^<([a-zA-Z_][\w-]*)\b[^>]*>/)
+    if (xmlOpen) {
+      const tag = xmlOpen[1].toLowerCase()
+      if (!USER_CONTEXT_TAGS.has(tag)) return undefined
+      const closePattern = new RegExp(`</${escapeRegExp(xmlOpen[1])}>`, 'i')
+      const close = closePattern.exec(rest)
+      if (!close) return undefined
+      rest = rest.slice((close.index ?? 0) + close[0].length)
+      removedStructuredBlock = true
+      continue
+    }
+
+    if (rest === before) break
+  }
+
+  if (!removedStructuredBlock) return undefined
+
+  const cleaned = rest.replace(/<\/?image[^>]*>/g, '').trim()
+  return cleaned || undefined
 }

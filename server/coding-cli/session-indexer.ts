@@ -10,7 +10,7 @@ import { extractTitleFromMessage } from '../title-utils.js'
 import type { CodingCliProvider } from './provider.js'
 import { makeSessionKey, type CodingCliSession, type CodingCliProviderName, type ProjectGroup } from './types.js'
 import { sanitizeCodexTaskEventsForTruncatedSnippet } from './providers/codex.js'
-import { extractFromIdeContext, isSystemContext, resolveGitCheckoutRoot, resolveGitRepoRoot } from './utils.js'
+import { extractUserAuthoredText, resolveGitCheckoutRoot, resolveGitRepoRoot } from './utils.js'
 import { diffProjects } from '../sessions-sync/diff.js'
 import type { SessionMetadataStore, SessionMetadataEntry } from '../session-metadata-store.js'
 
@@ -297,9 +297,7 @@ async function readLightweightMeta(filePath: string): Promise<LightweightFileMet
                     .join('\n')
                 : undefined
 
-            const ideRequest = rawText ? extractFromIdeContext(rawText) : undefined
-            const candidate = ideRequest
-              || (!isSystemContext(rawText ?? '') ? rawText?.replace(/<\/?image[^>]*>/g, '').trim() : '')
+            const candidate = rawText ? extractUserAuthoredText(rawText) : undefined
             if (candidate) {
               title = extractTitleFromMessage(candidate, 200)
             }

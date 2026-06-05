@@ -4,7 +4,7 @@ import fsp from 'fs/promises'
 import { extractTitleFromMessage } from '../../title-utils.js'
 import type { CodingCliProvider } from '../provider.js'
 import { normalizeFirstUserMessage, type CodexTaskEventSnapshot, type NormalizedEvent, type ParsedSessionMeta, type TokenPayload, type TokenSummary } from '../types.js'
-import { looksLikePath, isSystemContext, extractFromIdeContext, resolveGitRepoRoot } from '../utils.js'
+import { looksLikePath, extractUserAuthoredText, resolveGitRepoRoot } from '../utils.js'
 
 const CODEX_MAX_PLAUSIBLE_CONTEXT_TOKENS_WITHOUT_WINDOW = 5_000_000
 // Codex `model_context_window` is reduced by `effective_context_window_percent` (default 95%).
@@ -318,22 +318,13 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
 
     if (obj?.type === 'response_item' && obj?.payload?.type === 'message' && obj?.payload?.role === 'user') {
       const text = extractTextContent(obj.payload.content)
-      const normalized = normalizeFirstUserMessage(text)
+      const userText = extractUserAuthoredText(text)
+      const normalized = userText ? normalizeFirstUserMessage(userText) : undefined
       if (!firstUserMessage && normalized) {
         firstUserMessage = normalized
       }
-      if (!title && text.trim()) {
-        // Try to extract user request from IDE-formatted context first
-        const ideRequest = extractFromIdeContext(text)
-        if (ideRequest) {
-          title = extractTitleFromMessage(ideRequest, 200)
-        } else if (!isSystemContext(text)) {
-          // Strip image markup tags so titles show the actual user request
-          const cleaned = text.replace(/<\/?image[^>]*>/g, '').trim()
-          if (cleaned) {
-            title = extractTitleFromMessage(cleaned, 200)
-          }
-        }
+      if (!title && userText) {
+        title = extractTitleFromMessage(userText, 200)
       }
     }
 

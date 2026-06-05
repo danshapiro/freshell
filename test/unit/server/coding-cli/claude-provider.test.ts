@@ -776,6 +776,7 @@ describe('claude provider cross-platform tests', () => {
       const meta = parseSessionContent(content)
 
       expect(meta.title).toBe('Build the feature')
+      expect(meta.firstUserMessage).toBe('Build the feature')
     })
 
     it('skips XML-wrapped system context', () => {
@@ -859,6 +860,7 @@ describe('claude provider cross-platform tests', () => {
       const meta = parseSessionContent(content)
 
       expect(meta.title).toBeUndefined()
+      expect(meta.firstUserMessage).toBeUndefined()
     })
 
     it('extracts user request from IDE context messages', () => {

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { isSystemContext, extractFromIdeContext } from '../../../../server/coding-cli/utils'
+import { isSystemContext, extractFromIdeContext, extractUserAuthoredText } from '../../../../server/coding-cli/utils'
 
 describe('isSystemContext()', () => {
   describe('XML-wrapped context', () => {
@@ -198,5 +198,25 @@ describe('extractFromIdeContext()', () => {
     ].join('\n')
 
     expect(extractFromIdeContext(text)).toBeUndefined()
+  })
+})
+
+describe('extractUserAuthoredText()', () => {
+  it('skips leading AGENTS instructions and returns trailing user request', () => {
+    const text = [
+      '# AGENTS.md instructions for /project',
+      '',
+      '<INSTRUCTIONS>',
+      'Prefer bash to powershell.',
+      '</INSTRUCTIONS>',
+      '',
+      'Find, root cause, investigate, etc.',
+    ].join('\n')
+
+    expect(extractUserAuthoredText(text)).toBe('Find, root cause, investigate, etc.')
+  })
+
+  it('does not treat plain AGENTS instruction text as a user request', () => {
+    expect(extractUserAuthoredText('# AGENTS.md instructions\n\nFollow these rules...')).toBeUndefined()
   })
 })

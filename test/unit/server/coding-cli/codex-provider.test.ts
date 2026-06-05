@@ -673,6 +673,7 @@ describe('codex-provider', () => {
       const meta = parseCodexSessionContent(content)
 
       expect(meta.title).toBe('Review the current code changes')
+      expect(meta.firstUserMessage).toBe('Review the current code changes')
     })
 
     it('skips messages starting with XML tags like <INSTRUCTIONS>', () => {
@@ -897,6 +898,39 @@ describe('codex-provider', () => {
       const meta = parseCodexSessionContent(content)
 
       expect(meta.title).toBeUndefined()
+      expect(meta.firstUserMessage).toBeUndefined()
+    })
+
+    it('extracts firstUserMessage from the request inside IDE context', () => {
+      const ideMessage = [
+        '# Context from my IDE setup:',
+        '',
+        '## My codebase',
+        'This is a React project...',
+        '',
+        '## My request for Codex:',
+        'Fix the authentication bug in the login form',
+      ].join('\n')
+
+      const content = [
+        JSON.stringify({
+          type: 'session_meta',
+          payload: { id: 'session-ide-first-user', cwd: '/project' },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: ideMessage }],
+          },
+        }),
+      ].join('\n')
+
+      const meta = parseCodexSessionContent(content)
+
+      expect(meta.title).toBe('Fix the authentication bug in the login form')
+      expect(meta.firstUserMessage).toBe('Fix the authentication bug in the login form')
     })
 
     it('extracts user request from IDE context messages', () => {

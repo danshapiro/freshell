@@ -7,7 +7,7 @@ import { getClaudeHome } from '../../claude-home.js'
 import type { CodingCliProvider } from '../provider.js'
 import { normalizeFirstUserMessage, type NormalizedEvent, type ParsedSessionMeta, type TokenSummary } from '../types.js'
 import { parseClaudeEvent, isMessageEvent, isResultEvent, isToolResultContent, isToolUseContent, isTextContent } from '../../claude-stream-types.js'
-import { looksLikePath, isSystemContext, extractFromIdeContext, resolveGitRepoRoot } from '../utils.js'
+import { looksLikePath, extractUserAuthoredText, resolveGitRepoRoot } from '../utils.js'
 
 export type JsonlMeta = {
   sessionId?: string
@@ -376,7 +376,8 @@ export function parseSessionContent(content: string, options: ParseSessionOption
       if (typeof modelCandidate === 'string') model = modelCandidate
     }
     const userMessageText = extractUserMessageText(obj)
-    if (userMessageText !== undefined && !isSystemContext(userMessageText)) {
+    const userAuthoredText = typeof userMessageText === 'string' ? extractUserAuthoredText(userMessageText) : undefined
+    if (userAuthoredText !== undefined) {
       userMessageCount++
     }
 
@@ -393,20 +394,12 @@ export function parseSessionContent(content: string, options: ParseSessionOption
     }
 
     if (!title) {
-      const t =
-        obj?.title ||
-        obj?.sessionTitle ||
-        userMessageText
-
-      if (typeof t === 'string' && t.trim()) {
-        // Try to extract user request from IDE-formatted context first
-        const ideRequest = extractFromIdeContext(t)
-        if (ideRequest) {
-          title = extractTitleFromMessage(ideRequest, 200)
-        } else if (!isSystemContext(t)) {
-          // Store up to 200 chars - UI truncates visually, tooltip shows full text
-          title = extractTitleFromMessage(t, 200)
-        }
+      const explicitTitle = obj?.title || obj?.sessionTitle
+      if (typeof explicitTitle === 'string' && explicitTitle.trim()) {
+        title = extractTitleFromMessage(explicitTitle, 200)
+      } else if (userAuthoredText) {
+        // Store up to 200 chars - UI truncates visually, tooltip shows full text
+        title = extractTitleFromMessage(userAuthoredText, 200)
       }
     }
 
@@ -418,8 +411,8 @@ export function parseSessionContent(content: string, options: ParseSessionOption
     }
 
     if (!firstUserMessage) {
-      if (typeof userMessageText === 'string') {
-        const normalized = normalizeFirstUserMessage(userMessageText)
+      if (userAuthoredText) {
+        const normalized = normalizeFirstUserMessage(userAuthoredText)
         if (normalized) firstUserMessage = normalized
       }
     }
