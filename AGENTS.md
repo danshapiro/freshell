@@ -30,6 +30,9 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - Use `npm run test:vitest -- ...` for a repo-owned direct Vitest path. Raw `npx vitest` is not a coordinated workflow.
 - `test:unit` is the exact default-config `test/unit` workload, `test:integration` is the exact server-config `test/server` workload, and `test:server` stays watch-capable unless you pass an explicit broad `--run`.
 
+## Kata
+- `.kata.toml` is committed project configuration. Always commit it after modifying it.
+
 ## Branch Model And Self-Hosting (CRITICAL - Read This)
 
 **This checkout is self-hosted from local `dev`, not local `main`.**

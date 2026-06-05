@@ -37,3 +37,4 @@ artifacts/perf/
 .superpowers/
 .opencode/
 sdk.session.snapshot
+.kata.local.toml
