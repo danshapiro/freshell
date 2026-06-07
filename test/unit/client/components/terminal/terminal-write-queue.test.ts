@@ -98,4 +98,67 @@ describe('createTerminalWriteQueue', () => {
     expect(writes).toEqual(['A', 'B', 'C'])
     expect(rafCallbacks).toHaveLength(0)
   })
+
+  it('coalesces adjacent writes and preserves write callbacks', () => {
+    const writes: string[] = []
+    const callbacks: string[] = []
+    const rafCallbacks: FrameRequestCallback[] = []
+
+    const queue = createTerminalWriteQueue({
+      write: (chunk, onWritten) => {
+        writes.push(chunk)
+        onWritten?.()
+      },
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+    })
+
+    queue.enqueue('A', () => callbacks.push('A'), { mode: 'replay' })
+    queue.enqueue('B', () => callbacks.push('B'), { mode: 'replay' })
+    queue.enqueue('C', undefined, { mode: 'replay' })
+
+    rafCallbacks.shift()?.(16)
+
+    expect(writes).toEqual(['ABC'])
+    expect(callbacks).toEqual(['A', 'B'])
+  })
+
+  it('uses the replay budget when draining replay work', () => {
+    const tasks: string[] = []
+    const rafCallbacks: FrameRequestCallback[] = []
+    let nowMs = 0
+
+    const queue = createTerminalWriteQueue({
+      write: () => {},
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+      now: () => nowMs,
+      budgetMs: 4,
+      replayBudgetMs: 12,
+    })
+
+    queue.enqueueTask(() => {
+      tasks.push('A')
+      nowMs += 5
+    }, { mode: 'replay' })
+    queue.enqueueTask(() => {
+      tasks.push('B')
+      nowMs += 5
+    }, { mode: 'replay' })
+    queue.enqueueTask(() => {
+      tasks.push('C')
+      nowMs += 5
+    }, { mode: 'replay' })
+
+    rafCallbacks.shift()?.(16)
+
+    expect(tasks).toEqual(['A', 'B', 'C'])
+    expect(rafCallbacks).toHaveLength(0)
+  })
 })

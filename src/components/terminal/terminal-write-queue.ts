@@ -1,32 +1,76 @@
 export type TerminalWriteQueue = {
-  enqueue: (data: string, onWritten?: () => void) => void
-  enqueueTask: (task: () => void) => void
+  enqueue: (data: string, onWritten?: () => void, options?: TerminalWriteQueueOptions) => void
+  enqueueTask: (task: () => void, options?: TerminalWriteQueueOptions) => void
   clear: () => void
+}
+
+export type TerminalWriteQueueMode = 'live' | 'replay'
+
+export type TerminalWriteQueueOptions = {
+  mode?: TerminalWriteQueueMode
 }
 
 type TerminalWriteQueueArgs = {
   write: (data: string, onWritten?: () => void) => void
   onDrain?: () => void
   budgetMs?: number
+  replayBudgetMs?: number
   now?: () => number
   requestFrame?: (cb: FrameRequestCallback) => number
   cancelFrame?: (id: number) => void
 }
 
+type WriteQueueItem = {
+  kind: 'write'
+  mode: TerminalWriteQueueMode
+  data: string
+  callbacks: Array<() => void>
+}
+
+type TaskQueueItem = {
+  kind: 'task'
+  mode: TerminalWriteQueueMode
+  task: () => void
+}
+
+type QueueItem = WriteQueueItem | TaskQueueItem
+
+const DEFAULT_REPLAY_BUDGET_MS = 32
+const MAX_COALESCED_REPLAY_WRITE_LENGTH = 256 * 1024
+
 export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): TerminalWriteQueue {
-  const queue: Array<() => void> = []
+  const queue: QueueItem[] = []
   const budgetMs = args.budgetMs ?? 8
+  const replayBudgetMs = args.replayBudgetMs ?? Math.max(DEFAULT_REPLAY_BUDGET_MS, budgetMs)
   const now = args.now ?? (() => performance.now())
   const requestFrame = args.requestFrame ?? ((cb) => requestAnimationFrame(cb))
   const cancelFrame = args.cancelFrame ?? ((id) => cancelAnimationFrame(id))
   let rafId: number | null = null
   let scheduled = false
 
+  const budgetForMode = (mode: TerminalWriteQueueMode | undefined) => (
+    mode === 'replay' ? replayBudgetMs : budgetMs
+  )
+
+  const runItem = (item: QueueItem) => {
+    if (item.kind === 'task') {
+      item.task()
+      return
+    }
+
+    const onWritten = item.callbacks.length > 0
+      ? () => {
+          for (const callback of item.callbacks) callback()
+        }
+      : undefined
+    args.write(item.data, onWritten)
+  }
+
   const flush = () => {
-    const deadline = now() + budgetMs
+    const deadline = now() + budgetForMode(queue[0]?.mode)
     while (queue.length > 0 && now() <= deadline) {
       const next = queue.shift()
-      next?.()
+      if (next) runItem(next)
     }
     if (queue.length > 0) {
       scheduleFlush()
@@ -46,13 +90,26 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
   }
 
   return {
-    enqueue(data, onWritten) {
+    enqueue(data, onWritten, options) {
       if (!data) return
-      queue.push(() => args.write(data, onWritten))
+      const mode = options?.mode ?? 'live'
+      const callbacks = onWritten ? [onWritten] : []
+      const previous = queue[queue.length - 1]
+      if (
+        mode === 'replay'
+        && previous?.kind === 'write'
+        && previous.mode === 'replay'
+        && previous.data.length + data.length <= MAX_COALESCED_REPLAY_WRITE_LENGTH
+      ) {
+        previous.data += data
+        previous.callbacks.push(...callbacks)
+      } else {
+        queue.push({ kind: 'write', mode, data, callbacks })
+      }
       scheduleFlush()
     },
-    enqueueTask(task) {
-      queue.push(task)
+    enqueueTask(task, options) {
+      queue.push({ kind: 'task', mode: options?.mode ?? 'live', task })
       scheduleFlush()
     },
     clear() {

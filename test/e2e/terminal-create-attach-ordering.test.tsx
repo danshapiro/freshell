@@ -354,6 +354,85 @@ describe('terminal create/attach ordering (e2e)', () => {
     expect(writes).toContain('hidden-r8')
   })
 
+  it('coalesces attach replay writes that arrive before the frame drain', async () => {
+    const rafCallbacks: FrameRequestCallback[] = []
+    vi.mocked(window.requestAnimationFrame).mockImplementation((cb: FrameRequestCallback) => {
+      rafCallbacks.push(cb)
+      return rafCallbacks.length
+    })
+    const store = createStore({
+      status: 'running',
+      requestId: 'req-order-coalesce',
+      terminalId: 'term-order-coalesce',
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView
+          tabId="tab-order"
+          paneId="pane-order"
+          paneContent={store.getState().panes.layouts['tab-order']!.content as TerminalPaneContent}
+          hidden={false}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(lastSent('terminal.attach', 'term-order-coalesce')).toMatchObject({
+        type: 'terminal.attach',
+        terminalId: 'term-order-coalesce',
+        attachRequestId: expect.any(String),
+      })
+    })
+    rafCallbacks.length = 0
+
+    const attach = lastSent('terminal.attach', 'term-order-coalesce')
+    wsHarness.emit({
+      type: 'terminal.attach.ready',
+      terminalId: 'term-order-coalesce',
+      headSeq: 3,
+      replayFromSeq: 1,
+      replayToSeq: 3,
+      attachRequestId: attach.attachRequestId,
+    })
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId: 'term-order-coalesce',
+      seqStart: 1,
+      seqEnd: 1,
+      data: 'replay-1',
+      attachRequestId: attach.attachRequestId,
+    })
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId: 'term-order-coalesce',
+      seqStart: 2,
+      seqEnd: 2,
+      data: 'replay-2',
+      attachRequestId: attach.attachRequestId,
+    })
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId: 'term-order-coalesce',
+      seqStart: 3,
+      seqEnd: 3,
+      data: 'replay-3',
+      attachRequestId: attach.attachRequestId,
+    })
+
+    expect(terminalInstances[0].write).not.toHaveBeenCalled()
+
+    act(() => {
+      while (rafCallbacks.length > 0) {
+        rafCallbacks.shift()?.(16)
+      }
+    })
+
+    expect(terminalInstances[0].write.mock.calls.map(([data]) => String(data))).toEqual([
+      'replay-1replay-2replay-3',
+    ])
+  })
+
   it('reconnect path drops stale frames from the old attach generation and accepts the new one only after ready', async () => {
     const store = createStore({
       status: 'running',
