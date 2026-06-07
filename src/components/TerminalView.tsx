@@ -89,7 +89,11 @@ import {
   type TerminalRuntime,
 } from '@/components/terminal/terminal-runtime'
 import { createLayoutScheduler } from '@/components/terminal/layout-scheduler'
-import { createTerminalWriteQueue, type TerminalWriteQueue } from '@/components/terminal/terminal-write-queue'
+import {
+  createTerminalWriteQueue,
+  type TerminalWriteQueue,
+  type TerminalWriteQueueOptions,
+} from '@/components/terminal/terminal-write-queue'
 import { nanoid } from 'nanoid'
 import { cn } from '@/lib/utils'
 import { Terminal } from '@xterm/xterm'
@@ -992,11 +996,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     }
   }, [suppressNetworkEffects, ws])
 
-  const enqueueTerminalWrite = useCallback((data: string, onWritten?: () => void) => {
+  const enqueueTerminalWrite = useCallback((data: string, onWritten?: () => void, options?: TerminalWriteQueueOptions) => {
     if (!data) return
     const queue = writeQueueRef.current
     if (queue) {
-      queue.enqueue(data, onWritten)
+      queue.enqueue(data, onWritten, options)
       return
     }
     const term = termRef.current
@@ -1069,6 +1073,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     tid: string | undefined,
     allowReplies: boolean,
     onRendered?: () => void,
+    writeOptions?: TerminalWriteQueueOptions,
   ) => {
     const startup = extractTerminalStartupProbes(raw, startupProbeStateRef.current, {
       foreground: resolvedThemeRef.current.foreground,
@@ -1098,7 +1103,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     }
 
     if (cleaned) {
-      enqueueTerminalWrite(cleaned, onRendered)
+      enqueueTerminalWrite(cleaned, onRendered, writeOptions)
     } else {
       onRendered?.()
     }
@@ -2172,7 +2177,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               markAttachComplete()
             }
           }
-          handleTerminalOutput(raw, mode, tid, !frameOverlapsReplay, completeRenderedFrame)
+          handleTerminalOutput(
+            raw,
+            mode,
+            tid,
+            !frameOverlapsReplay,
+            completeRenderedFrame,
+            { mode: frameOverlapsReplay ? 'replay' : 'live' },
+          )
           if (completedAttachOnFrame && frameOverlapsReplay) {
             resetStartupProbeParser({ discardReplayRemainder: true })
           }
