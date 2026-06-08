@@ -461,6 +461,40 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
+  it('coalesces contiguous replay frames before sending terminal.output payloads', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-replay-coalesced')
+
+    for (let i = 1; i <= 1000; i += 1) {
+      registry.emit('terminal.output.raw', {
+        terminalId: 'term-replay-coalesced',
+        data: `f${i};`,
+        at: Date.now(),
+      })
+    }
+
+    const wsReplay = createMockWs()
+    await broker.attach(wsReplay as any, 'term-replay-coalesced', 'transport_reconnect', 80, 24, 0, 'replay-attach')
+    vi.advanceTimersByTime(5)
+
+    const outputs = wsReplay.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .filter((payload) => payload?.type === 'terminal.output')
+
+    expect(outputs).toHaveLength(1)
+    expect(outputs[0]).toMatchObject({
+      attachRequestId: 'replay-attach',
+      seqStart: 1,
+      seqEnd: 1000,
+    })
+    expect(outputs[0].data).toContain('f1;')
+    expect(outputs[0].data).toContain('f1000;')
+    expect(Buffer.byteLength(outputs[0].data, 'utf8')).toBeLessThanOrEqual(MAX_REALTIME_MESSAGE_BYTES)
+
+    broker.close()
+  })
+
   it('drains foreground replay batches without the background pacing delay', async () => {
     const registry = new FakeBrokerRegistry()
     const broker = new TerminalStreamBroker(registry as any, vi.fn())

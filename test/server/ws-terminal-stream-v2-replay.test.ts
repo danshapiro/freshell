@@ -408,9 +408,10 @@ describe('terminal stream v2 replay', () => {
     expect(ready.replayFromSeq).toBe(3)
     expect(ready.replayToSeq).toBe(4)
     expect(ready.attachRequestId).toBe(attachRequestId)
-    expect(replayed.length).toBe(2)
+    expect(replayed.length).toBe(1)
     expect(replayed[0]?.seqStart).toBe(3)
-    expect(replayed[1]?.seqEnd).toBe(4)
+    expect(replayed[0]?.seqEnd).toBe(4)
+    expect(replayed.map((frame) => frame.data).join('')).toBe('threefour')
     expect(replayed.every((frame) => frame.seqStart > 2)).toBe(true)
     expect(replayed.every((frame) => frame.attachRequestId === attachRequestId)).toBe(true)
 
@@ -508,11 +509,11 @@ describe('terminal stream v2 replay', () => {
     await close1()
 
     const { ws: ws2, close: close2 } = await createAuthenticatedConnection(port)
-    const received: Array<{ type: string; seqStart?: number; seqEnd?: number }> = []
+    const received: Array<{ type: string; seqStart?: number; seqEnd?: number; data?: string }> = []
     const listener = (data: WebSocket.Data) => {
       const msg = JSON.parse(data.toString())
       if (msg.terminalId !== terminalId) return
-      received.push({ type: msg.type, seqStart: msg.seqStart, seqEnd: msg.seqEnd })
+      received.push({ type: msg.type, seqStart: msg.seqStart, seqEnd: msg.seqEnd, data: msg.data })
     }
     ws2.on('message', listener)
 
@@ -536,13 +537,10 @@ describe('terminal stream v2 replay', () => {
     expect(received[0]?.type).toBe('terminal.attach.ready')
 
     const replayed = received.filter((msg) => msg.type === 'terminal.output')
-    expect(replayed).toHaveLength(7)
+    expect(replayed).toHaveLength(1)
     expect(replayed[0]?.seqStart).toBe(6)
     expect(replayed[replayed.length - 1]?.seqEnd).toBe(12)
-    for (let i = 0; i < replayed.length; i += 1) {
-      expect(replayed[i]?.seqStart).toBe(6 + i)
-      expect(replayed[i]?.seqEnd).toBe(6 + i)
-    }
+    expect(replayed.map((msg) => msg.data ?? '').join('')).toBe('f6|f7|f8|f9|f10|f11|f12|')
     expect(received.some((msg) => msg.type === 'terminals.changed')).toBe(false)
 
     await close2()
