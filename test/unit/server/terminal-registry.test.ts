@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { isLinuxPath, getSystemShell, escapeCmdExe, buildSpawnSpec, TerminalRegistry, isWsl, isWindowsLike, modeSupportsResume, buildTerminalSessionRef } from '../../../server/terminal-registry'
+import { isLinuxPath, getSystemShell, escapeCmdExe, buildSpawnSpec, TerminalRegistry, isWsl, isWindowsLike, modeSupportsResume, buildTerminalSessionRef, UnknownTerminalModeError } from '../../../server/terminal-registry'
 import { isValidClaudeSessionId } from '../../../server/claude-session-id'
 import { CODEX_DURABILITY_SCHEMA_VERSION } from '../../../shared/codex-durability'
 import * as fs from 'fs'
@@ -731,6 +731,22 @@ describe('buildSpawnSpec Unix paths', () => {
       configurable: true,
     })
     process.env = originalEnv
+  })
+
+  describe('invalid mode', () => {
+    beforeEach(() => {
+      mockPlatform('linux')
+    })
+
+    it('throws instead of returning a spec that would exec the mode name', () => {
+      // Regression: an unknown mode used to fall through to `file: mode`, so
+      // new-tab({ mode: 'terminal' }) spawned a process literally named
+      // "terminal" that died with "execvp(3) failed: No such file or directory".
+      expect(() => buildSpawnSpec('terminal', '/home/user', 'system'))
+        .toThrow(UnknownTerminalModeError)
+      expect(() => buildSpawnSpec('terminal', '/home/user', 'system'))
+        .toThrow(/Invalid terminal mode: 'terminal'/)
+    })
   })
 
   describe('macOS shell mode', () => {

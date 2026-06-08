@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import { createAgentApiRouter } from '../../server/agent-api/router'
+import { UnknownTerminalModeError } from '../../server/terminal-registry'
 import { FakeCodexLaunchPlanner } from '../helpers/coding-cli/fake-codex-launch-planner.js'
 import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../../server/coding-cli/codex-app-server/restore-decision.js'
 
@@ -683,5 +684,34 @@ describe('tab endpoints', () => {
     expect(res.status).toBe(200)
     expect(renameTab).toHaveBeenCalledWith('missing', 'Ghost')
     expect(broadcastUiCommand).not.toHaveBeenCalled()
+  })
+
+  it('rejects an unknown terminal mode with a 400 and rolls back the tab', async () => {
+    const app = express()
+    app.use(express.json())
+    const closeTab = vi.fn()
+    // A spawn for an unmodelled mode (e.g. mode: 'terminal') throws from the
+    // registry; the route must surface a 400, not spawn a dead terminal.
+    const registry = {
+      create: vi.fn(() => { throw new UnknownTerminalModeError('terminal') }),
+    }
+    const layoutStore = {
+      createTab: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+      attachPaneContent: vi.fn(),
+      closeTab,
+    }
+    app.use('/api', createAgentApiRouter({
+      layoutStore,
+      registry: registry as any,
+      wsHandler: { broadcastUiCommand: vi.fn() },
+    }))
+
+    const res = await request(app).post('/api/tabs').send({ name: 'x', mode: 'terminal' })
+
+    expect(res.status).toBe(400)
+    expect(res.body.status).toBe('error')
+    expect(res.body.message).toMatch(/Invalid terminal mode/)
+    // The half-created tab is cleaned up rather than left dangling.
+    expect(closeTab).toHaveBeenCalledWith('tab_1')
   })
 })

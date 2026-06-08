@@ -127,6 +127,33 @@ export function registerCodingCliCommands(specs: Map<string, CodingCliCommandSpe
 }
 
 /**
+ * The set of terminal modes that can actually be spawned: the built-in 'shell'
+ * plus every registered coding-CLI mode (claude, codex, opencode, ...).
+ */
+export function getKnownTerminalModes(): TerminalMode[] {
+  return ['shell', ...codingCliCommands.keys()]
+}
+
+/** Whether `mode` can be spawned (the built-in shell or a registered coding CLI). */
+export function isKnownTerminalMode(mode: TerminalMode): boolean {
+  return mode === 'shell' || codingCliCommands.has(mode)
+}
+
+/**
+ * Thrown when a spawn is requested for a mode that is neither the built-in
+ * 'shell' nor a registered coding-CLI extension. Guards against buildSpawnSpec's
+ * old behaviour of falling back to exec-ing the mode name itself, which produced
+ * a terminal that immediately died with "execvp(3) failed: No such file or
+ * directory" (e.g. new-tab({ mode: 'terminal' })).
+ */
+export class UnknownTerminalModeError extends Error {
+  constructor(public readonly mode: string) {
+    super(`Invalid terminal mode: '${mode}'. Valid: ${getKnownTerminalModes().join(', ')}`)
+    this.name = 'UnknownTerminalModeError'
+  }
+}
+
+/**
  * Check if a terminal mode supports session resume.
  * Only modes with configured resumeArgs in CODING_CLI_COMMANDS support resume.
  */
@@ -901,6 +928,13 @@ export function buildSpawnSpec(
   envOverrides?: Record<string, string>,
   terminalId?: string,
 ) {
+  // Reject modes that aren't the built-in shell or a registered coding CLI.
+  // Otherwise the fallbacks below (`cli?.command || mode`, and the WSL bash
+  // fallback) try to exec the mode name itself, spawning a terminal that dies
+  // instantly with "execvp(3) failed: No such file or directory".
+  if (mode !== 'shell' && !codingCliCommands.has(mode)) {
+    throw new UnknownTerminalModeError(mode)
+  }
   // Strip inherited env vars that interfere with child terminal behaviour:
   // - CLAUDECODE: causes child Claude processes to refuse to start ("nested session" error)
   // - CI/NO_COLOR/FORCE_COLOR/COLOR: disables interactive color in user PTYs

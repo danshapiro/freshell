@@ -14,7 +14,7 @@ import {
 } from '../coding-cli/codex-launch-config.js'
 import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../coding-cli/codex-app-server/restore-decision.js'
 import { makeSessionKey } from '../coding-cli/types.js'
-import { terminalIdFromCreateError, type ProviderSettings, type TerminalInputResult } from '../terminal-registry.js'
+import { terminalIdFromCreateError, UnknownTerminalModeError, type ProviderSettings, type TerminalInputResult } from '../terminal-registry.js'
 import { MAX_TERMINAL_TITLE_OVERRIDE_LENGTH } from '../terminals-router.js'
 import { logger } from '../logger.js'
 import { ok, approx, fail } from './response.js'
@@ -36,7 +36,11 @@ class AgentRouteInputError extends Error {
 }
 
 function agentRouteErrorStatus(error: unknown): number {
-  return error instanceof CodexLaunchConfigError || error instanceof AgentRouteInputError ? 400 : 500
+  return error instanceof CodexLaunchConfigError
+    || error instanceof AgentRouteInputError
+    || error instanceof UnknownTerminalModeError
+    ? 400
+    : 500
 }
 
 function errorMessage(error: unknown): string {
