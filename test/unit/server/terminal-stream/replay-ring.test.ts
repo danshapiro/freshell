@@ -53,7 +53,7 @@ describe('ReplayRing', () => {
     expect(replay.frames[1].seqEnd).toBe(3)
   })
 
-  it('returns bounded replay batches without materializing the full replay window', () => {
+  it('returns coalesced bounded replay batches without materializing the full replay window', () => {
     const ring = new ReplayRing(1024)
     ring.append('aa')
     ring.append('bb')
@@ -61,11 +61,48 @@ describe('ReplayRing', () => {
     ring.append('dd')
 
     const firstBatch = ring.replayBatchSince(0, 4, 4)
-    expect(firstBatch.frames.map((f) => f.data)).toEqual(['aa', 'bb'])
+    expect(firstBatch.frames).toHaveLength(1)
+    expect(firstBatch.frames[0]).toMatchObject({
+      seqStart: 1,
+      seqEnd: 2,
+      data: 'aabb',
+      bytes: 4,
+    })
     expect(firstBatch.missedFromSeq).toBeUndefined()
 
     const secondBatch = ring.replayBatchSince(firstBatch.frames.at(-1)?.seqEnd, 4, 4)
-    expect(secondBatch.frames.map((f) => f.data)).toEqual(['cc', 'dd'])
+    expect(secondBatch.frames).toHaveLength(1)
+    expect(secondBatch.frames[0]).toMatchObject({
+      seqStart: 3,
+      seqEnd: 4,
+      data: 'ccdd',
+      bytes: 4,
+    })
+  })
+
+  it('splits coalesced replay batches at the byte budget', () => {
+    const ring = new ReplayRing(1024)
+    ring.append('aaa')
+    ring.append('bbb')
+    ring.append('ccc')
+
+    const firstBatch = ring.replayBatchSince(0, 6, 3)
+    expect(firstBatch.frames).toHaveLength(1)
+    expect(firstBatch.frames[0]).toMatchObject({
+      seqStart: 1,
+      seqEnd: 2,
+      data: 'aaabbb',
+      bytes: 6,
+    })
+
+    const secondBatch = ring.replayBatchSince(firstBatch.frames[0].seqEnd, 6, 3)
+    expect(secondBatch.frames).toHaveLength(1)
+    expect(secondBatch.frames[0]).toMatchObject({
+      seqStart: 3,
+      seqEnd: 3,
+      data: 'ccc',
+      bytes: 3,
+    })
   })
 
   it('reports replay miss when requested sequence is older than tail', () => {

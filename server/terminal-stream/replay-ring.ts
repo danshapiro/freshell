@@ -112,7 +112,16 @@ export class ReplayRing {
       const frame = this.frames[i]
       if (frame.seqStart > normalizedToSeq) break
       if (frame.bytes > budget && frames.length > 0) break
-      frames.push(frame)
+
+      const previous = frames[frames.length - 1]
+      if (previous && frame.seqStart === previous.seqEnd + 1) {
+        previous.seqEnd = frame.seqEnd
+        previous.data += frame.data
+        previous.bytes += frame.bytes
+        previous.at = frame.at
+      } else {
+        frames.push({ ...frame })
+      }
       budget -= frame.bytes
       if (budget <= 0) break
     }

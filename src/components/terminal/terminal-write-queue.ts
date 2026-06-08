@@ -14,7 +14,6 @@ type TerminalWriteQueueArgs = {
   write: (data: string, onWritten?: () => void) => void
   onDrain?: () => void
   budgetMs?: number
-  replayBudgetMs?: number
   now?: () => number
   requestFrame?: (cb: FrameRequestCallback) => number
   cancelFrame?: (id: number) => void
@@ -35,22 +34,16 @@ type TaskQueueItem = {
 
 type QueueItem = WriteQueueItem | TaskQueueItem
 
-const DEFAULT_REPLAY_BUDGET_MS = 32
 const MAX_COALESCED_REPLAY_WRITE_LENGTH = 256 * 1024
 
 export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): TerminalWriteQueue {
   const queue: QueueItem[] = []
   const budgetMs = args.budgetMs ?? 8
-  const replayBudgetMs = args.replayBudgetMs ?? Math.max(DEFAULT_REPLAY_BUDGET_MS, budgetMs)
   const now = args.now ?? (() => performance.now())
   const requestFrame = args.requestFrame ?? ((cb) => requestAnimationFrame(cb))
   const cancelFrame = args.cancelFrame ?? ((id) => cancelAnimationFrame(id))
   let rafId: number | null = null
   let scheduled = false
-
-  const budgetForMode = (mode: TerminalWriteQueueMode | undefined) => (
-    mode === 'replay' ? replayBudgetMs : budgetMs
-  )
 
   const runItem = (item: QueueItem) => {
     if (item.kind === 'task') {
@@ -67,7 +60,7 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
   }
 
   const flush = () => {
-    const deadline = now() + budgetForMode(queue[0]?.mode)
+    const deadline = now() + budgetMs
     while (queue.length > 0 && now() <= deadline) {
       const next = queue.shift()
       if (next) runItem(next)

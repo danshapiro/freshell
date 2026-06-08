@@ -126,7 +126,7 @@ describe('createTerminalWriteQueue', () => {
     expect(callbacks).toEqual(['A', 'B'])
   })
 
-  it('uses the replay budget when draining replay work', () => {
+  it('keeps replay work on the normal frame budget', () => {
     const tasks: string[] = []
     const rafCallbacks: FrameRequestCallback[] = []
     let nowMs = 0
@@ -140,7 +140,6 @@ describe('createTerminalWriteQueue', () => {
       cancelFrame: () => {},
       now: () => nowMs,
       budgetMs: 4,
-      replayBudgetMs: 12,
     })
 
     queue.enqueueTask(() => {
@@ -157,6 +156,16 @@ describe('createTerminalWriteQueue', () => {
     }, { mode: 'replay' })
 
     rafCallbacks.shift()?.(16)
+
+    expect(tasks).toEqual(['A'])
+    expect(rafCallbacks).toHaveLength(1)
+
+    rafCallbacks.shift()?.(32)
+
+    expect(tasks).toEqual(['A', 'B'])
+    expect(rafCallbacks).toHaveLength(1)
+
+    rafCallbacks.shift()?.(48)
 
     expect(tasks).toEqual(['A', 'B', 'C'])
     expect(rafCallbacks).toHaveLength(0)
