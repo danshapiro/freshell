@@ -2769,6 +2769,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           } else if (
             typeof batchSerializedBytes !== 'number'
             || !Number.isFinite(batchSerializedBytes)
+            || !Number.isInteger(batchSerializedBytes)
             || batchSerializedBytes < 0
           ) {
             invalidBatchReason = 'invalid_batch_serialized_bytes'

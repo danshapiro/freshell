@@ -4545,6 +4545,7 @@ describe('TerminalView lifecycle updates', () => {
         { seqStart: 1, seqEnd: 1, serializedBytes: '128', segments: [validSegment] },
         { seqStart: 1, seqEnd: 1, serializedBytes: null, segments: [validSegment] },
         { seqStart: 1, seqEnd: 1, serializedBytes: -1, segments: [validSegment] },
+        { seqStart: 1, seqEnd: 1, serializedBytes: 128.5, segments: [validSegment] },
         { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, seqStart: '1' }] },
         { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, seqEnd: null }] },
         { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, endOffset: true }] },
