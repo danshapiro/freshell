@@ -976,14 +976,17 @@ it('records gaps without advancing the parser-applied sequence', () => {
   const afterFrame = onOutputFrame(state, { seqStart: 1, seqEnd: 1 })
   const afterGap = onOutputGap(afterFrame.state, { fromSeq: 2, toSeq: 10 })
 
-  expect(afterGap.state.parserAppliedSeq).toBe(1)
+  expect(afterFrame.state.highestObservedSeq).toBe(1)
+  expect(afterFrame.state.parserAppliedSeq).toBe(0)
+  expect(afterGap.state.highestObservedSeq).toBe(10)
+  expect(afterGap.state.parserAppliedSeq).toBe(0)
   expect(afterGap.state.knownLostRanges).toEqual([{ fromSeq: 2, toSeq: 10 }])
   expect(afterGap.surfaceSafeForDeltaReplay).toBe(false)
   expect(afterGap.requiresSurfaceQuarantine).toBe(true)
 })
 ```
 
-The exact helper names can follow local conventions, but the behavior is load-bearing: gaps do not advance parser-applied state, and persisted checkpoints require compatible stream/server identity.
+The exact helper names can follow local conventions, but the behavior is load-bearing: observed server order can advance on output and gaps, `parserAppliedSeq` advances only from a fenced xterm write acknowledgement, gaps do not advance parser-applied state, and persisted checkpoints require compatible stream/server identity.
 
 - [ ] **Step 5: Implement cursor identity and gap separation**
 
@@ -1053,6 +1056,8 @@ Add `trustResultingSurfaceForDeltaReplay?: boolean` to the `RevealAttachPlan` re
 
 Use `checkpointDecision.ok ? checkpointDecision.sinceSeq : undefined` when choosing delta replay. Replay hydrate from zero remains the default for explicit refresh or unsafe checkpoint, but it must set `trustResultingSurfaceForDeltaReplay: false` unless the server/client can prove compatible geometry history.
 
+Leave `TerminalView.tsx` call-site migration to Task 3 so Task 2 can finish the policy helper in isolation. Task 3 must construct `checkpointDecision` with `canUseCheckpointForDeltaReplay(...)` before calling `resolveRevealAttachPlan`; intermediate commits are allowed to have a TODO adapter only if the focused tests still pass and the next task removes it before `npm run check`.
+
 - [ ] **Step 8: Run focused tests**
 
 Run:
@@ -1086,6 +1091,8 @@ it('does not let stale write callbacks advance the current parser-applied cursor
   const { terminalId, term } = await renderTerminalHarness({
     status: 'running',
     terminalId: 'term-stale-write-callback',
+    serverInstanceId: 'server-a',
+    streamId: 'stream-1',
     clearSends: false,
   })
 
@@ -1123,6 +1130,23 @@ it('does not let stale write callbacks advance the current parser-applied cursor
   expect(secondAttach?.attachRequestId).toBeTruthy()
   expect(secondAttach?.attachRequestId).not.toBe(firstAttach?.attachRequestId)
 
+  saveTerminalSurfaceCheckpoint({
+    terminalId,
+    streamId: 'stream-1',
+    serverInstanceId: 'server-a',
+    surfaceEpoch: 1,
+    attachRequestId: secondAttach!.attachRequestId,
+    parserAppliedSeq: 0,
+    cols: 80,
+    rows: 24,
+    geometryEpoch: 1,
+    geometryAuthority: 'single_client',
+    scrollback: 5000,
+    xtermVersion: '6.0.0',
+    bufferType: 'normal',
+    parserIdle: true,
+  })
+
   act(() => {
     delayedCallbacks.shift()?.()
   })
@@ -1131,8 +1155,9 @@ it('does not let stale write callbacks advance the current parser-applied cursor
     streamId: 'stream-1',
     serverInstanceId: 'server-a',
   })
-  expect(checkpointAfterStaleCallback?.attachRequestId).not.toBe(firstAttach?.attachRequestId)
-  expect(checkpointAfterStaleCallback?.parserAppliedSeq ?? 0).toBe(0)
+  expect(checkpointAfterStaleCallback).not.toBeNull()
+  expect(checkpointAfterStaleCallback?.attachRequestId).toBe(secondAttach?.attachRequestId)
+  expect(checkpointAfterStaleCallback?.parserAppliedSeq).toBe(0)
 
   const currentAttach = wsMocks.send.mock.calls
     .map(([msg]) => msg)
@@ -1476,7 +1501,6 @@ git commit -m "Gate terminal output side effects by write scope"
 - Modify: `server/terminal-stream/broker.ts`
 - Modify: `server/terminal-stream/client-output-queue.ts`
 - Modify: `server/terminal-stream/replay-ring.ts`
-- Modify: `test/unit/server/terminal-stream/replay-ring.test.ts`
 
 - [ ] **Step 1: Add failing serialized budget and fragmentation tests**
 
@@ -1572,25 +1596,7 @@ describe('terminal stream serialized budget', () => {
 })
 ```
 
-Add a replay-ring regression test that proves fragmentation expands sequence space:
-
-```ts
-it('assigns distinct sequence ranges to serialized-budget fragments', () => {
-  const ring = new ReplayRing({ maxBytes: 1024 * 1024, maxSerializedPayloadBytes: 16 * 1024 })
-  ring.append('\u001b'.repeat(16 * 1024))
-
-  const replay = ring.replayBatchSince(0, 1024 * 1024)
-
-  expect(replay.frames.length).toBeGreaterThan(1)
-  expect(replay.frames.map((frame) => frame.seqStart)).toEqual(
-    replay.frames.map((_frame, index) => index + 1),
-  )
-  expect(new Set(replay.frames.map((frame) => `${frame.seqStart}:${frame.seqEnd}`)).size)
-    .toBe(replay.frames.length)
-})
-```
-
-The exact constructor shape can follow the implemented local API, but the invariant is fixed: no two emitted messages may reuse the same sequence range as a workaround for serialized budget overflow.
+Do not add replay-ring read-path coalescing assertions in this task. Task 5 proves the fragmentation helper and pre-sequence sequence-space expansion. Task 6 owns the replay read-path proof after the barrier scanner and serialized-budget batch builder exist; otherwise the existing raw-byte coalescing behavior can defeat this task's append-time fragmentation.
 
 Create `test/unit/server/terminal-stream/stream-identity.test.ts`:
 
@@ -1628,7 +1634,7 @@ describe('terminal stream identity', () => {
 Run:
 
 ```bash
-timeout 120s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/terminal-stream/stream-identity.test.ts test/unit/server/terminal-stream/serialized-budget.test.ts test/unit/server/terminal-stream/output-fragments.test.ts test/unit/server/terminal-stream/replay-ring.test.ts
+timeout 120s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/terminal-stream/stream-identity.test.ts test/unit/server/terminal-stream/serialized-budget.test.ts test/unit/server/terminal-stream/output-fragments.test.ts
 ```
 
 Expected: fail because the helpers and pre-sequence fragmentation path do not exist.
@@ -1741,7 +1747,7 @@ Expected: pass.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add server/terminal-stream/stream-identity.ts test/unit/server/terminal-stream/stream-identity.test.ts server/terminal-stream/serialized-budget.ts server/terminal-stream/output-fragments.ts test/unit/server/terminal-stream/serialized-budget.test.ts test/unit/server/terminal-stream/output-fragments.test.ts server/terminal-registry.ts server/terminal-stream/broker.ts server/terminal-stream/client-output-queue.ts server/terminal-stream/replay-ring.ts test/unit/server/terminal-stream/replay-ring.test.ts
+git add server/terminal-stream/stream-identity.ts test/unit/server/terminal-stream/stream-identity.test.ts server/terminal-stream/serialized-budget.ts server/terminal-stream/output-fragments.ts test/unit/server/terminal-stream/serialized-budget.test.ts test/unit/server/terminal-stream/output-fragments.test.ts server/terminal-registry.ts server/terminal-stream/broker.ts server/terminal-stream/client-output-queue.ts server/terminal-stream/replay-ring.ts
 git commit -m "Fragment terminal output before sequence assignment"
 ```
 
@@ -1915,8 +1921,37 @@ describe('terminal output batch builder', () => {
       { seqStart: 2, seqEnd: 2, endOffset: 3 },
     ])
   })
+
+  it('does not re-coalesce serialized-budget fragments across control barriers', () => {
+    const frames = Array.from({ length: 8 }, (_unused, index) => ({
+      seqStart: index + 1,
+      seqEnd: index + 1,
+      data: '\u001b'.repeat(2048),
+      bytes: 2048,
+      at: index + 1,
+      barrier: true,
+      barrierReason: 'control',
+      scannerStateBefore: { mode: 'ground' },
+      scannerStateAfter: { mode: 'ground' },
+    }))
+
+    const batches = buildTerminalOutputBatches({
+      terminalId: 'term-1',
+      attachRequestId: 'attach-1',
+      source: 'replay',
+      maxSerializedBytes: 16 * 1024,
+      frames,
+    })
+
+    expect(batches.length).toBeGreaterThan(1)
+    expect(new Set(batches.map((batch) => `${batch.seqStart}:${batch.seqEnd}`)).size)
+      .toBe(batches.length)
+    expect(batches.every((batch) => batch.serializedBytes <= 16 * 1024)).toBe(true)
+  })
 })
 ```
+
+Also update `test/unit/server/terminal-stream/replay-ring.test.ts` in this task where existing read-path coalescing assertions conflict with scanner-aware semantics. Transparent text may still coalesce through `buildTerminalOutputBatches`; control-barrier fragments and serialized-budget fragments must not be re-coalesced into an oversized serialized payload. This is the task that reconciles the old raw-byte coalescing tests with the new barrier-aware replay contract.
 
 - [ ] **Step 3: Run failing batch tests**
 
@@ -2016,7 +2051,7 @@ Expected: pass.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add server/terminal-stream/output-barrier-scanner.ts server/terminal-stream/output-batch.ts test/unit/server/terminal-stream/output-barrier-scanner.test.ts test/unit/server/terminal-stream/output-batch.test.ts server/terminal-stream/replay-ring.ts server/terminal-stream/client-output-queue.ts server/terminal-stream/broker.ts
+git add server/terminal-stream/output-barrier-scanner.ts server/terminal-stream/output-batch.ts test/unit/server/terminal-stream/output-barrier-scanner.test.ts test/unit/server/terminal-stream/output-batch.test.ts test/unit/server/terminal-stream/replay-ring.test.ts server/terminal-stream/replay-ring.ts server/terminal-stream/client-output-queue.ts server/terminal-stream/broker.ts
 git commit -m "Make terminal replay batching barrier aware"
 ```
 
