@@ -62,6 +62,7 @@ export const TERMINAL_CATCHUP_REQUIRED_METRIC_IDS = [
 
 const TERMINAL_RECONNECT_BACKLOG_REQUIRED_METRIC_IDS = [
   'focusedReadyMs',
+  'terminalInputToFirstOutputMs',
   'maxRafGapMs',
   ...TERMINAL_CATCHUP_REQUIRED_METRIC_IDS,
 ] as const satisfies readonly AuditRequiredMetricId[]

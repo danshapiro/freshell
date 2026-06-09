@@ -228,6 +228,40 @@ function replayWsGapFramesBeforeReady(input: DerivedMetricsInput, focusedReadyMs
   })
 }
 
+function isSentTerminalRecoveryInputFrame(frame: VisibleFirstWsObservation): boolean {
+  if ((frame as { direction?: unknown }).direction !== 'sent') return false
+  const frameType = frame.type ?? classifyWsFrameType(frame.payload ?? '')
+  return frameType === 'terminal.input' || frameType === 'terminal.attach'
+}
+
+function resolveTerminalInputToFirstOutputMs(
+  input: DerivedMetricsInput,
+  focusedReadyMs: number,
+): number | undefined {
+  const explicitSample = input.browser.terminalLatencySamplesMs?.[0]
+  if (typeof explicitSample === 'number' && Number.isFinite(explicitSample)) {
+    return explicitSample
+  }
+
+  const frames = input.transport.ws?.frames ?? []
+  const inputFrame = frames
+    .filter((frame) => frame.timestamp <= focusedReadyMs && isSentTerminalRecoveryInputFrame(frame))
+    .sort((a, b) => a.timestamp - b.timestamp)[0]
+  if (!inputFrame) return undefined
+
+  const outputFrame = frames
+    .filter((frame) => {
+      if (frame.timestamp < inputFrame.timestamp || frame.timestamp > focusedReadyMs) return false
+      if (!isReceivedTerminalOutputFrame(frame)) return false
+      const frameType = frame.type ?? classifyWsFrameType(frame.payload ?? '')
+      return frameType === 'terminal.output' || frameType === 'terminal.output.batch'
+    })
+    .sort((a, b) => a.timestamp - b.timestamp)[0]
+  if (!outputFrame) return undefined
+
+  return Math.max(0, outputFrame.timestamp - inputFrame.timestamp)
+}
+
 function resolveReplayMessageCount(input: DerivedMetricsInput, replayFrames: VisibleFirstWsObservation[]): number {
   const serverReplayBatchEvents = (input.server?.terminalReplayEvents ?? []).filter(isReplayBatchEvent)
   return serverReplayBatchEvents.length > 0 ? serverReplayBatchEvents.length : replayFrames.length
@@ -314,6 +348,7 @@ export function deriveVisibleFirstMetrics(input: DerivedMetricsInput): VisibleFi
   const allowedWsTypes = new Set(input.allowedWsTypesBeforeReady)
   const replayFrames = replayWsFramesBeforeReady(input, focusedReadyMs)
   const stopResumeMetrics = resolveStopResumeMetrics(input)
+  const terminalInputToFirstOutputMs = resolveTerminalInputToFirstOutputMs(input, focusedReadyMs)
 
   let httpRequestsBeforeReady = 0
   let httpBytesBeforeReady = 0
@@ -357,8 +392,8 @@ export function deriveVisibleFirstMetrics(input: DerivedMetricsInput): VisibleFi
     focusedReadyMs,
     ...(resolveWsReadyMs(input) !== undefined ? { wsReadyMs: resolveWsReadyMs(input) } : {}),
     maxRafGapMs: resolveMaxRafGapMs(input),
-    ...(typeof input.browser.terminalLatencySamplesMs?.[0] === 'number'
-      ? { terminalInputToFirstOutputMs: input.browser.terminalLatencySamplesMs[0] }
+    ...(terminalInputToFirstOutputMs !== undefined
+      ? { terminalInputToFirstOutputMs }
       : {}),
     httpRequestsBeforeReady,
     httpBytesBeforeReady,

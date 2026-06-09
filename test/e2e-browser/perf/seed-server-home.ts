@@ -145,6 +145,7 @@ async function writeSessionFile(filePath: string, content: string, mtimeMs: numb
 export async function seedVisibleFirstAuditServerHome(homeDir: string): Promise<VisibleFirstAuditHomeSeedResult> {
   const claudeProjectsDir = path.join(homeDir, '.claude', 'projects')
   await fs.mkdir(claudeProjectsDir, { recursive: true })
+  await fs.writeFile(path.join(homeDir, '.hushlogin'), '', 'utf8')
 
   const projectPaths: string[] = []
   let sessionSequence = 1

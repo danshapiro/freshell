@@ -38,6 +38,13 @@ const TERMINAL_RECONNECT_REQUIRED_METRICS = {
   terminalStopResumeGapCount: 0,
 }
 
+function reconnectRequiredMetrics(profileId: VisibleFirstProfileId) {
+  return {
+    terminalInputToFirstOutputMs: profileId === 'mobile_restricted' ? 35 : 25,
+    ...TERMINAL_RECONNECT_REQUIRED_METRICS,
+  }
+}
+
 function createArtifact(): VisibleFirstAuditArtifact {
   return VisibleFirstAuditSchema.parse({
     schemaVersion: 1,
@@ -67,7 +74,7 @@ function createArtifact(): VisibleFirstAuditArtifact {
         transport: {},
         server: {},
         derived: scenarioId === 'terminal-reconnect-backlog'
-          ? { ...TERMINAL_RECONNECT_REQUIRED_METRICS }
+          ? reconnectRequiredMetrics(profileId)
           : {},
         errors: [],
       })),
@@ -79,7 +86,7 @@ function createArtifact(): VisibleFirstAuditArtifact {
           offscreenHttpBytesBeforeReady: 0,
           offscreenWsFramesBeforeReady: 0,
           offscreenWsBytesBeforeReady: 0,
-          ...(scenarioId === 'terminal-reconnect-backlog' ? TERMINAL_RECONNECT_REQUIRED_METRICS : {}),
+          ...(scenarioId === 'terminal-reconnect-backlog' ? reconnectRequiredMetrics('desktop_local') : {}),
         },
         mobile_restricted: {
           focusedReadyMs: 150,
@@ -88,7 +95,7 @@ function createArtifact(): VisibleFirstAuditArtifact {
           offscreenHttpBytesBeforeReady: 0,
           offscreenWsFramesBeforeReady: 0,
           offscreenWsBytesBeforeReady: 0,
-          ...(scenarioId === 'terminal-reconnect-backlog' ? TERMINAL_RECONNECT_REQUIRED_METRICS : {}),
+          ...(scenarioId === 'terminal-reconnect-backlog' ? reconnectRequiredMetrics('mobile_restricted') : {}),
         },
       },
     })),

@@ -76,6 +76,7 @@ describe('visible-first audit scenarios', () => {
     ]))
     expect(scenario?.requiredMetricIds).toEqual(expect.arrayContaining([
       'focusedReadyMs',
+      'terminalInputToFirstOutputMs',
       'maxRafGapMs',
       ...TERMINAL_CATCHUP_REQUIRED_METRICS,
     ]))

@@ -82,7 +82,18 @@ describe('deriveVisibleFirstMetrics', () => {
         ws: {
           frames: [
             {
+              timestamp: 90,
+              direction: 'sent',
+              type: 'terminal.attach',
+              payload: JSON.stringify({
+                type: 'terminal.attach',
+                terminalId: 'term-reconnect',
+              }),
+              payloadLength: 80,
+            },
+            {
               timestamp: 100,
+              direction: 'received',
               type: 'terminal.output.batch',
               payload: JSON.stringify({
                 type: 'terminal.output.batch',
@@ -95,6 +106,7 @@ describe('deriveVisibleFirstMetrics', () => {
             },
             {
               timestamp: 130,
+              direction: 'received',
               type: 'terminal.output',
               payload: JSON.stringify({
                 type: 'terminal.output',
@@ -135,6 +147,7 @@ describe('deriveVisibleFirstMetrics', () => {
     })
 
     expect(result.maxRafGapMs).toBe(31)
+    expect(result.terminalInputToFirstOutputMs).toBe(10)
     expect(result.terminalReplayMessageCount).toBe(2)
     expect(result.terminalReplaySerializedBytes).toBe(520)
     expect(result.terminalParserAppliedLagMs).toBe(18)
