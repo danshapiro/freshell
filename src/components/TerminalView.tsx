@@ -149,6 +149,15 @@ const DEFAULT_MIN_CONTRAST_RATIO = 1
 const MAX_LAST_SENT_VIEWPORT_CACHE_ENTRIES = 200
 const TRUNCATED_REPLAY_BYTES = 128 * 1024
 const INPUT_BLOCKED_NOTICE_THROTTLE_MS = 2000
+const TERMINAL_OUTPUT_BATCH_BARRIER_REASONS = new Set([
+  'control',
+  'startup_probe',
+  'osc52',
+  'request_mode',
+  'turn_complete',
+  'gap',
+  'geometry',
+])
 
 function viewportHydrateReplayOptions(content?: TerminalPaneContent | null): { maxReplayBytes: number } | undefined {
   return content?.mode === 'opencode'
@@ -2708,6 +2717,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           raw = replayDiscard.raw
           const inputBytesEqualSubmission = raw === input.raw
           const outputTerminalInstanceId = terminalInstanceIdRef.current
+          const completeNoWriteReplayAttach = () => {
+            completeAttachGeneration({
+              attachRequestId: input.attachRequestId,
+              mode: input.mode,
+              terminalInstanceId: outputTerminalInstanceId,
+              terminalId: tid,
+              allowWithoutWriteScope: true,
+            })
+          }
+          const queueNoWriteReplayAttachCompletion = () => {
+            const queue = writeQueueRef.current
+            if (queue) {
+              queue.enqueueTask(completeNoWriteReplayAttach, {
+                mode: input.outputSource,
+                generation: input.attachRequestId,
+              })
+              return
+            }
+            completeNoWriteReplayAttach()
+          }
           const submission = handleTerminalOutput(
             raw,
             input.mode,
@@ -2738,13 +2767,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               toSeq: input.seqEnd,
             }))
             if (input.completedAttach && frameOverlapsReplay) {
-              completeAttachGeneration({
-                attachRequestId: input.attachRequestId,
-                mode: input.mode,
-                terminalInstanceId: outputTerminalInstanceId,
-                terminalId: tid,
-                allowWithoutWriteScope: true,
-              })
+              queueNoWriteReplayAttachCompletion()
             }
           }
           if (input.completedAttach && frameOverlapsReplay) {
@@ -2834,8 +2857,24 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               || seqEnd < seqStart
               || endOffset < 0
               || rawFrameCount <= 0
+              || rawFrameCount > seqEnd - seqStart + 1
             ) {
               invalidBatchReason = 'invalid_segment_range'
+              break
+            }
+            const barrier = rawSegment?.barrier
+            if (
+              barrier !== undefined
+              && barrier !== null
+              && (
+                typeof barrier !== 'string'
+                || (
+                  barrier.length > 0
+                  && !TERMINAL_OUTPUT_BATCH_BARRIER_REASONS.has(barrier)
+                )
+              )
+            ) {
+              invalidBatchReason = 'invalid_segment_barrier'
               break
             }
             if (previousSeqEnd !== null && seqStart !== previousSeqEnd + 1) {
@@ -2866,7 +2905,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               seqStart,
               seqEnd,
               data: segmentData,
-              barrier: typeof rawSegment.barrier === 'string' && rawSegment.barrier.length > 0,
+              barrier: typeof barrier === 'string' && barrier.length > 0,
             })
             previousEndOffset = normalizedEndOffset
             previousSeqEnd = seqEnd

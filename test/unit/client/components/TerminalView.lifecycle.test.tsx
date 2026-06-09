@@ -4527,7 +4527,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(terminalWriteStrings(term)).toContain('accepted-after-hole')
     })
 
-    it('rejects terminal.output.batch with malformed numeric fields before writing or checkpointing', async () => {
+    it('rejects terminal.output.batch with malformed fields before writing or checkpointing', async () => {
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',
         terminalId: 'term-output-batch-malformed-numbers',
@@ -4555,6 +4555,8 @@ describe('TerminalView lifecycle updates', () => {
         { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, rawFrameCount: 0 }] },
         { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, rawFrameCount: -1 }] },
         { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, rawFrameCount: 1.5 }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, rawFrameCount: 2 }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, barrier: 'unknown' }] },
       ]
 
       term.write.mockClear()
@@ -4806,6 +4808,92 @@ describe('TerminalView lifecycle updates', () => {
       }))
     })
 
+    it('queues stripped terminal.output.batch replay completion behind earlier replay write callbacks', async () => {
+      const { terminalId, term, queryByText, store } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-replay-stripped-tail',
+        mode: 'codex',
+        serverInstanceId: 'server-output-batch-replay-stripped-tail',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+      act(() => {
+        store.dispatch(setConnectionStatus('ready'))
+      })
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      const attachRequestId = attach?.attachRequestId
+      const streamId = 'stream-output-batch-replay-stripped-tail'
+      expect(attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId,
+          headSeq: 2,
+          replayFromSeq: 1,
+          replayToSeq: 2,
+          attachRequestId,
+        })
+      })
+      expect(queryByText('Recovering terminal output...')).not.toBeNull()
+
+      const delayedCallbacks: Array<{ data: string; callback: () => void }> = []
+      term.write.mockClear()
+      term.write.mockImplementation((data: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push({ data, callback: onWritten })
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'replay',
+          seqStart: 1,
+          seqEnd: 2,
+          data: 'A\x07',
+          serializedBytes: 128,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, rawFrameCount: 1 },
+            { seqStart: 2, seqEnd: 2, endOffset: 2, rawFrameCount: 1, barrier: 'turn_complete' },
+          ],
+        })
+      })
+
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['A'])
+      expect(queryByText('Recovering terminal output...')).not.toBeNull()
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-replay-stripped-tail',
+      })).toBeNull()
+
+      act(() => {
+        delayedCallbacks[0]?.callback()
+      })
+
+      await waitFor(() => {
+        expect(queryByText('Recovering terminal output...')).toBeNull()
+      })
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-replay-stripped-tail',
+      })?.parserAppliedSeq).toBe(1)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 1,
+      }))
+    })
+
     it('does not checkpoint a mixed renderable and stripped terminal.output.batch segment as parser-applied', async () => {
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',
@@ -4968,6 +5056,95 @@ describe('TerminalView lifecycle updates', () => {
         type: 'terminal.attach',
         terminalId,
         sinceSeq: 0,
+      }))
+    })
+
+    it('queues stripped legacy terminal.output replay completion behind earlier replay write callbacks', async () => {
+      const { terminalId, term, queryByText, store } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-legacy-replay-stripped-tail',
+        mode: 'codex',
+        serverInstanceId: 'server-output-legacy-replay-stripped-tail',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+      act(() => {
+        store.dispatch(setConnectionStatus('ready'))
+      })
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      const attachRequestId = attach?.attachRequestId
+      const streamId = 'stream-output-legacy-replay-stripped-tail'
+      expect(attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId,
+          headSeq: 2,
+          replayFromSeq: 1,
+          replayToSeq: 2,
+          attachRequestId,
+        })
+      })
+      expect(queryByText('Recovering terminal output...')).not.toBeNull()
+
+      const delayedCallbacks: Array<{ data: string; callback: () => void }> = []
+      term.write.mockClear()
+      term.write.mockImplementation((data: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push({ data, callback: onWritten })
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'A',
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: '\x07',
+        })
+      })
+
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['A'])
+      expect(queryByText('Recovering terminal output...')).not.toBeNull()
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-legacy-replay-stripped-tail',
+      })).toBeNull()
+
+      act(() => {
+        delayedCallbacks[0]?.callback()
+      })
+
+      await waitFor(() => {
+        expect(queryByText('Recovering terminal output...')).toBeNull()
+      })
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-legacy-replay-stripped-tail',
+      })?.parserAppliedSeq).toBe(1)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 1,
       }))
     })
 
