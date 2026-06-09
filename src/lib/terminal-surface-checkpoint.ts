@@ -100,6 +100,11 @@ export function canUseCheckpointForDeltaReplay(
   if (saved.terminalId !== current.terminalId) {
     return { ok: false, reason: 'terminal_changed' }
   }
+  // Stream identity is required for v2 delta replay. A missing/null stream id
+  // is a protocol failure, not a compatible legacy identity.
+  if (!saved.streamId || !current.streamId) {
+    return { ok: false, reason: 'stream_changed' }
+  }
   if (saved.streamId !== current.streamId) {
     return { ok: false, reason: 'stream_changed' }
   }

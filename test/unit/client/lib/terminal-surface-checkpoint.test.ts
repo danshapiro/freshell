@@ -38,6 +38,39 @@ describe('terminal surface checkpoint', () => {
     })).toMatchObject({ ok: true, sinceSeq: 42 })
   })
 
+  it('rejects warm delta when the current stream identity is missing even if the checkpoint is null-stream', () => {
+    const checkpoint = createTerminalSurfaceCheckpoint({
+      terminalId: 'term-1',
+      streamId: null,
+      serverInstanceId: 'server-a',
+      surfaceEpoch: 2,
+      attachRequestId: 'attach-2',
+      parserAppliedSeq: 42,
+      cols: 120,
+      rows: 40,
+      geometryEpoch: 3,
+      geometryAuthority: 'single_client',
+      scrollback: 5000,
+      xtermVersion: '6.0.0',
+      bufferType: 'normal',
+      parserIdle: true,
+    })
+
+    expect(canUseCheckpointForDeltaReplay(checkpoint, {
+      terminalId: 'term-1',
+      streamId: null,
+      serverInstanceId: 'server-a',
+      surfaceEpoch: 2,
+      cols: 120,
+      rows: 40,
+      geometryEpoch: 3,
+      geometryAuthority: 'single_client',
+      scrollback: 5000,
+      xtermVersion: '6.0.0',
+      requireParserIdle: true,
+    })).toMatchObject({ ok: false, reason: 'stream_changed' })
+  })
+
   it('rejects a checkpoint after geometry changes', () => {
     const checkpoint = createTerminalSurfaceCheckpoint({
       terminalId: 'term-1',

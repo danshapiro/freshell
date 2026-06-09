@@ -17,6 +17,7 @@ import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import {
   __resetTerminalCursorCacheForTests,
   loadTerminalSurfaceCheckpoint,
+  saveTerminalSurfaceCheckpoint,
 } from '@/lib/terminal-cursor'
 import { resetHydrationQueueForTests } from '@/lib/hydration-queue'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
@@ -4513,6 +4514,73 @@ describe('TerminalView lifecycle updates', () => {
         streamId: null,
         serverInstanceId: 'server-missing-ready-stream',
       })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
+    })
+
+    it('does not use a null-stream checkpoint for warm delta after attach-ready omits stream id', async () => {
+      const terminalId = 'term-null-stream-checkpoint'
+      const serverInstanceId = 'server-null-stream-checkpoint'
+      saveTerminalSurfaceCheckpoint({
+        terminalId,
+        streamId: null,
+        serverInstanceId,
+        surfaceEpoch: 0,
+        attachRequestId: 'seed-null-stream-checkpoint',
+        parserAppliedSeq: 17,
+        cols: 80,
+        rows: 24,
+        geometryEpoch: 1,
+        geometryAuthority: 'single_client',
+        scrollback: 10000,
+        xtermVersion: '6.0.0',
+        bufferType: 'unknown',
+        parserIdle: true,
+      })
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: null,
+        serverInstanceId,
+      })?.parserAppliedSeq).toBe(17)
+
+      await renderTerminalHarness({
+        status: 'running',
+        terminalId,
+        serverInstanceId,
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const initialAttach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(initialAttach).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 0,
+          replayFromSeq: 1,
+          replayToSeq: 0,
+          attachRequestId: initialAttach!.attachRequestId,
+          __preserveMissingStreamId: true,
+        } as any)
+      })
 
       wsMocks.send.mockClear()
       act(() => {
