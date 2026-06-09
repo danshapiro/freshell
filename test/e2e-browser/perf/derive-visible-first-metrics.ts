@@ -195,14 +195,13 @@ function isReceivedTerminalOutputFrame(frame: VisibleFirstWsObservation): boolea
     || (frame as { direction?: unknown }).direction === 'received'
 }
 
-function isReplayOutputPayload(payload: Record<string, unknown> | null, frameType: string | null): boolean {
+function isReplayOutputPayload(payload: Record<string, unknown> | null): boolean {
   if (!payload) return false
   if (payload.type === 'terminal.output.batch') {
     return payload.source === 'replay'
   }
   if (payload.type === 'terminal.output') {
     return payload.source === 'replay'
-      || frameType === 'terminal.output'
   }
   return false
 }
@@ -212,7 +211,7 @@ function replayWsFramesBeforeReady(input: DerivedMetricsInput, focusedReadyMs: n
     if (frame.timestamp > focusedReadyMs || !isReceivedTerminalOutputFrame(frame)) return false
     const frameType = frame.type ?? classifyWsFrameType(frame.payload ?? '')
     if (frameType !== 'terminal.output' && frameType !== 'terminal.output.batch') return false
-    return isReplayOutputPayload(parsePayload(frame.payload), frameType)
+    return isReplayOutputPayload(parsePayload(frame.payload))
   })
 }
 

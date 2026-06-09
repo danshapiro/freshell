@@ -84,6 +84,7 @@ function defaultPayloadForFrame(
   terminalId: string,
   attachRequestId: string | undefined,
   frame: ReplayFrame,
+  source?: string,
 ): JsonPayload {
   return {
     type: 'terminal.output',
@@ -93,6 +94,7 @@ function defaultPayloadForFrame(
     seqEnd: frame.seqEnd,
     data: frame.data,
     ...(attachRequestId ? { attachRequestId } : {}),
+    ...(source ? { source } : {}),
   }
 }
 
@@ -158,6 +160,7 @@ function measureBatch(
         input.terminalId,
         batch.attachRequestId ?? input.attachRequestId,
         { ...batch, data: '' },
+        batch.source ?? input.source,
       ))
       return emptyPayloadBytes - 2 + dataJsonContentBytes + 2
     }
@@ -166,6 +169,7 @@ function measureBatch(
       input.terminalId,
       batch.attachRequestId ?? input.attachRequestId,
       batch,
+      batch.source ?? input.source,
     ))
   }
 

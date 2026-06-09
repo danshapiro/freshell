@@ -116,6 +116,7 @@ describe('deriveVisibleFirstMetrics', () => {
               type: 'terminal.output',
               payload: JSON.stringify({
                 type: 'terminal.output',
+                source: 'replay',
                 seqStart: 7,
                 seqEnd: 8,
               }),
@@ -235,6 +236,56 @@ describe('deriveVisibleFirstMetrics', () => {
     })
     expect(withoutParserApplied.maxRafGapMs).toBe(16)
     expect(withoutParserApplied).not.toHaveProperty('terminalParserAppliedLagMs')
+  })
+
+  it('does not count untagged or live terminal output as replay websocket evidence', () => {
+    const result = deriveVisibleFirstMetrics({
+      focusedReadyMilestone: 'terminal.first_output',
+      allowedApiRouteIdsBeforeReady: [],
+      allowedWsTypesBeforeReady: ['terminal.output', 'terminal.output.batch'],
+      browser: {
+        milestones: {
+          'terminal.first_output': 100,
+        },
+        perfEvents: [
+          { event: 'terminal.parser_applied', timestamp: 90, parserAppliedSeq: 2 },
+        ],
+      },
+      transport: {
+        http: { requests: [] },
+        ws: {
+          frames: [
+            {
+              timestamp: 40,
+              direction: 'received',
+              type: 'terminal.output',
+              payload: JSON.stringify({
+                type: 'terminal.output',
+                seqStart: 1,
+                seqEnd: 1,
+              }),
+              payloadLength: 120,
+            },
+            {
+              timestamp: 50,
+              direction: 'received',
+              type: 'terminal.output.batch',
+              payload: JSON.stringify({
+                type: 'terminal.output.batch',
+                source: 'live',
+                seqStart: 2,
+                seqEnd: 2,
+              }),
+              payloadLength: 140,
+            },
+          ],
+        },
+      },
+    })
+
+    expect(result.terminalReplayMessageCount).toBe(0)
+    expect(result.terminalReplaySerializedBytes).toBe(0)
+    expect(result).not.toHaveProperty('terminalParserAppliedLagMs')
   })
 
   it('omits stop/resume metrics when process-suspend proof evidence is absent or synthetic', () => {

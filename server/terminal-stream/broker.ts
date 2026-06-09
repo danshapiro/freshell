@@ -4,7 +4,11 @@ import { buildTerminalSessionRef, type TerminalRegistry } from '../terminal-regi
 import { logger } from '../logger.js'
 import { logTerminalStreamPerfEvent, type TerminalStreamPerfEvent } from '../perf-logger.js'
 import type { TerminalOutputRawEvent } from './registry-events.js'
-import { ClientOutputQueue, isGapEvent, type GapEvent } from './client-output-queue.js'
+import {
+  ClientOutputQueue,
+  isGapEvent,
+  type GapEvent,
+} from './client-output-queue.js'
 import { ReplayRing, type ReplayFrame } from './replay-ring.js'
 import type { TerminalOutputBatch } from './output-batch.js'
 import { fragmentTerminalOutputForPayloadBudget } from './output-fragments.js'
@@ -37,8 +41,9 @@ import {
 import type { BrokerClientAttachment, BrokerTerminalState } from './types.js'
 
 const log = logger.child({ component: 'terminal-stream-broker' })
+const DEFAULT_CODING_CLI_REPLAY_RING_MAX_BYTES = 32 * 1024 * 1024
 const CODING_CLI_MIN_REPLAY_RING_MAX_BYTES = Number(
-  process.env.CODING_CLI_MIN_REPLAY_RING_MAX_BYTES || 8 * 1024 * 1024,
+  process.env.CODING_CLI_MIN_REPLAY_RING_MAX_BYTES || DEFAULT_CODING_CLI_REPLAY_RING_MAX_BYTES,
 )
 const TERMINAL_STREAM_BUDGET_SEQ_PLACEHOLDER = Number.MAX_SAFE_INTEGER
 const CONFIGURED_FOREGROUND_REPLAY_BUFFERED_PAUSE_BYTES = Number(
@@ -85,6 +90,9 @@ type ReplayGapRange = {
 type ReplaySendOutcome =
   | { status: 'sent'; pauseAfter: boolean; sentSeqEnd: number }
   | { status: 'paused' | 'failed' }
+type LiveSendOutcome =
+  | { status: 'sent'; sentFrameCount: number; sentSeqEnd: number }
+  | { status: 'failed'; sentFrameCount: number; sentSeqEnd?: number; reason?: SendJsonResult['reason'] }
 type PerfEventLogger = (
   event: TerminalStreamPerfEvent,
   context: Record<string, unknown>,
@@ -306,6 +314,7 @@ export class TerminalStreamBroker {
             terminalId,
             replayFrames[i],
             attachment.activeAttachRequestId,
+            'replay',
           )
           if (frameSerializedApplicationJsonBytes > budgetRemaining) break
           budgetRemaining -= frameSerializedApplicationJsonBytes
@@ -440,6 +449,7 @@ export class TerminalStreamBroker {
             terminalId,
             frame,
             attachment.activeAttachRequestId,
+            'live',
           ),
         )
       }
@@ -594,6 +604,7 @@ export class TerminalStreamBroker {
             event.terminalId,
             frame,
             attachment.activeAttachRequestId,
+            'live',
           ),
         )
       }
@@ -616,6 +627,7 @@ export class TerminalStreamBroker {
         seqEnd: TERMINAL_STREAM_BUDGET_SEQ_PLACEHOLDER,
         data: chunk,
         attachRequestId: TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE,
+        source: 'replay',
       }),
     })
     const frames: ReplayFrame[] = []
@@ -695,36 +707,68 @@ export class TerminalStreamBroker {
     }
 
     const attachRequestId = attachment.activeAttachRequestId
-    const batch = attachment.queue.nextBatch(
+    const preparedBatch = attachment.queue.prepareBatch(
       TERMINAL_STREAM_BATCH_MAX_BYTES,
-      (frame) => this.measureOutputFrameSerializedApplicationJsonBytes(terminalId, frame, attachRequestId),
+      (frame) => this.measureOutputFrameSerializedApplicationJsonBytes(terminalId, frame, attachRequestId, 'live'),
       { terminalId, attachRequestId, source: 'live' },
     )
-    if (batch.length === 0) return
+    if (preparedBatch.entries.length === 0) return
 
-    for (const item of batch) {
+    let sentGaps = 0
+    let sentFrames = 0
+    const acknowledgeAndRetry = (reason?: SendJsonResult['reason']) => {
+      attachment.queue.acknowledgePreparedBatch(preparedBatch, { gaps: sentGaps, frames: sentFrames })
+      if (reason === 'closed' || ws.readyState !== WebSocket.OPEN) {
+        this.detach(terminalId, ws)
+        return
+      }
+      if (this.hasPendingAttachmentOutput(attachment)) {
+        this.scheduleFlush(terminalId, attachment, TERMINAL_STREAM_RETRY_FLUSH_MS)
+      }
+    }
+
+    for (const item of preparedBatch.entries) {
       if (isGapEvent(item)) {
+        const gapQueueContext = item.reason === 'queue_overflow'
+          ? {
+              queueDepth: attachment.queue.pendingFrames(),
+              droppedSerializedApplicationJsonBytes: attachment.queue.peekDroppedBytes(),
+            }
+          : undefined
         if (!this.sendGap(
           ws,
           terminalId,
           item,
           attachRequestId,
-          item.reason === 'queue_overflow'
-            ? {
-                queueDepth: attachment.queue.pendingFrames(),
-                droppedSerializedApplicationJsonBytes: attachment.queue.consumeDroppedBytes(),
-              }
-            : undefined,
-        )) return
+          gapQueueContext,
+        )) {
+          acknowledgeAndRetry()
+          return
+        }
+        if (item.reason === 'queue_overflow') {
+          attachment.queue.consumeDroppedBytes()
+        }
+        sentGaps += 1
         attachment.lastSeq = Math.max(attachment.lastSeq, item.toSeq)
         continue
       }
 
-      if (!this.sendFrame(ws, terminalId, item, attachRequestId, 'live', attachment.terminalOutputBatchV1)) return
-      attachment.lastSeq = Math.max(attachment.lastSeq, item.seqEnd)
+      const sendResult = this.sendFrame(ws, terminalId, item, attachRequestId, 'live', attachment.terminalOutputBatchV1)
+      if (sendResult.sentFrameCount > 0) {
+        sentFrames += sendResult.sentFrameCount
+        if (typeof sendResult.sentSeqEnd === 'number') {
+          attachment.lastSeq = Math.max(attachment.lastSeq, sendResult.sentSeqEnd)
+        }
+      }
+      if (sendResult.status !== 'sent') {
+        acknowledgeAndRetry(sendResult.reason)
+        return
+      }
     }
 
-    if (attachment.queue.pendingBytes() > 0) {
+    attachment.queue.acknowledgePreparedBatch(preparedBatch, { gaps: sentGaps, frames: sentFrames })
+
+    if (this.hasPendingAttachmentOutput(attachment)) {
       this.scheduleFlush(terminalId, attachment)
     }
   }
@@ -744,7 +788,7 @@ export class TerminalStreamBroker {
       cursor.nextSeq - 1,
       TERMINAL_STREAM_BATCH_MAX_BYTES,
       cursor.toSeq,
-      (frame) => this.measureOutputFrameSerializedApplicationJsonBytes(terminalId, frame, attachRequestId),
+      (frame) => this.measureOutputFrameSerializedApplicationJsonBytes(terminalId, frame, attachRequestId, 'replay'),
       { terminalId, attachRequestId, source: 'replay' },
     )
 
@@ -828,7 +872,7 @@ export class TerminalStreamBroker {
   }
 
   private hasPendingAttachmentOutput(attachment: BrokerClientAttachment): boolean {
-    return Boolean(attachment.replayCursor) || attachment.queue.pendingBytes() > 0
+    return Boolean(attachment.replayCursor) || attachment.queue.hasPendingEntries()
   }
 
   private filterReplayFramesForStream(
@@ -1025,7 +1069,7 @@ export class TerminalStreamBroker {
     attachRequestId?: string,
     source: 'live' | 'replay' = 'live',
     terminalOutputBatchV1 = false,
-  ): boolean {
+  ): LiveSendOutcome {
     if (this.isTerminalOutputBatch(frame)) {
       if (terminalOutputBatchV1 && attachRequestId) {
         const payloads = this.buildTerminalOutputBatchPayloads({
@@ -1037,9 +1081,17 @@ export class TerminalStreamBroker {
         for (let index = 0; index < payloads.length; index += 1) {
           const payload = payloads[index]
           const prepared = this.prepareSendPayload(payload)
-          if (!prepared) return false
+          if (!prepared) return { status: 'failed', sentFrameCount: this.countSentBatchPayloadFrames(payloads, index) }
           const result = this.safeSendPrepared(ws, prepared)
-          if (!result.sent) return false
+          if (!result.sent) {
+            const sentFrameCount = this.countSentBatchPayloadFrames(payloads, index)
+            return {
+              status: 'failed',
+              sentFrameCount,
+              ...(sentFrameCount > 0 ? { sentSeqEnd: this.payloadSeqEnd(payloads[index - 1]) } : {}),
+              reason: result.reason,
+            }
+          }
           this.logTerminalReplayBatch({
             terminalId,
             attachRequestId,
@@ -1051,12 +1103,16 @@ export class TerminalStreamBroker {
             envelopeCount: payloads.length,
           })
         }
-        return true
+        return {
+          status: 'sent',
+          sentFrameCount: this.countSentBatchPayloadFrames(payloads, payloads.length),
+          sentSeqEnd: frame.seqEnd,
+        }
       }
       return this.sendLegacyOutputSegments(ws, terminalId, frame, attachRequestId)
     }
 
-    return this.safeSend(ws, this.buildTerminalOutputPayload({
+    const result = sendJsonMessage(ws, this.buildTerminalOutputPayload({
       type: 'terminal.output',
       terminalId,
       streamId: frame.streamId,
@@ -1064,11 +1120,26 @@ export class TerminalStreamBroker {
       seqEnd: frame.seqEnd,
       data: frame.data,
       attachRequestId,
+      source,
     }))
+    if (!result.sent) {
+      return { status: 'failed', sentFrameCount: 0, reason: result.reason }
+    }
+    return { status: 'sent', sentFrameCount: 1, sentSeqEnd: frame.seqEnd }
   }
 
   private isTerminalOutputBatch(frame: ReplayFrame | TerminalOutputBatch): frame is TerminalOutputBatch {
     return Array.isArray((frame as Partial<TerminalOutputBatch>).segments)
+  }
+
+  private countSentBatchPayloadFrames(payloads: JsonPayload[], sentPayloadCount: number): number {
+    return payloads
+      .slice(0, Math.max(0, sentPayloadCount))
+      .reduce((sum, payload) => sum + payloadRawFrameCount(payload), 0)
+  }
+
+  private payloadSeqEnd(payload: JsonPayload | undefined): number | undefined {
+    return typeof payload?.seqEnd === 'number' ? payload.seqEnd : undefined
   }
 
   private buildTerminalOutputBatchPayloads(input: {
@@ -1124,6 +1195,7 @@ export class TerminalStreamBroker {
       terminalId: string
       batch: TerminalOutputBatch
       attachRequestId: string
+      source: 'live' | 'replay'
     },
     segmentIndex: number,
   ): JsonPayload[] {
@@ -1141,6 +1213,7 @@ export class TerminalStreamBroker {
       seqEnd: segment.seqEnd,
       data: input.batch.data.slice(startOffset, endOffset),
       attachRequestId: input.attachRequestId,
+      source: input.source,
     })]
   }
 
@@ -1218,6 +1291,7 @@ export class TerminalStreamBroker {
     terminalId: string,
     batch: TerminalOutputBatch,
     attachRequestId?: string,
+    source?: 'live' | 'replay',
   ): JsonPayload[] {
     const payloads: JsonPayload[] = []
     let previousEndOffset = 0
@@ -1233,6 +1307,7 @@ export class TerminalStreamBroker {
         seqEnd: segment.seqEnd,
         data,
         attachRequestId,
+        source,
       }))
     }
     return payloads
@@ -1243,15 +1318,24 @@ export class TerminalStreamBroker {
     terminalId: string,
     batch: TerminalOutputBatch,
     attachRequestId?: string,
-  ): boolean {
-    const payloads = this.buildLegacyOutputSegmentPayloads(terminalId, batch, attachRequestId)
+  ): LiveSendOutcome {
     const source = batch.source === 'replay' ? 'replay' : 'live'
+    const payloads = this.buildLegacyOutputSegmentPayloads(terminalId, batch, attachRequestId, source)
     for (let index = 0; index < payloads.length; index += 1) {
       const payload = payloads[index]
       const prepared = this.prepareSendPayload(payload)
-      if (!prepared) return false
+      if (!prepared) {
+        return { status: 'failed', sentFrameCount: index, ...(index > 0 ? { sentSeqEnd: this.payloadSeqEnd(payloads[index - 1]) } : {}) }
+      }
       const result = this.safeSendPrepared(ws, prepared)
-      if (!result.sent) return false
+      if (!result.sent) {
+        return {
+          status: 'failed',
+          sentFrameCount: index,
+          ...(index > 0 ? { sentSeqEnd: this.payloadSeqEnd(payloads[index - 1]) } : {}),
+          reason: result.reason,
+        }
+      }
       this.logTerminalReplayBatch({
         terminalId,
         attachRequestId,
@@ -1263,7 +1347,7 @@ export class TerminalStreamBroker {
         envelopeCount: payloads.length,
       })
     }
-    return true
+    return { status: 'sent', sentFrameCount: payloads.length, sentSeqEnd: batch.seqEnd }
   }
 
   private sendLegacyOutputSegmentsWithPacing(
@@ -1273,8 +1357,8 @@ export class TerminalStreamBroker {
     attachRequestId?: string,
   ): ReplaySendOutcome {
     let sentSeqEnd = attachment.lastSeq
-    const payloads = this.buildLegacyOutputSegmentPayloads(terminalId, batch, attachRequestId)
     const source = batch.source === 'live' ? 'live' : 'replay'
+    const payloads = this.buildLegacyOutputSegmentPayloads(terminalId, batch, attachRequestId, source)
     for (let index = 0; index < payloads.length; index += 1) {
       const payload = payloads[index]
       const prepared = this.prepareSendPayload(payload)
@@ -1338,6 +1422,7 @@ export class TerminalStreamBroker {
       seqEnd: frame.seqEnd,
       data: frame.data,
       attachRequestId,
+      source: 'replay',
     })
     const prepared = this.prepareSendPayload(payload)
     if (!prepared) return { status: 'failed' }
@@ -1750,6 +1835,7 @@ export class TerminalStreamBroker {
     seqEnd: number
     data: string
     attachRequestId?: string
+    source?: 'live' | 'replay'
   }): JsonPayload {
     return {
       type: input.type ?? 'terminal.output',
@@ -1759,6 +1845,7 @@ export class TerminalStreamBroker {
       seqEnd: input.seqEnd,
       data: input.data,
       ...(input.attachRequestId ? { attachRequestId: input.attachRequestId } : {}),
+      ...(input.source ? { source: input.source } : {}),
     }
   }
 
@@ -1766,6 +1853,7 @@ export class TerminalStreamBroker {
     terminalId: string,
     frame: ReplayFrame,
     attachRequestId?: string,
+    source?: 'live' | 'replay',
   ): number {
     return measureTerminalOutputPayloadBytes(this.buildTerminalOutputPayload({
       terminalId,
@@ -1774,6 +1862,7 @@ export class TerminalStreamBroker {
       seqEnd: frame.seqEnd,
       data: frame.data,
       attachRequestId,
+      source,
     }))
   }
 

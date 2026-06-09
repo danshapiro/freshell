@@ -44,6 +44,60 @@ describe('ClientOutputQueue', () => {
     })
   })
 
+  it('does not consume prepared frames until acknowledged', () => {
+    const queue = new ClientOutputQueue(1024)
+    queue.enqueue(frame(1, 'hello '))
+    queue.enqueue(frame(2, 'world'))
+
+    const prepared = queue.prepareBatch(1024)
+
+    expect(prepared.frameCount).toBe(2)
+    expect(queue.pendingFrames()).toBe(2)
+    expect(queue.pendingBytes()).toBe(Buffer.byteLength('hello world', 'utf8'))
+
+    queue.acknowledgePreparedBatch(prepared)
+
+    expect(queue.pendingFrames()).toBe(0)
+    expect(queue.pendingBytes()).toBe(0)
+  })
+
+  it('keeps an unsent prepared suffix after partial acknowledgement', () => {
+    const queue = new ClientOutputQueue(1024)
+    queue.enqueue(frame(1, 'one'))
+    queue.enqueue(frame(2, 'two'))
+    queue.enqueue(frame(3, 'three'))
+
+    const prepared = queue.prepareBatch(1024)
+    queue.acknowledgePreparedBatch(prepared, { frames: 2 })
+
+    expect(queue.pendingFrames()).toBe(1)
+    const retry = queue.nextBatch(1024)
+    const dataFrames = retry.filter((entry): entry is ReplayFrame => entry.type !== 'gap')
+    expect(dataFrames).toHaveLength(1)
+    expect(dataFrames[0]).toMatchObject({
+      seqStart: 3,
+      seqEnd: 3,
+      data: 'three',
+    })
+  })
+
+  it('keeps overflow gaps pending until acknowledged', () => {
+    const queue = new ClientOutputQueue(2)
+    queue.enqueue(frame(1, '1'))
+    queue.enqueue(frame(2, '2'))
+    queue.enqueue(frame(3, '3'))
+
+    const prepared = queue.prepareBatch(64)
+    expect(prepared.entries[0]).toMatchObject({ type: 'gap', fromSeq: 1, toSeq: 1 })
+
+    const retryBeforeAck = queue.prepareBatch(64)
+    expect(retryBeforeAck.entries[0]).toMatchObject({ type: 'gap', fromSeq: 1, toSeq: 1 })
+
+    queue.acknowledgePreparedBatch(prepared, { gaps: 1, frames: 0 })
+    const retryAfterGapAck = queue.nextBatch(64)
+    expect(retryAfterGapAck.some(isGapEvent)).toBe(false)
+  })
+
   it('does not coalesce adjacent frames from different stream ids', () => {
     const queue = new ClientOutputQueue(1024)
     queue.enqueue(frame(1, 'old', 'stream-old'))

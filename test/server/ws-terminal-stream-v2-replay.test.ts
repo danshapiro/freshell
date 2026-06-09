@@ -516,6 +516,7 @@ describe('terminal stream v2 replay', () => {
     expect(replayed.map((frame) => [frame.seqStart, frame.seqEnd])).toEqual([[1, 1], [2, 2], [3, 3]])
     expect(replayed.every((frame) => typeof frame.streamId === 'string' && frame.streamId.length > 0)).toBe(true)
     expect(replayed.every((frame) => frame.attachRequestId === attachRequestId)).toBe(true)
+    expect(replayed.every((frame) => frame.source === 'replay')).toBe(true)
 
     await close2()
   })

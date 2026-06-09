@@ -450,6 +450,56 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
+  it('retains unsent live output after a partial legacy batch send failure', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-live-partial-send')
+
+    const ws = createMockWs()
+    await broker.attach(
+      ws as any,
+      'term-live-partial-send',
+      'viewport_hydrate',
+      80,
+      24,
+      0,
+      'live-partial-send-attach',
+    )
+
+    ws.send.mockClear()
+    const acceptedOutputPayloads: Array<Record<string, unknown>> = []
+    let outputSendAttempts = 0
+    ws.send.mockImplementation((raw: string, cb?: (err?: Error) => void) => {
+      const payload = JSON.parse(raw)
+      if (payload?.type === 'terminal.output') {
+        outputSendAttempts += 1
+        if (outputSendAttempts === 2) {
+          throw new Error('simulated partial send failure')
+        }
+        acceptedOutputPayloads.push(payload)
+      }
+      cb?.()
+    })
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-partial-send', data: 'one', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-partial-send', data: 'two', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-partial-send', data: 'three', at: Date.now() })
+
+    vi.advanceTimersByTime(1)
+
+    expect(outputSendAttempts).toBe(2)
+    expect(acceptedOutputPayloads.map((payload) => payload.data)).toEqual(['one'])
+    expect(ws.close).not.toHaveBeenCalled()
+
+    vi.advanceTimersByTime(50)
+
+    expect(acceptedOutputPayloads.map((payload) => payload.data)).toEqual(['one', 'two', 'three'])
+    expect(acceptedOutputPayloads.every((payload) => payload.source === 'live')).toBe(true)
+    expect(ws.close).not.toHaveBeenCalled()
+
+    broker.close()
+  })
+
   it('emits structured terminal.replay.gap logs for replay gaps', async () => {
     const originalRingMax = process.env.TERMINAL_REPLAY_RING_MAX_BYTES
     process.env.TERMINAL_REPLAY_RING_MAX_BYTES = '8'
@@ -894,6 +944,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
       seqEnd: 3,
       data: chunks[2],
       attachRequestId: replayAttachRequestId,
+      source: 'replay',
     })
     expect(chunks.reduce((sum, chunk) => sum + Buffer.byteLength(chunk, 'utf8'), 0))
       .toBeLessThan(oneSerializedPayloadBudget)
@@ -934,6 +985,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
       seqEnd: 3,
       attachRequestId: replayAttachRequestId,
       streamId: seedReady.streamId,
+      source: 'replay',
     })
     expect(Buffer.byteLength(String(outputFrames[0]?.raw ?? ''), 'utf8'))
       .toBeLessThanOrEqual(oneSerializedPayloadBudget)
@@ -1871,7 +1923,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
-  it('enforces a larger replay floor for coding-cli terminals to reduce history loss on attach', async () => {
+  it('enforces the 32 MiB replay floor for coding-cli terminals to reduce history loss on attach', async () => {
     const registry = new FakeBrokerRegistry()
     registry.setReplayRingMaxBytes(8)
     const perfSpy = vi.fn()
@@ -1880,6 +1932,9 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
 
     const wsSeed = createMockWs()
     await broker.attach(wsSeed as any, 'term-coding-floor', 'viewport_hydrate', 80, 24, 0)
+    const terminalState = (broker as any).terminals.get('term-coding-floor')
+    expect(terminalState?.replayRing.retentionMaxBytes()).toBe(32 * 1024 * 1024)
+
     registry.emit('terminal.output.raw', {
       terminalId: 'term-coding-floor',
       data: 'x'.repeat(96 * 1024),

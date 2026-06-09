@@ -20,6 +20,12 @@ export type QueuedBatchContext = {
   source?: string
 }
 
+export type PreparedClientOutputBatch = {
+  entries: Array<ReplayFrame | GapEvent>
+  gapCount: number
+  frameCount: number
+}
+
 export function isGapEvent(entry: ReplayFrame | GapEvent): entry is GapEvent {
   return 'type' in entry && entry.type === 'gap'
 }
@@ -59,21 +65,24 @@ export class ClientOutputQueue {
     this.evictOverflow()
   }
 
-  nextBatch(
+  prepareBatch(
     maxBytes: number,
     measureFrameBytes?: QueuedFrameByteMeasure,
     batchContext?: QueuedBatchContext,
-  ): Array<ReplayFrame | GapEvent> {
+  ): PreparedClientOutputBatch {
     const out: Array<ReplayFrame | GapEvent> = []
     const budget = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : 0
 
     if (this.pendingGaps.length > 0) {
       out.push(...this.pendingGaps)
-      this.pendingGaps = []
     }
 
     if (budget <= 0) {
-      return out
+      return {
+        entries: out,
+        gapCount: this.pendingGaps.length,
+        frameCount: 0,
+      }
     }
 
     const batches = buildTerminalOutputBatches({
@@ -86,10 +95,34 @@ export class ClientOutputQueue {
       source: batchContext?.source,
     })
     const consumedFrameCount = batches.reduce((sum, batch) => sum + batch.segments.length, 0)
-    this.consumeFrames(consumedFrameCount)
     out.push(...batches)
 
-    return out
+    return {
+      entries: out,
+      gapCount: this.pendingGaps.length,
+      frameCount: consumedFrameCount,
+    }
+  }
+
+  nextBatch(
+    maxBytes: number,
+    measureFrameBytes?: QueuedFrameByteMeasure,
+    batchContext?: QueuedBatchContext,
+  ): Array<ReplayFrame | GapEvent> {
+    const prepared = this.prepareBatch(maxBytes, measureFrameBytes, batchContext)
+    this.acknowledgePreparedBatch(prepared)
+    return prepared.entries
+  }
+
+  acknowledgePreparedBatch(prepared: PreparedClientOutputBatch, counts: { gaps?: number; frames?: number } = {}): void {
+    const gaps = Math.max(0, Math.min(
+      this.pendingGaps.length,
+      Math.floor(counts.gaps ?? prepared.gapCount),
+    ))
+    if (gaps > 0) {
+      this.pendingGaps.splice(0, gaps)
+    }
+    this.consumeFrames(Math.max(0, Math.floor(counts.frames ?? prepared.frameCount)))
   }
 
   pendingBytes(): number {
@@ -98,6 +131,10 @@ export class ClientOutputQueue {
 
   pendingFrames(): number {
     return this.frames.length
+  }
+
+  hasPendingEntries(): boolean {
+    return this.pendingGaps.length > 0 || this.frames.length > 0
   }
 
   peekDroppedBytes(): number {

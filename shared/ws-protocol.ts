@@ -703,6 +703,7 @@ export type TerminalOutputMessage = {
   seqEnd: number
   data: string
   attachRequestId?: string
+  source?: 'live' | 'replay'
 }
 
 export type TerminalOutputBatchSegment = {
