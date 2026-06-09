@@ -23,6 +23,8 @@ describe('runVisibleFirstAuditSample', () => {
             httpRequests: [],
             perfEvents: [],
             perfSystemSamples: [],
+            terminalReplayEvents: [],
+            terminalOutputEvents: [],
             parserDiagnostics: [],
           },
         }),

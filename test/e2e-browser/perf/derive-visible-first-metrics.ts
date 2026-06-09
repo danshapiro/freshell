@@ -27,11 +27,15 @@ export type DerivedMetricsInput = {
     http?: { requests: VisibleFirstHttpObservation[] }
     ws?: { frames: VisibleFirstWsObservation[] }
   }
+  server?: {
+    terminalReplayEvents?: Array<Record<string, unknown>>
+  }
 }
 
 export type VisibleFirstDerivedMetrics = {
   focusedReadyMs: number
   wsReadyMs?: number
+  maxRafGapMs: number
   terminalInputToFirstOutputMs?: number
   httpRequestsBeforeReady: number
   httpBytesBeforeReady: number
@@ -41,6 +45,15 @@ export type VisibleFirstDerivedMetrics = {
   offscreenHttpBytesBeforeReady: number
   offscreenWsFramesBeforeReady: number
   offscreenWsBytesBeforeReady: number
+  terminalReplayMessageCount: number
+  terminalReplaySerializedBytes: number
+  terminalParserAppliedLagMs: number
+  terminalReplayGapCount: number
+  terminalFullHydrateFallbackCount: number
+  terminalSurfaceQuarantineCount: number
+  terminalStaleGenerationRejectionCount: number
+  terminalStoppedRetentionCoveredMs: number
+  terminalStopResumeGapCount: number
 }
 
 const IGNORED_ROUTE_IDS = new Set(['/api/health', '/api/logs/client'])
@@ -113,6 +126,175 @@ function resolveWsReadyMs(input: DerivedMetricsInput): number | undefined {
   return typeof durationMs === 'number' && Number.isFinite(durationMs) ? durationMs : undefined
 }
 
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function nonnegativeMetric(value: unknown): number | undefined {
+  const numberValue = finiteNumber(value)
+  return numberValue === undefined ? undefined : Math.max(0, numberValue)
+}
+
+function parsePayload(payload?: string): Record<string, unknown> | null {
+  if (!payload) return null
+  try {
+    const parsed = JSON.parse(payload) as unknown
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null
+  } catch {
+    return null
+  }
+}
+
+function eventName(entry: Record<string, unknown>): string | null {
+  return typeof entry.event === 'string' ? entry.event : null
+}
+
+function maxMetric(values: Iterable<unknown>): number {
+  let max = 0
+  for (const value of values) {
+    const numberValue = nonnegativeMetric(value)
+    if (numberValue !== undefined) {
+      max = Math.max(max, numberValue)
+    }
+  }
+  return max
+}
+
+function sumMetric(values: Iterable<unknown>): number {
+  let sum = 0
+  for (const value of values) {
+    const numberValue = nonnegativeMetric(value)
+    if (numberValue !== undefined) {
+      sum += numberValue
+    }
+  }
+  return sum
+}
+
+function countPerfEvents(input: DerivedMetricsInput, name: string): number {
+  return (input.browser.perfEvents ?? []).filter((entry) => eventName(entry) === name).length
+}
+
+function resolveMaxRafGapMs(input: DerivedMetricsInput): number {
+  return maxMetric((input.browser.perfEvents ?? [])
+    .filter((entry) => eventName(entry) === 'visible_first.audit.max_raf_gap')
+    .flatMap((entry) => [entry.maxGapMs, entry.durationMs]))
+}
+
+function isReplayBatchEvent(entry: Record<string, unknown>): boolean {
+  return entry.event === 'terminal.replay.batch' && entry.source === 'replay'
+}
+
+function isReplayGapEvent(entry: Record<string, unknown>): boolean {
+  return entry.event === 'terminal.replay.gap' || (
+    entry.event === 'terminal.output.gap'
+    && entry.source === 'replay'
+  )
+}
+
+function isReceivedTerminalOutputFrame(frame: VisibleFirstWsObservation): boolean {
+  return (frame as { direction?: unknown }).direction === undefined
+    || (frame as { direction?: unknown }).direction === 'received'
+}
+
+function isReplayOutputPayload(payload: Record<string, unknown> | null, frameType: string | null): boolean {
+  if (!payload) return false
+  if (payload.type === 'terminal.output.batch') {
+    return payload.source === 'replay'
+  }
+  if (payload.type === 'terminal.output') {
+    return payload.source === 'replay'
+      || frameType === 'terminal.output'
+  }
+  return false
+}
+
+function replayWsFramesBeforeReady(input: DerivedMetricsInput, focusedReadyMs: number): VisibleFirstWsObservation[] {
+  return (input.transport.ws?.frames ?? []).filter((frame) => {
+    if (frame.timestamp > focusedReadyMs || !isReceivedTerminalOutputFrame(frame)) return false
+    const frameType = frame.type ?? classifyWsFrameType(frame.payload ?? '')
+    if (frameType !== 'terminal.output' && frameType !== 'terminal.output.batch') return false
+    return isReplayOutputPayload(parsePayload(frame.payload), frameType)
+  })
+}
+
+function replayWsGapFramesBeforeReady(input: DerivedMetricsInput, focusedReadyMs: number): VisibleFirstWsObservation[] {
+  return (input.transport.ws?.frames ?? []).filter((frame) => {
+    if (frame.timestamp > focusedReadyMs || !isReceivedTerminalOutputFrame(frame)) return false
+    const frameType = frame.type ?? classifyWsFrameType(frame.payload ?? '')
+    return frameType === 'terminal.output.gap'
+  })
+}
+
+function resolveReplayMessageCount(input: DerivedMetricsInput, replayFrames: VisibleFirstWsObservation[]): number {
+  const serverReplayBatchEvents = (input.server?.terminalReplayEvents ?? []).filter(isReplayBatchEvent)
+  return serverReplayBatchEvents.length > 0 ? serverReplayBatchEvents.length : replayFrames.length
+}
+
+function resolveReplaySerializedBytes(input: DerivedMetricsInput, replayFrames: VisibleFirstWsObservation[]): number {
+  const serverReplayBatchEvents = (input.server?.terminalReplayEvents ?? []).filter(isReplayBatchEvent)
+  if (serverReplayBatchEvents.length > 0) {
+    return sumMetric(serverReplayBatchEvents.map((entry) => entry.serializedBytes))
+  }
+  return replayFrames.reduce((sum, frame) => sum + resolveObservationBytes(frame), 0)
+}
+
+function resolveReplayGapCount(input: DerivedMetricsInput, focusedReadyMs: number): number {
+  const serverReplayGapEvents = (input.server?.terminalReplayEvents ?? []).filter(isReplayGapEvent)
+  return serverReplayGapEvents.length > 0
+    ? serverReplayGapEvents.length
+    : replayWsGapFramesBeforeReady(input, focusedReadyMs).length
+}
+
+function payloadSeqEnd(frame: VisibleFirstWsObservation): number | undefined {
+  const payload = parsePayload(frame.payload)
+  const seqEnd = payload?.seqEnd
+  return typeof seqEnd === 'number' && Number.isFinite(seqEnd) ? seqEnd : undefined
+}
+
+function resolveParserAppliedLagMs(input: DerivedMetricsInput, replayFrames: VisibleFirstWsObservation[]): number {
+  const frameMilestones = replayFrames
+    .map((frame) => {
+      const seqEnd = payloadSeqEnd(frame)
+      return seqEnd === undefined ? null : { seqEnd, timestamp: frame.timestamp }
+    })
+    .filter((entry): entry is { seqEnd: number; timestamp: number } => entry !== null)
+
+  if (frameMilestones.length === 0) return 0
+
+  let maxLagMs = 0
+  const parserAppliedEvents = (input.browser.perfEvents ?? [])
+    .filter((entry) => eventName(entry) === 'terminal.parser_applied')
+  for (const event of parserAppliedEvents) {
+    const timestamp = finiteNumber(event.timestamp)
+    const parserAppliedSeq = finiteNumber(event.parserAppliedSeq)
+    if (timestamp === undefined || parserAppliedSeq === undefined) continue
+    const coveredFrames = frameMilestones.filter((frame) => frame.seqEnd <= parserAppliedSeq)
+    if (coveredFrames.length === 0) continue
+    const lastFrameTimestamp = Math.max(...coveredFrames.map((frame) => frame.timestamp))
+    maxLagMs = Math.max(maxLagMs, Math.max(0, timestamp - lastFrameTimestamp))
+  }
+
+  return maxLagMs
+}
+
+function resolveStopResumeMetrics(input: DerivedMetricsInput): {
+  terminalStoppedRetentionCoveredMs: number
+  terminalStopResumeGapCount: number
+} {
+  const events = (input.browser.perfEvents ?? [])
+    .filter((entry) => eventName(entry) === 'terminal.catchup.stop_resume')
+  return {
+    terminalStoppedRetentionCoveredMs: maxMetric(events.flatMap((entry) => [
+      entry.retentionCoveredMs,
+      entry.stoppedDurationMs,
+    ])),
+    terminalStopResumeGapCount: sumMetric(events.map((entry) => entry.gapCount)),
+  }
+}
+
 function resolveObservationBytes(observation: { encodedDataLength?: number | null; bytes?: number | null; payloadLength?: number | null }): number {
   if (typeof observation.encodedDataLength === 'number' && Number.isFinite(observation.encodedDataLength)) {
     return Math.max(0, observation.encodedDataLength)
@@ -130,6 +312,8 @@ export function deriveVisibleFirstMetrics(input: DerivedMetricsInput): VisibleFi
   const focusedReadyMs = input.browser.milestones[input.focusedReadyMilestone]
   const allowedApiRoutes = new Set(input.allowedApiRouteIdsBeforeReady)
   const allowedWsTypes = new Set(input.allowedWsTypesBeforeReady)
+  const replayFrames = replayWsFramesBeforeReady(input, focusedReadyMs)
+  const stopResumeMetrics = resolveStopResumeMetrics(input)
 
   let httpRequestsBeforeReady = 0
   let httpBytesBeforeReady = 0
@@ -172,6 +356,7 @@ export function deriveVisibleFirstMetrics(input: DerivedMetricsInput): VisibleFi
   return {
     focusedReadyMs,
     ...(resolveWsReadyMs(input) !== undefined ? { wsReadyMs: resolveWsReadyMs(input) } : {}),
+    maxRafGapMs: resolveMaxRafGapMs(input),
     ...(typeof input.browser.terminalLatencySamplesMs?.[0] === 'number'
       ? { terminalInputToFirstOutputMs: input.browser.terminalLatencySamplesMs[0] }
       : {}),
@@ -183,5 +368,13 @@ export function deriveVisibleFirstMetrics(input: DerivedMetricsInput): VisibleFi
     offscreenHttpBytesBeforeReady,
     offscreenWsFramesBeforeReady,
     offscreenWsBytesBeforeReady,
+    terminalReplayMessageCount: resolveReplayMessageCount(input, replayFrames),
+    terminalReplaySerializedBytes: resolveReplaySerializedBytes(input, replayFrames),
+    terminalParserAppliedLagMs: resolveParserAppliedLagMs(input, replayFrames),
+    terminalReplayGapCount: resolveReplayGapCount(input, focusedReadyMs),
+    terminalFullHydrateFallbackCount: countPerfEvents(input, 'terminal.catchup.full_hydrate_fallback'),
+    terminalSurfaceQuarantineCount: countPerfEvents(input, 'terminal.catchup.surface_quarantined'),
+    terminalStaleGenerationRejectionCount: countPerfEvents(input, 'terminal.attach_generation_stale_rejected'),
+    ...stopResumeMetrics,
   }
 }

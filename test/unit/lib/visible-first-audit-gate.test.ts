@@ -24,6 +24,20 @@ const require = createRequire(import.meta.url)
 
 type GateMetric = VisibleFirstAuditGateResult['violations'][number]['metric']
 
+const TERMINAL_RECONNECT_REQUIRED_METRICS = {
+  focusedReadyMs: 100,
+  maxRafGapMs: 16,
+  terminalReplayMessageCount: 2,
+  terminalReplaySerializedBytes: 12_000,
+  terminalParserAppliedLagMs: 24,
+  terminalReplayGapCount: 0,
+  terminalFullHydrateFallbackCount: 0,
+  terminalSurfaceQuarantineCount: 0,
+  terminalStaleGenerationRejectionCount: 0,
+  terminalStoppedRetentionCoveredMs: 0,
+  terminalStopResumeGapCount: 0,
+}
+
 function createArtifact(): VisibleFirstAuditArtifact {
   return VisibleFirstAuditSchema.parse({
     schemaVersion: 1,
@@ -52,7 +66,9 @@ function createArtifact(): VisibleFirstAuditArtifact {
         browser: {},
         transport: {},
         server: {},
-        derived: {},
+        derived: scenarioId === 'terminal-reconnect-backlog'
+          ? { ...TERMINAL_RECONNECT_REQUIRED_METRICS }
+          : {},
         errors: [],
       })),
       summaryByProfile: {
@@ -63,6 +79,7 @@ function createArtifact(): VisibleFirstAuditArtifact {
           offscreenHttpBytesBeforeReady: 0,
           offscreenWsFramesBeforeReady: 0,
           offscreenWsBytesBeforeReady: 0,
+          ...(scenarioId === 'terminal-reconnect-backlog' ? TERMINAL_RECONNECT_REQUIRED_METRICS : {}),
         },
         mobile_restricted: {
           focusedReadyMs: 150,
@@ -71,6 +88,7 @@ function createArtifact(): VisibleFirstAuditArtifact {
           offscreenHttpBytesBeforeReady: 0,
           offscreenWsFramesBeforeReady: 0,
           offscreenWsBytesBeforeReady: 0,
+          ...(scenarioId === 'terminal-reconnect-backlog' ? TERMINAL_RECONNECT_REQUIRED_METRICS : {}),
         },
       },
     })),
@@ -146,6 +164,18 @@ describe('evaluateVisibleFirstAuditGate', () => {
     removeSample(candidate, 'terminal-cold-boot', 'mobile_restricted')
 
     expect(() => evaluateVisibleFirstAuditGate(base, candidate)).toThrow(/terminal-cold-boot\/mobile_restricted/i)
+  })
+
+  it('fails when a candidate sample is missing a scenario-required terminal catch-up metric', () => {
+    const base = createArtifact()
+    const candidate = createArtifact()
+    const scenario = getScenario(candidate, 'terminal-reconnect-backlog')
+    delete (scenario.samples[0].derived as Record<string, unknown>).terminalReplayGapCount
+    delete (scenario.summaryByProfile.desktop_local as Record<string, unknown>).terminalReplayGapCount
+
+    expect(() => evaluateVisibleFirstAuditGate(base, candidate)).toThrow(
+      /terminal-reconnect-backlog\/desktop_local.*terminalReplayGapCount/i,
+    )
   })
 
   it('fails on a positive mobile_restricted focusedReadyMs delta', () => {

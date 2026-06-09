@@ -2,6 +2,18 @@
 import { describe, expect, it } from 'vitest'
 import { AUDIT_SCENARIOS } from '@test/e2e-browser/perf/scenarios'
 
+const TERMINAL_CATCHUP_REQUIRED_METRICS = [
+  'terminalReplayMessageCount',
+  'terminalReplaySerializedBytes',
+  'terminalParserAppliedLagMs',
+  'terminalReplayGapCount',
+  'terminalFullHydrateFallbackCount',
+  'terminalSurfaceQuarantineCount',
+  'terminalStaleGenerationRejectionCount',
+  'terminalStoppedRetentionCoveredMs',
+  'terminalStopResumeGapCount',
+]
+
 describe('visible-first audit scenarios', () => {
   it('defines the six accepted scenarios in stable order', () => {
     expect(AUDIT_SCENARIOS.map((scenario) => scenario.id)).toEqual([
@@ -52,5 +64,20 @@ describe('visible-first audit scenarios', () => {
       expect(scenario.allowedApiRouteIdsBeforeReady.some((route) => forbiddenRoutes.has(route))).toBe(false)
       expect(scenario.allowedWsTypesBeforeReady.some((type) => forbiddenWsTypes.has(type))).toBe(false)
     }
+  })
+
+  it('declares the terminal catch-up replay metrics required by the reconnect-backlog scenario', () => {
+    const scenarioMap = new Map(AUDIT_SCENARIOS.map((scenario) => [scenario.id, scenario]))
+    const scenario = scenarioMap.get('terminal-reconnect-backlog')
+
+    expect(scenario?.allowedWsTypesBeforeReady).toEqual(expect.arrayContaining([
+      'terminal.output',
+      'terminal.output.batch',
+    ]))
+    expect(scenario?.requiredMetricIds).toEqual(expect.arrayContaining([
+      'focusedReadyMs',
+      'maxRafGapMs',
+      ...TERMINAL_CATCHUP_REQUIRED_METRICS,
+    ]))
   })
 })

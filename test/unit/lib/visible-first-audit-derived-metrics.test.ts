@@ -52,4 +52,97 @@ describe('deriveVisibleFirstMetrics', () => {
     expect(result.offscreenWsFramesBeforeReady).toBe(2)
     expect(result.terminalInputToFirstOutputMs).toBe(45)
   })
+
+  it('derives terminal catch-up replay metrics from structured logs, websocket evidence, and client perf events', () => {
+    const result = deriveVisibleFirstMetrics({
+      focusedReadyMilestone: 'terminal.first_output',
+      allowedApiRouteIdsBeforeReady: ['/api/bootstrap', '/api/terminals/:terminalId/viewport'],
+      allowedWsTypesBeforeReady: ['hello', 'ready', 'terminal.output', 'terminal.output.batch', 'terminal.output.gap'],
+      browser: {
+        milestones: {
+          'terminal.first_output': 150,
+        },
+        perfEvents: [
+          { event: 'visible_first.audit.max_raf_gap', maxGapMs: 31 },
+          { event: 'terminal.parser_applied', timestamp: 118, parserAppliedSeq: 6 },
+          { event: 'terminal.parser_applied', timestamp: 140, parserAppliedSeq: 8 },
+          { event: 'terminal.catchup.full_hydrate_fallback', timestamp: 141 },
+          { event: 'terminal.catchup.surface_quarantined', timestamp: 142 },
+          { event: 'terminal.attach_generation_stale_rejected', timestamp: 143 },
+          {
+            event: 'terminal.catchup.stop_resume',
+            timestamp: 144,
+            retentionCoveredMs: 2_500,
+            gapCount: 1,
+          },
+        ],
+      },
+      transport: {
+        http: { requests: [] },
+        ws: {
+          frames: [
+            {
+              timestamp: 100,
+              type: 'terminal.output.batch',
+              payload: JSON.stringify({
+                type: 'terminal.output.batch',
+                source: 'replay',
+                seqStart: 1,
+                seqEnd: 6,
+                serializedBytes: 400,
+              }),
+              payloadLength: 400,
+            },
+            {
+              timestamp: 130,
+              type: 'terminal.output',
+              payload: JSON.stringify({
+                type: 'terminal.output',
+                seqStart: 7,
+                seqEnd: 8,
+              }),
+              payloadLength: 120,
+            },
+          ],
+        },
+      },
+      server: {
+        terminalReplayEvents: [
+          {
+            event: 'terminal.replay.batch',
+            source: 'replay',
+            payloadType: 'terminal.output.batch',
+            seqStart: 1,
+            seqEnd: 6,
+            serializedBytes: 400,
+          },
+          {
+            event: 'terminal.replay.batch',
+            source: 'replay',
+            payloadType: 'terminal.output',
+            seqStart: 7,
+            seqEnd: 8,
+            serializedBytes: 120,
+          },
+          {
+            event: 'terminal.replay.gap',
+            source: 'replay',
+            fromSeq: 9,
+            toSeq: 9,
+          },
+        ],
+      },
+    })
+
+    expect(result.maxRafGapMs).toBe(31)
+    expect(result.terminalReplayMessageCount).toBe(2)
+    expect(result.terminalReplaySerializedBytes).toBe(520)
+    expect(result.terminalParserAppliedLagMs).toBe(18)
+    expect(result.terminalReplayGapCount).toBe(1)
+    expect(result.terminalFullHydrateFallbackCount).toBe(1)
+    expect(result.terminalSurfaceQuarantineCount).toBe(1)
+    expect(result.terminalStaleGenerationRejectionCount).toBe(1)
+    expect(result.terminalStoppedRetentionCoveredMs).toBe(2_500)
+    expect(result.terminalStopResumeGapCount).toBe(1)
+  })
 })

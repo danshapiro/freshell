@@ -8,6 +8,20 @@ export type AuditScenarioId =
   | 'terminal-reconnect-backlog'
   | 'offscreen-tab-selection'
 
+export type AuditRequiredMetricId =
+  | 'focusedReadyMs'
+  | 'maxRafGapMs'
+  | 'terminalInputToFirstOutputMs'
+  | 'terminalReplayMessageCount'
+  | 'terminalReplaySerializedBytes'
+  | 'terminalParserAppliedLagMs'
+  | 'terminalReplayGapCount'
+  | 'terminalFullHydrateFallbackCount'
+  | 'terminalSurfaceQuarantineCount'
+  | 'terminalStaleGenerationRejectionCount'
+  | 'terminalStoppedRetentionCoveredMs'
+  | 'terminalStopResumeGapCount'
+
 export type AuditScenarioContext = {
   token?: string
   profileId: AuditProfileId
@@ -19,6 +33,7 @@ export type AuditScenarioDefinition = {
   focusedReadyMilestone: string
   allowedApiRouteIdsBeforeReady: readonly string[]
   allowedWsTypesBeforeReady: readonly string[]
+  requiredMetricIds?: readonly AuditRequiredMetricId[]
   buildUrl: (context: AuditScenarioContext) => string
   seedServerHome?: () => Promise<void>
   seedBrowserStorage?: () => Record<string, string>
@@ -32,6 +47,24 @@ function buildRootUrl(token?: string): string {
   }
   return `/?${params.toString()}`
 }
+
+export const TERMINAL_CATCHUP_REQUIRED_METRIC_IDS = [
+  'terminalReplayMessageCount',
+  'terminalReplaySerializedBytes',
+  'terminalParserAppliedLagMs',
+  'terminalReplayGapCount',
+  'terminalFullHydrateFallbackCount',
+  'terminalSurfaceQuarantineCount',
+  'terminalStaleGenerationRejectionCount',
+  'terminalStoppedRetentionCoveredMs',
+  'terminalStopResumeGapCount',
+] as const satisfies readonly AuditRequiredMetricId[]
+
+const TERMINAL_RECONNECT_BACKLOG_REQUIRED_METRIC_IDS = [
+  'focusedReadyMs',
+  'maxRafGapMs',
+  ...TERMINAL_CATCHUP_REQUIRED_METRIC_IDS,
+] as const satisfies readonly AuditRequiredMetricId[]
 
 export const AUDIT_SCENARIOS: readonly AuditScenarioDefinition[] = [
   {
@@ -86,10 +119,12 @@ export const AUDIT_SCENARIOS: readonly AuditScenarioDefinition[] = [
       'terminal.attach',
       'terminal.attach.ready',
       'terminal.output',
+      'terminal.output.batch',
       'terminal.output.gap',
 
       'terminals.changed',
     ],
+    requiredMetricIds: TERMINAL_RECONNECT_BACKLOG_REQUIRED_METRIC_IDS,
     buildUrl: ({ token }) => buildRootUrl(token),
   },
   {

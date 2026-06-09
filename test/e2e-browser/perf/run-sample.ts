@@ -21,7 +21,7 @@ import {
   type NetworkCapture,
 } from './network-recorder.js'
 import { parseVisibleFirstServerLogs } from './parse-server-logs.js'
-import { AUDIT_SCENARIOS } from './scenarios.js'
+import { AUDIT_SCENARIOS, type AuditScenarioDefinition } from './scenarios.js'
 import {
   buildAgentChatBrowserStorageSeed,
   buildOffscreenTabBrowserStorageSeed,
@@ -60,6 +60,7 @@ type ReconnectBootstrapResult = {
 
 const SAMPLE_TIMEOUT_MS = 30_000
 const TERMINAL_RECONNECT_CREATE_REQUEST_ID = 'visible-first-reconnect-create'
+const TERMINAL_RECONNECT_REPLAY_MESSAGE_BUDGET = 30
 
 function getScenarioDefinition(scenarioId: VisibleFirstScenarioId) {
   const scenario = AUDIT_SCENARIOS.find((entry) => entry.id === scenarioId)
@@ -86,8 +87,125 @@ function emptyCollectors(): SampleCollectors {
       httpRequests: [],
       perfEvents: [],
       perfSystemSamples: [],
+      terminalReplayEvents: [],
+      terminalOutputEvents: [],
       parserDiagnostics: [],
     },
+  }
+}
+
+async function installRafGapSampler(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const state = {
+      maxGapMs: 0,
+      lastRafAt: 0,
+      sampleCount: 0,
+    }
+    ;(window as Window & {
+      __FRESHELL_VISIBLE_FIRST_RAF_GAP__?: typeof state
+    }).__FRESHELL_VISIBLE_FIRST_RAF_GAP__ = state
+
+    const tick = (now: number) => {
+      if (state.lastRafAt > 0) {
+        state.maxGapMs = Math.max(state.maxGapMs, now - state.lastRafAt)
+      }
+      state.lastRafAt = now
+      state.sampleCount += 1
+      window.requestAnimationFrame(tick)
+    }
+    window.requestAnimationFrame(tick)
+  })
+}
+
+async function readRafGapSummary(page: Page): Promise<Record<string, unknown> | null> {
+  return page.evaluate(() => {
+    const state = (window as Window & {
+      __FRESHELL_VISIBLE_FIRST_RAF_GAP__?: {
+        maxGapMs: number
+        lastRafAt: number
+        sampleCount: number
+      }
+    }).__FRESHELL_VISIBLE_FIRST_RAF_GAP__
+    if (!state) return null
+    return {
+      event: 'visible_first.audit.max_raf_gap',
+      timestamp: performance.now(),
+      maxGapMs: state.maxGapMs,
+      sampleCount: state.sampleCount,
+    }
+  })
+}
+
+async function waitForRafSampler(page: Page): Promise<void> {
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    const auditWindow = window as Window & {
+      __FRESHELL_VISIBLE_FIRST_RAF_GAP__?: {
+        maxGapMs: number
+        lastRafAt: number
+        sampleCount: number
+      }
+    }
+    window.requestAnimationFrame((firstNow) => {
+      const firstState = auditWindow.__FRESHELL_VISIBLE_FIRST_RAF_GAP__
+      if (firstState) {
+        if (firstState.lastRafAt > 0) {
+          firstState.maxGapMs = Math.max(firstState.maxGapMs, firstNow - firstState.lastRafAt)
+        }
+        firstState.lastRafAt = firstNow
+        firstState.sampleCount += 1
+      }
+      window.requestAnimationFrame((secondNow) => {
+        const secondState = auditWindow.__FRESHELL_VISIBLE_FIRST_RAF_GAP__
+        if (secondState) {
+          if (secondState.lastRafAt > 0) {
+            secondState.maxGapMs = Math.max(secondState.maxGapMs, secondNow - secondState.lastRafAt)
+          }
+          secondState.lastRafAt = secondNow
+          secondState.sampleCount += 1
+        }
+        resolve()
+      })
+    })
+  }))
+}
+
+function assertRequiredMetricsPresent(
+  scenario: AuditScenarioDefinition,
+  derived: Record<string, unknown>,
+): void {
+  const missing = (scenario.requiredMetricIds ?? []).filter((metricId) => {
+    const value = derived[metricId]
+    return typeof value !== 'number' || !Number.isFinite(value)
+  })
+  if (missing.length > 0) {
+    throw new Error(`Missing required audit metrics for ${scenario.id}: ${missing.join(', ')}`)
+  }
+}
+
+function assertTerminalReconnectTargets(derived: Record<string, unknown>): void {
+  const replayMessageCount = typeof derived.terminalReplayMessageCount === 'number'
+    ? derived.terminalReplayMessageCount
+    : Number.NaN
+  if (!Number.isFinite(replayMessageCount) || replayMessageCount <= 0) {
+    throw new Error('terminal-reconnect-backlog did not record replay message evidence')
+  }
+  if (replayMessageCount > TERMINAL_RECONNECT_REPLAY_MESSAGE_BUDGET) {
+    throw new Error(
+      `terminal-reconnect-backlog replay message count ${replayMessageCount} exceeded budget ${TERMINAL_RECONNECT_REPLAY_MESSAGE_BUDGET}`,
+    )
+  }
+
+  const zeroMetrics = [
+    'terminalReplayGapCount',
+    'terminalFullHydrateFallbackCount',
+    'terminalSurfaceQuarantineCount',
+    'terminalStaleGenerationRejectionCount',
+  ]
+  for (const metric of zeroMetrics) {
+    const value = derived[metric]
+    if (typeof value !== 'number' || value !== 0) {
+      throw new Error(`terminal-reconnect-backlog expected ${metric}=0, got ${String(value)}`)
+    }
   }
 }
 
@@ -429,6 +547,7 @@ async function executeSampleDefault(
       profileId: input.profileId,
     }))
     const page = await context.newPage()
+    await installRafGapSampler(page)
     const cdpSession = await context.newCDPSession(page)
     await applyProfileNetworkConditions(cdpSession, input.profileId)
 
@@ -473,9 +592,14 @@ async function executeSampleDefault(
 
     await waitForAuditMilestone(page, harness, scenario.focusedReadyMilestone)
 
+    await waitForRafSampler(page)
     const browserSnapshot = await harness.getPerfAuditSnapshot()
     if (!browserSnapshot) {
       throw new Error('Perf audit snapshot was not available from the test harness')
+    }
+    const rafGapSummary = await readRafGapSummary(page)
+    if (rafGapSummary) {
+      browserSnapshot.perfEvents.push(rafGapSummary)
     }
 
     const browserTimeOriginMs = await page.evaluate(() => performance.timeOrigin)
@@ -551,7 +675,14 @@ export async function runVisibleFirstAuditSample(
       allowedWsTypesBeforeReady: scenario.allowedWsTypesBeforeReady,
       browser: collectors.browser,
       transport: collectors.transport,
+      server: {
+        terminalReplayEvents: collectors.server.terminalReplayEvents,
+      },
     })
+    assertRequiredMetricsPresent(scenario, derived)
+    if (scenario.id === 'terminal-reconnect-backlog') {
+      assertTerminalReconnectTargets(derived)
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     errors.push(message)
