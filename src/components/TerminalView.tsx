@@ -82,6 +82,7 @@ import {
 } from '@/lib/terminal-osc52'
 import {
   beginTerminalOutputWriteScope,
+  getTerminalOutputWriteScope,
   shouldAllowTerminalOutputSideEffect,
   type TerminalOutputSource,
 } from '@/lib/terminal-output-write-scope'
@@ -1849,6 +1850,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         focus: false,
       }
       if (termRef.current === term) {
+        if (terminalInstanceIdRef.current === terminalInstanceId) {
+          terminalInstanceIdRef.current = `terminal-surface:disposed:${nanoid()}`
+        }
         runtime.dispose()
         runtimeRef.current = null
         term.dispose()
@@ -1892,9 +1896,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       // terminals are named from the server session (working dir / first message
       // / Gemini) and must stay stable, so they ignore OSC titles entirely.
       if (!terminalFollowsOscTitle(contentRef.current?.mode)) return
+      if (terminalInstanceIdRef.current !== titleTerminalInstanceId) return
       if (!shouldAllowTerminalOutputSideEffect({
         terminalInstanceId: titleTerminalInstanceId,
-        source: 'live',
+        source: getTerminalOutputWriteScope(titleTerminalInstanceId) ? undefined : 'live',
         effect: 'title_update',
         mode: contentRef.current?.mode,
       })) {

@@ -56,6 +56,45 @@ describe('terminal output side-effect policy', () => {
     })).toBe(false)
   })
 
+  it('uses explicit live frame context instead of an unrelated active replay write scope', () => {
+    const replayScope = beginTerminalOutputWriteScope({
+      terminalInstanceId: 'surface-live-frame',
+      source: 'replay',
+      attachRequestId: 'attach-1',
+      generation: 'attach-1',
+      suppressExternalSideEffects: true,
+    })
+
+    try {
+      expect(shouldAllowTerminalOutputSideEffect({
+        terminalInstanceId: 'surface-live-frame',
+        source: 'live',
+        effect: 'startup_reply',
+        mode: 'opencode',
+      })).toBe(true)
+      expect(shouldAllowTerminalOutputSideEffect({
+        terminalInstanceId: 'surface-live-frame',
+        source: 'live',
+        effect: 'osc52_clipboard_write',
+        mode: 'opencode',
+      })).toBe(true)
+      expect(shouldAllowTerminalOutputSideEffect({
+        terminalInstanceId: 'surface-live-frame',
+        source: 'live',
+        effect: 'turn_complete',
+        mode: 'opencode',
+      })).toBe(true)
+      expect(shouldAllowTerminalOutputSideEffect({
+        terminalInstanceId: 'surface-live-frame',
+        source: 'replay',
+        effect: 'osc52_clipboard_write',
+        mode: 'opencode',
+      })).toBe(false)
+    } finally {
+      replayScope.complete()
+    }
+  })
+
   it('keeps server-authoritative turn completion for Claude and Codex', () => {
     expect(shouldAllowTerminalOutputSideEffect({
       source: 'live',

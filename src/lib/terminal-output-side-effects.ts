@@ -39,6 +39,27 @@ function isServerAuthoritativeTurnCompleteMode(mode: string | undefined): boolea
 export function shouldAllowTerminalOutputSideEffect(
   input: ShouldAllowTerminalOutputSideEffectInput,
 ): boolean {
+  if (input.source) {
+    if (input.source === 'replay') {
+      return INTERNAL_WRITE_CALLBACK_EFFECTS.has(input.effect)
+        && Boolean(getTerminalOutputWriteScope(input.terminalInstanceId))
+    }
+
+    if (input.effect === 'turn_complete') {
+      return !isServerAuthoritativeTurnCompleteMode(input.mode)
+    }
+
+    if (INTERNAL_WRITE_CALLBACK_EFFECTS.has(input.effect)) {
+      return true
+    }
+
+    if (LIVE_EXTERNAL_EFFECTS.has(input.effect)) {
+      return true
+    }
+
+    return false
+  }
+
   const scope = getTerminalOutputWriteScope(input.terminalInstanceId)
   if (input.generation && scope && scope.generation !== input.generation) {
     return false
@@ -48,11 +69,7 @@ export function shouldAllowTerminalOutputSideEffect(
     return false
   }
 
-  if (scope && input.source && scope.source !== input.source) {
-    return false
-  }
-
-  const source = input.source ?? scope?.source
+  const source = scope?.source
   if (!source) return false
 
   if (source === 'replay') {

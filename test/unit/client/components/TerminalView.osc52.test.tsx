@@ -404,6 +404,59 @@ describe('TerminalView OSC52 policy handling', () => {
     expect(screen.queryByRole('dialog', { name: 'Clipboard access request' })).not.toBeInTheDocument()
   })
 
+  it('allows live startup replies and OSC52 writes while an earlier replay write callback is still pending', async () => {
+    const { terminalId } = await renderView('always')
+    clipboardMocks.copyText.mockClear()
+    wsMocks.send.mockClear()
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId,
+        headSeq: 2,
+        replayFromSeq: 1,
+        replayToSeq: 1,
+      })
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: 1,
+        seqEnd: 1,
+        data: 'pending replay write',
+      })
+    })
+
+    await waitFor(() => {
+      expect(writeEvents().map((event) => event.data)).toContain('pending replay write')
+    })
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: 2,
+        seqEnd: 2,
+        data: OPEN_CODE_STARTUP_PROBE_FRAME,
+      })
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: 3,
+        seqEnd: 3,
+        data: `live${OSC52_COPY}`,
+      })
+    })
+
+    expect(wsMocks.send.mock.calls.map(([msg]) => msg).filter((msg) => msg?.type === 'terminal.input')).toEqual(
+      OPEN_CODE_STARTUP_EXPECTED_REPLIES.map((data) => ({
+        type: 'terminal.input',
+        terminalId,
+        data,
+      })),
+    )
+    expect(clipboardMocks.copyText).toHaveBeenCalledWith('copy')
+  })
+
   it('ask + Yes copies once and keeps ask policy', async () => {
     const { store, terminalId } = await renderView('ask')
     act(() => {
