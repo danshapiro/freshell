@@ -23,15 +23,13 @@ type StreamState = {
 export function createTerminalStreamIdentityTracker(): TerminalStreamIdentityTracker {
   const streams = new Map<string, StreamState>()
 
-  const mintStreamId = (terminalId: string, generation: number) => (
-    `${terminalId}:stream:${generation}:${randomUUID()}`
-  )
+  const mintStreamId = () => randomUUID()
 
   const ensureState = (terminalId: string): StreamState => {
     let state = streams.get(terminalId)
     if (!state) {
       state = {
-        streamId: mintStreamId(terminalId, 1),
+        streamId: mintStreamId(),
         generation: 1,
       }
       streams.set(terminalId, state)
@@ -58,7 +56,7 @@ export function createTerminalStreamIdentityTracker(): TerminalStreamIdentityTra
     replaceStream(terminalId, _reason) {
       const state = ensureState(terminalId)
       state.generation += 1
-      state.streamId = mintStreamId(terminalId, state.generation)
+      state.streamId = mintStreamId()
       return state.streamId
     },
     forgetStream(terminalId) {

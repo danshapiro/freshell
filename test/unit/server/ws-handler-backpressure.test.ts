@@ -639,6 +639,105 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     }
   })
 
+  it('notifies active clients before live output switches to a replacement stream id', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-live-stream-change')
+
+    const ws = createMockWs()
+    await broker.attach(ws as any, 'term-live-stream-change', 'viewport_hydrate', 80, 24, 0, 'live-change-attach')
+    const ready = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(ready?.streamId).toEqual(expect.any(String))
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-stream-change', data: 'before-change', at: Date.now() })
+    vi.advanceTimersByTime(1)
+
+    registry.emit('terminal.stream.replaced', {
+      terminalId: 'term-live-stream-change',
+      reason: 'codex_pty_recovery',
+    })
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-stream-change', data: 'after-change', at: Date.now() })
+    vi.advanceTimersByTime(1)
+
+    const payloads = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+    const streamChangedIndex = payloads.findIndex((payload) => payload?.type === 'terminal.stream.changed')
+    const afterOutputIndex = payloads.findIndex((payload) =>
+      payload?.type === 'terminal.output' && payload.data === 'after-change'
+    )
+    const streamChanged = payloads[streamChangedIndex]
+    const afterOutput = payloads[afterOutputIndex]
+
+    expect(streamChanged).toMatchObject({
+      terminalId: 'term-live-stream-change',
+      reason: 'codex_pty_recovery',
+      attachRequestId: 'live-change-attach',
+      streamId: expect.any(String),
+    })
+    expect(streamChanged.streamId).not.toBe(ready.streamId)
+    expect(afterOutput).toMatchObject({
+      terminalId: 'term-live-stream-change',
+      data: 'after-change',
+      streamId: streamChanged.streamId,
+      attachRequestId: 'live-change-attach',
+    })
+    expect(streamChangedIndex).toBeGreaterThan(-1)
+    expect(afterOutputIndex).toBeGreaterThan(streamChangedIndex)
+
+    broker.close()
+  })
+
+  it('notifies active clients when retention loss rotates live stream identity', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(6)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-live-retention-change')
+
+    const ws = createMockWs()
+    await broker.attach(ws as any, 'term-live-retention-change', 'viewport_hydrate', 80, 24, 0, 'live-retention-attach')
+    const ready = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(ready?.streamId).toEqual(expect.any(String))
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-retention-change', data: 'aaa', at: Date.now() })
+    vi.advanceTimersByTime(1)
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-retention-change', data: 'bbb', at: Date.now() })
+    vi.advanceTimersByTime(1)
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-retention-change', data: 'ccc', at: Date.now() })
+    vi.advanceTimersByTime(1)
+
+    const payloads = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+    const streamChangedIndex = payloads.findIndex((payload) =>
+      payload?.type === 'terminal.stream.changed' && payload.reason === 'retention_lost'
+    )
+    const cccOutputIndex = payloads.findIndex((payload) =>
+      payload?.type === 'terminal.output' && payload.data === 'ccc'
+    )
+    const streamChanged = payloads[streamChangedIndex]
+    const cccOutput = payloads[cccOutputIndex]
+
+    expect(streamChanged).toMatchObject({
+      terminalId: 'term-live-retention-change',
+      reason: 'retention_lost',
+      attachRequestId: 'live-retention-attach',
+      streamId: expect.any(String),
+    })
+    expect(streamChanged.streamId).not.toBe(ready.streamId)
+    expect(cccOutput).toMatchObject({
+      terminalId: 'term-live-retention-change',
+      data: 'ccc',
+      streamId: streamChanged.streamId,
+      attachRequestId: 'live-retention-attach',
+    })
+    expect(cccOutputIndex).toBeGreaterThan(streamChangedIndex)
+
+    broker.close()
+  })
+
   it('retags retained replay frames when retention loss rotates stream identity', async () => {
     const registry = new FakeBrokerRegistry()
     registry.setReplayRingMaxBytes(6)

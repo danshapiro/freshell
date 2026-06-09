@@ -667,6 +667,14 @@ export type TerminalAttachReadyMessage = {
   sessionRef?: SessionLocator
 }
 
+export type TerminalStreamChangedMessage = {
+  type: 'terminal.stream.changed'
+  terminalId: string
+  streamId: string
+  reason: 'new_pty_session' | 'codex_pty_recovery' | 'retention_lost' | 'server_restart_incompatible_retention'
+  attachRequestId?: string
+}
+
 export type TerminalDetachedMessage = {
   type: 'terminal.detached'
   terminalId: string
@@ -987,6 +995,7 @@ export type ServerMessage =
   | ErrorMessage
   | TerminalCreatedMessage
   | TerminalAttachReadyMessage
+  | TerminalStreamChangedMessage
   | TerminalDetachedMessage
   | TerminalExitMessage
   | TerminalStatusMessage

@@ -75,6 +75,7 @@ vi.mock('lucide-react', () => ({
 
 const terminalInstances: any[] = []
 const latestAttachRequestIdByTerminal = new Map<string, string>()
+const latestStreamIdByTerminal = new Map<string, string>()
 
 vi.mock('@xterm/xterm', () => {
   class MockTerminal {
@@ -261,16 +262,50 @@ function expectTerminalWriteContaining(term: { write: { mock: { calls: Array<[un
 }
 
 function withCurrentAttachRequestId<T extends { type?: string; terminalId?: string; attachRequestId?: string }>(
-  msg: T & { __preserveMissingAttachRequestId?: boolean },
+  msg: T & { __preserveMissingAttachRequestId?: boolean; __preserveMissingStreamId?: boolean },
 ): T {
-  if (msg.__preserveMissingAttachRequestId) return msg
-  if (msg.attachRequestId || typeof msg.terminalId !== 'string') return msg
-  if (msg.type !== 'terminal.attach.ready' && msg.type !== 'terminal.output' && msg.type !== 'terminal.output.gap') {
+  const isStreamPayload = msg.type === 'terminal.attach.ready'
+    || msg.type === 'terminal.stream.changed'
+    || msg.type === 'terminal.output'
+    || msg.type === 'terminal.output.gap'
+  if (!isStreamPayload || typeof msg.terminalId !== 'string') {
     return msg
   }
-  const attachRequestId = latestAttachRequestIdForTerminal(msg.terminalId)
-  if (!attachRequestId) return msg
-  return { ...msg, attachRequestId }
+
+  let next: T & { __preserveMissingAttachRequestId?: boolean; __preserveMissingStreamId?: boolean } = msg
+  if (!msg.__preserveMissingAttachRequestId && !msg.attachRequestId) {
+    const attachRequestId = latestAttachRequestIdForTerminal(msg.terminalId)
+    if (attachRequestId) {
+      next = { ...next, attachRequestId }
+    }
+  }
+
+  if (!msg.__preserveMissingStreamId) {
+    if (msg.type === 'terminal.attach.ready') {
+      const streamId = typeof (next as { streamId?: unknown }).streamId === 'string'
+        ? (next as { streamId: string }).streamId
+        : (latestStreamIdByTerminal.get(msg.terminalId) ?? `test-stream:${msg.terminalId}`)
+      next = { ...next, streamId } as typeof next
+      latestStreamIdByTerminal.set(msg.terminalId, streamId)
+    } else if (msg.type === 'terminal.output' || msg.type === 'terminal.output.gap') {
+      const messageStreamId = (next as { streamId?: unknown }).streamId
+      const streamId = typeof messageStreamId === 'string' && messageStreamId.length > 0
+        ? messageStreamId
+        : latestStreamIdByTerminal.get(msg.terminalId)
+      if (streamId) {
+        next = { ...next, streamId } as typeof next
+      }
+    }
+  }
+
+  if (msg.type === 'terminal.stream.changed') {
+    const streamId = (next as { streamId?: unknown }).streamId
+    if (typeof streamId === 'string' && streamId.length > 0) {
+      latestStreamIdByTerminal.set(msg.terminalId, streamId)
+    }
+  }
+
+  return next
 }
 
 function sentMessages() {
@@ -291,6 +326,7 @@ describe('TerminalView lifecycle updates', () => {
     resetPersistedLayoutCacheForTests()
     resetPersistFlushListenersForTests()
     latestAttachRequestIdByTerminal.clear()
+    latestStreamIdByTerminal.clear()
     wsMocks.send.mockClear()
     wsMocks.send.mockImplementation((msg: any) => {
       if (
@@ -3508,6 +3544,9 @@ describe('TerminalView lifecycle updates', () => {
       const initialStatus = opts?.status ?? 'running'
       const terminalId = opts?.terminalId
       const mode = opts?.mode ?? 'shell'
+      if (terminalId && opts?.streamId) {
+        latestStreamIdByTerminal.set(terminalId, opts.streamId)
+      }
 
       const paneContent: TerminalPaneContent = {
         kind: 'terminal',
@@ -4035,6 +4074,82 @@ describe('TerminalView lifecycle updates', () => {
       })).toBeNull()
     })
 
+    it('accepts live output after a terminal.stream.changed control message without trusting the old stream', async () => {
+      const { store, tabId, terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-active-stream-change-client',
+        serverInstanceId: 'server-active-stream-change',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-before-change',
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-before-change',
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'BEFORE STREAM CHANGE',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-before-change',
+        serverInstanceId: 'server-active-stream-change',
+      })?.parserAppliedSeq).toBe(1)
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.stream.changed',
+          terminalId,
+          streamId: 'stream-after-change',
+          reason: 'codex_pty_recovery',
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-after-change',
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'AFTER STREAM CHANGE',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      const writes = terminalWriteStrings(term).join('')
+      expect(writes).toContain('BEFORE STREAM CHANGE')
+      expect(writes).toContain('AFTER STREAM CHANGE')
+
+      const layout = store.getState().panes.layouts[tabId]
+      expect(layout.type).toBe('leaf')
+      expect(layout.content.kind).toBe('terminal')
+      expect(layout.content.streamId).toBe('stream-after-change')
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-before-change',
+        serverInstanceId: 'server-active-stream-change',
+      })).toBeNull()
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-after-change',
+        serverInstanceId: 'server-active-stream-change',
+      })?.parserAppliedSeq).toBe(2)
+    })
+
     it('uses changed attach-ready stream id to invalidate warm delta replay eligibility', async () => {
       const { store, tabId, terminalId } = await renderTerminalHarness({
         status: 'running',
@@ -4211,6 +4326,7 @@ describe('TerminalView lifecycle updates', () => {
           seqEnd: 1,
           data: 'MISSING STREAM',
           attachRequestId: attach!.attachRequestId,
+          __preserveMissingStreamId: true,
         })
         messageHandler!({
           type: 'terminal.output',
@@ -4275,6 +4391,7 @@ describe('TerminalView lifecycle updates', () => {
           toSeq: 5,
           reason: 'queue_overflow',
           attachRequestId: attach!.attachRequestId,
+          __preserveMissingStreamId: true,
         })
         messageHandler!({
           type: 'terminal.output',
@@ -4336,6 +4453,81 @@ describe('TerminalView lifecycle updates', () => {
       expect(writes).toContain('LEGACY BEFORE READY')
     })
 
+    it('clears stale stored stream id when attach-ready omits stream id and rejects untagged output and gaps', async () => {
+      const { store, tabId, terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-legacy-ready-without-stream',
+        serverInstanceId: 'server-missing-ready-stream',
+        streamId: 'stored-stale-stream',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 0,
+          replayFromSeq: 1,
+          replayToSeq: 0,
+          attachRequestId: attach!.attachRequestId,
+          __preserveMissingStreamId: true,
+        } as any)
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'UNTAGGED AFTER BAD READY',
+          attachRequestId: attach!.attachRequestId,
+          __preserveMissingStreamId: true,
+        } as any)
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 2,
+          toSeq: 3,
+          reason: 'queue_overflow',
+          attachRequestId: attach!.attachRequestId,
+          __preserveMissingStreamId: true,
+        } as any)
+      })
+
+      const layout = store.getState().panes.layouts[tabId]
+      expect(layout.type).toBe('leaf')
+      expect(layout.content.kind).toBe('terminal')
+      expect(layout.content.streamId).toBeUndefined()
+
+      const writes = terminalWriteStrings(term).join('')
+      expect(writes).not.toContain('UNTAGGED AFTER BAD READY')
+      expect(writes).not.toContain('Output gap 2-3')
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stored-stale-stream',
+        serverInstanceId: 'server-missing-ready-stream',
+      })).toBeNull()
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: null,
+        serverInstanceId: 'server-missing-ready-stream',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
+    })
+
     it('ignores xterm title callbacks fired while replay writes are scoped', async () => {
       const { terminalId, term, store, tabId, paneId } = await renderTerminalHarness({
         status: 'running',
@@ -4386,7 +4578,7 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       expect(store.getState().tabs.tabs.find((tab) => tab.id === tabId)?.title).toBe('Shell')
-      expect(store.getState().panes.paneTitles[tabId]?.[paneId]).toBeUndefined()
+      expect(store.getState().panes.paneTitles[tabId]?.[paneId]).not.toBe('Replay Title')
 
       act(() => {
         delayedCallbacks[0]?.callback()

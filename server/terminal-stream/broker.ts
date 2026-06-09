@@ -835,12 +835,40 @@ export class TerminalStreamBroker {
 
   private replaceStreamIdentity(terminalId: string, reason: TerminalStreamReplacementReason): string {
     const streamId = this.streamIdentity.replaceStream(terminalId, reason)
+    const state = this.terminals.get(terminalId)
+    if (state) {
+      for (const attachment of state.clients.values()) {
+        this.sendStreamChanged(
+          attachment.ws,
+          terminalId,
+          streamId,
+          reason,
+          attachment.activeAttachRequestId,
+        )
+      }
+    }
     log.info({
       terminalId,
       streamId,
       reason,
     }, 'Terminal output stream identity replaced')
     return streamId
+  }
+
+  private sendStreamChanged(
+    ws: LiveWebSocket,
+    terminalId: string,
+    streamId: string,
+    reason: TerminalStreamReplacementReason,
+    attachRequestId?: string,
+  ): boolean {
+    return this.safeSend(ws, {
+      type: 'terminal.stream.changed',
+      terminalId,
+      streamId,
+      reason,
+      ...(attachRequestId ? { attachRequestId } : {}),
+    })
   }
 
   private handleReplayRetentionLoss(

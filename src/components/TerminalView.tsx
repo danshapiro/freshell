@@ -539,7 +539,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     cols: number
     rows: number
     surfaceQuarantined: boolean
-    streamId?: string
+    streamId?: string | null
   } | null>(null)
   const launchAttemptRef = useRef<LaunchAttemptState | null>(null)
   const suppressNextMatchingResizeRef = useRef<{
@@ -714,6 +714,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     cols: number
     rows: number
     surfaceQuarantined?: boolean
+    streamId?: string | null
   }) => {
     if (!terminalId || !Number.isFinite(seq)) return
     const parserAppliedSeq = Math.max(0, Math.floor(seq))
@@ -726,6 +727,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
     if (surfaceQuarantined) return
     if (!attach || attach.terminalId !== terminalId) return
+    if (typeof attach.streamId !== 'string' || attach.streamId.length === 0) return
     const checkpointInput = buildCheckpointReplayInput(terminalId, {
       cols: attach.cols,
       rows: attach.rows,
@@ -2070,7 +2072,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const messageStreamId = typeof msg.streamId === 'string' && msg.streamId.length > 0
       ? msg.streamId
       : null
-    if (!activeStreamId || messageStreamId === activeStreamId) {
+    if (activeStreamId === undefined) {
+      return true
+    }
+    if (typeof activeStreamId === 'string' && messageStreamId === activeStreamId) {
       return true
     }
 
@@ -2747,6 +2752,41 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           }
         }
 
+        if (msg.type === 'terminal.stream.changed' && msg.terminalId === tid) {
+          if (!isCurrentAttachMessage(msg)) {
+            if (debugRef.current) {
+              log.debug('Ignoring stale attach generation stream change', {
+                paneId: paneIdRef.current,
+                terminalId: msg.terminalId,
+                attachRequestId: msg.attachRequestId,
+                currentAttachRequestId: currentAttachRef.current?.requestId,
+                type: msg.type,
+              })
+            }
+            return
+          }
+
+          const nextStreamId = typeof msg.streamId === 'string' && msg.streamId.length > 0
+            ? msg.streamId
+            : null
+          const previousStreamId = getTerminalCheckpointStreamId()
+          const activeAttach = currentAttachRef.current
+          if (activeAttach?.terminalId === tid && activeAttach.requestId === msg.attachRequestId) {
+            currentAttachRef.current = {
+              ...activeAttach,
+              streamId: nextStreamId,
+            }
+          }
+          resetParserAppliedSurface(parserAppliedSeqRef.current)
+          if (nextStreamId) {
+            if (previousStreamId !== nextStreamId) {
+              updateContent({ streamId: nextStreamId })
+            }
+          } else if (previousStreamId) {
+            updateContent({ streamId: undefined })
+          }
+        }
+
         if (msg.type === 'terminal.attach.ready' && msg.terminalId === tid) {
           if (!isCurrentAttachMessage(msg)) {
             if (debugRef.current) {
@@ -2763,21 +2803,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
           const readyStreamId = typeof msg.streamId === 'string' && msg.streamId.length > 0
             ? msg.streamId
-            : undefined
-          if (readyStreamId) {
-            const previousStreamId = getTerminalCheckpointStreamId()
-            const activeAttach = currentAttachRef.current
-            if (activeAttach?.terminalId === tid && activeAttach.requestId === msg.attachRequestId) {
-              currentAttachRef.current = {
-                ...activeAttach,
-                streamId: readyStreamId,
-              }
+            : null
+          const previousStreamId = getTerminalCheckpointStreamId()
+          const activeAttach = currentAttachRef.current
+          if (activeAttach?.terminalId === tid && activeAttach.requestId === msg.attachRequestId) {
+            currentAttachRef.current = {
+              ...activeAttach,
+              streamId: readyStreamId,
             }
+          }
+          if (readyStreamId) {
             if (previousStreamId !== readyStreamId) {
               if (previousStreamId) {
                 resetParserAppliedSurface(parserAppliedSeqRef.current)
               }
               updateContent({ streamId: readyStreamId })
+            }
+          } else {
+            resetParserAppliedSurface(parserAppliedSeqRef.current)
+            if (previousStreamId) {
+              updateContent({ streamId: undefined })
             }
           }
 

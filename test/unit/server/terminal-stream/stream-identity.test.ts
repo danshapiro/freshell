@@ -23,4 +23,16 @@ describe('terminal stream identity', () => {
     expect(afterRecovery).not.toBe(initial)
     expect(afterRetentionLoss).not.toBe(afterRecovery)
   })
+
+  it('uses fixed-length opaque stream ids across replacements', () => {
+    const tracker = createTerminalStreamIdentityTracker()
+    const ids = [
+      tracker.ensureStream('term-variable-length-name'),
+      tracker.replaceStream('term-variable-length-name', 'codex_pty_recovery'),
+      tracker.replaceStream('term-variable-length-name', 'retention_lost'),
+    ]
+
+    expect(new Set(ids).size).toBe(ids.length)
+    expect(new Set(ids.map((id) => id.length)).size).toBe(1)
+  })
 })
