@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   createAttachSeqState,
   beginAttach,
+  markParserAppliedSeq,
   onAttachReady,
   onOutputFrame,
   onOutputGap,
@@ -145,6 +146,36 @@ describe('terminal-attach-seq-state', () => {
     expect(afterGap.state.knownLostRanges).toEqual([{ fromSeq: 2, toSeq: 10 }])
     expect(afterGap.surfaceSafeForDeltaReplay).toBe(false)
     expect(afterGap.requiresSurfaceQuarantine).toBe(true)
+    expect('lastSeq' in afterGap).toBe(false)
+    expect('parserAppliedSeq' in afterGap).toBe(false)
+  })
+
+  it('marks parser-applied output only after xterm acknowledgement', () => {
+    const frame = expectAcceptedFrame(onOutputFrame(createAttachSeqState(), {
+      seqStart: 1,
+      seqEnd: 3,
+    }))
+
+    const appliedToTwo = markParserAppliedSeq(frame.state, 2)
+    expect(appliedToTwo.parserAppliedSeq).toBe(2)
+    expect(appliedToTwo.highestObservedSeq).toBe(3)
+
+    const notDecreased = markParserAppliedSeq(appliedToTwo, 1)
+    expect(notDecreased.parserAppliedSeq).toBe(2)
+
+    const cappedAtObserved = markParserAppliedSeq(appliedToTwo, 9)
+    expect(cappedAtObserved.parserAppliedSeq).toBe(3)
+  })
+
+  it('does not mark parser-applied output across a known lost range', () => {
+    const frame = expectAcceptedFrame(onOutputFrame(createAttachSeqState(), {
+      seqStart: 1,
+      seqEnd: 1,
+    }))
+    const applied = markParserAppliedSeq(frame.state, 1)
+    const gap = onOutputGap(applied, { fromSeq: 2, toSeq: 10 })
+
+    expect(markParserAppliedSeq(gap.state, 10).parserAppliedSeq).toBe(1)
   })
 
   it('allows single fresh restart at seq=1 while awaitingFreshSequence', () => {

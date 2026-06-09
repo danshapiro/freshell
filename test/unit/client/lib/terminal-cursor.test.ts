@@ -5,6 +5,7 @@ import {
   getCursorMapSize,
   loadTerminalCursor,
   loadTerminalSurfaceCheckpoint,
+  saveTerminalCursor,
   saveTerminalSurfaceCheckpoint,
 } from '@/lib/terminal-cursor'
 import type { TerminalSurfaceCheckpoint } from '@/lib/terminal-surface-checkpoint'
@@ -61,6 +62,10 @@ describe('terminal-cursor', () => {
 
     saveTerminalSurfaceCheckpoint(createCheckpoint({ parserAppliedSeq: 8 }))
     expect(loadCheckpointSeq('term-1')).toBe(8)
+  })
+
+  it('uses the incompatible v2 storage namespace for checkpoint records', () => {
+    expect(TERMINAL_CURSOR_STORAGE_KEY).toBe('freshell.terminal-cursors.v2')
   })
 
   it('clears an entry when terminal exits', () => {
@@ -135,6 +140,31 @@ describe('terminal-cursor', () => {
     })).toBeNull()
   })
 
+  it('does not let legacy cursor writes mutate a trusted checkpoint', () => {
+    saveTerminalSurfaceCheckpoint(createCheckpoint({
+      terminalId: 'term-legacy-write',
+      parserAppliedSeq: 25,
+    }))
+
+    saveTerminalCursor('term-legacy-write', 100)
+
+    expect(loadTerminalCursor('term-legacy-write')).toBe(0)
+    expect(loadTerminalSurfaceCheckpoint('term-legacy-write', {
+      streamId: 'stream-1',
+      serverInstanceId: 'server-a',
+    })?.parserAppliedSeq).toBe(25)
+  })
+
+  it('does not create a trusted cursor from legacy cursor writes', () => {
+    saveTerminalCursor('term-only-legacy', 100)
+
+    expect(loadTerminalCursor('term-only-legacy')).toBe(0)
+    expect(loadTerminalSurfaceCheckpoint('term-only-legacy', {
+      streamId: null,
+      serverInstanceId: 'legacy-cursor',
+    })).toBeNull()
+  })
+
   it('does not load a persisted checkpoint for a different server instance', () => {
     saveTerminalSurfaceCheckpoint({
       terminalId: 'term-1',
@@ -157,6 +187,29 @@ describe('terminal-cursor', () => {
       streamId: 'stream-1',
       serverInstanceId: 'server-b',
     })).toBeNull()
+  })
+
+  it('does not load a persisted checkpoint when either side lacks a boot id', () => {
+    saveTerminalSurfaceCheckpoint(createCheckpoint({
+      terminalId: 'term-boot',
+      serverBootId: 'boot-a',
+      parserAppliedSeq: 25,
+    }))
+
+    expect(loadTerminalSurfaceCheckpoint('term-boot', {
+      streamId: 'stream-1',
+      serverInstanceId: 'server-a',
+    })).toBeNull()
+    expect(loadTerminalSurfaceCheckpoint('term-boot', {
+      streamId: 'stream-1',
+      serverInstanceId: 'server-a',
+      serverBootId: 'boot-b',
+    })).toBeNull()
+    expect(loadTerminalSurfaceCheckpoint('term-boot', {
+      streamId: 'stream-1',
+      serverInstanceId: 'server-a',
+      serverBootId: 'boot-a',
+    })?.parserAppliedSeq).toBe(25)
   })
 
   it('debounces localStorage persistence for rapid checkpoint updates', () => {

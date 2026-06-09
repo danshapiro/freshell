@@ -105,7 +105,7 @@ export function canUseCheckpointForDeltaReplay(
   }
   if (
     saved.serverInstanceId !== current.serverInstanceId
-    || Boolean(saved.serverBootId && current.serverBootId && saved.serverBootId !== current.serverBootId)
+    || (saved.serverBootId ?? null) !== (current.serverBootId ?? null)
   ) {
     return { ok: false, reason: 'server_changed' }
   }

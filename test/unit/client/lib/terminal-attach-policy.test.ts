@@ -54,6 +54,32 @@ describe('terminal attach policy', () => {
     })
   })
 
+  it('falls back to clearing viewport hydrate for unsafe transport reconnect', () => {
+    expect(resolveRevealAttachPlan({
+      pendingIntent: 'transport_reconnect',
+      pendingReason: 'hidden_reveal',
+      checkpointDecision: { ok: false, reason: 'parser_busy' },
+    })).toEqual({
+      intent: 'viewport_hydrate',
+      clearViewportFirst: true,
+      priority: 'foreground',
+      trustResultingSurfaceForDeltaReplay: false,
+    })
+  })
+
+  it('falls back to clearing viewport hydrate for unsafe keepalive delta', () => {
+    expect(resolveRevealAttachPlan({
+      pendingIntent: 'keepalive_delta',
+      pendingReason: 'background_catchup',
+      checkpointDecision: { ok: false, reason: 'geometry_changed' },
+    })).toEqual({
+      intent: 'viewport_hydrate',
+      clearViewportFirst: true,
+      priority: 'foreground',
+      trustResultingSurfaceForDeltaReplay: false,
+    })
+  })
+
   it('falls back to viewport hydrate when the parser-applied checkpoint is unsafe', () => {
     expect(resolveRevealAttachPlan({
       pendingIntent: 'viewport_hydrate',

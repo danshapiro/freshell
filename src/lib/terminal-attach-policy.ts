@@ -61,6 +61,18 @@ function replayHydrateTrust(
   return { trustResultingSurfaceForDeltaReplay: false }
 }
 
+function fullViewportHydratePlan(
+  input: RevealAttachPolicyInput | LegacyRevealAttachPolicyInput,
+  checkpointDecision: CheckpointDeltaReplayDecision,
+): RevealAttachPlan {
+  return {
+    intent: 'viewport_hydrate',
+    clearViewportFirst: true,
+    priority: 'foreground',
+    ...replayHydrateTrust(input, checkpointDecision),
+  }
+}
+
 export function resolveRevealAttachPlan(
   input: RevealAttachPolicyInput | LegacyRevealAttachPolicyInput,
 ): RevealAttachPlan {
@@ -68,11 +80,15 @@ export function resolveRevealAttachPlan(
   const sinceSeq = checkpointDecision.ok ? checkpointDecision.sinceSeq : undefined
 
   if (input.pendingIntent !== 'viewport_hydrate') {
+    if (!checkpointDecision.ok) {
+      return fullViewportHydratePlan(input, checkpointDecision)
+    }
+
     return {
       intent: input.pendingIntent,
       clearViewportFirst: false,
       priority: 'foreground',
-      ...(sinceSeq ? { sinceSeq } : {}),
+      sinceSeq,
     }
   }
 
@@ -88,10 +104,5 @@ export function resolveRevealAttachPlan(
     }
   }
 
-  return {
-    intent: 'viewport_hydrate',
-    clearViewportFirst: true,
-    priority: 'foreground',
-    ...replayHydrateTrust(input, checkpointDecision),
-  }
+  return fullViewportHydratePlan(input, checkpointDecision)
 }

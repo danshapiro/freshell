@@ -136,4 +136,72 @@ describe('terminal surface checkpoint', () => {
       requireParserIdle: true,
     })).toMatchObject({ ok: false, reason: 'server_changed' })
   })
+
+  it('rejects a checkpoint when only the checkpoint has a server boot id', () => {
+    const checkpoint = createTerminalSurfaceCheckpoint({
+      terminalId: 'term-1',
+      streamId: 'stream-1',
+      serverInstanceId: 'server-a',
+      serverBootId: 'boot-a',
+      surfaceEpoch: 2,
+      attachRequestId: 'attach-2',
+      parserAppliedSeq: 42,
+      cols: 120,
+      rows: 40,
+      geometryEpoch: 3,
+      geometryAuthority: 'single_client',
+      scrollback: 5000,
+      xtermVersion: '6.0.0',
+      bufferType: 'normal',
+      parserIdle: true,
+    })
+
+    expect(canUseCheckpointForDeltaReplay(checkpoint, {
+      terminalId: 'term-1',
+      streamId: 'stream-1',
+      serverInstanceId: 'server-a',
+      surfaceEpoch: 2,
+      cols: 120,
+      rows: 40,
+      geometryEpoch: 3,
+      geometryAuthority: 'single_client',
+      scrollback: 5000,
+      xtermVersion: '6.0.0',
+      requireParserIdle: true,
+    })).toMatchObject({ ok: false, reason: 'server_changed' })
+  })
+
+  it('rejects a checkpoint when only the current server has a boot id', () => {
+    const checkpoint = createTerminalSurfaceCheckpoint({
+      terminalId: 'term-1',
+      streamId: 'stream-1',
+      serverInstanceId: 'server-a',
+      surfaceEpoch: 2,
+      attachRequestId: 'attach-2',
+      parserAppliedSeq: 42,
+      cols: 120,
+      rows: 40,
+      geometryEpoch: 3,
+      geometryAuthority: 'single_client',
+      scrollback: 5000,
+      xtermVersion: '6.0.0',
+      bufferType: 'normal',
+      parserIdle: true,
+    })
+
+    expect(canUseCheckpointForDeltaReplay(checkpoint, {
+      terminalId: 'term-1',
+      streamId: 'stream-1',
+      serverInstanceId: 'server-a',
+      serverBootId: 'boot-a',
+      surfaceEpoch: 2,
+      cols: 120,
+      rows: 40,
+      geometryEpoch: 3,
+      geometryAuthority: 'single_client',
+      scrollback: 5000,
+      xtermVersion: '6.0.0',
+      requireParserIdle: true,
+    })).toMatchObject({ ok: false, reason: 'server_changed' })
+  })
 })

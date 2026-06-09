@@ -5,7 +5,7 @@ export type OutputFrameDecision =
   | { accept: true; freshReset: boolean; state: AttachSeqState }
   | { accept: false; reason: 'overlap' }
 
-export type OutputGapDecision = AttachSeqState & {
+export type OutputGapDecision = {
   state: AttachSeqState
   surfaceSafeForDeltaReplay: boolean
   requiresSurfaceQuarantine: boolean
@@ -81,7 +81,6 @@ function buildState(input: Partial<AttachSeqState>): AttachSeqState {
 
 function toGapDecision(state: AttachSeqState): OutputGapDecision {
   return {
-    ...state,
     state,
     surfaceSafeForDeltaReplay: state.surfaceSafeForDeltaReplay,
     requiresSurfaceQuarantine: state.requiresSurfaceQuarantine,
@@ -229,7 +228,13 @@ export function onOutputFrame(
 
 export function markParserAppliedSeq(state: AttachSeqState, seq: number): AttachSeqState {
   const current = createAttachSeqState(state)
-  const acknowledgedSeq = Math.min(normalizeSeq(seq), current.highestObservedSeq)
+  let acknowledgedSeq = Math.min(normalizeSeq(seq), current.highestObservedSeq)
+  for (const range of current.knownLostRanges) {
+    if (current.parserAppliedSeq < range.fromSeq && acknowledgedSeq >= range.fromSeq) {
+      acknowledgedSeq = range.fromSeq - 1
+      break
+    }
+  }
   if (acknowledgedSeq <= current.parserAppliedSeq) return current
   return buildState({
     ...current,

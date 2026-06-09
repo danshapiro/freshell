@@ -280,13 +280,7 @@ export function loadTerminalSurfaceCheckpoint(
   if (checkpoint.terminalId !== terminalId) return null
   if (checkpoint.streamId !== (identity.streamId ?? null)) return null
   if (checkpoint.serverInstanceId !== identity.serverInstanceId) return null
-  if (
-    checkpoint.serverBootId
-    && identity.serverBootId
-    && checkpoint.serverBootId !== identity.serverBootId
-  ) {
-    return null
-  }
+  if ((checkpoint.serverBootId ?? null) !== (identity.serverBootId ?? null)) return null
 
   return { ...checkpoint }
 }
@@ -296,40 +290,13 @@ export function saveTerminalSurfaceCheckpoint(input: TerminalSurfaceCheckpoint):
 }
 
 export function loadTerminalCursor(terminalId: string): number {
-  if (!terminalId) return 0
-  const map = ensureLoaded()
-  return map[terminalId]?.checkpoint.parserAppliedSeq ?? 0
+  void terminalId
+  return 0
 }
 
 export function saveTerminalCursor(terminalId: string, seq: number): void {
-  if (!terminalId) return
-  const normalizedSeq = normalizeSeq(seq)
-  if (normalizedSeq <= 0) return
-
-  const existing = ensureLoaded()[terminalId]?.checkpoint
-  const nextCheckpoint = existing
-    ? createTerminalSurfaceCheckpoint({
-        ...existing,
-        parserAppliedSeq: Math.max(existing.parserAppliedSeq, normalizedSeq),
-      })
-    : createTerminalSurfaceCheckpoint({
-        terminalId,
-        streamId: null,
-        serverInstanceId: 'legacy-cursor',
-        surfaceEpoch: 0,
-        attachRequestId: 'legacy-cursor',
-        parserAppliedSeq: normalizedSeq,
-        cols: 0,
-        rows: 0,
-        geometryEpoch: 0,
-        geometryAuthority: 'multi_client_unknown',
-        scrollback: 0,
-        xtermVersion: 'legacy-cursor',
-        bufferType: 'unknown',
-        parserIdle: false,
-      })
-
-  saveCheckpointEntry(nextCheckpoint)
+  void terminalId
+  void seq
 }
 
 export function clearTerminalCursor(terminalId: string): void {

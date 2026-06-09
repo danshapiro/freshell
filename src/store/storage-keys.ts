@@ -3,7 +3,7 @@ export const STORAGE_KEYS = {
   tabs: 'freshell.tabs.v2',
   panes: 'freshell.panes.v2',
   sessionActivity: 'freshell.sessionActivity.v2',
-  terminalCursor: 'freshell.terminal-cursors.v1',
+  terminalCursor: 'freshell.terminal-cursors.v2',
   browserPreferences: 'freshell.browser-preferences.v1',
   tabRecency: 'freshell.tab-recency.v1',
   turnCompletion: 'freshell.turn-completion.v1',
