@@ -133,6 +133,13 @@ export class ReplayRing {
 
       const previous = frames[frames.length - 1]
       if (previous && frame.seqStart === previous.seqEnd + 1) {
+        if (frame.streamId !== previous.streamId) {
+          if (frameBytes > budget && frames.length > 0) break
+          frames.push({ ...frame })
+          budget -= frameBytes
+          if (budget <= 0) break
+          continue
+        }
         const mergedCandidate: ReplayFrame = {
           ...previous,
           seqEnd: frame.seqEnd,

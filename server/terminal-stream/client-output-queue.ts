@@ -80,6 +80,7 @@ export class ClientOutputQueue {
       while (this.frames.length > 0) {
         const next = this.frames[0]
         if (next.seqStart !== merged.seqEnd + 1) break
+        if (next.streamId !== merged.streamId) break
         const mergedCandidate: ReplayFrame = {
           ...merged,
           seqEnd: next.seqEnd,

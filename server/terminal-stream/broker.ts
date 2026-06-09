@@ -6,7 +6,12 @@ import { logTerminalStreamPerfEvent, type TerminalStreamPerfEvent } from '../per
 import type { TerminalOutputRawEvent } from './registry-events.js'
 import { ClientOutputQueue, isGapEvent, type GapEvent } from './client-output-queue.js'
 import { ReplayRing, type ReplayFrame } from './replay-ring.js'
-import { measureTerminalOutputPayloadBytes, type JsonPayload } from './serialized-budget.js'
+import {
+  isTerminalStreamAttachRequestIdWithinSerializedBudget,
+  measureTerminalOutputPayloadBytes,
+  TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE,
+  type JsonPayload,
+} from './serialized-budget.js'
 import {
   createTerminalStreamIdentityTracker,
   type TerminalStreamReplacementReason,
@@ -25,7 +30,6 @@ const log = logger.child({ component: 'terminal-stream-broker' })
 const CODING_CLI_MIN_REPLAY_RING_MAX_BYTES = Number(
   process.env.CODING_CLI_MIN_REPLAY_RING_MAX_BYTES || 8 * 1024 * 1024,
 )
-const TERMINAL_STREAM_BUDGET_ATTACH_REQUEST_ID_RESERVE = 'x'.repeat(512)
 const TERMINAL_STREAM_BUDGET_SEQ_PLACEHOLDER = Number.MAX_SAFE_INTEGER
 
 type PerfLevel = 'debug' | 'info' | 'warn' | 'error'
@@ -110,9 +114,13 @@ export class TerminalStreamBroker {
     attachRequestId?: string,
     maxReplayBytes?: number,
     priority: AttachPriority = 'foreground',
-  ): Promise<'attached' | 'duplicate' | 'missing'> {
+  ): Promise<'attached' | 'duplicate' | 'missing' | 'invalid_attach_request_id'> {
+    if (!isTerminalStreamAttachRequestIdWithinSerializedBudget(attachRequestId)) {
+      return 'invalid_attach_request_id'
+    }
+
     const normalizedSinceSeq = sinceSeq === undefined || sinceSeq === 0 ? 0 : sinceSeq
-    let result: 'attached' | 'duplicate' | 'missing' = 'attached'
+    let result: 'attached' | 'duplicate' | 'missing' | 'invalid_attach_request_id' = 'attached'
 
     await this.withTerminalLock(terminalId, async () => {
       const existingState = this.terminals.get(terminalId)
@@ -453,7 +461,7 @@ export class TerminalStreamBroker {
         seqStart: TERMINAL_STREAM_BUDGET_SEQ_PLACEHOLDER,
         seqEnd: TERMINAL_STREAM_BUDGET_SEQ_PLACEHOLDER,
         data: chunk,
-        attachRequestId: TERMINAL_STREAM_BUDGET_ATTACH_REQUEST_ID_RESERVE,
+        attachRequestId: TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE,
       }),
     })
   }

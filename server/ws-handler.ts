@@ -29,6 +29,7 @@ import type {
 import type { ExtensionManager } from './extension-manager.js'
 import { allocateLocalhostPort } from './local-port.js'
 import { TerminalStreamBroker } from './terminal-stream/broker.js'
+import { isTerminalStreamAttachRequestIdWithinSerializedBudget } from './terminal-stream/serialized-budget.js'
 import { buildSidebarOpenSessionKeys, type SidebarSessionLocator } from './sidebar-session-selection.js'
 import { loadSessionHistory } from './session-history-loader.js'
 import type { SdkCreatedSession, SdkSessionState } from './sdk-bridge-types.js'
@@ -2992,6 +2993,15 @@ export class WsHandler {
       }
 
       case 'terminal.attach': {
+        if (!isTerminalStreamAttachRequestIdWithinSerializedBudget(m.attachRequestId)) {
+          this.sendError(ws, {
+            code: 'INVALID_MESSAGE',
+            message: 'attachRequestId exceeds terminal output serialized application JSON byte budget',
+            terminalId: m.terminalId,
+          })
+          return
+        }
+
         const record = this.registry.get(m.terminalId)
         if (!record) {
           recordSessionLifecycleEvent({
@@ -3035,6 +3045,14 @@ export class WsHandler {
           m.maxReplayBytes,
           m.priority ?? 'foreground',
         )
+        if (attachResult === 'invalid_attach_request_id') {
+          this.sendError(ws, {
+            code: 'INVALID_MESSAGE',
+            message: 'attachRequestId exceeds terminal output serialized application JSON byte budget',
+            terminalId: m.terminalId,
+          })
+          return
+        }
         if (attachResult === 'missing') {
           const latestRecord = this.registry.get(m.terminalId)
           if (latestRecord && latestRecord.status !== 'running') {

@@ -495,6 +495,42 @@ describe('terminal stream v2 replay', () => {
     }
   })
 
+  it('rejects attachRequestId values too large for terminal.output serialized payload budgets', async () => {
+    const { ws, close } = await createAuthenticatedConnection(port)
+    const { terminalId } = await createTerminal(ws, 'stream-long-attach-id-create')
+    const oversizedAttachRequestId = `long-${'x'.repeat(20 * 1024)}`
+
+    ws.send(JSON.stringify({
+      type: 'terminal.attach',
+      terminalId,
+      intent: 'viewport_hydrate',
+      sinceSeq: 0,
+      cols: 120,
+      rows: 40,
+      attachRequestId: oversizedAttachRequestId,
+    }))
+
+    const error = await waitForMessage(
+      ws,
+      (msg) => msg.type === 'error' && msg.code === 'INVALID_MESSAGE' && msg.terminalId === terminalId,
+    )
+    expect(error.message).toMatch(/attachRequestId/i)
+
+    const messages = await collectMessages(ws, 150)
+    expect(messages.some((msg) =>
+      msg.type === 'terminal.attach.ready'
+      && msg.terminalId === terminalId
+      && msg.attachRequestId === oversizedAttachRequestId,
+    )).toBe(false)
+    expect(messages.some((msg) =>
+      msg.type === 'terminal.output'
+      && msg.terminalId === terminalId
+      && msg.attachRequestId === oversizedAttachRequestId,
+    )).toBe(false)
+
+    await close()
+  })
+
   it('attach replay from sinceSeq emits ready first and replays an exact range above sequence 1', async () => {
     const { ws: ws1, close: close1 } = await createAuthenticatedConnection(port)
     const { terminalId } = await createTerminal(ws1, 'stream-range-create')

@@ -2,13 +2,14 @@ import { describe, expect, it } from 'vitest'
 import { ClientOutputQueue } from '../../../../server/terminal-stream/client-output-queue'
 import type { ReplayFrame } from '../../../../server/terminal-stream/replay-ring'
 
-function frame(seq: number, data: string): ReplayFrame {
+function frame(seq: number, data: string, streamId?: string): ReplayFrame {
   return {
     seqStart: seq,
     seqEnd: seq,
     data,
     bytes: Buffer.byteLength(data, 'utf8'),
     at: seq,
+    ...(streamId ? { streamId } : {}),
   }
 }
 
@@ -34,6 +35,30 @@ describe('ClientOutputQueue', () => {
       seqEnd: 2,
       data: 'hello world',
     })
+  })
+
+  it('does not coalesce adjacent frames from different stream ids', () => {
+    const queue = new ClientOutputQueue(1024)
+    queue.enqueue(frame(1, 'old', 'stream-old'))
+    queue.enqueue(frame(2, 'new', 'stream-new'))
+
+    const batch = queue.nextBatch(1024)
+    const dataFrames = batch.filter((entry): entry is ReplayFrame => entry.type !== 'gap')
+
+    expect(dataFrames).toHaveLength(2)
+    expect(dataFrames[0]).toMatchObject({
+      seqStart: 1,
+      seqEnd: 1,
+      data: 'old',
+      streamId: 'stream-old',
+    })
+    expect(dataFrames[1]).toMatchObject({
+      seqStart: 2,
+      seqEnd: 2,
+      data: 'new',
+      streamId: 'stream-new',
+    })
+    expect(queue.pendingBytes()).toBe(0)
   })
 
   it('drops oldest frames when queue overflows', () => {

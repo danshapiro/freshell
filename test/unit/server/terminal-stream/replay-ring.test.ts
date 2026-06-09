@@ -105,6 +105,37 @@ describe('ReplayRing', () => {
     })
   })
 
+  it('does not coalesce adjacent replay frames from different stream ids', () => {
+    const ring = new ReplayRing(1024)
+    ring.append('old', { streamId: 'stream-old' })
+    ring.append('new', { streamId: 'stream-new' })
+
+    const limitedBatch = ring.replayBatchSince(0, 3, 2)
+    expect(limitedBatch.frames).toHaveLength(1)
+    expect(limitedBatch.frames[0]).toMatchObject({
+      seqStart: 1,
+      seqEnd: 1,
+      data: 'old',
+      streamId: 'stream-old',
+    })
+
+    const batch = ring.replayBatchSince(0, 1024, 2)
+
+    expect(batch.frames).toHaveLength(2)
+    expect(batch.frames[0]).toMatchObject({
+      seqStart: 1,
+      seqEnd: 1,
+      data: 'old',
+      streamId: 'stream-old',
+    })
+    expect(batch.frames[1]).toMatchObject({
+      seqStart: 2,
+      seqEnd: 2,
+      data: 'new',
+      streamId: 'stream-new',
+    })
+  })
+
   it('reports replay miss when requested sequence is older than tail', () => {
     const ring = new ReplayRing(2)
     ring.append('1')
