@@ -540,6 +540,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     rows: number
     surfaceQuarantined: boolean
     streamId?: string | null
+    expectedStreamId?: string | null
   } | null>(null)
   const launchAttemptRef = useRef<LaunchAttemptState | null>(null)
   const suppressNextMatchingResizeRef = useRef<{
@@ -2130,6 +2131,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const attachRequestId = `${paneIdRef.current}:${++attachCounterRef.current}:${nanoid(6)}`
     const writeQueue = writeQueueRef.current
     const hasInFlightWrites = writeQueue?.hasInFlightWrites() === true
+    const expectedStreamId = getTerminalCheckpointStreamId()
     const checkpointDecision = getCheckpointDeltaReplayDecision(tid, { cols, rows })
     const explicitSinceSeq = typeof opts?.sinceSeq === 'number'
       ? Math.max(0, Math.floor(opts.sinceSeq))
@@ -2200,6 +2202,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       cols,
       rows,
       surfaceQuarantined,
+      expectedStreamId,
     }
     suppressNextMatchingResizeRef.current = opts?.suppressNextMatchingResize
       ? { terminalId: tid, cols, rows }
@@ -2227,6 +2230,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     applySeqState,
     clearQuarantineRepair,
     getCheckpointDeltaReplayDecision,
+    getTerminalCheckpointStreamId,
     resetParserAppliedSurface,
     scheduleQuarantineRepair,
     resetStartupProbeParser,
@@ -2806,6 +2810,30 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             : null
           const previousStreamId = getTerminalCheckpointStreamId()
           const activeAttach = currentAttachRef.current
+          const expectedStreamId = activeAttach?.expectedStreamId ?? previousStreamId
+          const incompatibleDeltaStream = activeAttach?.terminalId === tid
+            && activeAttach.requestId === msg.attachRequestId
+            && activeAttach.sinceSeq > 0
+            && typeof expectedStreamId === 'string'
+            && expectedStreamId.length > 0
+            && readyStreamId !== expectedStreamId
+          if (incompatibleDeltaStream) {
+            log.warn('Rejecting warm-delta terminal attach after stream identity changed', {
+              paneId: paneIdRef.current,
+              terminalId: tid,
+              attachRequestId: msg.attachRequestId,
+              expectedStreamId,
+              readyStreamId,
+              sinceSeq: activeAttach.sinceSeq,
+            })
+            resetParserAppliedSurface(parserAppliedSeqRef.current)
+            updateContent({ streamId: undefined })
+            attachTerminal(tid, 'viewport_hydrate', {
+              clearViewportFirst: true,
+              ...viewportHydrateReplayOptions(contentRef.current),
+            })
+            return
+          }
           if (activeAttach?.terminalId === tid && activeAttach.requestId === msg.attachRequestId) {
             currentAttachRef.current = {
               ...activeAttach,

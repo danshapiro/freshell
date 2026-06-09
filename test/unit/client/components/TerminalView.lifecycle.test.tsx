@@ -4151,8 +4151,8 @@ describe('TerminalView lifecycle updates', () => {
       })?.parserAppliedSeq).toBe(2)
     })
 
-    it('uses changed attach-ready stream id to invalidate warm delta replay eligibility', async () => {
-      const { store, tabId, terminalId } = await renderTerminalHarness({
+    it('rejects a warm-delta attach when attach-ready reports a different stream id', async () => {
+      const { store, tabId, terminalId, term } = await renderTerminalHarness({
         status: 'running',
         terminalId: 'term-stream-rotation-client',
         serverInstanceId: 'server-stream-rotation',
@@ -4201,6 +4201,7 @@ describe('TerminalView lifecycle updates', () => {
         sinceSeq: 1,
       })
 
+      term.write.mockClear()
       act(() => {
         messageHandler!({
           type: 'terminal.attach.ready',
@@ -4211,18 +4212,26 @@ describe('TerminalView lifecycle updates', () => {
           replayToSeq: 1,
           attachRequestId: warmDeltaAttach!.attachRequestId,
         })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-after-rotation',
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'STREAM B SHOULD NOT RENDER ON STREAM A SURFACE',
+          attachRequestId: warmDeltaAttach!.attachRequestId,
+        })
       })
 
       const layout = store.getState().panes.layouts[tabId]
       expect(layout.type).toBe('leaf')
       expect(layout.content.kind).toBe('terminal')
-      expect(layout.content.streamId).toBe('stream-after-rotation')
-
-      wsMocks.send.mockClear()
-      act(() => {
-        reconnectHandler?.()
-      })
-
+      expect(layout.content.streamId).toBeUndefined()
+      expect(terminalWriteStrings(term).join('')).not.toContain('STREAM B SHOULD NOT RENDER')
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-after-rotation',
+        serverInstanceId: 'server-stream-rotation',
+      })).toBeNull()
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'terminal.attach',
         terminalId,
@@ -4230,6 +4239,10 @@ describe('TerminalView lifecycle updates', () => {
         sinceSeq: 0,
         attachRequestId: expect.any(String),
       }))
+      const repairAttach = sentMessages()
+        .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+        .at(-1)
+      expect(repairAttach?.attachRequestId).not.toBe(warmDeltaAttach!.attachRequestId)
     })
 
     it('does not render or checkpoint terminal.output from a mismatched stream id', async () => {

@@ -8,6 +8,7 @@ export type BrokerClientPriority = 'foreground' | 'background'
 export type ReplayCursor = {
   nextSeq: number
   toSeq: number
+  streamId: string
 }
 
 export type BrokerClientAttachment = {

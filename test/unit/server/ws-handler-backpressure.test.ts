@@ -794,7 +794,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
-  it('does not erase retained stream-replacement boundaries when retention loss rotates the compatible suffix', async () => {
+  it('gaps old-stream retained replay and only sends output for the attach-ready stream', async () => {
     const registry = new FakeBrokerRegistry()
     registry.setReplayRingMaxBytes(9)
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
@@ -834,13 +834,22 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
       .find((payload) => payload?.type === 'terminal.attach.ready')
     const replayOutputsAfterLoss = payloadsAfterLoss
       .filter((payload) => payload?.type === 'terminal.output')
+    const replayGapsAfterLoss = payloadsAfterLoss
+      .filter((payload) => payload?.type === 'terminal.output.gap')
 
     expect(readyAfterLoss?.streamId).toEqual(expect.any(String))
     expect(readyAfterLoss.streamId).not.toBe(initialReady.streamId)
-    expect(replayOutputsAfterLoss.map((payload) => String(payload.data))).toEqual(['bbb', 'cccddd'])
-    expect(replayOutputsAfterLoss[0].streamId).toBe(initialReady.streamId)
-    expect(replayOutputsAfterLoss[1].streamId).toBe(readyAfterLoss.streamId)
-    expect(new Set(replayOutputsAfterLoss.map((payload) => payload.streamId)).size).toBe(2)
+    expect(replayGapsAfterLoss).toEqual([
+      expect.objectContaining({
+        streamId: readyAfterLoss.streamId,
+        fromSeq: 1,
+        toSeq: 2,
+        reason: 'replay_window_exceeded',
+      }),
+    ])
+    expect(replayOutputsAfterLoss.map((payload) => String(payload.data))).toEqual(['cccddd'])
+    expect(replayOutputsAfterLoss.every((payload) => payload.streamId === readyAfterLoss.streamId)).toBe(true)
+    expect(replayOutputsAfterLoss.every((payload) => payload.streamId !== initialReady.streamId)).toBe(true)
 
     broker.close()
   })

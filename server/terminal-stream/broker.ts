@@ -36,6 +36,10 @@ const TERMINAL_STREAM_BUDGET_SEQ_PLACEHOLDER = Number.MAX_SAFE_INTEGER
 type PerfLevel = 'debug' | 'info' | 'warn' | 'error'
 type AttachIntent = 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect'
 type AttachPriority = 'foreground' | 'background'
+type ReplayGapRange = {
+  fromSeq: number
+  toSeq: number
+}
 type PerfEventLogger = (
   event: TerminalStreamPerfEvent,
   context: Record<string, unknown>,
@@ -220,6 +224,10 @@ export class TerminalStreamBroker {
         }
       }
 
+      const streamFilteredReplay = this.filterReplayFramesForStream(replayFrames, streamId)
+      replayFrames = streamFilteredReplay.frames
+      const skippedReplayGaps = streamFilteredReplay.skippedGaps
+
       const replayFromSeq = replayFrames.length > 0 ? replayFrames[0].seqStart : headSeq + 1
       const replayToSeq = replayFrames.length > 0 ? replayFrames[replayFrames.length - 1].seqEnd : headSeq
 
@@ -285,10 +293,27 @@ export class TerminalStreamBroker {
         }
       }
 
+      const preReplayGapLimit = replayFrames.length > 0 ? replayFromSeq - 1 : headSeq
+      for (const gap of skippedReplayGaps) {
+        if (gap.fromSeq > preReplayGapLimit) continue
+        const fromSeq = Math.max(gap.fromSeq, attachment.lastSeq + 1)
+        const toSeq = Math.min(gap.toSeq, preReplayGapLimit)
+        if (toSeq < fromSeq) continue
+        if (!this.sendReplayGap(
+          ws,
+          terminalId,
+          fromSeq,
+          toSeq,
+          streamId,
+          attachment.activeAttachRequestId,
+        )) return
+        attachment.lastSeq = Math.max(attachment.lastSeq, toSeq)
+      }
+
       const staged = attachment.attachStaging.filter((frame) => frame.seqStart > replayToSeq)
       attachment.attachStaging = []
       attachment.replayCursor = replayFrames.length > 0
-        ? { nextSeq: replayFromSeq, toSeq: replayToSeq }
+        ? { nextSeq: replayFromSeq, toSeq: replayToSeq, streamId }
         : null
       for (const frame of staged) {
         attachment.queue.enqueue(
@@ -613,7 +638,7 @@ export class TerminalStreamBroker {
           terminalId,
           replay.missedFromSeq,
           missedToSeq,
-          this.streamIdentity.ensureStream(terminalId),
+          cursor.streamId,
           attachRequestId,
         )) return
         attachment.lastSeq = Math.max(attachment.lastSeq, missedToSeq)
@@ -621,11 +646,40 @@ export class TerminalStreamBroker {
       }
     }
 
+    let skippedGap: ReplayGapRange | null = null
+    const flushSkippedGap = (): boolean => {
+      if (!skippedGap) return true
+      const gap = skippedGap
+      skippedGap = null
+      if (!this.sendReplayGap(
+        attachment.ws,
+        terminalId,
+        gap.fromSeq,
+        gap.toSeq,
+        cursor.streamId,
+        attachRequestId,
+      )) return false
+      attachment.lastSeq = Math.max(attachment.lastSeq, gap.toSeq)
+      cursor.nextSeq = gap.toSeq + 1
+      return true
+    }
+
     for (const frame of replay.frames) {
+      if (frame.streamId !== cursor.streamId) {
+        if (!skippedGap || frame.seqStart > skippedGap.toSeq + 1) {
+          if (!flushSkippedGap()) return
+          skippedGap = { fromSeq: frame.seqStart, toSeq: frame.seqEnd }
+        } else {
+          skippedGap.toSeq = Math.max(skippedGap.toSeq, frame.seqEnd)
+        }
+        continue
+      }
+      if (!flushSkippedGap()) return
       if (!this.sendFrame(attachment.ws, terminalId, frame, attachRequestId)) return
       attachment.lastSeq = Math.max(attachment.lastSeq, frame.seqEnd)
       cursor.nextSeq = frame.seqEnd + 1
     }
+    if (!flushSkippedGap()) return
 
     if (cursor.nextSeq > cursor.toSeq || replay.frames.length === 0) {
       attachment.replayCursor = null
@@ -641,6 +695,30 @@ export class TerminalStreamBroker {
 
   private hasPendingAttachmentOutput(attachment: BrokerClientAttachment): boolean {
     return Boolean(attachment.replayCursor) || attachment.queue.pendingBytes() > 0
+  }
+
+  private filterReplayFramesForStream(
+    frames: ReplayFrame[],
+    streamId: string,
+  ): { frames: ReplayFrame[]; skippedGaps: ReplayGapRange[] } {
+    const keptFrames: ReplayFrame[] = []
+    const skippedGaps: ReplayGapRange[] = []
+
+    for (const frame of frames) {
+      if (frame.streamId === streamId) {
+        keptFrames.push(frame)
+        continue
+      }
+
+      const lastGap = skippedGaps[skippedGaps.length - 1]
+      if (!lastGap || frame.seqStart > lastGap.toSeq + 1) {
+        skippedGaps.push({ fromSeq: frame.seqStart, toSeq: frame.seqEnd })
+      } else {
+        lastGap.toSeq = Math.max(lastGap.toSeq, frame.seqEnd)
+      }
+    }
+
+    return { frames: keptFrames, skippedGaps }
   }
 
   private catastrophicBlocked(terminalId: string, attachment: BrokerClientAttachment): boolean {
