@@ -752,8 +752,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   }, [buildCheckpointReplayInput])
 
   const writeLocalXtermNotice = useCallback((term: Terminal, data: string) => {
+    const terminalInstanceId = terminalInstanceIdRef.current
     if (!shouldAllowTerminalOutputSideEffect({
-      terminalInstanceId: terminalInstanceIdRef.current,
+      terminalInstanceId,
       source: 'live',
       effect: 'local_xterm_notice',
       mode: contentRef.current?.mode,
@@ -761,10 +762,30 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       return
     }
     resetParserAppliedSurface(parserAppliedSeqRef.current)
+    const generation = currentAttachRef.current?.requestId
+    const queue = writeQueueRef.current
+    if (queue) {
+      queue.enqueue(data, undefined, { mode: 'live', generation })
+      return
+    }
+    const scope = beginTerminalOutputWriteScope({
+      terminalInstanceId,
+      source: 'live',
+      attachRequestId: generation,
+      generation: generation ?? 'local-notice',
+      suppressExternalSideEffects: false,
+    })
+    let didComplete = false
+    const complete = () => {
+      if (didComplete) return
+      didComplete = true
+      scope.complete()
+    }
     try {
-      term.writeln(data)
+      term.write(data, complete)
     } catch {
       // disposed
+      complete()
     }
   }, [resetParserAppliedSurface])
 
@@ -1532,6 +1553,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     resolvedThemeRef.current = resolvedTheme
     const terminalInstanceId = `terminal-surface:${nanoid()}`
     terminalInstanceIdRef.current = terminalInstanceId
+    const allowCurrentLinkAction = () => (
+      terminalInstanceIdRef.current === terminalInstanceId
+      && shouldAllowTerminalOutputSideEffect({
+        terminalInstanceId,
+        source: 'live',
+        effect: 'link_action',
+        mode: contentRef.current?.mode,
+      })
+    )
 
     const term = new Terminal({
       allowProposedApi: true,
@@ -1545,6 +1575,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       minimumContrastRatio: resolveMinimumContrastRatio(resolvedTheme),
       linkHandler: {
         activate: (event: MouseEvent, uri: string) => {
+          if (!allowCurrentLinkAction()) return
           if (event.button !== 0) return
           // Only open http/https URLs. Block javascript:, data:, and other
           // potentially dangerous schemes from OSC 8 links.
@@ -1556,12 +1587,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           }
         },
         hover: (_event: MouseEvent, text: string, _range: import('@xterm/xterm').IBufferRange) => {
+          if (!allowCurrentLinkAction()) return
           setHoveredUrl(paneId, text)
           if (wrapperRef.current) {
             wrapperRef.current.dataset.hoveredUrl = text
           }
         },
         leave: () => {
+          if (!allowCurrentLinkAction()) return
           clearHoveredUrl(paneId)
           if (wrapperRef.current) {
             delete wrapperRef.current.dataset.hoveredUrl
@@ -1688,24 +1721,51 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       })
       : { dispose: () => {} }
 
+    const allowCurrentTerminalAction = () => (
+      terminalInstanceIdRef.current === terminalInstanceId
+      && shouldAllowTerminalOutputSideEffect({
+        terminalInstanceId,
+        source: 'live',
+        effect: 'terminal_action',
+        mode: contentRef.current?.mode,
+      })
+    )
     const unregisterActions = registerTerminalActions(paneId, {
       copySelection: async () => {
+        if (!allowCurrentTerminalAction()) return
         const selection = term.getSelection()
-        if (selection) {
+        if (selection && allowCurrentTerminalAction()) {
           await copyText(selection)
         }
       },
       paste: async () => {
+        if (!allowCurrentTerminalAction()) return
         const text = await readText()
+        if (!allowCurrentTerminalAction()) return
         if (!text) return
         term.paste(text)
       },
-      selectAll: () => term.selectAll(),
-      clearScrollback: () => term.clear(),
-      reset: () => term.reset(),
-      scrollToBottom: () => { try { term.scrollToBottom() } catch { /* disposed */ } },
-      hasSelection: () => term.getSelection().length > 0,
-      openSearch: () => setSearchOpen(true),
+      selectAll: () => {
+        if (!allowCurrentTerminalAction()) return
+        term.selectAll()
+      },
+      clearScrollback: () => {
+        if (!allowCurrentTerminalAction()) return
+        term.clear()
+      },
+      reset: () => {
+        if (!allowCurrentTerminalAction()) return
+        term.reset()
+      },
+      scrollToBottom: () => {
+        if (!allowCurrentTerminalAction()) return
+        try { term.scrollToBottom() } catch { /* disposed */ }
+      },
+      hasSelection: () => allowCurrentTerminalAction() && term.getSelection().length > 0,
+      openSearch: () => {
+        if (!allowCurrentTerminalAction()) return
+        setSearchOpen(true)
+      },
     })
     const unregisterCaptureHandler = registerTerminalCaptureHandler(paneId, {
       suspendWebgl: () => runtimeRef.current?.suspendWebgl?.() ?? false,

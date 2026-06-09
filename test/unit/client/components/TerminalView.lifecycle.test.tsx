@@ -252,6 +252,14 @@ function createSettingsState(overrides: Record<string, unknown> = {}) {
   }
 }
 
+function terminalWriteStrings(term: { write: { mock: { calls: Array<[unknown]> } } }): string[] {
+  return term.write.mock.calls.map(([data]) => String(data))
+}
+
+function expectTerminalWriteContaining(term: { write: { mock: { calls: Array<[unknown]> } } }, text: string) {
+  expect(terminalWriteStrings(term).some((entry) => entry.includes(text))).toBe(true)
+}
+
 function withCurrentAttachRequestId<T extends { type?: string; terminalId?: string; attachRequestId?: string }>(
   msg: T & { __preserveMissingAttachRequestId?: boolean },
 ): T {
@@ -2458,8 +2466,8 @@ describe('TerminalView lifecycle updates', () => {
 
     const tab = store.getState().tabs.tabs.find((entry) => entry.id === tabId)
     expect(tab?.status).toBe('error')
-    expect(term.writeln).toHaveBeenCalledWith(expect.stringContaining('[Restore failed]'))
-    expect(term.writeln).toHaveBeenCalledWith(expect.stringContaining('execvp(3) failed.: No such file or directory'))
+    expectTerminalWriteContaining(term, '[Restore failed]')
+    expectTerminalWriteContaining(term, 'execvp(3) failed.: No such file or directory')
   })
 
   it('marks startup exit before first attach as a launch failure', async () => {
@@ -2545,9 +2553,7 @@ describe('TerminalView lifecycle updates', () => {
 
     expect(wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create')).toHaveLength(0)
     expect(store.getState().tabs.tabs.find((entry) => entry.id === tabId)?.status).toBe('error')
-    expect(term.writeln).toHaveBeenCalledWith(
-      expect.stringContaining('[Launch failed] The terminal exited before it finished starting (exit 2).'),
-    )
+    expectTerminalWriteContaining(term, '[Launch failed] The terminal exited before it finished starting (exit 2).')
   })
 
   it('marks restored terminal.create requests', async () => {
@@ -2785,8 +2791,7 @@ describe('TerminalView lifecycle updates', () => {
 
     // Verify user-facing feedback was shown
     const term = terminalInstances[0]
-    const writelnCalls = term.writeln.mock.calls.map(([s]: [string]) => s)
-    expect(writelnCalls.some((s: string) => s.includes('Terminal exited'))).toBe(true)
+    expectTerminalWriteContaining(term, 'Terminal exited')
   })
 
   it('shows feedback when Codex input is blocked by the restore identity gate', async () => {
@@ -2816,9 +2821,7 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     const term = terminalInstances[0]
-    expect(term.writeln).toHaveBeenCalledWith(
-      expect.stringContaining('Input not sent: Codex is still saving restore state. Try again in a moment.'),
-    )
+    expectTerminalWriteContaining(term, 'Input not sent: Codex is still saving restore state. Try again in a moment.')
   })
 
   it('shows feedback when Codex input is blocked by lifecycle-loss proof', async () => {
@@ -2848,9 +2851,7 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     const term = terminalInstances[0]
-    expect(term.writeln).toHaveBeenCalledWith(
-      expect.stringContaining('Input not sent: Codex is resolving a worker disconnect. Try again in a moment.'),
-    )
+    expectTerminalWriteContaining(term, 'Input not sent: Codex is resolving a worker disconnect. Try again in a moment.')
   })
 
   it('shows feedback when Codex input is blocked by clean-exit state resolution', async () => {
@@ -2880,9 +2881,7 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     const term = terminalInstances[0]
-    expect(term.writeln).toHaveBeenCalledWith(
-      expect.stringContaining('Input not sent: Codex is checking whether the session is still active. Try again in a moment.'),
-    )
+    expectTerminalWriteContaining(term, 'Input not sent: Codex is checking whether the session is still active. Try again in a moment.')
   })
 
   it('mirrors canonical durable identity to pane and tab on terminal.session.associated', async () => {
@@ -4993,7 +4992,7 @@ describe('TerminalView lifecycle updates', () => {
         .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
       expect(attach?.attachRequestId).toBeTruthy()
 
-      term.writeln.mockClear()
+      term.write.mockClear()
       messageHandler!({
         type: 'terminal.output.gap',
         terminalId,
@@ -5003,7 +5002,7 @@ describe('TerminalView lifecycle updates', () => {
         attachRequestId: attach!.attachRequestId,
       } as any)
 
-      expect(term.writeln).toHaveBeenCalledWith(expect.stringContaining('Output gap 1-50: reconnect window exceeded'))
+      expectTerminalWriteContaining(term, 'Output gap 1-50: reconnect window exceeded')
 
       wsMocks.send.mockClear()
       reconnectHandler?.()
@@ -5540,7 +5539,7 @@ describe('TerminalView lifecycle updates', () => {
       const { terminalId, term } = await renderTerminalHarness({ status: 'running', terminalId: 'term-v2-gap' })
 
       messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: 'ok' })
-      term.writeln.mockClear()
+      term.write.mockClear()
       wsMocks.send.mockClear()
 
       messageHandler!({
@@ -5551,7 +5550,7 @@ describe('TerminalView lifecycle updates', () => {
         reason: 'queue_overflow',
       })
 
-      expect(term.writeln).toHaveBeenCalledWith(expect.stringContaining('Output gap 2-5: slow link backlog'))
+      expectTerminalWriteContaining(term, 'Output gap 2-5: slow link backlog')
 
       reconnectHandler?.()
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
@@ -5561,6 +5560,70 @@ describe('TerminalView lifecycle updates', () => {
         sinceSeq: 0,
         attachRequestId: expect.any(String),
       }))
+    })
+
+    it('queues local gap notices behind a pending replay write', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-gap-notice-queued',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const submittedWrites: Array<{ data: string; onWritten?: () => void }> = []
+      term.write.mockImplementation((data: string, onWritten?: () => void) => {
+        submittedWrites.push({ data, onWritten })
+      })
+
+      const attach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'REPLAY',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      expect(submittedWrites.map((entry) => entry.data)).toEqual(['REPLAY'])
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 2,
+          toSeq: 5,
+          reason: 'queue_overflow',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      expect(term.writeln).not.toHaveBeenCalled()
+      expect(submittedWrites.map((entry) => entry.data)).toEqual(['REPLAY'])
+
+      act(() => {
+        submittedWrites[0].onWritten?.()
+      })
+
+      await waitFor(() => {
+        expect(submittedWrites.map((entry) => entry.data)).toContainEqual(
+          expect.stringContaining('Output gap 2-5: slow link backlog'),
+        )
+      })
     })
 
     it('renders replay frames after attach.ready when replay starts above 1', async () => {
@@ -5610,7 +5673,7 @@ describe('TerminalView lifecycle updates', () => {
         messageHandler!({ type: 'terminal.output', terminalId, seqStart: 13, seqEnd: 13, data: 'LIVE' })
       })
 
-      expect(term.writeln).toHaveBeenCalledWith(expect.stringContaining('Output gap 1-8: reconnect window exceeded'))
+      expectTerminalWriteContaining(term, 'Output gap 1-8: reconnect window exceeded')
       const writes = term.write.mock.calls.map(([data]: [string]) => String(data)).join('')
       expect(writes).toContain('TAIL')
       expect(writes).toContain('LIVE')

@@ -350,7 +350,7 @@ describe('settings remount scrollback hydration (e2e)', () => {
     const allWrites = terminalInstances.flatMap((instance) => instance.write.mock.calls.map(([data]) => data))
     expect(allWrites).toContain('hidden-replayed-after-settings')
     // Gap messages are written to the terminal for all gap types including replay_window_exceeded
-    const allGapLines = terminalInstances.flatMap((instance) => instance.writeln.mock.calls.map(([data]) => String(data)))
+    const allGapLines = allWrites.map((data) => String(data))
     expect(allGapLines.some((line) => line.includes('reconnect window exceeded'))).toBe(true)
   })
 
@@ -462,8 +462,7 @@ describe('settings remount scrollback hydration (e2e)', () => {
     expect(allWrites).toContain('hidden-r6')
     expect(allWrites).toContain('hidden-r8')
     expect(allWrites).toContain('hidden-live')
-    const allGapLines = terminalInstances.flatMap((instance) => instance.writeln.mock.calls.map(([data]) => String(data)))
-    expect(allGapLines.some((line) => line.includes('reconnect window exceeded'))).toBe(false)
+    expect(allWrites.some((line) => line.includes('reconnect window exceeded'))).toBe(false)
   })
 
   it('hidden remount restore sends zero attach while hidden and one viewport attach on visibility', async () => {

@@ -214,6 +214,56 @@ describe('TerminalView URL click behavior', () => {
     expect(windowOpenSpy).not.toHaveBeenCalled()
   })
 
+  it('ignores stale OSC 8 linkHandler callbacks after terminal instance replacement', async () => {
+    const store = createStore({ terminal: { ...defaultSettings.terminal, warnExternalLinks: false } })
+
+    const first = render(
+      <Provider store={store}>
+        <TerminalView tabId="tab-1" paneId="pane-1" paneContent={paneContent} hidden={false} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(terminalInstances).toHaveLength(1)
+    })
+
+    const staleHandler = getLinkHandler()
+    first.unmount()
+
+    const current = render(
+      <Provider store={store}>
+        <TerminalView tabId="tab-1" paneId="pane-1" paneContent={paneContent} hidden={false} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(terminalInstances).toHaveLength(2)
+    })
+
+    const mockRange = { start: { x: 1, y: 1 }, end: { x: 20, y: 1 } }
+    act(() => {
+      staleHandler.hover?.(new MouseEvent('mouseover'), 'https://stale.example.com', mockRange)
+      staleHandler.activate(new MouseEvent('click'), 'https://stale.example.com')
+      staleHandler.leave?.(new MouseEvent('mouseout'), 'https://stale.example.com', mockRange)
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(getHoveredUrl('pane-1')).toBeUndefined()
+    expect(store.getState().panes.layouts['tab-1'].type).toBe('leaf')
+
+    const currentHandler = getLinkHandler()
+    act(() => {
+      currentHandler.activate(new MouseEvent('click'), 'https://current.example.com')
+    })
+    await waitFor(() => {
+      expect(store.getState().panes.layouts['tab-1'].type).toBe('split')
+    })
+
+    current.unmount()
+  })
+
   it('OSC 8 linkHandler.activate with warnExternalLinks=true shows modal, confirm opens browser pane', async () => {
     const store = createStore()
 

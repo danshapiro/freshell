@@ -259,8 +259,8 @@ describe('terminal flaky-network responsiveness (e2e)', () => {
 
     flushRafQueue(rafCallbacks)
 
-    expect(terminalInstances[0].writeln).toHaveBeenCalledWith(expect.stringContaining('[Output gap 4-8'))
-    expect(terminalInstances[0].write).toHaveBeenCalled()
+    const writes = terminalInstances[0].write.mock.calls.map(([data]) => String(data))
+    expect(writes.some((line) => line.includes('[Output gap 4-8'))).toBe(true)
     await waitFor(() => {
       expect(screen.queryByText('Recovering terminal output...')).not.toBeInTheDocument()
     })
