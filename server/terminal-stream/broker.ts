@@ -54,6 +54,16 @@ const TERMINAL_FOREGROUND_REPLAY_BUFFERED_PAUSE_BYTES = Math.min(
   ),
   Math.max(1024, TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES - 1),
 )
+const CONFIGURED_REPLAY_BACKPRESSURE_LOG_RATE_LIMIT_MS = Number(
+  process.env.TERMINAL_REPLAY_BACKPRESSURE_LOG_RATE_LIMIT_MS || 1000,
+)
+const TERMINAL_REPLAY_BACKPRESSURE_LOG_RATE_LIMIT_MS = Math.max(
+  1,
+  Number.isFinite(CONFIGURED_REPLAY_BACKPRESSURE_LOG_RATE_LIMIT_MS)
+    && CONFIGURED_REPLAY_BACKPRESSURE_LOG_RATE_LIMIT_MS > 0
+    ? Math.floor(CONFIGURED_REPLAY_BACKPRESSURE_LOG_RATE_LIMIT_MS)
+    : 1000,
+)
 
 type PerfLevel = 'debug' | 'info' | 'warn' | 'error'
 type AttachIntent = 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect'
@@ -975,7 +985,10 @@ export class TerminalStreamBroker {
     if (typeof buffered !== 'number') return false
     const threshold = this.replayBufferedPauseThreshold(attachment)
     const projectedBufferedAmount = buffered + prepared.serializedApplicationJsonBytes
-    if (projectedBufferedAmount <= threshold) return false
+    if (projectedBufferedAmount <= threshold) {
+      this.resetReplayBackpressureLogState(attachment)
+      return false
+    }
     this.pauseReplayForBackpressure(terminalId, attachment, {
       bufferedAmount: buffered,
       projectedBufferedAmount,
@@ -994,7 +1007,10 @@ export class TerminalStreamBroker {
     const buffered = result.bufferedAfter
     if (typeof buffered !== 'number') return false
     const threshold = this.replayBufferedPauseThreshold(attachment)
-    if (buffered <= threshold) return false
+    if (buffered <= threshold) {
+      this.resetReplayBackpressureLogState(attachment)
+      return false
+    }
     this.pauseReplayForBackpressure(terminalId, attachment, {
       bufferedAmount: buffered,
       threshold,
@@ -1028,15 +1044,34 @@ export class TerminalStreamBroker {
     },
   ): void {
     const retryMs = this.replayBufferedPauseDelayMs(attachment)
+    const now = Date.now()
+    const lastLogAt = attachment.replayBackpressureLogLastAt
+    if (
+      typeof lastLogAt === 'number'
+      && now - lastLogAt < TERMINAL_REPLAY_BACKPRESSURE_LOG_RATE_LIMIT_MS
+    ) {
+      attachment.replayBackpressureLogSuppressed = (attachment.replayBackpressureLogSuppressed ?? 0) + 1
+      this.scheduleFlush(terminalId, attachment, retryMs)
+      return
+    }
+    const suppressedCount = attachment.replayBackpressureLogSuppressed ?? 0
+    attachment.replayBackpressureLogLastAt = now
+    attachment.replayBackpressureLogSuppressed = 0
     log.debug({
       event: 'terminal_stream_replay_backpressure_pause',
       terminalId,
       connectionId: attachment.ws.connectionId,
       priority: attachment.priority,
       retryMs,
+      ...(suppressedCount > 0 ? { suppressedCount } : {}),
       ...context,
     }, 'Terminal replay paused for websocket backpressure')
     this.scheduleFlush(terminalId, attachment, retryMs)
+  }
+
+  private resetReplayBackpressureLogState(attachment: BrokerClientAttachment): void {
+    attachment.replayBackpressureLogLastAt = undefined
+    attachment.replayBackpressureLogSuppressed = 0
   }
 
   private prepareSendPayload(payload: unknown): PreparedJsonMessage | null {

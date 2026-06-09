@@ -12,6 +12,27 @@ import {
 } from '../../../server/terminal-stream/serialized-budget'
 import { MAX_REALTIME_MESSAGE_BYTES } from '../../../shared/read-models.js'
 
+const loggerMocks = vi.hoisted(() => {
+  const logger = {
+    child: vi.fn(),
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  }
+  logger.child.mockReturnValue(logger)
+  return { logger }
+})
+
+vi.mock('../../../server/logger', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../server/logger')>()
+  return {
+    ...actual,
+    logger: loggerMocks.logger,
+    sessionLifecycleLogger: loggerMocks.logger,
+  }
+})
+
 vi.mock('node-pty', () => ({
   spawn: vi.fn(),
 }))
@@ -78,6 +99,7 @@ let originalAuthToken: string | undefined
 beforeEach(() => {
   originalAuthToken = process.env.AUTH_TOKEN
   process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
+  loggerMocks.logger.debug.mockClear()
 })
 
 afterEach(() => {
@@ -1101,6 +1123,100 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     }
 
     expect(wsReplay.bufferedAmount).toBeLessThanOrEqual(512 * 1024 + 64 * 1024)
+
+    broker.close()
+  })
+
+  it('resumes foreground replay after bufferedAmount drains and completes the retained backlog', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(4 * 1024 * 1024)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-foreground-resume')
+
+    const chunk = 'x'.repeat(2 * 1024)
+    for (let i = 1; i <= 800; i += 1) {
+      registry.emit('terminal.output.raw', {
+        terminalId: 'term-foreground-resume',
+        data: `foreground-resume-${i};${chunk}`,
+        at: Date.now(),
+      })
+    }
+
+    const wsReplay = createMockWs({ bufferedAmount: 0 })
+    wsReplay.send.mockImplementation((raw: string) => {
+      wsReplay.bufferedAmount += Buffer.byteLength(raw, 'utf8')
+    })
+
+    await broker.attach(
+      wsReplay as any,
+      'term-foreground-resume',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      'foreground-resume-attach',
+      undefined,
+      'foreground',
+    )
+
+    let outputs: any[] = []
+    for (let cycle = 0; cycle < 20; cycle += 1) {
+      for (let i = 0; i < 220; i += 1) {
+        vi.runOnlyPendingTimers()
+      }
+      outputs = wsReplay.send.mock.calls
+        .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+        .filter((payload) => payload?.type === 'terminal.output')
+      if (outputs.map((payload) => String(payload.data)).join('').includes('foreground-resume-800;')) {
+        break
+      }
+      wsReplay.bufferedAmount = 0
+    }
+
+    expect(outputs.length).toBeGreaterThan(0)
+    expect(outputs.every((payload) => payload.attachRequestId === 'foreground-resume-attach')).toBe(true)
+    expect(outputs.map((payload) => String(payload.data)).join('')).toContain('foreground-resume-800;')
+
+    broker.close()
+  })
+
+  it('rate limits foreground replay backpressure pause logs while the socket remains blocked', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(4 * 1024 * 1024)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-foreground-log-limited')
+
+    for (let i = 1; i <= 40; i += 1) {
+      registry.emit('terminal.output.raw', {
+        terminalId: 'term-foreground-log-limited',
+        data: `foreground-log-limited-${i};${'x'.repeat(2 * 1024)}`,
+        at: Date.now(),
+      })
+    }
+
+    const wsReplay = createMockWs({ bufferedAmount: 768 * 1024 })
+    await broker.attach(
+      wsReplay as any,
+      'term-foreground-log-limited',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      'foreground-log-limited-attach',
+      undefined,
+      'foreground',
+    )
+
+    for (let i = 0; i < 10; i += 1) {
+      vi.advanceTimersByTime(50)
+    }
+
+    const pauseLogs = loggerMocks.logger.debug.mock.calls.filter(([payload]) =>
+      payload
+      && typeof payload === 'object'
+      && (payload as { event?: unknown }).event === 'terminal_stream_replay_backpressure_pause'
+    )
+    expect(pauseLogs).toHaveLength(1)
 
     broker.close()
   })

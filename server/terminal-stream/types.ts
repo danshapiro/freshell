@@ -23,6 +23,8 @@ export type BrokerClientAttachment = {
   activeAttachRequestId?: string
   catastrophicSince?: number
   catastrophicClosed?: boolean
+  replayBackpressureLogLastAt?: number
+  replayBackpressureLogSuppressed?: number
 }
 
 export type BrokerTerminalState = {

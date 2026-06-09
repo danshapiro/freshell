@@ -12,11 +12,25 @@ const perfMocks = vi.hoisted(() => ({
   shouldLog: vi.fn(() => true),
 }))
 
+const loggerMocks = vi.hoisted(() => {
+  const logger = {
+    child: vi.fn(),
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  }
+  logger.child.mockReturnValue(logger)
+  return { logger }
+})
+
 vi.mock('../../../server/perf-logger', () => ({
   getPerfConfig: () => perfMocks.config,
   logPerfEvent: perfMocks.logPerfEvent,
   shouldLog: perfMocks.shouldLog,
 }))
+
+vi.mock('../../../server/logger', () => ({ logger: loggerMocks.logger }))
 
 import {
   prepareJsonMessage,
@@ -51,6 +65,7 @@ describe('ws-send', () => {
     perfMocks.logPerfEvent.mockClear()
     perfMocks.shouldLog.mockClear()
     perfMocks.shouldLog.mockReturnValue(true)
+    loggerMocks.logger.warn.mockClear()
   })
 
   it('serializes JSON once, measures serialized bytes, and reports bufferedAmount before and after send', () => {
@@ -123,6 +138,60 @@ describe('ws-send', () => {
         error: false,
       }),
       'warn',
+    )
+  })
+
+  it('logs callback errors for small sends when perf logging is disabled', () => {
+    perfMocks.config.enabled = false
+    const ws = createMockWs()
+    const error = new Error('small send failed')
+    ws.send.mockImplementation((_raw: string, cb?: (err?: Error) => void) => {
+      cb?.(error)
+    })
+
+    const result = sendJsonMessage(ws, { type: 'small.test', data: 'ok' })
+
+    expect(result.sent).toBe(true)
+    expect(loggerMocks.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        err: error,
+        connectionId: 'conn-test',
+        messageType: 'small.test',
+      }),
+      'WebSocket send callback reported failure',
+    )
+    expect(perfMocks.logPerfEvent).not.toHaveBeenCalledWith(
+      'ws_send_large',
+      expect.anything(),
+      expect.anything(),
+    )
+  })
+
+  it('logs callback errors even when large-send perf logging is rate limited', () => {
+    perfMocks.config.enabled = true
+    perfMocks.config.wsPayloadWarnBytes = 1
+    perfMocks.shouldLog.mockReturnValue(false)
+    const ws = createMockWs()
+    const error = new Error('rate limited send failed')
+    ws.send.mockImplementation((_raw: string, cb?: (err?: Error) => void) => {
+      cb?.(error)
+    })
+
+    const result = sendJsonMessage(ws, { type: 'limited.test', data: 'x'.repeat(32) })
+
+    expect(result.sent).toBe(true)
+    expect(loggerMocks.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        err: error,
+        connectionId: 'conn-test',
+        messageType: 'limited.test',
+      }),
+      'WebSocket send callback reported failure',
+    )
+    expect(perfMocks.logPerfEvent).not.toHaveBeenCalledWith(
+      'ws_send_large',
+      expect.anything(),
+      expect.anything(),
     )
   })
 

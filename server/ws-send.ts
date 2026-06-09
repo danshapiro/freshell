@@ -36,6 +36,7 @@ export type SendJsonOptions = {
 }
 
 export type SendJsonResult = {
+  /** true means ws.send returned without throwing; async callback failures are logged separately. */
   sent: boolean
   reason?: 'closed' | 'backpressure' | 'oversized' | 'serialize_error' | 'send_error'
   serializedApplicationJsonBytes?: number
@@ -161,22 +162,34 @@ export function sendPreparedJsonMessage(
   const sendStart = shouldLogSend ? process.hrtime.bigint() : null
   try {
     ws.send(prepared.serialized, (err) => {
-      if (!shouldLogSend) return
-      const sendMs = sendStart ? Number((Number(process.hrtime.bigint() - sendStart) / 1e6).toFixed(2)) : undefined
-      logPerfEvent(
-        'ws_send_large',
-        {
-          connectionId: ws.connectionId,
-          messageType: prepared.messageType,
+      const bufferedAfterCallback = readWebSocketBufferedAmount(ws)
+      if (err) {
+        log.warn({
+          err,
+          connectionId: ws.connectionId || 'unknown',
+          messageType: prepared.messageType || 'unknown',
           payloadBytes: prepared.serializedApplicationJsonBytes,
           bufferedBytes: bufferedBefore,
-          bufferedBytesAfter: readWebSocketBufferedAmount(ws),
-          serializeMs: prepared.serializeMs,
-          sendMs,
-          error: !!err,
-        },
-        'warn',
-      )
+          bufferedBytesAfter: bufferedAfterCallback,
+        }, 'WebSocket send callback reported failure')
+      }
+      if (shouldLogSend) {
+        const sendMs = sendStart ? Number((Number(process.hrtime.bigint() - sendStart) / 1e6).toFixed(2)) : undefined
+        logPerfEvent(
+          'ws_send_large',
+          {
+            connectionId: ws.connectionId,
+            messageType: prepared.messageType,
+            payloadBytes: prepared.serializedApplicationJsonBytes,
+            bufferedBytes: bufferedBefore,
+            bufferedBytesAfter: bufferedAfterCallback,
+            serializeMs: prepared.serializeMs,
+            sendMs,
+            error: !!err,
+          },
+          'warn',
+        )
+      }
     })
   } catch (error) {
     log.warn({
