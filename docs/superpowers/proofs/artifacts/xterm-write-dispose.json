@@ -1,0 +1,178 @@
+{
+  "generatedAt": "2026-06-09T01:05:38.465Z",
+  "nodeVersion": "v22.21.1",
+  "dependencies": {
+    "@xterm/xterm": "6.0.0"
+  },
+  "smallWriteOrder": [
+    {
+      "event": "after-write-alpha-returned",
+      "at": 0.155,
+      "cursorX": 0,
+      "cursorY": 0
+    },
+    {
+      "event": "after-write-beta-returned",
+      "at": 0.293,
+      "cursorX": 0,
+      "cursorY": 0
+    },
+    {
+      "event": "callback-alpha",
+      "at": 2.479,
+      "cursorX": 5,
+      "cursorY": 0
+    },
+    {
+      "event": "callback-beta",
+      "at": 2.775,
+      "cursorX": 9,
+      "cursorY": 1
+    },
+    {
+      "event": "after-50ms",
+      "at": 50.123,
+      "cursorX": 9,
+      "cursorY": 1
+    }
+  ],
+  "disposeAfterLargeWrite": {
+    "events": [
+      {
+        "event": "after-large-write-returned",
+        "at": 0.129,
+        "cursorX": 0,
+        "cursorY": 0
+      },
+      {
+        "event": "after-dispose",
+        "at": 0.225,
+        "cursorX": 0,
+        "cursorY": 0
+      },
+      {
+        "event": "large-write-callback",
+        "at": 310.032,
+        "cursorX": 80,
+        "cursorY": 29
+      },
+      {
+        "event": "after-250ms",
+        "at": 310.193,
+        "cursorX": 80,
+        "cursorY": 29
+      }
+    ],
+    "callbackAfterDispose": true
+  },
+  "disposeAfterQueuedWrites": {
+    "disposeAt": 0.382,
+    "callbackCount": 500,
+    "callbacksAfterDispose": 500,
+    "firstCallbacks": [
+      {
+        "index": 0,
+        "at": 1.738,
+        "afterDispose": true
+      },
+      {
+        "index": 1,
+        "at": 1.757,
+        "afterDispose": true
+      },
+      {
+        "index": 2,
+        "at": 1.763,
+        "afterDispose": true
+      },
+      {
+        "index": 3,
+        "at": 1.77,
+        "afterDispose": true
+      },
+      {
+        "index": 4,
+        "at": 1.774,
+        "afterDispose": true
+      },
+      {
+        "index": 5,
+        "at": 1.778,
+        "afterDispose": true
+      },
+      {
+        "index": 6,
+        "at": 1.789,
+        "afterDispose": true
+      },
+      {
+        "index": 7,
+        "at": 1.793,
+        "afterDispose": true
+      },
+      {
+        "index": 8,
+        "at": 1.796,
+        "afterDispose": true
+      },
+      {
+        "index": 9,
+        "at": 1.802,
+        "afterDispose": true
+      }
+    ],
+    "lastCallbacks": [
+      {
+        "index": 490,
+        "at": 3.19,
+        "afterDispose": true
+      },
+      {
+        "index": 491,
+        "at": 3.201,
+        "afterDispose": true
+      },
+      {
+        "index": 492,
+        "at": 3.205,
+        "afterDispose": true
+      },
+      {
+        "index": 493,
+        "at": 3.209,
+        "afterDispose": true
+      },
+      {
+        "index": 494,
+        "at": 3.212,
+        "afterDispose": true
+      },
+      {
+        "index": 495,
+        "at": 3.213,
+        "afterDispose": true
+      },
+      {
+        "index": 496,
+        "at": 3.215,
+        "afterDispose": true
+      },
+      {
+        "index": 497,
+        "at": 3.22,
+        "afterDispose": true
+      },
+      {
+        "index": 498,
+        "at": 3.222,
+        "afterDispose": true
+      },
+      {
+        "index": 499,
+        "at": 3.224,
+        "afterDispose": true
+      }
+    ],
+    "fifo": true
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "generatedAt": "2026-06-09T01:06:22.197Z",
+  "targetRawBytes": 16384,
+  "samples": [
+    {
+      "name": "plain-ascii",
+      "rawBytes": 16384,
+      "serializedBytes": 16503,
+      "jsonOverheadBytes": 119,
+      "expansionRatio": 1.007
+    },
+    {
+      "name": "ansi-sgr-repeat",
+      "rawBytes": 16384,
+      "serializedBytes": 30158,
+      "jsonOverheadBytes": 13774,
+      "expansionRatio": 1.841
+    },
+    {
+      "name": "esc-only-control",
+      "rawBytes": 16384,
+      "serializedBytes": 98423,
+      "jsonOverheadBytes": 82039,
+      "expansionRatio": 6.007
+    },
+    {
+      "name": "newline-heavy",
+      "rawBytes": 16384,
+      "serializedBytes": 24695,
+      "jsonOverheadBytes": 8311,
+      "expansionRatio": 1.507
+    },
+    {
+      "name": "quote-heavy",
+      "rawBytes": 16384,
+      "serializedBytes": 32887,
+      "jsonOverheadBytes": 16503,
+      "expansionRatio": 2.007
+    },
+    {
+      "name": "backslash-heavy",
+      "rawBytes": 16384,
+      "serializedBytes": 32887,
+      "jsonOverheadBytes": 16503,
+      "expansionRatio": 2.007
+    }
+  ]
+}

@@ -1,0 +1,89 @@
+{
+  "generatedAt": "2026-06-09T01:04:42.470Z",
+  "chromiumVersion": "145.0.7632.6",
+  "browserPid": 1211057,
+  "wsSendIntervalMs": 50,
+  "active": {
+    "before": {
+      "at": 1020.2000000178814,
+      "intervalTicks": 20,
+      "rafTicks": 61,
+      "wsReceived": 20,
+      "lastIntervalAt": 1006.9000000059605,
+      "lastRafAt": 1009.1000000238419,
+      "lastWsAt": 1013.2000000178814
+    },
+    "after": {
+      "at": 2024.300000011921,
+      "intervalTicks": 40,
+      "rafTicks": 121,
+      "wsReceived": 40,
+      "lastIntervalAt": 2007,
+      "lastRafAt": 2009,
+      "lastWsAt": 2017.2000000178814
+    },
+    "pageDelta": {
+      "elapsedMs": 1004.0999999940395,
+      "intervalTicks": 20,
+      "rafTicks": 60,
+      "wsReceived": 20
+    },
+    "serverSentDelta": 20
+  },
+  "stopped": {
+    "signal": "SIGSTOP",
+    "stoppedPids": [
+      1211057,
+      1211092,
+      1211140,
+      1211093,
+      1211229,
+      1211145
+    ],
+    "durationMs": 2002,
+    "before": {
+      "at": 2024.300000011921,
+      "intervalTicks": 40,
+      "rafTicks": 121,
+      "wsReceived": 40,
+      "lastIntervalAt": 2007,
+      "lastRafAt": 2009,
+      "lastWsAt": 2017.2000000178814
+    },
+    "afterResumeImmediate": {
+      "at": 4053,
+      "intervalTicks": 41,
+      "rafTicks": 124,
+      "wsReceived": 80,
+      "lastIntervalAt": 4050.5,
+      "lastRafAt": 4050.600000023842,
+      "lastWsAt": 4052.800000011921
+    },
+    "pageDeltaAfterResumeImmediate": {
+      "elapsedMs": 2028.699999988079,
+      "intervalTicks": 1,
+      "rafTicks": 3,
+      "wsReceived": 40
+    },
+    "serverSentWhileStopped": 40,
+    "serverSentByResumeImmediate": 40
+  },
+  "resumed": {
+    "after": {
+      "at": 5057.600000023842,
+      "intervalTicks": 62,
+      "rafTicks": 184,
+      "wsReceived": 100,
+      "lastIntervalAt": 5057,
+      "lastRafAt": 5042.300000011921,
+      "lastWsAt": 5026.5
+    },
+    "pageDeltaAfterResume": {
+      "elapsedMs": 1004.6000000238419,
+      "intervalTicks": 21,
+      "rafTicks": 60,
+      "wsReceived": 20
+    },
+    "serverSentDeltaAfterResume": 20
+  }
+}

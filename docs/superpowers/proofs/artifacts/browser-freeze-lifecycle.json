@@ -1,0 +1,103 @@
+{
+  "generatedAt": "2026-06-09T00:59:10.228Z",
+  "chromiumVersion": "145.0.7632.6",
+  "headed": true,
+  "wsSendIntervalMs": 50,
+  "active": {
+    "before": {
+      "at": 1024.800000011921,
+      "visibilityState": "visible",
+      "intervalTicks": 20,
+      "rafTicks": 50,
+      "wsReceived": 20,
+      "lastIntervalAt": 1012.1000000238419,
+      "lastRafAt": 1024,
+      "lastWsAt": 993.3000000119209
+    },
+    "after": {
+      "at": 2027,
+      "visibilityState": "visible",
+      "intervalTicks": 40,
+      "rafTicks": 110,
+      "wsReceived": 40,
+      "lastIntervalAt": 2012.1000000238419,
+      "lastRafAt": 2024.4000000059605,
+      "lastWsAt": 1995.5
+    },
+    "pageDelta": {
+      "elapsedMs": 1002.1999999880791,
+      "intervalTicks": 20,
+      "rafTicks": 60,
+      "wsReceived": 20
+    },
+    "serverSentDelta": 20
+  },
+  "frozen": {
+    "stateCommand": "Page.setWebLifecycleState({ state: 'frozen' })",
+    "durationMs": 3008,
+    "before": {
+      "at": 2027,
+      "visibilityState": "visible",
+      "intervalTicks": 40,
+      "rafTicks": 110,
+      "wsReceived": 40,
+      "lastIntervalAt": 2012.1000000238419,
+      "lastRafAt": 2024.4000000059605,
+      "lastWsAt": 1995.5
+    },
+    "evalStatus": "returned",
+    "evalSnapshot": {
+      "at": 4029.9000000059605,
+      "visibilityState": "visible",
+      "intervalTicks": 80,
+      "rafTicks": 230,
+      "wsReceived": 80,
+      "lastIntervalAt": 4012.100000023842,
+      "lastRafAt": 4024.100000023842,
+      "lastWsAt": 4002.7000000178814
+    },
+    "pageDeltaIfEvalReturned": {
+      "elapsedMs": 2002.9000000059605,
+      "intervalTicks": 40,
+      "rafTicks": 120,
+      "wsReceived": 40
+    },
+    "serverSentDelta": 40
+  },
+  "resumed": {
+    "immediate": {
+      "at": 4032,
+      "visibilityState": "visible",
+      "intervalTicks": 80,
+      "rafTicks": 230,
+      "wsReceived": 80,
+      "lastIntervalAt": 4012.100000023842,
+      "lastRafAt": 4024.100000023842,
+      "lastWsAt": 4002.7000000178814
+    },
+    "after": {
+      "at": 5034.800000011921,
+      "visibilityState": "visible",
+      "intervalTicks": 100,
+      "rafTicks": 290,
+      "wsReceived": 100,
+      "lastIntervalAt": 5012.100000023842,
+      "lastRafAt": 5024.100000023842,
+      "lastWsAt": 5003.800000011921
+    },
+    "immediateDeltaFromFreezeStart": {
+      "elapsedMs": 2005,
+      "intervalTicks": 40,
+      "rafTicks": 120,
+      "wsReceived": 40
+    },
+    "pageDeltaAfterResume": {
+      "elapsedMs": 1002.8000000119209,
+      "intervalTicks": 20,
+      "rafTicks": 60,
+      "wsReceived": 20
+    },
+    "serverSentDeltaImmediate": 40,
+    "serverSentDeltaAfterResume": 20
+  }
+}

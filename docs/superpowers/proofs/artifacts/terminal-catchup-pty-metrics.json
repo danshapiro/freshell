@@ -1,0 +1,718 @@
+{
+  "generatedAt": "2026-06-09T00:56:47.470Z",
+  "repoRoot": "/home/dan/code/freshell/.worktrees/proof-terminal-catchup-architecture",
+  "nodeVersion": "v22.21.1",
+  "terminalStreamBatchMaxBytes": 16384,
+  "dependencies": {
+    "@xterm/xterm": "6.0.0",
+    "ws": "8.19.0",
+    "node-pty": "1.2.0-beta.11"
+  },
+  "results": [
+    {
+      "scenario": "codex-version",
+      "command": "codex --version; printf '\\nFRESHELL_PROOF_DONE:%s:%s\\n' 'codex-version' '1'",
+      "terminalId": "FXO8Qf8fVAUZToVgC8dQe",
+      "durationMs": 658,
+      "raw": {
+        "chunks": 6,
+        "bytes": 613,
+        "bytesPerSecond": 932,
+        "previewStartJsonEscaped": "codex --version; printf '\\nFRESHELL_PROOF_DONE:%s:%s\\n' 'codex-version' '1'\r\n\u001b[?2004h\u001b]0;dan@DANDESKTOP: ~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u0007\u001b[01;32mdan@DANDESKTOP\u001b[00m:\u001b[01;34m~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u001b[00m$ codex --version; printf '\\nFRESHELL_PROOF_DONE:%s:%s\\n' 'codex-version' '1'\r\n\u001b[?2004l\rcodex-cli 0.137.0\r\n\r\nFRESHELL_PROOF_DONE:codex-version:1\r\n\u001b[?2004h\u001b]0;dan@DANDESKTOP: ~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u0007\u001b[01;32mdan@DANDESKTOP\u001b[00m:\u001b[01;34m~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u001b[00m$ ",
+        "previewEndJsonEscaped": "codex --version; printf '\\nFRESHELL_PROOF_DONE:%s:%s\\n' 'codex-version' '1'\r\n\u001b[?2004h\u001b]0;dan@DANDESKTOP: ~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u0007\u001b[01;32mdan@DANDESKTOP\u001b[00m:\u001b[01;34m~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u001b[00m$ codex --version; printf '\\nFRESHELL_PROOF_DONE:%s:%s\\n' 'codex-version' '1'\r\n\u001b[?2004l\rcodex-cli 0.137.0\r\n\r\nFRESHELL_PROOF_DONE:codex-version:1\r\n\u001b[?2004h\u001b]0;dan@DANDESKTOP: ~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u0007\u001b[01;32mdan@DANDESKTOP\u001b[00m:\u001b[01;34m~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u001b[00m$ ",
+        "chunkBytes": {
+          "min": 19,
+          "p50": 77,
+          "p90": 196,
+          "p95": 196,
+          "p99": 196,
+          "max": 196
+        },
+        "interarrivalMs": {
+          "min": 0,
+          "p50": 8,
+          "p90": 347,
+          "p95": 347,
+          "p99": 347,
+          "max": 347
+        },
+        "burstGroupsUnder10ms": {
+          "count": 3,
+          "chunks": {
+            "min": 1,
+            "p50": 2,
+            "p90": 3,
+            "p95": 3,
+            "p99": 3,
+            "max": 3
+          },
+          "bytes": {
+            "min": 77,
+            "p50": 254,
+            "p90": 282,
+            "p95": 282,
+            "p99": 282,
+            "max": 282
+          },
+          "durationMs": {
+            "min": 0,
+            "p50": 1,
+            "p90": 8,
+            "p95": 8,
+            "p99": 8,
+            "max": 8
+          }
+        }
+      },
+      "broker": {
+        "sentMessages": 8,
+        "outputMessages": 5,
+        "replayOutputMessages": 1,
+        "outputSerializedBytes": {
+          "min": 159,
+          "p50": 412,
+          "p90": 841,
+          "p95": 841,
+          "p99": 841,
+          "max": 841
+        },
+        "maxSerializedBytes": 841,
+        "maxRawDataBytesInOutputMessage": 613,
+        "sequenceRanges": [
+          {
+            "attachRequestId": "codex-version-attach",
+            "seqStart": 1,
+            "seqEnd": 1,
+            "dataBytes": 77
+          },
+          {
+            "attachRequestId": "codex-version-attach",
+            "seqStart": 2,
+            "seqEnd": 3,
+            "dataBytes": 282
+          },
+          {
+            "attachRequestId": "codex-version-attach",
+            "seqStart": 4,
+            "seqEnd": 4,
+            "dataBytes": 19
+          },
+          {
+            "attachRequestId": "codex-version-attach",
+            "seqStart": 5,
+            "seqEnd": 6,
+            "dataBytes": 235
+          },
+          {
+            "attachRequestId": "codex-version-replay",
+            "seqStart": 1,
+            "seqEnd": 6,
+            "dataBytes": 613
+          }
+        ]
+      },
+      "scanner": {
+        "scannerFrameCount": 6,
+        "conservativeBatchCount": 3,
+        "barrierFrameCount": 2,
+        "sideEffectBarrierFrameCount": 2,
+        "replacementFrameCount": 0,
+        "pendingEndStateCount": 0,
+        "finalState": "ground"
+      },
+      "ratios": {
+        "rawChunksPerLiveOutputMessage": 1.2,
+        "rawChunksPerReplayOutputMessage": 6,
+        "rawChunksPerConservativeScannerBatch": 2
+      }
+    },
+    {
+      "scenario": "codex-help",
+      "command": "codex exec --help; printf '\\nFRESHELL_PROOF_DONE:%s:%s\\n' 'codex-help' '1'",
+      "terminalId": "cptMLKlrWJZwJt4Zr1IVL",
+      "durationMs": 667,
+      "raw": {
+        "chunks": 7,
+        "bytes": 4686,
+        "bytesPerSecond": 7025,
+        "previewStartJsonEscaped": "codex exec --help; printf '\\nFRESHELL_PROOF_DONE:%s:%s\\n' 'codex-help' '1'\r\n\u001b[?2004h\u001b]0;dan@DANDESKTOP: ~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u0007\u001b[01;32mdan@DANDESKTOP\u001b[00m:\u001b[01;34m~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u001b[00m$ codex exec --help; printf '\\nFRESHELL_PROOF_DONE:%s:%s\\n' 'codex-help' '1'\r\n\u001b[?2004l\rRun Codex non-interactively\r\n\r\n\u001b[1m\u001b[4mUsage:\u001b[0m codex exec [OPTIONS] [PROMPT]\r\n       codex exec [OPTIONS] <COMMAND> [ARGS]\r\n\r\n\u001b[1m\u001b[4mCommands:\u001b[0m\r\n  \u001b[1mresume\u001b[0m  Resume a previous session by id or pick the most recent with --last\r\n  \u001b[1mreview\u001b[0m  Run a code review against the current repository\r\n  \u001b[1mhelp\u001b[0m    Print this message or the help of the given subcommand(s)\r\n\r\n\u001b[1m\u001b[4mArguments:\u001b[0m\r\n  [PROMPT]\r\n          Initial instructions for the agent. If not provided as an argument (or if `-` is used), instructions are read\r\n          from stdin. If stdin is piped and a prompt is also provided, stdin is appended as a `<stdin>` block\r\n\r\n\u001b[1m\u001b[4mOptions:\u001b[0m\r\n  \u001b[1m-c\u001b[0m, \u001b[1m--config\u001b[0m <key=value>\r\n          Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`. Use a dotted path\r\n          (`foo.bar.baz`) to override nested values. The `value` portion is parsed as TOML. If it fails to parse as\r\n          TOML, the raw string is used as a literal.\r\n          \r\n          Examples: - `-c model=\"o3\"` - `-c 'sandbox_permissions=[\"disk-full-read-access\"]'` - `-c\r\n          shell_environment_policy.inherit=all`\r\n\r\n      \u001b[1m--enable\u001b[0m <FEATURE>\r\n          Enable a feature (repea",
+        "previewEndJsonEscaped": "vocation. DANGEROUS. Intended only for\r\n          automation that already vets hook sources\r\n\r\n  \u001b[1m-C\u001b[0m, \u001b[1m--cd\u001b[0m <DIR>\r\n          Tell the agent to use the specified directory as its working root\r\n\r\n      \u001b[1m--add-dir\u001b[0m <DIR>\r\n          Additional directories that should be writable alongside the primary workspace\r\n\r\n      \u001b[1m--skip-git-repo-check\u001b[0m\r\n          Allow running Codex outside a Git repository\r\n\r\n      \u001b[1m--ephemeral\u001b[0m\r\n          Run without persisting session files to disk\r\n\r\n      \u001b[1m--ignore-user-config\u001b[0m\r\n          Do not load `$CODEX_HOME/config.toml`; auth still uses `CODEX_HOME`\r\n\r\n      \u001b[1m--ignore-rules\u001b[0m\r\n          Do not load user or project execpolicy `.rules` files\r\n\r\n      \u001b[1m--output-schema\u001b[0m <FILE>\r\n          Path to a JSON Schema file describing the model's final response shape\r\n\r\n      \u001b[1m--color\u001b[0m <COLOR>\r\n          Specifies color settings for use in the output\r\n          \r\n          [default: auto]\r\n          [possible values: always, never, auto]\r\n\r\n      \u001b[1m--json\u001b[0m\r\n          Print events to stdout as JSONL\r\n\r\n  \u001b[1m-o\u001b[0m, \u001b[1m--output-last-message\u001b[0m <FILE>\r\n          Specifies file where the last message from the agent should be written\r\n\r\n  \u001b[1m-h\u001b[0m, \u001b[1m--help\u001b[0m\r\n          Print help (see a summary with '-h')\r\n\r\n  \u001b[1m-V\u001b[0m, \u001b[1m--version\u001b[0m\r\n          Print version\r\n\r\nFRESHELL_PROOF_DONE:codex-help:1\r\n\u001b[?2004h\u001b]0;dan@DANDESKTOP: ~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u0007\u001b[01;32mdan@DANDESKTOP\u001b[00m:\u001b[01;34m~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u001b[00m$ ",
+        "chunkBytes": {
+          "min": 36,
+          "p50": 196,
+          "p90": 3823,
+          "p95": 3823,
+          "p99": 3823,
+          "max": 3823
+        },
+        "interarrivalMs": {
+          "min": 0,
+          "p50": 0,
+          "p90": 361,
+          "p95": 361,
+          "p99": 361,
+          "max": 361
+        },
+        "burstGroupsUnder10ms": {
+          "count": 3,
+          "chunks": {
+            "min": 1,
+            "p50": 2,
+            "p90": 4,
+            "p95": 4,
+            "p99": 4,
+            "max": 4
+          },
+          "bytes": {
+            "min": 76,
+            "p50": 281,
+            "p90": 4329,
+            "p95": 4329,
+            "p99": 4329,
+            "max": 4329
+          },
+          "durationMs": {
+            "min": 0,
+            "p50": 0,
+            "p90": 8,
+            "p95": 8,
+            "p99": 8,
+            "max": 8
+          }
+        }
+      },
+      "broker": {
+        "sentMessages": 8,
+        "outputMessages": 5,
+        "replayOutputMessages": 1,
+        "outputSerializedBytes": {
+          "min": 215,
+          "p50": 461,
+          "p90": 5533,
+          "p95": 5533,
+          "p99": 5533,
+          "max": 5533
+        },
+        "maxSerializedBytes": 5533,
+        "maxRawDataBytesInOutputMessage": 4686,
+        "sequenceRanges": [
+          {
+            "attachRequestId": "codex-help-attach",
+            "seqStart": 1,
+            "seqEnd": 1,
+            "dataBytes": 76
+          },
+          {
+            "attachRequestId": "codex-help-attach",
+            "seqStart": 2,
+            "seqEnd": 3,
+            "dataBytes": 281
+          },
+          {
+            "attachRequestId": "codex-help-attach",
+            "seqStart": 4,
+            "seqEnd": 5,
+            "dataBytes": 4097
+          },
+          {
+            "attachRequestId": "codex-help-attach",
+            "seqStart": 6,
+            "seqEnd": 7,
+            "dataBytes": 232
+          },
+          {
+            "attachRequestId": "codex-help-replay",
+            "seqStart": 1,
+            "seqEnd": 7,
+            "dataBytes": 4686
+          }
+        ]
+      },
+      "scanner": {
+        "scannerFrameCount": 7,
+        "conservativeBatchCount": 3,
+        "barrierFrameCount": 2,
+        "sideEffectBarrierFrameCount": 2,
+        "replacementFrameCount": 0,
+        "pendingEndStateCount": 0,
+        "finalState": "ground"
+      },
+      "ratios": {
+        "rawChunksPerLiveOutputMessage": 1.4,
+        "rawChunksPerReplayOutputMessage": 7,
+        "rawChunksPerConservativeScannerBatch": 2.333
+      }
+    },
+    {
+      "scenario": "codex-real-turn",
+      "command": "codex exec --ephemeral --color always --sandbox read-only --cd /tmp --skip-git-repo-check \"Print exactly 40 numbered lines, each line beginning proof-line-, and do not run shell commands.\"; printf '\\nFRESHELL_PROOF_DONE:%s:%s\\n' 'codex-real-turn' '40'",
+      "terminalId": "UyLO2yOWLvGow2BLbne9Q",
+      "durationMs": 16727,
+      "raw": {
+        "chunks": 15,
+        "bytes": 2000,
+        "bytesPerSecond": 120,
+        "previewStartJsonEscaped": "codex exec --ephemeral --color always --sandbox read-only --cd /tmp --skip-git-repo-check \"Print exactly 40 numbered lines, each line beginning proof-line-, and do not run shell commands.\"; printf '\\nFRESHELL_PROOF_DONE:%s:%s\\n' 'codex-real-turn' '40'\r\n\u001b[?2004h\u001b]0;dan@DANDESKTOP: ~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u0007\u001b[01;32mdan@DANDESKTOP\u001b[00m:\u001b[01;34m~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u001b[00m$ codex exec --ephemeral --color always --sandbox read-only --cd /tmp --skip-git-repo-check \"Print exactly 40 numbered lines, each line beginning proof-line-, and do not run shell commands.\"; printf '\\nFRESHELL_PROOF_DONE:%s:%s\\n' 'codex-real-turn' '40'\r\n\u001b[?2004l\rOpenAI Codex v0.137.0\r\n--------\r\n\u001b[1mworkdir:\u001b[0m /tmp\r\n\u001b[1mmodel:\u001b[0m gpt-5.5\r\n\u001b[1mprovider:\u001b[0m openai\r\n\u001b[1mapproval:\u001b[0m never\r\n\u001b[1msandbox:\u001b[0m read-only\r\n\u001b[1mreasoning effort:\u001b[0m xhigh\r\n\u001b[1mreasoning summaries:\u001b[0m none\r\n\u001b[1msession id:\u001b[0m 019ea9e1-720f-7aa2-b6f9-1f624ab4403f\r\n--------\r\n\u001b[36muser\u001b[0m\r\nPrint exactly 40 numbered lines, each line beginning proof-line-, and do not run shell commands.\r\n\u001b[35m\u001b[3mcodex\u001b[0m\u001b[0m\r\nproof-line-1\r\nproof-line-2\r\nproof-line-3\r\nproof-line-4\r\nproof-line-5\r\nproof-line-6\r\nproof-line-7\r\nproof-line-8\r\nproof-line-9\r\nproof-line-10\r\nproof-line-11\r\nproof-line-12\r\nproof-line-13\r\nproof-line-14\r\nproof-line-15\r\nproof-line-16\r\nproof-line-17\r\nproof-line-18\r\nproof-line-19\r\nproof-line-20\r\nproof-line-21\r\nproof-line-22\r\nproof-line-23\r\nproof-line-24\r\nproof-line-25\r\nproof-line-26\r\nproof-line-27\r\nproof-line-28\r\nproof-line-29\r\nproof-line-30\r\nproof-line-31\r\np",
+        "previewEndJsonEscaped": "ktrees/proof-terminal-catchup-architecture\u001b[00m$ codex exec --ephemeral --color always --sandbox read-only --cd /tmp --skip-git-repo-check \"Print exactly 40 numbered lines, each line beginning proof-line-, and do not run shell commands.\"; printf '\\nFRESHELL_PROOF_DONE:%s:%s\\n' 'codex-real-turn' '40'\r\n\u001b[?2004l\rOpenAI Codex v0.137.0\r\n--------\r\n\u001b[1mworkdir:\u001b[0m /tmp\r\n\u001b[1mmodel:\u001b[0m gpt-5.5\r\n\u001b[1mprovider:\u001b[0m openai\r\n\u001b[1mapproval:\u001b[0m never\r\n\u001b[1msandbox:\u001b[0m read-only\r\n\u001b[1mreasoning effort:\u001b[0m xhigh\r\n\u001b[1mreasoning summaries:\u001b[0m none\r\n\u001b[1msession id:\u001b[0m 019ea9e1-720f-7aa2-b6f9-1f624ab4403f\r\n--------\r\n\u001b[36muser\u001b[0m\r\nPrint exactly 40 numbered lines, each line beginning proof-line-, and do not run shell commands.\r\n\u001b[35m\u001b[3mcodex\u001b[0m\u001b[0m\r\nproof-line-1\r\nproof-line-2\r\nproof-line-3\r\nproof-line-4\r\nproof-line-5\r\nproof-line-6\r\nproof-line-7\r\nproof-line-8\r\nproof-line-9\r\nproof-line-10\r\nproof-line-11\r\nproof-line-12\r\nproof-line-13\r\nproof-line-14\r\nproof-line-15\r\nproof-line-16\r\nproof-line-17\r\nproof-line-18\r\nproof-line-19\r\nproof-line-20\r\nproof-line-21\r\nproof-line-22\r\nproof-line-23\r\nproof-line-24\r\nproof-line-25\r\nproof-line-26\r\nproof-line-27\r\nproof-line-28\r\nproof-line-29\r\nproof-line-30\r\nproof-line-31\r\nproof-line-32\r\nproof-line-33\r\nproof-line-34\r\nproof-line-35\r\nproof-line-36\r\nproof-line-37\r\nproof-line-38\r\nproof-line-39\r\nproof-line-40\r\n\u001b[2mtokens used\u001b[0m\r\n4,139\r\n\r\nFRESHELL_PROOF_DONE:codex-real-turn:40\r\n\u001b[?2004h\u001b]0;dan@DANDESKTOP: ~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u0007\u001b[01;32mdan@DANDESKTOP\u001b[00m:\u001b[01;34m~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u001b[00m$ ",
+        "chunkBytes": {
+          "min": 2,
+          "p50": 52,
+          "p90": 262,
+          "p95": 615,
+          "p99": 615,
+          "max": 615
+        },
+        "interarrivalMs": {
+          "min": 0,
+          "p50": 0,
+          "p90": 856,
+          "p95": 14978,
+          "p99": 14978,
+          "max": 14978
+        },
+        "burstGroupsUnder10ms": {
+          "count": 6,
+          "chunks": {
+            "min": 1,
+            "p50": 1,
+            "p90": 8,
+            "p95": 8,
+            "p99": 8,
+            "max": 8
+          },
+          "bytes": {
+            "min": 28,
+            "p50": 253,
+            "p90": 615,
+            "p95": 615,
+            "p99": 615,
+            "max": 615
+          },
+          "durationMs": {
+            "min": 0,
+            "p50": 0,
+            "p90": 1,
+            "p95": 1,
+            "p99": 1,
+            "max": 1
+          }
+        }
+      },
+      "broker": {
+        "sentMessages": 10,
+        "outputMessages": 7,
+        "replayOutputMessages": 1,
+        "outputSerializedBytes": {
+          "min": 184,
+          "p50": 645,
+          "p90": 2465,
+          "p95": 2465,
+          "p99": 2465,
+          "max": 2465
+        },
+        "maxSerializedBytes": 2465,
+        "maxRawDataBytesInOutputMessage": 2000,
+        "sequenceRanges": [
+          {
+            "attachRequestId": "codex-real-turn-attach",
+            "seqStart": 1,
+            "seqEnd": 1,
+            "dataBytes": 253
+          },
+          {
+            "attachRequestId": "codex-real-turn-attach",
+            "seqStart": 2,
+            "seqEnd": 3,
+            "dataBytes": 458
+          },
+          {
+            "attachRequestId": "codex-real-turn-attach",
+            "seqStart": 4,
+            "seqEnd": 11,
+            "dataBytes": 408
+          },
+          {
+            "attachRequestId": "codex-real-turn-attach",
+            "seqStart": 12,
+            "seqEnd": 12,
+            "dataBytes": 615
+          },
+          {
+            "attachRequestId": "codex-real-turn-attach",
+            "seqStart": 13,
+            "seqEnd": 13,
+            "dataBytes": 28
+          },
+          {
+            "attachRequestId": "codex-real-turn-attach",
+            "seqStart": 14,
+            "seqEnd": 15,
+            "dataBytes": 238
+          },
+          {
+            "attachRequestId": "codex-real-turn-replay",
+            "seqStart": 1,
+            "seqEnd": 15,
+            "dataBytes": 2000
+          }
+        ]
+      },
+      "scanner": {
+        "scannerFrameCount": 15,
+        "conservativeBatchCount": 8,
+        "barrierFrameCount": 7,
+        "sideEffectBarrierFrameCount": 2,
+        "replacementFrameCount": 0,
+        "pendingEndStateCount": 3,
+        "finalState": "ground"
+      },
+      "ratios": {
+        "rawChunksPerLiveOutputMessage": 2.143,
+        "rawChunksPerReplayOutputMessage": 15,
+        "rawChunksPerConservativeScannerBatch": 1.875
+      }
+    },
+    {
+      "scenario": "agent-burst-12000",
+      "command": "node scripts/proofs/terminal-catchup-agent-output-generator.mjs agent-burst 12000",
+      "terminalId": "hXOtvh0cTEEHXpaJK_vf2",
+      "durationMs": 1248,
+      "raw": {
+        "chunks": 3239,
+        "bytes": 776745,
+        "bytesPerSecond": 622392,
+        "previewStartJsonEscaped": "node scripts/proofs/terminal-catchup-agent-output-generator.mjs agent-burst 12000\r\n\u001b[?2004h\u001b]0;dan@DANDESKTOP: ~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u0007\u001b[01;32mdan@DANDESKTOP\u001b[00m:\u001b[01;34m~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u001b[00m$ node scripts/proofs/terminal-catchup-agent-output-generator.mjs agent-burst 12000\r\n\u001b[?2004l\r\u001b]0;Freshell proof agent burst\u0007\u001b[?25l\u001b[38;5;39mthinking\u001b[0m 00001 scanning repository\r\u001b[2K\r[\u001b[32mok\u001b[0m] 00001 edit src/example-1.ts chunk=1 tokens=1001\r\n[\u001b[32mok\u001b[0m] 00002 edit src/example-2.ts chunk=2 tokens=1002\r\n[\u001b[32mok\u001b[0m] 00003 edit src/example-3.ts chunk=3 tokens=1003\r\n[\u001b[32mok\u001b[0m] 00004 edit src/example-4.ts chunk=4 tokens=1004\r\n[\u001b[32mok\u001b[0m] 00005 edit src/example-5.ts chunk=5 tokens=1005\r\n[\u001b[32mok\u001b[0m] 00006 edit src/example-6.ts chunk=6 tokens=1006\r\n[\u001b[32mok\u001b[0m] 00007 edit src/example-7.ts chunk=7 tokens=1007\r\n[\u001b[32mok\u001b[0m] 00008 edit src/example-8.ts chunk=8 tokens=1008\r\n[\u001b[32mok\u001b[0m] 00009 edit src/example-9.ts chunk=9 tokens=1009\r\n[\u001b[32mok\u001b[0m] 00010 edit src/example-10.ts chunk=10 tokens=1010\r\n[\u001b[32mok\u001b[0m] 00011 edit src/example-11.ts chunk=0 tokens=1011\r\n[\u001b[32mok\u001b[0m] 00012 edit src/example-12.ts chunk=1 tokens=1012\r\n[\u001b[32mok\u001b[0m] 00013 edit src/example-13.ts chunk=2 tokens=1013\r\n[\u001b[32mok\u001b[0m] 00014 edit src/example-14.ts chunk=3 tokens=1014\r\n[\u001b[32mok\u001b[0m] 00015 edit src/example-15.ts chunk=4 tokens=1015\r\n[\u001b[32mok\u001b[0m] 00016 edit src/example-16.ts chunk=5 tokens=1016\r\n[\u001b[33mwarn\u001b[0m] 00017 edit src/example-17.ts chunk=6 tokens=1017\r\n[\u001b[32mok\u001b[0m] 00018 edit src/example-18.ts chunk=7 token",
+        "previewEndJsonEscaped": "[\u001b[32mok\u001b[0m] 11980 edit src/example-20.ts chunk=1 tokens=12980\r\n[\u001b[32mok\u001b[0m] 11981 edit src/example-21.ts chunk=2 tokens=12981\r\n[\u001b[32mok\u001b[0m] 11982 edit src/example-22.ts chunk=3 tokens=12982\r\n[\u001b[32mok\u001b[0m] 11983 edit src/example-0.ts chunk=4 tokens=12983\r\n[\u001b[32mok\u001b[0m] 11984 edit src/example-1.ts chunk=5 tokens=12984\r\n[\u001b[33mwarn\u001b[0m] 11985 edit src/example-2.ts chunk=6 tokens=12985\r\n[\u001b[32mok\u001b[0m] 11986 edit src/example-3.ts chunk=7 tokens=12986\r\n[\u001b[32mok\u001b[0m] 11987 edit src/example-4.ts chunk=8 tokens=12987\r\n[\u001b[32mok\u001b[0m] 11988 edit src/example-5.ts chunk=9 tokens=12988\r\n[\u001b[32mok\u001b[0m] 11989 edit src/example-6.ts chunk=10 tokens=12989\r\n[\u001b[32mok\u001b[0m] 11990 edit src/example-7.ts chunk=0 tokens=12990\r\n[\u001b[32mok\u001b[0m] 11991 edit src/example-8.ts chunk=1 tokens=12991\r\n[\u001b[32mok\u001b[0m] 11992 edit src/example-9.ts chunk=2 tokens=12992\r\n[\u001b[32mok\u001b[0m] 11993 edit src/example-10.ts chunk=3 tokens=12993\r\n[\u001b[32mok\u001b[0m] 11994 edit src/example-11.ts chunk=4 tokens=12994\r\n[\u001b[32mok\u001b[0m] 11995 edit src/example-12.ts chunk=5 tokens=12995\r\n[\u001b[32mok\u001b[0m] 11996 edit src/example-13.ts chunk=6 tokens=12996\r\n[\u001b[32mok\u001b[0m] 11997 edit src/example-14.ts chunk=7 tokens=12997\r\n[\u001b[32mok\u001b[0m] 11998 edit src/example-15.ts chunk=8 tokens=12998\r\n[\u001b[32mok\u001b[0m] 11999 edit src/example-16.ts chunk=9 tokens=12999\r\n[\u001b[32mok\u001b[0m] 12000 edit src/example-17.ts chunk=10 tokens=13000\r\n\u001b[?25hFRESHELL_PROOF_DONE:agent-burst:12000\r\n\u001b[?2004h\u001b]0;dan@DANDESKTOP: ~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u0007\u001b[01;32mdan@DANDESKTOP\u001b[00m:\u001b[01;34m~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u001b[00m$ ",
+        "chunkBytes": {
+          "min": 2,
+          "p50": 130,
+          "p90": 513,
+          "p95": 766,
+          "p99": 1403,
+          "max": 6999
+        },
+        "interarrivalMs": {
+          "min": 0,
+          "p50": 0,
+          "p90": 0,
+          "p95": 1,
+          "p99": 4,
+          "max": 327
+        },
+        "burstGroupsUnder10ms": {
+          "count": 3,
+          "chunks": {
+            "min": 1,
+            "p50": 2,
+            "p90": 3236,
+            "p95": 3236,
+            "p99": 3236,
+            "max": 3236
+          },
+          "bytes": {
+            "min": 83,
+            "p50": 288,
+            "p90": 776374,
+            "p95": 776374,
+            "p99": 776374,
+            "max": 776374
+          },
+          "durationMs": {
+            "min": 0,
+            "p50": 0,
+            "p90": 645,
+            "p95": 645,
+            "p99": 645,
+            "max": 645
+          }
+        }
+      },
+      "broker": {
+        "sentMessages": 294,
+        "outputMessages": 290,
+        "replayOutputMessages": 33,
+        "outputSerializedBytes": {
+          "min": 208,
+          "p50": 3784,
+          "p90": 18366,
+          "p95": 19430,
+          "p99": 19614,
+          "max": 19615
+        },
+        "maxSerializedBytes": 19615,
+        "maxRawDataBytesInOutputMessage": 16384,
+        "sequenceRanges": [
+          {
+            "attachRequestId": "agent-burst-12000-attach",
+            "seqStart": 1,
+            "seqEnd": 1,
+            "dataBytes": 83
+          },
+          {
+            "attachRequestId": "agent-burst-12000-attach",
+            "seqStart": 2,
+            "seqEnd": 3,
+            "dataBytes": 288
+          },
+          {
+            "attachRequestId": "agent-burst-12000-attach",
+            "seqStart": 4,
+            "seqEnd": 5,
+            "dataBytes": 86
+          },
+          {
+            "attachRequestId": "agent-burst-12000-attach",
+            "seqStart": 6,
+            "seqEnd": 26,
+            "dataBytes": 1912
+          },
+          {
+            "attachRequestId": "agent-burst-12000-attach",
+            "seqStart": 27,
+            "seqEnd": 55,
+            "dataBytes": 2430
+          },
+          {
+            "attachRequestId": "agent-burst-12000-attach",
+            "seqStart": 56,
+            "seqEnd": 73,
+            "dataBytes": 1995
+          },
+          {
+            "attachRequestId": "agent-burst-12000-attach",
+            "seqStart": 74,
+            "seqEnd": 75,
+            "dataBytes": 1850
+          },
+          {
+            "attachRequestId": "agent-burst-12000-attach",
+            "seqStart": 76,
+            "seqEnd": 85,
+            "dataBytes": 1338
+          },
+          {
+            "attachRequestId": "agent-burst-12000-attach",
+            "seqStart": 86,
+            "seqEnd": 101,
+            "dataBytes": 3332
+          },
+          {
+            "attachRequestId": "agent-burst-12000-attach",
+            "seqStart": 102,
+            "seqEnd": 117,
+            "dataBytes": 3601
+          },
+          {
+            "attachRequestId": "agent-burst-12000-attach",
+            "seqStart": 118,
+            "seqEnd": 139,
+            "dataBytes": 3789
+          },
+          {
+            "attachRequestId": "agent-burst-12000-attach",
+            "seqStart": 140,
+            "seqEnd": 162,
+            "dataBytes": 3634
+          },
+          {
+            "attachRequestId": "agent-burst-12000-attach",
+            "seqStart": 163,
+            "seqEnd": 168,
+            "dataBytes": 767
+          },
+          {
+            "attachRequestId": "agent-burst-12000-attach",
+            "seqStart": 169,
+            "seqEnd": 175,
+            "dataBytes": 1094
+          },
+          {
+            "attachRequestId": "agent-burst-12000-attach",
+            "seqStart": 176,
+            "seqEnd": 192,
+            "dataBytes": 4027
+          },
+          {
+            "attachRequestId": "agent-burst-12000-attach",
+            "seqStart": 193,
+            "seqEnd": 205,
+            "dataBytes": 3174
+          },
+          {
+            "attachRequestId": "agent-burst-12000-attach",
+            "seqStart": 206,
+            "seqEnd": 213,
+            "dataBytes": 1088
+          },
+          {
+            "attachRequestId": "agent-burst-12000-attach",
+            "seqStart": 214,
+            "seqEnd": 237,
+            "dataBytes": 2932
+          },
+          {
+            "attachRequestId": "agent-burst-12000-attach",
+            "seqStart": 238,
+            "seqEnd": 250,
+            "dataBytes": 1671
+          },
+          {
+            "attachRequestId": "agent-burst-12000-attach",
+            "seqStart": 251,
+            "seqEnd": 257,
+            "dataBytes": 575
+          }
+        ]
+      },
+      "scanner": {
+        "scannerFrameCount": 3239,
+        "conservativeBatchCount": 170,
+        "barrierFrameCount": 169,
+        "sideEffectBarrierFrameCount": 169,
+        "replacementFrameCount": 0,
+        "pendingEndStateCount": 0,
+        "finalState": "ground"
+      },
+      "ratios": {
+        "rawChunksPerLiveOutputMessage": 11.169,
+        "rawChunksPerReplayOutputMessage": 98.152,
+        "rawChunksPerConservativeScannerBatch": 19.053
+      }
+    },
+    {
+      "scenario": "control-barrier",
+      "command": "node scripts/proofs/terminal-catchup-agent-output-generator.mjs control-barrier 1",
+      "terminalId": "iVqY191Z6FYkF3dMqytuz",
+      "durationMs": 681,
+      "raw": {
+        "chunks": 10,
+        "bytes": 775,
+        "bytesPerSecond": 1138,
+        "previewStartJsonEscaped": "node scripts/proofs/terminal-catchup-agent-output-generator.mjs control-barrier 1\r\n\u001b[?2004h\u001b]0;dan@DANDESKTOP: ~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u0007\u001b[01;32mdan@DANDESKTOP\u001b[00m:\u001b[01;34m~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u001b[00m$ node scripts/proofs/terminal-catchup-agent-output-generator.mjs control-barrier 1\r\n\u001b[?2004l\r\u001b]0;Freshell proof split OSC\u0007after-title\r\n\u001b[38;5;196msplit-sgr-red\u001b[0m\r\n\u001bPqdcs-payload\u001b\\after-dcs\r\n\u001b[?2026;1$y\u001b]52;c;cHJvb2YgY2xpcGJvYXJk\u0007� replacement-byte-sentinel\r\nFRESHELL_PROOF_DONE:control-barrier:1\r\n\u001b[?2004h\u001b]0;dan@DANDESKTOP: ~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u0007\u001b[01;32mdan@DANDESKTOP\u001b[00m:\u001b[01;34m~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u001b[00m$ ",
+        "previewEndJsonEscaped": "node scripts/proofs/terminal-catchup-agent-output-generator.mjs control-barrier 1\r\n\u001b[?2004h\u001b]0;dan@DANDESKTOP: ~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u0007\u001b[01;32mdan@DANDESKTOP\u001b[00m:\u001b[01;34m~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u001b[00m$ node scripts/proofs/terminal-catchup-agent-output-generator.mjs control-barrier 1\r\n\u001b[?2004l\r\u001b]0;Freshell proof split OSC\u0007after-title\r\n\u001b[38;5;196msplit-sgr-red\u001b[0m\r\n\u001bPqdcs-payload\u001b\\after-dcs\r\n\u001b[?2026;1$y\u001b]52;c;cHJvb2YgY2xpcGJvYXJk\u0007� replacement-byte-sentinel\r\nFRESHELL_PROOF_DONE:control-barrier:1\r\n\u001b[?2004h\u001b]0;dan@DANDESKTOP: ~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u0007\u001b[01;32mdan@DANDESKTOP\u001b[00m:\u001b[01;34m~/code/freshell/.worktrees/proof-terminal-catchup-architecture\u001b[00m$ ",
+        "chunkBytes": {
+          "min": 22,
+          "p50": 39,
+          "p90": 196,
+          "p95": 196,
+          "p99": 196,
+          "max": 196
+        },
+        "interarrivalMs": {
+          "min": 0,
+          "p50": 5,
+          "p90": 381,
+          "p95": 381,
+          "p99": 381,
+          "max": 381
+        },
+        "burstGroupsUnder10ms": {
+          "count": 3,
+          "chunks": {
+            "min": 1,
+            "p50": 2,
+            "p90": 7,
+            "p95": 7,
+            "p99": 7,
+            "max": 7
+          },
+          "bytes": {
+            "min": 83,
+            "p50": 288,
+            "p90": 404,
+            "p95": 404,
+            "p99": 404,
+            "max": 404
+          },
+          "durationMs": {
+            "min": 0,
+            "p50": 0,
+            "p90": 21,
+            "p95": 21,
+            "p99": 21,
+            "max": 21
+          }
+        }
+      },
+      "broker": {
+        "sentMessages": 11,
+        "outputMessages": 8,
+        "replayOutputMessages": 1,
+        "outputSerializedBytes": {
+          "min": 173,
+          "p50": 225,
+          "p90": 1052,
+          "p95": 1052,
+          "p99": 1052,
+          "max": 1052
+        },
+        "maxSerializedBytes": 1052,
+        "maxRawDataBytesInOutputMessage": 775,
+        "sequenceRanges": [
+          {
+            "attachRequestId": "control-barrier-attach",
+            "seqStart": 1,
+            "seqEnd": 1,
+            "dataBytes": 83
+          },
+          {
+            "attachRequestId": "control-barrier-attach",
+            "seqStart": 2,
+            "seqEnd": 3,
+            "dataBytes": 288
+          },
+          {
+            "attachRequestId": "control-barrier-attach",
+            "seqStart": 4,
+            "seqEnd": 4,
+            "dataBytes": 28
+          },
+          {
+            "attachRequestId": "control-barrier-attach",
+            "seqStart": 5,
+            "seqEnd": 5,
+            "dataBytes": 25
+          },
+          {
+            "attachRequestId": "control-barrier-attach",
+            "seqStart": 6,
+            "seqEnd": 6,
+            "dataBytes": 22
+          },
+          {
+            "attachRequestId": "control-barrier-attach",
+            "seqStart": 7,
+            "seqEnd": 9,
+            "dataBytes": 133
+          },
+          {
+            "attachRequestId": "control-barrier-attach",
+            "seqStart": 10,
+            "seqEnd": 10,
+            "dataBytes": 196
+          },
+          {
+            "attachRequestId": "control-barrier-replay",
+            "seqStart": 1,
+            "seqEnd": 10,
+            "dataBytes": 775
+          }
+        ]
+      },
+      "scanner": {
+        "scannerFrameCount": 10,
+        "conservativeBatchCount": 8,
+        "barrierFrameCount": 7,
+        "sideEffectBarrierFrameCount": 6,
+        "replacementFrameCount": 1,
+        "pendingEndStateCount": 2,
+        "finalState": "ground"
+      },
+      "ratios": {
+        "rawChunksPerLiveOutputMessage": 1.25,
+        "rawChunksPerReplayOutputMessage": 10,
+        "rawChunksPerConservativeScannerBatch": 1.25
+      }
+    }
+  ]
+}
