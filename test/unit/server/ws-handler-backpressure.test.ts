@@ -482,21 +482,24 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     )
     vi.advanceTimersByTime(50)
 
-    expect(structuredLogs('debug', 'terminal.replay.backpressure_pause')).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          event: 'terminal.replay.backpressure_pause',
-          severity: 'debug',
-          terminalId: 'term-structured-backpressure',
-          attachRequestId: 'structured-backpressure-attach',
-          source: 'replay',
-          bufferedAmount: expect.any(Number),
-          threshold: expect.any(Number),
-          retryMs: expect.any(Number),
-          reason: 'websocket_buffered_amount',
-        }),
-      ]),
-    )
+    const pauseLog = structuredLogs('debug', 'terminal.replay.backpressure_pause')
+      .find((payload) => payload.terminalId === 'term-structured-backpressure')
+    expect(pauseLog).toEqual(expect.objectContaining({
+      event: 'terminal.replay.backpressure_pause',
+      severity: 'debug',
+      terminalId: 'term-structured-backpressure',
+      attachRequestId: 'structured-backpressure-attach',
+      source: 'replay',
+      seqStart: 1,
+      seqEnd: 1,
+      rawFrameCount: 1,
+      dataBytes: expect.any(Number),
+      bufferedAmount: expect.any(Number),
+      threshold: expect.any(Number),
+      retryMs: expect.any(Number),
+      reason: 'websocket_buffered_amount',
+    }))
+    expect(pauseLog?.dataBytes).toBeGreaterThan(0)
 
     broker.close()
   })

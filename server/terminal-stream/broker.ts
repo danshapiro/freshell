@@ -81,6 +81,12 @@ type PerfEventLogger = (
   level?: PerfLevel,
 ) => void
 type ReplayGapReason = 'replay_window_exceeded' | 'replay_budget_exceeded' | 'queue_overflow'
+type ReplayBackpressurePayloadFields = {
+  seqStart?: number
+  seqEnd?: number
+  rawFrameCount: number
+  dataBytes: number
+}
 
 function jsonNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
@@ -118,6 +124,21 @@ function batchRawFrameCount(batch: TerminalOutputBatch): number {
     const frameCount = Math.max(1, Math.floor(segment.seqEnd - segment.seqStart + 1))
     return sum + frameCount
   }, 0)
+}
+
+function payloadBackpressureFields(payload: JsonPayload): ReplayBackpressurePayloadFields {
+  const data = typeof payload.data === 'string' ? payload.data : ''
+  const seqStart = jsonNumberField(payload, 'seqStart') ?? jsonNumberField(payload, 'fromSeq')
+  const seqEnd = jsonNumberField(payload, 'seqEnd') ?? jsonNumberField(payload, 'toSeq')
+  const rawFrameCount = jsonStringField(payload, 'type') === 'terminal.output.gap'
+    ? 0
+    : payloadRawFrameCount(payload)
+  return {
+    ...(seqStart !== undefined ? { seqStart } : {}),
+    ...(seqEnd !== undefined ? { seqEnd } : {}),
+    rawFrameCount,
+    dataBytes: Buffer.byteLength(data, 'utf8'),
+  }
 }
 
 export class TerminalStreamBroker {
@@ -1254,6 +1275,7 @@ export class TerminalStreamBroker {
         prepared,
         payloadSeqEnd,
         {
+          backpressureFields: payloadBackpressureFields(payload),
           onSent: (sendResult) => this.logTerminalReplayBatch({
             terminalId,
             attachRequestId,
@@ -1297,7 +1319,7 @@ export class TerminalStreamBroker {
       return this.sendLegacyOutputSegmentsWithPacing(terminalId, attachment, frame, attachRequestId)
     }
 
-    const prepared = this.prepareSendPayload(this.buildTerminalOutputPayload({
+    const payload = this.buildTerminalOutputPayload({
       type: 'terminal.output',
       terminalId,
       streamId: frame.streamId,
@@ -1305,9 +1327,16 @@ export class TerminalStreamBroker {
       seqEnd: frame.seqEnd,
       data: frame.data,
       attachRequestId,
-    }))
+    })
+    const prepared = this.prepareSendPayload(payload)
     if (!prepared) return { status: 'failed' }
-    return this.sendPreparedReplayPayloadWithPacing(terminalId, attachment, prepared, frame.seqEnd)
+    return this.sendPreparedReplayPayloadWithPacing(
+      terminalId,
+      attachment,
+      prepared,
+      frame.seqEnd,
+      { backpressureFields: payloadBackpressureFields(payload) },
+    )
   }
 
   private sendBatchPayloadsWithPacing(input: {
@@ -1330,6 +1359,7 @@ export class TerminalStreamBroker {
         prepared,
         payloadSeqEnd,
         {
+          backpressureFields: payloadBackpressureFields(payload),
           onSent: (sendResult) => this.logTerminalReplayBatch({
             terminalId: input.terminalId,
             attachRequestId: input.attachRequestId,
@@ -1459,7 +1489,7 @@ export class TerminalStreamBroker {
     streamId: string,
     attachRequestId?: string,
   ): ReplaySendOutcome {
-    const prepared = this.prepareSendPayload({
+    const payload = {
       type: 'terminal.output.gap',
       terminalId,
       streamId,
@@ -1467,9 +1497,11 @@ export class TerminalStreamBroker {
       toSeq,
       reason: 'replay_window_exceeded',
       ...(attachRequestId ? { attachRequestId } : {}),
-    })
+    }
+    const backpressureFields = payloadBackpressureFields(payload)
+    const prepared = this.prepareSendPayload(payload)
     if (!prepared) return { status: 'failed' }
-    if (this.shouldPauseReplayBeforeSend(terminalId, attachment, prepared)) {
+    if (this.shouldPauseReplayBeforeSend(terminalId, attachment, prepared, backpressureFields)) {
       return { status: 'paused' }
     }
 
@@ -1496,7 +1528,7 @@ export class TerminalStreamBroker {
     })
     return {
       status: 'sent',
-      pauseAfter: this.shouldPauseReplayAfterSend(terminalId, attachment, result),
+      pauseAfter: this.shouldPauseReplayAfterSend(terminalId, attachment, result, backpressureFields),
       sentSeqEnd: toSeq,
     }
   }
@@ -1507,10 +1539,11 @@ export class TerminalStreamBroker {
     prepared: PreparedJsonMessage,
     sentSeqEnd: number,
     options?: {
+      backpressureFields?: ReplayBackpressurePayloadFields
       onSent?: (result: SendJsonResult) => void
     },
   ): ReplaySendOutcome {
-    if (this.shouldPauseReplayBeforeSend(terminalId, attachment, prepared)) {
+    if (this.shouldPauseReplayBeforeSend(terminalId, attachment, prepared, options?.backpressureFields)) {
       return { status: 'paused' }
     }
     const result = this.safeSendPrepared(attachment.ws, prepared)
@@ -1518,7 +1551,7 @@ export class TerminalStreamBroker {
     options?.onSent?.(result)
     return {
       status: 'sent',
-      pauseAfter: this.shouldPauseReplayAfterSend(terminalId, attachment, result),
+      pauseAfter: this.shouldPauseReplayAfterSend(terminalId, attachment, result, options?.backpressureFields),
       sentSeqEnd,
     }
   }
@@ -1527,6 +1560,7 @@ export class TerminalStreamBroker {
     terminalId: string,
     attachment: BrokerClientAttachment,
     prepared: PreparedJsonMessage,
+    backpressureFields?: ReplayBackpressurePayloadFields,
   ): boolean {
     const buffered = readWebSocketBufferedAmount(attachment.ws)
     if (typeof buffered !== 'number') return false
@@ -1542,6 +1576,7 @@ export class TerminalStreamBroker {
       threshold,
       serializedApplicationJsonBytes: prepared.serializedApplicationJsonBytes,
       phase: 'before_send',
+      ...(backpressureFields ?? {}),
     })
     return true
   }
@@ -1550,6 +1585,7 @@ export class TerminalStreamBroker {
     terminalId: string,
     attachment: BrokerClientAttachment,
     result: SendJsonResult,
+    backpressureFields?: ReplayBackpressurePayloadFields,
   ): boolean {
     const buffered = result.bufferedAfter
     if (typeof buffered !== 'number') return false
@@ -1563,6 +1599,7 @@ export class TerminalStreamBroker {
       threshold,
       serializedApplicationJsonBytes: result.serializedApplicationJsonBytes,
       phase: 'after_send',
+      ...(backpressureFields ?? {}),
     })
     return true
   }
@@ -1588,6 +1625,10 @@ export class TerminalStreamBroker {
       serializedApplicationJsonBytes?: number
       projectedBufferedAmount?: number
       phase: 'before_send' | 'after_send'
+      seqStart?: number
+      seqEnd?: number
+      rawFrameCount?: number
+      dataBytes?: number
     },
   ): void {
     const retryMs = this.replayBufferedPauseDelayMs(attachment)
@@ -1622,6 +1663,10 @@ export class TerminalStreamBroker {
       ...(typeof attachment.replayCursor?.toSeq === 'number'
         ? { toSeq: attachment.replayCursor.toSeq }
         : {}),
+      ...(typeof context.seqStart === 'number' ? { seqStart: context.seqStart } : {}),
+      ...(typeof context.seqEnd === 'number' ? { seqEnd: context.seqEnd } : {}),
+      ...(typeof context.rawFrameCount === 'number' ? { rawFrameCount: context.rawFrameCount } : {}),
+      ...(typeof context.dataBytes === 'number' ? { dataBytes: context.dataBytes } : {}),
       bufferedAmount: context.bufferedAmount,
       ...(typeof context.projectedBufferedAmount === 'number'
         ? { projectedBufferedAmount: context.projectedBufferedAmount }
