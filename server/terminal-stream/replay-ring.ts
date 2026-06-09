@@ -1,5 +1,6 @@
 import {
   createTerminalOutputBarrierScanner,
+  type TerminalOutputBarrierClassification,
   type TerminalOutputBarrierReason,
   type TerminalOutputScannerState,
 } from './output-barrier-scanner.js'
@@ -21,6 +22,11 @@ export type ReplayFrame = {
 export const DEFAULT_TERMINAL_REPLAY_RING_MAX_BYTES = 1024 * 1024
 
 export type ReplayFrameByteMeasure = (frame: ReplayFrame) => number
+export type ReplayBatchContext = {
+  terminalId?: string
+  attachRequestId?: string
+  source?: string
+}
 
 function resolveMaxBytes(explicitMaxBytes?: number): number {
   if (typeof explicitMaxBytes === 'number' && Number.isFinite(explicitMaxBytes) && explicitMaxBytes > 0) {
@@ -60,8 +66,12 @@ export class ReplayRing {
     const seq = this.nextSeq
     this.nextSeq += 1
     this.head = seq
+    const streamClassification = this.barrierScanner.scan(data)
     const normalizedData = this.normalizeFrameData(data)
-    const barrierClassification = this.barrierScanner.scan(normalizedData)
+    const wasTruncated = Buffer.byteLength(normalizedData, 'utf8') < Buffer.byteLength(data, 'utf8')
+    const barrierClassification = wasTruncated
+      ? this.conservativeTruncatedClassification(streamClassification)
+      : streamClassification
 
     const frame: ReplayFrame = {
       seqStart: seq,
@@ -119,6 +129,7 @@ export class ReplayRing {
     maxBytes: number,
     toSeq?: number,
     measureFrameBytes?: ReplayFrameByteMeasure,
+    batchContext?: ReplayBatchContext,
   ): { frames: ReplayFrame[]; missedFromSeq?: number } {
     const normalizedSinceSeq = sinceSeq === undefined || sinceSeq === 0 ? 0 : sinceSeq
     const normalizedMaxBytes = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : 0
@@ -142,6 +153,9 @@ export class ReplayRing {
       maxSerializedBytes: normalizedMaxBytes,
       maxTotalSerializedBytes: normalizedMaxBytes,
       measureFrameBytes,
+      terminalId: batchContext?.terminalId,
+      attachRequestId: batchContext?.attachRequestId,
+      source: batchContext?.source,
     })
 
     return { frames, missedFromSeq }
@@ -187,6 +201,22 @@ export class ReplayRing {
       const frame = this.frames[index]
       if (frame.seqStart > toSeq) break
       yield frame
+    }
+  }
+
+  private conservativeTruncatedClassification(
+    classification: TerminalOutputBarrierClassification,
+  ): {
+    barrier: true
+    reason: TerminalOutputBarrierReason
+    stateBefore: TerminalOutputScannerState
+    stateAfter: TerminalOutputScannerState
+  } {
+    return {
+      barrier: true,
+      reason: classification.barrier ? classification.reason : 'control',
+      stateBefore: classification.stateBefore,
+      stateAfter: classification.stateAfter,
     }
   }
 

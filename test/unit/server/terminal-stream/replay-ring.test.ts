@@ -243,6 +243,45 @@ describe('ReplayRing', () => {
     expect(replay.missedFromSeq).toBeUndefined()
   })
 
+  it('marks a retained tail truncated inside OSC as fail-closed barrier metadata', () => {
+    const ring = new ReplayRing(8)
+    const frame = append(ring, `\u001b]52;c;${'A'.repeat(32)}`)
+
+    expect(frame.data).toBe('A'.repeat(8))
+    expect(frame).toMatchObject({
+      barrier: true,
+      barrierReason: 'osc52',
+      scannerStateBefore: { mode: 'ground' },
+      scannerStateAfter: { mode: 'osc' },
+    })
+  })
+
+  it('keeps retained tails truncated inside CSI from batching as transparent text', () => {
+    const ring = new ReplayRing(8)
+    append(ring, `\u001b[${'1'.repeat(32)}`)
+    ring.setMaxBytes(1024)
+    append(ring, 'after')
+
+    const replay = ring.replaySince(0)
+    expect(replay.frames[0]).toMatchObject({
+      data: '1'.repeat(8),
+      barrier: true,
+      barrierReason: 'control',
+      scannerStateBefore: { mode: 'ground' },
+      scannerStateAfter: { mode: 'csi' },
+    })
+    expect(replay.frames[1]).toMatchObject({
+      data: 'after',
+      barrier: true,
+      barrierReason: 'control',
+      scannerStateBefore: { mode: 'csi' },
+      scannerStateAfter: { mode: 'ground' },
+    })
+
+    const batch = ring.replayBatchSince(0, 1024, 2)
+    expect(batch.frames.map((frame) => frame.data)).toEqual(['1'.repeat(8), 'after'])
+  })
+
   it('truncates oversized multi-byte frames on UTF-8 boundaries', () => {
     const ring = new ReplayRing(7)
     append(ring, '🙂🙂🙂')

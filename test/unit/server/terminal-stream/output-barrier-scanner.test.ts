@@ -68,6 +68,84 @@ describe('terminal output barrier scanner', () => {
     })
   })
 
+  it('keeps ESC intermediate sequences pending across fragments', () => {
+    const scanner = createTerminalOutputBarrierScanner()
+
+    expect(scanner.scan('\u001b(')).toMatchObject({
+      barrier: true,
+      reason: 'control',
+      ground: false,
+      stateBefore: { mode: 'ground' },
+      stateAfter: { mode: 'esc' },
+    })
+    expect(scanner.scan('0')).toMatchObject({
+      barrier: true,
+      reason: 'control',
+      ground: true,
+      stateBefore: { mode: 'esc' },
+      stateAfter: { mode: 'ground' },
+    })
+  })
+
+  it('keeps SOS and PM string controls pending until ST', () => {
+    const sosScanner = createTerminalOutputBarrierScanner()
+    expect(sosScanner.scan('\u001bXopaque')).toMatchObject({
+      barrier: true,
+      reason: 'control',
+      ground: false,
+      stateBefore: { mode: 'ground' },
+      stateAfter: { mode: 'apc' },
+    })
+    expect(sosScanner.scan('\u001b\\')).toMatchObject({
+      barrier: true,
+      reason: 'control',
+      ground: true,
+      stateBefore: { mode: 'apc' },
+      stateAfter: { mode: 'ground' },
+    })
+
+    const pmScanner = createTerminalOutputBarrierScanner()
+    expect(pmScanner.scan('\u009epending')).toMatchObject({
+      barrier: true,
+      reason: 'control',
+      ground: false,
+      stateBefore: { mode: 'ground' },
+      stateAfter: { mode: 'apc' },
+    })
+    expect(pmScanner.scan('\u009c')).toMatchObject({
+      barrier: true,
+      reason: 'control',
+      ground: true,
+      stateBefore: { mode: 'apc' },
+      stateAfter: { mode: 'ground' },
+    })
+  })
+
+  it('keeps large unterminated CSI streams bounded and fail-closed', () => {
+    const scanner = createTerminalOutputBarrierScanner()
+
+    expect(scanner.scan('\u001b[')).toMatchObject({
+      barrier: true,
+      reason: 'control',
+      ground: false,
+      stateAfter: { mode: 'csi' },
+    })
+    expect(scanner.scan('1'.repeat(100_000))).toMatchObject({
+      barrier: true,
+      reason: 'control',
+      ground: false,
+      stateBefore: { mode: 'csi' },
+      stateAfter: { mode: 'csi' },
+    })
+    expect(scanner.scan('6n')).toMatchObject({
+      barrier: true,
+      reason: 'request_mode',
+      ground: true,
+      stateBefore: { mode: 'csi' },
+      stateAfter: { mode: 'ground' },
+    })
+  })
+
   it('carries pending OSC state across fragments', () => {
     const scanner = createTerminalOutputBarrierScanner()
 

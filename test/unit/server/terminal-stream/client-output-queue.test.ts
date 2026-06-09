@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { ClientOutputQueue, isGapEvent } from '../../../../server/terminal-stream/client-output-queue'
+import { createTerminalOutputBarrierScanner } from '../../../../server/terminal-stream/output-barrier-scanner'
 import type { ReplayFrame } from '../../../../server/terminal-stream/replay-ring'
 
 function frame(seq: number, data: string, streamId = 'stream-1'): ReplayFrame {
+  const scanner = createTerminalOutputBarrierScanner()
+  const classification = scanner.scan(data)
   return {
     seqStart: seq,
     seqEnd: seq,
@@ -10,6 +13,10 @@ function frame(seq: number, data: string, streamId = 'stream-1'): ReplayFrame {
     bytes: Buffer.byteLength(data, 'utf8'),
     at: seq,
     streamId,
+    barrier: classification.barrier,
+    ...(classification.barrier ? { barrierReason: classification.reason } : {}),
+    scannerStateBefore: classification.stateBefore,
+    scannerStateAfter: classification.stateAfter,
   }
 }
 
@@ -59,6 +66,22 @@ describe('ClientOutputQueue', () => {
       streamId: 'stream-new',
     })
     expect(queue.pendingBytes()).toBe(0)
+  })
+
+  it('does not coalesce adjacent frames across barrier metadata', () => {
+    const queue = new ClientOutputQueue(1024)
+    queue.enqueue(frame(1, 'before'))
+    queue.enqueue(frame(2, '\u001b[31m'))
+    queue.enqueue(frame(3, 'after'))
+
+    const batch = queue.nextBatch(1024)
+    const dataFrames = batch.filter((entry): entry is ReplayFrame => entry.type !== 'gap')
+
+    expect(dataFrames.map((entry) => entry.data)).toEqual([
+      'before',
+      '\u001b[31m',
+      'after',
+    ])
   })
 
   it('drops oldest frames when queue overflows', () => {

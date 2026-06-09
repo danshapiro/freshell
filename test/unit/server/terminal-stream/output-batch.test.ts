@@ -206,4 +206,24 @@ describe('terminal output batch builder', () => {
       }) <= maxSerializedBytes,
     )).toBe(true)
   })
+
+  it('coalesces many small transparent frames without changing segment offsets', () => {
+    const frames = Array.from({ length: 4096 }, (_unused, index) => transparentFrame(index + 1, 'x'))
+
+    const batches = build(frames)
+
+    expect(batches).toHaveLength(1)
+    expect(batches[0]).toMatchObject({
+      seqStart: 1,
+      seqEnd: 4096,
+    })
+    expect(batches[0].data).toHaveLength(4096)
+    expect(batches[0].segments).toHaveLength(4096)
+    expect(batches[0].segments[4095]).toMatchObject({
+      seqStart: 4096,
+      seqEnd: 4096,
+      offset: 4095,
+      endOffset: 4096,
+    })
+  })
 })

@@ -580,6 +580,7 @@ export class TerminalStreamBroker {
     const batch = attachment.queue.nextBatch(
       TERMINAL_STREAM_BATCH_MAX_BYTES,
       (frame) => this.measureOutputFrameSerializedApplicationJsonBytes(terminalId, frame, attachRequestId),
+      { terminalId, attachRequestId, source: 'live' },
     )
     if (batch.length === 0) return
 
@@ -626,6 +627,7 @@ export class TerminalStreamBroker {
       TERMINAL_STREAM_BATCH_MAX_BYTES,
       cursor.toSeq,
       (frame) => this.measureOutputFrameSerializedApplicationJsonBytes(terminalId, frame, attachRequestId),
+      { terminalId, attachRequestId, source: 'replay' },
     )
 
     if (replay.missedFromSeq !== undefined) {

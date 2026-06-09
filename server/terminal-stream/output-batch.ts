@@ -53,6 +53,22 @@ type FrameClassification = {
 
 type AnnotatedReplayFrame = ReplayFrame & Partial<FrameClassification> & FrameBoundaryMetadata
 
+type MutableTerminalOutputBatch = FrameBoundaryMetadata & {
+  seqStart: number
+  seqEnd: number
+  chunks: string[]
+  dataLength: number
+  dataJsonContentBytes: number
+  bytes: number
+  at: number
+  streamId: string
+  serializedBytes: number
+  segments: TerminalOutputBatchSegment[]
+  barrier: false
+  scannerStateBefore: TerminalOutputScannerState
+  scannerStateAfter: TerminalOutputScannerState
+}
+
 function normalizeBudget(value: number | undefined): number {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 0
   return Math.floor(value)
@@ -76,6 +92,10 @@ function defaultPayloadForFrame(
     data: frame.data,
     ...(attachRequestId ? { attachRequestId } : {}),
   }
+}
+
+function jsonStringContentBytes(data: string): number {
+  return Math.max(0, Buffer.byteLength(JSON.stringify(data), 'utf8') - 2)
 }
 
 function classifyFrame(
@@ -123,16 +143,26 @@ function frameSource(frame: AnnotatedReplayFrame, inputSource: string | undefine
 
 function measureBatch(
   input: TerminalOutputBatchBuildInput,
-  batch: ReplayFrame,
+  batch: ReplayFrame & FrameBoundaryMetadata,
+  dataJsonContentBytes?: number,
 ): number {
   if (input.payloadForFrame) {
     return measureTerminalOutputPayloadBytes(input.payloadForFrame(batch))
   }
 
   if (input.terminalId) {
+    if (dataJsonContentBytes !== undefined) {
+      const emptyPayloadBytes = measureTerminalOutputPayloadBytes(defaultPayloadForFrame(
+        input.terminalId,
+        batch.attachRequestId ?? input.attachRequestId,
+        { ...batch, data: '' },
+      ))
+      return emptyPayloadBytes - 2 + dataJsonContentBytes + 2
+    }
+
     return measureTerminalOutputPayloadBytes(defaultPayloadForFrame(
       input.terminalId,
-      input.attachRequestId,
+      batch.attachRequestId ?? input.attachRequestId,
       batch,
     ))
   }
@@ -192,12 +222,12 @@ function buildSingleBatch(
     serializedBytes: 0,
     segments: [segmentForFrame(frame, classification, 0)],
   }
-  batch.serializedBytes = measureBatch(input, batch)
+  batch.serializedBytes = measureBatch(input, batch, jsonStringContentBytes(batch.data))
   return batch
 }
 
 function canMerge(
-  current: TerminalOutputBatch,
+  current: MutableTerminalOutputBatch,
   next: AnnotatedReplayFrame,
   nextClassification: FrameClassification,
   input: TerminalOutputBatchBuildInput,
@@ -212,30 +242,108 @@ function canMerge(
   return true
 }
 
-function mergeBatches(
-  current: TerminalOutputBatch,
+function startMutableBatch(
+  frame: AnnotatedReplayFrame,
+  classification: FrameClassification,
+  input: TerminalOutputBatchBuildInput,
+): MutableTerminalOutputBatch {
+  const attachRequestId = frameAttachRequestId(frame, input.attachRequestId)
+  const source = frameSource(frame, input.source)
+  const dataJsonContentBytes = jsonStringContentBytes(frame.data)
+  const batch: MutableTerminalOutputBatch = {
+    seqStart: frame.seqStart,
+    seqEnd: frame.seqEnd,
+    chunks: [frame.data],
+    dataLength: frame.data.length,
+    dataJsonContentBytes,
+    bytes: frame.bytes,
+    at: frame.at,
+    streamId: frame.streamId,
+    ...(attachRequestId ? { attachRequestId } : {}),
+    ...(source ? { source } : {}),
+    barrier: false,
+    scannerStateBefore: cloneScannerState(classification.scannerStateBefore),
+    scannerStateAfter: cloneScannerState(classification.scannerStateAfter),
+    segments: [segmentForFrame(frame, classification, 0)],
+    serializedBytes: 0,
+  }
+  batch.serializedBytes = measureBatch(input, materializeMutableBatchFrame(batch), dataJsonContentBytes)
+  return batch
+}
+
+function materializeMutableBatchFrame(batch: MutableTerminalOutputBatch): ReplayFrame & FrameBoundaryMetadata {
+  return {
+    seqStart: batch.seqStart,
+    seqEnd: batch.seqEnd,
+    data: batch.chunks.join(''),
+    bytes: batch.bytes,
+    at: batch.at,
+    streamId: batch.streamId,
+    barrier: false,
+    scannerStateBefore: batch.scannerStateBefore,
+    scannerStateAfter: batch.scannerStateAfter,
+    ...(batch.attachRequestId ? { attachRequestId: batch.attachRequestId } : {}),
+    ...(batch.source ? { source: batch.source } : {}),
+  }
+}
+
+function flushMutableBatch(batch: MutableTerminalOutputBatch): TerminalOutputBatch {
+  const frame = materializeMutableBatchFrame(batch)
+  return {
+    ...frame,
+    serializedBytes: batch.serializedBytes,
+    segments: batch.segments,
+  }
+}
+
+function measureMergedBatch(
+  current: MutableTerminalOutputBatch,
   next: AnnotatedReplayFrame,
   nextClassification: FrameClassification,
   input: TerminalOutputBatchBuildInput,
-): TerminalOutputBatch {
-  const merged: TerminalOutputBatch = {
-    ...current,
+): number {
+  const dataJsonContentBytes = current.dataJsonContentBytes + jsonStringContentBytes(next.data)
+  const candidate: ReplayFrame & FrameBoundaryMetadata = {
+    seqStart: current.seqStart,
     seqEnd: next.seqEnd,
-    data: current.data + next.data,
+    data: '',
     bytes: current.bytes + next.bytes,
     at: next.at,
+    streamId: current.streamId,
     barrier: false,
-    scannerStateBefore: cloneScannerState(current.scannerStateBefore),
-    scannerStateAfter: cloneScannerState(nextClassification.scannerStateAfter),
-    segments: [
-      ...current.segments,
-      segmentForFrame(next, nextClassification, current.data.length),
-    ],
-    serializedBytes: 0,
+    scannerStateBefore: current.scannerStateBefore,
+    scannerStateAfter: nextClassification.scannerStateAfter,
+    ...(current.attachRequestId ? { attachRequestId: current.attachRequestId } : {}),
+    ...(current.source ? { source: current.source } : {}),
   }
-  delete merged.barrierReason
-  merged.serializedBytes = measureBatch(input, merged)
-  return merged
+
+  if (input.terminalId && !input.payloadForFrame) {
+    return measureBatch(input, candidate, dataJsonContentBytes)
+  }
+  if (!input.payloadForFrame && !input.measureFrameBytes) {
+    return candidate.bytes
+  }
+
+  candidate.data = `${current.chunks.join('')}${next.data}`
+  return measureBatch(input, candidate, dataJsonContentBytes)
+}
+
+function appendMutableBatch(
+  current: MutableTerminalOutputBatch,
+  next: AnnotatedReplayFrame,
+  nextClassification: FrameClassification,
+  serializedBytes: number,
+): void {
+  const offset = current.dataLength
+  current.seqEnd = next.seqEnd
+  current.chunks.push(next.data)
+  current.dataLength += next.data.length
+  current.dataJsonContentBytes += jsonStringContentBytes(next.data)
+  current.bytes += next.bytes
+  current.at = next.at
+  current.scannerStateAfter = cloneScannerState(nextClassification.scannerStateAfter)
+  current.segments.push(segmentForFrame(next, nextClassification, offset))
+  current.serializedBytes = serializedBytes
 }
 
 export function buildTerminalOutputBatches<TFrame extends ReplayFrame>(
@@ -249,7 +357,7 @@ export function buildTerminalOutputBatches<TFrame extends ReplayFrame>(
 
   const fallbackScanner = createTerminalOutputBarrierScanner()
   const batches: TerminalOutputBatch[] = []
-  let current: TerminalOutputBatch | null = null
+  let current: MutableTerminalOutputBatch | null = null
   let totalSerializedBytes = 0
 
   const pushBatch = (batch: TerminalOutputBatch): boolean => {
@@ -265,33 +373,37 @@ export function buildTerminalOutputBatches<TFrame extends ReplayFrame>(
     return true
   }
 
+  const pushCurrent = (): boolean => {
+    if (!current) return true
+    const batch = flushMutableBatch(current)
+    current = null
+    return pushBatch(batch)
+  }
+
   for (const rawFrame of input.frames) {
     const frame = rawFrame as AnnotatedReplayFrame
     const classification = classifyFrame(frame, fallbackScanner)
-    const nextBatch = buildSingleBatch(frame, classification, input)
 
     if (!isTransparentGroundFrame(classification)) {
-      if (current && !pushBatch(current)) return batches
-      current = null
+      if (!pushCurrent()) return batches
+      const nextBatch = buildSingleBatch(frame, classification, input)
       if (!pushBatch(nextBatch)) return batches
       continue
     }
 
     if (current && canMerge(current, frame, classification, input)) {
-      const merged = mergeBatches(current, frame, classification, input)
-      if (merged.serializedBytes <= maxSerializedBytes) {
-        current = merged
+      const mergedSerializedBytes = measureMergedBatch(current, frame, classification, input)
+      if (mergedSerializedBytes <= maxSerializedBytes) {
+        appendMutableBatch(current, frame, classification, mergedSerializedBytes)
         continue
       }
     }
 
-    if (current && !pushBatch(current)) return batches
-    current = nextBatch
+    if (!pushCurrent()) return batches
+    current = startMutableBatch(frame, classification, input)
   }
 
-  if (current) {
-    pushBatch(current)
-  }
+  pushCurrent()
 
   return batches
 }

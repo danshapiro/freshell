@@ -14,6 +14,11 @@ export type GapEvent = {
 }
 
 export type QueuedFrameByteMeasure = (frame: ReplayFrame) => number
+export type QueuedBatchContext = {
+  terminalId?: string
+  attachRequestId?: string
+  source?: string
+}
 
 export function isGapEvent(entry: ReplayFrame | GapEvent): entry is GapEvent {
   return 'type' in entry && entry.type === 'gap'
@@ -54,7 +59,11 @@ export class ClientOutputQueue {
     this.evictOverflow()
   }
 
-  nextBatch(maxBytes: number, measureFrameBytes?: QueuedFrameByteMeasure): Array<ReplayFrame | GapEvent> {
+  nextBatch(
+    maxBytes: number,
+    measureFrameBytes?: QueuedFrameByteMeasure,
+    batchContext?: QueuedBatchContext,
+  ): Array<ReplayFrame | GapEvent> {
     const out: Array<ReplayFrame | GapEvent> = []
     const budget = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : 0
 
@@ -72,6 +81,9 @@ export class ClientOutputQueue {
       maxSerializedBytes: budget,
       maxTotalSerializedBytes: budget,
       measureFrameBytes: (frame) => this.measureFrameForBatch(frame, measureFrameBytes),
+      terminalId: batchContext?.terminalId,
+      attachRequestId: batchContext?.attachRequestId,
+      source: batchContext?.source,
     })
     const consumedFrameCount = batches.reduce((sum, batch) => sum + batch.segments.length, 0)
     this.consumeFrames(consumedFrameCount)

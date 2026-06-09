@@ -36,9 +36,12 @@ const BEL = 0x07
 const CSI = 0x9b
 const OSC = 0x9d
 const DCS = 0x90
+const SOS = 0x98
 const ST = 0x9c
+const PM = 0x9e
 const APC = 0x9f
 const REPLACEMENT_CHARACTER = 0xfffd
+const CSI_PAYLOAD_SUFFIX_LIMIT = 64
 
 const REASON_PRIORITY: Record<TerminalOutputBarrierReason, number> = {
   control: 1,
@@ -58,6 +61,14 @@ function defaultReasonForMode(mode: TerminalOutputScannerMode): TerminalOutputBa
 
 function isCsiFinalByte(codePoint: number): boolean {
   return codePoint >= 0x40 && codePoint <= 0x7e
+}
+
+function isEscIntermediateByte(codePoint: number): boolean {
+  return codePoint >= 0x20 && codePoint <= 0x2f
+}
+
+function isEscFinalByte(codePoint: number): boolean {
+  return codePoint >= 0x30 && codePoint <= 0x7e
 }
 
 function isTransparentGroundControl(codePoint: number): boolean {
@@ -82,30 +93,30 @@ function classifyCsiFinal(payload: string, finalChar: string): TerminalOutputBar
 
 export function createTerminalOutputBarrierScanner(): TerminalOutputBarrierScanner {
   let mode: TerminalOutputScannerMode = 'ground'
-  let csiPayload = ''
+  let csiPayloadSuffix = ''
   let stringEscPending = false
 
   const enterCsi = () => {
     mode = 'csi'
-    csiPayload = ''
+    csiPayloadSuffix = ''
     stringEscPending = false
   }
 
   const enterStringMode = (nextMode: 'osc' | 'dcs' | 'apc') => {
     mode = nextMode
-    csiPayload = ''
+    csiPayloadSuffix = ''
     stringEscPending = false
   }
 
   const enterEsc = () => {
     mode = 'esc'
-    csiPayload = ''
+    csiPayloadSuffix = ''
     stringEscPending = false
   }
 
   const enterGround = () => {
     mode = 'ground'
-    csiPayload = ''
+    csiPayloadSuffix = ''
     stringEscPending = false
   }
 
@@ -130,6 +141,13 @@ export function createTerminalOutputBarrierScanner(): TerminalOutputBarrierScann
 
       const markBarrier = (reason: TerminalOutputBarrierReason) => {
         barrierReason = recordReason(barrierReason, reason)
+      }
+
+      const appendCsiPayload = (char: string) => {
+        csiPayloadSuffix += char
+        if (csiPayloadSuffix.length > CSI_PAYLOAD_SUFFIX_LIMIT) {
+          csiPayloadSuffix = csiPayloadSuffix.slice(-CSI_PAYLOAD_SUFFIX_LIMIT)
+        }
       }
 
       const processStringMode = (
@@ -203,6 +221,11 @@ export function createTerminalOutputBarrierScanner(): TerminalOutputBarrierScann
             enterStringMode('dcs')
             continue
           }
+          if (codePoint === SOS || codePoint === PM) {
+            markBarrier('control')
+            enterStringMode('apc')
+            continue
+          }
           if (codePoint === APC) {
             markBarrier('control')
             enterStringMode('apc')
@@ -218,6 +241,10 @@ export function createTerminalOutputBarrierScanner(): TerminalOutputBarrierScann
           markBarrier('control')
           if (codePoint === 0x5b) {
             enterCsi()
+            continue
+          }
+          if (codePoint === 0x58 || codePoint === 0x5e) {
+            enterStringMode('apc')
             continue
           }
           if (codePoint === 0x5d) {
@@ -250,11 +277,20 @@ export function createTerminalOutputBarrierScanner(): TerminalOutputBarrierScann
             enterStringMode('dcs')
             continue
           }
+          if (codePoint === SOS || codePoint === PM) {
+            enterStringMode('apc')
+            continue
+          }
           if (codePoint === APC) {
             enterStringMode('apc')
             continue
           }
-          enterGround()
+          if (isEscIntermediateByte(codePoint)) {
+            continue
+          }
+          if (isEscFinalByte(codePoint)) {
+            enterGround()
+          }
           continue
         }
 
@@ -277,11 +313,11 @@ export function createTerminalOutputBarrierScanner(): TerminalOutputBarrierScann
             continue
           }
           if (isCsiFinalByte(codePoint)) {
-            markBarrier(classifyCsiFinal(csiPayload, char))
+            markBarrier(classifyCsiFinal(csiPayloadSuffix, char))
             enterGround()
             continue
           }
-          csiPayload += char
+          appendCsiPayload(char)
           continue
         }
 
