@@ -12,17 +12,30 @@ import TerminalView from '@/components/TerminalView'
 const wsHarness = vi.hoisted(() => {
   const handlers = new Set<(msg: any) => void>()
   const latestAttachRequestIdByTerminal = new Map<string, string>()
+  const latestStreamIdByTerminal = new Map<string, string>()
 
-  const withCurrentAttachRequestId = (msg: any) => {
+  const withCurrentAttachMetadata = (msg: any) => {
     if (
-      msg?.attachRequestId
-      || typeof msg?.terminalId !== 'string'
+      typeof msg?.terminalId !== 'string'
       || (msg?.type !== 'terminal.attach.ready' && msg?.type !== 'terminal.output' && msg?.type !== 'terminal.output.gap')
     ) {
       return msg
     }
-    const attachRequestId = latestAttachRequestIdByTerminal.get(msg.terminalId)
-    return attachRequestId ? { ...msg, attachRequestId } : msg
+    let normalized = msg
+    if (!normalized.attachRequestId) {
+      const attachRequestId = latestAttachRequestIdByTerminal.get(msg.terminalId)
+      if (attachRequestId) normalized = { ...normalized, attachRequestId }
+    }
+    if (normalized.type === 'terminal.attach.ready' && typeof normalized.streamId !== 'string') {
+      normalized = { ...normalized, streamId: `${msg.terminalId}:stream` }
+    } else if (typeof normalized.streamId !== 'string') {
+      const streamId = latestStreamIdByTerminal.get(msg.terminalId)
+      if (streamId) normalized = { ...normalized, streamId }
+    }
+    if (normalized.type === 'terminal.attach.ready' && typeof normalized.streamId === 'string') {
+      latestStreamIdByTerminal.set(msg.terminalId, normalized.streamId)
+    }
+    return normalized
   }
 
   return {
@@ -34,7 +47,7 @@ const wsHarness = vi.hoisted(() => {
       return () => handlers.delete(handler)
     }),
     emit(msg: any) {
-      const normalized = withCurrentAttachRequestId(msg)
+      const normalized = withCurrentAttachMetadata(msg)
       for (const handler of handlers) {
         handler(normalized)
       }
@@ -42,6 +55,7 @@ const wsHarness = vi.hoisted(() => {
     reset() {
       handlers.clear()
       latestAttachRequestIdByTerminal.clear()
+      latestStreamIdByTerminal.clear()
     },
     rememberAttach(msg: any) {
       if (
