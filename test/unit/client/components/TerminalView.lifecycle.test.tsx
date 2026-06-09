@@ -3976,6 +3976,8 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     it('drops stale and untagged terminal.output from non-current attach generations', async () => {
+      const bridge = createPerfAuditBridge()
+      installPerfAuditBridge(bridge)
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',
         terminalId: 'term-attach-gen',
@@ -4026,6 +4028,15 @@ describe('TerminalView lifecycle updates', () => {
       expect(writes).toContain('FRESH')
       expect(writes).not.toContain('STALE')
       expect(writes).not.toContain('UNTAGGED')
+      expect(bridge.snapshot().milestones['terminal.attach_generation_stale_rejected']).toBeTypeOf('number')
+      expect(bridge.snapshot().metadata['terminal.attach_generation_stale_rejected']).toEqual(
+        expect.objectContaining({
+          terminalId,
+          messageType: 'terminal.output',
+          reason: 'missing_attach_request_id',
+          activeAttachRequestId: secondAttach!.attachRequestId,
+        }),
+      )
     })
 
     it('persists attach-ready stream id into pane content and checkpoint identity', async () => {
@@ -4240,6 +4251,8 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     it('rejects a warm-delta attach when attach-ready reports a different stream id', async () => {
+      const bridge = createPerfAuditBridge()
+      installPerfAuditBridge(bridge)
       const { store, tabId, terminalId, term } = await renderTerminalHarness({
         status: 'running',
         terminalId: 'term-stream-rotation-client',
@@ -4331,6 +4344,17 @@ describe('TerminalView lifecycle updates', () => {
         .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
         .at(-1)
       expect(repairAttach?.attachRequestId).not.toBe(warmDeltaAttach!.attachRequestId)
+      expect(bridge.snapshot().milestones['terminal.catchup.full_hydrate_fallback']).toBeTypeOf('number')
+      expect(bridge.snapshot().metadata['terminal.catchup.full_hydrate_fallback']).toEqual(
+        expect.objectContaining({
+          terminalId,
+          attachRequestId: warmDeltaAttach!.attachRequestId,
+          reason: 'stream_identity_changed',
+          expectedStreamId: 'stream-before-rotation',
+          streamId: 'stream-after-rotation',
+          sinceSeq: 1,
+        }),
+      )
     })
 
     it('does not render or checkpoint terminal.output from a mismatched stream id', async () => {
@@ -4399,6 +4423,8 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     it('writes a homogeneous terminal.output.batch once and advances the parser-applied cursor after acknowledgement', async () => {
+      const bridge = createPerfAuditBridge()
+      installPerfAuditBridge(bridge)
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',
         terminalId: 'term-output-batch-combined',
@@ -4439,6 +4465,16 @@ describe('TerminalView lifecycle updates', () => {
         terminalId,
         sinceSeq: 3,
       }))
+      expect(bridge.snapshot().milestones['terminal.parser_applied']).toBeTypeOf('number')
+      expect(bridge.snapshot().metadata['terminal.parser_applied']).toEqual(
+        expect.objectContaining({
+          terminalId,
+          attachRequestId,
+          parserAppliedSeq: 3,
+          previousParserAppliedSeq: 0,
+          surfaceQuarantined: false,
+        }),
+      )
     })
 
     it('rejects an overlapping terminal.output.batch before writing partial bytes', async () => {
@@ -5746,6 +5782,8 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     it('fails closed from delta attach when writes are in flight and repairs quarantine after drain', async () => {
+      const bridge = createPerfAuditBridge()
+      installPerfAuditBridge(bridge)
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',
         terminalId: 'term-in-flight-delta',
@@ -5809,6 +5847,27 @@ describe('TerminalView lifecycle updates', () => {
         sinceSeq: 0,
         attachRequestId: expect.any(String),
       })
+      expect(bridge.snapshot().milestones['terminal.catchup.full_hydrate_fallback']).toBeTypeOf('number')
+      expect(bridge.snapshot().metadata['terminal.catchup.full_hydrate_fallback']).toEqual(
+        expect.objectContaining({
+          terminalId,
+          attachRequestId: secondAttach!.attachRequestId,
+          requestedIntent: 'transport_reconnect',
+          intent: 'viewport_hydrate',
+          reason: 'in_flight_writes',
+          hasInFlightWrites: true,
+        }),
+      )
+      expect(bridge.snapshot().milestones['terminal.catchup.surface_quarantined']).toBeTypeOf('number')
+      expect(bridge.snapshot().metadata['terminal.catchup.surface_quarantined']).toEqual(
+        expect.objectContaining({
+          terminalId,
+          attachRequestId: secondAttach!.attachRequestId,
+          requestedIntent: 'transport_reconnect',
+          intent: 'viewport_hydrate',
+          reason: 'in_flight_writes',
+        }),
+      )
 
       act(() => {
         messageHandler!({

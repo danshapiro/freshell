@@ -108,6 +108,14 @@ export class ReplayRing {
     return this.storage.tailSeq()
   }
 
+  retainedBytes(): number {
+    return this.storage.totalBytes()
+  }
+
+  retentionMaxBytes(): number {
+    return this.maxBytes
+  }
+
   private conservativeTruncatedClassification(
     classification: TerminalOutputBarrierClassification,
   ): {

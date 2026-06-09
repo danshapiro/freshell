@@ -687,6 +687,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     quarantineRepairRef.current = null
   }, [])
 
+  const markTerminalPerfAudit = useCallback((name: string, data: Record<string, unknown> = {}) => {
+    const payload = Object.fromEntries(Object.entries({
+      tabId,
+      paneId: paneIdRef.current,
+      ...data,
+    }).filter(([, value]) => value !== undefined))
+    getInstalledPerfAuditBridge()?.mark(name, payload)
+  }, [tabId])
+
   const scheduleQuarantineRepair = useCallback((terminalId: string, attachRequestId: string) => {
     clearQuarantineRepair()
     const queue = writeQueueRef.current
@@ -751,7 +760,18 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     if (parserAppliedSeq <= parserAppliedSeqRef.current) {
       return
     }
+    const previousParserAppliedSeq = parserAppliedSeqRef.current
     parserAppliedSeqRef.current = parserAppliedSeq
+    markTerminalPerfAudit('terminal.parser_applied', {
+      terminalId,
+      attachRequestId: attach?.requestId,
+      activeAttachRequestId: currentAttachRef.current?.requestId,
+      streamId: attach?.streamId ?? getTerminalCheckpointStreamId(),
+      parserAppliedSeq,
+      previousParserAppliedSeq,
+      surfaceEpoch: surfaceEpochRef.current,
+      surfaceQuarantined,
+    })
 
     if (surfaceQuarantined) return
     if (!attach || attach.terminalId !== terminalId) return
@@ -780,7 +800,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       bufferType: 'unknown',
       parserIdle: true,
     })
-  }, [buildCheckpointReplayInput])
+  }, [buildCheckpointReplayInput, getTerminalCheckpointStreamId, markTerminalPerfAudit])
 
   const writeLocalXtermNotice = useCallback((term: Terminal, data: string) => {
     const terminalInstanceId = terminalInstanceIdRef.current
@@ -2063,6 +2083,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const current = currentAttachRef.current
     if (!current) return true
     if (!msg.attachRequestId) {
+      markTerminalPerfAudit('terminal.attach_generation_stale_rejected', {
+        terminalId: msg.terminalId,
+        messageType: msg.type,
+        activeAttachRequestId: current.requestId,
+        reason: 'missing_attach_request_id',
+      })
       if (debugRef.current) {
         log.debug('Ignoring untagged stream message for active attach generation', {
           paneId: paneIdRef.current,
@@ -2073,8 +2099,18 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       }
       return false
     }
-    return msg.attachRequestId === current.requestId
-  }, [])
+    const isCurrent = msg.attachRequestId === current.requestId
+    if (!isCurrent) {
+      markTerminalPerfAudit('terminal.attach_generation_stale_rejected', {
+        terminalId: msg.terminalId,
+        messageType: msg.type,
+        attachRequestId: msg.attachRequestId,
+        activeAttachRequestId: current.requestId,
+        reason: 'stale_attach_request_id',
+      })
+    }
+    return isCurrent
+  }, [markTerminalPerfAudit])
 
   const isCurrentAttachStreamMessage = useCallback((msg: {
     type: string
@@ -2112,6 +2148,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       const nextSeqState = gapDecision.state
       applySeqState(nextSeqState)
       resetParserAppliedSurface(parserAppliedSeqRef.current)
+      markTerminalPerfAudit('terminal.catchup.surface_quarantined', {
+        terminalId: msg.terminalId,
+        messageType: msg.type,
+        attachRequestId: msg.attachRequestId,
+        activeAttachRequestId: current?.requestId,
+        activeStreamId,
+        streamId: messageStreamId,
+        fromSeq,
+        toSeq,
+        parserAppliedSeq: parserAppliedSeqRef.current,
+        highestObservedSeq: nextSeqState.highestObservedSeq,
+        reason: 'stream_identity_mismatch',
+      })
       const completedAttachOnGap = !nextSeqState.pendingReplay
         && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
       if (completedAttachOnGap) {
@@ -2121,6 +2170,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       }
     } else {
       resetParserAppliedSurface(parserAppliedSeqRef.current)
+      markTerminalPerfAudit('terminal.catchup.surface_quarantined', {
+        terminalId: msg.terminalId,
+        messageType: msg.type,
+        attachRequestId: msg.attachRequestId,
+        activeAttachRequestId: current?.requestId,
+        activeStreamId,
+        streamId: messageStreamId,
+        parserAppliedSeq: parserAppliedSeqRef.current,
+        reason: 'stream_identity_mismatch',
+      })
     }
 
     log.warn('Ignoring terminal stream message with mismatched stream identity', {
@@ -2138,6 +2197,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     applySeqState,
     isCurrentAttachMessage,
     markAttachComplete,
+    markTerminalPerfAudit,
     resetParserAppliedSurface,
     resetStartupProbeParser,
   ])
@@ -2171,12 +2231,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       : undefined
     let effectiveIntent = intent
     let clearViewportFirst = opts?.clearViewportFirst === true
+    let fullHydrateFallbackReason: string | null = null
     if (hasInFlightWrites && effectiveIntent !== 'viewport_hydrate') {
       effectiveIntent = 'viewport_hydrate'
       clearViewportFirst = true
+      fullHydrateFallbackReason = 'in_flight_writes'
     } else if (effectiveIntent !== 'viewport_hydrate' && explicitSinceSeq === undefined && !checkpointDecision.ok) {
       effectiveIntent = 'viewport_hydrate'
       clearViewportFirst = true
+      fullHydrateFallbackReason = checkpointDecision.reason
     }
     const deltaSeq = Math.max(0, Math.floor(explicitSinceSeq ?? (checkpointDecision.ok ? checkpointDecision.sinceSeq : 0)))
     const sinceSeq = effectiveIntent === 'viewport_hydrate' ? 0 : deltaSeq
@@ -2237,6 +2300,31 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       surfaceQuarantined,
       expectedStreamId,
     }
+    if (fullHydrateFallbackReason) {
+      markTerminalPerfAudit('terminal.catchup.full_hydrate_fallback', {
+        terminalId: tid,
+        attachRequestId,
+        requestedIntent: intent,
+        intent: effectiveIntent,
+        sinceSeq,
+        deltaSeq,
+        streamId: expectedStreamId,
+        reason: fullHydrateFallbackReason,
+        hasInFlightWrites,
+      })
+    }
+    if (surfaceQuarantined) {
+      markTerminalPerfAudit('terminal.catchup.surface_quarantined', {
+        terminalId: tid,
+        attachRequestId,
+        requestedIntent: intent,
+        intent: effectiveIntent,
+        sinceSeq,
+        streamId: expectedStreamId,
+        parserAppliedSeq: parserAppliedSeqRef.current,
+        reason: 'in_flight_writes',
+      })
+    }
     suppressNextMatchingResizeRef.current = opts?.suppressNextMatchingResize
       ? { terminalId: tid, cols, rows }
       : null
@@ -2264,6 +2352,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     clearQuarantineRepair,
     getCheckpointDeltaReplayDecision,
     getTerminalCheckpointStreamId,
+    markTerminalPerfAudit,
     resetParserAppliedSurface,
     scheduleQuarantineRepair,
     resetStartupProbeParser,
@@ -3106,6 +3195,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const nextSeqState = gapDecision.state
           applySeqState(nextSeqState)
           resetParserAppliedSurface(parserAppliedSeqRef.current)
+          if (gapDecision.requiresSurfaceQuarantine) {
+            markTerminalPerfAudit('terminal.catchup.surface_quarantined', {
+              terminalId: tid,
+              attachRequestId: msg.attachRequestId,
+              activeAttachRequestId: currentAttachRef.current?.requestId,
+              streamId: msg.streamId,
+              fromSeq: msg.fromSeq,
+              toSeq: msg.toSeq,
+              parserAppliedSeq: parserAppliedSeqRef.current,
+              highestObservedSeq: nextSeqState.highestObservedSeq,
+              reason: msg.reason ?? 'output_gap',
+            })
+          }
           const completedAttachOnGap = !nextSeqState.pendingReplay
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           if (completedAttachOnGap) {
@@ -3184,6 +3286,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               expectedStreamId,
               readyStreamId,
               sinceSeq: activeAttach.sinceSeq,
+            })
+            markTerminalPerfAudit('terminal.catchup.full_hydrate_fallback', {
+              terminalId: tid,
+              attachRequestId: msg.attachRequestId,
+              activeAttachRequestId: activeAttach.requestId,
+              streamId: readyStreamId,
+              expectedStreamId,
+              sinceSeq: activeAttach.sinceSeq,
+              reason: 'stream_identity_changed',
             })
             resetParserAppliedSurface(parserAppliedSeqRef.current)
             updateContent({ streamId: undefined })
@@ -3794,6 +3905,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     isCurrentAttachStreamMessage,
     markAttachComplete,
     markParserAppliedFrame,
+    markTerminalPerfAudit,
     registerForBackgroundHydration,
     resetParserAppliedSurface,
     resetStartupProbeParser,

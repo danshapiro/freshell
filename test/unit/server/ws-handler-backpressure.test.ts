@@ -57,6 +57,16 @@ function createMockWs(overrides: Record<string, unknown> = {}) {
   return ws
 }
 
+function structuredLogs(level: 'debug' | 'info' | 'warn' | 'error', event: string) {
+  return loggerMocks.logger[level].mock.calls
+    .map(([payload]) => payload)
+    .filter((payload): payload is Record<string, unknown> => (
+      !!payload
+      && typeof payload === 'object'
+      && (payload as { event?: unknown }).event === event
+    ))
+}
+
 class FakeBrokerRegistry extends EventEmitter {
   private records = new Map<string, { terminalId: string; mode: string; buffer: { snapshot: () => string } }>()
   private replayRingMaxChars: number | undefined
@@ -100,6 +110,9 @@ beforeEach(() => {
   originalAuthToken = process.env.AUTH_TOKEN
   process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
   loggerMocks.logger.debug.mockClear()
+  loggerMocks.logger.info.mockClear()
+  loggerMocks.logger.warn.mockClear()
+  loggerMocks.logger.error.mockClear()
 })
 
 afterEach(() => {
@@ -341,6 +354,189 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
       if (originalRingMax === undefined) delete process.env.TERMINAL_REPLAY_RING_MAX_BYTES
       else process.env.TERMINAL_REPLAY_RING_MAX_BYTES = originalRingMax
     }
+  })
+
+  it('emits structured terminal.replay.batch logs for replay batch sends', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-structured-batch')
+
+    for (let i = 1; i <= 8; i += 1) {
+      registry.emit('terminal.output.raw', {
+        terminalId: 'term-structured-batch',
+        data: `batch-${i};`,
+        at: Date.now(),
+      })
+    }
+
+    const wsReplay = createMockWs({ bufferedAmount: 0 })
+    await broker.attach(
+      wsReplay as any,
+      'term-structured-batch',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      'structured-batch-attach',
+      undefined,
+      'foreground',
+      true,
+    )
+    vi.advanceTimersByTime(5)
+
+    expect(structuredLogs('debug', 'terminal.replay.batch')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event: 'terminal.replay.batch',
+          severity: 'debug',
+          terminalId: 'term-structured-batch',
+          attachRequestId: 'structured-batch-attach',
+          source: 'replay',
+          streamId: expect.any(String),
+          seqStart: 1,
+          seqEnd: 8,
+          rawFrameCount: 8,
+          dataBytes: expect.any(Number),
+          serializedBytes: expect.any(Number),
+          bufferedAmount: expect.any(Number),
+        }),
+      ]),
+    )
+
+    broker.close()
+  })
+
+  it('emits structured terminal.replay.gap logs for replay gaps', async () => {
+    const originalRingMax = process.env.TERMINAL_REPLAY_RING_MAX_BYTES
+    process.env.TERMINAL_REPLAY_RING_MAX_BYTES = '8'
+    try {
+      const registry = new FakeBrokerRegistry()
+      const broker = new TerminalStreamBroker(registry as any, vi.fn())
+      registry.createTerminal('term-structured-gap')
+
+      const wsSeed = createMockWs()
+      await broker.attach(wsSeed as any, 'term-structured-gap', 'viewport_hydrate', 80, 24, 0)
+
+      registry.emit('terminal.output.raw', { terminalId: 'term-structured-gap', data: 'aaaa', at: Date.now() })
+      registry.emit('terminal.output.raw', { terminalId: 'term-structured-gap', data: 'bbbb', at: Date.now() })
+      registry.emit('terminal.output.raw', { terminalId: 'term-structured-gap', data: 'cccc', at: Date.now() })
+
+      const wsReplay = createMockWs()
+      await broker.attach(
+        wsReplay as any,
+        'term-structured-gap',
+        'viewport_hydrate',
+        80,
+        24,
+        0,
+        'structured-gap-attach',
+      )
+
+      expect(structuredLogs('warn', 'terminal.replay.gap')).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            event: 'terminal.replay.gap',
+            severity: 'warn',
+            terminalId: 'term-structured-gap',
+            attachRequestId: 'structured-gap-attach',
+            streamId: expect.any(String),
+            fromSeq: 1,
+            toSeq: 1,
+            reason: 'replay_window_exceeded',
+          }),
+        ]),
+      )
+
+      broker.close()
+    } finally {
+      if (originalRingMax === undefined) delete process.env.TERMINAL_REPLAY_RING_MAX_BYTES
+      else process.env.TERMINAL_REPLAY_RING_MAX_BYTES = originalRingMax
+    }
+  })
+
+  it('emits structured terminal.replay.backpressure_pause logs for replay pacing', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(4 * 1024 * 1024)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-structured-backpressure')
+
+    for (let i = 1; i <= 10; i += 1) {
+      registry.emit('terminal.output.raw', {
+        terminalId: 'term-structured-backpressure',
+        data: `paused-${i};${'x'.repeat(2 * 1024)}`,
+        at: Date.now(),
+      })
+    }
+
+    const wsReplay = createMockWs({ bufferedAmount: 768 * 1024 })
+    await broker.attach(
+      wsReplay as any,
+      'term-structured-backpressure',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      'structured-backpressure-attach',
+      undefined,
+      'foreground',
+    )
+    vi.advanceTimersByTime(50)
+
+    expect(structuredLogs('debug', 'terminal.replay.backpressure_pause')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event: 'terminal.replay.backpressure_pause',
+          severity: 'debug',
+          terminalId: 'term-structured-backpressure',
+          attachRequestId: 'structured-backpressure-attach',
+          source: 'replay',
+          bufferedAmount: expect.any(Number),
+          threshold: expect.any(Number),
+          retryMs: expect.any(Number),
+          reason: 'websocket_buffered_amount',
+        }),
+      ]),
+    )
+
+    broker.close()
+  })
+
+  it('emits structured terminal.replay.retention logs when retention loss rotates stream identity', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(6)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-structured-retention')
+
+    const ws = createMockWs()
+    await broker.attach(ws as any, 'term-structured-retention', 'viewport_hydrate', 80, 24, 0, 'structured-retention-attach')
+    const ready = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(ready?.streamId).toEqual(expect.any(String))
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-structured-retention', data: 'aaa', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-structured-retention', data: 'bbb', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-structured-retention', data: 'ccc', at: Date.now() })
+
+    expect(structuredLogs('warn', 'terminal.replay.retention')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event: 'terminal.replay.retention',
+          severity: 'warn',
+          terminalId: 'term-structured-retention',
+          attachRequestId: 'structured-retention-attach',
+          previousStreamId: ready.streamId,
+          streamId: expect.any(String),
+          reason: 'retention_lost',
+          retainedBytes: expect.any(Number),
+          maxBytes: 6,
+          tailSeq: expect.any(Number),
+          headSeq: expect.any(Number),
+        }),
+      ]),
+    )
+
+    broker.close()
   })
 
   it('echoes attachRequestId on attach.ready, output, and output.gap for a client attachment', async () => {
