@@ -1,3 +1,10 @@
+import {
+  createTerminalOutputBarrierScanner,
+  type TerminalOutputBarrierReason,
+  type TerminalOutputScannerState,
+} from './output-barrier-scanner.js'
+import { buildTerminalOutputBatches } from './output-batch.js'
+
 export type ReplayFrame = {
   seqStart: number
   seqEnd: number
@@ -5,6 +12,10 @@ export type ReplayFrame = {
   bytes: number
   at: number
   streamId: string
+  barrier: boolean
+  barrierReason?: TerminalOutputBarrierReason
+  scannerStateBefore: TerminalOutputScannerState
+  scannerStateAfter: TerminalOutputScannerState
 }
 
 export const DEFAULT_TERMINAL_REPLAY_RING_MAX_BYTES = 1024 * 1024
@@ -32,6 +43,7 @@ export class ReplayRing {
   private maxBytes: number
   private retentionLossPending = false
   private readonly utf8FatalDecoder = new TextDecoder('utf-8', { fatal: true })
+  private readonly barrierScanner = createTerminalOutputBarrierScanner()
 
   constructor(maxBytes?: number) {
     this.maxBytes = resolveMaxBytes(maxBytes)
@@ -49,6 +61,7 @@ export class ReplayRing {
     this.nextSeq += 1
     this.head = seq
     const normalizedData = this.normalizeFrameData(data)
+    const barrierClassification = this.barrierScanner.scan(normalizedData)
 
     const frame: ReplayFrame = {
       seqStart: seq,
@@ -57,6 +70,10 @@ export class ReplayRing {
       bytes: Buffer.byteLength(normalizedData, 'utf8'),
       at: Date.now(),
       streamId: metadata.streamId,
+      barrier: barrierClassification.barrier,
+      ...(barrierClassification.barrier ? { barrierReason: barrierClassification.reason } : {}),
+      scannerStateBefore: barrierClassification.stateBefore,
+      scannerStateAfter: barrierClassification.stateAfter,
     }
 
     this.frames.push(frame)
@@ -120,51 +137,12 @@ export class ReplayRing {
     const missedFromSeq = normalizedSinceSeq < tail - 1
       ? normalizedSinceSeq + 1
       : undefined
-    const frames: ReplayFrame[] = []
-    let budget = normalizedMaxBytes
-
-    if (budget <= 0) {
-      return { frames, missedFromSeq }
-    }
-
-    const startIndex = this.firstFrameIndexAfter(normalizedSinceSeq)
-    for (let i = startIndex; i < this.frames.length; i += 1) {
-      const frame = this.frames[i]
-      if (frame.seqStart > normalizedToSeq) break
-      const frameBytes = this.measureFrameForBatch(frame, measureFrameBytes)
-
-      const previous = frames[frames.length - 1]
-      if (previous && frame.seqStart === previous.seqEnd + 1) {
-        if (frame.streamId !== previous.streamId) {
-          if (frameBytes > budget && frames.length > 0) break
-          frames.push({ ...frame })
-          budget -= frameBytes
-          if (budget <= 0) break
-          continue
-        }
-        const mergedCandidate: ReplayFrame = {
-          ...previous,
-          seqEnd: frame.seqEnd,
-          data: previous.data + frame.data,
-          bytes: previous.bytes + frame.bytes,
-          at: frame.at,
-        }
-        const previousBytes = this.measureFrameForBatch(previous, measureFrameBytes)
-        const mergedBytes = this.measureFrameForBatch(mergedCandidate, measureFrameBytes)
-        const additionalBytes = Math.max(0, mergedBytes - previousBytes)
-        if (additionalBytes > budget) break
-        previous.seqEnd = mergedCandidate.seqEnd
-        previous.data = mergedCandidate.data
-        previous.bytes = mergedCandidate.bytes
-        previous.at = mergedCandidate.at
-        budget -= additionalBytes
-      } else {
-        if (frameBytes > budget && frames.length > 0) break
-        frames.push({ ...frame })
-        budget -= frameBytes
-      }
-      if (budget <= 0) break
-    }
+    const frames = buildTerminalOutputBatches({
+      frames: this.iterReplayFrames(normalizedSinceSeq, normalizedToSeq),
+      maxSerializedBytes: normalizedMaxBytes,
+      maxTotalSerializedBytes: normalizedMaxBytes,
+      measureFrameBytes,
+    })
 
     return { frames, missedFromSeq }
   }
@@ -203,10 +181,13 @@ export class ReplayRing {
     return low
   }
 
-  private measureFrameForBatch(frame: ReplayFrame, measureFrameBytes?: ReplayFrameByteMeasure): number {
-    if (!measureFrameBytes) return frame.bytes
-    const measured = measureFrameBytes(frame)
-    return Number.isFinite(measured) && measured > 0 ? Math.floor(measured) : 0
+  private *iterReplayFrames(sinceSeq: number, toSeq: number): IterableIterator<ReplayFrame> {
+    const startIndex = this.firstFrameIndexAfter(sinceSeq)
+    for (let index = startIndex; index < this.frames.length; index += 1) {
+      const frame = this.frames[index]
+      if (frame.seqStart > toSeq) break
+      yield frame
+    }
   }
 
   private decodeUtf8Fatal(bytes: Uint8Array): string | null {

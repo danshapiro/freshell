@@ -111,6 +111,53 @@ describe('ReplayRing', () => {
     })
   })
 
+  it('does not coalesce replay batches across retained parser barriers', () => {
+    const ring = new ReplayRing(1024)
+    append(ring, 'before')
+    append(ring, '\u001b[31m')
+    append(ring, 'after')
+
+    const batch = ring.replayBatchSince(0, 1024, 3)
+
+    expect(batch.frames.map((frame) => frame.data)).toEqual([
+      'before',
+      '\u001b[31m',
+      'after',
+    ])
+    expect(batch.frames[1]).toMatchObject({
+      seqStart: 2,
+      seqEnd: 2,
+      barrier: true,
+      barrierReason: 'control',
+      scannerStateBefore: { mode: 'ground' },
+      scannerStateAfter: { mode: 'ground' },
+    })
+  })
+
+  it('does not re-coalesce retained fragments into oversized serialized payloads', () => {
+    const ring = new ReplayRing(1024)
+    append(ring, 'a'.repeat(60))
+    append(ring, 'b'.repeat(60))
+
+    const measureSerializedPayload = (frame: { data: string }) => 100 + frame.data.length
+    const firstBatch = ring.replayBatchSince(0, 170, 2, measureSerializedPayload)
+
+    expect(firstBatch.frames).toHaveLength(1)
+    expect(firstBatch.frames[0]).toMatchObject({
+      seqStart: 1,
+      seqEnd: 1,
+      data: 'a'.repeat(60),
+    })
+
+    const secondBatch = ring.replayBatchSince(firstBatch.frames[0].seqEnd, 170, 2, measureSerializedPayload)
+    expect(secondBatch.frames).toHaveLength(1)
+    expect(secondBatch.frames[0]).toMatchObject({
+      seqStart: 2,
+      seqEnd: 2,
+      data: 'b'.repeat(60),
+    })
+  })
+
   it('does not coalesce adjacent replay frames from different stream ids', () => {
     const ring = new ReplayRing(1024)
     append(ring, 'old', 'stream-old')

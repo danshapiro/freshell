@@ -1112,8 +1112,23 @@ describe('WebSocket edge cases', () => {
         (m) => m.type === 'terminal.output' && m.terminalId === terminalId,
       ], 5000)
 
-      expect(ready.headSeq).toBeGreaterThanOrEqual(replay.seqEnd)
-      expect(replay.data.length).toBeGreaterThan(60_000)
+      const replayFrames = [replay]
+      let nextSeq = (replay.seqEnd as number) + 1
+      while (replayFrames[replayFrames.length - 1].seqEnd < ready.headSeq) {
+        const frame = await waitForMessage(
+          ws2,
+          (m) => m.type === 'terminal.output'
+            && m.terminalId === terminalId
+            && m.seqStart === nextSeq,
+          5000,
+        )
+        replayFrames.push(frame)
+        nextSeq = (frame.seqEnd as number) + 1
+      }
+
+      expect(ready.headSeq).toBeGreaterThanOrEqual(replayFrames[replayFrames.length - 1].seqEnd)
+      expect(replayFrames.length).toBeGreaterThan(1)
+      expect(replayFrames.map((frame) => String(frame.data)).join('').length).toBeGreaterThan(50_000)
 
       const extras = await collectMessages(ws2, 150)
       const legacyFrames = extras.filter((m) => typeof m.type === 'string' && m.type.startsWith('terminal.attached'))
@@ -1411,11 +1426,22 @@ describe('WebSocket edge cases', () => {
       const terminalId = await createTerminal(ws, 'large-chunk')
 
       // Single large chunk
-      const outputPromise = waitForMessage(ws, (m) => m.type === 'terminal.output')
       registry.simulateOutput(terminalId, 'x'.repeat(50_000))
 
-      const output = await outputPromise
-      expect(output.data.length).toBe(50_000)
+      let outputData = ''
+      let nextSeq: number | undefined
+      while (outputData.length < 50_000) {
+        const output = await waitForMessage(
+          ws,
+          (m) => m.type === 'terminal.output'
+            && m.terminalId === terminalId
+            && (nextSeq === undefined || m.seqStart === nextSeq),
+          5000,
+        )
+        outputData += String(output.data)
+        nextSeq = (output.seqEnd as number) + 1
+      }
+      expect(outputData).toHaveLength(50_000)
 
       close()
     })

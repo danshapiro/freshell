@@ -1,4 +1,5 @@
 import type { ReplayFrame } from './replay-ring.js'
+import { buildTerminalOutputBatches } from './output-batch.js'
 
 type QueuedReplayFrame = ReplayFrame & {
   queuedBytes: number
@@ -55,7 +56,7 @@ export class ClientOutputQueue {
 
   nextBatch(maxBytes: number, measureFrameBytes?: QueuedFrameByteMeasure): Array<ReplayFrame | GapEvent> {
     const out: Array<ReplayFrame | GapEvent> = []
-    let budget = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : 0
+    const budget = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : 0
 
     if (this.pendingGaps.length > 0) {
       out.push(...this.pendingGaps)
@@ -66,47 +67,15 @@ export class ClientOutputQueue {
       return out
     }
 
-    while (this.frames.length > 0) {
-      const first = this.frames[0]
-      const firstBytes = this.measureFrameForBatch(first, measureFrameBytes)
-      if (firstBytes > budget && out.some((item) => !isGapEvent(item))) break
-
-      const frame = this.frames.shift()
-      if (!frame) break
-      this.totalBytes -= frame.queuedBytes
-      budget -= firstBytes
-
-      const merged: ReplayFrame = this.toReplayFrame(frame)
-      let mergedBytes = firstBytes
-      while (this.frames.length > 0) {
-        const next = this.frames[0]
-        if (next.seqStart !== merged.seqEnd + 1) break
-        if (next.streamId !== merged.streamId) break
-        const mergedCandidate: ReplayFrame = {
-          ...merged,
-          seqEnd: next.seqEnd,
-          data: merged.data + next.data,
-          bytes: merged.bytes + next.bytes,
-          at: next.at,
-        }
-        const mergedCandidateBytes = this.measureFrameForBatch(mergedCandidate, measureFrameBytes)
-        const additionalBytes = Math.max(0, mergedCandidateBytes - mergedBytes)
-        if (additionalBytes > budget) break
-
-        const nextFrame = this.frames.shift()
-        if (!nextFrame) break
-        this.totalBytes -= nextFrame.queuedBytes
-        budget -= additionalBytes
-        merged.seqEnd = mergedCandidate.seqEnd
-        merged.data = mergedCandidate.data
-        merged.bytes = mergedCandidate.bytes
-        merged.at = mergedCandidate.at
-        mergedBytes = mergedCandidateBytes
-      }
-
-      out.push(merged)
-      if (budget <= 0) break
-    }
+    const batches = buildTerminalOutputBatches({
+      frames: this.frames,
+      maxSerializedBytes: budget,
+      maxTotalSerializedBytes: budget,
+      measureFrameBytes: (frame) => this.measureFrameForBatch(frame, measureFrameBytes),
+    })
+    const consumedFrameCount = batches.reduce((sum, batch) => sum + batch.segments.length, 0)
+    this.consumeFrames(consumedFrameCount)
+    out.push(...batches)
 
     return out
   }
@@ -147,12 +116,17 @@ export class ClientOutputQueue {
   }
 
   private measureFrameForBatch(frame: ReplayFrame, measureFrameBytes?: QueuedFrameByteMeasure): number {
-    if (!measureFrameBytes) {
-      const queuedBytes = (frame as Partial<QueuedReplayFrame>).queuedBytes
-      return typeof queuedBytes === 'number' ? queuedBytes : frame.bytes
-    }
+    if (!measureFrameBytes) return frame.bytes
     const measured = measureFrameBytes(this.toReplayFrame(frame))
     return Number.isFinite(measured) && measured > 0 ? Math.floor(measured) : 0
+  }
+
+  private consumeFrames(count: number): void {
+    for (let consumed = 0; consumed < count; consumed += 1) {
+      const frame = this.frames.shift()
+      if (!frame) return
+      this.totalBytes -= frame.queuedBytes
+    }
   }
 
   private toReplayFrame(frame: ReplayFrame): ReplayFrame {
@@ -163,6 +137,10 @@ export class ClientOutputQueue {
       bytes: frame.bytes,
       at: frame.at,
       streamId: frame.streamId,
+      barrier: frame.barrier,
+      ...(frame.barrier && frame.barrierReason ? { barrierReason: frame.barrierReason } : {}),
+      scannerStateBefore: frame.scannerStateBefore,
+      scannerStateAfter: frame.scannerStateAfter,
     }
   }
 

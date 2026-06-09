@@ -6,6 +6,7 @@ import { logTerminalStreamPerfEvent, type TerminalStreamPerfEvent } from '../per
 import type { TerminalOutputRawEvent } from './registry-events.js'
 import { ClientOutputQueue, isGapEvent, type GapEvent } from './client-output-queue.js'
 import { ReplayRing, type ReplayFrame } from './replay-ring.js'
+import type { TerminalOutputBatch } from './output-batch.js'
 import { fragmentTerminalOutputForPayloadBudget } from './output-fragments.js'
 import {
   isTerminalStreamAttachRequestIdWithinSerializedBudget,
@@ -769,9 +770,10 @@ export class TerminalStreamBroker {
   private sendFrame(
     ws: LiveWebSocket,
     terminalId: string,
-    frame: ReplayFrame,
+    frame: ReplayFrame | TerminalOutputBatch,
     attachRequestId?: string,
   ): boolean {
+    // Segment metadata stays server-internal until the batch protocol exists.
     return this.safeSend(ws, this.buildTerminalOutputPayload({
       type: 'terminal.output',
       terminalId,
