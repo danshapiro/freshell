@@ -4452,6 +4452,20 @@ describe('TerminalView lifecycle updates', () => {
       term.write.mockClear()
       act(() => {
         messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'already-rendered',
+        })
+      })
+      expect(terminalWriteStrings(term)).toContain('already-rendered')
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
           type: 'terminal.output.batch',
           terminalId,
           streamId,
@@ -4463,7 +4477,7 @@ describe('TerminalView lifecycle updates', () => {
           serializedBytes: 256,
           segments: [
             { seqStart: 1, seqEnd: 1, endOffset: 1, rawFrameCount: 1 },
-            { seqStart: 1, seqEnd: 2, endOffset: 2, rawFrameCount: 1 },
+            { seqStart: 2, seqEnd: 2, endOffset: 2, rawFrameCount: 1 },
           ],
         })
       })
@@ -4476,8 +4490,8 @@ describe('TerminalView lifecycle updates', () => {
           terminalId,
           streamId,
           attachRequestId,
-          seqStart: 1,
-          seqEnd: 1,
+          seqStart: 2,
+          seqEnd: 2,
           data: 'accepted-after-reject',
         })
       })
@@ -4546,6 +4560,7 @@ describe('TerminalView lifecycle updates', () => {
         { seqStart: 1, seqEnd: 1, serializedBytes: null, segments: [validSegment] },
         { seqStart: 1, seqEnd: 1, serializedBytes: -1, segments: [validSegment] },
         { seqStart: 1, seqEnd: 1, serializedBytes: 128.5, segments: [validSegment] },
+        { seqStart: 1, seqEnd: 1, data: null, segments: [{ seqStart: 1, seqEnd: 1, endOffset: 0, rawFrameCount: 1 }] },
         { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, seqStart: '1' }] },
         { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, seqEnd: null }] },
         { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, endOffset: true }] },
@@ -4584,6 +4599,19 @@ describe('TerminalView lifecycle updates', () => {
         serverInstanceId: 'server-output-batch-malformed-numbers',
       })).toBeNull()
 
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'accepted-after-malformed-batch',
+        })
+      })
+      expect(terminalWriteStrings(term)).toContain('accepted-after-malformed-batch')
+
       wsMocks.send.mockClear()
       act(() => {
         reconnectHandler?.()
@@ -4592,7 +4620,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'terminal.attach',
         terminalId,
-        sinceSeq: 0,
+        sinceSeq: 1,
       }))
     })
 

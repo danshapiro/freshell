@@ -2795,7 +2795,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const outputSource = msg.source === 'live' || msg.source === 'replay'
             ? msg.source
             : null
-          const batchData = typeof msg.data === 'string' ? msg.data : ''
+          const batchDataInput = msg.data
+          const batchData = typeof batchDataInput === 'string' ? batchDataInput : ''
           const rawSegmentsInput = Array.isArray(msg.segments) ? msg.segments : []
           const batchSeqStart = msg.seqStart
           const batchSeqEnd = msg.seqEnd
@@ -2812,6 +2813,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
           if (!outputSource) {
             invalidBatchReason = 'invalid_source'
+          } else if (typeof batchDataInput !== 'string') {
+            invalidBatchReason = 'invalid_batch_data'
           } else if (rawSegmentsInput.length === 0) {
             invalidBatchReason = 'missing_segments'
           } else if (
