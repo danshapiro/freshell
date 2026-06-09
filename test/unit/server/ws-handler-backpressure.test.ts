@@ -406,6 +406,50 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
+  it('does not emit terminal.replay.batch logs for live output batches', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-live-batch-observability')
+
+    const ws = createMockWs()
+    await broker.attach(
+      ws as any,
+      'term-live-batch-observability',
+      'viewport_hydrate',
+      80,
+      24,
+      0,
+      'live-batch-attach',
+      undefined,
+      'foreground',
+      true,
+    )
+    ws.send.mockClear()
+    loggerMocks.logger.debug.mockClear()
+
+    registry.emit('terminal.output.raw', {
+      terminalId: 'term-live-batch-observability',
+      data: 'live batch payload',
+      at: Date.now(),
+    })
+    vi.advanceTimersByTime(5)
+
+    const liveBatches = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .filter((payload) => payload?.type === 'terminal.output.batch')
+    expect(liveBatches).toEqual([
+      expect.objectContaining({
+        terminalId: 'term-live-batch-observability',
+        attachRequestId: 'live-batch-attach',
+        source: 'live',
+      }),
+    ])
+    expect(structuredLogs('debug', 'terminal.replay.batch')
+      .filter((payload) => payload.terminalId === 'term-live-batch-observability')).toHaveLength(0)
+
+    broker.close()
+  })
+
   it('emits structured terminal.replay.gap logs for replay gaps', async () => {
     const originalRingMax = process.env.TERMINAL_REPLAY_RING_MAX_BYTES
     process.env.TERMINAL_REPLAY_RING_MAX_BYTES = '8'

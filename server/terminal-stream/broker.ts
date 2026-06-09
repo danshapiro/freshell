@@ -900,6 +900,8 @@ export class TerminalStreamBroker {
     envelopeIndex: number
     envelopeCount: number
   }): void {
+    if (input.source !== 'replay') return
+
     const seqStart = jsonNumberField(input.payload, 'seqStart') ?? input.batch?.seqStart
     const seqEnd = jsonNumberField(input.payload, 'seqEnd') ?? input.batch?.seqEnd
     const streamId = jsonStringField(input.payload, 'streamId') ?? input.batch?.streamId

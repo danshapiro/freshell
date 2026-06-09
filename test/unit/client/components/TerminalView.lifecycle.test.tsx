@@ -4465,16 +4465,86 @@ describe('TerminalView lifecycle updates', () => {
         terminalId,
         sinceSeq: 3,
       }))
-      expect(bridge.snapshot().milestones['terminal.parser_applied']).toBeTypeOf('number')
-      expect(bridge.snapshot().metadata['terminal.parser_applied']).toEqual(
+      const parserAppliedEvents = bridge.snapshot().perfEvents
+        .filter((event) => event.event === 'terminal.parser_applied')
+      expect(parserAppliedEvents).toEqual([
         expect.objectContaining({
+          event: 'terminal.parser_applied',
+          timestamp: expect.any(Number),
           terminalId,
           attachRequestId,
           parserAppliedSeq: 3,
           previousParserAppliedSeq: 0,
           surfaceQuarantined: false,
         }),
-      )
+      ])
+      expect(bridge.snapshot().milestones['terminal.parser_applied']).toBeUndefined()
+    })
+
+    it('records each parser-applied acknowledgement as a separate audit event', async () => {
+      const bridge = createPerfAuditBridge()
+      installPerfAuditBridge(bridge)
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-parser-applied-events',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+      expect(attachRequestId).toBeTruthy()
+      expect(streamId).toBeTruthy()
+
+      term.write.mockClear()
+      let now = 100
+      const performanceNowSpy = vi.spyOn(performance, 'now').mockImplementation(() => {
+        now += 0.01
+        return now
+      })
+      try {
+        act(() => {
+          messageHandler!({
+            type: 'terminal.output',
+            terminalId,
+            streamId,
+            attachRequestId,
+            seqStart: 1,
+            seqEnd: 1,
+            data: 'first parser applied',
+          })
+          messageHandler!({
+            type: 'terminal.output',
+            terminalId,
+            streamId,
+            attachRequestId,
+            seqStart: 2,
+            seqEnd: 2,
+            data: 'second parser applied',
+          })
+        })
+
+        const parserAppliedEvents = bridge.snapshot().perfEvents
+          .filter((event) => event.event === 'terminal.parser_applied')
+        expect(parserAppliedEvents).toHaveLength(2)
+        expect(parserAppliedEvents[0]).toEqual(expect.objectContaining({
+          timestamp: expect.any(Number),
+          terminalId,
+          attachRequestId,
+          streamId,
+          parserAppliedSeq: 1,
+          previousParserAppliedSeq: 0,
+        }))
+        expect(parserAppliedEvents[1]).toEqual(expect.objectContaining({
+          timestamp: expect.any(Number),
+          terminalId,
+          attachRequestId,
+          streamId,
+          parserAppliedSeq: 2,
+          previousParserAppliedSeq: 1,
+        }))
+        expect(Number(parserAppliedEvents[0].timestamp)).toBeLessThan(Number(parserAppliedEvents[1].timestamp))
+        expect(bridge.snapshot().metadata['terminal.parser_applied']).toBeUndefined()
+      } finally {
+        performanceNowSpy.mockRestore()
+      }
     })
 
     it('rejects an overlapping terminal.output.batch before writing partial bytes', async () => {

@@ -696,6 +696,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     getInstalledPerfAuditBridge()?.mark(name, payload)
   }, [tabId])
 
+  const recordTerminalPerfAuditEvent = useCallback((event: string, data: Record<string, unknown> = {}) => {
+    const payload = Object.fromEntries(Object.entries({
+      event,
+      timestamp: typeof performance !== 'undefined' ? performance.now() : Date.now(),
+      tabId,
+      paneId: paneIdRef.current,
+      ...data,
+    }).filter(([, value]) => value !== undefined))
+    getInstalledPerfAuditBridge()?.addPerfEvent(payload)
+  }, [tabId])
+
   const scheduleQuarantineRepair = useCallback((terminalId: string, attachRequestId: string) => {
     clearQuarantineRepair()
     const queue = writeQueueRef.current
@@ -762,7 +773,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     }
     const previousParserAppliedSeq = parserAppliedSeqRef.current
     parserAppliedSeqRef.current = parserAppliedSeq
-    markTerminalPerfAudit('terminal.parser_applied', {
+    recordTerminalPerfAuditEvent('terminal.parser_applied', {
       terminalId,
       attachRequestId: attach?.requestId,
       activeAttachRequestId: currentAttachRef.current?.requestId,
@@ -800,7 +811,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       bufferType: 'unknown',
       parserIdle: true,
     })
-  }, [buildCheckpointReplayInput, getTerminalCheckpointStreamId, markTerminalPerfAudit])
+  }, [buildCheckpointReplayInput, getTerminalCheckpointStreamId, recordTerminalPerfAuditEvent])
 
   const writeLocalXtermNotice = useCallback((term: Terminal, data: string) => {
     const terminalInstanceId = terminalInstanceIdRef.current
