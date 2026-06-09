@@ -2808,7 +2808,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           term.writeln(`\r\n${prefix} ${msg.message || msg.code || 'Unknown error'}\r\n`)
         }
 
-        if (msg.type === 'error' && msg.code === 'INVALID_TERMINAL_ID' && !msg.requestId) {
+        const activeAttachForInvalidTerminalError = currentAttachRef.current
+        const currentAttachInvalidTerminalError = Boolean(
+          msg.type === 'error'
+          && msg.code === 'INVALID_TERMINAL_ID'
+          && typeof msg.requestId === 'string'
+          && typeof msg.terminalId === 'string'
+          && activeAttachForInvalidTerminalError !== null
+          && activeAttachForInvalidTerminalError.requestId === msg.requestId
+          && activeAttachForInvalidTerminalError.terminalId === msg.terminalId
+        )
+        if (
+          msg.type === 'error'
+          && msg.code === 'INVALID_TERMINAL_ID'
+          && (!msg.requestId || currentAttachInvalidTerminalError)
+        ) {
           const currentTerminalId = terminalIdRef.current
           const current = contentRef.current
           const launchAttempt = launchAttemptRef.current
@@ -2816,6 +2830,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           if (debugRef.current) log.debug('[TRACE resumeSessionId] INVALID_TERMINAL_ID received', {
             paneId: paneIdRef.current,
             msgTerminalId: msg.terminalId,
+            requestId: msg.requestId,
+            currentAttachRequestId: activeAttachForInvalidTerminalError?.requestId,
             currentTerminalId,
             currentResumeSessionId: current?.resumeSessionId,
             currentStatus: current?.status,

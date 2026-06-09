@@ -4413,6 +4413,115 @@ describe('TerminalView lifecycle updates', () => {
         .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)).toHaveLength(0)
     })
 
+    it('handles tagged invalid-terminal errors from quarantine repair attaches', async () => {
+      const { terminalId, term, store, tabId, requestId } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-quarantine-repair-invalid',
+        serverInstanceId: 'server-a',
+        streamId: 'stream-repair-invalid',
+        clearSends: false,
+      })
+
+      const firstAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(firstAttach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'trusted text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+
+      const delayedCallbacks: Array<() => void> = []
+      term.write.mockImplementation((_data: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push(onWritten)
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'old in-flight text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+      expect(delayedCallbacks).toHaveLength(1)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      const quarantineAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(quarantineAttach).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      })
+      expect(quarantineAttach?.attachRequestId).toBeTruthy()
+
+      wsMocks.send.mockClear()
+      await act(async () => {
+        delayedCallbacks.forEach((callback) => callback())
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      })
+
+      const repairAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(repairAttach).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      })
+      expect(repairAttach?.attachRequestId).toBeTruthy()
+      expect(repairAttach?.attachRequestId).not.toBe(quarantineAttach?.attachRequestId)
+
+      act(() => {
+        messageHandler!({
+          type: 'error',
+          code: 'INVALID_TERMINAL_ID',
+          terminalId,
+          requestId: repairAttach!.attachRequestId,
+          message: 'Terminal not running',
+        })
+      })
+
+      await waitFor(() => {
+        const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
+        expect(layout.content.terminalId).toBeUndefined()
+        expect(layout.content.status).toBe('creating')
+        expect(layout.content.createRequestId).not.toBe(requestId)
+      })
+
+      const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
+      expect(restoreMocks.addTerminalFreshRecoveryRequestId).toHaveBeenCalledWith(
+        layout.content.createRequestId,
+        'fresh_after_restore_unavailable',
+      )
+
+      wsMocks.send.mockClear()
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      })
+
+      expect(wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)).toHaveLength(0)
+    })
+
     it('keeps queued viewport_hydrate intent when reconnect fires before the first hidden attach completes', async () => {
       const { requestId, rerender, store, tabId, paneId } = await renderTerminalHarness({
         status: 'creating',
