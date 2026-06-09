@@ -761,11 +761,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     })) {
       return
     }
-    resetParserAppliedSurface(parserAppliedSeqRef.current)
+    const invalidateAppliedSurface = () => {
+      resetParserAppliedSurface(parserAppliedSeqRef.current)
+    }
     const generation = currentAttachRef.current?.requestId
     const queue = writeQueueRef.current
     if (queue) {
-      queue.enqueue(data, undefined, { mode: 'live', generation })
+      queue.enqueue(data, invalidateAppliedSurface, { mode: 'live', generation })
       return
     }
     const scope = beginTerminalOutputWriteScope({
@@ -782,7 +784,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       scope.complete()
     }
     try {
-      term.write(data, complete)
+      term.write(data, () => {
+        try {
+          invalidateAppliedSurface()
+        } finally {
+          complete()
+        }
+      })
     } catch {
       // disposed
       complete()

@@ -5626,6 +5626,95 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
+    it('invalidates warm delta eligibility only after a queued local notice applies', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-local-notice-invalidates',
+        mode: 'codex',
+        serverInstanceId: 'server-local-notice',
+        streamId: 'stream-local-notice',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const submittedWrites: Array<{ data: string; onWritten?: () => void }> = []
+      term.write.mockImplementation((data: string, onWritten?: () => void) => {
+        submittedWrites.push({ data, onWritten })
+      })
+
+      const attach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'REPLAY',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      expect(submittedWrites.map((entry) => entry.data)).toEqual(['REPLAY'])
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.input.blocked',
+          terminalId,
+          reason: 'codex_identity_pending',
+        })
+      })
+
+      expect(submittedWrites.map((entry) => entry.data)).toEqual(['REPLAY'])
+
+      act(() => {
+        submittedWrites[0].onWritten?.()
+      })
+
+      await waitFor(() => {
+        expect(submittedWrites.map((entry) => entry.data)).toContainEqual(
+          expect.stringContaining('Input not sent: Codex is still saving restore state.'),
+        )
+      })
+
+      const checkpointAfterReplay = loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-local-notice',
+        serverInstanceId: 'server-local-notice',
+      })
+      expect(checkpointAfterReplay?.attachRequestId).toBe(attach?.attachRequestId)
+      expect(checkpointAfterReplay?.parserAppliedSeq).toBe(1)
+
+      const noticeWrite = submittedWrites.find((entry) => entry.data.includes('Input not sent'))
+      expect(noticeWrite?.onWritten).toBeTypeOf('function')
+
+      wsMocks.send.mockClear()
+      act(() => {
+        noticeWrite?.onWritten?.()
+      })
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
+    })
+
     it('renders replay frames after attach.ready when replay starts above 1', async () => {
       const { terminalId, term } = await renderTerminalHarness({ status: 'running', terminalId: 'term-v2-ready-then-replay' })
 
