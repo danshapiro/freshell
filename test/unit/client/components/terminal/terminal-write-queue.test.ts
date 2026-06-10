@@ -27,9 +27,9 @@ describe('createTerminalWriteQueue', () => {
       budgetMs: 4,
     })
 
-    queue.enqueue('A')
-    queue.enqueue('B')
-    queue.enqueue('C')
+    queue.enqueue('A', undefined, { coalesce: false })
+    queue.enqueue('B', undefined, { coalesce: false })
+    queue.enqueue('C', undefined, { coalesce: false })
 
     expect(writes).toEqual([])
 
@@ -58,8 +58,8 @@ describe('createTerminalWriteQueue', () => {
       cancelFrame,
     })
 
-    queue.enqueue('A')
-    queue.enqueue('B')
+    queue.enqueue('A', undefined, { coalesce: false })
+    queue.enqueue('B', undefined, { coalesce: false })
     queue.clear()
 
     expect(cancelFrame).toHaveBeenCalledTimes(1)
@@ -87,8 +87,8 @@ describe('createTerminalWriteQueue', () => {
       budgetMs: 4,
     })
 
-    queue.enqueue('A')
-    queue.enqueue('B')
+    queue.enqueue('A', undefined, { coalesce: false })
+    queue.enqueue('B', undefined, { coalesce: false })
 
     expect(rafCallbacks).toHaveLength(1)
 
@@ -96,7 +96,7 @@ describe('createTerminalWriteQueue', () => {
     expect(writes).toEqual(['A'])
     expect(rafCallbacks).toHaveLength(1)
 
-    queue.enqueue('C')
+    queue.enqueue('C', undefined, { coalesce: false })
     expect(rafCallbacks).toHaveLength(1)
 
     rafCallbacks.shift()?.(32)
@@ -134,6 +134,92 @@ describe('createTerminalWriteQueue', () => {
 
     expect(writes).toEqual(['ABC'])
     expect(callbacks).toEqual(['A', 'B'])
+  })
+
+  it('coalesces adjacent live writes and preserves write callbacks', () => {
+    const writes: string[] = []
+    const callbacks: string[] = []
+    const rafCallbacks: FrameRequestCallback[] = []
+
+    const queue = createTerminalWriteQueue({
+      terminalInstanceId: 'surface-live-coalesce',
+      write: (chunk, onWritten) => {
+        writes.push(chunk)
+        onWritten?.()
+      },
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+    })
+
+    queue.enqueue('A', () => callbacks.push('A'), { mode: 'live' })
+    queue.enqueue('B', () => callbacks.push('B'), { mode: 'live' })
+    queue.enqueue('C', undefined, { mode: 'live' })
+
+    rafCallbacks.shift()?.(16)
+
+    expect(writes).toEqual(['ABC'])
+    expect(callbacks).toEqual(['A', 'B'])
+  })
+
+  it('does not coalesce across explicit output barriers', () => {
+    const writes: string[] = []
+    const rafCallbacks: FrameRequestCallback[] = []
+
+    const queue = createTerminalWriteQueue({
+      terminalInstanceId: 'surface-live-barriers',
+      write: (chunk, onWritten) => {
+        writes.push(chunk)
+        onWritten?.()
+      },
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+    })
+
+    queue.enqueue('A', undefined, { mode: 'live' })
+    queue.enqueue('B', undefined, { mode: 'live', coalesce: false })
+    queue.enqueue('C', undefined, { mode: 'live' })
+
+    rafCallbacks.shift()?.(16)
+
+    expect(writes).toEqual(['A', 'B', 'C'])
+  })
+
+  it('keeps a four-hour hidden-tab live backlog bounded to large coalesced writes', () => {
+    const writes: string[] = []
+    const callbacks: number[] = []
+    const rafCallbacks: FrameRequestCallback[] = []
+    const line = `${'B'.repeat(1023)}\n`
+
+    const queue = createTerminalWriteQueue({
+      terminalInstanceId: 'surface-live-four-hour-backlog',
+      write: (chunk, onWritten) => {
+        writes.push(chunk)
+        onWritten?.()
+      },
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+    })
+
+    for (let index = 0; index < 14_400; index += 1) {
+      queue.enqueue(line, () => callbacks.push(index), { mode: 'live' })
+    }
+
+    rafCallbacks.shift()?.(16)
+
+    expect(writes.length).toBeLessThanOrEqual(57)
+    expect(writes.reduce((total, write) => total + write.length, 0)).toBe(line.length * 14_400)
+    expect(callbacks).toHaveLength(14_400)
+    expect(callbacks[0]).toBe(0)
+    expect(callbacks.at(-1)).toBe(14_399)
   })
 
   it('drops queued writes from stale generations before they reach xterm', () => {

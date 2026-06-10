@@ -33,6 +33,7 @@ type WriteQueueItem = {
   kind: 'write'
   mode: TerminalWriteQueueMode
   generation: string | undefined
+  coalescible: boolean
   data: string
   callbacks: Array<() => void>
 }
@@ -46,7 +47,7 @@ type TaskQueueItem = {
 
 type QueueItem = WriteQueueItem | TaskQueueItem
 
-const MAX_COALESCED_REPLAY_WRITE_LENGTH = 256 * 1024
+const MAX_COALESCED_TERMINAL_WRITE_LENGTH = 256 * 1024
 
 export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): TerminalWriteQueue {
   const queue: QueueItem[] = []
@@ -190,20 +191,21 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
       if (!data) return
       const mode = options?.mode ?? 'live'
       const generation = resolveGeneration(options)
+      const coalescible = options?.coalesce !== false
       const callbacks = onWritten ? [onWritten] : []
       const previous = queue[queue.length - 1]
       if (
-        mode === 'replay'
-        && options?.coalesce !== false
+        coalescible
         && previous?.kind === 'write'
-        && previous.mode === 'replay'
+        && previous.coalescible
+        && previous.mode === mode
         && previous.generation === generation
-        && previous.data.length + data.length <= MAX_COALESCED_REPLAY_WRITE_LENGTH
+        && previous.data.length + data.length <= MAX_COALESCED_TERMINAL_WRITE_LENGTH
       ) {
         previous.data += data
         previous.callbacks.push(...callbacks)
       } else {
-        queue.push({ kind: 'write', mode, generation, data, callbacks })
+        queue.push({ kind: 'write', mode, generation, coalescible, data, callbacks })
       }
       scheduleFlush()
     },
