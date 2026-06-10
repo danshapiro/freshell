@@ -4,7 +4,7 @@
 
 **Goal:** Make long-hidden terminal catch-up fast, loss-explicit, and safe across server replay batching, xterm parser semantics, attach races, side-effect parsing, and WebSocket backpressure.
 
-**Proof status:** Implementation can proceed from this plan. The evidence dossier is committed at `docs/superpowers/proofs/2026-06-08-terminal-catchup-evidence-dossier.md`. It resolves the prior open architecture questions with reproducible probes and source inspection. The only remaining ambiguity is real Windows Chrome background/OS-freeze behavior, which is now an explicit local pre-PR acceptance gate rather than a blocker for starting implementation.
+**Proof status:** Implementation can proceed from this plan. The evidence dossier is committed at `docs/superpowers/proofs/2026-06-08-terminal-catchup-evidence-dossier.md`. It resolves the prior open architecture questions with reproducible probes and source inspection. The browser catch-up acceptance gate for the single implementation PR is the local production-style visible-first audit plus a local browser process-suspend stop/resume positive control on an isolated test server. A real Windows Chrome long-background soak remains useful release/user-acceptance evidence, but it is not a prerequisite for opening the single PR.
 
 **Architecture:** Keep server-side replay batching as the primary performance fix, but turn it into a protocol-aware stream system. The server owns replay retention, batching, serialized byte budgets, gaps, and backpressure; the client owns xterm surface identity, attach generation safety, parser-applied acknowledgements, and side-effect gating. Paint is a UX signal only, not a replay safety boundary.
 
@@ -63,7 +63,7 @@ These facts are now established and must shape the architecture:
 - The persisted cursor is currently keyed only by `terminalId`. Persisted replay checkpoints must include stream/server identity, otherwise a restarted server or replaced stream can make stale local cursors look valid.
 - Some parser side effects bypass `handleTerminalOutput`: request-mode replies are emitted from an xterm parser hook, OSC52 `always` can write to the clipboard directly, and title-change callbacks mutate Redux state. Side-effect suppression needs terminal-instance write scope that survives xterm's asynchronous parsing, not only a helper called before enqueueing output.
 - Current server-to-client protocol is a TypeScript union, not a runtime Zod schema. Batch protocol work must either add an explicit server-message schema intentionally or test behavior/types directly; it cannot rely on a non-existent `ServerMessageSchema`.
-- Current hello capabilities only advertise `uiScreenshotV1`. Batch output requires a `terminalOutputBatchV1` capability or a protocol version bump plus a legacy `terminal.output` fallback.
+- Current hello capabilities only advertise `uiScreenshotV1`. Batch output requires `terminalOutputBatchV1` negotiation inside protocol v6, plus a non-batch `terminal.output` fallback for v6 clients that omit the capability.
 - Serialized byte budgets are exact for the application JSON payload passed to `ws.send`. They are not exact compressed on-wire byte counts. `ws.bufferedAmount` is useful server-side transport pressure, not a browser parser or paint acknowledgement.
 
 ### Second Load-Bearing Pass Results
@@ -79,7 +79,7 @@ The revised plan was load-bearing checked again. These additional facts change t
 - Fragmentation can safely happen after raw-output observers if it remains inside `server/terminal-stream`; current Codex/Claude trackers observe `terminal.output.raw` before the broker path.
 - Current server attach staging and live-queue ownership are race-free under the existing synchronous broker attach critical section. The implementation must not add `await` points between attach id/mode reset, replay snapshot selection, staging drain, and `mode = 'live'`.
 - `ws.bufferedAmount` is confirmed useful for server-side transport/sender pressure in installed `ws` 8.19.0, with the caveat that bytes accepted into the OS socket buffer can be invisible.
-- Batch capability plumbing is feasible through hello/client state/broker attachment state, but batch frames must not mix replay/live source or parser-side-effect barriers. Legacy fallback must emit safe `terminal.output` segments, not flatten arbitrary batches.
+- Batch capability plumbing is feasible through hello/client state/broker attachment state, but batch frames must not mix replay/live source or parser-side-effect barriers. Non-batch fallback must emit safe `terminal.output` segments, not flatten arbitrary batches.
 - Existing visible-first audit metrics do not yet capture replay message count, serialized replay bytes, parser-applied lag, gaps, full-hydrate fallback, or stale-generation rejection. Observability work must create those metrics before the browser audit can be acceptance evidence.
 - xterm probes validate the installed 6.0.0 package, not the whole `^6.0.0` dependency range. Pin xterm exactly or add CI probes that run against every allowed resolved version.
 
@@ -95,8 +95,8 @@ Fresh Eyes and a third load-bearing pass found these additional constraints:
 - Checkpoint compatibility needs geometry authority/history, scrollback, and xterm version in addition to terminal/server/stream/surface identity. Multi-client resize with unknown authority must reject warm delta replay unless the server provides compatible geometry history.
 - Replay windows cannot reconstruct stream-stateful barrier scanner state from arbitrary prefixes. Retained frames must store barrier classification and scanner state snapshots at ingestion time.
 - Broker output is centralized for current browser attach paths, but broker direct `ws.send(JSON.stringify(...))` lacks the handler send callback, large-payload instrumentation, and shared payload limits. Terminal broker sends must use a shared WebSocket sender.
-- Batch protocol and capability negotiation do not exist today, and legacy `terminal.output` lacks source/stream/segment metadata. Legacy fallback is safe only as individual modern `terminal.output` frames with `seqStart`, `seqEnd`, `attachRequestId`, and segment `data`; it must not use the old registry direct-output shape.
-- Full Chrome background/freeze behavior remains gated. CDP `Page.setWebLifecycleState({ state: 'frozen' })` and Xvfb tab-background probes were tried and disproven as valid local proof in this environment because timers, RAF, and WebSocket delivery continued while the probes claimed to be frozen/backgrounded. A process-suspend probe proved the failure mechanic: WebSocket frames accumulate while browser execution is stopped and deliver as a burst after resume. Real Windows Chrome background/OS-freeze behavior remains a local pre-PR acceptance gate.
+- Batch protocol and capability negotiation do not exist today, and pre-v6 `terminal.output` lacks source/stream/segment metadata. Non-batch fallback is safe only as individual modern `terminal.output` frames with `seqStart`, `seqEnd`, `streamId`, `attachRequestId`, and segment `data`; it must not use the old registry direct-output shape.
+- Full Chrome background/freeze behavior remains hard to reproduce deterministically in this environment. CDP `Page.setWebLifecycleState({ state: 'frozen' })` and Xvfb tab-background probes were tried and disproven as valid local proof because timers, RAF, and WebSocket delivery continued while the probes claimed to be frozen/backgrounded. A process-suspend probe proved the failure mechanic: WebSocket frames accumulate while browser execution is stopped and deliver as a burst after resume. The PR gate therefore uses that stop/resume positive control plus visible-first audit metrics; a real Windows Chrome soak remains post-PR acceptance evidence.
 
 ### Proof Dossier Results
 
@@ -203,13 +203,13 @@ The terminal stream contract for this plan remains UTF-8 string output. Invalid 
 
 ### Protocol Direction
 
-The first hardening PR should keep existing `terminal.output` compatibility while fixing budgeting and barriers. A later additive protocol PR should introduce explicit batches gated by `terminalOutputBatchV1` capability negotiation or a deliberate protocol version bump:
+The single implementation branch makes protocol v6 the compatibility boundary because safe post-attach terminal traffic requires server-owned `streamId` on output, batch, gap, attach-ready, and stream-change messages. Protocol v5 peers must be rejected during `hello` rather than accepted into a stream that would silently drop untagged output. Within protocol v6, explicit batches remain gated by `terminalOutputBatchV1`; v6 clients that omit that capability receive segmented `terminal.output` frames with sequence and stream metadata.
 
 ```ts
 type TerminalOutputBatch = {
   type: 'terminal.output.batch'
   terminalId: string
-  streamId?: string
+  streamId: string
   attachRequestId: string
   source: 'live' | 'replay'
   seqStart: number
@@ -227,11 +227,11 @@ type TerminalOutputBatch = {
 }
 ```
 
-For this plan, `streamId` is server-owned output-stream identity. It is minted when a terminal output stream is created, remains stable across attach/detach/replay for that stream, and changes when the server replaces the stream identity, loses retention across restart, or intentionally starts a new PTY/session stream. Until the server supplies a non-null `streamId`, persisted checkpoints that depend on stream replacement safety must be treated as incompatible rather than silently trusted.
+For this plan, `streamId` is server-owned output-stream identity. It is minted when a terminal output stream is created, remains stable across attach/detach/replay for that stream, and changes when the server replaces the stream identity, loses retention across restart, or intentionally starts a new PTY/session stream. Protocol v6 makes `streamId` mandatory on terminal stream messages; any missing or mismatched stream identity after attach is fail-closed by the client.
 
 `segments[].endOffset` is a UTF-16 code-unit offset into the batch `data` string, matching JavaScript `String.prototype.slice` semantics. It must always fall on a code-point boundary; the batch builder must test emoji/surrogate-pair segment boundaries. If that contract becomes too fragile during implementation, replace offsets with required per-segment `data` and drop top-level slicing rather than leaving offset units implicit.
 
-Legacy clients that do not advertise `terminalOutputBatchV1` continue to receive compatible `terminal.output` messages, but the fallback must serialize safe batch segments as individual legacy frames. It must not flatten an arbitrary multi-segment batch into one `terminal.output` if that batch crosses replay/live source, parser-barrier, stream-id, attach-id, or budget boundaries. Server-to-client runtime validation is not currently present; if this work adds it, create the schema explicitly and test it as a new behavior.
+Protocol v6 clients that do not advertise `terminalOutputBatchV1` continue to receive compatible `terminal.output` messages, but the fallback must serialize safe batch segments as individual frames. It must not flatten an arbitrary multi-segment batch into one `terminal.output` if that batch crosses replay/live source, parser-barrier, stream-id, attach-id, or budget boundaries. Server-to-client runtime validation is not currently present; if this work adds it, create the schema explicitly and test it as a new behavior.
 
 The client processes segments in order and runs side-effect parsers with explicit context:
 
@@ -258,7 +258,7 @@ Before opening the final PR:
 - All task-level red-green-refactor gates must pass locally.
 - The focused client, server, parser side-effect, e2e, visible-first, and full coordinated checks in Final Verification must pass locally.
 - The implementation must be proven against an isolated local test server on a unique port. Do not stop or restart the self-hosted dev server.
-- The real Windows Chrome background/OS-freeze gate must pass locally, with retained logs/artifacts.
+- The local browser proof gate must pass on an isolated local test server: production-style visible-first audit plus process-suspend stop/resume positive-control evidence. A real Windows Chrome long-background soak is recommended release/user-acceptance evidence, not a blocker for opening this PR.
 
 ### Phase 1: Sender, Metrics, And Protocol-Neutral Safety
 
@@ -269,7 +269,7 @@ Use these work packages:
 - Add `server/ws-send.ts` from the server file-structure section.
 - Apply the shared sender portions of Task 8 and Task 10.
 - Route broker and registry direct terminal sends through the shared sender.
-- Keep output protocol as legacy `terminal.output` until Phase 5.
+- Keep output protocol as segmented `terminal.output` until Phase 5.
 
 Local gate before continuing:
 
@@ -331,22 +331,22 @@ Local gate before continuing:
 - `geometryAuthority='multi_client_unknown'` quarantines or rebuilds instead of warm-replaying.
 - `terminal.resize` updates geometry epoch/history and invalidates incompatible checkpoints.
 
-### Phase 5: Batch Capability And Legacy Fallback
+### Phase 5: Batch Capability And Non-Batch Fallback
 
 Purpose: add explicit batch protocol after both sides are safe and backwards compatible.
 
 Use these work packages:
 
 - Task 9: batch protocol.
-- Server batch builder pieces from Task 6 that were not needed by legacy segmented output.
+- Server batch builder pieces from Task 6 that were not needed by segmented `terminal.output`.
 - Client batch segment parsing in `TerminalView` and `terminal-attach-seq-state`.
 
 Local gate before continuing:
 
 - `terminal.output.batch` is sent only to clients advertising `terminalOutputBatchV1`.
-- New clients still accept old server `terminal.output`.
-- Old clients on a new server receive only legacy segmented `terminal.output` with seq metadata, never `terminal.output.batch`.
-- Legacy fallback emits the same safe segments as batch mode and never flattens across barriers or budgets.
+- Batch-capable protocol v6 clients still accept segmented `terminal.output`.
+- Protocol v5 clients are rejected at `hello`; protocol v6 clients without batch capability receive only segmented `terminal.output` with seq and stream metadata, never `terminal.output.batch`.
+- Non-batch fallback emits the same safe segments as batch mode and never flattens across barriers or budgets.
 
 ### Phase 6: Browser Acceptance And Local Proof
 
@@ -362,7 +362,7 @@ Local pre-PR gate:
 
 - Visible-first audit records replay message count, serialized replay bytes, parser-applied lag, gap count/ranges, warm replay accepted/rejected reason, stale callback rejection count, side-effect suppression count, retention coverage, and browser lifecycle state.
 - Local process-suspend or equivalent positive-control testing proves catch-up burst handling when browser execution is stopped.
-- The real Windows Chrome background/OS-freeze gate below passes on an isolated local test server. CDP freeze or Xvfb tab switching cannot substitute for this gate in this environment.
+- The local process-suspend stop/resume positive-control gate passes on an isolated local test server. CDP freeze or Xvfb tab switching cannot substitute for this gate in this environment unless their counters prove browser execution actually stopped or throttled.
 - Only after these gates pass should the branch be pushed and a single implementation PR opened.
 
 ## File Structure
@@ -390,7 +390,7 @@ Local pre-PR gate:
 - Modify `src/lib/terminal-attach-seq-state.ts`
   - Continue to handle sequence ranges, but do not imply sequence range equals full surface validity.
   - Keep parser-applied cursor advancement separate from gaps and known lost ranges.
-  - Accept batch segment ranges in the later batch protocol PR.
+  - Accept batch segment ranges in the batch protocol task on this branch.
 
 - Modify `src/lib/terminal-cursor.ts`
   - Persist parser-applied checkpoints with stream/server identity.
@@ -495,10 +495,10 @@ Local pre-PR gate:
   - Emit structured JSONL logs for replay, batching, gaps, and pressure.
 
 - Modify `shared/ws-protocol.ts`
-  - Add optional `streamId` metadata where needed without breaking legacy clients.
+  - Add required terminal stream identity metadata for protocol v6 terminal stream messages.
   - Define `streamId` lifecycle explicitly: server-minted per terminal output stream, stable across attach/detach for that stream, changed on stream replacement, restart without compatible retention, or new PTY stream.
   - Add `terminalOutputBatchV1` capability negotiation before emitting `terminal.output.batch`.
-  - Later PR: add `terminal.output.batch` typing/schema and client/server support.
+  - Add `terminal.output.batch` typing and client/server support in this branch.
 
 - Test `test/unit/server/terminal-stream/output-barrier-scanner.test.ts`
   - Transparent text can batch.
@@ -2398,9 +2398,10 @@ Add tests in `test/server/ws-protocol.test.ts` and `test/unit/client/lib/ws-clie
 - The client hello advertises `capabilities.terminalOutputBatchV1: true` only after the client can parse batches.
 - The server records the capability on the WebSocket/client attachment state.
 - A batch-capable client can receive the batch shape below.
-- A legacy client that omits the capability still receives compatible `terminal.output` messages.
-- Legacy fallback serializes safe batch segments as individual modern `terminal.output` frames that include `seqStart`, `seqEnd`, and `attachRequestId`; it must not use the old registry `{ type, terminalId, data }` shape.
-- Legacy fallback does not flatten arbitrary batches across parser barriers, stream id, attach id, budget, or replay/live source boundaries.
+- A protocol v6 client that omits the batch capability still receives compatible `terminal.output` messages.
+- Non-batch fallback serializes safe batch segments as individual modern `terminal.output` frames that include `seqStart`, `seqEnd`, `streamId`, and `attachRequestId`; it must not use the old registry `{ type, terminalId, data }` shape.
+- Non-batch fallback does not flatten arbitrary batches across parser barriers, stream id, attach id, budget, or replay/live source boundaries.
+- Protocol v5 clients are rejected during `hello` so they cannot silently receive or drop unsafe untagged terminal stream messages.
 - A batch-capable client rejects or splits any batch whose segments cannot all be accepted before bytes are written to xterm.
 
 Batch shape:
@@ -2423,7 +2424,7 @@ Batch shape:
 }
 ```
 
-`endOffset` is a UTF-16 code-unit offset into top-level `data`; segment `data` is optional redundancy for debugging and legacy fallback. If `data` is present, the client and server tests must assert it equals the slice implied by the previous segment offset and `endOffset`.
+`endOffset` is a UTF-16 code-unit offset into top-level `data`; segment `data` is optional redundancy for debugging and non-batch fallback. If `data` is present, the client and server tests must assert it equals the slice implied by the previous segment offset and `endOffset`.
 
 Do not write a test against a non-existent `ServerMessageSchema`. If this task adds server-to-client runtime validation, add the schema intentionally in this task and test that new API. Otherwise, use type-level tests and behavior tests around client/server message handling.
 
@@ -2449,15 +2450,15 @@ In `shared/ws-protocol.ts`:
 
 - [ ] **Step 4: Advertise and persist client capability**
 
-In `src/lib/ws-client.ts`, advertise `terminalOutputBatchV1: true` only in the same PR that implements client parsing.
+In `src/lib/ws-client.ts`, advertise `terminalOutputBatchV1: true` only in the same branch that implements client parsing.
 
-In `server/ws-handler.ts`, read the capability from the hello payload and pass it into terminal stream attachment state. Keep default false for old or unknown clients.
+In `server/ws-handler.ts`, read the capability from the hello payload and pass it into terminal stream attachment state. Keep default false for clients that omit the capability.
 
 - [ ] **Step 5: Emit batch messages only when supported**
 
-In `server/terminal-stream/broker.ts`, emit `terminal.output.batch` only for clients whose attachment state says `terminalOutputBatchV1` is true. For all other clients, send legacy `terminal.output` messages using the same server-side batch builder internally if useful, but serialize each safe segment as its own compatible output frame with `seqStart`, `seqEnd`, `attachRequestId`, and `data`.
+In `server/terminal-stream/broker.ts`, emit `terminal.output.batch` only for clients whose attachment state says `terminalOutputBatchV1` is true. For protocol v6 clients without that capability, send `terminal.output` messages using the same server-side batch builder internally if useful, but serialize each safe segment as its own compatible output frame with `seqStart`, `seqEnd`, `streamId`, `attachRequestId`, and `data`.
 
-Do not flatten an arbitrary batch into one legacy `terminal.output`. Legacy frames have no explicit `source`, `streamId`, or segment metadata, so they must not cross replay/live source, attach id, stream id, parser-barrier, or serialized-budget boundaries. Do not route terminal stream fallback through the legacy registry direct-output shape, because current clients ignore output without sequence ranges.
+Do not flatten an arbitrary batch into one fallback `terminal.output`. Fallback frames have less segment metadata than `terminal.output.batch`, so they must not cross replay/live source, attach id, stream id, parser-barrier, or serialized-budget boundaries. Do not route terminal stream fallback through the old registry direct-output shape, because current clients ignore output without sequence ranges.
 
 - [ ] **Step 6: Process batch messages client-side**
 
@@ -2689,7 +2690,7 @@ Create `test/e2e-browser/specs/terminal-background-freeze-catchup.spec.ts`. It m
 - Assert the WebSocket behavior observed during stop/resume: still open and stalled, closed/reconnected, or buffered/resumed. The test must record which path happened.
 - Assert catch-up either has no gaps and no quarantine for the covered retention window, or reports explicit gaps/quarantine when retention is exceeded. Silent parser-applied cursor jumps are failures.
 
-This positive-control probe is required implementation evidence, but it does not replace the real Windows Chrome gate. CDP `Page.setWebLifecycleState({ state: 'frozen' })` and Xvfb tab switching were disproven as valid proof in `docs/superpowers/proofs/artifacts/browser-freeze-lifecycle.json` and `docs/superpowers/proofs/artifacts/browser-background-visibility.json` because page work continued at active rates.
+This positive-control probe is required implementation evidence for the PR. CDP `Page.setWebLifecycleState({ state: 'frozen' })` and Xvfb tab switching were disproven as valid proof in `docs/superpowers/proofs/artifacts/browser-freeze-lifecycle.json` and `docs/superpowers/proofs/artifacts/browser-background-visibility.json` because page work continued at active rates.
 
 - [ ] **Step 6: Run browser perf audit and positive-control probe for the terminal scenario**
 
@@ -2702,9 +2703,9 @@ timeout 1200s npm run test:e2e:chromium -- test/e2e-browser/specs/terminal-backg
 
 Expected: audit completes and writes `/tmp/freshell-terminal-catchup-audit.json`; the stop/resume spec passes, proves the page execution stop with timer/RAF/WebSocket counters, and records WebSocket state plus retention coverage.
 
-- [ ] **Step 7: Run the real Windows Chrome local pre-PR gate**
+- [ ] **Step 7: Record real Windows Chrome acceptance follow-up**
 
-This gate must run before opening the final terminal catch-up implementation PR. It may be manual if CI cannot produce real Windows Chrome background or OS-freeze behavior, but the result must be retained as a local evidence artifact and summarized in the PR description.
+This is not a prerequisite for opening the single implementation PR. It is recommended release/user-acceptance evidence when a real Windows Chrome environment can be observed for a long background soak. If run, retain the artifact and summarize it in the PR or follow-up issue.
 
 Required gate:
 
@@ -2720,7 +2721,7 @@ Required gate:
    - no replay-triggered OSC52/request-mode/title/turn side effect;
    - catch-up to server head completes under the configured UX budget for covered retention;
    - all terminal catch-up metrics are present in structured JSONL logs.
-7. If disk retention is part of the implementation, repeat one 8h overnight soak before opening the PR.
+7. If disk retention is part of a later implementation, repeat one 8h overnight soak before enabling that retention mode by default.
 
 - [ ] **Step 8: Commit**
 
@@ -2764,9 +2765,9 @@ timeout 1200s npm run test:e2e:chromium -- test/e2e-browser/specs/terminal-backg
 
 Expected: pass and show no replay gaps, no stale cursor advancement, no unexpected surface quarantine, #397-class replay message count, explicit stop/resume retention coverage, and recorded timer/RAF/WebSocket counters proving the browser page was actually stopped or throttled during the local probe.
 
-- [ ] **Step 5: Run real Windows Chrome background acceptance gate**
+- [ ] **Step 5: Confirm browser acceptance scope**
 
-Use the Task 11 Windows Chrome gate. This is a local pre-PR gate for the single implementation PR. Passing local CDP freeze or Xvfb background tests is insufficient unless the counters prove page execution actually stopped or throttled.
+The required local acceptance scope is the visible-first audit plus process-suspend stop/resume proof above. Record that real Windows Chrome long-background soak remains recommended user-acceptance evidence, not a blocker for this PR.
 
 - [ ] **Step 6: Verify xterm dependency policy**
 
@@ -2791,10 +2792,11 @@ Expected: full coordinated check passes.
 - Stream-stateful barrier scanner may be too conservative and reduce batching for ANSI-heavy output. Cheapest validation: log batch reasons and compare real coding-agent sessions.
 - Multi-client geometry remains inherently constrained by one PTY size. Cheapest validation: visible-client resize authority test plus logs for geometry epoch mismatches.
 - Retained byte replay is not a complete snapshot system, especially across geometry history. Cheapest validation: observe retained age, retained bytes, output rate, gap frequency, and geometry changes before designing snapshots.
-- Older deployed clients may not understand `terminal.output.batch`. Cheapest validation: keep additive fallback until support policy says old clients can be dropped.
+- Protocol v5 clients cannot safely interoperate with mandatory stream identity. Cheapest validation: keep the protocol v6 rejection test and deploy client/server together.
+- Protocol v6 clients may omit `terminal.output.batch`. Cheapest validation: keep additive fallback until support policy says non-batch v6 clients can be dropped.
 - Stream/server identity rollout may need a compatibility bridge for existing local cursors. Cheapest validation: tests that old cursor records force full hydrate instead of warm delta replay.
 - Current terminal stream remains UTF-8 string based and is not byte-perfect for invalid UTF-8 or raw 8-bit C1 controls. Cheapest validation: decide whether coding-agent terminals need byte-perfect replay before starting a separate byte-protocol project.
-- Real Windows Chrome background/OS-freeze behavior remains the only gated uncertainty. Cheapest validation: run the Task 11 real Windows Chrome gate before opening the single implementation PR; local CDP freeze and Xvfb background probes are not acceptable substitutes unless their counters prove page execution actually stopped or throttled.
+- Real Windows Chrome long-background behavior remains valuable release/user-acceptance evidence. Cheapest validation: run the Task 11 Windows Chrome follow-up when a suitable environment is available; local CDP freeze and Xvfb background probes are not acceptable substitutes unless their counters prove page execution actually stopped or throttled.
 
 ## Self-Review
 
@@ -2818,10 +2820,10 @@ Spec coverage:
 - The plan replaces stateless barrier classification with a stream-stateful barrier scanner.
 - The plan stores barrier scanner metadata with retained replay frames so arbitrary replay windows do not reconstruct unsafe parser state.
 - The plan routes terminal broker WebSocket sends through a shared sender with callbacks, payload budgets, and instrumentation.
-- The plan gates `terminal.output.batch` behind `terminalOutputBatchV1` or a protocol version decision and keeps legacy fallback.
-- The plan requires safe legacy fallback segmentation instead of flattening arbitrary batches.
+- The plan uses protocol v6 for mandatory stream identity, gates `terminal.output.batch` behind `terminalOutputBatchV1`, and keeps a non-batch v6 fallback.
+- The plan requires safe non-batch fallback segmentation instead of flattening arbitrary batches.
 - The plan adds observability for retention, lag, gaps, serialized bytes, and backpressure.
-- The plan requires visible-first derived metrics, a local stop/resume positive-control probe, and a real Windows Chrome background/OS-freeze local pre-PR gate before using browser audit results as acceptance evidence.
+- The plan requires visible-first derived metrics and a local stop/resume positive-control probe before using browser audit results as PR acceptance evidence; real Windows Chrome long-background testing remains recommended release/user-acceptance follow-up.
 
 Placeholder scan:
 
