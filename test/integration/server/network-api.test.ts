@@ -72,6 +72,13 @@ describe('Network API integration', () => {
   let networkManager: NetworkManager
   let mockBroadcast: ReturnType<typeof vi.fn>
 
+  const waitForFirewallRepairSettled = async (targetNetworkManager = networkManager) => {
+    await vi.waitFor(async () => {
+      const status = await targetNetworkManager.getStatus()
+      expect(status.firewall.configuring).toBe(false)
+    })
+  }
+
   beforeAll(() => {
     process.env.AUTH_TOKEN = token
   })
@@ -517,6 +524,7 @@ describe('Network API integration', () => {
         expect(elevatedArgs[1]).not.toContain('2>\\$null')
         expect(elevatedArgs[1]).toContain('add rule name=\"Freshell (port 5173)\"')
         expect(elevatedArgs[1]).not.toContain('add rule name=\"Freshell (port 3001)\"')
+        await waitForFirewallRepairSettled(devNetworkManager)
       } finally {
         await devNetworkManager.stop()
         await new Promise<void>((resolve, reject) => {
@@ -819,8 +827,6 @@ describe('Network API integration', () => {
 
       expect(confirmedRes.status).toBe(200)
       expect(confirmedRes.body).toEqual({ method: 'wsl2', status: 'started' })
-
-      networkManager.setFirewallConfiguring(false)
     })
 
     it('consumes the WSL2 confirmation token when remote access is disabled before confirmed repair', async () => {
@@ -1143,8 +1149,6 @@ describe('Network API integration', () => {
 
       expect(confirmedRes.status).toBe(200)
       expect(confirmedRes.body).toEqual({ method: 'windows-elevated', status: 'started' })
-
-      networkManager.setFirewallConfiguring(false)
     })
 
     it('re-prompts when a confirmation token is superseded', async () => {
@@ -1219,7 +1223,7 @@ describe('Network API integration', () => {
       expect(confirmedRes.status).toBe(200)
       expect(confirmedRes.body).toEqual({ method: 'windows-elevated', status: 'started' })
 
-      networkManager.setFirewallConfiguring(false)
+      await waitForFirewallRepairSettled()
 
       const replayRes = await request(app)
         .post('/api/network/configure-firewall')
@@ -1401,7 +1405,7 @@ describe('Network API integration', () => {
       expect(startedRes.status).toBe(200)
       expect(startedRes.body).toEqual({ method: 'wsl2', status: 'started' })
 
-      networkManager.setFirewallConfiguring(false)
+      await waitForFirewallRepairSettled()
     })
 
     it('returns 409 in-progress for fresh and confirmed requests while a prior elevated repair is still running', async () => {
@@ -1487,7 +1491,7 @@ describe('Network API integration', () => {
       expect(wslModule.computeWslPortForwardingPlanAsync).not.toHaveBeenCalled()
 
       finishRepair?.()
-      networkManager.setFirewallConfiguring(false)
+      await waitForFirewallRepairSettled()
     })
   })
 
@@ -1933,7 +1937,7 @@ describe('Network API integration', () => {
       }))
 
       finishRepair?.()
-      networkManager.setFirewallConfiguring(false)
+      await waitForFirewallRepairSettled()
     })
 
     it('returns the teardown probe failure instead of treating it as a successful noop', async () => {
