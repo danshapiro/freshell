@@ -43,6 +43,7 @@ const FAKE_APP_SERVER_PATH = path.resolve(
 )
 const requireForFixture = createRequire(import.meta.url)
 const WS_MODULE_PATH = requireForFixture.resolve('ws')
+const describeLinux = process.platform === 'linux' ? describe : describe.skip
 
 async function writeFakeCodexExecutable(binaryPath: string) {
   const script = `#!/usr/bin/env node
@@ -311,7 +312,7 @@ async function closeWebSocket(ws: WebSocket): Promise<void> {
   })
 }
 
-describe('Codex Session Flow Integration', () => {
+describeLinux('Codex Session Flow Integration', () => {
   let tempDir: string
   let fakeCodexPath: string
   let argLogPath: string

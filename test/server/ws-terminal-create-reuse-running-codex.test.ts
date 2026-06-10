@@ -455,7 +455,7 @@ describe('terminal.create reuse running codex terminal', () => {
   it('reuses existing codex terminal and requires an explicit attach', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
-      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForOpen(ws)
       const helloReady = await waitForReady(ws)
 
       const requestId = 'codex-reuse-1'
@@ -502,7 +502,7 @@ describe('terminal.create reuse running codex terminal', () => {
   it('canonical reuse branch returns created only until explicit attach', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
-      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForOpen(ws)
       await waitForReady(ws)
 
       const createdPromise = waitForMessage(
@@ -542,7 +542,7 @@ describe('terminal.create reuse running codex terminal', () => {
   it('rejects raw Codex resume ids on restore instead of creating a fresh terminal', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
-      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForOpen(ws)
       await waitForReady(ws)
 
       const requestId = 'codex-raw-resume-restore'
@@ -575,7 +575,7 @@ describe('terminal.create reuse running codex terminal', () => {
   ] as const)('rejects raw Codex resume ids when restore is %s', async (_label, restore) => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
-      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForOpen(ws)
       await waitForReady(ws)
 
       const requestId = `codex-raw-resume-create-${_label}`
@@ -605,7 +605,7 @@ describe('terminal.create reuse running codex terminal', () => {
   it('existingId branch returns created only and requires explicit attach', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
-      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForOpen(ws)
       const helloReady = await waitForReady(ws)
 
       const firstCreatedPromise = waitForMessage(
@@ -661,7 +661,7 @@ describe('terminal.create reuse running codex terminal', () => {
   it('does not echo durable session ids from reused codex terminals via terminal.created', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
-      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForOpen(ws)
       await waitForReady(ws)
 
       const requestId = 'codex-reuse-2'
@@ -682,7 +682,7 @@ describe('terminal.create reuse running codex terminal', () => {
   it('creates a fresh codex terminal without persisting a provisional session id', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
-      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForOpen(ws)
       await waitForReady(ws)
 
       const requestId = 'codex-fresh-1'
@@ -870,7 +870,7 @@ describe('terminal.create reuse running codex terminal', () => {
           },
         },
       })
-      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForOpen(ws)
       await waitForReady(ws)
 
       const requestId = 'codex-fresh-ignores-store-record'
@@ -920,7 +920,7 @@ describe('terminal.create reuse running codex terminal', () => {
           },
         },
       })
-      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForOpen(ws)
       await waitForReady(ws)
 
       const requestId = 'codex-store-unproved-reopen'
@@ -985,7 +985,7 @@ describe('terminal.create reuse running codex terminal', () => {
         },
         turnCompletedAt: Date.now(),
       }
-      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForOpen(ws)
       const helloReady = await waitForReady(ws)
 
       const requestId = 'codex-proved-live-reopen'
@@ -1059,11 +1059,15 @@ describe('terminal.create reuse running codex terminal', () => {
         },
         turnCompletedAt: Date.now(),
       }
-      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForOpen(ws, PROOF_MESSAGE_TIMEOUT_MS)
       const helloReady = await waitForReady(ws)
 
       const requestId = 'codex-proved-live-mismatch-reopen'
-      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+      const createdPromise = waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.created' && m.requestId === requestId,
+        PROOF_MESSAGE_TIMEOUT_MS,
+      )
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId,
@@ -1100,14 +1104,14 @@ describe('terminal.create reuse running codex terminal', () => {
       await closeWebSocket(ws)
       await fsp.rm(tempDir, { recursive: true, force: true })
     }
-  })
+  }, PROOF_TEST_TIMEOUT_MS)
 
   it('does not resume a captured Codex candidate when proof fails', async () => {
     const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-proof-'))
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
       const rolloutPath = path.join(tempDir, 'missing.jsonl')
-      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForOpen(ws)
       await waitForReady(ws)
 
       const requestId = 'codex-unproved-reopen'
@@ -1171,7 +1175,7 @@ describe('terminal.create reuse running codex terminal', () => {
         },
         turnCompletedAt: Date.now(),
       }
-      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForOpen(ws)
       await waitForReady(ws)
 
       const requestId = 'codex-unproved-live-reopen'
@@ -1197,7 +1201,7 @@ describe('terminal.create reuse running codex terminal', () => {
   it('accepts Codex candidate persisted acknowledgements through the dynamic websocket schema', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
-      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForOpen(ws)
       await waitForReady(ws)
 
       const messagesPromise = collectMessages(ws, 75)
@@ -1231,7 +1235,7 @@ describe('terminal.create reuse running codex terminal', () => {
 
     const ws = new WebSocket(`ws://127.0.0.1:${info.port}/ws`)
     try {
-      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForOpen(ws)
       await waitForReady(ws)
 
       // Make canonical lookup fail initially so handler must invoke repair and retry.
