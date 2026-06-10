@@ -835,6 +835,26 @@ describe('runStartup', () => {
     expect(mockWindow.show).toHaveBeenCalled()
   })
 
+  it('shows the main window before waiting for page load to finish', async () => {
+    const mockWindow = createMockWindow()
+    let resolveLoad: (() => void) | undefined
+    ;(mockWindow.loadURL as ReturnType<typeof vi.fn>).mockReturnValue(new Promise<void>((resolve) => {
+      resolveLoad = resolve
+    }))
+    const ctx = createDefaultContext({
+      createBrowserWindow: vi.fn().mockReturnValue(mockWindow),
+    })
+
+    const startupPromise = runStartup(ctx)
+
+    await vi.waitFor(() => expect(mockWindow.loadURL).toHaveBeenCalledWith('http://localhost:3001'))
+    expect(mockWindow.show).toHaveBeenCalled()
+    const result = await startupPromise
+    expect(result.type).toBe('main')
+
+    resolveLoad?.()
+  })
+
   describe('auth token in URL', () => {
     it('appends ?token= to URL for app-bound mode', async () => {
       const mockWindow = createMockWindow()

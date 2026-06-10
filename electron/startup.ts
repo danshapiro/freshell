@@ -140,12 +140,21 @@ async function loadMainWindow(
   // so a raw token containing +, &, #, or whitespace would otherwise be
   // corrupted and the app would load unauthenticated.
   const loadUrl = authToken ? `${serverUrl}?token=${encodeURIComponent(authToken)}` : serverUrl
-  await window.loadURL(loadUrl)
   window.show()
 
   if (windowState.maximized) {
     window.maximize()
   }
+
+  void window.loadURL(loadUrl).catch((err) => {
+    console.error(JSON.stringify({
+      severity: 'error',
+      component: 'electron-startup',
+      event: 'main_window_load_failed',
+      serverUrl,
+      error: err instanceof Error ? err.message : String(err),
+    }))
+  })
 
   let saveTimeout: ReturnType<typeof setTimeout> | undefined
   const saveState = () => {
