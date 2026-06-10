@@ -1,7 +1,9 @@
 // @vitest-environment node
 import fsp from 'node:fs/promises'
+import { execFile } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
+import { promisify } from 'node:util'
 
 import { describe, expect, it } from 'vitest'
 import WebSocket from 'ws'
@@ -27,6 +29,45 @@ type PendingJsonRpcRequest = {
   reject: (error: Error) => void
   resolve: (value: unknown) => void
   timeout: NodeJS.Timeout
+}
+
+type ProbeAvailability = {
+  ready: boolean
+  reason?: string
+}
+
+const execFileAsync = promisify(execFile)
+
+async function pathExists(targetPath: string): Promise<boolean> {
+  try {
+    await fsp.access(targetPath)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function codexAvailability(): Promise<ProbeAvailability> {
+  try {
+    await execFileAsync('codex', ['--version'])
+  } catch {
+    return {
+      ready: false,
+      reason: 'Skipping Codex app-server durable readiness contract: codex is not on PATH.',
+    }
+  }
+
+  const missing = []
+  if (!(await pathExists(path.join(os.homedir(), '.codex', 'auth.json')))) missing.push('~/.codex/auth.json')
+  if (!(await pathExists(path.join(os.homedir(), '.codex', 'config.toml')))) missing.push('~/.codex/config.toml')
+  if (missing.length > 0) {
+    return {
+      ready: false,
+      reason: `Skipping Codex app-server durable readiness contract: missing ${missing.join(' and ')}.`,
+    }
+  }
+
+  return { ready: true }
 }
 
 async function seedIsolatedCodexHome(): Promise<{ codexHome: string; root: string }> {
@@ -168,6 +209,9 @@ function isDurableReadinessEvidence(event: CodexThreadLifecycleEvent, threadId: 
     && event.status.type === 'idle'
 }
 
+const codexProbe = await codexAvailability()
+const describeCodex = codexProbe.ready ? describe : describe.skip
+
 async function waitForSessionArtifact(codexHome: string, threadId: string, timeoutMs = 60_000): Promise<string> {
   const sessionsRoot = path.join(codexHome, 'sessions')
   const deadline = Date.now() + timeoutMs
@@ -182,7 +226,7 @@ async function waitForSessionArtifact(codexHome: string, threadId: string, timeo
   throw new Error('Timed out waiting for the durable Codex session artifact.')
 }
 
-describe('real Codex app-server durable readiness contract', () => {
+describeCodex(`real Codex app-server durable readiness contract${codexProbe.ready ? '' : ` (${codexProbe.reason})`}`, () => {
   it('emits current-generation lifecycle evidence when a durable thread is resumed', async () => {
     const { codexHome, root } = await seedIsolatedCodexHome()
     const creationRuntime = new CodexAppServerRuntime({

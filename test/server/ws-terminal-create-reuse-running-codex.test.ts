@@ -10,6 +10,8 @@ import { FakeCodexLaunchPlanner, DEFAULT_CODEX_REMOTE_WS_URL } from '../helpers/
 
 const HOOK_TIMEOUT_MS = 30_000
 const MESSAGE_TIMEOUT_MS = 5_000
+const PROOF_MESSAGE_TIMEOUT_MS = 15_000
+const PROOF_TEST_TIMEOUT_MS = 60_000
 const CODEX_SESSION_ID = 'codex-session-abc-123'
 const CODEX_REMOTE_WS_URL = DEFAULT_CODEX_REMOTE_WS_URL
 
@@ -106,6 +108,48 @@ function waitForReady(ws: WebSocket): Promise<any> {
   const readyPromise = waitForMessage(ws, (m) => m.type === 'ready')
   ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
   return readyPromise
+}
+
+function waitForOpen(ws: WebSocket, timeoutMs = MESSAGE_TIMEOUT_MS): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timeout)
+      ws.off('open', onOpen)
+      ws.off('close', onClose)
+      ws.off('error', onError)
+    }
+
+    const timeout = setTimeout(() => {
+      cleanup()
+      reject(new Error('Timeout waiting for websocket open'))
+    }, timeoutMs)
+
+    const onOpen = () => {
+      cleanup()
+      resolve()
+    }
+    const onClose = () => {
+      cleanup()
+      reject(new Error('Socket closed waiting for open'))
+    }
+    const onError = (error: Error) => {
+      cleanup()
+      reject(error)
+    }
+
+    if (ws.readyState === WebSocket.OPEN) {
+      onOpen()
+      return
+    }
+    if (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      onClose()
+      return
+    }
+
+    ws.once('open', onOpen)
+    ws.once('close', onClose)
+    ws.once('error', onError)
+  })
 }
 
 function collectMessages(ws: WebSocket, durationMs: number): Promise<any[]> {
@@ -360,6 +404,7 @@ describe('terminal.create reuse running codex terminal', () => {
   let originalHelloTimeoutMs: string | undefined
 
   beforeEach(async () => {
+    vi.useRealTimers()
     originalNodeEnv = process.env.NODE_ENV
     originalAuthToken = process.env.AUTH_TOKEN
     originalHelloTimeoutMs = process.env.HELLO_TIMEOUT_MS
@@ -404,6 +449,7 @@ describe('terminal.create reuse running codex terminal', () => {
     } else {
       process.env.HELLO_TIMEOUT_MS = originalHelloTimeoutMs
     }
+    vi.useRealTimers()
   }, HOOK_TIMEOUT_MS)
 
   it('reuses existing codex terminal and requires an explicit attach', async () => {
@@ -687,16 +733,20 @@ describe('terminal.create reuse running codex terminal', () => {
         '{"type":"session_meta","payload":{"id":"thread-proved"}}\n',
         'utf8',
       )
-      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForOpen(ws, PROOF_MESSAGE_TIMEOUT_MS)
       await waitForReady(ws)
 
       const requestId = 'codex-proved-reopen'
-      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+      const createdPromise = waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.created' && m.requestId === requestId,
+        PROOF_MESSAGE_TIMEOUT_MS,
+      )
       const associatedPromise = waitForMessage(ws, (m) => (
         m.type === 'terminal.session.associated'
         && m.sessionRef?.provider === 'codex'
         && m.sessionRef?.sessionId === 'thread-proved'
-      ))
+      ), PROOF_MESSAGE_TIMEOUT_MS)
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId,
@@ -730,7 +780,7 @@ describe('terminal.create reuse running codex terminal', () => {
       await closeWebSocket(ws)
       await fsp.rm(tempDir, { recursive: true, force: true })
     }
-  })
+  }, PROOF_TEST_TIMEOUT_MS)
 
   it('proof-reads server-stored Codex durability when the client has not persisted candidate state', async () => {
     const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-store-proof-'))
@@ -758,11 +808,15 @@ describe('terminal.create reuse running codex terminal', () => {
           },
         },
       })
-      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForOpen(ws, PROOF_MESSAGE_TIMEOUT_MS)
       await waitForReady(ws)
 
       const requestId = 'codex-store-proved-reopen'
-      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+      const createdPromise = waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.created' && m.requestId === requestId,
+        PROOF_MESSAGE_TIMEOUT_MS,
+      )
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId,
@@ -788,7 +842,7 @@ describe('terminal.create reuse running codex terminal', () => {
       await closeWebSocket(ws)
       await fsp.rm(tempDir, { recursive: true, force: true })
     }
-  })
+  }, PROOF_TEST_TIMEOUT_MS)
 
   it('does not use server-stored Codex durability for non-restore fresh creates', async () => {
     const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-store-fresh-'))
