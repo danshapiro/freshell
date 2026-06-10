@@ -4747,6 +4747,7 @@ describe('TerminalView lifecycle updates', () => {
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',
         terminalId: 'term-output-batch-hole',
+        serverInstanceId: 'server-output-batch-hole',
       })
       const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
       const streamId = latestStreamIdByTerminal.get(terminalId)
@@ -4778,12 +4779,28 @@ describe('TerminalView lifecycle updates', () => {
           terminalId,
           streamId,
           attachRequestId,
-          seqStart: 1,
-          seqEnd: 1,
+          seqStart: 4,
+          seqEnd: 4,
           data: 'accepted-after-hole',
         })
       })
       expect(terminalWriteStrings(term)).toContain('accepted-after-hole')
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-hole',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      }))
     })
 
     it('rejects terminal.output.batch with malformed fields before writing or checkpointing', async () => {
@@ -4850,12 +4867,16 @@ describe('TerminalView lifecycle updates', () => {
           terminalId,
           streamId,
           attachRequestId,
-          seqStart: 1,
-          seqEnd: 1,
+          seqStart: 3,
+          seqEnd: 3,
           data: 'accepted-after-malformed-batch',
         })
       })
       expect(terminalWriteStrings(term)).toContain('accepted-after-malformed-batch')
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-malformed-numbers',
+      })).toBeNull()
 
       wsMocks.send.mockClear()
       act(() => {
@@ -4865,7 +4886,8 @@ describe('TerminalView lifecycle updates', () => {
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'terminal.attach',
         terminalId,
-        sinceSeq: 1,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
       }))
     })
 
@@ -4932,6 +4954,74 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       expect(term.write).not.toHaveBeenCalled()
+    })
+
+    it('fails closed after an invalid terminal.output.batch instead of checkpointing later output across the lost range', async () => {
+      const bridge = createPerfAuditBridge()
+      installPerfAuditBridge(bridge)
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-invalid-fail-closed',
+        serverInstanceId: 'server-output-batch-invalid-fail-closed',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+      expect(attachRequestId).toBeTruthy()
+      expect(streamId).toBeTruthy()
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'live',
+          seqStart: 1,
+          seqEnd: 2,
+          data: 'ab',
+          serializedBytes: 256,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, data: 'a', rawFrameCount: 1 },
+            { seqStart: 2, seqEnd: 2, endOffset: 2, data: 'not-b', rawFrameCount: 1 },
+          ],
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 3,
+          seqEnd: 3,
+          data: 'c',
+        })
+      })
+
+      expect(terminalWriteStrings(term)).toEqual(['c'])
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-invalid-fail-closed',
+      })).toBeNull()
+      expect(bridge.snapshot().perfEvents).toContainEqual(expect.objectContaining({
+        event: 'terminal.catchup.surface_quarantined',
+        terminalId,
+        reason: 'invalid_terminal_output_batch',
+        invalidReason: 'segment_data_mismatch',
+        fromSeq: 1,
+        toSeq: 2,
+      }))
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      }))
     })
 
     it('splits terminal.output.batch writes around parser barrier segments', async () => {

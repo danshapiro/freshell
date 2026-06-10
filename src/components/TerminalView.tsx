@@ -2086,6 +2086,67 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     }
   }, [paneId, tabId])
 
+  const markTerminalOutputRangeLost = useCallback((input: {
+    terminalId: string
+    messageType: string
+    attachRequestId?: string
+    streamId?: unknown
+    fromSeq?: unknown
+    toSeq?: unknown
+    reason: string
+    invalidReason?: string
+  }) => {
+    const previousSeqState = seqStateRef.current
+    const explicitFromSeq = input.fromSeq
+    const explicitToSeq = input.toSeq
+    const hasExplicitRange = typeof explicitFromSeq === 'number'
+      && typeof explicitToSeq === 'number'
+      && Number.isFinite(explicitFromSeq)
+      && Number.isFinite(explicitToSeq)
+      && Number.isInteger(explicitFromSeq)
+      && Number.isInteger(explicitToSeq)
+      && explicitFromSeq >= 0
+      && explicitToSeq >= explicitFromSeq
+      && explicitToSeq > 0
+    const fromSeq = hasExplicitRange
+      ? Math.max(0, Math.floor(explicitFromSeq))
+      : previousSeqState.highestObservedSeq + 1
+    const toSeq = hasExplicitRange
+      ? Math.max(fromSeq, Math.floor(explicitToSeq))
+      : fromSeq
+    const gapDecision = onOutputGap(previousSeqState, { fromSeq, toSeq })
+    const nextSeqState = gapDecision.state
+    applySeqState(nextSeqState)
+    resetParserAppliedSurface(parserAppliedSeqRef.current)
+    recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
+      terminalId: input.terminalId,
+      messageType: input.messageType,
+      attachRequestId: input.attachRequestId,
+      activeAttachRequestId: currentAttachRef.current?.requestId,
+      streamId: typeof input.streamId === 'string' ? input.streamId : undefined,
+      fromSeq,
+      toSeq,
+      syntheticLostRange: !hasExplicitRange,
+      parserAppliedSeq: parserAppliedSeqRef.current,
+      highestObservedSeq: nextSeqState.highestObservedSeq,
+      reason: input.reason,
+      invalidReason: input.invalidReason,
+    })
+    const completedAttachOnGap = !nextSeqState.pendingReplay
+      && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
+    if (completedAttachOnGap) {
+      resetStartupProbeParser({ discardReplayRemainder: Boolean(previousSeqState.pendingReplay) })
+      setIsAttaching(false)
+      markAttachComplete()
+    }
+  }, [
+    applySeqState,
+    markAttachComplete,
+    recordTerminalPerfAuditEvent,
+    resetParserAppliedSurface,
+    resetStartupProbeParser,
+  ])
+
   const registerForBackgroundHydration = useCallback((options?: { queueIfStarted?: boolean }) => {
     if (hydrationRegisteredRef.current) return
     hydrationRegisteredRef.current = true
@@ -3043,6 +3104,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           }
 
           if (invalidBatchReason) {
+            markTerminalOutputRangeLost({
+              terminalId: tid,
+              messageType: msg.type,
+              attachRequestId: msg.attachRequestId,
+              streamId: msg.streamId,
+              fromSeq: batchSeqStart,
+              toSeq: batchSeqEnd,
+              reason: 'invalid_terminal_output_batch',
+              invalidReason: invalidBatchReason,
+            })
             if (import.meta.env.DEV) {
               log.warn('Ignoring invalid terminal.output.batch', {
                 paneId: paneIdRef.current,
@@ -3991,6 +4062,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     isCurrentAttachStreamMessage,
     markAttachComplete,
     markParserAppliedFrame,
+    markTerminalOutputRangeLost,
     recordTerminalPerfAuditEvent,
     registerForBackgroundHydration,
     resetParserAppliedSurface,
