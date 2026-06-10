@@ -58,12 +58,8 @@ describe('runVisibleFirstAudit', () => {
           branch: 'codex/visible-first-perf-audit',
           dirty: false,
         }),
-        getBuildInfo: async () => ({
-          nodeVersion: process.version,
-          browserVersion: 'Chromium 136.0.0.0',
-          command: 'npm run perf:audit:visible-first',
-        }),
-        generatedAt: () => '2026-03-10T08:00:00.000Z',
+        getBrowserVersion: async () => 'Chromium 136.0.0.0',
+        getNowIso: () => '2026-03-10T08:00:00.000Z',
       },
     })
 
