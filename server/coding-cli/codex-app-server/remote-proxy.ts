@@ -3,6 +3,7 @@ import { allocateLocalhostPort, type LoopbackServerEndpoint } from '../../local-
 import {
   CodexFsChangedNotificationSchema,
   CodexThreadLifecycleNotificationSchema,
+  CodexTurnInterruptParamsSchema,
   CodexTurnCompletedNotificationSchema,
   CodexTurnStartedNotificationSchema,
   type CodexThreadHandle,
@@ -47,6 +48,7 @@ type CodexRemoteProxyOptions = {
 
 const DEFAULT_REQUEST_HOLD_TIMEOUT_MS = 5_000
 const DEFAULT_CANDIDATE_CAPTURE_TIMEOUT_MS = 45_000
+const MAX_COMPLETED_TURN_KEYS = 256
 
 export class CodexRemoteProxy {
   private readonly upstreamWsUrl: string
@@ -67,6 +69,8 @@ export class CodexRemoteProxy {
   private readonly repairTriggerHandlers = new Set<(event: CodexRemoteProxyRepairTrigger) => void>()
   private readonly lifecycleHandlers = new Set<(event: CodexThreadLifecycleEvent) => void>()
   private readonly lifecycleLossHandlers = new Set<(event: CodexThreadLifecycleLossEvent) => void>()
+  private readonly activeTurnKeys = new Set<string>()
+  private readonly completedTurnKeys = new Set<string>()
 
   constructor(options: CodexRemoteProxyOptions) {
     this.upstreamWsUrl = options.upstreamWsUrl
@@ -260,16 +264,31 @@ export class CodexRemoteProxy {
     const parsed = parseJson(raw)
     const method = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>).method : undefined
     const id = jsonRpcId(parsed)
-    if (id !== undefined && typeof method === 'string') {
-      connection.pendingMethods.set(id, method)
-    }
     if (typeof method === 'string') {
       log.debug({
         proxyWsUrl: this.endpoint ? this.wsUrl : undefined,
         upstreamWsUrl: this.upstreamWsUrl,
         method,
         id,
-      }, 'Codex remote proxy forwarding client request')
+      }, 'Codex remote proxy received client request')
+    }
+
+    const completedTurnInterrupt = this.completedTurnInterrupt(parsed)
+    if (id !== undefined && completedTurnInterrupt) {
+      log.info({
+        proxyWsUrl: this.endpoint ? this.wsUrl : undefined,
+        upstreamWsUrl: this.upstreamWsUrl,
+        method,
+        id,
+        threadId: completedTurnInterrupt.threadId,
+        turnId: completedTurnInterrupt.turnId,
+      }, 'Codex remote proxy acknowledged interrupt for completed turn')
+      this.sendJsonRpcSuccess(connection.client, id, {})
+      return
+    }
+
+    if (id !== undefined && typeof method === 'string') {
+      connection.pendingMethods.set(id, method)
     }
 
     if (this.requireCandidatePersistence && method === 'turn/start' && !this.candidatePersisted) {
@@ -348,12 +367,14 @@ export class CodexRemoteProxy {
 
     const turnStarted = CodexTurnStartedNotificationSchema.safeParse(parsed)
     if (turnStarted.success) {
+      this.recordTurnStarted(turnStarted.data.params)
       this.emitTurnEvent(this.turnStartedHandlers, turnStarted.data.params)
       return
     }
 
     const turnCompleted = CodexTurnCompletedNotificationSchema.safeParse(parsed)
     if (turnCompleted.success) {
+      this.recordTurnCompleted(turnCompleted.data.params)
       this.emitTurnEvent(this.turnCompletedHandlers, turnCompleted.data.params)
       return
     }
@@ -430,6 +451,10 @@ export class CodexRemoteProxy {
     }))
   }
 
+  private sendJsonRpcSuccess(client: WebSocket, id: JsonRpcId, result: Record<string, never>): void {
+    sendIfOpen(client, JSON.stringify({ id, result }))
+  }
+
   private ensureCandidateCaptureTimer(): void {
     if (!this.requireCandidatePersistence) return
     if (this.candidatePersisted || this.candidateCaptureTimer) return
@@ -465,6 +490,40 @@ export class CodexRemoteProxy {
     for (const handler of handlers) {
       handler(event)
     }
+  }
+
+  private recordTurnStarted(params: { threadId: string; turnId?: string }): void {
+    if (typeof params.turnId !== 'string') return
+    const key = turnKey(params.threadId, params.turnId)
+    this.activeTurnKeys.add(key)
+    this.completedTurnKeys.delete(key)
+  }
+
+  private recordTurnCompleted(params: { threadId: string; turnId?: string }): void {
+    if (typeof params.turnId !== 'string') return
+    const key = turnKey(params.threadId, params.turnId)
+    this.activeTurnKeys.delete(key)
+    this.rememberCompletedTurnKey(key)
+  }
+
+  private rememberCompletedTurnKey(key: string): void {
+    this.completedTurnKeys.delete(key)
+    this.completedTurnKeys.add(key)
+    while (this.completedTurnKeys.size > MAX_COMPLETED_TURN_KEYS) {
+      const oldest = this.completedTurnKeys.values().next().value
+      if (typeof oldest !== 'string') return
+      this.completedTurnKeys.delete(oldest)
+    }
+  }
+
+  private completedTurnInterrupt(parsed: unknown): { threadId: string; turnId: string } | undefined {
+    if (!parsed || typeof parsed !== 'object') return undefined
+    const message = parsed as Record<string, unknown>
+    if (message.method !== 'turn/interrupt') return undefined
+    const params = CodexTurnInterruptParamsSchema.safeParse(message.params)
+    if (!params.success) return undefined
+    const key = turnKey(params.data.threadId, params.data.turnId)
+    return this.completedTurnKeys.has(key) && !this.activeTurnKeys.has(key) ? params.data : undefined
   }
 
   private emitRepairTrigger(event: CodexRemoteProxyRepairTrigger): void {
@@ -512,6 +571,10 @@ function sendIfOpen(socket: WebSocket, data: WebSocket.RawData | string): void {
       if (socket.readyState === WebSocket.OPEN) socket.send(data)
     })
   }
+}
+
+function turnKey(threadId: string, turnId: string): string {
+  return `${threadId}\u0000${turnId}`
 }
 
 function normalizeCandidateThread(thread: unknown): CodexThreadHandle | undefined {

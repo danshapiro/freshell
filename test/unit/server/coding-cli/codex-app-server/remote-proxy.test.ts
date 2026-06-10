@@ -81,6 +81,15 @@ function nextMessage(socket: WebSocket): Promise<any> {
   })
 }
 
+function nextMessageWithin(socket: WebSocket, ms: number): Promise<any> {
+  return Promise.race([
+    nextMessage(socket),
+    delay(ms).then(() => {
+      throw new Error(`Timed out waiting ${ms}ms for websocket message.`)
+    }),
+  ])
+}
+
 function nextMessageFrame(socket: WebSocket): Promise<{ message: any; isBinary: boolean }> {
   return new Promise((resolve) => {
     socket.once('message', (raw, isBinary) => resolve({
@@ -335,5 +344,49 @@ describe('CodexRemoteProxy', () => {
       turnId: 'turn-1',
       params: { threadId: 'thread-1', turnId: 'turn-1', status: 'completed' },
     })
+  })
+
+  it('acks duplicate turn/interrupt after the turn already completed', async () => {
+    const interruptRequests: unknown[] = []
+    const upstream = await startUpstream((socket, message) => {
+      if (message.method !== 'turn/interrupt') return
+      interruptRequests.push(message)
+      if (interruptRequests.length !== 1) return
+
+      socket.send(JSON.stringify({ id: message.id, result: {} }))
+      socket.send(JSON.stringify({
+        method: 'thread/status/changed',
+        params: { threadId: 'thread-1', status: { type: 'idle' } },
+      }))
+      socket.send(JSON.stringify({
+        method: 'turn/completed',
+        params: { threadId: 'thread-1', turnId: 'turn-1' },
+      }))
+    })
+    const proxy = await startProxy(upstream.wsUrl, {
+      requireCandidatePersistence: false,
+    })
+    const completed = new Promise((resolve) => {
+      proxy.onTurnCompleted((event) => resolve(event))
+    })
+    const tui = await connect(proxy.wsUrl)
+
+    tui.send(JSON.stringify({
+      id: 1,
+      method: 'turn/interrupt',
+      params: { threadId: 'thread-1', turnId: 'turn-1' },
+    }))
+    await expect(nextMessageWithin(tui, 100)).resolves.toEqual({ id: 1, result: {} })
+    await expect(completed).resolves.toMatchObject({ threadId: 'thread-1', turnId: 'turn-1' })
+
+    tui.send(JSON.stringify({
+      id: 2,
+      method: 'turn/interrupt',
+      params: { threadId: 'thread-1', turnId: 'turn-1' },
+    }))
+
+    await expect(nextMessageWithin(tui, 50)).resolves.toEqual({ id: 2, result: {} })
+    await delay(25)
+    expect(interruptRequests).toHaveLength(1)
   })
 })
