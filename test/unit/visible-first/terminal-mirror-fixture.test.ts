@@ -9,7 +9,9 @@ describe('createTerminalMirrorFixture', () => {
       replayMaxBytes: 12,
     })
 
-    mirror.applyOutput('\u001b[31mred\u001b[0m\nplain')
+    const firstFrame = mirror.applyOutput('\u001b[31mred\u001b[0m\nplain')
+    expect(firstFrame.streamId).toEqual(expect.any(String))
+    expect(firstFrame.streamId.length).toBeGreaterThan(0)
 
     const viewport = mirror.serializeViewport()
     expect(viewport.lines).toEqual(['red', 'plain'])
@@ -29,5 +31,6 @@ describe('createTerminalMirrorFixture', () => {
     const replay = mirror.replaySince(0)
     expect(replay.missedFromSeq).toBeGreaterThan(0)
     expect(replay.frames.length).toBeGreaterThan(0)
+    expect(replay.frames.every((frame) => frame.streamId === firstFrame.streamId)).toBe(true)
   })
 })

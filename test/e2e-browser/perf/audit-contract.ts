@@ -37,6 +37,7 @@ const VisibleFirstProfileSchema = z.object({
 const VisibleFirstSummaryMetricSchema = z.object({
   focusedReadyMs: z.number().nonnegative().optional(),
   wsReadyMs: z.number().nonnegative().optional(),
+  maxRafGapMs: z.number().nonnegative().optional(),
   terminalInputToFirstOutputMs: z.number().nonnegative().optional(),
   httpRequestsBeforeReady: z.number().nonnegative().optional(),
   httpBytesBeforeReady: z.number().nonnegative().optional(),
@@ -46,6 +47,15 @@ const VisibleFirstSummaryMetricSchema = z.object({
   offscreenHttpBytesBeforeReady: z.number().nonnegative().optional(),
   offscreenWsFramesBeforeReady: z.number().nonnegative().optional(),
   offscreenWsBytesBeforeReady: z.number().nonnegative().optional(),
+  terminalReplayMessageCount: z.number().nonnegative().optional(),
+  terminalReplaySerializedBytes: z.number().nonnegative().optional(),
+  terminalParserAppliedLagMs: z.number().nonnegative().optional(),
+  terminalReplayGapCount: z.number().nonnegative().optional(),
+  terminalFullHydrateFallbackCount: z.number().nonnegative().optional(),
+  terminalSurfaceQuarantineCount: z.number().nonnegative().optional(),
+  terminalStaleGenerationRejectionCount: z.number().nonnegative().optional(),
+  terminalStoppedRetentionCoveredMs: z.number().nonnegative().optional(),
+  terminalStopResumeGapCount: z.number().nonnegative().optional(),
 }).strict().catchall(z.unknown())
 
 export const VisibleFirstAuditSampleSchema = z.object({

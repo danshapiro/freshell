@@ -831,6 +831,46 @@ describe('TerminalView keyboard handling', () => {
         data: 'pasted content',
       })
     })
+
+    it('stale terminal actions captured before remount do not mutate the old terminal instance', async () => {
+      clipboardMocks.readText.mockResolvedValue('pasted content')
+      const { store, tabId, paneId, paneContent } = createTestStore('term-1')
+
+      const first = render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(capturedTerminal).not.toBeNull()
+      })
+
+      const staleTerminal = capturedTerminal!
+      const staleActions = getTerminalActions(paneId)!
+      first.unmount()
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(capturedTerminal).not.toBe(staleTerminal)
+      })
+
+      await staleActions.paste()
+      staleActions.selectAll()
+      staleActions.clearScrollback()
+      staleActions.reset()
+      staleActions.scrollToBottom()
+
+      expect(staleTerminal.paste).not.toHaveBeenCalled()
+      expect(staleTerminal.selectAll).not.toHaveBeenCalled()
+      expect(staleTerminal.clear).not.toHaveBeenCalled()
+      expect(staleTerminal.reset).not.toHaveBeenCalled()
+    })
   })
 
   describe('other keys', () => {

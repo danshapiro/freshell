@@ -9,6 +9,7 @@ export type VisibleFirstScenarioSummary = Partial<Record<VisibleFirstProfileId, 
   durationMs: number
   focusedReadyMs?: number
   wsReadyMs?: number
+  maxRafGapMs?: number
   terminalInputToFirstOutputMs?: number
   httpRequestsBeforeReady?: number
   httpBytesBeforeReady?: number
@@ -18,25 +19,31 @@ export type VisibleFirstScenarioSummary = Partial<Record<VisibleFirstProfileId, 
   offscreenHttpBytesBeforeReady?: number
   offscreenWsFramesBeforeReady?: number
   offscreenWsBytesBeforeReady?: number
-}>> 
+  terminalReplayMessageCount?: number
+  terminalReplaySerializedBytes?: number
+  terminalParserAppliedLagMs?: number
+  terminalReplayGapCount?: number
+  terminalFullHydrateFallbackCount?: number
+  terminalSurfaceQuarantineCount?: number
+  terminalStaleGenerationRejectionCount?: number
+  terminalStoppedRetentionCoveredMs?: number
+  terminalStopResumeGapCount?: number
+} & Record<string, unknown>>>
 
 function summarizeSample(sample: VisibleFirstAuditSample) {
   const derived = sample.derived as Record<string, number | undefined>
-  return {
+  const summary: Record<string, unknown> = {
     status: sample.status,
     durationMs: sample.durationMs,
-    focusedReadyMs: derived.focusedReadyMs,
-    wsReadyMs: derived.wsReadyMs,
-    terminalInputToFirstOutputMs: derived.terminalInputToFirstOutputMs,
-    httpRequestsBeforeReady: derived.httpRequestsBeforeReady,
-    httpBytesBeforeReady: derived.httpBytesBeforeReady,
-    wsFramesBeforeReady: derived.wsFramesBeforeReady,
-    wsBytesBeforeReady: derived.wsBytesBeforeReady,
-    offscreenHttpRequestsBeforeReady: derived.offscreenHttpRequestsBeforeReady,
-    offscreenHttpBytesBeforeReady: derived.offscreenHttpBytesBeforeReady,
-    offscreenWsFramesBeforeReady: derived.offscreenWsFramesBeforeReady,
-    offscreenWsBytesBeforeReady: derived.offscreenWsBytesBeforeReady,
   }
+
+  for (const [metric, value] of Object.entries(derived)) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      summary[metric] = value
+    }
+  }
+
+  return summary
 }
 
 export function summarizeScenarioSamples(

@@ -126,7 +126,7 @@ function createStore(mode: TerminalPaneContent['mode']) {
 }
 
 async function renderAndGetTitleCb(store: ReturnType<typeof createStore>['store'], paneContent: TerminalPaneContent, tabId: string, paneId: string) {
-  render(
+  const view = render(
     <Provider store={store}>
       <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
     </Provider>,
@@ -135,7 +135,7 @@ async function renderAndGetTitleCb(store: ReturnType<typeof createStore>['store'
     expect(terminalInstances.length).toBeGreaterThan(0)
     expect(terminalInstances[terminalInstances.length - 1].titleCb).toBeTypeOf('function')
   })
-  return terminalInstances[terminalInstances.length - 1].titleCb!
+  return { titleCb: terminalInstances[terminalInstances.length - 1].titleCb!, view }
 }
 
 describe('TerminalView OSC title scope', () => {
@@ -153,7 +153,7 @@ describe('TerminalView OSC title scope', () => {
 
   it('a shell terminal still follows OSC titles (program tracking)', async () => {
     const { store, paneContent, tabId, paneId } = createStore('shell')
-    const fire = await renderAndGetTitleCb(store, paneContent, tabId, paneId)
+    const { titleCb: fire } = await renderAndGetTitleCb(store, paneContent, tabId, paneId)
 
     act(() => fire('vim README.md'))
 
@@ -163,11 +163,41 @@ describe('TerminalView OSC title scope', () => {
 
   it('a coding-agent (claude) terminal ignores OSC titles (stays its working-dir name)', async () => {
     const { store, paneContent, tabId, paneId } = createStore('claude')
-    const fire = await renderAndGetTitleCb(store, paneContent, tabId, paneId)
+    const { titleCb: fire } = await renderAndGetTitleCb(store, paneContent, tabId, paneId)
 
     act(() => fire('Building project...'))
 
     expect(store.getState().tabs.tabs[0].title).toBe('freshell')
     expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('freshell')
+  })
+
+  it('ignores a stale title callback after its terminal instance is disposed', async () => {
+    const { store, paneContent, tabId, paneId } = createStore('shell')
+    const { titleCb: staleFire, view } = await renderAndGetTitleCb(store, paneContent, tabId, paneId)
+
+    view.unmount()
+
+    const current = render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>,
+    )
+    await waitFor(() => {
+      expect(terminalInstances.length).toBeGreaterThan(1)
+      expect(terminalInstances[terminalInstances.length - 1].titleCb).toBeTypeOf('function')
+    })
+    const currentFire = terminalInstances[terminalInstances.length - 1].titleCb!
+
+    act(() => staleFire('stale old title'))
+
+    expect(store.getState().tabs.tabs[0].title).toBe('freshell')
+    expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('freshell')
+
+    act(() => currentFire('current title'))
+
+    expect(store.getState().tabs.tabs[0].title).toBe('current title')
+    expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('current title')
+
+    current.unmount()
   })
 })

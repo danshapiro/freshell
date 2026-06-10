@@ -1,4 +1,7 @@
+import { execFile } from 'child_process'
 import fs from 'fs/promises'
+import path from 'path'
+import { promisify } from 'util'
 import { chromium, type Browser, type BrowserContext, type Page } from '@playwright/test'
 import WebSocket from 'ws'
 import { TestHarness } from '../helpers/test-harness.js'
@@ -14,14 +17,14 @@ import {
   applyProfileNetworkConditions,
   buildAuditContextOptions,
 } from './create-audit-context.js'
-import { deriveVisibleFirstMetrics } from './derive-visible-first-metrics.js'
+import { classifyWsFrameType, deriveVisibleFirstMetrics } from './derive-visible-first-metrics.js'
 import {
   createNetworkRecorder,
   summarizeNetworkCapture,
   type NetworkCapture,
 } from './network-recorder.js'
 import { parseVisibleFirstServerLogs } from './parse-server-logs.js'
-import { AUDIT_SCENARIOS } from './scenarios.js'
+import { AUDIT_SCENARIOS, type AuditScenarioDefinition } from './scenarios.js'
 import {
   buildAgentChatBrowserStorageSeed,
   buildOffscreenTabBrowserStorageSeed,
@@ -58,8 +61,21 @@ type ReconnectBootstrapResult = {
   browserStorageSeed: Record<string, string>
 }
 
+type ReceivedWsFrame = {
+  observedAtMs: number
+  type: string
+  payloadLength: number
+}
+
+type ReconnectStopResumeEvidence = Record<string, unknown>
+
+const execFileAsync = promisify(execFile)
 const SAMPLE_TIMEOUT_MS = 30_000
 const TERMINAL_RECONNECT_CREATE_REQUEST_ID = 'visible-first-reconnect-create'
+const TERMINAL_RECONNECT_REPLAY_MESSAGE_BUDGET = 30
+const TERMINAL_RECONNECT_STOPPED_PROBE_MS = 1_200
+const TERMINAL_RECONNECT_STOPPED_OUTPUT_DELAY_MS = 300
+const TERMINAL_RECONNECT_STOPPED_OUTPUT_LINE_COUNT = 60
 
 function getScenarioDefinition(scenarioId: VisibleFirstScenarioId) {
   const scenario = AUDIT_SCENARIOS.find((entry) => entry.id === scenarioId)
@@ -86,8 +102,314 @@ function emptyCollectors(): SampleCollectors {
       httpRequests: [],
       perfEvents: [],
       perfSystemSamples: [],
+      terminalReplayEvents: [],
+      terminalOutputEvents: [],
       parserDiagnostics: [],
     },
+  }
+}
+
+async function installRafGapSampler(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const state = {
+      maxGapMs: 0,
+      lastRafAt: 0,
+      sampleCount: 0,
+    }
+    ;(window as Window & {
+      __FRESHELL_VISIBLE_FIRST_RAF_GAP__?: typeof state
+    }).__FRESHELL_VISIBLE_FIRST_RAF_GAP__ = state
+
+    const tick = (now: number) => {
+      if (state.lastRafAt > 0) {
+        state.maxGapMs = Math.max(state.maxGapMs, now - state.lastRafAt)
+      }
+      state.lastRafAt = now
+      state.sampleCount += 1
+      window.requestAnimationFrame(tick)
+    }
+    window.requestAnimationFrame(tick)
+  })
+}
+
+async function readRafGapSummary(page: Page): Promise<Record<string, unknown> | null> {
+  return page.evaluate(() => {
+    const state = (window as Window & {
+      __FRESHELL_VISIBLE_FIRST_RAF_GAP__?: {
+        maxGapMs: number
+        lastRafAt: number
+        sampleCount: number
+      }
+    }).__FRESHELL_VISIBLE_FIRST_RAF_GAP__
+    if (!state) return null
+    return {
+      event: 'visible_first.audit.max_raf_gap',
+      timestamp: performance.now(),
+      maxGapMs: state.maxGapMs,
+      sampleCount: state.sampleCount,
+    }
+  })
+}
+
+async function waitForRafSampler(page: Page): Promise<void> {
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    const auditWindow = window as Window & {
+      __FRESHELL_VISIBLE_FIRST_RAF_GAP__?: {
+        maxGapMs: number
+        lastRafAt: number
+        sampleCount: number
+      }
+    }
+    window.requestAnimationFrame((firstNow) => {
+      const firstState = auditWindow.__FRESHELL_VISIBLE_FIRST_RAF_GAP__
+      if (firstState) {
+        if (firstState.lastRafAt > 0) {
+          firstState.maxGapMs = Math.max(firstState.maxGapMs, firstNow - firstState.lastRafAt)
+        }
+        firstState.lastRafAt = firstNow
+        firstState.sampleCount += 1
+      }
+      window.requestAnimationFrame((secondNow) => {
+        const secondState = auditWindow.__FRESHELL_VISIBLE_FIRST_RAF_GAP__
+        if (secondState) {
+          if (secondState.lastRafAt > 0) {
+            secondState.maxGapMs = Math.max(secondState.maxGapMs, secondNow - secondState.lastRafAt)
+          }
+          secondState.lastRafAt = secondNow
+          secondState.sampleCount += 1
+        }
+        resolve()
+      })
+    })
+  }))
+}
+
+function assertRequiredMetricsPresent(
+  scenario: AuditScenarioDefinition,
+  derived: Record<string, unknown>,
+): void {
+  const missing = (scenario.requiredMetricIds ?? []).filter((metricId) => {
+    const value = derived[metricId]
+    return typeof value !== 'number' || !Number.isFinite(value)
+  })
+  if (missing.length > 0) {
+    throw new Error(`Missing required audit metrics for ${scenario.id}: ${missing.join(', ')}`)
+  }
+}
+
+function assertTerminalReconnectTargets(derived: Record<string, unknown>): void {
+  const replayMessageCount = typeof derived.terminalReplayMessageCount === 'number'
+    ? derived.terminalReplayMessageCount
+    : Number.NaN
+  if (!Number.isFinite(replayMessageCount) || replayMessageCount <= 0) {
+    throw new Error('terminal-reconnect-backlog did not record replay message evidence')
+  }
+  if (replayMessageCount > TERMINAL_RECONNECT_REPLAY_MESSAGE_BUDGET) {
+    throw new Error(
+      `terminal-reconnect-backlog replay message count ${replayMessageCount} exceeded budget ${TERMINAL_RECONNECT_REPLAY_MESSAGE_BUDGET}`,
+    )
+  }
+
+  const zeroMetrics = [
+    'terminalReplayGapCount',
+    'terminalFullHydrateFallbackCount',
+    'terminalSurfaceQuarantineCount',
+    'terminalStaleGenerationRejectionCount',
+    'terminalStopResumeGapCount',
+  ]
+  for (const metric of zeroMetrics) {
+    const value = derived[metric]
+    if (typeof value !== 'number' || value !== 0) {
+      throw new Error(`terminal-reconnect-backlog expected ${metric}=0, got ${String(value)}`)
+    }
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
+}
+
+async function waitForFile(filePath: string, timeoutMs = SAMPLE_TIMEOUT_MS): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      await fs.stat(filePath)
+      return
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw error
+      }
+    }
+    await sleep(25)
+  }
+  throw new Error(`Timed out waiting for audit proof file ${filePath}`)
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+async function collectProcessForestPids(rootPids: number[]): Promise<number[]> {
+  if (process.platform === 'win32') {
+    throw new Error('POSIX SIGSTOP/SIGCONT process suspend proof is not available on native Windows')
+  }
+
+  const { stdout } = await execFileAsync('ps', ['-eo', 'pid=,ppid='])
+  const childrenByParent = new Map<number, number[]>()
+  for (const line of stdout.split(/\r?\n/)) {
+    const [pidRaw, ppidRaw] = line.trim().split(/\s+/)
+    const pid = Number(pidRaw)
+    const ppid = Number(ppidRaw)
+    if (!Number.isFinite(pid) || !Number.isFinite(ppid)) continue
+    const children = childrenByParent.get(ppid) ?? []
+    children.push(pid)
+    childrenByParent.set(ppid, children)
+  }
+
+  const pids = new Set<number>()
+  const queue = [...rootPids]
+  while (queue.length > 0) {
+    const pid = queue.shift()
+    if (!pid || pids.has(pid)) continue
+    pids.add(pid)
+    queue.push(...(childrenByParent.get(pid) ?? []))
+  }
+  return [...pids]
+}
+
+async function collectBrowserExecutionPids(browser: Browser): Promise<number[]> {
+  const browserWithProcess = browser as unknown as { process?: () => { pid?: number } | null }
+  const childProcess = browserWithProcess.process?.()
+  if (!childProcess?.pid) {
+    const browserWithCdp = browser as unknown as {
+      newBrowserCDPSession?: () => Promise<{
+        send: (method: string) => Promise<unknown>
+        detach: () => Promise<void>
+      }>
+    }
+    if (typeof browserWithCdp.newBrowserCDPSession !== 'function') {
+      throw new Error('Playwright did not expose a browser process or CDP session for the reconnect suspend proof')
+    }
+    const cdpSession = await browserWithCdp.newBrowserCDPSession()
+    try {
+      const processInfo = await cdpSession.send('SystemInfo.getProcessInfo') as {
+        processInfo?: Array<{ id?: number }>
+      }
+      const pids = (processInfo.processInfo ?? [])
+        .map((entry) => Number(entry.id))
+        .filter((pid) => Number.isInteger(pid) && pid > 0)
+      if (pids.length > 0) {
+        return collectProcessForestPids(pids)
+      }
+    } finally {
+      await cdpSession.detach().catch(() => {})
+    }
+    throw new Error('Could not resolve Chromium process IDs for the reconnect suspend proof')
+  }
+  return collectProcessForestPids([childProcess.pid])
+}
+
+function signalPids(pids: number[], signal: NodeJS.Signals): void {
+  for (const pid of pids) {
+    try {
+      process.kill(pid, signal)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
+        throw error
+      }
+    }
+  }
+}
+
+function isTerminalOutputFrame(frame: ReceivedWsFrame): boolean {
+  return frame.type === 'terminal.output' || frame.type === 'terminal.output.batch'
+}
+
+async function runReconnectStopResumeProof(input: {
+  browser: Browser
+  page: Page
+  serverInfo: TestServerInfo
+  harness: TestHarness
+  terminal: TerminalHelper
+  receivedWsFrames: ReceivedWsFrame[]
+}): Promise<ReconnectStopResumeEvidence> {
+  const terminalId = getActiveTerminalId(await input.harness.getState())
+  if (!terminalId) {
+    throw new Error('terminal-reconnect-backlog stop/resume proof did not find an active terminal')
+  }
+
+  const stoppedPids = await collectBrowserExecutionPids(input.browser)
+  const markerId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  const outputScriptPath = path.join(input.serverInfo.homeDir, `visible-first-stop-resume-${markerId}.cjs`)
+  const scheduledMarkerPath = path.join(input.serverInfo.homeDir, `visible-first-stop-resume-scheduled-${markerId}.json`)
+  const startedMarkerPath = path.join(input.serverInfo.homeDir, `visible-first-stop-resume-started-${markerId}.json`)
+  const finalLine = `visible-first-stop-resume-${TERMINAL_RECONNECT_STOPPED_OUTPUT_LINE_COUNT}`
+  const outputScript = [
+    'const { writeFileSync } = require("fs");',
+    `const scheduledMarkerPath = ${JSON.stringify(scheduledMarkerPath)};`,
+    `const startedMarkerPath = ${JSON.stringify(startedMarkerPath)};`,
+    `const prefix = ${JSON.stringify('visible-first-stop-resume-')};`,
+    'writeFileSync(scheduledMarkerPath, JSON.stringify({ scheduledAt: Date.now() }));',
+    `setTimeout(() => {`,
+    '  writeFileSync(startedMarkerPath, JSON.stringify({ startedAt: Date.now() }));',
+    `  for (let i = 1; i <= ${TERMINAL_RECONNECT_STOPPED_OUTPUT_LINE_COUNT}; i += 1) console.log(prefix + i);`,
+    `}, ${TERMINAL_RECONNECT_STOPPED_OUTPUT_DELAY_MS});`,
+    `setTimeout(() => process.exit(0), ${TERMINAL_RECONNECT_STOPPED_OUTPUT_DELAY_MS + 500});`,
+  ].join('\n')
+
+  await fs.writeFile(outputScriptPath, `${outputScript}\n`, 'utf8')
+  await input.terminal.executeCommand(`node ${shellQuote(outputScriptPath)}`)
+  await waitForFile(scheduledMarkerPath)
+
+  const wsFrameBaseline = input.receivedWsFrames.length
+  const stopStartedAt = Date.now()
+  try {
+    signalPids([...stoppedPids].sort((a, b) => b - a), 'SIGSTOP')
+    await sleep(TERMINAL_RECONNECT_STOPPED_PROBE_MS)
+  } finally {
+    signalPids([...stoppedPids].sort((a, b) => a - b), 'SIGCONT')
+  }
+  const stopEndedAt = Date.now()
+
+  await waitForFile(startedMarkerPath)
+  const outputStartedAt = JSON.parse(await fs.readFile(startedMarkerPath, 'utf8')).startedAt as number
+  if (outputStartedAt < stopStartedAt || outputStartedAt > stopEndedAt) {
+    throw new Error(
+      `terminal-reconnect-backlog stop/resume proof output started outside stopped window: ${outputStartedAt}`,
+    )
+  }
+
+  await input.terminal.waitForOutput(finalLine, { terminalId, timeout: SAMPLE_TIMEOUT_MS })
+  await input.page.waitForTimeout(150)
+
+  const catchupFrames = input.receivedWsFrames.slice(wsFrameBaseline)
+  const outputMessageCount = catchupFrames.filter(isTerminalOutputFrame).length
+  if (outputMessageCount <= 0) {
+    throw new Error('terminal-reconnect-backlog stop/resume proof did not observe post-resume terminal output frames')
+  }
+
+  const gapCount = catchupFrames.filter((frame) => frame.type === 'terminal.output.gap').length
+  const timestamp = await input.page.evaluate(() => performance.now())
+  const stoppedDurationMs = Math.max(0, stopEndedAt - stopStartedAt)
+  const retentionCoveredMs = Math.max(0, stopEndedAt - outputStartedAt)
+
+  return {
+    event: 'terminal.catchup.stop_resume',
+    source: 'visible_first_audit_process_suspend',
+    scenarioId: 'terminal-reconnect-backlog',
+    timestamp,
+    terminalId,
+    browserExecutionStopped: true,
+    stoppedDurationMs,
+    stoppedOutputDelayMs: TERMINAL_RECONNECT_STOPPED_OUTPUT_DELAY_MS,
+    outputStartedAfterStopMs: outputStartedAt - stopStartedAt,
+    outputStartedBeforeResumeMs: stopEndedAt - outputStartedAt,
+    retentionCoveredMs,
+    gapCount,
+    cdpCatchupOutputMessageCount: outputMessageCount,
+    cdpCatchupMessageCount: catchupFrames.length,
   }
 }
 
@@ -429,15 +751,25 @@ async function executeSampleDefault(
       profileId: input.profileId,
     }))
     const page = await context.newPage()
+    await installRafGapSampler(page)
     const cdpSession = await context.newCDPSession(page)
     await applyProfileNetworkConditions(cdpSession, input.profileId)
 
     const recorder = createNetworkRecorder()
+    const receivedWsFrames: ReceivedWsFrame[] = []
     cdpSession.on('Network.requestWillBeSent', (event) => recorder.onRequestWillBeSent(event))
     cdpSession.on('Network.responseReceived', (event) => recorder.onResponseReceived(event))
     cdpSession.on('Network.loadingFinished', (event) => recorder.onLoadingFinished(event))
     cdpSession.on('Network.webSocketFrameSent', (event) => recorder.onWebSocketFrameSent(event))
-    cdpSession.on('Network.webSocketFrameReceived', (event) => recorder.onWebSocketFrameReceived(event))
+    cdpSession.on('Network.webSocketFrameReceived', (event) => {
+      recorder.onWebSocketFrameReceived(event)
+      const payload = event.response?.payloadData ?? ''
+      receivedWsFrames.push({
+        observedAtMs: Date.now(),
+        type: classifyWsFrameType(payload),
+        payloadLength: Buffer.byteLength(payload),
+      })
+    })
 
     const browserStorageSeed = await resolveBrowserStorageSeed({
       scenarioId: input.scenarioId,
@@ -473,9 +805,25 @@ async function executeSampleDefault(
 
     await waitForAuditMilestone(page, harness, scenario.focusedReadyMilestone)
 
+    await waitForRafSampler(page)
     const browserSnapshot = await harness.getPerfAuditSnapshot()
     if (!browserSnapshot) {
       throw new Error('Perf audit snapshot was not available from the test harness')
+    }
+    const rafGapSummary = await readRafGapSummary(page)
+    if (rafGapSummary) {
+      browserSnapshot.perfEvents.push(rafGapSummary)
+    }
+
+    if (input.scenarioId === 'terminal-reconnect-backlog') {
+      browserSnapshot.perfEvents.push(await runReconnectStopResumeProof({
+        browser,
+        page,
+        serverInfo,
+        harness,
+        terminal,
+        receivedWsFrames,
+      }))
     }
 
     const browserTimeOriginMs = await page.evaluate(() => performance.timeOrigin)
@@ -551,7 +899,14 @@ export async function runVisibleFirstAuditSample(
       allowedWsTypesBeforeReady: scenario.allowedWsTypesBeforeReady,
       browser: collectors.browser,
       transport: collectors.transport,
+      server: {
+        terminalReplayEvents: collectors.server.terminalReplayEvents,
+      },
     })
+    assertRequiredMetricsPresent(scenario, derived)
+    if (scenario.id === 'terminal-reconnect-backlog') {
+      assertTerminalReconnectTargets(derived)
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     errors.push(message)

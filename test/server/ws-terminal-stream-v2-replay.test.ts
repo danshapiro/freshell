@@ -243,7 +243,10 @@ function collectMessages(ws: WebSocket, durationMs: number): Promise<any[]> {
   })
 }
 
-async function createAuthenticatedConnection(port: number): Promise<{ ws: WebSocket; close: () => Promise<void> }> {
+async function createAuthenticatedConnection(
+  port: number,
+  opts?: { terminalOutputBatchV1?: boolean },
+): Promise<{ ws: WebSocket; close: () => Promise<void> }> {
   const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
   await new Promise<void>((resolve) => ws.on('open', () => resolve()))
 
@@ -252,6 +255,9 @@ async function createAuthenticatedConnection(port: number): Promise<{ ws: WebSoc
     type: 'hello',
     token: 'testtoken-testtoken',
     protocolVersion: WS_PROTOCOL_VERSION,
+    ...(opts?.terminalOutputBatchV1
+      ? { capabilities: { terminalOutputBatchV1: true } }
+      : {}),
   }))
   await readyPromise
 
@@ -408,12 +414,109 @@ describe('terminal stream v2 replay', () => {
     expect(ready.replayFromSeq).toBe(3)
     expect(ready.replayToSeq).toBe(4)
     expect(ready.attachRequestId).toBe(attachRequestId)
-    expect(replayed.length).toBe(1)
+    expect(replayed.length).toBe(2)
     expect(replayed[0]?.seqStart).toBe(3)
-    expect(replayed[0]?.seqEnd).toBe(4)
+    expect(replayed[0]?.seqEnd).toBe(3)
+    expect(replayed[1]?.seqStart).toBe(4)
+    expect(replayed[1]?.seqEnd).toBe(4)
     expect(replayed.map((frame) => frame.data).join('')).toBe('threefour')
     expect(replayed.every((frame) => frame.seqStart > 2)).toBe(true)
     expect(replayed.every((frame) => frame.attachRequestId === attachRequestId)).toBe(true)
+
+    await close2()
+  })
+
+  it('sends terminal.output.batch to batch-capable replay attachments', async () => {
+    const { ws: ws1, close: close1 } = await createAuthenticatedConnection(port)
+    const { terminalId } = await createTerminal(ws1, 'stream-batch-create')
+
+    for (const chunk of ['one', 'two', 'three', 'four']) {
+      registry.simulateOutput(terminalId, chunk)
+    }
+    await waitForMessage(
+      ws1,
+      (msg) => msg.type === 'terminal.output' && msg.terminalId === terminalId && msg.seqEnd >= 4,
+    )
+    await close1()
+
+    const { ws: ws2, close: close2 } = await createAuthenticatedConnection(port, {
+      terminalOutputBatchV1: true,
+    })
+    const attachRequestId = 'attach-batch-replay-1'
+    const batchPromise = waitForMessage(
+      ws2,
+      (msg) => msg.type === 'terminal.output.batch' && msg.terminalId === terminalId && msg.seqEnd === 4,
+    )
+
+    sendAttach(ws2, terminalId, { sinceSeq: 1, attachRequestId })
+
+    const batch = await batchPromise
+    expect(batch).toMatchObject({
+      type: 'terminal.output.batch',
+      terminalId,
+      attachRequestId,
+      source: 'replay',
+      seqStart: 2,
+      seqEnd: 4,
+      data: 'twothreefour',
+      serializedBytes: expect.any(Number),
+      segments: [
+        { seqStart: 2, seqEnd: 2, endOffset: 3, rawFrameCount: 1 },
+        { seqStart: 3, seqEnd: 3, endOffset: 8, rawFrameCount: 1 },
+        { seqStart: 4, seqEnd: 4, endOffset: 12, rawFrameCount: 1 },
+      ],
+    })
+    expect(batch.streamId).toEqual(expect.any(String))
+    expect(batch.serializedBytes).toBeGreaterThan(0)
+    expect(batch.segments.every((segment: any) => segment.streamId === undefined)).toBe(true)
+    expect(batch.segments.every((segment: any) => segment.attachRequestId === undefined)).toBe(true)
+
+    await close2()
+  })
+
+  it('keeps legacy replay fallback as per-segment modern terminal.output frames across barriers', async () => {
+    const { ws: ws1, close: close1 } = await createAuthenticatedConnection(port)
+    const { terminalId } = await createTerminal(ws1, 'stream-legacy-barrier-create')
+
+    for (const chunk of ['before', '\u0007', 'after']) {
+      registry.simulateOutput(terminalId, chunk)
+    }
+    await waitForMessage(
+      ws1,
+      (msg) => msg.type === 'terminal.output' && msg.terminalId === terminalId && msg.seqEnd >= 3,
+    )
+    await close1()
+
+    const { ws: ws2, close: close2 } = await createAuthenticatedConnection(port)
+    const attachRequestId = 'attach-legacy-barrier-1'
+    const replayed: any[] = []
+    const onMessage = (data: WebSocket.Data) => {
+      const msg = JSON.parse(data.toString())
+      if (msg.type === 'terminal.output' && msg.terminalId === terminalId) {
+        replayed.push(msg)
+      }
+    }
+    ws2.on('message', onMessage)
+
+    const tailPromise = waitForMessage(
+      ws2,
+      (msg) => msg.type === 'terminal.output' && msg.terminalId === terminalId && msg.seqEnd === 3,
+    )
+    sendAttach(ws2, terminalId, { sinceSeq: 0, attachRequestId })
+    await tailPromise
+    ws2.off('message', onMessage)
+
+    expect(replayed).toHaveLength(3)
+    expect(replayed.map((frame) => frame.type)).toEqual([
+      'terminal.output',
+      'terminal.output',
+      'terminal.output',
+    ])
+    expect(replayed.map((frame) => frame.data)).toEqual(['before', '\u0007', 'after'])
+    expect(replayed.map((frame) => [frame.seqStart, frame.seqEnd])).toEqual([[1, 1], [2, 2], [3, 3]])
+    expect(replayed.every((frame) => typeof frame.streamId === 'string' && frame.streamId.length > 0)).toBe(true)
+    expect(replayed.every((frame) => frame.attachRequestId === attachRequestId)).toBe(true)
+    expect(replayed.every((frame) => frame.source === 'replay')).toBe(true)
 
     await close2()
   })
@@ -495,6 +598,42 @@ describe('terminal stream v2 replay', () => {
     }
   })
 
+  it('rejects attachRequestId values too large for terminal.output serialized payload budgets', async () => {
+    const { ws, close } = await createAuthenticatedConnection(port)
+    const { terminalId } = await createTerminal(ws, 'stream-long-attach-id-create')
+    const oversizedAttachRequestId = `long-${'x'.repeat(20 * 1024)}`
+
+    ws.send(JSON.stringify({
+      type: 'terminal.attach',
+      terminalId,
+      intent: 'viewport_hydrate',
+      sinceSeq: 0,
+      cols: 120,
+      rows: 40,
+      attachRequestId: oversizedAttachRequestId,
+    }))
+
+    const error = await waitForMessage(
+      ws,
+      (msg) => msg.type === 'error' && msg.code === 'INVALID_MESSAGE' && msg.terminalId === terminalId,
+    )
+    expect(error.message).toMatch(/attachRequestId/i)
+
+    const messages = await collectMessages(ws, 150)
+    expect(messages.some((msg) =>
+      msg.type === 'terminal.attach.ready'
+      && msg.terminalId === terminalId
+      && msg.attachRequestId === oversizedAttachRequestId,
+    )).toBe(false)
+    expect(messages.some((msg) =>
+      msg.type === 'terminal.output'
+      && msg.terminalId === terminalId
+      && msg.attachRequestId === oversizedAttachRequestId,
+    )).toBe(false)
+
+    await close()
+  })
+
   it('attach replay from sinceSeq emits ready first and replays an exact range above sequence 1', async () => {
     const { ws: ws1, close: close1 } = await createAuthenticatedConnection(port)
     const { terminalId } = await createTerminal(ws1, 'stream-range-create')
@@ -537,8 +676,10 @@ describe('terminal stream v2 replay', () => {
     expect(received[0]?.type).toBe('terminal.attach.ready')
 
     const replayed = received.filter((msg) => msg.type === 'terminal.output')
-    expect(replayed).toHaveLength(1)
+    expect(replayed).toHaveLength(7)
     expect(replayed[0]?.seqStart).toBe(6)
+    expect(replayed[0]?.seqEnd).toBe(6)
+    expect(replayed[replayed.length - 1]?.seqStart).toBe(12)
     expect(replayed[replayed.length - 1]?.seqEnd).toBe(12)
     expect(replayed.map((msg) => msg.data ?? '').join('')).toBe('f6|f7|f8|f9|f10|f11|f12|')
     expect(received.some((msg) => msg.type === 'terminals.changed')).toBe(false)

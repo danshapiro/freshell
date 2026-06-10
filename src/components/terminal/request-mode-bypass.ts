@@ -1,4 +1,5 @@
 import type { Terminal } from '@xterm/xterm'
+import { shouldAllowTerminalOutputSideEffect } from '@/lib/terminal-output-side-effects'
 
 type RequestModeStatus = 0 | 1 | 2 | 3 | 4
 
@@ -220,6 +221,7 @@ export function buildTerminalRequestModeResponse(
 export function registerTerminalRequestModeBypass(
   term: TerminalWithRequestModeAccess | undefined,
   sendInput: (data: string) => void,
+  options?: { terminalInstanceId?: string },
 ): CsiHandlerRegistration {
   if (!term) {
     return {
@@ -243,6 +245,14 @@ export function registerTerminalRequestModeBypass(
         : undefined
     if (mode === undefined) return false
     const response = buildTerminalRequestModeResponse(mode, ansi, snapshotTerminalRequestModes(term))
+    if (!shouldAllowTerminalOutputSideEffect({
+      terminalInstanceId: options?.terminalInstanceId,
+      source: options?.terminalInstanceId ? undefined : 'live',
+      effect: 'request_mode_reply',
+      mode: 'shell',
+    })) {
+      return true
+    }
     sendInput(response)
     return true
   }

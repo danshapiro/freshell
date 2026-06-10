@@ -66,6 +66,8 @@ export type TerminalPaneContent = {
   codexDurability?: CodexDurabilityRef
   /** Runtime-only server locality for same-server matching; never part of canonical durable identity. */
   serverInstanceId?: string
+  /** Runtime output stream identity from terminal.attach.ready; invalidates delta replay after stream replacement. */
+  streamId?: string
   /** Explicit restore failure when no canonical durable target exists. */
   restoreError?: RestoreError
   /** Initial working directory */

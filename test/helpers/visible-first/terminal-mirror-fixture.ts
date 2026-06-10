@@ -29,6 +29,7 @@ type TerminalMirrorFixtureOptions = {
 }
 
 const ANSI_ESCAPE_PATTERN = /\u001B\[[0-9;?]*[ -/]*[@-~]/gu
+const FIXTURE_STREAM_ID = 'visible-first-terminal-mirror-fixture'
 
 function normalizeOutput(value: string): string {
   return value
@@ -54,7 +55,7 @@ export function createTerminalMirrorFixture(options: TerminalMirrorFixtureOption
   return {
     applyOutput(rawOutput: string): ReplayFrame {
       const normalized = normalizeOutput(rawOutput)
-      const frame = replayRing.append(normalized)
+      const frame = replayRing.append(normalized, { streamId: FIXTURE_STREAM_ID })
       appendText(normalized)
       return frame
     },

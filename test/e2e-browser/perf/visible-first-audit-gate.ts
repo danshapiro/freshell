@@ -6,9 +6,11 @@ import {
   type VisibleFirstProfileId,
   type VisibleFirstScenarioId,
 } from './audit-contract.js'
+import { AUDIT_SCENARIOS, type AuditRequiredMetricId } from './scenarios.js'
 
 export type VisibleFirstAuditGateResult = {
   ok: boolean
+  validationErrors?: string[]
   violations: Array<{
     scenarioId: string
     profileId: string
@@ -38,6 +40,10 @@ const OFFSCREEN_METRICS: GateMetric[] = [
   'offscreenWsFramesBeforeReady',
   'offscreenWsBytesBeforeReady',
 ]
+
+const SCENARIO_REQUIRED_METRICS = new Map(
+  AUDIT_SCENARIOS.map((scenario) => [scenario.id, scenario.requiredMetricIds ?? []] as const),
+)
 
 function assertFullAuditMatrix(artifact: VisibleFirstAuditArtifact, label: string): void {
   const profileIds = new Set(artifact.profiles.map((profile) => profile.id))
@@ -86,6 +92,58 @@ function getMetricValue(
   return typeof value === 'number' ? value : 0
 }
 
+function isFiniteMetric(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+function assertMetricPresent(input: {
+  artifact: VisibleFirstAuditArtifact
+  label: string
+  scenarioId: VisibleFirstScenarioId
+  profileId: VisibleFirstProfileId
+  metricId: AuditRequiredMetricId
+}): void {
+  const scenario = getScenario(input.artifact, input.scenarioId)
+  const sample = scenario.samples.find((entry) => entry.profileId === input.profileId)
+  if (!sample) {
+    throw new Error(`${input.label} missing scenario/profile pair ${input.scenarioId}/${input.profileId}`)
+  }
+  if (!isFiniteMetric((sample.derived as Record<string, unknown>)[input.metricId])) {
+    throw new Error(
+      `${input.label} missing required metric ${input.scenarioId}/${input.profileId}:${input.metricId}`,
+    )
+  }
+
+  const summary = scenario.summaryByProfile[input.profileId] as Record<string, unknown> | undefined
+  if (!summary || !isFiniteMetric(summary[input.metricId])) {
+    throw new Error(
+      `${input.label} missing required summary metric ${input.scenarioId}/${input.profileId}:${input.metricId}`,
+    )
+  }
+}
+
+function assertRequiredMetricIdsPresent(
+  artifact: VisibleFirstAuditArtifact,
+  label: string,
+): void {
+  for (const scenarioId of AUDIT_SCENARIO_IDS) {
+    const requiredMetricIds = SCENARIO_REQUIRED_METRICS.get(scenarioId) ?? []
+    if (requiredMetricIds.length === 0) continue
+    const scenario = getScenario(artifact, scenarioId)
+    for (const sample of scenario.samples) {
+      for (const metricId of requiredMetricIds) {
+        assertMetricPresent({
+          artifact,
+          label,
+          scenarioId,
+          profileId: sample.profileId,
+          metricId,
+        })
+      }
+    }
+  }
+}
+
 function createViolation(
   base: VisibleFirstAuditArtifact,
   candidate: VisibleFirstAuditArtifact,
@@ -119,6 +177,7 @@ export function evaluateVisibleFirstAuditGate(
   assertVisibleFirstAuditTrusted(candidate)
   assertFullAuditMatrix(base, 'base')
   assertFullAuditMatrix(candidate, 'candidate')
+  assertRequiredMetricIdsPresent(candidate, 'candidate')
 
   const violations: VisibleFirstAuditGateResult['violations'] = []
 

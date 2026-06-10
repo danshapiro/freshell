@@ -27,11 +27,15 @@ export type DerivedMetricsInput = {
     http?: { requests: VisibleFirstHttpObservation[] }
     ws?: { frames: VisibleFirstWsObservation[] }
   }
+  server?: {
+    terminalReplayEvents?: Array<Record<string, unknown>>
+  }
 }
 
 export type VisibleFirstDerivedMetrics = {
   focusedReadyMs: number
   wsReadyMs?: number
+  maxRafGapMs?: number
   terminalInputToFirstOutputMs?: number
   httpRequestsBeforeReady: number
   httpBytesBeforeReady: number
@@ -41,6 +45,15 @@ export type VisibleFirstDerivedMetrics = {
   offscreenHttpBytesBeforeReady: number
   offscreenWsFramesBeforeReady: number
   offscreenWsBytesBeforeReady: number
+  terminalReplayMessageCount: number
+  terminalReplaySerializedBytes: number
+  terminalParserAppliedLagMs?: number
+  terminalReplayGapCount: number
+  terminalFullHydrateFallbackCount: number
+  terminalSurfaceQuarantineCount: number
+  terminalStaleGenerationRejectionCount: number
+  terminalStoppedRetentionCoveredMs?: number
+  terminalStopResumeGapCount?: number
 }
 
 const IGNORED_ROUTE_IDS = new Set(['/api/health', '/api/logs/client'])
@@ -113,6 +126,237 @@ function resolveWsReadyMs(input: DerivedMetricsInput): number | undefined {
   return typeof durationMs === 'number' && Number.isFinite(durationMs) ? durationMs : undefined
 }
 
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function nonnegativeMetric(value: unknown): number | undefined {
+  const numberValue = finiteNumber(value)
+  return numberValue === undefined ? undefined : Math.max(0, numberValue)
+}
+
+function parsePayload(payload?: string): Record<string, unknown> | null {
+  if (!payload) return null
+  try {
+    const parsed = JSON.parse(payload) as unknown
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null
+  } catch {
+    return null
+  }
+}
+
+function eventName(entry: Record<string, unknown>): string | null {
+  return typeof entry.event === 'string' ? entry.event : null
+}
+
+function sumMetric(values: Iterable<unknown>): number {
+  let sum = 0
+  for (const value of values) {
+    const numberValue = nonnegativeMetric(value)
+    if (numberValue !== undefined) {
+      sum += numberValue
+    }
+  }
+  return sum
+}
+
+function countPerfEvents(input: DerivedMetricsInput, name: string): number {
+  return (input.browser.perfEvents ?? []).filter((entry) => eventName(entry) === name).length
+}
+
+function finiteNonnegativeValues(values: Iterable<unknown>): number[] {
+  return Array.from(values)
+    .map(nonnegativeMetric)
+    .filter((value): value is number => value !== undefined)
+}
+
+function resolveMaxRafGapMs(input: DerivedMetricsInput): number | undefined {
+  const values = finiteNonnegativeValues((input.browser.perfEvents ?? [])
+    .filter((entry) => eventName(entry) === 'visible_first.audit.max_raf_gap')
+    .flatMap((entry) => [entry.maxGapMs, entry.durationMs]))
+  return values.length > 0 ? Math.max(...values) : undefined
+}
+
+function isReplayBatchEvent(entry: Record<string, unknown>): boolean {
+  return entry.event === 'terminal.replay.batch' && entry.source === 'replay'
+}
+
+function isReplayGapEvent(entry: Record<string, unknown>): boolean {
+  return entry.event === 'terminal.replay.gap' || (
+    entry.event === 'terminal.output.gap'
+    && entry.source === 'replay'
+  )
+}
+
+function isReceivedTerminalOutputFrame(frame: VisibleFirstWsObservation): boolean {
+  return (frame as { direction?: unknown }).direction === undefined
+    || (frame as { direction?: unknown }).direction === 'received'
+}
+
+function isReplayOutputPayload(payload: Record<string, unknown> | null): boolean {
+  if (!payload) return false
+  if (payload.type === 'terminal.output.batch') {
+    return payload.source === 'replay'
+  }
+  if (payload.type === 'terminal.output') {
+    return payload.source === 'replay'
+  }
+  return false
+}
+
+function replayWsFramesBeforeReady(input: DerivedMetricsInput, focusedReadyMs: number): VisibleFirstWsObservation[] {
+  return (input.transport.ws?.frames ?? []).filter((frame) => {
+    if (frame.timestamp > focusedReadyMs || !isReceivedTerminalOutputFrame(frame)) return false
+    const frameType = frame.type ?? classifyWsFrameType(frame.payload ?? '')
+    if (frameType !== 'terminal.output' && frameType !== 'terminal.output.batch') return false
+    return isReplayOutputPayload(parsePayload(frame.payload))
+  })
+}
+
+function replayWsGapFramesBeforeReady(input: DerivedMetricsInput, focusedReadyMs: number): VisibleFirstWsObservation[] {
+  return (input.transport.ws?.frames ?? []).filter((frame) => {
+    if (frame.timestamp > focusedReadyMs || !isReceivedTerminalOutputFrame(frame)) return false
+    const frameType = frame.type ?? classifyWsFrameType(frame.payload ?? '')
+    return frameType === 'terminal.output.gap'
+  })
+}
+
+function isSentTerminalRecoveryInputFrame(frame: VisibleFirstWsObservation): boolean {
+  if ((frame as { direction?: unknown }).direction !== 'sent') return false
+  const frameType = frame.type ?? classifyWsFrameType(frame.payload ?? '')
+  return frameType === 'terminal.input' || frameType === 'terminal.attach'
+}
+
+function resolveTerminalInputToFirstOutputMs(
+  input: DerivedMetricsInput,
+  focusedReadyMs: number,
+): number | undefined {
+  const explicitSample = input.browser.terminalLatencySamplesMs?.[0]
+  if (typeof explicitSample === 'number' && Number.isFinite(explicitSample)) {
+    return explicitSample
+  }
+
+  const frames = input.transport.ws?.frames ?? []
+  const inputFrame = frames
+    .filter((frame) => frame.timestamp <= focusedReadyMs && isSentTerminalRecoveryInputFrame(frame))
+    .sort((a, b) => a.timestamp - b.timestamp)[0]
+  if (!inputFrame) return undefined
+
+  const outputFrame = frames
+    .filter((frame) => {
+      if (frame.timestamp < inputFrame.timestamp || frame.timestamp > focusedReadyMs) return false
+      if (!isReceivedTerminalOutputFrame(frame)) return false
+      const frameType = frame.type ?? classifyWsFrameType(frame.payload ?? '')
+      return frameType === 'terminal.output' || frameType === 'terminal.output.batch'
+    })
+    .sort((a, b) => a.timestamp - b.timestamp)[0]
+  if (!outputFrame) return undefined
+
+  return Math.max(0, outputFrame.timestamp - inputFrame.timestamp)
+}
+
+function resolveReplayMessageCount(input: DerivedMetricsInput, replayFrames: VisibleFirstWsObservation[]): number {
+  const serverReplayBatchEvents = (input.server?.terminalReplayEvents ?? []).filter(isReplayBatchEvent)
+  return serverReplayBatchEvents.length > 0 ? serverReplayBatchEvents.length : replayFrames.length
+}
+
+function resolveReplaySerializedBytes(input: DerivedMetricsInput, replayFrames: VisibleFirstWsObservation[]): number {
+  const serverReplayBatchEvents = (input.server?.terminalReplayEvents ?? []).filter(isReplayBatchEvent)
+  if (serverReplayBatchEvents.length > 0) {
+    return sumMetric(serverReplayBatchEvents.map((entry) => entry.serializedBytes))
+  }
+  return replayFrames.reduce((sum, frame) => sum + resolveObservationBytes(frame), 0)
+}
+
+function resolveReplayGapCount(input: DerivedMetricsInput, focusedReadyMs: number): number {
+  const serverReplayGapEvents = (input.server?.terminalReplayEvents ?? []).filter(isReplayGapEvent)
+  return serverReplayGapEvents.length > 0
+    ? serverReplayGapEvents.length
+    : replayWsGapFramesBeforeReady(input, focusedReadyMs).length
+}
+
+function payloadSeqEnd(frame: VisibleFirstWsObservation): number | undefined {
+  const payload = parsePayload(frame.payload)
+  const seqEnd = payload?.seqEnd
+  return typeof seqEnd === 'number' && Number.isFinite(seqEnd) ? seqEnd : undefined
+}
+
+function resolveParserAppliedLagMs(
+  input: DerivedMetricsInput,
+  replayFrames: VisibleFirstWsObservation[],
+): number | undefined {
+  const frameMilestones = replayFrames
+    .map((frame) => {
+      const seqEnd = payloadSeqEnd(frame)
+      return seqEnd === undefined ? null : { seqEnd, timestamp: frame.timestamp }
+    })
+    .filter((entry): entry is { seqEnd: number; timestamp: number } => entry !== null)
+
+  if (frameMilestones.length === 0) return undefined
+
+  let maxLagMs = 0
+  let observedParserAppliedEvidence = false
+  const parserAppliedEvents = (input.browser.perfEvents ?? [])
+    .filter((entry) => eventName(entry) === 'terminal.parser_applied')
+  for (const event of parserAppliedEvents) {
+    const timestamp = finiteNumber(event.timestamp)
+    const parserAppliedSeq = finiteNumber(event.parserAppliedSeq)
+    if (timestamp === undefined || parserAppliedSeq === undefined) continue
+    const coveredFrames = frameMilestones.filter((frame) => frame.seqEnd <= parserAppliedSeq)
+    if (coveredFrames.length === 0) continue
+    observedParserAppliedEvidence = true
+    const lastFrameTimestamp = Math.max(...coveredFrames.map((frame) => frame.timestamp))
+    maxLagMs = Math.max(maxLagMs, Math.max(0, timestamp - lastFrameTimestamp))
+  }
+
+  return observedParserAppliedEvidence ? maxLagMs : undefined
+}
+
+function resolveStopResumeMetrics(input: DerivedMetricsInput): {
+  terminalStoppedRetentionCoveredMs?: number
+  terminalStopResumeGapCount?: number
+} {
+  const events = (input.browser.perfEvents ?? [])
+    .filter((entry) => eventName(entry) === 'terminal.catchup.stop_resume')
+    .filter((entry) => {
+      const stoppedDurationMs = finiteNumber(entry.stoppedDurationMs)
+      const outputStartedAfterStopMs = finiteNumber(entry.outputStartedAfterStopMs)
+      const outputStartedBeforeResumeMs = finiteNumber(entry.outputStartedBeforeResumeMs)
+      const cdpCatchupOutputMessageCount = finiteNumber(entry.cdpCatchupOutputMessageCount)
+      const catchupOutputMessageCount = finiteNumber(entry.catchupOutputMessageCount)
+      return entry.source === 'visible_first_audit_process_suspend'
+        && entry.browserExecutionStopped === true
+        && stoppedDurationMs !== undefined
+        && stoppedDurationMs > 0
+        && outputStartedAfterStopMs !== undefined
+        && outputStartedAfterStopMs >= 0
+        && outputStartedBeforeResumeMs !== undefined
+        && outputStartedBeforeResumeMs >= 0
+        && (
+          (cdpCatchupOutputMessageCount !== undefined && cdpCatchupOutputMessageCount > 0)
+          || (catchupOutputMessageCount !== undefined && catchupOutputMessageCount > 0)
+        )
+    })
+  const retentionCoveredValues = events
+    .map((entry) => entry.retentionCoveredMs)
+    .map(nonnegativeMetric)
+    .filter((value): value is number => value !== undefined)
+  const gapCountValues = events
+    .map((entry) => nonnegativeMetric(entry.gapCount))
+    .filter((value): value is number => value !== undefined)
+
+  return {
+    ...(retentionCoveredValues.length > 0
+      ? { terminalStoppedRetentionCoveredMs: Math.max(...retentionCoveredValues) }
+      : {}),
+    ...(gapCountValues.length > 0
+      ? { terminalStopResumeGapCount: gapCountValues.reduce((sum, value) => sum + value, 0) }
+      : {}),
+  }
+}
+
 function resolveObservationBytes(observation: { encodedDataLength?: number | null; bytes?: number | null; payloadLength?: number | null }): number {
   if (typeof observation.encodedDataLength === 'number' && Number.isFinite(observation.encodedDataLength)) {
     return Math.max(0, observation.encodedDataLength)
@@ -130,6 +374,11 @@ export function deriveVisibleFirstMetrics(input: DerivedMetricsInput): VisibleFi
   const focusedReadyMs = input.browser.milestones[input.focusedReadyMilestone]
   const allowedApiRoutes = new Set(input.allowedApiRouteIdsBeforeReady)
   const allowedWsTypes = new Set(input.allowedWsTypesBeforeReady)
+  const replayFrames = replayWsFramesBeforeReady(input, focusedReadyMs)
+  const stopResumeMetrics = resolveStopResumeMetrics(input)
+  const terminalInputToFirstOutputMs = resolveTerminalInputToFirstOutputMs(input, focusedReadyMs)
+  const maxRafGapMs = resolveMaxRafGapMs(input)
+  const terminalParserAppliedLagMs = resolveParserAppliedLagMs(input, replayFrames)
 
   let httpRequestsBeforeReady = 0
   let httpBytesBeforeReady = 0
@@ -172,8 +421,9 @@ export function deriveVisibleFirstMetrics(input: DerivedMetricsInput): VisibleFi
   return {
     focusedReadyMs,
     ...(resolveWsReadyMs(input) !== undefined ? { wsReadyMs: resolveWsReadyMs(input) } : {}),
-    ...(typeof input.browser.terminalLatencySamplesMs?.[0] === 'number'
-      ? { terminalInputToFirstOutputMs: input.browser.terminalLatencySamplesMs[0] }
+    ...(maxRafGapMs !== undefined ? { maxRafGapMs } : {}),
+    ...(terminalInputToFirstOutputMs !== undefined
+      ? { terminalInputToFirstOutputMs }
       : {}),
     httpRequestsBeforeReady,
     httpBytesBeforeReady,
@@ -183,5 +433,13 @@ export function deriveVisibleFirstMetrics(input: DerivedMetricsInput): VisibleFi
     offscreenHttpBytesBeforeReady,
     offscreenWsFramesBeforeReady,
     offscreenWsBytesBeforeReady,
+    terminalReplayMessageCount: resolveReplayMessageCount(input, replayFrames),
+    terminalReplaySerializedBytes: resolveReplaySerializedBytes(input, replayFrames),
+    ...(terminalParserAppliedLagMs !== undefined ? { terminalParserAppliedLagMs } : {}),
+    terminalReplayGapCount: resolveReplayGapCount(input, focusedReadyMs),
+    terminalFullHydrateFallbackCount: countPerfEvents(input, 'terminal.catchup.full_hydrate_fallback'),
+    terminalSurfaceQuarantineCount: countPerfEvents(input, 'terminal.catchup.surface_quarantined'),
+    terminalStaleGenerationRejectionCount: countPerfEvents(input, 'terminal.attach_generation_stale_rejected'),
+    ...stopResumeMetrics,
   }
 }

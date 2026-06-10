@@ -4,7 +4,7 @@ import WebSocket, { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { logger } from './logger.js'
 import { recordSessionLifecycleEvent } from './session-observability.js'
-import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
+import { getPerfConfig, startPerfTimer } from './perf-logger.js'
 import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed, timingSafeCompare } from './auth.js'
 import { buildTerminalSessionRef, modeSupportsResume, terminalIdFromCreateError } from './terminal-registry.js'
 import type { TerminalRecord, TerminalRegistry, TerminalMode } from './terminal-registry.js'
@@ -29,6 +29,7 @@ import type {
 import type { ExtensionManager } from './extension-manager.js'
 import { allocateLocalhostPort } from './local-port.js'
 import { TerminalStreamBroker } from './terminal-stream/broker.js'
+import { isTerminalStreamAttachRequestIdWithinSerializedBudget } from './terminal-stream/serialized-budget.js'
 import { buildSidebarOpenSessionKeys, type SidebarSessionLocator } from './sidebar-session-selection.js'
 import { loadSessionHistory } from './session-history-loader.js'
 import type { SdkCreatedSession, SdkSessionState } from './sdk-bridge-types.js'
@@ -102,6 +103,7 @@ import {
   planCodexCreateRestoreDecision,
   resolveCodexCreateRestoreDecision,
 } from './coding-cli/codex-app-server/restore-decision.js'
+import { sendJsonMessage } from './ws-send.js'
 
 type WsHandlerConfig = {
   maxConnections: number
@@ -212,6 +214,7 @@ export interface LiveWebSocket extends WebSocket {
   connectionId?: string
   connectedAt?: number
   isMobileClient?: boolean
+  supportsTerminalOutputBatchV1?: boolean
   // Generation counter for chunked session updates to prevent interleaving
   sessionUpdateGeneration?: number
 }
@@ -428,6 +431,7 @@ const TabsSyncClientRetireSchema = z.object({
 type ClientState = {
   authenticated: boolean
   supportsUiScreenshotV1: boolean
+  supportsTerminalOutputBatchV1: boolean
   attachedTerminalIds: Set<string>
   createdByRequestId: Map<string, string>
   terminalCreateTimestamps: number[]
@@ -1229,6 +1233,7 @@ export class WsHandler {
     const state: ClientState = {
       authenticated: false,
       supportsUiScreenshotV1: false,
+      supportsTerminalOutputBatchV1: false,
       attachedTerminalIds: new Set(),
       createdByRequestId: new Map(),
       terminalCreateTimestamps: [],
@@ -1453,88 +1458,13 @@ export class WsHandler {
     }
   }
 
-  private closeForBackpressureIfNeeded(ws: LiveWebSocket, bufferedOverride?: number): boolean {
-    const buffered = bufferedOverride ?? (ws.bufferedAmount as number | undefined)
-    if (typeof buffered !== 'number' || buffered <= this.config.maxWsBufferedAmount) return false
-
-    if (perfConfig.enabled && shouldLog(`ws_backpressure_${ws.connectionId || 'unknown'}`, perfConfig.rateLimitMs)) {
-      logPerfEvent(
-        'ws_backpressure_close',
-        {
-          connectionId: ws.connectionId,
-          bufferedBytes: buffered,
-          limitBytes: this.config.maxWsBufferedAmount,
-        },
-        'warn',
-      )
-    }
-    ws.close(CLOSE_CODES.BACKPRESSURE, 'Backpressure')
-    return true
-  }
-
   private send(ws: LiveWebSocket, msg: unknown, skipBackpressureCheck = false) {
-    let messageType: string | undefined
-    try {
-      // Backpressure guard (skipped for pre-drained chunked sends).
-      const buffered = ws.bufferedAmount as number | undefined
-      if (!skipBackpressureCheck && this.closeForBackpressureIfNeeded(ws, buffered)) return
-      let serialized = ''
-      let payloadBytes: number | undefined
-      let serializeMs: number | undefined
-      let shouldLogSend = false
-
-      if (perfConfig.enabled) {
-        if (msg && typeof msg === 'object' && 'type' in msg) {
-          const typeValue = (msg as { type?: unknown }).type
-          if (typeof typeValue === 'string') messageType = typeValue
-        }
-
-        const serializeStart = process.hrtime.bigint()
-        serialized = JSON.stringify(msg)
-        const serializeEnd = process.hrtime.bigint()
-        payloadBytes = Buffer.byteLength(serialized)
-
-        if (payloadBytes >= perfConfig.wsPayloadWarnBytes) {
-          shouldLogSend = shouldLog(
-            `ws_send_large_${ws.connectionId || 'unknown'}_${messageType || 'unknown'}`,
-            perfConfig.rateLimitMs,
-          )
-          if (shouldLogSend) {
-            serializeMs = Number((Number(serializeEnd - serializeStart) / 1e6).toFixed(2))
-          }
-        }
-      } else {
-        serialized = JSON.stringify(msg)
-      }
-
-      const sendStart = shouldLogSend ? process.hrtime.bigint() : null
-      ws.send(serialized, (err) => {
-        if (!shouldLogSend) return
-        const sendMs = sendStart ? Number((Number(process.hrtime.bigint() - sendStart) / 1e6).toFixed(2)) : undefined
-        logPerfEvent(
-          'ws_send_large',
-          {
-            connectionId: ws.connectionId,
-            messageType,
-            payloadBytes,
-            bufferedBytes: buffered,
-            serializeMs,
-            sendMs,
-            error: !!err,
-          },
-          'warn',
-        )
-      })
-    } catch (err) {
-      log.warn(
-        {
-          err: err instanceof Error ? err : new Error(String(err)),
-          connectionId: ws.connectionId || 'unknown',
-          messageType: messageType || 'unknown',
-        },
-        'WebSocket send failed',
-      )
-    }
+    sendJsonMessage(ws, msg, {
+      skipBackpressureCheck,
+      maxBufferedAmount: this.config.maxWsBufferedAmount,
+      backpressureCloseCode: CLOSE_CODES.BACKPRESSURE,
+      backpressureCloseReason: 'Backpressure',
+    })
   }
 
   private safeSend(ws: LiveWebSocket, msg: unknown, skipBackpressureCheck = false) {
@@ -2129,6 +2059,8 @@ export class WsHandler {
         }
         state.authenticated = true
         state.supportsUiScreenshotV1 = !!m.capabilities?.uiScreenshotV1
+        state.supportsTerminalOutputBatchV1 = !!m.capabilities?.terminalOutputBatchV1
+        ws.supportsTerminalOutputBatchV1 = state.supportsTerminalOutputBatchV1
         state.sidebarOpenSessionKeys = buildSidebarOpenSessionKeys(
           m.sidebarOpenSessions ?? [],
           this.serverInstanceId,
@@ -2992,6 +2924,15 @@ export class WsHandler {
       }
 
       case 'terminal.attach': {
+        if (!isTerminalStreamAttachRequestIdWithinSerializedBudget(m.attachRequestId)) {
+          this.sendError(ws, {
+            code: 'INVALID_MESSAGE',
+            message: 'attachRequestId exceeds terminal output serialized application JSON byte budget',
+            terminalId: m.terminalId,
+          })
+          return
+        }
+
         const record = this.registry.get(m.terminalId)
         if (!record) {
           recordSessionLifecycleEvent({
@@ -3034,7 +2975,16 @@ export class WsHandler {
           m.attachRequestId,
           m.maxReplayBytes,
           m.priority ?? 'foreground',
+          state.supportsTerminalOutputBatchV1,
         )
+        if (attachResult === 'invalid_attach_request_id') {
+          this.sendError(ws, {
+            code: 'INVALID_MESSAGE',
+            message: 'attachRequestId exceeds terminal output serialized application JSON byte budget',
+            terminalId: m.terminalId,
+          })
+          return
+        }
         if (attachResult === 'missing') {
           const latestRecord = this.registry.get(m.terminalId)
           if (latestRecord && latestRecord.status !== 'running') {
@@ -3212,6 +3162,8 @@ export class WsHandler {
             })
           }
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Terminal not running', terminalId: m.terminalId })
+        } else {
+          this.terminalStreamBroker.recordResize(m.terminalId, ws, m.cols, m.rows)
         }
         return
       }

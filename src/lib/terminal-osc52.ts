@@ -1,3 +1,6 @@
+import { shouldAllowTerminalOutputSideEffect } from './terminal-output-side-effects.js'
+import type { TerminalOutputSource } from './terminal-output-write-scope.js'
+
 const ESC = '\u001b'
 const BEL = '\u0007'
 const C1_ST = '\u009c'
@@ -117,4 +120,28 @@ export function extractOsc52Events(
   }
 
   return { cleaned, events }
+}
+
+type Osc52SideEffectInput = {
+  terminalInstanceId?: string
+  source?: TerminalOutputSource
+  mode?: string
+}
+
+export function shouldAllowOsc52Prompt(input: Osc52SideEffectInput): boolean {
+  return shouldAllowTerminalOutputSideEffect({
+    terminalInstanceId: input.terminalInstanceId,
+    source: input.source,
+    effect: 'osc52_prompt',
+    mode: input.mode,
+  })
+}
+
+export function shouldAllowOsc52ClipboardWrite(input: Osc52SideEffectInput): boolean {
+  return shouldAllowTerminalOutputSideEffect({
+    terminalInstanceId: input.terminalInstanceId,
+    source: input.source,
+    effect: 'osc52_clipboard_write',
+    mode: input.mode,
+  })
 }

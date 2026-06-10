@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { createOsc52ParserState, extractOsc52Events } from '@/lib/terminal-osc52'
+import {
+  createOsc52ParserState,
+  extractOsc52Events,
+  shouldAllowOsc52ClipboardWrite,
+  shouldAllowOsc52Prompt,
+} from '@/lib/terminal-osc52'
+import { beginTerminalOutputWriteScope } from '@/lib/terminal-output-write-scope'
 
 describe('terminal-osc52', () => {
   it('extracts OSC52 payload and returns cleaned output', () => {
@@ -47,5 +53,43 @@ describe('terminal-osc52', () => {
 
     expect(result.cleaned).toBe('ab')
     expect(result.events).toEqual([])
+  })
+
+  it('suppresses always-policy clipboard writes while the submitted write scope is replay', () => {
+    const replayScope = beginTerminalOutputWriteScope({
+      terminalInstanceId: 'surface-osc52',
+      source: 'replay',
+      attachRequestId: 'attach-1',
+      generation: 'attach-1',
+      suppressExternalSideEffects: true,
+    })
+
+    expect(shouldAllowOsc52ClipboardWrite({
+      terminalInstanceId: 'surface-osc52',
+      mode: 'shell',
+    })).toBe(false)
+    expect(shouldAllowOsc52Prompt({
+      terminalInstanceId: 'surface-osc52',
+      mode: 'shell',
+    })).toBe(false)
+    replayScope.complete()
+
+    const liveScope = beginTerminalOutputWriteScope({
+      terminalInstanceId: 'surface-osc52',
+      source: 'live',
+      attachRequestId: 'attach-2',
+      generation: 'attach-2',
+      suppressExternalSideEffects: false,
+    })
+
+    expect(shouldAllowOsc52ClipboardWrite({
+      terminalInstanceId: 'surface-osc52',
+      mode: 'shell',
+    })).toBe(true)
+    expect(shouldAllowOsc52Prompt({
+      terminalInstanceId: 'surface-osc52',
+      mode: 'shell',
+    })).toBe(true)
+    liveScope.complete()
   })
 })

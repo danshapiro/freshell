@@ -173,7 +173,7 @@ function createStore(options: {
         paneTitles: {},
       },
       settings: { settings: defaultSettings, status: 'loaded' },
-      connection: { status: 'ready', error: null },
+      connection: { status: 'ready', error: null, serverInstanceId: 'srv-order' },
     },
   })
 }
@@ -258,6 +258,7 @@ describe('terminal create/attach ordering (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.attach.ready',
       terminalId: 'term-order-create',
+      streamId: 'stream-order-create',
       headSeq: 1,
       replayFromSeq: 1,
       replayToSeq: 1,
@@ -266,6 +267,7 @@ describe('terminal create/attach ordering (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.output',
       terminalId: 'term-order-create',
+      streamId: 'stream-order-create',
       seqStart: 1,
       seqEnd: 1,
       data: 'create-replay-1',
@@ -327,6 +329,7 @@ describe('terminal create/attach ordering (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.attach.ready',
       terminalId: 'term-order-hidden',
+      streamId: 'stream-order-hidden',
       headSeq: 8,
       replayFromSeq: 6,
       replayToSeq: 8,
@@ -335,6 +338,7 @@ describe('terminal create/attach ordering (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.output',
       terminalId: 'term-order-hidden',
+      streamId: 'stream-order-hidden',
       seqStart: 6,
       seqEnd: 6,
       data: 'hidden-r6',
@@ -343,6 +347,7 @@ describe('terminal create/attach ordering (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.output',
       terminalId: 'term-order-hidden',
+      streamId: 'stream-order-hidden',
       seqStart: 8,
       seqEnd: 8,
       data: 'hidden-r8',
@@ -390,6 +395,7 @@ describe('terminal create/attach ordering (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.attach.ready',
       terminalId: 'term-order-coalesce',
+      streamId: 'stream-order-coalesce',
       headSeq: 3,
       replayFromSeq: 1,
       replayToSeq: 3,
@@ -398,6 +404,7 @@ describe('terminal create/attach ordering (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.output',
       terminalId: 'term-order-coalesce',
+      streamId: 'stream-order-coalesce',
       seqStart: 1,
       seqEnd: 1,
       data: 'replay-1',
@@ -406,6 +413,7 @@ describe('terminal create/attach ordering (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.output',
       terminalId: 'term-order-coalesce',
+      streamId: 'stream-order-coalesce',
       seqStart: 2,
       seqEnd: 2,
       data: 'replay-2',
@@ -414,6 +422,7 @@ describe('terminal create/attach ordering (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.output',
       terminalId: 'term-order-coalesce',
+      streamId: 'stream-order-coalesce',
       seqStart: 3,
       seqEnd: 3,
       data: 'replay-3',
@@ -463,6 +472,7 @@ describe('terminal create/attach ordering (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.attach.ready',
       terminalId: 'term-order-reconnect',
+      streamId: 'stream-order-reconnect',
       headSeq: 1,
       replayFromSeq: 2,
       replayToSeq: 1,
@@ -471,6 +481,7 @@ describe('terminal create/attach ordering (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.output',
       terminalId: 'term-order-reconnect',
+      streamId: 'stream-order-reconnect',
       seqStart: 2,
       seqEnd: 2,
       data: 'before-reconnect',
@@ -496,6 +507,7 @@ describe('terminal create/attach ordering (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.output',
       terminalId: 'term-order-reconnect',
+      streamId: 'stream-order-reconnect',
       seqStart: 3,
       seqEnd: 3,
       data: 'stale-after-reconnect',
@@ -504,6 +516,7 @@ describe('terminal create/attach ordering (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.attach.ready',
       terminalId: 'term-order-reconnect',
+      streamId: 'stream-order-reconnect',
       headSeq: 2,
       replayFromSeq: 3,
       replayToSeq: 2,
@@ -512,6 +525,7 @@ describe('terminal create/attach ordering (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.output',
       terminalId: 'term-order-reconnect',
+      streamId: 'stream-order-reconnect',
       seqStart: 3,
       seqEnd: 3,
       data: 'fresh-after-reconnect',

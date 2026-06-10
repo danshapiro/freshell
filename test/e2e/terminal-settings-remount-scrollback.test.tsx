@@ -15,16 +15,29 @@ import TerminalView from '@/components/TerminalView'
 const wsHarness = vi.hoisted(() => {
   const handlers = new Set<(msg: any) => void>()
   const latestAttachRequestIdByTerminal = new Map<string, string>()
-  const withCurrentAttachRequestId = (msg: any) => {
+  const latestStreamIdByTerminal = new Map<string, string>()
+  const withCurrentAttachMetadata = (msg: any) => {
     if (
-      msg?.attachRequestId
-      || typeof msg?.terminalId !== 'string'
+      typeof msg?.terminalId !== 'string'
       || (msg?.type !== 'terminal.attach.ready' && msg?.type !== 'terminal.output' && msg?.type !== 'terminal.output.gap')
     ) {
       return msg
     }
-    const attachRequestId = latestAttachRequestIdByTerminal.get(msg.terminalId)
-    return attachRequestId ? { ...msg, attachRequestId } : msg
+    let normalized = msg
+    if (!normalized.attachRequestId) {
+      const attachRequestId = latestAttachRequestIdByTerminal.get(msg.terminalId)
+      if (attachRequestId) normalized = { ...normalized, attachRequestId }
+    }
+    if (normalized.type === 'terminal.attach.ready' && typeof normalized.streamId !== 'string') {
+      normalized = { ...normalized, streamId: `${msg.terminalId}:stream` }
+    } else if (typeof normalized.streamId !== 'string') {
+      const streamId = latestStreamIdByTerminal.get(msg.terminalId)
+      if (streamId) normalized = { ...normalized, streamId }
+    }
+    if (normalized.type === 'terminal.attach.ready' && typeof normalized.streamId === 'string') {
+      latestStreamIdByTerminal.set(msg.terminalId, normalized.streamId)
+    }
+    return normalized
   }
   return {
     send: vi.fn(),
@@ -35,7 +48,7 @@ const wsHarness = vi.hoisted(() => {
       return () => handlers.delete(handler)
     }),
     emit(msg: any) {
-      const normalized = withCurrentAttachRequestId(msg)
+      const normalized = withCurrentAttachMetadata(msg)
       for (const handler of handlers) {
         handler(normalized)
       }
@@ -43,6 +56,7 @@ const wsHarness = vi.hoisted(() => {
     reset() {
       handlers.clear()
       latestAttachRequestIdByTerminal.clear()
+      latestStreamIdByTerminal.clear()
     },
     rememberAttach(msg: any) {
       if (
@@ -350,7 +364,7 @@ describe('settings remount scrollback hydration (e2e)', () => {
     const allWrites = terminalInstances.flatMap((instance) => instance.write.mock.calls.map(([data]) => data))
     expect(allWrites).toContain('hidden-replayed-after-settings')
     // Gap messages are written to the terminal for all gap types including replay_window_exceeded
-    const allGapLines = terminalInstances.flatMap((instance) => instance.writeln.mock.calls.map(([data]) => String(data)))
+    const allGapLines = allWrites.map((data) => String(data))
     expect(allGapLines.some((line) => line.includes('reconnect window exceeded'))).toBe(true)
   })
 
@@ -462,8 +476,7 @@ describe('settings remount scrollback hydration (e2e)', () => {
     expect(allWrites).toContain('hidden-r6')
     expect(allWrites).toContain('hidden-r8')
     expect(allWrites).toContain('hidden-live')
-    const allGapLines = terminalInstances.flatMap((instance) => instance.writeln.mock.calls.map(([data]) => String(data)))
-    expect(allGapLines.some((line) => line.includes('reconnect window exceeded'))).toBe(false)
+    expect(allWrites.some((line) => line.includes('reconnect window exceeded'))).toBe(false)
   })
 
   it('hidden remount restore sends zero attach while hidden and one viewport attach on visibility', async () => {

@@ -2857,6 +2857,11 @@ export class TerminalRegistry extends EventEmitter {
       record.codexSidecarLifecycleUnsubscribe?.()
       record.codexSidecarLifecycleUnsubscribe = undefined
       record.pty = candidate.pty
+      this.emit('terminal.stream.replaced', {
+        terminalId: record.terminalId,
+        reason: 'codex_pty_recovery',
+        at: Date.now(),
+      })
       record.mcpCwd = candidate.mcpCwd
       record.codexSidecar = plan.sidecar
       record.codexSidecarLifecyclePublished = true

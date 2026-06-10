@@ -51,7 +51,7 @@ export class TerminalViewMirror {
 
   applyOutput(rawOutput: string): ReplayFrame {
     const normalized = normalizeOutput(rawOutput)
-    const frame = this.replayRing.append(normalized)
+    const frame = this.replayRing.append(normalized, { streamId: this.terminalId })
     this.lines = appendLines(this.lines, normalized)
     this.revision += 1
     return frame

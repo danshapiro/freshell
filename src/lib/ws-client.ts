@@ -6,6 +6,7 @@ import {
 } from '@/lib/perf-logger'
 import { getAuthToken } from '@/lib/auth'
 import { sanitizeSessionLocators } from '@/lib/session-utils'
+import { WS_PROTOCOL_VERSION } from '@shared/ws-version'
 import type { ServerMessage, SessionLocator } from '@shared/ws-protocol'
 import { createLogger } from '@/lib/client-logger'
 
@@ -74,7 +75,6 @@ type InFlightCreate = {
 }
 
 const CONNECTION_TIMEOUT_MS = 10_000
-const WS_PROTOCOL_VERSION = 5
 const perfConfig = getClientPerfConfig()
 
 function isTerminalInputMessage(msg: unknown): msg is TerminalInputClientMessage {
@@ -206,7 +206,10 @@ export class WsClient {
       }
     }
 
-    if (msg.type === 'terminal.output' && typeof msg.terminalId === 'string') {
+    if (
+      (msg.type === 'terminal.output' || msg.type === 'terminal.output.batch')
+      && typeof msg.terminalId === 'string'
+    ) {
       markTerminalOutputSeen(msg.terminalId)
     }
 
@@ -334,7 +337,7 @@ export class WsClient {
           type: 'hello',
           token,
           protocolVersion: WS_PROTOCOL_VERSION,
-          capabilities: { uiScreenshotV1: true },
+          capabilities: { uiScreenshotV1: true, terminalOutputBatchV1: true },
           ...helloExtensions,
         })
       }

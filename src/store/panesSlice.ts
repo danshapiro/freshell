@@ -67,6 +67,7 @@ function normalizePaneContent(
       ...(sessionRef ? { sessionRef } : {}),
       ...(codexDurability ? { codexDurability } : {}),
       serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
+      streamId: typeof input.streamId === 'string' && input.streamId.length > 0 ? input.streamId : undefined,
       ...(restoreError.success ? { restoreError: restoreError.data } : {}),
       initialCwd: typeof input.initialCwd === 'string' ? input.initialCwd : undefined,
     }

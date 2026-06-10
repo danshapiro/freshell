@@ -7,6 +7,7 @@
  * Client MUST use `import type` to avoid bundling Zod runtime code.
  */
 import { z } from 'zod'
+import { WS_PROTOCOL_VERSION } from './ws-version.js'
 import type { ClientExtensionEntry } from './extension-types.js'
 import type { ServerSettings } from './settings.js'
 import { LiveTerminalHandleSchema, SessionRefSchema, type RestoreError } from './session-contract.js'
@@ -34,7 +35,7 @@ export const ErrorCode = z.enum([
 
 export type ErrorCode = z.infer<typeof ErrorCode>
 
-export const WS_PROTOCOL_VERSION = 5 as const
+export { WS_PROTOCOL_VERSION }
 
 export const ShellSchema = z.enum(['system', 'cmd', 'powershell', 'wsl'])
 
@@ -228,6 +229,7 @@ export const HelloSchema = z.object({
   protocolVersion: z.literal(WS_PROTOCOL_VERSION),
   capabilities: z.object({
     uiScreenshotV1: z.boolean().optional(),
+    terminalOutputBatchV1: z.boolean().optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),
@@ -659,11 +661,27 @@ export type TerminalCreatedMessage = {
 export type TerminalAttachReadyMessage = {
   type: 'terminal.attach.ready'
   terminalId: string
+  streamId: string
+  geometryEpoch?: number
+  geometryAuthority?: TerminalGeometryAuthority
+  requestedSinceSeq?: number
+  effectiveSinceSeq?: number
+  replayResetReason?: 'geometry_authority_unknown'
   headSeq: number
   replayFromSeq: number
   replayToSeq: number
   attachRequestId?: string
   sessionRef?: SessionLocator
+}
+
+export type TerminalGeometryAuthority = 'single_client' | 'server_stream' | 'multi_client_unknown'
+
+export type TerminalStreamChangedMessage = {
+  type: 'terminal.stream.changed'
+  terminalId: string
+  streamId: string
+  reason: 'new_pty_session' | 'codex_pty_recovery' | 'retention_lost' | 'server_restart_incompatible_retention'
+  attachRequestId?: string
 }
 
 export type TerminalDetachedMessage = {
@@ -688,15 +706,40 @@ export type TerminalStatusMessage = {
 export type TerminalOutputMessage = {
   type: 'terminal.output'
   terminalId: string
+  streamId: string
   seqStart: number
   seqEnd: number
   data: string
   attachRequestId?: string
+  source?: 'live' | 'replay'
+}
+
+export type TerminalOutputBatchSegment = {
+  seqStart: number
+  seqEnd: number
+  endOffset: number
+  data?: string
+  rawFrameCount: number
+  barrier?: 'control' | 'startup_probe' | 'osc52' | 'request_mode' | 'turn_complete' | 'gap' | 'geometry'
+}
+
+export type TerminalOutputBatchMessage = {
+  type: 'terminal.output.batch'
+  terminalId: string
+  streamId: string
+  attachRequestId: string
+  source: 'live' | 'replay'
+  seqStart: number
+  seqEnd: number
+  data: string
+  serializedBytes: number
+  segments: TerminalOutputBatchSegment[]
 }
 
 export type TerminalOutputGapMessage = {
   type: 'terminal.output.gap'
   terminalId: string
+  streamId: string
   fromSeq: number
   toSeq: number
   reason: 'queue_overflow' | 'replay_window_exceeded' | 'replay_budget_exceeded'
@@ -984,10 +1027,12 @@ export type ServerMessage =
   | ErrorMessage
   | TerminalCreatedMessage
   | TerminalAttachReadyMessage
+  | TerminalStreamChangedMessage
   | TerminalDetachedMessage
   | TerminalExitMessage
   | TerminalStatusMessage
   | TerminalOutputMessage
+  | TerminalOutputBatchMessage
   | TerminalOutputGapMessage
   | TerminalTitleUpdatedMessage
   | TerminalSessionAssociatedMessage

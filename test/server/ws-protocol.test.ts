@@ -7,6 +7,7 @@ import {
   ClaudeActivityListResponseSchema,
   ClaudeActivityUpdatedSchema,
   ClaudeActivityListSchema,
+  HelloSchema,
   TerminalTurnCompleteSchema,
 } from '../../shared/ws-protocol.js'
 import {
@@ -402,6 +403,38 @@ describe('ws protocol', () => {
       token: 'testtoken-testtoken',
       protocolVersion: WS_PROTOCOL_VERSION,
       capabilities: { uiScreenshotV1: true },
+    }))
+
+    const ready = await new Promise<any>((resolve) => {
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data.toString())
+        if (msg.type === 'ready') resolve(msg)
+      })
+    })
+    expect(ready.type).toBe('ready')
+    await closeWebSocket(ws)
+  })
+
+  it('accepts hello with terminalOutputBatchV1 capability', async () => {
+    const parsed = HelloSchema.safeParse({
+      type: 'hello',
+      token: 'testtoken-testtoken',
+      protocolVersion: WS_PROTOCOL_VERSION,
+      capabilities: {
+        uiScreenshotV1: true,
+        terminalOutputBatchV1: true,
+      },
+    })
+    expect(parsed.success).toBe(true)
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+
+    ws.send(JSON.stringify({
+      type: 'hello',
+      token: 'testtoken-testtoken',
+      protocolVersion: WS_PROTOCOL_VERSION,
+      capabilities: { terminalOutputBatchV1: true },
     }))
 
     const ready = await new Promise<any>((resolve) => {

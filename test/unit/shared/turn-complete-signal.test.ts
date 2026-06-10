@@ -6,6 +6,7 @@ import {
   extractTurnCompleteSignals,
   isSubmitInput,
 } from '../../../shared/turn-complete-signal'
+import { shouldAllowTerminalOutputSideEffect } from '@/lib/terminal-output-write-scope'
 
 describe('shared turn-complete signal parser', () => {
   it('counts BEL in Codex output and strips it from cleaned output', () => {
@@ -96,5 +97,35 @@ describe('countTrackerTurnCompleteSignals', () => {
   it('ignores an OSC title terminator BEL', () => {
     const state = createTurnCompleteSignalParserState()
     expect(countTrackerTurnCompleteSignals('\x1b]0;title\x07', state)).toBe(0)
+  })
+})
+
+describe('turn-complete side-effect gating', () => {
+  it('allows client-minted live turn completion only for non-server-authoritative modes', () => {
+    expect(shouldAllowTerminalOutputSideEffect({
+      source: 'live',
+      effect: 'turn_complete',
+      mode: 'opencode',
+    })).toBe(true)
+    expect(shouldAllowTerminalOutputSideEffect({
+      source: 'live',
+      effect: 'turn_complete',
+      mode: 'shell',
+    })).toBe(true)
+    expect(shouldAllowTerminalOutputSideEffect({
+      source: 'live',
+      effect: 'turn_complete',
+      mode: 'claude',
+    })).toBe(false)
+    expect(shouldAllowTerminalOutputSideEffect({
+      source: 'live',
+      effect: 'turn_complete',
+      mode: 'codex',
+    })).toBe(false)
+    expect(shouldAllowTerminalOutputSideEffect({
+      source: 'replay',
+      effect: 'turn_complete',
+      mode: 'opencode',
+    })).toBe(false)
   })
 })

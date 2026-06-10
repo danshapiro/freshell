@@ -37,7 +37,11 @@ const browserRegistry = new Map<string, BrowserActions>()
 
 export function registerTerminalActions(paneId: string, actions: TerminalActions): () => void {
   terminalRegistry.set(paneId, actions)
-  return () => terminalRegistry.delete(paneId)
+  return () => {
+    if (terminalRegistry.get(paneId) === actions) {
+      terminalRegistry.delete(paneId)
+    }
+  }
 }
 
 export function getTerminalActions(paneId: string): TerminalActions | undefined {

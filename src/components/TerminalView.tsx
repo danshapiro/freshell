@@ -38,7 +38,15 @@ import {
 } from '@/lib/terminal-restore'
 import { isTerminalPasteShortcut } from '@/lib/terminal-input-policy'
 import { terminalFollowsOscTitle } from '@/lib/terminal-title-policy'
-import { clearTerminalCursor, loadTerminalCursor, saveTerminalCursor } from '@/lib/terminal-cursor'
+import {
+  clearTerminalCursor,
+  loadTerminalSurfaceCheckpoint,
+  saveTerminalSurfaceCheckpoint,
+} from '@/lib/terminal-cursor'
+import {
+  canUseCheckpointForDeltaReplay,
+  type TerminalGeometryAuthority,
+} from '@/lib/terminal-surface-checkpoint'
 import {
   resolveRevealAttachPlan,
   type DeferredAttachReason,
@@ -49,10 +57,14 @@ import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import {
   beginAttach,
   createAttachSeqState,
+  markOutputRangeUnapplied,
+  markParserAppliedSeq,
   onAttachReady,
+  onOutputBatchSegments,
   onOutputFrame,
   onOutputGap,
   type AttachSeqState,
+  type OutputBatchAcceptedSegment,
 } from '@/lib/terminal-attach-seq-state'
 import { useMobile } from '@/hooks/useMobile'
 import { useKeyboardInset } from '@/hooks/useKeyboardInset'
@@ -69,9 +81,17 @@ import {
 import {
   createOsc52ParserState,
   extractOsc52Events,
+  shouldAllowOsc52ClipboardWrite,
+  shouldAllowOsc52Prompt,
   type Osc52Event,
   type Osc52Policy,
 } from '@/lib/terminal-osc52'
+import {
+  beginTerminalOutputWriteScope,
+  getTerminalOutputWriteScope,
+  shouldAllowTerminalOutputSideEffect,
+  type TerminalOutputSource,
+} from '@/lib/terminal-output-write-scope'
 import {
   createTerminalStartupProbeState,
   extractTerminalStartupProbes,
@@ -115,6 +135,9 @@ import { buildRestoreError, sanitizeSessionRef } from '@shared/session-contract'
 const log = createLogger('TerminalView')
 
 const SESSION_ACTIVITY_THROTTLE_MS = 5000
+const TERMINAL_CHECKPOINT_XTERM_VERSION = '6.0.0'
+const QUARANTINE_REPAIR_POLL_MS = 16
+const QUARANTINE_REPAIR_TIMEOUT_MS = 2000
 export const RATE_LIMIT_RETRY_MAX_ATTEMPTS = 5
 export const RATE_LIMIT_RETRY_BASE_MS = 2000
 export const RATE_LIMIT_RETRY_MAX_MS = 12000
@@ -129,6 +152,15 @@ const DEFAULT_MIN_CONTRAST_RATIO = 1
 const MAX_LAST_SENT_VIEWPORT_CACHE_ENTRIES = 200
 const TRUNCATED_REPLAY_BYTES = 128 * 1024
 const INPUT_BLOCKED_NOTICE_THROTTLE_MS = 2000
+const TERMINAL_OUTPUT_BATCH_BARRIER_REASONS = new Set([
+  'control',
+  'startup_probe',
+  'osc52',
+  'request_mode',
+  'turn_complete',
+  'gap',
+  'geometry',
+])
 
 function viewportHydrateReplayOptions(content?: TerminalPaneContent | null): { maxReplayBytes: number } | undefined {
   return content?.mode === 'opencode'
@@ -190,8 +222,23 @@ type StartupProbeReplayDiscardState = {
   resumeState: TerminalStartupProbeState | null
 }
 
+type TerminalOutputSubmission = {
+  submittedWrite: boolean
+  submittedBytesEqualInput: boolean
+}
+
 function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): number {
   return theme?.isDark === false ? LIGHT_THEME_MIN_CONTRAST_RATIO : DEFAULT_MIN_CONTRAST_RATIO
+}
+
+function isUtf16SurrogateSplitOffset(data: string, offset: number): boolean {
+  if (offset <= 0 || offset >= data.length) return false
+  const previous = data.charCodeAt(offset - 1)
+  const next = data.charCodeAt(offset)
+  return previous >= 0xD800
+    && previous <= 0xDBFF
+    && next >= 0xDC00
+    && next <= 0xDFFF
 }
 
 function consumeStartupProbeReplayDiscard(
@@ -293,10 +340,32 @@ type PendingDurableReplacement = {
   reason: 'opencode_replay_window_exceeded'
 }
 
+type AttachTerminalOptions = {
+  clearViewportFirst?: boolean
+  suppressNextMatchingResize?: boolean
+  skipPreAttachFit?: boolean
+  maxReplayBytes?: number
+  priority?: TerminalAttachPriority
+  sinceSeq?: number
+}
+
 type SentViewport = {
   terminalId: string
   cols: number
   rows: number
+}
+
+function parseTerminalGeometryAuthority(value: unknown): TerminalGeometryAuthority | null {
+  return value === 'single_client' || value === 'server_stream' || value === 'multi_client_unknown'
+    ? value
+    : null
+}
+
+function normalizeGeometryEpoch(value: unknown, fallback: number): number {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.max(0, Math.floor(value))
+  }
+  return Math.max(0, Math.floor(Number.isFinite(fallback) ? fallback : 1))
 }
 
 const lastSentViewportByTerminal = new Map<string, { cols: number; rows: number }>()
@@ -415,6 +484,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const containerRef = useRef<HTMLDivElement | null>(null)
   const wrapperRef = useRef<HTMLDivElement | null>(null)
   const termRef = useRef<Terminal | null>(null)
+  const terminalInstanceIdRef = useRef(`terminal-surface:${nanoid()}`)
   const runtimeRef = useRef<TerminalRuntime | null>(null)
   const writeQueueRef = useRef<TerminalWriteQueue | null>(null)
   const layoutSchedulerRef = useRef<ReturnType<typeof createLayoutScheduler> | null>(null)
@@ -442,6 +512,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     resumeState: null,
   })
   const osc52ParserRef = useRef(createOsc52ParserState())
+  const settingsRef = useRef(settings)
   const resolvedThemeRef = useRef(getTerminalTheme(settings.terminal.theme, settings.theme))
   const osc52PolicyRef = useRef<Osc52Policy>(settings.terminal.osc52Clipboard)
   const pendingOsc52EventRef = useRef<Osc52Event | null>(null)
@@ -491,8 +562,20 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const requestIdRef = useRef<string>(terminalContent?.createRequestId || '')
   const terminalIdRef = useRef<string | undefined>(terminalContent?.terminalId)
   const seqStateRef = useRef<AttachSeqState>(createAttachSeqState())
-  const renderedSeqRef = useRef(0)
-  const hasTrustedSurfaceRef = useRef(false)
+  const parserAppliedSeqRef = useRef(0)
+  const surfaceEpochRef = useRef(0)
+  const geometryEpochRef = useRef(1)
+  const geometryAuthorityRef = useRef<TerminalGeometryAuthority>('single_client')
+  const attachTerminalRef = useRef<((tid: string, intent: AttachIntent, opts?: AttachTerminalOptions) => void) | null>(null)
+  const quarantineRepairRef = useRef<{
+    terminalId: string
+    attachRequestId: string
+    queue: TerminalWriteQueue
+    startedAt: number
+    timedOut: boolean
+    timer: ReturnType<typeof setTimeout> | null
+  } | null>(null)
+  const abandonedAttachRequestIdsRef = useRef(new Set<string>())
   const attachCounterRef = useRef(0)
   const currentAttachRef = useRef<{
     requestId: string
@@ -501,6 +584,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     sinceSeq: number
     cols: number
     rows: number
+    surfaceQuarantined: boolean
+    streamId?: string | null
+    expectedStreamId?: string | null
+    geometryEpoch: number
+    geometryAuthority: TerminalGeometryAuthority
+    expectedGeometryEpoch: number
+    expectedGeometryAuthority: TerminalGeometryAuthority
   } | null>(null)
   const launchAttemptRef = useRef<LaunchAttemptState | null>(null)
   const suppressNextMatchingResizeRef = useRef<{
@@ -532,24 +622,274 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     seqStateRef.current = nextState
   }, [])
 
-  const resetRenderedSurface = useCallback((seq = 0) => {
-    renderedSeqRef.current = Math.max(0, Math.floor(Number.isFinite(seq) ? seq : 0))
-    hasTrustedSurfaceRef.current = false
+  const getTerminalCheckpointStreamId = useCallback((): string | null => {
+    const streamId = contentRef.current?.streamId
+    return typeof streamId === 'string' && streamId.length > 0
+      ? streamId
+      : null
   }, [])
 
-  const markRenderedSeq = useCallback((terminalId: string | undefined, seq: number) => {
-    if (!terminalId || !Number.isFinite(seq)) return
-    const renderedSeq = Math.max(0, Math.floor(seq))
-    if (renderedSeq <= renderedSeqRef.current) {
-      if (renderedSeq > 0) {
-        hasTrustedSurfaceRef.current = true
+  const getTerminalCheckpointServerInstanceId = useCallback((): string | null => {
+    const contentServerInstanceId = contentRef.current?.serverInstanceId
+    if (typeof contentServerInstanceId === 'string' && contentServerInstanceId.length > 0) {
+      return contentServerInstanceId
+    }
+    return typeof serverInstanceIdRef.current === 'string' && serverInstanceIdRef.current.length > 0
+      ? serverInstanceIdRef.current
+      : null
+  }, [])
+
+  const buildCheckpointReplayInput = useCallback((terminalId: string, dimensions?: { cols?: number; rows?: number }) => {
+    const serverInstanceId = getTerminalCheckpointServerInstanceId()
+    if (!terminalId || !serverInstanceId) return null
+    const term = termRef.current
+    const normalizeDimension = (value: number | undefined, fallback: number) => {
+      const resolved = typeof value === 'number' && Number.isFinite(value) ? value : fallback
+      return Math.max(2, Math.floor(resolved))
+    }
+    const normalizeScrollback = (value: number) => (
+      Math.max(0, Math.floor(Number.isFinite(value) ? value : 0))
+    )
+    return {
+      terminalId,
+      streamId: getTerminalCheckpointStreamId(),
+      serverInstanceId,
+      surfaceEpoch: surfaceEpochRef.current,
+      cols: normalizeDimension(dimensions?.cols, term?.cols ?? 80),
+      rows: normalizeDimension(dimensions?.rows, term?.rows ?? 24),
+      geometryEpoch: geometryEpochRef.current,
+      geometryAuthority: geometryAuthorityRef.current,
+      scrollback: normalizeScrollback(settingsRef.current.terminal.scrollback),
+      xtermVersion: TERMINAL_CHECKPOINT_XTERM_VERSION,
+      requireParserIdle: true,
+    }
+  }, [
+    getTerminalCheckpointServerInstanceId,
+    getTerminalCheckpointStreamId,
+  ])
+
+  const getCheckpointDeltaReplayDecision = useCallback((terminalId: string, dimensions?: { cols?: number; rows?: number }) => {
+    const checkpointInput = buildCheckpointReplayInput(terminalId, dimensions)
+    if (!checkpointInput) {
+      return { ok: false as const, reason: 'missing_checkpoint' as const }
+    }
+    const checkpoint = loadTerminalSurfaceCheckpoint(terminalId, {
+      streamId: checkpointInput.streamId,
+      serverInstanceId: checkpointInput.serverInstanceId,
+    })
+    return canUseCheckpointForDeltaReplay(checkpoint, checkpointInput)
+  }, [buildCheckpointReplayInput])
+
+  const resetParserAppliedSurface = useCallback((seq = 0, opts?: { incrementEpoch?: boolean }) => {
+    parserAppliedSeqRef.current = Math.max(0, Math.floor(Number.isFinite(seq) ? seq : 0))
+    if (opts?.incrementEpoch !== false) {
+      surfaceEpochRef.current += 1
+    }
+  }, [])
+
+  const syncGeometryEpochForViewport = useCallback((terminalId: string, cols: number, rows: number) => {
+    const lastSentViewport = lastSentViewportRef.current
+    if (
+      lastSentViewport
+      && lastSentViewport.terminalId === terminalId
+      && (lastSentViewport.cols !== cols || lastSentViewport.rows !== rows)
+    ) {
+      geometryEpochRef.current += 1
+    }
+  }, [])
+
+  const clearQuarantineRepair = useCallback((attachRequestId?: string) => {
+    const pending = quarantineRepairRef.current
+    if (!pending) {
+      if (attachRequestId) {
+        abandonedAttachRequestIdsRef.current.delete(attachRequestId)
       }
       return
     }
-    renderedSeqRef.current = renderedSeq
-    hasTrustedSurfaceRef.current = true
-    saveTerminalCursor(terminalId, renderedSeq)
+    if (attachRequestId && pending.attachRequestId !== attachRequestId) return
+    if (pending.timer) {
+      clearTimeout(pending.timer)
+    }
+    abandonedAttachRequestIdsRef.current.delete(pending.attachRequestId)
+    quarantineRepairRef.current = null
   }, [])
+
+  const recordTerminalPerfAuditEvent = useCallback((event: string, data: Record<string, unknown> = {}) => {
+    const payload = Object.fromEntries(Object.entries({
+      event,
+      timestamp: typeof performance !== 'undefined' ? performance.now() : Date.now(),
+      tabId,
+      paneId: paneIdRef.current,
+      ...data,
+    }).filter(([, value]) => value !== undefined))
+    getInstalledPerfAuditBridge()?.addPerfEvent(payload)
+  }, [tabId])
+
+  const scheduleQuarantineRepair = useCallback((terminalId: string, attachRequestId: string) => {
+    clearQuarantineRepair()
+    const queue = writeQueueRef.current
+    if (!queue) return
+    const startedAt = Date.now()
+    const poll = () => {
+      const pending = quarantineRepairRef.current
+      if (!pending || pending.attachRequestId !== attachRequestId) return
+      const activeAttach = currentAttachRef.current
+      if (
+        !mountedRef.current
+        || pending.terminalId !== terminalId
+        || terminalIdRef.current !== terminalId
+        || !activeAttach
+        || activeAttach.terminalId !== terminalId
+        || activeAttach.requestId !== attachRequestId
+        || writeQueueRef.current !== pending.queue
+      ) {
+        clearQuarantineRepair(attachRequestId)
+        return
+      }
+      if (!pending.queue.hasInFlightWrites()) {
+        clearQuarantineRepair(attachRequestId)
+        attachTerminalRef.current?.(terminalId, 'viewport_hydrate', {
+          clearViewportFirst: true,
+          ...viewportHydrateReplayOptions(contentRef.current),
+        })
+        return
+      }
+      if (!pending.timedOut && Date.now() - pending.startedAt >= QUARANTINE_REPAIR_TIMEOUT_MS) {
+        log.warn('Terminal quarantine repair timed out while writes remained in flight', {
+          paneId: paneIdRef.current,
+          terminalId,
+          attachRequestId,
+        })
+        abandonedAttachRequestIdsRef.current.add(attachRequestId)
+        pending.timedOut = true
+        pending.queue.setActiveGeneration(`${attachRequestId}:quarantine-timeout`, {
+          dropQueuedStaleWrites: true,
+        })
+        recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantine_timeout', {
+          terminalId,
+          attachRequestId,
+          parserAppliedSeq: parserAppliedSeqRef.current,
+          reason: 'in_flight_writes_timeout',
+        })
+      }
+      pending.timer = setTimeout(poll, QUARANTINE_REPAIR_POLL_MS)
+    }
+    quarantineRepairRef.current = {
+      terminalId,
+      attachRequestId,
+      queue,
+      startedAt,
+      timedOut: false,
+      timer: setTimeout(poll, QUARANTINE_REPAIR_POLL_MS),
+    }
+  }, [clearQuarantineRepair, recordTerminalPerfAuditEvent])
+
+  const markParserAppliedFrame = useCallback((terminalId: string | undefined, seq: number, attachContext?: {
+    requestId: string
+    terminalId: string
+    cols: number
+    rows: number
+    surfaceQuarantined?: boolean
+    streamId?: string | null
+  }) => {
+    if (!terminalId || !Number.isFinite(seq)) return
+    const parserAppliedSeq = Math.max(0, Math.floor(seq))
+    const attach = attachContext ?? currentAttachRef.current
+    const surfaceQuarantined = attach?.surfaceQuarantined === true
+    if (parserAppliedSeq <= parserAppliedSeqRef.current) {
+      return
+    }
+    const previousParserAppliedSeq = parserAppliedSeqRef.current
+    parserAppliedSeqRef.current = parserAppliedSeq
+    recordTerminalPerfAuditEvent('terminal.parser_applied', {
+      terminalId,
+      attachRequestId: attach?.requestId,
+      activeAttachRequestId: currentAttachRef.current?.requestId,
+      streamId: attach?.streamId ?? getTerminalCheckpointStreamId(),
+      parserAppliedSeq,
+      previousParserAppliedSeq,
+      surfaceEpoch: surfaceEpochRef.current,
+      surfaceQuarantined,
+    })
+
+    if (surfaceQuarantined) return
+    if (!attach || attach.terminalId !== terminalId) return
+    if (typeof attach.streamId !== 'string' || attach.streamId.length === 0) return
+    const checkpointInput = buildCheckpointReplayInput(terminalId, {
+      cols: attach.cols,
+      rows: attach.rows,
+    })
+    if (!checkpointInput) return
+
+    saveTerminalSurfaceCheckpoint({
+      terminalId: checkpointInput.terminalId,
+      streamId: checkpointInput.streamId,
+      serverInstanceId: checkpointInput.serverInstanceId,
+      surfaceEpoch: checkpointInput.surfaceEpoch,
+      attachRequestId: attach.requestId,
+      parserAppliedSeq,
+      cols: checkpointInput.cols,
+      rows: checkpointInput.rows,
+      geometryEpoch: checkpointInput.geometryEpoch,
+      geometryAuthority: checkpointInput.geometryAuthority,
+      scrollback: checkpointInput.scrollback,
+      xtermVersion: checkpointInput.xtermVersion,
+      // Task 3 cannot yet prove normal vs alternate buffer. Keep checkpoints conservative
+      // until the geometry/buffer authority work supplies this context.
+      bufferType: 'unknown',
+      parserIdle: true,
+    })
+  }, [buildCheckpointReplayInput, getTerminalCheckpointStreamId, recordTerminalPerfAuditEvent])
+
+  const writeLocalXtermNotice = useCallback((term: Terminal, data: string) => {
+    const terminalInstanceId = terminalInstanceIdRef.current
+    if (!shouldAllowTerminalOutputSideEffect({
+      terminalInstanceId,
+      source: 'live',
+      effect: 'local_xterm_notice',
+      mode: contentRef.current?.mode,
+    })) {
+      return
+    }
+    const invalidateAppliedSurface = () => {
+      resetParserAppliedSurface(parserAppliedSeqRef.current)
+    }
+    const generation = currentAttachRef.current?.requestId
+    const queue = writeQueueRef.current
+    if (queue) {
+      queue.enqueue(data, invalidateAppliedSurface, { mode: 'live', generation })
+      return
+    }
+    const scope = beginTerminalOutputWriteScope({
+      terminalInstanceId,
+      source: 'live',
+      attachRequestId: generation,
+      generation: generation ?? 'local-notice',
+      suppressExternalSideEffects: false,
+    })
+    let didComplete = false
+    const complete = () => {
+      if (didComplete) return
+      didComplete = true
+      scope.complete()
+    }
+    try {
+      term.write(data, () => {
+        try {
+          invalidateAppliedSurface()
+        } finally {
+          complete()
+        }
+      })
+    } catch {
+      // disposed
+      complete()
+    }
+  }, [resetParserAppliedSurface])
+
+  useEffect(() => () => {
+    clearQuarantineRepair()
+  }, [clearQuarantineRepair])
 
   // Keep refs in sync with props
   useEffect(() => {
@@ -566,7 +906,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       }
       terminalIdRef.current = terminalContent.terminalId
       if (terminalContent.terminalId !== prevTerminalId) {
-        resetRenderedSurface()
+        resetParserAppliedSurface()
+        geometryEpochRef.current = 1
+        geometryAuthorityRef.current = 'single_client'
+        clearQuarantineRepair()
         forgetSentViewport(prevTerminalId)
         const cachedViewport = terminalContent.terminalId
           ? lastSentViewportByTerminal.get(terminalContent.terminalId)
@@ -574,15 +917,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         lastSentViewportRef.current = terminalContent.terminalId && cachedViewport
           ? { terminalId: terminalContent.terminalId, cols: cachedViewport.cols, rows: cachedViewport.rows }
           : null
-        const initialSeq = terminalContent.terminalId
-          ? loadTerminalCursor(terminalContent.terminalId)
-          : 0
-        applySeqState(createAttachSeqState({ lastSeq: initialSeq }))
+        applySeqState(createAttachSeqState())
       }
       requestIdRef.current = terminalContent.createRequestId
       contentRef.current = terminalContent
     }
-  }, [terminalContent, paneId, applySeqState, resetRenderedSurface])
+  }, [terminalContent, paneId, applySeqState, clearQuarantineRepair, resetParserAppliedSurface])
 
   // Register terminal buffer accessor with test harness (for E2E tests).
   // Uses xterm.js Terminal.buffer.active API which works with all renderers
@@ -643,6 +983,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
   // Sync during render (not in useEffect) so refs always have latest values
   paneLastInputAtRef.current = paneLastInputAt
+  settingsRef.current = settings
   debugRef.current = !!settings.logging?.debug
   refreshRequestRef.current = refreshRequest
   providerBehaviorRef.current = providerBehavior
@@ -980,6 +1321,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           if (matchesSuppressedViewport) {
             suppressNextMatchingResizeRef.current = null
           } else if (!matchesLastSentViewport && !suppressNetworkEffects) {
+            syncGeometryEpochForViewport(tid, term.cols, term.rows)
             ws.send({ type: 'terminal.resize', terminalId: tid, cols: term.cols, rows: term.rows })
             rememberSentViewport(tid, term.cols, term.rows)
             lastSentViewportRef.current = { terminalId: tid, cols: term.cols, rows: term.rows }
@@ -994,21 +1336,39 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     if (shouldFocus) {
       term.focus()
     }
-  }, [suppressNetworkEffects, ws])
+  }, [suppressNetworkEffects, syncGeometryEpochForViewport, ws])
 
-  const enqueueTerminalWrite = useCallback((data: string, onWritten?: () => void, options?: TerminalWriteQueueOptions) => {
-    if (!data) return
+  const enqueueTerminalWrite = useCallback((data: string, onWritten?: () => void, options?: TerminalWriteQueueOptions): boolean => {
+    if (!data) return false
     const queue = writeQueueRef.current
     if (queue) {
       queue.enqueue(data, onWritten, options)
-      return
+      return true
     }
     const term = termRef.current
-    if (!term) return
+    if (!term) return false
+    const mode = options?.mode ?? 'live'
+    const generation = options?.generation ?? 'no-attach'
+    const scope = beginTerminalOutputWriteScope({
+      terminalInstanceId: terminalInstanceIdRef.current,
+      source: mode,
+      attachRequestId: options?.generation,
+      generation,
+      suppressExternalSideEffects: mode === 'replay',
+    })
     try {
-      term.write(data, onWritten)
+      term.write(data, () => {
+        try {
+          onWritten?.()
+        } finally {
+          scope.complete()
+        }
+      })
+      return true
     } catch {
       // disposed
+      scope.complete()
+      return false
     }
   }, [])
 
@@ -1032,13 +1392,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     setPendingOsc52Event(null)
   }, [])
 
-  const handleOsc52Event = useCallback((event: Osc52Event) => {
+  const handleOsc52Event = useCallback((event: Osc52Event, source: TerminalOutputSource, mode: TerminalPaneContent['mode']) => {
     const policy = osc52PolicyRef.current
     if (policy === 'always') {
-      attemptOsc52ClipboardWrite(event.text)
+      if (shouldAllowOsc52ClipboardWrite({
+        terminalInstanceId: terminalInstanceIdRef.current,
+        source,
+        mode,
+      })) {
+        attemptOsc52ClipboardWrite(event.text)
+      }
       return
     }
     if (policy === 'never') {
+      return
+    }
+    if (!shouldAllowOsc52Prompt({
+      terminalInstanceId: terminalInstanceIdRef.current,
+      source,
+      mode,
+    })) {
       return
     }
     if (pendingOsc52EventRef.current) {
@@ -1072,16 +1445,22 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     mode: TerminalPaneContent['mode'],
     tid: string | undefined,
     allowReplies: boolean,
-    onRendered?: () => void,
+    onParserApplied?: () => void,
     writeOptions?: TerminalWriteQueueOptions,
-  ) => {
+  ): TerminalOutputSubmission => {
+    const outputSource = writeOptions?.mode ?? 'live'
     const startup = extractTerminalStartupProbes(raw, startupProbeStateRef.current, {
       foreground: resolvedThemeRef.current.foreground,
       background: resolvedThemeRef.current.background,
       cursor: resolvedThemeRef.current.cursor,
     })
 
-    if (allowReplies) {
+    if (allowReplies && shouldAllowTerminalOutputSideEffect({
+      terminalInstanceId: terminalInstanceIdRef.current,
+      source: outputSource,
+      effect: 'startup_reply',
+      mode,
+    })) {
       for (const reply of startup.replies) {
         sendInput(reply)
       }
@@ -1093,7 +1472,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     // claude and codex turn-completion are server-authoritative (terminal.turn.complete
     // broadcast). The client must not mint a completion from output (live or replayed)
     // for those modes — only opencode/other modes still use the client BEL path.
-    if (count > 0 && tid && mode !== 'claude' && mode !== 'codex') {
+    if (count > 0 && tid && shouldAllowTerminalOutputSideEffect({
+      terminalInstanceId: terminalInstanceIdRef.current,
+      source: outputSource,
+      effect: 'turn_complete',
+      mode,
+    })) {
       dispatch(recordTurnComplete({
         tabId,
         paneId: paneIdRef.current,
@@ -1102,15 +1486,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       }))
     }
 
-    if (cleaned) {
-      enqueueTerminalWrite(cleaned, onRendered, writeOptions)
-    } else {
-      onRendered?.()
-    }
+    const submittedBytesEqualInput = cleaned === raw
+    const submittedWrite = cleaned
+      ? enqueueTerminalWrite(
+          cleaned,
+          submittedBytesEqualInput ? onParserApplied : undefined,
+          writeOptions,
+        )
+      : false
 
     for (const event of osc.events) {
-      handleOsc52Event(event)
+      handleOsc52Event(event, outputSource, mode)
     }
+    return { submittedWrite, submittedBytesEqualInput: submittedWrite && submittedBytesEqualInput }
   }, [dispatch, enqueueTerminalWrite, handleOsc52Event, sendInput, tabId])
 
   const findNext = useCallback((value: string = searchQuery) => {
@@ -1255,6 +1643,18 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
     const resolvedTheme = getTerminalTheme(settings.terminal.theme, settings.theme)
     resolvedThemeRef.current = resolvedTheme
+    const terminalInstanceId = `terminal-surface:${nanoid()}`
+    terminalInstanceIdRef.current = terminalInstanceId
+    const allowCurrentLinkAction = () => (
+      terminalInstanceIdRef.current === terminalInstanceId
+      && shouldAllowTerminalOutputSideEffect({
+        terminalInstanceId,
+        source: 'live',
+        effect: 'link_action',
+        mode: contentRef.current?.mode,
+      })
+    )
+
     const term = new Terminal({
       allowProposedApi: true,
       convertEol: true,
@@ -1267,6 +1667,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       minimumContrastRatio: resolveMinimumContrastRatio(resolvedTheme),
       linkHandler: {
         activate: (event: MouseEvent, uri: string) => {
+          if (!allowCurrentLinkAction()) return
           if (event.button !== 0) return
           // Only open http/https URLs. Block javascript:, data:, and other
           // potentially dangerous schemes from OSC 8 links.
@@ -1278,12 +1679,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           }
         },
         hover: (_event: MouseEvent, text: string, _range: import('@xterm/xterm').IBufferRange) => {
+          if (!allowCurrentLinkAction()) return
           setHoveredUrl(paneId, text)
           if (wrapperRef.current) {
             wrapperRef.current.dataset.hoveredUrl = text
           }
         },
         leave: () => {
+          if (!allowCurrentLinkAction()) return
           clearHoveredUrl(paneId)
           if (wrapperRef.current) {
             delete wrapperRef.current.dataset.hoveredUrl
@@ -1306,11 +1709,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     termRef.current = term
     runtimeRef.current = runtime
     const writeQueue = createTerminalWriteQueue({
+      terminalInstanceId,
       write: (data, onWritten) => {
         try {
           term.write(data, onWritten)
         } catch {
           // disposed
+          onWritten?.()
         }
       },
     })
@@ -1319,7 +1724,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     layoutSchedulerRef.current = layoutScheduler
 
     term.open(containerRef.current)
-    const requestModeBypass = registerTerminalRequestModeBypass(term, sendInput)
+    const requestModeBypass = registerTerminalRequestModeBypass(term, sendInput, { terminalInstanceId })
     term.attachCustomWheelEventHandler((event) => {
       const lines = event.deltaY < 0 ? -1 : event.deltaY > 0 ? 1 : 0
       if (!translateScrollLinesToInput(term, lines)) {
@@ -1332,6 +1737,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     })
 
     // Register custom link provider for clickable local file paths
+    const linkProviderTerminalInstanceId = terminalInstanceId
     const filePathLinkDisposable = typeof term.registerLinkProvider === 'function'
       ? term.registerLinkProvider({
         provideLinks(bufferLineNumber: number, callback: (links: import('@xterm/xterm').ILink[] | undefined) => void) {
@@ -1348,6 +1754,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             text: m.path,
             activate: (event: MouseEvent) => {
               if (event && event.button !== 0) return
+              if (terminalInstanceIdRef.current !== linkProviderTerminalInstanceId) return
               queuePaneSplit({
                 kind: 'editor',
                 filePath: m.path,
@@ -1380,6 +1787,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             text: m.url,
             activate: (event: MouseEvent) => {
               if (event && event.button !== 0) return
+              if (terminalInstanceIdRef.current !== linkProviderTerminalInstanceId) return
               if (warnExternalLinksRef.current !== false) {
                 setPendingLinkUriRef.current(m.url)
               } else {
@@ -1387,12 +1795,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               }
             },
             hover: () => {
+              if (terminalInstanceIdRef.current !== linkProviderTerminalInstanceId) return
               setHoveredUrl(paneId, m.url)
               if (wrapperRef.current) {
                 wrapperRef.current.dataset.hoveredUrl = m.url
               }
             },
             leave: () => {
+              if (terminalInstanceIdRef.current !== linkProviderTerminalInstanceId) return
               clearHoveredUrl(paneId)
               if (wrapperRef.current) {
                 delete wrapperRef.current.dataset.hoveredUrl
@@ -1403,24 +1813,51 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       })
       : { dispose: () => {} }
 
+    const allowCurrentTerminalAction = () => (
+      terminalInstanceIdRef.current === terminalInstanceId
+      && shouldAllowTerminalOutputSideEffect({
+        terminalInstanceId,
+        source: 'live',
+        effect: 'terminal_action',
+        mode: contentRef.current?.mode,
+      })
+    )
     const unregisterActions = registerTerminalActions(paneId, {
       copySelection: async () => {
+        if (!allowCurrentTerminalAction()) return
         const selection = term.getSelection()
-        if (selection) {
+        if (selection && allowCurrentTerminalAction()) {
           await copyText(selection)
         }
       },
       paste: async () => {
+        if (!allowCurrentTerminalAction()) return
         const text = await readText()
+        if (!allowCurrentTerminalAction()) return
         if (!text) return
         term.paste(text)
       },
-      selectAll: () => term.selectAll(),
-      clearScrollback: () => term.clear(),
-      reset: () => term.reset(),
-      scrollToBottom: () => { try { term.scrollToBottom() } catch { /* disposed */ } },
-      hasSelection: () => term.getSelection().length > 0,
-      openSearch: () => setSearchOpen(true),
+      selectAll: () => {
+        if (!allowCurrentTerminalAction()) return
+        term.selectAll()
+      },
+      clearScrollback: () => {
+        if (!allowCurrentTerminalAction()) return
+        term.clear()
+      },
+      reset: () => {
+        if (!allowCurrentTerminalAction()) return
+        term.reset()
+      },
+      scrollToBottom: () => {
+        if (!allowCurrentTerminalAction()) return
+        try { term.scrollToBottom() } catch { /* disposed */ }
+      },
+      hasSelection: () => allowCurrentTerminalAction() && term.getSelection().length > 0,
+      openSearch: () => {
+        if (!allowCurrentTerminalAction()) return
+        setSearchOpen(true)
+      },
     })
     const unregisterCaptureHandler = registerTerminalCaptureHandler(paneId, {
       suspendWebgl: () => runtimeRef.current?.suspendWebgl?.() ?? false,
@@ -1539,6 +1976,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
     const wrapperEl = wrapperRef.current
     return () => {
+      clearQuarantineRepair()
       requestModeBypass.dispose()
       filePathLinkDisposable?.dispose()
       urlLinkDisposable?.dispose()
@@ -1564,10 +2002,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         focus: false,
       }
       if (termRef.current === term) {
+        if (terminalInstanceIdRef.current === terminalInstanceId) {
+          terminalInstanceIdRef.current = `terminal-surface:disposed:${nanoid()}`
+        }
         runtime.dispose()
         runtimeRef.current = null
         term.dispose()
         termRef.current = null
+        mountedRef.current = false
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1599,12 +2041,22 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     if (!isTerminal) return
     const term = termRef.current
     if (!term) return
+    const titleTerminalInstanceId = terminalInstanceIdRef.current
 
     const disposable = term.onTitleChange((rawTitle: string) => {
       // Only shell terminals follow the program's OSC window title. Coding-agent
       // terminals are named from the server session (working dir / first message
       // / Gemini) and must stay stable, so they ignore OSC titles entirely.
       if (!terminalFollowsOscTitle(contentRef.current?.mode)) return
+      if (terminalInstanceIdRef.current !== titleTerminalInstanceId) return
+      if (!shouldAllowTerminalOutputSideEffect({
+        terminalInstanceId: titleTerminalInstanceId,
+        source: getTerminalOutputWriteScope(titleTerminalInstanceId) ? undefined : 'live',
+        effect: 'title_update',
+        mode: contentRef.current?.mode,
+      })) {
+        return
+      }
       // Strip prefix noise (spinners, status chars) - everything before first letter
       const match = rawTitle.match(/[a-zA-Z]/)
       if (!match) return // No letters = all noise, ignore
@@ -1652,6 +2104,67 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     }
   }, [paneId, tabId])
 
+  const markTerminalOutputRangeLost = useCallback((input: {
+    terminalId: string
+    messageType: string
+    attachRequestId?: string
+    streamId?: unknown
+    fromSeq?: unknown
+    toSeq?: unknown
+    reason: string
+    invalidReason?: string
+  }) => {
+    const previousSeqState = seqStateRef.current
+    const explicitFromSeq = input.fromSeq
+    const explicitToSeq = input.toSeq
+    const hasExplicitRange = typeof explicitFromSeq === 'number'
+      && typeof explicitToSeq === 'number'
+      && Number.isFinite(explicitFromSeq)
+      && Number.isFinite(explicitToSeq)
+      && Number.isInteger(explicitFromSeq)
+      && Number.isInteger(explicitToSeq)
+      && explicitFromSeq >= 0
+      && explicitToSeq >= explicitFromSeq
+      && explicitToSeq > 0
+    const fromSeq = hasExplicitRange
+      ? Math.max(0, Math.floor(explicitFromSeq))
+      : previousSeqState.highestObservedSeq + 1
+    const toSeq = hasExplicitRange
+      ? Math.max(fromSeq, Math.floor(explicitToSeq))
+      : fromSeq
+    const gapDecision = onOutputGap(previousSeqState, { fromSeq, toSeq })
+    const nextSeqState = gapDecision.state
+    applySeqState(nextSeqState)
+    resetParserAppliedSurface(parserAppliedSeqRef.current)
+    recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
+      terminalId: input.terminalId,
+      messageType: input.messageType,
+      attachRequestId: input.attachRequestId,
+      activeAttachRequestId: currentAttachRef.current?.requestId,
+      streamId: typeof input.streamId === 'string' ? input.streamId : undefined,
+      fromSeq,
+      toSeq,
+      syntheticLostRange: !hasExplicitRange,
+      parserAppliedSeq: parserAppliedSeqRef.current,
+      highestObservedSeq: nextSeqState.highestObservedSeq,
+      reason: input.reason,
+      invalidReason: input.invalidReason,
+    })
+    const completedAttachOnGap = !nextSeqState.pendingReplay
+      && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
+    if (completedAttachOnGap) {
+      resetStartupProbeParser({ discardReplayRemainder: Boolean(previousSeqState.pendingReplay) })
+      setIsAttaching(false)
+      markAttachComplete()
+    }
+  }, [
+    applySeqState,
+    markAttachComplete,
+    recordTerminalPerfAuditEvent,
+    resetParserAppliedSurface,
+    resetStartupProbeParser,
+  ])
+
   const registerForBackgroundHydration = useCallback((options?: { queueIfStarted?: boolean }) => {
     if (hydrationRegisteredRef.current) return
     hydrationRegisteredRef.current = true
@@ -1671,6 +2184,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const current = currentAttachRef.current
     if (!current) return true
     if (!msg.attachRequestId) {
+      recordTerminalPerfAuditEvent('terminal.attach_generation_stale_rejected', {
+        terminalId: msg.terminalId,
+        messageType: msg.type,
+        activeAttachRequestId: current.requestId,
+        reason: 'missing_attach_request_id',
+      })
       if (debugRef.current) {
         log.debug('Ignoring untagged stream message for active attach generation', {
           paneId: paneIdRef.current,
@@ -1681,20 +2200,132 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       }
       return false
     }
-    return msg.attachRequestId === current.requestId
-  }, [])
+    if (abandonedAttachRequestIdsRef.current.has(msg.attachRequestId)) {
+      recordTerminalPerfAuditEvent('terminal.attach_generation_stale_rejected', {
+        terminalId: msg.terminalId,
+        messageType: msg.type,
+        attachRequestId: msg.attachRequestId,
+        activeAttachRequestId: current.requestId,
+        reason: 'abandoned_attach_request_id',
+      })
+      if (debugRef.current) {
+        log.debug('Ignoring abandoned attach generation message', {
+          paneId: paneIdRef.current,
+          terminalId: msg.terminalId,
+          type: msg.type,
+          attachRequestId: msg.attachRequestId,
+          currentAttachRequestId: current.requestId,
+        })
+      }
+      return false
+    }
+    const isCurrent = msg.attachRequestId === current.requestId
+    if (!isCurrent) {
+      recordTerminalPerfAuditEvent('terminal.attach_generation_stale_rejected', {
+        terminalId: msg.terminalId,
+        messageType: msg.type,
+        attachRequestId: msg.attachRequestId,
+        activeAttachRequestId: current.requestId,
+        reason: 'stale_attach_request_id',
+      })
+    }
+    return isCurrent
+  }, [recordTerminalPerfAuditEvent])
+
+  const isCurrentAttachStreamMessage = useCallback((msg: {
+    type: string
+    terminalId: string
+    attachRequestId?: string
+    streamId?: unknown
+    seqStart?: unknown
+    seqEnd?: unknown
+    fromSeq?: unknown
+    toSeq?: unknown
+  }) => {
+    if (!isCurrentAttachMessage(msg)) return false
+
+    const current = currentAttachRef.current
+    const activeStreamId = current?.streamId
+    const messageStreamId = typeof msg.streamId === 'string' && msg.streamId.length > 0
+      ? msg.streamId
+      : null
+    if (activeStreamId === undefined) {
+      return true
+    }
+    if (typeof activeStreamId === 'string' && messageStreamId === activeStreamId) {
+      return true
+    }
+
+    const fromSeq = typeof msg.seqStart === 'number'
+      ? msg.seqStart
+      : (typeof msg.fromSeq === 'number' ? msg.fromSeq : undefined)
+    const toSeq = typeof msg.seqEnd === 'number'
+      ? msg.seqEnd
+      : (typeof msg.toSeq === 'number' ? msg.toSeq : undefined)
+    if (typeof fromSeq === 'number' && typeof toSeq === 'number') {
+      const previousSeqState = seqStateRef.current
+      const gapDecision = onOutputGap(previousSeqState, { fromSeq, toSeq })
+      const nextSeqState = gapDecision.state
+      applySeqState(nextSeqState)
+      resetParserAppliedSurface(parserAppliedSeqRef.current)
+      recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
+        terminalId: msg.terminalId,
+        messageType: msg.type,
+        attachRequestId: msg.attachRequestId,
+        activeAttachRequestId: current?.requestId,
+        activeStreamId,
+        streamId: messageStreamId,
+        fromSeq,
+        toSeq,
+        parserAppliedSeq: parserAppliedSeqRef.current,
+        highestObservedSeq: nextSeqState.highestObservedSeq,
+        reason: 'stream_identity_mismatch',
+      })
+      const completedAttachOnGap = !nextSeqState.pendingReplay
+        && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
+      if (completedAttachOnGap) {
+        resetStartupProbeParser({ discardReplayRemainder: Boolean(previousSeqState.pendingReplay) })
+        setIsAttaching(false)
+        markAttachComplete()
+      }
+    } else {
+      resetParserAppliedSurface(parserAppliedSeqRef.current)
+      recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
+        terminalId: msg.terminalId,
+        messageType: msg.type,
+        attachRequestId: msg.attachRequestId,
+        activeAttachRequestId: current?.requestId,
+        activeStreamId,
+        streamId: messageStreamId,
+        parserAppliedSeq: parserAppliedSeqRef.current,
+        reason: 'stream_identity_mismatch',
+      })
+    }
+
+    log.warn('Ignoring terminal stream message with mismatched stream identity', {
+      paneId: paneIdRef.current,
+      terminalId: msg.terminalId,
+      type: msg.type,
+      attachRequestId: msg.attachRequestId,
+      activeStreamId,
+      messageStreamId,
+      fromSeq,
+      toSeq,
+    })
+    return false
+  }, [
+    applySeqState,
+    isCurrentAttachMessage,
+    markAttachComplete,
+    recordTerminalPerfAuditEvent,
+    resetParserAppliedSurface,
+    resetStartupProbeParser,
+  ])
 
   const attachTerminal = useCallback((
     tid: string,
     intent: AttachIntent,
-    opts?: {
-      clearViewportFirst?: boolean
-      suppressNextMatchingResize?: boolean
-      skipPreAttachFit?: boolean
-      maxReplayBytes?: number
-      priority?: TerminalAttachPriority
-      sinceSeq?: number
-    },
+    opts?: AttachTerminalOptions,
   ) => {
     if (suppressNetworkEffects) return
     const term = termRef.current
@@ -1709,46 +2340,117 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     }
     const cols = Math.max(2, term.cols || 80)
     const rows = Math.max(2, term.rows || 24)
+    syncGeometryEpochForViewport(tid, cols, rows)
+    const attachRequestId = `${paneIdRef.current}:${++attachCounterRef.current}:${nanoid(6)}`
+    const writeQueue = writeQueueRef.current
+    const hasInFlightWrites = writeQueue?.hasInFlightWrites() === true
+    const expectedStreamId = getTerminalCheckpointStreamId()
+    const checkpointInput = buildCheckpointReplayInput(tid, { cols, rows })
+    const checkpointDecision = getCheckpointDeltaReplayDecision(tid, { cols, rows })
+    const expectedGeometryEpoch = checkpointInput?.geometryEpoch ?? geometryEpochRef.current
+    const expectedGeometryAuthority = checkpointInput?.geometryAuthority ?? geometryAuthorityRef.current
+    const explicitSinceSeq = typeof opts?.sinceSeq === 'number'
+      ? Math.max(0, Math.floor(opts.sinceSeq))
+      : undefined
+    let effectiveIntent = intent
+    let clearViewportFirst = opts?.clearViewportFirst === true
+    let fullHydrateFallbackReason: string | null = null
+    if (hasInFlightWrites && effectiveIntent !== 'viewport_hydrate') {
+      effectiveIntent = 'viewport_hydrate'
+      clearViewportFirst = true
+      fullHydrateFallbackReason = 'in_flight_writes'
+    } else if (effectiveIntent !== 'viewport_hydrate' && explicitSinceSeq === undefined && !checkpointDecision.ok) {
+      effectiveIntent = 'viewport_hydrate'
+      clearViewportFirst = true
+      fullHydrateFallbackReason = checkpointDecision.reason
+    }
+    const deltaSeq = Math.max(0, Math.floor(explicitSinceSeq ?? (checkpointDecision.ok ? checkpointDecision.sinceSeq : 0)))
+    const sinceSeq = effectiveIntent === 'viewport_hydrate' ? 0 : deltaSeq
+    const surfaceQuarantined = hasInFlightWrites
+    writeQueue?.setActiveGeneration(attachRequestId, { dropQueuedStaleWrites: true })
+    if (!surfaceQuarantined) {
+      clearQuarantineRepair()
+    }
+    if (surfaceQuarantined) {
+      log.warn('Quarantining terminal attach while writes are still in flight', {
+        paneId: paneIdRef.current,
+        terminalId: tid,
+        attachRequestId,
+        intent: effectiveIntent,
+        requestedIntent: intent,
+        sinceSeq,
+        clearViewportFirst,
+      })
+    }
+
     setIsAttaching(true)
     setTruncatedHistoryGap(null)
-
-    const renderedSeq = hasTrustedSurfaceRef.current ? renderedSeqRef.current : 0
-    const deltaSeq = Math.max(0, Math.floor(opts?.sinceSeq ?? renderedSeq))
-    const sinceSeq = intent === 'viewport_hydrate' ? 0 : deltaSeq
 
     // Startup probes must not leak across attach generations.
     resetStartupProbeParser()
 
-    if (intent === 'viewport_hydrate') {
-      resetRenderedSurface()
-      if (opts?.clearViewportFirst) {
+    if (effectiveIntent === 'viewport_hydrate') {
+      resetParserAppliedSurface()
+      if (clearViewportFirst && !surfaceQuarantined) {
         try {
           termRef.current?.clear()
         } catch {
           // disposed
         }
       }
-      // Keep persisted cursor untouched so transport reconnect can still use high-water.
       applySeqState(beginAttach(createAttachSeqState({ lastSeq: 0 })))
     } else {
-      applySeqState(beginAttach(createAttachSeqState({ lastSeq: deltaSeq })))
+      applySeqState(beginAttach(createAttachSeqState({
+        lastSeq: deltaSeq,
+        parserAppliedSeq: deltaSeq,
+      })))
     }
 
     deferredAttachStateRef.current = {
       mode: 'attaching',
-      pendingIntent: intent,
+      pendingIntent: effectiveIntent,
       pendingSinceSeq: sinceSeq,
       pendingReason: opts?.priority === 'background' ? 'background_catchup' : 'initial_hydrate',
     }
 
-    const attachRequestId = `${paneIdRef.current}:${++attachCounterRef.current}:${nanoid(6)}`
     currentAttachRef.current = {
       requestId: attachRequestId,
-      intent,
+      intent: effectiveIntent,
       terminalId: tid,
       sinceSeq,
       cols,
       rows,
+      surfaceQuarantined,
+      expectedStreamId,
+      geometryEpoch: expectedGeometryEpoch,
+      geometryAuthority: expectedGeometryAuthority,
+      expectedGeometryEpoch,
+      expectedGeometryAuthority,
+    }
+    if (fullHydrateFallbackReason) {
+      recordTerminalPerfAuditEvent('terminal.catchup.full_hydrate_fallback', {
+        terminalId: tid,
+        attachRequestId,
+        requestedIntent: intent,
+        intent: effectiveIntent,
+        sinceSeq,
+        deltaSeq,
+        streamId: expectedStreamId,
+        reason: fullHydrateFallbackReason,
+        hasInFlightWrites,
+      })
+    }
+    if (surfaceQuarantined) {
+      recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
+        terminalId: tid,
+        attachRequestId,
+        requestedIntent: intent,
+        intent: effectiveIntent,
+        sinceSeq,
+        streamId: expectedStreamId,
+        parserAppliedSeq: parserAppliedSeqRef.current,
+        reason: 'in_flight_writes',
+      })
     }
     suppressNextMatchingResizeRef.current = opts?.suppressNextMatchingResize
       ? { terminalId: tid, cols, rows }
@@ -1757,7 +2459,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     ws.send({
       type: 'terminal.attach',
       terminalId: tid,
-      intent,
+      intent: effectiveIntent,
       cols,
       rows,
       sinceSeq,
@@ -1767,7 +2469,24 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     })
     rememberSentViewport(tid, cols, rows)
     lastSentViewportRef.current = { terminalId: tid, cols, rows }
-  }, [suppressNetworkEffects, ws, applySeqState, resetRenderedSurface, resetStartupProbeParser])
+    if (surfaceQuarantined) {
+      scheduleQuarantineRepair(tid, attachRequestId)
+    }
+  }, [
+    suppressNetworkEffects,
+    ws,
+    applySeqState,
+    buildCheckpointReplayInput,
+    clearQuarantineRepair,
+    getCheckpointDeltaReplayDecision,
+    getTerminalCheckpointStreamId,
+    recordTerminalPerfAuditEvent,
+    resetParserAppliedSurface,
+    scheduleQuarantineRepair,
+    resetStartupProbeParser,
+    syncGeometryEpochForViewport,
+  ])
+  attachTerminalRef.current = attachTerminal
 
   const runRefreshAttach = useCallback((request: PaneRefreshRequest | null | undefined) => {
     if (suppressNetworkEffects) return false
@@ -1840,11 +2559,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           hydrationRegisteredRef.current = false
         }
         getHydrationQueue().onActiveTabChanged(tabId, tabOrderRef.current)
+        const checkpointDecision = getCheckpointDeltaReplayDecision(tid)
         const revealPlan = resolveRevealAttachPlan({
           pendingIntent: deferred.pendingIntent,
           pendingReason: deferred.pendingReason,
-          hasTrustedSurface: hasTrustedSurfaceRef.current,
-          renderedSeq: renderedSeqRef.current,
+          checkpointDecision,
         })
         attachTerminal(tid, revealPlan.intent, {
           clearViewportFirst: revealPlan.clearViewportFirst,
@@ -1860,7 +2579,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       }
       requestTerminalLayout({ fit: true, resize: true })
     }
-  }, [hidden, isTerminal, paneId, requestTerminalLayout, tabId, attachTerminal])
+  }, [hidden, isTerminal, paneId, requestTerminalLayout, tabId, attachTerminal, getCheckpointDeltaReplayDecision])
 
   // Background hydration: triggered by the hydration queue for hidden tabs
   useEffect(() => {
@@ -1868,11 +2587,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     setBackgroundHydrationTriggered(false)
     const tid = terminalIdRef.current
     if (!tid || !hiddenRef.current) return
-    if (hasTrustedSurfaceRef.current && renderedSeqRef.current > 0) {
+    const checkpointDecision = getCheckpointDeltaReplayDecision(tid)
+    if (checkpointDecision.ok) {
       attachTerminal(tid, 'keepalive_delta', {
         clearViewportFirst: false,
         priority: 'background',
-        sinceSeq: renderedSeqRef.current,
+        sinceSeq: checkpointDecision.sinceSeq,
       })
       return
     }
@@ -1881,7 +2601,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       priority: 'background',
       ...viewportHydrateReplayOptions(contentRef.current),
     })
-  }, [backgroundHydrationTriggered, attachTerminal])
+  }, [backgroundHydrationTriggered, attachTerminal, getCheckpointDeltaReplayDecision])
 
   // Create or attach to backend terminal
   useEffect(() => {
@@ -1982,7 +2702,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         if (requestIdRef.current !== requestId) return
         sendCreate(requestId)
       }, delayMs)
-      term.writeln(`\r\n[Rate limited - retrying in ${(delayMs / 1000).toFixed(0)}s]\r\n`)
+      writeLocalXtermNotice(term, `\r\n[Rate limited - retrying in ${(delayMs / 1000).toFixed(0)}s]\r\n`)
       return true
     }
 
@@ -1995,6 +2715,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       requestIdRef.current = pending.requestId
       terminalIdRef.current = undefined
       launchAttemptRef.current = null
+      clearQuarantineRepair()
       currentAttachRef.current = null
       deferredAttachStateRef.current = {
         mode: 'none',
@@ -2009,6 +2730,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       updateContent({
         terminalId: undefined,
         serverInstanceId: undefined,
+        streamId: undefined,
         createRequestId: pending.requestId,
         status: 'creating',
         restoreError: undefined,
@@ -2042,6 +2764,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         reason: 'opencode_replay_window_exceeded',
       }
       clearRateLimitRetry()
+      clearQuarantineRepair()
       currentAttachRef.current = null
       launchAttemptRef.current = null
       deferredAttachStateRef.current = {
@@ -2054,14 +2777,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       setTruncatedHistoryGap(null)
       dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
       clearTerminalCursor(terminalId)
+      resetParserAppliedSurface()
       forgetSentViewport(terminalId)
       lastSentViewportRef.current = null
       applySeqState(createAttachSeqState())
-      try {
-        term.writeln('\r\n[Restarting OpenCode session because the saved terminal replay is no longer available]\r\n')
-      } catch {
-        // disposed
-      }
+      writeLocalXtermNotice(term, '\r\n[Restarting OpenCode session because the saved terminal replay is no longer available]\r\n')
       ws.send({ type: 'terminal.kill', terminalId })
       return true
     }
@@ -2072,6 +2792,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
       const failLaunch = (message: string, restore: boolean, terminalId?: string) => {
         clearRateLimitRetry()
+        clearQuarantineRepair()
         setIsAttaching(false)
         currentAttachRef.current = null
         deferredAttachStateRef.current = {
@@ -2083,33 +2804,433 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
         if (terminalId) {
           clearTerminalCursor(terminalId)
+          resetParserAppliedSurface()
           forgetSentViewport(terminalId)
         }
         lastSentViewportRef.current = null
         terminalIdRef.current = undefined
         launchAttemptRef.current = null
         applySeqState(createAttachSeqState())
-        updateContent({ terminalId: undefined, status: 'error' })
+        updateContent({ terminalId: undefined, streamId: undefined, status: 'error' })
         const currentTab = tabRef.current
         if (currentTab) {
           dispatch(updateTab({ id: currentTab.id, updates: { status: 'error' } }))
         }
         const prefix = restore ? '[Restore failed]' : '[Launch failed]'
-        term.writeln(`\r\n${prefix} ${message}\r\n`)
+        writeLocalXtermNotice(term, `\r\n${prefix} ${message}\r\n`)
       }
 
       unsub = ws.onMessage((msg) => {
         const tid = terminalIdRef.current
         const reqId = requestIdRef.current
 
-        if (msg.type === 'terminal.output' && msg.terminalId === tid) {
-          if (!isCurrentAttachMessage(msg)) {
+        const markFirstOutputIfNeeded = (raw: string) => {
+          if (
+            raw.length > 0
+            && !terminalFirstOutputMarkedRef.current
+            && activeTabId === tabId
+            && activePaneId === paneId
+            && !hiddenRef.current
+          ) {
+            getInstalledPerfAuditBridge()?.mark('terminal.first_output', {
+              tabId,
+              paneId,
+              terminalId: tid,
+            })
+            terminalFirstOutputMarkedRef.current = true
+          }
+        }
+
+        const completeParserAppliedFrame = (input: {
+          attachRequestId?: string
+          mode: TerminalPaneContent['mode']
+          terminalInstanceId: string
+          parserAppliedSeq: number
+          completedAttach: boolean
+        }) => {
+          const activeAttach = currentAttachRef.current
+          if (!activeAttach || activeAttach.requestId !== input.attachRequestId) return
+          if (terminalInstanceIdRef.current !== input.terminalInstanceId) return
+          if (!shouldAllowTerminalOutputSideEffect({
+            terminalInstanceId: input.terminalInstanceId,
+            effect: 'parser_applied_checkpoint',
+            mode: input.mode,
+            generation: input.attachRequestId,
+          })) {
+            return
+          }
+          const nextSeqState = markParserAppliedSeq(seqStateRef.current, input.parserAppliedSeq)
+          applySeqState(nextSeqState)
+          markParserAppliedFrame(tid, nextSeqState.parserAppliedSeq, activeAttach)
+          if (input.completedAttach) {
+            completeAttachGeneration({
+              attachRequestId: input.attachRequestId,
+              mode: input.mode,
+              terminalInstanceId: input.terminalInstanceId,
+              terminalId: tid,
+              allowWithoutWriteScope: false,
+            })
+          }
+        }
+
+        const completeAttachGeneration = (input: {
+          attachRequestId?: string
+          mode: TerminalPaneContent['mode']
+          terminalInstanceId: string
+          terminalId?: string
+          allowWithoutWriteScope: boolean
+        }) => {
+          const activeAttach = currentAttachRef.current
+          if (!activeAttach || activeAttach.requestId !== input.attachRequestId) return false
+          if (input.terminalId && activeAttach.terminalId !== input.terminalId) return false
+          if (terminalInstanceIdRef.current !== input.terminalInstanceId) return false
+          const allowedByWriteScope = shouldAllowTerminalOutputSideEffect({
+            terminalInstanceId: input.terminalInstanceId,
+            effect: 'attach_completion',
+            mode: input.mode,
+            generation: input.attachRequestId,
+          })
+          if (!allowedByWriteScope) {
+            const activeScope = getTerminalOutputWriteScope(input.terminalInstanceId)
+            if (!input.allowWithoutWriteScope || activeScope) return false
+          }
+          setIsAttaching(false)
+          markAttachComplete()
+          return true
+        }
+
+        const submitAcceptedOutput = (input: {
+          raw: string
+          seqStart: number
+          seqEnd: number
+          attachRequestId?: string
+          mode: TerminalPaneContent['mode']
+          previousSeqState: AttachSeqState
+          outputSource: TerminalOutputSource
+          parserAppliedSeq: number
+          completedAttach: boolean
+          disableWriteCoalescing?: boolean
+        }) => {
+          let raw = input.raw
+          const frameOverlapsReplay = input.outputSource === 'replay' || Boolean(
+            input.previousSeqState.pendingReplay
+            && input.seqEnd >= input.previousSeqState.pendingReplay.fromSeq
+            && input.seqStart <= input.previousSeqState.pendingReplay.toSeq,
+          )
+          const enteringFreshLiveOutput = input.outputSource === 'live'
+            && !frameOverlapsReplay
+            && (Boolean(input.previousSeqState.pendingReplay) || input.previousSeqState.awaitingFreshSequence)
+          if (
+            enteringFreshLiveOutput
+            && !startupProbeReplayDiscardStateRef.current.remainder
+            && !startupProbeReplayDiscardStateRef.current.buffered
+          ) {
+            resetStartupProbeParser({ discardReplayRemainder: Boolean(input.previousSeqState.pendingReplay) })
+          }
+          const replayDiscard = consumeStartupProbeReplayDiscard(raw, startupProbeReplayDiscardStateRef.current)
+          if (replayDiscard.resumeState) {
+            startupProbeStateRef.current = replayDiscard.resumeState
+          }
+          raw = replayDiscard.raw
+          const inputBytesEqualSubmission = raw === input.raw
+          const outputTerminalInstanceId = terminalInstanceIdRef.current
+          const completeNoWriteReplayAttach = () => {
+            completeAttachGeneration({
+              attachRequestId: input.attachRequestId,
+              mode: input.mode,
+              terminalInstanceId: outputTerminalInstanceId,
+              terminalId: tid,
+              allowWithoutWriteScope: true,
+            })
+          }
+          const queueNoWriteReplayAttachCompletion = () => {
+            const queue = writeQueueRef.current
+            if (queue) {
+              queue.enqueueTask(completeNoWriteReplayAttach, {
+                mode: input.outputSource,
+                generation: input.attachRequestId,
+              })
+              return
+            }
+            completeNoWriteReplayAttach()
+          }
+          const submission = handleTerminalOutput(
+            raw,
+            input.mode,
+            tid,
+            input.outputSource === 'live',
+            inputBytesEqualSubmission
+              ? () => completeParserAppliedFrame({
+                  attachRequestId: input.attachRequestId,
+                  mode: input.mode,
+                  terminalInstanceId: outputTerminalInstanceId,
+                  parserAppliedSeq: input.parserAppliedSeq,
+                  completedAttach: input.completedAttach,
+                })
+              : undefined,
+            {
+              mode: input.outputSource,
+              generation: input.attachRequestId,
+              coalesce: input.disableWriteCoalescing ? false : undefined,
+            },
+          )
+          if (
+            !submission.submittedWrite
+            || !inputBytesEqualSubmission
+            || !submission.submittedBytesEqualInput
+          ) {
+            applySeqState(markOutputRangeUnapplied(seqStateRef.current, {
+              fromSeq: input.seqStart,
+              toSeq: input.seqEnd,
+            }))
+            if (input.completedAttach && frameOverlapsReplay) {
+              queueNoWriteReplayAttachCompletion()
+            }
+          }
+          if (input.completedAttach && frameOverlapsReplay) {
+            resetStartupProbeParser({ discardReplayRemainder: true })
+          }
+          markFirstOutputIfNeeded(raw)
+        }
+
+        if (msg.type === 'terminal.output.batch' && msg.terminalId === tid) {
+          if (!isCurrentAttachStreamMessage(msg)) {
             if (debugRef.current) {
               log.debug('Ignoring stale attach generation message', {
                 paneId: paneIdRef.current,
                 terminalId: msg.terminalId,
                 attachRequestId: msg.attachRequestId,
                 currentAttachRequestId: currentAttachRef.current?.requestId,
+                currentAttachStreamId: currentAttachRef.current?.streamId,
+                streamId: msg.streamId,
+                type: msg.type,
+              })
+            }
+            return
+          }
+
+          const outputSource = msg.source === 'live' || msg.source === 'replay'
+            ? msg.source
+            : null
+          const batchDataInput = msg.data
+          const batchData = typeof batchDataInput === 'string' ? batchDataInput : ''
+          const rawSegmentsInput = Array.isArray(msg.segments) ? msg.segments : []
+          const batchSeqStart = msg.seqStart
+          const batchSeqEnd = msg.seqEnd
+          const batchSerializedBytes = msg.serializedBytes
+          const batchSegments: Array<{
+            seqStart: number
+            seqEnd: number
+            data: string
+            barrier: boolean
+          }> = []
+          let previousEndOffset = 0
+          let previousSeqEnd: number | null = null
+          let invalidBatchReason: string | null = null
+
+          if (!outputSource) {
+            invalidBatchReason = 'invalid_source'
+          } else if (typeof batchDataInput !== 'string') {
+            invalidBatchReason = 'invalid_batch_data'
+          } else if (rawSegmentsInput.length === 0) {
+            invalidBatchReason = 'missing_segments'
+          } else if (
+            typeof batchSeqStart !== 'number'
+            || typeof batchSeqEnd !== 'number'
+            || !Number.isFinite(batchSeqStart)
+            || !Number.isFinite(batchSeqEnd)
+            || !Number.isInteger(batchSeqStart)
+            || !Number.isInteger(batchSeqEnd)
+            || batchSeqStart < 0
+            || batchSeqEnd < batchSeqStart
+          ) {
+            invalidBatchReason = 'invalid_batch_range'
+          } else if (
+            typeof batchSerializedBytes !== 'number'
+            || !Number.isFinite(batchSerializedBytes)
+            || !Number.isInteger(batchSerializedBytes)
+            || batchSerializedBytes < 0
+          ) {
+            invalidBatchReason = 'invalid_batch_serialized_bytes'
+          }
+
+          for (const rawSegment of rawSegmentsInput) {
+            if (invalidBatchReason) break
+            const seqStart = rawSegment?.seqStart
+            const seqEnd = rawSegment?.seqEnd
+            const endOffset = rawSegment?.endOffset
+            const rawFrameCount = rawSegment?.rawFrameCount
+            if (
+              typeof seqStart !== 'number'
+              || typeof seqEnd !== 'number'
+              || typeof endOffset !== 'number'
+              || typeof rawFrameCount !== 'number'
+              || !Number.isFinite(seqStart)
+              || !Number.isFinite(seqEnd)
+              || !Number.isFinite(endOffset)
+              || !Number.isFinite(rawFrameCount)
+              || !Number.isInteger(seqStart)
+              || !Number.isInteger(seqEnd)
+              || !Number.isInteger(endOffset)
+              || !Number.isInteger(rawFrameCount)
+              || seqStart < 0
+              || seqEnd < seqStart
+              || endOffset < 0
+              || rawFrameCount <= 0
+              || rawFrameCount !== seqEnd - seqStart + 1
+            ) {
+              invalidBatchReason = 'invalid_segment_range'
+              break
+            }
+            const barrier = rawSegment?.barrier
+            if (
+              barrier !== undefined
+              && (
+                typeof barrier !== 'string'
+                || !TERMINAL_OUTPUT_BATCH_BARRIER_REASONS.has(barrier)
+              )
+            ) {
+              invalidBatchReason = 'invalid_segment_barrier'
+              break
+            }
+            if (previousSeqEnd !== null && seqStart !== previousSeqEnd + 1) {
+              invalidBatchReason = 'non_contiguous_segment_range'
+              break
+            }
+            const normalizedEndOffset = endOffset
+            if (
+              normalizedEndOffset < previousEndOffset
+              || normalizedEndOffset > batchData.length
+            ) {
+              invalidBatchReason = 'invalid_segment_offset'
+              break
+            }
+            if (
+              isUtf16SurrogateSplitOffset(batchData, previousEndOffset)
+              || isUtf16SurrogateSplitOffset(batchData, normalizedEndOffset)
+            ) {
+              invalidBatchReason = 'invalid_segment_offset'
+              break
+            }
+            const segmentData = batchData.slice(previousEndOffset, normalizedEndOffset)
+            if (typeof rawSegment.data === 'string' && rawSegment.data !== segmentData) {
+              invalidBatchReason = 'segment_data_mismatch'
+              break
+            }
+            batchSegments.push({
+              seqStart,
+              seqEnd,
+              data: segmentData,
+              barrier: typeof barrier === 'string' && barrier.length > 0,
+            })
+            previousEndOffset = normalizedEndOffset
+            previousSeqEnd = seqEnd
+          }
+
+          if (!invalidBatchReason && previousEndOffset !== batchData.length) {
+            invalidBatchReason = 'trailing_batch_data'
+          }
+          if (
+            !invalidBatchReason
+            && (
+              batchSegments[0]?.seqStart !== batchSeqStart
+              || batchSegments[batchSegments.length - 1]?.seqEnd !== batchSeqEnd
+            )
+          ) {
+            invalidBatchReason = 'batch_range_mismatch'
+          }
+
+          if (invalidBatchReason) {
+            markTerminalOutputRangeLost({
+              terminalId: tid,
+              messageType: msg.type,
+              attachRequestId: msg.attachRequestId,
+              streamId: msg.streamId,
+              fromSeq: batchSeqStart,
+              toSeq: batchSeqEnd,
+              reason: 'invalid_terminal_output_batch',
+              invalidReason: invalidBatchReason,
+            })
+            if (import.meta.env.DEV) {
+              log.warn('Ignoring invalid terminal.output.batch', {
+                paneId: paneIdRef.current,
+                terminalId: tid,
+                reason: invalidBatchReason,
+              })
+            }
+            return
+          }
+          if (!outputSource) return
+
+          const previousSeqState = seqStateRef.current
+          const batchDecision = onOutputBatchSegments(previousSeqState, batchSegments)
+          if (!batchDecision.accept) {
+            if (import.meta.env.DEV) {
+              log.warn('Ignoring overlapping terminal.output.batch sequence range', {
+                paneId: paneIdRef.current,
+                terminalId: tid,
+                rejectedSegment: batchDecision.rejectedSegment,
+                lastSeq: previousSeqState.lastSeq,
+              })
+            }
+            return
+          }
+
+          if (tid && batchDecision.freshReset) {
+            clearTerminalCursor(tid)
+            resetParserAppliedSurface()
+          }
+
+          const mode = contentRef.current?.mode || 'shell'
+          const completedAttachOnBatch = !batchDecision.state.pendingReplay
+            && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
+          applySeqState(batchDecision.state)
+
+          const containsBarrier = batchSegments.some((segment) => segment.barrier)
+          if (!containsBarrier) {
+            submitAcceptedOutput({
+              raw: batchData,
+              seqStart: msg.seqStart,
+              seqEnd: msg.seqEnd,
+              attachRequestId: msg.attachRequestId,
+              mode,
+              previousSeqState,
+              outputSource,
+              parserAppliedSeq: batchDecision.state.highestObservedSeq,
+              completedAttach: completedAttachOnBatch,
+            })
+            return
+          }
+
+          batchSegments.forEach((segment, index) => {
+            const acceptedSegment: OutputBatchAcceptedSegment | undefined = batchDecision.segments[index]
+            if (!acceptedSegment) return
+            submitAcceptedOutput({
+              raw: segment.data,
+              seqStart: segment.seqStart,
+              seqEnd: segment.seqEnd,
+              attachRequestId: msg.attachRequestId,
+              mode,
+              previousSeqState: acceptedSegment.previousState,
+              outputSource,
+              parserAppliedSeq: acceptedSegment.parserAppliedSeq,
+              completedAttach: completedAttachOnBatch && index === batchSegments.length - 1,
+              disableWriteCoalescing: true,
+            })
+          })
+          return
+        }
+
+        if (msg.type === 'terminal.output' && msg.terminalId === tid) {
+          if (!isCurrentAttachStreamMessage(msg)) {
+            if (debugRef.current) {
+              log.debug('Ignoring stale attach generation message', {
+                paneId: paneIdRef.current,
+                terminalId: msg.terminalId,
+                attachRequestId: msg.attachRequestId,
+                currentAttachRequestId: currentAttachRef.current?.requestId,
+                currentAttachStreamId: currentAttachRef.current?.streamId,
+                streamId: msg.streamId,
                 type: msg.type,
               })
             }
@@ -2145,74 +3266,40 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
           if (tid && frameDecision.freshReset) {
             clearTerminalCursor(tid)
-            resetRenderedSurface()
+            resetParserAppliedSurface()
           }
-          let raw = msg.data || ''
           const mode = contentRef.current?.mode || 'shell'
           const frameOverlapsReplay = Boolean(
             previousSeqState.pendingReplay
             && msg.seqEnd >= previousSeqState.pendingReplay.fromSeq
             && msg.seqStart <= previousSeqState.pendingReplay.toSeq,
           )
-          const enteringFreshLiveOutput = !frameOverlapsReplay
-            && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
-          if (
-            enteringFreshLiveOutput
-            && !startupProbeReplayDiscardStateRef.current.remainder
-            && !startupProbeReplayDiscardStateRef.current.buffered
-          ) {
-            resetStartupProbeParser({ discardReplayRemainder: Boolean(previousSeqState.pendingReplay) })
-          }
-          const replayDiscard = consumeStartupProbeReplayDiscard(raw, startupProbeReplayDiscardStateRef.current)
-          if (replayDiscard.resumeState) {
-            startupProbeStateRef.current = replayDiscard.resumeState
-          }
-          raw = replayDiscard.raw
           const completedAttachOnFrame = !frameDecision.state.pendingReplay
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
-          const completeRenderedFrame = () => {
-            markRenderedSeq(tid, frameDecision.state.lastSeq)
-            if (completedAttachOnFrame) {
-              setIsAttaching(false)
-              markAttachComplete()
-            }
-          }
-          handleTerminalOutput(
-            raw,
-            mode,
-            tid,
-            !frameOverlapsReplay,
-            completeRenderedFrame,
-            { mode: frameOverlapsReplay ? 'replay' : 'live' },
-          )
-          if (completedAttachOnFrame && frameOverlapsReplay) {
-            resetStartupProbeParser({ discardReplayRemainder: true })
-          }
-          if (
-            raw.length > 0
-            && !terminalFirstOutputMarkedRef.current
-            && activeTabId === tabId
-            && activePaneId === paneId
-            && !hiddenRef.current
-          ) {
-            getInstalledPerfAuditBridge()?.mark('terminal.first_output', {
-              tabId,
-              paneId,
-              terminalId: tid,
-            })
-            terminalFirstOutputMarkedRef.current = true
-          }
           applySeqState(frameDecision.state)
+          submitAcceptedOutput({
+            raw: msg.data || '',
+            seqStart: msg.seqStart,
+            seqEnd: msg.seqEnd,
+            attachRequestId: msg.attachRequestId,
+            mode,
+            previousSeqState,
+            outputSource: frameOverlapsReplay ? 'replay' : 'live',
+            parserAppliedSeq: frameDecision.state.highestObservedSeq,
+            completedAttach: completedAttachOnFrame,
+          })
         }
 
         if (msg.type === 'terminal.output.gap' && msg.terminalId === tid) {
-          if (!isCurrentAttachMessage(msg)) {
+          if (!isCurrentAttachStreamMessage(msg)) {
             if (debugRef.current) {
               log.debug('Ignoring stale attach generation message', {
                 paneId: paneIdRef.current,
                 terminalId: msg.terminalId,
                 attachRequestId: msg.attachRequestId,
                 currentAttachRequestId: currentAttachRef.current?.requestId,
+                currentAttachStreamId: currentAttachRef.current?.streamId,
+                streamId: msg.streamId,
                 type: msg.type,
               })
             }
@@ -2239,22 +3326,67 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             const reason = msg.reason === 'replay_window_exceeded'
               ? 'reconnect window exceeded'
               : 'slow link backlog'
-            try {
-              term.writeln(`\r\n[Output gap ${msg.fromSeq}-${msg.toSeq}: ${reason}]\r\n`)
-            } catch {
-              // disposed
-            }
+            writeLocalXtermNotice(term, `\r\n[Output gap ${msg.fromSeq}-${msg.toSeq}: ${reason}]\r\n`)
           }
           const previousSeqState = seqStateRef.current
-          const nextSeqState = onOutputGap(previousSeqState, { fromSeq: msg.fromSeq, toSeq: msg.toSeq })
+          const gapDecision = onOutputGap(previousSeqState, { fromSeq: msg.fromSeq, toSeq: msg.toSeq })
+          const nextSeqState = gapDecision.state
           applySeqState(nextSeqState)
-          markRenderedSeq(tid, nextSeqState.lastSeq)
+          resetParserAppliedSurface(parserAppliedSeqRef.current)
+          if (gapDecision.requiresSurfaceQuarantine) {
+            recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
+              terminalId: tid,
+              attachRequestId: msg.attachRequestId,
+              activeAttachRequestId: currentAttachRef.current?.requestId,
+              streamId: msg.streamId,
+              fromSeq: msg.fromSeq,
+              toSeq: msg.toSeq,
+              parserAppliedSeq: parserAppliedSeqRef.current,
+              highestObservedSeq: nextSeqState.highestObservedSeq,
+              reason: msg.reason ?? 'output_gap',
+            })
+          }
           const completedAttachOnGap = !nextSeqState.pendingReplay
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           if (completedAttachOnGap) {
             resetStartupProbeParser({ discardReplayRemainder: Boolean(previousSeqState.pendingReplay) })
             setIsAttaching(false)
             markAttachComplete()
+          }
+        }
+
+        if (msg.type === 'terminal.stream.changed' && msg.terminalId === tid) {
+          if (!isCurrentAttachMessage(msg)) {
+            if (debugRef.current) {
+              log.debug('Ignoring stale attach generation stream change', {
+                paneId: paneIdRef.current,
+                terminalId: msg.terminalId,
+                attachRequestId: msg.attachRequestId,
+                currentAttachRequestId: currentAttachRef.current?.requestId,
+                type: msg.type,
+              })
+            }
+            return
+          }
+
+          const nextStreamId = typeof msg.streamId === 'string' && msg.streamId.length > 0
+            ? msg.streamId
+            : null
+          const previousStreamId = getTerminalCheckpointStreamId()
+          const activeAttach = currentAttachRef.current
+          if (activeAttach?.terminalId === tid && activeAttach.requestId === msg.attachRequestId) {
+            currentAttachRef.current = {
+              ...activeAttach,
+              streamId: nextStreamId,
+            }
+          }
+          resetParserAppliedSurface(parserAppliedSeqRef.current)
+          if (nextStreamId) {
+            if (previousStreamId !== nextStreamId) {
+              updateContent({ streamId: nextStreamId })
+            }
+          } else if (previousStreamId) {
+            updateContent({ streamId: undefined })
           }
         }
 
@@ -2270,6 +3402,120 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               })
             }
             return
+          }
+
+          const readyStreamId = typeof msg.streamId === 'string' && msg.streamId.length > 0
+            ? msg.streamId
+            : null
+          const readyGeometryAuthority = parseTerminalGeometryAuthority(
+            (msg as { geometryAuthority?: unknown }).geometryAuthority,
+          ) ?? geometryAuthorityRef.current
+          const readyGeometryEpoch = normalizeGeometryEpoch(
+            (msg as { geometryEpoch?: unknown }).geometryEpoch,
+            geometryEpochRef.current,
+          )
+          const previousStreamId = getTerminalCheckpointStreamId()
+          const activeAttach = currentAttachRef.current
+          const expectedStreamId = activeAttach?.expectedStreamId ?? previousStreamId
+          const expectedGeometryAuthority = activeAttach?.expectedGeometryAuthority ?? geometryAuthorityRef.current
+          const expectedGeometryEpoch = activeAttach?.expectedGeometryEpoch ?? geometryEpochRef.current
+          const incompatibleDeltaStream = activeAttach?.terminalId === tid
+            && activeAttach.requestId === msg.attachRequestId
+            && activeAttach.sinceSeq > 0
+            && typeof expectedStreamId === 'string'
+            && expectedStreamId.length > 0
+            && readyStreamId !== expectedStreamId
+          const incompatibleDeltaGeometry = activeAttach?.terminalId === tid
+            && activeAttach.requestId === msg.attachRequestId
+            && activeAttach.sinceSeq > 0
+            && (
+              readyGeometryAuthority === 'multi_client_unknown'
+              || readyGeometryAuthority !== expectedGeometryAuthority
+              || readyGeometryEpoch !== expectedGeometryEpoch
+            )
+          geometryAuthorityRef.current = readyGeometryAuthority
+          geometryEpochRef.current = readyGeometryEpoch
+          if (incompatibleDeltaStream) {
+            log.warn('Rejecting warm-delta terminal attach after stream identity changed', {
+              paneId: paneIdRef.current,
+              terminalId: tid,
+              attachRequestId: msg.attachRequestId,
+              expectedStreamId,
+              readyStreamId,
+              sinceSeq: activeAttach.sinceSeq,
+            })
+            recordTerminalPerfAuditEvent('terminal.catchup.full_hydrate_fallback', {
+              terminalId: tid,
+              attachRequestId: msg.attachRequestId,
+              activeAttachRequestId: activeAttach.requestId,
+              streamId: readyStreamId,
+              expectedStreamId,
+              sinceSeq: activeAttach.sinceSeq,
+              reason: 'stream_identity_changed',
+            })
+            resetParserAppliedSurface(parserAppliedSeqRef.current)
+            updateContent({ streamId: undefined })
+            attachTerminal(tid, 'viewport_hydrate', {
+              clearViewportFirst: true,
+              ...viewportHydrateReplayOptions(contentRef.current),
+            })
+            return
+          }
+          if (incompatibleDeltaGeometry) {
+            const reason = readyGeometryAuthority === 'multi_client_unknown'
+              ? 'geometry_authority_unknown'
+              : 'geometry_changed'
+            log.warn('Rejecting warm-delta terminal attach after geometry authority changed', {
+              paneId: paneIdRef.current,
+              terminalId: tid,
+              attachRequestId: msg.attachRequestId,
+              expectedGeometryAuthority,
+              expectedGeometryEpoch,
+              geometryAuthority: readyGeometryAuthority,
+              geometryEpoch: readyGeometryEpoch,
+              sinceSeq: activeAttach.sinceSeq,
+              reason,
+            })
+            recordTerminalPerfAuditEvent('terminal.catchup.full_hydrate_fallback', {
+              terminalId: tid,
+              attachRequestId: msg.attachRequestId,
+              activeAttachRequestId: activeAttach.requestId,
+              streamId: readyStreamId,
+              expectedStreamId,
+              geometryAuthority: readyGeometryAuthority,
+              geometryEpoch: readyGeometryEpoch,
+              expectedGeometryAuthority,
+              expectedGeometryEpoch,
+              sinceSeq: activeAttach.sinceSeq,
+              reason,
+            })
+            resetParserAppliedSurface(parserAppliedSeqRef.current)
+            attachTerminal(tid, 'viewport_hydrate', {
+              clearViewportFirst: true,
+              ...viewportHydrateReplayOptions(contentRef.current),
+            })
+            return
+          }
+          if (activeAttach?.terminalId === tid && activeAttach.requestId === msg.attachRequestId) {
+            currentAttachRef.current = {
+              ...activeAttach,
+              streamId: readyStreamId,
+              geometryAuthority: readyGeometryAuthority,
+              geometryEpoch: readyGeometryEpoch,
+            }
+          }
+          if (readyStreamId) {
+            if (previousStreamId !== readyStreamId) {
+              if (previousStreamId) {
+                resetParserAppliedSurface(parserAppliedSeqRef.current)
+              }
+              updateContent({ streamId: readyStreamId })
+            }
+          } else {
+            resetParserAppliedSurface(parserAppliedSeqRef.current)
+            if (previousStreamId) {
+              updateContent({ streamId: undefined })
+            }
           }
 
           if (launchAttemptRef.current?.terminalId === tid) {
@@ -2332,6 +3578,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               : {}),
             attachReady: false,
           }
+          clearQuarantineRepair()
           currentAttachRef.current = null
           if (debugRef.current) log.debug('[TRACE resumeSessionId] terminal.created received', {
             paneId: paneIdRef.current,
@@ -2345,6 +3592,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           updateContent({
             terminalId: newId,
             serverInstanceId: serverInstanceIdRef.current,
+            streamId: undefined,
             status: 'running',
             ...(createdSessionUpdates ?? {}),
             ...(msg.clearCodexDurability ? { codexDurability: undefined } : {}),
@@ -2420,6 +3668,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           }
 
           launchAttemptRef.current = null
+          clearQuarantineRepair()
           currentAttachRef.current = null
           deferredAttachStateRef.current = {
             mode: 'none',
@@ -2429,6 +3678,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           }
           dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
           clearTerminalCursor(tid)
+          resetParserAppliedSurface()
           forgetSentViewport(tid)
           lastSentViewportRef.current = null
           // Clear terminalIdRef AND the stored terminalId to prevent any subsequent
@@ -2438,7 +3688,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           // would otherwise reset the ref from the Redux state on re-render.
           terminalIdRef.current = undefined
           applySeqState(createAttachSeqState())
-          updateContent({ terminalId: undefined, status: 'exited' })
+          updateContent({ terminalId: undefined, streamId: undefined, status: 'exited' })
           const exitTab = tabRef.current
           if (exitTab) {
             const code = typeof msg.exitCode === 'number' ? msg.exitCode : undefined
@@ -2515,7 +3765,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const previous = lastInputBlockedNoticeRef.current
           if (!previous || previous.reason !== reason || now - previous.at >= INPUT_BLOCKED_NOTICE_THROTTLE_MS) {
             lastInputBlockedNoticeRef.current = { reason, at: now }
-            term.writeln(`\r\n[${terminalInputBlockedNotice(reason)}]\r\n`)
+            writeLocalXtermNotice(term, `\r\n[${terminalInputBlockedNotice(reason)}]\r\n`)
           }
           return
         }
@@ -2536,6 +3786,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
           updateContent({
             status: 'error',
+            streamId: undefined,
             ...(launchAttempt?.recoveryIntent
               ? { restoreError: buildRestoreError('dead_live_handle') }
               : {}),
@@ -2547,10 +3798,24 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const prefix = launchAttempt
             ? (launchAttempt.restore ? '[Restore failed]' : '[Launch failed]')
             : '[Error]'
-          term.writeln(`\r\n${prefix} ${msg.message || msg.code || 'Unknown error'}\r\n`)
+          writeLocalXtermNotice(term, `\r\n${prefix} ${msg.message || msg.code || 'Unknown error'}\r\n`)
         }
 
-        if (msg.type === 'error' && msg.code === 'INVALID_TERMINAL_ID' && !msg.requestId) {
+        const activeAttachForInvalidTerminalError = currentAttachRef.current
+        const currentAttachInvalidTerminalError = Boolean(
+          msg.type === 'error'
+          && msg.code === 'INVALID_TERMINAL_ID'
+          && typeof msg.requestId === 'string'
+          && typeof msg.terminalId === 'string'
+          && activeAttachForInvalidTerminalError !== null
+          && activeAttachForInvalidTerminalError.requestId === msg.requestId
+          && activeAttachForInvalidTerminalError.terminalId === msg.terminalId
+        )
+        if (
+          msg.type === 'error'
+          && msg.code === 'INVALID_TERMINAL_ID'
+          && (!msg.requestId || currentAttachInvalidTerminalError)
+        ) {
           const currentTerminalId = terminalIdRef.current
           const current = contentRef.current
           const launchAttempt = launchAttemptRef.current
@@ -2558,6 +3823,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           if (debugRef.current) log.debug('[TRACE resumeSessionId] INVALID_TERMINAL_ID received', {
             paneId: paneIdRef.current,
             msgTerminalId: msg.terminalId,
+            requestId: msg.requestId,
+            currentAttachRequestId: activeAttachForInvalidTerminalError?.requestId,
             currentTerminalId,
             currentResumeSessionId: current?.resumeSessionId,
             currentStatus: current?.status,
@@ -2573,7 +3840,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             // Show feedback if the terminal already exited (the ID was cleared by
             // the exit handler, so msg.terminalId no longer matches the ref)
             if (current?.status === 'exited') {
-              term.writeln('\r\n[Terminal exited - use the + button or split to start a new session]\r\n')
+              writeLocalXtermNotice(term, '\r\n[Terminal exited - use the + button or split to start a new session]\r\n')
             }
             return
           }
@@ -2610,9 +3877,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
                 type: 'client.diagnostic',
                 ...restoreDiagnostic,
               })
-              term.writeln('\r\n[Starting a new terminal because the previous live terminal is gone and no durable session identity was saved]\r\n')
+              writeLocalXtermNotice(term, '\r\n[Starting a new terminal because the previous live terminal is gone and no durable session identity was saved]\r\n')
               const newRequestId = nanoid()
               launchAttemptRef.current = null
+              clearQuarantineRepair()
+              currentAttachRef.current = null
               clearRateLimitRetry()
               setIsAttaching(false)
               dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
@@ -2620,6 +3889,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               addTerminalFreshRecoveryRequestId(newRequestId, 'fresh_after_restore_unavailable')
               requestIdRef.current = newRequestId
               clearTerminalCursor(currentTerminalId)
+              resetParserAppliedSurface()
               forgetSentViewport(currentTerminalId)
               lastSentViewportRef.current = null
               terminalIdRef.current = undefined
@@ -2633,6 +3903,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               updateContent({
                 terminalId: undefined,
                 serverInstanceId: undefined,
+                streamId: undefined,
                 createRequestId: newRequestId,
                 status: 'creating',
                 restoreError: undefined,
@@ -2643,7 +3914,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               }
               return
             }
-            term.writeln('\r\n[Reconnecting...]\r\n')
+            writeLocalXtermNotice(term, '\r\n[Reconnecting...]\r\n')
             const newRequestId = nanoid()
             if (debugRef.current) log.debug('[TRACE resumeSessionId] INVALID_TERMINAL_ID reconnecting', {
               paneId: paneIdRef.current,
@@ -2660,7 +3931,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             consumeTerminalRestoreRequestId(requestIdRef.current)
             addTerminalRestoreRequestId(newRequestId)
             requestIdRef.current = newRequestId
+            clearQuarantineRepair()
+            currentAttachRef.current = null
             clearTerminalCursor(currentTerminalId)
+            resetParserAppliedSurface()
             forgetSentViewport(currentTerminalId)
             lastSentViewportRef.current = null
             terminalIdRef.current = undefined
@@ -2674,6 +3948,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             updateContent({
               terminalId: undefined,
               serverInstanceId: undefined,
+              streamId: undefined,
               createRequestId: newRequestId,
               status: 'creating',
             })
@@ -2682,7 +3957,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               dispatch(updateTab({ id: currentTab.id, updates: { status: 'creating' } }))
             }
           } else if (current?.status === 'exited') {
-            term.writeln('\r\n[Terminal exited - use the + button or split to start a new session]\r\n')
+            writeLocalXtermNotice(term, '\r\n[Terminal exited - use the + button or split to start a new session]\r\n')
           }
         }
       })
@@ -2696,12 +3971,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         })
         if (!tid) return
         if (hiddenRef.current) {
-          const canResumeFromRenderedSurface = hasTrustedSurfaceRef.current && renderedSeqRef.current > 0
-          deferredAttachStateRef.current = deferredAttachStateRef.current.mode === 'live' || canResumeFromRenderedSurface
+          const checkpointDecision = getCheckpointDeltaReplayDecision(tid)
+          const canResumeFromParserAppliedSurface = checkpointDecision.ok
+          deferredAttachStateRef.current = deferredAttachStateRef.current.mode === 'live' || canResumeFromParserAppliedSurface
             ? {
                 mode: 'waiting_for_geometry',
                 pendingIntent: 'transport_reconnect',
-                pendingSinceSeq: renderedSeqRef.current,
+                pendingSinceSeq: canResumeFromParserAppliedSurface ? checkpointDecision.sinceSeq : 0,
                 pendingReason: 'transport_reconnect',
               }
             : {
@@ -2710,7 +3986,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
                 pendingSinceSeq: 0,
                 pendingReason: 'hidden_reveal',
               }
-          registerForBackgroundHydration({ queueIfStarted: canResumeFromRenderedSurface })
+          registerForBackgroundHydration({ queueIfStarted: canResumeFromParserAppliedSurface })
           return
         }
         attachTerminal(tid, 'transport_reconnect')
@@ -2740,12 +4016,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
       if (currentTerminalId) {
         if (hiddenRef.current) {
-          const canResumeFromRenderedSurface = hasTrustedSurfaceRef.current && renderedSeqRef.current > 0
-          deferredAttachStateRef.current = deferredAttachStateRef.current.mode === 'live' || canResumeFromRenderedSurface
+          const checkpointDecision = getCheckpointDeltaReplayDecision(currentTerminalId)
+          const canResumeFromParserAppliedSurface = checkpointDecision.ok
+          deferredAttachStateRef.current = deferredAttachStateRef.current.mode === 'live' || canResumeFromParserAppliedSurface
             ? {
                 mode: 'waiting_for_geometry',
                 pendingIntent: 'transport_reconnect',
-                pendingSinceSeq: renderedSeqRef.current,
+                pendingSinceSeq: canResumeFromParserAppliedSurface ? checkpointDecision.sinceSeq : 0,
                 pendingReason: 'transport_reconnect',
               }
             : {
@@ -2815,13 +4092,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     dispatch,
     handleTerminalOutput,
     attachTerminal,
-    markRenderedSeq,
+    clearQuarantineRepair,
+    getCheckpointDeltaReplayDecision,
+    getTerminalCheckpointStreamId,
+    isCurrentAttachMessage,
+    isCurrentAttachStreamMessage,
     markAttachComplete,
+    markParserAppliedFrame,
+    markTerminalOutputRangeLost,
+    recordTerminalPerfAuditEvent,
     registerForBackgroundHydration,
-    resetRenderedSurface,
+    resetParserAppliedSurface,
     resetStartupProbeParser,
     runRefreshAttach,
     syncContentRefWithSessionAssociation,
+    writeLocalXtermNotice,
   ])
 
   useEffect(() => {

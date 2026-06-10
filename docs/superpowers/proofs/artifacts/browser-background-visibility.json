@@ -1,0 +1,94 @@
+{
+  "generatedAt": "2026-06-09T01:00:28.173Z",
+  "chromiumVersion": "145.0.7632.6",
+  "headed": true,
+  "wsSendIntervalMs": 50,
+  "active": {
+    "before": {
+      "at": 1087.699999988079,
+      "visibilityState": "visible",
+      "hidden": false,
+      "intervalTicks": 21,
+      "rafTicks": 57,
+      "wsReceived": 21,
+      "lastIntervalAt": 1059.4000000059605,
+      "lastRafAt": 1086.2999999821186,
+      "lastWsAt": 1064.9000000059605
+    },
+    "after": {
+      "at": 2091.2999999821186,
+      "visibilityState": "visible",
+      "hidden": false,
+      "intervalTicks": 41,
+      "rafTicks": 117,
+      "wsReceived": 41,
+      "lastIntervalAt": 2059.2999999821186,
+      "lastRafAt": 2087.0999999940395,
+      "lastWsAt": 2069.4000000059605
+    },
+    "pageDelta": {
+      "elapsedMs": 1003.5999999940395,
+      "visibilityStateBefore": "visible",
+      "visibilityStateAfter": "visible",
+      "intervalTicks": 20,
+      "rafTicks": 60,
+      "wsReceived": 20
+    },
+    "serverSentDelta": 20
+  },
+  "backgrounded": {
+    "before": {
+      "at": 2349.0999999940395,
+      "visibilityState": "visible",
+      "hidden": false,
+      "intervalTicks": 46,
+      "rafTicks": 132,
+      "wsReceived": 46,
+      "lastIntervalAt": 2309.199999988079,
+      "lastRafAt": 2336.4000000059605,
+      "lastWsAt": 2322.5999999940395
+    },
+    "after": {
+      "at": 5351.5,
+      "visibilityState": "visible",
+      "hidden": false,
+      "intervalTicks": 106,
+      "rafTicks": 312,
+      "wsReceived": 106,
+      "lastIntervalAt": 5309.199999988079,
+      "lastRafAt": 5336.5999999940395,
+      "lastWsAt": 5327.9000000059605
+    },
+    "pageDelta": {
+      "elapsedMs": 3002.4000000059605,
+      "visibilityStateBefore": "visible",
+      "visibilityStateAfter": "visible",
+      "intervalTicks": 60,
+      "rafTicks": 180,
+      "wsReceived": 60
+    },
+    "serverSentDelta": 60
+  },
+  "resumed": {
+    "after": {
+      "at": 6362,
+      "visibilityState": "visible",
+      "hidden": false,
+      "intervalTicks": 127,
+      "rafTicks": 373,
+      "wsReceived": 126,
+      "lastIntervalAt": 6359.199999988079,
+      "lastRafAt": 6352.699999988079,
+      "lastWsAt": 6331.199999988079
+    },
+    "pageDeltaFromHiddenEnd": {
+      "elapsedMs": 1010.5,
+      "visibilityStateBefore": "visible",
+      "visibilityStateAfter": "visible",
+      "intervalTicks": 21,
+      "rafTicks": 61,
+      "wsReceived": 20
+    },
+    "serverSentDelta": 20
+  }
+}

@@ -31,16 +31,22 @@ const wsHarness = vi.hoisted(() => {
   const reconnectHandlers = new Set<() => void>()
   const latestAttachRequestIdByTerminal = new Map<string, string>()
 
-  const withCurrentAttachRequestId = (msg: any) => {
+  const withCurrentAttachMetadata = (msg: any) => {
     if (
-      msg?.attachRequestId
-      || typeof msg?.terminalId !== 'string'
+      typeof msg?.terminalId !== 'string'
       || (msg?.type !== 'terminal.attach.ready' && msg?.type !== 'terminal.output' && msg?.type !== 'terminal.output.gap')
     ) {
       return msg
     }
     const attachRequestId = latestAttachRequestIdByTerminal.get(msg.terminalId)
-    return attachRequestId ? { ...msg, attachRequestId } : msg
+    const streamId = typeof msg.streamId === 'string' && msg.streamId.length > 0
+      ? msg.streamId
+      : `stream-${msg.terminalId}`
+    return {
+      ...msg,
+      ...(attachRequestId && !msg.attachRequestId ? { attachRequestId } : {}),
+      streamId,
+    }
   }
 
   return {
@@ -55,7 +61,7 @@ const wsHarness = vi.hoisted(() => {
       return () => reconnectHandlers.delete(handler)
     }),
     emit(msg: any) {
-      const normalized = withCurrentAttachRequestId(msg)
+      const normalized = withCurrentAttachMetadata(msg)
       for (const handler of messageHandlers) handler(normalized)
     },
     rememberAttach(msg: any) {

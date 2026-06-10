@@ -6,7 +6,32 @@ import WebSocket from 'ws'
 import { WsHandler } from '../../../server/ws-handler'
 import { TerminalRegistry } from '../../../server/terminal-registry'
 import { TerminalStreamBroker } from '../../../server/terminal-stream/broker'
+import {
+  measureTerminalOutputPayloadBytes,
+  TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE,
+} from '../../../server/terminal-stream/serialized-budget'
 import { MAX_REALTIME_MESSAGE_BYTES } from '../../../shared/read-models.js'
+
+const loggerMocks = vi.hoisted(() => {
+  const logger = {
+    child: vi.fn(),
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  }
+  logger.child.mockReturnValue(logger)
+  return { logger }
+})
+
+vi.mock('../../../server/logger', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../server/logger')>()
+  return {
+    ...actual,
+    logger: loggerMocks.logger,
+    sessionLifecycleLogger: loggerMocks.logger,
+  }
+})
 
 vi.mock('node-pty', () => ({
   spawn: vi.fn(),
@@ -30,6 +55,16 @@ function createMockWs(overrides: Record<string, unknown> = {}) {
   ws.close = vi.fn()
   Object.assign(ws, overrides)
   return ws
+}
+
+function structuredLogs(level: 'debug' | 'info' | 'warn' | 'error', event: string) {
+  return loggerMocks.logger[level].mock.calls
+    .map(([payload]) => payload)
+    .filter((payload): payload is Record<string, unknown> => (
+      !!payload
+      && typeof payload === 'object'
+      && (payload as { event?: unknown }).event === event
+    ))
 }
 
 class FakeBrokerRegistry extends EventEmitter {
@@ -70,19 +105,34 @@ class FakeBrokerRegistry extends EventEmitter {
 }
 
 let originalAuthToken: string | undefined
+let originalTerminalClientQueueMaxBytes: string | undefined
 
 beforeEach(() => {
   originalAuthToken = process.env.AUTH_TOKEN
+  originalTerminalClientQueueMaxBytes = process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES
   process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
+  loggerMocks.logger.debug.mockClear()
+  loggerMocks.logger.info.mockClear()
+  loggerMocks.logger.warn.mockClear()
+  loggerMocks.logger.error.mockClear()
 })
 
 afterEach(() => {
   if (originalAuthToken === undefined) {
     delete process.env.AUTH_TOKEN
-    return
+  } else {
+    process.env.AUTH_TOKEN = originalAuthToken
   }
-  process.env.AUTH_TOKEN = originalAuthToken
+  if (originalTerminalClientQueueMaxBytes === undefined) {
+    delete process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES
+  } else {
+    process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES = originalTerminalClientQueueMaxBytes
+  }
 })
+
+function forceSmallTerminalClientQueueForOverflowTest(): void {
+  process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES = String(128 * 1024)
+}
 
 describe('WsHandler backpressure', () => {
   let server: http.Server
@@ -241,7 +291,9 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     // Recover below threshold and allow queued frame to flush.
     ws.bufferedAmount = 0
     vi.advanceTimersByTime(100)
-    expect(ws.send).toHaveBeenCalledWith(expect.stringContaining('"type":"terminal.output"'))
+    expect(ws.send.mock.calls.some(([raw]) =>
+      typeof raw === 'string' && raw.includes('"type":"terminal.output"')
+    )).toBe(true)
     expect(perfSpy).not.toHaveBeenCalledWith('terminal_stream_catastrophic_close', expect.any(Object), expect.anything())
 
     broker.close()
@@ -315,7 +367,380 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     }
   })
 
+  it('emits structured terminal.replay.batch logs for replay batch sends', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-structured-batch')
+
+    for (let i = 1; i <= 8; i += 1) {
+      registry.emit('terminal.output.raw', {
+        terminalId: 'term-structured-batch',
+        data: `batch-${i};`,
+        at: Date.now(),
+      })
+    }
+
+    const wsReplay = createMockWs({ bufferedAmount: 0 })
+    await broker.attach(
+      wsReplay as any,
+      'term-structured-batch',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      'structured-batch-attach',
+      undefined,
+      'foreground',
+      true,
+    )
+    vi.advanceTimersByTime(5)
+
+    expect(structuredLogs('debug', 'terminal.replay.batch')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event: 'terminal.replay.batch',
+          severity: 'debug',
+          terminalId: 'term-structured-batch',
+          attachRequestId: 'structured-batch-attach',
+          source: 'replay',
+          streamId: expect.any(String),
+          seqStart: 1,
+          seqEnd: 8,
+          rawFrameCount: 8,
+          dataBytes: expect.any(Number),
+          serializedBytes: expect.any(Number),
+          bufferedAmount: expect.any(Number),
+        }),
+      ]),
+    )
+
+    broker.close()
+  })
+
+  it('does not emit terminal.replay.batch logs for live output batches', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-live-batch-observability')
+
+    const ws = createMockWs()
+    await broker.attach(
+      ws as any,
+      'term-live-batch-observability',
+      'viewport_hydrate',
+      80,
+      24,
+      0,
+      'live-batch-attach',
+      undefined,
+      'foreground',
+      true,
+    )
+    ws.send.mockClear()
+    loggerMocks.logger.debug.mockClear()
+
+    registry.emit('terminal.output.raw', {
+      terminalId: 'term-live-batch-observability',
+      data: 'live batch payload',
+      at: Date.now(),
+    })
+    vi.advanceTimersByTime(5)
+
+    const liveBatches = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .filter((payload) => payload?.type === 'terminal.output.batch')
+    expect(liveBatches).toEqual([
+      expect.objectContaining({
+        terminalId: 'term-live-batch-observability',
+        attachRequestId: 'live-batch-attach',
+        source: 'live',
+      }),
+    ])
+    expect(structuredLogs('debug', 'terminal.replay.batch')
+      .filter((payload) => payload.terminalId === 'term-live-batch-observability')).toHaveLength(0)
+
+    broker.close()
+  })
+
+  it('retains unsent live output after a partial legacy batch send failure', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-live-partial-send')
+
+    const ws = createMockWs()
+    await broker.attach(
+      ws as any,
+      'term-live-partial-send',
+      'viewport_hydrate',
+      80,
+      24,
+      0,
+      'live-partial-send-attach',
+    )
+
+    ws.send.mockClear()
+    const acceptedOutputPayloads: Array<Record<string, unknown>> = []
+    let outputSendAttempts = 0
+    ws.send.mockImplementation((raw: string, cb?: (err?: Error) => void) => {
+      const payload = JSON.parse(raw)
+      if (payload?.type === 'terminal.output') {
+        outputSendAttempts += 1
+        if (outputSendAttempts === 2) {
+          throw new Error('simulated partial send failure')
+        }
+        acceptedOutputPayloads.push(payload)
+      }
+      cb?.()
+    })
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-partial-send', data: 'one', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-partial-send', data: 'two', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-partial-send', data: 'three', at: Date.now() })
+
+    vi.advanceTimersByTime(1)
+
+    expect(outputSendAttempts).toBe(2)
+    expect(acceptedOutputPayloads.map((payload) => payload.data)).toEqual(['one'])
+    expect(ws.close).not.toHaveBeenCalled()
+
+    vi.advanceTimersByTime(50)
+
+    expect(acceptedOutputPayloads.map((payload) => payload.data)).toEqual(['one', 'two', 'three'])
+    expect(acceptedOutputPayloads.every((payload) => payload.source === 'live')).toBe(true)
+    expect(ws.close).not.toHaveBeenCalled()
+
+    broker.close()
+  })
+
+  it('emits structured terminal.replay.gap logs for replay gaps', async () => {
+    const originalRingMax = process.env.TERMINAL_REPLAY_RING_MAX_BYTES
+    process.env.TERMINAL_REPLAY_RING_MAX_BYTES = '8'
+    try {
+      const registry = new FakeBrokerRegistry()
+      const broker = new TerminalStreamBroker(registry as any, vi.fn())
+      registry.createTerminal('term-structured-gap')
+
+      const wsSeed = createMockWs()
+      await broker.attach(wsSeed as any, 'term-structured-gap', 'viewport_hydrate', 80, 24, 0)
+
+      registry.emit('terminal.output.raw', { terminalId: 'term-structured-gap', data: 'aaaa', at: Date.now() })
+      registry.emit('terminal.output.raw', { terminalId: 'term-structured-gap', data: 'bbbb', at: Date.now() })
+      registry.emit('terminal.output.raw', { terminalId: 'term-structured-gap', data: 'cccc', at: Date.now() })
+
+      const wsReplay = createMockWs()
+      await broker.attach(
+        wsReplay as any,
+        'term-structured-gap',
+        'viewport_hydrate',
+        80,
+        24,
+        0,
+        'structured-gap-attach',
+      )
+
+      expect(structuredLogs('warn', 'terminal.replay.gap')).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            event: 'terminal.replay.gap',
+            severity: 'warn',
+            terminalId: 'term-structured-gap',
+            attachRequestId: 'structured-gap-attach',
+            streamId: expect.any(String),
+            source: 'replay',
+            fromSeq: 1,
+            toSeq: 1,
+            reason: 'replay_window_exceeded',
+          }),
+        ]),
+      )
+
+      broker.close()
+    } finally {
+      if (originalRingMax === undefined) delete process.env.TERMINAL_REPLAY_RING_MAX_BYTES
+      else process.env.TERMINAL_REPLAY_RING_MAX_BYTES = originalRingMax
+    }
+  })
+
+  it('emits structured terminal.replay.backpressure_pause logs for replay pacing', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(4 * 1024 * 1024)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-structured-backpressure')
+
+    for (let i = 1; i <= 10; i += 1) {
+      registry.emit('terminal.output.raw', {
+        terminalId: 'term-structured-backpressure',
+        data: `paused-${i};${'x'.repeat(2 * 1024)}`,
+        at: Date.now(),
+      })
+    }
+
+    const wsReplay = createMockWs({ bufferedAmount: 768 * 1024 })
+    await broker.attach(
+      wsReplay as any,
+      'term-structured-backpressure',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      'structured-backpressure-attach',
+      undefined,
+      'foreground',
+    )
+    vi.advanceTimersByTime(50)
+
+    const pauseLog = structuredLogs('debug', 'terminal.replay.backpressure_pause')
+      .find((payload) => payload.terminalId === 'term-structured-backpressure')
+    expect(pauseLog).toEqual(expect.objectContaining({
+      event: 'terminal.replay.backpressure_pause',
+      severity: 'debug',
+      terminalId: 'term-structured-backpressure',
+      attachRequestId: 'structured-backpressure-attach',
+      source: 'replay',
+      seqStart: 1,
+      seqEnd: 1,
+      rawFrameCount: 1,
+      dataBytes: expect.any(Number),
+      bufferedAmount: expect.any(Number),
+      threshold: expect.any(Number),
+      retryMs: expect.any(Number),
+      reason: 'websocket_buffered_amount',
+    }))
+    expect(pauseLog?.dataBytes).toBeGreaterThan(0)
+
+    broker.close()
+  })
+
+  it('emits structured terminal.replay.retention logs when retention loss rotates stream identity', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(6)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-structured-retention')
+
+    const ws = createMockWs()
+    await broker.attach(ws as any, 'term-structured-retention', 'viewport_hydrate', 80, 24, 0, 'structured-retention-attach')
+    const ready = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(ready?.streamId).toEqual(expect.any(String))
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-structured-retention', data: 'aaa', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-structured-retention', data: 'bbb', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-structured-retention', data: 'ccc', at: Date.now() })
+
+    const retentionLogs = structuredLogs('warn', 'terminal.replay.retention')
+      .filter((payload) => payload.terminalId === 'term-structured-retention')
+    expect(retentionLogs).toHaveLength(1)
+    expect(retentionLogs[0]).toEqual(expect.objectContaining({
+      event: 'terminal.replay.retention',
+      severity: 'warn',
+      terminalId: 'term-structured-retention',
+      attachRequestIds: ['structured-retention-attach'],
+      attachmentCount: 1,
+      previousStreamId: ready.streamId,
+      streamId: expect.any(String),
+      reason: 'retention_lost',
+      retainedBytes: expect.any(Number),
+      maxBytes: 6,
+      tailSeq: expect.any(Number),
+      headSeq: expect.any(Number),
+    }))
+    expect(retentionLogs[0]?.attachRequestId).toBeUndefined()
+
+    broker.close()
+  })
+
+  it('emits one aggregate terminal.replay.retention log for multiple attached clients', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(6)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-retention-multi-client')
+
+    const wsA = createMockWs()
+    const wsB = createMockWs()
+    await broker.attach(wsA as any, 'term-retention-multi-client', 'viewport_hydrate', 80, 24, 0, 'retention-attach-a')
+    await broker.attach(wsB as any, 'term-retention-multi-client', 'viewport_hydrate', 80, 24, 0, 'retention-attach-b')
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-retention-multi-client', data: 'aaa', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-retention-multi-client', data: 'bbb', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-retention-multi-client', data: 'ccc', at: Date.now() })
+
+    const retentionLogs = structuredLogs('warn', 'terminal.replay.retention')
+      .filter((payload) => payload.terminalId === 'term-retention-multi-client')
+    expect(retentionLogs).toHaveLength(1)
+    expect(retentionLogs[0]).toEqual(expect.objectContaining({
+      event: 'terminal.replay.retention',
+      severity: 'warn',
+      terminalId: 'term-retention-multi-client',
+      attachRequestIds: expect.arrayContaining(['retention-attach-a', 'retention-attach-b']),
+      attachmentCount: 2,
+      reason: 'retention_lost',
+      retainedBytes: expect.any(Number),
+      maxBytes: 6,
+      tailSeq: expect.any(Number),
+      headSeq: expect.any(Number),
+    }))
+    expect(retentionLogs[0]?.attachRequestIds).toHaveLength(2)
+    expect(retentionLogs[0]?.attachRequestId).toBeUndefined()
+
+    broker.close()
+  })
+
+  it('rate limits structured terminal.replay.retention logs and reports suppressed losses', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(6)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-retention-rate-limit')
+
+    const ws = createMockWs()
+    await broker.attach(ws as any, 'term-retention-rate-limit', 'viewport_hydrate', 80, 24, 0, 'retention-rate-attach')
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-retention-rate-limit', data: 'aaa', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-retention-rate-limit', data: 'bbb', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-retention-rate-limit', data: 'ccc', at: Date.now() })
+
+    let retentionLogs = structuredLogs('warn', 'terminal.replay.retention')
+      .filter((payload) => payload.terminalId === 'term-retention-rate-limit')
+    expect(retentionLogs).toHaveLength(1)
+    expect(retentionLogs[0]).toEqual(expect.objectContaining({
+      event: 'terminal.replay.retention',
+      severity: 'warn',
+      terminalId: 'term-retention-rate-limit',
+      attachRequestIds: ['retention-rate-attach'],
+      attachmentCount: 1,
+      reason: 'retention_lost',
+    }))
+    expect(retentionLogs[0]?.attachRequestId).toBeUndefined()
+    expect(retentionLogs[0]?.suppressedCount).toBeUndefined()
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-retention-rate-limit', data: 'ddd', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-retention-rate-limit', data: 'eee', at: Date.now() })
+
+    retentionLogs = structuredLogs('warn', 'terminal.replay.retention')
+      .filter((payload) => payload.terminalId === 'term-retention-rate-limit')
+    expect(retentionLogs).toHaveLength(1)
+
+    vi.advanceTimersByTime(1000)
+    registry.emit('terminal.output.raw', { terminalId: 'term-retention-rate-limit', data: 'fff', at: Date.now() })
+
+    retentionLogs = structuredLogs('warn', 'terminal.replay.retention')
+      .filter((payload) => payload.terminalId === 'term-retention-rate-limit')
+    expect(retentionLogs).toHaveLength(2)
+    expect(retentionLogs[1]).toEqual(expect.objectContaining({
+      event: 'terminal.replay.retention',
+      severity: 'warn',
+      terminalId: 'term-retention-rate-limit',
+      attachRequestIds: ['retention-rate-attach'],
+      attachmentCount: 1,
+      reason: 'retention_lost',
+      suppressedCount: 2,
+    }))
+    expect(retentionLogs[1]?.attachRequestId).toBeUndefined()
+
+    broker.close()
+  })
+
   it('echoes attachRequestId on attach.ready, output, and output.gap for a client attachment', async () => {
+    forceSmallTerminalClientQueueForOverflowTest()
     const registry = new FakeBrokerRegistry()
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
     registry.createTerminal('term-attach-id')
@@ -375,6 +800,54 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
+  it('reports unknown geometry authority and ignores warm delta when another client is attached', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-geometry-authority')
+
+    const wsA = createMockWs()
+    await broker.attach(wsA as any, 'term-geometry-authority', 'viewport_hydrate', 80, 24, 0, 'geometry-a-1')
+    registry.emit('terminal.output.raw', {
+      terminalId: 'term-geometry-authority',
+      data: 'geometry-seed',
+      at: Date.now(),
+    })
+    vi.advanceTimersByTime(1)
+
+    const wsB = createMockWs()
+    await broker.attach(wsB as any, 'term-geometry-authority', 'viewport_hydrate', 100, 30, 0, 'geometry-b-1')
+    const readyB = wsB.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(readyB).toMatchObject({
+      terminalId: 'term-geometry-authority',
+      attachRequestId: 'geometry-b-1',
+      geometryAuthority: 'multi_client_unknown',
+      geometryEpoch: expect.any(Number),
+    })
+
+    wsA.send.mockClear()
+    await broker.attach(wsA as any, 'term-geometry-authority', 'transport_reconnect', 80, 24, 1, 'geometry-a-2')
+    const readyA2 = wsA.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+
+    expect(readyA2).toMatchObject({
+      terminalId: 'term-geometry-authority',
+      attachRequestId: 'geometry-a-2',
+      geometryAuthority: 'multi_client_unknown',
+      geometryEpoch: expect.any(Number),
+      requestedSinceSeq: 1,
+      effectiveSinceSeq: 0,
+      replayResetReason: 'geometry_authority_unknown',
+      replayFromSeq: 1,
+      replayToSeq: 1,
+    })
+    expect(readyA2.geometryEpoch).toBeGreaterThan(readyB.geometryEpoch)
+
+    broker.close()
+  })
+
   it('keeps each live terminal.output frame within the shared realtime byte budget', async () => {
     const registry = new FakeBrokerRegistry()
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
@@ -399,6 +872,625 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
 
     expect(payloads.length).toBeGreaterThan(0)
     expect(payloads.every((payload) => Buffer.byteLength(payload.data ?? '', 'utf8') <= MAX_REALTIME_MESSAGE_BYTES)).toBe(true)
+
+    broker.close()
+  })
+
+  it('keeps actual live and replay terminal.output JSON payloads within the serialized budget', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-serialized-budget')
+
+    const wsLive = createMockWs()
+    await broker.attach(
+      wsLive as any,
+      'term-serialized-budget',
+      'viewport_hydrate',
+      80,
+      24,
+      0,
+      TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE,
+    )
+
+    registry.emit('terminal.output.raw', {
+      terminalId: 'term-serialized-budget',
+      data: '\u001b'.repeat(20 * 1024),
+      at: Date.now(),
+    })
+    for (let i = 0; i < 20; i += 1) {
+      vi.advanceTimersByTime(1)
+    }
+
+    const liveOutputFrames = wsLive.send.mock.calls
+      .map(([raw]) => raw)
+      .filter((raw): raw is string => {
+        if (typeof raw !== 'string') return false
+        const payload = JSON.parse(raw)
+        return payload?.type === 'terminal.output'
+      })
+    expect(liveOutputFrames.length).toBeGreaterThan(1)
+
+    for (const raw of liveOutputFrames) {
+      const payload = JSON.parse(raw)
+      expect(Buffer.byteLength(raw, 'utf8')).toBeLessThanOrEqual(MAX_REALTIME_MESSAGE_BYTES)
+      expect(payload).toEqual(expect.objectContaining({
+        type: 'terminal.output',
+        terminalId: 'term-serialized-budget',
+        attachRequestId: TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE,
+        streamId: expect.any(String),
+        seqStart: expect.any(Number),
+        seqEnd: expect.any(Number),
+      }))
+    }
+
+    const wsReplay = createMockWs()
+    await broker.attach(
+      wsReplay as any,
+      'term-serialized-budget',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE,
+    )
+    for (let i = 0; i < 20; i += 1) {
+      vi.advanceTimersByTime(1)
+    }
+
+    const replayOutputFrames = wsReplay.send.mock.calls
+      .map(([raw]) => raw)
+      .filter((raw): raw is string => {
+        if (typeof raw !== 'string') return false
+        const payload = JSON.parse(raw)
+        return payload?.type === 'terminal.output'
+      })
+    expect(replayOutputFrames.length).toBeGreaterThan(1)
+
+    for (const raw of replayOutputFrames) {
+      const payload = JSON.parse(raw)
+      expect(Buffer.byteLength(raw, 'utf8')).toBeLessThanOrEqual(MAX_REALTIME_MESSAGE_BYTES)
+      expect(payload).toEqual(expect.objectContaining({
+        type: 'terminal.output',
+        terminalId: 'term-serialized-budget',
+        attachRequestId: TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE,
+        streamId: expect.any(String),
+        seqStart: expect.any(Number),
+        seqEnd: expect.any(Number),
+      }))
+    }
+
+    broker.close()
+  })
+
+  it('uses serialized terminal.output JSON bytes for maxReplayBytes truncation', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-replay-serialized-truncation')
+
+    const wsSeed = createMockWs()
+    await broker.attach(
+      wsSeed as any,
+      'term-replay-serialized-truncation',
+      'viewport_hydrate',
+      80,
+      24,
+      0,
+      'seed-serialized-truncation',
+    )
+    const seedReady = wsSeed.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(seedReady?.streamId).toEqual(expect.any(String))
+
+    const replayAttachRequestId = TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE
+    const chunks = [
+      `A${'\u001b'.repeat(100)}`,
+      `B${'\u001b'.repeat(100)}`,
+      `C${'\u001b'.repeat(100)}`,
+    ]
+    for (const chunk of chunks) {
+      registry.emit('terminal.output.raw', {
+        terminalId: 'term-replay-serialized-truncation',
+        data: chunk,
+        at: Date.now(),
+      })
+    }
+
+    const oneSerializedPayloadBudget = measureTerminalOutputPayloadBytes({
+      type: 'terminal.output',
+      terminalId: 'term-replay-serialized-truncation',
+      streamId: seedReady.streamId,
+      seqStart: 3,
+      seqEnd: 3,
+      data: chunks[2],
+      attachRequestId: replayAttachRequestId,
+      source: 'replay',
+    })
+    expect(chunks.reduce((sum, chunk) => sum + Buffer.byteLength(chunk, 'utf8'), 0))
+      .toBeLessThan(oneSerializedPayloadBudget)
+
+    const wsReplay = createMockWs()
+    await broker.attach(
+      wsReplay as any,
+      'term-replay-serialized-truncation',
+      'viewport_hydrate',
+      80,
+      24,
+      0,
+      replayAttachRequestId,
+      oneSerializedPayloadBudget,
+    )
+    vi.advanceTimersByTime(1)
+
+    const replayMessages = wsReplay.send.mock.calls
+      .map(([raw]) => ({
+        raw,
+        payload: typeof raw === 'string' ? JSON.parse(raw) : raw,
+      }))
+
+    const gap = replayMessages.find(({ payload }) => payload?.type === 'terminal.output.gap')?.payload
+    expect(gap).toMatchObject({
+      fromSeq: 1,
+      toSeq: 2,
+      reason: 'replay_budget_exceeded',
+      attachRequestId: replayAttachRequestId,
+      streamId: seedReady.streamId,
+    })
+
+    const outputFrames = replayMessages
+      .filter(({ payload }) => payload?.type === 'terminal.output')
+    expect(outputFrames.map(({ payload }) => payload.data)).toEqual([chunks[2]])
+    expect(outputFrames[0]?.payload).toMatchObject({
+      seqStart: 3,
+      seqEnd: 3,
+      attachRequestId: replayAttachRequestId,
+      streamId: seedReady.streamId,
+      source: 'replay',
+    })
+    expect(Buffer.byteLength(String(outputFrames[0]?.raw ?? ''), 'utf8'))
+      .toBeLessThanOrEqual(oneSerializedPayloadBudget)
+
+    broker.close()
+  })
+
+  it('emits separate queue overflow gaps for different stream ids', async () => {
+    const originalClientQueueMaxBytes = process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES
+    process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES = '2048'
+
+    try {
+      const registry = new FakeBrokerRegistry()
+      const broker = new TerminalStreamBroker(registry as any, vi.fn())
+      registry.createTerminal('term-gap-stream')
+
+      const ws = createMockWs()
+      await broker.attach(ws as any, 'term-gap-stream', 'viewport_hydrate', 80, 24, 0, 'gap-attach')
+      const attachReady = ws.send.mock.calls
+        .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+        .find((payload) => payload?.type === 'terminal.attach.ready')
+      expect(attachReady?.streamId).toEqual(expect.any(String))
+
+      for (let i = 0; i < 3; i += 1) {
+        registry.emit('terminal.output.raw', {
+          terminalId: 'term-gap-stream',
+          data: `old-${i}-${'o'.repeat(900)}`,
+          at: Date.now(),
+        })
+      }
+      registry.emit('terminal.stream.replaced', {
+        terminalId: 'term-gap-stream',
+        reason: 'codex_pty_recovery',
+      })
+      for (let i = 0; i < 3; i += 1) {
+        registry.emit('terminal.output.raw', {
+          terminalId: 'term-gap-stream',
+          data: `new-${i}-${'n'.repeat(900)}`,
+          at: Date.now(),
+        })
+      }
+      vi.advanceTimersByTime(5)
+
+      const gaps = ws.send.mock.calls
+        .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+        .filter((payload) => payload?.type === 'terminal.output.gap')
+
+      expect(gaps.length).toBeGreaterThanOrEqual(2)
+      expect(gaps[0]).toEqual(expect.objectContaining({
+        streamId: attachReady.streamId,
+        reason: 'queue_overflow',
+      }))
+      expect(new Set(gaps.map((gap) => gap.streamId)).size).toBeGreaterThanOrEqual(2)
+
+      broker.close()
+    } finally {
+      if (originalClientQueueMaxBytes === undefined) {
+        delete process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES
+      } else {
+        process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES = originalClientQueueMaxBytes
+      }
+    }
+  })
+
+  it('notifies active clients before live output switches to a replacement stream id', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-live-stream-change')
+
+    const ws = createMockWs()
+    await broker.attach(ws as any, 'term-live-stream-change', 'viewport_hydrate', 80, 24, 0, 'live-change-attach')
+    const ready = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(ready?.streamId).toEqual(expect.any(String))
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-stream-change', data: 'before-change', at: Date.now() })
+    vi.advanceTimersByTime(1)
+
+    registry.emit('terminal.stream.replaced', {
+      terminalId: 'term-live-stream-change',
+      reason: 'codex_pty_recovery',
+    })
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-stream-change', data: 'after-change', at: Date.now() })
+    vi.advanceTimersByTime(1)
+
+    const payloads = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+    const streamChangedIndex = payloads.findIndex((payload) => payload?.type === 'terminal.stream.changed')
+    const afterOutputIndex = payloads.findIndex((payload) =>
+      payload?.type === 'terminal.output' && payload.data === 'after-change'
+    )
+    const streamChanged = payloads[streamChangedIndex]
+    const afterOutput = payloads[afterOutputIndex]
+
+    expect(streamChanged).toMatchObject({
+      terminalId: 'term-live-stream-change',
+      reason: 'codex_pty_recovery',
+      attachRequestId: 'live-change-attach',
+      streamId: expect.any(String),
+    })
+    expect(streamChanged.streamId).not.toBe(ready.streamId)
+    expect(afterOutput).toMatchObject({
+      terminalId: 'term-live-stream-change',
+      data: 'after-change',
+      streamId: streamChanged.streamId,
+      attachRequestId: 'live-change-attach',
+    })
+    expect(streamChangedIndex).toBeGreaterThan(-1)
+    expect(afterOutputIndex).toBeGreaterThan(streamChangedIndex)
+
+    broker.close()
+  })
+
+  it('converts a stale replay cursor to a current-stream gap before replacement live output', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-replay-stream-change')
+
+    const seedWs = createMockWs()
+    await broker.attach(seedWs as any, 'term-replay-stream-change', 'viewport_hydrate', 80, 24, 0, 'seed-attach')
+    const initialReady = seedWs.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(initialReady?.streamId).toEqual(expect.any(String))
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-replay-stream-change', data: 'old-a', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-replay-stream-change', data: 'old-b', at: Date.now() })
+
+    const replayWs = createMockWs()
+    await broker.attach(
+      replayWs as any,
+      'term-replay-stream-change',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      'replay-attach',
+    )
+
+    registry.emit('terminal.stream.replaced', {
+      terminalId: 'term-replay-stream-change',
+      reason: 'codex_pty_recovery',
+    })
+    registry.emit('terminal.output.raw', { terminalId: 'term-replay-stream-change', data: 'new-live', at: Date.now() })
+    vi.advanceTimersByTime(1)
+
+    const payloads = replayWs.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+    const ready = payloads.find((payload) => payload?.type === 'terminal.attach.ready')
+    const streamChangedIndex = payloads.findIndex((payload) => payload?.type === 'terminal.stream.changed')
+    const gapIndex = payloads.findIndex((payload) => payload?.type === 'terminal.output.gap')
+    const newOutputIndex = payloads.findIndex((payload) =>
+      payload?.type === 'terminal.output' && payload.data === 'new-live'
+    )
+    const replayOutputs = payloads
+      .filter((payload) => payload?.type === 'terminal.output')
+      .map((payload) => payload.data)
+
+    expect(ready).toMatchObject({
+      terminalId: 'term-replay-stream-change',
+      streamId: initialReady.streamId,
+      replayFromSeq: 1,
+      replayToSeq: 2,
+      attachRequestId: 'replay-attach',
+    })
+    expect(payloads[streamChangedIndex]).toMatchObject({
+      terminalId: 'term-replay-stream-change',
+      reason: 'codex_pty_recovery',
+      attachRequestId: 'replay-attach',
+      streamId: expect.any(String),
+    })
+    expect(payloads[streamChangedIndex].streamId).not.toBe(initialReady.streamId)
+    expect(payloads[gapIndex]).toMatchObject({
+      terminalId: 'term-replay-stream-change',
+      streamId: payloads[streamChangedIndex].streamId,
+      fromSeq: 1,
+      toSeq: 2,
+      reason: 'replay_window_exceeded',
+      attachRequestId: 'replay-attach',
+    })
+    expect(payloads[newOutputIndex]).toMatchObject({
+      terminalId: 'term-replay-stream-change',
+      streamId: payloads[streamChangedIndex].streamId,
+      seqStart: 3,
+      seqEnd: 3,
+      data: 'new-live',
+      attachRequestId: 'replay-attach',
+    })
+    expect(streamChangedIndex).toBeGreaterThan(-1)
+    expect(gapIndex).toBeGreaterThan(streamChangedIndex)
+    expect(newOutputIndex).toBeGreaterThan(gapIndex)
+    expect(replayOutputs).toEqual(['new-live'])
+
+    broker.close()
+  })
+
+  it('notifies active clients when retention loss rotates live stream identity', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(6)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-live-retention-change')
+
+    const ws = createMockWs()
+    await broker.attach(ws as any, 'term-live-retention-change', 'viewport_hydrate', 80, 24, 0, 'live-retention-attach')
+    const ready = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(ready?.streamId).toEqual(expect.any(String))
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-retention-change', data: 'aaa', at: Date.now() })
+    vi.advanceTimersByTime(1)
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-retention-change', data: 'bbb', at: Date.now() })
+    vi.advanceTimersByTime(1)
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-retention-change', data: 'ccc', at: Date.now() })
+    vi.advanceTimersByTime(1)
+
+    const payloads = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+    const streamChangedIndex = payloads.findIndex((payload) =>
+      payload?.type === 'terminal.stream.changed' && payload.reason === 'retention_lost'
+    )
+    const cccOutputIndex = payloads.findIndex((payload) =>
+      payload?.type === 'terminal.output' && payload.data === 'ccc'
+    )
+    const streamChanged = payloads[streamChangedIndex]
+    const cccOutput = payloads[cccOutputIndex]
+
+    expect(streamChanged).toMatchObject({
+      terminalId: 'term-live-retention-change',
+      reason: 'retention_lost',
+      attachRequestId: 'live-retention-attach',
+      streamId: expect.any(String),
+    })
+    expect(streamChanged.streamId).not.toBe(ready.streamId)
+    expect(cccOutput).toMatchObject({
+      terminalId: 'term-live-retention-change',
+      data: 'ccc',
+      streamId: streamChanged.streamId,
+      attachRequestId: 'live-retention-attach',
+    })
+    expect(cccOutputIndex).toBeGreaterThan(streamChangedIndex)
+
+    broker.close()
+  })
+
+  it('retags queued live output when retention loss rotates stream identity before flush', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(6)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-live-retention-queued')
+
+    const ws = createMockWs()
+    await broker.attach(ws as any, 'term-live-retention-queued', 'viewport_hydrate', 80, 24, 0, 'live-retention-queued-attach')
+    const ready = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(ready?.streamId).toEqual(expect.any(String))
+    ws.send.mockClear()
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-retention-queued', data: 'aaa', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-retention-queued', data: 'bbb', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-retention-queued', data: 'ccc', at: Date.now() })
+    vi.advanceTimersByTime(1)
+
+    const payloads = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+    const streamChangedIndex = payloads.findIndex((payload) =>
+      payload?.type === 'terminal.stream.changed' && payload.reason === 'retention_lost'
+    )
+    const streamChanged = payloads[streamChangedIndex]
+    const outputs = payloads.filter((payload) => payload?.type === 'terminal.output')
+
+    expect(streamChanged).toMatchObject({
+      terminalId: 'term-live-retention-queued',
+      reason: 'retention_lost',
+      attachRequestId: 'live-retention-queued-attach',
+      streamId: expect.any(String),
+    })
+    expect(streamChanged.streamId).not.toBe(ready.streamId)
+    expect(outputs.map((payload) => payload.data)).toEqual(['aaa', 'bbb', 'ccc'])
+    expect(outputs.every((payload) => payload.streamId === streamChanged.streamId)).toBe(true)
+    expect(outputs.every((payload) => payload.streamId !== ready.streamId)).toBe(true)
+    for (const output of outputs) {
+      expect(payloads.indexOf(output)).toBeGreaterThan(streamChangedIndex)
+      expect(output.attachRequestId).toBe('live-retention-queued-attach')
+    }
+
+    broker.close()
+  })
+
+  it('retags returned live fragments when retention loss rotates stream identity before enqueue', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(64 * 1024)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-live-retention-fragments')
+
+    const ws = createMockWs()
+    await broker.attach(ws as any, 'term-live-retention-fragments', 'viewport_hydrate', 80, 24, 0, 'live-retention-fragments-attach')
+    const ready = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(ready?.streamId).toEqual(expect.any(String))
+    ws.send.mockClear()
+
+    registry.emit('terminal.output.raw', {
+      terminalId: 'term-live-retention-fragments',
+      data: 'x'.repeat(200 * 1024),
+      at: Date.now(),
+    })
+    for (let i = 0; i < 100; i += 1) {
+      vi.advanceTimersByTime(1)
+    }
+
+    const payloads = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+    const streamChanges = payloads.filter((payload) =>
+      payload?.type === 'terminal.stream.changed' && payload.reason === 'retention_lost'
+    )
+    const outputs = payloads.filter((payload) => payload?.type === 'terminal.output')
+    const finalStreamId = streamChanges.at(-1)?.streamId
+
+    expect(streamChanges.length).toBeGreaterThan(0)
+    expect(finalStreamId).toEqual(expect.any(String))
+    expect(finalStreamId).not.toBe(ready.streamId)
+    expect(outputs.length).toBeGreaterThan(0)
+    expect(outputs.every((payload) => payload.streamId === finalStreamId)).toBe(true)
+    expect(outputs.every((payload) => payload.streamId !== ready.streamId)).toBe(true)
+    expect(outputs.map((payload) => payload.data).join('')).toHaveLength(200 * 1024)
+
+    broker.close()
+  })
+
+  it('retags retained replay frames when retention loss rotates stream identity', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(6)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-retention-stream')
+
+    const ws = createMockWs()
+    await broker.attach(ws as any, 'term-retention-stream', 'viewport_hydrate', 80, 24, 0, 'retention-attach')
+    const initialReady = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    const initialStreamId = initialReady?.streamId
+    expect(initialStreamId).toEqual(expect.any(String))
+
+    for (const data of ['aaa', 'bbb', 'ccc']) {
+      registry.emit('terminal.output.raw', { terminalId: 'term-retention-stream', data, at: Date.now() })
+      vi.advanceTimersByTime(1)
+    }
+
+    const wsAfterLoss = createMockWs()
+    await broker.attach(
+      wsAfterLoss as any,
+      'term-retention-stream',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      'after-retention-loss',
+    )
+    vi.advanceTimersByTime(1)
+
+    const payloadsAfterLoss = wsAfterLoss.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+    const readyAfterLoss = payloadsAfterLoss
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(readyAfterLoss?.streamId).toEqual(expect.any(String))
+    expect(readyAfterLoss.streamId).not.toBe(initialStreamId)
+
+    const gapAfterLoss = payloadsAfterLoss
+      .find((payload) => payload?.type === 'terminal.output.gap')
+    expect(gapAfterLoss).toMatchObject({
+      streamId: readyAfterLoss.streamId,
+      fromSeq: 1,
+      toSeq: 1,
+      reason: 'replay_window_exceeded',
+    })
+
+    const replayOutputsAfterLoss = payloadsAfterLoss
+      .filter((payload) => payload?.type === 'terminal.output')
+    expect(replayOutputsAfterLoss.map((payload) => String(payload.data)).join('')).toBe('bbbccc')
+    expect(replayOutputsAfterLoss.every((payload) => payload.streamId === readyAfterLoss.streamId)).toBe(true)
+    expect(replayOutputsAfterLoss.every((payload) => payload.streamId !== initialStreamId)).toBe(true)
+
+    broker.close()
+  })
+
+  it('gaps old-stream retained replay and only sends output for the attach-ready stream', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(9)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-retained-boundary')
+
+    const ws = createMockWs()
+    await broker.attach(ws as any, 'term-retained-boundary', 'viewport_hydrate', 80, 24, 0, 'boundary-seed')
+    const initialReady = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(initialReady?.streamId).toEqual(expect.any(String))
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-retained-boundary', data: 'aaa', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-retained-boundary', data: 'bbb', at: Date.now() })
+    registry.emit('terminal.stream.replaced', {
+      terminalId: 'term-retained-boundary',
+      reason: 'codex_pty_recovery',
+    })
+    registry.emit('terminal.output.raw', { terminalId: 'term-retained-boundary', data: 'ccc', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-retained-boundary', data: 'ddd', at: Date.now() })
+
+    const wsAfterLoss = createMockWs()
+    await broker.attach(
+      wsAfterLoss as any,
+      'term-retained-boundary',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      'boundary-after-loss',
+    )
+    vi.advanceTimersByTime(1)
+
+    const payloadsAfterLoss = wsAfterLoss.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+    const readyAfterLoss = payloadsAfterLoss
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    const replayOutputsAfterLoss = payloadsAfterLoss
+      .filter((payload) => payload?.type === 'terminal.output')
+    const replayGapsAfterLoss = payloadsAfterLoss
+      .filter((payload) => payload?.type === 'terminal.output.gap')
+
+    expect(readyAfterLoss?.streamId).toEqual(expect.any(String))
+    expect(readyAfterLoss.streamId).not.toBe(initialReady.streamId)
+    expect(replayGapsAfterLoss).toEqual([
+      expect.objectContaining({
+        streamId: readyAfterLoss.streamId,
+        fromSeq: 1,
+        toSeq: 2,
+        reason: 'replay_window_exceeded',
+      }),
+    ])
+    expect(replayOutputsAfterLoss.map((payload) => String(payload.data))).toEqual(['ccc', 'ddd'])
+    expect(replayOutputsAfterLoss.every((payload) => payload.streamId === readyAfterLoss.streamId)).toBe(true)
+    expect(replayOutputsAfterLoss.every((payload) => payload.streamId !== initialReady.streamId)).toBe(true)
 
     broker.close()
   })
@@ -461,7 +1553,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
-  it('coalesces contiguous replay frames before sending terminal.output payloads', async () => {
+  it('coalesces contiguous replay frames into terminal.output.batch for batch-capable clients', async () => {
     const registry = new FakeBrokerRegistry()
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
     registry.createTerminal('term-replay-coalesced')
@@ -475,22 +1567,150 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     }
 
     const wsReplay = createMockWs()
-    await broker.attach(wsReplay as any, 'term-replay-coalesced', 'transport_reconnect', 80, 24, 0, 'replay-attach')
+    await broker.attach(
+      wsReplay as any,
+      'term-replay-coalesced',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      'replay-attach',
+      undefined,
+      'foreground',
+      true,
+    )
     vi.advanceTimersByTime(5)
 
     const outputs = wsReplay.send.mock.calls
       .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
-      .filter((payload) => payload?.type === 'terminal.output')
+      .filter((payload) => payload?.type === 'terminal.output.batch')
 
-    expect(outputs).toHaveLength(1)
+    expect(outputs.length).toBeGreaterThan(0)
+    expect(outputs.length).toBeLessThan(1000)
     expect(outputs[0]).toMatchObject({
+      type: 'terminal.output.batch',
       attachRequestId: 'replay-attach',
+      source: 'replay',
       seqStart: 1,
+      segments: expect.any(Array),
+    })
+    expect(outputs[outputs.length - 1]).toMatchObject({
+      attachRequestId: 'replay-attach',
+      source: 'replay',
       seqEnd: 1000,
     })
-    expect(outputs[0].data).toContain('f1;')
-    expect(outputs[0].data).toContain('f1000;')
-    expect(Buffer.byteLength(outputs[0].data, 'utf8')).toBeLessThanOrEqual(MAX_REALTIME_MESSAGE_BYTES)
+    expect(outputs.every((payload) => payload.serializedBytes <= MAX_REALTIME_MESSAGE_BYTES)).toBe(true)
+    expect(outputs.reduce((sum, payload) => sum + payload.segments.length, 0)).toBe(1000)
+    const joinedData = outputs.map((payload) => String(payload.data)).join('')
+    expect(joinedData).toContain('f1;')
+    expect(joinedData).toContain('f1000;')
+
+    broker.close()
+  })
+
+  it('falls back to budget-safe terminal.output when one batch segment exceeds the batch envelope budget', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    const terminalId = 'term-single-batch-budget'
+    const attachRequestId = TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE
+    registry.createTerminal(terminalId)
+
+    const ws = createMockWs()
+    await broker.attach(
+      ws as any,
+      terminalId,
+      'viewport_hydrate',
+      80,
+      24,
+      0,
+      attachRequestId,
+      undefined,
+      'foreground',
+      true,
+    )
+    const ready = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(ready?.streamId).toEqual(expect.any(String))
+    const streamId = String(ready.streamId)
+
+    const legacyBudgetBytes = (data: string) => measureTerminalOutputPayloadBytes({
+      type: 'terminal.output',
+      terminalId,
+      streamId,
+      seqStart: Number.MAX_SAFE_INTEGER,
+      seqEnd: Number.MAX_SAFE_INTEGER,
+      data,
+      attachRequestId,
+    })
+    const batchBudgetBytes = (data: string) => {
+      let serializedBytes = 0
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const measured = measureTerminalOutputPayloadBytes({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'live',
+          seqStart: 1,
+          seqEnd: 1,
+          data,
+          serializedBytes,
+          segments: [{ seqStart: 1, seqEnd: 1, endOffset: data.length, rawFrameCount: 1 }],
+        })
+        if (measured === serializedBytes) return measured
+        serializedBytes = measured
+      }
+      return measureTerminalOutputPayloadBytes({
+        type: 'terminal.output.batch',
+        terminalId,
+        streamId,
+        attachRequestId,
+        source: 'live',
+        seqStart: 1,
+        seqEnd: 1,
+        data,
+        serializedBytes,
+        segments: [{ seqStart: 1, seqEnd: 1, endOffset: data.length, rawFrameCount: 1 }],
+      })
+    }
+
+    let data = ''
+    for (let length = 1; length <= MAX_REALTIME_MESSAGE_BYTES; length += 1) {
+      const candidate = 'x'.repeat(length)
+      if (
+        legacyBudgetBytes(candidate) <= MAX_REALTIME_MESSAGE_BYTES
+        && batchBudgetBytes(candidate) > MAX_REALTIME_MESSAGE_BYTES
+      ) {
+        data = candidate
+        break
+      }
+    }
+    expect(data.length).toBeGreaterThan(0)
+    expect(legacyBudgetBytes(data)).toBeLessThanOrEqual(MAX_REALTIME_MESSAGE_BYTES)
+    expect(batchBudgetBytes(data)).toBeGreaterThan(MAX_REALTIME_MESSAGE_BYTES)
+
+    ws.send.mockClear()
+    registry.emit('terminal.output.raw', { terminalId, data, at: Date.now() })
+    vi.advanceTimersByTime(5)
+
+    const payloads = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+    const batchOutputs = payloads.filter((payload) => payload?.type === 'terminal.output.batch')
+    const outputFallbacks = payloads.filter((payload) => payload?.type === 'terminal.output')
+
+    expect(batchOutputs.every((payload) => payload.serializedBytes <= MAX_REALTIME_MESSAGE_BYTES)).toBe(true)
+    expect(outputFallbacks).toHaveLength(1)
+    expect(outputFallbacks[0]).toMatchObject({
+      type: 'terminal.output',
+      terminalId,
+      streamId,
+      attachRequestId,
+      seqStart: 1,
+      seqEnd: 1,
+      data,
+    })
+    expect(measureTerminalOutputPayloadBytes(outputFallbacks[0])).toBeLessThanOrEqual(MAX_REALTIME_MESSAGE_BYTES)
 
     broker.close()
   })
@@ -522,6 +1742,143 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
       .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
       .filter((payload) => payload?.type === 'terminal.output')
     expect(outputs.map((payload) => String(payload.data)).join('')).toContain('foreground-frame-4;')
+
+    broker.close()
+  })
+
+  it('paces foreground replay when socket bufferedAmount grows under replay pressure', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(4 * 1024 * 1024)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-foreground-paced')
+
+    const wsSeed = createMockWs()
+    await broker.attach(wsSeed as any, 'term-foreground-paced', 'viewport_hydrate', 80, 24, 0, 'seed-attach')
+
+    const chunk = 'x'.repeat(2 * 1024)
+    for (let i = 1; i <= 1400; i += 1) {
+      registry.emit('terminal.output.raw', {
+        terminalId: 'term-foreground-paced',
+        data: `foreground-paced-${i};${chunk}`,
+        at: Date.now(),
+      })
+    }
+
+    const wsReplay = createMockWs({ bufferedAmount: 0 })
+    wsReplay.send.mockImplementation((raw: string) => {
+      wsReplay.bufferedAmount += Buffer.byteLength(raw, 'utf8')
+    })
+
+    await broker.attach(
+      wsReplay as any,
+      'term-foreground-paced',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      'foreground-paced-attach',
+      undefined,
+      'foreground',
+    )
+    for (let i = 0; i < 220; i += 1) {
+      vi.runOnlyPendingTimers()
+    }
+
+    expect(wsReplay.bufferedAmount).toBeLessThanOrEqual(512 * 1024 + 64 * 1024)
+
+    broker.close()
+  })
+
+  it('resumes foreground replay after bufferedAmount drains and completes the retained backlog', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(4 * 1024 * 1024)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-foreground-resume')
+
+    const chunk = 'x'.repeat(2 * 1024)
+    for (let i = 1; i <= 800; i += 1) {
+      registry.emit('terminal.output.raw', {
+        terminalId: 'term-foreground-resume',
+        data: `foreground-resume-${i};${chunk}`,
+        at: Date.now(),
+      })
+    }
+
+    const wsReplay = createMockWs({ bufferedAmount: 0 })
+    wsReplay.send.mockImplementation((raw: string) => {
+      wsReplay.bufferedAmount += Buffer.byteLength(raw, 'utf8')
+    })
+
+    await broker.attach(
+      wsReplay as any,
+      'term-foreground-resume',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      'foreground-resume-attach',
+      undefined,
+      'foreground',
+    )
+
+    let outputs: any[] = []
+    for (let cycle = 0; cycle < 20; cycle += 1) {
+      for (let i = 0; i < 220; i += 1) {
+        vi.runOnlyPendingTimers()
+      }
+      outputs = wsReplay.send.mock.calls
+        .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+        .filter((payload) => payload?.type === 'terminal.output')
+      if (outputs.map((payload) => String(payload.data)).join('').includes('foreground-resume-800;')) {
+        break
+      }
+      wsReplay.bufferedAmount = 0
+    }
+
+    expect(outputs.length).toBeGreaterThan(0)
+    expect(outputs.every((payload) => payload.attachRequestId === 'foreground-resume-attach')).toBe(true)
+    expect(outputs.map((payload) => String(payload.data)).join('')).toContain('foreground-resume-800;')
+
+    broker.close()
+  })
+
+  it('rate limits foreground replay backpressure pause logs while the socket remains blocked', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(4 * 1024 * 1024)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-foreground-log-limited')
+
+    for (let i = 1; i <= 40; i += 1) {
+      registry.emit('terminal.output.raw', {
+        terminalId: 'term-foreground-log-limited',
+        data: `foreground-log-limited-${i};${'x'.repeat(2 * 1024)}`,
+        at: Date.now(),
+      })
+    }
+
+    const wsReplay = createMockWs({ bufferedAmount: 768 * 1024 })
+    await broker.attach(
+      wsReplay as any,
+      'term-foreground-log-limited',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      'foreground-log-limited-attach',
+      undefined,
+      'foreground',
+    )
+
+    for (let i = 0; i < 10; i += 1) {
+      vi.advanceTimersByTime(50)
+    }
+
+    const pauseLogs = loggerMocks.logger.debug.mock.calls.filter(([payload]) =>
+      payload
+      && typeof payload === 'object'
+      && (payload as { event?: unknown }).event === 'terminal_stream_replay_backpressure_pause'
+    )
+    expect(pauseLogs).toHaveLength(1)
 
     broker.close()
   })
@@ -591,7 +1948,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
       })
     }
 
-    const ws = createMockWs({ bufferedAmount: 768 * 1024 })
+    const ws = createMockWs({ bufferedAmount: 512 * 1024 + 16 * 1024 })
     await broker.attach(ws as any, 'term-promoted', 'keepalive_delta', 80, 24, 0, 'background-attach', undefined, 'background')
     vi.advanceTimersByTime(100)
     expect(ws.send.mock.calls
@@ -612,6 +1969,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
   })
 
   it('emits terminal_stream_replay_hit, terminal_stream_queue_pressure, and terminal_stream_gap on overflow', async () => {
+    forceSmallTerminalClientQueueForOverflowTest()
     const registry = new FakeBrokerRegistry()
     const perfSpy = vi.fn()
     const broker = new TerminalStreamBroker(registry as any, perfSpy)
@@ -621,6 +1979,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     await broker.attach(wsSeed as any, 'term-overflow', 'viewport_hydrate', 80, 24, 0)
     registry.emit('terminal.output.raw', { terminalId: 'term-overflow', data: 'seed-1', at: Date.now() })
     registry.emit('terminal.output.raw', { terminalId: 'term-overflow', data: 'seed-2', at: Date.now() })
+    broker.detach('term-overflow', wsSeed as any)
 
     const wsReplay = createMockWs()
     await broker.attach(wsReplay as any, 'term-overflow', 'viewport_hydrate', 80, 24, 1)
@@ -655,6 +2014,28 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
       payload.droppedBytes > 0 &&
       level === 'warn',
     )).toBe(true)
+    expect(structuredLogs('warn', 'terminal.replay.gap')
+      .filter((payload) => (
+        payload.terminalId === 'term-overflow'
+        && payload.reason === 'queue_overflow'
+      ))).toHaveLength(0)
+    expect(structuredLogs('warn', 'terminal.output.gap')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event: 'terminal.output.gap',
+          severity: 'warn',
+          terminalId: 'term-overflow',
+          source: 'live',
+          reason: 'queue_overflow',
+          fromSeq: expect.any(Number),
+          toSeq: expect.any(Number),
+          streamId: expect.any(String),
+          queueDepth: expect.any(Number),
+          droppedBytes: expect.any(Number),
+          droppedSerializedApplicationJsonBytes: expect.any(Number),
+        }),
+      ]),
+    )
 
     broker.close()
   })
@@ -691,7 +2072,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
-  it('enforces a larger replay floor for coding-cli terminals to reduce history loss on attach', async () => {
+  it('enforces the 32 MiB replay floor for coding-cli terminals to reduce history loss on attach', async () => {
     const registry = new FakeBrokerRegistry()
     registry.setReplayRingMaxBytes(8)
     const perfSpy = vi.fn()
@@ -700,6 +2081,9 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
 
     const wsSeed = createMockWs()
     await broker.attach(wsSeed as any, 'term-coding-floor', 'viewport_hydrate', 80, 24, 0)
+    const terminalState = (broker as any).terminals.get('term-coding-floor')
+    expect(terminalState?.replayRing.retentionMaxBytes()).toBe(32 * 1024 * 1024)
+
     registry.emit('terminal.output.raw', {
       terminalId: 'term-coding-floor',
       data: 'x'.repeat(96 * 1024),

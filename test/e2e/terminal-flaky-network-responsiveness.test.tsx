@@ -238,6 +238,7 @@ describe('terminal flaky-network responsiveness (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.attach.ready',
       terminalId: 'term-flaky',
+      streamId: 'stream-flaky-gap',
       headSeq: 3,
       replayFromSeq: 1,
       replayToSeq: 3,
@@ -245,6 +246,7 @@ describe('terminal flaky-network responsiveness (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.output.gap',
       terminalId: 'term-flaky',
+      streamId: 'stream-flaky-gap',
       fromSeq: 4,
       toSeq: 8,
       reason: 'queue_overflow',
@@ -252,6 +254,7 @@ describe('terminal flaky-network responsiveness (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.output',
       terminalId: 'term-flaky',
+      streamId: 'stream-flaky-gap',
       seqStart: 9,
       seqEnd: 9,
       data: 'after-gap',
@@ -259,8 +262,8 @@ describe('terminal flaky-network responsiveness (e2e)', () => {
 
     flushRafQueue(rafCallbacks)
 
-    expect(terminalInstances[0].writeln).toHaveBeenCalledWith(expect.stringContaining('[Output gap 4-8'))
-    expect(terminalInstances[0].write).toHaveBeenCalled()
+    const writes = terminalInstances[0].write.mock.calls.map(([data]) => String(data))
+    expect(writes.some((line) => line.includes('[Output gap 4-8'))).toBe(true)
     await waitFor(() => {
       expect(screen.queryByText('Recovering terminal output...')).not.toBeInTheDocument()
     })
@@ -301,6 +304,7 @@ describe('terminal flaky-network responsiveness (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.attach.ready',
       terminalId: 'term-flaky',
+      streamId: 'stream-flaky-replay',
       headSeq: 9,
       replayFromSeq: 7,
       replayToSeq: 9,
@@ -308,6 +312,7 @@ describe('terminal flaky-network responsiveness (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.output',
       terminalId: 'term-flaky',
+      streamId: 'stream-flaky-replay',
       seqStart: 7,
       seqEnd: 7,
       data: 'replay-7',
@@ -315,6 +320,7 @@ describe('terminal flaky-network responsiveness (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.output',
       terminalId: 'term-flaky',
+      streamId: 'stream-flaky-replay',
       seqStart: 8,
       seqEnd: 8,
       data: 'replay-8',
@@ -322,6 +328,7 @@ describe('terminal flaky-network responsiveness (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.output',
       terminalId: 'term-flaky',
+      streamId: 'stream-flaky-replay',
       seqStart: 9,
       seqEnd: 9,
       data: 'replay-9',
@@ -329,6 +336,7 @@ describe('terminal flaky-network responsiveness (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.output',
       terminalId: 'term-flaky',
+      streamId: 'stream-flaky-replay',
       seqStart: 10,
       seqEnd: 10,
       data: 'live-10',

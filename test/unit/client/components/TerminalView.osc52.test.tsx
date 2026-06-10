@@ -85,18 +85,34 @@ vi.mock('lucide-react', () => ({
 
 const terminalInstances: any[] = []
 const latestAttachRequestIdByTerminal = new Map<string, string>()
+const latestStreamIdByTerminal = new Map<string, string>()
 const ioEvents: Array<{ kind: 'send' | 'write', type?: string, data: string }> = []
 
 function withCurrentAttachRequestId(msg: any) {
   if (
-    msg?.attachRequestId
-    || typeof msg?.terminalId !== 'string'
+    typeof msg?.terminalId !== 'string'
     || (msg?.type !== 'terminal.attach.ready' && msg?.type !== 'terminal.output' && msg?.type !== 'terminal.output.gap')
   ) {
     return msg
   }
-  const attachRequestId = latestAttachRequestIdByTerminal.get(msg.terminalId)
-  return attachRequestId ? { ...msg, attachRequestId } : msg
+  let next = msg
+  if (!next.attachRequestId) {
+    const attachRequestId = latestAttachRequestIdByTerminal.get(msg.terminalId)
+    if (attachRequestId) next = { ...next, attachRequestId }
+  }
+  if (msg.type === 'terminal.attach.ready') {
+    const streamId = typeof next.streamId === 'string' && next.streamId.length > 0
+      ? next.streamId
+      : `test-stream:${msg.terminalId}`
+    latestStreamIdByTerminal.set(msg.terminalId, streamId)
+    next = { ...next, streamId }
+  } else {
+    const streamId = typeof next.streamId === 'string' && next.streamId.length > 0
+      ? next.streamId
+      : latestStreamIdByTerminal.get(msg.terminalId)
+    if (streamId) next = { ...next, streamId }
+  }
+  return next
 }
 
 vi.mock('@xterm/xterm', () => {
@@ -217,6 +233,7 @@ describe('TerminalView OSC52 policy handling', () => {
   beforeEach(() => {
     terminalInstances.length = 0
     latestAttachRequestIdByTerminal.clear()
+    latestStreamIdByTerminal.clear()
     ioEvents.length = 0
     wsMocks.send.mockClear()
     wsMocks.send.mockImplementation((msg: any) => {
@@ -402,6 +419,59 @@ describe('TerminalView OSC52 policy handling', () => {
     })
     expect(clipboardMocks.copyText).not.toHaveBeenCalled()
     expect(screen.queryByRole('dialog', { name: 'Clipboard access request' })).not.toBeInTheDocument()
+  })
+
+  it('allows live startup replies and OSC52 writes while an earlier replay write callback is still pending', async () => {
+    const { terminalId } = await renderView('always')
+    clipboardMocks.copyText.mockClear()
+    wsMocks.send.mockClear()
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId,
+        headSeq: 2,
+        replayFromSeq: 1,
+        replayToSeq: 1,
+      })
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: 1,
+        seqEnd: 1,
+        data: 'pending replay write',
+      })
+    })
+
+    await waitFor(() => {
+      expect(writeEvents().map((event) => event.data)).toContain('pending replay write')
+    })
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: 2,
+        seqEnd: 2,
+        data: OPEN_CODE_STARTUP_PROBE_FRAME,
+      })
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: 3,
+        seqEnd: 3,
+        data: `live${OSC52_COPY}`,
+      })
+    })
+
+    expect(wsMocks.send.mock.calls.map(([msg]) => msg).filter((msg) => msg?.type === 'terminal.input')).toEqual(
+      OPEN_CODE_STARTUP_EXPECTED_REPLIES.map((data) => ({
+        type: 'terminal.input',
+        terminalId,
+        data,
+      })),
+    )
+    expect(clipboardMocks.copyText).toHaveBeenCalledWith('copy')
   })
 
   it('ask + Yes copies once and keeps ask policy', async () => {

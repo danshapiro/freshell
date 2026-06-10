@@ -27,8 +27,9 @@ async function main(): Promise<void> {
     if (!result.ok) {
       process.exitCode = 1
     }
-  } catch {
-    writeResult({ ok: false, violations: [] })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    writeResult({ ok: false, validationErrors: [message], violations: [] })
     process.exitCode = 1
   }
 }

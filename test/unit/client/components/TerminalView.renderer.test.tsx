@@ -92,17 +92,33 @@ vi.mock('@/components/terminal/terminal-runtime', () => ({
 const terminalInstances: any[] = []
 let messageHandler: ((msg: any) => void) | null = null
 const latestAttachRequestIdByTerminal = new Map<string, string>()
+const latestStreamIdByTerminal = new Map<string, string>()
 
 function withCurrentAttachRequestId(msg: any) {
   if (
-    msg?.attachRequestId
-    || typeof msg?.terminalId !== 'string'
+    typeof msg?.terminalId !== 'string'
     || (msg?.type !== 'terminal.attach.ready' && msg?.type !== 'terminal.output' && msg?.type !== 'terminal.output.gap')
   ) {
     return msg
   }
-  const attachRequestId = latestAttachRequestIdByTerminal.get(msg.terminalId)
-  return attachRequestId ? { ...msg, attachRequestId } : msg
+  let next = msg
+  if (!next.attachRequestId) {
+    const attachRequestId = latestAttachRequestIdByTerminal.get(msg.terminalId)
+    if (attachRequestId) next = { ...next, attachRequestId }
+  }
+  if (msg.type === 'terminal.attach.ready') {
+    const streamId = typeof next.streamId === 'string' && next.streamId.length > 0
+      ? next.streamId
+      : `test-stream:${msg.terminalId}`
+    latestStreamIdByTerminal.set(msg.terminalId, streamId)
+    next = { ...next, streamId }
+  } else {
+    const streamId = typeof next.streamId === 'string' && next.streamId.length > 0
+      ? next.streamId
+      : latestStreamIdByTerminal.get(msg.terminalId)
+    if (streamId) next = { ...next, streamId }
+  }
+  return next
 }
 
 vi.mock('@xterm/xterm', () => {
@@ -218,6 +234,7 @@ describe('TerminalView renderer mode', () => {
   beforeEach(() => {
     terminalInstances.length = 0
     latestAttachRequestIdByTerminal.clear()
+    latestStreamIdByTerminal.clear()
     runtimeMockState.throwOnAttach = false
     runtimeMockState.lastEnableWebgl = null
     runtimeMockState.lastRuntime = null

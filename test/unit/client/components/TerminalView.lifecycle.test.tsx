@@ -5,7 +5,7 @@ import { Provider } from 'react-redux'
 import tabsReducer, { setActiveTab } from '@/store/tabsSlice'
 import panesReducer, { requestPaneRefresh } from '@/store/panesSlice'
 import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/settingsSlice'
-import connectionReducer from '@/store/connectionSlice'
+import connectionReducer, { setStatus as setConnectionStatus } from '@/store/connectionSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import { persistMiddleware, resetPersistedLayoutCacheForTests, resetPersistFlushListenersForTests } from '@/store/persistMiddleware'
@@ -14,7 +14,11 @@ import { LAYOUT_STORAGE_KEY } from '@/store/storage-keys'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { useAppSelector } from '@/store/hooks'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
-import { __resetTerminalCursorCacheForTests } from '@/lib/terminal-cursor'
+import {
+  __resetTerminalCursorCacheForTests,
+  loadTerminalSurfaceCheckpoint,
+  saveTerminalSurfaceCheckpoint,
+} from '@/lib/terminal-cursor'
 import { resetHydrationQueueForTests } from '@/lib/hydration-queue'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { TERMINAL_CURSOR_STORAGE_KEY } from '@/store/storage-keys'
@@ -72,6 +76,7 @@ vi.mock('lucide-react', () => ({
 
 const terminalInstances: any[] = []
 const latestAttachRequestIdByTerminal = new Map<string, string>()
+const latestStreamIdByTerminal = new Map<string, string>()
 
 vi.mock('@xterm/xterm', () => {
   class MockTerminal {
@@ -249,17 +254,60 @@ function createSettingsState(overrides: Record<string, unknown> = {}) {
   }
 }
 
+function terminalWriteStrings(term: { write: { mock: { calls: Array<[unknown]> } } }): string[] {
+  return term.write.mock.calls.map(([data]) => String(data))
+}
+
+function expectTerminalWriteContaining(term: { write: { mock: { calls: Array<[unknown]> } } }, text: string) {
+  expect(terminalWriteStrings(term).some((entry) => entry.includes(text))).toBe(true)
+}
+
 function withCurrentAttachRequestId<T extends { type?: string; terminalId?: string; attachRequestId?: string }>(
-  msg: T & { __preserveMissingAttachRequestId?: boolean },
+  msg: T & { __preserveMissingAttachRequestId?: boolean; __preserveMissingStreamId?: boolean },
 ): T {
-  if (msg.__preserveMissingAttachRequestId) return msg
-  if (msg.attachRequestId || typeof msg.terminalId !== 'string') return msg
-  if (msg.type !== 'terminal.attach.ready' && msg.type !== 'terminal.output' && msg.type !== 'terminal.output.gap') {
+  const isStreamPayload = msg.type === 'terminal.attach.ready'
+    || msg.type === 'terminal.stream.changed'
+    || msg.type === 'terminal.output'
+    || msg.type === 'terminal.output.batch'
+    || msg.type === 'terminal.output.gap'
+  if (!isStreamPayload || typeof msg.terminalId !== 'string') {
     return msg
   }
-  const attachRequestId = latestAttachRequestIdForTerminal(msg.terminalId)
-  if (!attachRequestId) return msg
-  return { ...msg, attachRequestId }
+
+  let next: T & { __preserveMissingAttachRequestId?: boolean; __preserveMissingStreamId?: boolean } = msg
+  if (!msg.__preserveMissingAttachRequestId && !msg.attachRequestId) {
+    const attachRequestId = latestAttachRequestIdForTerminal(msg.terminalId)
+    if (attachRequestId) {
+      next = { ...next, attachRequestId }
+    }
+  }
+
+  if (!msg.__preserveMissingStreamId) {
+    if (msg.type === 'terminal.attach.ready') {
+      const streamId = typeof (next as { streamId?: unknown }).streamId === 'string'
+        ? (next as { streamId: string }).streamId
+        : (latestStreamIdByTerminal.get(msg.terminalId) ?? `test-stream:${msg.terminalId}`)
+      next = { ...next, streamId } as typeof next
+      latestStreamIdByTerminal.set(msg.terminalId, streamId)
+    } else if (msg.type === 'terminal.output' || msg.type === 'terminal.output.batch' || msg.type === 'terminal.output.gap') {
+      const messageStreamId = (next as { streamId?: unknown }).streamId
+      const streamId = typeof messageStreamId === 'string' && messageStreamId.length > 0
+        ? messageStreamId
+        : latestStreamIdByTerminal.get(msg.terminalId)
+      if (streamId) {
+        next = { ...next, streamId } as typeof next
+      }
+    }
+  }
+
+  if (msg.type === 'terminal.stream.changed') {
+    const streamId = (next as { streamId?: unknown }).streamId
+    if (typeof streamId === 'string' && streamId.length > 0) {
+      latestStreamIdByTerminal.set(msg.terminalId, streamId)
+    }
+  }
+
+  return next
 }
 
 function sentMessages() {
@@ -280,6 +328,7 @@ describe('TerminalView lifecycle updates', () => {
     resetPersistedLayoutCacheForTests()
     resetPersistFlushListenersForTests()
     latestAttachRequestIdByTerminal.clear()
+    latestStreamIdByTerminal.clear()
     wsMocks.send.mockClear()
     wsMocks.send.mockImplementation((msg: any) => {
       if (
@@ -2455,8 +2504,8 @@ describe('TerminalView lifecycle updates', () => {
 
     const tab = store.getState().tabs.tabs.find((entry) => entry.id === tabId)
     expect(tab?.status).toBe('error')
-    expect(term.writeln).toHaveBeenCalledWith(expect.stringContaining('[Restore failed]'))
-    expect(term.writeln).toHaveBeenCalledWith(expect.stringContaining('execvp(3) failed.: No such file or directory'))
+    expectTerminalWriteContaining(term, '[Restore failed]')
+    expectTerminalWriteContaining(term, 'execvp(3) failed.: No such file or directory')
   })
 
   it('marks startup exit before first attach as a launch failure', async () => {
@@ -2542,9 +2591,7 @@ describe('TerminalView lifecycle updates', () => {
 
     expect(wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create')).toHaveLength(0)
     expect(store.getState().tabs.tabs.find((entry) => entry.id === tabId)?.status).toBe('error')
-    expect(term.writeln).toHaveBeenCalledWith(
-      expect.stringContaining('[Launch failed] The terminal exited before it finished starting (exit 2).'),
-    )
+    expectTerminalWriteContaining(term, '[Launch failed] The terminal exited before it finished starting (exit 2).')
   })
 
   it('marks restored terminal.create requests', async () => {
@@ -2782,8 +2829,7 @@ describe('TerminalView lifecycle updates', () => {
 
     // Verify user-facing feedback was shown
     const term = terminalInstances[0]
-    const writelnCalls = term.writeln.mock.calls.map(([s]: [string]) => s)
-    expect(writelnCalls.some((s: string) => s.includes('Terminal exited'))).toBe(true)
+    expectTerminalWriteContaining(term, 'Terminal exited')
   })
 
   it('shows feedback when Codex input is blocked by the restore identity gate', async () => {
@@ -2813,9 +2859,7 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     const term = terminalInstances[0]
-    expect(term.writeln).toHaveBeenCalledWith(
-      expect.stringContaining('Input not sent: Codex is still saving restore state. Try again in a moment.'),
-    )
+    expectTerminalWriteContaining(term, 'Input not sent: Codex is still saving restore state. Try again in a moment.')
   })
 
   it('shows feedback when Codex input is blocked by lifecycle-loss proof', async () => {
@@ -2845,9 +2889,7 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     const term = terminalInstances[0]
-    expect(term.writeln).toHaveBeenCalledWith(
-      expect.stringContaining('Input not sent: Codex is resolving a worker disconnect. Try again in a moment.'),
-    )
+    expectTerminalWriteContaining(term, 'Input not sent: Codex is resolving a worker disconnect. Try again in a moment.')
   })
 
   it('shows feedback when Codex input is blocked by clean-exit state resolution', async () => {
@@ -2877,9 +2919,7 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     const term = terminalInstances[0]
-    expect(term.writeln).toHaveBeenCalledWith(
-      expect.stringContaining('Input not sent: Codex is checking whether the session is still active. Try again in a moment.'),
-    )
+    expectTerminalWriteContaining(term, 'Input not sent: Codex is checking whether the session is still active. Try again in a moment.')
   })
 
   it('mirrors canonical durable identity to pane and tab on terminal.session.associated', async () => {
@@ -3497,6 +3537,8 @@ describe('TerminalView lifecycle updates', () => {
       ackInitialAttach?: boolean
       refreshOnMount?: boolean
       sessionRef?: TerminalPaneContent['sessionRef']
+      serverInstanceId?: string
+      streamId?: string
     }) {
       const tabId = 'tab-v2-stream'
       const paneId = 'pane-v2-stream'
@@ -3504,6 +3546,9 @@ describe('TerminalView lifecycle updates', () => {
       const initialStatus = opts?.status ?? 'running'
       const terminalId = opts?.terminalId
       const mode = opts?.mode ?? 'shell'
+      if (terminalId && opts?.streamId) {
+        latestStreamIdByTerminal.set(terminalId, opts.streamId)
+      }
 
       const paneContent: TerminalPaneContent = {
         kind: 'terminal',
@@ -3513,6 +3558,7 @@ describe('TerminalView lifecycle updates', () => {
         shell: 'system',
         ...(terminalId ? { terminalId } : {}),
         ...(opts?.sessionRef ? { sessionRef: opts.sessionRef } : {}),
+        ...(opts?.streamId ? { streamId: opts.streamId } : {}),
       }
 
       const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
@@ -3559,7 +3605,7 @@ describe('TerminalView lifecycle updates', () => {
               : {},
           },
           settings: createSettingsState(),
-          connection: { status: 'connected', error: null },
+          connection: { status: 'connected', error: null, serverInstanceId: opts?.serverInstanceId ?? 'srv-v2-stream' },
         },
       })
 
@@ -3813,7 +3859,7 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
-    it('reconnect and future creates stay on the explicit attach lifecycle', async () => {
+    it('reconnect without a parser-applied checkpoint stays on the explicit hydrate lifecycle', async () => {
       const first = await renderTerminalHarness({
         status: 'creating',
         hidden: false,
@@ -3848,7 +3894,8 @@ describe('TerminalView lifecycle updates', () => {
         terminalId: 'term-latched-1',
         cols: expect.any(Number),
         rows: expect.any(Number),
-        intent: 'transport_reconnect',
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
       }))
 
       first.unmount()
@@ -3929,6 +3976,8 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     it('drops stale and untagged terminal.output from non-current attach generations', async () => {
+      const bridge = createPerfAuditBridge()
+      installPerfAuditBridge(bridge)
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',
         terminalId: 'term-attach-gen',
@@ -3950,35 +3999,2819 @@ describe('TerminalView lifecycle updates', () => {
       expect(secondAttach?.attachRequestId).toBeTruthy()
       expect(secondAttach?.attachRequestId).not.toBe(firstAttach?.attachRequestId)
 
-      messageHandler!({
-        type: 'terminal.output',
-        terminalId,
-        seqStart: 1,
-        seqEnd: 1,
-        data: 'STALE',
-        attachRequestId: firstAttach!.attachRequestId,
-      } as any)
-      messageHandler!({
-        type: 'terminal.output',
-        terminalId,
-        seqStart: 2,
-        seqEnd: 2,
-        data: 'FRESH',
-        attachRequestId: secondAttach!.attachRequestId,
-      } as any)
-      messageHandler!({
-        type: 'terminal.output',
-        terminalId,
-        seqStart: 3,
-        seqEnd: 3,
-        data: 'UNTAGGED',
-        __preserveMissingAttachRequestId: true,
-      } as any)
+      let now = 200
+      const performanceNowSpy = vi.spyOn(performance, 'now').mockImplementation(() => {
+        now += 0.01
+        return now
+      })
+      try {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'STALE',
+          attachRequestId: firstAttach!.attachRequestId,
+        } as any)
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'FRESH',
+          attachRequestId: secondAttach!.attachRequestId,
+        } as any)
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 3,
+          seqEnd: 3,
+          data: 'UNTAGGED',
+          __preserveMissingAttachRequestId: true,
+        } as any)
+      } finally {
+        performanceNowSpy.mockRestore()
+      }
 
       const writes = term.write.mock.calls.map(([d]) => String(d)).join('')
       expect(writes).toContain('FRESH')
       expect(writes).not.toContain('STALE')
       expect(writes).not.toContain('UNTAGGED')
+      const staleRejectedEvents = bridge.snapshot().perfEvents
+        .filter((event) => event.event === 'terminal.attach_generation_stale_rejected')
+      expect(staleRejectedEvents).toHaveLength(2)
+      expect(staleRejectedEvents[0]).toEqual(expect.objectContaining({
+        event: 'terminal.attach_generation_stale_rejected',
+        timestamp: expect.any(Number),
+        terminalId,
+        messageType: 'terminal.output',
+        attachRequestId: firstAttach!.attachRequestId,
+        activeAttachRequestId: secondAttach!.attachRequestId,
+        reason: 'stale_attach_request_id',
+      }))
+      expect(staleRejectedEvents[1]).toEqual(expect.objectContaining({
+        event: 'terminal.attach_generation_stale_rejected',
+        timestamp: expect.any(Number),
+        terminalId,
+        messageType: 'terminal.output',
+        activeAttachRequestId: secondAttach!.attachRequestId,
+        reason: 'missing_attach_request_id',
+      }))
+      expect(staleRejectedEvents[1]).not.toHaveProperty('attachRequestId')
+      expect(Number(staleRejectedEvents[0].timestamp)).toBeLessThan(Number(staleRejectedEvents[1].timestamp))
+      expect(bridge.snapshot().metadata['terminal.attach_generation_stale_rejected']).toBeUndefined()
+      expect(bridge.snapshot().milestones['terminal.attach_generation_stale_rejected']).toBeUndefined()
+    })
+
+    it('persists attach-ready stream id into pane content and checkpoint identity', async () => {
+      const { store, tabId, terminalId } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-attach-stream-checkpoint',
+        serverInstanceId: 'server-attach-stream',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-from-ready',
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-from-ready',
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'checkpointed on stream',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      const layout = store.getState().panes.layouts[tabId]
+      expect(layout.type).toBe('leaf')
+      expect(layout.content.kind).toBe('terminal')
+      expect(layout.content.streamId).toBe('stream-from-ready')
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-from-ready',
+        serverInstanceId: 'server-attach-stream',
+      })?.parserAppliedSeq).toBe(1)
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: null,
+        serverInstanceId: 'server-attach-stream',
+      })).toBeNull()
+    })
+
+    it('accepts live output after a terminal.stream.changed control message without trusting the old stream', async () => {
+      const { store, tabId, terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-active-stream-change-client',
+        serverInstanceId: 'server-active-stream-change',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-before-change',
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-before-change',
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'BEFORE STREAM CHANGE',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-before-change',
+        serverInstanceId: 'server-active-stream-change',
+      })?.parserAppliedSeq).toBe(1)
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.stream.changed',
+          terminalId,
+          streamId: 'stream-after-change',
+          reason: 'codex_pty_recovery',
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-after-change',
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'AFTER STREAM CHANGE',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      const writes = terminalWriteStrings(term).join('')
+      expect(writes).toContain('BEFORE STREAM CHANGE')
+      expect(writes).toContain('AFTER STREAM CHANGE')
+
+      const layout = store.getState().panes.layouts[tabId]
+      expect(layout.type).toBe('leaf')
+      expect(layout.content.kind).toBe('terminal')
+      expect(layout.content.streamId).toBe('stream-after-change')
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-before-change',
+        serverInstanceId: 'server-active-stream-change',
+      })).toBeNull()
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-after-change',
+        serverInstanceId: 'server-active-stream-change',
+      })?.parserAppliedSeq).toBe(2)
+    })
+
+    it('treats mismatched replay after a stream change as a completing lost range', async () => {
+      const { store, terminalId, term, queryByText } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-stale-replay-stream-change-client',
+        serverInstanceId: 'server-stale-replay-stream-change',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+      act(() => {
+        store.dispatch(setConnectionStatus('ready'))
+      })
+
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-before-change',
+          headSeq: 0,
+          replayFromSeq: 1,
+          replayToSeq: 0,
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+      const replayAttach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(replayAttach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-before-change',
+          headSeq: 2,
+          replayFromSeq: 1,
+          replayToSeq: 2,
+          attachRequestId: replayAttach!.attachRequestId,
+        })
+      })
+      expect(queryByText('Recovering terminal output...')).not.toBeNull()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.stream.changed',
+          terminalId,
+          streamId: 'stream-after-change',
+          reason: 'codex_pty_recovery',
+          attachRequestId: replayAttach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-before-change',
+          seqStart: 1,
+          seqEnd: 2,
+          data: 'STALE REPLAY SHOULD NOT RENDER',
+          attachRequestId: replayAttach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-after-change',
+          seqStart: 3,
+          seqEnd: 3,
+          data: 'LIVE AFTER STREAM CHANGE',
+          attachRequestId: replayAttach!.attachRequestId,
+        })
+      })
+
+      const writes = terminalWriteStrings(term).join('')
+      expect(writes).not.toContain('STALE REPLAY SHOULD NOT RENDER')
+      expect(writes).toContain('LIVE AFTER STREAM CHANGE')
+      expect(queryByText('Recovering terminal output...')).toBeNull()
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-after-change',
+        serverInstanceId: 'server-stale-replay-stream-change',
+      })).toBeNull()
+    })
+
+    it('rejects a warm-delta attach when attach-ready reports a different stream id', async () => {
+      const bridge = createPerfAuditBridge()
+      installPerfAuditBridge(bridge)
+      const { store, tabId, terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-stream-rotation-client',
+        serverInstanceId: 'server-stream-rotation',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const initialAttach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(initialAttach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-before-rotation',
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId: initialAttach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-before-rotation',
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'before rotation',
+          attachRequestId: initialAttach!.attachRequestId,
+        })
+      })
+
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-before-rotation',
+        serverInstanceId: 'server-stream-rotation',
+      })?.parserAppliedSeq).toBe(1)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+      const warmDeltaAttach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(warmDeltaAttach).toMatchObject({
+        intent: 'transport_reconnect',
+        sinceSeq: 1,
+      })
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-after-rotation',
+          headSeq: 1,
+          replayFromSeq: 2,
+          replayToSeq: 1,
+          attachRequestId: warmDeltaAttach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-after-rotation',
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'STREAM B SHOULD NOT RENDER ON STREAM A SURFACE',
+          attachRequestId: warmDeltaAttach!.attachRequestId,
+        })
+      })
+
+      const layout = store.getState().panes.layouts[tabId]
+      expect(layout.type).toBe('leaf')
+      expect(layout.content.kind).toBe('terminal')
+      expect(layout.content.streamId).toBeUndefined()
+      expect(terminalWriteStrings(term).join('')).not.toContain('STREAM B SHOULD NOT RENDER')
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-after-rotation',
+        serverInstanceId: 'server-stream-rotation',
+      })).toBeNull()
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
+      const repairAttach = sentMessages()
+        .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+        .at(-1)
+      expect(repairAttach?.attachRequestId).not.toBe(warmDeltaAttach!.attachRequestId)
+      const fallbackEvents = bridge.snapshot().perfEvents
+        .filter((event) => event.event === 'terminal.catchup.full_hydrate_fallback')
+      expect(fallbackEvents).toEqual([
+        expect.objectContaining({
+          event: 'terminal.catchup.full_hydrate_fallback',
+          timestamp: expect.any(Number),
+          terminalId,
+          attachRequestId: warmDeltaAttach!.attachRequestId,
+          reason: 'stream_identity_changed',
+          expectedStreamId: 'stream-before-rotation',
+          streamId: 'stream-after-rotation',
+          sinceSeq: 1,
+        }),
+      ])
+      expect(bridge.snapshot().milestones['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
+      expect(bridge.snapshot().metadata['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
+    })
+
+    it('rejects a warm-delta attach when attach-ready reports unknown geometry authority', async () => {
+      const bridge = createPerfAuditBridge()
+      installPerfAuditBridge(bridge)
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-geometry-authority-client',
+        serverInstanceId: 'server-geometry-authority',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const initialAttach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(initialAttach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-geometry',
+          geometryEpoch: 1,
+          geometryAuthority: 'single_client',
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId: initialAttach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-geometry',
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'before geometry conflict',
+          attachRequestId: initialAttach!.attachRequestId,
+        })
+      })
+
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-geometry',
+        serverInstanceId: 'server-geometry-authority',
+      })?.parserAppliedSeq).toBe(1)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+      const warmDeltaAttach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(warmDeltaAttach).toMatchObject({
+        intent: 'transport_reconnect',
+        sinceSeq: 1,
+      })
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-geometry',
+          geometryEpoch: 2,
+          geometryAuthority: 'multi_client_unknown',
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId: warmDeltaAttach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-geometry',
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'GEOMETRY DELTA SHOULD NOT RENDER',
+          attachRequestId: warmDeltaAttach!.attachRequestId,
+        })
+      })
+
+      expect(terminalWriteStrings(term).join('')).not.toContain('GEOMETRY DELTA SHOULD NOT RENDER')
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
+      const repairAttach = sentMessages()
+        .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+        .at(-1)
+      expect(repairAttach?.attachRequestId).not.toBe(warmDeltaAttach!.attachRequestId)
+      const fallbackEvents = bridge.snapshot().perfEvents
+        .filter((event) => event.event === 'terminal.catchup.full_hydrate_fallback')
+      expect(fallbackEvents).toEqual([
+        expect.objectContaining({
+          event: 'terminal.catchup.full_hydrate_fallback',
+          timestamp: expect.any(Number),
+          terminalId,
+          attachRequestId: warmDeltaAttach!.attachRequestId,
+          reason: 'geometry_authority_unknown',
+          geometryAuthority: 'multi_client_unknown',
+          geometryEpoch: 2,
+          expectedGeometryAuthority: 'single_client',
+          expectedGeometryEpoch: 1,
+          sinceSeq: 1,
+        }),
+      ])
+      expect(bridge.snapshot().milestones['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
+      expect(bridge.snapshot().metadata['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
+    })
+
+    it('does not render or checkpoint terminal.output from a mismatched stream id', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-stream-mismatch-client',
+        serverInstanceId: 'server-stream-mismatch',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-active',
+          headSeq: 0,
+          replayFromSeq: 1,
+          replayToSeq: 0,
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-stale',
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'STALE STREAM',
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-active',
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'ACTIVE STREAM',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      const writes = term.write.mock.calls.map(([data]) => String(data)).join('')
+      expect(writes).not.toContain('STALE STREAM')
+      expect(writes).toContain('ACTIVE STREAM')
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-active',
+        serverInstanceId: 'server-stream-mismatch',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
+    })
+
+    it('writes a homogeneous terminal.output.batch once and advances the parser-applied cursor after acknowledgement', async () => {
+      const bridge = createPerfAuditBridge()
+      installPerfAuditBridge(bridge)
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-combined',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+      expect(attachRequestId).toBeTruthy()
+      expect(streamId).toBeTruthy()
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'live',
+          seqStart: 1,
+          seqEnd: 3,
+          data: 'abc',
+          serializedBytes: 256,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, rawFrameCount: 1 },
+            { seqStart: 2, seqEnd: 2, endOffset: 2, rawFrameCount: 1 },
+            { seqStart: 3, seqEnd: 3, endOffset: 3, rawFrameCount: 1 },
+          ],
+        })
+      })
+
+      expect(terminalWriteStrings(term)).toContain('abc')
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 3,
+      }))
+      const parserAppliedEvents = bridge.snapshot().perfEvents
+        .filter((event) => event.event === 'terminal.parser_applied')
+      expect(parserAppliedEvents).toEqual([
+        expect.objectContaining({
+          event: 'terminal.parser_applied',
+          timestamp: expect.any(Number),
+          terminalId,
+          attachRequestId,
+          parserAppliedSeq: 3,
+          previousParserAppliedSeq: 0,
+          surfaceQuarantined: false,
+        }),
+      ])
+      expect(bridge.snapshot().milestones['terminal.parser_applied']).toBeUndefined()
+    })
+
+    it('records each parser-applied acknowledgement as a separate audit event', async () => {
+      const bridge = createPerfAuditBridge()
+      installPerfAuditBridge(bridge)
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-parser-applied-events',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+      expect(attachRequestId).toBeTruthy()
+      expect(streamId).toBeTruthy()
+
+      term.write.mockClear()
+      let now = 100
+      const performanceNowSpy = vi.spyOn(performance, 'now').mockImplementation(() => {
+        now += 0.01
+        return now
+      })
+      try {
+        act(() => {
+          messageHandler!({
+            type: 'terminal.output',
+            terminalId,
+            streamId,
+            attachRequestId,
+            seqStart: 1,
+            seqEnd: 1,
+            data: 'first parser applied',
+          })
+          messageHandler!({
+            type: 'terminal.output',
+            terminalId,
+            streamId,
+            attachRequestId,
+            seqStart: 2,
+            seqEnd: 2,
+            data: 'second parser applied',
+          })
+        })
+
+        const parserAppliedEvents = bridge.snapshot().perfEvents
+          .filter((event) => event.event === 'terminal.parser_applied')
+        expect(parserAppliedEvents).toHaveLength(2)
+        expect(parserAppliedEvents[0]).toEqual(expect.objectContaining({
+          timestamp: expect.any(Number),
+          terminalId,
+          attachRequestId,
+          streamId,
+          parserAppliedSeq: 1,
+          previousParserAppliedSeq: 0,
+        }))
+        expect(parserAppliedEvents[1]).toEqual(expect.objectContaining({
+          timestamp: expect.any(Number),
+          terminalId,
+          attachRequestId,
+          streamId,
+          parserAppliedSeq: 2,
+          previousParserAppliedSeq: 1,
+        }))
+        expect(Number(parserAppliedEvents[0].timestamp)).toBeLessThan(Number(parserAppliedEvents[1].timestamp))
+        expect(bridge.snapshot().metadata['terminal.parser_applied']).toBeUndefined()
+      } finally {
+        performanceNowSpy.mockRestore()
+      }
+    })
+
+    it('rejects an overlapping terminal.output.batch before writing partial bytes', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-overlap',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'already-rendered',
+        })
+      })
+      expect(terminalWriteStrings(term)).toContain('already-rendered')
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'live',
+          seqStart: 1,
+          seqEnd: 2,
+          data: 'ab',
+          serializedBytes: 256,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, rawFrameCount: 1 },
+            { seqStart: 2, seqEnd: 2, endOffset: 2, rawFrameCount: 1 },
+          ],
+        })
+      })
+
+      expect(term.write).not.toHaveBeenCalled()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'accepted-after-reject',
+        })
+      })
+      expect(terminalWriteStrings(term)).toContain('accepted-after-reject')
+    })
+
+    it('rejects terminal.output.batch with non-contiguous segment ranges before writing', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-hole',
+        serverInstanceId: 'server-output-batch-hole',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'live',
+          seqStart: 1,
+          seqEnd: 3,
+          data: 'ac',
+          serializedBytes: 256,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, rawFrameCount: 1 },
+            { seqStart: 3, seqEnd: 3, endOffset: 2, rawFrameCount: 1 },
+          ],
+        })
+      })
+
+      expect(term.write).not.toHaveBeenCalled()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 4,
+          seqEnd: 4,
+          data: 'accepted-after-hole',
+        })
+      })
+      expect(terminalWriteStrings(term)).toContain('accepted-after-hole')
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-hole',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      }))
+    })
+
+    it('rejects terminal.output.batch with malformed fields before writing or checkpointing', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-malformed-numbers',
+        serverInstanceId: 'server-output-batch-malformed-numbers',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+      expect(attachRequestId).toBeTruthy()
+      expect(streamId).toBeTruthy()
+
+      const validSegment = { seqStart: 1, seqEnd: 1, endOffset: 1, rawFrameCount: 1 }
+      const malformedBatches: Array<Record<string, unknown>> = [
+        { seqStart: '1', seqEnd: 1, segments: [validSegment] },
+        { seqStart: 1, seqEnd: null, segments: [validSegment] },
+        { seqStart: 1, seqEnd: 1, serializedBytes: '128', segments: [validSegment] },
+        { seqStart: 1, seqEnd: 1, serializedBytes: null, segments: [validSegment] },
+        { seqStart: 1, seqEnd: 1, serializedBytes: -1, segments: [validSegment] },
+        { seqStart: 1, seqEnd: 1, serializedBytes: 128.5, segments: [validSegment] },
+        { seqStart: 1, seqEnd: 1, data: null, segments: [{ seqStart: 1, seqEnd: 1, endOffset: 0, rawFrameCount: 1 }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, seqStart: '1' }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, seqEnd: null }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, endOffset: true }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, endOffset: Number.POSITIVE_INFINITY }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, rawFrameCount: '1' }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, rawFrameCount: null }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, rawFrameCount: 0 }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, rawFrameCount: -1 }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, rawFrameCount: 1.5 }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, rawFrameCount: 2 }] },
+        { seqStart: 1, seqEnd: 2, segments: [{ seqStart: 1, seqEnd: 2, endOffset: 1, rawFrameCount: 1 }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, barrier: null }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, barrier: '' }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, barrier: 'unknown' }] },
+      ]
+
+      term.write.mockClear()
+      act(() => {
+        for (const malformed of malformedBatches) {
+          messageHandler!({
+            type: 'terminal.output.batch',
+            terminalId,
+            streamId,
+            attachRequestId,
+            source: 'live',
+            data: 'x',
+            serializedBytes: 128,
+            ...malformed,
+          })
+        }
+      })
+
+      expect(term.write).not.toHaveBeenCalled()
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-malformed-numbers',
+      })).toBeNull()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 3,
+          seqEnd: 3,
+          data: 'accepted-after-malformed-batch',
+        })
+      })
+      expect(terminalWriteStrings(term)).toContain('accepted-after-malformed-batch')
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-malformed-numbers',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      }))
+    })
+
+    it('rejects terminal.output.batch when an endOffset splits a UTF-16 surrogate pair', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-surrogate-split',
+        serverInstanceId: 'server-output-batch-surrogate-split',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'live',
+          seqStart: 1,
+          seqEnd: 2,
+          data: '\ud83d\ude00',
+          serializedBytes: 128,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, data: '\ud83d', rawFrameCount: 1 },
+            { seqStart: 2, seqEnd: 2, endOffset: 2, data: '\ude00', rawFrameCount: 1 },
+          ],
+        })
+      })
+
+      expect(term.write).not.toHaveBeenCalled()
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-surrogate-split',
+      })).toBeNull()
+    })
+
+    it('rejects terminal.output.batch when segment data disagrees with offsets', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-data-mismatch',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'live',
+          seqStart: 1,
+          seqEnd: 2,
+          data: 'ab',
+          serializedBytes: 256,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, data: 'a', rawFrameCount: 1 },
+            { seqStart: 2, seqEnd: 2, endOffset: 2, data: 'not-b', rawFrameCount: 1 },
+          ],
+        })
+      })
+
+      expect(term.write).not.toHaveBeenCalled()
+    })
+
+    it('fails closed after an invalid terminal.output.batch instead of checkpointing later output across the lost range', async () => {
+      const bridge = createPerfAuditBridge()
+      installPerfAuditBridge(bridge)
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-invalid-fail-closed',
+        serverInstanceId: 'server-output-batch-invalid-fail-closed',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+      expect(attachRequestId).toBeTruthy()
+      expect(streamId).toBeTruthy()
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'live',
+          seqStart: 1,
+          seqEnd: 2,
+          data: 'ab',
+          serializedBytes: 256,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, data: 'a', rawFrameCount: 1 },
+            { seqStart: 2, seqEnd: 2, endOffset: 2, data: 'not-b', rawFrameCount: 1 },
+          ],
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 3,
+          seqEnd: 3,
+          data: 'c',
+        })
+      })
+
+      expect(terminalWriteStrings(term)).toEqual(['c'])
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-invalid-fail-closed',
+      })).toBeNull()
+      expect(bridge.snapshot().perfEvents).toContainEqual(expect.objectContaining({
+        event: 'terminal.catchup.surface_quarantined',
+        terminalId,
+        reason: 'invalid_terminal_output_batch',
+        invalidReason: 'segment_data_mismatch',
+        fromSeq: 1,
+        toSeq: 2,
+      }))
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      }))
+    })
+
+    it('does not checkpoint through the unapplied tail of an invalid terminal.output.batch that overlaps the current cursor', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-invalid-overlap-tail',
+        serverInstanceId: 'server-output-batch-invalid-overlap-tail',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+      expect(attachRequestId).toBeTruthy()
+      expect(streamId).toBeTruthy()
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 1,
+          seqEnd: 10,
+          data: 'abcdefghij',
+        })
+      })
+
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-invalid-overlap-tail',
+      })?.parserAppliedSeq).toBe(10)
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'live',
+          seqStart: 9,
+          seqEnd: 11,
+          data: 'ijk',
+          serializedBytes: 256,
+          segments: [
+            { seqStart: 9, seqEnd: 9, endOffset: 1, data: 'i', rawFrameCount: 1 },
+            { seqStart: 10, seqEnd: 10, endOffset: 2, data: 'j', rawFrameCount: 1 },
+            { seqStart: 11, seqEnd: 11, endOffset: 3, data: 'not-k', rawFrameCount: 1 },
+          ],
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 12,
+          seqEnd: 12,
+          data: 'l',
+        })
+      })
+
+      expect(terminalWriteStrings(term)).toEqual(['l'])
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-invalid-overlap-tail',
+      })?.parserAppliedSeq).toBe(10)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      }))
+    })
+
+    it('splits terminal.output.batch writes around parser barrier segments', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-barrier',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'replay',
+          seqStart: 1,
+          seqEnd: 3,
+          data: 'aBc',
+          serializedBytes: 256,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, rawFrameCount: 1 },
+            { seqStart: 2, seqEnd: 2, endOffset: 2, rawFrameCount: 1, barrier: 'control' },
+            { seqStart: 3, seqEnd: 3, endOffset: 3, rawFrameCount: 1 },
+          ],
+        })
+      })
+
+      expect(terminalWriteStrings(term)).toEqual(['a', 'B', 'c'])
+    })
+
+    it('does not checkpoint a stripped terminal.output.batch BEL segment as parser-applied', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-stripped-bel',
+        mode: 'codex',
+        serverInstanceId: 'server-output-batch-stripped-bel',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+      expect(attachRequestId).toBeTruthy()
+      expect(streamId).toBeTruthy()
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'live',
+          seqStart: 1,
+          seqEnd: 2,
+          data: 'A\x07',
+          serializedBytes: 256,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, rawFrameCount: 1 },
+            { seqStart: 2, seqEnd: 2, endOffset: 2, rawFrameCount: 1, barrier: 'turn_complete' },
+          ],
+        })
+      })
+
+      expect(terminalWriteStrings(term)).toEqual(['A'])
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-stripped-bel',
+      })?.parserAppliedSeq).toBe(1)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 1,
+      }))
+    })
+
+    it('completes attach when replay ends in a stripped terminal.output.batch BEL segment without checkpointing it', async () => {
+      const { terminalId, term, queryByText, store } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-replay-stripped-complete',
+        mode: 'codex',
+        serverInstanceId: 'server-output-batch-replay-stripped-complete',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+      act(() => {
+        store.dispatch(setConnectionStatus('ready'))
+      })
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      const attachRequestId = attach?.attachRequestId
+      const streamId = 'stream-output-batch-replay-stripped-complete'
+      expect(attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId,
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId,
+        })
+      })
+      expect(queryByText('Recovering terminal output...')).not.toBeNull()
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'replay',
+          seqStart: 1,
+          seqEnd: 1,
+          data: '\x07',
+          serializedBytes: 128,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, rawFrameCount: 1, barrier: 'turn_complete' },
+          ],
+        })
+      })
+
+      expect(term.write).not.toHaveBeenCalled()
+      await waitFor(() => {
+        expect(queryByText('Recovering terminal output...')).toBeNull()
+      })
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-replay-stripped-complete',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 0,
+      }))
+    })
+
+    it('queues stripped terminal.output.batch replay completion behind earlier replay write callbacks', async () => {
+      const { terminalId, term, queryByText, store } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-replay-stripped-tail',
+        mode: 'codex',
+        serverInstanceId: 'server-output-batch-replay-stripped-tail',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+      act(() => {
+        store.dispatch(setConnectionStatus('ready'))
+      })
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      const attachRequestId = attach?.attachRequestId
+      const streamId = 'stream-output-batch-replay-stripped-tail'
+      expect(attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId,
+          headSeq: 2,
+          replayFromSeq: 1,
+          replayToSeq: 2,
+          attachRequestId,
+        })
+      })
+      expect(queryByText('Recovering terminal output...')).not.toBeNull()
+
+      const delayedCallbacks: Array<{ data: string; callback: () => void }> = []
+      term.write.mockClear()
+      term.write.mockImplementation((data: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push({ data, callback: onWritten })
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'replay',
+          seqStart: 1,
+          seqEnd: 2,
+          data: 'A\x07',
+          serializedBytes: 128,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, rawFrameCount: 1 },
+            { seqStart: 2, seqEnd: 2, endOffset: 2, rawFrameCount: 1, barrier: 'turn_complete' },
+          ],
+        })
+      })
+
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['A'])
+      expect(queryByText('Recovering terminal output...')).not.toBeNull()
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-replay-stripped-tail',
+      })).toBeNull()
+
+      act(() => {
+        delayedCallbacks[0]?.callback()
+      })
+
+      await waitFor(() => {
+        expect(queryByText('Recovering terminal output...')).toBeNull()
+      })
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-replay-stripped-tail',
+      })?.parserAppliedSeq).toBe(1)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 1,
+      }))
+    })
+
+    it('does not checkpoint a mixed renderable and stripped terminal.output.batch segment as parser-applied', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-mixed-stripped-bel',
+        mode: 'codex',
+        serverInstanceId: 'server-output-batch-mixed-stripped-bel',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+      expect(attachRequestId).toBeTruthy()
+      expect(streamId).toBeTruthy()
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'live',
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'A\x07',
+          serializedBytes: 256,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 2, rawFrameCount: 1, barrier: 'turn_complete' },
+          ],
+        })
+      })
+
+      expect(terminalWriteStrings(term)).toEqual(['A'])
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-mixed-stripped-bel',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 0,
+      }))
+    })
+
+    it('does not checkpoint a stripped legacy terminal.output BEL frame as parser-applied', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-legacy-stripped-bel',
+        mode: 'codex',
+        serverInstanceId: 'server-output-legacy-stripped-bel',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+      expect(attachRequestId).toBeTruthy()
+      expect(streamId).toBeTruthy()
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: '\x07',
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'B',
+        })
+      })
+
+      expect(terminalWriteStrings(term)).toEqual(['B'])
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-legacy-stripped-bel',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 0,
+      }))
+    })
+
+    it('completes attach when replay ends in a stripped legacy terminal.output BEL frame without checkpointing it', async () => {
+      const { terminalId, term, queryByText, store } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-legacy-replay-stripped-complete',
+        mode: 'codex',
+        serverInstanceId: 'server-output-legacy-replay-stripped-complete',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+      act(() => {
+        store.dispatch(setConnectionStatus('ready'))
+      })
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      const attachRequestId = attach?.attachRequestId
+      const streamId = 'stream-output-legacy-replay-stripped-complete'
+      expect(attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId,
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId,
+        })
+      })
+      expect(queryByText('Recovering terminal output...')).not.toBeNull()
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: '\x07',
+        })
+      })
+
+      expect(term.write).not.toHaveBeenCalled()
+      await waitFor(() => {
+        expect(queryByText('Recovering terminal output...')).toBeNull()
+      })
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-legacy-replay-stripped-complete',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 0,
+      }))
+    })
+
+    it('queues stripped legacy terminal.output replay completion behind earlier replay write callbacks', async () => {
+      const { terminalId, term, queryByText, store } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-legacy-replay-stripped-tail',
+        mode: 'codex',
+        serverInstanceId: 'server-output-legacy-replay-stripped-tail',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+      act(() => {
+        store.dispatch(setConnectionStatus('ready'))
+      })
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      const attachRequestId = attach?.attachRequestId
+      const streamId = 'stream-output-legacy-replay-stripped-tail'
+      expect(attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId,
+          headSeq: 2,
+          replayFromSeq: 1,
+          replayToSeq: 2,
+          attachRequestId,
+        })
+      })
+      expect(queryByText('Recovering terminal output...')).not.toBeNull()
+
+      const delayedCallbacks: Array<{ data: string; callback: () => void }> = []
+      term.write.mockClear()
+      term.write.mockImplementation((data: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push({ data, callback: onWritten })
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'A',
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: '\x07',
+        })
+      })
+
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['A'])
+      expect(queryByText('Recovering terminal output...')).not.toBeNull()
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-legacy-replay-stripped-tail',
+      })).toBeNull()
+
+      act(() => {
+        delayedCallbacks[0]?.callback()
+      })
+
+      await waitFor(() => {
+        expect(queryByText('Recovering terminal output...')).toBeNull()
+      })
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-legacy-replay-stripped-tail',
+      })?.parserAppliedSeq).toBe(1)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 1,
+      }))
+    })
+
+    it('does not checkpoint a mixed renderable and stripped legacy terminal.output frame as parser-applied', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-legacy-mixed-stripped-bel',
+        mode: 'codex',
+        serverInstanceId: 'server-output-legacy-mixed-stripped-bel',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+      expect(attachRequestId).toBeTruthy()
+      expect(streamId).toBeTruthy()
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'A\x07',
+        })
+      })
+
+      expect(terminalWriteStrings(term)).toEqual(['A'])
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-legacy-mixed-stripped-bel',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 0,
+      }))
+    })
+
+    it('does not render or checkpoint terminal.output missing stream id after attach-ready', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-missing-output-stream-client',
+        serverInstanceId: 'server-missing-output-stream',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-active',
+          headSeq: 0,
+          replayFromSeq: 1,
+          replayToSeq: 0,
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'MISSING STREAM',
+          attachRequestId: attach!.attachRequestId,
+          __preserveMissingStreamId: true,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-active',
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'ACTIVE AFTER MISSING',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      const writes = term.write.mock.calls.map(([data]) => String(data)).join('')
+      expect(writes).not.toContain('MISSING STREAM')
+      expect(writes).toContain('ACTIVE AFTER MISSING')
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-active',
+        serverInstanceId: 'server-missing-output-stream',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
+    })
+
+    it('does not render or checkpoint terminal.output.gap missing stream id after attach-ready', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-missing-gap-stream-client',
+        serverInstanceId: 'server-missing-gap-stream',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-active',
+          headSeq: 0,
+          replayFromSeq: 1,
+          replayToSeq: 0,
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 1,
+          toSeq: 5,
+          reason: 'queue_overflow',
+          attachRequestId: attach!.attachRequestId,
+          __preserveMissingStreamId: true,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-active',
+          seqStart: 6,
+          seqEnd: 6,
+          data: 'ACTIVE AFTER MISSING GAP',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      const writes = term.write.mock.calls.map(([data]) => String(data)).join('')
+      expect(writes).not.toContain('Output gap 1-5')
+      expect(writes).toContain('ACTIVE AFTER MISSING GAP')
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-active',
+        serverInstanceId: 'server-missing-gap-stream',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
+    })
+
+    it('keeps the legacy missing-stream output path only before attach-ready establishes stream identity', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-legacy-pre-ready-stream',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'LEGACY BEFORE READY',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      const writes = term.write.mock.calls.map(([data]) => String(data)).join('')
+      expect(writes).toContain('LEGACY BEFORE READY')
+    })
+
+    it('clears stale stored stream id when attach-ready omits stream id and rejects untagged output and gaps', async () => {
+      const { store, tabId, terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-legacy-ready-without-stream',
+        serverInstanceId: 'server-missing-ready-stream',
+        streamId: 'stored-stale-stream',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 0,
+          replayFromSeq: 1,
+          replayToSeq: 0,
+          attachRequestId: attach!.attachRequestId,
+          __preserveMissingStreamId: true,
+        } as any)
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'UNTAGGED AFTER BAD READY',
+          attachRequestId: attach!.attachRequestId,
+          __preserveMissingStreamId: true,
+        } as any)
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 2,
+          toSeq: 3,
+          reason: 'queue_overflow',
+          attachRequestId: attach!.attachRequestId,
+          __preserveMissingStreamId: true,
+        } as any)
+      })
+
+      const layout = store.getState().panes.layouts[tabId]
+      expect(layout.type).toBe('leaf')
+      expect(layout.content.kind).toBe('terminal')
+      expect(layout.content.streamId).toBeUndefined()
+
+      const writes = terminalWriteStrings(term).join('')
+      expect(writes).not.toContain('UNTAGGED AFTER BAD READY')
+      expect(writes).not.toContain('Output gap 2-3')
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stored-stale-stream',
+        serverInstanceId: 'server-missing-ready-stream',
+      })).toBeNull()
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: null,
+        serverInstanceId: 'server-missing-ready-stream',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
+    })
+
+    it('does not use a null-stream checkpoint for warm delta after attach-ready omits stream id', async () => {
+      const terminalId = 'term-null-stream-checkpoint'
+      const serverInstanceId = 'server-null-stream-checkpoint'
+      saveTerminalSurfaceCheckpoint({
+        terminalId,
+        streamId: null,
+        serverInstanceId,
+        surfaceEpoch: 0,
+        attachRequestId: 'seed-null-stream-checkpoint',
+        parserAppliedSeq: 17,
+        cols: 80,
+        rows: 24,
+        geometryEpoch: 1,
+        geometryAuthority: 'single_client',
+        scrollback: 10000,
+        xtermVersion: '6.0.0',
+        bufferType: 'unknown',
+        parserIdle: true,
+      })
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: null,
+        serverInstanceId,
+      })?.parserAppliedSeq).toBe(17)
+
+      await renderTerminalHarness({
+        status: 'running',
+        terminalId,
+        serverInstanceId,
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const initialAttach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(initialAttach).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 0,
+          replayFromSeq: 1,
+          replayToSeq: 0,
+          attachRequestId: initialAttach!.attachRequestId,
+          __preserveMissingStreamId: true,
+        } as any)
+      })
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
+    })
+
+    it('ignores xterm title callbacks fired while replay writes are scoped', async () => {
+      const { terminalId, term, store, tabId, paneId } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-replay-title',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      await waitFor(() => {
+        expect(term.onTitleChange).toHaveBeenCalled()
+      })
+      const titleHandler = term.onTitleChange.mock.calls[0]?.[0]
+      expect(typeof titleHandler).toBe('function')
+
+      const delayedCallbacks: Array<{ data: string; callback: () => void }> = []
+      term.write.mockImplementation((data: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push({ data, callback: onWritten })
+      })
+
+      const attach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'replay title frame',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['replay title frame'])
+
+      act(() => {
+        titleHandler('Replay Title')
+      })
+
+      expect(store.getState().tabs.tabs.find((tab) => tab.id === tabId)?.title).toBe('Shell')
+      expect(store.getState().panes.paneTitles[tabId]?.[paneId]).not.toBe('Replay Title')
+
+      act(() => {
+        delayedCallbacks[0]?.callback()
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'live title frame',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual([
+        'replay title frame',
+        'live title frame',
+      ])
+
+      act(() => {
+        titleHandler('Live Title')
+      })
+
+      expect(store.getState().tabs.tabs.find((tab) => tab.id === tabId)?.title).toBe('Live Title')
+      expect(store.getState().panes.paneTitles[tabId]?.[paneId]).toBe('Live Title')
+    })
+
+    it('does not let stale write callbacks advance the current parser-applied cursor', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-stale-write-callback',
+        serverInstanceId: 'server-a',
+        streamId: 'stream-1',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const firstAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(firstAttach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'first replay text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+
+      const initialCheckpoint = loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-1',
+        serverInstanceId: 'server-a',
+      })
+      expect(initialCheckpoint?.attachRequestId).toBe(firstAttach?.attachRequestId)
+      expect(initialCheckpoint?.parserAppliedSeq).toBe(1)
+
+      const delayedCallbacks: Array<{ data: string; callback: () => void }> = []
+      term.write.mockImplementation((data: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push({ data, callback: onWritten })
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'old replay text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+
+      expect(delayedCallbacks).toHaveLength(1)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      const secondAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(secondAttach?.attachRequestId).toBeTruthy()
+      expect(secondAttach?.attachRequestId).not.toBe(firstAttach?.attachRequestId)
+      expect(secondAttach).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 4,
+          replayFromSeq: 2,
+          replayToSeq: 4,
+          attachRequestId: secondAttach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 4,
+          data: 'current replay text',
+          attachRequestId: secondAttach!.attachRequestId,
+        })
+      })
+
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['old replay text'])
+
+      act(() => {
+        delayedCallbacks.find(({ data }) => data === 'old replay text')?.callback()
+      })
+
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual([
+        'old replay text',
+        'current replay text',
+      ])
+
+      const checkpointAfterStaleCallback = loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-1',
+        serverInstanceId: 'server-a',
+      })
+      expect(checkpointAfterStaleCallback).not.toBeNull()
+      expect(checkpointAfterStaleCallback?.attachRequestId).toBe(firstAttach?.attachRequestId)
+      expect(checkpointAfterStaleCallback?.parserAppliedSeq).toBe(1)
+
+      const currentAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(currentAttach?.attachRequestId).toBe(secondAttach?.attachRequestId)
+
+      wsMocks.send.mockClear()
+      term.clear.mockClear()
+      act(() => {
+        delayedCallbacks.find(({ data }) => data === 'current replay text')?.callback()
+      })
+
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'terminal.attach',
+          terminalId,
+          intent: 'viewport_hydrate',
+          sinceSeq: 0,
+          attachRequestId: expect.any(String),
+        }))
+      })
+      expect(term.clear).toHaveBeenCalledTimes(1)
+
+      const checkpointAfterCurrentCallback = loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-1',
+        serverInstanceId: 'server-a',
+      })
+      expect(checkpointAfterCurrentCallback?.attachRequestId).toBe(firstAttach?.attachRequestId)
+      expect(checkpointAfterCurrentCallback?.parserAppliedSeq).toBe(1)
+    })
+
+    it('fails closed from delta attach when writes are in flight and repairs quarantine after drain', async () => {
+      const bridge = createPerfAuditBridge()
+      installPerfAuditBridge(bridge)
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-in-flight-delta',
+        serverInstanceId: 'server-a',
+        streamId: 'stream-delta',
+        clearSends: false,
+      })
+
+      const firstAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(firstAttach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'checkpointed text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+
+      const initialCheckpoint = loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-delta',
+        serverInstanceId: 'server-a',
+      })
+      expect(initialCheckpoint?.attachRequestId).toBe(firstAttach?.attachRequestId)
+      expect(initialCheckpoint?.parserAppliedSeq).toBe(1)
+
+      const delayedCallbacks: Array<{ data: string; callback: () => void }> = []
+      term.write.mockImplementation((data: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push({ data, callback: onWritten })
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'old in-flight delta text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+      expect(delayedCallbacks).toHaveLength(1)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      const secondAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(secondAttach).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      })
+      const fallbackEvents = bridge.snapshot().perfEvents
+        .filter((event) => event.event === 'terminal.catchup.full_hydrate_fallback')
+      expect(fallbackEvents).toEqual([
+        expect.objectContaining({
+          event: 'terminal.catchup.full_hydrate_fallback',
+          timestamp: expect.any(Number),
+          terminalId,
+          attachRequestId: secondAttach!.attachRequestId,
+          requestedIntent: 'transport_reconnect',
+          intent: 'viewport_hydrate',
+          reason: 'in_flight_writes',
+          hasInFlightWrites: true,
+        }),
+      ])
+      const quarantineEvents = bridge.snapshot().perfEvents
+        .filter((event) => event.event === 'terminal.catchup.surface_quarantined')
+      expect(quarantineEvents).toEqual([
+        expect.objectContaining({
+          event: 'terminal.catchup.surface_quarantined',
+          timestamp: expect.any(Number),
+          terminalId,
+          attachRequestId: secondAttach!.attachRequestId,
+          requestedIntent: 'transport_reconnect',
+          intent: 'viewport_hydrate',
+          reason: 'in_flight_writes',
+        }),
+      ])
+      expect(bridge.snapshot().milestones['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
+      expect(bridge.snapshot().metadata['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
+      expect(bridge.snapshot().milestones['terminal.catchup.surface_quarantined']).toBeUndefined()
+      expect(bridge.snapshot().metadata['terminal.catchup.surface_quarantined']).toBeUndefined()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 3,
+          replayFromSeq: 2,
+          replayToSeq: 3,
+          attachRequestId: secondAttach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 3,
+          data: 'quarantined replay text',
+          attachRequestId: secondAttach!.attachRequestId,
+        })
+      })
+
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['old in-flight delta text'])
+
+      act(() => {
+        delayedCallbacks.find(({ data }) => data === 'old in-flight delta text')?.callback()
+      })
+
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual([
+        'old in-flight delta text',
+        'quarantined replay text',
+      ])
+
+      wsMocks.send.mockClear()
+      term.clear.mockClear()
+      act(() => {
+        delayedCallbacks.find(({ data }) => data === 'quarantined replay text')?.callback()
+      })
+
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'terminal.attach',
+          terminalId,
+          intent: 'viewport_hydrate',
+          sinceSeq: 0,
+          attachRequestId: expect.any(String),
+        }))
+      })
+      expect(term.clear).toHaveBeenCalledTimes(1)
+
+      const checkpointAfterCallbacks = loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-delta',
+        serverInstanceId: 'server-a',
+      })
+      expect(checkpointAfterCallbacks?.attachRequestId).toBe(firstAttach?.attachRequestId)
+      expect(checkpointAfterCallbacks?.parserAppliedSeq).toBe(1)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
+    })
+
+    it('drops quarantined replay and forces a clearing hydrate when quarantine repair times out before writes drain', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-in-flight-quarantine-timeout',
+        serverInstanceId: 'server-a',
+        streamId: 'stream-timeout',
+        clearSends: false,
+      })
+
+      const firstAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(firstAttach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'checkpointed text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+
+      const delayedCallbacks: Array<{ data: string; callback: () => void }> = []
+      term.write.mockImplementation((data: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push({ data, callback: onWritten })
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'old in-flight timeout text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['old in-flight timeout text'])
+
+      vi.useFakeTimers()
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      const quarantinedAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(quarantinedAttach).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 3,
+          replayFromSeq: 2,
+          replayToSeq: 3,
+          attachRequestId: quarantinedAttach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 3,
+          data: 'quarantined replay timeout text',
+          attachRequestId: quarantinedAttach!.attachRequestId,
+        })
+      })
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['old in-flight timeout text'])
+
+      act(() => {
+        vi.advanceTimersByTime(2_100)
+      })
+
+      wsMocks.send.mockClear()
+      term.clear.mockClear()
+      act(() => {
+        delayedCallbacks.find(({ data }) => data === 'old in-flight timeout text')?.callback()
+      })
+
+      expect(terminalWriteStrings(term)).not.toContain('quarantined replay timeout text')
+
+      act(() => {
+        vi.advanceTimersByTime(100)
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
+      expect(term.clear).toHaveBeenCalledTimes(1)
+      const repairAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(repairAttach?.attachRequestId).not.toBe(quarantinedAttach?.attachRequestId)
+    })
+
+    it('records repeated in-flight full-hydrate fallback and quarantine audit events separately', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-repeat-fallback-quarantine',
+        serverInstanceId: 'server-a',
+        streamId: 'stream-repeat',
+        clearSends: false,
+      })
+
+      const firstAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(firstAttach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'checkpoint before repeat fallback',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+
+      const delayedCallbacks: Array<() => void> = []
+      term.write.mockImplementation((_data: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push(onWritten)
+      })
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'held in-flight write',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+      expect(delayedCallbacks).toHaveLength(1)
+
+      const bridge = createPerfAuditBridge()
+      installPerfAuditBridge(bridge)
+      let now = 200
+      const performanceNowSpy = vi.spyOn(performance, 'now').mockImplementation(() => {
+        now += 0.01
+        return now
+      })
+      try {
+        wsMocks.send.mockClear()
+        act(() => {
+          reconnectHandler?.()
+          reconnectHandler?.()
+        })
+
+        const reconnectAttaches = sentMessages()
+          .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+        expect(reconnectAttaches).toHaveLength(2)
+        expect(reconnectAttaches[0]?.attachRequestId).not.toBe(reconnectAttaches[1]?.attachRequestId)
+
+        const fallbackEvents = bridge.snapshot().perfEvents
+          .filter((event) => event.event === 'terminal.catchup.full_hydrate_fallback')
+        expect(fallbackEvents).toHaveLength(2)
+        expect(fallbackEvents[0]).toEqual(expect.objectContaining({
+          event: 'terminal.catchup.full_hydrate_fallback',
+          timestamp: expect.any(Number),
+          terminalId,
+          attachRequestId: reconnectAttaches[0]!.attachRequestId,
+          requestedIntent: 'transport_reconnect',
+          intent: 'viewport_hydrate',
+          reason: 'in_flight_writes',
+          hasInFlightWrites: true,
+        }))
+        expect(fallbackEvents[1]).toEqual(expect.objectContaining({
+          event: 'terminal.catchup.full_hydrate_fallback',
+          timestamp: expect.any(Number),
+          terminalId,
+          attachRequestId: reconnectAttaches[1]!.attachRequestId,
+          requestedIntent: 'transport_reconnect',
+          intent: 'viewport_hydrate',
+          reason: 'in_flight_writes',
+          hasInFlightWrites: true,
+        }))
+        expect(Number(fallbackEvents[0]!.timestamp)).toBeLessThan(Number(fallbackEvents[1]!.timestamp))
+
+        const quarantineEvents = bridge.snapshot().perfEvents
+          .filter((event) => event.event === 'terminal.catchup.surface_quarantined')
+        expect(quarantineEvents).toHaveLength(2)
+        expect(quarantineEvents[0]).toEqual(expect.objectContaining({
+          event: 'terminal.catchup.surface_quarantined',
+          timestamp: expect.any(Number),
+          terminalId,
+          attachRequestId: reconnectAttaches[0]!.attachRequestId,
+          requestedIntent: 'transport_reconnect',
+          intent: 'viewport_hydrate',
+          reason: 'in_flight_writes',
+        }))
+        expect(quarantineEvents[1]).toEqual(expect.objectContaining({
+          event: 'terminal.catchup.surface_quarantined',
+          timestamp: expect.any(Number),
+          terminalId,
+          attachRequestId: reconnectAttaches[1]!.attachRequestId,
+          requestedIntent: 'transport_reconnect',
+          intent: 'viewport_hydrate',
+          reason: 'in_flight_writes',
+        }))
+        expect(Number(quarantineEvents[0]!.timestamp)).toBeLessThan(Number(quarantineEvents[1]!.timestamp))
+
+        expect(bridge.snapshot().metadata['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
+        expect(bridge.snapshot().milestones['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
+        expect(bridge.snapshot().metadata['terminal.catchup.surface_quarantined']).toBeUndefined()
+        expect(bridge.snapshot().milestones['terminal.catchup.surface_quarantined']).toBeUndefined()
+      } finally {
+        performanceNowSpy.mockRestore()
+      }
+    })
+
+    it('does not clear the old surface when full hydrate starts with in-flight writes', async () => {
+      const { store, tabId, paneId, terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-in-flight-full-hydrate',
+        serverInstanceId: 'server-a',
+        streamId: 'stream-in-flight',
+        clearSends: false,
+      })
+
+      const firstAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(firstAttach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'trusted text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+
+      const trustedCheckpoint = loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-in-flight',
+        serverInstanceId: 'server-a',
+      })
+      expect(trustedCheckpoint?.parserAppliedSeq).toBe(1)
+
+      const delayedCallbacks: Array<() => void> = []
+      term.write.mockImplementation((_data: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push(onWritten)
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'in-flight text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+      expect(delayedCallbacks).toHaveLength(1)
+
+      term.clear.mockClear()
+      wsMocks.send.mockClear()
+      act(() => {
+        store.dispatch(requestPaneRefresh({ tabId, paneId }))
+      })
+
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'terminal.attach',
+          terminalId,
+          intent: 'viewport_hydrate',
+          sinceSeq: 0,
+          attachRequestId: expect.any(String),
+        }))
+      })
+      expect(term.clear).not.toHaveBeenCalled()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
+    })
+
+    it('cancels quarantined repair after invalid-terminal replacement before writes drain', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-quarantine-invalid',
+        serverInstanceId: 'server-a',
+        streamId: 'stream-invalid',
+        clearSends: false,
+      })
+
+      const firstAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(firstAttach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'trusted text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+
+      const delayedCallbacks: Array<() => void> = []
+      term.write.mockImplementation((_data: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push(onWritten)
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'old in-flight text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+      expect(delayedCallbacks).toHaveLength(1)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      const quarantineAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(quarantineAttach).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'error',
+          code: 'INVALID_TERMINAL_ID',
+          terminalId,
+          message: 'gone',
+        })
+      })
+
+      wsMocks.send.mockClear()
+      await act(async () => {
+        delayedCallbacks.forEach((callback) => callback())
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      })
+
+      expect(wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)).toHaveLength(0)
+    })
+
+    it('handles tagged invalid-terminal errors from quarantine repair attaches', async () => {
+      const { terminalId, term, store, tabId, requestId } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-quarantine-repair-invalid',
+        serverInstanceId: 'server-a',
+        streamId: 'stream-repair-invalid',
+        clearSends: false,
+      })
+
+      const firstAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(firstAttach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'trusted text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+
+      const delayedCallbacks: Array<() => void> = []
+      term.write.mockImplementation((_data: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push(onWritten)
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'old in-flight text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+      expect(delayedCallbacks).toHaveLength(1)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      const quarantineAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(quarantineAttach).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      })
+      expect(quarantineAttach?.attachRequestId).toBeTruthy()
+
+      wsMocks.send.mockClear()
+      await act(async () => {
+        delayedCallbacks.forEach((callback) => callback())
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      })
+
+      const repairAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(repairAttach).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      })
+      expect(repairAttach?.attachRequestId).toBeTruthy()
+      expect(repairAttach?.attachRequestId).not.toBe(quarantineAttach?.attachRequestId)
+
+      act(() => {
+        messageHandler!({
+          type: 'error',
+          code: 'INVALID_TERMINAL_ID',
+          terminalId,
+          requestId: repairAttach!.attachRequestId,
+          message: 'Terminal not running',
+        })
+      })
+
+      await waitFor(() => {
+        const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
+        expect(layout.content.terminalId).toBeUndefined()
+        expect(layout.content.status).toBe('creating')
+        expect(layout.content.createRequestId).not.toBe(requestId)
+      })
+
+      const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
+      expect(restoreMocks.addTerminalFreshRecoveryRequestId).toHaveBeenCalledWith(
+        layout.content.createRequestId,
+        'fresh_after_restore_unavailable',
+      )
+
+      wsMocks.send.mockClear()
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      })
+
+      expect(wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)).toHaveLength(0)
     })
 
     it('keeps queued viewport_hydrate intent when reconnect fires before the first hidden attach completes', async () => {
@@ -4364,7 +7197,7 @@ describe('TerminalView lifecycle updates', () => {
         .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
       expect(attach?.attachRequestId).toBeTruthy()
 
-      term.writeln.mockClear()
+      term.write.mockClear()
       messageHandler!({
         type: 'terminal.output.gap',
         terminalId,
@@ -4374,14 +7207,15 @@ describe('TerminalView lifecycle updates', () => {
         attachRequestId: attach!.attachRequestId,
       } as any)
 
-      expect(term.writeln).toHaveBeenCalledWith(expect.stringContaining('Output gap 1-50: reconnect window exceeded'))
+      expectTerminalWriteContaining(term, 'Output gap 1-50: reconnect window exceeded')
 
       wsMocks.send.mockClear()
       reconnectHandler?.()
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'terminal.attach',
         terminalId,
-        sinceSeq: 50,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
         attachRequestId: expect.any(String),
       }))
     })
@@ -4906,11 +7740,11 @@ describe('TerminalView lifecycle updates', () => {
       expect(__getLastSentViewportCacheSizeForTests()).toBe(200)
     })
 
-    it('renders terminal.output.gap marker and advances sinceSeq for subsequent attach', async () => {
+    it('renders terminal.output.gap marker and fails closed for subsequent attach', async () => {
       const { terminalId, term } = await renderTerminalHarness({ status: 'running', terminalId: 'term-v2-gap' })
 
       messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: 'ok' })
-      term.writeln.mockClear()
+      term.write.mockClear()
       wsMocks.send.mockClear()
 
       messageHandler!({
@@ -4921,13 +7755,167 @@ describe('TerminalView lifecycle updates', () => {
         reason: 'queue_overflow',
       })
 
-      expect(term.writeln).toHaveBeenCalledWith(expect.stringContaining('Output gap 2-5: slow link backlog'))
+      expectTerminalWriteContaining(term, 'Output gap 2-5: slow link backlog')
 
       reconnectHandler?.()
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'terminal.attach',
         terminalId,
-        sinceSeq: 5,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
+    })
+
+    it('queues local gap notices behind a pending replay write', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-gap-notice-queued',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const submittedWrites: Array<{ data: string; onWritten?: () => void }> = []
+      term.write.mockImplementation((data: string, onWritten?: () => void) => {
+        submittedWrites.push({ data, onWritten })
+      })
+
+      const attach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'REPLAY',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      expect(submittedWrites.map((entry) => entry.data)).toEqual(['REPLAY'])
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 2,
+          toSeq: 5,
+          reason: 'queue_overflow',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      expect(term.writeln).not.toHaveBeenCalled()
+      expect(submittedWrites.map((entry) => entry.data)).toEqual(['REPLAY'])
+
+      act(() => {
+        submittedWrites[0].onWritten?.()
+      })
+
+      await waitFor(() => {
+        expect(submittedWrites.map((entry) => entry.data)).toContainEqual(
+          expect.stringContaining('Output gap 2-5: slow link backlog'),
+        )
+      })
+    })
+
+    it('invalidates warm delta eligibility only after a queued local notice applies', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-local-notice-invalidates',
+        mode: 'codex',
+        serverInstanceId: 'server-local-notice',
+        streamId: 'stream-local-notice',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const submittedWrites: Array<{ data: string; onWritten?: () => void }> = []
+      term.write.mockImplementation((data: string, onWritten?: () => void) => {
+        submittedWrites.push({ data, onWritten })
+      })
+
+      const attach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'REPLAY',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      expect(submittedWrites.map((entry) => entry.data)).toEqual(['REPLAY'])
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.input.blocked',
+          terminalId,
+          reason: 'codex_identity_pending',
+        })
+      })
+
+      expect(submittedWrites.map((entry) => entry.data)).toEqual(['REPLAY'])
+
+      act(() => {
+        submittedWrites[0].onWritten?.()
+      })
+
+      await waitFor(() => {
+        expect(submittedWrites.map((entry) => entry.data)).toContainEqual(
+          expect.stringContaining('Input not sent: Codex is still saving restore state.'),
+        )
+      })
+
+      const checkpointAfterReplay = loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-local-notice',
+        serverInstanceId: 'server-local-notice',
+      })
+      expect(checkpointAfterReplay?.attachRequestId).toBe(attach?.attachRequestId)
+      expect(checkpointAfterReplay?.parserAppliedSeq).toBe(1)
+
+      const noticeWrite = submittedWrites.find((entry) => entry.data.includes('Input not sent'))
+      expect(noticeWrite?.onWritten).toBeTypeOf('function')
+
+      wsMocks.send.mockClear()
+      act(() => {
+        noticeWrite?.onWritten?.()
+      })
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
         attachRequestId: expect.any(String),
       }))
     })
@@ -4979,7 +7967,7 @@ describe('TerminalView lifecycle updates', () => {
         messageHandler!({ type: 'terminal.output', terminalId, seqStart: 13, seqEnd: 13, data: 'LIVE' })
       })
 
-      expect(term.writeln).toHaveBeenCalledWith(expect.stringContaining('Output gap 1-8: reconnect window exceeded'))
+      expectTerminalWriteContaining(term, 'Output gap 1-8: reconnect window exceeded')
       const writes = term.write.mock.calls.map(([data]: [string]) => String(data)).join('')
       expect(writes).toContain('TAIL')
       expect(writes).toContain('LIVE')
