@@ -6,6 +6,7 @@ import path from 'node:path'
 import { CODEX_MANAGED_REMOTE_CONFIG_ARGS } from '../codex-managed-config.js'
 import { allocateLocalhostPort, type LoopbackServerEndpoint } from '../../local-port.js'
 import { logger } from '../../logger.js'
+import { resolveLaunchCwd, type LaunchCwdConversion } from '../../launch-cwd.js'
 import {
   CodexAppServerClient,
   type CodexTurnEvent,
@@ -123,6 +124,40 @@ function defaultMetadataDir(): string {
 function normalizeLaunchCwd(cwd: string | undefined): string | undefined {
   const trimmed = cwd?.trim()
   return trimmed ? trimmed : undefined
+}
+
+type CodexAppServerLaunchCwd = {
+  rawCwd?: string
+  launchCwd?: string
+  conversion: LaunchCwdConversion
+}
+
+function resolveCodexAppServerLaunchCwd(rawCwd: string | undefined): CodexAppServerLaunchCwd {
+  const resolved = resolveLaunchCwd(rawCwd, { targetRuntime: 'linux-process' })
+  if (rawCwd && !resolved.launchCwd) {
+    throw new Error(`Codex app-server cannot use cwd "${rawCwd}" for Linux sidecar launch.`)
+  }
+  return {
+    ...(rawCwd !== undefined ? { rawCwd } : {}),
+    ...(resolved.launchCwd !== undefined ? { launchCwd: resolved.launchCwd } : {}),
+    conversion: resolved.conversion,
+  }
+}
+
+async function assertCodexAppServerLaunchCwdReachable(cwd: CodexAppServerLaunchCwd): Promise<void> {
+  if (!cwd.launchCwd) return
+  try {
+    const stat = await fsp.stat(cwd.launchCwd)
+    if (!stat.isDirectory()) {
+      throw new Error('resolved path is not a directory')
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    const conversion = cwd.conversion === 'none' ? 'without conversion' : `using ${cwd.conversion}`
+    throw new Error(
+      `Codex app-server launch cwd is not a reachable directory: input "${cwd.rawCwd ?? cwd.launchCwd}" resolved to "${cwd.launchCwd}" ${conversion}: ${detail}`,
+    )
+  }
 }
 
 function assertUnixSidecarSupport(): void {
@@ -711,24 +746,25 @@ export class CodexAppServerRuntime {
       throw new Error('Codex app-server sidecar is shutting down.')
     }
     await this.assertNoBlockedOwnership('ensure Codex app-server sidecar readiness')
-    const launchCwd = normalizeLaunchCwd(cwd) ?? this.defaultCwd
+    const requestedCwd = normalizeLaunchCwd(cwd) ?? this.defaultCwd
+    const launchCwd = resolveCodexAppServerLaunchCwd(requestedCwd)
     if (this.ready) {
-      this.assertCompatibleLaunchCwd(launchCwd, this.readyCwd)
+      this.assertCompatibleLaunchCwd(launchCwd.launchCwd, this.readyCwd)
       return this.ready
     }
     if (this.ensureReadyPromise) {
-      this.assertCompatibleLaunchCwd(launchCwd, this.ensureReadyCwd)
+      this.assertCompatibleLaunchCwd(launchCwd.launchCwd, this.ensureReadyCwd)
       return this.ensureReadyPromise
     }
 
-    this.ensureReadyCwd = launchCwd
+    this.ensureReadyCwd = launchCwd.launchCwd
     this.ensureReadyPromise = this.startRuntime(launchCwd).finally(() => {
       this.ensureReadyPromise = null
       this.ensureReadyCwd = undefined
     })
 
     this.ready = await this.ensureReadyPromise
-    this.readyCwd = launchCwd
+    this.readyCwd = launchCwd.launchCwd
     this.statusValue = 'running'
     return this.ready
   }
@@ -901,8 +937,9 @@ export class CodexAppServerRuntime {
     await this.stopActiveChild()
   }
 
-  private async startRuntime(cwd?: string): Promise<ReadyState> {
+  private async startRuntime(cwd: CodexAppServerLaunchCwd): Promise<ReadyState> {
     await assertProcOwnershipProofAvailable()
+    await assertCodexAppServerLaunchCwdReachable(cwd)
     await this.waitForOwnershipTeardown()
     await this.assertNoBlockedOwnership('start a new Codex app-server sidecar')
     let lastError: Error | undefined
@@ -925,7 +962,7 @@ export class CodexAppServerRuntime {
         wsUrl,
       ], {
         detached: true,
-        ...(cwd ? { cwd } : {}),
+        ...(cwd.launchCwd ? { cwd: cwd.launchCwd } : {}),
         env: {
           ...process.env,
           ...this.env,

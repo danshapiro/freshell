@@ -1749,6 +1749,18 @@ describe('buildSpawnSpec WSL paths', () => {
       expect(spec.args.some(arg => arg.includes('cd /d "D:\\projects\\demo"'))).toBe(true)
     })
 
+    it('does not invent a Windows cwd for Linux-only /home paths in cmd', () => {
+      mockWsl()
+      process.env.USERPROFILE = 'C:\\Users\\testuser'
+
+      const spec = buildSpawnSpec('shell', '/home/dan/code/freshell', 'cmd')
+
+      expect(spec.cwd).toBeUndefined()
+      expect(spec.args.some(arg => arg.includes('cd /d "C:\\Users\\testuser"'))).toBe(true)
+      expect(spec.args.some(arg => arg.includes('freshell'))).toBe(false)
+      expect(spec.mcpCwd).toBe('/home/dan/code/freshell')
+    })
+
     it('respects custom WSL mount prefix when converting WSL cwd for powershell args', () => {
       mockWsl()
       process.env.WSL_WINDOWS_SYS32 = '/win/c/Windows/System32'
@@ -1801,6 +1813,22 @@ describe('buildSpawnSpec WSL paths', () => {
 
       expect(spec.file).toBe('codex')
       expect(spec.cwd).toBe('/mnt/d/users/dan/project')
+    })
+
+    it('does not map Windows cwd to a same-named /home checkout for codex in WSL system shell', () => {
+      mockWsl()
+      delete process.env.CODEX_CMD
+
+      const spec = buildSpawnSpec(
+        'codex',
+        String.raw`D:\Users\Dan\GoogleDrivePersonal\code\DirectorDeck`,
+        'system',
+      )
+
+      expect(spec.file).toBe('codex')
+      expect(spec.cwd).toBe('/mnt/d/Users/Dan/GoogleDrivePersonal/code/DirectorDeck')
+      expect(spec.cwd).not.toBe('/home/dan/code/DirectorDeck')
+      expect(spec.mcpCwd).toBe('/mnt/d/Users/Dan/GoogleDrivePersonal/code/DirectorDeck')
     })
 
     it('converts Windows cwd to WSL path for shell mode in WSL system shell', () => {
@@ -4003,6 +4031,31 @@ describe('buildSpawnSpec Unix paths', () => {
       expect(calledCwd).toMatch(/^\//)
     })
 
+    it('keeps native Windows cmd OpenCode mcpCwd as a Windows path', async () => {
+      mockPlatform('win32')
+      const { generateMcpInjection } = await import('../../../server/mcp/config-writer.js')
+      vi.mocked(generateMcpInjection).mockClear()
+
+      const spec = buildSpawnSpec(
+        'opencode',
+        String.raw`C:\Users\Dan\repo`,
+        'cmd',
+        undefined,
+        { opencodeServer: TEST_OPENCODE_SERVER },
+        undefined,
+        'term-native-win-cmd',
+      )
+
+      expect(spec.cwd).toBe(String.raw`C:\Users\Dan\repo`)
+      expect(spec.mcpCwd).toBe(String.raw`C:\Users\Dan\repo`)
+      expect(generateMcpInjection).toHaveBeenCalledWith(
+        'opencode',
+        'term-native-win-cmd',
+        String.raw`C:\Users\Dan\repo`,
+        'windows',
+      )
+    })
+
     it('WSL cmd coding CLI returns non-undefined mcpCwd even when procCwd is undefined', () => {
       // In WSL, cmd.exe cannot use Linux paths as cwd, so procCwd is undefined.
       // But MCP injection used a resolved Linux path (cmdMcpCwd). The mcpCwd field
@@ -4030,14 +4083,43 @@ describe('buildSpawnSpec Unix paths', () => {
       expect(spec.mcpCwd).toMatch(/^\//)
     })
 
-    it('WSL wsl.exe coding CLI returns wslCwd as mcpCwd', () => {
-      // When using wsl.exe (from native Windows), mcpCwd should be the Linux path
+    it('native Windows wsl.exe OpenCode keeps --cd as WSL path but passes Windows cwd to MCP injection', async () => {
       mockPlatform('win32')
-      const spec = buildSpawnSpec('claude', 'C:\\Users\\test', 'wsl', undefined, undefined, undefined, 'term-wsl2')
-      // wsl.exe passes cwd: undefined to the process
+      const { generateMcpInjection } = await import('../../../server/mcp/config-writer.js')
+      vi.mocked(generateMcpInjection).mockClear()
+
+      const spec = buildSpawnSpec(
+        'opencode',
+        String.raw`C:\Users\Dan\repo`,
+        'wsl',
+        undefined,
+        { opencodeServer: TEST_OPENCODE_SERVER },
+        undefined,
+        'term-wsl-opencode',
+      )
+
+      expect(spec.file).toBe('wsl.exe')
       expect(spec.cwd).toBeUndefined()
-      // mcpCwd should be the Linux-normalized cwd
-      expect(spec.mcpCwd).toBeDefined()
+      expect(spec.args).toContain('--cd')
+      expect(spec.args[spec.args.indexOf('--cd') + 1]).toBe('/mnt/c/Users/Dan/repo')
+      expect(spec.mcpCwd).toBe(String.raw`C:\Users\Dan\repo`)
+      expect(generateMcpInjection).toHaveBeenCalledWith(
+        'opencode',
+        'term-wsl-opencode',
+        String.raw`C:\Users\Dan\repo`,
+        'unix',
+      )
+    })
+
+    it('native Windows wsl.exe does not invent a host MCP cwd for Linux-only paths', () => {
+      mockPlatform('win32')
+      const spec = buildSpawnSpec('shell', '/home/dan/code/freshell', 'wsl')
+
+      expect(spec.file).toBe('wsl.exe')
+      expect(spec.cwd).toBeUndefined()
+      expect(spec.args).toContain('--cd')
+      expect(spec.args[spec.args.indexOf('--cd') + 1]).toBe('/home/dan/code/freshell')
+      expect(spec.mcpCwd).toBeUndefined()
     })
 
     it('Unix coding CLI returns unixCwd as mcpCwd', () => {

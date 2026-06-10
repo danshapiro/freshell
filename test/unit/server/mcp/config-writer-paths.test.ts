@@ -92,7 +92,7 @@ describe('config-writer path verification', () => {
     }
   })
 
-  it('opencode mode: writes to project-local config path', async () => {
+  it('opencode mode treats cwd as an already-resolved host filesystem path and cleans up only the injected state', async () => {
     vi.resetModules()
     vi.doMock('os', () => ({
       ...os,
@@ -100,19 +100,53 @@ describe('config-writer path verification', () => {
       homedir: os.homedir,
       default: { ...os, tmpdir: () => testTmpDir, homedir: os.homedir },
     }))
-    const testCwd = path.join(testTmpDir, 'opencode-test-project')
+    const hostRoot = path.join(testTmpDir, 'opencode-host-native')
+    const testCwd = path.join(hostRoot, String.raw`C:\Users\Dan\repo`)
+    const expectedConfigPath = path.join(testCwd, '.opencode', 'opencode.json')
+    const expectedSidecarPath = path.join(testCwd, '.opencode', '.freshell-mcp-state.json')
+    const unexpectedRemappedConfigPath = path.join(hostRoot, 'C:', 'Users', 'Dan', 'repo', '.opencode', 'opencode.json')
     fs.mkdirSync(testCwd, { recursive: true })
+    fs.mkdirSync(path.dirname(expectedConfigPath), { recursive: true })
+    fs.writeFileSync(
+      expectedConfigPath,
+      JSON.stringify({
+        mcp: {
+          other: {
+            type: 'local',
+            command: ['node', 'other-server.js'],
+          },
+        },
+        theme: 'dark',
+      }, null, 2),
+      { mode: 0o600 },
+    )
 
     const { generateMcpInjection, cleanupMcpConfig } = await import('../../../../server/mcp/config-writer.js')
-    generateMcpInjection('opencode', 'test-opencode', testCwd)
+    const result = generateMcpInjection('opencode', 'test-opencode', testCwd)
 
-    const configPath = path.join(testCwd, '.opencode', 'opencode.json')
-    expect(fs.existsSync(configPath)).toBe(true)
-    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
+    expect(result).toEqual({ args: [], env: {} })
+    expect(fs.existsSync(expectedConfigPath)).toBe(true)
+    expect(fs.existsSync(expectedSidecarPath)).toBe(true)
+    expect(fs.existsSync(unexpectedRemappedConfigPath)).toBe(false)
+
+    const config = JSON.parse(fs.readFileSync(expectedConfigPath, 'utf-8'))
     expect(config.mcp.freshell).toBeDefined()
     expect(config.mcp.freshell.type).toBe('local')
+    expect(config.mcp.other).toEqual({
+      type: 'local',
+      command: ['node', 'other-server.js'],
+    })
+    expect(config.theme).toBe('dark')
 
-    // Clean up
     cleanupMcpConfig('test-opencode', 'opencode', testCwd)
+
+    const cleanedConfig = JSON.parse(fs.readFileSync(expectedConfigPath, 'utf-8'))
+    expect(cleanedConfig.mcp.freshell).toBeUndefined()
+    expect(cleanedConfig.mcp.other).toEqual({
+      type: 'local',
+      command: ['node', 'other-server.js'],
+    })
+    expect(cleanedConfig.theme).toBe('dark')
+    expect(fs.existsSync(expectedSidecarPath)).toBe(false)
   })
 })

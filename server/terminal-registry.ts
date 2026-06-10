@@ -16,6 +16,7 @@ import {
   type CodexDurabilityRef,
   type CodexDurabilityStoreRecord,
 } from '../shared/codex-durability.js'
+import { resolveLaunchCwd } from './launch-cwd.js'
 import { convertWindowsPathToWslPath, isReachableDirectorySync } from './path-utils.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
 import type { LoopbackServerEndpoint } from './local-port.js'
@@ -687,93 +688,17 @@ function getWindowsExe(exe: 'cmd' | 'powershell'): string {
   return process.env.POWERSHELL_EXE || `${systemRoot}/WindowsPowerShell/v1.0/powershell.exe`
 }
 
-/**
- * Get the WSL mount prefix for Windows drives.
- * Derives from WSL_WINDOWS_SYS32 (e.g., /mnt/c/Windows/System32 → /mnt)
- * or defaults to /mnt for standard WSL configurations.
- *
- * Handles various mount configurations:
- * - /mnt/c/... → /mnt (standard)
- * - /c/... → '' (drives at root)
- * - /win/c/... → /win (custom prefix)
- */
-function getWslMountPrefix(): string {
-  const sys32 = process.env.WSL_WINDOWS_SYS32
-  if (sys32) {
-    // Extract mount prefix from path like /mnt/c/Windows/System32
-    // The drive letter is a single char followed by /
-    const match = sys32.match(/^(.*)\/[a-zA-Z]\//)
-    if (match) {
-      return match[1]
-    }
-  }
-  return '/mnt'
-}
-
-const WINDOWS_DRIVE_PREFIX_RE = /^[A-Za-z]:([\\/]|$)/
-const WINDOWS_UNC_PREFIX_RE = /^\\\\[^\\]+\\[^\\]+/
-const WINDOWS_ROOTED_PREFIX_RE = /^\\(?!\\)/
-
-function isWindowsAbsolutePath(input: string): boolean {
-  return WINDOWS_DRIVE_PREFIX_RE.test(input) || WINDOWS_UNC_PREFIX_RE.test(input) || WINDOWS_ROOTED_PREFIX_RE.test(input)
-}
-
-function escapeRegex(input: string): string {
-  return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
-function convertWslDrivePathToWindows(input: string): string | undefined {
-  const normalized = input.replace(/\\/g, '/')
-  const mountPrefix = getWslMountPrefix()
-  const prefixes = new Set([mountPrefix, '/mnt'])
-
-  for (const prefix of prefixes) {
-    const match = prefix
-      ? normalized.match(new RegExp(`^${escapeRegex(prefix)}/([a-zA-Z])(?:/(.*))?$`))
-      : normalized.match(/^\/([a-zA-Z])(?:\/(.*))?$/)
-    if (!match) continue
-    const drive = `${match[1].toUpperCase()}:`
-    const rest = match[2]?.replace(/\//g, '\\')
-    return rest ? `${drive}\\${rest}` : `${drive}\\`
-  }
-  return undefined
-}
-
 function resolveWindowsShellCwd(cwd: string | undefined): string | undefined {
-  if (!cwd) return undefined
-  const candidate = cwd.trim()
-  if (!candidate) return undefined
-
-  if (isLinuxPath(candidate)) {
-    return convertWslDrivePathToWindows(candidate)
-  }
-
-  if (WINDOWS_UNC_PREFIX_RE.test(candidate)) {
-    return undefined
-  }
-
-  if (isWindowsAbsolutePath(candidate) || !isWsl()) {
-    return path.win32.resolve(candidate)
-  }
-  return undefined
+  return resolveLaunchCwd(cwd, { targetRuntime: 'windows-process' }).launchCwd
 }
 
 function resolveUnixShellCwd(cwd: string | undefined): string | undefined {
-  if (!cwd) return undefined
-  const candidate = cwd.trim()
-  if (!candidate) return undefined
+  return resolveLaunchCwd(cwd, { targetRuntime: 'linux-process' }).launchCwd
+}
 
-  // In WSL, Linux processes need POSIX paths. Convert Windows-style cwd inputs
-  // (e.g. D:\users\dan) to WSL mount paths before passing cwd to node-pty.
-  // Skip conversion for paths already in Linux/POSIX format.
-  if (isWsl() && !isLinuxPath(candidate)) {
-    const converted = convertWindowsPathToWslPath(candidate)
-    if (converted) {
-      return converted
-    }
-  }
-
-  return candidate
+function resolveMcpCwd(cwd: string | undefined): string | undefined {
+  const targetRuntime = isWindows() ? 'windows-process' : 'linux-process'
+  return resolveLaunchCwd(cwd, { targetRuntime }).launchCwd
 }
 
 /**
@@ -1006,28 +931,32 @@ export function buildSpawnSpec(
       const args: string[] = []
       if (distro) args.push('-d', distro)
 
-      // cwd must be a Linux path inside WSL for both the --cd arg and MCP injection.
-      const wslCwd = cwd
+      // The WSL child process needs a Linux cwd for `wsl.exe --cd`.
+      const wslChildCwd = cwd
         ? (isLinuxPath(cwd) ? cwd : (convertWindowsPathToWslPath(cwd) || cwd))
         : undefined
-      if (wslCwd) {
-        args.push('--cd', wslCwd)
+      // MCP/config work still happens on the server host, so keep a separate
+      // host-native cwd for config-writer validation and cleanup.
+      const wslMcpCwd = resolveMcpCwd(cwd)
+      if (wslChildCwd) {
+        args.push('--cd', wslChildCwd)
       }
 
       if (mode === 'shell') {
         args.push('--exec', 'bash', '-l')
-        return { file: wsl, args, cwd: undefined, mcpCwd: wslCwd, env }
+        return { file: wsl, args, cwd: undefined, mcpCwd: wslMcpCwd, env }
       }
 
-      // Pass wslCwd (Linux-normalized) so MCP injection receives a valid POSIX path
-      const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings, terminalId, wslCwd)
+      // The coding CLI runs inside WSL, so its launch target stays Unix, but any
+      // host-side MCP file writes must use the server host's native cwd.
+      const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings, terminalId, wslMcpCwd)
       if (!cli) {
         args.push('--exec', 'bash', '-l')
-        return { file: wsl, args, cwd: undefined, mcpCwd: wslCwd, env }
+        return { file: wsl, args, cwd: undefined, mcpCwd: wslMcpCwd, env }
       }
 
       args.push('--exec', cli.command, ...cli.args)
-      return { file: wsl, args, cwd: undefined, mcpCwd: wslCwd, env: { ...env, ...cli.env } }
+      return { file: wsl, args, cwd: undefined, mcpCwd: wslMcpCwd, env: { ...env, ...cli.env } }
     }
 
     // Option B: Native Windows shells (PowerShell/cmd)
@@ -1053,12 +982,12 @@ export function buildSpawnSpec(
       if (mode === 'shell') {
         if (inWsl && winCwd) {
           // Use /K with cd command to change to Windows directory
-          return { file, args: ['/K', `cd /d ${quoteCmdArg(winCwd)}`], cwd: procCwd, mcpCwd: resolveUnixShellCwd(cwd), env }
+          return { file, args: ['/K', `cd /d ${quoteCmdArg(winCwd)}`], cwd: procCwd, mcpCwd: resolveMcpCwd(cwd), env }
         }
-        return { file, args: ['/K'], cwd: procCwd, mcpCwd: resolveUnixShellCwd(cwd), env }
+        return { file, args: ['/K'], cwd: procCwd, mcpCwd: resolveMcpCwd(cwd), env }
       }
-      // Pass Linux-resolved cwd for MCP injection (server writes config to Linux filesystem)
-      const cmdMcpCwd = resolveUnixShellCwd(cwd)
+      // Pass the host-resolved cwd for MCP injection.
+      const cmdMcpCwd = resolveMcpCwd(cwd)
       const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows', providerSettings, terminalId, cmdMcpCwd)
       const cmd = cli?.command || mode
       const command = buildCmdCommand(cmd, cli?.args || [])
@@ -1085,13 +1014,13 @@ export function buildSpawnSpec(
     if (mode === 'shell') {
       if (inWsl && winCwd) {
         // Use Set-Location to change to Windows directory
-        return { file, args: ['-NoLogo', '-NoExit', '-Command', `Set-Location -LiteralPath ${quotePowerShellLiteral(winCwd)}`], cwd: procCwd, mcpCwd: resolveUnixShellCwd(cwd), env }
+        return { file, args: ['-NoLogo', '-NoExit', '-Command', `Set-Location -LiteralPath ${quotePowerShellLiteral(winCwd)}`], cwd: procCwd, mcpCwd: resolveMcpCwd(cwd), env }
       }
-      return { file, args: ['-NoLogo'], cwd: procCwd, mcpCwd: resolveUnixShellCwd(cwd), env }
+      return { file, args: ['-NoLogo'], cwd: procCwd, mcpCwd: resolveMcpCwd(cwd), env }
     }
 
-    // Pass Linux-resolved cwd for MCP injection (server writes config to Linux filesystem)
-    const psMcpCwd = resolveUnixShellCwd(cwd)
+    // Pass the host-resolved cwd for MCP injection.
+    const psMcpCwd = resolveMcpCwd(cwd)
     const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows', providerSettings, terminalId, psMcpCwd)
     const cmd = cli?.command || mode
     const invocation = buildPowerShellCommand(cmd, cli?.args || [])
@@ -1442,7 +1371,7 @@ export class TerminalRegistry extends EventEmitter {
       })
     } catch (err) {
       // Clean up MCP config temp files that were created before the spawn attempt.
-      // Use mcpCwd (the Linux path passed to generateMcpInjection), not procCwd
+      // Use mcpCwd (the path passed to generateMcpInjection), not procCwd
       // (which may be undefined for WSL cmd/powershell paths).
       cleanupMcpConfig(terminalId, opts.mode, mcpCwd)
       throw wrapTerminalSpawnError(err, {

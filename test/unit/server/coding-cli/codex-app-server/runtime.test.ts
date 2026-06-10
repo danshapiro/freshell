@@ -216,6 +216,50 @@ function createRuntime(options: ConstructorParameters<typeof CodexAppServerRunti
   return runtime
 }
 
+function mockWslEnvironment(mountPrefix: string): () => void {
+  const originalPlatform = process.platform
+  const originalWslDistro = process.env.WSL_DISTRO_NAME
+  const originalWslInterop = process.env.WSL_INTEROP
+  const originalWslenv = process.env.WSLENV
+  const originalWslSys32 = process.env.WSL_WINDOWS_SYS32
+
+  Object.defineProperty(process, 'platform', {
+    value: 'linux',
+    configurable: true,
+  })
+  process.env.WSL_DISTRO_NAME = 'Ubuntu'
+  delete process.env.WSL_INTEROP
+  delete process.env.WSLENV
+  process.env.WSL_WINDOWS_SYS32 = `${mountPrefix}/c/Windows/System32`
+
+  return () => {
+    Object.defineProperty(process, 'platform', {
+      value: originalPlatform,
+      configurable: true,
+    })
+    if (originalWslDistro === undefined) {
+      delete process.env.WSL_DISTRO_NAME
+    } else {
+      process.env.WSL_DISTRO_NAME = originalWslDistro
+    }
+    if (originalWslInterop === undefined) {
+      delete process.env.WSL_INTEROP
+    } else {
+      process.env.WSL_INTEROP = originalWslInterop
+    }
+    if (originalWslenv === undefined) {
+      delete process.env.WSLENV
+    } else {
+      process.env.WSLENV = originalWslenv
+    }
+    if (originalWslSys32 === undefined) {
+      delete process.env.WSL_WINDOWS_SYS32
+    } else {
+      process.env.WSL_WINDOWS_SYS32 = originalWslSys32
+    }
+  }
+}
+
 if (process.platform !== 'linux') {
   describe('CodexAppServerRuntime unsupported platform', () => {
     it('rejects before spawning without Linux /proc ownership support', async () => {
@@ -1244,6 +1288,71 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     runtimes.add(runtime)
 
     await expect(runtime.ensureReady()).rejects.toThrow(/failed to launch codex app-server sidecar|enoent/i)
+  })
+
+  it('normalizes Windows drive cwd to the WSL mount before spawning the Codex app-server sidecar', async () => {
+    const metadataDir = await makeTempDir()
+    const mountRoot = await makeTempDir()
+    const restoreEnv = mockWslEnvironment(mountRoot)
+    const fakeSys32 = path.join(mountRoot, 'c', 'Windows', 'System32')
+    const launchDir = path.join(
+      mountRoot,
+      'd',
+      'Users',
+      'Dan',
+      'GoogleDrivePersonal',
+      'code',
+      'DirectorDeck',
+    )
+    await fsp.mkdir(fakeSys32, { recursive: true })
+    await fsp.mkdir(launchDir, { recursive: true })
+    const canonicalLaunchDir = await fsp.realpath(launchDir)
+
+    try {
+      const runtime = createRuntime({
+        metadataDir,
+        serverInstanceId: 'srv-wsl-cwd',
+      })
+
+      await runtime.ensureReady(String.raw`D:\Users\Dan\GoogleDrivePersonal\code\DirectorDeck`)
+
+      const record = await waitForMetadataRecord(
+        metadataDir,
+        (candidate) => candidate.wrapperIdentity?.cwd === canonicalLaunchDir,
+      )
+      expect(record.wrapperIdentity.cwd).toBe(canonicalLaunchDir)
+      expect(record.wrapperIdentity.cwd).not.toBe('/home/dan/code/DirectorDeck')
+    } finally {
+      restoreEnv()
+    }
+  })
+
+  it('rejects missing converted sidecar cwd before spawning with a clear path-specific error', async () => {
+    const metadataDir = await makeTempDir()
+    const mountRoot = await makeTempDir()
+    const restoreEnv = mockWslEnvironment(mountRoot)
+    await fsp.mkdir(path.join(mountRoot, 'c', 'Windows', 'System32'), { recursive: true })
+
+    try {
+      const runtime = createRuntime({
+        metadataDir,
+        serverInstanceId: 'srv-wsl-cwd-missing',
+      })
+
+      await expect(
+        runtime.ensureReady(String.raw`D:\Users\Dan\GoogleDrivePersonal\code\MissingProject`),
+      ).rejects.toThrow(
+        /Codex app-server launch cwd is not a reachable directory.*D:\\Users\\Dan\\GoogleDrivePersonal\\code\\MissingProject.*\/d\/Users\/Dan\/GoogleDrivePersonal\/code\/MissingProject/s,
+      )
+
+      const entries = await fsp.readdir(metadataDir).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+        throw error
+      })
+      expect(entries).toEqual([])
+    } finally {
+      restoreEnv()
+    }
   })
 
   it('reaps only verified stale new-schema sidecar groups on startup', async () => {

@@ -80,23 +80,39 @@ export function isWslEnvironment(): boolean {
   )
 }
 
-function getWslMountPrefix(): string {
+export function getWslMountPrefix(): string {
   const sys32 = process.env.WSL_WINDOWS_SYS32
   if (sys32) {
-    const normalized = sys32.replace(/\\/g, '/')
-    const match = normalized.match(/^(.*?)\/[a-zA-Z]\//)
+    const normalized = sys32.replace(/\\/g, '/').replace(/\/+$/, '')
+    const match = normalized.match(/^(.*)\/[a-zA-Z]\/Windows\/System32$/i)
     if (match) return match[1]
   }
   return '/mnt'
 }
 
-function convertWslMountPathToWindows(posixPath: string): string | undefined {
-  const match = posixPath.match(/^\/mnt\/([a-zA-Z])(?:\/(.*))?$/)
-  if (!match) return undefined
-  const drive = match[1].toUpperCase()
-  const rest = match[2]
-  if (!rest) return `${drive}:\\`
-  return `${drive}:\\${rest.replace(/\//g, '\\')}`
+function escapeRegex(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+export function convertWslDrivePathToWindowsPath(input: string): string | undefined {
+  const normalized = sanitizeUserPathInput(input).replace(/\\/g, '/')
+  if (!normalized) return undefined
+
+  const mountPrefix = getWslMountPrefix()
+  const prefixes = mountPrefix === '/mnt' ? ['/mnt'] : [mountPrefix]
+
+  for (const prefix of prefixes) {
+    const match = prefix
+      ? normalized.match(new RegExp(`^${escapeRegex(prefix)}/([a-zA-Z])(?:/(.*))?$`))
+      : normalized.match(/^\/([a-zA-Z])(?:\/(.*))?$/)
+    if (!match) continue
+
+    const drive = `${match[1].toUpperCase()}:`
+    const rest = match[2]?.replace(/\//g, '\\')
+    return rest ? `${drive}\\${rest}` : `${drive}\\`
+  }
+
+  return undefined
 }
 
 export function convertWindowsPathToWslPath(input: string): string | undefined {
@@ -161,7 +177,7 @@ async function convertWslPathToWindows(posixPath: string): Promise<string | unde
   if (process.platform !== 'win32') return undefined
   if (!posixPath.startsWith('/')) return undefined
 
-  const mountMapped = convertWslMountPathToWindows(posixPath)
+  const mountMapped = convertWslDrivePathToWindowsPath(posixPath)
   if (mountMapped) return mountMapped
 
   // Skip wsl.exe calls if no WSL distributions are installed —
@@ -200,7 +216,7 @@ function resolveWindowsFlavorPath(resolvedPath: string): string {
 
 function resolvePosixFlavorPathSync(resolvedPath: string): string {
   if (process.platform === 'win32') {
-    const converted = convertWslMountPathToWindows(resolvedPath)
+    const converted = convertWslDrivePathToWindowsPath(resolvedPath)
     if (converted) return path.win32.resolve(converted)
     return path.win32.resolve(resolvedPath)
   }

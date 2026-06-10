@@ -3,6 +3,7 @@ import path from 'path'
 import os from 'os'
 import {
   convertWindowsPathToWslPath,
+  convertWslDrivePathToWindowsPath,
   detectUserPathFlavor,
   isPathAllowed,
   normalizePath,
@@ -175,9 +176,11 @@ describe('server/path-utils cross-platform path handling', () => {
       configurable: true,
     })
     process.env.WSL_DISTRO_NAME = 'Ubuntu'
-    process.env.WSL_WINDOWS_SYS32 = '/custom-mount/c/X/System32'
+    process.env.WSL_WINDOWS_SYS32 = '/prefix/x/mount/c/Windows/System32'
 
-    expect(convertWindowsPathToWslPath(String.raw`D:\users\words with spaces`)).toBe('/custom-mount/d/users/words with spaces')
+    expect(convertWindowsPathToWslPath(String.raw`D:\users\words with spaces`)).toBe(
+      '/prefix/x/mount/d/users/words with spaces',
+    )
   })
 
   it('maps Windows flavor paths to host filesystem paths when running in WSL', async () => {
@@ -202,6 +205,32 @@ describe('server/path-utils cross-platform path handling', () => {
 
     const fsPath = toFilesystemPathSync('/mnt/d/projects/app', 'posix')
     expect(fsPath).toBe(String.raw`D:\projects\app`)
+  })
+
+  it('maps custom WSL drive paths to Windows paths when running on Windows', () => {
+    Object.defineProperty(process, 'platform', {
+      value: 'win32',
+      writable: true,
+      configurable: true,
+    })
+    process.env.WSL_WINDOWS_SYS32 = '/prefix/x/mount/c/Windows/System32'
+
+    const fsPath = toFilesystemPathSync('/prefix/x/mount/d/projects/app', 'posix')
+    expect(fsPath).toBe(String.raw`D:\projects\app`)
+    expect(convertWslDrivePathToWindowsPath('/prefix/x/mount/d/projects/app')).toBe(String.raw`D:\projects\app`)
+  })
+
+  it('does not map stale /mnt drive paths under a custom WSL mount prefix', () => {
+    Object.defineProperty(process, 'platform', {
+      value: 'win32',
+      writable: true,
+      configurable: true,
+    })
+    process.env.WSL_WINDOWS_SYS32 = '/prefix/x/mount/c/Windows/System32'
+
+    const fsPath = toFilesystemPathSync('/mnt/d/projects/app', 'posix')
+    expect(fsPath).toBe(String.raw`\mnt\d\projects\app`)
+    expect(convertWslDrivePathToWindowsPath('/mnt/d/projects/app')).toBeUndefined()
   })
 
   it('allows Windows-configured roots against WSL-mapped targets', () => {
