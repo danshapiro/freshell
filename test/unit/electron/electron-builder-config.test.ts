@@ -41,6 +41,12 @@ describe('electron-builder Windows config', () => {
     )
   })
 
+  it('sets Linux maintainer metadata required by Debian packaging', () => {
+    const config = readText(path.join(PROJECT_ROOT, 'electron-builder.yml'))
+
+    expect(config).toMatch(/^linux:\n(?:.*\n)*?  maintainer: Freshell Maintainers <maintainers@freshell\.dev>$/m)
+  })
+
   it('uses a silent-install friendly NSIS flow', () => {
     const config = readText(path.join(PROJECT_ROOT, 'electron-builder.yml'))
 
