@@ -1244,6 +1244,51 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
+  it('retags queued live output when retention loss rotates stream identity before flush', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(6)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-live-retention-queued')
+
+    const ws = createMockWs()
+    await broker.attach(ws as any, 'term-live-retention-queued', 'viewport_hydrate', 80, 24, 0, 'live-retention-queued-attach')
+    const ready = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(ready?.streamId).toEqual(expect.any(String))
+    ws.send.mockClear()
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-retention-queued', data: 'aaa', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-retention-queued', data: 'bbb', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-live-retention-queued', data: 'ccc', at: Date.now() })
+    vi.advanceTimersByTime(1)
+
+    const payloads = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+    const streamChangedIndex = payloads.findIndex((payload) =>
+      payload?.type === 'terminal.stream.changed' && payload.reason === 'retention_lost'
+    )
+    const streamChanged = payloads[streamChangedIndex]
+    const outputs = payloads.filter((payload) => payload?.type === 'terminal.output')
+
+    expect(streamChanged).toMatchObject({
+      terminalId: 'term-live-retention-queued',
+      reason: 'retention_lost',
+      attachRequestId: 'live-retention-queued-attach',
+      streamId: expect.any(String),
+    })
+    expect(streamChanged.streamId).not.toBe(ready.streamId)
+    expect(outputs.map((payload) => payload.data)).toEqual(['aaa', 'bbb', 'ccc'])
+    expect(outputs.every((payload) => payload.streamId === streamChanged.streamId)).toBe(true)
+    expect(outputs.every((payload) => payload.streamId !== ready.streamId)).toBe(true)
+    for (const output of outputs) {
+      expect(payloads.indexOf(output)).toBeGreaterThan(streamChangedIndex)
+      expect(output.attachRequestId).toBe('live-retention-queued-attach')
+    }
+
+    broker.close()
+  })
+
   it('retags retained replay frames when retention loss rotates stream identity', async () => {
     const registry = new FakeBrokerRegistry()
     registry.setReplayRingMaxBytes(6)

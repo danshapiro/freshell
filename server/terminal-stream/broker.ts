@@ -1867,10 +1867,19 @@ export class TerminalStreamBroker {
   }
 
   private replaceStreamIdentity(terminalId: string, reason: TerminalStreamReplacementReason): string {
+    const previousStreamId = this.streamIdentity.getStream(terminalId)
     const streamId = this.streamIdentity.replaceStream(terminalId, reason)
     const state = this.terminals.get(terminalId)
     if (state) {
       for (const attachment of state.clients.values()) {
+        if (previousStreamId && reason === 'retention_lost') {
+          attachment.queue.retagPendingStream(previousStreamId, streamId)
+          for (const frame of attachment.attachStaging) {
+            if (frame.streamId === previousStreamId) {
+              frame.streamId = streamId
+            }
+          }
+        }
         this.sendStreamChanged(
           attachment.ws,
           terminalId,
