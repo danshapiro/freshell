@@ -225,6 +225,41 @@ describe('resolveLaunchCwd', () => {
     expect(result.launchCwd).toBe(String.raw`D:\Users\Dan\DirectorDeck`)
     expect(result.conversion).toBe('none')
   })
+
+  it('does not convert native Windows drive cwd values for Linux process targets outside WSL', () => {
+    mockPlatform('win32')
+
+    const result = resolveLaunchCwd(String.raw`C:\Users\Dan\repo`, {
+      targetRuntime: 'linux-process',
+    })
+
+    expect(result).toEqual({
+      targetRuntime: 'linux-process',
+      inputCwd: String.raw`C:\Users\Dan\repo`,
+      displayCwd: String.raw`C:\Users\Dan\repo`,
+      launchCwd: undefined,
+      conversion: 'none',
+    })
+  })
+
+  it('keeps double-slash paths aligned with terminal registry path semantics', () => {
+    mockWsl()
+
+    expect(resolveLaunchCwd('//server/share', { targetRuntime: 'linux-process' })).toEqual({
+      targetRuntime: 'linux-process',
+      inputCwd: '//server/share',
+      displayCwd: '//server/share',
+      launchCwd: '//server/share',
+      conversion: 'none',
+    })
+    expect(resolveLaunchCwd('//server/share', { targetRuntime: 'windows-process' })).toEqual({
+      targetRuntime: 'windows-process',
+      inputCwd: '//server/share',
+      displayCwd: '//server/share',
+      launchCwd: undefined,
+      conversion: 'none',
+    })
+  })
 })
 
 describe('convertWslDrivePathToWindowsPath', () => {
@@ -298,7 +333,7 @@ export function isWslRuntime(): boolean {
 }
 
 function isLinuxPath(input: string): boolean {
-  return POSIX_ABSOLUTE_PREFIX_RE.test(input)
+  return POSIX_ABSOLUTE_PREFIX_RE.test(input) && !input.startsWith('//')
 }
 
 function isWindowsAbsolutePath(input: string): boolean {
@@ -315,7 +350,7 @@ function getWslMountPrefix(): string {
   const sys32 = process.env.WSL_WINDOWS_SYS32
   if (sys32) {
     const normalized = sys32.replace(/\\/g, '/')
-    const match = normalized.match(/^(.*?)\/[a-zA-Z]\//)
+    const match = normalized.match(/^(.*)\/[a-zA-Z]\//)
     if (match) return match[1]
   }
   return '/mnt'
@@ -347,7 +382,7 @@ function resolveLinuxProcessCwd(candidate: string): Pick<ResolvedLaunchCwd, 'lau
     return { launchCwd: candidate, conversion: 'none' }
   }
 
-  if (isWindowsAbsolutePath(candidate) && (isWslRuntime() || process.platform === 'win32')) {
+  if (isWindowsAbsolutePath(candidate) && isWslRuntime()) {
     const converted = convertWindowsPathToWslPath(candidate)
     if (converted) {
       return { launchCwd: converted, conversion: 'windows-drive-to-wsl-mount' }
@@ -473,12 +508,41 @@ In the same file, add this test inside `describe('cwd handling for Windows shell
     })
 ```
 
+In the same file, add this test inside `describe('buildSpawnSpec MCP injection', () => { ... })` after the existing WSL cwd normalization test:
+
+```ts
+    it('keeps native Windows cmd OpenCode mcpCwd as a Windows path', async () => {
+      mockPlatform('win32')
+      const { generateMcpInjection } = await import('../../../server/mcp/config-writer.js')
+      vi.mocked(generateMcpInjection).mockClear()
+
+      const spec = buildSpawnSpec(
+        'opencode',
+        String.raw`C:\Users\Dan\repo`,
+        'cmd',
+        undefined,
+        { opencodeServer: TEST_OPENCODE_SERVER },
+        undefined,
+        'term-native-win-cmd',
+      )
+
+      expect(spec.cwd).toBe(String.raw`C:\Users\Dan\repo`)
+      expect(spec.mcpCwd).toBe(String.raw`C:\Users\Dan\repo`)
+      expect(generateMcpInjection).toHaveBeenCalledWith(
+        'opencode',
+        'term-native-win-cmd',
+        String.raw`C:\Users\Dan\repo`,
+        'windows',
+      )
+    })
+```
+
 - [ ] **Step 2: Run terminal tests and verify they already pass or expose coupling**
 
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/terminal-registry.test.ts -t "buildSpawnSpec WSL paths"
+npm run test:vitest -- --config vitest.server.config.ts test/unit/server/terminal-registry.test.ts -t "buildSpawnSpec WSL paths|buildSpawnSpec MCP injection"
 ```
 
 Expected: PASS before the refactor. These tests lock behavior before moving conversion code into the shared resolver.
@@ -529,9 +593,40 @@ function resolveWindowsShellCwd(cwd: string | undefined): string | undefined {
 function resolveUnixShellCwd(cwd: string | undefined): string | undefined {
   return resolveLaunchCwd(cwd, { targetRuntime: 'linux-process' }).launchCwd
 }
+
+function resolveMcpCwd(cwd: string | undefined): string | undefined {
+  const targetRuntime = isWindows() ? 'windows-process' : 'linux-process'
+  return resolveLaunchCwd(cwd, { targetRuntime }).launchCwd
+}
 ```
 
 Keep the existing `convertWindowsPathToWslPath` import from `server/path-utils.ts` because `buildSpawnSpec` still uses it in the native Windows `wsl.exe` branch.
+
+In the cmd.exe branch, replace:
+
+```ts
+mcpCwd: resolveUnixShellCwd(cwd)
+```
+
+with:
+
+```ts
+mcpCwd: resolveMcpCwd(cwd)
+```
+
+for both shell-mode return objects, and replace:
+
+```ts
+const cmdMcpCwd = resolveUnixShellCwd(cwd)
+```
+
+with:
+
+```ts
+const cmdMcpCwd = resolveMcpCwd(cwd)
+```
+
+In the PowerShell branch, make the same replacements: use `resolveMcpCwd(cwd)` for shell-mode `mcpCwd` fields and for `const psMcpCwd = ...`.
 
 - [ ] **Step 4: Check for leftover duplicate helper references**
 
@@ -548,7 +643,7 @@ Expected: no output. If output remains, remove only the unused local declaration
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/terminal-registry.test.ts -t "buildSpawnSpec WSL paths"
+npm run test:vitest -- --config vitest.server.config.ts test/unit/server/terminal-registry.test.ts -t "buildSpawnSpec WSL paths|buildSpawnSpec MCP injection"
 ```
 
 Expected: PASS.
@@ -639,6 +734,7 @@ In the same file, add these tests after `it('rejects with a launch error instead
     )
     await fsp.mkdir(fakeSys32, { recursive: true })
     await fsp.mkdir(launchDir, { recursive: true })
+    const canonicalLaunchDir = await fsp.realpath(launchDir)
 
     try {
       const runtime = createRuntime({
@@ -650,9 +746,9 @@ In the same file, add these tests after `it('rejects with a launch error instead
 
       const record = await waitForMetadataRecord(
         metadataDir,
-        (candidate) => candidate.wrapperIdentity?.cwd === launchDir,
+        (candidate) => candidate.wrapperIdentity?.cwd === canonicalLaunchDir,
       )
-      expect(record.wrapperIdentity.cwd).toBe(launchDir)
+      expect(record.wrapperIdentity.cwd).toBe(canonicalLaunchDir)
       expect(record.wrapperIdentity.cwd).not.toBe('/home/dan/code/DirectorDeck')
     } finally {
       restoreEnv()
@@ -748,9 +844,15 @@ async function assertCodexAppServerLaunchCwdReachable(cwd: CodexAppServerLaunchC
 
 - [ ] **Step 4: Resolve sidecar cwd before compatibility checks and spawn**
 
-In `server/coding-cli/codex-app-server/runtime.ts`, replace the start of `ensureReady(cwd?: string)` through the `startRuntime(...)` call with:
+In `server/coding-cli/codex-app-server/runtime.ts`, replace the entire `ensureReady(cwd?: string): Promise<ReadyState>` method with this implementation:
 
 ```ts
+  async ensureReady(cwd?: string): Promise<ReadyState> {
+    if (this.shutdownRequested) {
+      throw new Error('Codex app-server sidecar is shutting down.')
+    }
+    await this.assertNoBlockedOwnership('ensure Codex app-server sidecar readiness')
+
     const requestedCwd = normalizeLaunchCwd(cwd) ?? this.defaultCwd
     const launchCwd = resolveCodexAppServerLaunchCwd(requestedCwd)
     if (this.ready) {
@@ -770,6 +872,9 @@ In `server/coding-cli/codex-app-server/runtime.ts`, replace the start of `ensure
 
     this.ready = await this.ensureReadyPromise
     this.readyCwd = launchCwd.launchCwd
+    this.statusValue = 'running'
+    return this.ready
+  }
 ```
 
 Change the `startRuntime` signature from:
