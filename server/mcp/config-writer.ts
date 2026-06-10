@@ -296,10 +296,10 @@ export function generateMcpInjection(
       // Without this check, mkdirSync({recursive:true}) would silently create directories
       // for invalid/mistyped cwd paths, which is confusing to debug.
       //
-      // Assumption: cwd is always a valid Linux/POSIX path by the time it reaches here.
-      // On WSL, buildSpawnSpec passes the resolved unixCwd (via resolveUnixShellCwd which
-      // converts Windows-style paths like D:\project to /mnt/d/project) to the MCP injection
-      // pipeline, not the raw input cwd. This ensures existsSync works correctly on Linux.
+      // Contract: cwd is already resolved into the server process's native filesystem view
+      // by the time it reaches here. That means POSIX paths on Linux/WSL and Windows drive
+      // paths on native Windows. This module validates and uses that host-native path as-is;
+      // it does not reinterpret or remap cwd on its own.
       if (!fs.existsSync(cwd)) {
         throw new Error(
           `Cannot inject MCP config for OpenCode: cwd directory does not exist: ${cwd}. `
@@ -307,12 +307,11 @@ export function generateMcpInjection(
         )
       }
 
-      // Design note (WSL cwd path handling):
-      // On WSL, the cwd is a Linux path (e.g., /home/user/project). OpenCode processes
-      // (even when spawned via Windows shells like cmd.exe or powershell.exe) access the
-      // same filesystem via UNC paths (\\wsl.localhost\...) or /mnt/... mount points.
-      // Writing .opencode/opencode.json under the Linux cwd is correct because the Linux
-      // path and the Windows-accessible path resolve to the same physical file.
+      // Design note:
+      // The project-local OpenCode config always lives directly under the validated host
+      // cwd (`<cwd>/.opencode/opencode.json`). On WSL this is a POSIX path such as
+      // /home/user/project or /mnt/d/project; on native Windows it is a Windows drive
+      // path such as C:\Users\dev\project.
       const configPath = getOpenCodeConfigPath(cwd)
       const dirPath = path.dirname(configPath)
 
