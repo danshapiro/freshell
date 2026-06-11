@@ -195,6 +195,7 @@ describe('createTerminalWriteQueue', () => {
     const callbacks: number[] = []
     const rafCallbacks: FrameRequestCallback[] = []
     const line = `${'B'.repeat(1023)}\n`
+    const nowMs = 0
 
     const queue = createTerminalWriteQueue({
       terminalInstanceId: 'surface-live-four-hour-backlog',
@@ -207,6 +208,7 @@ describe('createTerminalWriteQueue', () => {
         return rafCallbacks.length
       },
       cancelFrame: () => {},
+      now: () => nowMs,
     })
 
     for (let index = 0; index < 14_400; index += 1) {

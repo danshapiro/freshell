@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, expect, it, beforeEach, afterEach } from 'vitest'
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest'
 import fsp from 'fs/promises'
 import path from 'path'
 import os from 'os'
@@ -968,23 +968,32 @@ describe('querySessionDirectory file-based search', () => {
     await expect(resultPromise).rejects.toThrow(/aborted/i)
   })
 
-  it('title-tier search completes quickly for many sessions (performance guard)', async () => {
+  it('title-tier search stays metadata-only for many sessions', async () => {
+    const sessionFile = path.join(tempDir, 'title-tier-should-not-read.jsonl')
+    await fsp.writeFile(sessionFile, '{"type":"user","message":{"role":"user","content":"deploy"}}\n')
+    const parseEvent = vi.fn(() => {
+      throw new Error('title-tier search must not scan session files')
+    })
+    const provider = {
+      ...claudeProvider,
+      parseEvent,
+    }
     const sessions = Array.from({ length: 1000 }, (_, i) => makeSession({
       sessionId: `session-${i}`,
       projectPath: '/repo',
       lastActivityAt: 10000 - i,
       title: i % 10 === 0 ? `Deploy session ${i}` : `Other session ${i}`,
+      sourceFile: sessionFile,
     }))
 
-    const start = performance.now()
     const page = await querySessionDirectory({
       projects: [makeProject('/repo', sessions)],
       terminalMeta: [],
+      providers: [provider],
       query: { priority: 'visible', query: 'deploy', tier: 'title' },
     })
-    const elapsed = performance.now() - start
 
     expect(page.items.length).toBeGreaterThan(0)
-    expect(elapsed).toBeLessThan(50)
+    expect(parseEvent).not.toHaveBeenCalled()
   })
 })

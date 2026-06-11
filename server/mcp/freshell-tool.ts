@@ -278,6 +278,7 @@ const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> 
   'list-sessions':   { required: [],                          optional: [] },
   'search-sessions': { required: ['query'],                   optional: [] },
   'lan-info':        { required: [],                          optional: [] },
+  'fresh-send':      { required: ['sessionId', 'sessionType', 'provider', 'text'], optional: [] },
   'health':          { required: [],                          optional: [] },
   'help':            { required: [],                          optional: [] },
 }
@@ -569,6 +570,14 @@ async function routeAction(
   const c = client()
 
   switch (action) {
+    // -- Fresh agent (chat client) actions --
+    case 'fresh-send': {
+      const sessionId = requireParam(params, 'sessionId')
+      const sessionType = requireParam(params, 'sessionType')
+      const provider = requireParam(params, 'provider')
+      const text = requireParam(params, 'text')
+      return c.post('/api/fresh-agent/send', { sessionId, sessionType, provider, text })
+    }
     // -- Tab actions --
     case 'new-tab': {
       const { name, mode, shell, cwd, browser, editor, resume, sessionRef: explicitSessionRef, prompt, ...rest } = params || {}

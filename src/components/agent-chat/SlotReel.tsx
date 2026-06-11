@@ -14,6 +14,12 @@ interface ReelSlot {
   current: string
   previous: string | null
   animating: boolean
+  /** Monotonic counter — keys the animated spans so a change that lands
+   * mid-animation remounts them and the CSS animation restarts from frame 0.
+   * (The previous transition-based approach left the outgoing span stuck at
+   * its translated end state when values changed faster than the animation,
+   * so rapid tool sequences froze instead of rolling.) */
+  serial: number
 }
 
 function useReelSlot(value: string): ReelSlot {
@@ -21,6 +27,7 @@ function useReelSlot(value: string): ReelSlot {
     current: value,
     previous: null,
     animating: false,
+    serial: 0,
   })
   const prevValueRef = useRef(value)
 
@@ -29,10 +36,17 @@ function useReelSlot(value: string): ReelSlot {
     const prev = prevValueRef.current
     prevValueRef.current = value
 
-    setSlot({ current: value, previous: prev, animating: true })
+    setSlot((s) => ({
+      current: value,
+      // If a roll is already in flight, the in-flight target becomes the
+      // outgoing value so the reel never skips a frame backwards.
+      previous: s.animating ? s.current : prev,
+      animating: true,
+      serial: s.serial + 1,
+    }))
 
     const timer = setTimeout(() => {
-      setSlot(s => ({ ...s, previous: null, animating: false }))
+      setSlot((s) => ({ ...s, previous: null, animating: false }))
     }, 150)
     return () => clearTimeout(timer)
   }, [value])
@@ -43,20 +57,20 @@ function useReelSlot(value: string): ReelSlot {
 function ReelCell({ slot, className }: { slot: ReelSlot; className?: string }) {
   return (
     <span className={cn('relative inline-flex overflow-hidden', className)}>
-      <span
-        className={cn(
-          'inline-block transition-transform duration-150 ease-out',
-          slot.animating && '-translate-y-full',
-        )}
-      >
-        {slot.previous ?? slot.current}
-      </span>
-      {slot.animating && (
-        <span
-          className="absolute left-0 top-full inline-block transition-transform duration-150 ease-out -translate-y-full"
-        >
-          {slot.current}
-        </span>
+      {slot.animating && slot.previous !== null ? (
+        <>
+          <span key={`out-${slot.serial}`} className="inline-block animate-reel-out">
+            {slot.previous}
+          </span>
+          <span
+            key={`in-${slot.serial}`}
+            className="absolute left-0 top-0 inline-block animate-reel-in"
+          >
+            {slot.current}
+          </span>
+        </>
+      ) : (
+        <span className="inline-block">{slot.current}</span>
       )}
     </span>
   )

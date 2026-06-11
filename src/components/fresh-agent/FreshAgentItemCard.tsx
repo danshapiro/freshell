@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { Check, ChevronRight, Loader2, X } from 'lucide-react'
 import DiffView from '@/components/agent-chat/DiffView'
 import { getToolPreview } from '@/components/agent-chat/tool-preview'
+import { LazyMarkdown } from '@/components/markdown/LazyMarkdown'
 import type { FreshAgentTranscriptItem } from '@shared/fresh-agent-contract'
 import { cn } from '@/lib/utils'
 
@@ -219,13 +220,41 @@ export function itemToToolDisplay(item: FreshAgentTranscriptItem): FreshAgentToo
   return null
 }
 
-function renderText(text: string) {
+/**
+ * Render visible item text. Assistant-authored text renders as markdown
+ * (matching agent-chat's MessageBubble); user text and thinking stay plain
+ * so literal input is never re-interpreted. The plain <p> doubles as the
+ * Suspense fallback so content is readable while the renderer chunk loads.
+ */
+function renderText(text: string, markdown = false) {
   const visibleText = stripSystemReminders(text)
   if (!visibleText) return null
-  return <p className="whitespace-pre-wrap break-words">{visibleText}</p>
+  const plain = <p className="whitespace-pre-wrap break-words">{visibleText}</p>
+  if (!markdown) return plain
+  return (
+    <div
+      data-markdown-body=""
+      className="prose prose-sm dark:prose-invert max-w-none [&_h1]:my-2 [&_h2]:my-1.5 [&_h3]:my-1.5 [&_p]:my-1 [&_pre]:my-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5"
+    >
+      <LazyMarkdown content={visibleText} fallback={plain} />
+    </div>
+  )
 }
 
-export function FreshAgentItemCard({ item }: { item: FreshAgentTranscriptItem }) {
+/** Markdown-rendered body for agent-authored text that lives outside item
+ * cards (turn-summary fallbacks, expanded thinking). Keeps every assistant
+ * text path on the same renderer so backticks never show literally. */
+export function FreshAgentMarkdownBody({ text }: { text: string }) {
+  return <>{renderText(text, true)}</>
+}
+
+export function FreshAgentItemCard({
+  item,
+  markdown = false,
+}: {
+  item: FreshAgentTranscriptItem
+  markdown?: boolean
+}) {
   if (item.kind === 'text' || item.kind === 'thinking') {
     if (item.kind === 'thinking') {
       return (
@@ -235,7 +264,7 @@ export function FreshAgentItemCard({ item }: { item: FreshAgentTranscriptItem })
         </details>
       )
     }
-    return renderText(item.text)
+    return renderText(item.text, markdown)
   }
 
   if (item.kind === 'reasoning') {

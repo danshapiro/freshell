@@ -171,6 +171,9 @@ vi.mock('lucide-react', () => ({
   Square: ({ className }: { className?: string }) => (
     <svg data-testid="square-icon" className={className} />
   ),
+  SquareTerminal: ({ className }: { className?: string }) => (
+    <svg data-testid="square-terminal-icon" className={className} />
+  ),
   Search: ({ className }: { className?: string }) => (
     <svg data-testid="search-icon" className={className} />
   ),
@@ -2671,7 +2674,7 @@ describe('PaneContainer', () => {
         store,
       )
 
-      expect(screen.getByText('Kilroy')).toBeInTheDocument()
+      expect(screen.getByTitle('Kilroy session')).toHaveTextContent('Kilroy')
       expect(screen.getByText(/freshell \(main\)\s+25%/)).toBeInTheDocument()
     })
 

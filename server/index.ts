@@ -1,3 +1,4 @@
+import { createFreshAgentExtrasRouter } from './fresh-agent-extras-router.js'
 import { detectLanIpsAsync } from './bootstrap.js' // Must be first - ensures .env exists before dotenv loads
 import 'dotenv/config'
 import express from 'express'
@@ -624,6 +625,9 @@ async function main() {
     codingCliIndexer,
     terminalViewService: createTerminalViewService({ configStore, registry }),
   }))
+
+  // --- API: fresh-agent extras (attachments, exec, diffs) ---
+  app.use('/api/fresh-agent', createFreshAgentExtrasRouter({ freshAgentRuntimeManager }))
 
   // --- API: AI ---
   app.use('/api/ai', createAiRouter({ registry, perfConfig }))

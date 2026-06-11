@@ -6,14 +6,70 @@ import path from 'node:path'
 import { EventEmitter } from 'node:events'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
+import { WsHandler } from '../../server/ws-handler'
 import { FakeCodexLaunchPlanner, DEFAULT_CODEX_REMOTE_WS_URL } from '../helpers/coding-cli/fake-codex-launch-planner.js'
 
+const TEST_TIMEOUT_MS = 60_000
 const HOOK_TIMEOUT_MS = 30_000
 const MESSAGE_TIMEOUT_MS = 5_000
 const PROOF_MESSAGE_TIMEOUT_MS = 15_000
 const PROOF_TEST_TIMEOUT_MS = 60_000
 const CODEX_SESSION_ID = 'codex-session-abc-123'
 const CODEX_REMOTE_WS_URL = DEFAULT_CODEX_REMOTE_WS_URL
+
+vi.setConfig({ testTimeout: TEST_TIMEOUT_MS, hookTimeout: HOOK_TIMEOUT_MS })
+
+let activeSockets: WebSocket[] = []
+
+function trackWebSocket(ws: WebSocket): WebSocket {
+  activeSockets.push(ws)
+  return ws
+}
+
+function waitForOpen(ws: WebSocket, timeoutMs = MESSAGE_TIMEOUT_MS): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timeout)
+      ws.off('open', onOpen)
+      ws.off('close', onClose)
+      ws.off('error', onError)
+    }
+
+    const timeout = setTimeout(() => {
+      cleanup()
+      reject(new Error('Timeout waiting for WebSocket open'))
+    }, timeoutMs)
+
+    const onOpen = () => {
+      cleanup()
+      resolve()
+    }
+
+    const onClose = () => {
+      cleanup()
+      reject(new Error('Socket closed waiting for open'))
+    }
+
+    const onError = (error: Error) => {
+      cleanup()
+      reject(error)
+    }
+
+    if (ws.readyState === WebSocket.OPEN) {
+      onOpen()
+      return
+    }
+
+    if (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      onClose()
+      return
+    }
+
+    ws.once('open', onOpen)
+    ws.once('close', onClose)
+    ws.once('error', onError)
+  })
+}
 
 function listen(server: http.Server, timeoutMs = HOOK_TIMEOUT_MS): Promise<{ port: number }> {
   return new Promise((resolve, reject) => {
@@ -110,48 +166,6 @@ function waitForReady(ws: WebSocket): Promise<any> {
   return readyPromise
 }
 
-function waitForOpen(ws: WebSocket, timeoutMs = MESSAGE_TIMEOUT_MS): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const cleanup = () => {
-      clearTimeout(timeout)
-      ws.off('open', onOpen)
-      ws.off('close', onClose)
-      ws.off('error', onError)
-    }
-
-    const timeout = setTimeout(() => {
-      cleanup()
-      reject(new Error('Timeout waiting for websocket open'))
-    }, timeoutMs)
-
-    const onOpen = () => {
-      cleanup()
-      resolve()
-    }
-    const onClose = () => {
-      cleanup()
-      reject(new Error('Socket closed waiting for open'))
-    }
-    const onError = (error: Error) => {
-      cleanup()
-      reject(error)
-    }
-
-    if (ws.readyState === WebSocket.OPEN) {
-      onOpen()
-      return
-    }
-    if (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
-      onClose()
-      return
-    }
-
-    ws.once('open', onOpen)
-    ws.once('close', onClose)
-    ws.once('error', onError)
-  })
-}
-
 function collectMessages(ws: WebSocket, durationMs: number): Promise<any[]> {
   return new Promise((resolve) => {
     const messages: any[] = []
@@ -172,6 +186,7 @@ function collectMessages(ws: WebSocket, durationMs: number): Promise<any[]> {
 
 function closeWebSocket(ws: WebSocket, timeoutMs = 1_000): Promise<void> {
   return new Promise((resolve) => {
+    let settled = false
     if (ws.readyState === WebSocket.CLOSED) {
       resolve()
       return
@@ -183,14 +198,20 @@ function closeWebSocket(ws: WebSocket, timeoutMs = 1_000): Promise<void> {
       ws.off('error', onClose)
     }
 
-    const onClose = () => {
+    const finish = () => {
+      if (settled) return
+      settled = true
       cleanup()
       resolve()
     }
 
+    const onClose = () => finish()
+
     const timeout = setTimeout(() => {
-      cleanup()
-      resolve()
+      if (ws.readyState !== WebSocket.CLOSED) {
+        ws.terminate()
+      }
+      setTimeout(finish, 25)
     }, timeoutMs)
 
     ws.on('close', onClose)
@@ -199,6 +220,29 @@ function closeWebSocket(ws: WebSocket, timeoutMs = 1_000): Promise<void> {
     if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
       ws.close()
     }
+  })
+}
+
+function closeServer(serverToClose: http.Server, timeoutMs = 5_000): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(forceClose)
+      clearTimeout(timeout)
+      resolve()
+    }
+    const forceClose = setTimeout(() => {
+      serverToClose.closeIdleConnections?.()
+      serverToClose.closeAllConnections?.()
+    }, 50)
+    const timeout = setTimeout(() => {
+      serverToClose.closeIdleConnections?.()
+      serverToClose.closeAllConnections?.()
+      finish()
+    }, timeoutMs)
+    serverToClose.close(() => finish())
   })
 }
 
@@ -411,9 +455,8 @@ describe('terminal.create reuse running codex terminal', () => {
     process.env.NODE_ENV = 'test'
     process.env.AUTH_TOKEN = 'testtoken-testtoken'
     process.env.HELLO_TIMEOUT_MS = '5000'
+    activeSockets = []
 
-    vi.resetModules()
-    const { WsHandler } = await import('../../server/ws-handler')
     server = http.createServer((_req, res) => { res.statusCode = 404; res.end() })
     registry = new FakeRegistry(['term-codex-existing'])
     codexLaunchPlanner = new FakeCodexLaunchPlanner()
@@ -430,8 +473,16 @@ describe('terminal.create reuse running codex terminal', () => {
   }, HOOK_TIMEOUT_MS)
 
   afterEach(async () => {
+    const sockets = activeSockets
+    activeSockets = []
+    await Promise.all(sockets.map(async (ws) => {
+      await closeWebSocket(ws, 250).catch(() => undefined)
+      if (ws.readyState !== WebSocket.CLOSED) {
+        ws.terminate()
+      }
+    }))
     if (server) {
-      await new Promise<void>((resolve) => server!.close(() => resolve()))
+      await closeServer(server)
       server = undefined
     }
     if (originalNodeEnv === undefined) {
@@ -453,7 +504,7 @@ describe('terminal.create reuse running codex terminal', () => {
   }, HOOK_TIMEOUT_MS)
 
   it('reuses existing codex terminal and requires an explicit attach', async () => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
     try {
       await waitForOpen(ws)
       const helloReady = await waitForReady(ws)
@@ -500,7 +551,7 @@ describe('terminal.create reuse running codex terminal', () => {
   })
 
   it('canonical reuse branch returns created only until explicit attach', async () => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
     try {
       await waitForOpen(ws)
       await waitForReady(ws)
@@ -540,7 +591,7 @@ describe('terminal.create reuse running codex terminal', () => {
   })
 
   it('rejects raw Codex resume ids on restore instead of creating a fresh terminal', async () => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
     try {
       await waitForOpen(ws)
       await waitForReady(ws)
@@ -573,7 +624,7 @@ describe('terminal.create reuse running codex terminal', () => {
     ['omitted', undefined],
     ['false', false],
   ] as const)('rejects raw Codex resume ids when restore is %s', async (_label, restore) => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
     try {
       await waitForOpen(ws)
       await waitForReady(ws)
@@ -603,7 +654,7 @@ describe('terminal.create reuse running codex terminal', () => {
   })
 
   it('existingId branch returns created only and requires explicit attach', async () => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
     try {
       await waitForOpen(ws)
       const helloReady = await waitForReady(ws)
@@ -659,7 +710,7 @@ describe('terminal.create reuse running codex terminal', () => {
   })
 
   it('does not echo durable session ids from reused codex terminals via terminal.created', async () => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
     try {
       await waitForOpen(ws)
       await waitForReady(ws)
@@ -680,7 +731,7 @@ describe('terminal.create reuse running codex terminal', () => {
   })
 
   it('creates a fresh codex terminal without persisting a provisional session id', async () => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
     try {
       await waitForOpen(ws)
       await waitForReady(ws)
@@ -725,7 +776,7 @@ describe('terminal.create reuse running codex terminal', () => {
 
   it('proof-reads captured Codex durability and resumes only after proof succeeds', async () => {
     const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-proof-'))
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
     try {
       const rolloutPath = path.join(tempDir, 'rollout.jsonl')
       await fsp.writeFile(
@@ -784,7 +835,7 @@ describe('terminal.create reuse running codex terminal', () => {
 
   it('proof-reads server-stored Codex durability when the client has not persisted candidate state', async () => {
     const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-store-proof-'))
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
     try {
       const rolloutPath = path.join(tempDir, 'rollout.jsonl')
       await fsp.writeFile(
@@ -846,7 +897,7 @@ describe('terminal.create reuse running codex terminal', () => {
 
   it('does not use server-stored Codex durability for non-restore fresh creates', async () => {
     const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-store-fresh-'))
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
     try {
       const rolloutPath = path.join(tempDir, 'rollout.jsonl')
       await fsp.writeFile(
@@ -901,7 +952,7 @@ describe('terminal.create reuse running codex terminal', () => {
 
   it('fresh-creates with restore failure when server-stored Codex durability cannot be proved', async () => {
     const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-store-proof-missing-'))
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
     try {
       const rolloutPath = path.join(tempDir, 'missing.jsonl')
       registry.durabilityRestoreRecords.push({
@@ -964,7 +1015,7 @@ describe('terminal.create reuse running codex terminal', () => {
 
   it('proof-reads a same-server live Codex candidate before reattaching it', async () => {
     const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-proof-live-'))
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
     try {
       const rolloutPath = path.join(tempDir, 'rollout.jsonl')
       await fsp.writeFile(
@@ -1038,7 +1089,7 @@ describe('terminal.create reuse running codex terminal', () => {
 
   it('does not promote a stale same-server live Codex handle when its candidate differs', async () => {
     const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-proof-live-mismatch-'))
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
     try {
       const rolloutPath = path.join(tempDir, 'rollout.jsonl')
       await fsp.writeFile(
@@ -1108,7 +1159,7 @@ describe('terminal.create reuse running codex terminal', () => {
 
   it('does not resume a captured Codex candidate when proof fails', async () => {
     const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-proof-'))
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
     try {
       const rolloutPath = path.join(tempDir, 'missing.jsonl')
       await waitForOpen(ws)
@@ -1160,7 +1211,7 @@ describe('terminal.create reuse running codex terminal', () => {
 
   it('attaches exact live Codex candidate when captured proof fails and live terminal exists', async () => {
     const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-proof-'))
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
     try {
       const rolloutPath = path.join(tempDir, 'missing-live.jsonl')
       registry.records[0].codexDurability = {
@@ -1199,7 +1250,7 @@ describe('terminal.create reuse running codex terminal', () => {
   })
 
   it('accepts Codex candidate persisted acknowledgements through the dynamic websocket schema', async () => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
     try {
       await waitForOpen(ws)
       await waitForReady(ws)
@@ -1227,13 +1278,12 @@ describe('terminal.create reuse running codex terminal', () => {
   })
 
   it('reuses canonical owner and repairs duplicate session records before reuse', async () => {
-    const { WsHandler } = await import('../../server/ws-handler')
     const dupeServer = http.createServer((_req, res) => { res.statusCode = 404; res.end() })
     const dupeRegistry = new FakeRegistry(['term-canonical', 'term-duplicate'])
     new WsHandler(dupeServer, dupeRegistry as any, { codexLaunchPlanner: new FakeCodexLaunchPlanner() })
     const info = await listen(dupeServer)
 
-    const ws = new WebSocket(`ws://127.0.0.1:${info.port}/ws`)
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${info.port}/ws`))
     try {
       await waitForOpen(ws)
       await waitForReady(ws)

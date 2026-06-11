@@ -8,6 +8,7 @@ import {
   getFreshAgentThinkingOptions,
   normalizeFreshAgentEffort,
   normalizeFreshAgentModel,
+  resolveFreshAgentType,
 } from '@/lib/fresh-agent-registry'
 import { cn } from '@/lib/utils'
 
@@ -17,6 +18,27 @@ function getEffectiveFreshAgentModel(content: FreshAgentPaneContent): string | u
 
 function getEffectiveFreshAgentEffort(content: FreshAgentPaneContent): string | undefined {
   return normalizeFreshAgentEffort(content.sessionType, content.provider, getEffectiveFreshAgentModel(content), content.effort)
+}
+
+type PermissionModeOption = { value: string; label: string; description?: string }
+
+/**
+ * Permission modes per runtime provider. 'plan' maps to the Claude SDK's
+ * read-only research mode; codex modes mirror its approval policies.
+ */
+const PERMISSION_MODES_BY_PROVIDER: Record<string, PermissionModeOption[]> = {
+  claude: [
+    { value: 'default', label: 'Default (ask)' },
+    { value: 'acceptEdits', label: 'Accept edits' },
+    { value: 'bypassPermissions', label: 'Bypass permissions' },
+    { value: 'plan', label: 'Plan mode (read-only)', description: 'Research and propose; no edits until approved.' },
+  ],
+  codex: [
+    { value: 'read-only', label: 'Read-only' },
+    { value: 'on-request', label: 'On request' },
+    { value: 'on-failure', label: 'On failure' },
+    { value: 'never', label: 'Never ask (full access)' },
+  ],
 }
 
 export function FreshAgentSettingsButton({
@@ -38,6 +60,14 @@ export function FreshAgentSettingsButton({
   const modelValue = activeModel ?? ''
   const thinkingOptions = getFreshAgentThinkingOptions(paneContent.sessionType, paneContent.provider, activeModel)
   const thinkingValue = getEffectiveFreshAgentEffort(paneContent) ?? ''
+  const descriptor = resolveFreshAgentType(paneContent.sessionType)
+  const permissionModeVisible = descriptor?.settingsVisibility.permissionMode === true
+  const permissionModes = permissionModeVisible
+    ? PERMISSION_MODES_BY_PROVIDER[paneContent.provider] ?? []
+    : []
+  const permissionModeValue = paneContent.permissionMode
+    ?? descriptor?.defaultPermissionMode
+    ?? ''
   const settingsDisabled = paneContent.status === 'running' || paneContent.status === 'compacting'
 
   const close = useCallback(() => setOpen(false), [])
@@ -86,7 +116,7 @@ export function FreshAgentSettingsButton({
       {open ? (
         <div
           ref={popoverRef}
-          className="absolute right-0 top-full z-50 mt-1 w-64 rounded-md border border-border bg-card p-3 text-xs text-foreground shadow-lg"
+          className="absolute right-0 top-full z-50 mt-1 w-[min(16rem,calc(100vw-1rem))] rounded-md border border-border bg-card p-3 text-xs text-foreground shadow-lg"
           role="dialog"
           aria-label="Agent settings"
         >
@@ -99,7 +129,7 @@ export function FreshAgentSettingsButton({
                     <label
                       key={option.value}
                       className={cn(
-                        'flex cursor-pointer items-center gap-2 rounded border border-border/60 px-2 py-1 transition-colors',
+                        'flex min-h-[2.5rem] cursor-pointer items-center gap-2 rounded border border-border/60 px-2 py-1 transition-colors sm:min-h-0',
                         modelValue === option.value ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/50',
                         settingsDisabled && 'cursor-not-allowed opacity-60 hover:bg-transparent',
                       )}
@@ -138,7 +168,7 @@ export function FreshAgentSettingsButton({
                 <span className="font-medium">Thinking</span>
                 <select
                   aria-label="Thinking level"
-                  className="w-full rounded border border-border/70 bg-background px-2 py-1 text-xs"
+                  className="min-h-[2.5rem] w-full rounded border border-border/70 bg-background px-2 py-1 text-base sm:min-h-0 sm:text-xs"
                   value={thinkingValue}
                   disabled={settingsDisabled}
                   onChange={(event) => {
@@ -153,6 +183,37 @@ export function FreshAgentSettingsButton({
                     <option key={option.value} value={option.value}>{option.label}</option>
                   ))}
                 </select>
+              </label>
+            ) : null}
+
+            {permissionModes.length > 0 ? (
+              <label className="block space-y-1">
+                <span className="font-medium">Permission mode</span>
+                <select
+                  aria-label="Permission mode"
+                  className="min-h-[2.5rem] w-full rounded border border-border/70 bg-background px-2 py-1 text-base sm:min-h-0 sm:text-xs"
+                  value={permissionModeValue}
+                  disabled={settingsDisabled}
+                  onChange={(event) => {
+                    dispatch(mergePaneContent({
+                      tabId,
+                      paneId,
+                      updates: { permissionMode: event.target.value },
+                    }))
+                  }}
+                >
+                  {permissionModes.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+                {permissionModes.find((option) => option.value === permissionModeValue)?.description ? (
+                  <span className="block text-[11px] text-muted-foreground">
+                    {permissionModes.find((option) => option.value === permissionModeValue)?.description}
+                  </span>
+                ) : null}
+                <span className="block text-[11px] text-muted-foreground">
+                  Applies from the next message.
+                </span>
               </label>
             ) : null}
           </div>

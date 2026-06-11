@@ -541,7 +541,11 @@ describe('test coordinator CLI', () => {
 
       expect((await waitForExit(holder)).code).toBe(0)
 
-      const activeHolder = await waitForHolder(fixture.storeDir, (holder) => holder.entrypoint.commandKey === commandKey)
+      const activeHolder = await waitForHolder(
+        fixture.storeDir,
+        (holder) => holder.entrypoint.commandKey === commandKey,
+        15_000,
+      )
       expect(activeHolder).toMatchObject({
         entrypoint: {
           commandKey,

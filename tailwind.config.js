@@ -53,11 +53,21 @@ export default {
       },
       animation: {
         'pulse-subtle': 'pulse-subtle 2s ease-in-out infinite',
+        'reel-out': 'reel-out 150ms ease-out forwards',
+        'reel-in': 'reel-in 150ms ease-out forwards',
       },
       keyframes: {
         'pulse-subtle': {
           '0%, 100%': { opacity: 1 },
           '50%': { opacity: 0.7 },
+        },
+        'reel-out': {
+          '0%': { transform: 'translateY(0)', opacity: 1 },
+          '100%': { transform: 'translateY(-100%)', opacity: 0 },
+        },
+        'reel-in': {
+          '0%': { transform: 'translateY(100%)' },
+          '100%': { transform: 'translateY(0)' },
         },
       },
     },

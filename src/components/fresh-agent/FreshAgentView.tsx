@@ -1,10 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { nanoid } from 'nanoid'
-import PermissionBanner from '@/components/agent-chat/PermissionBanner'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { getWsClient } from '@/lib/ws-client'
-import { getFreshAgentThreadSnapshot } from '@/lib/api'
+import { api, getFreshAgentThreadSnapshot } from '@/lib/api'
 import { consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { clearPendingCreateFailure } from '@/store/freshAgentSlice'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
@@ -21,8 +20,15 @@ import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import { getFreshAgentSlashCommands, type FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
 import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
+import {
+  checkpointLabelForText,
+  pickCheckpointForTurn,
+  type CheckpointEntry,
+} from '@/lib/fresh-agent-checkpoints'
+import type { FreshAgentTurn } from '@shared/fresh-agent-contract'
 import { finalizeCodingAgentSessionName } from '@/store/codingAgentNaming'
 import { FreshAgentApprovalBanner } from './FreshAgentApprovalBanner'
+import { FreshAgentApprovalCard } from './FreshAgentApprovalCard'
 import FreshAgentQuestionBanner from './FreshAgentQuestionBanner'
 import { FreshAgentTranscript } from './FreshAgentTranscript'
 import { FreshAgentComposer, type FreshAgentComposerHandle } from './FreshAgentComposer'
@@ -30,6 +36,7 @@ import { FreshAgentDiffPanel } from './FreshAgentDiffPanel'
 import { FreshAgentSidebar } from './FreshAgentSidebar'
 
 const EARLY_STATES = new Set(['creating', 'starting'])
+const BUSY_STATES = new Set(['running', 'compacting'])
 
 function getEffectiveFreshAgentModel(content: FreshAgentPaneContent): string | undefined {
   return normalizeFreshAgentModel(content.sessionType, content.provider, content.model)
@@ -65,7 +72,11 @@ function getFreshAgentSnapshotThreadId(
   claudeSession: Parameters<typeof getCanonicalDurableSessionId>[0],
 ): string | undefined {
   if (pane.provider === 'claude') {
-    return getCanonicalDurableSessionId(claudeSession) ?? getCanonicalPaneResumeSessionId(pane)
+    // Snapshot history is keyed by Claude's durable UUID. Runtime-only live
+    // handles stay interactive through the WS transport, but should not hit
+    // the snapshot route or surface history-load errors.
+    return getCanonicalDurableSessionId(claudeSession)
+      ?? getCanonicalPaneResumeSessionId(pane)
   }
   if (EARLY_STATES.has(pane.status)) {
     // While a new session is still being created, avoid reading an older durable ref.
@@ -143,6 +154,12 @@ function readCodexFork(value: unknown): { parentThreadId?: string } | undefined 
   }
 }
 
+function composeOutgoingText(text: string, attachmentPaths: string[]): string {
+  if (attachmentPaths.length === 0) return text
+  const list = attachmentPaths.map((path) => `- ${path}`).join('\n')
+  return `${text ? `${text}\n\n` : ''}Attached files (read them from disk):\n${list}`
+}
+
 export function FreshAgentView({
   tabId,
   paneId,
@@ -170,17 +187,54 @@ export function FreshAgentView({
     })
     return state.freshAgent.sessions[sessionKey] ?? state.agentChat.sessions[paneContent.sessionId]
   })
+  // Provider-agnostic session meta: codex/opencode status and errors flow
+  // through the freshAgent slice too, but the claudeSession selector above is
+  // claude-only — without this, a dead codex/opencode process left the pane
+  // looking healthy (blank pane, enabled composer).
+  const agentSessionMeta = useAppSelector((state) => {
+    if (!paneContent.sessionId) return undefined
+    const sessionKey = makeFreshAgentSessionKey({
+      sessionId: paneContent.sessionId,
+      sessionType: paneContent.sessionType,
+      provider: paneContent.provider,
+    })
+    const session = state.freshAgent.sessions[sessionKey]
+    if (!session) return undefined
+    return {
+      status: session.status as string | undefined,
+      lastError: (session as { lastError?: string }).lastError,
+    }
+  })
   const refreshRequest = useAppSelector((state) => state.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
   const [snapshot, setSnapshot] = useState<FreshAgentSnapshot | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [snapshotRefreshNonce, setSnapshotRefreshNonce] = useState(0)
+  const [queuedMessages, setQueuedMessages] = useState<string[]>([])
+  // Transient, self-clearing banner for action feedback (rewind, shell errors).
+  const [notice, setNotice] = useState<string | null>(null)
+  // Optimistic echo of the just-sent user message: the transcript renders
+  // snapshot turns only, which left a 2-10s blank gap after send
+  // (live-test finding). Cleared when a snapshot containing the turn lands.
+  const [localEcho, setLocalEcho] = useState<string | null>(null)
+  const localEchoRef = useRef<string | null>(null)
+  localEchoRef.current = localEcho
   const descriptor = resolveFreshAgentType(paneContent.sessionType)
-  const slashCommands = useMemo(() => getFreshAgentSlashCommands(paneContent.sessionType), [paneContent.sessionType])
+  // Capability-gated commands (e.g. /fork) only appear once the snapshot
+  // confirms the provider supports the action.
+  const slashCommands = useMemo(() => (
+    getFreshAgentSlashCommands(paneContent.sessionType).filter((command) => (
+      command.requiresCapability
+        ? snapshot?.capabilities?.[command.requiresCapability] === true
+        : true
+    ))
+  ), [paneContent.sessionType, snapshot?.capabilities])
   const paneContentRef = useRef(paneContent)
   const composerRef = useRef<FreshAgentComposerHandle | null>(null)
   paneContentRef.current = paneContent
   const restoreTimeoutRef = useRef<number | null>(null)
   const createSentRef = useRef(false)
+  // Session-scoped "always allow" tool names; reset with the pane, never persisted.
+  const alwaysAllowToolsRef = useRef<Set<string>>(new Set())
   // Auto-title state tracks four things:
   // 1. whether this mounted pane has already consumed first-message auto-title,
   // 2. whether we observed a fresh conversation boundary in this mount,
@@ -351,6 +405,9 @@ export function FreshAgentView({
     }
     setSnapshot(null)
     setLoadError(null)
+    setQueuedMessages([])
+    setLocalEcho(null)
+    alwaysAllowToolsRef.current.clear()
     dispatch(updatePaneContent({
       tabId,
       paneId,
@@ -367,6 +424,23 @@ export function FreshAgentView({
     }))
   }, [dispatch, paneId, sendFreshAgentMessage, tabId])
 
+  const sendFork = useCallback((atTurnId?: string) => {
+    const current = paneContentRef.current
+    if (!current.sessionId) return
+    // The freshAgent.forked broadcast is matched on createRequestId +
+    // parentSessionId by the listener below, which repoints this pane at
+    // the forked session. atTurnId is best-effort: providers that can't
+    // fork mid-thread fork from the tip.
+    sendFreshAgentMessage({
+      type: 'freshAgent.fork',
+      requestId: current.createRequestId,
+      sessionId: current.sessionId,
+      sessionType: current.sessionType,
+      provider: current.provider,
+      ...(atTurnId ? { input: { atTurnId } } : {}),
+    })
+  }, [sendFreshAgentMessage])
+
   const runSlashCommand = useCallback((command: FreshAgentSlashCommand, args: string) => {
     const current = paneContentRef.current
     if (command.action === 'new') {
@@ -382,8 +456,12 @@ export function FreshAgentView({
         provider: current.provider,
         ...(args ? { instructions: args } : {}),
       })
+      return
     }
-  }, [sendFreshAgentMessage, startNewConversation])
+    if (command.action === 'fork') {
+      sendFork()
+    }
+  }, [sendFork, sendFreshAgentMessage, startNewConversation])
 
   useEffect(() => {
     if (!refreshRequest) return
@@ -635,6 +713,16 @@ export function FreshAgentView({
         }
         setSnapshot(resolved)
         setSnapshotAutoTitleIdentity(requestAutoTitleIdentity)
+        const echo = localEchoRef.current
+        if (echo) {
+          const needle = echo.slice(0, 80)
+          const echoLanded = resolved.turns.some((turn) => (
+            turn.role === 'user' && turn.items.some((item) => (
+              item.kind === 'text' && item.text.includes(needle)
+            ))
+          ))
+          if (echoLanded) setLocalEcho(null)
+        }
         const fresh = paneContentRef.current
         const nextStatus = (resolved.status as FreshAgentPaneContent['status']) ?? fresh.status
         const snapshotSessionRef = provider === 'opencode' && resolved.sessionId && resolved.sessionId !== sessionId
@@ -667,7 +755,10 @@ export function FreshAgentView({
       .catch((error: unknown) => {
         if (error instanceof Error && error.name === 'AbortError') return
         if (isStaleSnapshotRequest()) return
-        if (paneContent.provider === 'claude' && claudeSession) {
+        if (paneContent.provider === 'claude' && claudeSession && isRestoring) {
+          // While a restore is in flight the snapshot legitimately 404s.
+          // Outside of restore, swallowing here left dead Claude sessions as
+          // silent blank panes (live-test finding) — let the error surface.
           setLoadError(null)
           return
         }
@@ -791,6 +882,165 @@ export function FreshAgentView({
     triggerRecovery,
   ])
 
+  const effectiveStatus = paneContent.provider === 'claude'
+    ? (claudeSessionStatus ?? paneContent.status)
+    : (agentSessionMeta?.status ?? paneContent.status)
+  const isBusy = BUSY_STATES.has(effectiveStatus)
+  const sessionEnded = effectiveStatus === 'exited' || effectiveStatus === 'create-failed'
+  const sessionErrorMessage = agentSessionMeta?.lastError ?? null
+
+  // Fallback poll while the agent is (or claims to be) working: if a
+  // transport event is missed, the pane self-heals within a few seconds
+  // instead of stranding on an empty turn with a stop button.
+  useEffect(() => {
+    if (hidden || !paneContent.sessionId) return
+    if (!isBusy && !EARLY_STATES.has(effectiveStatus)) return
+    const timer = window.setInterval(() => {
+      setSnapshotRefreshNonce((value) => value + 1)
+    }, 3000)
+    return () => window.clearInterval(timer)
+  }, [effectiveStatus, hidden, isBusy, paneContent.sessionId])
+
+  useEffect(() => {
+    if (!notice) return
+    const timer = window.setTimeout(() => setNotice(null), 6000)
+    return () => window.clearTimeout(timer)
+  }, [notice])
+
+  /** Core outgoing-message path shared by direct sends and queue flushes. */
+  const sendUserText = useCallback((text: string) => {
+    const current = paneContentRef.current
+    if (!current.sessionId) return
+    // Checkpoint the working tree before the agent acts on this message, so
+    // "rewind code to here" on this turn restores the pre-turn state. Fire and
+    // forget: a failed snapshot must never block the send.
+    if (current.initialCwd) {
+      void Promise
+        .resolve(api.post('/api/fresh-agent/checkpoints', {
+          cwd: current.initialCwd,
+          label: checkpointLabelForText(text),
+        }))
+        .catch(() => { /* surfaced lazily when a rewind finds no checkpoint */ })
+    }
+    const isFirstMessage = !autoTitleSentRef.current
+      && (autoTitleFreshBoundaryRef.current || snapshotConfirmsNoUserTurns)
+    if (isFirstMessage) {
+      autoTitleFreshBoundaryRef.current = false
+      autoTitleSentRef.current = true
+      dispatch(finalizeCodingAgentSessionName({
+        tabId,
+        paneId,
+        provider: current.provider,
+        sessionId: current.sessionId,
+        firstMessage: text,
+      }))
+    }
+    sendFreshAgentMessage({
+      type: 'freshAgent.send',
+      sessionId: current.sessionId,
+      sessionType: current.sessionType,
+      provider: current.provider,
+      text,
+      settings: {
+        ...(current.initialCwd ? { cwd: current.initialCwd } : {}),
+        ...(getEffectiveFreshAgentModel(current) ? { model: getEffectiveFreshAgentModel(current) } : {}),
+        ...(getEffectiveFreshAgentPermissionMode(current) ? { permissionMode: getEffectiveFreshAgentPermissionMode(current) } : {}),
+        ...(current.sandbox ? { sandbox: current.sandbox } : {}),
+        ...(getEffectiveFreshAgentEffort(current) ? { effort: getEffectiveFreshAgentEffort(current) } : {}),
+      },
+    })
+    setLocalEcho(text)
+  }, [dispatch, paneId, sendFreshAgentMessage, snapshotConfirmsNoUserTurns, tabId])
+
+  // Flush queued messages when the turn ends. One flush per status change is
+  // enough: all queued entries are delivered in order for the next turn.
+  useEffect(() => {
+    if (isBusy || queuedMessages.length === 0) return
+    if (!paneContentRef.current.sessionId) return
+    const toSend = queuedMessages
+    setQueuedMessages([])
+    for (const message of toSend) {
+      sendUserText(message)
+    }
+  }, [isBusy, queuedMessages, sendUserText])
+
+  // Session-scoped auto-approval: any pending approval whose tool the user
+  // marked "always allow" is answered immediately.
+  const pendingApprovalsFromSnapshot = snapshot?.pendingApprovals
+  useEffect(() => {
+    if (!pendingApprovalsFromSnapshot || pendingApprovalsFromSnapshot.length === 0) return
+    const current = paneContentRef.current
+    if (!current.sessionId) return
+    for (const approval of pendingApprovalsFromSnapshot) {
+      if (approval.toolName && alwaysAllowToolsRef.current.has(approval.toolName)) {
+        sendFreshAgentMessage({
+          type: 'freshAgent.approval.respond',
+          sessionId: current.sessionId,
+          sessionType: current.sessionType,
+          provider: current.provider,
+          requestId: approval.requestId,
+          decision: { behavior: 'allow', updatedInput: {} },
+        })
+      }
+    }
+  }, [pendingApprovalsFromSnapshot, sendFreshAgentMessage])
+
+  /** `!command` shell escape: run via the extras endpoint, then hand the
+   * command + output to the agent as explicit user-provided context. */
+  const runShellCommand = useCallback((command: string) => {
+    const current = paneContentRef.current
+    void Promise
+      .resolve(api.post<{ output: string; exitCode: number | null; truncated: boolean }>(
+        '/api/fresh-agent/exec',
+        { command, cwd: current.initialCwd },
+      ))
+      .then((result) => {
+        const status = result.exitCode === 0 ? '' : ` (exit ${result.exitCode})`
+        const body = `I ran \`${command}\`${status} in ${current.initialCwd ?? 'the home directory'}. Output:\n\`\`\`\n${result.output || '(no output)'}\n\`\`\``
+        if (isBusy) {
+          setQueuedMessages((queue) => [...queue, body])
+        } else {
+          sendUserText(body)
+        }
+      })
+      .catch((error: unknown) => {
+        setNotice(error instanceof Error ? `Shell command failed: ${error.message}` : 'Shell command failed')
+      })
+  }, [isBusy, sendUserText])
+
+  /** Rewind the working tree to the checkpoint taken when a user turn was
+   * sent. Conversation history is untouched — this is the code half of
+   * rewind; fork-from-turn covers the conversation half. */
+  const rewindToTurn = useCallback((turn: FreshAgentTurn) => {
+    const current = paneContentRef.current
+    if (!current.initialCwd) {
+      setNotice('Rewind unavailable: this session has no working directory.')
+      return
+    }
+    const cwd = current.initialCwd
+    void Promise
+      .resolve(api.get<{ checkpoints: CheckpointEntry[] }>(
+        `/api/fresh-agent/checkpoints?cwd=${encodeURIComponent(cwd)}`,
+      ))
+      .then((result) => {
+        const checkpoint = pickCheckpointForTurn(result?.checkpoints ?? [], snapshot?.turns ?? [], turn)
+        if (!checkpoint) {
+          setNotice('No checkpoint found for that message (it may predate checkpointing).')
+          return
+        }
+        const confirmed = typeof window === 'undefined' || window.confirm(
+          `Rewind code to the state before "${checkpoint.label}"?\n\nTracked files changed since will be overwritten. Files created since are left in place. The conversation is not affected.`,
+        )
+        if (!confirmed) return
+        return Promise
+          .resolve(api.post('/api/fresh-agent/checkpoints/restore', { cwd, id: checkpoint.id }))
+          .then(() => setNotice(`Code rewound to before: "${checkpoint.label}"`))
+      })
+      .catch((error: unknown) => {
+        setNotice(error instanceof Error ? `Rewind failed: ${error.message}` : 'Rewind failed')
+      })
+  }, [snapshot?.turns])
+
   const content = useMemo(() => {
     const turns = snapshot?.turns ?? []
     const pendingApprovals = snapshot?.pendingApprovals ?? []
@@ -800,21 +1050,26 @@ export function FreshAgentView({
     const diffs = snapshot?.diffs ?? []
     const codexReview = readCodexReview(snapshot?.extensions?.codex?.review)
     const codexFork = readCodexFork(snapshot?.extensions?.codex?.fork)
-    const effectiveStatus = paneContent.provider === 'claude'
-      ? (claudeSessionStatus ?? paneContent.status)
-      : paneContent.status
-    const canSend = snapshot?.capabilities?.send === true || (
+    // sessionEnded gates everything: a stale snapshot can still claim
+    // capabilities.send after the provider process died.
+    const canSend = !sessionEnded && (snapshot?.capabilities?.send === true || (
       paneContent.provider === 'claude'
       && Boolean(paneContent.sessionId)
       && !isRestoring
       && !hasRestoreFailure
       && !['creating', 'starting', 'create-failed', 'exited'].includes(effectiveStatus)
-    )
+    ))
     const canInterrupt = snapshot?.capabilities?.interrupt === true || (
       paneContent.provider === 'claude'
       && Boolean(paneContent.sessionId)
       && ['connected', 'running', 'idle', 'compacting'].includes(effectiveStatus)
     )
+    const canFork = snapshot?.capabilities?.fork === true
+    // Providers report capabilities.send=false WHILE BUSY — that must not
+    // disable the composer, or queueing becomes unreachable for codex and
+    // opencode (live-test finding). Disabled = no session, ended, or truly
+    // read-only when idle.
+    const composerDisabled = !paneContent.sessionId || sessionEnded || (!canSend && !isBusy)
     const questionAgentLabel = getQuestionAgentLabel(paneContent, descriptor?.label)
     const visibleRestoreFailure = paneContent.provider === 'claude'
       ? claudeSession?.restoreFailureMessage
@@ -830,6 +1085,20 @@ export function FreshAgentView({
         sessionId: paneContent.sessionId,
         sessionType: paneContent.sessionType,
         provider: paneContent.provider,
+      })
+    }
+    const respondToApproval = (requestId: string | number, allow: boolean) => {
+      dispatch(dismissTabGreen(tabId))
+      if (!paneContent.sessionId) return
+      sendFreshAgentMessage({
+        type: 'freshAgent.approval.respond',
+        sessionId: paneContent.sessionId,
+        sessionType: paneContent.sessionType,
+        provider: paneContent.provider,
+        requestId,
+        decision: allow
+          ? { behavior: 'allow', updatedInput: {} }
+          : { behavior: 'deny', message: 'Denied by user', interrupt: false },
       })
     }
 
@@ -882,41 +1151,31 @@ export function FreshAgentView({
               {visibleRestoreFailure ? <FreshAgentApprovalBanner text={visibleRestoreFailure} /> : null}
               {visiblePaneRestoreFailure ? <FreshAgentApprovalBanner text={visiblePaneRestoreFailure} /> : null}
               {visibleLoadError ? <FreshAgentApprovalBanner text={visibleLoadError} /> : null}
+              {sessionErrorMessage ? <FreshAgentApprovalBanner text={`Agent error: ${sessionErrorMessage}`} /> : null}
+              {sessionEnded ? (
+                <div className="flex items-center justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm">
+                  <span>This session has ended{sessionErrorMessage ? '' : ' (the agent process exited)'}.</span>
+                  <button
+                    type="button"
+                    className="shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
+                    onClick={startNewConversation}
+                  >
+                    Start new session
+                  </button>
+                </div>
+              ) : null}
+              {notice ? <FreshAgentApprovalBanner text={notice} /> : null}
               {pendingApprovals.map((approval) => (
-                <PermissionBanner
+                <FreshAgentApprovalCard
                   key={String(approval.requestId)}
-                  permission={{
-                    requestId: String(approval.requestId),
-                    subtype: 'can_use_tool',
-                    tool: approval.toolName
-                      ? { name: approval.toolName, input: approval.input }
-                      : undefined,
-                  }}
-                  onAllow={() => {
-                    dispatch(dismissTabGreen(tabId))
-                    if (!paneContent.sessionId) return
-                    sendFreshAgentMessage({
-                      type: 'freshAgent.approval.respond',
-                      sessionId: paneContent.sessionId,
-                      sessionType: paneContent.sessionType,
-                      provider: paneContent.provider,
-                      requestId: approval.requestId,
-                      decision: { behavior: 'allow', updatedInput: {} },
-                    })
-                  }}
-                  onDeny={() => {
-                    dispatch(dismissTabGreen(tabId))
-                    if (!paneContent.sessionId) return
-                    sendFreshAgentMessage({
-                      type: 'freshAgent.approval.respond',
-                      sessionId: paneContent.sessionId,
-                      sessionType: paneContent.sessionType,
-                      provider: paneContent.provider,
-                      requestId: approval.requestId,
-                      decision: { behavior: 'deny', message: 'Denied by user', interrupt: false },
-                    })
-                  }}
+                  approval={approval}
                   disabled={!paneContent.sessionId}
+                  onAllow={() => respondToApproval(approval.requestId, true)}
+                  onAlwaysAllow={(toolName) => {
+                    alwaysAllowToolsRef.current.add(toolName)
+                    respondToApproval(approval.requestId, true)
+                  }}
+                  onDeny={() => respondToApproval(approval.requestId, false)}
                 />
               ))}
               {pendingQuestions.map((question) => (
@@ -947,47 +1206,64 @@ export function FreshAgentView({
                   disabled={!paneContent.sessionId}
                 />
               ))}
-              <FreshAgentDiffPanel diffs={diffs} />
+              <FreshAgentDiffPanel
+                diffs={diffs}
+                cwd={paneContent.initialCwd}
+                onComment={(text) => composerRef.current?.insertText(text)}
+              />
             </div>
-            <FreshAgentTranscript turns={turns} />
+            <FreshAgentTranscript
+              turns={localEcho
+                ? [...turns, {
+                    id: '__local-echo',
+                    turnId: '__local-echo',
+                    role: 'user',
+                    summary: localEcho,
+                    items: [{ id: '__local-echo-item', kind: 'text', text: localEcho }],
+                  } as FreshAgentTurn]
+                : turns}
+              canFork={canFork}
+              onForkFromTurn={(turnId) => sendFork(turnId)}
+              onRewindToTurn={paneContent.initialCwd ? rewindToTurn : undefined}
+            />
             <FreshAgentComposer
               ref={composerRef}
-              disabled={!canSend || !paneContent.sessionId}
+              disabled={composerDisabled}
+              placeholder={
+                sessionEnded
+                  ? 'Session ended — start a new one above or via the ⌘ menu'
+                  : !paneContent.sessionId || EARLY_STATES.has(effectiveStatus)
+                    ? 'Starting session…'
+                    : isBusy
+                      ? 'Agent is working — sends queue for the next turn'
+                      : !canSend
+                        ? 'Read-only session'
+                        : undefined
+              }
               storageKey={`fresh-agent-draft:${paneContent.sessionType}:${paneContent.sessionId ?? paneContent.createRequestId}`}
+              historyKey={`fresh-agent-prompt-history:${paneContent.sessionType}`}
+              cwd={paneContent.initialCwd}
+              provider={paneContent.provider}
+              queuedMessages={queuedMessages}
+              onCancelQueued={(index) => {
+                setQueuedMessages((queue) => queue.filter((_, i) => i !== index))
+              }}
               canInterrupt={canInterrupt && Boolean(paneContent.sessionId)}
               onInterrupt={sendInterrupt}
               commands={slashCommands}
               onCommand={runSlashCommand}
-              onSend={(text) => {
+              onShellCommand={runShellCommand}
+              onSend={(text, attachmentPaths) => {
                 dispatch(dismissTabGreen(tabId))
-                if (!paneContent.sessionId || !canSend) return
-                const isFirstMessage = !autoTitleSentRef.current
-                  && (autoTitleFreshBoundaryRef.current || snapshotConfirmsNoUserTurns)
-                if (isFirstMessage) {
-                  autoTitleFreshBoundaryRef.current = false
-                  autoTitleSentRef.current = true
-                  dispatch(finalizeCodingAgentSessionName({
-                    tabId,
-                    paneId,
-                    provider: paneContent.provider,
-                    sessionId: paneContent.sessionId,
-                    firstMessage: text,
-                  }))
+                if (!paneContent.sessionId || sessionEnded) return
+                if (!canSend && !isBusy) return
+                const outgoing = composeOutgoingText(text, attachmentPaths)
+                if (!outgoing) return
+                if (isBusy) {
+                  setQueuedMessages((queue) => [...queue, outgoing])
+                  return
                 }
-                sendFreshAgentMessage({
-                  type: 'freshAgent.send',
-                  sessionId: paneContent.sessionId,
-                  sessionType: paneContent.sessionType,
-                  provider: paneContent.provider,
-                  text,
-                  settings: {
-                    ...(paneContent.initialCwd ? { cwd: paneContent.initialCwd } : {}),
-                    ...(getEffectiveFreshAgentModel(paneContent) ? { model: getEffectiveFreshAgentModel(paneContent) } : {}),
-                    ...(getEffectiveFreshAgentPermissionMode(paneContent) ? { permissionMode: getEffectiveFreshAgentPermissionMode(paneContent) } : {}),
-                    ...(paneContent.sandbox ? { sandbox: paneContent.sandbox } : {}),
-                    ...(getEffectiveFreshAgentEffort(paneContent) ? { effort: getEffectiveFreshAgentEffort(paneContent) } : {}),
-                  },
-                })
+                sendUserText(outgoing)
               }}
             />
           </div>
@@ -1002,19 +1278,30 @@ export function FreshAgentView({
     )
   }, [
     claudeSession?.restoreFailureMessage,
-    claudeSessionStatus,
     descriptor?.label,
+    effectiveStatus,
     hasRestoreFailure,
+    isBusy,
     isRestoring,
     loadError,
+    localEcho,
+    notice,
     paneContent,
     pendingCreateFailure,
+    queuedMessages,
+    rewindToTurn,
+    runShellCommand,
+    sessionEnded,
+    sessionErrorMessage,
+    startNewConversation,
     runSlashCommand,
-    snapshotConfirmsNoUserTurns,
+    sendFork,
+    sendUserText,
     snapshot,
     slashCommands,
     dispatch,
     paneId,
+    sendFreshAgentMessage,
     tabId,
     tabTitleSetByUser,
   ])

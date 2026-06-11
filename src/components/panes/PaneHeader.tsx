@@ -1,11 +1,15 @@
 import { useRef, useEffect } from 'react'
-import { X, Maximize2, Minimize2, Search, RefreshCw } from 'lucide-react'
+import { X, Maximize2, Minimize2, Search, RefreshCw, SquareTerminal } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { getTerminalStatusIconClassName } from '@/lib/terminal-status-indicator'
 import type { TerminalStatus } from '@/store/types'
 import type { PaneContent } from '@/store/paneTypes'
+import { useAppDispatch } from '@/store/hooks'
+import { splitPane } from '@/store/panesSlice'
 import PaneIcon from '@/components/icons/PaneIcon'
 import FreshAgentSettingsButton from '@/components/fresh-agent/FreshAgentSettingsButton'
+import FreshAgentContextMeter from '@/components/fresh-agent/FreshAgentContextMeter'
+import { getFreshAgentLabel } from '@/lib/fresh-agent-registry'
 
 interface PaneHeaderProps {
   tabId?: string
@@ -30,6 +34,45 @@ interface PaneHeaderProps {
   onDoubleClick?: () => void
   onSearch?: () => void
   onRefresh?: () => void
+}
+
+function FreshAgentOpenTerminalButton({
+  tabId,
+  paneId,
+  content,
+}: {
+  tabId: string
+  paneId: string
+  content: Extract<PaneContent, { kind: 'fresh-agent' }>
+}) {
+  const dispatch = useAppDispatch()
+
+  return (
+    <button
+      onClick={(e) => {
+        e.stopPropagation()
+        // normalizePaneContent fills createRequestId/status for terminal
+        // inputs; mode 'shell' + cwd is a complete input.
+        dispatch(splitPane({
+          tabId,
+          paneId,
+          direction: 'horizontal',
+          newContent: {
+            kind: 'terminal',
+            mode: 'shell',
+            ...(content.initialCwd ? { initialCwd: content.initialCwd } : {}),
+          } as Parameters<typeof splitPane>[0]['newContent'],
+        }))
+      }}
+      className="inline-flex h-6 w-6 items-center justify-center rounded opacity-60 hover:opacity-100 transition-opacity sm:h-4 sm:w-4"
+      title={content.initialCwd
+        ? `Open terminal pane at ${content.initialCwd}`
+        : 'Open terminal pane at this session’s directory'}
+      aria-label="Open terminal at session directory"
+    >
+      <SquareTerminal className="h-[18px] w-[18px] sm:h-3 sm:w-3" />
+    </button>
+  )
 }
 
 export default function PaneHeader({
@@ -144,11 +187,25 @@ export default function PaneHeader({
         )}
 
         {content.kind === 'fresh-agent' && (
-          <FreshAgentSettingsButton
-            tabId={tabId}
-            paneId={paneId}
-            paneContent={content}
-          />
+          <>
+            {/* Cwd/prompt-derived titles make the three fresh clients look
+                identical — pin the agent identity in the header. */}
+            <span
+              className="shrink-0 rounded-full border border-border/70 px-2 py-0.5 text-2xs text-muted-foreground"
+              title={`${getFreshAgentLabel(content.sessionType)} session`}
+            >
+              {getFreshAgentLabel(content.sessionType)}
+            </span>
+            <FreshAgentContextMeter paneContent={content} />
+            {tabId && paneId ? (
+              <FreshAgentOpenTerminalButton tabId={tabId} paneId={paneId} content={content} />
+            ) : null}
+            <FreshAgentSettingsButton
+              tabId={tabId}
+              paneId={paneId}
+              paneContent={content}
+            />
+          </>
         )}
 
         {onToggleZoom && (

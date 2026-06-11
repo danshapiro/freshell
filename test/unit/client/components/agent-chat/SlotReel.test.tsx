@@ -1,9 +1,12 @@
-import { describe, it, expect, afterEach } from 'vitest'
-import { render, screen, cleanup } from '@testing-library/react'
+import { describe, it, expect, afterEach, vi } from 'vitest'
+import { render, screen, cleanup, act } from '@testing-library/react'
 import SlotReel from '@/components/agent-chat/SlotReel'
 
 describe('SlotReel', () => {
-  afterEach(cleanup)
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+  })
 
   it('renders tool name badge and preview text', () => {
     render(<SlotReel toolName="Bash" previewText="$ ls -la" />)
@@ -37,13 +40,10 @@ describe('SlotReel', () => {
     const { rerender, container } = render(
       <SlotReel toolName="Bash" previewText="$ echo hi" />
     )
-    // Get the tool badge container (the element with overflow-hidden for animation)
     const nameSlot = container.querySelector('[data-slot="name"]')
     expect(nameSlot).toBeInTheDocument()
 
     rerender(<SlotReel toolName="Read" previewText="/file.ts" />)
-    // After rerender with different tool name, the animation wrapper should
-    // contain the new tool name
     expect(screen.getByText('Read')).toBeInTheDocument()
   })
 
@@ -53,5 +53,35 @@ describe('SlotReel', () => {
     )
     rerender(<SlotReel toolName="Bash" previewText="$ echo 2" />)
     expect(screen.getByText('$ echo 2')).toBeInTheDocument()
+  })
+
+  it('animates with keyed spans so interrupted rolls restart from frame zero', () => {
+    const { rerender, container } = render(
+      <SlotReel toolName="Bash" previewText="one" />
+    )
+    rerender(<SlotReel toolName="Read" previewText="two" />)
+    // Mid-animation both outgoing and incoming spans are present, keyed per change.
+    expect(container.querySelector('.animate-reel-out')).toBeInTheDocument()
+    expect(container.querySelector('.animate-reel-in')).toBeInTheDocument()
+  })
+
+  it('settles on the latest value when changes arrive faster than the animation', () => {
+    vi.useFakeTimers()
+    const { rerender } = render(<SlotReel toolName="Bash" previewText="one" />)
+
+    rerender(<SlotReel toolName="Read" previewText="two" />)
+    act(() => {
+      vi.advanceTimersByTime(50)
+    })
+    // Interrupt the in-flight roll with a third value.
+    rerender(<SlotReel toolName="Grep" previewText="three" />)
+    act(() => {
+      vi.advanceTimersByTime(200)
+    })
+
+    expect(screen.getByText('Grep')).toBeInTheDocument()
+    expect(screen.getByText('three')).toBeInTheDocument()
+    expect(screen.queryByText('Bash')).not.toBeInTheDocument()
+    expect(screen.queryByText('one')).not.toBeInTheDocument()
   })
 })

@@ -1,12 +1,14 @@
 import type { FreshAgentSessionType } from './fresh-agent.js'
 
-export type FreshAgentSlashCommandAction = 'new' | 'compact'
+export type FreshAgentSlashCommandAction = 'new' | 'compact' | 'fork'
 
 export type FreshAgentSlashCommand = {
   name: string
   description: string
   action: FreshAgentSlashCommandAction
   aliases?: readonly string[]
+  /** Requires the matching capability flag in the thread snapshot to be true. */
+  requiresCapability?: 'fork'
 }
 
 const BASE_COMMANDS = [
@@ -21,6 +23,13 @@ const BASE_COMMANDS = [
     description: 'Ask the agent to compact its current conversation context',
     action: 'compact',
     aliases: ['compress', 'summarize-context'],
+  },
+  {
+    name: 'fork',
+    description: 'Fork this conversation into a new session from this point',
+    action: 'fork',
+    aliases: ['branch'],
+    requiresCapability: 'fork',
   },
 ] as const satisfies readonly FreshAgentSlashCommand[]
 
