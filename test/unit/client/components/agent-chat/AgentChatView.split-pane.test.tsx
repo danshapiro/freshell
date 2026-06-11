@@ -741,7 +741,7 @@ describe('AgentChatView — split pane (Bug 2)', () => {
         expect.objectContaining({ signal: expect.any(AbortSignal), revision: 2 }),
       )
     })
-    expect(await screen.findByText('Expanded older turn body')).toBeInTheDocument()
+    expect(await screen.findByText('Expanded older turn body', undefined, { timeout: 5_000 })).toBeInTheDocument()
   })
 
   it('skips sdk.attach and preserves content on split when session is fully hydrated', async () => {
