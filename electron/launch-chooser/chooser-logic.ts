@@ -26,6 +26,18 @@ export function validateRemoteLaunchUrl(value: string): string {
   }
 }
 
+/**
+ * Validate a local-server port. Mirrors the chooser's number-input bounds
+ * (1024–65535) and rejects non-integers (e.g. NaN from an empty field).
+ * Returns an error message, or null when the port is acceptable.
+ */
+export function validateLaunchPort(port: number): string | null {
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+    return 'Enter a port between 1024 and 65535'
+  }
+  return null
+}
+
 export function buildConnectChoice(input: {
   url: string
   token?: string

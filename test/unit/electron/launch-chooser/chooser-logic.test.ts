@@ -4,6 +4,7 @@ import {
   buildRemoteChoice,
   buildStartLocalChoice,
   formatLaunchReason,
+  validateLaunchPort,
   validateRemoteLaunchUrl,
 } from '../../../../electron/launch-chooser/chooser-logic.js'
 
@@ -64,4 +65,17 @@ describe('launch chooser logic', () => {
     expect(formatLaunchReason('missing-token')).toContain('needs a token')
     expect(formatLaunchReason('unknown')).toContain('connect to an existing server')
   })
+
+  it('accepts ports inside the allowed range', () => {
+    expect(validateLaunchPort(1024)).toBeNull()
+    expect(validateLaunchPort(3001)).toBeNull()
+    expect(validateLaunchPort(65535)).toBeNull()
+  })
+
+  it('rejects ports outside the allowed range or that are not whole numbers', () => {
+    for (const port of [0, 80, 1023, 65536, 70000, -1, Number.NaN, 3001.5]) {
+      expect(validateLaunchPort(port)).toContain('between 1024 and 65535')
+    }
+  })
+
 })

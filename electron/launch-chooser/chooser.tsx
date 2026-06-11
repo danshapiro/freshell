@@ -5,6 +5,7 @@ import {
   buildRemoteChoice,
   buildStartLocalChoice,
   formatLaunchReason,
+  validateLaunchPort,
   validateRemoteLaunchUrl,
 } from './chooser-logic.js'
 
@@ -16,6 +17,7 @@ declare global {
         reason: string
         alwaysAskOnLaunch: boolean
         port: number
+        remoteUrl?: string
       }>
       chooseLaunchOption: (choice: LaunchChoice) => Promise<LaunchChoiceResult | void>
     }
@@ -39,6 +41,7 @@ export function LaunchChooser() {
       setReason(options.reason)
       setAlwaysAskOnLaunch(options.alwaysAskOnLaunch)
       setPort(options.port)
+      setRemoteUrl(options.remoteUrl ?? '')
     })
   }, [])
 
@@ -80,6 +83,18 @@ export function LaunchChooser() {
       return
     }
     await choose(buildRemoteChoice({ url: remoteUrl, token: remoteToken, alwaysAskOnLaunch, remember }))
+  }
+
+  const startLocal = async () => {
+    // Only basic range validation here. Whether the port is actually free is
+    // decided authoritatively by the main process at choose time (a fresh bind
+    // test), so the renderer never false-rejects from a stale candidate list.
+    const portError = validateLaunchPort(port)
+    if (portError) {
+      setError(portError)
+      return
+    }
+    await choose(buildStartLocalChoice({ port, alwaysAskOnLaunch, remember }))
   }
 
   return (
@@ -147,7 +162,7 @@ export function LaunchChooser() {
             Port
             <input type="number" min={1024} max={65535} value={port} onChange={(event) => setPort(Number(event.target.value))} />
           </label>
-          <button type="button" onClick={() => choose(buildStartLocalChoice({ port, alwaysAskOnLaunch, remember }))}>
+          <button type="button" onClick={() => void startLocal()}>
             Start local
           </button>
         </div>

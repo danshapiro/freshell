@@ -133,6 +133,7 @@ function expectOrderedSubsequence(actual: string[], expected: string[]): void {
 const codexProbe = await codexAvailability()
 const claudeProbe = await claudeAvailability()
 const opencodeProbe = opencodeAvailability()
+const itWithProcOwnership = process.platform === 'linux' ? it : it.skip
 
 describe.sequential('coding cli real provider session contract', () => {
   it('loads the checked-in lab note facts and date rationale', async () => {
@@ -152,7 +153,7 @@ describe.sequential('coding cli real provider session contract', () => {
     ])
   }, 30_000)
 
-  it('emits provenance-gated ownership reports before cleanup', async () => {
+  itWithProcOwnership('emits provenance-gated ownership reports before cleanup', async () => {
     const workspace = await ProbeWorkspace.create('cleanup-audit')
     try {
       const sleeper = await workspace.spawnProcess('bash', ['-lc', 'sleep 30'])

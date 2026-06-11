@@ -26,6 +26,10 @@ vi.mock('os', () => ({
   default: { tmpdir: mockTmpdir, homedir: mockHomedir },
 }))
 
+function toPosixPath(value: string): string {
+  return value.replace(/\\/g, '/')
+}
+
 describe('generateMcpInjection -- per-agent config', () => {
   const originalEnv = { ...process.env }
 
@@ -56,7 +60,7 @@ describe('generateMcpInjection -- per-agent config', () => {
     const result = generateMcpInjection('claude', 'term-abc')
     expect(result.args).toContain('--mcp-config')
     const configIndex = result.args.indexOf('--mcp-config')
-    expect(result.args[configIndex + 1]).toMatch(/freshell-mcp\/term-abc\.json$/)
+    expect(toPosixPath(result.args[configIndex + 1])).toMatch(/freshell-mcp\/term-abc\.json$/)
     expect(result.env).toEqual({})
   })
 
@@ -95,7 +99,7 @@ describe('generateMcpInjection -- per-agent config', () => {
     const result = generateMcpInjection('gemini', 'term-ghi')
     expect(result.args).toEqual([])
     expect(result.env).toHaveProperty('GEMINI_CLI_SYSTEM_DEFAULTS_PATH')
-    expect(result.env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH).toMatch(/freshell-mcp\/term-ghi\.json$/)
+    expect(toPosixPath(result.env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH)).toMatch(/freshell-mcp\/term-ghi\.json$/)
   })
 
   it('gemini mode: temp file contains valid JSON with mcpServers.freshell', async () => {
@@ -114,7 +118,7 @@ describe('generateMcpInjection -- per-agent config', () => {
     const result = generateMcpInjection('kimi', 'term-jkl')
     expect(result.args).toContain('--mcp-config-file')
     const configIndex = result.args.indexOf('--mcp-config-file')
-    expect(result.args[configIndex + 1]).toMatch(/freshell-mcp\/term-jkl\.json$/)
+    expect(toPosixPath(result.args[configIndex + 1])).toMatch(/freshell-mcp\/term-jkl\.json$/)
     expect(result.env).toEqual({})
   })
 
@@ -220,7 +224,7 @@ describe('generateMcpInjection -- per-agent config', () => {
       const { buildMcpServerCommandArgs } = await importModule()
       const args = buildMcpServerCommandArgs()
       expect(args).toHaveLength(1)
-      expect(args[0]).toMatch(/dist\/server\/mcp\/server\.js$/)
+      expect(toPosixPath(args[0])).toMatch(/dist\/server\/mcp\/server\.js$/)
     })
   })
 })
@@ -254,7 +258,7 @@ describe('generateMcpInjection -- dev/production detection', () => {
     expect(writeCall).toBeDefined()
     const parsed = JSON.parse(writeCall![1])
     const args = parsed.mcpServers.freshell.args as string[]
-    expect(args.some((a: string) => a.includes('dist/server/mcp/server.js'))).toBe(true)
+    expect(args.some((a: string) => toPosixPath(a).includes('dist/server/mcp/server.js'))).toBe(true)
     expect(args).not.toContain('--import')
   })
 
@@ -270,7 +274,7 @@ describe('generateMcpInjection -- dev/production detection', () => {
     const args = parsed.mcpServers.freshell.args as string[]
     expect(args).toContain('--import')
     expect(args[args.indexOf('--import') + 1]).toContain('tsx')
-    expect(args.some((a: string) => a.includes('server/mcp/server.ts'))).toBe(true)
+    expect(args.some((a: string) => toPosixPath(a).includes('server/mcp/server.ts'))).toBe(true)
   })
 })
 
@@ -294,7 +298,7 @@ describe('cleanupMcpConfig', () => {
     mockFs.existsSync.mockReturnValue(true)
     const { cleanupMcpConfig } = await importModule()
     cleanupMcpConfig('term-abc')
-    expect(mockFs.unlinkSync).toHaveBeenCalledWith(expect.stringMatching(/freshell-mcp\/term-abc\.json$/))
+    expect(toPosixPath(mockFs.unlinkSync.mock.calls[0][0])).toMatch(/freshell-mcp\/term-abc\.json$/)
   })
 
   it('does not throw when temp file does not exist', async () => {
@@ -1361,7 +1365,7 @@ describe('generateMcpInjection -- Windows platform path conversion', () => {
     const configIndex = result.args.indexOf('--mcp-config')
     const configPath = result.args[configIndex + 1]
     // Should remain a Linux path
-    expect(configPath).toMatch(/^\/tmp\//)
+    expect(toPosixPath(configPath)).toMatch(/^\/tmp\//)
   })
 
   it('codex mode with platform=windows converts TOML args to Windows paths on WSL', async () => {

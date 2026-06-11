@@ -90,4 +90,57 @@ describe('LaunchChooser', () => {
     expect((await screen.findByRole('alert')).textContent).toContain('Enter a token for the remote server')
     expect(chooseLaunchOption).not.toHaveBeenCalled()
   })
+
+  it('pre-fills the remote URL from the saved configuration', async () => {
+    window.freshellDesktop = {
+      getLaunchOptions: vi.fn().mockResolvedValue({
+        candidates: [],
+        reason: 'saved-remote-unreachable',
+        alwaysAskOnLaunch: false,
+        port: 3001,
+        remoteUrl: 'http://10.0.0.5:3001',
+      }),
+      chooseLaunchOption: vi.fn().mockResolvedValue(undefined),
+    }
+
+    render(<LaunchChooser />)
+
+    const urlInput = (await screen.findByLabelText('URL')) as HTMLInputElement
+    await waitFor(() => expect(urlInput.value).toBe('http://10.0.0.5:3001'))
+  })
+
+  it('rejects an out-of-range local port before sending a choice', async () => {
+    const { chooseLaunchOption } = installDesktopApi({ candidates: [] })
+
+    render(<LaunchChooser />)
+
+    const portInput = await screen.findByLabelText('Port')
+    fireEvent.change(portInput, { target: { value: '80' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Start local' }))
+
+    expect((await screen.findByRole('alert')).textContent).toContain('between 1024 and 65535')
+    expect(chooseLaunchOption).not.toHaveBeenCalled()
+  })
+
+  it('submits "Start local" and lets the main process decide, even when a candidate occupies that port', async () => {
+    const chooseLaunchOption = vi.fn().mockResolvedValue({ ok: true })
+    installDesktopApi({
+      candidates: [localCandidate({ id: 'l', url: 'http://localhost:3001', label: 'localhost:3001' })],
+      chooseLaunchOption,
+    })
+
+    render(<LaunchChooser />)
+
+    // Wait for candidates to load; default port (3001) matches the detected server.
+    await screen.findByRole('button', { name: 'Connect to localhost:3001' })
+    fireEvent.click(screen.getByRole('button', { name: 'Start local' }))
+
+    // The renderer no longer second-guesses occupancy from a stale snapshot;
+    // it submits and the authoritative main-process check is the decider.
+    await waitFor(() =>
+      expect(chooseLaunchOption).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: 'start-local', port: 3001 }),
+      ),
+    )
+  })
 })

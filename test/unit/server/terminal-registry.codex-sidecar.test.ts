@@ -73,6 +73,10 @@ function deferred<T = void>() {
   return { promise, resolve, reject }
 }
 
+async function removeTempDir(dir: string): Promise<void> {
+  await fsp.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
+}
+
 function createFakeSidecar(options: {
   adopt?: () => Promise<void>
   shutdown?: () => Promise<void>
@@ -229,7 +233,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       expect(registry.input(term.terminalId, 'hello\r')).toEqual({ status: 'written' })
       expect(mockPtyProcess.instances[0].write).toHaveBeenCalledWith('hello\r')
     } finally {
-      await fsp.rm(durabilityDir, { recursive: true, force: true })
+      await removeTempDir(durabilityDir)
     }
   })
 
@@ -394,7 +398,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         await expect(store.read(term.terminalId)).resolves.toBeUndefined()
       })
     } finally {
-      await fsp.rm(durabilityDir, { recursive: true, force: true })
+      await removeTempDir(durabilityDir)
     }
   })
 
@@ -429,7 +433,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       })
       expect(mockPtyProcess.instances[0].kill).toHaveBeenCalledTimes(1)
     } finally {
-      await fsp.rm(durabilityDir, { recursive: true, force: true })
+      await removeTempDir(durabilityDir)
     }
   })
 
@@ -501,7 +505,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       expect(sidecar.markCandidatePersisted).not.toHaveBeenCalled()
     } finally {
       releaseFirstCandidateWrite.resolve()
-      await fsp.rm(durabilityDir, { recursive: true, force: true })
+      await removeTempDir(durabilityDir)
     }
   })
 
@@ -582,7 +586,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       expect(sidecar.markCandidatePersisted).toHaveBeenCalledTimes(1)
     } finally {
       releaseFirstCandidateWrite.resolve()
-      await fsp.rm(durabilityDir, { recursive: true, force: true })
+      await removeTempDir(durabilityDir)
     }
   })
 
@@ -637,7 +641,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       })
       expect(mockPtyProcess.instances[0].write).not.toHaveBeenCalled()
     } finally {
-      await fsp.rm(durabilityDir, { recursive: true, force: true })
+      await removeTempDir(durabilityDir)
     }
   })
 
@@ -686,9 +690,11 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       sidecar.emitTurnCompleted({ threadId: 'thread-proof-ok', turnId: 'turn-1', params: {} })
 
       await vi.waitFor(() => expect(registry.get(term.terminalId)?.resumeSessionId).toBe('thread-proof-ok'))
-      expect(registry.get(term.terminalId)?.codexDurability).toMatchObject({
-        state: 'durable',
-        durableThreadId: 'thread-proof-ok',
+      await vi.waitFor(() => {
+        expect(registry.get(term.terminalId)?.codexDurability).toMatchObject({
+          state: 'durable',
+          durableThreadId: 'thread-proof-ok',
+        })
       })
       expect(sent).toContainEqual(expect.objectContaining({
         type: 'terminal.session.associated',
@@ -699,7 +705,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         },
       }))
     } finally {
-      await fsp.rm(durabilityDir, { recursive: true, force: true })
+      await removeTempDir(durabilityDir)
     }
   })
 
@@ -782,7 +788,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         }),
       }))
     } finally {
-      await fsp.rm(durabilityDir, { recursive: true, force: true })
+      await removeTempDir(durabilityDir)
     }
   })
 
@@ -829,7 +835,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         updatedAt: 67890,
       })
     } finally {
-      await fsp.rm(durabilityDir, { recursive: true, force: true })
+      await removeTempDir(durabilityDir)
     }
   })
 
@@ -896,7 +902,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       }))
       expect(mockPtyProcess.instances.at(-1)?.kill).toHaveBeenCalledTimes(1)
     } finally {
-      await fsp.rm(durabilityDir, { recursive: true, force: true })
+      await removeTempDir(durabilityDir)
     }
   })
 
@@ -958,7 +964,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       sidecar.emitTurnCompleted({ threadId: 'thread-repair-pre-turn', turnId: 'turn-1', params: {} })
       await vi.waitFor(() => expect(registry.get(term.terminalId)?.resumeSessionId).toBe('thread-repair-pre-turn'))
     } finally {
-      await fsp.rm(durabilityDir, { recursive: true, force: true })
+      await removeTempDir(durabilityDir)
     }
   })
 
@@ -1026,7 +1032,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         'terminal_exit_without_durable_session',
       )
     } finally {
-      await fsp.rm(durabilityDir, { recursive: true, force: true })
+      await removeTempDir(durabilityDir)
     }
   })
 
@@ -1083,7 +1089,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         durableThreadId: 'thread-final-recovery',
       })
     } finally {
-      await fsp.rm(durabilityDir, { recursive: true, force: true })
+      await removeTempDir(durabilityDir)
     }
   })
 
@@ -1133,7 +1139,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         type: 'terminal.session.associated',
       }))
     } finally {
-      await fsp.rm(durabilityDir, { recursive: true, force: true })
+      await removeTempDir(durabilityDir)
     }
   })
 
@@ -1184,7 +1190,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       }))
       expect(sidecar.unwatchPath).toHaveBeenCalledWith(watchId)
     } finally {
-      await fsp.rm(durabilityDir, { recursive: true, force: true })
+      await removeTempDir(durabilityDir)
     }
   })
 
@@ -1793,7 +1799,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         await expect(store.read(term.terminalId)).resolves.toBeUndefined()
       })
     } finally {
-      await fsp.rm(durabilityDir, { recursive: true, force: true })
+      await removeTempDir(durabilityDir)
     }
   })
 

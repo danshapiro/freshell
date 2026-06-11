@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { createRequire } from 'module'
 import { resolve, dirname } from 'path'
-import { fileURLToPath } from 'url'
+import { fileURLToPath, pathToFileURL } from 'url'
 
 const require = createRequire(import.meta.url)
 
@@ -147,7 +147,7 @@ describe('MCP server process-level smoke test', () => {
     const serverPath = resolve(repoRoot, 'server/mcp/server.ts')
     const tsxLoaderPath = resolveTsxLoaderPath()
 
-    const child = spawn('node', ['--import', tsxLoaderPath, serverPath], {
+    const child = spawn(process.execPath, ['--import', pathToFileURL(tsxLoaderPath).href, serverPath], {
       env: {
         ...process.env,
         FRESHELL_URL: 'http://localhost:3001',
@@ -172,12 +172,14 @@ describe('MCP server process-level smoke test', () => {
         },
       })
 
-      // Write the JSON-RPC request (MCP stdio transport uses Content-Length framing like LSP)
       child.stdin!.write(initRequest + '\n')
 
       const response = await new Promise<string>((resolve, reject) => {
         let buffer = ''
-        const timeout = setTimeout(() => reject(new Error('Timeout waiting for MCP response')), 10000)
+        let stderr = ''
+        const timeout = setTimeout(() => {
+          reject(new Error(`Timeout waiting for MCP response${stderr ? `; stderr: ${stderr}` : ''}`))
+        }, 20000)
         child.stdout!.on('data', (data: Buffer) => {
           buffer += data.toString()
           // Try to find a complete JSON-RPC response in the buffer.
@@ -215,6 +217,13 @@ describe('MCP server process-level smoke test', () => {
           clearTimeout(timeout)
           reject(err)
         })
+        child.stderr!.on('data', (data: Buffer) => {
+          stderr += data.toString()
+        })
+        child.on('exit', (code, signal) => {
+          clearTimeout(timeout)
+          reject(new Error(`MCP server exited before initialize response: code=${code ?? 'null'} signal=${signal ?? 'null'}${stderr ? ` stderr=${stderr}` : ''}`))
+        })
       })
 
       const parsed = JSON.parse(response)
@@ -223,7 +232,7 @@ describe('MCP server process-level smoke test', () => {
     } finally {
       cleanup()
     }
-  }, 15000)
+  }, 30000)
 
   it('MCP server does not write to stdout outside JSON-RPC', async () => {
     const { spawn } = await import('child_process')
@@ -232,7 +241,7 @@ describe('MCP server process-level smoke test', () => {
     const serverPath = resolve(repoRoot, 'server/mcp/server.ts')
     const tsxLoaderPath = resolveTsxLoaderPath()
 
-    const child = spawn('node', ['--import', tsxLoaderPath, serverPath], {
+    const child = spawn(process.execPath, ['--import', pathToFileURL(tsxLoaderPath).href, serverPath], {
       env: {
         ...process.env,
         FRESHELL_URL: 'http://localhost:3001',

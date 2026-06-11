@@ -21,6 +21,7 @@ import {
 } from '../../../../scripts/testing/coordinator-store.js'
 
 let tempDir: string
+const itSupportsUnixSockets = process.platform === 'win32' ? it.skip : it
 
 beforeEach(async () => {
   tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'fcs-'))
@@ -129,7 +130,7 @@ describe('buildStatusView()', () => {
     expect(renderStatusView(view)).toContain('idle')
   })
 
-  it('reports running with holder details, latest results, and a matching reusable baseline', async () => {
+  itSupportsUnixSockets('reports running with holder details, latest results, and a matching reusable baseline', async () => {
     const commonDir = path.join(tempDir, 'repo', '.git')
     const storeDir = getCoordinatorStoreDir(commonDir)
     const endpoint = buildCoordinatorEndpoint(commonDir, 'linux', [tempDir])
@@ -187,7 +188,7 @@ describe('buildStatusView()', () => {
     await listener.close()
   })
 
-  it('reports running-undescribed when the endpoint is live but holder metadata is missing or corrupt', async () => {
+  itSupportsUnixSockets('reports running-undescribed when the endpoint is live but holder metadata is missing or corrupt', async () => {
     const commonDir = path.join(tempDir, 'repo', '.git')
     const storeDir = getCoordinatorStoreDir(commonDir)
     const endpoint = buildCoordinatorEndpoint(commonDir, 'linux', [tempDir])

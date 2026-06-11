@@ -45,15 +45,27 @@ export interface LaunchServerCandidate {
   token?: string
 }
 
-export interface LaunchChoice {
-  kind: 'connect' | 'remote' | 'start-local'
-  url?: string
-  token?: string
-  port?: number
-  requiresAuth?: boolean
-  alwaysAskOnLaunch: boolean
-  remember: boolean
-}
+// Schema (not just a TS type) because LaunchChoice crosses the IPC boundary and
+// must be runtime-validated before it can drive a launch.
+export const LaunchChoiceSchema = z.object({
+  kind: z.enum(['connect', 'remote', 'start-local']),
+  url: z.string().optional(),
+  token: z.string().optional(),
+  port: z.number().optional(),
+  requiresAuth: z.boolean().optional(),
+  alwaysAskOnLaunch: z.boolean(),
+  remember: z.boolean(),
+})
+
+export type LaunchChoice = z.infer<typeof LaunchChoiceSchema>
+
+/**
+ * An explicit launch selection that must be honored for the current launch,
+ * independent of saved config, `alwaysAskOnLaunch`, or re-discovered servers.
+ */
+export type ForcedLaunch =
+  | { kind: 'connect'; url: string; token?: string }
+  | { kind: 'start-local'; port: number }
 
 export type LaunchChoiceResult =
   | { ok: true }

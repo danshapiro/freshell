@@ -11,6 +11,7 @@ import path from 'path'
 
 // Only mock os.tmpdir to use a test-safe temp directory
 const testTmpDir = path.join(os.tmpdir(), 'freshell-mcp-test-' + process.pid)
+const toPosixPath = (value: string) => value.replace(/\\/g, '/')
 
 describe('config-writer path verification', () => {
   afterEach(() => {
@@ -61,7 +62,7 @@ describe('config-writer path verification', () => {
       expect(loaderPath).toContain('tsx')
       expect(fs.existsSync(loaderPath)).toBe(true)
 
-      const serverPath = args.find((a: string) => a.includes('server/mcp/server.ts'))
+      const serverPath = args.find((a: string) => toPosixPath(a).includes('server/mcp/server.ts'))
       expect(serverPath).toBeDefined()
       expect(fs.existsSync(serverPath!)).toBe(true)
 
@@ -82,10 +83,10 @@ describe('config-writer path verification', () => {
     const argsArg = result.args.find((a: string) => a.includes('mcp_servers.freshell.args'))
     expect(argsArg).toBeDefined()
     // Extract paths from TOML array
-    const pathMatches = argsArg!.match(/"([^"]+)"/g)
+    const pathMatches = argsArg!.match(/"((?:\\.|[^"])*)"/g)
     expect(pathMatches).toBeTruthy()
     for (const quoted of pathMatches!) {
-      const p = quoted.replace(/^"|"$/g, '')
+      const p = JSON.parse(quoted) as string
       if (p.includes('/') || p.includes('\\')) {
         expect(fs.existsSync(p)).toBe(true)
       }
@@ -101,7 +102,9 @@ describe('config-writer path verification', () => {
       default: { ...os, tmpdir: () => testTmpDir, homedir: os.homedir },
     }))
     const hostRoot = path.join(testTmpDir, 'opencode-host-native')
-    const testCwd = path.join(hostRoot, String.raw`C:\Users\Dan\repo`)
+    const testCwd = process.platform === 'win32'
+      ? path.join(hostRoot, 'Users', 'Dan', 'repo')
+      : path.join(hostRoot, String.raw`C:\Users\Dan\repo`)
     const expectedConfigPath = path.join(testCwd, '.opencode', 'opencode.json')
     const expectedSidecarPath = path.join(testCwd, '.opencode', '.freshell-mcp-state.json')
     const unexpectedRemappedConfigPath = path.join(hostRoot, 'C:', 'Users', 'Dan', 'repo', '.opencode', 'opencode.json')

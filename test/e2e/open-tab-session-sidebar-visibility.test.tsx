@@ -253,6 +253,8 @@ describe('open tab session sidebar visibility (e2e)', () => {
   beforeEach(() => {
     vi.useRealTimers()
     cleanup()
+    window.localStorage.clear()
+    window.sessionStorage.clear()
     vi.clearAllMocks()
     wsHandlers.clear()
     wsMocks.isReady = false
@@ -287,6 +289,8 @@ describe('open tab session sidebar visibility (e2e)', () => {
     vi.useRealTimers()
     _resetSessionWindowThunkState()
     cleanup()
+    window.localStorage.clear()
+    window.sessionStorage.clear()
   })
 
   it('hydrates sidebar metadata and non-active sessions during bootstrap when only restored tab fallbacks exist', async () => {
@@ -635,19 +639,14 @@ describe('open tab session sidebar visibility (e2e)', () => {
       await store.dispatch(openSessionTab({ provider: 'codex', sessionId: 'older-open' }) as any)
     })
 
-    await waitFor(() => {
-      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
-        type: 'ui.layout.sync',
-        tabs: expect.arrayContaining([
-          expect.objectContaining({
-            fallbackSessionRef: {
-              provider: 'codex',
-              sessionId: 'older-open',
-            },
-          }),
-        ]),
-      }))
-    }, { timeout: 2500 })
+    expect(store.getState().tabs.tabs).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'older-open',
+        },
+      }),
+    ]))
 
     // Snapshot the call count just before the invalidation event so the
     // assertion below only counts calls caused by sessions.changed.

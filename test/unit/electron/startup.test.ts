@@ -532,6 +532,94 @@ describe('runStartup', () => {
     })
   })
 
+  describe('forced launch (explicit chooser selection)', () => {
+    it('honors a forced connect without discovery or policy, even when alwaysAskOnLaunch is true', async () => {
+      const discoverLaunchCandidates = vi.fn().mockResolvedValue([
+        {
+          id: 'local-a',
+          url: 'http://localhost:3001',
+          origin: 'port-scan',
+          ownership: 'detected-local',
+          label: 'localhost:3001',
+          requiresAuth: true,
+          token: 'local-token',
+        },
+      ])
+      const fetchHealthCheck = vi.fn()
+      const mockWindow = createMockWindow()
+      const ctx = createDefaultContext({
+        desktopConfig: {
+          serverMode: 'remote',
+          port: 3001,
+          remoteUrl: 'http://saved:3001',
+          remoteToken: 'saved-token',
+          knownServers: [],
+          alwaysAskOnLaunch: true,
+          globalHotkey: 'CommandOrControl+`',
+          startOnLogin: false,
+          minimizeToTray: true,
+          setupCompleted: true,
+        },
+        discoverLaunchCandidates,
+        fetchHealthCheck,
+        createBrowserWindow: vi.fn().mockReturnValue(mockWindow),
+        forcedLaunch: { kind: 'connect', url: 'http://10.0.0.5:3001', token: 'vpn-token' },
+      })
+
+      const result = await runStartup(ctx)
+
+      expect(discoverLaunchCandidates).not.toHaveBeenCalled()
+      expect(fetchHealthCheck).not.toHaveBeenCalled()
+      expect(ctx.serverSpawner.start).not.toHaveBeenCalled()
+      expect(result.type).toBe('main')
+      expect(mockWindow.loadURL).toHaveBeenCalledWith('http://10.0.0.5:3001?token=vpn-token')
+    })
+
+    it('starts a local server on the forced port even when other servers are detected', async () => {
+      const discoverLaunchCandidates = vi.fn().mockResolvedValue([
+        {
+          id: 'other',
+          url: 'http://localhost:3001',
+          origin: 'port-scan',
+          ownership: 'detected-local',
+          label: 'localhost:3001',
+          requiresAuth: false,
+        },
+      ])
+      const mockWindow = createMockWindow()
+      const ctx = createDefaultContext({
+        desktopConfig: {
+          serverMode: 'remote',
+          port: 3001,
+          remoteUrl: 'http://saved:3001',
+          remoteToken: 'saved-token',
+          knownServers: [],
+          alwaysAskOnLaunch: false,
+          globalHotkey: 'CommandOrControl+`',
+          startOnLogin: false,
+          minimizeToTray: true,
+          setupCompleted: true,
+        },
+        discoverLaunchCandidates,
+        readEnvToken: vi.fn().mockResolvedValue('env-token'),
+        createBrowserWindow: vi.fn().mockReturnValue(mockWindow),
+        forcedLaunch: { kind: 'start-local', port: 3007 },
+      })
+
+      const result = await runStartup(ctx)
+
+      expect(discoverLaunchCandidates).not.toHaveBeenCalled()
+      expect(ctx.serverSpawner.start).toHaveBeenCalledTimes(1)
+      const startArgs = (ctx.serverSpawner.start as ReturnType<typeof vi.fn>).mock.calls[0][0]
+      expect(startArgs.port).toBe(3007)
+      expect(result.type).toBe('main')
+      if (result.type === 'main') {
+        expect(result.serverUrl).toBe('http://localhost:3007')
+      }
+      expect(mockWindow.loadURL).toHaveBeenCalledWith('http://localhost:3007?token=env-token')
+    })
+  })
+
   it('registers hotkey with configured accelerator', async () => {
     const ctx = createDefaultContext()
     await runStartup(ctx)
@@ -747,6 +835,26 @@ describe('runStartup', () => {
     expect(mockWindow.show).toHaveBeenCalled()
   })
 
+  it('shows the main window before waiting for page load to finish', async () => {
+    const mockWindow = createMockWindow()
+    let resolveLoad: (() => void) | undefined
+    ;(mockWindow.loadURL as ReturnType<typeof vi.fn>).mockReturnValue(new Promise<void>((resolve) => {
+      resolveLoad = resolve
+    }))
+    const ctx = createDefaultContext({
+      createBrowserWindow: vi.fn().mockReturnValue(mockWindow),
+    })
+
+    const startupPromise = runStartup(ctx)
+
+    await vi.waitFor(() => expect(mockWindow.loadURL).toHaveBeenCalledWith('http://localhost:3001'))
+    expect(mockWindow.show).toHaveBeenCalled()
+    const result = await startupPromise
+    expect(result.type).toBe('main')
+
+    resolveLoad?.()
+  })
+
   describe('auth token in URL', () => {
     it('appends ?token= to URL for app-bound mode', async () => {
       const mockWindow = createMockWindow()
@@ -756,6 +864,19 @@ describe('runStartup', () => {
       })
       await runStartup(ctx)
       expect(mockWindow.loadURL).toHaveBeenCalledWith('http://localhost:3001?token=test-auth-token-abc')
+    })
+
+    it('URL-encodes the auth token so metacharacters survive the renderer round-trip', async () => {
+      // The renderer reads the token back via URLSearchParams.get, so a raw
+      // token containing +, &, #, or a trailing space must be percent-encoded
+      // or it would be corrupted (and the app would load unauthenticated).
+      const mockWindow = createMockWindow()
+      const ctx = createDefaultContext({
+        createBrowserWindow: vi.fn().mockReturnValue(mockWindow),
+        readEnvToken: vi.fn().mockResolvedValue('a+b&c#d '),
+      })
+      await runStartup(ctx)
+      expect(mockWindow.loadURL).toHaveBeenCalledWith('http://localhost:3001?token=a%2Bb%26c%23d%20')
     })
 
     it('appends ?token= to URL for daemon mode', async () => {

@@ -1,6 +1,5 @@
 import WebSocket, { WebSocketServer } from 'ws'
 import { afterEach, describe, expect, it } from 'vitest'
-import { allocateLocalhostPort } from '../../../../../server/local-port.js'
 import { CodexRemoteProxy } from '../../../../../server/coding-cli/codex-app-server/remote-proxy.js'
 
 type UpstreamHandle = {
@@ -27,12 +26,21 @@ afterEach(async () => {
 })
 
 async function startUpstream(handler?: (socket: WebSocket, message: any) => void): Promise<UpstreamHandle> {
-  const endpoint = await allocateLocalhostPort()
   const sockets = new Set<WebSocket>()
   const messages: unknown[] = []
   const binaryFlags: boolean[] = []
-  const server = await new Promise<WebSocketServer>((resolve) => {
-    const wss = new WebSocketServer({ host: endpoint.hostname, port: endpoint.port }, () => resolve(wss))
+  const server = await new Promise<WebSocketServer>((resolve, reject) => {
+    const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 })
+    const onListening = () => {
+      wss.off('error', onError)
+      resolve(wss)
+    }
+    const onError = (error: Error) => {
+      wss.off('listening', onListening)
+      reject(error)
+    }
+    wss.once('listening', onListening)
+    wss.once('error', onError)
     wss.on('connection', (socket) => {
       sockets.add(socket)
       socket.on('close', () => sockets.delete(socket))
@@ -44,9 +52,14 @@ async function startUpstream(handler?: (socket: WebSocket, message: any) => void
       })
     })
   })
+  const address = server.address()
+  if (!address || typeof address === 'string') {
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+    throw new Error('Upstream WebSocket server did not expose a localhost port.')
+  }
   const handle = {
     server,
-    wsUrl: `ws://${endpoint.hostname}:${endpoint.port}`,
+    wsUrl: `ws://127.0.0.1:${address.port}`,
     messages,
     binaryFlags,
     sockets,
@@ -88,6 +101,16 @@ function nextMessageWithin(socket: WebSocket, ms: number): Promise<any> {
       throw new Error(`Timed out waiting ${ms}ms for websocket message.`)
     }),
   ])
+}
+
+async function nextResponseWithIdWithin(socket: WebSocket, id: number, ms: number): Promise<any> {
+  const deadline = Date.now() + ms
+  while (Date.now() < deadline) {
+    const remainingMs = Math.max(1, deadline - Date.now())
+    const message = await nextMessageWithin(socket, remainingMs)
+    if (message?.id === id) return message
+  }
+  throw new Error(`Timed out waiting ${ms}ms for websocket response ${id}.`)
 }
 
 function nextMessageFrame(socket: WebSocket): Promise<{ message: any; isBinary: boolean }> {
@@ -385,7 +408,7 @@ describe('CodexRemoteProxy', () => {
       params: { threadId: 'thread-1', turnId: 'turn-1' },
     }))
 
-    await expect(nextMessageWithin(tui, 50)).resolves.toEqual({ id: 2, result: {} })
+    await expect(nextResponseWithIdWithin(tui, 2, 50)).resolves.toEqual({ id: 2, result: {} })
     await delay(25)
     expect(interruptRequests).toHaveLength(1)
   })

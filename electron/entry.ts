@@ -33,13 +33,25 @@ import { runStartup, type StartupContext, type BrowserWindowLike } from './start
 import { initMainProcess } from './main.js'
 import { createWizardWindow } from './setup-wizard/wizard-window.js'
 import { createChooseLaunchOptionHandler } from './launch-choice-handler.js'
-import type { LaunchServerCandidate } from './types.js'
+import { buildLaunchOptions } from './launch-options.js'
+import { applyProvisioningFile } from './desktop-provisioning.js'
+import { createPortAvailabilityCheck } from './port-check.js'
+import type { ForcedLaunch, LaunchServerCandidate } from './types.js'
+
+const isPortAvailable = createPortAvailabilityCheck()
 
 const isDev = process.env.ELECTRON_DEV === '1'
 const configDir = path.join(os.homedir(), '.freshell')
 
 /** True during the wizard flow; prevents app.quit() on window-all-closed. */
 let wizardPhase = true
+
+/**
+ * An explicit chooser selection to honor on the next main() pass. Set by the
+ * choose-launch-option handler before it restarts the launch flow, consumed
+ * once at the top of main().
+ */
+let pendingForcedLaunch: ForcedLaunch | undefined
 
 async function main(): Promise<void> {
   // Wait for Electron to be ready before creating any BrowserWindow or using
@@ -58,6 +70,26 @@ async function main(): Promise<void> {
       }
     })
   }
+
+  // Apply one-time provisioning from a silent install. The installer writes raw
+  // values to desktop.provision (it cannot escape JSON); we convert them into a
+  // properly-serialized desktop.json here, then remove the provision file.
+  await applyProvisioningFile(path.join(configDir, 'desktop.provision'), {
+    readFile: (p) => (fs.existsSync(p) ? fs.readFileSync(p, 'utf-8') : undefined),
+    deleteFile: (p) => {
+      try {
+        fs.rmSync(p, { force: true })
+      } catch {
+        /* best-effort cleanup */
+      }
+    },
+    patchDesktopConfig,
+  })
+
+  // Consume any pending forced launch (set by the chooser handler before it
+  // restarted main). It must apply only to this pass.
+  const forcedLaunch = pendingForcedLaunch
+  pendingForcedLaunch = undefined
 
   // Read desktop config (or use defaults for first run)
   const desktopConfig = (await readDesktopConfig()) ?? getDefaultDesktopConfig()
@@ -100,6 +132,7 @@ async function main(): Promise<void> {
   // Construct the startup context
   const ctx: StartupContext = {
     desktopConfig,
+    forcedLaunch,
     daemonManager,
     serverSpawner,
     hotkeyManager,
@@ -244,6 +277,9 @@ async function main(): Promise<void> {
   ipcMain.removeHandler('choose-launch-option')
 
   let pendingLaunchChooser: { candidates: LaunchServerCandidate[]; reason: string } | undefined
+  // webContents id of the launch chooser window, so choose-launch-option only
+  // honors requests originating from it (the API is exposed to every window).
+  let chooserWebContentsId: number | undefined
 
   // Register the complete-setup handler before runStartup so it is available
   // when the wizard renderer calls it via the preload API.
@@ -264,18 +300,21 @@ async function main(): Promise<void> {
     })
   })
 
-  ipcMain.handle('get-launch-options', () => ({
-    candidates: pendingLaunchChooser?.candidates ?? [],
-    reason: pendingLaunchChooser?.reason ?? 'Choose how Freshell should connect.',
-    alwaysAskOnLaunch: desktopConfig.alwaysAskOnLaunch,
-    port: desktopConfig.port,
-  }))
+  ipcMain.handle('get-launch-options', () =>
+    buildLaunchOptions({ pending: pendingLaunchChooser, desktopConfig }),
+  )
 
   ipcMain.handle('choose-launch-option', createChooseLaunchOptionHandler({
     patchDesktopConfig,
     getCurrentPort: () => desktopConfig.port,
     validateServerAuth: (url: string, token: string) => ctx.fetchAuthenticated?.(`${url}/api/settings`, token) ?? Promise.resolve(false),
-    restartMain: async () => {
+    isAllowedSender: (event) => {
+      const senderId = (event as { sender?: { id?: number } }).sender?.id
+      return chooserWebContentsId !== undefined && senderId === chooserWebContentsId
+    },
+    isPortAvailable,
+    restartMain: async (forced: ForcedLaunch) => {
+      pendingForcedLaunch = forced
       wizardPhase = true
       for (const win of BrowserWindow.getAllWindows()) {
         win.close()
@@ -329,6 +368,8 @@ async function main(): Promise<void> {
         contextIsolation: true,
       },
     })
+    // Only this window may drive choose-launch-option (see isAllowedSender).
+    chooserWebContentsId = chooserWin.webContents.id
 
     if (isDev) {
       await chooserWin.loadURL('http://localhost:5175')

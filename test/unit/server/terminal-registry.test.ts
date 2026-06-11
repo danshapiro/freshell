@@ -1950,6 +1950,7 @@ describe('TerminalRegistry', () => {
   beforeEach(async () => {
     vi.resetAllMocks()
     vi.mocked(fs.existsSync).mockReturnValue(true)
+    vi.mocked(fs.statSync).mockReturnValue({ isDirectory: () => true } as fs.Stats)
     // Re-setup node-pty mock after resetAllMocks clears implementations
     const pty = await import('node-pty')
     vi.mocked(pty.spawn).mockImplementation(() => ({
@@ -2871,11 +2872,16 @@ describe('TerminalRegistry', () => {
   })
 
   describe('MCP cleanup on terminal exit', () => {
+    const testCwd = (suffix: string) => process.platform === 'win32'
+      ? `C:\\Users\\user\\${suffix}`
+      : `/home/user/${suffix}`
+
     it('cleanupMcpConfig is called on onExit', async () => {
       const { cleanupMcpConfig } = await import('../../../server/mcp/config-writer.js')
       vi.mocked(cleanupMcpConfig).mockClear()
 
-      const record = registry.create({ mode: 'claude', cwd: '/home/user/project' })
+      const cwd = testCwd('project')
+      const record = registry.create({ mode: 'claude', cwd })
       const pty = await import('node-pty')
       // Get the mock pty object from the most recent spawn call
       const mockPty = vi.mocked(pty.spawn).mock.results.at(-1)?.value
@@ -2884,17 +2890,18 @@ describe('TerminalRegistry', () => {
       // Trigger the exit handler
       onExitCallback({ exitCode: 0, signal: 0 })
 
-      expect(cleanupMcpConfig).toHaveBeenCalledWith(record.terminalId, 'claude', '/home/user/project')
+      expect(cleanupMcpConfig).toHaveBeenCalledWith(record.terminalId, 'claude', cwd)
     })
 
     it('cleanupMcpConfig is called on explicit kill()', async () => {
       const { cleanupMcpConfig } = await import('../../../server/mcp/config-writer.js')
       vi.mocked(cleanupMcpConfig).mockClear()
 
-      const record = registry.create({ mode: 'codex', cwd: '/home/user/work' })
+      const cwd = testCwd('work')
+      const record = registry.create({ mode: 'codex', cwd })
       registry.kill(record.terminalId)
 
-      expect(cleanupMcpConfig).toHaveBeenCalledWith(record.terminalId, 'codex', '/home/user/work')
+      expect(cleanupMcpConfig).toHaveBeenCalledWith(record.terminalId, 'codex', cwd)
     })
 
     it('cleanupMcpConfig is called on spawn failure', async () => {
@@ -2906,11 +2913,12 @@ describe('TerminalRegistry', () => {
         throw new Error('spawn failed: command not found')
       })
 
-      expect(() => registry.create({ mode: 'claude', cwd: '/home/user/fail' })).toThrow('spawn failed')
+      const cwd = testCwd('fail')
+      expect(() => registry.create({ mode: 'claude', cwd })).toThrow('spawn failed')
       expect(cleanupMcpConfig).toHaveBeenCalledWith(
         expect.any(String),
         'claude',
-        '/home/user/fail',
+        cwd,
       )
     })
 
@@ -2942,9 +2950,10 @@ describe('TerminalRegistry', () => {
     it('terminal record stores mcpCwd from normalized buildSpawnSpec cwd', () => {
       // The terminal record should store the normalized cwd (from buildSpawnSpec)
       // separately from the raw cwd, so cleanup uses the same path as injection.
-      const record = registry.create({ mode: 'claude', cwd: '/home/user/project' })
-      // On Linux (no WSL), mcpCwd should equal the resolved cwd (same as raw here)
-      expect(record.mcpCwd).toBe('/home/user/project')
+      const cwd = testCwd('project')
+      const record = registry.create({ mode: 'claude', cwd })
+      // The reachable test cwd should be the same path MCP injection receives.
+      expect(record.mcpCwd).toBe(cwd)
     })
 
     it('kill() passes mcpCwd (not raw cwd) to cleanupMcpConfig', async () => {

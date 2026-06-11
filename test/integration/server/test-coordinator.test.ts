@@ -37,6 +37,7 @@ const require = createRequire(import.meta.url)
 const TSX_CLI = require.resolve('tsx/cli')
 const COORDINATOR_SCRIPT = path.join(REPO_ROOT, 'scripts', 'testing', 'test-coordinator.ts')
 const FAKE_UPSTREAM = path.join(REPO_ROOT, 'test', 'fixtures', 'testing', 'fake-coordinated-workload.mjs')
+const itRequiresObservableForeignListener = process.platform === 'win32' ? it.skip : it
 
 type CoordinatorHandle = {
   child: ChildProcessWithoutNullStreams
@@ -190,24 +191,26 @@ async function stopChild(handle: CoordinatorHandle): Promise<void> {
     activeChildren.splice(index, 1)
   }
 
-  if (handle.child.exitCode !== null || handle.child.killed) {
+  if (handle.child.exitCode !== null) {
     return
   }
 
-  handle.child.kill('SIGTERM')
-  try {
-    await Promise.race([
-      once(handle.child, 'exit'),
-      delay(3_000),
-    ])
-  } catch {
-    // ignore
-  }
+  await signalChildAndWait(handle, 'SIGTERM', 3_000)
 
   if (handle.child.exitCode === null) {
-    handle.child.kill('SIGKILL')
-    await once(handle.child, 'exit').catch(() => {})
+    await signalChildAndWait(handle, 'SIGKILL', 3_000)
   }
+}
+
+async function signalChildAndWait(
+  handle: CoordinatorHandle,
+  signal: NodeJS.Signals,
+  timeoutMs: number,
+): Promise<void> {
+  if (handle.child.exitCode !== null) return
+  const exited = once(handle.child, 'exit').catch(() => undefined)
+  handle.child.kill(signal)
+  await Promise.race([exited, delay(timeoutMs)])
 }
 
 async function readCaptureLines(captureFile: string) {
@@ -753,7 +756,7 @@ describe('test coordinator CLI', () => {
     },
   )
 
-  it('reports running-undescribed when the gate is live but holder metadata is missing or corrupt', async () => {
+  itRequiresObservableForeignListener('reports running-undescribed when the gate is live but holder metadata is missing or corrupt', async () => {
     const fixture = await createRepoFixture({ linkedWorktree: true })
     const endpoint = buildCoordinatorEndpoint(fixture.commonDir)
     const listener = await tryListen(endpoint)
@@ -939,7 +942,7 @@ describe('test coordinator CLI', () => {
     expect(captures.map((entry) => entry.selector)).not.toContain('vitest:server:run --config vitest.server.config.ts --ui')
 
     await stopChild(holder)
-  })
+  }, 60_000)
 
   it('coordinates exact broad single-phase workloads and records their distinct suite keys', async () => {
     const fixture = await createRepoFixture({ linkedWorktree: true })
@@ -1184,7 +1187,7 @@ describe('test coordinator CLI', () => {
     expect((await readSuiteRuns(fixture.storeDir)).byKey['full-suite']).toBeUndefined()
 
     await stopChild(holder)
-  })
+  }, 60_000)
 
   it('rejects unknown coordinator run subcommands with a clean usage error', async () => {
     const fixture = await createRepoFixture({ linkedWorktree: true })

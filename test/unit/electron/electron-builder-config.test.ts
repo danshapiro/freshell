@@ -41,6 +41,12 @@ describe('electron-builder Windows config', () => {
     )
   })
 
+  it('sets Linux maintainer metadata required by Debian packaging', () => {
+    const config = readText(path.join(PROJECT_ROOT, 'electron-builder.yml'))
+
+    expect(config).toMatch(/^linux:\n(?:.*\n)*?  maintainer: Freshell Maintainers <maintainers@freshell\.dev>$/m)
+  })
+
   it('uses a silent-install friendly NSIS flow', () => {
     const config = readText(path.join(PROJECT_ROOT, 'electron-builder.yml'))
 
@@ -69,15 +75,19 @@ describe('electron-builder Windows config', () => {
     expect(include).not.toContain('taskkill')
   })
 
-  it('can provision remote desktop config from silent installer args', () => {
+  it('provisions remote desktop config from silent installer args without hand-writing JSON', () => {
     const include = readText(path.join(PROJECT_ROOT, 'assets', 'electron', 'installer.nsh'))
 
     expect(include).toContain('${StdUtils.GetParameter} $0 "FRESHELL_REMOTE_URL" ""')
     expect(include).toContain('${StdUtils.GetParameter} $1 "FRESHELL_TOKEN" ""')
-    expect(include).toContain('FileOpen $2 "$PROFILE\\.freshell\\desktop.json" w')
-    expect(include).toContain('$\\"serverMode$\\": $\\"remote$\\",')
-    expect(include).toContain('$\\"remoteUrl$\\": $\\"$0$\\",')
-    expect(include).toContain('$\\"remoteToken$\\": $\\"$1$\\",')
-    expect(include).toContain('$\\"setupCompleted$\\": true')
+    // Raw values are written to a line-based provision file. NSIS cannot escape
+    // JSON, so a token/URL containing a quote or backslash would otherwise
+    // corrupt the file; the app serializes a real desktop.json on first launch.
+    expect(include).toContain('FileOpen $2 "$PROFILE\\.freshell\\desktop.provision" w')
+    expect(include).toContain('FileWrite $2 "FRESHELL_REMOTE_URL=$0')
+    expect(include).toContain('FileWrite $2 "FRESHELL_TOKEN=$1')
+    // The injection-prone hand-written JSON path must be gone.
+    expect(include).not.toContain('desktop.json" w')
+    expect(include).not.toContain('$\\"serverMode$\\"')
   })
 })

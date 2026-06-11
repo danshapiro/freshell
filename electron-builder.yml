@@ -87,6 +87,7 @@ linux:
     - deb
   category: Development
   icon: assets/electron/icons
+  maintainer: Freshell Maintainers <maintainers@freshell.dev>
 
 nsis:
   oneClick: true
