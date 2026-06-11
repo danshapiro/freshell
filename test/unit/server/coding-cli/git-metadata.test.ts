@@ -32,6 +32,10 @@ async function initRepo(repoDir: string, branchName: string) {
   await runGit(['checkout', '-B', branchName], repoDir)
 }
 
+async function realpath(input: string): Promise<string> {
+  return fsp.realpath(input)
+}
+
 async function createLinkedWorktreeFixture(baseDir: string) {
   const repoDir = path.join(baseDir, 'repo')
   const worktreeDir = path.join(baseDir, 'repo-feature')
@@ -95,9 +99,9 @@ describe('resolveGitBranchAndDirty()', () => {
 
     await fsp.writeFile(path.join(worktreeDir, 'dirty.txt'), 'dirty\n')
 
-    expect(await resolveGitCheckoutRoot(nestedDir)).toBe(worktreeDir)
-    expect(await resolveGitRepoRoot(nestedDir)).toBe(repoDir)
-    expect(await resolveGitCommonDir(nestedDir)).toBe(path.join(repoDir, '.git'))
+    await expect(realpath(await resolveGitCheckoutRoot(nestedDir) ?? '')).resolves.toBe(await realpath(worktreeDir))
+    await expect(realpath(await resolveGitRepoRoot(nestedDir) ?? '')).resolves.toBe(await realpath(repoDir))
+    await expect(realpath(await resolveGitCommonDir(nestedDir) ?? '')).resolves.toBe(await realpath(path.join(repoDir, '.git')))
 
     const result = await resolveGitBranchAndDirty(nestedDir)
 

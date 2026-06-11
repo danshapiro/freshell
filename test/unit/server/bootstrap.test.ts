@@ -313,7 +313,7 @@ Ethernet adapter vEthernet (WSL):
     it('reads config from FRESHELL_HOME when set', () => {
       process.env.FRESHELL_HOME = '/tmp/freshell-test-home'
       vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
-        expect(filePath).toBe(path.join('/tmp/freshell-test-home', '.freshell', 'config.json'))
+        expect(filePath).toBe(path.join(path.resolve('/tmp/freshell-test-home'), '.freshell', 'config.json'))
         return JSON.stringify({ settings: { network: { host: '0.0.0.0' } } })
       })
 

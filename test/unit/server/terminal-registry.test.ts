@@ -1950,6 +1950,7 @@ describe('TerminalRegistry', () => {
   beforeEach(async () => {
     vi.resetAllMocks()
     vi.mocked(fs.existsSync).mockReturnValue(true)
+    vi.mocked(fs.statSync).mockReturnValue({ isDirectory: () => true } as fs.Stats)
     // Re-setup node-pty mock after resetAllMocks clears implementations
     const pty = await import('node-pty')
     vi.mocked(pty.spawn).mockImplementation(() => ({

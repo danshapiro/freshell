@@ -229,7 +229,7 @@ describe('server/path-utils cross-platform path handling', () => {
     process.env.WSL_WINDOWS_SYS32 = '/prefix/x/mount/c/Windows/System32'
 
     const fsPath = toFilesystemPathSync('/mnt/d/projects/app', 'posix')
-    expect(fsPath).toBe(String.raw`\mnt\d\projects\app`)
+    expect(fsPath.toLowerCase()).toMatch(/^[a-z]:\\mnt\\d\\projects\\app$|^\\mnt\\d\\projects\\app$/)
     expect(convertWslDrivePathToWindowsPath('/mnt/d/projects/app')).toBeUndefined()
   })
 

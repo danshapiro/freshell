@@ -245,7 +245,7 @@ describe("logger", () => {
 
         expect(resolved).toBe(
           path.join(
-            "/tmp/freshell-home",
+            path.resolve("/tmp/freshell-home"),
             ".freshell",
             "logs",
             "session-lifecycle.production.prod-main.jsonl",
@@ -264,7 +264,7 @@ describe("logger", () => {
         expect(resolveSessionLifecycleLogPath({
           VITEST: "true",
           LOG_SESSION_LIFECYCLE_PATH: "/tmp/session-lifecycle.jsonl",
-        } as NodeJS.ProcessEnv, "/home/test")).toBe("/tmp/session-lifecycle.jsonl")
+        } as NodeJS.ProcessEnv, "/home/test")).toBe(path.resolve("/tmp/session-lifecycle.jsonl"))
       },
       TEST_TIMEOUT_MS,
     )
@@ -278,7 +278,7 @@ describe("logger", () => {
         )
         expect(resolved).toBe(
           path.join(
-            "/tmp/freshell-home",
+            path.resolve("/tmp/freshell-home"),
             ".freshell",
             "logs",
             "server-debug.development.3001.jsonl",
