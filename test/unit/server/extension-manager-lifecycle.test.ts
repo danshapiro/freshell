@@ -122,7 +122,7 @@ describe('ExtensionManager — Server Process Lifecycle', () => {
   afterEach(async () => {
     // Clean up any running servers
     await mgr.stopAll()
-    await fsp.rm(tempDir, { recursive: true, force: true })
+    await fsp.rm(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
   })
 
   // ── startServer() ──
