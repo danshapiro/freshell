@@ -690,9 +690,11 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       sidecar.emitTurnCompleted({ threadId: 'thread-proof-ok', turnId: 'turn-1', params: {} })
 
       await vi.waitFor(() => expect(registry.get(term.terminalId)?.resumeSessionId).toBe('thread-proof-ok'))
-      expect(registry.get(term.terminalId)?.codexDurability).toMatchObject({
-        state: 'durable',
-        durableThreadId: 'thread-proof-ok',
+      await vi.waitFor(() => {
+        expect(registry.get(term.terminalId)?.codexDurability).toMatchObject({
+          state: 'durable',
+          durableThreadId: 'thread-proof-ok',
+        })
       })
       expect(sent).toContainEqual(expect.objectContaining({
         type: 'terminal.session.associated',
