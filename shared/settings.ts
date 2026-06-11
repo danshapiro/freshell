@@ -42,6 +42,11 @@ const PANE_SNAP_THRESHOLD_MIN = 0
 const PANE_SNAP_THRESHOLD_MAX = 8
 const SIDEBAR_WIDTH_MIN = 200
 const SIDEBAR_WIDTH_MAX = 500
+const FRESH_AGENT_FONT_SCALE_MIN = 1
+const FRESH_AGENT_FONT_SCALE_MAX = 2
+// Fresh-agent panes render 50% larger than the base UI by default.
+export const FRESH_AGENT_FONT_SCALE_DEFAULT = 1.5
+export const FRESH_AGENT_FONT_SCALE_OPTIONS = [1, 1.25, 1.5, 1.75, 2] as const
 
 const TERMINAL_LOCAL_KEYS = [
   'fontSize',
@@ -69,6 +74,7 @@ const AGENT_CHAT_LOCAL_KEYS = [
   'showThinking',
   'showTools',
   'showTimecodes',
+  'fontScale',
 ] as const
 
 export type ThemeMode = (typeof THEME_VALUES)[number]
@@ -202,11 +208,13 @@ export type LocalSettings = {
     showThinking: boolean
     showTools: boolean
     showTimecodes: boolean
+    fontScale: number
   }
   agentChat: {
     showThinking: boolean
     showTools: boolean
     showTimecodes: boolean
+    fontScale: number
   }
   notifications: {
     soundEnabled: boolean
@@ -408,6 +416,17 @@ function normalizeRoundedClampedNumber(value: unknown, min: number, max: number)
   return Math.round(normalized)
 }
 
+function normalizeFreshAgentFontScale(value: unknown): number {
+  return (
+    normalizeClampedNumber(value, FRESH_AGENT_FONT_SCALE_MIN, FRESH_AGENT_FONT_SCALE_MAX)
+    ?? FRESH_AGENT_FONT_SCALE_DEFAULT
+  )
+}
+
+function normalizeLocalFreshAgent(value: LocalSettings['freshAgent']): LocalSettings['freshAgent'] {
+  return { ...value, fontScale: normalizeFreshAgentFontScale(value.fontScale) }
+}
+
 function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSettingsPatch | undefined {
   const normalized: LocalSettingsPatch = {}
 
@@ -539,6 +558,14 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
     }
     if (typeof patch.agentChat.showTimecodes === 'boolean') {
       agentChat.showTimecodes = patch.agentChat.showTimecodes as boolean
+    }
+    const normalizedFontScale = normalizeClampedNumber(
+      patch.agentChat.fontScale,
+      FRESH_AGENT_FONT_SCALE_MIN,
+      FRESH_AGENT_FONT_SCALE_MAX,
+    )
+    if (normalizedFontScale !== undefined) {
+      agentChat.fontScale = normalizedFontScale
     }
     if (Object.keys(agentChat).length > 0) {
       normalized.agentChat = agentChat
@@ -810,11 +837,13 @@ export const defaultLocalSettings: LocalSettings = {
     showThinking: false,
     showTools: false,
     showTimecodes: false,
+    fontScale: FRESH_AGENT_FONT_SCALE_DEFAULT,
   },
   agentChat: {
     showThinking: false,
     showTools: false,
     showTimecodes: false,
+    fontScale: FRESH_AGENT_FONT_SCALE_DEFAULT,
   },
   notifications: {
     soundEnabled: true,
@@ -1165,8 +1194,8 @@ export function resolveLocalSettings(patch?: LocalSettingsPatch): LocalSettings 
       sortMode: normalizeLocalSortMode(patch?.sidebar?.sortMode),
       worktreeGrouping: normalizeWorktreeGrouping(patch?.sidebar?.worktreeGrouping),
     },
-    freshAgent: mergeDefined(defaultLocalSettings.freshAgent, freshAgentPatch),
-    agentChat: mergeDefined(defaultLocalSettings.agentChat, freshAgentPatch),
+    freshAgent: normalizeLocalFreshAgent(mergeDefined(defaultLocalSettings.freshAgent, freshAgentPatch)),
+    agentChat: normalizeLocalFreshAgent(mergeDefined(defaultLocalSettings.agentChat, freshAgentPatch)),
     notifications: mergeDefined(defaultLocalSettings.notifications, patch?.notifications),
   }
 }

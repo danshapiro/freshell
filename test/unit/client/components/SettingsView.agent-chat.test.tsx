@@ -127,6 +127,38 @@ describe('SettingsView fresh agent settings', () => {
     expect(store.getState().settings.settings.agentChat.showTimecodes).toBe(true)
   })
 
+  it('renders the Font size dropdown defaulting to 150% (50% larger)', () => {
+    const store = createSettingsViewStore()
+    renderSettingsView(store)
+    switchSettingsTab('Workspace')
+
+    const select = screen.getByLabelText('Fresh agent font size') as HTMLSelectElement
+    expect(select).toBeInTheDocument()
+    expect(select.value).toBe('1.5')
+    expect(screen.getByRole('option', { name: '150%' })).toBeInTheDocument()
+  })
+
+  it('reflects a preloaded fresh agent font scale', () => {
+    const store = createSettingsViewStore({
+      settings: { freshAgent: { fontScale: 2 }, agentChat: { fontScale: 2 } },
+    })
+    renderSettingsView(store)
+    switchSettingsTab('Workspace')
+
+    expect((screen.getByLabelText('Fresh agent font size') as HTMLSelectElement).value).toBe('2')
+  })
+
+  it('changing the Font size dropdown updates freshAgent and agentChat in the store', () => {
+    const store = createSettingsViewStore()
+    renderSettingsView(store)
+    switchSettingsTab('Workspace')
+
+    fireEvent.change(screen.getByLabelText('Fresh agent font size'), { target: { value: '1.75' } })
+
+    expect(store.getState().settings.settings.freshAgent.fontScale).toBe(1.75)
+    expect(store.getState().settings.settings.agentChat.fontScale).toBe(1.75)
+  })
+
   it('toggling off a previously-on setting sets it to false', () => {
     const store = createSettingsViewStore({
       settings: { freshAgent: { showThinking: true }, agentChat: { showThinking: true } },

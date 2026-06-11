@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { nanoid } from 'nanoid'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
@@ -17,6 +17,7 @@ import { paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { getCanonicalDurableSessionId, getPreferredResumeSessionId } from '@/store/persistControl'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+import { FRESH_AGENT_FONT_SCALE_DEFAULT } from '@shared/settings'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import { getFreshAgentSlashCommands, type FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
 import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
@@ -173,6 +174,9 @@ export function FreshAgentView({
 }) {
   const dispatch = useAppDispatch()
   const ws = getWsClient()
+  const freshFontScale = useAppSelector(
+    (state) => state.settings.settings.freshAgent?.fontScale,
+  ) ?? FRESH_AGENT_FONT_SCALE_DEFAULT
   const pendingCreateFailure = useAppSelector(
     (state) => state.freshAgent?.pendingCreateFailures?.[paneContent.createRequestId],
   )
@@ -1103,7 +1107,12 @@ export function FreshAgentView({
     }
 
     return (
-      <div className="flex h-full min-h-0 flex-col" data-context="fresh-agent" data-session-id={paneContent.sessionId}>
+      <div
+        className="flex h-full min-h-0 flex-col"
+        data-context="fresh-agent"
+        data-session-id={paneContent.sessionId}
+        style={{ '--fresh-font-scale': String(freshFontScale) } as CSSProperties}
+      >
         <div className="flex min-h-0 flex-1">
           <div
             className="flex min-h-0 flex-1 flex-col"
@@ -1304,6 +1313,7 @@ export function FreshAgentView({
     sendFreshAgentMessage,
     tabId,
     tabTitleSetByUser,
+    freshFontScale,
   ])
 
   useEffect(() => {

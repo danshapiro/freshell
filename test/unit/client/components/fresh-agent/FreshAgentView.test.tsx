@@ -3,7 +3,7 @@ import { render, screen, waitFor, fireEvent, cleanup, act } from '@testing-libra
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
-import settingsReducer from '@/store/settingsSlice'
+import settingsReducer, { updateSettingsLocal } from '@/store/settingsSlice'
 import freshAgentReducer from '@/store/freshAgentSlice'
 import agentChatReducer from '@/store/agentChatSlice'
 import tabsReducer from '@/store/tabsSlice'
@@ -2449,5 +2449,54 @@ describe('FreshAgentView', () => {
       expect(leaf.content.sessionId).toBe('runtime-id')
       expect(leaf.content.modelSelection).toEqual({ kind: 'exact', modelId: 'ui-selected-model' })
     })
+  })
+})
+
+describe('FreshAgentView font scale', () => {
+  const freshClaudePane = {
+    kind: 'fresh-agent',
+    sessionType: 'freshclaude',
+    provider: 'claude',
+    createRequestId: 'req-1',
+    sessionId: CLAUDE_THREAD_ID,
+    status: 'connected',
+  } as const
+
+  it('applies the default 50%-larger font scale to the fresh-agent pane root', async () => {
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={freshClaudePane} />
+      </Provider>,
+    )
+
+    const root = document.querySelector('[data-context="fresh-agent"]') as HTMLElement
+    expect(root).toBeTruthy()
+    expect(root.style.getPropertyValue('--fresh-font-scale')).toBe('1.5')
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+  })
+
+  it('updates the fresh-agent pane font scale live when the setting changes', async () => {
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={freshClaudePane} />
+      </Provider>,
+    )
+
+    const root = document.querySelector('[data-context="fresh-agent"]') as HTMLElement
+    expect(root.style.getPropertyValue('--fresh-font-scale')).toBe('1.5')
+
+    await act(async () => {
+      store.dispatch(updateSettingsLocal({
+        freshAgent: { fontScale: 1.25 },
+        agentChat: { fontScale: 1.25 },
+      }))
+    })
+
+    expect(root.style.getPropertyValue('--fresh-font-scale')).toBe('1.25')
   })
 })
