@@ -547,9 +547,11 @@ describeLinux('Codex Session Flow Integration', () => {
       await vi.waitFor(() => {
         expect(registry.get(created.terminalId)?.resumeSessionId).toBe('thread-fake-tui-durable')
       })
-      expect(registry.get(created.terminalId)?.codexDurability).toMatchObject({
-        state: 'durable',
-        durableThreadId: 'thread-fake-tui-durable',
+      await vi.waitFor(() => {
+        expect(registry.get(created.terminalId)?.codexDurability).toMatchObject({
+          state: 'durable',
+          durableThreadId: 'thread-fake-tui-durable',
+        })
       })
       expect(registry.list().find((term) => term.terminalId === created.terminalId)?.sessionRef).toEqual({
         provider: 'codex',

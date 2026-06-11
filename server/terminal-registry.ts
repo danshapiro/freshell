@@ -1846,6 +1846,35 @@ export class TerminalRegistry extends EventEmitter {
     return storedDurability
   }
 
+  private isCurrentRunningTerminalRecord(record: TerminalRecord): boolean {
+    return this.terminals.get(record.terminalId) === record && record.status === 'running'
+  }
+
+  private async writeCodexDurabilityForRunningRecord(
+    record: TerminalRecord,
+    durability: CodexDurabilityRef,
+    updatedAt = Date.now(),
+  ): Promise<CodexDurabilityRef | undefined> {
+    if (!this.isCurrentRunningTerminalRecord(record)) return undefined
+    const stored = await this.writeCodexDurability(record, durability, updatedAt)
+    if (this.isCurrentRunningTerminalRecord(record)) return stored
+
+    try {
+      await this.codexDurabilityStore.delete(record.terminalId)
+    } catch (err) {
+      logger.warn({
+        err,
+        terminalId: record.terminalId,
+        state: durability.state,
+      }, 'Failed to delete stale Codex durability write after terminal stopped')
+    }
+    logger.info({
+      terminalId: record.terminalId,
+      state: durability.state,
+    }, 'Discarded stale Codex durability write after terminal stopped')
+    return undefined
+  }
+
   private async replaceCodexDurabilityStoreRecord(record: TerminalRecord, durability: CodexDurabilityRef, updatedAt = Date.now()): Promise<CodexDurabilityRef> {
     await this.codexDurabilityStore.delete(record.terminalId)
     return this.writeCodexDurability(record, durability, updatedAt)
@@ -2095,13 +2124,15 @@ export class TerminalRegistry extends EventEmitter {
       ...record.codexDurability,
       state: 'proof_checking',
     }
-    const checkingStored = await this.writeCodexDurability(record, checking)
+    const checkingStored = await this.writeCodexDurabilityForRunningRecord(record, checking)
+    if (!checkingStored) return
     this.broadcastCodexDurability(record, checkingStored)
 
     const proof = await proofCodexRollout({
       rolloutPath: candidate.rolloutPath,
       candidateThreadId: candidate.candidateThreadId,
     })
+    if (!this.isCurrentRunningTerminalRecord(record)) return
     const checkedAt = Date.now()
     if (proof.ok) {
       const bound = this.bindSession(terminalId, 'codex', proof.rolloutProofId, 'association')
@@ -2112,7 +2143,8 @@ export class TerminalRegistry extends EventEmitter {
           lastProofFailure: undefined,
           nonRestorableReason: `session_binding_failed:${bound.reason}`,
         }
-        const stored = await this.writeCodexDurability(record, failed, checkedAt)
+        const stored = await this.writeCodexDurabilityForRunningRecord(record, failed, checkedAt)
+        if (!stored) return
         record.codexDurabilityProof = undefined
         this.unwatchCodexRollout(record, 'session_binding_failed')
         logger.warn({ terminalId, proof, reason: bound.reason }, 'Codex rollout proof succeeded but session binding failed')
@@ -2128,7 +2160,8 @@ export class TerminalRegistry extends EventEmitter {
         durableThreadId: proof.rolloutProofId,
         lastProofFailure: undefined,
       }
-      const stored = await this.writeCodexDurability(record, durable, checkedAt)
+      const stored = await this.writeCodexDurabilityForRunningRecord(record, durable, checkedAt)
+      if (!stored) return
       record.codexDurabilityProof = undefined
       this.unwatchCodexRollout(record, 'durable')
       logger.info({
@@ -2162,7 +2195,8 @@ export class TerminalRegistry extends EventEmitter {
         checkedAt,
       },
     }
-    const stored = await this.writeCodexDurability(record, failed, checkedAt)
+    const stored = await this.writeCodexDurabilityForRunningRecord(record, failed, checkedAt)
+    if (!stored) return
     logger.warn({
       terminalId,
       candidateThreadId: candidate.candidateThreadId,
