@@ -103,6 +103,16 @@ function nextMessageWithin(socket: WebSocket, ms: number): Promise<any> {
   ])
 }
 
+async function nextResponseWithIdWithin(socket: WebSocket, id: number, ms: number): Promise<any> {
+  const deadline = Date.now() + ms
+  while (Date.now() < deadline) {
+    const remainingMs = Math.max(1, deadline - Date.now())
+    const message = await nextMessageWithin(socket, remainingMs)
+    if (message?.id === id) return message
+  }
+  throw new Error(`Timed out waiting ${ms}ms for websocket response ${id}.`)
+}
+
 function nextMessageFrame(socket: WebSocket): Promise<{ message: any; isBinary: boolean }> {
   return new Promise((resolve) => {
     socket.once('message', (raw, isBinary) => resolve({
@@ -398,7 +408,7 @@ describe('CodexRemoteProxy', () => {
       params: { threadId: 'thread-1', turnId: 'turn-1' },
     }))
 
-    await expect(nextMessageWithin(tui, 50)).resolves.toEqual({ id: 2, result: {} })
+    await expect(nextResponseWithIdWithin(tui, 2, 50)).resolves.toEqual({ id: 2, result: {} })
     await delay(25)
     expect(interruptRequests).toHaveLength(1)
   })
