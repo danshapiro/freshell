@@ -131,6 +131,7 @@ export function buildLocalSettingsPatch(localSettings: LocalSettings): LocalSett
   assignChangedScalar(freshAgent, localSettings.freshAgent, defaultLocalSettings.freshAgent, 'showThinking')
   assignChangedScalar(freshAgent, localSettings.freshAgent, defaultLocalSettings.freshAgent, 'showTools')
   assignChangedScalar(freshAgent, localSettings.freshAgent, defaultLocalSettings.freshAgent, 'showTimecodes')
+  assignChangedScalar(freshAgent, localSettings.freshAgent, defaultLocalSettings.freshAgent, 'fontScale')
   if (Object.keys(freshAgent).length > 0) {
     patch.freshAgent = freshAgent
     patch.agentChat = freshAgent

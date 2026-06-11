@@ -220,4 +220,38 @@ describe('browserPreferencesPersistence', () => {
     const bp = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
     expect(bp.settings?.agentChat).toBeUndefined()
   })
+
+  it('persists freshAgent.fontScale (mirrored to agentChat) when changed from the default', () => {
+    const store = createStore()
+
+    store.dispatch(updateSettingsLocal({
+      freshAgent: { fontScale: 1.75 },
+      agentChat: { fontScale: 1.75 },
+    }))
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    const bp = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+    expect(bp.settings.freshAgent).toEqual({ fontScale: 1.75 })
+    expect(bp.settings.agentChat).toEqual({ fontScale: 1.75 })
+
+    const rehydrated = resolveLocalSettings(bp.settings)
+    expect(rehydrated.freshAgent.fontScale).toBe(1.75)
+    expect(rehydrated.agentChat.fontScale).toBe(1.75)
+  })
+
+  it('does not persist freshAgent.fontScale when left at the default', () => {
+    const store = createStore()
+
+    store.dispatch(updateSettingsLocal({
+      freshAgent: { fontScale: 1.5 },
+      agentChat: { fontScale: 1.5 },
+    }))
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    const bp = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+    expect(bp.settings?.freshAgent).toBeUndefined()
+    expect(bp.settings?.agentChat).toBeUndefined()
+  })
 })

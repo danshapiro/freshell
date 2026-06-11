@@ -10,6 +10,7 @@ import type {
   AttentionDismiss,
 } from '@/store/types'
 import { parseNormalizedLineList } from '@shared/string-list'
+import { FRESH_AGENT_FONT_SCALE_OPTIONS, FRESH_AGENT_FONT_SCALE_DEFAULT } from '@shared/settings'
 import type { SettingsSectionProps } from './settings-types'
 import {
   SettingsSection,
@@ -310,6 +311,31 @@ export default function WorkspaceSettings({
               })
             }}
           />
+        </SettingsRow>
+        <SettingsRow
+          label="Font size"
+          description="Scale the text in fresh-agent panes (Freshclaude, Freshcodex, and friends)."
+        >
+          <select
+            aria-label="Fresh agent font size"
+            value={String(
+              settings.freshAgent?.fontScale ?? settings.agentChat?.fontScale ?? FRESH_AGENT_FONT_SCALE_DEFAULT,
+            )}
+            onChange={(e) => {
+              const fontScale = Number(e.target.value)
+              applyLocalSetting({
+                freshAgent: { fontScale },
+                agentChat: { fontScale },
+              })
+            }}
+            className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
+          >
+            {FRESH_AGENT_FONT_SCALE_OPTIONS.map((scale) => (
+              <option key={scale} value={String(scale)}>
+                {`${Math.round(scale * 100)}%`}
+              </option>
+            ))}
+          </select>
         </SettingsRow>
       </SettingsSection>
 

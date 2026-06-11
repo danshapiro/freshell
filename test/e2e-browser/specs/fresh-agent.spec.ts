@@ -253,6 +253,96 @@ test.describe('Fresh Agent', () => {
     })
   })
 
+  test('renders the fresh-agent pane at the configured font scale without clipping the composer', async ({ freshellPage, page, harness, terminal }) => {
+    await terminal.waitForTerminal()
+    const { tabId, paneId } = await getActiveLeaf(harness)
+    const sessionId = '44444444-4444-4444-8444-444444444444'
+
+    await page.route(`**/api/fresh-agent/threads/freshclaude/claude/${sessionId}*`, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          threadId: sessionId,
+          sessionId,
+          revision: 1,
+          latestTurnId: null,
+          status: 'idle',
+          summary: 'Scaled summary line',
+          capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: false },
+          settings: { model: 'claude-opus-4-6', permissionMode: 'default', plugins: [] },
+          tokenUsage: { inputTokens: 10, outputTokens: 20, totalTokens: 30, costUsd: 0 },
+          pendingApprovals: [],
+          pendingQuestions: [],
+          turns: [],
+          extensions: {
+            claude: {
+              liveSessionId: sessionId,
+              cliSessionId: sessionId,
+            },
+          },
+        }),
+      })
+    })
+
+    await page.evaluate(({ currentTabId, currentPaneId, currentSessionId }) => {
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'panes/updatePaneContent',
+        payload: {
+          tabId: currentTabId,
+          paneId: currentPaneId,
+          content: {
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-e2e-fontscale',
+            sessionId: currentSessionId,
+            sessionRef: { provider: 'claude', sessionId: currentSessionId },
+            resumeSessionId: currentSessionId,
+            status: 'idle',
+            settingsDismissed: true,
+          },
+        },
+      })
+    }, { currentTabId: tabId, currentPaneId: paneId, currentSessionId: sessionId })
+
+    const paneRoot = page.locator('[data-context="fresh-agent"]')
+    await expect(paneRoot).toBeVisible({ timeout: 10_000 })
+
+    const readScale = () =>
+      paneRoot.evaluate((el) => getComputedStyle(el).getPropertyValue('--fresh-font-scale').trim())
+
+    // The fresh-agent panes default to 150% (the +50% larger default).
+    expect(await readScale()).toBe('1.5')
+
+    const textLine = page.getByText('Scaled summary line')
+    await expect(textLine).toBeVisible()
+    const heightAt150 = (await textLine.boundingBox())!.height
+
+    // No clipping: the composer textarea stays within the pane at the larger scale.
+    const composer = paneRoot.locator('textarea').first()
+    await expect(composer).toBeVisible()
+    const paneBox = (await paneRoot.boundingBox())!
+    const composerBox = (await composer.boundingBox())!
+    expect(composerBox.y + composerBox.height).toBeLessThanOrEqual(paneBox.y + paneBox.height + 2)
+
+    // Shrinking the setting to 100% scales the rendered transcript down ~1.5x.
+    await page.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'settings/updateSettingsLocal',
+        payload: { freshAgent: { fontScale: 1 }, agentChat: { fontScale: 1 } },
+      })
+    })
+    await expect.poll(readScale).toBe('1')
+    const heightAt100 = (await textLine.boundingBox())!.height
+
+    const ratio = heightAt150 / heightAt100
+    expect(ratio).toBeGreaterThan(1.35)
+    expect(ratio).toBeLessThan(1.65)
+  })
+
   test('browser user can create and resume Freshcodex with worktree, review, and fork metadata in the shared pane', async ({ freshellPage, page, harness, terminal, serverInfo }) => {
     await terminal.waitForTerminal()
     await enableClaudeAndCodex(page)
