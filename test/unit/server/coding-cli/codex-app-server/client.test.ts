@@ -9,6 +9,7 @@ import { CodexAppServerClient } from '../../../../../server/coding-cli/codex-app
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const FAKE_SERVER_PATH = path.resolve(__dirname, '../../../../fixtures/coding-cli/codex-app-server/fake-app-server.mjs')
+const ROLLOUT_THREAD_NEW_1_PATH = /[\\/]sessions[\\/]\d{4}[\\/]\d{2}[\\/]\d{2}[\\/]rollout-thread-new-1\.jsonl$/
 
 type FakeServerBehavior = {
   closeSocketAfterMethodsOnce?: string[]
@@ -150,7 +151,7 @@ describe('CodexAppServerClient', () => {
     await expect(client.startThread({ cwd: '/repo/worktree' })).resolves.toMatchObject({
       thread: {
         id: 'thread-new-1',
-        path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
+        path: expect.stringMatching(ROLLOUT_THREAD_NEW_1_PATH),
         ephemeral: false,
       },
     })
@@ -169,7 +170,7 @@ describe('CodexAppServerClient', () => {
 
     await expect(startedThread).resolves.toMatchObject({
       id: 'thread-new-1',
-      path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
+      path: expect.stringMatching(ROLLOUT_THREAD_NEW_1_PATH),
       ephemeral: false,
     })
   })
@@ -309,7 +310,7 @@ describe('CodexAppServerClient', () => {
     await expect(client.startThread({ cwd: '/repo/worktree' })).resolves.toMatchObject({
       thread: {
         id: 'thread-new-1',
-        path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
+        path: expect.stringMatching(ROLLOUT_THREAD_NEW_1_PATH),
         ephemeral: false,
       },
     })
@@ -362,7 +363,7 @@ describe('CodexAppServerClient', () => {
     await expect(client.startThread({ cwd: '/repo/worktree' })).resolves.toMatchObject({
       thread: {
         id: 'thread-new-1',
-        path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
+        path: expect.stringMatching(ROLLOUT_THREAD_NEW_1_PATH),
         ephemeral: false,
       },
     })
@@ -387,7 +388,7 @@ describe('CodexAppServerClient', () => {
     await expect(startThreadPromise).resolves.toMatchObject({
       thread: {
         id: 'thread-new-1',
-        path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
+        path: expect.stringMatching(ROLLOUT_THREAD_NEW_1_PATH),
         ephemeral: false,
       },
     })
@@ -416,7 +417,7 @@ describe('CodexAppServerClient', () => {
 
     await client.initialize()
     await expect(client.watchPath(rolloutPath, 'watch-rollout')).resolves.toEqual({
-      path: rolloutPath,
+      path: path.resolve(rolloutPath),
     })
     await expect(changedEvent).resolves.toEqual({
       watchId: 'watch-rollout',

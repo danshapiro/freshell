@@ -128,7 +128,10 @@ describe('coordinator-upstream', () => {
       'npm:typecheck': { signal: 'SIGTERM' },
     }))
 
-    expect(exitCode).toBe(128 + osConstants.signals.SIGTERM)
+    const expectedExitCode = process.platform === 'win32'
+      ? 1
+      : 128 + osConstants.signals.SIGTERM
+    expect(exitCode).toBe(expectedExitCode)
   })
 
   it('rejects recursive public coordinator entry', () => {

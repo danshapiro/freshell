@@ -11,6 +11,7 @@ import {
 } from '../../../../scripts/testing/coordinator-endpoint.js'
 
 let tempDir: string
+const describeUnixSockets = process.platform === 'win32' ? describe.skip : describe
 
 beforeEach(async () => {
   tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'fce-'))
@@ -99,7 +100,7 @@ function fsSetup(...dirs: string[]) {
   }
 }
 
-describe('tryListen()', () => {
+describeUnixSockets('tryListen()', () => {
   it('reports busy without deleting the unix socket when a live owner is present', async () => {
     const commonDir = path.join(tempDir, 'repo', '.git')
     const endpoint = buildCoordinatorEndpoint(commonDir, 'linux', [tempDir])
