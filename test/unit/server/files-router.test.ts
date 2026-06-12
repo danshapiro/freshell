@@ -328,12 +328,42 @@ describe('files-router path validation', () => {
       expect(res.status).toBe(200)
     })
 
+    it('anchors relative completion prefixes to the root query parameter', async () => {
+      mockGetSettings.mockResolvedValue({ allowedFilePaths: ['/home/user/projects'] })
+      mockStat.mockRejectedValue({ code: 'ENOENT' })
+      mockReaddir.mockResolvedValue([
+        { name: 'src', isDirectory: () => true },
+        { name: 'notes.md', isDirectory: () => false },
+      ])
+
+      const res = await request(app)
+        .get('/api/files/complete')
+        .query({ prefix: 's', root: '/home/user/projects' })
+
+      expect(res.status).toBe(200)
+      expect(mockReaddir).toHaveBeenCalledWith('/home/user/projects', { withFileTypes: true })
+      expect(res.body.suggestions).toEqual([
+        { path: '/home/user/projects/src', isDirectory: true },
+      ])
+    })
+
     it('blocks completion outside allowed directory', async () => {
       mockGetSettings.mockResolvedValue({ allowedFilePaths: ['/home/user/projects'] })
 
       const res = await request(app)
         .get('/api/files/complete')
         .query({ prefix: '/etc/pass' })
+
+      expect(res.status).toBe(403)
+      expect(res.body.error).toBe('Path not allowed')
+    })
+
+    it('blocks root-anchored relative completion that escapes allowed directories', async () => {
+      mockGetSettings.mockResolvedValue({ allowedFilePaths: ['/home/user/projects'] })
+
+      const res = await request(app)
+        .get('/api/files/complete')
+        .query({ prefix: '../secret', root: '/home/user/projects' })
 
       expect(res.status).toBe(403)
       expect(res.body.error).toBe('Path not allowed')
