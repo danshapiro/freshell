@@ -17,30 +17,30 @@ import type {
   ServerSettingsPatch,
 } from '@/store/types'
 import type { AppView } from '@/components/Sidebar'
-import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
-import { Puzzle, ChevronRight } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import AppearanceSettings from '@/components/settings/AppearanceSettings'
 import WorkspaceSettings from '@/components/settings/WorkspaceSettings'
-import SafetySettings from '@/components/settings/SafetySettings'
 import AdvancedSettings from '@/components/settings/AdvancedSettings'
-import AISettings from '@/components/settings/AISettings'
+import CodingAgentsSettings from '@/components/settings/CodingAgentsSettings'
+import PanesSettings from '@/components/settings/PanesSettings'
+import NamingSettings from '@/components/settings/NamingSettings'
+import NetworkSettings from '@/components/settings/NetworkSettings'
 
 const SERVER_TEXT_SETTINGS_DEBOUNCE_MS = 500
 
 const sections = [
   { id: 'appearance', label: 'Appearance' },
+  { id: 'coding-agents', label: 'Coding Agents' },
+  { id: 'panes', label: 'Panes' },
   { id: 'workspace', label: 'Workspace' },
-  { id: 'ai', label: 'AI' },
-  { id: 'safety', label: 'Safety' },
+  { id: 'naming', label: 'Naming' },
+  { id: 'network', label: 'Network' },
   { id: 'advanced', label: 'Advanced' },
 ] as const
 
 type SectionId = typeof sections[number]['id']
 
 export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePanel }: { onNavigate?: (view: AppView) => void; onFirewallTerminal?: (cmd: { tabId: string; command: string }) => void; onSharePanel?: () => void } = {}) {
-  useEnsureExtensionsRegistry()
-
   const dispatch = useAppDispatch()
   const rawSettings = useAppSelector((s) => s.settings.settings)
   const settings = useMemo(
@@ -111,26 +111,9 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto">
-        <div className="mx-auto w-full max-w-2xl px-3 py-4 md:px-6 md:py-6 space-y-6">
-
-          {/* Manage Extensions — prominent, always visible */}
-          <button
-            onClick={() => onNavigate?.('extensions')}
-            className="w-full flex items-center justify-between rounded-lg border border-border/40 bg-card px-4 py-3 text-left hover:bg-muted/50 transition-colors"
-            aria-label="Manage extensions"
-          >
-            <div className="flex items-center gap-3">
-              <Puzzle className="w-5 h-5 text-muted-foreground" />
-              <div>
-                <div className="text-sm font-medium">Manage Extensions</div>
-                <div className="text-xs text-muted-foreground">View and configure installed extensions</div>
-              </div>
-            </div>
-            <ChevronRight className="w-4 h-4 text-muted-foreground" />
-          </button>
-
+        <div className="mx-auto w-full max-w-3xl px-3 py-4 md:px-6 md:py-6 space-y-6">
           {/* Tabs */}
-          <div className="flex gap-1 border-b border-border/30 -mx-1" role="tablist" aria-label="Settings sections">
+          <div className="flex flex-wrap gap-x-1 gap-y-1 border-b border-border/30 -mx-1" role="tablist" aria-label="Settings sections">
             {sections.map((section) => (
               <button
                 key={section.id}
@@ -150,12 +133,14 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
           </div>
 
           {/* Tab content — only the active section renders */}
-          <div role="tabpanel" aria-label={`${activeSection} settings`}>
+          <div role="tabpanel" aria-label={`${activeSection} settings`} className="space-y-6">
             {activeSection === 'appearance' && <AppearanceSettings {...sectionProps} />}
+            {activeSection === 'coding-agents' && <CodingAgentsSettings {...sectionProps} />}
+            {activeSection === 'panes' && <PanesSettings {...sectionProps} />}
             {activeSection === 'workspace' && <WorkspaceSettings {...sectionProps} />}
-            {activeSection === 'ai' && <AISettings {...sectionProps} />}
-            {activeSection === 'safety' && (
-              <SafetySettings
+            {activeSection === 'naming' && <NamingSettings {...sectionProps} />}
+            {activeSection === 'network' && (
+              <NetworkSettings
                 {...sectionProps}
                 onNavigate={onNavigate}
                 onFirewallTerminal={onFirewallTerminal}

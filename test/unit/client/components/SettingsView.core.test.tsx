@@ -47,14 +47,21 @@ describe('SettingsView core sections', () => {
       expect(headings[0]).toBeInTheDocument()
     })
 
-    it('renders tab buttons for all sections', () => {
+    it('renders tab buttons for the shipped settings sections', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
-      expect(screen.getByRole('tab', { name: 'Appearance' })).toBeInTheDocument()
-      expect(screen.getByRole('tab', { name: 'Workspace' })).toBeInTheDocument()
-      expect(screen.getByRole('tab', { name: 'Safety' })).toBeInTheDocument()
-      expect(screen.getByRole('tab', { name: 'Advanced' })).toBeInTheDocument()
+      const tabs = screen.getAllByRole('tab').map((tab) => tab.textContent?.trim())
+      expect(tabs).toEqual([
+        'Appearance',
+        'Coding Agents',
+        'Panes',
+        'Workspace',
+        'Naming',
+        'Network',
+        'Advanced',
+      ])
+      expect(screen.queryByRole('button', { name: /manage extensions/i })).not.toBeInTheDocument()
     })
 
     it('shows Appearance tab content by default', () => {
@@ -77,19 +84,50 @@ describe('SettingsView core sections', () => {
 
       expect(screen.getByRole('heading', { name: 'Sidebar' })).toBeInTheDocument()
       expect(screen.getByText('Session list and navigation')).toBeInTheDocument()
-      expect(screen.getByText('Notifications')).toBeInTheDocument()
+      expect(screen.getByText('Keyboard shortcuts')).toBeInTheDocument()
+      expect(screen.queryByText('Notifications')).not.toBeInTheDocument()
       expect(screen.queryByTestId('terminal-preview')).not.toBeInTheDocument()
     })
 
-    it('switches to Safety tab on click', () => {
+    it('switches to Coding Agents tab on click', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
-      fireEvent.click(screen.getByRole('tab', { name: 'Safety' }))
+      fireEvent.click(screen.getByRole('tab', { name: 'Coding Agents' }))
 
-      expect(screen.getByRole('heading', { name: 'Safety' })).toBeInTheDocument()
-      expect(screen.getByText('Network Access')).toBeInTheDocument()
-      expect(screen.getByText('Devices')).toBeInTheDocument()
+      expect(screen.getByRole('heading', { name: 'Coding Agents' })).toBeInTheDocument()
+      expect(screen.getByRole('switch', { name: 'Claude CLI' })).toBeInTheDocument()
+      expect(screen.getByRole('switch', { name: 'Freshclaude' })).toBeInTheDocument()
+    })
+
+    it('switches to Panes tab on click', () => {
+      const store = createSettingsViewStore()
+      renderSettingsView(store)
+
+      fireEvent.click(screen.getByRole('tab', { name: 'Panes' }))
+
+      expect(screen.getByRole('heading', { name: 'Pane behavior' })).toBeInTheDocument()
+      expect(screen.getByText('Editor pane')).toBeInTheDocument()
+    })
+
+    it('switches to Naming tab on click', () => {
+      const store = createSettingsViewStore()
+      renderSettingsView(store)
+
+      fireEvent.click(screen.getByRole('tab', { name: 'Naming' }))
+
+      expect(screen.getByRole('heading', { name: 'Naming' })).toBeInTheDocument()
+      expect(screen.queryByRole('heading', { name: 'AI' })).not.toBeInTheDocument()
+    })
+
+    it('switches to Network tab on click', () => {
+      const store = createSettingsViewStore()
+      renderSettingsView(store)
+
+      fireEvent.click(screen.getByRole('tab', { name: 'Network' }))
+
+      expect(screen.getByRole('heading', { name: 'Network' })).toBeInTheDocument()
+      expect(screen.getByRole('switch', { name: /remote access/i })).toBeInTheDocument()
     })
 
     it('switches to Advanced tab on click', () => {
@@ -100,6 +138,39 @@ describe('SettingsView core sections', () => {
 
       expect(screen.getByRole('heading', { name: 'Advanced' })).toBeInTheDocument()
       expect(screen.getByText('Terminal internals and debugging')).toBeInTheDocument()
+      expect(screen.getByText('Runtime')).toBeInTheDocument()
+      expect(screen.getByText('Devices')).toBeInTheDocument()
+      expect(screen.getByRole('heading', { name: 'Extensions' })).toBeInTheDocument()
+      expect(screen.getByText('Developer extension controls')).toBeInTheDocument()
+      expect(screen.getByText('No extensions installed')).toBeInTheDocument()
+      expect(screen.queryByText('CLI Agents')).not.toBeInTheDocument()
+      expect(screen.queryByRole('heading', { name: 'Safety' })).not.toBeInTheDocument()
+    })
+
+    it('shows non-CLI extensions in the Advanced extension manager', () => {
+      const store = createSettingsViewStore({
+        extraPreloadedState: {
+          extensions: {
+            entries: [{
+              name: 'my-server',
+              version: '1.0.0',
+              label: 'My Server',
+              description: 'Server extension',
+              category: 'server',
+              serverRunning: true,
+              serverPort: 8080,
+            }],
+          },
+        },
+      })
+      renderSettingsView(store)
+      switchSettingsTab('Advanced')
+
+      expect(screen.getByRole('heading', { name: 'Extensions' })).toBeInTheDocument()
+      expect(screen.getByText('Server Extensions')).toBeInTheDocument()
+      expect(screen.getByText('My Server')).toBeInTheDocument()
+      expect(screen.getByText('Running')).toBeInTheDocument()
+      expect(screen.queryByText('No extensions installed')).not.toBeInTheDocument()
     })
 
     it('renders Appearance tab setting labels', () => {
@@ -220,10 +291,10 @@ describe('SettingsView core sections', () => {
       expect(screen.getByDisplayValue('Recency')).toBeInTheDocument()
     })
 
-    it('displays safety settings values', () => {
+    it('displays runtime settings values', () => {
       const store = createSettingsViewStore({ settings: { safety: { autoKillIdleMinutes: 120 } } })
       renderSettingsView(store)
-      switchSettingsTab('Safety')
+      switchSettingsTab('Advanced')
 
       expect(screen.getByText('120')).toBeInTheDocument()
     })

@@ -20,6 +20,11 @@ interface ExtensionsViewProps {
   onNavigate: (view: AppView) => void
 }
 
+interface ExtensionsManagerProps {
+  className?: string
+  includeCli?: boolean
+}
+
 function categoryIcon(category: 'cli' | 'server' | 'client') {
   switch (category) {
     case 'server': return <Server className="w-4 h-4" />
@@ -260,7 +265,7 @@ function ExtensionCard({ item, expanded, onToggleExpand, onToggleEnabled, onConf
   )
 }
 
-export default function ExtensionsView({ onNavigate }: ExtensionsViewProps) {
+export function ExtensionsManager({ className, includeCli = true }: ExtensionsManagerProps = {}) {
   useEnsureExtensionsRegistry()
 
   const dispatch = useAppDispatch()
@@ -385,16 +390,65 @@ export default function ExtensionsView({ onNavigate }: ExtensionsViewProps) {
     }
   }, [dispatch, scheduleCwdValidation, scheduleTextSave])
 
+  const visibleItems = useMemo(
+    () => includeCli ? items : items.filter((item) => item.kind !== 'cli'),
+    [includeCli, items],
+  )
+
   const groups = useMemo(() => {
-    const cli = items.filter((i) => i.kind === 'cli')
-    const server = items.filter((i) => i.kind === 'server')
-    const client = items.filter((i) => i.kind === 'client')
+    const cli = visibleItems.filter((i) => i.kind === 'cli')
+    const server = visibleItems.filter((i) => i.kind === 'server')
+    const client = visibleItems.filter((i) => i.kind === 'client')
     return [
       { kind: 'cli' as const, items: cli },
       { kind: 'server' as const, items: server },
       { kind: 'client' as const, items: client },
     ].filter((g) => g.items.length > 0)
-  }, [items])
+  }, [visibleItems])
+
+  return (
+    <div className={cn('space-y-6', className)}>
+      {visibleItems.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-16 text-muted-foreground">
+          <Puzzle className="w-12 h-12 mb-4 opacity-50" />
+          <p className="text-lg font-medium">No extensions installed</p>
+          {includeCli && (
+            <p className="text-sm mt-1">
+              Drop a directory with a <code className="rounded bg-muted px-1 py-0.5 text-xs">freshell.json</code> into <code className="rounded bg-muted px-1 py-0.5 text-xs">~/.freshell/extensions/</code> and restart.
+            </p>
+          )}
+        </div>
+      ) : (
+        groups.map((group) => (
+          <div key={group.kind}>
+            <h2 className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-3">
+              {groupLabel(group.kind)}
+            </h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {group.items.map((item) => (
+                <ExtensionCard
+                  key={item.id}
+                  item={item}
+                  expanded={expandedCards.has(item.id)}
+                  onToggleExpand={() => toggleExpand(item.id)}
+                  onToggleEnabled={handleToggleEnabled}
+                  onConfigChange={handleConfigChange}
+                  cwdDrafts={cwdDrafts}
+                  cwdErrors={cwdErrors}
+                />
+              ))}
+            </div>
+          </div>
+        ))
+      )}
+    </div>
+  )
+}
+
+export default function ExtensionsView({ onNavigate }: ExtensionsViewProps) {
+  useEnsureExtensionsRegistry()
+
+  const items = useAppSelector(selectManagedItems)
 
   return (
     <div className="h-full flex flex-col">
@@ -419,38 +473,8 @@ export default function ExtensionsView({ onNavigate }: ExtensionsViewProps) {
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto">
-        <div className="mx-auto w-full max-w-3xl px-3 py-4 md:px-6 md:py-6 space-y-6">
-          {items.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-16 text-muted-foreground">
-              <Puzzle className="w-12 h-12 mb-4 opacity-50" />
-              <p className="text-lg font-medium">No extensions installed</p>
-              <p className="text-sm mt-1">
-                Drop a directory with a <code className="rounded bg-muted px-1 py-0.5 text-xs">freshell.json</code> into <code className="rounded bg-muted px-1 py-0.5 text-xs">~/.freshell/extensions/</code> and restart.
-              </p>
-            </div>
-          ) : (
-            groups.map((group) => (
-              <div key={group.kind}>
-                <h2 className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-3">
-                  {groupLabel(group.kind)}
-                </h2>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                  {group.items.map((item) => (
-                    <ExtensionCard
-                      key={item.id}
-                      item={item}
-                      expanded={expandedCards.has(item.id)}
-                      onToggleExpand={() => toggleExpand(item.id)}
-                      onToggleEnabled={handleToggleEnabled}
-                      onConfigChange={handleConfigChange}
-                      cwdDrafts={cwdDrafts}
-                      cwdErrors={cwdErrors}
-                    />
-                  ))}
-                </div>
-              </div>
-            ))
-          )}
+        <div className="mx-auto w-full max-w-3xl px-3 py-4 md:px-6 md:py-6">
+          <ExtensionsManager />
         </div>
       </div>
     </div>

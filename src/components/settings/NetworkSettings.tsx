@@ -1,15 +1,5 @@
-// Safety, network access, and device management settings.
-
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import {
-  dismissDeviceIds,
-  persistDeviceAliasesForDevices,
-  persistOwnDeviceLabel,
-  setTabRegistryDeviceAliases,
-  setTabRegistryDismissedDeviceIds,
-  setTabRegistryDeviceLabel,
-} from '@/store/tabRegistrySlice'
 import { api, type ApiError } from '@/lib/api'
 import { createLogger } from '@/lib/client-logger'
 import { configureNetwork, fetchNetworkStatus, type NetworkStatusResponse } from '@/store/networkSlice'
@@ -21,7 +11,6 @@ import {
 } from '@/lib/firewall-configure'
 import { nanoid } from '@reduxjs/toolkit'
 import type { AppView } from '@/components/Sidebar'
-import { buildKnownDevices, type KnownDevice } from '@/lib/known-devices'
 import { isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { SettingsSectionProps } from './settings-types'
@@ -29,12 +18,11 @@ import {
   SettingsSection,
   SettingsRow,
   Toggle,
-  RangeSlider,
 } from './settings-controls'
 
 const SETTINGS_FIREWALL_POLL_INTERVAL_MS = 2000
 const SETTINGS_FIREWALL_POLL_MAX_ATTEMPTS = 10
-const log = createLogger('SafetySettings')
+const log = createLogger('NetworkSettings')
 
 type FirewallConfirmation = Extract<ConfigureFirewallResult, { method: 'confirmation-required' }>
 type PendingConfirmation =
@@ -84,19 +72,17 @@ function getErrorMessage(error: unknown, fallback: string): string {
   return fallback
 }
 
-export interface SafetySettingsProps extends SettingsSectionProps {
+export interface NetworkSettingsProps extends SettingsSectionProps {
   onNavigate?: (view: AppView) => void
   onFirewallTerminal?: (cmd: { tabId: string; command: string }) => void
   onSharePanel?: () => void
 }
 
-export default function SafetySettings({
-  settings,
-  applyServerSetting,
+export default function NetworkSettings({
   onNavigate,
   onFirewallTerminal,
   onSharePanel,
-}: SafetySettingsProps) {
+}: NetworkSettingsProps) {
   const dispatch = useAppDispatch()
   const networkStatus = useAppSelector((s) => s.network.status)
   const configuring = useAppSelector((s) => s.network.configuring)
@@ -107,21 +93,7 @@ export default function SafetySettings({
     || networkStatus?.firewall?.platform === 'wsl2'
   )
   const remoteAccessToggleChecked = remoteAccessEnabled || remoteAccessRequested
-  const tabRegistryState = useAppSelector((s) => (s as any).tabRegistry)
-  const tabRegistry = tabRegistryState ?? {
-    deviceId: 'local-device',
-    deviceLabel: 'local-device',
-    deviceAliases: {} as Record<string, string>,
-    dismissedDeviceIds: [] as string[],
-    localOpen: [],
-    sameDeviceOpen: [],
-    remoteOpen: [],
-    closed: [],
-    devices: [],
-  }
 
-  const [defaultCwdInput, setDefaultCwdInput] = useState(settings.defaultCwd ?? '')
-  const [defaultCwdError, setDefaultCwdError] = useState<string | null>(null)
   const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmation | null>(null)
   const [firewallRefreshDetail, setFirewallRefreshDetail] = useState<string | null>(null)
   const firewallRepairInProgress = networkStatus?.firewall
@@ -129,68 +101,17 @@ export default function SafetySettings({
     : false
   const [remoteAccessPending, setRemoteAccessPending] = useState(false)
   const [remoteAccessError, setRemoteAccessError] = useState<string | null>(null)
-  const [deviceNameInputs, setDeviceNameInputs] = useState<Record<string, string>>({})
   const firewallRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const firewallRefreshRequestRef = useRef(0)
   const remoteAccessRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const remoteAccessRefreshRequestRef = useRef(0)
-  const defaultCwdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const defaultCwdValidationRef = useRef(0)
-  const lastSettingsDefaultCwdRef = useRef(settings.defaultCwd ?? '')
 
   useEffect(() => {
     return () => {
       if (firewallRefreshTimerRef.current) clearTimeout(firewallRefreshTimerRef.current)
       if (remoteAccessRefreshTimerRef.current) clearTimeout(remoteAccessRefreshTimerRef.current)
-      if (defaultCwdTimerRef.current) clearTimeout(defaultCwdTimerRef.current)
     }
   }, [])
-
-  useEffect(() => {
-    const next = settings.defaultCwd ?? ''
-    if (defaultCwdInput === lastSettingsDefaultCwdRef.current) {
-      setDefaultCwdInput(next)
-    }
-    lastSettingsDefaultCwdRef.current = next
-  }, [defaultCwdInput, settings.defaultCwd])
-
-  const commitDefaultCwd = useCallback((nextValue: string | undefined) => {
-    if (nextValue === settings.defaultCwd) return
-    applyServerSetting({ defaultCwd: nextValue })
-  }, [applyServerSetting, settings.defaultCwd])
-
-  const scheduleDefaultCwdValidation = useCallback((value: string) => {
-    defaultCwdValidationRef.current += 1
-    const validationId = defaultCwdValidationRef.current
-    if (defaultCwdTimerRef.current) clearTimeout(defaultCwdTimerRef.current)
-
-    defaultCwdTimerRef.current = setTimeout(() => {
-      if (defaultCwdValidationRef.current !== validationId) return
-      const trimmed = value.trim()
-      if (!trimmed) {
-        setDefaultCwdError(null)
-        commitDefaultCwd(undefined)
-        return
-      }
-
-      api.post<{ valid: boolean }>('/api/files/validate-dir', { path: trimmed })
-        .then((result) => {
-          if (defaultCwdValidationRef.current !== validationId) return
-          if (result.valid) {
-            setDefaultCwdError(null)
-            commitDefaultCwd(trimmed)
-            return
-          }
-          setDefaultCwdError('directory not found')
-          commitDefaultCwd(undefined)
-        })
-        .catch(() => {
-          if (defaultCwdValidationRef.current !== validationId) return
-          setDefaultCwdError('directory not found')
-          commitDefaultCwd(undefined)
-        })
-    }, 500)
-  }, [commitDefaultCwd])
 
   const refreshFirewallStatusAfterNoop = useCallback(async (message?: string) => {
     setFirewallRefreshDetail(message ?? 'Refreshing firewall status...')
@@ -433,108 +354,11 @@ export default function SafetySettings({
 
   const handleCancelPendingAction = useCallback(() => {
     setPendingConfirmation(null)
-  }, [pendingConfirmation])
-
-  const knownDevices = useMemo(() => {
-    return buildKnownDevices({
-      ownDeviceId: tabRegistry.deviceId,
-      ownDeviceLabel: tabRegistry.deviceLabel,
-      deviceAliases: tabRegistry.deviceAliases,
-      dismissedDeviceIds: tabRegistry.dismissedDeviceIds,
-      localOpen: tabRegistry.localOpen,
-      sameDeviceOpen: tabRegistry.sameDeviceOpen,
-      remoteOpen: tabRegistry.remoteOpen,
-      closed: tabRegistry.closed,
-      devices: tabRegistry.devices,
-    })
-  }, [tabRegistry])
-
-  useEffect(() => {
-    setDeviceNameInputs((current) => {
-      const next: Record<string, string> = {}
-      for (const device of knownDevices) {
-        next[device.key] = current[device.key] ?? device.effectiveLabel
-      }
-      const changed =
-        Object.keys(current).length !== Object.keys(next).length ||
-        Object.entries(next).some(([key, value]) => current[key] !== value)
-      return changed ? next : current
-    })
-  }, [knownDevices])
-
-  const saveDeviceName = useCallback((device: KnownDevice) => {
-    const nextValue = (deviceNameInputs[device.key] || '').trim()
-    if (device.isOwn) {
-      const persisted = persistOwnDeviceLabel(nextValue || tabRegistry.deviceLabel)
-      dispatch(setTabRegistryDeviceLabel(persisted))
-      setDeviceNameInputs((current) => ({ ...current, [device.key]: persisted }))
-      return
-    }
-    const aliases = persistDeviceAliasesForDevices(device.deviceIds, nextValue || undefined)
-    dispatch(setTabRegistryDeviceAliases(aliases))
-    setDeviceNameInputs((current) => ({
-      ...current,
-      [device.key]: device.deviceIds.map((deviceId) => aliases[deviceId]).find(Boolean) || device.baseLabel,
-    }))
-  }, [deviceNameInputs, dispatch, tabRegistry.deviceLabel])
-
-  const deleteDevice = useCallback((device: KnownDevice) => {
-    if (device.isOwn) return
-
-    const aliases = persistDeviceAliasesForDevices(device.deviceIds, undefined)
-    const dismissedIds = dismissDeviceIds(device.deviceIds)
-    dispatch(setTabRegistryDeviceAliases(aliases))
-    dispatch(setTabRegistryDismissedDeviceIds(dismissedIds))
-    setDeviceNameInputs((current) => {
-      const next = { ...current }
-      delete next[device.key]
-      return next
-    })
-  }, [dispatch])
+  }, [])
 
   return (
     <>
-      <SettingsSection id="safety" title="Safety" description="Auto-kill and idle terminal management">
-        <SettingsRow label="Auto-kill idle (minutes)">
-          <RangeSlider
-            value={settings.safety.autoKillIdleMinutes}
-            min={5}
-            max={720}
-            step={5}
-            format={(v) => String(v)}
-            onChange={(v) => {
-              applyServerSetting({ safety: { autoKillIdleMinutes: v } })
-            }}
-          />
-        </SettingsRow>
-
-        <SettingsRow label="Default working directory">
-          <div className="relative w-full md:max-w-xs">
-            <input
-              type="text"
-              value={defaultCwdInput}
-              placeholder="e.g. C:\Users\you\projects"
-              aria-invalid={defaultCwdError ? true : undefined}
-              onChange={(e) => {
-                const nextValue = e.target.value
-                setDefaultCwdInput(nextValue)
-                setDefaultCwdError(null)
-                scheduleDefaultCwdValidation(nextValue)
-              }}
-              className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-border md:h-8"
-            />
-            {defaultCwdError && (
-              <span
-                className="pointer-events-none absolute right-2 -bottom-4 text-[10px] text-destructive"
-              >
-                {defaultCwdError}
-              </span>
-            )}
-          </div>
-        </SettingsRow>
-      </SettingsSection>
-
-      <SettingsSection title="Network Access" description="Control how Freshell is accessible on your network">
+      <SettingsSection id="network" title="Network" description="Remote access for this Freshell server">
         <SettingsRow
           label="Remote access"
           description={remoteAccessError ?? 'Allow connections from other devices on your network'}
@@ -612,50 +436,6 @@ export default function SafetySettings({
             )}
           </>
         )}
-      </SettingsSection>
-
-      <SettingsSection
-        title="Devices"
-        description="Rename devices for the Tabs workspace. Remote device aliases apply only on this machine."
-      >
-        {knownDevices.map((device) => (
-          <SettingsRow
-            key={device.key}
-            label={device.isOwn ? 'This machine' : device.baseLabel}
-            description={device.isOwn ? 'Renaming this updates what other machines see.' : 'Alias stored locally on this machine only.'}
-          >
-            <div className="flex w-full items-center gap-2 md:w-auto">
-              <input
-                type="text"
-                value={deviceNameInputs[device.key] ?? device.effectiveLabel}
-                onChange={(event) => setDeviceNameInputs((current) => ({
-                  ...current,
-                  [device.key]: event.target.value,
-                }))}
-                className="h-10 w-full min-w-[14rem] px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-[20rem]"
-                aria-label={`Device name for ${device.effectiveLabel}`}
-                placeholder={device.baseLabel}
-              />
-              <button
-                type="button"
-                onClick={() => saveDeviceName(device)}
-                className="h-10 px-3 text-sm rounded-md border border-border hover:bg-muted md:h-8"
-              >
-                Save
-              </button>
-              {!device.isOwn ? (
-                <button
-                  type="button"
-                  onClick={() => deleteDevice(device)}
-                  className="h-10 px-3 text-sm rounded-md border border-border hover:bg-muted md:h-8"
-                  aria-label={`Delete device ${device.effectiveLabel}`}
-                >
-                  Delete
-                </button>
-              ) : null}
-            </div>
-          </SettingsRow>
-        ))}
       </SettingsSection>
 
       <ConfirmModal

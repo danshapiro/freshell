@@ -500,6 +500,12 @@ export function classifyCodexItemRole(item: Record<string, unknown>): CodexDispl
   }
 }
 
+function readCodexRawItems(rawTurn: Record<string, unknown>): Record<string, unknown>[] {
+  return Array.isArray(rawTurn.items)
+    ? rawTurn.items.filter((item): item is Record<string, unknown> => !!item && typeof item === 'object' && !Array.isArray(item))
+    : []
+}
+
 function readCodexTurnError(rawTurn: Record<string, unknown>): string | undefined {
   const error = rawTurn.error
   if (!error) return undefined

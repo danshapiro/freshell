@@ -22,10 +22,14 @@ test.describe('Settings', () => {
     await openSettings(page)
 
     await expect(page.getByRole('tab', { name: /^Appearance$/i })).toBeVisible()
+    await expect(page.getByRole('tab', { name: /^Coding Agents$/i })).toBeVisible()
+    await expect(page.getByRole('tab', { name: /^Panes$/i })).toBeVisible()
     await expect(page.getByRole('tab', { name: /^Workspace$/i })).toBeVisible()
-    await expect(page.getByRole('tab', { name: /^AI$/i })).toBeVisible()
-    await expect(page.getByRole('tab', { name: /^Safety$/i })).toBeVisible()
+    await expect(page.getByRole('tab', { name: /^Naming$/i })).toBeVisible()
+    await expect(page.getByRole('tab', { name: /^Network$/i })).toBeVisible()
     await expect(page.getByRole('tab', { name: /^Advanced$/i })).toBeVisible()
+    await expect(page.getByRole('tab', { name: /^AI$/i })).toHaveCount(0)
+    await expect(page.getByRole('tab', { name: /^Safety$/i })).toHaveCount(0)
   })
 
   test('terminal font size slider changes setting', async ({ freshellPage, page, harness }) => {

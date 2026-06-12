@@ -774,7 +774,7 @@ describe('Component Edge Cases', () => {
         const store = createTestStore()
         renderWithStore(<SettingsView />, store)
 
-        fireEvent.click(screen.getByRole('tab', { name: 'Safety' }))
+        fireEvent.click(screen.getByRole('tab', { name: 'Advanced' }))
         const defaultCwdInput = screen.getByPlaceholderText('e.g. C:\\Users\\you\\projects')
         let finalPath = ''
 
@@ -882,7 +882,7 @@ describe('Component Edge Cases', () => {
 
         renderWithStore(<SettingsView />, store)
 
-        fireEvent.click(screen.getByRole('tab', { name: 'Safety' }))
+        fireEvent.click(screen.getByRole('tab', { name: 'Advanced' }))
         fireEvent.change(screen.getByPlaceholderText('e.g. C:\\Users\\you\\projects'), {
           target: { value: '/tmp/save-failure' },
         })
@@ -1057,7 +1057,7 @@ describe('Component Edge Cases', () => {
         const store = createTestStore()
         const { unmount } = renderWithStore(<SettingsView />, store)
 
-        fireEvent.click(screen.getByRole('tab', { name: 'Safety' }))
+        fireEvent.click(screen.getByRole('tab', { name: 'Advanced' }))
         // Trigger a save
         fireEvent.change(screen.getByPlaceholderText('e.g. C:\\Users\\you\\projects'), {
           target: { value: '/tmp/pending-save' },

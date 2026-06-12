@@ -137,12 +137,13 @@ describe('settings devices management flow (e2e)', () => {
       </Provider>,
     )
 
-    fireEvent.click(screen.getByRole('tab', { name: /^safety$/i }))
-    expect(screen.getAllByLabelText('Device name for studio-mac')).toHaveLength(2)
+    fireEvent.click(screen.getByRole('tab', { name: /^network$/i }))
+    expect(screen.getByRole('heading', { name: /^network$/i })).toBeInTheDocument()
+    expect(screen.getByRole('switch', { name: /remote access/i })).toBeInTheDocument()
 
-    const devicesHeading = screen.getByText('Devices')
-    const networkHeading = screen.getByText('Network Access')
-    expect(devicesHeading.compareDocumentPosition(networkHeading) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy()
+    fireEvent.click(screen.getByRole('tab', { name: /^advanced$/i }))
+    expect(screen.getAllByLabelText('Device name for studio-mac')).toHaveLength(2)
+    expect(screen.getByRole('heading', { name: 'Devices' })).toBeInTheDocument()
 
     fireEvent.click(screen.getAllByRole('button', { name: 'Delete device studio-mac' })[0])
 

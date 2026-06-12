@@ -85,6 +85,10 @@ function isWindowsLike(platform: string | null): boolean {
   return platform === 'win32' || platform === 'wsl'
 }
 
+function isFreshAgentSessionDisabled(sessionType: string, disabledItems: readonly string[]): boolean {
+  return disabledItems.includes(sessionType)
+}
+
 interface PanePickerProps {
   onSelect: (type: PanePickerType) => void
   onCancel: () => void
@@ -119,6 +123,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
     // Fresh-agent provider options: only show if underlying CLI is available, enabled, and not hidden by feature flag
     const visibleFreshAgentConfigs = freshClientsEnabled ? getVisibleFreshAgentConfigs(featureFlags) : []
     const freshAgentProviderOptions: PickerOption[] = visibleFreshAgentConfigs
+      .filter((config) => !isFreshAgentSessionDisabled(config.name, disabledExtensions))
       .filter((config) => availableClis[config.codingCliProvider] && enabledProviders.includes(config.codingCliProvider) && !disabledExtensions.includes(config.codingCliProvider))
       .map((config) => ({
         type: config.name as PanePickerType,
@@ -131,6 +136,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
       ? FRESH_AGENT_REGISTRY
           .filter((entry) => !visibleFreshAgentConfigs.some((config) => config.name === entry.sessionType))
           .filter((entry) => !entry.disabled)
+          .filter((entry) => !isFreshAgentSessionDisabled(entry.sessionType, disabledExtensions))
           .filter((entry) => !entry.hidden || featureFlags[entry.featureFlag ?? entry.sessionType] === true)
           .filter((entry) => availableClis[entry.runtimeProvider] && enabledProviders.includes(entry.runtimeProvider) && !disabledExtensions.includes(entry.runtimeProvider))
           .map((entry) => ({

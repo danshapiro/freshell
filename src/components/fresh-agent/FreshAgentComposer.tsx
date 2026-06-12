@@ -8,11 +8,12 @@ import {
   useState,
   type KeyboardEvent,
 } from 'react'
-import { Command, File, Folder, Loader2, Paperclip, Send, Square, X } from 'lucide-react'
+import { File, Folder, ListStart, Loader2, Paperclip, Send, Square, X } from 'lucide-react'
 import { api } from '@/lib/api'
 import { getAuthToken } from '@/lib/auth'
 import { useCoarsePointer } from '@/lib/pointer'
 import { cn } from '@/lib/utils'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import type { FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
 
 export type FreshAgentAttachment = {
@@ -703,26 +704,38 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
           >
             <Square className="h-4 w-4" />
           </button>
-          <button
-            type="button"
-            disabled={commands.length === 0}
-            className="fresh-agent-composer-action inline-flex h-11 w-11 items-center justify-center rounded-md border border-border/70 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:w-9"
-            aria-label="Slash commands"
-            onClick={() => {
-              setMenuMode((mode) => mode === 'browse' ? null : 'browse')
-              setFilter('')
-            }}
-          >
-            <Command className="h-4 w-4" />
-          </button>
-          <button
-            type="submit"
-            disabled={disabled}
-            className="fresh-agent-composer-action inline-flex h-11 w-11 items-center justify-center rounded-md bg-primary text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50 sm:h-10 sm:w-10"
-            aria-label="Send"
-          >
-            <Send className="h-4 w-4" />
-          </button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                disabled={commands.length === 0}
+                className="fresh-agent-composer-action inline-flex h-11 w-11 items-center justify-center rounded-md border border-border/70 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:w-9"
+                aria-label="Slash commands"
+                title="Slash commands"
+                onClick={() => {
+                  setMenuMode((mode) => mode === 'browse' ? null : 'browse')
+                  setFilter('')
+                }}
+              >
+                <ListStart className="h-4 w-4" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent align="end">Slash commands</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="submit"
+                disabled={disabled}
+                className="fresh-agent-composer-action inline-flex h-11 w-11 items-center justify-center rounded-md bg-primary text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50 sm:h-10 sm:w-10"
+                aria-label="Send"
+                title="Send message"
+              >
+                <Send className="h-4 w-4" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent align="end">Send message</TooltipContent>
+          </Tooltip>
         </div>
         <input
           ref={fileInputRef}

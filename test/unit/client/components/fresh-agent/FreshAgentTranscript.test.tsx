@@ -139,7 +139,9 @@ describe('FreshAgentTranscript', () => {
       />,
     )
 
-    expect(screen.getByText('**not bold** and # not a heading')).toBeInTheDocument()
+    const userMessage = screen.getByText('**not bold** and # not a heading')
+    expect(userMessage).toBeInTheDocument()
+    expect(userMessage.className).not.toContain('text-sm')
     expect(container.querySelector('strong')).toBeNull()
     expect(container.querySelector('h1')).toBeNull()
   })

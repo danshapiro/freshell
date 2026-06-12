@@ -459,6 +459,138 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
   .fresh-actions { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .fresh-action { width: 100%; }
 }
+
+/* ========== Settings View ========== */
+.settings-view {
+  display: none; flex: 1; min-height: 0; overflow-y: auto;
+  background: hsl(var(--background)); color: hsl(var(--foreground));
+}
+.settings-view.active { display: block; }
+.settings-shell { max-width: 720px; margin: 0 auto; padding: 24px; }
+.settings-page-header {
+  padding: 20px 24px; border-bottom: 1px solid hsl(var(--border) / .3);
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+}
+.settings-page-header h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; }
+.settings-page-header p { margin-top: 4px; color: hsl(var(--muted-foreground)); font-size: 13px; }
+.settings-tabs {
+  display: flex; flex-wrap: wrap; gap: 4px; border-bottom: 1px solid hsl(var(--border) / .35);
+  overflow: visible;
+}
+.settings-tab {
+  padding: 9px 12px; margin-bottom: -1px; border: none; border-bottom: 2px solid transparent;
+  border-radius: 6px 6px 0 0; background: transparent; color: hsl(var(--muted-foreground));
+  font-size: 13px; cursor: pointer; white-space: nowrap;
+}
+.settings-tab:hover { color: hsl(var(--foreground)); background: hsl(var(--muted) / .35); }
+.settings-tab.active {
+  color: hsl(var(--foreground)); border-bottom-color: hsl(var(--foreground)); font-weight: 500;
+}
+.settings-panel { display: none; padding: 22px 8px 0 0; }
+.settings-panel.active { display: block; }
+.settings-section { margin-top: 24px; }
+.settings-section:first-child { margin-top: 0; }
+.settings-section h2 { font-size: 14px; font-weight: 500; }
+.settings-section-desc { margin-top: 3px; color: hsl(var(--muted-foreground)); font-size: 12px; }
+.settings-list { margin-top: 16px; display: flex; flex-direction: column; gap: 15px; }
+.settings-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 20px;
+}
+.settings-row.stack { align-items: stretch; flex-direction: column; gap: 8px; }
+.settings-label { min-width: 0; }
+.settings-label-title { color: hsl(var(--muted-foreground)); font-size: 13px; }
+.settings-label-desc { margin-top: 3px; color: hsl(var(--muted-foreground) / .65); font-size: 12px; line-height: 1.45; }
+.settings-control { flex: 0 0 auto; width: 248px; max-width: 100%; }
+.settings-control.wide { width: 100%; }
+.settings-select,
+.settings-input,
+.settings-textarea {
+  width: 100%; min-height: 32px; padding: 0 10px; border: none; border-radius: 6px;
+  background: hsl(var(--muted)); color: hsl(var(--foreground)); font: inherit; font-size: 13px;
+}
+.settings-select { padding-right: 32px; }
+.settings-textarea { min-height: 76px; padding: 9px 10px; resize: vertical; font-family: inherit; }
+.settings-segmented {
+  display: flex; width: 100%; gap: 2px; padding: 2px; border-radius: 7px; background: hsl(var(--muted));
+}
+.settings-segment {
+  flex: 1; min-height: 28px; padding: 4px 10px; border: none; border-radius: 5px;
+  background: transparent; color: hsl(var(--muted-foreground)); font-size: 12px; cursor: pointer;
+}
+.settings-segment.active { background: hsl(var(--background)); color: hsl(var(--foreground)); box-shadow: var(--shadow-sm); }
+.settings-switch {
+  position: relative; width: 36px; height: 20px; border: none; border-radius: 999px;
+  display: block; flex: 0 0 auto; padding: 0;
+  background: hsl(var(--muted)); cursor: pointer; transition: background .15s;
+}
+.settings-switch-wrap {
+  width: auto; min-height: 32px; display: flex; align-items: center; justify-content: flex-end;
+}
+.settings-switch::after {
+  content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+  border-radius: 50%; background: hsl(var(--muted-foreground)); transition: transform .15s, background .15s;
+}
+.settings-switch.on { background: hsl(var(--foreground)); }
+.settings-switch.on::after { transform: translateX(16px); background: hsl(var(--background)); }
+.settings-range { display: flex; align-items: center; gap: 10px; }
+.settings-range input { width: 145px; accent-color: hsl(var(--foreground)); }
+.settings-range span { width: 68px; text-align: right; font-size: 13px; font-variant-numeric: tabular-nums; }
+.settings-preview-title {
+  display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;
+  color: hsl(var(--muted-foreground)); font-size: 12px;
+}
+.settings-terminal-preview {
+  width: min(100%, 40ch); height: 12.4em; overflow: hidden;
+  border: 1px solid hsl(var(--border) / .45); border-radius: 8px;
+  background: var(--t-bg); color: var(--t-fg); padding: 10px 12px;
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px; line-height: 1.55; white-space: pre; box-shadow: var(--shadow-sm);
+}
+.settings-shortcuts { display: flex; flex-direction: column; gap: 10px; font-size: 13px; }
+.settings-shortcut-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.settings-shortcut-keys { white-space: nowrap; }
+.settings-shortcut-keys kbd {
+  display: inline-block; padding: 2px 6px; border-radius: 4px;
+  background: hsl(var(--muted)); font-family: 'JetBrains Mono', monospace; font-size: 11px;
+}
+.settings-note {
+  margin-top: 12px; padding: 10px 12px; border: 1px solid hsl(var(--border) / .45);
+  border-radius: 8px; color: hsl(var(--muted-foreground)); background: hsl(var(--muted) / .35);
+  font-size: 12px; line-height: 1.5;
+}
+.settings-empty-state {
+  margin-top: 16px; min-height: 88px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+  border: 1px solid hsl(var(--border) / .35); border-radius: 8px; background: hsl(var(--muted) / .22);
+  color: hsl(var(--muted-foreground)); font-size: 13px;
+}
+.settings-agent-list { margin-top: 16px; display: flex; flex-direction: column; gap: 8px; }
+.settings-agent-item {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px;
+  min-height: 56px; padding: 10px 12px; border: 1px solid hsl(var(--border) / .42);
+  border-radius: 8px; background: hsl(var(--card));
+}
+.settings-agent-main { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.settings-agent-icon {
+  width: 32px; height: 32px; border-radius: 7px; display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0; background: hsl(var(--muted)); color: hsl(var(--foreground));
+}
+.settings-agent-icon svg { width: 18px; height: 18px; }
+.settings-agent-name { min-width: 0; color: hsl(var(--foreground)); font-size: 14px; font-weight: 500; }
+@media (max-width: 767px) {
+  .sidebar {
+    position: fixed; inset: 0 auto 0 0; z-index: 60;
+    width: min(85vw, 288px); box-shadow: var(--shadow-md);
+  }
+  .content { width: 100%; }
+  .settings-shell { padding: 16px; }
+  .settings-page-header { padding: 16px 16px 16px 48px; }
+  .settings-row { align-items: stretch; flex-direction: column; gap: 8px; }
+  .settings-row:has(.settings-switch-wrap) { align-items: center; flex-direction: row; }
+  .settings-row:has(.settings-switch-wrap) .settings-label { flex: 1; }
+  .settings-row:has(.settings-switch-wrap) .settings-switch-wrap { width: auto; min-width: 36px; }
+  .settings-control { width: 100%; }
+  .settings-range input { width: 100%; }
+}
 </style>
 </head>
 <body>
@@ -687,7 +819,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
               <div class="fresh-composer">
                 <div class="fresh-thinking"><span></span></div>
                 <div class="fresh-input">Agent is working — sends queue for the next turn</div>
-                <div class="fresh-actions"><div class="fresh-action"><i data-lucide="paperclip" class="icon-xs"></i></div><div class="fresh-action"><i data-lucide="square" class="icon-xs"></i></div><div class="fresh-action"><i data-lucide="command" class="icon-xs"></i></div><div class="fresh-action send"><i data-lucide="send" class="icon-xs"></i></div></div>
+                <div class="fresh-actions"><div class="fresh-action"><i data-lucide="paperclip" class="icon-xs"></i></div><div class="fresh-action"><i data-lucide="square" class="icon-xs"></i></div><div class="fresh-action"><i data-lucide="list-start" class="icon-xs"></i></div><div class="fresh-action send"><i data-lucide="send" class="icon-xs"></i></div></div>
               </div>
             </div>
             <aside class="fresh-rail">
@@ -699,6 +831,394 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
           </div>
         </div>
       </div>
+
+      <!-- Settings -->
+      <section class="settings-view" id="settings-view" aria-label="Settings preview" aria-hidden="true">
+        <div class="settings-page-header">
+          <div>
+            <h1>Settings</h1>
+            <p>Configure your preferences</p>
+          </div>
+        </div>
+        <div class="settings-shell">
+          <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+            <button class="settings-tab active" type="button" role="tab" aria-selected="true" data-settings-tab="appearance">Appearance</button>
+            <button class="settings-tab" type="button" role="tab" aria-selected="false" data-settings-tab="agents">Coding Agents</button>
+            <button class="settings-tab" type="button" role="tab" aria-selected="false" data-settings-tab="panes">Panes</button>
+            <button class="settings-tab" type="button" role="tab" aria-selected="false" data-settings-tab="workspace">Workspace</button>
+            <button class="settings-tab" type="button" role="tab" aria-selected="false" data-settings-tab="naming">Naming</button>
+            <button class="settings-tab" type="button" role="tab" aria-selected="false" data-settings-tab="network">Network</button>
+            <button class="settings-tab" type="button" role="tab" aria-selected="false" data-settings-tab="advanced">Advanced</button>
+          </div>
+
+          <div class="settings-panel active" id="settings-panel-appearance" role="tabpanel" aria-label="Appearance settings" aria-hidden="false">
+            <div class="settings-preview-title">
+              <span>Terminal preview</span>
+              <span>40x8</span>
+            </div>
+            <div class="settings-terminal-preview" aria-label="Terminal preview"><span class="t-dim">// terminal preview: syntax demo</span>
+<span class="t-blue">const</span> answer: <span class="t-magenta">number</span> = <span class="t-yellow">42</span>
+<span class="t-blue">type</span> User = { id: <span class="t-magenta">number</span> }
+<span class="t-blue">function</span> <span class="t-cyan">greet</span>(name: <span class="t-magenta">string</span>) {
+  <span class="t-blue">return</span> <span class="t-green">"hi, "</span> + name
+} <span class="t-dim">// end</span></div>
+
+            <div class="settings-section">
+              <h2>Appearance</h2>
+              <p class="settings-section-desc">Theme and visual preferences</p>
+              <div class="settings-list">
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Theme</div></div>
+                  <div class="settings-control">
+                    <div class="settings-segmented" data-segmented>
+                      <button class="settings-segment active" type="button">System</button>
+                      <button class="settings-segment" type="button">Light</button>
+                      <button class="settings-segment" type="button">Dark</button>
+                    </div>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">UI scale</div></div>
+                  <div class="settings-control">
+                    <div class="settings-range"><input type="range" min="0.75" max="1.5" step="0.05" value="1" aria-label="UI scale" data-format="percent"><span>100%</span></div>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Color scheme</div></div>
+                  <div class="settings-control">
+                    <select class="settings-select" aria-label="Color scheme">
+                      <option>Auto (follow app theme)</option>
+                      <option>Dracula</option>
+                      <option>One Dark</option>
+                      <option>Solarized Dark</option>
+                      <option>GitHub Dark</option>
+                      <option>One Light</option>
+                      <option>Solarized Light</option>
+                      <option>GitHub Light</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Font family</div></div>
+                  <div class="settings-control">
+                    <select class="settings-select" aria-label="Font family">
+                      <option>System monospace</option>
+                      <option>JetBrains Mono</option>
+                      <option>Cascadia Code</option>
+                      <option>Cascadia Mono</option>
+                      <option>Fira Code</option>
+                      <option>Meslo LG S</option>
+                      <option>Source Code Pro</option>
+                      <option>IBM Plex Mono</option>
+                      <option>Consolas</option>
+                      <option>Monaco</option>
+                      <option>Menlo</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Font size</div></div>
+                  <div class="settings-control">
+                    <div class="settings-range"><input type="range" min="12" max="32" step="1" value="16" aria-label="Font size" data-format="px-percent"><span>16px (100%)</span></div>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Line height</div></div>
+                  <div class="settings-control">
+                    <div class="settings-range"><input type="range" min="1" max="1.8" step="0.05" value="1" aria-label="Line height" data-format="fixed"><span>1.00</span></div>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Cursor blink</div></div>
+                  <div class="settings-control settings-switch-wrap">
+                    <button class="settings-switch on" type="button" role="switch" aria-checked="true" aria-label="Cursor blink"></button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-panel" id="settings-panel-agents" role="tabpanel" aria-label="Coding agent settings" aria-hidden="true">
+            <div class="settings-agent-list">
+              <div class="settings-agent-item">
+                <div class="settings-agent-main">
+                  <span class="settings-agent-icon" aria-hidden="true">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="75.73 64.08 872.25 872.25" fill="currentColor"><path d="M616.9,649.5h-209.7c0,0,0,104.7,0,104.7h-56.6c0,0,.2-104.5.2-104.5h-48.6s.2,104.5.2,104.5h-56.7c0,0,.2-104.4.2-104.4l-48.6-.7v-96.4c.1,0-104.8,0-104.8,0v-104.9s104.9,0,104.9,0v-201.6c0,0,628.9,0,628.9,0v201.6c0,0,104.9,0,104.9,0v104.9s-104.9,0-104.9,0v96.6c.1,0-56.5.4-56.5.4l.2,104.5h-48.6s.2-104.6.2-104.6h-56.6s.2,104.6.2,104.6h-48.6s.2-104.6.2-104.6ZM351.1,447.5l-.5-96.4h-48.4c0,0,0,96.6,0,96.6l48.8-.2ZM722,447.7l-.4-96.7h-56.5c0,0,0,96.8,0,96.8h56.9Z"/></svg>
+                  </span>
+                  <span class="settings-agent-name">Claude CLI</span>
+                </div>
+                <button class="settings-switch on" type="button" role="switch" aria-checked="true" aria-label="Enable Claude CLI"></button>
+              </div>
+              <div class="settings-agent-item">
+                <div class="settings-agent-main">
+                  <span class="settings-agent-icon" aria-hidden="true">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" fill="currentColor"><path d="M853.1,283.1c94.2,0,170.6,76.4,170.6,170.6s-76.4,170.6-170.6,170.6v-341.3h0ZM170.6,283.1C76.4,283.1,0,359.5,0,453.8s76.4,170.6,170.6,170.6v-341.3h0ZM853.1,624.3H170.6c0-188.5,152.8-341.3,341.3-341.3s341.3,152.8,341.3,341.3h-.1ZM410.8,496.4c0-23.6-19-42.6-42.6-42.6s-42.6,19-42.6,42.6,19,42.6,42.6,42.6,42.6-19,42.6-42.6h0ZM698.2,496.4c0-23.6-19-42.6-42.6-42.6s-42.6,19-42.6,42.6,19,42.6,42.6,42.6,42.6-19,42.6-42.6h0ZM234.6,624.3c-35.4,0-64,28.7-64,64s28.7,64,64,64v-127.9h0ZM368.2,624.3c-35.4,0-64,28.7-64,64s28.7,64,64,64v-127.9h0ZM789.1,752.3c35.4,0,64-28.7,64-64s-28.7-64-64-64v127.9h0ZM655.5,752.3c35.4,0,64-28.7,64-64s-28.7-64-64-64v127.9h0Z"/></svg>
+                  </span>
+                  <span class="settings-agent-name">Freshclaude</span>
+                </div>
+                <button class="settings-switch on" type="button" role="switch" aria-checked="true" aria-label="Enable Freshclaude"></button>
+              </div>
+              <div class="settings-agent-item">
+                <div class="settings-agent-main">
+                  <span class="settings-agent-icon" aria-hidden="true">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="-0.27 -0.23 16.55 16.55" fill="currentColor"><path d="M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z"/></svg>
+                  </span>
+                  <span class="settings-agent-name">Codex CLI</span>
+                </div>
+                <button class="settings-switch on" type="button" role="switch" aria-checked="true" aria-label="Enable Codex CLI"></button>
+              </div>
+              <div class="settings-agent-item">
+                <div class="settings-agent-main">
+                  <span class="settings-agent-icon" aria-hidden="true">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="-0.27 -0.23 16.55 16.55" fill="currentColor"><path d="M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z"/></svg>
+                  </span>
+                  <span class="settings-agent-name">Freshcodex</span>
+                </div>
+                <button class="settings-switch on" type="button" role="switch" aria-checked="true" aria-label="Enable Freshcodex"></button>
+              </div>
+              <div class="settings-agent-item">
+                <div class="settings-agent-main">
+                  <span class="settings-agent-icon" aria-hidden="true">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="444 174 312 312" fill="currentColor"><path d="M520,180h200v300h-240V180h40ZM540,300v120h120v-180h-120v60Z"/><path d="M660,300v120h-120v-120h120Z" fill-opacity="0.5"/></svg>
+                  </span>
+                  <span class="settings-agent-name">OpenCode</span>
+                </div>
+                <button class="settings-switch on" type="button" role="switch" aria-checked="true" aria-label="Enable OpenCode"></button>
+              </div>
+              <div class="settings-agent-item">
+                <div class="settings-agent-main">
+                  <span class="settings-agent-icon" aria-hidden="true">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="444.00 174.00 312.00 312.00" fill="currentColor"><path d="M520,180h200v300h-240V180h40ZM540,300v120h120v-180h-120v60Z"/><path d="M660,300v120h-120v-120h120Z" fill-opacity="0.5"/></svg>
+                  </span>
+                  <span class="settings-agent-name">Freshopencode</span>
+                </div>
+                <button class="settings-switch on" type="button" role="switch" aria-checked="true" aria-label="Enable Freshopencode"></button>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-panel" id="settings-panel-panes" role="tabpanel" aria-label="Pane settings" aria-hidden="true">
+            <div class="settings-section">
+              <h2>Pane behavior</h2>
+              <p class="settings-section-desc">Layout, defaults, and completion indicators</p>
+              <div class="settings-list">
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Open sidebar session in</div><div class="settings-label-desc">Where to open a session when clicked in the sidebar.</div></div>
+                  <div class="settings-control">
+                    <div class="settings-segmented" data-segmented><button class="settings-segment active" type="button">New tab</button><button class="settings-segment" type="button">Split pane</button></div>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Default new pane</div></div>
+                  <div class="settings-control"><select class="settings-select" aria-label="Default new pane"><option>Ask</option><option>Shell</option><option>Browser</option><option>Editor</option></select></div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Snap distance</div></div>
+                  <div class="settings-control"><div class="settings-range"><input type="range" min="0" max="8" step="1" value="2" aria-label="Snap distance" data-format="snap"><span>2%</span></div></div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Icons on tabs</div></div>
+                  <div class="settings-control settings-switch-wrap"><button class="settings-switch on" type="button" role="switch" aria-checked="true" aria-label="Icons on tabs"></button></div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Multi-row tabs</div><div class="settings-label-desc">Show tabs in multiple rows instead of a single scrollable row.</div></div>
+                  <div class="settings-control settings-switch-wrap"><button class="settings-switch" type="button" role="switch" aria-checked="false" aria-label="Multi-row tabs"></button></div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Tab completion indicator</div></div>
+                  <div class="settings-control"><div class="settings-segmented" data-segmented><button class="settings-segment active" type="button">Highlight</button><button class="settings-segment" type="button">Pulse</button><button class="settings-segment" type="button">Darken</button><button class="settings-segment" type="button">None</button></div></div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Dismiss attention on</div></div>
+                  <div class="settings-control"><div class="settings-segmented" data-segmented><button class="settings-segment active" type="button">Tab click</button><button class="settings-segment" type="button">Typing</button></div></div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Sound on completion</div></div>
+                  <div class="settings-control settings-switch-wrap"><button class="settings-switch on" type="button" role="switch" aria-checked="true" aria-label="Sound on completion"></button></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="settings-section">
+              <h2>Editor pane</h2>
+              <p class="settings-section-desc">External editor for file opening</p>
+              <div class="settings-list">
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">External editor</div><div class="settings-label-desc">Which editor to use when opening files from the editor pane.</div></div>
+                  <div class="settings-control"><select class="settings-select" aria-label="External editor"><option>Auto (system default)</option><option>Cursor</option><option>VS Code</option><option>Custom command</option></select></div>
+                </div>
+              </div>
+            </div>
+
+          </div>
+
+          <div class="settings-panel" id="settings-panel-workspace" role="tabpanel" aria-label="Workspace settings" aria-hidden="true">
+            <div class="settings-section">
+              <h2>Sidebar</h2>
+              <p class="settings-section-desc">Session list and navigation</p>
+              <div class="settings-list">
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Sort mode</div></div>
+                  <div class="settings-control">
+                    <select class="settings-select" aria-label="Sort mode">
+                      <option>Activity (tabs first)</option>
+                      <option>Recency</option>
+                      <option>Recency (tabs first)</option>
+                      <option>Project</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Worktree grouping</div></div>
+                  <div class="settings-control"><select class="settings-select" aria-label="Worktree grouping"><option>Repository</option><option>Worktree</option></select></div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Show project badges</div></div>
+                  <div class="settings-control settings-switch-wrap"><button class="settings-switch on" type="button" role="switch" aria-checked="true" aria-label="Show project badges"></button></div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Show subagent sessions</div></div>
+                  <div class="settings-control settings-switch-wrap"><button class="settings-switch" type="button" role="switch" aria-checked="false" aria-label="Show subagent sessions"></button></div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Ignore Codex subagent sessions</div></div>
+                  <div class="settings-control settings-switch-wrap"><button class="settings-switch on" type="button" role="switch" aria-checked="true" aria-label="Ignore Codex subagent sessions"></button></div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Show non-interactive sessions</div></div>
+                  <div class="settings-control settings-switch-wrap"><button class="settings-switch" type="button" role="switch" aria-checked="false" aria-label="Show non-interactive sessions"></button></div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Hide empty sessions</div><div class="settings-label-desc">Hide sessions that have no messages yet.</div></div>
+                  <div class="settings-control settings-switch-wrap"><button class="settings-switch on" type="button" role="switch" aria-checked="true" aria-label="Hide empty sessions"></button></div>
+                </div>
+                <div class="settings-row stack">
+                  <div class="settings-label"><div class="settings-label-title">Hide sessions by first chat</div><div class="settings-label-desc">One substring per line. Matching sessions are hidden from the sidebar.</div></div>
+                  <div class="settings-control wide"><textarea class="settings-textarea" aria-label="Sidebar first chat exclusion substrings" placeholder="__AUTO__"></textarea></div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">First chat must start with match</div></div>
+                  <div class="settings-control settings-switch-wrap"><button class="settings-switch" type="button" role="switch" aria-checked="false" aria-label="Require first chat exclusion substring at start"></button></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="settings-section">
+              <h2>Keyboard shortcuts</h2>
+              <p class="settings-section-desc">Navigation and terminal</p>
+              <div class="settings-shortcuts" aria-label="Keyboard shortcuts">
+                <div class="settings-shortcut-row"><span>New tab</span><span class="settings-shortcut-keys"><kbd>Alt</kbd> <kbd>T</kbd></span></div>
+                <div class="settings-shortcut-row"><span>Close tab</span><span class="settings-shortcut-keys"><kbd>Alt</kbd> <kbd>W</kbd></span></div>
+                <div class="settings-shortcut-row"><span>Reopen closed tab</span><span class="settings-shortcut-keys"><kbd>Alt</kbd> <kbd>H</kbd></span></div>
+                <div class="settings-shortcut-row"><span>Previous tab</span><span class="settings-shortcut-keys"><kbd>Ctrl</kbd> <kbd>Shift</kbd> <kbd>[</kbd></span></div>
+                <div class="settings-shortcut-row"><span>Next tab</span><span class="settings-shortcut-keys"><kbd>Ctrl</kbd> <kbd>Shift</kbd> <kbd>]</kbd></span></div>
+                <div class="settings-shortcut-row"><span>Copy selection</span><span class="settings-shortcut-keys"><kbd>Ctrl</kbd> <kbd>Shift</kbd> <kbd>C</kbd></span></div>
+                <div class="settings-shortcut-row"><span>Paste</span><span class="settings-shortcut-keys"><kbd>Ctrl</kbd> <kbd>V</kbd></span></div>
+                <div class="settings-shortcut-row"><span>Search</span><span class="settings-shortcut-keys"><kbd>Ctrl</kbd> <kbd>F</kbd></span></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-panel" id="settings-panel-naming" role="tabpanel" aria-label="Naming settings" aria-hidden="true">
+            <div class="settings-section">
+              <h2>Naming</h2>
+              <p class="settings-section-desc">Automatic session names</p>
+              <div class="settings-list">
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Gemini API key</div><div class="settings-label-desc">Used for automatic session naming.</div></div>
+                  <div class="settings-control"><input class="settings-input" type="password" aria-label="Gemini API key" placeholder="Enter Gemini API key"></div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Auto-generate session titles</div><div class="settings-label-desc">Generate names for new coding sessions.</div></div>
+                  <div class="settings-control settings-switch-wrap"><button class="settings-switch on" type="button" role="switch" aria-checked="true" aria-label="Auto-generate session titles"></button></div>
+                </div>
+                <div class="settings-row stack">
+                  <div class="settings-label"><div class="settings-label-title">Naming prompt</div><div class="settings-label-desc">Instructions for generating session titles.</div></div>
+                  <div class="settings-control wide"><textarea class="settings-textarea" aria-label="Naming prompt" placeholder="Generate a short title (3-8 words) for a coding assistant conversation."></textarea></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-panel" id="settings-panel-network" role="tabpanel" aria-label="Network settings" aria-hidden="true">
+            <div class="settings-section">
+              <h2>Network</h2>
+              <p class="settings-section-desc">Remote access from other devices</p>
+              <div class="settings-list">
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Remote access</div><div class="settings-label-desc">Allow connections from other devices on your network.</div></div>
+                  <div class="settings-control settings-switch-wrap"><button class="settings-switch" type="button" role="switch" aria-checked="false" aria-label="Remote access"></button></div>
+                </div>
+              </div>
+              <div class="settings-note">Firewall status and device links appear here only when remote access is enabled or needs attention.</div>
+            </div>
+          </div>
+
+          <div class="settings-panel" id="settings-panel-advanced" role="tabpanel" aria-label="Advanced settings" aria-hidden="true">
+            <div class="settings-section">
+              <h2>Advanced</h2>
+              <p class="settings-section-desc">Terminal internals and debugging</p>
+              <div class="settings-list">
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Scrollback lines</div></div>
+                  <div class="settings-control"><div class="settings-range"><input type="range" min="1000" max="20000" step="500" value="10000" aria-label="Scrollback lines" data-format="locale"><span>10,000</span></div></div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Warn on external links</div></div>
+                  <div class="settings-control settings-switch-wrap"><button class="settings-switch on" type="button" role="switch" aria-checked="true" aria-label="Warn on external links"></button></div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Debug logging</div></div>
+                  <div class="settings-control settings-switch-wrap"><button class="settings-switch" type="button" role="switch" aria-checked="false" aria-label="Debug logging"></button></div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Agent MCP server</div><div class="settings-label-desc">Expose Freshell as an MCP tool to coding agents.</div></div>
+                  <div class="settings-control settings-switch-wrap"><button class="settings-switch on" type="button" role="switch" aria-checked="true" aria-label="Agent MCP server"></button></div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">OSC52 clipboard access</div></div>
+                  <div class="settings-control"><div class="settings-segmented" data-segmented><button class="settings-segment active" type="button">Ask</button><button class="settings-segment" type="button">Always</button><button class="settings-segment" type="button">Never</button></div></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="settings-section">
+              <h2>Runtime</h2>
+              <p class="settings-section-desc">Idle terminals and startup defaults</p>
+              <div class="settings-list">
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Auto-kill idle (minutes)</div></div>
+                  <div class="settings-control"><div class="settings-range"><input type="range" min="5" max="720" step="5" value="15" aria-label="Auto-kill idle minutes" data-format="plain"><span>15</span></div></div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Default working directory</div></div>
+                  <div class="settings-control"><input class="settings-input" type="text" aria-label="Default working directory" placeholder="e.g. C:\Users\you\projects"></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="settings-section">
+              <h2>Extensions</h2>
+              <p class="settings-section-desc">Developer extension controls</p>
+              <div class="settings-empty-state">
+                <i data-lucide="puzzle" class="icon"></i>
+                <span>No extensions installed</span>
+              </div>
+            </div>
+
+            <div class="settings-section">
+              <h2>Devices</h2>
+              <p class="settings-section-desc">Device names and local aliases</p>
+              <div class="settings-list">
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">This machine</div><div class="settings-label-desc">Renaming this updates what other machines see.</div></div>
+                  <div class="settings-control"><input class="settings-input" type="text" aria-label="Device name for this machine" value="local-device"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
     </div>
   </div>
 </div>
@@ -745,16 +1265,62 @@ window.addEventListener('resize', () => {
 
 document.addEventListener('keydown', (event) => {
   if (event.key !== 'Escape') return
+  if (document.getElementById('settings-view')?.classList.contains('active')) return
   if (!sidebarVisible) return
   sidebarVisible = !sidebarVisible;
   updateSidebarVisibility();
 });
 
 // ========== Sidebar Nav ==========
+const settingsView = document.getElementById('settings-view');
+const tabbar = document.querySelector('.tabbar');
+const settingsNavButton = document.querySelector('.sb-nav-btn[title="Settings"]');
+const primaryNavButton = document.querySelector('.sb-nav-btn[title="Coding Agents"]');
+
+function restoreActiveTabPanel() {
+  const activeTab = document.querySelector('.tab.active[data-tab]') || document.querySelector('.tab[data-tab]');
+  if (!activeTab) return;
+  const id = activeTab.dataset.tab;
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.getElementById('panel-' + id)?.classList.add('active');
+}
+
+function hideSettingsView() {
+  if (!settingsView) return;
+  settingsView.classList.remove('active');
+  settingsView.setAttribute('aria-hidden', 'true');
+  if (tabbar) tabbar.style.display = '';
+  restoreActiveTabPanel();
+  if (window.innerWidth <= 768) {
+    sidebarVisible = false;
+    updateSidebarVisibility();
+  }
+}
+
+function showSettingsView() {
+  if (!settingsView) return;
+  cancelAnimations();
+  hideSnark();
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  if (tabbar) tabbar.style.display = 'none';
+  settingsView.classList.add('active');
+  settingsView.setAttribute('aria-hidden', 'false');
+  if (window.innerWidth <= 768) {
+    sidebarVisible = false;
+    updateSidebarVisibility();
+  }
+  lucide.createIcons();
+}
+
 document.querySelectorAll('.sb-nav-btn').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.sb-nav-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
+    if (btn === settingsNavButton) {
+      showSettingsView();
+      return;
+    }
+    hideSettingsView();
   });
 });
 
@@ -765,6 +1331,9 @@ let activeAnimations = [];
 
 allTabs.forEach(tab => {
   tab.addEventListener('click', () => {
+    hideSettingsView();
+    document.querySelectorAll('.sb-nav-btn').forEach(b => b.classList.remove('active'));
+    primaryNavButton?.classList.add('active');
     const id = tab.dataset.tab;
     allTabs.forEach(t => t.classList.remove('active'));
     tab.classList.add('active');
@@ -864,8 +1433,8 @@ const content = {
     { html: '  <span class="t-success">✓</span> Session history &amp; AI summaries', delay: 50 },
     { html: '  <span class="t-success">✓</span> Remote tab copies keep layout and reconnect safely on this machine', delay: 50 },
     { html: '  <span class="t-success">✓</span> Remote access with setup wizard &amp; QR code', delay: 50 },
-    { html: '  <span class="t-success">✓</span> Extension system for custom pane types', delay: 50 },
-    { html: '  <span class="t-success">✓</span> AI-powered session titles', delay: 50 },
+    { html: '  <span class="t-success">✓</span> Pane type system for custom panes', delay: 50 },
+    { html: '  <span class="t-success">✓</span> Automatic session titles', delay: 50 },
     { html: '  <span class="t-success">✓</span> Progressive sidebar search', delay: 50 },
     { html: '  <span class="t-success">✓</span> Keyboard shortcuts dialog (Alt+T, Alt+W, Alt+H)', delay: 50 },
     { html: '  <span class="t-success">✓</span> Personalized sidebar per device', delay: 50 },
@@ -1076,6 +1645,7 @@ snarkDismiss.addEventListener('click', (e) => {
 
 // Trigger: keypress anywhere (someone trying to type)
 document.addEventListener('keydown', (e) => {
+  if (settingsView?.classList.contains('active')) return;
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   if (e.key === 'Escape') { hideSnark(); return; }
   if (e.key === 'Tab') return; // let tab switching work
@@ -1109,6 +1679,87 @@ document.addEventListener('click', (e) => {
   for (const sel of inertSelectors) {
     if (e.target.closest(sel)) { showSnark(); return; }
   }
+});
+
+// ========== Settings Preview Interactions ==========
+function activateSettingsTab(id) {
+  const tab = document.querySelector(`.settings-tab[data-settings-tab="${id}"]`);
+  if (!tab) return;
+  document.querySelectorAll('.settings-tab').forEach(item => {
+    const selected = item === tab;
+    item.classList.toggle('active', selected);
+    item.setAttribute('aria-selected', selected ? 'true' : 'false');
+  });
+  document.querySelectorAll('.settings-panel').forEach(panel => {
+    const selected = panel.id === 'settings-panel-' + id;
+    panel.classList.toggle('active', selected);
+    panel.setAttribute('aria-hidden', selected ? 'false' : 'true');
+  });
+}
+
+document.querySelectorAll('.settings-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    activateSettingsTab(tab.dataset.settingsTab);
+  });
+});
+
+document.querySelectorAll('[data-segmented]').forEach(group => {
+  group.querySelectorAll('.settings-segment').forEach(button => {
+    button.addEventListener('click', () => {
+      group.querySelectorAll('.settings-segment').forEach(item => item.classList.remove('active'));
+      button.classList.add('active');
+    });
+  });
+});
+
+document.querySelectorAll('.settings-switch').forEach(button => {
+  button.addEventListener('click', () => {
+    const next = !button.classList.contains('on');
+    button.classList.toggle('on', next);
+    button.setAttribute('aria-checked', next ? 'true' : 'false');
+  });
+});
+
+function formatSettingsRange(input) {
+  const value = Number(input.value);
+  switch (input.dataset.format) {
+    case 'percent':
+      return Math.round(value * 100) + '%';
+    case 'px-percent':
+      return `${value}px (${Math.round(value / 16 * 100)}%)`;
+    case 'fixed':
+      return value.toFixed(2);
+    case 'snap':
+      return value === 0 ? 'Off' : value + '%';
+    case 'locale':
+      return value.toLocaleString();
+    default:
+      return String(value);
+  }
+}
+
+document.querySelectorAll('.settings-range input').forEach(input => {
+  const label = input.closest('.settings-range')?.querySelector('span');
+  const preview = document.querySelector('.settings-terminal-preview');
+  const update = () => {
+    if (label) label.textContent = formatSettingsRange(input);
+    if (preview && input.dataset.format === 'px-percent') {
+      preview.style.fontSize = input.value + 'px';
+    }
+    if (preview && input.dataset.format === 'fixed') {
+      preview.style.lineHeight = input.value;
+    }
+  };
+  input.addEventListener('input', update);
+  update();
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape') return;
+  if (!settingsView?.classList.contains('active')) return;
+  hideSettingsView();
+  document.querySelectorAll('.sb-nav-btn').forEach(b => b.classList.remove('active'));
+  primaryNavButton?.classList.add('active');
 });
 </script>
 </body>

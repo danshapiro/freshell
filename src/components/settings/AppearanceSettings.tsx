@@ -388,6 +388,7 @@ export default function AppearanceSettings({
         <SettingsRow label="Cursor blink">
           <Toggle
             checked={settings.terminal.cursorBlink}
+            aria-label="Cursor blink"
             onChange={(checked) => {
               applyLocalSetting({ terminal: { cursorBlink: checked } })
             }}

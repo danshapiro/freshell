@@ -82,8 +82,8 @@ function createStore(networkStatus: NetworkStatusResponse | null = unconfiguredS
   })
 }
 
-async function openSafetySettings() {
-  fireEvent.click(screen.getByRole('tab', { name: /^safety$/i }))
+async function openNetworkSettings() {
+  fireEvent.click(screen.getByRole('tab', { name: /^network$/i }))
   return screen.findByRole('switch', { name: /remote access/i })
 }
 
@@ -306,7 +306,7 @@ describe('Settings network section (e2e)', () => {
       </Provider>,
     )
 
-    expect(await openSafetySettings()).toBeInTheDocument()
+    expect(await openNetworkSettings()).toBeInTheDocument()
   })
 
   it('toggles remote access on and dispatches configure', async () => {
@@ -319,7 +319,7 @@ describe('Settings network section (e2e)', () => {
       </Provider>,
     )
 
-    const toggle = await openSafetySettings()
+    const toggle = await openNetworkSettings()
     fireEvent.click(toggle)
 
     await waitFor(() => {
@@ -358,7 +358,7 @@ describe('Settings network section (e2e)', () => {
       </Provider>,
     )
 
-    await openSafetySettings()
+    await openNetworkSettings()
     fireEvent.click(screen.getByRole('button', { name: /fix firewall configuration/i }))
 
     const confirmationDialog = await screen.findByRole('dialog', { name: /administrator approval required/i })

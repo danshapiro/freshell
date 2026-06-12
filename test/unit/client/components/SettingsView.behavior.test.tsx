@@ -190,7 +190,7 @@ describe('SettingsView behavior sections', () => {
         },
       })
       renderSettingsView(store)
-      switchSettingsTab('Workspace')
+      switchSettingsTab('Panes')
 
       const soundRow = screen.getByText('Sound on completion').closest('div')
       const soundToggle = within(soundRow!).getByRole('switch')
@@ -322,7 +322,7 @@ describe('SettingsView behavior sections', () => {
     it('updates auto-kill idle minutes slider', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
-      switchSettingsTab('Safety')
+      switchSettingsTab('Advanced')
 
       const autoKillSlider = getSlider((slider) => {
         const min = slider.getAttribute('min')
@@ -340,7 +340,7 @@ describe('SettingsView behavior sections', () => {
       vi.mocked(api.post).mockResolvedValue({ valid: true })
       const store = createSettingsViewStore()
       renderSettingsView(store)
-      switchSettingsTab('Safety')
+      switchSettingsTab('Advanced')
 
       const cwdInput = screen.getByPlaceholderText('e.g. C:\\Users\\you\\projects')
       fireEvent.change(cwdInput, { target: { value: '/home/user/projects' } })
@@ -368,7 +368,7 @@ describe('SettingsView behavior sections', () => {
         settings: { defaultCwd: '/some/path' },
       })
       renderSettingsView(store)
-      switchSettingsTab('Safety')
+      switchSettingsTab('Advanced')
 
       const cwdInput = screen.getByDisplayValue('/some/path')
       fireEvent.change(cwdInput, { target: { value: '/missing/path' } })
@@ -396,7 +396,7 @@ describe('SettingsView behavior sections', () => {
         settings: { defaultCwd: '/some/path' },
       })
       renderSettingsView(store)
-      switchSettingsTab('Safety')
+      switchSettingsTab('Advanced')
 
       const cwdInput = screen.getByDisplayValue('/some/path')
       fireEvent.change(cwdInput, { target: { value: '' } })
@@ -474,7 +474,7 @@ describe('SettingsView behavior sections', () => {
         },
       })
       renderSettingsView(store)
-      switchSettingsTab('Safety')
+      switchSettingsTab('Advanced')
 
       expect(screen.getAllByLabelText('Device name for studio-mac')).toHaveLength(2)
 

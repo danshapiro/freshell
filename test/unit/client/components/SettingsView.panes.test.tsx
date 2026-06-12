@@ -72,9 +72,9 @@ describe('SettingsView Panes section', () => {
         <SettingsView />
       </Provider>
     )
-    switchSettingsTab('Workspace')
+    switchSettingsTab('Panes')
 
-    expect(screen.getByText('Panes')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Pane behavior' })).toBeInTheDocument()
   })
 
   it('renders Default new pane dropdown', () => {
@@ -84,7 +84,7 @@ describe('SettingsView Panes section', () => {
         <SettingsView />
       </Provider>
     )
-    switchSettingsTab('Workspace')
+    switchSettingsTab('Panes')
 
     expect(screen.getByText('Default new pane')).toBeInTheDocument()
   })
@@ -96,7 +96,7 @@ describe('SettingsView Panes section', () => {
         <SettingsView />
       </Provider>
     )
-    switchSettingsTab('Workspace')
+    switchSettingsTab('Panes')
 
     const dropdown = screen.getByRole('combobox', { name: /default new pane/i })
     expect(dropdown).toHaveValue('shell')
@@ -109,7 +109,7 @@ describe('SettingsView Panes section', () => {
         <SettingsView />
       </Provider>
     )
-    switchSettingsTab('Workspace')
+    switchSettingsTab('Panes')
 
     const dropdown = screen.getByRole('combobox', { name: /default new pane/i })
     const options = dropdown.querySelectorAll('option')
@@ -128,7 +128,7 @@ describe('SettingsView Panes section', () => {
         <SettingsView />
       </Provider>
     )
-    switchSettingsTab('Workspace')
+    switchSettingsTab('Panes')
 
     expect(screen.getByText('Snap distance')).toBeInTheDocument()
   })
@@ -140,7 +140,7 @@ describe('SettingsView Panes section', () => {
         <SettingsView />
       </Provider>
     )
-    switchSettingsTab('Workspace')
+    switchSettingsTab('Panes')
 
     // The slider should show "2%" for the default value
     expect(screen.getByText('2%')).toBeInTheDocument()
@@ -153,7 +153,7 @@ describe('SettingsView Panes section', () => {
         <SettingsView />
       </Provider>
     )
-    switchSettingsTab('Workspace')
+    switchSettingsTab('Panes')
 
     const snapSlider = screen.getAllByRole('slider').find((slider) => {
       return slider.getAttribute('min') === '0' && slider.getAttribute('max') === '8'
@@ -178,7 +178,7 @@ describe('SettingsView Panes section', () => {
         <SettingsView />
       </Provider>
     )
-    switchSettingsTab('Workspace')
+    switchSettingsTab('Panes')
 
     expect(screen.getByText('Open sidebar session in')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /new tab/i })).toBeInTheDocument()
@@ -192,7 +192,7 @@ describe('SettingsView Panes section', () => {
         <SettingsView />
       </Provider>
     )
-    switchSettingsTab('Workspace')
+    switchSettingsTab('Panes')
 
     const splitButton = screen.getByRole('button', { name: /split pane/i })
     fireEvent.click(splitButton)
@@ -213,7 +213,7 @@ describe('SettingsView Panes section', () => {
         <SettingsView />
       </Provider>
     )
-    switchSettingsTab('Workspace')
+    switchSettingsTab('Panes')
 
     const row = screen.getByText('Icons on tabs').closest('div')!
     const toggle = row.querySelector('button')!

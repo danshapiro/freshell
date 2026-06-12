@@ -229,7 +229,7 @@ export function itemToToolDisplay(item: FreshAgentTranscriptItem): FreshAgentToo
 function renderText(text: string, markdown = false) {
   const visibleText = stripSystemReminders(text)
   if (!visibleText) return null
-  const plain = <p className="whitespace-pre-wrap break-words">{visibleText}</p>
+  const plain = <p className="whitespace-pre-wrap break-words leading-[inherit]">{visibleText}</p>
   if (!markdown) return plain
   return (
     <div

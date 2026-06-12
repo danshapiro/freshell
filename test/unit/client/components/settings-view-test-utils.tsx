@@ -213,7 +213,14 @@ export function renderSettingsView(store: SettingsViewStore, props: SettingsView
   )
 }
 
-export type SettingsTab = 'Appearance' | 'Workspace' | 'Safety' | 'Advanced'
+export type SettingsTab =
+  | 'Appearance'
+  | 'Coding Agents'
+  | 'Panes'
+  | 'Workspace'
+  | 'Naming'
+  | 'Network'
+  | 'Advanced'
 
 /** Click a tab button in the settings tabbed navigation to switch sections. */
 export function switchSettingsTab(tab: SettingsTab) {

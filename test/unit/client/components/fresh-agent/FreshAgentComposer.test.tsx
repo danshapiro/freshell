@@ -186,6 +186,27 @@ describe('FreshAgentComposer', () => {
     expect(screen.getByTestId('fresh-agent-thinking-bar')).toHaveAttribute('data-state', 'active')
   })
 
+  it('matches message text sizing and labels the command and send buttons with tooltips', () => {
+    render(<FreshAgentComposer commands={COMMANDS} onSend={vi.fn()} />)
+
+    expect(getInput().className).toContain('fresh-agent-composer-input')
+    expect(getInput().className).toContain('text-base')
+    expect(getInput().className).toContain('sm:text-sm')
+
+    const commandButton = screen.getByRole('button', { name: 'Slash commands' })
+    expect(commandButton).toHaveAttribute('title', 'Slash commands')
+    expect(commandButton.querySelector('.lucide-list-start')).not.toBeNull()
+
+    fireEvent.mouseEnter(commandButton)
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Slash commands')
+    fireEvent.mouseLeave(commandButton)
+
+    const sendButton = screen.getByRole('button', { name: 'Send' })
+    expect(sendButton).toHaveAttribute('title', 'Send message')
+    fireEvent.focus(sendButton)
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Send message')
+  })
+
   describe('state-aware disabled behavior', () => {
     it('shows the provided placeholder instead of the generic read-only text', () => {
       render(

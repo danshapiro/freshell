@@ -37,6 +37,8 @@ export interface ManagedItem {
   source: ClientExtensionEntry
 }
 
+const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
+
 function buildCliConfig(
   ext: ClientExtensionEntry,
   providerSettings: Record<string, unknown> = {},
@@ -118,7 +120,7 @@ function buildContentSchemaConfig(
 }
 
 export const selectManagedItems = createSelector(
-  [(state: RootState) => state.extensions.entries,
+  [(state: RootState) => state.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES,
    (state: RootState) => state.settings.settings],
   (entries, resolvedSettings): ManagedItem[] => {
     const enabledProviders = resolvedSettings?.codingCli?.enabledProviders ?? []

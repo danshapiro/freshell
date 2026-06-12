@@ -496,7 +496,7 @@ function FreshAgentTurnArticle({
           }
           return <FreshAgentItemCard key={block.item.id} item={block.item} markdown={!isUser} />
         }) : isUser ? (
-          <p className="whitespace-pre-wrap break-words">{stripSystemReminders(turn.summary)}</p>
+          <p className="whitespace-pre-wrap break-words leading-[inherit]">{stripSystemReminders(turn.summary)}</p>
         ) : (
           // Summary-only agent turns went through the plain-text path and
           // showed literal backticks (live-test finding) — render markdown.

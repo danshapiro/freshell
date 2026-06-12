@@ -1188,6 +1188,11 @@ html {
   padding-right: max(env(safe-area-inset-right), 4.25rem);
 }
 
+.fresh-agent-composer-input {
+  font-size: var(--fresh-transcript-font-size);
+  line-height: 1.25;
+}
+
 .fresh-agent-composer-row {
   align-items: end;
   display: grid;

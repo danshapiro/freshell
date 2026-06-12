@@ -56,6 +56,7 @@ function createStore(overrides?: {
   serverInstanceId?: string
   availableClis?: Record<string, boolean>
   enabledProviders?: string[]
+  disabledExtensions?: string[]
   extensions?: ClientExtensionEntry[]
   featureFlags?: Record<string, boolean>
   freshClientsEnabled?: boolean
@@ -105,6 +106,9 @@ function createStore(overrides?: {
             enabled: overrides?.freshClientsEnabled ?? false,
           },
           logging: { debug: false },
+          extensions: {
+            disabled: overrides?.disabledExtensions ?? [],
+          },
         },
         loaded: true,
         lastSavedAt: null,
@@ -307,6 +311,20 @@ describe('PanePicker', () => {
       expect(screen.getByRole('button', { name: 'Freshcodex' })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Freshopencode' })).toBeInTheDocument()
       expect(document.body.textContent).not.toMatch(/agent[-\s]?chat/i)
+    })
+
+    it('hides a Fresh-agent picker entry disabled by session type without hiding its CLI', () => {
+      renderPicker({
+        availableClis: { claude: true, codex: true },
+        enabledProviders: ['claude', 'codex'],
+        extensions: defaultCliExtensions,
+        freshClientsEnabled: true,
+        disabledExtensions: ['freshcodex'],
+      })
+
+      expect(screen.getByRole('button', { name: 'Freshclaude' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Codex CLI' })).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Freshcodex' })).not.toBeInTheDocument()
     })
 
     it('shows only non-CLI options when no CLIs are available', () => {

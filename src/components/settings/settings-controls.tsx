@@ -39,16 +39,16 @@ export function SettingsRow({
   children: React.ReactNode
 }) {
   return (
-    <div className="flex w-full flex-col items-start gap-2 md:flex-row md:items-center md:justify-between md:gap-4">
+    <div className="flex w-full flex-col items-start gap-2 md:flex-row md:items-center md:justify-between md:gap-6">
       {description ? (
-        <div className="flex flex-col gap-0.5">
+        <div className="min-w-0 flex flex-col gap-0.5">
           <span className="text-sm text-muted-foreground">{label}</span>
           <span className="text-xs text-muted-foreground/60">{description}</span>
         </div>
       ) : (
-        <span className="text-sm text-muted-foreground">{label}</span>
+        <span className="min-w-0 text-sm text-muted-foreground">{label}</span>
       )}
-      <div className="w-full md:w-auto">{children}</div>
+      <div className="flex w-full items-center pr-1 md:w-auto md:justify-end md:pr-2">{children}</div>
     </div>
   )
 }
@@ -63,7 +63,7 @@ export function SegmentedControl({
   onChange: (value: string) => void
 }) {
   return (
-    <div className="flex w-full flex-wrap bg-muted rounded-md p-0.5 md:w-auto">
+    <div className="flex w-full min-w-0 flex-wrap bg-muted rounded-md p-0.5 md:w-auto md:min-w-[12rem]">
       {options.map((opt) => (
         <button
           key={opt.value}
@@ -101,7 +101,7 @@ export function Toggle({
       aria-label={ariaLabel ?? (checked ? 'Toggle off' : 'Toggle on')}
       aria-checked={checked}
       className={cn(
-        'relative w-9 h-5 rounded-full transition-colors',
+        'relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors',
         checked ? 'bg-foreground' : 'bg-muted',
         disabled && 'opacity-50 cursor-not-allowed'
       )}

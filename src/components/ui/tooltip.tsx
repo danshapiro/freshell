@@ -60,11 +60,13 @@ export function TooltipTrigger({
 export function TooltipContent({
   children,
   className,
+  align = 'start',
   side = 'top',
   sideOffset = 4,
 }: {
   children: React.ReactNode
   className?: string
+  align?: 'start' | 'center' | 'end'
   side?: 'top' | 'bottom'
   sideOffset?: number
 }) {
@@ -76,15 +78,21 @@ export function TooltipContent({
   React.useLayoutEffect(() => {
     if (ctx?.open && ctx.triggerRef.current) {
       const rect = ctx.triggerRef.current.getBoundingClientRect()
+      const contentWidth = contentRef.current?.offsetWidth || 0
       const contentHeight = contentRef.current?.offsetHeight || 24
+      const left = align === 'end'
+        ? rect.right - contentWidth
+        : align === 'center'
+          ? rect.left + (rect.width / 2) - (contentWidth / 2)
+          : rect.left
       setPosition({
         top: side === 'bottom'
           ? rect.bottom + sideOffset
           : rect.top - contentHeight - sideOffset,
-        left: rect.left,
+        left: Math.max(4, left),
       })
     }
-  }, [ctx?.open, ctx?.triggerRef, side, sideOffset])
+  }, [align, ctx?.open, ctx?.triggerRef, side, sideOffset])
 
   if (!ctx?.open) return null
 

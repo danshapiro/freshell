@@ -20,148 +20,206 @@ vi.mock('@/lib/api', () => ({
 
 installSettingsViewHooks({ fakeTimers: true, mockFonts: true })
 
-function getToggle(labelText: string) {
-  const label = screen.getByText(labelText)
-  let row: HTMLElement | null = label.parentElement
-  while (row && !row.querySelector('[role="switch"]')) {
-    row = row.parentElement
-  }
-  if (!row) throw new Error(`Row with label "${labelText}" not found`)
-  return row.querySelector('[role="switch"]') as HTMLElement
-}
-
-describe('SettingsView fresh agent settings', () => {
-  it('renders the Fresh agent section on the Workspace tab', () => {
+describe('SettingsView coding agents settings', () => {
+  it('renders compact rows for CLI and Fresh coding agents', () => {
     const store = createSettingsViewStore()
     renderSettingsView(store)
-    switchSettingsTab('Workspace')
+    switchSettingsTab('Coding Agents')
 
-    expect(screen.getByRole('heading', { name: 'Fresh agent' })).toBeInTheDocument()
-    expect(screen.getByText('Display settings for fresh-agent panes')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Coding Agents' })).toBeInTheDocument()
+    for (const name of [
+      'Claude CLI',
+      'Freshclaude',
+      'Codex CLI',
+      'Freshcodex',
+      'OpenCode',
+      'Freshopencode',
+      'Gemini',
+      'Kimi',
+    ]) {
+      expect(screen.getByRole('switch', { name })).toBeInTheDocument()
+    }
+    expect(screen.queryByText('Show thinking')).not.toBeInTheDocument()
+    expect(screen.queryByText('Show tools')).not.toBeInTheDocument()
+    expect(screen.queryByText('Show timecodes & model')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Fresh agent font size')).not.toBeInTheDocument()
   })
 
-  it('renders the enable switch, Show thinking, Show tools, and Show timecodes toggles', () => {
-    const store = createSettingsViewStore()
-    renderSettingsView(store)
-    switchSettingsTab('Workspace')
-
-    expect(getToggle('Enable fresh clients (experimental)')).toBeInTheDocument()
-    expect(getToggle('Show thinking')).toBeInTheDocument()
-    expect(getToggle('Show tools')).toBeInTheDocument()
-    expect(getToggle('Show timecodes & model')).toBeInTheDocument()
-  })
-
-  it('all agent chat toggles default to unchecked (off)', () => {
-    const store = createSettingsViewStore()
-    renderSettingsView(store)
-    switchSettingsTab('Workspace')
-
-    expect(getToggle('Enable fresh clients (experimental)')).toHaveAttribute('aria-checked', 'false')
-    expect(getToggle('Show thinking')).toHaveAttribute('aria-checked', 'false')
-    expect(getToggle('Show tools')).toHaveAttribute('aria-checked', 'false')
-    expect(getToggle('Show timecodes & model')).toHaveAttribute('aria-checked', 'false')
-  })
-
-  it('reflects current freshAgent settings when preloaded', () => {
+  it('hides unavailable CLI agents and their Fresh variants', () => {
     const store = createSettingsViewStore({
-      settings: { freshAgent: { showThinking: true, showTools: true, showTimecodes: true } },
+      settings: {
+        codingCli: { enabledProviders: ['claude', 'codex', 'opencode', 'gemini', 'kimi'] },
+        freshAgent: { enabled: true },
+      },
+      extraPreloadedState: {
+        connection: {
+          status: 'ready',
+          platform: 'linux',
+          availableClis: {
+            claude: true,
+            codex: false,
+            opencode: false,
+            gemini: false,
+            kimi: false,
+          },
+          featureFlags: {},
+        },
+      },
     })
     renderSettingsView(store)
-    switchSettingsTab('Workspace')
+    switchSettingsTab('Coding Agents')
 
-    expect(getToggle('Show thinking')).toHaveAttribute('aria-checked', 'true')
-    expect(getToggle('Show tools')).toHaveAttribute('aria-checked', 'true')
-    expect(getToggle('Show timecodes & model')).toHaveAttribute('aria-checked', 'true')
+    expect(screen.getByRole('switch', { name: 'Claude CLI' })).toBeInTheDocument()
+    expect(screen.getByRole('switch', { name: 'Freshclaude' })).toBeInTheDocument()
+    expect(screen.queryByRole('switch', { name: 'Codex CLI' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('switch', { name: 'Freshcodex' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('switch', { name: 'OpenCode' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('switch', { name: 'Freshopencode' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('switch', { name: 'Gemini' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('switch', { name: 'Kimi' })).not.toBeInTheDocument()
   })
 
-  it('toggling Enable fresh clients updates server-backed settings', async () => {
-    const store = createSettingsViewStore()
+  it('hides Fresh agent rows when the runtime CLI is disabled in settings', () => {
+    const store = createSettingsViewStore({
+      settings: {
+        codingCli: { enabledProviders: ['claude'] },
+        freshAgent: { enabled: true },
+      },
+      extraPreloadedState: {
+        connection: {
+          status: 'ready',
+          platform: 'linux',
+          availableClis: {
+            claude: true,
+            codex: true,
+            opencode: true,
+            gemini: true,
+            kimi: true,
+          },
+          featureFlags: {},
+        },
+      },
+    })
     renderSettingsView(store)
-    switchSettingsTab('Workspace')
+    switchSettingsTab('Coding Agents')
 
-    fireEvent.click(getToggle('Enable fresh clients (experimental)'))
+    expect(screen.getByRole('switch', { name: 'Claude CLI' })).toBeInTheDocument()
+    expect(screen.getByRole('switch', { name: 'Freshclaude' })).toBeInTheDocument()
+    expect(screen.getByRole('switch', { name: 'Codex CLI' })).toBeInTheDocument()
+    expect(screen.queryByRole('switch', { name: 'Freshcodex' })).not.toBeInTheDocument()
+    expect(screen.getByRole('switch', { name: 'OpenCode' })).toBeInTheDocument()
+    expect(screen.queryByRole('switch', { name: 'Freshopencode' })).not.toBeInTheDocument()
+  })
 
-    expect(store.getState().settings.settings.freshAgent.enabled).toBe(true)
-    expect('agentChat' in store.getState().settings.settings).toBe(false)
+  it('toggles CLI agents through codingCli.enabledProviders', async () => {
+    const store = createSettingsViewStore({
+      settings: { codingCli: { enabledProviders: ['claude', 'codex'] } },
+    })
+    renderSettingsView(store)
+    switchSettingsTab('Coding Agents')
 
+    fireEvent.click(screen.getByRole('switch', { name: 'Codex CLI' }))
+
+    expect(store.getState().settings.settings.codingCli.enabledProviders).toEqual(['claude'])
     await act(async () => {
       await Promise.resolve()
     })
+    expect(api.patch).toHaveBeenCalledWith('/api/settings', {
+      codingCli: { enabledProviders: ['claude'] },
+    })
+  })
 
+  it('renders stale extension-disabled CLI agents as off and clears the stale disablement when re-enabled', async () => {
+    const store = createSettingsViewStore({
+      settings: {
+        codingCli: { enabledProviders: ['claude', 'codex'] },
+        extensions: { disabled: ['codex', 'freshcodex'] },
+      },
+    })
+    renderSettingsView(store)
+    switchSettingsTab('Coding Agents')
+
+    expect(screen.getByRole('switch', { name: 'Codex CLI' })).not.toBeChecked()
+    fireEvent.click(screen.getByRole('switch', { name: 'Codex CLI' }))
+
+    expect(store.getState().settings.settings.codingCli.enabledProviders).toEqual(['claude', 'codex'])
+    expect(store.getState().settings.settings.extensions.disabled).toEqual(['freshcodex'])
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(api.patch).toHaveBeenCalledWith('/api/settings', {
+      codingCli: { enabledProviders: ['claude', 'codex'] },
+      extensions: { disabled: ['freshcodex'] },
+    })
+  })
+
+  it('toggles one Fresh agent independently through extensions.disabled', async () => {
+    const store = createSettingsViewStore({
+      settings: {
+        freshAgent: { enabled: true },
+        extensions: { disabled: ['freshcodex'] },
+      },
+    })
+    renderSettingsView(store)
+    switchSettingsTab('Coding Agents')
+
+    expect(screen.getByRole('switch', { name: 'Freshcodex' })).not.toBeChecked()
+    fireEvent.click(screen.getByRole('switch', { name: 'Freshcodex' }))
+
+    expect(store.getState().settings.settings.extensions.disabled).not.toContain('freshcodex')
+    await act(async () => {
+      await Promise.resolve()
+    })
     expect(api.patch).toHaveBeenCalledWith('/api/settings', {
       freshAgent: { enabled: true },
+      extensions: { disabled: [] },
     })
   })
 
-  it('toggling Show thinking updates the store to true', () => {
+  it('turns on only the selected Fresh agent from the default all-off state', async () => {
     const store = createSettingsViewStore()
     renderSettingsView(store)
-    switchSettingsTab('Workspace')
+    switchSettingsTab('Coding Agents')
 
-    fireEvent.click(getToggle('Show thinking'))
+    fireEvent.click(screen.getByRole('switch', { name: 'Freshcodex' }))
 
-    expect(store.getState().settings.settings.freshAgent.showThinking).toBe(true)
-    expect('agentChat' in store.getState().settings.settings).toBe(false)
-  })
-
-  it('toggling Show tools updates the store to true', () => {
-    const store = createSettingsViewStore()
-    renderSettingsView(store)
-    switchSettingsTab('Workspace')
-
-    fireEvent.click(getToggle('Show tools'))
-
-    expect(store.getState().settings.settings.freshAgent.showTools).toBe(true)
-    expect('agentChat' in store.getState().settings.settings).toBe(false)
-  })
-
-  it('toggling Show timecodes updates the store to true', () => {
-    const store = createSettingsViewStore()
-    renderSettingsView(store)
-    switchSettingsTab('Workspace')
-
-    fireEvent.click(getToggle('Show timecodes & model'))
-
-    expect(store.getState().settings.settings.freshAgent.showTimecodes).toBe(true)
-    expect('agentChat' in store.getState().settings.settings).toBe(false)
-  })
-
-  it('does not render a separate Fresh agent font size dropdown', () => {
-    const store = createSettingsViewStore()
-    renderSettingsView(store)
-    switchSettingsTab('Workspace')
-
-    expect(screen.queryByLabelText('Fresh agent font size')).not.toBeInTheDocument()
-    expect(screen.queryByText('Scale the text in fresh-agent panes (Freshclaude, Freshcodex, and friends).')).not.toBeInTheDocument()
-  })
-
-  it('toggling off a previously-on setting sets it to false', () => {
-    const store = createSettingsViewStore({
-      settings: { freshAgent: { showThinking: true } },
-    })
-    renderSettingsView(store)
-    switchSettingsTab('Workspace')
-
-    fireEvent.click(getToggle('Show thinking'))
-
-    expect(store.getState().settings.settings.freshAgent.showThinking).toBe(false)
-    expect('agentChat' in store.getState().settings.settings).toBe(false)
-  })
-
-  it('fresh agent setting changes are local-only (no api.patch call)', async () => {
-    const store = createSettingsViewStore()
-    renderSettingsView(store)
-    switchSettingsTab('Workspace')
-
-    fireEvent.click(getToggle('Show thinking'))
-    fireEvent.click(getToggle('Show tools'))
-    fireEvent.click(getToggle('Show timecodes & model'))
-
+    expect(store.getState().settings.settings.freshAgent.enabled).toBe(true)
+    expect(store.getState().settings.settings.extensions.disabled).toEqual(
+      expect.arrayContaining(['freshclaude', 'freshopencode', 'kilroy']),
+    )
+    expect(store.getState().settings.settings.extensions.disabled).not.toContain('freshcodex')
     await act(async () => {
-      vi.advanceTimersByTime(600)
+      await Promise.resolve()
     })
+    expect(api.patch).toHaveBeenCalledWith('/api/settings', {
+      freshAgent: { enabled: true },
+      extensions: { disabled: ['freshclaude', 'freshopencode', 'kilroy'] },
+    })
+  })
 
-    const { api } = await import('@/lib/api')
-    expect(api.patch).not.toHaveBeenCalled()
+  it('turns off the global Fresh agent gate when disabling the last visible Fresh agent', async () => {
+    const store = createSettingsViewStore({
+      settings: {
+        freshAgent: { enabled: true },
+        extensions: { disabled: ['freshclaude', 'freshopencode'] },
+      },
+    })
+    renderSettingsView(store)
+    switchSettingsTab('Coding Agents')
+
+    fireEvent.click(screen.getByRole('switch', { name: 'Freshcodex' }))
+
+    expect(store.getState().settings.settings.freshAgent.enabled).toBe(false)
+    expect('agentChat' in store.getState().settings.settings).toBe(false)
+    expect(store.getState().settings.settings.extensions.disabled).toEqual(
+      expect.arrayContaining(['freshclaude', 'freshcodex', 'freshopencode', 'kilroy']),
+    )
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(api.patch).toHaveBeenCalledWith('/api/settings', {
+      freshAgent: { enabled: false },
+      extensions: { disabled: ['freshclaude', 'freshopencode', 'freshcodex', 'kilroy'] },
+    })
   })
 })
