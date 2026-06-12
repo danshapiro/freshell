@@ -268,7 +268,13 @@ function FreshAgentActivityStrip({
           >
             <ChevronRight className="h-3 w-3" />
           </button>
-          {running ? <Loader2 className="h-3 w-3 shrink-0 animate-spin" aria-label="running" /> : null}
+          <span
+            className="fresh-agent-activity-status-slot"
+            data-testid="fresh-agent-activity-status-slot"
+            aria-hidden={running ? undefined : true}
+          >
+            {running ? <Loader2 className="h-3 w-3 animate-spin" aria-label="running" /> : null}
+          </span>
           <SlotReel
             toolName={running ? reelName : null}
             previewText={running ? reelPreview : null}
@@ -417,7 +423,7 @@ function FreshAgentTurnArticle({
         <span>{getTurnLabel(turn)}</span>
         {turn.model ? <span className="truncate normal-case">{turn.model}</span> : null}
       </div>
-      <div className="space-y-1.5 text-sm">
+      <div className="fresh-agent-transcript-copy space-y-1.5">
         {blocks.length > 0 ? blocks.map((block, blockIndex) => {
           if (block.kind === 'activity') {
             return (
@@ -512,7 +518,7 @@ export function FreshAgentTranscript({
     <div className="relative min-h-0 flex-1">
       <div
         ref={scrollerRef}
-        className="flex h-full flex-col gap-3 overflow-y-auto overscroll-contain px-3 py-3"
+        className="flex h-full flex-col gap-3 overflow-x-hidden overflow-y-auto overscroll-contain px-3 py-3"
         data-context="fresh-agent-transcript"
         onScroll={(event) => {
           const node = event.currentTarget

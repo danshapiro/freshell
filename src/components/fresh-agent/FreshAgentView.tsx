@@ -1082,6 +1082,10 @@ export function FreshAgentView({
     const diffs = snapshot?.diffs ?? []
     const codexReview = readCodexReview(snapshot?.extensions?.codex?.review)
     const codexFork = readCodexFork(snapshot?.extensions?.codex?.fork)
+    const hasSidebarMetadata = worktrees.length > 0
+      || childThreads.length > 0
+      || Boolean(codexReview)
+      || Boolean(codexFork)
     // sessionEnded gates everything: a stale snapshot can still claim
     // capabilities.send after the provider process died.
     const canSend = !sessionEnded && (snapshot?.capabilities?.send === true || (
@@ -1149,7 +1153,7 @@ export function FreshAgentView({
 
     return (
       <div
-        className="relative flex h-full min-h-0 flex-col overflow-hidden"
+        className="fresh-agent-pane relative flex h-full min-h-0 flex-col overflow-hidden"
         data-context="fresh-agent"
         data-session-id={paneContent.sessionId}
         style={{ '--fresh-font-scale': String(freshFontScale) } as CSSProperties}
@@ -1163,8 +1167,8 @@ export function FreshAgentView({
             data-testid="fresh-agent-watermark"
           />
         ) : null}
-        <div className="fresh-agent-scaled-content relative z-10 flex min-h-0">
-          <div className="flex min-h-0 flex-1 flex-col">
+        <div className={`${hasSidebarMetadata ? 'fresh-agent-layout--with-sidebar ' : ''}fresh-agent-layout relative z-10 min-h-0 flex-1`}>
+          <div className="fresh-agent-main flex min-h-0 flex-1 flex-col">
             <div className="space-y-2 px-3 pt-3">
               {isRestoring ? (
                 <FreshAgentApprovalBanner text="Restoring session..." />

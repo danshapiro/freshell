@@ -165,10 +165,14 @@ describe('FreshAgentComposer', () => {
     })
   })
 
-  it('renders the subtle thinking bar while the agent is working', () => {
-    render(<FreshAgentComposer commands={COMMANDS} thinking onSend={vi.fn()} />)
+  it('keeps the subtle thinking bar slot stable when work starts and stops', () => {
+    const { rerender } = render(<FreshAgentComposer commands={COMMANDS} onSend={vi.fn()} />)
 
+    expect(screen.getByTestId('fresh-agent-thinking-bar')).toHaveAttribute('data-state', 'idle')
+
+    rerender(<FreshAgentComposer commands={COMMANDS} thinking onSend={vi.fn()} />)
     expect(screen.getByTestId('fresh-agent-thinking-bar')).toBeInTheDocument()
+    expect(screen.getByTestId('fresh-agent-thinking-bar')).toHaveAttribute('data-state', 'active')
   })
 
   describe('state-aware disabled behavior', () => {

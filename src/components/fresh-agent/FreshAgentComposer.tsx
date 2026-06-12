@@ -485,7 +485,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
 
   return (
     <form
-      className="relative border-t border-border/60 p-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] sm:pb-3"
+      className="fresh-agent-composer relative border-t border-border/60 p-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] sm:pb-3"
       onSubmit={(event) => {
         event.preventDefault()
         sendText()
@@ -614,19 +614,23 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
         </div>
       ) : null}
 
-      {thinking ? (
+      <div
+        className="mb-2 flex h-[0.5em] justify-center"
+        aria-hidden="true"
+        data-state={thinking ? 'active' : 'idle'}
+        data-testid="fresh-agent-thinking-bar"
+      >
         <div
-          className="mb-2 flex justify-center"
-          aria-hidden="true"
-          data-testid="fresh-agent-thinking-bar"
+          className={cn(
+            'h-full w-[80%] overflow-hidden rounded-sm bg-muted/50 transition-opacity duration-150',
+            thinking ? 'opacity-100' : 'opacity-0',
+          )}
         >
-          <div className="h-[0.5em] w-[80%] overflow-hidden rounded-sm bg-muted/50">
-            <div className="fresh-agent-thinking-gradient h-full w-2/5" />
-          </div>
+          <div className="fresh-agent-thinking-gradient h-full w-2/5" />
         </div>
-      ) : null}
+      </div>
 
-      <div className="flex items-end gap-2">
+      <div className="fresh-agent-composer-row">
         <textarea
           ref={textareaRef}
           name="message"
@@ -674,46 +678,52 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
             }
           }}
         />
-        <button
-          type="button"
-          disabled={disabled}
-          className="inline-flex h-11 w-11 items-center justify-center rounded-md border border-border/70 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:w-9"
-          aria-label="Attach files"
-          title="Attach files — images, PDFs (claude), and text files"
-          onClick={() => fileInputRef.current?.click()}
-        >
-          <Paperclip className="h-4 w-4" />
-        </button>
-        {canInterrupt ? (
+        <div className="fresh-agent-composer-actions">
+          <button
+            type="button"
+            disabled={disabled}
+            className="fresh-agent-composer-action inline-flex h-11 w-11 items-center justify-center rounded-md border border-border/70 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:w-9"
+            aria-label="Attach files"
+            title="Attach files — images, PDFs (claude), and text files"
+            onClick={() => fileInputRef.current?.click()}
+          >
+            <Paperclip className="h-4 w-4" />
+          </button>
           <button
             type="button"
             onClick={onInterrupt}
-            className="inline-flex h-11 w-11 items-center justify-center rounded-md border border-border bg-background text-sm transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50 sm:h-10 sm:w-10"
+            disabled={!canInterrupt}
+            tabIndex={canInterrupt ? undefined : -1}
+            aria-hidden={canInterrupt ? undefined : true}
+            className={cn(
+              'fresh-agent-composer-action inline-flex h-11 w-11 items-center justify-center rounded-md border border-border bg-background text-sm transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50 sm:h-10 sm:w-10',
+              !canInterrupt && 'invisible',
+            )}
             aria-label="Stop"
           >
             <Square className="h-4 w-4" />
           </button>
-        ) : null}
-        <button
-          type="button"
-          disabled={commands.length === 0}
-          className="inline-flex h-11 w-11 items-center justify-center rounded-md border border-border/70 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:w-9"
-          aria-label="Slash commands"
-          onClick={() => {
-            setMenuMode((mode) => mode === 'browse' ? null : 'browse')
-            setFilter('')
-          }}
-        >
-          <Command className="h-4 w-4" />
-        </button>
-        <button
-          type="submit"
-          disabled={disabled}
-          className="inline-flex h-11 w-11 items-center justify-center rounded-md bg-primary text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50 sm:h-10 sm:w-10"
-          aria-label="Send"
-        >
-          <Send className="h-4 w-4" />
-        </button>
+          <button
+            type="button"
+            disabled={commands.length === 0}
+            className="fresh-agent-composer-action inline-flex h-11 w-11 items-center justify-center rounded-md border border-border/70 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:w-9"
+            aria-label="Slash commands"
+            onClick={() => {
+              setMenuMode((mode) => mode === 'browse' ? null : 'browse')
+              setFilter('')
+            }}
+          >
+            <Command className="h-4 w-4" />
+          </button>
+          <button
+            type="submit"
+            disabled={disabled}
+            className="fresh-agent-composer-action inline-flex h-11 w-11 items-center justify-center rounded-md bg-primary text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50 sm:h-10 sm:w-10"
+            aria-label="Send"
+          >
+            <Send className="h-4 w-4" />
+          </button>
+        </div>
         <input
           ref={fileInputRef}
           type="file"

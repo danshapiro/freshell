@@ -2563,7 +2563,7 @@ describe('FreshAgentView font scale', () => {
     status: 'connected',
   } as const
 
-  it('applies the default 50%-larger font scale to the fresh-agent pane root', async () => {
+  it('applies the default 50%-larger font scale without transforming pane geometry', async () => {
     const store = createStore()
     render(
       <Provider store={store}>
@@ -2574,7 +2574,8 @@ describe('FreshAgentView font scale', () => {
     const root = document.querySelector('[data-context="fresh-agent"]') as HTMLElement
     expect(root).toBeTruthy()
     expect(root.style.getPropertyValue('--fresh-font-scale')).toBe('1.5')
-    expect(root.querySelector('.fresh-agent-scaled-content')).toBeTruthy()
+    expect(root.querySelector('.fresh-agent-layout')).toBeTruthy()
+    expect(root.querySelector('.fresh-agent-scaled-content')).toBeNull()
 
     await act(async () => {
       await Promise.resolve()

@@ -15,23 +15,172 @@ html {
   font-size: calc(100% * var(--ui-scale, 1.25));
 }
 
-/* Fresh-agent panes render at a user-configurable scale (Settings -> Workspace
-   -> Fresh agent -> Font size; default 150%). Keep the pane root at full size
-   and scale only its content surface; shrinking the root itself leaves blank
-   space in the surrounding pane layout. */
-.fresh-agent-scaled-content {
-  transform: scale(var(--fresh-font-scale, 1));
-  transform-origin: top left;
-  width: calc(100% / var(--fresh-font-scale, 1));
-  height: calc(100% / var(--fresh-font-scale, 1));
+/* Fresh-agent panes use their real pane geometry at every font scale. Only
+   transcript copy scales with the Fresh agent font setting, so chrome, rails,
+   buttons, and textarea layout remain responsive on desktop and phone. */
+.fresh-agent-pane {
+  container-type: inline-size;
+  --fresh-transcript-font-size: calc(0.875rem * var(--fresh-font-scale, 1));
+}
+
+.fresh-agent-layout {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  width: 100%;
+}
+
+.fresh-agent-main {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  order: 2;
+}
+
+.fresh-agent-sidebar {
+  border-bottom: 1px solid hsl(var(--border) / 0.6);
+  flex: 0 0 auto;
+  max-height: 8rem;
+  min-height: 0;
+  min-width: 0;
+  order: 1;
+  overflow: auto;
+  padding: 0.6rem 0.75rem;
+}
+
+.fresh-agent-sidebar-content {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  min-width: 0;
+}
+
+.fresh-agent-sidebar-section {
+  border: 1px solid hsl(var(--border) / 0.58);
+  border-radius: 0.35rem;
+  min-width: min(100%, 12rem);
+  padding: 0.45rem 0.55rem;
+}
+
+.fresh-agent-sidebar-list {
+  overflow-wrap: anywhere;
+}
+
+.fresh-agent-transcript-copy {
+  font-size: var(--fresh-transcript-font-size);
+  line-height: 1.45;
+}
+
+.fresh-agent-transcript-copy [data-markdown-body] {
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.fresh-agent-transcript-copy [data-markdown-body] :where(p, li, blockquote, pre, code) {
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.fresh-agent-composer {
+  container-type: inline-size;
+  padding-right: max(env(safe-area-inset-right), 4.25rem);
+}
+
+.fresh-agent-composer-row {
+  align-items: end;
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.fresh-agent-composer-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 0.5rem;
+}
+
+.fresh-agent-composer-action {
+  flex: 0 0 auto;
+}
+
+.fresh-agent-activity-status-slot {
+  align-items: center;
+  display: inline-flex;
+  flex: 0 0 0.75rem;
+  height: 0.75rem;
+  justify-content: center;
+  width: 0.75rem;
+}
+
+@container (max-width: 520px) {
+  .fresh-agent-composer-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .fresh-agent-composer-actions {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .fresh-agent-composer-action {
+    width: 100% !important;
+  }
+}
+
+@container (min-width: 900px) {
+  .fresh-agent-layout--with-sidebar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(12rem, 17rem);
+  }
+
+  .fresh-agent-main {
+    order: 0;
+  }
+
+  .fresh-agent-sidebar {
+    border-bottom: 0;
+    border-left: 1px solid hsl(var(--border) / 0.6);
+    height: 100%;
+    max-height: none;
+    order: 0;
+    padding: 0.75rem;
+  }
+
+  .fresh-agent-sidebar-content {
+    display: block;
+  }
+
+  .fresh-agent-sidebar-section {
+    border: 0;
+    border-radius: 0;
+    padding: 0;
+  }
+
+  .fresh-agent-sidebar-section + .fresh-agent-sidebar-section {
+    margin-top: 0.75rem;
+  }
+
+  .fresh-agent-layout--with-sidebar .fresh-agent-composer {
+    padding-right: 0.75rem;
+  }
+}
+
+@container (min-width: 1180px) {
+  .fresh-agent-layout--with-sidebar {
+    grid-template-columns: minmax(0, 1fr) minmax(14rem, 18rem);
+  }
 }
 
 @keyframes fresh-agent-thinking-sweep {
   0%, 100% {
-    transform: translateX(-120%);
+    transform: translateX(0%);
   }
   50% {
-    transform: translateX(250%);
+    transform: translateX(150%);
   }
 }
 

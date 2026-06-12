@@ -125,7 +125,20 @@ test.describe('Mobile Viewport', () => {
     }, paneId)
 
     const sessionId = '44444444-4444-4444-8444-444444444444'
-    await routeFreshClaudeSnapshot(page, sessionId)
+    await routeFreshClaudeSnapshot(page, sessionId, {
+      summary: 'Mobile fresh-agent overflow check',
+      turns: [{
+        id: 'turn-mobile-layout',
+        turnId: 'turn-mobile-layout',
+        role: 'assistant',
+        summary: 'mobile layout',
+        items: [{
+          id: 'item-mobile-layout',
+          kind: 'text',
+          text: 'Fresh client transcript text should wrap on a phone without creating a horizontal scrollbar, even when the message contains src/components/fresh-agent/FreshAgentView.tsx.',
+        }],
+      }],
+    })
 
     await page.evaluate(({ currentTabId, currentPaneId, currentSessionId }) => {
       const harness = window.__FRESHELL_TEST_HARNESS__
@@ -164,6 +177,19 @@ test.describe('Mobile Viewport', () => {
     // Verify the chat input is visible
     const input = pane.getByRole('textbox', { name: /chat message input/i })
     await expect(input).toBeVisible()
+
+    const paneRoot = page.locator('[data-context="fresh-agent"]')
+    const transcript = paneRoot.locator('[data-context="fresh-agent-transcript"]')
+    await expect.poll(async () => paneRoot.evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1)
+    await expect.poll(async () => transcript.evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1)
+
+    const addPaneButton = page.getByRole('button', { name: /^add pane$/i })
+    await expect(addPaneButton).toBeVisible()
+    const sendBox = await sendBtn.boundingBox()
+    const addPaneBox = await addPaneButton.boundingBox()
+    expect(sendBox).not.toBeNull()
+    expect(addPaneBox).not.toBeNull()
+    expect(sendBox!.x + sendBox!.width).toBeLessThanOrEqual(addPaneBox!.x - 4)
   })
 
   test('permission banner buttons are visible and functional on mobile', async ({ freshellPage, page, harness, terminal }) => {

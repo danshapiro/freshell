@@ -421,6 +421,41 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
 .sv-session-time { font-size: 12px; color: hsl(var(--muted-foreground)); margin-left: auto; }
 .sv-session-summary { font-size: 12px; color: hsl(var(--muted-foreground)); margin-top: 4px; line-height: 1.5; }
 .sv-session-cwd { font-size: 11px; color: var(--t-dim); margin-top: 3px; font-family: 'JetBrains Mono', monospace; }
+
+/* ========== Fresh Agent Mock ========== */
+.fresh-mock { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 260px); overflow: hidden; background: hsl(var(--background)); }
+.fresh-main { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.fresh-summary, .fresh-diffs {
+  margin: 12px 12px 0; border: 1px solid hsl(var(--border) / .65); border-radius: 6px;
+  background: hsl(var(--background) / .85); color: hsl(var(--muted-foreground)); font-size: 13px; padding: 10px 12px;
+}
+.fresh-diffs { color: hsl(var(--foreground)); font-family: 'JetBrains Mono', monospace; font-size: 11px; }
+.fresh-diffs-title, .fresh-rail-title { font-size: 10px; letter-spacing: .16em; text-transform: uppercase; color: hsl(var(--muted-foreground)); margin-bottom: 8px; font-family: inherit; }
+.fresh-transcript { min-height: 0; flex: 1; overflow-x: hidden; overflow-y: auto; padding: 14px 12px; }
+.fresh-turn { border-left: 2px solid hsl(var(--border)); padding-left: 10px; margin-bottom: 14px; }
+.fresh-turn.user { border-left-color: hsl(var(--foreground)); }
+.fresh-role { font-size: 11px; text-transform: uppercase; color: hsl(var(--muted-foreground)); margin-bottom: 6px; }
+.fresh-copy { font-size: 22px; line-height: 1.42; color: hsl(var(--foreground)); }
+.fresh-activity { font: 11px 'JetBrains Mono', monospace; color: hsl(var(--muted-foreground)); margin-bottom: 6px; }
+.fresh-composer { border-top: 1px solid hsl(var(--border) / .6); padding: 10px 12px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: end; }
+.fresh-thinking { grid-column: 1 / -1; height: 7px; width: 80%; justify-self: center; border-radius: 2px; overflow: hidden; background: hsl(var(--muted)); }
+.fresh-thinking span { display: block; height: 100%; width: 40%; background: linear-gradient(90deg, transparent, hsl(var(--foreground) / .22), transparent); }
+.fresh-input { min-height: 38px; border: 1px solid hsl(var(--border)); border-radius: 6px; display: flex; align-items: center; padding: 0 12px; color: hsl(var(--muted-foreground)); font-size: 13px; }
+.fresh-actions { display: flex; gap: 8px; }
+.fresh-action { width: 38px; height: 38px; border: 1px solid hsl(var(--border)); border-radius: 6px; display: flex; align-items: center; justify-content: center; color: hsl(var(--foreground)); }
+.fresh-action.send { background: hsl(var(--foreground)); color: hsl(var(--background)); border-color: hsl(var(--foreground)); }
+.fresh-rail { min-width: 0; border-left: 1px solid hsl(var(--border) / .6); background: hsl(var(--muted) / .2); padding: 12px; overflow: auto; }
+.fresh-rail-section + .fresh-rail-section { margin-top: 14px; }
+.fresh-rail-line { font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; color: hsl(var(--foreground)); }
+
+@media (max-width: 768px) {
+  .fresh-mock { display: flex; flex-direction: column; }
+  .fresh-rail { order: -1; max-height: 120px; border-left: 0; border-bottom: 1px solid hsl(var(--border) / .6); display: flex; gap: 10px; padding: 10px 12px; }
+  .fresh-rail-section { min-width: 170px; border: 1px solid hsl(var(--border) / .55); border-radius: 6px; padding: 8px; }
+  .fresh-composer { grid-template-columns: minmax(0, 1fr); padding-right: 76px; }
+  .fresh-actions { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .fresh-action { width: 100%; }
+}
 </style>
 </head>
 <body>
@@ -634,11 +669,30 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
         </div>
       </div>
 
-      <!-- Get Started -->
+      <!-- Fresh Agent -->
       <div class="tab-panel" id="panel-start">
         <div class="pane">
-          <div class="pane-header active"><i data-lucide="terminal" class="icon"></i><span class="pane-header-title">Terminal — zsh</span><span class="pane-header-meta">~</span><div class="pane-btns"><span class="pane-btn"><i data-lucide="maximize-2" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="x" class="icon-xs"></i></span></div></div>
-          <div class="terminal" id="term-start"></div>
+          <div class="pane-header active"><svg class="icon" viewBox="-0.27 -0.23 16.55 16.55" fill="currentColor"><path d="M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z"/></svg><span class="pane-header-title">Freshcodex</span><span class="pane-header-meta">~/code/freshell</span><div class="pane-btns"><span class="pane-btn"><i data-lucide="refresh-cw" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="settings" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="maximize-2" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="x" class="icon-xs"></i></span></div></div>
+          <div class="fresh-mock">
+            <div class="fresh-main">
+              <div class="fresh-summary">Freshcodex session with bounded metadata rail.</div>
+              <div class="fresh-diffs"><div class="fresh-diffs-title">Diffs</div>src/components/fresh-agent/FreshAgentView.tsx</div>
+              <div class="fresh-transcript">
+                <div class="fresh-turn user"><div class="fresh-role">You</div><div class="fresh-copy">What layout should Fresh clients use on desktop and phone?</div></div>
+                <div class="fresh-turn"><div class="fresh-role">Assistant</div><div class="fresh-activity">thought · 1 tool used</div><div class="fresh-copy">The pane keeps real geometry. Transcript text scales; metadata becomes a rail only when the pane has enough width.</div></div>
+              </div>
+              <div class="fresh-composer">
+                <div class="fresh-thinking"><span></span></div>
+                <div class="fresh-input">Agent is working — sends queue for the next turn</div>
+                <div class="fresh-actions"><div class="fresh-action"><i data-lucide="paperclip" class="icon-xs"></i></div><div class="fresh-action"><i data-lucide="square" class="icon-xs"></i></div><div class="fresh-action"><i data-lucide="command" class="icon-xs"></i></div><div class="fresh-action send"><i data-lucide="send" class="icon-xs"></i></div></div>
+              </div>
+            </div>
+            <aside class="fresh-rail">
+              <div class="fresh-rail-section"><div class="fresh-rail-title">Review</div><div class="fresh-rail-line">pending</div><div class="fresh-rail-line">review-responsive-display</div></div>
+              <div class="fresh-rail-section"><div class="fresh-rail-title">Fork lineage</div><div class="fresh-rail-line">parent-thread-with-long-identifier</div></div>
+              <div class="fresh-rail-section"><div class="fresh-rail-title">Worktrees</div><div class="fresh-rail-line">codex/fresh-client-responsive-display</div></div>
+            </aside>
+          </div>
         </div>
       </div>
     </div>

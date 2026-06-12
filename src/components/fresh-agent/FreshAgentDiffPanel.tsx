@@ -43,10 +43,10 @@ function FreshAgentFileDiff({
   const lines = diff !== null && diff.trim() ? diff.split('\n') : null
 
   return (
-    <div className="border-l-2 border-l-border text-xs">
+    <div className="min-w-0 border-l-2 border-l-border text-xs">
       <button
         type="button"
-        className="flex min-h-[2.75rem] w-full items-center gap-2 rounded-r px-2 py-1 text-left transition-colors hover:bg-accent/50 sm:min-h-0"
+        className="flex min-h-[2.75rem] w-full min-w-0 items-center gap-2 rounded-r px-2 py-1 text-left transition-colors hover:bg-accent/50 sm:min-h-0"
         aria-expanded={expanded}
         aria-label={`Diff: ${label}`}
         onClick={() => {
@@ -55,7 +55,7 @@ function FreshAgentFileDiff({
         }}
       >
         <ChevronRight className={cn('h-3 w-3 shrink-0 transition-transform', expanded && 'rotate-90')} />
-        <span className="truncate font-mono">{label}</span>
+        <span className="min-w-0 flex-1 truncate font-mono">{label}</span>
         {summary.status ? <span className="ml-auto shrink-0 text-muted-foreground">{summary.status}</span> : null}
       </button>
       {expanded ? (
@@ -117,7 +117,7 @@ export function FreshAgentDiffPanel({
 }) {
   if (diffs.length === 0) return null
   return (
-    <div className="rounded-lg border border-border/60 bg-background/70 p-3">
+    <div className="min-w-0 overflow-hidden rounded-lg border border-border/60 bg-background/70 p-3">
       <div className="mb-2 text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Diffs</div>
       <div className="space-y-1">
         {diffs.map((diff) => (

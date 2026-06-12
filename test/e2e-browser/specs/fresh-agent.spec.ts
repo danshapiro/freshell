@@ -278,7 +278,13 @@ test.describe('Fresh Agent', () => {
           tokenUsage: { inputTokens: 10, outputTokens: 20, totalTokens: 30, costUsd: 0 },
           pendingApprovals: [],
           pendingQuestions: [],
-          turns: [],
+          turns: [{
+            id: 'turn-scaled',
+            turnId: 'turn-scaled',
+            role: 'assistant',
+            summary: 'Scaled transcript line',
+            items: [{ id: 'item-scaled', kind: 'text', text: 'Scaled transcript line' }],
+          }],
           extensions: {
             claude: {
               liveSessionId: sessionId,
@@ -319,21 +325,38 @@ test.describe('Fresh Agent', () => {
     // The fresh-agent panes default to 150% (the +50% larger default).
     expect(await readScale()).toBe('1.5')
 
-    const textLine = page.getByText('Scaled summary line')
+    const textLine = paneRoot
+      .locator('article[aria-label="Assistant transcript turn"] p')
+      .filter({ hasText: 'Scaled transcript line' })
+      .first()
     await expect(textLine).toBeVisible()
-    const heightAt150 = (await textLine.boundingBox())!.height
+    const readPositiveTextHeight = async () => {
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const height = await textLine
+          .evaluate((el) => el.getBoundingClientRect().height)
+          .catch(() => 0)
+        if (height > 0) return height
+        await page.waitForTimeout(50)
+      }
+      throw new Error('Scaled transcript line did not have a measurable height')
+    }
+    const heightAt150 = await readPositiveTextHeight()
 
-    // No clipping: the composer textarea stays within the pane at the larger scale.
+    // No clipping or hidden geometry growth: the composer textarea and responsive
+    // layout stay within the pane at the larger transcript scale.
     const composer = paneRoot.locator('textarea').first()
     await expect(composer).toBeVisible()
-    const scaledContent = paneRoot.locator('.fresh-agent-scaled-content')
-    await expect(scaledContent).toBeVisible()
+    const layout = paneRoot.locator('.fresh-agent-layout')
+    await expect(layout).toBeVisible()
     const paneBox = (await paneRoot.boundingBox())!
-    const scaledBox = (await scaledContent.boundingBox())!
-    expect(scaledBox.width).toBeGreaterThanOrEqual(paneBox.width - 2)
-    expect(scaledBox.height).toBeGreaterThanOrEqual(paneBox.height - 2)
+    const layoutBox = (await layout.boundingBox())!
+    expect(layoutBox.width).toBeLessThanOrEqual(paneBox.width + 2)
+    expect(layoutBox.height).toBeLessThanOrEqual(paneBox.height + 2)
     const composerBox = (await composer.boundingBox())!
     expect(composerBox.y + composerBox.height).toBeLessThanOrEqual(paneBox.y + paneBox.height + 2)
+    await expect.poll(async () => paneRoot.evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1)
+    const transcript = paneRoot.locator('[data-context="fresh-agent-transcript"]')
+    await expect.poll(async () => transcript.evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1)
 
     // Shrinking the setting to 100% scales the rendered transcript down ~1.5x.
     await page.evaluate(() => {
@@ -343,7 +366,7 @@ test.describe('Fresh Agent', () => {
       })
     })
     await expect.poll(readScale).toBe('1')
-    const heightAt100 = (await textLine.boundingBox())!.height
+    const heightAt100 = await readPositiveTextHeight()
 
     const ratio = heightAt150 / heightAt100
     expect(ratio).toBeGreaterThan(1.35)
@@ -399,7 +422,8 @@ test.describe('Fresh Agent', () => {
     }, activePaneId)
     await page.getByRole('button', { name: /^Freshcodex$/i }).click()
     await page.getByRole('option').first().click()
-    await expect(page.getByRole('group', { name: /pane: freshcodex/i }).last()).toBeVisible()
+    await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible()
+    await expect(page.getByText('Freshcodex', { exact: true })).toBeVisible()
 
     await page.evaluate(({ currentTabId, currentPaneId }) => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({

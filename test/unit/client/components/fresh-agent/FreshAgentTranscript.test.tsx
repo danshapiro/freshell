@@ -196,7 +196,7 @@ describe('FreshAgentTranscript', () => {
   })
 
   it('shows a live reel while a tool is running', () => {
-    render(
+    const { container } = render(
       <FreshAgentTranscript
         turns={[
           {
@@ -219,6 +219,7 @@ describe('FreshAgentTranscript', () => {
 
     expect(screen.getByLabelText('running')).toBeInTheDocument()
     expect(screen.getByText('Bash')).toBeInTheDocument()
+    expect(container.querySelector('[data-testid="fresh-agent-activity-status-slot"]')).toBeTruthy()
   })
 
   it('treats trailing thinking in the latest turn as live activity', () => {
