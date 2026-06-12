@@ -15,6 +15,11 @@ export type OpencodeExport = {
 }
 
 const STRUCTURAL_PART_TYPES = new Set(['step-start', 'step-finish'])
+const VISIBLE_PART_TYPES = new Set(['text', 'reasoning', 'tool', 'file', 'patch', 'compaction'])
+
+type OpencodeExportWithPageMetadata = OpencodeExport & {
+  nextCursor?: string | null
+}
 
 function modelFromInfo(info: Record<string, any> | undefined): string | undefined {
   const providerId = info?.providerID ?? info?.model?.providerID
@@ -64,7 +69,11 @@ function normalizePatchChange(value: unknown): Record<string, unknown> | undefin
 }
 
 function normalizePatchChanges(files: unknown): Record<string, unknown>[] {
-  const values = Array.isArray(files) ? files : [files]
+  const values = Array.isArray(files)
+    ? files
+    : (typeof files === 'string' || (files && typeof files === 'object' && !Array.isArray(files)))
+        ? [files]
+        : []
   return values
     .map((value) => normalizePatchChange(value))
     .filter((value): value is Record<string, unknown> => Boolean(value))
@@ -113,6 +122,10 @@ function itemFromPart(part: Record<string, any>, fallbackId: string): FreshAgent
 function collectOpencodePartMetadata(messages: NonNullable<OpencodeExport['messages']>): Record<string, unknown> {
   const structuralPartTypes: Array<{ type: string; id?: string; messageId?: string }> = []
   const unsupportedPartTypes: Array<{ type: string; id?: string; messageId?: string }> = []
+  const structuralParts: Array<{ messageId?: string; part: Record<string, any> }> = []
+  const unsupportedParts: Array<{ messageId?: string; part: Record<string, any> }> = []
+  const fileParts: Array<{ messageId?: string; part: Record<string, any> }> = []
+  const compactionParts: Array<{ messageId?: string; part: Record<string, any> }> = []
   const structuralPartCounts: Record<string, number> = {}
 
   messages.forEach((message) => {
@@ -126,20 +139,36 @@ function collectOpencodePartMetadata(messages: NonNullable<OpencodeExport['messa
         ...(typeof part.id === 'string' ? { id: part.id } : {}),
         ...(messageId ? { messageId } : {}),
       }
+      const rawEntry = {
+        ...(messageId ? { messageId } : {}),
+        part,
+      }
       if (STRUCTURAL_PART_TYPES.has(type)) {
         structuralPartTypes.push(entry)
+        structuralParts.push(rawEntry)
         structuralPartCounts[type] = (structuralPartCounts[type] ?? 0) + 1
         return
       }
-      if (!['text', 'reasoning', 'tool', 'file', 'patch', 'compaction'].includes(type)) {
+      if (type === 'file') {
+        fileParts.push(rawEntry)
+        return
+      }
+      if (type === 'compaction') {
+        compactionParts.push(rawEntry)
+        return
+      }
+      if (!VISIBLE_PART_TYPES.has(type)) {
         unsupportedPartTypes.push(entry)
+        unsupportedParts.push(rawEntry)
       }
     })
   })
 
   return {
-    ...(structuralPartTypes.length > 0 ? { structuralPartTypes, structuralPartCounts } : {}),
-    ...(unsupportedPartTypes.length > 0 ? { unsupportedPartTypes } : {}),
+    ...(structuralPartTypes.length > 0 ? { structuralPartTypes, structuralPartCounts, structuralParts } : {}),
+    ...(unsupportedPartTypes.length > 0 ? { unsupportedPartTypes, unsupportedParts } : {}),
+    ...(fileParts.length > 0 ? { fileParts } : {}),
+    ...(compactionParts.length > 0 ? { compactionParts } : {}),
   }
 }
 
@@ -216,11 +245,14 @@ export function normalizeOpencodeSnapshot(input: {
 
 export function normalizeOpencodeTurnPage(input: {
   threadId: string
-  exported?: OpencodeExport
+  exported?: OpencodeExportWithPageMetadata
   revision: number
+  nextCursor?: string | null
 }): FreshAgentTurnPage {
   const messages = Array.isArray(input.exported?.messages) ? input.exported.messages : []
-  const nextCursor = (input.exported as { nextCursor?: unknown } | undefined)?.nextCursor
+  const nextCursor = Object.prototype.hasOwnProperty.call(input, 'nextCursor')
+    ? input.nextCursor
+    : input.exported?.nextCursor
   return {
     sessionType: 'freshopencode',
     provider: 'opencode',

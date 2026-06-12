@@ -43,6 +43,23 @@ describe('OpenCode DB history query', () => {
     return new DatabaseSync(path.join(tempDir, name))
   }
 
+  function instrumentReadDatabase(db: DatabaseSyncInstance): { reader: Parameters<typeof readOpencodeSessionInfo>[0]; events: string[] } {
+    const events: string[] = []
+    return {
+      events,
+      reader: {
+        exec(sql: string) {
+          events.push(sql.trim())
+          return db.exec(sql)
+        },
+        prepare(sql: string) {
+          events.push(`PREPARE:${sql.trim()}`)
+          return db.prepare(sql) as any
+        },
+      },
+    }
+  }
+
   function createOpenCodeSchema(db: DatabaseSyncInstance): void {
     db.exec(`
       CREATE TABLE session (
@@ -275,6 +292,34 @@ describe('OpenCode DB history query', () => {
     }
   })
 
+  it('wraps schema inspection and reads in a transaction for each public read helper', () => {
+    const db = createDatabase()
+    try {
+      seedConversation(db)
+      const { reader, events } = instrumentReadDatabase(db)
+      const reads: Array<[string, () => unknown]> = [
+        ['session info', () => readOpencodeSessionInfo(reader, { sessionId })],
+        ['snapshot page', () => readOpencodeSnapshotPage(reader, { sessionId, limit: 2 })],
+        ['turn page', () => readOpencodeTurnPage(reader, { sessionId, limit: 2 })],
+        ['turn body', () => readOpencodeTurnBody(reader, { sessionId, turnId: 'message-4' })],
+      ]
+
+      for (const [_label, read] of reads) {
+        events.length = 0
+        read()
+        const beginIndex = events.indexOf('BEGIN')
+        const commitIndex = events.indexOf('COMMIT')
+        const firstSchemaPrepareIndex = events.findIndex((event) => event.startsWith('PREPARE:PRAGMA table_info'))
+
+        expect(beginIndex).toBe(0)
+        expect(firstSchemaPrepareIndex).toBeGreaterThan(beginIndex)
+        expect(commitIndex).toBeGreaterThan(firstSchemaPrepareIndex)
+      }
+    } finally {
+      db.close()
+    }
+  })
+
   it('reads the newest snapshot messages in chronological order and reports older history', () => {
     const db = createDatabase()
     try {
@@ -295,22 +340,28 @@ describe('OpenCode DB history query', () => {
     }
   })
 
-  it('pages turns chronologically with an opaque cursor', () => {
+  it('loads the newest turn page first and uses an opaque cursor for older history', () => {
     const db = createDatabase()
     try {
       seedConversation(db)
 
       const first = readOpencodeTurnPage(db, { sessionId, limit: 2 })
-      const expectedCursor = encodeOpencodeCursor({ timeCreated: baseTime + 2_000, id: 'message-2' })
+      const expectedCursor = encodeOpencodeCursor({ timeCreated: baseTime + 4_000, id: 'message-4' })
 
-      expect(first.messages.map((message) => message.info.id)).toEqual(['message-1', 'message-2'])
+      expect(first.messages.map((message) => message.info.id)).toEqual(['message-4', 'message-5'])
       expect(first.nextCursor).toBe(expectedCursor)
-      expect(first.nextCursor).not.toContain('message-2')
+      expect(first.nextCursor).not.toContain('message-4')
+      expect(first.hasMoreBefore).toBe(true)
 
       const second = readOpencodeTurnPage(db, { sessionId, limit: 2, cursor: first.nextCursor })
-      expect(second.messages.map((message) => message.info.id)).toEqual(['message-3', 'message-4'])
+      expect(second.messages.map((message) => message.info.id)).toEqual(['message-2', 'message-3'])
       expect(second.nextCursor).toEqual(expect.any(String))
       expect(second.nextCursor).not.toEqual(first.nextCursor)
+
+      const third = readOpencodeTurnPage(db, { sessionId, limit: 2, cursor: second.nextCursor })
+      expect(third.messages.map((message) => message.info.id)).toEqual(['message-1'])
+      expect(third.nextCursor).toBeNull()
+      expect(third.hasMoreBefore).toBe(false)
     } finally {
       db.close()
     }
@@ -331,16 +382,16 @@ describe('OpenCode DB history query', () => {
       insertPart(db, 'part-d', 'message-d', { type: 'text', text: 'Final message.' })
 
       const first = readOpencodeTurnPage(db, { sessionId, limit: 2 })
-      const expectedCursor = encodeOpencodeCursor({ timeCreated: baseTime + 2_000, id: 'message-b' })
+      const expectedCursor = encodeOpencodeCursor({ timeCreated: baseTime + 2_000, id: 'message-c' })
 
-      expect(first.messages.map((message) => message.info.id)).toEqual(['message-a', 'message-b'])
+      expect(first.messages.map((message) => message.info.id)).toEqual(['message-c', 'message-d'])
       expect(first.nextCursor).toBe(expectedCursor)
 
       const second = readOpencodeTurnPage(db, { sessionId, limit: 2, cursor: first.nextCursor })
-      expect(second.messages.map((message) => message.info.id)).toEqual(['message-c', 'message-d'])
+      expect(second.messages.map((message) => message.info.id)).toEqual(['message-a', 'message-b'])
       expect(second.nextCursor).toBeNull()
 
-      const pagedIds = [...first.messages, ...second.messages].map((message) => message.info.id)
+      const pagedIds = [...second.messages, ...first.messages].map((message) => message.info.id)
       expect(pagedIds).toEqual(['message-a', 'message-b', 'message-c', 'message-d'])
       expect(new Set(pagedIds).size).toBe(pagedIds.length)
     } finally {

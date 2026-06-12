@@ -407,18 +407,20 @@ export function readOpencodeSessionInfo(
   db: DatabaseLike,
   input: { sessionId: string },
 ): OpencodeSessionInfo | undefined {
-  const sessionColumns = requireColumns(db, 'session', SESSION_REQUIRED_COLUMNS)
-  const row = readSessionRow(db, input.sessionId, sessionColumns)
-  return row ? hydrateSessionInfo(row) : undefined
+  return withReadTransaction(db, () => {
+    const sessionColumns = requireColumns(db, 'session', SESSION_REQUIRED_COLUMNS)
+    const row = readSessionRow(db, input.sessionId, sessionColumns)
+    return row ? hydrateSessionInfo(row) : undefined
+  })
 }
 
 export function readOpencodeSnapshotPage(
   db: DatabaseLike,
   input: { sessionId: string; limit?: number },
 ): OpencodeHistoryExportPage | undefined {
-  const { sessionColumns } = requireHistorySchema(db)
   const limit = normalizeLimit(input.limit, DEFAULT_SNAPSHOT_TURN_LIMIT)
   return withReadTransaction(db, () => {
+    const { sessionColumns } = requireHistorySchema(db)
     const sessionRow = readSessionRow(db, input.sessionId, sessionColumns)
     if (!sessionRow) return undefined
     const info = hydrateSessionInfo(sessionRow)
@@ -445,15 +447,15 @@ export function readOpencodeTurnPage(
   db: DatabaseLike,
   input: { sessionId: string; cursor?: string; limit?: number },
 ): OpencodeHistoryExportPage | undefined {
-  const { sessionColumns } = requireHistorySchema(db)
   const limit = normalizeLimit(input.limit, DEFAULT_SNAPSHOT_TURN_LIMIT)
   const cursor = input.cursor ? decodeOpencodeCursor(input.cursor) : undefined
   return withReadTransaction(db, () => {
+    const { sessionColumns } = requireHistorySchema(db)
     const sessionRow = readSessionRow(db, input.sessionId, sessionColumns)
     if (!sessionRow) return undefined
     const info = hydrateSessionInfo(sessionRow)
     const cursorClause = cursor
-      ? 'AND (time_created > ? OR (time_created = ? AND id > ?))'
+      ? 'AND (time_created < ? OR (time_created = ? AND id < ?))'
       : ''
     const cursorParams = cursor ? [cursor.time, cursor.time, cursor.id] : []
     const rows = db.prepare(`
@@ -461,20 +463,20 @@ export function readOpencodeTurnPage(
       FROM message
       WHERE session_id = ?
         ${cursorClause}
-      ORDER BY time_created ASC, id ASC
+      ORDER BY time_created DESC, id DESC
       LIMIT ?
     `).all(input.sessionId, ...cursorParams, limit + 1) as MessageRow[]
     const pageRows = rows.slice(0, limit)
-    const messages = hydrateMessages(db, input.sessionId, pageRows)
-    const lastRow = pageRows.at(-1)
-    const nextCursor = rows.length > limit && lastRow
-      ? encodeOpencodeCursor({ time: numberValue(lastRow.time_created) ?? 0, id: String(lastRow.id) })
+    const messages = hydrateMessages(db, input.sessionId, [...pageRows].reverse())
+    const oldestReturnedRow = pageRows.at(-1)
+    const nextCursor = rows.length > limit && oldestReturnedRow
+      ? encodeOpencodeCursor({ time: numberValue(oldestReturnedRow.time_created) ?? 0, id: String(oldestReturnedRow.id) })
       : null
     const exported = { info, messages }
     return makePage(exported, {
       revision: revisionFromInfo(info),
       nextCursor,
-      hasMoreBefore: Boolean(cursor),
+      hasMoreBefore: rows.length > limit,
       totalMessages: countMessages(db, input.sessionId),
     })
   })
@@ -484,8 +486,8 @@ export function readOpencodeTurnBody(
   db: DatabaseLike,
   input: { sessionId: string; turnId: string },
 ): OpencodeHistoryTurnBody | null {
-  const { sessionColumns } = requireHistorySchema(db)
   return withReadTransaction(db, () => {
+    const { sessionColumns } = requireHistorySchema(db)
     const sessionRow = readSessionRow(db, input.sessionId, sessionColumns)
     if (!sessionRow) return null
     const info = hydrateSessionInfo(sessionRow)
