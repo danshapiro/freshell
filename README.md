@@ -140,7 +140,7 @@ Drop a directory with a `freshell.json` manifest into `~/.freshell/extensions/` 
 
 ## Contributing
 
-Contributions are welcome. Start from `origin/main`, submit a Pull Request against `main`, and keep behavior changes on PR branches. Local development self-hosting uses the `dev` integration branch described in [docs/development/branch-model.md](docs/development/branch-model.md).
+Contributions are welcome. Start from `origin/main` in a worktree, submit a Pull Request against `main`, and keep behavior changes on PR branches. After a PR merges, update local `main` from `origin/main`. See [docs/development/branch-model.md](docs/development/branch-model.md).
 
 ## Community Projects
 

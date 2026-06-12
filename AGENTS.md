@@ -13,9 +13,9 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 ## Repo Rules
 - Always work in a worktree (in \.worktrees\)
 - Before creating a new worktree, ensure the repo-supported test suite is green on the intended base. If the suite is not green, pause before creating the worktree and notify the user with the failing command and failure summary.
-- New behavior changes start on a worktree branch from `origin/main` and are submitted as PRs to `origin/main`; local `dev` only consumes PR heads.
+- New behavior changes start on a worktree branch from `origin/main` and are submitted as PRs targeting `main`.
 - Everything goes through a PR — never push behavior changes directly to `origin/main`.
-- Merge PRs once their required checks pass; self-merging your own PRs is the norm. The only exception is a PR the user has said needs someone else to approve it first — leave those unmerged.
+- Merge PRs once their required checks pass, then bring `origin/main` down to local `main`. Self-merging your own PRs is the norm. The only exception is a PR the user has said needs someone else to approve it first — leave those unmerged.
 - Many agents may be working in the worktree at the same time. If you see activity from other agents (for example test runs or file changes), respect it.
 - Specific user instructions override ALL other instructions, including the above, and including superpowers or skills
 - Server uses NodeNext/ESM; relative imports must include `.js` extensions
@@ -35,17 +35,14 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 
 ## Branch Model And Self-Hosting (CRITICAL - Read This)
 
-**This checkout is self-hosted from local `dev`, not local `main`.**
+**Freshell no longer uses a local `dev` integration branch.**
 
-- Local `main` is a mirror of `origin/main`; do not commit to it, merge into it, or self-host from it.
-- Local `dev` is the self-hosted integration branch. It is rebuilt from `origin/main` plus pending PR heads.
-- The repo root normally remains on local `main`; use `.worktrees/dev` as the self-hosted integration checkout and create separate worktrees for authored changes.
-- Do not edit production behavior directly on `dev`.
-- If a change is needed on `dev`, create or update a PR against `origin/main`, then apply that PR head to `dev`.
-- If applying a PR to `dev` needs semantic conflict resolution, stop and fix the PR branch or create a replacement PR. Do not hide behavior changes in a local-only `dev` merge commit.
-- Never run `git merge` directly on `main`.
-- Never reset, force-push, or fast-forward local `main` during ordinary work. If the user explicitly asks to refresh the mirror, first verify Freshell is self-hosting from `dev` and local `main` has no work to preserve.
-- Self-merge is the norm: once a PR's required checks pass, merge it rather than waiting for outside review. `dev` may carry pending PR heads that haven't merged yet, which is fine. The only PRs to leave unmerged are ones the user has flagged as needing someone else's approval first.
+- `main` is the only integration branch. Local `main` should track the merged state of `origin/main`.
+- Author changes in dedicated `.worktrees/<slug>` worktrees on feature branches created from `origin/main`.
+- Do not commit behavior changes directly to local `main` or push them directly to `origin/main`.
+- When a change is ready, push the feature branch, open a PR targeting `main`, wait for required checks, merge the PR, then update local `main` from `origin/main`.
+- Update local `main` with a fast-forward pull or merge only. If local `main` has local-only commits, a dirty worktree, or cannot fast-forward, stop and resolve that explicitly instead of creating a local merge commit.
+- Delete or retire obsolete local `dev` worktrees/branches after confirming they are not running the self-hosted Freshell process.
 
 ## Process Safety (CRITICAL)
 
@@ -56,7 +53,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
   - **NEVER run `node dist/server/index.js` directly** — use `npm start` which sets `NODE_ENV=production`; without it the server prints the Vite port (5173) in the startup URL even though Vite isn't running
 - Example stop: `kill "$(cat /tmp/freshell-3344.pid)" && rm -f /tmp/freshell-3344.pid`
 - Before stopping any process, verify it belongs to the worktree (`ps -fp <pid>` and confirm cwd/path includes `.worktrees/...`).
-- **The self-hosted dev server must never be restarted without explicit user approval (the word "APPROVED").** Building is fine; deploying (stop + start) is not. The user's current Freshell session depends on it, and an unapproved restart will disconnect them mid-operation.
+- **The self-hosted Freshell server must never be restarted without explicit user approval (the word "APPROVED").** Building is fine; deploying (stop + start) is not. The user's current Freshell session depends on it, and an unapproved restart will disconnect them mid-operation.
 
 ## Codex Agent in CMD Instructions (Codex agents only; only when running in CMD on windows; all other agents must ignore)
 - Prefer bash/WSL over PowerShell; Windows paths map like `D:\...` -> `/mnt/d/...`.

@@ -2,7 +2,6 @@
 import { checkForUpdate } from './version-checker.js'
 import { promptForUpdate } from './prompt.js'
 import { executeUpdate, type UpdateProgress } from './executor.js'
-import { shouldSkipSourceUpdateForBranch } from '../../shared/selfhost-branch-policy.js'
 
 export type UpdateAction = 'none' | 'updated' | 'skipped' | 'error' | 'check-failed'
 
@@ -79,6 +78,12 @@ export interface SkipCheckOptions {
   branch?: string
 }
 
+function shouldSkipSourceUpdateForBranch(branch: string | undefined): boolean {
+  const currentBranch = branch?.trim()
+  if (!currentBranch) return true
+  return currentBranch !== 'main'
+}
+
 export function shouldSkipUpdateCheck(options: SkipCheckOptions = {}): boolean {
   const argv = options.argv ?? process.argv
   const env = options.env ?? process.env
@@ -86,7 +91,7 @@ export function shouldSkipUpdateCheck(options: SkipCheckOptions = {}): boolean {
   if (argv.includes('--skip-update-check')) return true
   if (env.SKIP_UPDATE_CHECK === 'true') return true
   if (env.npm_lifecycle_event === 'predev') return true
-  if (shouldSkipSourceUpdateForBranch({ branch: options.branch, env })) return true
+  if (shouldSkipSourceUpdateForBranch(options.branch)) return true
 
   return false
 }

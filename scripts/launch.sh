@@ -34,9 +34,6 @@ if [[ -f "$PID_FILE" ]]; then
   fi
 fi
 
-echo "Checking self-host branch..."
-npx tsx scripts/selfhost-branch.ts validate-launch
-
 # Build
 echo "Building..."
 npm run build

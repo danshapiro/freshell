@@ -401,17 +401,7 @@ describe('update orchestrator', () => {
       expect(result).toBe(false)
     })
 
-    it('skips update checks on dev branch', () => {
-      const result = shouldSkipUpdateCheck({
-        argv: ['node', 'script.js'],
-        env: {},
-        branch: 'dev',
-      })
-
-      expect(result).toBe(true)
-    })
-
-    it('skips update checks on feature branches', () => {
+    it('skips source update checks on non-main branches', () => {
       const result = shouldSkipUpdateCheck({
         argv: ['node', 'script.js'],
         env: {},

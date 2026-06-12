@@ -16,8 +16,6 @@
     "dev": "tsx scripts/run-with-default-port.ts concurrently -n client,server -c blue,green \"vite\" \"tsx watch server/index.ts\"",
     "dev:client": "vite",
     "dev:server": "tsx scripts/run-with-default-port.ts tsx watch server/index.ts",
-    "dev:queue": "tsx scripts/dev-pr-queue.ts",
-    "selfhost:check-branch": "tsx scripts/selfhost-branch.ts validate-launch",
     "typecheck": "npm run typecheck:client && npm run typecheck:server",
     "typecheck:client": "tsc -p tsconfig.json --noEmit",
     "typecheck:server": "tsc -p tsconfig.server.json --noEmit",
