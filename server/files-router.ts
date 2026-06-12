@@ -6,6 +6,7 @@ import {
   isPathAllowed,
   isReachableDirectory,
   normalizeUserPath,
+  sanitizeUserPathInput,
   toFilesystemPath,
 } from './path-utils.js'
 import { detectPlatform } from './platform.js'
@@ -30,6 +31,25 @@ async function resolveUserFilesystemPath(input: string): Promise<string> {
   return toFilesystemPath(normalizedPath, flavor)
 }
 
+function readRequestString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined
+}
+
+function isAbsoluteUserPath(input: string): boolean {
+  const cleaned = sanitizeUserPathInput(input)
+  if (!cleaned) return false
+  return cleaned.startsWith('~') || path.posix.isAbsolute(cleaned) || path.win32.isAbsolute(cleaned)
+}
+
+function resolveCompletionInput(prefix: string, root?: string): string {
+  const cleanedRoot = root ? sanitizeUserPathInput(root) : ''
+  if (!cleanedRoot || isAbsoluteUserPath(prefix)) return prefix
+
+  const { normalizedPath: rootPath, flavor } = normalizeUserPath(cleanedRoot)
+  const pathModule = getPathModuleForFlavor(flavor)
+  return pathModule.resolve(rootPath, sanitizeUserPathInput(prefix))
+}
+
 export function createFilesRouter(deps: FilesRouterDeps): Router {
   const { configStore, codingCliIndexer, registry } = deps
   const router = Router()
@@ -40,7 +60,14 @@ export function createFilesRouter(deps: FilesRouterDeps): Router {
    * When allowedFilePaths is empty/undefined, all paths are allowed (backward compatible).
    */
   async function validatePath(req: Request, res: Response, next: NextFunction) {
-    const filePath = (req.query.path as string) || (req.query.prefix as string) || req.body?.path
+    const queryPath = readRequestString(req.query.path)
+    const queryPrefix = readRequestString(req.query.prefix)
+    const queryRoot = readRequestString(req.query.root)
+    const bodyPath = readRequestString(req.body?.path)
+    const completionPath = queryPrefix
+      ? resolveCompletionInput(queryPrefix, queryRoot)
+      : undefined
+    const filePath = queryPath || completionPath || bodyPath
     if (!filePath) {
       return next()
     }
@@ -139,13 +166,15 @@ export function createFilesRouter(deps: FilesRouterDeps): Router {
   })
 
   router.get('/complete', validatePath, async (req, res) => {
-    const prefix = req.query.prefix as string
+    const prefix = readRequestString(req.query.prefix)
+    const root = readRequestString(req.query.root)
     const dirsOnly = req.query.dirs === 'true' || req.query.dirs === '1'
     if (!prefix) {
       return res.status(400).json({ error: 'prefix query parameter required' })
     }
 
-    const { normalizedPath, flavor } = normalizeUserPath(prefix)
+    const completionInput = resolveCompletionInput(prefix, root)
+    const { normalizedPath, flavor } = normalizeUserPath(completionInput)
     const pathModule = getPathModuleForFlavor(flavor)
     const resolvedFsPath = await toFilesystemPath(normalizedPath, flavor)
 
