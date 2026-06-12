@@ -2574,6 +2574,7 @@ describe('FreshAgentView font scale', () => {
     const root = document.querySelector('[data-context="fresh-agent"]') as HTMLElement
     expect(root).toBeTruthy()
     expect(root.style.getPropertyValue('--fresh-font-scale')).toBe('1.5')
+    expect(root.querySelector('.fresh-agent-scaled-content')).toBeTruthy()
 
     await act(async () => {
       await Promise.resolve()

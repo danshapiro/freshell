@@ -15,14 +15,13 @@ html {
   font-size: calc(100% * var(--ui-scale, 1.25));
 }
 
-/* Fresh-agent panes render at a user-configurable scale (Settings → Workspace →
-   Fresh agent → Font size; default 150%). FreshAgentView sets --fresh-font-scale
-   on the pane root. `zoom` scales the whole pane proportionally so every text
-   size — including markdown prose and responsive variants — grows together; the
-   width/height compensation keeps the (block-filling) pane exactly inside its
-   slot instead of overflowing by the scale factor. */
-[data-context="fresh-agent"] {
-  zoom: var(--fresh-font-scale, 1);
+/* Fresh-agent panes render at a user-configurable scale (Settings -> Workspace
+   -> Fresh agent -> Font size; default 150%). Keep the pane root at full size
+   and scale only its content surface; shrinking the root itself leaves blank
+   space in the surrounding pane layout. */
+.fresh-agent-scaled-content {
+  transform: scale(var(--fresh-font-scale, 1));
+  transform-origin: top left;
   width: calc(100% / var(--fresh-font-scale, 1));
   height: calc(100% / var(--fresh-font-scale, 1));
 }

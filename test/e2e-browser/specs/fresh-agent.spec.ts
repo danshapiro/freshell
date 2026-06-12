@@ -326,7 +326,12 @@ test.describe('Fresh Agent', () => {
     // No clipping: the composer textarea stays within the pane at the larger scale.
     const composer = paneRoot.locator('textarea').first()
     await expect(composer).toBeVisible()
+    const scaledContent = paneRoot.locator('.fresh-agent-scaled-content')
+    await expect(scaledContent).toBeVisible()
     const paneBox = (await paneRoot.boundingBox())!
+    const scaledBox = (await scaledContent.boundingBox())!
+    expect(scaledBox.width).toBeGreaterThanOrEqual(paneBox.width - 2)
+    expect(scaledBox.height).toBeGreaterThanOrEqual(paneBox.height - 2)
     const composerBox = (await composer.boundingBox())!
     expect(composerBox.y + composerBox.height).toBeLessThanOrEqual(paneBox.y + paneBox.height + 2)
 

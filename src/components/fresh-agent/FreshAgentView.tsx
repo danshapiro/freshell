@@ -1158,12 +1158,12 @@ export function FreshAgentView({
       >
         {WatermarkIcon ? (
           <WatermarkIcon
-            className="pointer-events-none absolute left-1/2 top-1/2 z-0 h-[min(34rem,64%)] w-[min(34rem,64%)] -translate-x-1/2 -translate-y-1/2 text-foreground opacity-5"
+            className="pointer-events-none absolute left-1/2 top-1/2 z-0 h-[min(34rem,64%)] w-[min(34rem,64%)] -translate-x-1/2 -translate-y-1/2 text-foreground opacity-[0.01]"
             aria-hidden="true"
             data-testid="fresh-agent-watermark"
           />
         ) : null}
-        <div className="relative z-10 flex min-h-0 flex-1">
+        <div className="fresh-agent-scaled-content relative z-10 flex min-h-0">
           <div className="flex min-h-0 flex-1 flex-col">
             <div className="space-y-2 px-3 pt-3">
               {isRestoring ? (
