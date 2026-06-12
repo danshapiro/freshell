@@ -62,6 +62,8 @@ npm run dev     # Development with hot reload
 npm run serve   # Production build and run
 ```
 
+`npm run serve` is intended for `main`. If you run it from another branch, Freshell asks for confirmation in an interactive terminal and refuses in non-interactive shells unless `FRESHELL_ALLOW_NON_MAIN_SERVE=1` is set.
+
 ## Keyboard Shortcuts
 
 <!-- Canonical source: src/lib/keyboard-shortcuts.ts -->

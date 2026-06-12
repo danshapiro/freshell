@@ -14,6 +14,7 @@ import { execFileSync } from 'child_process'
 import { resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { createRequire } from 'module'
+import { createInterface } from 'readline/promises'
 import { runUpdateCheck, shouldSkipUpdateCheck } from '../server/updater/index.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -40,6 +41,54 @@ function getCurrentBranch(): string | undefined {
     }).trim() || undefined
   } catch {
     return undefined
+  }
+}
+
+function isServePrecheck(): boolean {
+  return process.env.FRESHELL_PRECHECK_INTENT === 'serve'
+}
+
+function allowsNonMainServe(): boolean {
+  const value = process.env.FRESHELL_ALLOW_NON_MAIN_SERVE?.trim().toLowerCase()
+  return value === '1' || value === 'true' || value === 'yes'
+}
+
+function formatBranchForMessage(branch: string | undefined): string {
+  return branch ? `branch "${branch}"` : 'an unknown Git branch'
+}
+
+async function confirmServeFromNonMain(branch: string | undefined): Promise<boolean> {
+  const rl = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  })
+
+  try {
+    const answer = await rl.question(
+      `You are about to serve Freshell from ${formatBranchForMessage(branch)}, not "main". Continue? [y/N] `,
+    )
+    const normalized = answer.trim().toLowerCase()
+    return normalized === 'y' || normalized === 'yes'
+  } finally {
+    rl.close()
+  }
+}
+
+async function confirmServeBranchIfNeeded(branch: string | undefined): Promise<void> {
+  if (!isServePrecheck() || branch === 'main' || allowsNonMainServe()) {
+    return
+  }
+
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.error(`\n\x1b[31m✖ Refusing to run npm run serve from ${formatBranchForMessage(branch)} without confirmation.\x1b[0m`)
+    console.error('Check out main first, or set FRESHELL_ALLOW_NON_MAIN_SERVE=1 if this is intentional.\n')
+    process.exit(1)
+  }
+
+  const confirmed = await confirmServeFromNonMain(branch)
+  if (!confirmed) {
+    console.error('\nServe cancelled. Check out main before serving Freshell.\n')
+    process.exit(1)
   }
 }
 
@@ -194,8 +243,11 @@ async function checkVitePort(): Promise<PortCheckResult> {
 }
 
 async function main(): Promise<void> {
+  const currentBranch = getCurrentBranch()
+  await confirmServeBranchIfNeeded(currentBranch)
+
   // 1. Check for updates first (before anything else can fail)
-  if (!shouldSkipUpdateCheck({ branch: getCurrentBranch() })) {
+  if (!shouldSkipUpdateCheck({ branch: currentBranch })) {
     const currentVersion = getPackageVersion()
     const updateResult = await runUpdateCheck(currentVersion)
 
@@ -226,7 +278,7 @@ async function main(): Promise<void> {
   }
 
   // 3. Check for port conflicts
-  // Only check Vite port in dev mode (predev), not production (preserve)
+  // Only check Vite port in dev mode (predev), not production (serve:precheck)
   const isDevMode = process.env.npm_lifecycle_event === 'predev'
 
   const serverCheck = await checkServerPort(SERVER_PORT)

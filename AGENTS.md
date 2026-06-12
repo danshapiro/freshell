@@ -78,6 +78,8 @@ npm run build               # Full build (client + server)
 npm run build:client        # Vite build → dist/client
 npm run build:server        # TypeScript compile → dist/server
 npm run serve               # Build and run production server
+# `npm run serve` prompts before serving from a non-main branch; use
+# `FRESHELL_ALLOW_NON_MAIN_SERVE=1 npm run serve` only when intentional.
 # Note: `npm run build` is guarded — it will refuse to overwrite dist/
 # if a production server is detected on the configured PORT. Use
 # `npm run check` for safe verification, or build from a worktree.

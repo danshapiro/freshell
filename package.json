@@ -12,7 +12,6 @@
   },
   "scripts": {
     "predev": "tsx scripts/run-with-default-port.ts tsx scripts/precheck.ts",
-    "preserve": "tsx scripts/precheck.ts",
     "dev": "tsx scripts/run-with-default-port.ts concurrently -n client,server -c blue,green \"vite\" \"tsx watch server/index.ts\"",
     "dev:client": "vite",
     "dev:server": "tsx scripts/run-with-default-port.ts tsx watch server/index.ts",
@@ -33,7 +32,8 @@
     "electron:build:win": "tsx scripts/assert-native-windows-build.ts && npm run build && npm run build:electron && npm run build:wizard && npm run build:launch-chooser && npm run prepare:bundled-node && electron-builder --win nsis --publish never",
     "prepare:bundled-node": "tsx scripts/prepare-bundled-node.ts",
     "start": "cross-env NODE_ENV=production node dist/server/index.js",
-    "serve": "npm run build && npm run start",
+    "serve:precheck": "cross-env FRESHELL_PRECHECK_INTENT=serve tsx scripts/precheck.ts",
+    "serve": "npm run serve:precheck && npm run build && npm run start",
     "test": "tsx scripts/testing/test-coordinator.ts run test",
     "test:balanced": "tsx scripts/run-standard-tests.ts",
     "test:sequential": "vitest run && vitest run --config vitest.server.config.ts && vitest run --config vitest.electron.config.ts",
