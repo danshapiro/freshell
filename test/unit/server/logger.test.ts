@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest"
 import os from "os"
 import path from "path"
 import fsp from "fs/promises"
-import { Writable } from "stream"
+import { Writable } from "node:stream"
 
 describe("logger", () => {
   const originalEnv = { ...process.env }

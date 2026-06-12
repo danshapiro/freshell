@@ -29,7 +29,7 @@ import http from 'http'
 import https from 'https'
 import { createRequire } from 'module'
 import path from 'path'
-import { pipeline } from 'stream/promises'
+import { pipeline } from 'node:stream/promises'
 import { fileURLToPath } from 'url'
 import tar from 'tar'
 
