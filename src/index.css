@@ -21,6 +21,14 @@ html {
 .fresh-agent-pane {
   container-type: inline-size;
   --fresh-transcript-font-size: 16px;
+  --fresh-agent-copy-font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --fresh-agent-meta-font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --fresh-agent-surface: hsl(var(--background));
+  --fresh-agent-panel-surface: hsl(var(--card));
+  --fresh-agent-subtle-surface: hsl(var(--muted) / 0.4);
+  --fresh-agent-border: hsl(var(--border) / 0.6);
+  --fresh-agent-text: hsl(var(--foreground));
+  --fresh-agent-muted-text: hsl(var(--muted-foreground));
 }
 
 .fresh-agent-layout {
@@ -82,6 +90,59 @@ html {
 .fresh-agent-transcript-copy [data-markdown-body] :where(p, li, blockquote, pre, code) {
   font-size: inherit;
   line-height: inherit;
+}
+
+.fresh-agent-style-serif {
+  --fresh-agent-copy-font-family: ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
+  --fresh-agent-meta-font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --fresh-agent-surface: #ffffff;
+  --fresh-agent-panel-surface: #fbfaf8;
+  --fresh-agent-subtle-surface: #f6f2ec;
+  --fresh-agent-border: color-mix(in srgb, hsl(var(--border)) 72%, #b47d3c 28%);
+  --fresh-agent-text: #221f1b;
+  --fresh-agent-muted-text: #696159;
+  background: var(--fresh-agent-surface);
+  color: var(--fresh-agent-text);
+}
+
+.dark .fresh-agent-style-serif {
+  --fresh-agent-surface: #141311;
+  --fresh-agent-panel-surface: #1c1a17;
+  --fresh-agent-subtle-surface: #25211d;
+  --fresh-agent-border: color-mix(in srgb, hsl(var(--border)) 74%, #c59b6a 26%);
+  --fresh-agent-text: #f4efe7;
+  --fresh-agent-muted-text: #b8aea2;
+}
+
+.fresh-agent-style-serif .fresh-agent-transcript-copy {
+  color: var(--fresh-agent-text);
+  font-family: var(--fresh-agent-copy-font-family);
+  line-height: 1.42;
+}
+
+.fresh-agent-style-serif .fresh-agent-transcript-copy [data-markdown-body] :where(h1, h2, h3, h4) {
+  color: var(--fresh-agent-text);
+  font-family: var(--fresh-agent-copy-font-family);
+  font-weight: 650;
+  letter-spacing: 0;
+}
+
+.fresh-agent-style-serif .fresh-agent-transcript-copy [data-markdown-body] :where(p, li, blockquote) {
+  color: var(--fresh-agent-text);
+}
+
+.fresh-agent-style-serif .fresh-agent-transcript-copy [data-markdown-body] :where(pre, code) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+.fresh-agent-style-serif .fresh-agent-sidebar,
+.fresh-agent-style-serif .fresh-agent-sidebar-section {
+  border-color: var(--fresh-agent-border);
+}
+
+.fresh-agent-style-serif .fresh-agent-sidebar-section,
+.fresh-agent-style-serif .fresh-agent-transcript-copy [data-markdown-body] blockquote {
+  background: var(--fresh-agent-subtle-surface);
 }
 
 .fresh-agent-composer {
