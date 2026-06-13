@@ -540,6 +540,7 @@ test.describe('Fresh Agent', () => {
     await terminal.waitForTerminal()
     const { tabId, paneId } = await getActiveLeaf(harness)
     const sessionId = '44444444-4444-4444-8444-444444444444'
+    await suppressFreshAgentNetworkForActivePane(page)
 
     await page.route(`**/api/fresh-agent/threads/freshclaude/claude/${sessionId}*`, async (route) => {
       await route.fulfill({
@@ -606,7 +607,7 @@ test.describe('Fresh Agent', () => {
     expect(await readTranscriptFontSize()).toBe('16px')
 
     const textLine = paneRoot
-      .locator('article[aria-label="Assistant transcript turn"] p')
+      .locator('article[aria-label="Freshclaude transcript turn"] p')
       .filter({ hasText: 'Terminal-sized transcript line' })
       .first()
     await expect(textLine).toBeVisible()

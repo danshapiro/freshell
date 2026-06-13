@@ -52,6 +52,48 @@ const EARLY_STATES = new Set(['creating', 'starting'])
 const BUSY_STATES = new Set(['running', 'compacting'])
 const log = createLogger('FreshAgentView')
 
+function getSnapshotIdentity(snapshot: FreshAgentSnapshot): string | null {
+  if (!snapshot.sessionType || !snapshot.provider || !snapshot.threadId) return null
+  return `${snapshot.sessionType}:${snapshot.provider}:${snapshot.threadId}`
+}
+
+function getTurnKey(turn: FreshAgentTurn): string {
+  return (turn as { turnId?: string }).turnId ?? turn.id
+}
+
+function isSnapshotInFlight(snapshot: FreshAgentSnapshot): boolean {
+  return snapshot.status === 'running' || snapshot.status === 'compacting'
+}
+
+function mergeSnapshotForDisplay(
+  previous: FreshAgentSnapshot | null,
+  next: FreshAgentSnapshot,
+): FreshAgentSnapshot {
+  if (!previous) return next
+  const previousIdentity = getSnapshotIdentity(previous)
+  const nextIdentity = getSnapshotIdentity(next)
+  if (!previousIdentity || previousIdentity !== nextIdentity) return next
+  if (
+    typeof previous.revision === 'number'
+    && typeof next.revision === 'number'
+    && next.revision < previous.revision
+  ) {
+    return previous
+  }
+  if (next.turns.length >= previous.turns.length || !isSnapshotInFlight(next)) return next
+
+  const nextByKey = new Map(next.turns.map((turn) => [getTurnKey(turn), turn]))
+  const previousKeys = new Set(previous.turns.map(getTurnKey))
+  const mergedTurns = previous.turns.map((turn) => nextByKey.get(getTurnKey(turn)) ?? turn)
+  for (const turn of next.turns) {
+    if (!previousKeys.has(getTurnKey(turn))) {
+      mergedTurns.push(turn)
+    }
+  }
+
+  return { ...next, turns: mergedTurns }
+}
+
 function getEffectiveFreshAgentModel(content: FreshAgentPaneContent): string | undefined {
   return normalizeFreshAgentModel(content.sessionType, content.provider, content.model)
 }
@@ -316,6 +358,11 @@ export function FreshAgentView({
   })
   const refreshRequest = useAppSelector((state) => state.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
   const [snapshot, setSnapshot] = useState<FreshAgentSnapshot | null>(null)
+  const snapshotRef = useRef<FreshAgentSnapshot | null>(null)
+  const commitSnapshot = useCallback((next: FreshAgentSnapshot | null) => {
+    snapshotRef.current = next
+    setSnapshot(next)
+  }, [])
   const [loadError, setLoadError] = useState<string | null>(null)
   const [snapshotRefreshNonce, setSnapshotRefreshNonce] = useState(0)
   const [queuedMessages, setQueuedMessages] = useState<string[]>([])
@@ -537,7 +584,7 @@ export function FreshAgentView({
         provider: current.provider,
       })
     }
-    setSnapshot(null)
+    commitSnapshot(null)
     setLoadError(null)
     setQueuedMessages([])
     setLocalEcho(null)
@@ -557,7 +604,7 @@ export function FreshAgentView({
         status: 'creating',
       },
     }))
-  }, [dispatch, paneId, sendFreshAgentMessage, tabId])
+  }, [commitSnapshot, dispatch, paneId, sendFreshAgentMessage, tabId])
 
   const sendFork = useCallback((atTurnId?: string) => {
     const current = paneContentRef.current
@@ -605,7 +652,7 @@ export function FreshAgentView({
     if (!paneRefreshTargetMatchesContent(refreshRequest.target, current)) return
 
     handledRefreshRequestIdRef.current = refreshRequest.requestId
-    setSnapshot(null)
+    commitSnapshot(null)
     setLoadError(null)
 
     if (current.sessionId) {
@@ -629,7 +676,7 @@ export function FreshAgentView({
     }
 
     dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: refreshRequest.requestId }))
-  }, [buildCreateMessage, dispatch, hidden, paneId, refreshRequest, sendFreshAgentMessage, tabId])
+  }, [buildCreateMessage, commitSnapshot, dispatch, hidden, paneId, refreshRequest, sendFreshAgentMessage, tabId])
 
   const triggerRecovery = useCallback(() => {
     if (restoreTimeoutRef.current !== null) {
@@ -827,7 +874,7 @@ export function FreshAgentView({
             provider: paneContent.provider,
           })
         }
-        setSnapshot(null)
+        commitSnapshot(null)
         dispatch(updatePaneContent({
           tabId,
           paneId,
@@ -848,7 +895,7 @@ export function FreshAgentView({
       }
     })
     return unsubscribe
-  }, [dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, sendFreshAgentMessage, tabId, ws])
+  }, [commitSnapshot, dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, sendFreshAgentMessage, tabId, ws])
 
   useEffect(() => {
     if (!snapshotThreadId) return
@@ -875,12 +922,13 @@ export function FreshAgentView({
           autoTitleFreshBoundaryRef.current = false
           autoTitleSentRef.current = true
         }
-        setSnapshot(resolved)
+        const displaySnapshot = mergeSnapshotForDisplay(snapshotRef.current, resolved)
+        commitSnapshot(displaySnapshot)
         setSnapshotAutoTitleIdentity(requestAutoTitleIdentity)
         const echo = localEchoRef.current
         if (echo) {
           const needle = echo.slice(0, 80)
-          const echoLanded = resolved.turns.some((turn) => (
+          const echoLanded = displaySnapshot.turns.some((turn) => (
             turn.role === 'user' && turn.items.some((item) => (
               item.kind === 'text' && item.text.includes(needle)
             ))
@@ -932,7 +980,7 @@ export function FreshAgentView({
         if (paneContent.provider === 'codex' && isUnmaterializedCodexThreadError(error)) {
           const fresh = paneContentRef.current
           setLoadError(null)
-          setSnapshot(null)
+          commitSnapshot(null)
           dispatch(updatePaneContent({
             tabId,
             paneId,
@@ -951,7 +999,7 @@ export function FreshAgentView({
         if (paneContent.provider === 'opencode' && isLostFreshOpencodeThreadError(error)) {
           const fresh = paneContentRef.current
           setLoadError(null)
-          setSnapshot(null)
+          commitSnapshot(null)
           dispatch(updatePaneContent({
             tabId,
             paneId,
@@ -986,6 +1034,7 @@ export function FreshAgentView({
     paneContent.sessionType,
     paneId,
     autoTitleIdentity,
+    commitSnapshot,
     migratePendingAutoTitle,
     snapshotThreadId,
     snapshotRefreshNonce,

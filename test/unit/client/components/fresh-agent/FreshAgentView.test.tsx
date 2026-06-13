@@ -1758,6 +1758,300 @@ describe('FreshAgentView', () => {
     expect(screen.getByText('Loaded assistant turn')).toBeInTheDocument()
   })
 
+  it('preserves loaded transcript history when a submit refresh returns only the in-flight turn', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce({
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        threadId: 'thread-partial-refresh',
+        status: 'idle',
+        summary: 'Loaded history',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [
+          {
+            id: 'turn-old-user',
+            turnId: 'turn-old-user',
+            role: 'user',
+            summary: 'Older user request',
+            items: [{ id: 'item-old-user', kind: 'text', text: 'Older user request' }],
+          },
+          {
+            id: 'turn-old-assistant',
+            turnId: 'turn-old-assistant',
+            role: 'assistant',
+            summary: 'Older assistant answer',
+            items: [{ id: 'item-old-assistant', kind: 'text', text: 'Older assistant answer' }],
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        threadId: 'thread-partial-refresh',
+        status: 'running',
+        summary: 'Partial in-flight turn',
+        capabilities: { send: false, interrupt: true, fork: true },
+        turns: [
+          {
+            id: 'turn-new-user',
+            turnId: 'turn-new-user',
+            role: 'user',
+            summary: 'New user request',
+            items: [{ id: 'item-new-user', kind: 'text', text: 'New user request' }],
+          },
+        ],
+      })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-partial-refresh',
+        sessionId: 'thread-partial-refresh',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Older assistant answer')).toBeInTheDocument()
+    })
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'New user request' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(screen.getByText('Older user request')).toBeInTheDocument()
+    expect(screen.getByText('Older assistant answer')).toBeInTheDocument()
+
+    expect(onMessage).toBeTypeOf('function')
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.event',
+        sessionId: 'thread-partial-refresh',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        event: {
+          type: 'sdk.session.snapshot',
+          sessionId: 'thread-partial-refresh',
+          latestTurnId: 'turn-new-user',
+          status: 'running',
+          revision: 2,
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+    })
+    expect(screen.getByText('Older user request')).toBeInTheDocument()
+    expect(screen.getByText('Older assistant answer')).toBeInTheDocument()
+    expect(screen.getByText('New user request')).toBeInTheDocument()
+  })
+
+  it('replaces prior history when a settled same-session snapshot intentionally has fewer turns', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce({
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        threadId: 'thread-authoritative-refresh',
+        revision: 1,
+        status: 'idle',
+        summary: 'Loaded history',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [
+          {
+            id: 'turn-prior-user',
+            turnId: 'turn-prior-user',
+            role: 'user',
+            summary: 'Prior user request',
+            items: [{ id: 'item-prior-user', kind: 'text', text: 'Prior user request' }],
+          },
+          {
+            id: 'turn-prior-assistant',
+            turnId: 'turn-prior-assistant',
+            role: 'assistant',
+            summary: 'Prior assistant answer',
+            items: [{ id: 'item-prior-assistant', kind: 'text', text: 'Prior assistant answer' }],
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        threadId: 'thread-authoritative-refresh',
+        revision: 2,
+        status: 'idle',
+        summary: 'Authoritative shorter history',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [
+          {
+            id: 'turn-authoritative-user',
+            turnId: 'turn-authoritative-user',
+            role: 'user',
+            summary: 'Authoritative replacement request',
+            items: [{ id: 'item-authoritative-user', kind: 'text', text: 'Authoritative replacement request' }],
+          },
+        ],
+      })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-authoritative-refresh',
+        sessionId: 'thread-authoritative-refresh',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Prior assistant answer')).toBeInTheDocument()
+    })
+
+    expect(onMessage).toBeTypeOf('function')
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.event',
+        sessionId: 'thread-authoritative-refresh',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        event: {
+          type: 'sdk.session.snapshot',
+          sessionId: 'thread-authoritative-refresh',
+          latestTurnId: 'turn-authoritative-user',
+          status: 'idle',
+          revision: 2,
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText('Authoritative replacement request')).toBeInTheDocument()
+    })
+    expect(screen.queryByText('Prior user request')).not.toBeInTheDocument()
+    expect(screen.queryByText('Prior assistant answer')).not.toBeInTheDocument()
+  })
+
+  it('ignores an older same-session snapshot revision after newer history is already rendered', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce({
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        threadId: 'thread-stale-revision',
+        revision: 8,
+        status: 'idle',
+        summary: 'Current history',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [
+          {
+            id: 'turn-current',
+            turnId: 'turn-current',
+            role: 'assistant',
+            summary: 'Current rendered answer',
+            items: [{ id: 'item-current', kind: 'text', text: 'Current rendered answer' }],
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        threadId: 'thread-stale-revision',
+        revision: 7,
+        status: 'running',
+        summary: 'Stale history',
+        capabilities: { send: false, interrupt: true, fork: true },
+        turns: [
+          {
+            id: 'turn-stale',
+            turnId: 'turn-stale',
+            role: 'assistant',
+            summary: 'Stale older answer',
+            items: [{ id: 'item-stale', kind: 'text', text: 'Stale older answer' }],
+          },
+        ],
+      })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-stale-revision',
+        sessionId: 'thread-stale-revision',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Current rendered answer')).toBeInTheDocument()
+    })
+
+    expect(onMessage).toBeTypeOf('function')
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.event',
+        sessionId: 'thread-stale-revision',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        event: {
+          type: 'sdk.session.snapshot',
+          sessionId: 'thread-stale-revision',
+          latestTurnId: 'turn-stale',
+          status: 'running',
+          revision: 7,
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+    })
+    expect(screen.getByText('Current rendered answer')).toBeInTheDocument()
+    expect(screen.queryByText('Stale older answer')).not.toBeInTheDocument()
+  })
+
   it('resets auto-title for a new conversation even if the stale prior snapshot had user turns', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({

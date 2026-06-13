@@ -196,6 +196,92 @@ function buildBlocks(items: FreshAgentTranscriptItem[]): RenderBlock[] {
   return blocks
 }
 
+function isActivityOnlyTurn(turn: FreshAgentTurn): boolean {
+  return turn.items.length > 0 && turn.items.every(isActivityLike)
+}
+
+function mergeActivityOnlyTurns(previous: FreshAgentTurn, next: FreshAgentTurn): FreshAgentTurn {
+  return {
+    ...next,
+    id: `${previous.id}:${next.id}`,
+    turnId: next.turnId ?? next.id,
+    summary: [previous.summary, next.summary].filter(Boolean).join('\n\n'),
+    items: [...previous.items, ...next.items],
+    model: next.model ?? previous.model,
+    timestamp: next.timestamp ?? previous.timestamp,
+  }
+}
+
+function coalesceActivityOnlyTurns(turns: FreshAgentTurn[]): FreshAgentTurn[] {
+  const coalesced: FreshAgentTurn[] = []
+  for (const turn of turns) {
+    const previous = coalesced[coalesced.length - 1]
+    if (
+      previous
+      && turn.role !== 'user'
+      && previous.role === turn.role
+      && isActivityOnlyTurn(previous)
+      && isActivityOnlyTurn(turn)
+    ) {
+      coalesced[coalesced.length - 1] = mergeActivityOnlyTurns(previous, turn)
+      continue
+    }
+    coalesced.push(turn)
+  }
+  return coalesced
+}
+
+function normalizeActivityRows(rows: ActivityRow[], live: boolean): ActivityRow[] {
+  const runningToolIds = rows
+    .filter((row): row is Extract<ActivityRow, { type: 'tool' }> => row.type === 'tool' && row.tool.status === 'running')
+    .map((row) => row.tool.id)
+  const activeRunningToolId = live ? (runningToolIds.at(-1) ?? null) : null
+
+  let changed = false
+  const settledRows = rows.map((row) => {
+    if (
+      row.type !== 'tool'
+      || row.tool.status !== 'running'
+      || row.tool.id === activeRunningToolId
+    ) {
+      return row
+    }
+    changed = true
+    return {
+      type: 'tool' as const,
+      tool: {
+        ...row.tool,
+        status: 'complete' as const,
+      },
+    }
+  })
+  return changed ? settledRows : rows
+}
+
+function selectLiveActivityBlockId(turns: FreshAgentTurn[], isStreaming: boolean): string | null {
+  let latestActivityBlockId: string | null = null
+  let latestTrailingThinkingBlockId: string | null = null
+
+  turns.forEach((turn, turnIndex) => {
+    const blocks = buildBlocks(turn.items)
+    for (const block of blocks) {
+      if (block.kind === 'activity') {
+        latestActivityBlockId = block.id
+      }
+    }
+
+    if (turnIndex === turns.length - 1) {
+      const lastBlock = blocks[blocks.length - 1]
+      if (lastBlock?.kind === 'activity' && lastBlock.rows.at(-1)?.type === 'thinking') {
+        latestTrailingThinkingBlockId = lastBlock.id
+      }
+    }
+  })
+
+  if (isStreaming) return latestActivityBlockId
+  return latestTrailingThinkingBlockId
+}
+
 function FreshAgentThinkingRow({ text }: { text: string }) {
   const [expanded, setExpanded] = useState(false)
   return (
@@ -227,16 +313,19 @@ function FreshAgentActivityStrip({
   live?: boolean
 }) {
   const [expanded, setExpanded] = useState(false)
-  const tools = activityTools(rows)
+  const displayRows = useMemo(() => (
+    normalizeActivityRows(rows, live)
+  ), [live, rows])
+  const tools = activityTools(displayRows)
   const hasErrors = tools.some((tool) => tool.isError)
-  const lastRow = rows[rows.length - 1] ?? null
-  const runningTool = [...tools].reverse().find((tool) => tool.status === 'running') ?? null
+  const lastRow = displayRows[displayRows.length - 1] ?? null
+  const runningTool = live ? [...tools].reverse().find((tool) => tool.status === 'running') ?? null : null
   const thinkingLive = live && lastRow?.type === 'thinking'
   const liveTool = !thinkingLive && live ? (tools[tools.length - 1] ?? null) : null
   const activeTool = runningTool ?? liveTool
-  const running = activeTool !== null || thinkingLive
+  const running = live && (activeTool !== null || thinkingLive)
 
-  if (rows.length === 0) return null
+  if (displayRows.length === 0) return null
 
   const reelName = activeTool ? activeTool.name : thinkingLive ? 'Thinking' : null
   const reelPreview = activeTool ? getToolPreview(activeTool.name, activeTool.input) : null
@@ -269,7 +358,7 @@ function FreshAgentActivityStrip({
           <SlotReel
             toolName={running ? reelName : null}
             previewText={running ? reelPreview : null}
-            settledText={running ? undefined : settledSummary(rows)}
+            settledText={running ? undefined : settledSummary(displayRows)}
           />
         </div>
       ) : (
@@ -283,7 +372,7 @@ function FreshAgentActivityStrip({
           >
             <ChevronRight className="h-3 w-3 rotate-90 transition-transform" />
           </button>
-          {rows.map((row) => (
+          {displayRows.map((row) => (
             row.type === 'thinking'
               ? <FreshAgentThinkingRow key={row.id} text={row.text} />
               : <FreshAgentToolBlock key={row.tool.id} tool={row.tool} initialExpanded={false} />
@@ -292,27 +381,6 @@ function FreshAgentActivityStrip({
       )}
     </div>
   )
-}
-
-function countTools(turn: FreshAgentTurn): number {
-  return activityTools(buildActivity(turn.items.filter(isToolLike))).length
-}
-
-function getTurnSummary(turn: FreshAgentTurn, agentLabel?: string): string {
-  const text = turn.items
-    .filter((item): item is Extract<FreshAgentTranscriptItem, { kind: 'text' }> => item.kind === 'text')
-    .map((item) => stripSystemReminders(item.text))
-    .join(' ')
-    .trim()
-    .replace(/\s+/g, ' ')
-  const base = text || turn.summary || getTurnLabel(turn, agentLabel)
-  const short = base.length > 44 ? `${base.slice(0, 41)}...` : base
-  const toolCount = countTools(turn)
-  const itemCount = turn.items.filter((item) => item.kind === 'text').length
-  const parts: string[] = []
-  if (toolCount > 0) parts.push(`${toolCount} tool${toolCount === 1 ? '' : 's'}`)
-  if (itemCount > 0 && turn.role !== 'user') parts.push(`${itemCount} msg${itemCount === 1 ? '' : 's'}`)
-  return parts.length > 0 ? `${short} -> ${parts.join(', ')}` : short
 }
 
 type TurnActionProps = {
@@ -324,87 +392,26 @@ type TurnActionProps = {
   onOpenActions?: (turn: FreshAgentTurn) => void
 }
 
-function CollapsedFreshAgentTurn({
-  turn,
-  actions,
-  agentLabel,
-  showModel,
-}: {
-  turn: FreshAgentTurn
-  actions: TurnActionProps
-  agentLabel?: string
-  showModel: boolean
-}) {
-  const [expanded, setExpanded] = useState(false)
-  const summary = getTurnSummary(turn, agentLabel)
-  if (expanded) {
-    return (
-      <div className="fresh-agent-collapsed-turn-expanded space-y-2">
-        <button
-          type="button"
-          onClick={() => setExpanded(false)}
-          className="flex items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
-          aria-expanded={true}
-          aria-label="Collapse turn"
-        >
-          <ChevronRight className="h-3 w-3 rotate-90 transition-transform" />
-          <span className="truncate font-mono opacity-70">{summary}</span>
-        </button>
-        <FreshAgentTurnArticle
-          turn={turn}
-          compact={false}
-          isLatest={false}
-          actions={actions}
-          agentLabel={agentLabel}
-          showModel={showModel}
-          showHeader
-          continuation={false}
-          isStreaming={false}
-        />
-      </div>
-    )
-  }
-  return (
-    <button
-      type="button"
-      onClick={() => setExpanded(true)}
-      className="fresh-agent-collapsed-turn flex w-full items-center gap-1 text-left text-xs text-muted-foreground transition-colors hover:text-foreground"
-      aria-expanded={false}
-      aria-label="Expand turn"
-    >
-      <ChevronRight className="h-3 w-3 shrink-0 transition-transform" />
-      <span className="truncate font-mono">{summary}</span>
-    </button>
-  )
-}
-
 function FreshAgentTurnArticle({
   turn,
-  compact,
-  isLatest,
   actions,
   agentLabel,
   showModel,
   showHeader,
   continuation,
-  isStreaming,
+  liveActivityBlockId,
 }: {
   turn: FreshAgentTurn
-  compact: boolean
-  isLatest: boolean
   actions: TurnActionProps
   agentLabel?: string
   showModel: boolean
   showHeader: boolean
   continuation: boolean
-  isStreaming: boolean
+  liveActivityBlockId: string | null
 }) {
   const isUser = turn.role === 'user'
   const blocks = buildBlocks(turn.items)
   const turnLabel = getTurnLabel(turn, agentLabel)
-  const lastActivityBlockIndex = blocks.reduce((lastIndex, block, index) => (
-    block.kind === 'activity' ? index : lastIndex
-  ), -1)
   // Long-press opens the action sheet on touch devices (iOS fires no
   // contextmenu event; Android does — both paths land on onOpenActions and
   // the second call is a no-op re-set of the same state).
@@ -418,7 +425,6 @@ function FreshAgentTurnArticle({
       className={cn(
         'fresh-agent-turn group relative mt-3 w-full border-l-2 py-0.5 pl-2.5 pr-1 first:mt-0',
         isUser ? 'border-l-[hsl(var(--primary))]' : 'border-l-border',
-        compact && 'opacity-95',
         continuation && 'mt-1.5',
       )}
       data-turn-role={turn.role}
@@ -454,14 +460,13 @@ function FreshAgentTurnArticle({
         </div>
       ) : null}
       <div className="fresh-agent-transcript-copy space-y-1.5">
-        {blocks.length > 0 ? blocks.map((block, blockIndex) => {
+        {blocks.length > 0 ? blocks.map((block) => {
           if (block.kind === 'activity') {
-            const blockEndsWithThinking = block.rows[block.rows.length - 1]?.type === 'thinking'
             return (
               <FreshAgentActivityStrip
                 key={block.id}
                 rows={block.rows}
-                live={isLatest && blockIndex === lastActivityBlockIndex && (isStreaming || blockEndsWithThinking)}
+                live={block.id === liveActivityBlockId}
               />
             )
           }
@@ -501,6 +506,8 @@ export function FreshAgentTranscript({
   const [contextMenu, setContextMenu] = useState<FreshAgentTurnContextMenuState>(null)
   const [sheetTurn, setSheetTurn] = useState<FreshAgentTurn | null>(null)
   const coarsePointer = useCoarsePointer()
+  const displayTurns = useMemo(() => coalesceActivityOnlyTurns(turns), [turns])
+  const liveActivityBlockId = useMemo(() => selectLiveActivityBlockId(displayTurns, isStreaming), [displayTurns, isStreaming])
   const transcriptSignature = useMemo(() => (
     turns.map((turn) => {
       const itemSignature = turn.items.map((item) => {
@@ -549,8 +556,6 @@ export function FreshAgentTranscript({
     }
   }, [atBottom, transcriptSignature])
 
-  const collapsedCutoff = Math.max(0, turns.length - 8)
-
   return (
     <div className="relative min-h-0 flex-1">
       <div
@@ -562,31 +567,17 @@ export function FreshAgentTranscript({
           setAtBottom(node.scrollHeight - node.scrollTop - node.clientHeight < 24)
         }}
       >
-        {turns.map((turn, index) => (
-          index < collapsedCutoff
-            ? (
-              <CollapsedFreshAgentTurn
-                key={`${turn.id}:${index}`}
-                turn={turn}
-                actions={actions}
-                agentLabel={agentLabel}
-                showModel={showModel}
-              />
-            )
-            : (
-              <FreshAgentTurnArticle
-                key={`${turn.id}:${index}`}
-                turn={turn}
-                compact={index < collapsedCutoff}
-                isLatest={index === turns.length - 1}
-                actions={actions}
-                agentLabel={agentLabel}
-                showModel={showModel}
-                showHeader={index === collapsedCutoff || turns[index - 1]?.role !== turn.role}
-                continuation={index > collapsedCutoff && turns[index - 1]?.role === turn.role}
-                isStreaming={isStreaming}
-              />
-            )
+        {displayTurns.map((turn, index) => (
+          <FreshAgentTurnArticle
+            key={`${turn.id}:${index}`}
+            turn={turn}
+            actions={actions}
+            agentLabel={agentLabel}
+            showModel={showModel}
+            showHeader={index === 0 || displayTurns[index - 1]?.role !== turn.role}
+            continuation={index > 0 && displayTurns[index - 1]?.role === turn.role}
+            liveActivityBlockId={liveActivityBlockId}
+          />
         ))}
       </div>
       <FreshAgentTurnContextMenu

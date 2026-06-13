@@ -220,6 +220,7 @@ describe('FreshAgentTranscript', () => {
   it('shows a live reel while a tool is running', () => {
     const { container } = render(
       <FreshAgentTranscript
+        isStreaming
         turns={[
           {
             id: 'turn-1',
@@ -295,6 +296,127 @@ describe('FreshAgentTranscript', () => {
     expect(screen.queryByText('1 tool used')).not.toBeInTheDocument()
   })
 
+  it('shows only the latest activity block as running while an assistant response streams across turns', () => {
+    render(
+      <FreshAgentTranscript
+        isStreaming
+        turns={[
+          {
+            id: 'turn-user-1',
+            role: 'user',
+            summary: 'request',
+            items: [{ id: 'item-user-1', kind: 'text', text: 'Check these files' }],
+          },
+          {
+            id: 'turn-agent-read-1',
+            role: 'assistant',
+            summary: 'Read',
+            items: [
+              {
+                id: 'tool-read-1',
+                kind: 'tool_use',
+                toolUseId: 'call-read-1',
+                name: 'Read',
+                input: { file_path: 'src/one.ts' },
+              },
+            ],
+          },
+          {
+            id: 'turn-agent-text-1',
+            role: 'assistant',
+            summary: 'first note',
+            items: [{ id: 'item-agent-1', kind: 'text', text: 'I checked the first file.' }],
+          },
+          {
+            id: 'turn-agent-read-2',
+            role: 'assistant',
+            summary: 'Read',
+            items: [
+              {
+                id: 'tool-read-2',
+                kind: 'tool_use',
+                toolUseId: 'call-read-2',
+                name: 'Read',
+                input: { file_path: 'src/two.ts' },
+              },
+            ],
+          },
+          {
+            id: 'turn-agent-text-2',
+            role: 'assistant',
+            summary: 'second note',
+            items: [{ id: 'item-agent-2', kind: 'text', text: 'Still checking.' }],
+          },
+        ]}
+      />,
+    )
+
+    const strips = screen.getAllByRole('region', { name: 'Activity strip' })
+    expect(strips).toHaveLength(2)
+    expect(screen.getAllByLabelText('running')).toHaveLength(1)
+    expect(strips[0]).toHaveTextContent('1 tool used')
+  })
+
+  it('coalesces consecutive activity-only assistant turns into one live activity strip', () => {
+    render(
+      <FreshAgentTranscript
+        isStreaming
+        turns={[
+          {
+            id: 'turn-user-1',
+            role: 'user',
+            summary: 'request',
+            items: [{ id: 'item-user-1', kind: 'text', text: 'Read these files' }],
+          },
+          {
+            id: 'turn-agent-read-1',
+            role: 'assistant',
+            summary: 'Read',
+            items: [{
+              id: 'tool-read-1',
+              kind: 'tool_use',
+              toolUseId: 'call-read-1',
+              name: 'Read',
+              input: { file_path: 'src/one.ts' },
+            }],
+          },
+          {
+            id: 'turn-agent-read-2',
+            role: 'assistant',
+            summary: 'Read',
+            items: [{
+              id: 'tool-read-2',
+              kind: 'tool_use',
+              toolUseId: 'call-read-2',
+              name: 'Read',
+              input: { file_path: 'src/two.ts' },
+            }],
+          },
+          {
+            id: 'turn-agent-read-3',
+            role: 'assistant',
+            summary: 'Read',
+            items: [{
+              id: 'tool-read-3',
+              kind: 'tool_use',
+              toolUseId: 'call-read-3',
+              name: 'Read',
+              input: { file_path: 'src/three.ts' },
+            }],
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+    expect(screen.getAllByLabelText('running')).toHaveLength(1)
+    expect(screen.getByText('src/three.ts')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+    expect(screen.getAllByLabelText('running')).toHaveLength(1)
+    expect(screen.getAllByLabelText('complete')).toHaveLength(2)
+  })
+
   it('shows the speaker label once for consecutive turns from the same role', () => {
     const { container } = render(
       <FreshAgentTranscript
@@ -338,6 +460,32 @@ describe('FreshAgentTranscript', () => {
       .map((node) => node.textContent)
     expect(visibleHeaders.filter((text) => text === 'freshclaude')).toHaveLength(2)
     expect(container.querySelectorAll('[data-turn-continuation="true"]')).toHaveLength(2)
+  })
+
+  it('keeps completed long transcripts expanded instead of replacing older turns with summary rows', () => {
+    const turns = Array.from({ length: 10 }, (_, index) => ({
+      id: `turn-${index}`,
+      role: index % 2 === 0 ? 'user' as const : 'assistant' as const,
+      items: [{
+        id: `item-${index}`,
+        kind: 'text' as const,
+        text: index % 2 === 0 ? `User note ${index}` : `Agent reply ${index}`,
+      }],
+    }))
+
+    const { container } = render(
+      <FreshAgentTranscript
+        agentLabel="freshclaude"
+        turns={turns}
+      />,
+    )
+
+    for (let index = 0; index < turns.length; index += 1) {
+      expect(screen.getByText(index % 2 === 0 ? `User note ${index}` : `Agent reply ${index}`)).toBeInTheDocument()
+    }
+    expect(screen.queryByRole('button', { name: 'Expand turn' })).not.toBeInTheDocument()
+    expect(container.querySelector('.fresh-agent-collapsed-turn')).toBeNull()
+    expect(container.querySelectorAll('.fresh-agent-turn')).toHaveLength(10)
   })
 
   it('tolerates duplicate provider turn ids without duplicate React keys', () => {
@@ -428,16 +576,16 @@ describe('FreshAgentTranscript', () => {
       .toHaveTextContent('1 tool used · 1 file changed')
   })
 
-  it('strips system reminders and collapses older turns', () => {
+  it('strips system reminders without collapsing older turns', () => {
     render(
       <FreshAgentTranscript
         turns={Array.from({ length: 9 }, (_, index) => ({
           id: `turn-${index}`,
-          role: index % 2 === 0 ? 'user' : 'assistant',
+          role: index % 2 === 0 ? 'user' as const : 'assistant' as const,
           summary: `turn ${index}`,
           items: [{
             id: `item-${index}`,
-            kind: 'text',
+            kind: 'text' as const,
             text: index === 0
               ? 'visible <system-reminder>hidden internals</system-reminder>'
               : `message ${index}`,
@@ -446,7 +594,8 @@ describe('FreshAgentTranscript', () => {
       />,
     )
 
-    expect(screen.getByRole('button', { name: 'Expand turn' })).toHaveTextContent('visible')
+    expect(screen.getByText('visible')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Expand turn' })).not.toBeInTheDocument()
     expect(screen.queryByText(/hidden internals/)).not.toBeInTheDocument()
   })
 
