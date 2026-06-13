@@ -8,6 +8,7 @@ import type { SessionLocator as SharedSessionLocator } from '@shared/ws-protocol
 import type { RestoreError } from '@shared/session-contract'
 import type { CodexDurabilityRef } from '@shared/codex-durability'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
+import type { FreshAgentStyle } from '@shared/settings'
 
 export type SessionLocator = SharedSessionLocator
 
@@ -144,6 +145,8 @@ export type FreshAgentPaneContent = {
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
   effort?: string
   plugins?: string[]
+  /** Visual style for this pane; missing legacy panes resolve from provider defaults, then sans. */
+  style?: FreshAgentStyle
   settingsDismissed?: boolean
 }
 

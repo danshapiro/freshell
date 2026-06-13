@@ -38,6 +38,7 @@ import type { AgentChatProviderName } from '@/lib/agent-chat-types'
 import { migrateLegacyAgentChatDurableState } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { normalizeFreshAgentSessionType, resolveFreshAgentRuntimeProvider } from '@shared/fresh-agent'
+import { normalizeFreshAgentStyleOverride } from '@shared/settings'
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                             */
@@ -186,6 +187,7 @@ function sanitizePaneSnapshot(
       fallbackProvider: provider,
       fallbackSessionId: resumeSessionId,
     })
+    const style = normalizeFreshAgentStyleOverride(payload.style)
     return {
       kind: 'fresh-agent',
       sessionType,
@@ -200,6 +202,7 @@ function sanitizePaneSnapshot(
       sandbox: payload.sandbox as 'read-only' | 'workspace-write' | 'danger-full-access' | undefined,
       effort: normalizeAgentChatEffortOverride(payload.effort),
       plugins: payload.plugins as string[] | undefined,
+      ...(style ? { style } : {}),
     }
   }
   if (snapshot.kind === 'extension') {
