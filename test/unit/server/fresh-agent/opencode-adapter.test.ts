@@ -308,6 +308,42 @@ describe('OpenCode fresh-agent adapter', () => {
     expect(calls.some((args) => args[0] === 'export')).toBe(false)
   })
 
+  it('returns an empty live snapshot for a newly-created placeholder before first materialization', async () => {
+    const historyReader = makeHistoryReader()
+    const { spawnFn, calls } = makeSpawn({
+      'export freshopencode-req-empty': {
+        stdout: JSON.stringify(exportedSession),
+      },
+    })
+    const adapter = createOpencodeFreshAgentAdapter({ spawnFn: spawnFn as any, historyReader })
+    await adapter.create({
+      requestId: 'req-empty',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      model: 'opencode-go/deepseek-v4-flash',
+      effort: 'max',
+    })
+
+    await expect(adapter.getSnapshot?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: 'freshopencode-req-empty',
+    }, 0)).resolves.toMatchObject({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: 'freshopencode-req-empty',
+      sessionId: 'freshopencode-req-empty',
+      status: 'idle',
+      turns: [],
+      settings: {
+        model: 'opencode-go/deepseek-v4-flash',
+        effort: 'max',
+      },
+    })
+    expect(historyReader.readSnapshotPage).not.toHaveBeenCalled()
+    expect(calls).toEqual([])
+  })
+
   it('only materializes from top-level ses-prefixed run sessionID values', async () => {
     const historyReader = makeHistoryReader()
     const { spawnFn, calls } = makeSpawn({
@@ -334,8 +370,12 @@ describe('OpenCode fresh-agent adapter', () => {
       sessionType: 'freshopencode',
       provider: 'opencode',
       threadId: 'freshopencode-req-nested',
-    }, 0)).rejects.toBeInstanceOf(FreshAgentLostSessionError)
+    }, 0)).resolves.toMatchObject({
+      sessionId: 'freshopencode-req-nested',
+      turns: [],
+    })
     expect(historyReader.readSessionInfo).not.toHaveBeenCalled()
+    expect(historyReader.readSnapshotPage).not.toHaveBeenCalled()
     expect(calls.some((args) => args[0] === 'export')).toBe(false)
   })
 
@@ -359,7 +399,10 @@ describe('OpenCode fresh-agent adapter', () => {
       sessionType: 'freshopencode',
       provider: 'opencode',
       threadId: 'freshopencode-req-no-session-id',
-    }, 0)).rejects.toBeInstanceOf(FreshAgentLostSessionError)
+    }, 0)).resolves.toMatchObject({
+      sessionId: 'freshopencode-req-no-session-id',
+      turns: [],
+    })
     expect(historyReader.readSessionInfo).not.toHaveBeenCalled()
     expect(historyReader.readSnapshotPage).not.toHaveBeenCalled()
     expect(calls.some((args) => args[0] === 'export')).toBe(false)

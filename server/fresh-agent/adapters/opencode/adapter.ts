@@ -437,6 +437,16 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     },
 
     async getSnapshot(thread: FreshAgentThreadLocator) {
+      const liveState = sessions.get(thread.threadId)
+      if (liveState && !liveState.realSessionId) {
+        return normalizeOpencodeSnapshot({
+          sessionType: 'freshopencode',
+          threadId: thread.threadId,
+          status: liveState.status,
+          model: liveState.model,
+          effort: liveState.effort,
+        })
+      }
       const durable = requireDurableSession(thread.threadId)
       let exported: OpencodeExport
       try {
@@ -474,6 +484,15 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     },
 
     async getTurnPage(thread, query) {
+      const liveState = sessions.get(thread.threadId)
+      if (liveState && !liveState.realSessionId) {
+        return normalizeOpencodeTurnPage({
+          threadId: thread.threadId,
+          exported: { messages: [] },
+          revision: Number(query.revision) || 0,
+          nextCursor: null,
+        })
+      }
       const durable = requireDurableSession(thread.threadId)
       try {
         const page = await historyReader.readTurnPage(durable.sessionId, {
@@ -515,6 +534,10 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     },
 
     async getTurnBody(thread, revision) {
+      const liveState = sessions.get(thread.threadId)
+      if (liveState && !liveState.realSessionId) {
+        return null
+      }
       const durable = requireDurableSession(thread.threadId)
       try {
         const body = await historyReader.readTurnBody(durable.sessionId, thread.turnId)
