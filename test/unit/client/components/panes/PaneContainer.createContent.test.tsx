@@ -427,6 +427,7 @@ describe('createContentForType with ext: prefix', () => {
               modelSelection: { kind: 'exact', modelId: 'gpt-5.4-flash' },
               defaultPermissionMode: 'never',
               effort: 'high',
+              style: 'serif',
             },
           },
         },
@@ -462,6 +463,58 @@ describe('createContentForType with ext: prefix', () => {
       expect(paneContent.model).toBe('gpt-5.4-flash')
       expect(paneContent.permissionMode).toBe('never')
       expect(paneContent.effort).toBe('high')
+      expect(paneContent.style).toBe('serif')
+    })
+  })
+
+  it('does not let the Freshcodex style default affect Freshclaude panes', async () => {
+    const node = createPickerNode('pane-1')
+    const store = createStore(
+      { layouts: { 'tab-1': node }, activePane: { 'tab-1': 'pane-1' } },
+      [],
+      {
+        codingCli: {
+          enabledProviders: ['claude', 'codex'],
+          providers: {
+            claude: { permissionMode: 'default' },
+            codex: {},
+          },
+        },
+        freshAgent: {
+          enabled: true,
+          providers: {
+            freshcodex: { style: 'serif' },
+          },
+        },
+      },
+      {
+        status: 'ready',
+        platform: 'linux',
+        availableClis: { claude: true, codex: true },
+      },
+    )
+
+    render(
+      <Provider store={store}>
+        <PaneContainer tabId="tab-1" node={node} />
+      </Provider>,
+    )
+
+    const freshclaudeButton = screen.getByRole('button', { name: 'Freshclaude' })
+    fireEvent.click(freshclaudeButton)
+    const container = getPickerContainer()
+    fireEvent.transitionEnd(container)
+
+    const input = await screen.findByLabelText('Starting directory for Freshclaude')
+    fireEvent.change(input, { target: { value: '/workspace/claude' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    await waitFor(() => {
+      const paneContent = (store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
+      expect(paneContent.kind).toBe('fresh-agent')
+      if (paneContent.kind !== 'fresh-agent') return
+      expect(paneContent.sessionType).toBe('freshclaude')
+      expect(paneContent.style).toBe('sans')
     })
   })
 
