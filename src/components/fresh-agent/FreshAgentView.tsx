@@ -1343,22 +1343,22 @@ export function FreshAgentView({
         ) : null}
         <div className={`${hasSidebarMetadata ? 'fresh-agent-layout--with-sidebar ' : ''}fresh-agent-layout relative z-10 min-h-0 flex-1`}>
           <div className="fresh-agent-main flex min-h-0 flex-1 flex-col">
-            <div className="space-y-2 px-3 pt-3">
+            <div className="fresh-agent-top-stack space-y-2 px-3 pt-3">
               {isRestoring ? (
                 <FreshAgentApprovalBanner text="Restoring session..." />
               ) : null}
               {snapshot?.summary ? (
-                <div className="rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
+                <div className="fresh-agent-summary-card rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
                   {snapshot.summary}
                 </div>
               ) : null}
               {pendingCreateFailure || paneContent.createError ? (
-                <div className="flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm">
+                <div className="fresh-agent-error-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm">
                   <FreshAgentApprovalBanner text={(pendingCreateFailure ?? paneContent.createError)?.message ?? 'Create failed'} />
                   {(pendingCreateFailure ?? paneContent.createError)?.retryable ? (
                     <button
                       type="button"
-                      className="rounded border border-border/70 px-2 py-1"
+                      className="fresh-agent-error-action rounded border border-border/70 px-2 py-1"
                       onClick={() => {
                         const nextRequestId = nanoid()
                         dispatch(updatePaneContent({
@@ -1384,11 +1384,11 @@ export function FreshAgentView({
               {visibleLoadError ? <FreshAgentApprovalBanner text={visibleLoadError} /> : null}
               {sessionErrorMessage ? <FreshAgentApprovalBanner text={`Agent error: ${sessionErrorMessage}`} /> : null}
               {sessionEnded ? (
-                <div className="flex items-center justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm">
+                <div className="fresh-agent-session-ended-card flex items-center justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm">
                   <span>This session has ended{sessionErrorMessage ? '' : ' (the agent process exited)'}.</span>
                   <button
                     type="button"
-                    className="shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
+                    className="fresh-agent-session-ended-action shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
                     onClick={startNewConversation}
                   >
                     Start new session
@@ -1456,6 +1456,7 @@ export function FreshAgentView({
               canFork={canFork}
               agentLabel={descriptor?.label}
               showModel={showTranscriptModel}
+              isStreaming={isBusy}
               onForkFromTurn={(turnId) => sendFork(turnId)}
               onRewindToTurn={paneContent.initialCwd ? rewindToTurn : undefined}
             />

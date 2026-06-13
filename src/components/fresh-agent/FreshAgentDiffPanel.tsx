@@ -43,10 +43,10 @@ function FreshAgentFileDiff({
   const lines = diff !== null && diff.trim() ? diff.split('\n') : null
 
   return (
-    <div className="min-w-0 border-l-2 border-l-border text-xs">
+    <div className="fresh-agent-file-diff min-w-0 border-l-2 border-l-border text-xs">
       <button
         type="button"
-        className="flex min-h-[2.75rem] w-full min-w-0 items-center gap-2 rounded-r px-2 py-1 text-left transition-colors hover:bg-accent/50 sm:min-h-0"
+        className="fresh-agent-file-diff-trigger flex min-h-[2.75rem] w-full min-w-0 items-center gap-2 rounded-r px-2 py-1 text-left transition-colors hover:bg-accent/50 sm:min-h-0"
         aria-expanded={expanded}
         aria-label={`Diff: ${label}`}
         onClick={() => {
@@ -55,11 +55,11 @@ function FreshAgentFileDiff({
         }}
       >
         <ChevronRight className={cn('h-3 w-3 shrink-0 transition-transform', expanded && 'rotate-90')} />
-        <span className="min-w-0 flex-1 truncate font-mono">{label}</span>
-        {summary.status ? <span className="ml-auto shrink-0 text-muted-foreground">{summary.status}</span> : null}
+        <span className="fresh-agent-file-diff-label min-w-0 flex-1 truncate font-mono">{label}</span>
+        {summary.status ? <span className="fresh-agent-file-diff-status ml-auto shrink-0 text-muted-foreground">{summary.status}</span> : null}
       </button>
       {expanded ? (
-        <div className="mt-1 overflow-x-auto rounded border border-border/60 bg-background/70 font-mono text-[11px] leading-5">
+        <div className="fresh-agent-file-diff-body mt-1 overflow-x-auto rounded border border-border/60 bg-background/70 font-mono text-[11px] leading-5">
           {loading ? <div className="px-3 py-2 text-muted-foreground">Loading diff…</div> : null}
           {error ? <div className="px-3 py-2 text-destructive">{error}</div> : null}
           {!loading && !error && lines === null && diff !== null ? (
@@ -117,9 +117,9 @@ export function FreshAgentDiffPanel({
 }) {
   if (diffs.length === 0) return null
   return (
-    <div className="min-w-0 overflow-hidden rounded-lg border border-border/60 bg-background/70 p-3">
-      <div className="mb-2 text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Diffs</div>
-      <div className="space-y-1">
+    <div className="fresh-agent-diff-panel min-w-0 overflow-hidden rounded-lg border border-border/60 bg-background/70 p-3">
+      <div className="fresh-agent-diff-title mb-2 text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Diffs</div>
+      <div className="fresh-agent-diff-list space-y-1">
         {diffs.map((diff) => (
           <FreshAgentFileDiff key={diff.id} summary={diff} cwd={cwd} onComment={onComment} />
         ))}

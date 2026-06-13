@@ -42,7 +42,7 @@ function summarizeResult(name: string, output?: string, isError?: boolean): stri
 function StatusBadge({ value }: { value?: string }) {
   if (!value) return null
   return (
-    <span className="rounded-full border border-border/70 bg-background/80 px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+    <span className="fresh-agent-status-badge rounded-full border border-border/70 bg-background/80 px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
       {value}
     </span>
   )
@@ -78,33 +78,33 @@ export function FreshAgentToolBlock({
   return (
     <div
       className={cn(
-        'my-0.5 border-l-2 text-xs',
+        'fresh-agent-tool-block my-0.5 border-l-2 text-xs',
         tool.isError ? 'border-l-[hsl(var(--destructive))]' : 'border-l-[hsl(var(--primary))]',
       )}
     >
       <button
         type="button"
         onClick={() => setExpanded((value) => !value)}
-        className="flex w-full items-center gap-2 rounded-r px-2 py-0.5 text-left transition-colors hover:bg-accent/50"
+        className="fresh-agent-tool-trigger flex w-full items-center gap-2 rounded-r px-2 py-0.5 text-left transition-colors hover:bg-accent/50"
         aria-expanded={expanded}
         aria-label={`${tool.name} tool call`}
       >
         <ChevronRight className={cn('h-3 w-3 shrink-0 transition-transform', expanded && 'rotate-90')} />
-        <span className="font-medium">{tool.name}:</span>
-        {preview ? <span className="truncate font-mono text-muted-foreground">{preview}</span> : null}
+        <span className="fresh-agent-tool-name font-medium">{tool.name}:</span>
+        {preview ? <span className="fresh-agent-tool-preview truncate font-mono text-muted-foreground">{preview}</span> : null}
         {resultSummary ? (
-          <span className={cn('shrink-0 text-muted-foreground', tool.isError && 'text-destructive')}>
+          <span className={cn('fresh-agent-tool-result-summary shrink-0 text-muted-foreground', tool.isError && 'text-destructive')}>
             ({resultSummary})
           </span>
         ) : null}
-        <span className="ml-auto shrink-0">
+        <span className="fresh-agent-tool-status ml-auto shrink-0">
           {tool.status === 'running' ? <Loader2 className="h-3 w-3 animate-spin" aria-label="running" /> : null}
           {tool.status === 'complete' && !tool.isError ? <Check className="h-3 w-3 text-green-500" aria-label="complete" /> : null}
           {tool.status === 'complete' && tool.isError ? <X className="h-3 w-3 text-destructive" aria-label="error" /> : null}
         </span>
       </button>
       {expanded ? (
-        <div className="border-t border-border/50 px-2 py-1 text-xs">
+        <div className="fresh-agent-tool-body border-t border-border/50 px-2 py-1 text-xs">
           {hasEditDiff ? (
             <DiffView
               oldStr={String(tool.input?.old_string ?? '')}
@@ -115,7 +115,7 @@ export function FreshAgentToolBlock({
             <>
               {tool.input ? (
                 <pre
-                  className="max-h-48 overflow-y-auto whitespace-pre-wrap break-words font-mono opacity-80"
+                  className="fresh-agent-tool-pre max-h-48 overflow-y-auto whitespace-pre-wrap break-words font-mono opacity-80"
                   data-tool-input=""
                   data-tool-name={tool.name}
                 >
@@ -127,7 +127,7 @@ export function FreshAgentToolBlock({
               {tool.output ? (
                 <pre
                   className={cn(
-                    'mt-0.5 max-h-48 overflow-y-auto whitespace-pre-wrap break-words font-mono',
+                    'fresh-agent-tool-pre mt-0.5 max-h-48 overflow-y-auto whitespace-pre-wrap break-words font-mono',
                     tool.isError ? 'text-destructive' : 'opacity-80',
                   )}
                   data-tool-output=""
@@ -248,6 +248,25 @@ export function FreshAgentMarkdownBody({ text }: { text: string }) {
   return <>{renderText(text, true)}</>
 }
 
+function FreshAgentThinkingDisclosure({ text }: { text: string }) {
+  const [expanded, setExpanded] = useState(false)
+  return (
+    <div className="fresh-agent-thinking-details border-l-2 border-l-[hsl(var(--primary))] text-xs text-muted-foreground">
+      <button
+        type="button"
+        onClick={() => setExpanded((value) => !value)}
+        className="flex w-full items-center gap-2 rounded-r px-2 py-0.5 text-left font-medium transition-colors hover:bg-accent/50"
+        aria-expanded={expanded}
+        aria-label="Thinking"
+      >
+        <ChevronRight className={cn('h-3 w-3 shrink-0 transition-transform', expanded && 'rotate-90')} />
+        <span>Thinking</span>
+      </button>
+      {expanded ? <div className="px-2 py-1 text-sm">{renderText(text)}</div> : null}
+    </div>
+  )
+}
+
 export function FreshAgentItemCard({
   item,
   markdown = false,
@@ -257,12 +276,7 @@ export function FreshAgentItemCard({
 }) {
   if (item.kind === 'text' || item.kind === 'thinking') {
     if (item.kind === 'thinking') {
-      return (
-        <details className="border-l-2 border-l-[hsl(var(--primary))] pl-2.5 text-xs text-muted-foreground">
-          <summary className="cursor-pointer font-medium">Thinking</summary>
-          <div className="mt-1 text-sm">{renderText(item.text)}</div>
-        </details>
-      )
+      return <FreshAgentThinkingDisclosure text={item.text} />
     }
     return renderText(item.text, markdown)
   }
@@ -270,7 +284,7 @@ export function FreshAgentItemCard({
   if (item.kind === 'reasoning') {
     const summary = item.summary.length > 0 ? item.summary.join('\n') : item.text
     return (
-      <details className="rounded-md border border-border/60 bg-background/70 px-3 py-2">
+      <details className="fresh-agent-inline-card fresh-agent-reasoning-card rounded-md border border-border/60 bg-background/70 px-3 py-2">
         <summary className="cursor-pointer text-xs font-medium">Reasoning</summary>
         {summary ? <p className="mt-2 whitespace-pre-wrap text-sm">{summary}</p> : null}
         {item.content.length > 0 ? (
@@ -287,7 +301,7 @@ export function FreshAgentItemCard({
 
   if (item.kind === 'tool_result') {
     return (
-      <div className="border-l-2 border-l-border px-2 py-1 text-xs">
+      <div className="fresh-agent-tool-result border-l-2 border-l-border px-2 py-1 text-xs">
         <div className="mb-1 flex items-center gap-2 font-medium">
           Tool result
           {item.isError ? <StatusBadge value="error" /> : null}
@@ -299,7 +313,7 @@ export function FreshAgentItemCard({
 
   if (item.kind === 'collab_agent') {
     return (
-      <div className="rounded-md border border-border/60 bg-background/70 px-3 py-2 text-xs">
+      <div className="fresh-agent-inline-card rounded-md border border-border/60 bg-background/70 px-3 py-2 text-xs">
         <div className="mb-1 flex items-center justify-between gap-2">
           <span className="font-medium">{item.tool}</span>
           <StatusBadge value={item.status} />
@@ -313,7 +327,7 @@ export function FreshAgentItemCard({
 
   if (item.kind === 'web_search') {
     return (
-      <div className="rounded-md border border-border/60 bg-background/70 px-3 py-2 text-xs">
+      <div className="fresh-agent-inline-card rounded-md border border-border/60 bg-background/70 px-3 py-2 text-xs">
         <div className="font-medium">Web search</div>
         <div className="mt-1 whitespace-pre-wrap">{item.query}</div>
       </div>
@@ -322,7 +336,7 @@ export function FreshAgentItemCard({
 
   if (item.kind === 'image_view') {
     return (
-      <div className="rounded-md border border-border/60 bg-background/70 px-3 py-2 text-xs">
+      <div className="fresh-agent-inline-card rounded-md border border-border/60 bg-background/70 px-3 py-2 text-xs">
         <div className="font-medium">Image</div>
         <div className="mt-1 break-all text-muted-foreground">{item.path}</div>
       </div>
@@ -331,7 +345,7 @@ export function FreshAgentItemCard({
 
   if (item.kind === 'image_generation') {
     return (
-      <div className="rounded-md border border-border/60 bg-background/70 px-3 py-2 text-xs">
+      <div className="fresh-agent-inline-card rounded-md border border-border/60 bg-background/70 px-3 py-2 text-xs">
         <div className="mb-1 flex items-center justify-between gap-2">
           <span className="font-medium">Image generation</span>
           <StatusBadge value={item.displayStatus ?? item.status} />
@@ -345,7 +359,7 @@ export function FreshAgentItemCard({
 
   if (item.kind === 'review_mode') {
     return (
-      <div className="rounded-md border border-border/60 bg-background/70 px-3 py-2 text-xs">
+      <div className="fresh-agent-inline-card rounded-md border border-border/60 bg-background/70 px-3 py-2 text-xs">
         {item.event === 'entered' ? 'Entered review mode' : 'Exited review mode'}
         {item.review ? <span className="text-muted-foreground"> · {item.review}</span> : null}
       </div>
@@ -353,7 +367,7 @@ export function FreshAgentItemCard({
   }
 
   return (
-    <div className="rounded-md border border-border/60 bg-background/70 px-3 py-2 text-xs">
+    <div className="fresh-agent-inline-card rounded-md border border-border/60 bg-background/70 px-3 py-2 text-xs">
       Context compaction
     </div>
   )

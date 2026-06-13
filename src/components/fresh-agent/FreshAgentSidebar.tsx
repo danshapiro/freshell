@@ -20,7 +20,7 @@ export function FreshAgentSidebar({
       <div className="fresh-agent-sidebar-content">
       {codexReview ? (
         <section className="fresh-agent-sidebar-section">
-          <div className="mb-2 text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Review</div>
+          <div className="fresh-agent-sidebar-title mb-2 text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Review</div>
           <ul className="fresh-agent-sidebar-list space-y-1 text-sm">
             {codexReview.status ? <li>{codexReview.status}</li> : null}
             {codexReview.id ? <li>{codexReview.id}</li> : null}
@@ -29,7 +29,7 @@ export function FreshAgentSidebar({
       ) : null}
       {codexFork?.parentThreadId ? (
         <section className="fresh-agent-sidebar-section">
-          <div className="mb-2 text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Fork lineage</div>
+          <div className="fresh-agent-sidebar-title mb-2 text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Fork lineage</div>
           <ul className="fresh-agent-sidebar-list space-y-1 text-sm">
             <li>Parent thread</li>
             <li>{codexFork.parentThreadId}</li>
@@ -38,7 +38,7 @@ export function FreshAgentSidebar({
       ) : null}
       {worktrees.length > 0 ? (
         <section className="fresh-agent-sidebar-section">
-          <div className="mb-2 text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Worktrees</div>
+          <div className="fresh-agent-sidebar-title mb-2 text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Worktrees</div>
           <ul className="fresh-agent-sidebar-list space-y-1 text-sm">
             {worktrees.map((worktree) => (
               <li key={worktree.id}>{worktree.branch ? `${worktree.branch} · ` : ''}{worktree.path}</li>
@@ -48,7 +48,7 @@ export function FreshAgentSidebar({
       ) : null}
       {childThreads.length > 0 ? (
         <section className="fresh-agent-sidebar-section">
-          <div className="mb-2 text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Child Threads</div>
+          <div className="fresh-agent-sidebar-title mb-2 text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Child Threads</div>
           <ul className="fresh-agent-sidebar-list space-y-1 text-sm">
             {childThreads.map((thread) => (
               <li key={thread.id}>{thread.title ?? thread.threadId}</li>

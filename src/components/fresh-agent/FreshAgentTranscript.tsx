@@ -165,14 +165,9 @@ function settledSummary(rows: ActivityRow[]): string {
   return parts.join(' · ') || 'thought'
 }
 
-function thinkingPreview(text: string): string {
-  const flat = text.replace(/\s+/g, ' ').trim()
-  return flat.length > 64 ? `…${flat.slice(-60)}` : flat
-}
-
 type RenderBlock =
   | { kind: 'item'; item: FreshAgentTranscriptItem }
-  | { kind: 'activity'; id: string; rows: ActivityRow[]; endsWithThinking: boolean }
+  | { kind: 'activity'; id: string; rows: ActivityRow[] }
 
 function buildBlocks(items: FreshAgentTranscriptItem[]): RenderBlock[] {
   const blocks: RenderBlock[] = []
@@ -185,7 +180,6 @@ function buildBlocks(items: FreshAgentTranscriptItem[]): RenderBlock[] {
         kind: 'activity',
         id: pending.map((item) => item.id).join(':'),
         rows,
-        endsWithThinking: rows[rows.length - 1]?.type === 'thinking',
       })
     }
     pending = []
@@ -205,20 +199,19 @@ function buildBlocks(items: FreshAgentTranscriptItem[]): RenderBlock[] {
 function FreshAgentThinkingRow({ text }: { text: string }) {
   const [expanded, setExpanded] = useState(false)
   return (
-    <div className="my-0.5 border-l-2 border-l-[hsl(var(--primary))] text-xs">
+    <div className="fresh-agent-thinking-row my-0.5 border-l-2 border-l-[hsl(var(--primary))] text-xs">
       <button
         type="button"
         onClick={() => setExpanded((value) => !value)}
-        className="flex w-full items-center gap-2 rounded-r px-2 py-0.5 text-left transition-colors hover:bg-accent/50"
+        className="fresh-agent-thinking-trigger flex w-full items-center gap-2 rounded-r px-2 py-0.5 text-left transition-colors hover:bg-accent/50"
         aria-expanded={expanded}
         aria-label="Thinking"
       >
         <ChevronRight className={cn('h-3 w-3 shrink-0 transition-transform', expanded && 'rotate-90')} />
-        <span className="font-medium">Thinking:</span>
-        <span className="truncate italic text-muted-foreground">{thinkingPreview(text)}</span>
+        <span className="font-medium">Thinking</span>
       </button>
       {expanded ? (
-        <div className="border-t border-border/50 px-2 py-1 text-sm text-muted-foreground">
+        <div className="fresh-agent-thinking-body border-t border-border/50 px-2 py-1 text-sm text-muted-foreground">
           <FreshAgentMarkdownBody text={text} />
         </div>
       ) : null}
@@ -228,34 +221,32 @@ function FreshAgentThinkingRow({ text }: { text: string }) {
 
 function FreshAgentActivityStrip({
   rows,
-  liveTrailingThinking = false,
+  live = false,
 }: {
   rows: ActivityRow[]
-  liveTrailingThinking?: boolean
+  live?: boolean
 }) {
   const [expanded, setExpanded] = useState(false)
   const tools = activityTools(rows)
   const hasErrors = tools.some((tool) => tool.isError)
   const lastRow = rows[rows.length - 1] ?? null
   const runningTool = [...tools].reverse().find((tool) => tool.status === 'running') ?? null
-  const thinkingLive = liveTrailingThinking && lastRow?.type === 'thinking'
-  const running = runningTool !== null || thinkingLive
+  const thinkingLive = live && lastRow?.type === 'thinking'
+  const liveTool = !thinkingLive && live ? (tools[tools.length - 1] ?? null) : null
+  const activeTool = runningTool ?? liveTool
+  const running = activeTool !== null || thinkingLive
 
   if (rows.length === 0) return null
 
-  const reelName = runningTool ? runningTool.name : thinkingLive ? 'Thinking' : null
-  const reelPreview = runningTool
-    ? getToolPreview(runningTool.name, runningTool.input)
-    : thinkingLive && lastRow?.type === 'thinking'
-      ? thinkingPreview(lastRow.text)
-      : null
+  const reelName = activeTool ? activeTool.name : thinkingLive ? 'Thinking' : null
+  const reelPreview = activeTool ? getToolPreview(activeTool.name, activeTool.input) : null
 
   return (
-    <div role="region" aria-label="Activity strip" className="my-0.5">
+    <div role="region" aria-label="Activity strip" className="fresh-agent-activity-strip my-0.5">
       {!expanded ? (
         <div
           className={cn(
-            'flex min-w-0 items-center gap-1.5 border-l-2 px-2 py-0.5 text-xs',
+            'fresh-agent-activity-summary flex min-w-0 items-center gap-1.5 border-l-2 px-2 py-0.5 text-xs',
             hasErrors ? 'border-l-[hsl(var(--destructive))]' : 'border-l-[hsl(var(--primary))]',
           )}
         >
@@ -282,7 +273,7 @@ function FreshAgentActivityStrip({
           />
         </div>
       ) : (
-        <>
+        <div className="fresh-agent-activity-details">
           <button
             type="button"
             onClick={() => setExpanded(false)}
@@ -297,7 +288,7 @@ function FreshAgentActivityStrip({
               ? <FreshAgentThinkingRow key={row.id} text={row.text} />
               : <FreshAgentToolBlock key={row.tool.id} tool={row.tool} initialExpanded={false} />
           ))}
-        </>
+        </div>
       )}
     </div>
   )
@@ -348,7 +339,7 @@ function CollapsedFreshAgentTurn({
   const summary = getTurnSummary(turn, agentLabel)
   if (expanded) {
     return (
-      <div className="space-y-2">
+      <div className="fresh-agent-collapsed-turn-expanded space-y-2">
         <button
           type="button"
           onClick={() => setExpanded(false)}
@@ -366,6 +357,9 @@ function CollapsedFreshAgentTurn({
           actions={actions}
           agentLabel={agentLabel}
           showModel={showModel}
+          showHeader
+          continuation={false}
+          isStreaming={false}
         />
       </div>
     )
@@ -374,7 +368,7 @@ function CollapsedFreshAgentTurn({
     <button
       type="button"
       onClick={() => setExpanded(true)}
-      className="flex w-full items-center gap-1 text-left text-xs text-muted-foreground transition-colors hover:text-foreground"
+      className="fresh-agent-collapsed-turn flex w-full items-center gap-1 text-left text-xs text-muted-foreground transition-colors hover:text-foreground"
       aria-expanded={false}
       aria-label="Expand turn"
     >
@@ -391,6 +385,9 @@ function FreshAgentTurnArticle({
   actions,
   agentLabel,
   showModel,
+  showHeader,
+  continuation,
+  isStreaming,
 }: {
   turn: FreshAgentTurn
   compact: boolean
@@ -398,10 +395,16 @@ function FreshAgentTurnArticle({
   actions: TurnActionProps
   agentLabel?: string
   showModel: boolean
+  showHeader: boolean
+  continuation: boolean
+  isStreaming: boolean
 }) {
   const isUser = turn.role === 'user'
   const blocks = buildBlocks(turn.items)
   const turnLabel = getTurnLabel(turn, agentLabel)
+  const lastActivityBlockIndex = blocks.reduce((lastIndex, block, index) => (
+    block.kind === 'activity' ? index : lastIndex
+  ), -1)
   // Long-press opens the action sheet on touch devices (iOS fires no
   // contextmenu event; Android does — both paths land on onOpenActions and
   // the second call is a no-op re-set of the same state).
@@ -413,10 +416,13 @@ function FreshAgentTurnArticle({
   return (
     <article
       className={cn(
-        'group relative w-full border-l-2 py-0.5 pl-2.5 pr-1',
+        'fresh-agent-turn group relative mt-3 w-full border-l-2 py-0.5 pl-2.5 pr-1 first:mt-0',
         isUser ? 'border-l-[hsl(var(--primary))]' : 'border-l-border',
         compact && 'opacity-95',
+        continuation && 'mt-1.5',
       )}
+      data-turn-role={turn.role}
+      data-turn-continuation={continuation ? 'true' : 'false'}
       aria-label={`${turnLabel} transcript turn`}
       onContextMenu={(event) => {
         // stopPropagation matters: freshell has a global contextmenu handler
@@ -441,18 +447,21 @@ function FreshAgentTurnArticle({
         onRewindToTurn={actions.onRewindToTurn}
         onOpenActions={actions.onOpenActions}
       />
-      <div className="fresh-agent-turn-header mb-1 flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
-        <span>{turnLabel}</span>
-        {showModel && turn.model ? <span className="truncate">{turn.model}</span> : null}
-      </div>
+      {showHeader ? (
+        <div className="fresh-agent-turn-header mb-1 flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+          <span>{turnLabel}</span>
+          {showModel && turn.model ? <span className="truncate">{turn.model}</span> : null}
+        </div>
+      ) : null}
       <div className="fresh-agent-transcript-copy space-y-1.5">
         {blocks.length > 0 ? blocks.map((block, blockIndex) => {
           if (block.kind === 'activity') {
+            const blockEndsWithThinking = block.rows[block.rows.length - 1]?.type === 'thinking'
             return (
               <FreshAgentActivityStrip
                 key={block.id}
                 rows={block.rows}
-                liveTrailingThinking={isLatest && blockIndex === blocks.length - 1 && block.endsWithThinking}
+                live={isLatest && blockIndex === lastActivityBlockIndex && (isStreaming || blockEndsWithThinking)}
               />
             )
           }
@@ -474,6 +483,7 @@ export function FreshAgentTranscript({
   canFork = false,
   agentLabel,
   showModel = false,
+  isStreaming = false,
   onForkFromTurn,
   onRewindToTurn,
 }: {
@@ -481,6 +491,7 @@ export function FreshAgentTranscript({
   canFork?: boolean
   agentLabel?: string
   showModel?: boolean
+  isStreaming?: boolean
   onForkFromTurn?: (turnId: string) => void
   onRewindToTurn?: (turn: FreshAgentTurn) => void
 }) {
@@ -544,7 +555,7 @@ export function FreshAgentTranscript({
     <div className="relative min-h-0 flex-1">
       <div
         ref={scrollerRef}
-        className="flex h-full flex-col gap-3 overflow-x-hidden overflow-y-auto overscroll-contain px-3 py-3"
+        className="fresh-agent-transcript-scroll flex h-full flex-col gap-0 overflow-x-hidden overflow-y-auto overscroll-contain px-3 py-3"
         data-context="fresh-agent-transcript"
         onScroll={(event) => {
           const node = event.currentTarget
@@ -555,7 +566,7 @@ export function FreshAgentTranscript({
           index < collapsedCutoff
             ? (
               <CollapsedFreshAgentTurn
-                key={turn.id}
+                key={`${turn.id}:${index}`}
                 turn={turn}
                 actions={actions}
                 agentLabel={agentLabel}
@@ -564,13 +575,16 @@ export function FreshAgentTranscript({
             )
             : (
               <FreshAgentTurnArticle
-                key={turn.id}
+                key={`${turn.id}:${index}`}
                 turn={turn}
                 compact={index < collapsedCutoff}
                 isLatest={index === turns.length - 1}
                 actions={actions}
                 agentLabel={agentLabel}
                 showModel={showModel}
+                showHeader={index === collapsedCutoff || turns[index - 1]?.role !== turn.role}
+                continuation={index > collapsedCutoff && turns[index - 1]?.role === turn.role}
+                isStreaming={isStreaming}
               />
             )
         ))}
@@ -592,7 +606,7 @@ export function FreshAgentTranscript({
       {!atBottom ? (
         <button
           type="button"
-          className="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-full border border-border bg-background px-3 py-1 text-xs shadow"
+          className="fresh-agent-scroll-bottom absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-full border border-border bg-background px-3 py-1 text-xs shadow"
           onClick={() => {
             const node = scrollerRef.current
             if (!node) return

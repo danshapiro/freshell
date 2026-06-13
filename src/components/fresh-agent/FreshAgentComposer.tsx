@@ -498,31 +498,31 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
     >
       {menuMode && menuLength > 0 ? (
         <div
-          className="absolute bottom-full left-3 mb-2 w-[min(420px,calc(100%-1.5rem))] overflow-hidden rounded-md border border-border/70 bg-popover text-popover-foreground shadow-lg"
+          className="fresh-agent-composer-menu absolute bottom-full left-3 mb-2 w-[min(420px,calc(100%-1.5rem))] overflow-hidden rounded-md border border-border/70 bg-popover text-popover-foreground shadow-lg"
           role="menu"
           aria-label={menuMode === 'files' ? 'File suggestions' : 'Slash commands'}
         >
           {menuMode === 'browse' ? (
-            <div className="border-b border-border/60 p-2">
+            <div className="fresh-agent-composer-menu-filter border-b border-border/60 p-2">
               <input
                 ref={filterRef}
                 value={filter}
                 onChange={(event) => setFilter(event.target.value)}
                 onKeyDown={handleMenuKeyDown}
-                className="w-full rounded border border-border/70 bg-background px-2 py-1 text-sm outline-none"
+                className="fresh-agent-composer-filter-input w-full rounded border border-border/70 bg-background px-2 py-1 text-sm outline-none"
                 aria-label="Filter slash commands"
                 placeholder="Filter commands..."
               />
             </div>
           ) : null}
-          <div className="max-h-[45vh] overflow-auto overscroll-contain py-1 sm:max-h-72">
+          <div className="fresh-agent-composer-menu-list max-h-[45vh] overflow-auto overscroll-contain py-1 sm:max-h-72">
             {menuMode === 'files' ? fileSuggestions.map((suggestion, index) => (
               <button
                 key={suggestion.path}
                 type="button"
                 role="menuitem"
                 className={[
-                  'flex min-h-[2.75rem] w-full items-center gap-2 px-3 py-1.5 text-left text-sm sm:min-h-0',
+                  'fresh-agent-composer-menu-item flex min-h-[2.75rem] w-full items-center gap-2 px-3 py-1.5 text-left text-sm sm:min-h-0',
                   index === highlightedIndex ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/60',
                 ].join(' ')}
                 onMouseEnter={() => setHighlightedIndex(index)}
@@ -539,7 +539,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
                 type="button"
                 role="menuitem"
                 className={[
-                  'flex min-h-[2.75rem] w-full flex-col justify-center px-3 py-2 text-left text-sm sm:min-h-0',
+                  'fresh-agent-composer-menu-item flex min-h-[2.75rem] w-full flex-col justify-center px-3 py-2 text-left text-sm sm:min-h-0',
                   index === highlightedIndex ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/60',
                 ].join(' ')}
                 onMouseEnter={() => setHighlightedIndex(index)}
@@ -550,7 +550,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
               </button>
             ))}
           </div>
-          <div className="flex gap-3 border-t border-border/60 px-3 py-2 text-xs text-muted-foreground">
+          <div className="fresh-agent-composer-menu-help flex gap-3 border-t border-border/60 px-3 py-2 text-xs text-muted-foreground">
             <span>Arrow keys navigate</span>
             <span>Enter {menuMode === 'files' ? 'inserts' : 'runs'}</span>
             {menuMode === 'chat' ? <span>Tab completes</span> : null}
@@ -560,12 +560,12 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
       ) : null}
 
       {queuedMessages.length > 0 ? (
-        <div className="mb-2 space-y-1" role="list" aria-label="Queued messages">
+        <div className="fresh-agent-queued-messages mb-2 space-y-1" role="list" aria-label="Queued messages">
           {queuedMessages.map((message, index) => (
             <div
               key={`${index}-${message.slice(0, 16)}`}
               role="listitem"
-              className="flex items-center gap-2 rounded-md border border-dashed border-border/70 px-2 py-1 text-xs text-muted-foreground"
+              className="fresh-agent-queued-message flex items-center gap-2 rounded-md border border-dashed border-border/70 px-2 py-1 text-xs text-muted-foreground"
             >
               <span className="shrink-0">queued</span>
               <span className="min-w-0 flex-1 truncate">{message}</span>
@@ -585,13 +585,13 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
       ) : null}
 
       {attachments.length > 0 ? (
-        <div className="mb-2 flex flex-wrap gap-1.5" role="list" aria-label="Attachments">
+        <div className="fresh-agent-attachments mb-2 flex flex-wrap gap-1.5" role="list" aria-label="Attachments">
           {attachments.map((attachment, index) => (
             <span
               key={`${attachment.name}-${index}`}
               role="listitem"
               className={cn(
-                'inline-flex max-w-full items-center gap-1.5 rounded-md border px-2 py-0.5 text-xs',
+                'fresh-agent-attachment inline-flex max-w-full items-center gap-1.5 rounded-md border px-2 py-0.5 text-xs',
                 attachment.status === 'error'
                   ? 'border-destructive/60 text-destructive'
                   : 'border-border/70 text-muted-foreground',
@@ -615,7 +615,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
       ) : null}
 
       <div
-        className="mb-2 flex h-[0.5em] justify-center"
+        className="fresh-agent-thinking-bar mb-2 flex h-[0.5em] justify-center"
         aria-hidden="true"
         data-state={thinking ? 'active' : 'idle'}
         data-testid="fresh-agent-thinking-bar"
@@ -641,7 +641,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
           placeholder={placeholder ?? (disabled ? 'Read-only session' : 'Send a message — / commands, @ files, ! shell')}
           className={cn(
             // text-base at small sizes prevents iOS Safari's zoom-on-focus.
-            'max-h-44 min-h-[44px] flex-1 resize-none rounded-md border border-border/70 bg-background px-3 py-2 text-base outline-none sm:min-h-[40px] sm:text-sm',
+            'fresh-agent-composer-input max-h-44 min-h-[44px] flex-1 resize-none rounded-md border border-border/70 bg-background px-3 py-2 text-base outline-none sm:min-h-[40px] sm:text-sm',
             isShellInput && 'border-warning/60 font-mono',
           )}
           onChange={(event) => {

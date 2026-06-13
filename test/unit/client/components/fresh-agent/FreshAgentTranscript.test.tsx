@@ -210,7 +210,9 @@ describe('FreshAgentTranscript', () => {
     )
 
     expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('thought · 1 tool used')
+    expect(screen.queryByText('the race is in the close handler')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+    expect(screen.queryByText('the race is in the close handler')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Thinking' }))
     expect(screen.getAllByText('the race is in the close handler').length).toBeGreaterThanOrEqual(1)
   })
@@ -260,6 +262,114 @@ describe('FreshAgentTranscript', () => {
 
     expect(screen.getByLabelText('running')).toBeInTheDocument()
     expect(screen.getByText('Thinking')).toBeInTheDocument()
+    expect(screen.queryByText('still reasoning about the fix')).not.toBeInTheDocument()
+  })
+
+  it('keeps the latest completed tool in the live reel while the turn is still streaming', () => {
+    render(
+      <FreshAgentTranscript
+        isStreaming
+        turns={[
+          {
+            id: 'turn-1',
+            role: 'assistant',
+            summary: 'streaming after tool',
+            items: [
+              {
+                id: 'tool-1',
+                kind: 'tool_use',
+                toolUseId: 'call-1',
+                name: 'Read',
+                input: { file_path: 'src/App.tsx' },
+              },
+              { id: 'result-1', kind: 'tool_result', toolUseId: 'call-1', content: 'ok', isError: false },
+              { id: 'item-1', kind: 'text', text: 'I found the relevant file.' },
+            ],
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.getByLabelText('running')).toBeInTheDocument()
+    expect(screen.getByText('Read')).toBeInTheDocument()
+    expect(screen.queryByText('1 tool used')).not.toBeInTheDocument()
+  })
+
+  it('shows the speaker label once for consecutive turns from the same role', () => {
+    const { container } = render(
+      <FreshAgentTranscript
+        agentLabel="freshclaude"
+        turns={[
+          {
+            id: 'turn-user-1',
+            role: 'user',
+            items: [{ id: 'item-user-1', kind: 'text', text: 'First request' }],
+          },
+          {
+            id: 'turn-agent-1',
+            role: 'assistant',
+            items: [{ id: 'item-agent-1', kind: 'text', text: 'First response line' }],
+          },
+          {
+            id: 'turn-agent-2',
+            role: 'assistant',
+            items: [{ id: 'item-agent-2', kind: 'text', text: 'Second response line' }],
+          },
+          {
+            id: 'turn-agent-3',
+            role: 'assistant',
+            items: [{ id: 'item-agent-3', kind: 'text', text: 'Third response line' }],
+          },
+          {
+            id: 'turn-user-2',
+            role: 'user',
+            items: [{ id: 'item-user-2', kind: 'text', text: 'Follow-up' }],
+          },
+          {
+            id: 'turn-agent-4',
+            role: 'assistant',
+            items: [{ id: 'item-agent-4', kind: 'text', text: 'Fresh response group' }],
+          },
+        ]}
+      />,
+    )
+
+    const visibleHeaders = Array.from(container.querySelectorAll('.fresh-agent-turn-header'))
+      .map((node) => node.textContent)
+    expect(visibleHeaders.filter((text) => text === 'freshclaude')).toHaveLength(2)
+    expect(container.querySelectorAll('[data-turn-continuation="true"]')).toHaveLength(2)
+  })
+
+  it('tolerates duplicate provider turn ids without duplicate React keys', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      render(
+        <FreshAgentTranscript
+          turns={[
+            {
+              id: 'provider-duplicate',
+              role: 'user',
+              items: [{ id: 'item-user', kind: 'text', text: 'First duplicate id turn' }],
+            },
+            {
+              id: 'provider-duplicate',
+              role: 'assistant',
+              items: [{ id: 'item-agent', kind: 'text', text: 'Second duplicate id turn' }],
+            },
+          ]}
+        />,
+      )
+
+      expect(screen.getByText('First duplicate id turn')).toBeInTheDocument()
+      expect(screen.getByText('Second duplicate id turn')).toBeInTheDocument()
+      expect(consoleError).not.toHaveBeenCalledWith(
+        expect.stringContaining('Encountered two children with the same key'),
+        expect.anything(),
+        expect.anything(),
+      )
+    } finally {
+      consoleError.mockRestore()
+    }
   })
 
   it('keeps auto-scroll enabled for streamed text when already at the bottom', () => {

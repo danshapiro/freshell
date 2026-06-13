@@ -32,44 +32,44 @@ export function FreshAgentApprovalCard({
     <div
       role="alert"
       aria-label={`Permission request for ${toolName}`}
-      className="rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
+      className="fresh-agent-approval-card rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
     >
-      <div className="flex items-center gap-2 font-medium">
-        <span className="rounded-full border border-amber-500/60 px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] text-amber-600 dark:text-amber-400">
+      <div className="fresh-agent-approval-heading flex items-center gap-2 font-medium">
+        <span className="fresh-agent-approval-kicker rounded-full border border-amber-500/60 px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] text-amber-600 dark:text-amber-400">
           approval
         </span>
-        <span>{toolName}</span>
+        <span className="fresh-agent-approval-tool">{toolName}</span>
         {approval.blockedPath ? (
-          <span className="truncate font-mono text-xs text-muted-foreground">{approval.blockedPath}</span>
+          <span className="fresh-agent-approval-path truncate font-mono text-xs text-muted-foreground">{approval.blockedPath}</span>
         ) : null}
       </div>
       {approval.decisionReason ? (
-        <p className="mt-1 text-xs text-muted-foreground">{approval.decisionReason}</p>
+        <p className="fresh-agent-approval-reason mt-1 text-xs text-muted-foreground">{approval.decisionReason}</p>
       ) : null}
 
       {command ? (
-        <pre className="mt-2 overflow-x-auto rounded border border-border/60 bg-background/70 px-2 py-1.5 font-mono text-xs">
+        <pre className="fresh-agent-approval-preview mt-2 overflow-x-auto rounded border border-border/60 bg-background/70 px-2 py-1.5 font-mono text-xs">
           {command}
         </pre>
       ) : editDiff ? (
-        <div className="mt-2 text-xs">
+        <div className="fresh-agent-approval-preview mt-2 text-xs">
           <DiffView oldStr={editDiff.oldStr} newStr={editDiff.newStr} filePath={editDiff.filePath} />
         </div>
       ) : Object.keys(input).length > 0 ? (
-        <pre className="mt-2 max-h-40 overflow-auto rounded border border-border/60 bg-background/70 px-2 py-1.5 font-mono text-xs">
+        <pre className="fresh-agent-approval-preview mt-2 max-h-40 overflow-auto rounded border border-border/60 bg-background/70 px-2 py-1.5 font-mono text-xs">
           {JSON.stringify(input, null, 2)}
         </pre>
       ) : null}
 
       {/* Touch targets ≥44px at base; compact on sm+. flex-1 lets the buttons
           share the full row width on narrow panes for easy thumbing. */}
-      <div className="mt-2 flex flex-wrap gap-2">
+      <div className="fresh-agent-approval-actions mt-2 flex flex-wrap gap-2">
         <button
           type="button"
           aria-label="Allow tool use"
           disabled={disabled}
           onClick={onAllow}
-          className="min-h-[2.75rem] flex-1 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:flex-none sm:px-3 sm:py-1 sm:text-xs"
+          className="fresh-agent-approval-button fresh-agent-approval-button-primary min-h-[2.75rem] flex-1 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:flex-none sm:px-3 sm:py-1 sm:text-xs"
         >
           Allow
         </button>
@@ -79,7 +79,7 @@ export function FreshAgentApprovalCard({
             aria-label={`Always allow ${toolName} this session`}
             disabled={disabled}
             onClick={() => onAlwaysAllow(toolName)}
-            className="min-h-[2.75rem] flex-1 rounded-md border border-border px-4 text-sm disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:flex-none sm:px-3 sm:py-1 sm:text-xs"
+            className="fresh-agent-approval-button min-h-[2.75rem] flex-1 rounded-md border border-border px-4 text-sm disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:flex-none sm:px-3 sm:py-1 sm:text-xs"
             title={`Auto-approve every ${toolName} request for the rest of this session`}
           >
             Always allow {toolName} this session
@@ -90,7 +90,7 @@ export function FreshAgentApprovalCard({
           aria-label="Deny tool use"
           disabled={disabled}
           onClick={onDeny}
-          className="min-h-[2.75rem] flex-1 rounded-md border border-border px-4 text-sm text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:flex-none sm:px-3 sm:py-1 sm:text-xs"
+          className="fresh-agent-approval-button fresh-agent-approval-button-deny min-h-[2.75rem] flex-1 rounded-md border border-border px-4 text-sm text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:flex-none sm:px-3 sm:py-1 sm:text-xs"
         >
           Deny
         </button>

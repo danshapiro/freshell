@@ -30,9 +30,9 @@ function SingleSelectQuestion({
   }, [showOther])
 
   return (
-    <div className="space-y-2">
-      <p className="text-sm font-medium">{question.question}</p>
-      <div className="flex flex-wrap gap-2">
+    <div className="fresh-agent-question-block space-y-2">
+      <p className="fresh-agent-question-text text-sm font-medium">{question.question}</p>
+      <div className="fresh-agent-question-options flex flex-wrap gap-2">
         {question.options.map((option) => (
           <button
             key={option.label}
@@ -40,7 +40,7 @@ function SingleSelectQuestion({
             onClick={() => onSelect(option.label)}
             disabled={disabled}
             className={cn(
-              'px-3 py-1.5 text-xs rounded-md border transition-colors',
+              'fresh-agent-question-option px-3 py-1.5 text-xs rounded-md border transition-colors',
               'bg-sky-600/10 border-sky-500/30 hover:bg-sky-600/20 hover:border-sky-500/50',
               'disabled:opacity-50',
             )}
@@ -57,7 +57,7 @@ function SingleSelectQuestion({
           onClick={() => setShowOther(true)}
           disabled={disabled}
           className={cn(
-            'px-3 py-1.5 text-xs rounded-md border transition-colors',
+            'fresh-agent-question-option fresh-agent-question-option-other px-3 py-1.5 text-xs rounded-md border transition-colors',
             'bg-muted/50 border-border hover:bg-muted',
             'disabled:opacity-50',
           )}
@@ -67,21 +67,21 @@ function SingleSelectQuestion({
         </button>
       </div>
       {showOther ? (
-        <div className="flex items-center gap-2">
+        <div className="fresh-agent-question-other flex items-center gap-2">
           <input
             ref={otherInputRef}
             type="text"
             value={otherText}
             onChange={(event) => setOtherText(event.target.value)}
             placeholder="Type your answer..."
-            className="flex-1 rounded border bg-background px-2 py-1 text-xs"
+            className="fresh-agent-question-input flex-1 rounded border bg-background px-2 py-1 text-xs"
           />
           <button
             type="button"
             onClick={() => otherText.trim() && onSelect(otherText.trim())}
             disabled={disabled || !otherText.trim()}
             className={cn(
-              'px-3 py-1 text-xs rounded font-medium',
+              'fresh-agent-question-submit px-3 py-1 text-xs rounded font-medium',
               'bg-sky-600 text-white hover:bg-sky-700',
               'disabled:opacity-50',
             )}
@@ -120,9 +120,9 @@ function MultiSelectQuestion({
   }, [onSelect, selected])
 
   return (
-    <div className="space-y-2">
-      <p className="text-sm font-medium">{question.question}</p>
-      <div className="flex flex-wrap gap-2">
+    <div className="fresh-agent-question-block space-y-2">
+      <p className="fresh-agent-question-text text-sm font-medium">{question.question}</p>
+      <div className="fresh-agent-question-options flex flex-wrap gap-2">
         {question.options.map((option) => (
           <button
             key={option.label}
@@ -130,7 +130,7 @@ function MultiSelectQuestion({
             onClick={() => toggle(option.label)}
             disabled={disabled}
             className={cn(
-              'px-3 py-1.5 text-xs rounded-md border transition-colors',
+              'fresh-agent-question-option px-3 py-1.5 text-xs rounded-md border transition-colors',
               selected.has(option.label)
                 ? 'bg-sky-600/30 border-sky-500/60 ring-1 ring-sky-500/40'
                 : 'bg-sky-600/10 border-sky-500/30 hover:bg-sky-600/20',
@@ -151,7 +151,7 @@ function MultiSelectQuestion({
         onClick={handleSubmit}
         disabled={disabled || selected.size === 0}
         className={cn(
-          'px-3 py-1 text-xs rounded font-medium',
+          'fresh-agent-question-submit px-3 py-1 text-xs rounded font-medium',
           'bg-sky-600 text-white hover:bg-sky-700',
           'disabled:opacity-50',
         )}
@@ -191,11 +191,11 @@ function FreshAgentQuestionBanner({
 
   return (
     <div
-      className="rounded-lg border border-sky-500/50 bg-sky-500/10 p-3 space-y-3"
+      className="fresh-agent-question-card rounded-lg border border-sky-500/50 bg-sky-500/10 p-3 space-y-3"
       role="region"
       aria-label={regionLabel}
     >
-      <div className="flex items-center gap-2 text-sm font-medium">
+      <div className="fresh-agent-question-heading flex items-center gap-2 text-sm font-medium">
         <MessageCircleQuestion className="h-4 w-4 text-sky-500" />
         <span>{heading}</span>
       </div>
@@ -230,7 +230,7 @@ function FreshAgentQuestionBanner({
           }}
           disabled={disabled}
           className={cn(
-            'px-4 py-1.5 text-xs rounded font-medium',
+            'fresh-agent-question-submit px-4 py-1.5 text-xs rounded font-medium',
             'bg-sky-600 text-white hover:bg-sky-700',
             'disabled:opacity-50',
           )}

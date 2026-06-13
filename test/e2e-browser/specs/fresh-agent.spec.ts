@@ -149,6 +149,21 @@ test.describe('Fresh Agent', () => {
       return settings?.freshAgent?.providers?.freshcodex?.style ?? null
     }).toBe('serif')
 
+    await page.route('**/api/fresh-agent/diff*', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          diff: [
+            'diff --git a/src/index.css b/src/index.css',
+            '@@ -1,3 +1,3 @@',
+            '-.old { color: blue; }',
+            '+.fresh-agent-style-serif { color: #1d1a16; }',
+            ' context line',
+          ].join('\n'),
+        }),
+      })
+    })
     await page.route('**/api/fresh-agent/threads/freshcodex/codex/style-thread*', async (route) => {
       await route.fulfill({
         status: 200,
@@ -161,19 +176,58 @@ test.describe('Fresh Agent', () => {
           revision: 1,
           latestTurnId: 'turn-style',
           status: 'idle',
-          summary: 'Serif style summary',
-          capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: true },
+          summary: '',
+          capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: true },
           settings: { model: 'gpt-5.4-flash', permissionMode: 'on-request', effort: 'high', plugins: [] },
           tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
-          pendingApprovals: [],
-          pendingQuestions: [],
-          turns: [{
-            id: 'turn-style',
-            turnId: 'turn-style',
-            role: 'assistant',
-            summary: 'Serif transcript line',
-            items: [{ id: 'item-style', kind: 'text', text: 'Serif transcript line' }],
+          pendingApprovals: [{
+            requestId: 'approval-style',
+            toolName: 'Bash',
+            input: { command: 'git diff -- src/index.css' },
+            decisionReason: 'Review command output before continuing.',
           }],
+          pendingQuestions: [{
+            requestId: 'question-style',
+            questions: [{
+              header: 'Direction',
+              question: 'Which style should apply?',
+              options: [
+                { label: 'Serif', description: 'Use the reference visual' },
+                { label: 'Sans', description: 'Keep current UI' },
+              ],
+              multiSelect: false,
+            }],
+          }],
+          worktrees: [{ id: 'wt-style', path: '/tmp/freshell', branch: 'freshagent-serif-full-style' }],
+          diffs: [{ id: 'diff-style', path: 'src/index.css', title: 'src/index.css', status: 'modified' }],
+          turns: [
+            {
+              id: 'turn-style-user',
+              turnId: 'turn-style-user',
+              role: 'user',
+              summary: 'Apply the reference treatment',
+              items: [{ id: 'item-style-user', kind: 'text', text: 'Apply the reference treatment.' }],
+            },
+            {
+              id: 'turn-style',
+              turnId: 'turn-style',
+              role: 'assistant',
+              summary: 'Serif transcript line',
+              items: [
+                { id: 'item-style', kind: 'text', text: '## Serif transcript line\n\nThe transcript uses the serif reference treatment.' },
+                { id: 'think-style', kind: 'thinking', text: 'private style reasoning should stay hidden' },
+                { id: 'tool-style', kind: 'tool_use', toolUseId: 'tool-style-call', name: 'Bash', input: { command: 'rg FreshAgent src' } },
+                { id: 'result-style', kind: 'tool_result', toolUseId: 'tool-style-call', content: 'src/components/fresh-agent/FreshAgentView.tsx', isError: false },
+              ],
+            },
+            {
+              id: 'turn-style-continuation',
+              turnId: 'turn-style-continuation',
+              role: 'assistant',
+              summary: 'Continuation line',
+              items: [{ id: 'item-style-continuation', kind: 'text', text: 'The continuation should not repeat the agent label.' }],
+            },
+          ],
         }),
       })
     })
@@ -224,7 +278,15 @@ test.describe('Fresh Agent', () => {
 
     const transcript = freshcodexRoot.locator('.fresh-agent-transcript-copy').first()
     await expect(transcript).toBeVisible({ timeout: 10_000 })
-    await expect(transcript.getByText('Serif transcript line')).toBeVisible()
+    await expect(freshcodexRoot.getByText('Serif transcript line')).toBeVisible()
+    await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toHaveCount(0)
+    await expect(freshcodexRoot.locator('.fresh-agent-turn-header', { hasText: 'Freshcodex' })).toHaveCount(1)
+    await expect(freshcodexRoot.locator('[data-turn-continuation="true"]')).toHaveCount(1)
+    await freshcodexRoot.getByRole('button', { name: 'Toggle activity details' }).click()
+    await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toHaveCount(0)
+    await freshcodexRoot.getByRole('button', { name: 'Thinking' }).click()
+    await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toBeVisible()
+    await freshcodexRoot.getByRole('button', { name: /Diff: src\/index\.css/ }).click()
     const transcriptFont = await transcript.evaluate((node) => getComputedStyle(node).fontFamily)
     expect(transcriptFont.toLowerCase()).toContain('georgia')
     const rootFont = await freshcodexRoot.evaluate((node) => getComputedStyle(node).fontFamily)
@@ -232,6 +294,24 @@ test.describe('Fresh Agent', () => {
     const composerFont = await freshcodexRoot.getByRole('textbox', { name: 'Chat message input' })
       .evaluate((node) => getComputedStyle(node).fontFamily)
     expect(composerFont.toLowerCase()).toContain('georgia')
+    const toolFont = await freshcodexRoot.locator('.fresh-agent-tool-block').first()
+      .evaluate((node) => getComputedStyle(node).fontFamily)
+    expect(toolFont.toLowerCase()).toContain('ibm plex mono')
+    const approvalBackground = await freshcodexRoot.locator('.fresh-agent-approval-card').first()
+      .evaluate((node) => getComputedStyle(node).backgroundColor)
+    expect(approvalBackground).toBe('rgb(251, 250, 247)')
+    const questionBackground = await freshcodexRoot.locator('.fresh-agent-question-card').first()
+      .evaluate((node) => getComputedStyle(node).backgroundColor)
+    expect(questionBackground).toBe('rgb(251, 250, 247)')
+    const diffBackground = await freshcodexRoot.locator('.fresh-agent-diff-panel').first()
+      .evaluate((node) => getComputedStyle(node).backgroundColor)
+    expect(diffBackground).toBe('rgb(251, 250, 247)')
+    const composerButtonFont = await freshcodexRoot.locator('.fresh-agent-composer-action').first()
+      .evaluate((node) => getComputedStyle(node).fontFamily)
+    expect(composerButtonFont.toLowerCase()).toContain('ibm plex mono')
+    const chromeFont = await page.locator('[data-context="tab-add"]').evaluate((node) => getComputedStyle(node).fontFamily)
+    expect(chromeFont.toLowerCase()).not.toContain('georgia')
+    expect(chromeFont.toLowerCase()).not.toContain('literata')
     const watermarkOpacity = await freshcodexRoot.getByTestId('fresh-agent-watermark')
       .evaluate((node) => Number(getComputedStyle(node).opacity))
     expect(watermarkOpacity).toBeLessThanOrEqual(0.004)
