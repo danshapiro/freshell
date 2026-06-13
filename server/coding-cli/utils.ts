@@ -313,6 +313,8 @@ export function isSystemContext(text: string): boolean {
   if (/^<(environment_context|system_context|system|context|INSTRUCTIONS|user_instructions|permissions|collaboration_mode|skills_instructions)[>\s]/i.test(trimmed)) return true
   // Instruction file headers: "# AGENTS.md instructions for...", "# System", "# Instructions"
   if (/^#\s*(AGENTS|Instructions?|System)/i.test(trimmed)) return true
+  // Claude Code injects invoked skills as user-role context with the skill path first.
+  if (/^Base directory for this skill:\s+/i.test(trimmed)) return true
   // Bracketed agent mode instructions: [SUGGESTION MODE: ...], [REVIEW MODE: ...]
   if (/^\[[A-Z][A-Z_ ]*:/.test(trimmed)) return true
   // IDE context format: "# Context from my IDE setup:"
