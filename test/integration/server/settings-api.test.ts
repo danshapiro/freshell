@@ -175,12 +175,17 @@ describe('Settings API Integration', () => {
       .send({
         freshAgent: {
           defaultPlugins: ['fs', 'search'],
+          providers: {
+            freshcodex: { style: 'serif' },
+          },
         },
       })
 
     expect(res.status).toBe(200)
     expect(res.body.freshAgent.defaultPlugins).toEqual(['fs', 'search'])
     expect(res.body.agentChat.defaultPlugins).toEqual(['fs', 'search'])
+    expect(res.body.freshAgent.providers.freshcodex).toEqual({ style: 'serif' })
+    expect(res.body.agentChat.providers.freshcodex).toEqual({ style: 'serif' })
   })
 
   it('PATCH /api/settings preserves runtime CLI providers outside the built-in defaults', async () => {

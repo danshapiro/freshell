@@ -143,6 +143,55 @@ describe('shared settings contract', () => {
     expect(merged.agentChat).toEqual(merged.freshAgent)
   })
 
+  it('accepts fresh-agent provider style defaults and keeps them per session type', () => {
+    const parsed = buildServerSettingsPatchSchema().parse({
+      freshAgent: {
+        providers: {
+          freshcodex: { style: 'serif' },
+          freshclaude: { style: 'sans' },
+        },
+      },
+    })
+
+    expect(parsed.freshAgent?.providers?.freshcodex).toEqual({ style: 'serif' })
+    expect(parsed.freshAgent?.providers?.freshclaude).toEqual({ style: 'sans' })
+
+    const merged = mergeServerSettings(createDefaultServerSettings({ loggingDebug: false }), {
+      freshAgent: {
+        providers: {
+          freshcodex: { style: 'serif' },
+          freshclaude: { style: 'sans' },
+        },
+      },
+    })
+
+    expect(merged.freshAgent.providers.freshcodex?.style).toBe('serif')
+    expect(merged.freshAgent.providers.freshclaude?.style).toBe('sans')
+    expect(merged.agentChat.providers).toEqual(merged.freshAgent.providers)
+  })
+
+  it('rejects invalid fresh-agent provider style defaults', () => {
+    const schema = buildServerSettingsPatchSchema()
+
+    expect(schema.safeParse({
+      freshAgent: {
+        providers: {
+          freshcodex: { style: 'mono' },
+        },
+      },
+    }).success).toBe(false)
+
+    const merged = mergeServerSettings(createDefaultServerSettings({ loggingDebug: false }), {
+      freshAgent: {
+        providers: {
+          freshcodex: { style: 'mono' as any },
+        },
+      },
+    })
+
+    expect(merged.freshAgent.providers.freshcodex).toBeUndefined()
+  })
+
   it('rejects representative local-only fields in the server patch schema', () => {
     const schema = buildServerSettingsPatchSchema()
 

@@ -10,7 +10,7 @@ describe('config-store fresh-agent settings compatibility', () => {
         agentChat: {
           defaultPlugins: ['/tmp/plugin'],
           providers: {
-            freshclaude: { defaultModel: 'fixture-claude-model', defaultEffort: 'high' },
+            freshclaude: { defaultModel: 'fixture-claude-model', defaultEffort: 'high', style: 'serif' },
           },
         },
       },
@@ -21,10 +21,12 @@ describe('config-store fresh-agent settings compatibility', () => {
     expect(settings.freshAgent.providers.freshclaude).toEqual({
       modelSelection: { kind: 'exact', modelId: 'fixture-claude-model' },
       effort: 'high',
+      style: 'serif',
     })
     expect(settings.agentChat.providers.freshclaude).toEqual({
       modelSelection: { kind: 'exact', modelId: 'fixture-claude-model' },
       effort: 'high',
+      style: 'serif',
     })
   })
 })

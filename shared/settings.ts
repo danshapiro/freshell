@@ -47,6 +47,9 @@ const FRESH_AGENT_FONT_SCALE_MAX = 2
 // Fresh-agent panes render 50% larger than the base UI by default.
 export const FRESH_AGENT_FONT_SCALE_DEFAULT = 1.5
 export const FRESH_AGENT_FONT_SCALE_OPTIONS = [1, 1.25, 1.5, 1.75, 2] as const
+export const FRESH_AGENT_STYLE_VALUES = ['sans', 'serif'] as const
+export type FreshAgentStyle = (typeof FRESH_AGENT_STYLE_VALUES)[number]
+export const DEFAULT_FRESH_AGENT_STYLE: FreshAgentStyle = 'sans'
 
 const TERMINAL_LOCAL_KEYS = [
   'fontSize',
@@ -118,6 +121,7 @@ export type AgentChatProviderDefaults = {
   modelSelection?: AgentChatModelSelection
   defaultPermissionMode?: string
   effort?: AgentChatEffort
+  style?: FreshAgentStyle
 }
 
 export type ServerSettings = {
@@ -257,6 +261,7 @@ const AttentionDismissSchema = z.enum(ATTENTION_DISMISS_VALUES)
 const SessionOpenModeSchema = z.enum(SESSION_OPEN_MODE_VALUES)
 const ExternalEditorSchema = z.enum(EXTERNAL_EDITOR_VALUES)
 const NetworkHostSchema = z.enum(NETWORK_HOST_VALUES)
+const FreshAgentStyleSchema = z.enum(FRESH_AGENT_STYLE_VALUES)
 
 function hasOwn<T extends object>(value: T | undefined | null, key: PropertyKey): boolean {
   return !!value && Object.prototype.hasOwnProperty.call(value, key)
@@ -421,6 +426,16 @@ function normalizeFreshAgentFontScale(value: unknown): number {
     normalizeClampedNumber(value, FRESH_AGENT_FONT_SCALE_MIN, FRESH_AGENT_FONT_SCALE_MAX)
     ?? FRESH_AGENT_FONT_SCALE_DEFAULT
   )
+}
+
+export function normalizeFreshAgentStyleOverride(value: unknown): FreshAgentStyle | undefined {
+  return FreshAgentStyleSchema.safeParse(value).success
+    ? value as FreshAgentStyle
+    : undefined
+}
+
+export function normalizeFreshAgentStyle(value: unknown): FreshAgentStyle {
+  return normalizeFreshAgentStyleOverride(value) ?? DEFAULT_FRESH_AGENT_STYLE
 }
 
 function normalizeLocalFreshAgent(value: LocalSettings['freshAgent']): LocalSettings['freshAgent'] {
@@ -628,6 +643,7 @@ function createAgentChatProviderDefaultsSchema() {
       modelSelection: AgentChatModelSelectionSchema.optional(),
       defaultPermissionMode: z.string().optional(),
       effort: AgentChatOpaqueStringSchema.optional(),
+      style: FreshAgentStyleSchema.optional(),
     })
     .strict()
 }
@@ -638,6 +654,7 @@ function createAgentChatProviderDefaultsPatchSchema() {
       modelSelection: AgentChatModelSelectionSchema.nullable().optional(),
       defaultPermissionMode: z.string().optional(),
       effort: z.union([AgentChatOpaqueStringSchema, z.literal('')]).nullable().optional(),
+      style: FreshAgentStyleSchema.optional(),
     })
     .strict()
 }
@@ -1044,6 +1061,9 @@ function sanitizeServerSettingsPatch(patch: ServerSettingsPatch): ServerSettings
               ? undefined
               : parsedEffort ?? undefined
           }
+          if (hasOwn(normalizedProviderPatchInput, 'style')) {
+            normalizedProviderPatch.style = parsed.data.style
+          }
           providers[providerName] = normalizedProviderPatch
         }
       }
@@ -1097,7 +1117,7 @@ function normalizeLegacyAgentChatProviderDefaultsInput(
 
   const normalized = pickOwnKeysPreservingUndefined(
     providerPatch,
-    ['modelSelection', 'defaultPermissionMode', 'effort'],
+    ['modelSelection', 'defaultPermissionMode', 'effort', 'style'],
   )
 
   if (
