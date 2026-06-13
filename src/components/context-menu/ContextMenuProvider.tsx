@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { KeyboardShortcutsDialog } from '@/components/KeyboardShortcutsDialog'
-import { useAppDispatch, useAppSelector } from '@/store/hooks'
+import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { addTab, closeTab, reopenClosedTab, closePaneWithCleanup, reorderTabs, updateTab, setActiveTab, openSessionTab, requestTabRename } from '@/store/tabsSlice'
 import {
   addPane,
@@ -12,16 +12,17 @@ import {
   resetSplit,
   splitPane as splitPaneAction,
   swapSplit,
+  updatePaneContent,
 } from '@/store/panesSlice'
 import { setProjectExpanded } from '@/store/sessionsSlice'
 import { getWsClient } from '@/lib/ws-client'
-import { api } from '@/lib/api'
+import { api, setSessionMetadata } from '@/lib/api'
 import { refreshActiveSessionWindow } from '@/store/sessionsThunks'
 import { getAuthToken } from '@/lib/auth'
 import { buildShareUrl } from '@/lib/utils'
 import { copyText } from '@/lib/clipboard'
 import { triggerHapticFeedback } from '@/lib/mobile-haptics'
-import { collectTerminalIds, findPaneContent } from '@/lib/pane-utils'
+import { collectPaneEntries, collectTerminalIds, findPaneContent } from '@/lib/pane-utils'
 import { collectSessionRefsFromNode } from '@/lib/session-utils'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { getBrowserActions, getEditorActions, getTerminalActions } from '@/lib/pane-action-registry'
@@ -31,9 +32,19 @@ import { buildResumeContent } from '@/lib/session-type-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 import { deriveTabRecencyAt } from '@/lib/tab-recency'
+import { resolvePaneActivity } from '@/lib/pane-activity'
+import {
+  resolveReopenPaneSessionTarget,
+  type ReopenPaneActivity,
+  type ReopenPaneSessionTarget,
+} from '@/lib/session-flavor-reopen'
+import { createLogger } from '@/lib/client-logger'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { AppView } from '@/components/Sidebar'
 import type { CodingCliProviderName, CodingCliSession, ProjectGroup } from '@/store/types'
+import type { ChatSessionState } from '@/store/agentChatTypes'
+import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
+import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 import type { ContextId } from './context-menu-constants'
 import type { ContextTarget } from './context-menu-types'
 import { ContextMenu } from './ContextMenu'
@@ -48,12 +59,21 @@ import {
   copyAgentChatDiffOld,
   copyAgentChatFilePath,
 } from './agent-chat-copy'
+import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import { nanoid } from 'nanoid'
 
 const CONTEXT_MENU_KEYS = ['ContextMenu']
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 const EMPTY_PANE_LAST_INPUT_AT: Record<string, number | undefined> = {}
 const EMPTY_FEATURE_FLAGS: Record<string, boolean> = {}
+const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
+const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
+const EMPTY_CODEX_ACTIVITY_BY_ID = {}
+const EMPTY_CLAUDE_ACTIVITY_BY_ID = {}
+const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
+const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
+
+const log = createLogger('ContextMenuProvider')
 
 
 type MenuState = {
@@ -94,6 +114,26 @@ function resolveContextId(value: string | undefined): ContextId {
   return allowed.has(value as ContextId) ? (value as ContextId) : ContextIds.Global
 }
 
+function hasWaitingPrompt(
+  session: Pick<ChatSessionState | FreshAgentSessionState, 'pendingPermissions' | 'pendingQuestions'> | undefined,
+): boolean {
+  if (!session) return false
+  return Object.keys(session.pendingPermissions).length > 0
+    || Object.keys(session.pendingQuestions).length > 0
+}
+
+function sameReopenTargetIdentity(
+  a: ReopenPaneSessionTarget,
+  b: ReopenPaneSessionTarget,
+): boolean {
+  return a.tabId === b.tabId
+    && a.paneId === b.paneId
+    && a.sourceSessionType === b.sourceSessionType
+    && a.targetSessionType === b.targetSessionType
+    && a.provider === b.provider
+    && a.sessionId === b.sessionId
+}
+
 export function ContextMenuProvider({
   view,
   onViewChange,
@@ -102,6 +142,7 @@ export function ContextMenuProvider({
   children,
 }: ContextMenuProviderProps) {
   const dispatch = useAppDispatch()
+  const appStore = useAppStore()
   const tabsState = useAppSelector((s) => s.tabs)
   const panes = useAppSelector((s) => s.panes.layouts)
   const paneTitles = useAppSelector((s) => s.panes.paneTitles)
@@ -114,6 +155,12 @@ export function ContextMenuProvider({
   const appSettings = useAppSelector((s) => s.settings.settings)
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const paneLastInputAt = useAppSelector((s) => s.tabRecency?.paneLastInputAt ?? EMPTY_PANE_LAST_INPUT_AT)
+  const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
+  const freshAgentSessions = useAppSelector((s) => s.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS)
+  const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
+  const claudeActivityByTerminalId = useAppSelector((s) => s.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID)
+  const opencodeActivityByTerminalId = useAppSelector((s) => s.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID)
+  const paneRuntimeActivityByPaneId = useAppSelector((s) => s.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID)
 
   const [menuState, setMenuState] = useState<MenuState | null>(null)
   const [confirmState, setConfirmState] = useState<ConfirmState | null>(null)
@@ -727,6 +774,187 @@ export function ContextMenuProvider({
     if (code?.textContent) await copyText(code.textContent)
   }, [])
 
+  const reopenActivityByPaneId = useMemo<Record<string, ReopenPaneActivity>>(() => {
+    const result: Record<string, ReopenPaneActivity> = {}
+
+    for (const tab of tabsState.tabs) {
+      const layout = panes[tab.id]
+      if (!layout) continue
+      const isOnlyPane = layout.type === 'leaf'
+
+      for (const entry of collectPaneEntries(layout)) {
+        const activity = resolvePaneActivity({
+          paneId: entry.paneId,
+          content: entry.content,
+          tabMode: tab.mode,
+          isOnlyPane,
+          codexActivityByTerminalId,
+          opencodeActivityByTerminalId,
+          claudeActivityByTerminalId,
+          paneRuntimeActivityByPaneId,
+          agentChatSessions,
+          freshAgentSessions,
+        })
+        let hasWaitingItems = false
+        if (entry.content.kind === 'agent-chat' && entry.content.sessionId) {
+          hasWaitingItems = hasWaitingPrompt(agentChatSessions[entry.content.sessionId])
+        } else if (entry.content.kind === 'fresh-agent' && entry.content.sessionId) {
+          const sessionKey = makeFreshAgentSessionKey({
+            sessionType: entry.content.sessionType,
+            provider: entry.content.provider,
+            sessionId: entry.content.sessionId,
+          })
+          hasWaitingItems = hasWaitingPrompt(freshAgentSessions[sessionKey])
+        }
+        result[entry.paneId] = {
+          isBusy: activity.isBusy,
+          ...(hasWaitingItems ? { hasWaitingItems } : {}),
+        }
+      }
+    }
+
+    return result
+  }, [
+    agentChatSessions,
+    claudeActivityByTerminalId,
+    codexActivityByTerminalId,
+    freshAgentSessions,
+    opencodeActivityByTerminalId,
+    paneRuntimeActivityByPaneId,
+    panes,
+    tabsState.tabs,
+  ])
+
+  const reopenPaneAsSessionTargetAction = useCallback(async (clickedTarget: ReopenPaneSessionTarget) => {
+    const resolveCurrent = () => {
+      const state = appStore.getState()
+      const tab = state.tabs.tabs.find((item) => item.id === clickedTarget.tabId)
+      const layout = state.panes.layouts[clickedTarget.tabId]
+      const content = layout ? findPaneContent(layout, clickedTarget.paneId) : null
+      if (!tab || !content) return null
+
+      const activity = resolvePaneActivity({
+        paneId: clickedTarget.paneId,
+        content,
+        tabMode: tab.mode,
+        isOnlyPane: layout.type === 'leaf',
+        codexActivityByTerminalId: state.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID,
+        opencodeActivityByTerminalId: state.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID,
+        claudeActivityByTerminalId: state.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID,
+        paneRuntimeActivityByPaneId: state.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID,
+        agentChatSessions: state.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS,
+        freshAgentSessions: state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS,
+      })
+      let hasWaitingItems = false
+      if (content.kind === 'agent-chat' && content.sessionId) {
+        hasWaitingItems = hasWaitingPrompt((state.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)[content.sessionId])
+      } else if (content.kind === 'fresh-agent' && content.sessionId) {
+        const sessionKey = makeFreshAgentSessionKey({
+          sessionType: content.sessionType,
+          provider: content.provider,
+          sessionId: content.sessionId,
+        })
+        hasWaitingItems = hasWaitingPrompt((state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS)[sessionKey])
+      }
+
+      const target = resolveReopenPaneSessionTarget({
+        tabId: clickedTarget.tabId,
+        paneId: clickedTarget.paneId,
+        content,
+        tab,
+        activity: {
+          isBusy: activity.isBusy,
+          ...(hasWaitingItems ? { hasWaitingItems } : {}),
+        },
+      })
+
+      if (!target) return null
+      return {
+        tab,
+        content,
+        target,
+        providerSettings: state.settings.settings.agentChat?.providers?.[target.targetSessionType],
+      }
+    }
+
+    const current = resolveCurrent()
+    if (
+      !current
+      || current.target.disabled
+      || !sameReopenTargetIdentity(current.target, clickedTarget)
+    ) {
+      return
+    }
+
+    try {
+      await setSessionMetadata(
+        current.target.provider,
+        current.target.sessionId,
+        current.target.targetSessionType,
+        { sessionTypeSource: 'explicit' },
+      )
+    } catch (err) {
+      log.warn({
+        event: 'reopen_session_flavor_metadata_persist_failed',
+        provider: current.target.provider,
+        sessionId: current.target.sessionId,
+        targetSessionType: current.target.targetSessionType,
+        tabId: current.target.tabId,
+        paneId: current.target.paneId,
+        err,
+      })
+      return
+    }
+
+    const latest = resolveCurrent()
+    if (
+      !latest
+      || latest.target.disabled
+      || !sameReopenTargetIdentity(latest.target, clickedTarget)
+    ) {
+      return
+    }
+
+    if (latest.content.kind === 'terminal' && latest.content.terminalId) {
+      ws.send({ type: 'terminal.kill', terminalId: latest.content.terminalId })
+    } else if (latest.content.kind === 'fresh-agent' && latest.content.sessionId) {
+      ws.send({
+        type: 'freshAgent.kill',
+        sessionId: latest.content.sessionId,
+        sessionType: latest.content.sessionType,
+        provider: latest.content.provider,
+      })
+    }
+
+    dispatch(updatePaneContent({
+      tabId: latest.target.tabId,
+      paneId: latest.target.paneId,
+      content: buildResumeContent({
+        sessionType: latest.target.targetSessionType,
+        sessionId: latest.target.sessionId,
+        cwd: latest.target.cwd,
+        agentChatProviderSettings: latest.providerSettings,
+      }),
+    }))
+
+    const sessionMetadataByKey = mergeSessionMetadataByKey(
+      latest.tab.sessionMetadataByKey,
+      latest.target.provider,
+      latest.target.sessionId,
+      { sessionType: latest.target.targetSessionType },
+    )
+    if (sessionMetadataByKey !== latest.tab.sessionMetadataByKey) {
+      dispatch(updateTab({
+        id: latest.tab.id,
+        updates: { sessionMetadataByKey },
+      }))
+    }
+  }, [
+    appStore,
+    dispatch,
+    ws,
+  ])
+
   const shouldUseNativeMenu = useCallback((targetEl: HTMLElement | null, contextId: string, contextEl: HTMLElement | null, evt: MouseEvent | KeyboardEvent) => {
     if (evt.type === 'contextmenu' && (evt as MouseEvent).shiftKey) return true
     if (contextEl?.dataset.nativeContext === 'true') return true
@@ -936,6 +1164,7 @@ export function ContextMenuProvider({
       aiEnabled: Boolean(appSettings.ai?.geminiApiKey) || Boolean(featureFlags.aiEnabled),
       platform,
       extensions: extensionEntries,
+      reopenActivityByPaneId,
       actions: {
         newDefaultTab,
         newTabWithPane,
@@ -981,6 +1210,7 @@ export function ContextMenuProvider({
         copySessionSummary,
         copySessionMetadata,
         copyResumeCommand,
+        reopenPaneAsSessionTarget: reopenPaneAsSessionTargetAction,
         setProjectColor,
         toggleProjectExpanded: toggleProjectExpandedAction,
         openAllSessionsInProject,
@@ -1016,6 +1246,7 @@ export function ContextMenuProvider({
     extensionEntries,
     appSettings.ai?.geminiApiKey,
     featureFlags.aiEnabled,
+    reopenActivityByPaneId,
     newDefaultTab,
     newTabWithPane,
     copyTabNames,
@@ -1046,6 +1277,7 @@ export function ContextMenuProvider({
     copySessionSummary,
     copySessionMetadata,
     copyResumeCommand,
+    reopenPaneAsSessionTargetAction,
     setProjectColor,
     toggleProjectExpandedAction,
     openAllSessionsInProject,

@@ -510,8 +510,14 @@ export async function setSessionMetadata(
   provider: string,
   sessionId: string,
   sessionType: string,
+  options: { sessionTypeSource?: 'explicit' | 'materialized' } = {},
 ): Promise<void> {
-  await api.post('/api/session-metadata', { provider, sessionId, sessionType })
+  await api.post('/api/session-metadata', {
+    provider,
+    sessionId,
+    sessionType,
+    sessionTypeSource: options.sessionTypeSource ?? 'explicit',
+  })
 }
 
 export async function fetchSidebarSessionsSnapshot(options: {

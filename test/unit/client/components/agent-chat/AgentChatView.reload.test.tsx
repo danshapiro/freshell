@@ -230,6 +230,32 @@ describe('AgentChatView reload/restore behavior', () => {
     })
   })
 
+  it('tags automatic agent-chat session metadata as materialized when a durable id appears', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000123'
+    const store = makeStore()
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
+      </Provider>,
+    )
+
+    act(() => {
+      store.dispatch(sessionMetadataReceived({
+        sessionId: RELOAD_PANE.sessionId!,
+        cliSessionId: canonicalSessionId,
+      }))
+    })
+
+    await waitFor(() => {
+      expect(setSessionMetadata).toHaveBeenCalledWith(
+        'claude',
+        canonicalSessionId,
+        'freshclaude',
+        { sessionTypeSource: 'materialized' },
+      )
+    })
+  })
+
   it('includes the named resumeSessionId when attaching a persisted pane before the canonical durable id exists', () => {
     const store = makeStore()
     render(

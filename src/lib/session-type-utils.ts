@@ -7,6 +7,11 @@ import type { AgentChatProviderName, AgentChatProviderSettings } from '@/lib/age
 import type { CodingCliProviderName } from '@/store/types'
 import type { FreshAgentPaneInput, AgentChatPaneInput, TerminalPaneInput } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
+import {
+  getPairedPublicSessionType,
+  resolveSessionTypeRuntimeProvider,
+  type PublicSessionType,
+} from '@shared/session-flavor'
 
 export interface SessionTypeConfig {
   icon: ComponentType<{ className?: string }>
@@ -43,6 +48,38 @@ export function resolveSessionTypeConfig(sessionType: string, extensions?: Clien
   return {
     icon: DefaultProviderIcon,
     label: sessionType,
+  }
+}
+
+export type PairedSessionTypeTarget = {
+  sourceSessionType: PublicSessionType
+  targetSessionType: PublicSessionType
+  runtimeProvider: CodingCliProviderName
+  label: string
+  targetKind: 'terminal' | 'fresh-agent'
+}
+
+function cliProviderLabel(provider: CodingCliProviderName): string {
+  if (provider === 'opencode') return 'OpenCode CLI'
+  return `${getProviderLabel(provider)} CLI`
+}
+
+export function getPairedSessionTypeTarget(
+  sessionType: string | undefined,
+): PairedSessionTypeTarget | null {
+  const targetSessionType = getPairedPublicSessionType(sessionType)
+  if (!targetSessionType || !sessionType) return null
+  const runtimeProvider = resolveSessionTypeRuntimeProvider(targetSessionType)
+  if (!runtimeProvider) return null
+  const targetKind = targetSessionType.startsWith('fresh') ? 'fresh-agent' : 'terminal'
+  return {
+    sourceSessionType: sessionType as PublicSessionType,
+    targetSessionType,
+    runtimeProvider,
+    targetKind,
+    label: targetKind === 'fresh-agent'
+      ? `Reopen as ${targetSessionType}`
+      : `Reopen as ${cliProviderLabel(runtimeProvider)}`,
   }
 }
 

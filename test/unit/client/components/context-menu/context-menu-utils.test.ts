@@ -53,4 +53,23 @@ describe('parseContextTarget', () => {
     const result = parseContextTarget(ContextIds.Tab, { tabId: 'tab-1' })
     expect(result).toEqual({ kind: 'tab', tabId: 'tab-1' })
   })
+
+  it('parseContextTarget for FreshAgent preserves pane and session flavor identity', () => {
+    const result = parseContextTarget(ContextIds.FreshAgent, {
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      sessionId: 'thread-1',
+      provider: 'claude',
+      sessionType: 'freshclaude',
+    })
+
+    expect(result).toEqual({
+      kind: 'fresh-agent',
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      sessionId: 'thread-1',
+      provider: 'claude',
+      sessionType: 'freshclaude',
+    })
+  })
 })

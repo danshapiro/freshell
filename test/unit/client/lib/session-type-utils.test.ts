@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type-utils'
+import { resolveSessionTypeConfig, buildResumeContent, getPairedSessionTypeTarget } from '@/lib/session-type-utils'
 import { CodexIcon } from '@/components/icons/provider-icons'
 
 describe('resolveSessionTypeConfig', () => {
@@ -238,5 +238,28 @@ describe('buildResumeContent', () => {
     if (content.kind !== 'terminal') throw new Error('expected terminal')
     // Any non-shell mode is preserved as-is (provider was validated at session creation)
     expect(content.mode).toBe('bogus-garbage')
+  })
+})
+
+describe('getPairedSessionTypeTarget', () => {
+  it.each([
+    ['claude', 'freshclaude', 'Reopen as freshclaude', 'fresh-agent'],
+    ['codex', 'freshcodex', 'Reopen as freshcodex', 'fresh-agent'],
+    ['opencode', 'freshopencode', 'Reopen as freshopencode', 'fresh-agent'],
+    ['freshclaude', 'claude', 'Reopen as Claude CLI', 'terminal'],
+    ['freshcodex', 'codex', 'Reopen as Codex CLI', 'terminal'],
+    ['freshopencode', 'opencode', 'Reopen as OpenCode CLI', 'terminal'],
+  ] as const)('maps %s to %s', (sourceSessionType, targetSessionType, label, targetKind) => {
+    expect(getPairedSessionTypeTarget(sourceSessionType)).toMatchObject({
+      targetSessionType,
+      label,
+      targetKind,
+    })
+  })
+
+  it('does not expose hidden or unsupported session types', () => {
+    expect(getPairedSessionTypeTarget('kilroy')).toBeNull()
+    expect(getPairedSessionTypeTarget('shell')).toBeNull()
+    expect(getPairedSessionTypeTarget(undefined)).toBeNull()
   })
 })

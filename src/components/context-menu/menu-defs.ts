@@ -8,6 +8,11 @@ import { buildPaneRefreshTarget, findPaneContent } from '@/lib/pane-utils'
 import { collectSessionRefsFromNode } from '@/lib/session-utils'
 import type { TerminalActions, EditorActions, BrowserActions } from '@/lib/pane-action-registry'
 import { buildResumeCommand, isResumeCommandProvider, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
+import {
+  resolveReopenPaneSessionTarget,
+  type ReopenPaneActivity,
+  type ReopenPaneSessionTarget,
+} from '@/lib/session-flavor-reopen'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
 export type MenuActions = {
@@ -46,6 +51,7 @@ export type MenuActions = {
   copySessionSummary: (sessionId: string, provider?: string) => void
   copySessionMetadata: (sessionId: string, provider?: string) => void
   copyResumeCommand: (provider: ResumeCommandProvider, sessionId: string) => void
+  reopenPaneAsSessionTarget?: (target: ReopenPaneSessionTarget) => void | Promise<void>
   setProjectColor: (projectPath: string) => void
   toggleProjectExpanded: (projectPath: string, expanded: boolean) => void
   openAllSessionsInProject: (projectPath: string) => void
@@ -83,6 +89,7 @@ export type MenuBuildContext = {
   aiEnabled: boolean
   platform: string | null
   extensions?: ClientExtensionEntry[]
+  reopenActivityByPaneId?: Record<string, ReopenPaneActivity>
 }
 
 function isWindowsLike(platform: string | null): boolean {
@@ -145,6 +152,36 @@ function buildCopyResumeMenuItem(id: string, candidate: ResumeCommandCandidate, 
     },
     disabled: !canCopy,
   }
+}
+
+function buildReopenPaneAsItem(
+  tabId: string | undefined,
+  paneId: string | undefined,
+  content: PaneContent | null,
+  tab: Tab | undefined,
+  ctx: MenuBuildContext,
+): MenuItem[] {
+  if (!tabId || !paneId || !content) return []
+  const reopenPaneAsSessionTarget = ctx.actions.reopenPaneAsSessionTarget
+  if (!reopenPaneAsSessionTarget) return []
+  const target = resolveReopenPaneSessionTarget({
+    tabId,
+    paneId,
+    content,
+    tab,
+    activity: ctx.reopenActivityByPaneId?.[paneId] ?? { isBusy: false },
+  })
+  if (!target) return []
+  return [{
+    type: 'item',
+    id: 'reopen-pane-as-session-type',
+    label: target.label,
+    disabled: target.disabled,
+    onSelect: () => {
+      if (target.disabled) return
+      return reopenPaneAsSessionTarget(target)
+    },
+  }]
 }
 
 function buildTerminalClipboardItems(
@@ -311,9 +348,11 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     const paneResumeMenuItem = resumeCandidate
       ? [buildCopyResumeMenuItem('pane-copy-resume-command', resumeCandidate, actions, extensions)]
       : []
+    const reopenPaneAsItem = buildReopenPaneAsItem(target.tabId, target.paneId, paneContent, tab, ctx)
     const canRefreshPane = !!paneContent && !!buildPaneRefreshTarget(paneContent)
     return [
       ...paneResumeMenuItem,
+      ...reopenPaneAsItem,
       {
         type: 'item',
         id: 'refresh-pane',
@@ -347,6 +386,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     const terminalResumeMenuItem = resumeCandidate
       ? [buildCopyResumeMenuItem('terminal-copy-resume-command', resumeCandidate, actions, extensions)]
       : []
+    const reopenPaneAsItem = buildReopenPaneAsItem(target.tabId, target.paneId, paneContent, tab, ctx)
     const canRefreshPane = !!paneContent && !!buildPaneRefreshTarget(paneContent)
 
     const urlItems: MenuItem[] = target.hoveredUrl ? [
@@ -399,6 +439,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
         disabled: !terminalActions,
       },
       ...terminalResumeMenuItem,
+      ...reopenPaneAsItem,
       { type: 'separator', id: 'terminal-sep' },
       {
         type: 'item',
@@ -693,6 +734,13 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
           onSelect: () => actions.copyAgentChatFilePath(diffView),
         })
       }
+    }
+
+    if (target.kind === 'fresh-agent' && target.tabId && target.paneId) {
+      const tab = tabs.find((t) => t.id === target.tabId)
+      const layout = paneLayouts[target.tabId]
+      const paneContent = layout ? findPaneContent(layout, target.paneId) : null
+      items.push(...buildReopenPaneAsItem(target.tabId, target.paneId, paneContent, tab, ctx))
     }
 
     // Session metadata at the bottom

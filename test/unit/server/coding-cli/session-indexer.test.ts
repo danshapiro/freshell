@@ -1872,7 +1872,7 @@ describe('CodingCliSessionIndexer', () => {
 
   describe('sessionType merge from metadata store', () => {
     function mockMetadataStore(
-      entries: Record<string, { sessionType?: string; derivedTitle?: string }>,
+      entries: Record<string, { sessionType?: string; sessionTypeSource?: 'explicit' | 'materialized'; derivedTitle?: string }>,
     ): SessionMetadataStore {
       return {
         getAll: vi.fn().mockResolvedValue(entries),
@@ -1896,6 +1896,33 @@ describe('CodingCliSessionIndexer', () => {
 
       const session = indexer.getProjects()[0]?.sessions[0]
       expect(session?.sessionType).toBe('freshclaude')
+    })
+
+    it('applies persisted sessionType metadata to indexed sessions for left-panel reopen', async () => {
+      const sessionId = 'session-with-explicit-type'
+      const fileA = path.join(tempDir, `${sessionId}.jsonl`)
+      await fsp.writeFile(fileA, JSON.stringify({
+        cwd: '/repo',
+        title: 'Durable session',
+      }) + '\n')
+
+      const provider = makeProvider([fileA])
+      const metadataStore = mockMetadataStore({
+        [makeSessionKey('claude', sessionId)]: {
+          sessionType: 'freshclaude',
+          sessionTypeSource: 'explicit',
+        },
+      })
+      const indexer = new CodingCliSessionIndexer([provider], {}, metadataStore)
+
+      await indexer.refresh()
+
+      const session = indexer.getProjects()[0]?.sessions[0]
+      expect(session).toMatchObject({
+        provider: 'claude',
+        sessionId,
+        sessionType: 'freshclaude',
+      })
     })
 
     it('does not set sessionType when metadata store has no entry', async () => {

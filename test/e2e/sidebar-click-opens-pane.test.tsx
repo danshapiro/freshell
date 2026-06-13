@@ -692,6 +692,60 @@ describe('sidebar click opens pane (e2e)', () => {
     expect(screen.queryByText('Exec hidden')).not.toBeInTheDocument()
   })
 
+  it('opens a closed persisted freshclaude session from the left panel as FreshAgent', async () => {
+    const targetId = sessionId('persisted-freshclaude')
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/repo',
+        sessions: [
+          {
+            sessionId: targetId,
+            projectPath: '/repo',
+            lastActivityAt: Date.now(),
+            title: 'FreshClaude task',
+            cwd: '/repo',
+            provider: 'claude',
+            sessionType: 'freshclaude',
+          },
+        ],
+      },
+    ]
+
+    const store = createStore({
+      projects,
+      tabs: [{ id: 'tab-1', mode: 'shell' }],
+      activeTabId: 'tab-1',
+      sessionOpenMode: 'split',
+    })
+
+    renderSidebar(store)
+
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    const sessionButton = screen.getByText('FreshClaude task').closest('button')
+    fireEvent.click(sessionButton!)
+
+    const layout = store.getState().panes.layouts['tab-1']
+    expect(layout.type).toBe('split')
+    if (layout.type === 'split') {
+      const sessionPane = layout.children.find((child: any) =>
+        child.type === 'leaf' &&
+        child.content.kind === 'fresh-agent' &&
+        child.content.sessionType === 'freshclaude' &&
+        child.content.sessionRef?.provider === 'claude' &&
+        child.content.sessionRef?.sessionId === targetId
+      )
+      expect(sessionPane).toBeDefined()
+      expect(sessionPane!.content).toMatchObject({
+        provider: 'claude',
+        resumeSessionId: targetId,
+        sessionRef: { provider: 'claude', sessionId: targetId },
+      })
+    }
+  })
+
   it('clicking a session with no active tab creates a new tab', async () => {
     const projects: ProjectGroup[] = [
       {

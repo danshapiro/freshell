@@ -14,6 +14,7 @@ function createActions(): MenuActions {
     refreshTab: vi.fn(),
     renameTab: vi.fn(),
     closeTab: vi.fn(),
+    reopenClosedTab: vi.fn(),
     closeOtherTabs: vi.fn(),
     closeTabsToRight: vi.fn(),
     moveTab: vi.fn(),
@@ -56,6 +57,7 @@ function createActions(): MenuActions {
     openSessionInNewTab: vi.fn(),
     openSessionInThisTab: vi.fn(),
     renameSession: vi.fn(),
+    generateSessionTitle: vi.fn(),
     toggleArchiveSession: vi.fn(),
     deleteSession: vi.fn(),
     copySessionId: vi.fn(),
@@ -63,6 +65,7 @@ function createActions(): MenuActions {
     copySessionSummary: vi.fn(),
     copySessionMetadata: vi.fn(),
     copyResumeCommand: vi.fn(),
+    reopenPaneAsSessionTarget: vi.fn(),
     setProjectColor: vi.fn(),
     toggleProjectExpanded: vi.fn(),
     openAllSessionsInProject: vi.fn(),
@@ -74,12 +77,17 @@ function createActions(): MenuActions {
     copyTerminalCwd: vi.fn(),
     copyMessageText: vi.fn(),
     copyMessageCode: vi.fn(),
-    copyFreshclaudeCodeBlock: vi.fn(),
-    copyFreshclaudeToolInput: vi.fn(),
-    copyFreshclaudeToolOutput: vi.fn(),
-    copyFreshclaudeDiffNew: vi.fn(),
-    copyFreshclaudeDiffOld: vi.fn(),
-    copyFreshclaudeFilePath: vi.fn(),
+    copyAgentChatCodeBlock: vi.fn(),
+    copyAgentChatToolInput: vi.fn(),
+    copyAgentChatToolOutput: vi.fn(),
+    copyAgentChatDiffNew: vi.fn(),
+    copyAgentChatDiffOld: vi.fn(),
+    copyAgentChatFilePath: vi.fn(),
+    showKeyboardShortcuts: vi.fn(),
+    openUrlInPane: vi.fn(),
+    openUrlInTab: vi.fn(),
+    openUrlInBrowser: vi.fn(),
+    copyUrl: vi.fn(),
   }
 }
 
@@ -100,6 +108,7 @@ function makeCtx(actions: MenuActions, overrides?: Partial<MenuBuildContext>): M
     contextElement: null,
     clickTarget: null,
     actions,
+    aiEnabled: false,
     platform: 'linux',
     ...overrides,
   }
@@ -262,6 +271,173 @@ describe('buildMenuItems - refresh items', () => {
 
       expect(items.find((item) => item.type === 'item' && item.id === 'refresh-pane')).toBeDefined()
     }
+  })
+})
+
+describe('buildMenuItems - reopen as paired session flavor', () => {
+  it('adds Reopen as freshclaude to a Claude CLI terminal body menu with a durable target payload', () => {
+    const actions = createActions()
+    const items = buildMenuItems(
+      { kind: 'terminal', tabId: 'tab-1', paneId: 'pane-1' },
+      makeCtx(actions, {
+        paneLayouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              sessionRef: { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' },
+              createRequestId: 'req-1',
+              status: 'running',
+            },
+          },
+        },
+      }),
+    )
+
+    const item = getTerminalItem(items, 'reopen-pane-as-session-type')
+    expect(item.label).toBe('Reopen as freshclaude')
+    item.onSelect()
+    expect(actions.reopenPaneAsSessionTarget).toHaveBeenCalledWith(expect.objectContaining({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      provider: 'claude',
+      sessionId: '550e8400-e29b-41d4-a716-446655440000',
+      targetSessionType: 'freshclaude',
+    }))
+  })
+
+  it('adds Reopen as Claude CLI to a FreshClaude body menu', () => {
+    const actions = createActions()
+    const items = buildMenuItems(
+      {
+        kind: 'fresh-agent',
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        sessionId: 'runtime-sdk-session-id',
+        provider: 'claude',
+        sessionType: 'freshclaude',
+      },
+      makeCtx(actions, {
+        paneLayouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'fresh-agent',
+              sessionType: 'freshclaude',
+              provider: 'claude',
+              sessionId: 'runtime-sdk-session-id',
+              sessionRef: { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' },
+              createRequestId: 'req-1',
+              status: 'idle',
+            },
+          },
+        },
+      }),
+    )
+
+    const item = items.find((candidate) => candidate.type === 'item' && candidate.id === 'reopen-pane-as-session-type')
+    expect(item?.type).toBe('item')
+    if (!item || item.type !== 'item') throw new Error('missing reopen item')
+    expect(item.label).toBe('Reopen as Claude CLI')
+    item.onSelect()
+    expect(actions.reopenPaneAsSessionTarget).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'claude',
+      sessionId: '550e8400-e29b-41d4-a716-446655440000',
+      targetSessionType: 'claude',
+    }))
+  })
+
+  it('does not add a FreshAgent reopen item for non-durable placeholder ids', () => {
+    const actions = createActions()
+    const items = buildMenuItems(
+      { kind: 'fresh-agent', tabId: 'tab-1', paneId: 'pane-1', sessionId: 'freshopencode-req-1', provider: 'opencode', sessionType: 'freshopencode' },
+      makeCtx(actions, {
+        paneLayouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'fresh-agent',
+              sessionType: 'freshopencode',
+              provider: 'opencode',
+              sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-1' },
+              createRequestId: 'req-1',
+              status: 'idle',
+            },
+          },
+        },
+      }),
+    )
+
+    expect(items.some((item) => item.type === 'item' && item.id === 'reopen-pane-as-session-type')).toBe(false)
+  })
+
+  it('disables reopen while the source agent is busy', () => {
+    const actions = createActions()
+    const items = buildMenuItems(
+      { kind: 'terminal', tabId: 'tab-1', paneId: 'pane-1' },
+      makeCtx(actions, {
+        paneLayouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              sessionRef: { provider: 'codex', sessionId: 'codex-thread-1' },
+              terminalId: 'term-1',
+              createRequestId: 'req-1',
+              status: 'running',
+            },
+          },
+        },
+        reopenActivityByPaneId: {
+          'pane-1': { isBusy: true },
+        },
+      }),
+    )
+
+    const item = getTerminalItem(items, 'reopen-pane-as-session-type')
+    expect(item.disabled).toBe(true)
+    expect(item.label).toBe('Reopen as freshcodex')
+    item.onSelect()
+    expect(actions.reopenPaneAsSessionTarget).not.toHaveBeenCalled()
+  })
+
+  it('disables reopen while the source agent has pending prompts', () => {
+    const actions = createActions()
+    const items = buildMenuItems(
+      { kind: 'fresh-agent', tabId: 'tab-1', paneId: 'pane-1', sessionId: 'runtime-sdk-session-id', provider: 'claude', sessionType: 'freshclaude' },
+      makeCtx(actions, {
+        paneLayouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'fresh-agent',
+              sessionType: 'freshclaude',
+              provider: 'claude',
+              sessionId: 'runtime-sdk-session-id',
+              sessionRef: { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' },
+              createRequestId: 'req-1',
+              status: 'idle',
+            },
+          },
+        },
+        reopenActivityByPaneId: {
+          'pane-1': { isBusy: false, hasWaitingItems: true },
+        },
+      }),
+    )
+
+    const item = getTerminalItem(items, 'reopen-pane-as-session-type')
+    expect(item.disabled).toBe(true)
+    expect(item.label).toBe('Reopen as Claude CLI')
+    item.onSelect()
+    expect(actions.reopenPaneAsSessionTarget).not.toHaveBeenCalled()
   })
 })
 

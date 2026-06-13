@@ -98,4 +98,78 @@ describe('SessionMetadataStore', () => {
     const meta = await store.get('claude', 'y')
     expect(meta?.sessionType).toBe('freshclaude')
   })
+
+  it('does not let materialized metadata override an explicit user flavor', async () => {
+    await store.set('claude', 'sess-1', { sessionType: 'claude', sessionTypeSource: 'explicit' })
+    const changed = await store.set('claude', 'sess-1', {
+      sessionType: 'freshclaude',
+      sessionTypeSource: 'materialized',
+    })
+
+    expect(changed).toBe(false)
+    await expect(store.get('claude', 'sess-1')).resolves.toMatchObject({
+      sessionType: 'claude',
+      sessionTypeSource: 'explicit',
+    })
+  })
+
+  it('returns false when setting unchanged session type metadata', async () => {
+    await store.set('claude', 'sess-1', { sessionType: 'freshclaude', sessionTypeSource: 'materialized' })
+    const changed = await store.set('claude', 'sess-1', {
+      sessionType: 'freshclaude',
+      sessionTypeSource: 'materialized',
+    })
+
+    expect(changed).toBe(false)
+  })
+
+  it('allows explicit metadata to override materialized metadata', async () => {
+    await store.set('claude', 'sess-1', { sessionType: 'freshclaude', sessionTypeSource: 'materialized' })
+    const changed = await store.set('claude', 'sess-1', {
+      sessionType: 'claude',
+      sessionTypeSource: 'explicit',
+    })
+
+    expect(changed).toBe(true)
+    await expect(store.get('claude', 'sess-1')).resolves.toMatchObject({
+      sessionType: 'claude',
+      sessionTypeSource: 'explicit',
+    })
+  })
+
+  it('continues to store hidden metadata types for existing hidden flows', async () => {
+    const changed = await store.set('claude', 'sess-kilroy', { sessionType: 'kilroy' })
+
+    expect(changed).toBe(true)
+    await expect(store.get('claude', 'sess-kilroy')).resolves.toMatchObject({
+      sessionType: 'kilroy',
+    })
+  })
+
+  it('does not let materialized metadata override source-less existing session type metadata', async () => {
+    await store.set('claude', 'sess-1', { sessionType: 'claude' })
+    const changed = await store.set('claude', 'sess-1', {
+      sessionType: 'freshclaude',
+      sessionTypeSource: 'materialized',
+    })
+
+    expect(changed).toBe(false)
+    await expect(store.get('claude', 'sess-1')).resolves.toMatchObject({
+      sessionType: 'claude',
+    })
+  })
+
+  it('allows explicit metadata to upgrade source-less existing session type metadata', async () => {
+    await store.set('claude', 'sess-1', { sessionType: 'freshclaude' })
+    const changed = await store.set('claude', 'sess-1', {
+      sessionType: 'claude',
+      sessionTypeSource: 'explicit',
+    })
+
+    expect(changed).toBe(true)
+    await expect(store.get('claude', 'sess-1')).resolves.toMatchObject({
+      sessionType: 'claude',
+      sessionTypeSource: 'explicit',
+    })
+  })
 })

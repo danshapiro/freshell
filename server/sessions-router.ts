@@ -14,6 +14,10 @@ import type { TerminalMeta } from './terminal-metadata-service.js'
 import type { SessionMetadataStore } from './session-metadata-store.js'
 import { DEFAULT_CLI_PROVIDER_NAMES } from './platform.js'
 import { SessionDirectoryQuerySchema } from '../shared/read-models.js'
+import {
+  KnownSessionMetadataTypeSchema,
+  SessionTypeMetadataSourceSchema,
+} from '../shared/session-flavor.js'
 import { querySessionDirectory } from './session-directory/service.js'
 import { createRequestAbortSignal } from './read-models/request-abort.js'
 import {
@@ -217,7 +221,8 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
   const SessionMetadataPostSchema = z.object({
     provider: sessionMetadataProviderSchema,
     sessionId: z.string().min(1),
-    sessionType: z.string().min(1),
+    sessionType: KnownSessionMetadataTypeSchema,
+    sessionTypeSource: SessionTypeMetadataSourceSchema.optional(),
   })
 
   router.post('/session-metadata', async (req, res) => {
@@ -228,10 +233,15 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
     if (!parsed.success) {
       return res.status(400).json({ error: 'Missing required fields: provider, sessionId, sessionType', details: parsed.error.issues })
     }
-    const { provider, sessionId, sessionType } = parsed.data
-    await deps.sessionMetadataStore.set(provider, sessionId, { sessionType })
-    await codingCliIndexer.refresh()
-    res.json({ ok: true })
+    const { provider, sessionId, sessionType, sessionTypeSource } = parsed.data
+    const changed = await deps.sessionMetadataStore.set(provider, sessionId, {
+      sessionType,
+      ...(sessionTypeSource ? { sessionTypeSource } : {}),
+    })
+    if (changed) {
+      await codingCliIndexer.refresh()
+    }
+    res.json({ ok: true, changed })
   })
 
   return router

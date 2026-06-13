@@ -493,6 +493,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         providerConfig.codingCliProvider,
         preferredResumeSessionId,
         paneContent.provider,
+        { sessionTypeSource: 'materialized' },
       ).catch((err) => {
         console.warn('Failed to tag session metadata:', err)
       })

@@ -650,7 +650,7 @@ describe('setSessionMetadata()', () => {
     localStorage.clear()
   })
 
-  it('POSTs to /api/session-metadata with provider, sessionId, and sessionType', async () => {
+  it('POSTs to /api/session-metadata with provider, sessionId, sessionType, and explicit source by default', async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
       text: () => Promise.resolve(''),
@@ -662,7 +662,35 @@ describe('setSessionMetadata()', () => {
       '/api/session-metadata',
       expect.objectContaining({
         method: 'POST',
-        body: JSON.stringify({ provider: 'claude', sessionId: 'sess-abc', sessionType: 'freshclaude' }),
+        body: JSON.stringify({
+          provider: 'claude',
+          sessionId: 'sess-abc',
+          sessionType: 'freshclaude',
+          sessionTypeSource: 'explicit',
+        }),
+      }),
+    )
+  })
+
+  it('POSTs materialized session metadata source when requested', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      text: () => Promise.resolve(''),
+    })
+
+    await setSessionMetadata('opencode', 'ses_real_1', 'freshopencode', {
+      sessionTypeSource: 'materialized',
+    })
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/session-metadata',
+      expect.objectContaining({
+        body: JSON.stringify({
+          provider: 'opencode',
+          sessionId: 'ses_real_1',
+          sessionType: 'freshopencode',
+          sessionTypeSource: 'materialized',
+        }),
       }),
     )
   })

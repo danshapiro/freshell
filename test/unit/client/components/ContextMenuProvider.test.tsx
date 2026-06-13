@@ -1,11 +1,11 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, cleanup, fireEvent } from '@testing-library/react'
+import { act, render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 
 import tabsReducer from '@/store/tabsSlice'
-import panesReducer from '@/store/panesSlice'
+import panesReducer, { initLayout, updatePaneContent } from '@/store/panesSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import settingsReducer from '@/store/settingsSlice'
@@ -42,18 +42,28 @@ const wsMocks = vi.hoisted(() => ({
   setHelloExtensionProvider: vi.fn(),
 }))
 
+const apiMocks = vi.hoisted(() => ({
+  get: vi.fn().mockResolvedValue([]),
+  post: vi.fn().mockResolvedValue({}),
+  patch: vi.fn().mockResolvedValue({}),
+  put: vi.fn().mockResolvedValue({}),
+  delete: vi.fn().mockResolvedValue({}),
+  setSessionMetadata: vi.fn().mockResolvedValue(undefined),
+}))
+
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => wsMocks,
 }))
 
 vi.mock('@/lib/api', () => ({
   api: {
-    get: vi.fn().mockResolvedValue([]),
-    post: vi.fn().mockResolvedValue({}),
-    patch: vi.fn().mockResolvedValue({}),
-    put: vi.fn().mockResolvedValue({}),
-    delete: vi.fn().mockResolvedValue({}),
+    get: apiMocks.get,
+    post: apiMocks.post,
+    patch: apiMocks.patch,
+    put: apiMocks.put,
+    delete: apiMocks.delete,
   },
+  setSessionMetadata: apiMocks.setSessionMetadata,
 }))
 
 vi.mock('@/lib/clipboard', () => ({
@@ -61,6 +71,16 @@ vi.mock('@/lib/clipboard', () => ({
 }))
 
 const VALID_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
+
+function createDeferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
 
 function createTestStore(options?: { platform?: string | null }) {
   return configureStore({
@@ -587,6 +607,7 @@ describe('ContextMenuProvider', () => {
   afterEach(() => {
     cleanup()
     vi.clearAllMocks()
+    apiMocks.setSessionMetadata.mockResolvedValue(undefined)
   })
 
   it('does not emit selector instability warnings when feature flags are absent', () => {
@@ -854,6 +875,317 @@ describe('ContextMenuProvider', () => {
         }
       }
     }
+  })
+
+  it('reopens a CLI terminal session as a FreshAgent pane', async () => {
+    const user = userEvent.setup()
+    const store = createTestStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'terminal',
+        mode: 'claude',
+        status: 'running',
+        terminalId: 'term-1',
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
+        initialCwd: '/test/project',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.Terminal}
+            data-tab-id="tab-1"
+            data-pane-id="pane-1"
+          >
+            Terminal body
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Terminal body'), keys: '[MouseRight]' })
+    await user.click(await screen.findByRole('menuitem', { name: 'Reopen as freshclaude' }))
+
+    await waitFor(() => {
+      expect(apiMocks.setSessionMetadata).toHaveBeenCalledWith(
+        'claude',
+        VALID_SESSION_ID,
+        'freshclaude',
+        { sessionTypeSource: 'explicit' },
+      )
+    })
+    await waitFor(() => {
+      expect(wsMocks.send).toHaveBeenCalledWith({ type: 'terminal.kill', terminalId: 'term-1' })
+    })
+
+    expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+      type: 'leaf',
+      content: {
+        kind: 'fresh-agent',
+        provider: 'claude',
+        sessionType: 'freshclaude',
+        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
+        initialCwd: '/test/project',
+      },
+    })
+    expect(store.getState().tabs.tabs[0].sessionMetadataByKey).toEqual({
+      [`claude:${VALID_SESSION_ID}`]: {
+        sessionType: 'freshclaude',
+      },
+    })
+  })
+
+  it('reopens a FreshAgent pane as its CLI terminal session', async () => {
+    const user = userEvent.setup()
+    const store = createTestStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        provider: 'claude',
+        sessionType: 'freshclaude',
+        sessionId: 'runtime-sdk-session-id',
+        status: 'idle',
+        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
+        initialCwd: '/test/project',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.FreshAgent}
+            data-session-id="runtime-sdk-session-id"
+            data-tab-id="tab-1"
+            data-pane-id="pane-1"
+            data-provider="claude"
+            data-session-type="freshclaude"
+          >
+            FreshAgent body
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('FreshAgent body'), keys: '[MouseRight]' })
+    await user.click(await screen.findByRole('menuitem', { name: 'Reopen as Claude CLI' }))
+
+    await waitFor(() => {
+      expect(apiMocks.setSessionMetadata).toHaveBeenCalledWith(
+        'claude',
+        VALID_SESSION_ID,
+        'claude',
+        { sessionTypeSource: 'explicit' },
+      )
+    })
+    await waitFor(() => {
+      expect(wsMocks.send).toHaveBeenCalledWith({
+        type: 'freshAgent.kill',
+        sessionId: 'runtime-sdk-session-id',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+      })
+    })
+
+    expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+      type: 'leaf',
+      content: {
+        kind: 'terminal',
+        mode: 'claude',
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
+        initialCwd: '/test/project',
+      },
+    })
+    expect(store.getState().tabs.tabs[0].sessionMetadataByKey).toEqual({
+      [`claude:${VALID_SESSION_ID}`]: {
+        sessionType: 'claude',
+      },
+    })
+  })
+
+  it('does not kill or replace a pane when reopen metadata persistence fails', async () => {
+    const user = userEvent.setup()
+    const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    apiMocks.setSessionMetadata.mockRejectedValueOnce(new Error('persist failed'))
+    const store = createTestStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'terminal',
+        mode: 'claude',
+        status: 'running',
+        terminalId: 'term-1',
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
+        initialCwd: '/test/project',
+      },
+    }))
+
+    try {
+      render(
+        <Provider store={store}>
+          <ContextMenuProvider
+            view="terminal"
+            onViewChange={() => {}}
+            onToggleSidebar={() => {}}
+            sidebarCollapsed={false}
+          >
+            <div
+              data-context={ContextIds.Terminal}
+              data-tab-id="tab-1"
+              data-pane-id="pane-1"
+            >
+              Terminal body
+            </div>
+          </ContextMenuProvider>
+        </Provider>
+      )
+
+      await user.pointer({ target: screen.getByText('Terminal body'), keys: '[MouseRight]' })
+      await user.click(await screen.findByRole('menuitem', { name: 'Reopen as freshclaude' }))
+
+      await waitFor(() => {
+        expect(apiMocks.setSessionMetadata).toHaveBeenCalledWith(
+          'claude',
+          VALID_SESSION_ID,
+          'freshclaude',
+          { sessionTypeSource: 'explicit' },
+        )
+      })
+      await waitFor(() => {
+        expect(consoleWarnSpy).toHaveBeenCalled()
+      })
+
+      expect(wsMocks.send).not.toHaveBeenCalled()
+      expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          status: 'running',
+          terminalId: 'term-1',
+          sessionRef: {
+            provider: 'claude',
+            sessionId: VALID_SESSION_ID,
+          },
+          initialCwd: '/test/project',
+        },
+      })
+    } finally {
+      consoleWarnSpy.mockRestore()
+    }
+  })
+
+  it('does not kill or overwrite a pane that changes while reopen metadata is pending', async () => {
+    const user = userEvent.setup()
+    const deferred = createDeferred<void>()
+    apiMocks.setSessionMetadata.mockReturnValueOnce(deferred.promise)
+    const store = createTestStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'terminal',
+        mode: 'claude',
+        status: 'running',
+        terminalId: 'term-1',
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
+        initialCwd: '/test/project',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.Terminal}
+            data-tab-id="tab-1"
+            data-pane-id="pane-1"
+          >
+            Terminal body
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Terminal body'), keys: '[MouseRight]' })
+    await user.click(await screen.findByRole('menuitem', { name: 'Reopen as freshclaude' }))
+
+    await waitFor(() => {
+      expect(apiMocks.setSessionMetadata).toHaveBeenCalledWith(
+        'claude',
+        VALID_SESSION_ID,
+        'freshclaude',
+        { sessionTypeSource: 'explicit' },
+      )
+    })
+
+    store.dispatch(updatePaneContent({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'browser',
+        url: 'https://example.com',
+        devToolsOpen: false,
+      },
+    }))
+
+    await act(async () => {
+      deferred.resolve()
+      await deferred.promise
+      await Promise.resolve()
+    })
+
+    expect(wsMocks.send).not.toHaveBeenCalled()
+    expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+      type: 'leaf',
+      content: {
+        kind: 'browser',
+        url: 'https://example.com',
+      },
+    })
+    expect(store.getState().tabs.tabs[0].sessionMetadataByKey).toBeUndefined()
   })
 
   it('uses the sidebar session window for sidebar actions and preserves agent-chat session type', async () => {
