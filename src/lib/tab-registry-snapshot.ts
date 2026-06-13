@@ -63,6 +63,7 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
         sandbox: content.sandbox,
         effort: content.effort,
         plugins: content.plugins,
+        ...(content.style ? { style: content.style } : {}),
       }
     case 'extension':
       return {

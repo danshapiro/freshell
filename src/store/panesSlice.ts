@@ -21,6 +21,7 @@ import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
 import { RestoreErrorSchema, migrateLegacyAgentChatDurableState, sanitizeSessionRef } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { migrateLegacyFreshAgentContent } from '@shared/fresh-agent'
+import { normalizeFreshAgentStyleOverride } from '@shared/settings'
 
 
 const log = createLogger('PanesSlice')
@@ -94,6 +95,7 @@ function normalizePaneContent(
       : { sessionRef: sanitizeSessionRef(input.sessionRef) }
     const sessionRef = durableState.sessionRef
     const restoreError = RestoreErrorSchema.safeParse((input as { restoreError?: unknown }).restoreError)
+    const style = normalizeFreshAgentStyleOverride((input as { style?: unknown }).style)
     return {
       kind: 'fresh-agent',
       sessionType: input.sessionType,
@@ -118,6 +120,7 @@ function normalizePaneContent(
       sandbox: input.sandbox,
       effort: normalizeAgentChatEffortOverride(input.effort),
       plugins: input.plugins,
+      ...(style ? { style } : {}),
       settingsDismissed: input.settingsDismissed,
     }
   }

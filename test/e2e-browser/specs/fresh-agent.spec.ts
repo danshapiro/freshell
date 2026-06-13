@@ -128,6 +128,199 @@ test.describe('Fresh Agent', () => {
     })
   })
 
+  test('style setting persists per Fresh Agent pane type and applies serif rendering', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
+    await terminal.waitForTerminal()
+    await enableClaudeAndCodex(page)
+
+    await harness.clearSentWsMessages()
+    let picker = await openPanePicker(page)
+    await suppressFreshAgentNetworkForActivePane(page)
+    await picker.getByRole('button', { name: /^Freshcodex$/i }).click({ force: true })
+    await page.getByRole('option').first().click()
+
+    let dialog = await openFreshAgentSettings(page, 'Freshcodex')
+    await expect(dialog.getByRole('combobox', { name: /^Style$/i })).toHaveValue('sans')
+    await dialog.getByRole('combobox', { name: /^Style$/i }).selectOption('serif')
+
+    const freshcodexRoot = page.locator('[data-context="fresh-agent"][data-style="serif"]').last()
+    await expect(freshcodexRoot).toBeVisible({ timeout: 10_000 })
+    await expect.poll(async () => {
+      const settings = await harness.getSettings()
+      return settings?.freshAgent?.providers?.freshcodex?.style ?? null
+    }).toBe('serif')
+
+    await page.route('**/api/fresh-agent/threads/freshcodex/codex/style-thread*', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          threadId: 'style-thread',
+          sessionId: 'style-thread',
+          revision: 1,
+          latestTurnId: 'turn-style',
+          status: 'idle',
+          summary: 'Serif style summary',
+          capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: true },
+          settings: { model: 'gpt-5.4-flash', permissionMode: 'on-request', effort: 'high', plugins: [] },
+          tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+          pendingApprovals: [],
+          pendingQuestions: [],
+          turns: [{
+            id: 'turn-style',
+            turnId: 'turn-style',
+            role: 'assistant',
+            summary: 'Serif transcript line',
+            items: [{ id: 'item-style', kind: 'text', text: 'Serif transcript line' }],
+          }],
+        }),
+      })
+    })
+    await page.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      const state = harness?.getState()
+      const findFreshcodexLeaf = (node: any): any => {
+        if (!node) return null
+        if (
+          node.type === 'leaf'
+          && node.content?.kind === 'fresh-agent'
+          && node.content.sessionType === 'freshcodex'
+          && node.content.style === 'serif'
+        ) {
+          return node
+        }
+        if (node.type === 'split') {
+          return findFreshcodexLeaf(node.children?.[0]) ?? findFreshcodexLeaf(node.children?.[1])
+        }
+        return null
+      }
+      let tabId: string | null = null
+      let leaf: any = null
+      for (const [candidateTabId, layout] of Object.entries(state?.panes?.layouts ?? {})) {
+        const candidateLeaf = findFreshcodexLeaf(layout)
+        if (candidateLeaf) {
+          tabId = candidateTabId
+          leaf = candidateLeaf
+        }
+      }
+      if (!tabId || !leaf) return
+      harness?.dispatch({
+        type: 'panes/updatePaneContent',
+        payload: {
+          tabId,
+          paneId: leaf.id,
+          content: {
+            ...leaf.content,
+            sessionId: 'style-thread',
+            sessionRef: { provider: 'codex', sessionId: 'style-thread' },
+            resumeSessionId: 'style-thread',
+            status: 'idle',
+            settingsDismissed: true,
+          },
+        },
+      })
+    })
+
+    const transcript = freshcodexRoot.locator('.fresh-agent-transcript-copy').first()
+    await expect(transcript).toBeVisible({ timeout: 10_000 })
+    await expect(transcript.getByText('Serif transcript line')).toBeVisible()
+    const transcriptFont = await transcript.evaluate((node) => getComputedStyle(node).fontFamily)
+    expect(transcriptFont.toLowerCase()).toContain('georgia')
+
+    await page.keyboard.press('Escape')
+    await page.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      const state = harness?.getState()
+      const findFreshAgentLeaf = (node: any): any => {
+        if (!node) return null
+        if (node.type === 'leaf' && node.content?.kind === 'fresh-agent') return node
+        if (node.type === 'split') {
+          return findFreshAgentLeaf(node.children?.[0]) ?? findFreshAgentLeaf(node.children?.[1])
+        }
+        return null
+      }
+      let tabId: string | null = null
+      let leaf: any = null
+      for (const [candidateTabId, layout] of Object.entries(state?.panes?.layouts ?? {})) {
+        const candidateLeaf = findFreshAgentLeaf(layout)
+        if (candidateLeaf) {
+          tabId = candidateTabId
+          leaf = candidateLeaf
+        }
+      }
+      if (!tabId || !leaf) return
+      harness?.dispatch({
+        type: 'panes/updatePaneContent',
+        payload: {
+          tabId,
+          paneId: leaf.id,
+          content: {
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-style-freshclaude',
+            sessionId: 'style-freshclaude',
+            sessionRef: { provider: 'claude', sessionId: 'style-freshclaude' },
+            resumeSessionId: 'style-freshclaude',
+            status: 'idle',
+            settingsDismissed: true,
+          },
+        },
+      })
+    })
+    await expect(page.locator('[data-context="fresh-agent"][data-style="sans"]').last()).toBeVisible({ timeout: 10_000 })
+
+    dialog = await openFreshAgentSettings(page, 'Freshclaude')
+    await expect(dialog.getByRole('combobox', { name: /^Style$/i })).toHaveValue('sans')
+
+    await page.keyboard.press('Escape')
+    await page.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      const state = harness?.getState()
+      const findFreshAgentLeaf = (node: any): any => {
+        if (!node) return null
+        if (node.type === 'leaf' && node.content?.kind === 'fresh-agent') return node
+        if (node.type === 'split') {
+          return findFreshAgentLeaf(node.children?.[0]) ?? findFreshAgentLeaf(node.children?.[1])
+        }
+        return null
+      }
+      let tabId: string | null = null
+      let leaf: any = null
+      for (const [candidateTabId, layout] of Object.entries(state?.panes?.layouts ?? {})) {
+        const candidateLeaf = findFreshAgentLeaf(layout)
+        if (candidateLeaf) {
+          tabId = candidateTabId
+          leaf = candidateLeaf
+        }
+      }
+      if (!tabId || !leaf) return
+      harness?.dispatch({
+        type: 'panes/updatePaneContent',
+        payload: {
+          tabId,
+          paneId: leaf.id,
+          content: {
+            kind: 'fresh-agent',
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            createRequestId: 'req-style-freshcodex-next',
+            sessionId: 'style-freshcodex-next',
+            sessionRef: { provider: 'codex', sessionId: 'style-freshcodex-next' },
+            resumeSessionId: 'style-freshcodex-next',
+            status: 'idle',
+            settingsDismissed: true,
+          },
+        },
+      })
+    })
+    await expect(page.locator('[data-context="fresh-agent"][data-style="serif"]').last()).toBeVisible({ timeout: 10_000 })
+
+    dialog = await openFreshAgentSettings(page, 'Freshcodex')
+    await expect(dialog.getByRole('combobox', { name: /^Style$/i })).toHaveValue('serif')
+  })
+
   test('freshclaude banners render through the fresh-agent pane surface and answer over WS', async ({ freshellPage, page, harness, terminal }) => {
     await terminal.waitForTerminal()
     const { tabId, paneId } = await getActiveLeaf(harness)

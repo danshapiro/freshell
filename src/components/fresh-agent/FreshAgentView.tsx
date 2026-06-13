@@ -22,6 +22,7 @@ import {
   normalizeFreshAgentModel,
   resolveFreshAgentType,
 } from '@/lib/fresh-agent-registry'
+import { cn } from '@/lib/utils'
 import { paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { getCanonicalDurableSessionId, getPreferredResumeSessionId } from '@/store/persistControl'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
@@ -29,6 +30,7 @@ import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import { getFreshAgentSlashCommands, type FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
 import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
+import { DEFAULT_FRESH_AGENT_STYLE, normalizeFreshAgentStyle } from '@shared/settings'
 import {
   checkpointLabelForText,
   pickCheckpointForTurn,
@@ -240,6 +242,15 @@ export function FreshAgentView({
   const terminalFontSize = useAppSelector(
     (state) => state.settings.settings.terminal?.fontSize,
   ) ?? 16
+  const providerDefaults = useAppSelector(
+    (state) => state.settings.settings.freshAgent?.providers?.[paneContent.sessionType]
+      ?? state.settings.serverSettings?.freshAgent?.providers?.[paneContent.sessionType]
+      ?? state.settings.settings.agentChat?.providers?.[paneContent.sessionType]
+      ?? state.settings.serverSettings?.agentChat?.providers?.[paneContent.sessionType],
+  )
+  const activeStyle = normalizeFreshAgentStyle(
+    paneContent.style ?? providerDefaults?.style ?? DEFAULT_FRESH_AGENT_STYLE,
+  )
   const pendingCreateFailure = useAppSelector(
     (state) => state.freshAgent?.pendingCreateFailures?.[paneContent.createRequestId],
   )
@@ -1271,8 +1282,12 @@ export function FreshAgentView({
 
     return (
       <div
-        className="fresh-agent-pane relative flex h-full min-h-0 flex-col overflow-hidden"
+        className={cn(
+          'fresh-agent-pane relative flex h-full min-h-0 flex-col overflow-hidden',
+          `fresh-agent-style-${activeStyle}`,
+        )}
         data-context="fresh-agent"
+        data-style={activeStyle}
         data-session-id={paneContent.sessionId}
         style={{ '--fresh-transcript-font-size': `${terminalFontSize}px` } as CSSProperties}
         onPointerUpCapture={handlePanePointerUp}
@@ -1455,6 +1470,7 @@ export function FreshAgentView({
     )
   }, [
     claudeSession?.restoreFailureMessage,
+    activeStyle,
     descriptor?.icon,
     descriptor?.label,
     effectiveStatus,

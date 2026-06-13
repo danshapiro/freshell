@@ -58,6 +58,7 @@ describe('TabsView fresh-agent reopen', () => {
             provider: 'claude',
             sessionType: 'freshclaude',
             resumeSessionId: 'resume-1',
+            style: 'serif',
             sessionRef: {
               provider: 'claude',
               sessionId: 'resume-1',
@@ -84,6 +85,7 @@ describe('TabsView fresh-agent reopen', () => {
       kind: 'fresh-agent',
       sessionType: 'freshclaude',
       provider: 'claude',
+      style: 'serif',
     })
   })
 })

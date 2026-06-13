@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Settings } from 'lucide-react'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
-import { useAppDispatch } from '@/store/hooks'
+import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { mergePaneContent } from '@/store/panesSlice'
 import { saveServerSettingsPatch } from '@/store/settingsThunks'
 import {
@@ -12,6 +12,12 @@ import {
   resolveFreshAgentType,
 } from '@/lib/fresh-agent-registry'
 import { cn } from '@/lib/utils'
+import {
+  DEFAULT_FRESH_AGENT_STYLE,
+  FRESH_AGENT_STYLE_VALUES,
+  normalizeFreshAgentStyle,
+  type FreshAgentStyle,
+} from '@shared/settings'
 
 function getEffectiveFreshAgentModel(content: FreshAgentPaneContent): string | undefined {
   return normalizeFreshAgentModel(content.sessionType, content.provider, content.model)
@@ -52,6 +58,12 @@ export function FreshAgentSettingsButton({
   paneContent: FreshAgentPaneContent
 }) {
   const dispatch = useAppDispatch()
+  const providerDefaults = useAppSelector(
+    (state) => state.settings.settings.freshAgent?.providers?.[paneContent.sessionType]
+      ?? state.settings.serverSettings?.freshAgent?.providers?.[paneContent.sessionType]
+      ?? state.settings.settings.agentChat?.providers?.[paneContent.sessionType]
+      ?? state.settings.serverSettings?.agentChat?.providers?.[paneContent.sessionType],
+  )
   const [open, setOpen] = useState(false)
   const buttonRef = useRef<HTMLButtonElement>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
@@ -70,12 +82,16 @@ export function FreshAgentSettingsButton({
     ?? descriptor?.defaultPermissionMode
     ?? ''
   const settingsDisabled = paneContent.status === 'running' || paneContent.status === 'compacting'
+  const styleValue = normalizeFreshAgentStyle(
+    paneContent.style ?? providerDefaults?.style ?? DEFAULT_FRESH_AGENT_STYLE,
+  )
 
   const close = useCallback(() => setOpen(false), [])
   const persistProviderDefaults = useCallback((defaults: {
     modelSelection?: { kind: 'exact'; modelId: string }
     defaultPermissionMode?: string
     effort?: string
+    style?: FreshAgentStyle
   }) => {
     void dispatch(saveServerSettingsPatch({
       freshAgent: {
@@ -135,6 +151,30 @@ export function FreshAgentSettingsButton({
           aria-label="Agent settings"
         >
           <div className="space-y-3">
+            <label className="block space-y-1">
+              <span className="font-medium">Style</span>
+              <select
+                aria-label="Style"
+                className="min-h-[2.5rem] w-full rounded border border-border/70 bg-background px-2 py-1 text-base sm:min-h-0 sm:text-xs"
+                value={styleValue}
+                onChange={(event) => {
+                  const nextStyle = normalizeFreshAgentStyle(event.target.value)
+                  dispatch(mergePaneContent({
+                    tabId,
+                    paneId,
+                    updates: { style: nextStyle },
+                  }))
+                  persistProviderDefaults({ style: nextStyle })
+                }}
+              >
+                {FRESH_AGENT_STYLE_VALUES.map((style) => (
+                  <option key={style} value={style}>
+                    {style === 'sans' ? 'Sans' : 'Serif'}
+                  </option>
+                ))}
+              </select>
+            </label>
+
             {modelOptions.length > 0 ? (
               <fieldset className="space-y-1">
                 <legend className="font-medium">Model</legend>

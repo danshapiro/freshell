@@ -44,6 +44,7 @@ import {
   clearPendingCreate as clearFreshAgentPendingCreate,
   removeSession as removeFreshAgentSession,
 } from '@/store/freshAgentSlice'
+import { DEFAULT_FRESH_AGENT_STYLE } from '@shared/settings'
 import { cancelCreate } from '@/lib/sdk-message-handler'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
@@ -655,6 +656,7 @@ function PickerWrapper({
           normalizeAgentChatEffortOverride(providerSettings?.effort) ?? freshAgentType.defaultEffort,
         ) ?? freshAgentType.defaultEffort,
         plugins: freshAgentType.runtimeProvider === 'claude' ? agentChatSettings?.defaultPlugins : undefined,
+        style: providerSettings?.style ?? DEFAULT_FRESH_AGENT_STYLE,
         ...(cwd ? { initialCwd: cwd } : {}),
       }
     }

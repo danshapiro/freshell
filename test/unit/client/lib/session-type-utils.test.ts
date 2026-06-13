@@ -205,6 +205,20 @@ describe('buildResumeContent', () => {
     expect(content.effort).toBe('turbo')
   })
 
+  it('does not stamp visual style onto fresh-agent resume content', () => {
+    const content = buildResumeContent({
+      sessionType: 'freshcodex',
+      sessionId: 'codex-session-1',
+      cwd: '/workspace/codex',
+    })
+
+    expect(content.kind).toBe('fresh-agent')
+    if (content.kind !== 'fresh-agent') throw new Error('expected fresh-agent')
+    expect(content.sessionType).toBe('freshcodex')
+    expect(content.provider).toBe('codex')
+    expect(content.style).toBeUndefined()
+  })
+
   it('does not apply a baked-in provider effort override', () => {
     const content = buildResumeContent({
       sessionType: 'freshclaude',

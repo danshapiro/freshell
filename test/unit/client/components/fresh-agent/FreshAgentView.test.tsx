@@ -290,6 +290,31 @@ describe('FreshAgentView', () => {
     expect(textbox.value).toBe('h')
   })
 
+  it('applies the resolved fresh-agent style to the view root', async () => {
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            createRequestId: 'req-render-style',
+            sessionId: 'thread-render-style',
+            status: 'idle',
+            style: 'serif',
+          }}
+        />
+      </Provider>,
+    )
+
+    const root = await waitFor(() => document.querySelector('[data-context="fresh-agent"]') as HTMLElement)
+    expect(root).toHaveAttribute('data-style', 'serif')
+    expect(root).toHaveClass('fresh-agent-style-serif')
+  })
+
   it('renders Codex review and fork metadata in the shared shell', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
@@ -1881,6 +1906,47 @@ describe('FreshAgentView', () => {
       freshAgent: {
         providers: {
           freshcodex: { defaultPermissionMode: 'never' },
+        },
+      },
+    })
+  })
+
+  it('lets a Freshcodex pane choose style and persists it as a per-sessionType default', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-style',
+        sessionId: 'thread-style',
+        status: 'idle',
+        model: 'gpt-5.4-flash',
+        effort: 'high',
+        style: 'sans',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentSettingsButton tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+    const styleSelect = screen.getByRole('combobox', { name: 'Style' })
+    expect(styleSelect).toHaveValue('sans')
+
+    fireEvent.change(styleSelect, { target: { value: 'serif' } })
+
+    const layout = store.getState().panes.layouts['tab-1']
+    expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.style : null).toBe('serif')
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      freshAgent: {
+        providers: {
+          freshcodex: { style: 'serif' },
         },
       },
     })

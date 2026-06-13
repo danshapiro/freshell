@@ -121,6 +121,31 @@ describe('collectPaneSnapshots', () => {
     }])
   })
 
+  it('keeps fresh-agent style in tab-registry pane payloads', () => {
+    const node: PaneNode = {
+      type: 'leaf',
+      id: 'pane-style',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-style',
+        status: 'idle',
+        style: 'serif',
+      },
+    }
+
+    const snapshots = collectPaneSnapshots(node, 'server-style')
+
+    expect(snapshots[0]).toMatchObject({
+      kind: 'fresh-agent',
+      payload: {
+        sessionType: 'freshcodex',
+        style: 'serif',
+      },
+    })
+  })
+
   describe('extension content', () => {
     it('serializes extension pane content with correct kind and payload', () => {
       const node: PaneNode = {

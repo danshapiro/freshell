@@ -404,6 +404,56 @@ describe('panesSlice', () => {
       })
       expect(leaf.content.sessionRef).toBeUndefined()
     })
+
+    it('preserves fresh-agent style through content initialization and merge updates', () => {
+      const state = panesReducer(undefined, initLayout({
+        tabId: 'tab-style',
+        paneId: 'pane-style',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-style',
+          status: 'idle',
+          style: 'serif',
+        },
+      }))
+
+      const initialized = state.layouts['tab-style']
+      expect(initialized.type).toBe('leaf')
+      expect(initialized.type === 'leaf' && initialized.content.kind === 'fresh-agent'
+        ? initialized.content.style
+        : null).toBe('serif')
+
+      const updated = panesReducer(state, mergePaneContent({
+        tabId: 'tab-style',
+        paneId: 'pane-style',
+        updates: { style: 'sans' },
+      }))
+      const updatedNode = updated.layouts['tab-style']
+      expect(updatedNode.type === 'leaf' && updatedNode.content.kind === 'fresh-agent'
+        ? updatedNode.content.style
+        : null).toBe('sans')
+    })
+
+    it('does not force a style override onto legacy fresh-agent panes', () => {
+      const state = panesReducer(undefined, initLayout({
+        tabId: 'tab-legacy-style',
+        paneId: 'pane-legacy-style',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-legacy-style',
+          status: 'idle',
+        },
+      }))
+
+      const initialized = state.layouts['tab-legacy-style']
+      expect(initialized.type === 'leaf' && initialized.content.kind === 'fresh-agent'
+        ? initialized.content.style
+        : 'unexpected').toBeUndefined()
+    })
   })
 
   describe('restartAgentChatCreate', () => {
