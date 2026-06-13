@@ -200,6 +200,23 @@ function isActivityOnlyTurn(turn: FreshAgentTurn): boolean {
   return turn.items.length > 0 && turn.items.every(isActivityLike)
 }
 
+function isSyntheticToolResultTurn(turn: FreshAgentTurn): boolean {
+  return turn.role === 'user'
+    && turn.items.length > 0
+    && turn.items.every((item) => item.kind === 'tool_result')
+}
+
+function appendTurnItems(previous: FreshAgentTurn, next: FreshAgentTurn): FreshAgentTurn {
+  return {
+    ...previous,
+    id: `${previous.id}:${next.id}`,
+    summary: [previous.summary, next.summary].filter(Boolean).join('\n\n'),
+    items: [...previous.items, ...next.items],
+    model: next.model ?? previous.model,
+    timestamp: next.timestamp ?? previous.timestamp,
+  }
+}
+
 function mergeActivityOnlyTurns(previous: FreshAgentTurn, next: FreshAgentTurn): FreshAgentTurn {
   return {
     ...next,
@@ -216,6 +233,14 @@ function coalesceActivityOnlyTurns(turns: FreshAgentTurn[]): FreshAgentTurn[] {
   const coalesced: FreshAgentTurn[] = []
   for (const turn of turns) {
     const previous = coalesced[coalesced.length - 1]
+    if (isSyntheticToolResultTurn(turn)) {
+      if (previous?.role === 'assistant') {
+        coalesced[coalesced.length - 1] = appendTurnItems(previous, turn)
+      } else {
+        coalesced.push({ ...turn, role: 'tool' })
+      }
+      continue
+    }
     if (
       previous
       && turn.role !== 'user'
