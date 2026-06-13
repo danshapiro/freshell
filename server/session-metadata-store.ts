@@ -1,9 +1,14 @@
 import fsp from 'fs/promises'
 import path from 'path'
 import { logger } from './logger.js'
+import {
+  shouldApplySessionTypeMetadata,
+  type SessionTypeMetadataSource,
+} from '../shared/session-flavor.js'
 
 export interface SessionMetadataEntry {
   sessionType?: string
+  sessionTypeSource?: SessionTypeMetadataSource
   derivedTitle?: string
 }
 
@@ -116,7 +121,7 @@ export class SessionMetadataStore {
     return result
   }
 
-  async set(provider: string, sessionId: string, entry: SessionMetadataEntry): Promise<void> {
+  async set(provider: string, sessionId: string, entry: SessionMetadataEntry): Promise<boolean> {
     return this.writeMutex.acquire(async () => {
       const current = await this.load()
       // Build a new data object so the cache is untouched if save() fails
@@ -127,11 +132,28 @@ export class SessionMetadataStore {
       if (!sessions[provider]) {
         sessions[provider] = safeRecord()
       }
-      sessions[provider][sessionId] = {
-        ...(sessions[provider][sessionId] ?? {}),
-        ...entry,
+
+      const existing = sessions[provider][sessionId] ?? {}
+      let next: SessionMetadataEntry = { ...existing, ...entry }
+      if (entry.sessionType && entry.sessionTypeSource) {
+        const source = entry.sessionTypeSource
+        const shouldApply = shouldApplySessionTypeMetadata(existing, {
+          sessionType: entry.sessionType,
+          sessionTypeSource: source,
+        })
+        next = shouldApply
+          ? { ...existing, ...entry, sessionTypeSource: source }
+          : {
+              ...next,
+              sessionType: existing.sessionType,
+              sessionTypeSource: existing.sessionTypeSource,
+            }
       }
+
+      if (JSON.stringify(existing) === JSON.stringify(next)) return false
+      sessions[provider][sessionId] = next
       await this.save({ version: 1, sessions })
+      return true
     })
   }
 }
