@@ -15,6 +15,7 @@ import type {
   FreshAgentCreateResult,
   FreshAgentInputImage,
   FreshAgentRuntimeAdapter,
+  FreshAgentSendResult,
   FreshAgentSessionLocator,
 } from './runtime-adapter.js'
 
@@ -143,12 +144,23 @@ export class FreshAgentRuntimeManager {
     return await record.adapter.subscribe(locator.sessionId, listener)
   }
 
-  async send(locator: FreshAgentSessionLocator, input: { text: string; images?: FreshAgentInputImage[]; settings?: FreshAgentCreateRequest }) {
+  async send(
+    locator: FreshAgentSessionLocator,
+    input: { text: string; images?: FreshAgentInputImage[]; settings?: FreshAgentCreateRequest },
+  ): Promise<FreshAgentSendResult> {
     const record = this.requireSession(locator)
     if (!record.adapter.send) {
       throw new FreshAgentUnsupportedCapabilityError(`Send is not supported for ${record.sessionType}`)
     }
-    await record.adapter.send(locator.sessionId, input)
+    const result = await record.adapter.send(locator.sessionId, input)
+    if (result?.sessionId && result.sessionId !== locator.sessionId) {
+      this.sessions.set(this.key({
+        sessionType: locator.sessionType,
+        provider: record.runtimeProvider,
+        sessionId: result.sessionId,
+      }), record)
+    }
+    return result
   }
 
   async interrupt(locator: FreshAgentSessionLocator) {

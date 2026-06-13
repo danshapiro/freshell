@@ -32,7 +32,19 @@ type FreshAgentCreateFailedMessage = {
   retryable?: boolean
 }
 
-type FreshAgentClientMessage = FreshAgentCreatedMessage | FreshAgentCreateFailedMessage
+type FreshAgentSessionMaterializedMessage = {
+  type: 'freshAgent.session.materialized'
+  previousSessionId: string
+  sessionId: string
+  sessionType: FreshAgentSessionType
+  provider: FreshAgentRuntimeProvider
+  sessionRef?: SessionRef
+}
+
+type FreshAgentClientMessage =
+  | FreshAgentCreatedMessage
+  | FreshAgentCreateFailedMessage
+  | FreshAgentSessionMaterializedMessage
 
 interface FreshAgentMessageSink {
   send: (msg: unknown) => void
@@ -99,6 +111,8 @@ export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<strin
       }))
       return true
     }
+    case 'freshAgent.session.materialized':
+      return true
     case 'freshAgent.event':
       return handleFreshAgentTransportEvent(dispatch, msg as FreshAgentEventMessage)
     default:
@@ -171,4 +185,10 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
   }
 }
 
-export type { FreshAgentClientMessage, FreshAgentCreatedMessage, FreshAgentCreateFailedMessage, FreshAgentEventMessage }
+export type {
+  FreshAgentClientMessage,
+  FreshAgentCreatedMessage,
+  FreshAgentCreateFailedMessage,
+  FreshAgentEventMessage,
+  FreshAgentSessionMaterializedMessage,
+}

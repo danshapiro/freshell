@@ -462,6 +462,81 @@ describe('WsHandler fresh-agent routing', () => {
     }
   })
 
+  it('emits freshAgent.session.materialized when send returns a new session id', async () => {
+    const runtimeManager = {
+      create: vi.fn().mockResolvedValue({
+        sessionId: 'freshopencode-req-1',
+        sessionType: 'freshopencode',
+        runtimeProvider: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-1' },
+      }),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+      send: vi.fn().mockResolvedValue({
+        sessionId: 'ses_real_1',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' },
+      }),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const ws = await connectAndAuth(server)
+      const seenMessages: any[] = []
+      ws.on('message', (data) => {
+        seenMessages.push(JSON.parse(data.toString()))
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.create',
+        requestId: 'req-materialize',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+      }))
+
+      await vi.waitFor(() => {
+        expect(seenMessages).toContainEqual(expect.objectContaining({
+          type: 'freshAgent.created',
+          sessionId: 'freshopencode-req-1',
+        }))
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.send',
+        sessionId: 'freshopencode-req-1',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        text: 'Ship it',
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.send).toHaveBeenCalledWith({
+          sessionId: 'freshopencode-req-1',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+        }, {
+          text: 'Ship it',
+          images: undefined,
+          settings: undefined,
+        })
+        expect(runtimeManager.subscribe).toHaveBeenCalledWith(
+          { sessionId: 'ses_real_1', sessionType: 'freshopencode', provider: 'opencode' },
+          expect.any(Function),
+        )
+        expect(seenMessages).toContainEqual({
+          type: 'freshAgent.session.materialized',
+          previousSessionId: 'freshopencode-req-1',
+          sessionId: 'ses_real_1',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' },
+        })
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
   it('routes freshAgent.compact through the runtime manager', async () => {
     const runtimeManager = {
       create: vi.fn().mockResolvedValue({

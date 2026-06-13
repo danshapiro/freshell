@@ -182,6 +182,67 @@ describe('FreshAgentRuntimeManager', () => {
     expect(codexAdapter.compact).toHaveBeenCalledWith('thread-compact-1', { instructions: 'keep decisions' })
   })
 
+  it('registers adapter send aliases while keeping the original placeholder routable', async () => {
+    const opencodeAdapter = {
+      create: vi.fn().mockResolvedValue({
+        sessionId: 'freshopencode-req-alias',
+        sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-alias' },
+      }),
+      send: vi.fn()
+        .mockResolvedValueOnce({
+          sessionId: 'ses_real_1',
+          sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' },
+        })
+        .mockResolvedValueOnce({
+          sessionId: 'ses_real_1',
+          sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' },
+        })
+        .mockResolvedValueOnce({
+          sessionId: 'ses_real_1',
+          sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' },
+        }),
+    }
+    const registry = createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshopencode',
+        runtimeProvider: 'opencode',
+        adapter: opencodeAdapter as any,
+      },
+    ])
+    const manager = new FreshAgentRuntimeManager({ registry })
+    await manager.create({ requestId: 'req-alias', sessionType: 'freshopencode' })
+
+    await expect(manager.send({
+      sessionId: 'freshopencode-req-alias',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    }, { text: 'first' })).resolves.toEqual({
+      sessionId: 'ses_real_1',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' },
+    })
+
+    await expect(manager.send({
+      sessionId: 'freshopencode-req-alias',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    }, { text: 'via placeholder' })).resolves.toEqual({
+      sessionId: 'ses_real_1',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' },
+    })
+    await expect(manager.send({
+      sessionId: 'ses_real_1',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    }, { text: 'via real id' })).resolves.toEqual({
+      sessionId: 'ses_real_1',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' },
+    })
+
+    expect(opencodeAdapter.send).toHaveBeenNthCalledWith(1, 'freshopencode-req-alias', { text: 'first' })
+    expect(opencodeAdapter.send).toHaveBeenNthCalledWith(2, 'freshopencode-req-alias', { text: 'via placeholder' })
+    expect(opencodeAdapter.send).toHaveBeenNthCalledWith(3, 'ses_real_1', { text: 'via real id' })
+  })
+
   it('hydrates adapter state when attaching a restored session before send and compact', async () => {
     const opencodeAdapter = {
       create: vi.fn().mockResolvedValue({ sessionId: 'opencode-created-1' }),

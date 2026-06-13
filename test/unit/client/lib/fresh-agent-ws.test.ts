@@ -91,6 +91,23 @@ describe('fresh-agent-ws', () => {
     })
   })
 
+  it('recognizes freshAgent.session.materialized as a handled fresh-agent message', () => {
+    const store = configureStore({
+      reducer: {
+        freshAgent: freshAgentReducer,
+      },
+    })
+
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.session.materialized',
+      previousSessionId: 'freshopencode-req-1',
+      sessionId: 'ses_real_1',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' },
+    })).toBe(true)
+  })
+
   it('projects Claude freshAgent.event snapshot and lost-session transport updates into fresh-agent session state', () => {
     const store = configureStore({
       reducer: {

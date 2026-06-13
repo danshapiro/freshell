@@ -6,12 +6,19 @@ import type {
   FreshAgentTurnPage,
 } from '../../../../shared/fresh-agent-contract.js'
 
-type OpencodeExport = {
+export type OpencodeExport = {
   info?: Record<string, any>
   messages?: Array<{
     info?: Record<string, any>
     parts?: Array<Record<string, any>>
   }>
+}
+
+const STRUCTURAL_PART_TYPES = new Set(['step-start', 'step-finish'])
+const VISIBLE_PART_TYPES = new Set(['text', 'reasoning', 'tool', 'file', 'patch', 'compaction'])
+
+type OpencodeExportWithPageMetadata = OpencodeExport & {
+  nextCursor?: string | null
 }
 
 function modelFromInfo(info: Record<string, any> | undefined): string | undefined {
@@ -38,6 +45,40 @@ function tokenUsage(info: Record<string, any> | undefined): FreshAgentSnapshot['
   }
 }
 
+function fileAttachmentTarget(part: Record<string, any>): string {
+  for (const key of ['filename', 'name', 'url', 'path']) {
+    if (typeof part[key] === 'string' && part[key].trim().length > 0) return part[key].trim()
+  }
+  return 'unknown file'
+}
+
+function normalizePatchChange(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value === 'string' && value.length > 0) return { path: value }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  const change: Record<string, unknown> = { ...record }
+  if (typeof change.path !== 'string') {
+    const path = typeof record.file === 'string'
+      ? record.file
+      : typeof record.name === 'string'
+        ? record.name
+        : undefined
+    if (path) change.path = path
+  }
+  return change
+}
+
+function normalizePatchChanges(files: unknown): Record<string, unknown>[] {
+  const values = Array.isArray(files)
+    ? files
+    : (typeof files === 'string' || (files && typeof files === 'object' && !Array.isArray(files)))
+        ? [files]
+        : []
+  return values
+    .map((value) => normalizePatchChange(value))
+    .filter((value): value is Record<string, unknown> => Boolean(value))
+}
+
 function itemFromPart(part: Record<string, any>, fallbackId: string): FreshAgentTranscriptItem | undefined {
   const id = typeof part.id === 'string' && part.id.length > 0 ? part.id : fallbackId
   if (part.type === 'text') {
@@ -60,7 +101,75 @@ function itemFromPart(part: Record<string, any>, fallbackId: string): FreshAgent
       success: state.status === 'completed' ? true : undefined,
     }
   }
+  if (part.type === 'file') {
+    return { id, kind: 'text', text: `Attached file: ${fileAttachmentTarget(part)}` }
+  }
+  if (part.type === 'patch') {
+    return {
+      id,
+      kind: 'file_change',
+      status: 'completed',
+      changes: normalizePatchChanges(part.files),
+      extensions: { opencode: part },
+    }
+  }
+  if (part.type === 'compaction') {
+    return { id, kind: 'context_compaction' }
+  }
   return undefined
+}
+
+function collectOpencodePartMetadata(messages: NonNullable<OpencodeExport['messages']>): Record<string, unknown> {
+  const structuralPartTypes: Array<{ type: string; id?: string; messageId?: string }> = []
+  const unsupportedPartTypes: Array<{ type: string; id?: string; messageId?: string }> = []
+  const structuralParts: Array<{ messageId?: string; part: Record<string, any> }> = []
+  const unsupportedParts: Array<{ messageId?: string; part: Record<string, any> }> = []
+  const fileParts: Array<{ messageId?: string; part: Record<string, any> }> = []
+  const compactionParts: Array<{ messageId?: string; part: Record<string, any> }> = []
+  const structuralPartCounts: Record<string, number> = {}
+
+  messages.forEach((message) => {
+    const messageId = typeof message.info?.id === 'string' ? message.info.id : undefined
+    const parts = Array.isArray(message.parts) ? message.parts : []
+    parts.forEach((part) => {
+      const type = typeof part.type === 'string' ? part.type : undefined
+      if (!type) return
+      const entry = {
+        type,
+        ...(typeof part.id === 'string' ? { id: part.id } : {}),
+        ...(messageId ? { messageId } : {}),
+      }
+      const rawEntry = {
+        ...(messageId ? { messageId } : {}),
+        part,
+      }
+      if (STRUCTURAL_PART_TYPES.has(type)) {
+        structuralPartTypes.push(entry)
+        structuralParts.push(rawEntry)
+        structuralPartCounts[type] = (structuralPartCounts[type] ?? 0) + 1
+        return
+      }
+      if (type === 'file') {
+        fileParts.push(rawEntry)
+        return
+      }
+      if (type === 'compaction') {
+        compactionParts.push(rawEntry)
+        return
+      }
+      if (!VISIBLE_PART_TYPES.has(type)) {
+        unsupportedPartTypes.push(entry)
+        unsupportedParts.push(rawEntry)
+      }
+    })
+  })
+
+  return {
+    ...(structuralPartTypes.length > 0 ? { structuralPartTypes, structuralPartCounts, structuralParts } : {}),
+    ...(unsupportedPartTypes.length > 0 ? { unsupportedPartTypes, unsupportedParts } : {}),
+    ...(fileParts.length > 0 ? { fileParts } : {}),
+    ...(compactionParts.length > 0 ? { compactionParts } : {}),
+  }
 }
 
 export function normalizeOpencodeTurn(message: NonNullable<OpencodeExport['messages']>[number], ordinal: number): FreshAgentTurn {
@@ -99,6 +208,7 @@ export function normalizeOpencodeSnapshot(input: {
   const turns = messages.map((message, index) => normalizeOpencodeTurn(message, index))
   const sessionModel = modelFromInfo(info) ?? input.model
   const durableSessionId = typeof info.id === 'string' && info.id.length > 0 ? info.id : input.threadId
+  const opencodeExtensions = collectOpencodePartMetadata(messages)
   return {
     sessionType: input.sessionType,
     provider: 'opencode',
@@ -129,22 +239,26 @@ export function normalizeOpencodeSnapshot(input: {
     diffs: [],
     childThreads: [],
     turns,
-    extensions: { opencode: {} },
+    extensions: { opencode: opencodeExtensions },
   }
 }
 
 export function normalizeOpencodeTurnPage(input: {
   threadId: string
-  exported?: OpencodeExport
+  exported?: OpencodeExportWithPageMetadata
   revision: number
+  nextCursor?: string | null
 }): FreshAgentTurnPage {
   const messages = Array.isArray(input.exported?.messages) ? input.exported.messages : []
+  const nextCursor = Object.prototype.hasOwnProperty.call(input, 'nextCursor')
+    ? input.nextCursor
+    : input.exported?.nextCursor
   return {
     sessionType: 'freshopencode',
     provider: 'opencode',
     threadId: input.threadId,
     revision: input.revision,
-    nextCursor: null,
+    nextCursor: typeof nextCursor === 'string' ? nextCursor : null,
     turns: messages.map((message, index) => normalizeOpencodeTurn(message, index)),
   }
 }

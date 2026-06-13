@@ -127,6 +127,16 @@ function isUnmaterializedCodexThreadError(error: unknown): boolean {
     && (error as { message: string }).message.includes('no rollout found for thread id')
 }
 
+function isLostFreshOpencodeThreadError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false
+  const status = 'status' in error ? (error as { status?: unknown }).status : undefined
+  const details = 'details' in error ? (error as { details?: unknown }).details : undefined
+  const code = details && typeof details === 'object' && 'code' in details
+    ? (details as { code?: unknown }).code
+    : undefined
+  return status === 404 && code === 'FRESH_AGENT_LOST_SESSION'
+}
+
 function getRestoreErrorMessage(reason: RestoreErrorReason): string {
   switch (reason) {
     case 'invalid_legacy_restore_target':
@@ -268,6 +278,7 @@ export function FreshAgentView({
   const autoTitleCreateRequestIdRef = useRef(paneContent.createRequestId)
   const autoTitleDurableIdentityRef = useRef<string | null>(null)
   const autoTitleIdentityRef = useRef<string | null>(null)
+  const pendingAutoTitleBySessionIdRef = useRef<Map<string, string>>(new Map())
   const handledRefreshRequestIdRef = useRef<string | null>(null)
   const preferredResumeSessionId = getPreferredResumeSessionId(claudeSession) ?? paneContent.resumeSessionId
   const snapshotThreadId = getFreshAgentSnapshotThreadId(paneContent, claudeSession)
@@ -339,6 +350,24 @@ export function FreshAgentView({
     }
     ws.send(message as never)
   }, [paneId, ws])
+
+  const migratePendingAutoTitle = useCallback((
+    previousSessionId: string | undefined,
+    nextSessionId: string | undefined,
+    provider: string,
+  ) => {
+    if (!previousSessionId || !nextSessionId || previousSessionId === nextSessionId) return
+    const firstMessage = pendingAutoTitleBySessionIdRef.current.get(previousSessionId)
+    if (!firstMessage) return
+    pendingAutoTitleBySessionIdRef.current.delete(previousSessionId)
+    dispatch(finalizeCodingAgentSessionName({
+      tabId,
+      paneId,
+      provider,
+      sessionId: nextSessionId,
+      firstMessage,
+    }))
+  }, [dispatch, paneId, tabId])
 
   const prevCreateRequestIdRef = useRef(paneContent.createRequestId)
   if (prevCreateRequestIdRef.current !== paneContent.createRequestId) {
@@ -430,6 +459,7 @@ export function FreshAgentView({
     setQueuedMessages([])
     setLocalEcho(null)
     alwaysAllowToolsRef.current.clear()
+    pendingAutoTitleBySessionIdRef.current.clear()
     dispatch(updatePaneContent({
       tabId,
       paneId,
@@ -655,6 +685,28 @@ export function FreshAgentView({
         }))
       }
       if (
+        message.type === 'freshAgent.session.materialized'
+        && message.previousSessionId === paneContentRef.current.sessionId
+        && message.sessionType === paneContentRef.current.sessionType
+        && message.provider === paneContentRef.current.provider
+      ) {
+        const current = paneContentRef.current
+        const sessionRef = message.sessionRef ?? { provider: message.provider, sessionId: message.sessionId }
+        migratePendingAutoTitle(current.sessionId, message.sessionId, message.provider)
+        setSnapshotRefreshNonce((value) => value + 1)
+        dispatch(updatePaneContent({
+          tabId,
+          paneId,
+          content: {
+            ...current,
+            sessionId: message.sessionId,
+            sessionRef,
+            resumeSessionId: message.sessionId,
+            restoreError: undefined,
+          },
+        }))
+      }
+      if (
         message.type === 'freshAgent.event'
         && message.sessionId === paneContent.sessionId
         && message.sessionType === paneContent.sessionType
@@ -706,7 +758,7 @@ export function FreshAgentView({
       }
     })
     return unsubscribe
-  }, [dispatch, paneContent, paneContent.createRequestId, paneId, sendFreshAgentMessage, tabId, ws])
+  }, [dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, sendFreshAgentMessage, tabId, ws])
 
   useEffect(() => {
     if (!snapshotThreadId) return
@@ -753,6 +805,9 @@ export function FreshAgentView({
         const nextSessionId = snapshotSessionRef?.sessionId ?? fresh.sessionId
         const nextSessionRef = snapshotSessionRef ?? fresh.sessionRef
         const nextResumeSessionId = snapshotSessionRef?.sessionId ?? fresh.resumeSessionId ?? sessionId
+        if (snapshotSessionRef) {
+          migratePendingAutoTitle(fresh.sessionId, snapshotSessionRef.sessionId, provider)
+        }
         if (
           nextStatus === fresh.status
           && nextSessionId === fresh.sessionId
@@ -803,6 +858,26 @@ export function FreshAgentView({
           }))
           return
         }
+        if (paneContent.provider === 'opencode' && isLostFreshOpencodeThreadError(error)) {
+          const fresh = paneContentRef.current
+          setLoadError(null)
+          setSnapshot(null)
+          dispatch(updatePaneContent({
+            tabId,
+            paneId,
+            content: {
+              ...fresh,
+              sessionId: undefined,
+              sessionRef: undefined,
+              resumeSessionId: undefined,
+              createRequestId: nanoid(),
+              status: 'idle',
+              createError: undefined,
+              restoreError: buildRestoreError('durable_artifact_missing'),
+            },
+          }))
+          return
+        }
         setLoadError(error instanceof Error ? error.message : 'Failed to load session')
       })
     return () => controller.abort()
@@ -821,6 +896,7 @@ export function FreshAgentView({
     paneContent.sessionType,
     paneId,
     autoTitleIdentity,
+    migratePendingAutoTitle,
     snapshotThreadId,
     snapshotRefreshNonce,
     tabId,
@@ -958,6 +1034,7 @@ export function FreshAgentView({
     if (isFirstMessage) {
       autoTitleFreshBoundaryRef.current = false
       autoTitleSentRef.current = true
+      pendingAutoTitleBySessionIdRef.current.set(current.sessionId, text)
       dispatch(finalizeCodingAgentSessionName({
         tabId,
         paneId,

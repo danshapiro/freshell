@@ -937,6 +937,7 @@ export type FreshAgentServerMessage =
   | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
   | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean }
   | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
+  | { type: 'freshAgent.session.materialized'; previousSessionId: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string } }
   | { type: 'freshAgent.forked'; requestId?: string; parentSessionId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
   | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean }
 

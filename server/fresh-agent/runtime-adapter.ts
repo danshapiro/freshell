@@ -23,6 +23,11 @@ export type FreshAgentCreateResult = {
   sessionRef?: { provider: string; sessionId: string }
 }
 
+export type FreshAgentSendResult = void | {
+  sessionId?: string
+  sessionRef?: { provider: string; sessionId: string }
+}
+
 export type FreshAgentThreadLocator = {
   sessionType: FreshAgentSessionType
   provider: FreshAgentRuntimeProvider
@@ -46,7 +51,7 @@ export interface FreshAgentRuntimeAdapter {
   resume?(input: FreshAgentCreateRequest): Promise<{ sessionId: string; sessionRef?: { provider: string; sessionId: string } }>
   attach?(locator: FreshAgentSessionLocator): Promise<{ sessionId: string; sessionRef?: { provider: string; sessionId: string } }> | { sessionId: string; sessionRef?: { provider: string; sessionId: string } }
   subscribe?(sessionId: string, listener: (message: unknown) => void): Promise<() => void> | (() => void)
-  send?(sessionId: string, input: { text: string; images?: FreshAgentInputImage[]; settings?: FreshAgentCreateRequest }): Promise<void> | void
+  send?(sessionId: string, input: { text: string; images?: FreshAgentInputImage[]; settings?: FreshAgentCreateRequest }): Promise<FreshAgentSendResult> | FreshAgentSendResult
   interrupt?(sessionId: string): Promise<void> | void
   compact?(sessionId: string, input?: { instructions?: string }): Promise<void> | void
   kill?(sessionId: string): Promise<boolean> | boolean

@@ -124,13 +124,18 @@ type FreshAgentRuntimeManagerLike = {
   create: (input: any) => Promise<any>
   attach: (input: any) => any
   subscribe?: (locator: any, listener: (message: unknown) => void) => Promise<() => void> | (() => void)
-  send?: (locator: any, input: any) => Promise<void> | void
+  send?: (locator: any, input: any) => Promise<FreshAgentSendResult> | FreshAgentSendResult
   interrupt?: (locator: any) => Promise<void> | void
   compact?: (locator: any, input?: { instructions?: string }) => Promise<void> | void
   resolveApproval?: (locator: any, requestId: string | number, decision: Record<string, unknown>) => Promise<void> | void
   answerQuestion?: (locator: any, requestId: string | number, answers: Record<string, string>) => Promise<void> | void
   kill?: (locator: any) => Promise<boolean> | boolean
   fork?: (locator: any, input?: Record<string, unknown>) => Promise<unknown> | unknown
+}
+
+type FreshAgentSendResult = void | {
+  sessionId?: string
+  sessionRef?: { provider: string; sessionId: string }
 }
 
 type FreshAgentLocator = {
@@ -3667,7 +3672,22 @@ export class WsHandler {
         }
         const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
         try {
-          await manager.send(locator, { text: m.text, images: m.images, settings: m.settings })
+          const result = await manager.send(locator, { text: m.text, images: m.images, settings: m.settings })
+          if (result?.sessionId && result.sessionId !== m.sessionId) {
+            this.ensureFreshAgentSubscription(ws, state, {
+              sessionId: result.sessionId,
+              sessionType: m.sessionType,
+              provider: m.provider,
+            })
+            this.send(ws, {
+              type: 'freshAgent.session.materialized',
+              previousSessionId: m.sessionId,
+              sessionId: result.sessionId,
+              sessionType: m.sessionType,
+              provider: m.provider,
+              sessionRef: result.sessionRef ?? { provider: m.provider, sessionId: result.sessionId },
+            })
+          }
         } catch (error) {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error) })
         }
