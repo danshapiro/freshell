@@ -372,6 +372,36 @@ describe('FreshAgentView', () => {
     expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
   })
 
+  it('marks the fresh-agent body with pane and session flavor context metadata', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        sessionId: CLAUDE_THREAD_ID,
+        createRequestId: 'req-context',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    const root = document.querySelector('.fresh-agent-pane') as HTMLElement
+    expect(root.dataset.context).toBe('fresh-agent')
+    expect(root.dataset.tabId).toBe('tab-1')
+    expect(root.dataset.paneId).toBe('pane-1')
+    expect(root.dataset.sessionId).toBe(CLAUDE_THREAD_ID)
+    expect(root.dataset.provider).toBe('claude')
+    expect(root.dataset.sessionType).toBe('freshclaude')
+  })
+
   it('renders Codex review and fork metadata in the shared shell', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
