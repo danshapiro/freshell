@@ -12,7 +12,8 @@ import { nanoid } from 'nanoid'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { getWsClient } from '@/lib/ws-client'
-import { api, getFreshAgentThreadSnapshot } from '@/lib/api'
+import { createLogger } from '@/lib/client-logger'
+import { api, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
 import { consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { clearPendingCreateFailure } from '@/store/freshAgentSlice'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
@@ -30,6 +31,7 @@ import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import { getFreshAgentSlashCommands, type FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
 import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
+import { isDurableProviderSessionId } from '@shared/session-flavor'
 import { DEFAULT_FRESH_AGENT_STYLE, normalizeFreshAgentStyle } from '@shared/settings'
 import {
   checkpointLabelForText,
@@ -48,6 +50,7 @@ import { FreshAgentSidebar } from './FreshAgentSidebar'
 
 const EARLY_STATES = new Set(['creating', 'starting'])
 const BUSY_STATES = new Set(['running', 'compacting'])
+const log = createLogger('FreshAgentView')
 
 function getEffectiveFreshAgentModel(content: FreshAgentPaneContent): string | undefined {
   return normalizeFreshAgentModel(content.sessionType, content.provider, content.model)
@@ -119,6 +122,28 @@ function getCreatedResumeSessionId(
   if (message.sessionRef?.provider === current.provider) return message.sessionRef.sessionId
   if (current.provider === 'claude' && !isValidClaudeSessionId(message.sessionId)) return undefined
   return message.sessionId
+}
+
+function persistDurableFreshAgentFlavor(message: {
+  provider: string
+  sessionId?: string
+  sessionType: string
+  sessionRef?: { provider: string; sessionId: string }
+}) {
+  const provider = message.sessionRef?.provider ?? message.provider
+  const sessionId = message.sessionRef?.sessionId ?? message.sessionId
+  if (!provider || !sessionId || !isDurableProviderSessionId(provider, sessionId)) return
+  setSessionMetadata(provider, sessionId, message.sessionType, {
+    sessionTypeSource: 'materialized',
+  }).catch((err) => {
+    log.warn({
+      event: 'fresh_agent_session_metadata_tag_failed',
+      provider,
+      sessionId,
+      sessionType: message.sessionType,
+      err,
+    })
+  })
 }
 
 function buildLegacyRestoreContext(tab: { title?: string; createdAt?: number; updatedAt?: number } | undefined) {
@@ -710,6 +735,7 @@ export function FreshAgentView({
     const unsubscribe = ws.onMessage((message) => {
       if (message.type === 'freshAgent.created' && message.requestId === paneContentRef.current.createRequestId) {
         const current = paneContentRef.current
+        persistDurableFreshAgentFlavor(message)
         dispatch(updatePaneContent({
           tabId,
           paneId,
@@ -750,6 +776,12 @@ export function FreshAgentView({
       ) {
         const current = paneContentRef.current
         const sessionRef = message.sessionRef ?? { provider: message.provider, sessionId: message.sessionId }
+        persistDurableFreshAgentFlavor({
+          provider: message.provider,
+          sessionId: message.sessionId,
+          sessionType: message.sessionType,
+          sessionRef,
+        })
         migratePendingAutoTitle(current.sessionId, message.sessionId, message.provider)
         setSnapshotRefreshNonce((value) => value + 1)
         dispatch(updatePaneContent({

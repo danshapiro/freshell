@@ -26,6 +26,7 @@ const wsMock = vi.hoisted(() => ({
 const apiMock = vi.hoisted(() => ({
   getFreshAgentThreadSnapshot: vi.fn(),
   post: vi.fn(),
+  setSessionMetadata: vi.fn().mockResolvedValue(undefined),
 }))
 
 const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn((patch: unknown) => ({
@@ -47,6 +48,7 @@ vi.mock('@/lib/api', async () => {
     ...actual,
     api: { ...actual.api, post: apiMock.post },
     getFreshAgentThreadSnapshot: apiMock.getFreshAgentThreadSnapshot,
+    setSessionMetadata: apiMock.setSessionMetadata,
   }
 })
 
@@ -166,7 +168,9 @@ beforeEach(() => {
   wsMock.onMessage.mockImplementation(() => () => {})
   apiMock.getFreshAgentThreadSnapshot.mockReset()
   apiMock.post.mockReset()
+  apiMock.setSessionMetadata.mockReset()
   apiMock.post.mockResolvedValue({ title: null, source: 'none' })
+  apiMock.setSessionMetadata.mockResolvedValue(undefined)
   saveServerSettingsPatchSpy.mockClear()
   apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
     status: 'idle',
@@ -534,6 +538,145 @@ describe('FreshAgentView', () => {
     })
   })
 
+  it('tags durable FreshAgent created events as materialized metadata', async () => {
+    const listeners: Array<(message: any) => void> = []
+    wsMock.onMessage.mockImplementation((listener) => {
+      listeners.push(listener)
+      return () => {}
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-created',
+        status: 'creating',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    act(() => {
+      listeners.forEach((listener) => listener({
+        type: 'freshAgent.created',
+        requestId: 'req-created',
+        sessionId: 'codex-thread-1',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        runtimeProvider: 'codex',
+        sessionRef: { provider: 'codex', sessionId: 'codex-thread-1' },
+      }))
+    })
+
+    await waitFor(() => {
+      expect(apiMock.setSessionMetadata).toHaveBeenCalledWith('codex', 'codex-thread-1', 'freshcodex', {
+        sessionTypeSource: 'materialized',
+      })
+    })
+  })
+
+  it('tags durable FreshAgent created events without sessionRef as materialized metadata', async () => {
+    const listeners: Array<(message: any) => void> = []
+    wsMock.onMessage.mockImplementation((listener) => {
+      listeners.push(listener)
+      return () => {}
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-created-no-ref',
+        status: 'creating',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    act(() => {
+      listeners.forEach((listener) => listener({
+        type: 'freshAgent.created',
+        requestId: 'req-created-no-ref',
+        sessionId: 'codex-thread-no-ref-1',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        runtimeProvider: 'codex',
+      }))
+    })
+
+    await waitFor(() => {
+      expect(apiMock.setSessionMetadata).toHaveBeenCalledWith('codex', 'codex-thread-no-ref-1', 'freshcodex', {
+        sessionTypeSource: 'materialized',
+      })
+    })
+  })
+
+  it('logs when FreshAgent materialized metadata tagging fails', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    apiMock.setSessionMetadata.mockRejectedValueOnce(new Error('metadata write failed'))
+    const listeners: Array<(message: any) => void> = []
+    wsMock.onMessage.mockImplementation((listener) => {
+      listeners.push(listener)
+      return () => {}
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-created-log-failure',
+        status: 'creating',
+      },
+    }))
+
+    try {
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      act(() => {
+        listeners.forEach((listener) => listener({
+          type: 'freshAgent.created',
+          requestId: 'req-created-log-failure',
+          sessionId: 'codex-thread-log-failure-1',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          runtimeProvider: 'codex',
+        }))
+      })
+
+      await waitFor(() => {
+        expect(warnSpy).toHaveBeenCalledWith('[FreshAgentView]', expect.objectContaining({
+          event: 'fresh_agent_session_metadata_tag_failed',
+          provider: 'codex',
+          sessionId: 'codex-thread-log-failure-1',
+          sessionType: 'freshcodex',
+        }))
+      })
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
   it('promotes Freshopencode panes when freshAgent.session.materialized arrives', async () => {
     const store = createStore()
     let onMessage: ((message: Record<string, unknown>) => void) | undefined
@@ -599,6 +742,62 @@ describe('FreshAgentView', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
     expect(sentFreshAgentMessages('freshAgent.send').at(-1)).toMatchObject({
       sessionId: 'ses_real_materialized_1',
+    })
+  })
+
+  it('tags durable FreshAgent materialization events and ignores placeholders', async () => {
+    const listeners: Array<(message: any) => void> = []
+    wsMock.onMessage.mockImplementation((listener) => {
+      listeners.push(listener)
+      return () => {}
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionId: 'freshopencode-req-provisional',
+        createRequestId: 'req-provisional',
+        status: 'connected',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    act(() => {
+      listeners.forEach((listener) => listener({
+        type: 'freshAgent.session.materialized',
+        previousSessionId: 'freshopencode-req-provisional',
+        sessionId: 'freshopencode-req-still-placeholder',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-still-placeholder' },
+      }))
+    })
+    expect(apiMock.setSessionMetadata).not.toHaveBeenCalled()
+
+    act(() => {
+      listeners.forEach((listener) => listener({
+        type: 'freshAgent.session.materialized',
+        previousSessionId: 'freshopencode-req-still-placeholder',
+        sessionId: 'ses_real_1',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' },
+      }))
+    })
+
+    await waitFor(() => {
+      expect(apiMock.setSessionMetadata).toHaveBeenCalledWith('opencode', 'ses_real_1', 'freshopencode', {
+        sessionTypeSource: 'materialized',
+      })
     })
   })
 
