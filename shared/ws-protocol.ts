@@ -491,7 +491,7 @@ export const FreshAgentForkSchema = z.object({
   input: z.record(z.string(), z.unknown()).optional(),
 })
 
-export const BrowserSdkMessageSchema = z.discriminatedUnion('type', [
+export const FreshAgentClientMessageSchema = z.discriminatedUnion('type', [
   FreshAgentCreateSchema,
   FreshAgentAttachSchema,
   FreshAgentSendSchema,
@@ -503,7 +503,7 @@ export const BrowserSdkMessageSchema = z.discriminatedUnion('type', [
   FreshAgentForkSchema,
 ])
 
-export type BrowserSdkMessage = z.infer<typeof BrowserSdkMessageSchema>
+export type FreshAgentClientMessage = z.infer<typeof FreshAgentClientMessageSchema>
 
 // ── Client message discriminated union ──
 

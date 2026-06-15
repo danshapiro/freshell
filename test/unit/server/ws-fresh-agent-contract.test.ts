@@ -1,13 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import {
-  BrowserSdkMessageSchema,
   ClientMessageSchema,
+  FreshAgentClientMessageSchema,
 } from '../../../shared/ws-protocol.js'
 import { normalizeFreshAgentProviderEvent } from '../../../server/fresh-agent/sdk-events.js'
 
 describe('fresh-agent websocket contract', () => {
   it('rejects legacy top-level SDK client commands from the public browser protocol', () => {
-    expect(BrowserSdkMessageSchema.safeParse({ type: 'sdk.create', requestId: 'req-1' }).success).toBe(false)
+    expect(FreshAgentClientMessageSchema.safeParse({ type: 'sdk.create', requestId: 'req-1' }).success).toBe(false)
     expect(ClientMessageSchema.safeParse({ type: 'sdk.send', sessionId: 's1', text: 'hello' }).success).toBe(false)
     expect(ClientMessageSchema.safeParse({
       type: 'freshAgent.send',
