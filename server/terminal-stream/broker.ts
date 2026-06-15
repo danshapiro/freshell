@@ -1,6 +1,11 @@
 import WebSocket from 'ws'
 import type { LiveWebSocket } from '../ws-handler.js'
 import { buildTerminalSessionRef, type TerminalRegistry } from '../terminal-registry.js'
+import type { SessionLocator } from '../../shared/ws-protocol.js'
+import {
+  buildSessionIdentityMismatchDetails,
+  terminalMatchesExpectedSession,
+} from '../terminal-session-identity.js'
 import { logger } from '../logger.js'
 import { logTerminalStreamPerfEvent, type TerminalStreamPerfEvent } from '../perf-logger.js'
 import type { TerminalOutputRawEvent } from './registry-events.js'
@@ -95,6 +100,15 @@ const TERMINAL_REPLAY_RETENTION_LOG_RATE_LIMIT_MS = Math.max(
 type PerfLevel = 'debug' | 'info' | 'warn' | 'error'
 type AttachIntent = 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect'
 type AttachPriority = 'foreground' | 'background'
+type AttachResult =
+  | 'attached'
+  | 'duplicate'
+  | 'missing'
+  | 'invalid_attach_request_id'
+  | {
+    status: 'session_identity_mismatch'
+    actualSessionRef?: SessionLocator
+  }
 type ReplayGapRange = {
   fromSeq: number
   toSeq: number
@@ -110,6 +124,19 @@ type PerfEventLogger = (
   context: Record<string, unknown>,
   level?: PerfLevel,
 ) => void
+type AttachRequest = {
+  ws: LiveWebSocket
+  terminalId: string
+  intent: AttachIntent
+  cols: number
+  rows: number
+  sinceSeq: number | undefined
+  expectedSessionRef?: SessionLocator
+  attachRequestId?: string
+  maxReplayBytes?: number
+  priority: AttachPriority
+  terminalOutputBatchV1: boolean
+}
 type ReplayGapReason = 'replay_window_exceeded' | 'replay_budget_exceeded' | 'queue_overflow'
 type ReplayBackpressurePayloadFields = {
   seqStart?: number
@@ -239,15 +266,78 @@ export class TerminalStreamBroker {
     maxReplayBytes?: number,
     priority: AttachPriority = 'foreground',
     terminalOutputBatchV1 = false,
-  ): Promise<'attached' | 'duplicate' | 'missing' | 'invalid_attach_request_id'> {
+  ): Promise<AttachResult> {
+    return this.attachInternal({
+      ws,
+      terminalId,
+      intent,
+      cols,
+      rows,
+      sinceSeq,
+      attachRequestId,
+      maxReplayBytes,
+      priority,
+      terminalOutputBatchV1,
+    })
+  }
+
+  async attachWithExpectedSession(
+    ws: LiveWebSocket,
+    terminalId: string,
+    intent: AttachIntent,
+    cols: number,
+    rows: number,
+    sinceSeq: number | undefined,
+    expectedSessionRef: SessionLocator | undefined,
+    attachRequestId?: string,
+    maxReplayBytes?: number,
+    priority: AttachPriority = 'foreground',
+    terminalOutputBatchV1 = false,
+  ): Promise<AttachResult> {
+    return this.attachInternal({
+      ws,
+      terminalId,
+      intent,
+      cols,
+      rows,
+      sinceSeq,
+      expectedSessionRef,
+      attachRequestId,
+      maxReplayBytes,
+      priority,
+      terminalOutputBatchV1,
+    })
+  }
+
+  private async attachInternal({
+    ws,
+    terminalId,
+    intent,
+    cols,
+    rows,
+    sinceSeq,
+    expectedSessionRef,
+    attachRequestId,
+    maxReplayBytes,
+    priority,
+    terminalOutputBatchV1,
+  }: AttachRequest): Promise<AttachResult> {
     if (!isTerminalStreamAttachRequestIdWithinSerializedBudget(attachRequestId)) {
       return 'invalid_attach_request_id'
     }
 
     const normalizedSinceSeq = sinceSeq === undefined || sinceSeq === 0 ? 0 : sinceSeq
-    let result: 'attached' | 'duplicate' | 'missing' | 'invalid_attach_request_id' = 'attached'
+    let result: AttachResult = 'attached'
 
     await this.withTerminalLock(terminalId, async () => {
+      const currentRecord = this.registry.get(terminalId)
+      if (currentRecord && expectedSessionRef && !terminalMatchesExpectedSession(currentRecord, expectedSessionRef)) {
+        result = {
+          status: 'session_identity_mismatch',
+          actualSessionRef: buildSessionIdentityMismatchDetails(currentRecord, expectedSessionRef).actualSessionRef,
+        }
+        return
+      }
       const existingState = this.terminals.get(terminalId)
       const existingAttachment = existingState?.clients.get(ws)
       if (attachRequestId && existingAttachment?.activeAttachRequestId === attachRequestId) {
@@ -272,7 +362,24 @@ export class TerminalStreamBroker {
         )
 
       const terminalState = existingState ?? this.getOrCreateTerminalState(terminalId)
-      if (shouldResize && !this.registry.resize(terminalId, cols, rows)) {
+      const resizeResult = shouldResize
+        ? (
+          typeof (this.registry as { resizeIfSessionMatches?: unknown }).resizeIfSessionMatches === 'function'
+            ? this.registry.resizeIfSessionMatches(terminalId, cols, rows, expectedSessionRef)
+            : (this.registry.resize(terminalId, cols, rows)
+                ? { status: 'resized' as const }
+                : { status: 'missing' as const })
+        )
+        : { status: 'unchanged' as const }
+      if (resizeResult.status === 'session_identity_mismatch') {
+        this.registry.detach(terminalId, ws)
+        result = {
+          status: 'session_identity_mismatch',
+          actualSessionRef: resizeResult.actualSessionRef,
+        }
+        return
+      }
+      if (shouldResize && resizeResult.status !== 'resized' && resizeResult.status !== 'unchanged') {
         this.registry.detach(terminalId, ws)
         result = 'missing'
         return
@@ -320,6 +427,16 @@ export class TerminalStreamBroker {
         ? 'geometry_authority_unknown' as const
         : undefined
       const effectiveSinceSeq = replayResetReason ? 0 : normalizedSinceSeq
+
+      const replayRecord = this.registry.get(terminalId)
+      if (replayRecord && expectedSessionRef && !terminalMatchesExpectedSession(replayRecord, expectedSessionRef)) {
+        this.registry.detach(terminalId, ws)
+        result = {
+          status: 'session_identity_mismatch',
+          actualSessionRef: buildSessionIdentityMismatchDetails(replayRecord, expectedSessionRef).actualSessionRef,
+        }
+        return
+      }
 
       const replay = terminalState.replayRing.replaySince(effectiveSinceSeq)
       let replayFrames = replay.frames

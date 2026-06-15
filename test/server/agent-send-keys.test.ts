@@ -129,3 +129,36 @@ it('waits for Codex identity capture before sending a seeded prompt when request
   expect(res.body.status).toBe('ok')
   expect(input).toHaveBeenLastCalledWith('term_1', 'build the thing\r')
 })
+
+it('passes the pane canonical sessionRef to the registry identity gate', async () => {
+  const inputIfSessionMatches = vi.fn(() => ({ status: 'written' }))
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      resolvePaneToTerminal: () => 'term_1',
+      getPaneSnapshot: () => ({
+        tabId: 'tab_1',
+        paneId: 'pane_1',
+        terminalId: 'term_1',
+        paneContent: {
+          kind: 'terminal',
+          terminalId: 'term_1',
+          sessionRef: { provider: 'codex', sessionId: 'thread-1' },
+        },
+      }),
+    },
+    registry: {
+      get: () => ({ mode: 'codex' }),
+      input: vi.fn(() => ({ status: 'written' })),
+      inputIfSessionMatches,
+    },
+  }))
+
+  const res = await request(app).post('/api/panes/p1/send-keys').send({ data: 'ls\r' })
+  expect(res.body.status).toBe('ok')
+  expect(inputIfSessionMatches).toHaveBeenCalledWith('term_1', 'ls\r', {
+    provider: 'codex',
+    sessionId: 'thread-1',
+  })
+})

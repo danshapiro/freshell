@@ -4,6 +4,7 @@ import request from 'supertest'
 import { createAgentApiRouter } from '../../server/agent-api/router'
 import { FakeCodexLaunchPlanner } from '../helpers/coding-cli/fake-codex-launch-planner.js'
 import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../../server/coding-cli/codex-app-server/restore-decision.js'
+import { CODEX_DURABILITY_SCHEMA_VERSION } from '../../shared/codex-durability.js'
 
 it('splits a pane horizontally', async () => {
   const app = express()
@@ -531,6 +532,47 @@ it('preserves attached shell metadata for non-system terminals', async () => {
     terminalId: 'term_1',
     mode: 'shell',
     shell: 'powershell',
+  }))
+})
+
+it('persists an explicit canonical sessionRef when attaching a matching Codex terminal', async () => {
+  const app = express()
+  app.use(express.json())
+  const attachPaneContent = vi.fn()
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      attachPaneContent,
+      resolveTarget: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+      getPaneSnapshot: () => ({
+        tabId: 'tab_1',
+        paneId: 'pane_1',
+        paneContent: { kind: 'terminal' },
+      }),
+    } as any,
+    registry: {
+      get: () => ({
+        mode: 'codex',
+        shell: 'system',
+        resumeSessionId: 'thread-1',
+        codexDurability: {
+          schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+          state: 'durable',
+          durableThreadId: 'thread-1',
+        },
+      }),
+    } as any,
+    wsHandler: { broadcastUiCommand: vi.fn() },
+  }))
+
+  const res = await request(app)
+    .post('/api/panes/pane_1/attach')
+    .send({ terminalId: 'term_1', sessionRef: { provider: 'codex', sessionId: 'thread-1' } })
+
+  expect(res.status).toBe(200)
+  expect(attachPaneContent).toHaveBeenCalledWith('tab_1', 'pane_1', expect.objectContaining({
+    terminalId: 'term_1',
+    mode: 'codex',
+    sessionRef: { provider: 'codex', sessionId: 'thread-1' },
   }))
 })
 

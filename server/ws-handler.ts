@@ -10,7 +10,7 @@ import { buildTerminalSessionRef, modeSupportsResume, terminalIdFromCreateError 
 import type { TerminalRecord, TerminalRegistry, TerminalMode } from './terminal-registry.js'
 import { configStore, type ConfigReadError, type UserConfig } from './config-store.js'
 import type { CodingCliSessionManager } from './coding-cli/session-manager.js'
-import type { ProjectGroup } from './coding-cli/types.js'
+import { makeSessionKey, type CodingCliProviderName, type ProjectGroup } from './coding-cli/types.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
 import type { SessionRepairService } from './session-scanner/service.js'
 import type { SessionScanResult, SessionRepairResult } from './session-scanner/types.js'
@@ -97,6 +97,10 @@ import {
 } from './coding-cli/codex-app-server/restore-decision.js'
 import { sendJsonMessage } from './ws-send.js'
 import {
+  buildSessionIdentityMismatchDetails,
+  terminalMatchesExpectedSession,
+} from './terminal-session-identity.js'
+import {
   makeFreshAgentProviderErrorEvent,
   normalizeFreshAgentProviderEvent,
 } from './fresh-agent/sdk-events.js'
@@ -162,6 +166,11 @@ type WsErrorLogEntry = {
   suppressedCount: number
   firstRequestId?: string
   lastRequestId?: string
+}
+
+type CreatedTerminalRequestBinding = {
+  terminalId: string
+  expectedSessionKey?: string
 }
 
 export type WsHandlerOptions = {
@@ -428,7 +437,7 @@ type ClientState = {
   supportsUiScreenshotV1: boolean
   supportsTerminalOutputBatchV1: boolean
   attachedTerminalIds: Set<string>
-  createdByRequestId: Map<string, string>
+  createdByRequestId: Map<string, CreatedTerminalRequestBinding | typeof REPAIR_PENDING_SENTINEL>
   claudeFreshSessionIdByRequestId: Map<string, string>
   terminalCreateTimestamps: number[]
   codingCliSessions: Set<string>
@@ -502,7 +511,10 @@ export class WsHandler {
   private freshAgentRuntimeManager?: FreshAgentRuntimeManagerLike
   private terminalStreamBroker: TerminalStreamBroker
   private terminalCreateLocks = new Map<string, Promise<void>>()
-  private createdTerminalByRequestId = new Map<string, string>()
+  private createdTerminalByRequestId = new Map<string, CreatedTerminalRequestBinding>()
+  private sdkCreateLocks = new Map<string, Promise<void>>()
+  private createdSdkSessionByRequestId = new Map<string, string>()
+  private sdkSessionByCreateOwnerKey = new Map<string, string>()
   private freshAgentCreateLocks = new Map<string, Promise<void>>()
   private createdFreshAgentByRequestId = new Map<string, FreshAgentCreatedRecord>()
   private screenshotRequests = new Map<string, PendingScreenshot>()
@@ -786,8 +798,15 @@ export class WsHandler {
     return this.connections.size
   }
 
-  private rememberCreatedRequestId(requestId: string, terminalId: string): void {
-    this.createdTerminalByRequestId.set(requestId, terminalId)
+  private rememberCreatedRequestId(
+    requestId: string,
+    terminalId: string,
+    expectedSessionKey?: string,
+  ): void {
+    this.createdTerminalByRequestId.set(requestId, {
+      terminalId,
+      ...(expectedSessionKey ? { expectedSessionKey } : {}),
+    })
   }
 
   private forgetCreatedRequestId(requestId: string): void {
@@ -795,22 +814,69 @@ export class WsHandler {
   }
 
   private forgetCreatedRequestIdsForTerminal(terminalId: string): void {
-    for (const [requestId, cachedTerminalId] of this.createdTerminalByRequestId) {
-      if (cachedTerminalId === terminalId) {
+    for (const [requestId, binding] of this.createdTerminalByRequestId) {
+      if (binding.terminalId === terminalId) {
         this.createdTerminalByRequestId.delete(requestId)
       }
     }
   }
 
-  private resolveCreatedTerminalId(requestId: string): string | undefined {
+  private createdRequestBindingMatchesExpectedSession(
+    binding: CreatedTerminalRequestBinding,
+    expectedSessionKey: string | undefined,
+  ): boolean {
+    return binding.expectedSessionKey === expectedSessionKey
+  }
+
+  private resolveCreatedTerminalBinding(
+    requestId: string,
+    expectedSessionKey: string | undefined,
+  ): CreatedTerminalRequestBinding | undefined {
     const cached = this.createdTerminalByRequestId.get(requestId)
-    if (!cached) return undefined
-    const record = this.registry.get(cached)
+    if (!cached || !this.createdRequestBindingMatchesExpectedSession(cached, expectedSessionKey)) {
+      return undefined
+    }
+    const record = this.registry.get(cached.terminalId)
     if (!record) {
       this.createdTerminalByRequestId.delete(requestId)
       return undefined
     }
     return cached
+  }
+
+  private expectedSessionKey(expectedSessionRef: { provider: string; sessionId: string } | undefined): string | undefined {
+    if (!expectedSessionRef) return undefined
+    return makeSessionKey(expectedSessionRef.provider as CodingCliProviderName, expectedSessionRef.sessionId)
+  }
+
+  private sendSessionIdentityMismatch(
+    ws: LiveWebSocket,
+    params: {
+      operation: 'terminal.attach' | 'terminal.input' | 'terminal.resize'
+      requestId?: string
+      terminalId: string
+      expectedSessionRef: { provider: string; sessionId: string }
+      record: Pick<TerminalRecord, 'mode' | 'resumeSessionId' | 'codexDurability'>
+      attemptedInputBytes?: number
+    },
+  ): void {
+    const details = buildSessionIdentityMismatchDetails(params.record, params.expectedSessionRef)
+    log.warn({
+      connectionId: ws.connectionId,
+      terminalId: params.terminalId,
+      operation: params.operation,
+      expectedSessionRef: details.expectedSessionRef,
+      actualSessionRef: details.actualSessionRef,
+      ...(params.attemptedInputBytes !== undefined ? { attemptedInputBytes: params.attemptedInputBytes } : {}),
+    }, 'Terminal operation rejected due to canonical session identity mismatch')
+    this.sendError(ws, {
+      code: 'SESSION_IDENTITY_MISMATCH',
+      message: 'Terminal session does not match the expected session.',
+      requestId: params.requestId,
+      terminalId: params.terminalId,
+      expectedSessionRef: details.expectedSessionRef,
+      actualSessionRef: details.actualSessionRef,
+    })
   }
 
   private async planCodexLaunch(
@@ -1350,7 +1416,14 @@ export class WsHandler {
 
   private sendError(
     ws: LiveWebSocket,
-    params: { code: z.infer<typeof ErrorCode>; message: string; requestId?: string; terminalId?: string }
+    params: {
+      code: z.infer<typeof ErrorCode>
+      message: string
+      requestId?: string
+      terminalId?: string
+      expectedSessionRef?: { provider: string; sessionId: string }
+      actualSessionRef?: { provider: string; sessionId: string }
+    },
   ) {
     this.recordWsErrorLog(ws, params)
     this.send(ws, {
@@ -1359,6 +1432,8 @@ export class WsHandler {
       message: params.message,
       requestId: params.requestId,
       terminalId: params.terminalId,
+      expectedSessionRef: params.expectedSessionRef,
+      actualSessionRef: params.actualSessionRef,
       timestamp: nowIso(),
     })
   }
@@ -1677,6 +1752,10 @@ export class WsHandler {
         let error = false
         let rateLimited = false
         const requestedSessionRef = normalizeUiSessionLocator(m.sessionRef)
+        const expectedSessionRef = requestedSessionRef && requestedSessionRef.provider === m.mode
+          ? requestedSessionRef
+          : undefined
+        const expectedSessionKey = this.expectedSessionKey(expectedSessionRef)
         if (
           m.recoveryIntent === 'fresh_after_restore_unavailable'
           && (
@@ -1697,49 +1776,22 @@ export class WsHandler {
           return
         }
         const hasReusableRequestedLiveTerminal = Boolean(
-          m.liveTerminal?.serverInstanceId === this.serverInstanceId
+          (m.mode !== 'codex' || expectedSessionRef)
+          && m.liveTerminal?.serverInstanceId === this.serverInstanceId
             && m.liveTerminal.terminalId
             && (() => {
               const live = this.registry.get(m.liveTerminal.terminalId)
               return live && live.status === 'running' && live.mode === m.mode
             })(),
         )
-        let codexDurabilityForDecision = m.codexDurability
-        let codexDurabilityStoreRecordTerminalId: string | undefined
-        if (m.mode === 'codex' && m.restore === true && !requestedSessionRef && !codexDurabilityForDecision) {
-          try {
-            const restoreRecord = await this.registry.readCodexDurabilityRecordForRestoreLocator({
-              ...(m.liveTerminal?.terminalId ? { terminalId: m.liveTerminal.terminalId } : {}),
-              ...(m.tabId ? { tabId: m.tabId } : {}),
-              ...(m.paneId ? { paneId: m.paneId } : {}),
-              ...(m.liveTerminal?.serverInstanceId ? { serverInstanceId: m.liveTerminal.serverInstanceId } : {}),
-            })
-            codexDurabilityForDecision = restoreRecord?.durability
-            codexDurabilityStoreRecordTerminalId = restoreRecord?.terminalId
-          } catch (err) {
-            error = true
-            log.warn({
-              err,
-              requestId: m.requestId,
-              connectionId: ws.connectionId,
-              tabId: m.tabId,
-              paneId: m.paneId,
-              terminalId: m.liveTerminal?.terminalId,
-            }, 'Failed to resolve Codex durability record for restore locator')
-            this.sendError(ws, {
-              code: 'RESTORE_UNAVAILABLE',
-              message: 'Codex restore identity is ambiguous or unavailable.',
-              requestId: m.requestId,
-            })
-            endCreateTimer({ error, rateLimited })
-            return
-          }
-        }
+        const codexDurabilityForDecision = m.mode === 'codex' && expectedSessionRef
+          ? m.codexDurability
+          : undefined
         const codexRestorePlan = m.mode === 'codex'
           ? planCodexCreateRestoreDecision({
             restoreRequested: m.restore === true,
             legacyResumeSessionId: m.resumeSessionId,
-            sessionRef: requestedSessionRef,
+            sessionRef: expectedSessionRef,
             codexDurability: codexDurabilityForDecision,
           })
           : undefined
@@ -1785,7 +1837,6 @@ export class WsHandler {
           endCreateTimer({ error, rateLimited })
           return
         }
-        const hasCodexCapturedRestoreState = codexRestorePlan?.kind === 'proof_existing_candidate_first'
         if (
           m.restore === true
           && modeSupportsResume(m.mode as TerminalMode)
@@ -1806,7 +1857,6 @@ export class WsHandler {
         if (
           m.restore === true
           && modeSupportsResume(m.mode as TerminalMode)
-          && !hasCodexCapturedRestoreState
           && !hasReusableRequestedLiveTerminal
           && (
             !requestedSessionRef
@@ -1838,11 +1888,13 @@ export class WsHandler {
           await this.withTerminalCreateLock(
             this.terminalCreateLockKey(m.mode as TerminalMode, m.requestId, effectiveResumeSessionId),
             async () => {
-              const resolveExistingRequestTerminalId = (requestId: string): string | undefined => {
+              const resolveExistingRequestBinding = (
+                requestId: string,
+              ): CreatedTerminalRequestBinding | typeof REPAIR_PENDING_SENTINEL | undefined => {
                 const local = state.createdByRequestId.get(requestId)
                 if (local === REPAIR_PENDING_SENTINEL) return REPAIR_PENDING_SENTINEL
-                if (local) return local
-                const cached = this.resolveCreatedTerminalId(requestId)
+                if (local) return this.createdRequestBindingMatchesExpectedSession(local, expectedSessionKey) ? local : undefined
+                const cached = this.resolveCreatedTerminalBinding(requestId, expectedSessionKey)
                 if (cached) {
                   state.createdByRequestId.set(requestId, cached)
                 }
@@ -1876,7 +1928,34 @@ export class WsHandler {
 
               const attachReusedTerminal = async (
                 record: TerminalRecord,
+                opts: { reuseSource: string; allowCodexWithoutExpectedSession?: boolean },
               ): Promise<boolean> => {
+                if (
+                  expectedSessionRef
+                  && !terminalMatchesExpectedSession(record, expectedSessionRef)
+                ) {
+                  log.warn({
+                    requestId: m.requestId,
+                    connectionId: ws.connectionId,
+                    terminalId: record.terminalId,
+                    reuseSource: opts.reuseSource,
+                    ...buildSessionIdentityMismatchDetails(record, expectedSessionRef),
+                  }, 'Ignoring terminal reuse candidate with mismatched canonical session identity')
+                  return false
+                }
+                if (
+                  m.mode === 'codex'
+                  && !expectedSessionRef
+                  && !opts.allowCodexWithoutExpectedSession
+                ) {
+                  log.warn({
+                    requestId: m.requestId,
+                    connectionId: ws.connectionId,
+                    terminalId: record.terminalId,
+                    reuseSource: opts.reuseSource,
+                  }, 'Ignoring Codex terminal reuse candidate without a canonical expected session')
+                  return false
+                }
                 const sent = await sendCreateResult({
                   ws,
                   requestId: m.requestId,
@@ -1885,8 +1964,12 @@ export class WsHandler {
                 if (!sent) {
                   return false
                 }
-                state.createdByRequestId.set(m.requestId, record.terminalId)
-                this.rememberCreatedRequestId(m.requestId, record.terminalId)
+                const binding = {
+                  terminalId: record.terminalId,
+                  ...(expectedSessionKey ? { expectedSessionKey } : {}),
+                }
+                state.createdByRequestId.set(m.requestId, binding)
+                this.rememberCreatedRequestId(m.requestId, record.terminalId, expectedSessionKey)
                 terminalId = record.terminalId
                 reused = true
                 const sessionRef = buildTerminalSessionRef(record)
@@ -1910,85 +1993,32 @@ export class WsHandler {
                 const live = this.registry.get(m.liveTerminal.terminalId)
                 return live && live.status === 'running' && live.mode === m.mode ? live : undefined
               }
-              const requestedLiveCodexCandidate = (candidate: {
-                candidateThreadId: string
-                rolloutPath: string
-              }): TerminalRecord | undefined => {
-                const live = requestedLiveTerminal()
-                if (!live) return undefined
-                const liveCandidate = live.codexDurability?.candidate
-                if (
-                  liveCandidate?.candidateThreadId !== candidate.candidateThreadId
-                  || liveCandidate?.rolloutPath !== candidate.rolloutPath
-                ) {
-                  log.warn({
-                    requestId: m.requestId,
-                    connectionId: ws.connectionId,
-                    terminalId: live.terminalId,
-                    requestedCandidateThreadId: candidate.candidateThreadId,
-                    liveCandidateThreadId: liveCandidate?.candidateThreadId,
-                  }, 'Ignoring stale Codex live terminal handle with mismatched restore candidate')
-                  return undefined
-                }
-                return live
-              }
-              const broadcastCodexSessionAssociated = (associatedTerminalId: string, sessionId: string) => {
-                this.broadcast({
-                  type: 'terminal.session.associated',
-                  terminalId: associatedTerminalId,
-                  sessionRef: {
-                    provider: 'codex',
-                    sessionId,
-                  },
-                })
-              }
-              const broadcastCodexDurabilityUpdated = (associatedTerminalId: string, durability: unknown) => {
-                this.broadcast({
-                  type: 'terminal.codex.durability.updated',
-                  terminalId: associatedTerminalId,
-                  durability,
-                })
-              }
 
-              const existingId = resolveExistingRequestTerminalId(m.requestId)
-              if (existingId) {
-                if (existingId === REPAIR_PENDING_SENTINEL) {
+              const existingBinding = resolveExistingRequestBinding(m.requestId)
+              if (existingBinding) {
+                if (existingBinding === REPAIR_PENDING_SENTINEL) {
                   log.debug({ requestId: m.requestId, connectionId: ws.connectionId },
                     'terminal.create already in progress (repair pending), ignoring duplicate')
                   return
                 }
-                const existing = this.registry.get(existingId)
+                const existing = this.registry.get(existingBinding.terminalId)
                 if (existing) {
-                  await attachReusedTerminal(existing)
-                  return
+                  const attached = await attachReusedTerminal(existing, {
+                    reuseSource: 'request_id_cache',
+                    allowCodexWithoutExpectedSession: true,
+                  })
+                  if (attached) return
                 }
                 // If it no longer exists, fall through and create a new one.
                 state.createdByRequestId.delete(m.requestId)
                 this.forgetCreatedRequestId(m.requestId)
               }
-
-              let clearCodexDurabilityOnCreate = false
-              let restoreErrorOnCreate: RestoreError | undefined
-              let codexDurabilityStoreRecordToDeleteOnSuccessfulUse: string | undefined
-              const deleteCodexDurabilityStoreRecord = async (recordTerminalId: string | undefined, reason: string) => {
-                if (!recordTerminalId) return
-                await this.registry.deleteCodexDurabilityStoreRecord(recordTerminalId, reason)
-                if (codexDurabilityStoreRecordToDeleteOnSuccessfulUse === recordTerminalId) {
-                  codexDurabilityStoreRecordToDeleteOnSuccessfulUse = undefined
-                }
-              }
               if (m.mode === 'codex') {
                 const decision = await resolveCodexCreateRestoreDecision({
                   restoreRequested: m.restore === true,
                   legacyResumeSessionId: m.resumeSessionId,
-                  sessionRef: requestedSessionRef,
+                  sessionRef: expectedSessionRef,
                   codexDurability: codexDurabilityForDecision,
-                  findLiveTerminalByCandidate: (candidate) => (
-                    this.registry.findRunningCodexTerminalByCandidate(
-                      candidate.candidateThreadId,
-                      candidate.rolloutPath,
-                    ) ?? requestedLiveCodexCandidate(candidate)
-                  ),
                 })
 
                 if (
@@ -2008,95 +2038,15 @@ export class WsHandler {
                   effectiveResumeSessionId = decision.sessionId
                 } else if (decision.kind === 'fresh_codex_launch') {
                   effectiveResumeSessionId = undefined
-                } else if (decision.kind === 'proof_succeeded_resume_durable') {
-                  const { candidate, liveTerminal: live } = decision
-                  if (live) {
-                    if (codexDurabilityStoreRecordTerminalId && codexDurabilityStoreRecordTerminalId !== live.terminalId) {
-                      await deleteCodexDurabilityStoreRecord(
-                        codexDurabilityStoreRecordTerminalId,
-                        'restore_proof_succeeded_attached_live',
-                      )
-                    }
-                    const promoted = typeof this.registry.promoteCodexDurabilityFromCreateProof === 'function'
-                      ? await this.registry.promoteCodexDurabilityFromCreateProof(live.terminalId, decision.sessionId)
-                      : undefined
-                    const bound = promoted ?? this.registry.bindSession?.(live.terminalId, 'codex', decision.sessionId, 'association')
-                    if (!bound || bound.ok) {
-                      if (!promoted) {
-                        live.resumeSessionId = decision.sessionId
-                        live.codexDurability = {
-                          schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
-                          state: 'durable',
-                          durableThreadId: decision.sessionId,
-                        }
-                      }
-                      broadcastCodexDurabilityUpdated(live.terminalId, live.codexDurability ?? {
-                        schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
-                        state: 'durable',
-                        durableThreadId: decision.sessionId,
-                      })
-                      await attachReusedTerminal(live)
-                      broadcastCodexSessionAssociated(live.terminalId, decision.sessionId)
-                      return
-                    }
-                    log.warn({
-                      requestId: m.requestId,
-                      connectionId: ws.connectionId,
-                      terminalId: live.terminalId,
-                      sessionId: decision.sessionId,
-                      reason: bound.reason,
-                    }, 'Codex captured restore state proved durable but live terminal binding failed')
-                  }
-                  effectiveResumeSessionId = decision.sessionId
-                  codexDurabilityStoreRecordToDeleteOnSuccessfulUse = codexDurabilityStoreRecordTerminalId
-                  log.info({
-                    requestId: m.requestId,
-                    connectionId: ws.connectionId,
-                    candidateThreadId: candidate.candidateThreadId,
-                    rolloutPath: candidate.rolloutPath,
-                  }, 'Codex captured restore state proved durable during terminal.create')
-                } else if (decision.kind === 'proof_failed_attach_live_candidate') {
-                  const { candidate, proof, liveTerminal: live } = decision
-                  log.warn({
-                    requestId: m.requestId,
-                    connectionId: ws.connectionId,
-                    candidateThreadId: candidate.candidateThreadId,
-                    rolloutPath: candidate.rolloutPath,
-                    reason: proof.reason,
-                  }, 'Codex captured restore state could not be proved during terminal.create')
-                  if (codexDurabilityStoreRecordTerminalId && codexDurabilityStoreRecordTerminalId !== live.terminalId) {
-                    await deleteCodexDurabilityStoreRecord(
-                      codexDurabilityStoreRecordTerminalId,
-                      'restore_proof_failed_attached_live',
-                    )
-                  }
-                  await attachReusedTerminal(live)
-                  return
-                } else if (decision.kind === 'proof_failed_fresh_create') {
-                  const { candidate, proof } = decision
-                  log.warn({
-                    requestId: m.requestId,
-                    connectionId: ws.connectionId,
-                    candidateThreadId: candidate.candidateThreadId,
-                    rolloutPath: candidate.rolloutPath,
-                    reason: proof.reason,
-                  }, 'Codex captured restore state could not be proved during terminal.create')
-                  await deleteCodexDurabilityStoreRecord(
-                    codexDurabilityStoreRecordTerminalId,
-                    'restore_proof_failed_fresh_create',
-                  )
-                  clearCodexDurabilityOnCreate = decision.clearCodexDurability
-                  restoreErrorOnCreate = decision.restoreError
-                  effectiveResumeSessionId = undefined
                 }
               }
 
-              if (!codexDurabilityForDecision?.candidate) {
-                const live = requestedLiveTerminal()
-                if (live) {
-                  await attachReusedTerminal(live)
-                  return
-                }
+              const live = requestedLiveTerminal()
+              if (live) {
+                const attached = await attachReusedTerminal(live, {
+                  reuseSource: 'requested_live_terminal',
+                })
+                if (attached) return
               }
 
               if (modeSupportsResume(m.mode as TerminalMode) && effectiveResumeSessionId) {
@@ -2118,12 +2068,10 @@ export class WsHandler {
                   )
                 }
                 if (existing) {
-                  await deleteCodexDurabilityStoreRecord(
-                    codexDurabilityStoreRecordToDeleteOnSuccessfulUse,
-                    'restore_proof_succeeded_attached_existing',
-                  )
-                  await attachReusedTerminal(existing)
-                  return
+                  const attached = await attachReusedTerminal(existing, {
+                    reuseSource: 'canonical_session_owner',
+                  })
+                  if (attached) return
                 }
               }
 
@@ -2133,17 +2081,20 @@ export class WsHandler {
                 : undefined
 
               // Re-check idempotency after async config loading in case another create won the race.
-              const existingAfterConfigId = resolveExistingRequestTerminalId(m.requestId)
-              if (existingAfterConfigId) {
-                if (existingAfterConfigId === REPAIR_PENDING_SENTINEL) {
+              const existingAfterConfigBinding = resolveExistingRequestBinding(m.requestId)
+              if (existingAfterConfigBinding) {
+                if (existingAfterConfigBinding === REPAIR_PENDING_SENTINEL) {
                   log.debug({ requestId: m.requestId, connectionId: ws.connectionId },
                     'terminal.create already in progress (repair pending), ignoring duplicate')
                   return
                 }
-                const existing = this.registry.get(existingAfterConfigId)
+                const existing = this.registry.get(existingAfterConfigBinding.terminalId)
                 if (existing) {
-                  await attachReusedTerminal(existing)
-                  return
+                  const attached = await attachReusedTerminal(existing, {
+                    reuseSource: 'request_id_cache_after_config',
+                    allowCodexWithoutExpectedSession: true,
+                  })
+                  if (attached) return
                 }
                 state.createdByRequestId.delete(m.requestId)
                 this.forgetCreatedRequestId(m.requestId)
@@ -2185,12 +2136,10 @@ export class WsHandler {
                   )
                 }
                 if (existing) {
-                  await deleteCodexDurabilityStoreRecord(
-                    codexDurabilityStoreRecordToDeleteOnSuccessfulUse,
-                    'restore_proof_succeeded_attached_existing',
-                  )
-                  await attachReusedTerminal(existing)
-                  return
+                  const attached = await attachReusedTerminal(existing, {
+                    reuseSource: 'canonical_session_owner_after_config',
+                  })
+                  if (attached) return
                 }
               }
 
@@ -2338,10 +2287,6 @@ export class WsHandler {
                   })
                 }
               }
-              await deleteCodexDurabilityStoreRecord(
-                codexDurabilityStoreRecordToDeleteOnSuccessfulUse,
-                'restore_proof_succeeded_created_replacement',
-              )
               this.assertTerminalCreateAccepted()
 
               if (m.mode !== 'shell' && typeof m.cwd === 'string' && m.cwd.trim()) {
@@ -2351,15 +2296,17 @@ export class WsHandler {
                 })
               }
 
-              state.createdByRequestId.set(m.requestId, record.terminalId)
-              this.rememberCreatedRequestId(m.requestId, record.terminalId)
+              const createdBinding = {
+                terminalId: record.terminalId,
+                ...(expectedSessionKey ? { expectedSessionKey } : {}),
+              }
+              state.createdByRequestId.set(m.requestId, createdBinding)
+              this.rememberCreatedRequestId(m.requestId, record.terminalId, expectedSessionKey)
 
               const sent = await sendCreateResult({
                 ws,
                 requestId: m.requestId,
                 record,
-                clearCodexDurability: clearCodexDurabilityOnCreate,
-                restoreError: restoreErrorOnCreate,
               })
               if (!sent) {
                 // Terminal may still exist even if created delivery failed (for
@@ -2368,10 +2315,6 @@ export class WsHandler {
                 this.broadcastTerminalsChanged()
                 return
               }
-              if (m.mode === 'codex' && effectiveResumeSessionId) {
-                broadcastCodexSessionAssociated(record.terminalId, effectiveResumeSessionId)
-              }
-
               recordSessionLifecycleEvent({
                 kind: 'terminal_created',
                 requestId: m.requestId,
@@ -2439,6 +2382,7 @@ export class WsHandler {
         }
 
         const record = this.registry.get(m.terminalId)
+        const expectedSessionRef = normalizeUiSessionLocator(m.expectedSessionRef)
         if (!record) {
           recordSessionLifecycleEvent({
             kind: 'invalid_terminal_id_without_session_ref',
@@ -2469,19 +2413,70 @@ export class WsHandler {
           })
           return
         }
+        if (expectedSessionRef && !terminalMatchesExpectedSession(record, expectedSessionRef)) {
+          this.sendSessionIdentityMismatch(ws, {
+            operation: 'terminal.attach',
+            requestId: m.attachRequestId,
+            terminalId: record.terminalId,
+            expectedSessionRef,
+            record,
+          })
+          return
+        }
 
-        const attachResult = await this.terminalStreamBroker.attach(
-          ws,
-          m.terminalId,
-          m.intent,
-          m.cols,
-          m.rows,
-          m.sinceSeq,
-          m.attachRequestId,
-          m.maxReplayBytes,
-          m.priority ?? 'foreground',
-          state.supportsTerminalOutputBatchV1,
-        )
+        const attachBroker = this.terminalStreamBroker as {
+          attach: (
+            ws: LiveWebSocket,
+            terminalId: string,
+            intent: 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect',
+            cols: number,
+            rows: number,
+            sinceSeq: number | undefined,
+            attachRequestId?: string,
+            maxReplayBytes?: number,
+            priority?: 'foreground' | 'background',
+            terminalOutputBatchV1?: boolean,
+          ) => Promise<any>
+          attachWithExpectedSession?: (
+            ws: LiveWebSocket,
+            terminalId: string,
+            intent: 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect',
+            cols: number,
+            rows: number,
+            sinceSeq: number | undefined,
+            expectedSessionRef: { provider: string; sessionId: string } | undefined,
+            attachRequestId?: string,
+            maxReplayBytes?: number,
+            priority?: 'foreground' | 'background',
+            terminalOutputBatchV1?: boolean,
+          ) => Promise<any>
+        }
+        const attachResult = typeof attachBroker.attachWithExpectedSession === 'function'
+          ? await attachBroker.attachWithExpectedSession(
+            ws,
+            m.terminalId,
+            m.intent,
+            m.cols,
+            m.rows,
+            m.sinceSeq,
+            expectedSessionRef,
+            m.attachRequestId,
+            m.maxReplayBytes,
+            m.priority ?? 'foreground',
+            state.supportsTerminalOutputBatchV1,
+          )
+          : await attachBroker.attach(
+            ws,
+            m.terminalId,
+            m.intent,
+            m.cols,
+            m.rows,
+            m.sinceSeq,
+            m.attachRequestId,
+            m.maxReplayBytes,
+            m.priority ?? 'foreground',
+            state.supportsTerminalOutputBatchV1,
+          )
         if (attachResult === 'invalid_attach_request_id') {
           this.sendError(ws, {
             code: 'INVALID_MESSAGE',
@@ -2521,6 +2516,18 @@ export class WsHandler {
           })
           return
         }
+        if (typeof attachResult === 'object' && attachResult.status === 'session_identity_mismatch') {
+          if (expectedSessionRef) {
+            this.sendSessionIdentityMismatch(ws, {
+              operation: 'terminal.attach',
+              requestId: m.attachRequestId,
+              terminalId: m.terminalId,
+              expectedSessionRef,
+              record: this.registry.get(m.terminalId) ?? record,
+            })
+          }
+          return
+        }
         if (attachResult === 'duplicate') return
         state.attachedTerminalIds.add(m.terminalId)
         return
@@ -2546,7 +2553,23 @@ export class WsHandler {
       }
 
       case 'terminal.input': {
-        const result = this.registry.input(m.terminalId, m.data)
+        const expectedSessionRef = normalizeUiSessionLocator(m.expectedSessionRef)
+        const result = typeof this.registry.inputIfSessionMatches === 'function'
+          ? this.registry.inputIfSessionMatches(m.terminalId, m.data, expectedSessionRef)
+          : this.registry.input(m.terminalId, m.data)
+        if (result.status === 'session_identity_mismatch') {
+          const record = this.registry.get(m.terminalId)
+          if (record && expectedSessionRef) {
+            this.sendSessionIdentityMismatch(ws, {
+              operation: 'terminal.input',
+              terminalId: m.terminalId,
+              expectedSessionRef,
+              record,
+              attemptedInputBytes: Buffer.byteLength(m.data, 'utf8'),
+            })
+            return
+          }
+        }
         if (result.status === 'blocked_codex_identity_pending') {
           log.debug({
             terminalId: m.terminalId,
@@ -2656,8 +2679,25 @@ export class WsHandler {
       }
 
       case 'terminal.resize': {
-        const ok = this.registry.resize(m.terminalId, m.cols, m.rows)
-        if (!ok) {
+        const expectedSessionRef = normalizeUiSessionLocator(m.expectedSessionRef)
+        const result = typeof this.registry.resizeIfSessionMatches === 'function'
+          ? this.registry.resizeIfSessionMatches(m.terminalId, m.cols, m.rows, expectedSessionRef)
+          : (this.registry.resize(m.terminalId, m.cols, m.rows)
+              ? { status: 'resized' as const }
+              : { status: 'missing' as const })
+        if (result.status === 'session_identity_mismatch') {
+          const record = this.registry.get(m.terminalId)
+          if (record && expectedSessionRef) {
+            this.sendSessionIdentityMismatch(ws, {
+              operation: 'terminal.resize',
+              terminalId: m.terminalId,
+              expectedSessionRef,
+              record,
+            })
+            return
+          }
+        }
+        if (result.status !== 'resized' && result.status !== 'unchanged') {
           if (!this.registry.get(m.terminalId)) {
             recordSessionLifecycleEvent({
               kind: 'invalid_terminal_id_without_session_ref',

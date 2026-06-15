@@ -9,11 +9,8 @@ import {
   CodexRpcProbeClient,
   ProbeWorkspace,
   captureCodexBootstrapEvents,
-  captureCodexResumeBootstrapEvents,
-  extractCodexResumeId,
   findClaudeTranscript,
   findClaudeTranscripts,
-  findCodexSessionArtifacts,
   loadCodingCliSessionContractNote,
   queryOpencodeSessionRow,
   readClaudeTranscriptLines,
@@ -25,8 +22,6 @@ import {
   startCodexAppServer,
   startOpencodeServe,
   waitForCodexSessionArtifact,
-  waitForCodexShellSnapshot,
-  waitForFileSizeIncrease,
   waitForAnyHttpBusyStatus,
   waitForJsonResponse,
   waitForJsonLine,
@@ -270,84 +265,6 @@ describe.sequential('coding cli real provider session contract', () => {
       }
     }, 180_000)
 
-    it('stays live-only until the durable artifact exists, then restores via the artifact id', async () => {
-      const codexPath = requireAvailableBinary(codexBinary, codexProbe)
-      const workspace = await ProbeWorkspace.create('codex-durable')
-      try {
-        await seedCodexHome(workspace)
-
-        const liveOnlyAppServer = await startCodexAppServer(workspace, codexPath)
-        const liveOnlyClient = await CodexRpcProbeClient.connect(liveOnlyAppServer.wsUrl)
-        await liveOnlyClient.initialize()
-        const liveOnlyThread = await liveOnlyClient.startThread(process.cwd())
-
-        const snapshotPath = await waitForCodexShellSnapshot(workspace)
-        expect(path.relative(workspace.inTemp('.codex'), snapshotPath)).toMatch(/^shell_snapshots\/.+\.sh$/)
-        expect(liveOnlyThread.thread.id).toMatch(/[0-9a-f-]{36}/)
-
-        expect(await findCodexSessionArtifacts(workspace)).toEqual([])
-        await liveOnlyClient.close()
-        await liveOnlyAppServer.process.stop()
-
-        const createAppServer = await startCodexAppServer(workspace, codexPath)
-        const createClient = await CodexRpcProbeClient.connect(createAppServer.wsUrl)
-        await createClient.initialize()
-        const createdThread = await createClient.startThread(process.cwd())
-        await createClient.startTurn(createdThread.thread.id, 'Reply with exactly: codex-contract-alpha')
-        await createClient.waitForNotification(
-          'turn/completed',
-          (notification) => notification.params?.threadId === createdThread.thread.id,
-          120_000,
-        )
-
-        const artifactPath = await waitForCodexSessionArtifact(workspace)
-        expect(path.relative(workspace.inTemp('.codex'), artifactPath)).toMatch(
-          /^sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-.+\.jsonl$/,
-        )
-        await createClient.close()
-        await createAppServer.process.stop()
-
-        const resumeId = extractCodexResumeId(artifactPath)
-        const sizeBeforeResume = (await fsp.stat(artifactPath)).size
-
-        const resumeBootstrapEvents = await captureCodexResumeBootstrapEvents(
-          workspace,
-          codexPath,
-          resumeId,
-        )
-        expectOrderedSubsequence(resumeBootstrapEvents, [
-          'connection',
-          'initialize',
-          'initialized',
-          'thread/read',
-          'model/list',
-          'thread/resume',
-        ])
-        expect(resumeBootstrapEvents).toContain('account/read')
-        expect(resumeBootstrapEvents).not.toContain('thread/start')
-
-        const resumedAppServer = await startCodexAppServer(workspace, codexPath)
-        const resumedClient = await CodexRpcProbeClient.connect(resumedAppServer.wsUrl)
-        await resumedClient.initialize()
-        const resumedThread = await resumedClient.resumeThread(resumeId, process.cwd())
-        expect(resumedThread.thread.id).toBe(resumeId)
-        await resumedClient.startTurn(resumeId, 'Reply with exactly: codex-contract-beta')
-        await resumedClient.waitForNotification(
-          'turn/completed',
-          (notification) => notification.params?.threadId === resumeId,
-          120_000,
-        )
-
-        const resumedSize = await waitForFileSizeIncrease(artifactPath, sizeBeforeResume, 60_000)
-        expect(resumedSize).toBeGreaterThan(sizeBeforeResume)
-        expect(await findCodexSessionArtifacts(workspace)).toEqual([artifactPath])
-
-        await resumedClient.close()
-        await resumedAppServer.process.stop()
-      } finally {
-        await workspace.cleanup().catch(() => undefined)
-      }
-    }, 180_000)
   })
 
   const describeClaude = claudeProbe.ready ? describe.sequential : describe.skip

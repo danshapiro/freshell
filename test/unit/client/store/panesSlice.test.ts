@@ -23,6 +23,7 @@ import panesReducer, {
   toggleZoom,
   clearDeadTerminals,
   restartFreshAgentCreate,
+  repairCodexIdentityMismatch,
   PanesState,
 } from '../../../../src/store/panesSlice'
 import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent, EditorPaneContent, ExtensionPaneContent } from '../../../../src/store/paneTypes'
@@ -2868,11 +2869,124 @@ describe('panesSlice', () => {
       const leaf2 = next.layouts['tab-2'] as Extract<PaneNode, { type: 'leaf' }>
       expect((leaf2.content as TerminalPaneContent).createRequestId).not.toBe('original-req-2')
       expect((leaf2.content as TerminalPaneContent).terminalId).toBeUndefined()
+      expect((leaf2.content as TerminalPaneContent).serverInstanceId).toBeUndefined()
+      expect((leaf2.content as TerminalPaneContent).streamId).toBeUndefined()
       expect((leaf2.content as TerminalPaneContent).status).toBe('creating')
     })
   })
 
+  describe('repairCodexIdentityMismatch', () => {
+    it('clears stale runtime plumbing and preserves only matching durable identity', () => {
+      const state = stateWithLeaf('pane-codex', {
+        kind: 'terminal',
+        createRequestId: 'req-old',
+        status: 'running',
+        mode: 'codex',
+        shell: 'system',
+        terminalId: 'term-old',
+        serverInstanceId: 'srv-1',
+        streamId: 'stream-1',
+        sessionRef: { provider: 'codex', sessionId: 'thread-1' },
+        codexDurability: {
+          schemaVersion: 1,
+          state: 'durable',
+          durableThreadId: 'thread-1',
+        },
+      })
+
+      const next = panesReducer(state, repairCodexIdentityMismatch({
+        tabId: 'tab-1',
+        paneId: 'pane-codex',
+        staleTerminalId: 'term-old',
+        expectedSessionRef: { provider: 'codex', sessionId: 'thread-1' },
+        createRequestId: 'req-new',
+      }))
+
+      const leaf = next.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      const content = leaf.content as TerminalPaneContent
+      expect(content.terminalId).toBeUndefined()
+      expect(content.serverInstanceId).toBeUndefined()
+      expect(content.streamId).toBeUndefined()
+      expect(content.createRequestId).toBe('req-new')
+      expect(content.status).toBe('creating')
+      expect(content.sessionRef).toEqual({ provider: 'codex', sessionId: 'thread-1' })
+      expect(content.codexDurability).toEqual({
+        schemaVersion: 1,
+        state: 'durable',
+        durableThreadId: 'thread-1',
+      })
+    })
+  })
+
   describe('PaneContent types', () => {
+    it('preserves local canonical Codex identity over incoming runtime fields during hydration', () => {
+      const localState = stateWithLeaf('pane-canonical', {
+        kind: 'terminal',
+        createRequestId: 'req-1',
+        status: 'running',
+        mode: 'codex',
+        shell: 'system',
+        terminalId: 'term-local',
+        serverInstanceId: 'srv-local',
+        streamId: 'stream-local',
+        sessionRef: { provider: 'codex', sessionId: 'thread-1' },
+        codexDurability: {
+          schemaVersion: 1,
+          state: 'durable',
+          durableThreadId: 'thread-1',
+        },
+      })
+
+      const incoming: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-canonical',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-2',
+              status: 'running',
+              mode: 'codex',
+              shell: 'system',
+              terminalId: 'term-remote',
+              serverInstanceId: 'srv-remote',
+              streamId: 'stream-remote',
+              sessionRef: { provider: 'codex', sessionId: 'thread-other' },
+              codexDurability: {
+                schemaVersion: 1,
+                state: 'durable',
+                durableThreadId: 'thread-other',
+              },
+            },
+          },
+        },
+        activePane: localState.activePane,
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      }
+
+      const merged = panesReducer(localState, hydratePanes(incoming))
+      const leaf = merged.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content).toMatchObject({
+        kind: 'terminal',
+        createRequestId: 'req-1',
+        status: 'running',
+        sessionRef: { provider: 'codex', sessionId: 'thread-1' },
+        terminalId: 'term-local',
+        serverInstanceId: 'srv-local',
+        streamId: 'stream-local',
+        codexDurability: {
+          schemaVersion: 1,
+          state: 'durable',
+          durableThreadId: 'thread-1',
+        },
+      })
+    })
+
     it('TerminalPaneContent has required lifecycle fields', () => {
       const content: TerminalPaneContent = {
         kind: 'terminal',

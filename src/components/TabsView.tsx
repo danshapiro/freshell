@@ -123,14 +123,15 @@ export function sanitizePaneSnapshot(
     const codexDurability = mode === 'codex'
       ? sanitizeCodexDurabilityRef(payload.codexDurability)
       : undefined
+    const includeLiveTerminal = sameServer && !sessionRef
     return {
       kind: 'terminal',
       mode,
       shell: (payload.shell as 'system' | 'cmd' | 'powershell' | 'wsl') || 'system',
       sessionRef,
       ...(codexDurability ? { codexDurability } : {}),
-      terminalId: sameServer ? liveTerminal?.terminalId : undefined,
-      serverInstanceId: record.serverInstanceId,
+      terminalId: includeLiveTerminal ? liveTerminal?.terminalId : undefined,
+      serverInstanceId: includeLiveTerminal ? record.serverInstanceId : undefined,
       initialCwd: payload.initialCwd as string | undefined,
     }
   }

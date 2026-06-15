@@ -50,15 +50,14 @@ function terminalPaneNeedsDurableIdentityUpdate(content: TerminalPaneContent, se
   if (!(
     sessionRef.provider === 'codex'
     && content.codexDurability?.state === 'durable'
-    && (
-      content.codexDurability.durableThreadId === sessionRef.sessionId
-      || content.codexDurability.candidate?.candidateThreadId === sessionRef.sessionId
-    )
+    && content.codexDurability.durableThreadId === sessionRef.sessionId
   )) {
     return content.codexDurability !== undefined
   }
   return false
 }
+
+export type TerminalSessionAssociationReconcileStatus = 'ignored' | 'reconciled' | 'conflict'
 
 export function reconcileTerminalSessionAssociation({
   dispatch,
@@ -70,13 +69,14 @@ export function reconcileTerminalSessionAssociation({
   getState: () => SessionAssociationState
   terminalId?: string
   sessionRef?: unknown
-}): boolean {
-  if (!terminalId) return false
+}): TerminalSessionAssociationReconcileStatus {
+  if (!terminalId) return 'ignored'
   const sessionRef = sanitizeSessionRef(rawSessionRef)
-  if (!sessionRef) return false
+  if (!sessionRef) return 'ignored'
 
   const state = getState()
   let matchedAnyPane = false
+  let conflictingPane = false
   let shouldFlush = false
   const matchedSinglePaneTabs: Array<{ tabId: string; content: TerminalPaneContent }> = []
   for (const [tabId, layout] of Object.entries(state.panes.layouts)) {
@@ -85,6 +85,10 @@ export function reconcileTerminalSessionAssociation({
     if (matches.length === 0) continue
 
     matchedAnyPane = true
+    if (matches.some(({ content }) => content.sessionRef && !sessionRefsEqual(content.sessionRef, sessionRef))) {
+      conflictingPane = true
+      continue
+    }
     if (matches.some(({ content }) => terminalPaneNeedsDurableIdentityUpdate(content, sessionRef))) {
       shouldFlush = true
     }
@@ -93,7 +97,8 @@ export function reconcileTerminalSessionAssociation({
     }
   }
 
-  if (!matchedAnyPane) return false
+  if (conflictingPane) return 'conflict'
+  if (!matchedAnyPane) return 'ignored'
 
   dispatch(reconcileTerminalSessionRefByTerminalId({ terminalId, sessionRef }))
 
@@ -111,10 +116,7 @@ export function reconcileTerminalSessionAssociation({
     })
     const nextTabCodexDurability = sessionRef.provider === 'codex'
       && tab.codexDurability?.state === 'durable'
-      && (
-        tab.codexDurability.durableThreadId === sessionRef.sessionId
-        || tab.codexDurability.candidate?.candidateThreadId === sessionRef.sessionId
-      )
+      && tab.codexDurability.durableThreadId === sessionRef.sessionId
       ? tab.codexDurability
       : undefined
     const tabUpdates = {
@@ -135,5 +137,5 @@ export function reconcileTerminalSessionAssociation({
   if (shouldFlush) {
     dispatch(flushPersistedLayoutNow())
   }
-  return true
+  return 'reconciled'
 }

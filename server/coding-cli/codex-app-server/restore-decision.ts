@@ -1,7 +1,5 @@
-import type { SessionRef, RestoreError } from '../../../shared/session-contract.js'
-import { buildRestoreError } from '../../../shared/session-contract.js'
+import type { SessionRef } from '../../../shared/session-contract.js'
 import type { CodexCandidateIdentity, CodexDurabilityRef } from '../../../shared/codex-durability.js'
-import { proofCodexRollout, type CodexRolloutProofResult } from './durability-proof.js'
 
 type MaybePromise<T> = T | Promise<T>
 
@@ -21,31 +19,10 @@ export type RejectCodexCreateRestoreDecision = {
 export type CodexCreateRestorePlan =
   | RejectCodexCreateRestoreDecision
   | { kind: 'fresh_codex_launch' }
-  | { kind: 'proof_existing_candidate_first'; candidate: CodexCandidateIdentity }
   | { kind: 'durable_session_ref_resume'; sessionRef: SessionRef & { provider: 'codex' }; sessionId: string }
 
 export type CodexCreateRestoreDecision<TLiveTerminal extends CodexLiveRestoreTerminal = CodexLiveRestoreTerminal> =
-  | Exclude<CodexCreateRestorePlan, { kind: 'proof_existing_candidate_first' }>
-  | {
-    kind: 'proof_succeeded_resume_durable'
-    candidate: CodexCandidateIdentity
-    proof: Extract<CodexRolloutProofResult, { ok: true }>
-    sessionId: string
-    liveTerminal?: TLiveTerminal
-  }
-  | {
-    kind: 'proof_failed_attach_live_candidate'
-    candidate: CodexCandidateIdentity
-    proof: Extract<CodexRolloutProofResult, { ok: false }>
-    liveTerminal: TLiveTerminal
-  }
-  | {
-    kind: 'proof_failed_fresh_create'
-    candidate: CodexCandidateIdentity
-    proof: Extract<CodexRolloutProofResult, { ok: false }>
-    clearCodexDurability: true
-    restoreError: RestoreError
-  }
+  | CodexCreateRestorePlan
 
 export const INVALID_RAW_CODEX_RESUME_MESSAGE =
   'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.'
@@ -76,23 +53,6 @@ export function planCodexCreateRestoreDecision(input: {
     }
   }
 
-  const durableSessionId = input.restoreRequested ? getDurableCodexSessionId(input.codexDurability) : undefined
-  if (durableSessionId) {
-    return {
-      kind: 'durable_session_ref_resume',
-      sessionRef: { provider: 'codex', sessionId: durableSessionId },
-      sessionId: durableSessionId,
-    }
-  }
-
-  const candidate = input.codexDurability?.candidate
-  if (input.restoreRequested && candidate && !input.legacyResumeSessionId) {
-    return {
-      kind: 'proof_existing_candidate_first',
-      candidate,
-    }
-  }
-
   if (input.restoreRequested) {
     return {
       kind: 'reject_missing_codex_session_ref',
@@ -110,51 +70,10 @@ export async function resolveCodexCreateRestoreDecision<TLiveTerminal extends Co
     legacyResumeSessionId?: string
     sessionRef?: SessionRef
     codexDurability?: CodexDurabilityRef
-    proofRollout?: (input: { rolloutPath: string; candidateThreadId: string }) => Promise<CodexRolloutProofResult>
     findLiveTerminalByCandidate?: (candidate: CodexCandidateIdentity) => MaybePromise<TLiveTerminal | undefined>
   },
 ): Promise<CodexCreateRestoreDecision<TLiveTerminal>> {
-  const plan = planCodexCreateRestoreDecision(input)
-  if (plan.kind !== 'proof_existing_candidate_first') {
-    return plan
-  }
-
-  const candidate = plan.candidate
-  const proof = await (input.proofRollout ?? proofCodexRollout)({
-    rolloutPath: candidate.rolloutPath,
-    candidateThreadId: candidate.candidateThreadId,
-  })
-  const returnedLiveTerminal = await input.findLiveTerminalByCandidate?.(candidate)
-  const liveTerminal = returnedLiveTerminal && isExactLiveCodexCandidate(returnedLiveTerminal, candidate)
-    ? returnedLiveTerminal
-    : undefined
-
-  if (proof.ok) {
-    return {
-      kind: 'proof_succeeded_resume_durable',
-      candidate,
-      proof,
-      sessionId: proof.rolloutProofId,
-      ...(liveTerminal ? { liveTerminal } : {}),
-    }
-  }
-
-  if (liveTerminal) {
-    return {
-      kind: 'proof_failed_attach_live_candidate',
-      candidate,
-      proof,
-      liveTerminal,
-    }
-  }
-
-  return {
-    kind: 'proof_failed_fresh_create',
-    candidate,
-    proof,
-    clearCodexDurability: true,
-    restoreError: buildRestoreError('durable_artifact_missing'),
-  }
+  return planCodexCreateRestoreDecision(input)
 }
 
 function isCodexSessionRef(value: SessionRef | undefined): value is SessionRef & { provider: 'codex' } {
@@ -163,10 +82,6 @@ function isCodexSessionRef(value: SessionRef | undefined): value is SessionRef &
 
 function hasRawLegacyResume(value: string | undefined): boolean {
   return typeof value === 'string' && value.length > 0
-}
-
-function getDurableCodexSessionId(value: CodexDurabilityRef | undefined): string | undefined {
-  return value?.state === 'durable' ? value.durableThreadId : undefined
 }
 
 export function isExactLiveCodexCandidate(

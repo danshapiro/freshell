@@ -9,6 +9,7 @@ import {
   type PaneContentInput,
   type PaneNode,
   type PaneRefreshRequest,
+  type TerminalPaneContent,
 } from './paneTypes'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { matchesDerivedPaneTitle } from '@/lib/pane-title'
@@ -510,6 +511,49 @@ function sessionRefsEqual(left?: { provider?: string; sessionId?: string }, righ
   return left?.provider === right?.provider && left?.sessionId === right?.sessionId
 }
 
+function codexDurabilityMatchesCanonicalSession(
+  codexDurability: TerminalPaneContent['codexDurability'],
+  sessionRef: { provider?: string; sessionId?: string } | undefined,
+): boolean {
+  return Boolean(
+    sessionRef?.provider === 'codex'
+    && codexDurability?.state === 'durable'
+    && codexDurability.durableThreadId === sessionRef.sessionId,
+  )
+}
+
+function pickCanonicalCodexDurability(
+  localContent: TerminalPaneContent,
+  incomingContent: TerminalPaneContent,
+  sessionRef: { provider?: string; sessionId?: string } | undefined,
+): TerminalPaneContent['codexDurability'] | undefined {
+  if (codexDurabilityMatchesCanonicalSession(localContent.codexDurability, sessionRef)) {
+    return localContent.codexDurability
+  }
+  return codexDurabilityMatchesCanonicalSession(incomingContent.codexDurability, sessionRef)
+    ? incomingContent.codexDurability
+    : undefined
+}
+
+function preserveLocalCanonicalTerminalIdentity(
+  localContent: TerminalPaneContent,
+  incomingContent: TerminalPaneContent,
+): TerminalPaneContent {
+  const localSessionRef = sanitizeSessionRef(localContent.sessionRef)
+  if (!localSessionRef) return incomingContent
+  return {
+    ...incomingContent,
+    createRequestId: localContent.createRequestId,
+    status: localContent.status,
+    sessionRef: localSessionRef,
+    resumeSessionId: undefined,
+    terminalId: localContent.terminalId,
+    serverInstanceId: localContent.serverInstanceId,
+    streamId: localContent.streamId,
+    codexDurability: pickCanonicalCodexDurability(localContent, incomingContent, localSessionRef),
+  }
+}
+
 function reconcileRefreshRequestsForTab(state: PanesState, tabId: string) {
   const tabRequests = state.refreshRequestsByPane?.[tabId]
   if (!tabRequests) return
@@ -557,6 +601,7 @@ function mergeTerminalState(
   // If both leaves, apply smart merge for terminal and fresh-agent content
   if (incoming.type === 'leaf' && local.type === 'leaf') {
     if (incoming.content?.kind === 'terminal' && local.content?.kind === 'terminal') {
+      const localSessionRef = sanitizeSessionRef(local.content.sessionRef)
       if (incoming.content.createRequestId === local.content.createRequestId) {
         // Same createRequestId: prefer local if it has terminalId and
         // incoming is still creating (not exited). Exit state must propagate.
@@ -588,6 +633,13 @@ function mergeTerminalState(
         // regenerated its ID (e.g. after INVALID_TERMINAL_ID). Stale remote
         // state must not overwrite the active reconnection.
         return local
+      }
+
+      if (localSessionRef) {
+        return {
+          ...incoming,
+          content: preserveLocalCanonicalTerminalIdentity(local.content, incoming.content),
+        }
       }
     }
 
@@ -1551,14 +1603,7 @@ export const panesSlice = createSlice({
             content.sessionRef = canonicalSessionRef
           }
           content.resumeSessionId = undefined
-          if (!(
-            canonicalSessionRef.provider === 'codex'
-            && content.codexDurability?.state === 'durable'
-            && (
-              content.codexDurability.durableThreadId === canonicalSessionRef.sessionId
-              || content.codexDurability.candidate?.candidateThreadId === canonicalSessionRef.sessionId
-            )
-          )) {
+          if (!codexDurabilityMatchesCanonicalSession(content.codexDurability, canonicalSessionRef)) {
             content.codexDurability = undefined
           }
           clearRestoreFallbackAttemptForPane(state, tabId, node.id)
@@ -1586,6 +1631,8 @@ export const panesSlice = createSlice({
             const staleTerminalId = node.content.terminalId
             const nextRequestId = nanoid()
             node.content.terminalId = undefined
+            node.content.serverInstanceId = undefined
+            node.content.streamId = undefined
             node.content.status = 'creating'
             node.content.createRequestId = nextRequestId
             if (!sanitizeSessionRef(node.content.sessionRef)) {
@@ -1616,6 +1663,48 @@ export const panesSlice = createSlice({
       for (const [tabId, layout] of Object.entries(state.layouts)) {
         clearDeadInNode(layout, tabId)
       }
+    },
+
+    repairCodexIdentityMismatch: (
+      state,
+      action: PayloadAction<{
+        tabId: string
+        paneId: string
+        staleTerminalId: string
+        expectedSessionRef: { provider: string; sessionId: string }
+        createRequestId: string
+      }>
+    ) => {
+      const { tabId, paneId, staleTerminalId, expectedSessionRef, createRequestId } = action.payload
+      const root = state.layouts[tabId]
+      if (!root) return
+
+      function repairNode(node: PaneNode): void {
+        if (node.type === 'leaf') {
+          if (node.id !== paneId || node.content.kind !== 'terminal') return
+          if (node.content.terminalId !== staleTerminalId) return
+          if (!sessionRefsEqual(node.content.sessionRef, expectedSessionRef)) return
+
+          node.content.terminalId = undefined
+          node.content.serverInstanceId = undefined
+          node.content.streamId = undefined
+          node.content.status = 'creating'
+          node.content.createRequestId = createRequestId
+          node.content.sessionRef = expectedSessionRef
+          node.content.codexDurability = codexDurabilityMatchesCanonicalSession(
+            node.content.codexDurability,
+            expectedSessionRef,
+          )
+            ? node.content.codexDurability
+            : undefined
+          clearRestoreFallbackAttemptForPane(state, tabId, paneId)
+          return
+        }
+        repairNode(node.children[0])
+        repairNode(node.children[1])
+      }
+
+      repairNode(root)
     },
   },
 })
@@ -1649,6 +1738,7 @@ export const {
   clearPaneRenameRequest,
   toggleZoom,
   clearDeadTerminals,
+  repairCodexIdentityMismatch,
 } = panesSlice.actions
 
 export default panesSlice.reducer

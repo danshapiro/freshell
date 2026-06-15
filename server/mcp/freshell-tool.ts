@@ -264,14 +264,14 @@ const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> 
   'resize-pane':     { required: ['target'],                  optional: ['x', 'y', 'sizes'] },
   'swap-pane':       { required: ['target', 'with'],          optional: [] },
   'respawn-pane':    { required: ['target'],                  optional: ['mode', 'shell', 'cwd', 'resume', 'sessionRef'] },
-  'send-keys':       { required: [],                          optional: ['target', 'keys', 'literal'] },
+  'send-keys':       { required: [],                          optional: ['target', 'keys', 'literal', 'sessionRef'] },
   'capture-pane':    { required: [],                          optional: ['target', 'S', 'J', 'e'] },
   'wait-for':        { required: [],                          optional: ['target', 'pattern', 'stable', 'exit', 'prompt', 'timeout'] },
   'run':             { required: ['command'],                 optional: ['capture', 'detached', 'timeout', 'name', 'cwd'] },
   'summarize':       { required: [],                          optional: ['target'] },
   'display':         { required: [],                          optional: ['target', 'format'] },
   'list-terminals':  { required: [],                          optional: [] },
-  'attach':          { required: ['target', 'terminalId'],    optional: [] },
+  'attach':          { required: ['target', 'terminalId'],    optional: ['sessionRef'] },
   'open-browser':    { required: ['url'],                     optional: ['name'] },
   'navigate':        { required: ['target', 'url'],           optional: [] },
   'screenshot':      { required: ['scope'],                   optional: ['target', 'name'] },
@@ -389,7 +389,7 @@ Pane commands:
   respawn-pane    Restart a pane's terminal. Params: target, mode?, shell?, cwd?, resume?, sessionRef?
 
 Terminal I/O:
-  send-keys       Send input to a pane. Params: target, keys, literal?
+  send-keys       Send input to a pane. Params: target, keys, literal?, sessionRef?
                   Token mode (default): keys=["ls","ENTER"] translates ENTER to \\r, C-C to Ctrl-C, etc.
                   Literal mode: keys="your prompt text here", literal=true sends raw string.
                   IMPORTANT: Always use literal mode for natural-language prompts or multi-word text.
@@ -403,7 +403,7 @@ Terminal I/O:
   summarize       Get AI summary of a terminal. Params: target (pane ID)
   display         Format info about a pane. Params: target?, format (#S=tab name, #P=pane ID, #I=tab ID, #{pane_index}, #{terminal_id}, #{pane_type})
   list-terminals  List all terminal processes.
-  attach          Attach a terminal to a pane. Params: target (pane ID), terminalId
+  attach          Attach a terminal to a pane. Params: target (pane ID), terminalId, sessionRef?
 
 Browser/navigation:
   open-browser    Open a URL in a new browser tab to display web pages or images.
@@ -713,6 +713,7 @@ async function routeAction(
       const paneId = resolved.pane.id
       const keys = params?.keys
       const literal = params?.literal
+      const sessionRef = params?.sessionRef
       let data: string
       if (literal && typeof keys === 'string') {
         // Literal mode: send raw string
@@ -726,7 +727,10 @@ async function routeAction(
       } else {
         throw new MissingParamError('keys')
       }
-      return c.post(`/api/panes/${encodeURIComponent(paneId)}/send-keys`, { data })
+      return c.post(`/api/panes/${encodeURIComponent(paneId)}/send-keys`, {
+        data,
+        ...(sessionRef ? { sessionRef } : {}),
+      })
     }
     case 'capture-pane': {
       const rawTarget = params?.target as string | undefined
@@ -782,7 +786,11 @@ async function routeAction(
     case 'attach': {
       const target = requireParam(params, 'target')
       const terminalId = requireParam(params, 'terminalId')
-      return c.post(`/api/panes/${encodeURIComponent(target)}/attach`, { terminalId })
+      const sessionRef = params?.sessionRef
+      return c.post(`/api/panes/${encodeURIComponent(target)}/attach`, {
+        terminalId,
+        ...(sessionRef ? { sessionRef } : {}),
+      })
     }
 
     // -- Browser --

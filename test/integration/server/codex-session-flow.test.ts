@@ -61,14 +61,21 @@ function remoteUrlFromArgs(args) {
   return args[index + 1]
 }
 
+function resumeIdFromArgs(args) {
+  const index = args.indexOf('resume')
+  if (index === -1 || index === args.length - 1) return undefined
+  return args[index + 1]
+}
+
+const codexArgs = process.argv.slice(2)
 const argLogPath = process.env.FAKE_CODEX_ARG_LOG
 if (argLogPath) {
-  fs.writeFileSync(argLogPath, JSON.stringify(process.argv.slice(2)), 'utf8')
+  fs.writeFileSync(argLogPath, JSON.stringify(codexArgs), 'utf8')
 }
 
 appendJsonLine(process.env.FAKE_CODEX_LAUNCH_LOG, {
   pid: process.pid,
-  args: process.argv.slice(2),
+  args: codexArgs,
 })
 
 let isFirstLaunch = false
@@ -81,7 +88,8 @@ if (process.env.FAKE_CODEX_FIRST_LAUNCH_CLAIM_PATH) {
   }
 }
 
-const remoteUrl = remoteUrlFromArgs(process.argv.slice(2))
+const remoteUrl = remoteUrlFromArgs(codexArgs)
+const resumeId = resumeIdFromArgs(codexArgs)
 let remoteSocket
 let remoteMessageId = 1
 let remoteThreadId
@@ -93,8 +101,10 @@ if (process.env.FAKE_CODEX_CONNECT_REMOTE === '1' && remoteUrl) {
     remoteSocket.on('open', () => {
       remoteSocket.send(JSON.stringify({
         id: remoteMessageId++,
-        method: 'thread/start',
-        params: { cwd: process.cwd() },
+        method: resumeId ? 'thread/resume' : 'thread/start',
+        params: resumeId
+          ? { threadId: resumeId, cwd: process.cwd() }
+          : { cwd: process.cwd() },
       }))
     })
     remoteSocket.on('message', (raw) => {
@@ -467,11 +477,12 @@ describeLinux('Codex Session Flow Integration', () => {
     }
   })
 
-  it('captures a fresh Codex restore identity from the fake TUI and promotes it after turn completion', async () => {
+  it('keeps fresh Codex live-only until rollout proof, then restores via durable sessionRef', async () => {
     const testDir = await fsp.mkdtemp(path.join(tempDir, 'fresh-durable-flow-'))
     const rolloutPath = path.join(testDir, 'rollout.jsonl')
     const remoteLogPath = path.join(testDir, 'remote.jsonl')
     const launchLogPath = path.join(testDir, 'codex-launches.jsonl')
+    const threadOperationLogPath = path.join(testDir, 'thread-operations.jsonl')
     const previousConnectRemote = process.env.FAKE_CODEX_CONNECT_REMOTE
     const previousRemoteDelay = process.env.FAKE_CODEX_REMOTE_CONNECT_DELAY_MS
     const previousRemoteLog = process.env.FAKE_CODEX_REMOTE_LOG
@@ -483,12 +494,14 @@ describeLinux('Codex Session Flow Integration', () => {
     process.env.FAKE_CODEX_STAY_ALIVE = '1'
     process.env.FAKE_CODEX_LAUNCH_LOG = launchLogPath
     process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR = JSON.stringify({
+      appendThreadOperationLogPath: threadOperationLogPath,
       threadStartThreadId: 'thread-fake-tui-durable',
       threadStartRolloutPath: rolloutPath,
       writeRolloutOnMethods: {
         'turn/start': {
           path: rolloutPath,
           threadId: 'thread-fake-tui-durable',
+          append: true,
         },
       },
       notificationsAfterMethods: {
@@ -504,6 +517,8 @@ describeLinux('Codex Session Flow Integration', () => {
     })
 
     const ws = await createAuthenticatedWs(port)
+    let freshTerminalId: string | undefined
+    let restoredTerminalId: string | undefined
 
     try {
       ws.send(JSON.stringify({
@@ -523,7 +538,9 @@ describeLinux('Codex Session Flow Integration', () => {
       if (created.type === 'error') {
         throw new Error(`terminal.create failed: ${created.message}`)
       }
+      freshTerminalId = created.terminalId
 
+      expect(created.sessionRef).toBeUndefined()
       await vi.waitFor(() => {
         expect(registry.get(created.terminalId)?.codexDurability).toMatchObject({
           state: 'captured_pre_turn',
@@ -537,6 +554,11 @@ describeLinux('Codex Session Flow Integration', () => {
         line.pid === registry.get(created.terminalId)?.pty.pid
         && line.message?.result?.thread?.id === 'thread-fake-tui-durable'
       ))
+      await waitForJsonLine(threadOperationLogPath, (line) => (
+        line.method === 'thread/start'
+        && line.threadId === 'thread-fake-tui-durable'
+      ))
+      expect((await readJsonLines(threadOperationLogPath)).some((line) => line.method === 'thread/resume')).toBe(false)
 
       ws.send(JSON.stringify({
         type: 'terminal.input',
@@ -558,7 +580,72 @@ describeLinux('Codex Session Flow Integration', () => {
         sessionId: 'thread-fake-tui-durable',
       })
       expect(await fsp.readFile(rolloutPath, 'utf8')).toContain('"thread-fake-tui-durable"')
+
+      const sizeBeforeRestore = (await fsp.stat(rolloutPath)).size
+      await registry.killAndWait(created.terminalId)
+      freshTerminalId = undefined
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'test-req-codex-restore-after-proof',
+        mode: 'codex',
+        cwd: testDir,
+        restore: true,
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'thread-fake-tui-durable',
+        },
+      }))
+
+      const restored = await waitForMessage(
+        ws,
+        (msg) => (
+          msg.requestId === 'test-req-codex-restore-after-proof'
+          && (msg.type === 'terminal.created' || msg.type === 'error')
+        ),
+      )
+      if (restored.type === 'error') {
+        throw new Error(`terminal.create restore failed: ${restored.message}`)
+      }
+      restoredTerminalId = restored.terminalId
+
+      expect(restored.sessionRef).toEqual({
+        provider: 'codex',
+        sessionId: 'thread-fake-tui-durable',
+      })
+      const restoredRecord = registry.get(restored.terminalId)
+      expect(restoredRecord?.resumeSessionId).toBe('thread-fake-tui-durable')
+      const restoredLaunch = await waitForJsonLine(launchLogPath, (line) => line.pid === restoredRecord?.pty.pid)
+      expect(restoredLaunch.args).toContain('resume')
+      expect(restoredLaunch.args).toContain('thread-fake-tui-durable')
+
+      await waitForJsonLine(threadOperationLogPath, (line) => (
+        line.method === 'thread/resume'
+        && line.threadId === 'thread-fake-tui-durable'
+      ))
+      const operations = await readJsonLines(threadOperationLogPath)
+      expect(operations.filter((line) => line.method === 'thread/start').map((line) => line.threadId)).toEqual([
+        'thread-fake-tui-durable',
+      ])
+      expect(operations.filter((line) => line.method === 'thread/resume').map((line) => line.threadId)).toEqual([
+        'thread-fake-tui-durable',
+      ])
+
+      ws.send(JSON.stringify({
+        type: 'terminal.input',
+        terminalId: restored.terminalId,
+        data: 'hello after restore\r',
+      }))
+      await vi.waitFor(async () => {
+        expect((await fsp.stat(rolloutPath)).size).toBeGreaterThan(sizeBeforeRestore)
+      })
     } finally {
+      if (restoredTerminalId) {
+        await registry.killAndWait(restoredTerminalId).catch(() => undefined)
+      }
+      if (freshTerminalId) {
+        await registry.killAndWait(freshTerminalId).catch(() => undefined)
+      }
       await closeWebSocket(ws)
       if (previousConnectRemote === undefined) delete process.env.FAKE_CODEX_CONNECT_REMOTE
       else process.env.FAKE_CODEX_CONNECT_REMOTE = previousConnectRemote

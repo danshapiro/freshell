@@ -15,6 +15,7 @@ import {
 import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../coding-cli/codex-app-server/restore-decision.js'
 import { makeSessionKey } from '../coding-cli/types.js'
 import { terminalIdFromCreateError, UnknownTerminalModeError, type ProviderSettings, type TerminalInputResult } from '../terminal-registry.js'
+import { buildSessionIdentityMismatchDetails, terminalMatchesExpectedSession } from '../terminal-session-identity.js'
 import { MAX_TERMINAL_TITLE_OVERRIDE_LENGTH } from '../terminals-router.js'
 import { logger } from '../logger.js'
 import { ok, approx, fail } from './response.js'
@@ -189,7 +190,44 @@ function assertCodexCreateTerminalRunning(terminal: { status?: unknown }): void 
   }
 }
 
+function formatSessionRef(sessionRef: ReturnType<typeof sanitizeSessionRef> | undefined): string {
+  if (!sessionRef) return 'unknown session'
+  return `${sessionRef.provider}:${sessionRef.sessionId}`
+}
+
+function sessionIdentityMismatchMessage(
+  expectedSessionRef: ReturnType<typeof sanitizeSessionRef> | undefined,
+  actualSessionRef: ReturnType<typeof sanitizeSessionRef> | undefined,
+): string {
+  const expected = formatSessionRef(expectedSessionRef)
+  if (!actualSessionRef) {
+    return `Terminal session identity mismatch. Expected ${expected}, but the target terminal could not prove that identity.`
+  }
+  return `Terminal session identity mismatch. Expected ${expected}, got ${formatSessionRef(actualSessionRef)}.`
+}
+
+function paneCanonicalSessionRef(
+  layoutStore: any,
+  paneId: string,
+): ReturnType<typeof sanitizeSessionRef> {
+  return sanitizeSessionRef(layoutStore.getPaneSnapshot?.(paneId)?.paneContent?.sessionRef)
+}
+
+function expectedPaneSessionRefForTerminal(
+  layoutStore: any,
+  paneId: string,
+  terminalMode: unknown,
+  requestedSessionRef: ReturnType<typeof sanitizeSessionRef>,
+): ReturnType<typeof sanitizeSessionRef> {
+  const paneSessionRef = paneCanonicalSessionRef(layoutStore, paneId)
+  if (paneSessionRef) return paneSessionRef
+  return acceptedSessionRefForMode(requestedSessionRef, typeof terminalMode === 'string' ? terminalMode : '')
+}
+
 function terminalInputFailureMessage(result: Exclude<TerminalInputResult, { status: 'written' }>): string {
+  if (result.status === 'session_identity_mismatch') {
+    return sessionIdentityMismatchMessage(result.expectedSessionRef, result.actualSessionRef)
+  }
   if (result.status === 'blocked_codex_identity_pending') {
     return 'Codex restore identity is not ready yet.'
   }
@@ -217,6 +255,11 @@ function shouldWaitForCodexIdentity(payload: Record<string, unknown>): boolean {
 
 function registrySupportsEvents(registry: any): registry is {
   input: (terminalId: string, data: string) => TerminalInputResult
+  inputIfSessionMatches?: (
+    terminalId: string,
+    data: string,
+    expectedSessionRef?: ReturnType<typeof sanitizeSessionRef>,
+  ) => TerminalInputResult
   on: (event: string, handler: (...args: any[]) => void) => void
   off: (event: string, handler: (...args: any[]) => void) => void
 } {
@@ -227,9 +270,17 @@ async function sendTerminalInput(
   registry: any,
   terminalId: string,
   data: string,
-  options: { waitForCodexIdentity?: boolean } = {},
+  options: {
+    expectedSessionRef?: ReturnType<typeof sanitizeSessionRef>
+    waitForCodexIdentity?: boolean
+  } = {},
 ): Promise<TerminalInputResult> {
-  const first = registry.input(terminalId, data) as TerminalInputResult
+  const send = () => (
+    typeof registry.inputIfSessionMatches === 'function'
+      ? registry.inputIfSessionMatches(terminalId, data, options.expectedSessionRef)
+      : registry.input(terminalId, data)
+  ) as TerminalInputResult
+  const first = send()
   if (first.status !== 'blocked_codex_identity_pending' || !options.waitForCodexIdentity) {
     return first
   }
@@ -252,7 +303,7 @@ async function sendTerminalInput(
     }
     const retry = () => {
       if (settled) return
-      const next = registry.input(terminalId, data) as TerminalInputResult
+      const next = send()
       if (next.status === 'blocked_codex_identity_pending') return
       finish(next)
     }
@@ -1336,6 +1387,17 @@ export function createAgentApiRouter({
     const tabId = target?.tabId
     if (!tabId) return res.status(404).json(fail('pane not found'))
     const attachedTerminal = registry.get?.(terminalId)
+    const requestedSessionRef = sanitizeSessionRef(req.body?.sessionRef)
+    const expectedSessionRef = expectedPaneSessionRefForTerminal(
+      layoutStore,
+      paneId,
+      attachedTerminal?.mode ?? req.body?.mode,
+      requestedSessionRef,
+    )
+    if (attachedTerminal && expectedSessionRef && !terminalMatchesExpectedSession(attachedTerminal, expectedSessionRef)) {
+      const { actualSessionRef } = buildSessionIdentityMismatchDetails(attachedTerminal, expectedSessionRef)
+      return res.status(409).json(fail(sessionIdentityMismatchMessage(expectedSessionRef, actualSessionRef)))
+    }
     const content = {
       kind: 'terminal',
       terminalId,
@@ -1343,6 +1405,7 @@ export function createAgentApiRouter({
       mode: req.body?.mode || attachedTerminal?.mode || 'shell',
       shell: req.body?.shell || attachedTerminal?.shell || 'system',
       createRequestId: nanoid(),
+      ...(expectedSessionRef ? { sessionRef: expectedSessionRef } : {}),
     }
     layoutStore.attachPaneContent(tabId, paneId, content)
     wsHandler?.broadcastUiCommand({ command: 'pane.attach', payload: { tabId, paneId, content } })
@@ -1370,13 +1433,23 @@ export function createAgentApiRouter({
     const paneId = resolved.paneId || req.params.id
     const payload = req.body || {}
     const data = payload.data ?? payload.keys ?? payload.text ?? ''
-    let terminalId = layoutStore.resolvePaneToTerminal?.(paneId)
+    const paneSnapshot = layoutStore.getPaneSnapshot?.(paneId)
+    let terminalId = paneSnapshot?.terminalId || layoutStore.resolvePaneToTerminal?.(paneId)
     if (!terminalId && layoutStore.resolveTarget) {
       const target = layoutStore.resolveTarget(paneId)
       if (target?.paneId) terminalId = layoutStore.resolvePaneToTerminal?.(target.paneId)
     }
     if (!terminalId) return res.status(404).json(fail('terminal not found'))
+    const terminal = registry.get?.(terminalId)
+    const requestedSessionRef = sanitizeSessionRef(payload.sessionRef)
+    const expectedSessionRef = expectedPaneSessionRefForTerminal(
+      layoutStore,
+      paneId,
+      terminal?.mode ?? paneSnapshot?.paneContent?.mode,
+      requestedSessionRef,
+    )
     const inputResult = await sendTerminalInput(registry, terminalId, data, {
+      expectedSessionRef,
       waitForCodexIdentity: shouldWaitForCodexIdentity(payload),
     })
     if (inputResult.status !== 'written') {

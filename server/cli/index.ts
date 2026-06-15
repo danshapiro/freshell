@@ -138,7 +138,7 @@ function resolveSessionRefFlag(mode: unknown, raw: unknown): { rejected: boolean
     process.exitCode = 1
     return { rejected: true }
   }
-  if (typeof mode !== 'string' || mode !== provider) {
+  if (mode !== undefined && (typeof mode !== 'string' || mode !== provider)) {
     writeError('--session-ref provider must match --mode.')
     process.exitCode = 1
     return { rejected: true }
@@ -622,6 +622,8 @@ async function main() {
       const parsedSendKeys = partitionSendKeysArgs(args, targetFromFlag)
       let target: string | undefined = parsedSendKeys.target
       const literal = isTruthy(getFlag(flags, 'l', 'literal'))
+      const sessionRefResult = resolveSessionRefFlag(undefined, getFlag(flags, 'session-ref'))
+      if (sessionRefResult.rejected) return
       const keyArgs = parsedSendKeys.keyArgs
       if (!target) {
         const resolved = await resolvePaneTarget(client, undefined)
@@ -635,11 +637,14 @@ async function main() {
       }
       if (literal) {
         const data = keyArgs.join(' ')
-        const res = await client.post(`/api/panes/${encodeURIComponent(target)}/send-keys`, { data })
+        const res = await client.post(`/api/panes/${encodeURIComponent(target)}/send-keys`, {
+          data,
+          ...(sessionRefResult.sessionRef ? { sessionRef: sessionRefResult.sessionRef } : {}),
+        })
         writeJson(res)
         return
       }
-      const res = await sendKeysCommand({ target, keys: keyArgs }, client)
+      const res = await sendKeysCommand({ target, keys: keyArgs, sessionRef: sessionRefResult.sessionRef }, client)
       writeJson(res)
       return
     }
@@ -842,6 +847,8 @@ async function main() {
         process.exitCode = 1
         return
       }
+      const sessionRefResult = resolveSessionRefFlag(undefined, getFlag(flags, 'session-ref'))
+      if (sessionRefResult.rejected) return
       let target = (getFlag(flags, 'p', 'pane', 'target') as string | undefined) || args[1]
       const resolved = await resolvePaneTarget(client, target)
       if (!resolved.pane?.id) {
@@ -849,7 +856,10 @@ async function main() {
         process.exitCode = 1
         return
       }
-      const res = await client.post(`/api/panes/${encodeURIComponent(resolved.pane.id)}/attach`, { terminalId })
+      const res = await client.post(`/api/panes/${encodeURIComponent(resolved.pane.id)}/attach`, {
+        terminalId,
+        ...(sessionRefResult.sessionRef ? { sessionRef: sessionRefResult.sessionRef } : {}),
+      })
       writeJson(res)
       return
     }
