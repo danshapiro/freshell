@@ -15,8 +15,13 @@ import {
   FreshAgentSessionLocatorMismatchError,
   FreshAgentContractValidationError,
 } from './runtime-manager.js'
+import {
+  ClaudeFreshAgentHistoryResolutionError,
+  ClaudeFreshAgentStaleHistoryRevisionError,
+} from './history/claude/history-service.js'
 import { createRequestAbortSignal } from '../read-models/request-abort.js'
 import { setResponsePerfContext } from '../request-logger.js'
+import { recordSessionLifecycleEvent } from '../session-observability.js'
 import {
   defaultReadModelScheduler,
   isReadModelAbortError,
@@ -33,6 +38,33 @@ const TurnParamsSchema = ThreadParamsSchema.extend({
   turnId: z.string().min(1),
 })
 
+function restoreResolutionReason(
+  code: ClaudeFreshAgentHistoryResolutionError['code'],
+): 'restore_not_found' | 'restore_unavailable' | 'restore_internal' | undefined {
+  switch (code) {
+    case 'RESTORE_NOT_FOUND':
+      return 'restore_not_found'
+    case 'RESTORE_UNAVAILABLE':
+      return 'restore_unavailable'
+    case 'RESTORE_INTERNAL':
+      return 'restore_internal'
+    default:
+      return undefined
+  }
+}
+
+function recordRestoreResolutionLifecycle(sessionId: string, code: ClaudeFreshAgentHistoryResolutionError['code']): void {
+  const reason = restoreResolutionReason(code)
+  if (!reason) return
+  recordSessionLifecycleEvent({
+    kind: 'client_restore_unavailable',
+    sessionId,
+    connectionId: 'http',
+    reason,
+    hasSessionRef: true,
+  })
+}
+
 export function createFreshAgentRouter(deps: {
   runtimeManager: FreshAgentRuntimeManager
   readModelScheduler?: ReadModelWorkScheduler
@@ -40,7 +72,37 @@ export function createFreshAgentRouter(deps: {
   const router = Router()
   const readModelScheduler = deps.readModelScheduler ?? defaultReadModelScheduler
 
-  function sendFreshAgentError(res: any, error: unknown) {
+  function restoreResolutionStatus(code: ClaudeFreshAgentHistoryResolutionError['code']): number {
+    switch (code) {
+      case 'RESTORE_NOT_FOUND':
+        return 404
+      case 'RESTORE_UNAVAILABLE':
+        return 503
+      case 'RESTORE_DIVERGED':
+        return 409
+      case 'RESTORE_INTERNAL':
+      default:
+        return 500
+    }
+  }
+
+  function sendFreshAgentError(res: any, error: unknown, options?: { sessionId?: string }) {
+    if (error instanceof ClaudeFreshAgentStaleHistoryRevisionError) {
+      return res.status(409).json({
+        error: 'Stale restore revision',
+        code: error.code,
+        currentRevision: error.actualRevision,
+      })
+    }
+    if (error instanceof ClaudeFreshAgentHistoryResolutionError) {
+      if (options?.sessionId) {
+        recordRestoreResolutionLifecycle(options.sessionId, error.code)
+      }
+      return res.status(restoreResolutionStatus(error.code)).json({
+        error: error.message,
+        code: error.code,
+      })
+    }
     if (error instanceof FreshAgentStaleThreadRevisionError) {
       return res.status(409).json({
         error: 'Stale thread revision',
@@ -108,7 +170,7 @@ export function createFreshAgentRouter(deps: {
       res.json(snapshot)
     } catch (error) {
       if (signal.aborted || isReadModelAbortError(error)) return
-      return sendFreshAgentError(res, error)
+      return sendFreshAgentError(res, error, { sessionId: params.data.threadId })
     }
   })
 
@@ -152,7 +214,7 @@ export function createFreshAgentRouter(deps: {
       res.json(page)
     } catch (error) {
       if (signal.aborted || isReadModelAbortError(error)) return
-      return sendFreshAgentError(res, error)
+      return sendFreshAgentError(res, error, { sessionId: params.data.threadId })
     }
   })
 
@@ -181,7 +243,7 @@ export function createFreshAgentRouter(deps: {
       }
       res.json(turn)
     } catch (error) {
-      return sendFreshAgentError(res, error)
+      return sendFreshAgentError(res, error, { sessionId: params.data.threadId })
     }
   })
 

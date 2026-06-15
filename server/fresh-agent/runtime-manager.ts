@@ -298,6 +298,9 @@ export class FreshAgentRuntimeManager {
       },
       input.revision,
     )
+    if (body == null) {
+      return null
+    }
     const parsed = FreshAgentTurnBodySchema.safeParse(body)
     if (!parsed.success) {
       throw new FreshAgentContractValidationError('turn-body', parsed.error.issues)

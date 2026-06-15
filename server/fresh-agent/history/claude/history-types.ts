@@ -1,14 +1,14 @@
-import type { ChatMessage } from '../session-history-loader.js'
-import type { CanonicalTurn } from './ledger.js'
+import type { ChatMessage } from '../../../session-history-loader.js'
+import type { CanonicalTurn } from './history-ledger.js'
 import type {
   AgentTimelinePageQuery as SharedAgentTimelinePageQuery,
   AgentTimelineTurnBodyQuery as SharedAgentTimelineTurnBodyQuery,
-} from '../../shared/read-models.js'
+} from '../../../../shared/read-models.js'
 
-export type AgentTimelinePageQuery = SharedAgentTimelinePageQuery
-export type AgentTimelineTurnBodyQuery = SharedAgentTimelineTurnBodyQuery
+export type ClaudeFreshAgentHistoryPageQuery = SharedAgentTimelinePageQuery
+export type ClaudeFreshAgentHistoryTurnBodyQuery = SharedAgentTimelineTurnBodyQuery
 
-export type AgentTimelineItem = {
+export type ClaudeFreshAgentHistoryItem = {
   turnId: string
   messageId: string
   ordinal: number
@@ -19,17 +19,17 @@ export type AgentTimelineItem = {
   timestamp?: string
 }
 
-export type AgentTimelinePage = {
+export type ClaudeFreshAgentHistoryPage = {
   sessionId: string
   latestTurnId: string | null
-  items: AgentTimelineItem[]
+  items: ClaudeFreshAgentHistoryItem[]
   nextCursor: string | null
   revision: number
   /** When includeBodies is requested, maps turnId to full turn body. */
-  bodies?: Record<string, AgentTimelineTurn>
+  bodies?: Record<string, ClaudeFreshAgentHistoryTurn>
 }
 
-export type AgentTimelineTurn = {
+export type ClaudeFreshAgentHistoryTurn = {
   sessionId: string
   turnId: string
   messageId: string

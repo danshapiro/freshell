@@ -36,7 +36,7 @@ describe('visible-first audit scenarios', () => {
     ])
     expect(scenarioMap.get('fresh-agent-cold-boot')?.allowedApiRouteIdsBeforeReady).toEqual([
       '/api/bootstrap',
-      '/api/agent-sessions/:sessionId/timeline',
+      '/api/fresh-agent/threads/:sessionType/:provider/:threadId/turns',
     ])
     expect(scenarioMap.get('sidebar-search-large-corpus')?.allowedApiRouteIdsBeforeReady).toEqual([
       '/api/bootstrap',

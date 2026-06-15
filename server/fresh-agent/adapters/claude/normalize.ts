@@ -1,5 +1,8 @@
-import type { RestoreResolution } from '../../../agent-timeline/ledger.js'
-import type { AgentTimelinePage, AgentTimelineTurn } from '../../../agent-timeline/types.js'
+import type { RestoreResolution } from '../../history/claude/history-ledger.js'
+import type {
+  ClaudeFreshAgentHistoryPage,
+  ClaudeFreshAgentHistoryTurn,
+} from '../../history/claude/history-types.js'
 import type { QuestionDefinition, SdkSessionState } from '../../../sdk-bridge-types.js'
 import type { SdkSessionStatus } from '../../../../shared/ws-protocol.js'
 import type { ContentBlock } from '../../../../shared/ws-protocol.js'
@@ -104,7 +107,9 @@ function blockSummary(blocks: ContentBlock[]): string {
   return ''
 }
 
-export function normalizeClaudeTurn(input: Pick<AgentTimelineTurn, 'turnId' | 'messageId' | 'ordinal' | 'source' | 'message'>): FreshAgentNormalizedTurn {
+export function normalizeClaudeTurn(
+  input: Pick<ClaudeFreshAgentHistoryTurn, 'turnId' | 'messageId' | 'ordinal' | 'source' | 'message'>,
+): FreshAgentNormalizedTurn {
   return {
     id: input.turnId,
     turnId: input.turnId,
@@ -209,7 +214,7 @@ export function normalizeClaudeThreadSnapshot(input: {
 
 export function normalizeClaudeTurnPage(input: {
   threadId: string
-  page: AgentTimelinePage
+  page: ClaudeFreshAgentHistoryPage
 }): FreshAgentClaudeTurnPage {
   return FreshAgentTurnPageSchema.parse({
     sessionType: 'freshclaude',
@@ -237,7 +242,7 @@ export function normalizeClaudeTurnPage(input: {
 }
 
 export function normalizeClaudeTurnBody(input: {
-  turn: AgentTimelineTurn
+  turn: ClaudeFreshAgentHistoryTurn
   revision: number
   threadId: string
 }) {

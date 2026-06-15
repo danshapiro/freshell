@@ -1,11 +1,10 @@
 import {
-  RestoreResolutionError,
-  RestoreStaleRevisionError,
-  createAgentTimelineService,
-  type AgentTimelineService,
-} from '../../../agent-timeline/service.js'
-import type { AgentHistorySource } from '../../../agent-timeline/history-source.js'
-import { synthesizeLiveMessageId, type RestoreResolution } from '../../../agent-timeline/ledger.js'
+  ClaudeFreshAgentHistoryResolutionError,
+  createClaudeFreshAgentHistoryService,
+  type ClaudeFreshAgentHistoryService,
+} from '../../history/claude/history-service.js'
+import type { ClaudeFreshAgentHistorySource } from '../../history/claude/history-source.js'
+import { synthesizeLiveMessageId, type RestoreResolution } from '../../history/claude/history-ledger.js'
 import type { SdkBridge } from '../../../sdk-bridge.js'
 import type { SdkSessionState } from '../../../sdk-bridge-types.js'
 import { logger } from '../../../logger.js'
@@ -35,15 +34,8 @@ type ClaudeBridgePort = Pick<
 
 export type ClaudeFreshAgentAdapterDeps = {
   sdkBridge: ClaudeBridgePort
-  agentHistorySource?: AgentHistorySource
-  timelineService?: AgentTimelineService
-}
-
-function mapTimelineError(error: unknown): never {
-  if (error instanceof RestoreStaleRevisionError) {
-    throw new FreshAgentStaleThreadRevisionError(error.actualRevision)
-  }
-  throw error
+  agentHistorySource?: ClaudeFreshAgentHistorySource
+  timelineService?: ClaudeFreshAgentHistoryService
 }
 
 function toClaudeEffort(value: FreshAgentCreateRequest['effort']) {
@@ -106,7 +98,7 @@ function assertFreshAgentRevision(currentRevision: number, requestedRevision?: n
 export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps): FreshAgentRuntimeAdapter {
   const timelineService = deps.timelineService ?? (
     deps.agentHistorySource
-      ? createAgentTimelineService({ agentHistorySource: deps.agentHistorySource })
+      ? createClaudeFreshAgentHistoryService({ agentHistorySource: deps.agentHistorySource })
       : null
   )
 
@@ -118,11 +110,7 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
     if (!timelineService) {
       throw new Error('Claude timeline service is not configured')
     }
-    try {
-      return await timelineService.getSnapshot({ sessionId: threadId, revision })
-    } catch (error) {
-      mapTimelineError(error)
-    }
+    return await timelineService.getSnapshot({ sessionId: threadId, revision })
   }
 
   return {
@@ -242,7 +230,7 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
       const resolvedSnapshot = await loadResolved(thread.threadId, revision)
       const resolved = await deps.agentHistorySource?.resolve(thread.threadId)
       if (!resolved || resolved.kind !== 'resolved') {
-        throw new RestoreResolutionError('RESTORE_NOT_FOUND', 'Restore session not found')
+        throw new ClaudeFreshAgentHistoryResolutionError('RESTORE_NOT_FOUND', 'Restore session not found')
       }
       return normalizeClaudeThreadSnapshot({
         threadId: thread.threadId,
@@ -261,40 +249,32 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
       if (!timelineService) {
         throw new Error('Claude timeline service is not configured')
       }
-      try {
-        const page = await timelineService.getTimelinePage({
-          sessionId: thread.threadId,
-          cursor: typeof query.cursor === 'string' ? query.cursor : undefined,
-          priority: typeof query.priority === 'string' ? query.priority as 'visible' | 'background' : undefined,
-          revision: Number(query.revision),
-          limit: typeof query.limit === 'number' ? query.limit : undefined,
-          includeBodies: query.includeBodies === true,
-        })
-        return normalizeClaudeTurnPage({ threadId: thread.threadId, page })
-      } catch (error) {
-        mapTimelineError(error)
-      }
+      const page = await timelineService.getTimelinePage({
+        sessionId: thread.threadId,
+        cursor: typeof query.cursor === 'string' ? query.cursor : undefined,
+        priority: typeof query.priority === 'string' ? query.priority as 'visible' | 'background' : undefined,
+        revision: Number(query.revision),
+        limit: typeof query.limit === 'number' ? query.limit : undefined,
+        includeBodies: query.includeBodies === true,
+      })
+      return normalizeClaudeTurnPage({ threadId: thread.threadId, page })
     },
 
     async getTurnBody(thread, revision) {
       if (!timelineService) {
         throw new Error('Claude timeline service is not configured')
       }
-      try {
-        const turn = await timelineService.getTurnBody({
-          sessionId: thread.threadId,
-          turnId: thread.turnId,
-          revision,
-        })
-        if (!turn) return null
-        return normalizeClaudeTurnBody({
-          turn,
-          revision,
-          threadId: thread.threadId,
-        })
-      } catch (error) {
-        mapTimelineError(error)
-      }
+      const turn = await timelineService.getTurnBody({
+        sessionId: thread.threadId,
+        turnId: thread.turnId,
+        revision,
+      })
+      if (!turn) return null
+      return normalizeClaudeTurnBody({
+        turn,
+        revision,
+        threadId: thread.threadId,
+      })
     },
   }
 }

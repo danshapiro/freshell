@@ -97,7 +97,7 @@ export const AUDIT_SCENARIOS: readonly AuditScenarioDefinition[] = [
     id: 'fresh-agent-cold-boot',
     description: 'Cold boot into the seeded long-history fresh-agent session until the surface is visible.',
     focusedReadyMilestone: 'agent_chat.surface_visible',
-    allowedApiRouteIdsBeforeReady: ['/api/bootstrap', '/api/agent-sessions/:sessionId/timeline'],
+    allowedApiRouteIdsBeforeReady: ['/api/bootstrap', '/api/fresh-agent/threads/:sessionType/:provider/:threadId/turns'],
     allowedWsTypesBeforeReady: ['hello', 'ready', 'sdk.session.snapshot', 'sdk.status', 'sdk.stream', 'sdk.assistant', 'sdk.result', 'sdk.error', 'sdk.exit'],
     buildUrl: ({ token }) => buildRootUrl(token),
   },

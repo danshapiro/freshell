@@ -278,7 +278,7 @@ export async function getAgentTimelinePage(
 ): Promise<any> {
   const parsed = AgentTimelinePageQuerySchema.parse(query)
   return api.get(
-    `/api/agent-sessions/${encodeURIComponent(sessionId)}/timeline${buildQueryString([
+    `/api/fresh-agent/threads/freshclaude/claude/${encodeURIComponent(sessionId)}/turns${buildQueryString([
       ['cursor', parsed.cursor],
       ['priority', parsed.priority],
       ['revision', parsed.revision],
@@ -298,7 +298,7 @@ export async function getAgentTurnBody(
   const parsed = AgentTimelineTurnBodyQuerySchema.parse(query)
   const signal = query.signal ?? options.signal
   return api.get(
-    `/api/agent-sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}${buildQueryString([
+    `/api/fresh-agent/threads/freshclaude/claude/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}${buildQueryString([
       ['revision', parsed.revision],
     ])}`,
     { ...options, signal },

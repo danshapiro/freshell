@@ -1,8 +1,8 @@
 import { createHash } from 'crypto'
-import { isValidClaudeSessionId } from '../claude-session-id.js'
-import type { SdkSessionState } from '../sdk-bridge-types.js'
-import type { ChatMessage } from '../session-history-loader.js'
-import type { AgentHistoryResolveOptions } from './history-source.js'
+import { isValidClaudeSessionId } from '../../../claude-session-id.js'
+import type { SdkSessionState } from '../../../sdk-bridge-types.js'
+import type { ChatMessage } from '../../../session-history-loader.js'
+import type { ClaudeFreshAgentHistoryResolveOptions } from './history-source.js'
 
 export type CanonicalTurnSource = 'durable' | 'live'
 export type LedgerReadiness = 'durable_only' | 'live_only' | 'merged'
@@ -586,7 +586,7 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
       await syncLiveSession(liveSession, { refreshDurableHistory: false })
     },
 
-    async resolve(queryId: string, options?: AgentHistoryResolveOptions): Promise<RestoreResolution> {
+    async resolve(queryId: string, options?: ClaudeFreshAgentHistoryResolveOptions): Promise<RestoreResolution> {
       try {
         const existing = findLedgerRecord([queryId])
         const liveSessionCandidate = options?.liveSessionOverride ?? (

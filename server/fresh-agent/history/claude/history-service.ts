@@ -1,14 +1,14 @@
-import { MAX_AGENT_TIMELINE_ITEMS } from '../../shared/read-models.js'
-import type { ChatMessage } from '../session-history-loader.js'
-import type { AgentHistorySource } from './history-source.js'
-import type { CanonicalTurn, RestoreResolution } from './ledger.js'
+import { MAX_AGENT_TIMELINE_ITEMS } from '../../../../shared/read-models.js'
+import type { ChatMessage } from '../../../session-history-loader.js'
+import type { ClaudeFreshAgentHistorySource } from './history-source.js'
+import type { CanonicalTurn, RestoreResolution } from './history-ledger.js'
 import type {
-  AgentTimelineItem,
-  AgentTimelinePage,
-  AgentTimelinePageQuery,
-  AgentTimelineTurnBodyQuery,
-  AgentTimelineTurn,
-} from './types.js'
+  ClaudeFreshAgentHistoryItem,
+  ClaudeFreshAgentHistoryPage,
+  ClaudeFreshAgentHistoryPageQuery,
+  ClaudeFreshAgentHistoryTurnBodyQuery,
+  ClaudeFreshAgentHistoryTurn,
+} from './history-types.js'
 
 const DEFAULT_TIMELINE_LIMIT = 20
 const MAX_TIMELINE_LIMIT = MAX_AGENT_TIMELINE_ITEMS
@@ -20,24 +20,24 @@ type TimelineCursorPayload = {
 
 type TimelineMessageRecord = CanonicalTurn & { sessionId: string }
 
-export type AgentTimelineSnapshot = {
+export type ClaudeFreshAgentHistorySnapshot = {
   sessionId: string
   latestTurnId: string | null
   revision: number
   turns: CanonicalTurn[]
 }
 
-export type AgentTimelineService = {
-  getSnapshot: (query: { sessionId: string; revision?: number; signal?: AbortSignal }) => Promise<AgentTimelineSnapshot>
-  getTimelinePage: (query: AgentTimelinePageQuery & { sessionId: string; signal?: AbortSignal }) => Promise<AgentTimelinePage>
-  getTurnBody: (query: AgentTimelineTurnBodyQuery & { sessionId: string; turnId: string; signal?: AbortSignal }) => Promise<AgentTimelineTurn | null>
+export type ClaudeFreshAgentHistoryService = {
+  getSnapshot: (query: { sessionId: string; revision?: number; signal?: AbortSignal }) => Promise<ClaudeFreshAgentHistorySnapshot>
+  getTimelinePage: (query: ClaudeFreshAgentHistoryPageQuery & { sessionId: string; signal?: AbortSignal }) => Promise<ClaudeFreshAgentHistoryPage>
+  getTurnBody: (query: ClaudeFreshAgentHistoryTurnBodyQuery & { sessionId: string; turnId: string; signal?: AbortSignal }) => Promise<ClaudeFreshAgentHistoryTurn | null>
 }
 
-export type AgentTimelineServiceDeps = {
-  agentHistorySource: AgentHistorySource
+export type ClaudeFreshAgentHistoryServiceDeps = {
+  agentHistorySource: ClaudeFreshAgentHistorySource
 }
 
-export class RestoreStaleRevisionError extends Error {
+export class ClaudeFreshAgentStaleHistoryRevisionError extends Error {
   code = 'RESTORE_STALE_REVISION' as const
 
   constructor(public readonly requestedRevision: number, public readonly actualRevision: number) {
@@ -45,7 +45,7 @@ export class RestoreStaleRevisionError extends Error {
   }
 }
 
-export class RestoreResolutionError extends Error {
+export class ClaudeFreshAgentHistoryResolutionError extends Error {
   constructor(
     public readonly code: 'RESTORE_NOT_FOUND' | 'RESTORE_UNAVAILABLE' | 'RESTORE_INTERNAL' | 'RESTORE_DIVERGED',
     message: string,
@@ -73,7 +73,7 @@ function decodeCursor(cursor: string): TimelineCursorPayload {
     }
     return { offset: parsed.offset, revision: parsed.revision }
   } catch {
-    throw new Error('Invalid agent-timeline cursor')
+    throw new Error('Invalid Claude fresh-agent history cursor')
   }
 }
 
@@ -100,7 +100,7 @@ function buildTimeline(turns: CanonicalTurn[], sessionId: string): TimelineMessa
     .reverse()
 }
 
-function toTimelineItem(record: TimelineMessageRecord): AgentTimelineItem {
+function toTimelineItem(record: TimelineMessageRecord): ClaudeFreshAgentHistoryItem {
   return {
     turnId: record.turnId,
     messageId: record.messageId,
@@ -113,10 +113,12 @@ function toTimelineItem(record: TimelineMessageRecord): AgentTimelineItem {
   }
 }
 
-export function createAgentTimelineService(deps: AgentTimelineServiceDeps): AgentTimelineService {
+export function createClaudeFreshAgentHistoryService(
+  deps: ClaudeFreshAgentHistoryServiceDeps,
+): ClaudeFreshAgentHistoryService {
   function throwIfAborted(signal?: AbortSignal): void {
     if (signal?.aborted) {
-      throw signal.reason instanceof Error ? signal.reason : new Error('Agent timeline request aborted')
+      throw signal.reason instanceof Error ? signal.reason : new Error('Claude fresh-agent history request aborted')
     }
   }
 
@@ -127,10 +129,10 @@ export function createAgentTimelineService(deps: AgentTimelineServiceDeps): Agen
 
   function buildResolvedTimeline(queryId: string, resolved: RestoreResolution): { sessionId: string, latestTurnId: string | null, revision: number, records: TimelineMessageRecord[] } {
     if (resolved.kind === 'missing') {
-      throw new RestoreResolutionError(resolved.code, 'Restore session not found')
+      throw new ClaudeFreshAgentHistoryResolutionError(resolved.code, 'Restore session not found')
     }
     if (resolved.kind === 'fatal') {
-      throw new RestoreResolutionError(resolved.code, resolved.message)
+      throw new ClaudeFreshAgentHistoryResolutionError(resolved.code, resolved.message)
     }
     const sessionId = resolved.timelineSessionId ?? queryId
     return {
@@ -147,7 +149,7 @@ export function createAgentTimelineService(deps: AgentTimelineServiceDeps): Agen
       const timeline = await loadTimeline(sessionId)
       throwIfAborted(signal)
       if (revision != null && revision !== timeline.revision) {
-        throw new RestoreStaleRevisionError(revision, timeline.revision)
+        throw new ClaudeFreshAgentStaleHistoryRevisionError(revision, timeline.revision)
       }
       return {
         sessionId: timeline.sessionId,
@@ -177,15 +179,15 @@ export function createAgentTimelineService(deps: AgentTimelineServiceDeps): Agen
       const timeline = await loadTimeline(query.sessionId)
       throwIfAborted(query.signal)
       if (query.revision !== timeline.revision) {
-        throw new RestoreStaleRevisionError(query.revision, timeline.revision)
+        throw new ClaudeFreshAgentStaleHistoryRevisionError(query.revision, timeline.revision)
       }
       if (cursor && cursor.revision !== timeline.revision) {
-        throw new RestoreStaleRevisionError(cursor.revision, timeline.revision)
+        throw new ClaudeFreshAgentStaleHistoryRevisionError(cursor.revision, timeline.revision)
       }
       const pageItems = timeline.records.slice(offset, offset + limit)
       const nextOffset = offset + pageItems.length
 
-      const result: AgentTimelinePage = {
+      const result: ClaudeFreshAgentHistoryPage = {
         sessionId: timeline.sessionId,
         latestTurnId: timeline.latestTurnId,
         items: pageItems.map(toTimelineItem),
@@ -194,7 +196,7 @@ export function createAgentTimelineService(deps: AgentTimelineServiceDeps): Agen
       }
 
       if (query.includeBodies) {
-        const bodies: Record<string, AgentTimelineTurn> = {}
+        const bodies: Record<string, ClaudeFreshAgentHistoryTurn> = {}
         for (const record of pageItems) {
           bodies[record.turnId] = {
             sessionId: timeline.sessionId,
@@ -217,7 +219,7 @@ export function createAgentTimelineService(deps: AgentTimelineServiceDeps): Agen
       }
       const timeline = await loadTimeline(sessionId)
       if (revision !== timeline.revision) {
-        throw new RestoreStaleRevisionError(revision, timeline.revision)
+        throw new ClaudeFreshAgentStaleHistoryRevisionError(revision, timeline.revision)
       }
       const match = timeline.records.find((record) => record.turnId === turnId)
       if (!match) return null

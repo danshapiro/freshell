@@ -3,9 +3,9 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   createDurableMessageFingerprint,
   createRestoreLedgerManager,
-} from '../../../server/agent-timeline/ledger.js'
-import type { SdkSessionState } from '../../../server/sdk-bridge-types.js'
-import type { ChatMessage } from '../../../server/session-history-loader.js'
+} from '../../../../server/fresh-agent/history/claude/history-ledger.js'
+import type { SdkSessionState } from '../../../../server/sdk-bridge-types.js'
+import type { ChatMessage } from '../../../../server/session-history-loader.js'
 
 function makeMessage(
   role: 'user' | 'assistant',

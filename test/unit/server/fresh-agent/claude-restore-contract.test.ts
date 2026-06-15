@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { createAgentHistorySource } from '../../../../server/agent-timeline/history-source.js'
-import { createAgentTimelineService } from '../../../../server/agent-timeline/service.js'
+import { createClaudeFreshAgentHistorySource } from '../../../../server/fresh-agent/history/claude/history-source.js'
+import { createClaudeFreshAgentHistoryService } from '../../../../server/fresh-agent/history/claude/history-service.js'
 import { createClaudeFreshAgentAdapter } from '../../../../server/fresh-agent/adapters/claude/adapter.js'
 import { makeClaudeLiveSession } from '../../../fixtures/fresh-agent/claude/thread.js'
 import type { ChatMessage } from '../../../../server/session-history-loader.js'
@@ -26,7 +26,7 @@ describe('Claude fresh-agent restore contract', () => {
         makeMessage('assistant', 'Live reply', { messageId: 'live-2' }),
       ],
     })
-    const historySource = createAgentHistorySource({
+    const historySource = createClaudeFreshAgentHistorySource({
       loadSessionHistory: vi.fn().mockResolvedValue([
         makeMessage('user', 'Durable prompt', { messageId: 'durable-1' }),
       ]),
@@ -37,7 +37,7 @@ describe('Claude fresh-agent restore contract', () => {
         sessionId === '00000000-0000-4000-8000-000000000111' ? liveSession : undefined
       )),
     })
-    const timelineService = createAgentTimelineService({
+    const timelineService = createClaudeFreshAgentHistoryService({
       agentHistorySource: historySource,
     })
     const adapter = createClaudeFreshAgentAdapter({

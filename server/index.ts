@@ -73,9 +73,7 @@ import { createShellBootstrapRouter } from './shell-bootstrap-router.js'
 import { createHealthRouter } from './health-router.js'
 import { loadSessionHistory } from './session-history-loader.js'
 import { SessionContentCache } from './session-content-cache.js'
-import { createAgentTimelineService } from './agent-timeline/service.js'
-import { createAgentTimelineRouter } from './agent-timeline/router.js'
-import { createAgentHistorySource } from './agent-timeline/history-source.js'
+import { createClaudeFreshAgentHistorySource } from './fresh-agent/history/claude/history-source.js'
 import { createTerminalViewService } from './terminal-view/service.js'
 import { resolveStartupBanner } from './startup-banner.js'
 import { createFreshAgentProviderRegistry } from './fresh-agent/provider-registry.js'
@@ -302,7 +300,7 @@ async function main() {
       resolveFilePath: (id) => codingCliIndexer.getFilePathForSession(id),
       contentCache: sessionContentCache,
     })
-  const agentHistorySource = createAgentHistorySource({
+  const agentHistorySource = createClaudeFreshAgentHistorySource({
     loadSessionHistory: loadSessionHistoryWithCache,
     getLiveSessionBySdkSessionId: (sdkSessionId) => sdkBridge.getLiveSession(sdkSessionId),
     getLiveSessionByCliSessionId: (timelineSessionId) => sdkBridge.findLiveSessionByCliSessionId(timelineSessionId),
@@ -607,12 +605,6 @@ async function main() {
     sessionMetadataStore,
     serverInstanceId,
     validCliProviders: allCliNames,
-  }))
-
-  app.use('/api', createAgentTimelineRouter({
-    service: createAgentTimelineService({
-      agentHistorySource,
-    }),
   }))
 
   app.use('/api', createProjectColorsRouter({ configStore, codingCliIndexer }))

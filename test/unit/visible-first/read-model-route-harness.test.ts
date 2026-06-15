@@ -27,7 +27,7 @@ describe('createReadModelRouteHarness', () => {
         },
         revision: 7,
       }),
-      agentTimeline: async () => ({
+      freshAgentTurns: async () => ({
         body: {
           revision: 11,
           items: [{ turnId: 'turn-1', summary: 'Recent turn' }],
@@ -61,7 +61,7 @@ describe('createReadModelRouteHarness', () => {
       query: 'alpha',
     })
 
-    const timeline = await harness.fetchJson('/api/agent-sessions/session-1/timeline?priority=background&revision=11')
+    const timeline = await harness.fetchJson('/api/fresh-agent/threads/freshclaude/claude/session-1/turns?priority=background&revision=11')
     expect(timeline.status).toBe(200)
     expect(timeline.body).toMatchObject({
       revision: 11,
@@ -84,7 +84,7 @@ describe('createReadModelRouteHarness', () => {
         expect.objectContaining({ route: 'bootstrap', lane: 'critical', phase: 'start' }),
         expect.objectContaining({ route: 'bootstrap', lane: 'critical', phase: 'complete' }),
         expect.objectContaining({ route: 'session-directory', lane: 'visible', phase: 'complete' }),
-        expect.objectContaining({ route: 'agent-timeline', lane: 'background', phase: 'complete' }),
+        expect.objectContaining({ route: 'fresh-agent.turns', lane: 'background', phase: 'complete' }),
         expect.objectContaining({ route: 'terminal.viewport', lane: 'critical', phase: 'abort' }),
       ]),
     )
@@ -92,7 +92,7 @@ describe('createReadModelRouteHarness', () => {
       expect.arrayContaining([
         expect.objectContaining({ route: 'bootstrap', revision: 1 }),
         expect.objectContaining({ route: 'session-directory', revision: 7 }),
-        expect.objectContaining({ route: 'agent-timeline', revision: 11 }),
+        expect.objectContaining({ route: 'fresh-agent.turns', revision: 11 }),
       ]),
     )
     expect(harness.getResponseBytes('/api/bootstrap')).toBeGreaterThan(0)

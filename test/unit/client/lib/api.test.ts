@@ -131,7 +131,7 @@ describe('visible-first read-model helpers', () => {
 
     expect(mockFetch).toHaveBeenNthCalledWith(
       1,
-      '/api/agent-sessions/session-1/timeline?cursor=page-2&revision=7&limit=20',
+      '/api/fresh-agent/threads/freshclaude/claude/session-1/turns?cursor=page-2&revision=7&limit=20',
       expect.objectContaining({
         signal,
         headers: expect.any(Headers),
@@ -139,7 +139,7 @@ describe('visible-first read-model helpers', () => {
     )
     expect(mockFetch).toHaveBeenNthCalledWith(
       2,
-      '/api/agent-sessions/session-1/turns/turn-1?revision=7',
+      '/api/fresh-agent/threads/freshclaude/claude/session-1/turns/turn-1?revision=7',
       expect.objectContaining({
         signal,
         headers: expect.any(Headers),
@@ -266,7 +266,7 @@ describe('visible-first read-model helpers', () => {
     await getAgentTimelinePage('session-1', { priority: 'visible', includeBodies: true, revision: 11 }, { signal })
 
     expect(mockFetch).toHaveBeenCalledWith(
-      '/api/agent-sessions/session-1/timeline?priority=visible&revision=11&includeBodies=true',
+      '/api/fresh-agent/threads/freshclaude/claude/session-1/turns?priority=visible&revision=11&includeBodies=true',
       expect.objectContaining({
         signal,
         headers: expect.any(Headers),
@@ -289,7 +289,7 @@ describe('visible-first read-model helpers', () => {
 
     expect(mockFetch).toHaveBeenNthCalledWith(
       1,
-      '/api/agent-sessions/session-1/timeline?priority=visible&revision=13&includeBodies=true',
+      '/api/fresh-agent/threads/freshclaude/claude/session-1/turns?priority=visible&revision=13&includeBodies=true',
       expect.objectContaining({
         signal,
         headers: expect.any(Headers),
@@ -297,7 +297,7 @@ describe('visible-first read-model helpers', () => {
     )
     expect(mockFetch).toHaveBeenNthCalledWith(
       2,
-      '/api/agent-sessions/session-1/turns/turn-7?revision=13',
+      '/api/fresh-agent/threads/freshclaude/claude/session-1/turns/turn-7?revision=13',
       expect.objectContaining({
         signal,
         headers: expect.any(Headers),

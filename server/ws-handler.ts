@@ -16,7 +16,10 @@ import type { SessionRepairService } from './session-scanner/service.js'
 import type { SessionScanResult, SessionRepairResult } from './session-scanner/types.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
 import type { SdkBridge } from './sdk-bridge.js'
-import { createAgentHistorySource, type AgentHistorySource } from './agent-timeline/history-source.js'
+import {
+  createClaudeFreshAgentHistorySource,
+  type ClaudeFreshAgentHistorySource,
+} from './fresh-agent/history/claude/history-source.js'
 import type {
   ClaudeActivityRecord,
   CodexActivityRecord,
@@ -184,7 +187,7 @@ export type WsHandlerOptions = {
   claudeActivityListProvider?: () => ClaudeActivityRecord[]
   codexLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
   claudeLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
-  agentHistorySource?: AgentHistorySource
+  agentHistorySource?: ClaudeFreshAgentHistorySource
   opencodeActivityListProvider?: () => OpencodeActivityRecord[]
   opencodeLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
   freshAgentRuntimeManager?: FreshAgentRuntimeManagerLike
@@ -505,7 +508,7 @@ export class WsHandler {
   private tabsRegistryStore?: TabsRegistryStore
   private layoutStore?: LayoutStore
   private extensionManager?: ExtensionManager
-  private agentHistorySource?: AgentHistorySource
+  private agentHistorySource?: ClaudeFreshAgentHistorySource
   private freshAgentRuntimeManager?: FreshAgentRuntimeManagerLike
   private terminalStreamBroker: TerminalStreamBroker
   private terminalCreateLocks = new Map<string, Promise<void>>()
@@ -568,7 +571,7 @@ export class WsHandler {
     this.extensionManager = options.extensionManager
     this.freshAgentRuntimeManager = options.freshAgentRuntimeManager
     this.agentHistorySource = options.agentHistorySource ?? (this.sdkBridge
-      ? createAgentHistorySource({
+      ? createClaudeFreshAgentHistorySource({
         loadSessionHistory,
         getLiveSessionBySdkSessionId: (sdkSessionId) => this.sdkBridge?.getLiveSession(sdkSessionId),
         getLiveSessionByCliSessionId: (timelineSessionId) => this.sdkBridge?.findLiveSessionByCliSessionId(timelineSessionId),
@@ -1581,7 +1584,7 @@ export class WsHandler {
       status: SdkSessionStatus
       historyQueryId: string
       liveSession?: SdkSessionState
-      resolvedHistory?: Awaited<ReturnType<AgentHistorySource['resolve']>>
+      resolvedHistory?: Awaited<ReturnType<ClaudeFreshAgentHistorySource['resolve']>>
     },
   ) {
     let resolved = opts.resolvedHistory ?? null
@@ -4139,7 +4142,7 @@ export class WsHandler {
         }
         const historyQueryId = m.resumeSessionId ?? m.sessionId
         const directSession = this.sdkBridge.getLiveSession(m.sessionId)
-        let resolved: Awaited<ReturnType<AgentHistorySource['resolve']>> | null = null
+        let resolved: Awaited<ReturnType<ClaudeFreshAgentHistorySource['resolve']>> | null = null
         if (!directSession) {
           try {
             resolved = await this.agentHistorySource?.resolve(historyQueryId) ?? null

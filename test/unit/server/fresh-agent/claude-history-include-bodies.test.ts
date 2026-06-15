@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from 'vitest'
-import { AgentTimelinePageQuerySchema } from '../../../shared/read-models.js'
-import { createAgentTimelineService } from '../../../server/agent-timeline/service.js'
+import { AgentTimelinePageQuerySchema } from '../../../../shared/read-models.js'
+import { createClaudeFreshAgentHistoryService } from '../../../../server/fresh-agent/history/claude/history-service.js'
 
 const mockMessages = [
   {
@@ -86,9 +86,9 @@ describe('AgentTimelinePageQuerySchema includeBodies parsing', () => {
   })
 })
 
-describe('agent timeline includeBodies', () => {
+describe('Claude fresh-agent history includeBodies', () => {
   it('includeBodies=false (default): no bodies field in response', async () => {
-    const service = createAgentTimelineService({
+    const service = createClaudeFreshAgentHistoryService({
       agentHistorySource: {
         resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
           liveSessionId: 'sess-1',
@@ -108,7 +108,7 @@ describe('agent timeline includeBodies', () => {
   })
 
   it('includeBodies=true: bodies map includes all page items', async () => {
-    const service = createAgentTimelineService({
+    const service = createClaudeFreshAgentHistoryService({
       agentHistorySource: {
         resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
           liveSessionId: 'sdk-sess-1',
@@ -140,7 +140,7 @@ describe('agent timeline includeBodies', () => {
   })
 
   it('bodies map keys match item turnIds', async () => {
-    const service = createAgentTimelineService({
+    const service = createClaudeFreshAgentHistoryService({
       agentHistorySource: {
         resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
           liveSessionId: 'sess-1',
@@ -168,7 +168,7 @@ describe('agent timeline includeBodies', () => {
       content: [{ type: 'text' as const, text: `Message ${i}` }],
     }))
 
-    const service = createAgentTimelineService({
+    const service = createClaudeFreshAgentHistoryService({
       agentHistorySource: {
         resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
           liveSessionId: 'sess-1',
@@ -209,7 +209,7 @@ describe('agent timeline includeBodies', () => {
   })
 
   it('getTurnBody still works independently (backward compatible)', async () => {
-    const service = createAgentTimelineService({
+    const service = createClaudeFreshAgentHistoryService({
       agentHistorySource: {
         resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
           liveSessionId: 'sdk-sess-1',

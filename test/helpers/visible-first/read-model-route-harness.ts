@@ -23,7 +23,7 @@ type ReadModelRouteHarnessOptions = {
   token?: string
   bootstrap?: ReadModelRouteHandler
   sessionDirectory?: ReadModelRouteHandler
-  agentTimeline?: ReadModelRouteHandler
+  freshAgentTurns?: ReadModelRouteHandler
   terminalDirectory?: ReadModelRouteHandler
   terminalViewport?: ReadModelRouteHandler
   terminalScrollback?: ReadModelRouteHandler
@@ -188,7 +188,7 @@ export async function createReadModelRouteHarness(options: ReadModelRouteHarness
 
   mount('get', '/api/bootstrap', 'bootstrap', 'critical', options.bootstrap)
   mount('get', '/api/session-directory', 'session-directory', 'visible', options.sessionDirectory)
-  mount('get', '/api/agent-sessions/:sessionId/timeline', 'agent-timeline', 'visible', options.agentTimeline)
+  mount('get', '/api/fresh-agent/threads/:sessionType/:provider/:threadId/turns', 'fresh-agent.turns', 'visible', options.freshAgentTurns)
   mount('get', '/api/terminals', 'terminal-directory', 'visible', options.terminalDirectory)
   mount('get', '/api/terminals/:terminalId/viewport', 'terminal.viewport', 'critical', options.terminalViewport)
   mount('get', '/api/terminals/:terminalId/scrollback', 'terminal.scrollback', 'background', options.terminalScrollback)

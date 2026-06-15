@@ -1,8 +1,8 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from 'vitest'
-import { createAgentHistorySource } from '../../../server/agent-timeline/history-source.js'
-import type { SdkSessionState } from '../../../server/sdk-bridge-types.js'
-import type { ChatMessage } from '../../../server/session-history-loader.js'
+import { createClaudeFreshAgentHistorySource } from '../../../../server/fresh-agent/history/claude/history-source.js'
+import type { SdkSessionState } from '../../../../server/sdk-bridge-types.js'
+import type { ChatMessage } from '../../../../server/session-history-loader.js'
 
 function makeMessage(
   role: 'user' | 'assistant',
@@ -36,9 +36,9 @@ function makeLiveSession(
   }
 }
 
-describe('agent timeline history source', () => {
+describe('Claude fresh-agent history source', () => {
   it('returns a typed missing outcome instead of null when no restore authority exists', async () => {
-    const source = createAgentHistorySource({
+    const source = createClaudeFreshAgentHistorySource({
       loadSessionHistory: vi.fn().mockResolvedValue(null),
       getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(undefined),
       getLiveSessionByCliSessionId: vi.fn().mockReturnValue(undefined),
@@ -51,7 +51,7 @@ describe('agent timeline history source', () => {
   })
 
   it('returns a typed merged outcome with canonical turn identity', async () => {
-    const source = createAgentHistorySource({
+    const source = createClaudeFreshAgentHistorySource({
       loadSessionHistory: vi.fn().mockResolvedValue([
         makeMessage('user', 'older durable prompt', { messageId: 'durable-1' }),
       ]),
@@ -94,7 +94,7 @@ describe('agent timeline history source', () => {
       messages: [makeMessage('user', 'ephemeral', { messageId: 'live-msg-1' })],
     })
 
-    const source = createAgentHistorySource({
+    const source = createClaudeFreshAgentHistorySource({
       loadSessionHistory: vi.fn().mockResolvedValue(null),
       getLiveSessionBySdkSessionId: vi.fn((queryId: string) => (
         queryId === liveSession.sessionId ? liveSession : undefined

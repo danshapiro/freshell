@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { createAgentHistorySource } from '../../../server/agent-timeline/history-source.js'
+import { createClaudeFreshAgentHistorySource } from '../../../server/fresh-agent/history/claude/history-source.js'
 
 // Mock the SDK's query function
 const mockMessages: any[] = []
@@ -969,7 +969,7 @@ describe('SdkBridge', () => {
         },
       ])
       let bridgeWithHistory!: SdkBridge
-      const historySource = createAgentHistorySource({
+      const historySource = createClaudeFreshAgentHistorySource({
         loadSessionHistory,
         getLiveSessionBySdkSessionId: (id) => bridgeWithHistory.getLiveSession(id),
         getLiveSessionByCliSessionId: (id) => bridgeWithHistory.findLiveSessionByCliSessionId(id),

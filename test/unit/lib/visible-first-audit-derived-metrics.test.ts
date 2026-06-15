@@ -9,8 +9,8 @@ describe('deriveVisibleFirstMetrics', () => {
   it('normalizes routes and counts offscreen work before focused readiness', () => {
     expect(normalizeAuditRouteId('http://localhost:3000/api/bootstrap?token=secret')).toBe('/api/bootstrap')
     expect(normalizeAuditRouteId('http://localhost:3000/api/session-directory?query=alpha')).toBe('/api/session-directory')
-    expect(normalizeAuditRouteId('http://localhost:3000/api/agent-sessions/abc123/timeline')).toBe(
-      '/api/agent-sessions/:sessionId/timeline',
+    expect(normalizeAuditRouteId('http://localhost:3000/api/fresh-agent/threads/freshclaude/claude/abc123/turns')).toBe(
+      '/api/fresh-agent/threads/:sessionType/:provider/:threadId/turns',
     )
     expect(normalizeAuditRouteId('http://localhost:3000/api/terminals/term-1/viewport')).toBe(
       '/api/terminals/:terminalId/viewport',

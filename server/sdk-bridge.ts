@@ -16,8 +16,8 @@ import type { PermissionResult, PermissionUpdate } from '@anthropic-ai/claude-ag
 import { buildMcpServerCommandArgs } from './mcp/config-writer.js'
 import { sanitizeFreshAgentPluginPaths } from '../shared/fresh-agent-plugins.js'
 import { logger } from './logger.js'
-import { synthesizeLiveMessageId } from './agent-timeline/ledger.js'
-import type { AgentHistorySource } from './agent-timeline/history-source.js'
+import { synthesizeLiveMessageId } from './fresh-agent/history/claude/history-ledger.js'
+import type { ClaudeFreshAgentHistorySource } from './fresh-agent/history/claude/history-source.js'
 import type {
   SdkSessionState,
   SdkCreatedSession,
@@ -107,7 +107,7 @@ export class SdkBridge extends EventEmitter {
   private sessions = new Map<string, SdkSessionState>()
   private processes = new Map<string, SessionProcess>()
 
-  constructor(private readonly agentHistorySource?: AgentHistorySource) {
+  constructor(private readonly agentHistorySource?: ClaudeFreshAgentHistorySource) {
     super()
   }
 

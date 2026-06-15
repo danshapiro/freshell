@@ -1,6 +1,8 @@
 // @vitest-environment node
+import fsp from 'fs/promises'
+import path from 'path'
 import { describe, expect, it, vi } from 'vitest'
-import { createAgentTimelineService } from '../../../../server/agent-timeline/service.js'
+import { createClaudeFreshAgentHistoryService } from '../../../../server/fresh-agent/history/claude/history-service.js'
 
 const baseMessages = [
   {
@@ -45,12 +47,12 @@ function toResolvedHistory(sessionId: string, timelineSessionId: string | undefi
   }
 }
 
-describe('agent timeline service', () => {
+describe('Claude fresh-agent history service', () => {
   it('returns recent-first timeline pages with a cursor', async () => {
     const resolve = vi.fn().mockResolvedValue({
       ...toResolvedHistory('agent-session-1', undefined),
     })
-    const service = createAgentTimelineService({
+    const service = createClaudeFreshAgentHistoryService({
       agentHistorySource: { resolve },
     })
 
@@ -81,7 +83,7 @@ describe('agent timeline service', () => {
   })
 
   it('hydrates full turn bodies on demand', async () => {
-    const service = createAgentTimelineService({
+    const service = createClaudeFreshAgentHistoryService({
       agentHistorySource: {
         resolve: vi.fn().mockResolvedValue({
           ...toResolvedHistory('agent-session-2', undefined, [
@@ -123,7 +125,7 @@ describe('agent timeline service', () => {
   })
 
   it('returns canonical timeline session ids for pages and turn bodies', async () => {
-    const service = createAgentTimelineService({
+    const service = createClaudeFreshAgentHistoryService({
       agentHistorySource: {
         resolve: vi.fn().mockResolvedValue({
           ...toResolvedHistory('sdk-1', '00000000-0000-4000-8000-000000000001', [
@@ -158,7 +160,7 @@ describe('agent timeline service', () => {
   })
 
   it('rejects invalid cursors deterministically', async () => {
-    const service = createAgentTimelineService({
+    const service = createClaudeFreshAgentHistoryService({
       agentHistorySource: {
         resolve: vi.fn().mockResolvedValue({
           kind: 'resolved',
@@ -181,7 +183,7 @@ describe('agent timeline service', () => {
   })
 
   it('throws typed restore errors instead of fabricating empty timelines for missing sessions', async () => {
-    const service = createAgentTimelineService({
+    const service = createClaudeFreshAgentHistoryService({
       agentHistorySource: {
         resolve: vi.fn().mockResolvedValue({
           kind: 'missing',
@@ -200,7 +202,7 @@ describe('agent timeline service', () => {
   })
 
   it('throws typed fatal restore errors instead of fabricating empty timelines', async () => {
-    const service = createAgentTimelineService({
+    const service = createClaudeFreshAgentHistoryService({
       agentHistorySource: {
         resolve: vi.fn().mockResolvedValue({
           kind: 'fatal',
@@ -221,7 +223,7 @@ describe('agent timeline service', () => {
   })
 
   it('rejects timeline-page reads that omit the accepted restore revision', async () => {
-    const service = createAgentTimelineService({
+    const service = createClaudeFreshAgentHistoryService({
       agentHistorySource: {
         resolve: vi.fn().mockResolvedValue({
           ...toResolvedHistory('sdk-1', '00000000-0000-4000-8000-000000000001'),
@@ -237,7 +239,7 @@ describe('agent timeline service', () => {
   })
 
   it('rejects stale timeline-page revisions with the current ledger revision', async () => {
-    const service = createAgentTimelineService({
+    const service = createClaudeFreshAgentHistoryService({
       agentHistorySource: {
         resolve: vi.fn().mockResolvedValue({
           ...toResolvedHistory('sdk-1', '00000000-0000-4000-8000-000000000001'),
@@ -258,7 +260,7 @@ describe('agent timeline service', () => {
   })
 
   it('rejects stale turn-body revisions with the current ledger revision', async () => {
-    const service = createAgentTimelineService({
+    const service = createClaudeFreshAgentHistoryService({
       agentHistorySource: {
         resolve: vi.fn().mockResolvedValue({
           ...toResolvedHistory('sdk-1', '00000000-0000-4000-8000-000000000001'),
@@ -279,7 +281,7 @@ describe('agent timeline service', () => {
   })
 
   it('rejects turn-body reads that omit the accepted restore revision', async () => {
-    const service = createAgentTimelineService({
+    const service = createClaudeFreshAgentHistoryService({
       agentHistorySource: {
         resolve: vi.fn().mockResolvedValue({
           ...toResolvedHistory('sdk-1', '00000000-0000-4000-8000-000000000001'),
@@ -292,5 +294,32 @@ describe('agent timeline service', () => {
       sessionId: 'sdk-1',
       turnId: 'turn:sdk-1-2',
     } as any)).rejects.toThrow('Restore revision is required')
+  })
+})
+
+describe('Claude fresh-agent history package boundaries', () => {
+  it('does not import fresh-agent route, runtime, or Claude adapter layers', async () => {
+    const historyDir = path.join(process.cwd(), 'server/fresh-agent/history/claude')
+    const files = (await fsp.readdir(historyDir)).filter((file) => file.endsWith('.ts'))
+    const forbiddenImports = [
+      /from ['"].*fresh-agent\/router\.js['"]/,
+      /from ['"].*fresh-agent\/runtime-manager\.js['"]/,
+      /from ['"].*fresh-agent\/adapters\/claude\b/,
+      /from ['"]\.\.\/\.\.\/router\.js['"]/,
+      /from ['"]\.\.\/\.\.\/runtime-manager\.js['"]/,
+      /from ['"]\.\.\/\.\.\/adapters\/claude\b/,
+    ]
+
+    const violations: string[] = []
+    for (const file of files) {
+      const content = await fsp.readFile(path.join(historyDir, file), 'utf8')
+      for (const pattern of forbiddenImports) {
+        if (pattern.test(content)) {
+          violations.push(file)
+        }
+      }
+    }
+
+    expect(violations).toEqual([])
   })
 })

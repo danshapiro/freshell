@@ -8,7 +8,10 @@ import fsp from 'fs/promises'
 import path from 'path'
 import { getClaudeHome } from './claude-home.js'
 import type { ContentBlock } from '../shared/ws-protocol.js'
-import { synthesizeDeterministicMessageId, createDurableMessageFingerprint } from './agent-timeline/ledger.js'
+import {
+  synthesizeDeterministicMessageId,
+  createDurableMessageFingerprint,
+} from './fresh-agent/history/claude/history-ledger.js'
 
 export interface ChatMessage {
   role: 'user' | 'assistant'
