@@ -2,7 +2,10 @@
 import fsp from 'fs/promises'
 import path from 'path'
 import { describe, expect, it, vi } from 'vitest'
-import { createClaudeFreshAgentHistoryService } from '../../../../server/fresh-agent/history/claude/history-service.js'
+import {
+  ClaudeFreshAgentHistoryInvalidCursorError,
+  createClaudeFreshAgentHistoryService,
+} from '../../../../server/fresh-agent/history/claude/history-service.js'
 
 const baseMessages = [
   {
@@ -174,12 +177,15 @@ describe('Claude fresh-agent history service', () => {
       },
     })
 
-    await expect(service.getTimelinePage({
+    const page = service.getTimelinePage({
       sessionId: 'agent-session-3',
       priority: 'background',
       cursor: 'not-a-valid-cursor',
       revision: 0,
-    })).rejects.toThrow(/cursor/i)
+    })
+
+    await expect(page).rejects.toBeInstanceOf(ClaudeFreshAgentHistoryInvalidCursorError)
+    await expect(page).rejects.toThrow(/cursor/i)
   })
 
   it('throws typed restore errors instead of fabricating empty timelines for missing sessions', async () => {

@@ -16,6 +16,7 @@ import {
   FreshAgentContractValidationError,
 } from './runtime-manager.js'
 import {
+  ClaudeFreshAgentHistoryInvalidCursorError,
   ClaudeFreshAgentHistoryResolutionError,
   ClaudeFreshAgentHistoryStaleRevisionError,
 } from './history/claude/history-service.js'
@@ -93,6 +94,9 @@ export function createFreshAgentRouter(deps: {
         code: error.code,
         currentRevision: error.actualRevision,
       })
+    }
+    if (error instanceof ClaudeFreshAgentHistoryInvalidCursorError) {
+      return res.status(400).json({ error: error.message })
     }
     if (error instanceof ClaudeFreshAgentHistoryResolutionError) {
       if (options?.sessionId) {

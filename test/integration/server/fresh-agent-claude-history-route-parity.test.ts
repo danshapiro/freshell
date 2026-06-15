@@ -168,6 +168,12 @@ describe('fresh-agent Claude history route parity', () => {
 
     expect(unpinnedTurnBody.status).toBe(400)
 
+    const malformedCursor = await request(app)
+      .get('/api/fresh-agent/threads/freshclaude/claude/thread-parity/turns?revision=7&cursor=not-a-valid-cursor')
+
+    expect(malformedCursor.status).toBe(400)
+    expect(malformedCursor.body.error).toMatch(/cursor/i)
+
     const staleCursor = encodeCursor({ offset: 1, revision: 6 })
     const cursorMismatch = await request(app)
       .get(`/api/fresh-agent/threads/freshclaude/claude/thread-parity/turns?revision=7&cursor=${encodeURIComponent(staleCursor)}`)

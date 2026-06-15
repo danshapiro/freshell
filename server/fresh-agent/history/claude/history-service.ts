@@ -37,6 +37,12 @@ export type ClaudeFreshAgentHistoryServiceDeps = {
   agentHistorySource: ClaudeFreshAgentHistorySource
 }
 
+export class ClaudeFreshAgentHistoryInvalidCursorError extends Error {
+  constructor() {
+    super('Invalid Claude fresh-agent history cursor')
+  }
+}
+
 export class ClaudeFreshAgentHistoryStaleRevisionError extends Error {
   code = 'RESTORE_STALE_REVISION' as const
 
@@ -73,7 +79,7 @@ function decodeCursor(cursor: string): TimelineCursorPayload {
     }
     return { offset: parsed.offset, revision: parsed.revision }
   } catch {
-    throw new Error('Invalid Claude fresh-agent history cursor')
+    throw new ClaudeFreshAgentHistoryInvalidCursorError()
   }
 }
 
