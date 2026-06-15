@@ -4,9 +4,9 @@
 
 **Goal:** Restore fast OpenCode replay playback by allowing parser-barrier-heavy terminal output to reach xterm in bounded coalesced writes while preserving parser checkpoint ordering and attach completion safety.
 
-**Architecture:** Keep the terminal write-scope gate and xterm acknowledgement sequencing introduced by the recent playback safety work. Change the client batch replay path so parser barriers no longer force hard xterm write boundaries; barrier metadata still controls checkpoint callbacks, but adjacent renderable segments can coalesce through `TerminalWriteQueue`. No server protocol or PTY lifecycle changes are required for this fix.
+**Architecture:** Keep the terminal write-scope gate and xterm acknowledgement sequencing introduced by the recent playback safety work. Change the client batch replay path so parser barriers no longer force hard xterm write boundaries; barrier metadata still controls checkpoint callbacks, while adjacent renderable segments coalesce through `TerminalWriteQueue`. Add e2e-only write/callback recording so a browser regression test verifies real `Terminal.write` progression without changing server protocol or production logging.
 
-**Tech Stack:** React 18, TypeScript, xterm.js, Vitest, Testing Library, Freshell WebSocket terminal output protocol.
+**Tech Stack:** React 18, TypeScript, xterm.js 6.0.0, Vitest, Testing Library, Playwright, Freshell WebSocket terminal output protocol.
 
 ---
 
@@ -14,28 +14,46 @@
 
 - Modify: `src/components/TerminalView.tsx`
   - Remove the `disableWriteCoalescing` control path from accepted terminal output submission.
+  - Record e2e-only terminal write submitted/written events through `window.__FRESHELL_TEST_HARNESS__`.
   - Keep per-segment parser checkpoint callbacks for `terminal.output.batch` barrier segments.
+- Modify: `src/lib/test-harness.ts`
+  - Add e2e-only terminal write event storage and accessors.
+- Modify: `test/e2e-browser/helpers/test-harness.ts`
+  - Add Playwright helper methods for terminal write events.
+- Create: `test/e2e-browser/specs/opencode-replay-write-progression.spec.ts`
+  - Mount a real browser `TerminalView`, feed a barrier-heavy replay batch through the test WebSocket path, and assert real xterm writes are bounded.
 - Modify: `test/unit/client/components/TerminalView.lifecycle.test.tsx`
   - Replace the old expectation that barrier segments produce separate xterm writes.
-  - Keep the committed red regression test that reproduces the OpenCode slow replay failure.
-  - Verify stripped/no-write barrier cases still hold checkpoints until safe.
+  - Keep the committed red OpenCode replay regression test.
+  - Add a direct `A`, stripped segment, `B` checkpoint-safety regression.
 - No change: `src/components/terminal/terminal-write-queue.ts`
   - The queue already coalesces adjacent compatible writes and preserves callback order.
 - No change: `server/terminal-stream/output-batch.ts`
-  - Server batching can be optimized later, but the user-facing regression is caused by client-side hard write boundaries.
+  - Server batching can be optimized later, but this fix removes the client-side hard write boundary causing the observed slowdown.
 
-## Baseline Evidence
+## Baseline And Load-Bearing Evidence
 
-- Temp report: `/tmp/freshell-opencode-playback-investigation-20260615/baseline-slow-playback-data.md`
+- Temp baseline report: `/tmp/freshell-opencode-playback-investigation-20260615/baseline-slow-playback-data.md`
 - Red test commit: `7895df4a test: cover barrier-heavy replay coalescing`
-- Current failure:
+- Current red failure:
 
 ```text
 Expected submitted replay to equal the full 96-segment data payload.
 Received only the first 5-byte segment, "\x1b[30m", after one replay flush.
 ```
 
-## Task 1: Update The Parser-Barrier Write Expectation
+- Load-bearing validation results:
+
+```text
+A2 confirmed: installed @xterm/xterm 6.0.0 applies concatenated writes in order and invokes callbacks after parsing.
+A3 confirmed: barrier metadata is parser classification, not a protocol-level xterm write boundary.
+A4 confirmed: one replay write scope around a coalesced write still suppresses external side effects.
+A5/A6 structurally confirmed but missing a direct TerminalView regression for renderable + stripped + renderable coalescing.
+A1 inconclusive from existing artifacts: local logs do not prove real OpenCode write progression.
+A7 confirmed as a plan gap: focused Vitest + coordinated suite are not enough without browser/xterm write-progression evidence.
+```
+
+## Task 1: Update Terminal Lifecycle Regression Coverage
 
 **Files:**
 - Modify: `test/unit/client/components/TerminalView.lifecycle.test.tsx`
@@ -48,7 +66,7 @@ Find the test named:
 it('splits terminal.output.batch writes around parser barrier segments', async () => {
 ```
 
-Replace the test name and final expectation with:
+Replace the whole test with:
 
 ```ts
 it('preserves parser barrier checkpoints while allowing terminal.output.batch writes to coalesce', async () => {
@@ -87,29 +105,121 @@ it('preserves parser barrier checkpoints while allowing terminal.output.batch wr
 })
 ```
 
-- [ ] **Step 2: Run the focused old/new expectation**
+- [ ] **Step 2: Add the stripped-middle checkpoint regression**
+
+Add this test immediately after the parser barrier coalescing test:
+
+```ts
+it('does not checkpoint across a stripped middle batch segment when adjacent renderable segments coalesce', async () => {
+  const rafCallbacks: FrameRequestCallback[] = []
+  requestAnimationFrameSpy?.mockImplementation((cb: FrameRequestCallback) => {
+    rafCallbacks.push(cb)
+    return rafCallbacks.length
+  })
+
+  const { terminalId, term } = await renderTerminalHarness({
+    status: 'running',
+    terminalId: 'term-output-batch-stripped-middle-coalesced',
+    mode: 'opencode',
+    serverInstanceId: 'server-output-batch-stripped-middle-coalesced',
+  })
+  const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+  const streamId = latestStreamIdByTerminal.get(terminalId)
+  expect(attachRequestId).toBeTruthy()
+  expect(streamId).toBeTruthy()
+
+  const delayedCallbacks: Array<{ data: string; callback: () => void }> = []
+  term.write.mockClear()
+  term.write.mockImplementation((chunk: string, onWritten?: () => void) => {
+    if (onWritten) delayedCallbacks.push({ data: chunk, callback: onWritten })
+  })
+
+  act(() => {
+    messageHandler!({
+      type: 'terminal.output.batch',
+      terminalId,
+      streamId,
+      attachRequestId,
+      source: 'replay',
+      seqStart: 1,
+      seqEnd: 3,
+      data: 'A\x07B',
+      serializedBytes: 256,
+      segments: [
+        { seqStart: 1, seqEnd: 1, endOffset: 1, rawFrameCount: 1 },
+        { seqStart: 2, seqEnd: 2, endOffset: 2, rawFrameCount: 1, barrier: 'turn_complete' },
+        { seqStart: 3, seqEnd: 3, endOffset: 3, rawFrameCount: 1 },
+      ],
+    })
+  })
+
+  expect(delayedCallbacks).toEqual([])
+  expect(loadTerminalSurfaceCheckpoint(terminalId, {
+    streamId,
+    serverInstanceId: 'server-output-batch-stripped-middle-coalesced',
+  })).toBeNull()
+
+  act(() => {
+    rafCallbacks.shift()?.(16)
+  })
+
+  expect(delayedCallbacks.map(({ data }) => data)).toEqual(['AB'])
+  expect(loadTerminalSurfaceCheckpoint(terminalId, {
+    streamId,
+    serverInstanceId: 'server-output-batch-stripped-middle-coalesced',
+  })).toBeNull()
+
+  act(() => {
+    delayedCallbacks[0]?.callback()
+  })
+
+  expect(loadTerminalSurfaceCheckpoint(terminalId, {
+    streamId,
+    serverInstanceId: 'server-output-batch-stripped-middle-coalesced',
+  })?.parserAppliedSeq).toBe(1)
+
+  wsMocks.send.mockClear()
+  act(() => {
+    reconnectHandler?.()
+  })
+
+  expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+    type: 'terminal.attach',
+    terminalId,
+    sinceSeq: 1,
+  }))
+})
+```
+
+- [ ] **Step 3: Run both focused red tests**
 
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/components/TerminalView.lifecycle.test.tsx -t "preserves parser barrier checkpoints" --run
+npm run test:vitest -- test/unit/client/components/TerminalView.lifecycle.test.tsx -t "preserves parser barrier checkpoints|stripped middle batch segment|replays barrier-heavy OpenCode batches" --run
 ```
 
-Expected before production changes: fail because the terminal still writes `['a', 'B', 'c']`.
+Expected before production changes:
 
-- [ ] **Step 3: Commit the test expectation update**
+```text
+FAIL replays barrier-heavy OpenCode batches as bounded writes while holding checkpoints until xterm applies them
+FAIL preserves parser barrier checkpoints while allowing terminal.output.batch writes to coalesce
+FAIL does not checkpoint across a stripped middle batch segment when adjacent renderable segments coalesce
+```
+
+- [ ] **Step 4: Commit the lifecycle test update**
 
 Run:
 
 ```bash
 git add test/unit/client/components/TerminalView.lifecycle.test.tsx
-git commit -m "test: expect parser barriers to coalesce terminal writes"
+git commit -m "test: expect parser barrier replay writes to coalesce"
 ```
 
 Expected:
 
 ```text
-[test/opencode-playback-coalescing <sha>] test: expect parser barriers to coalesce terminal writes
+[test/opencode-playback-coalescing <sha>] test: expect parser barrier replay writes to coalesce
 ```
 
 ## Task 2: Let Parser-Barrier Segments Use Normal Write Coalescing
@@ -208,35 +318,21 @@ submitAcceptedOutput({
 })
 ```
 
-- [ ] **Step 4: Run the OpenCode regression test**
+- [ ] **Step 4: Run the focused lifecycle tests**
 
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/components/TerminalView.lifecycle.test.tsx -t "replays barrier-heavy OpenCode batches" --run
+npm run test:vitest -- test/unit/client/components/TerminalView.lifecycle.test.tsx -t "preserves parser barrier checkpoints|stripped middle batch segment|replays barrier-heavy OpenCode batches" --run
 ```
 
 Expected after production changes:
 
 ```text
-✓ test/unit/client/components/TerminalView.lifecycle.test.tsx > TerminalView lifecycle > ... > replays barrier-heavy OpenCode batches as bounded writes while holding checkpoints until xterm applies them
+Test Files  1 passed
 ```
 
-- [ ] **Step 5: Run the parser-barrier focused test**
-
-Run:
-
-```bash
-npm run test:vitest -- test/unit/client/components/TerminalView.lifecycle.test.tsx -t "preserves parser barrier checkpoints" --run
-```
-
-Expected after production changes:
-
-```text
-✓ test/unit/client/components/TerminalView.lifecycle.test.tsx > TerminalView lifecycle > ... > preserves parser barrier checkpoints while allowing terminal.output.batch writes to coalesce
-```
-
-- [ ] **Step 6: Commit the client fix**
+- [ ] **Step 5: Commit the client coalescing fix**
 
 Run:
 
@@ -251,13 +347,288 @@ Expected:
 [test/opencode-playback-coalescing <sha>] fix: coalesce parser-barrier terminal replay writes
 ```
 
-## Task 3: Verify Existing Replay Safety Cases
+## Task 3: Add Browser Write-Progression Coverage
+
+**Files:**
+- Modify: `src/lib/test-harness.ts`
+- Modify: `src/components/TerminalView.tsx`
+- Modify: `test/e2e-browser/helpers/test-harness.ts`
+- Create: `test/e2e-browser/specs/opencode-replay-write-progression.spec.ts`
+
+- [ ] **Step 1: Extend the e2e harness type and storage**
+
+In `src/lib/test-harness.ts`, add this exported type after the imports:
+
+```ts
+export type TerminalWriteEvent = {
+  terminalId?: string
+  paneId?: string
+  phase: 'submitted' | 'written'
+  chars: number
+  data: string
+  at: number
+}
+```
+
+Add these optional methods to `FreshellTestHarness`:
+
+```ts
+  recordTerminalWrite?: (event: TerminalWriteEvent) => void
+  getTerminalWriteEvents?: () => TerminalWriteEvent[]
+  clearTerminalWriteEvents?: () => void
+```
+
+Inside `installTestHarness`, add storage next to `sentWsMessages`:
+
+```ts
+  const terminalWriteEvents: TerminalWriteEvent[] = []
+```
+
+Add these methods to the `window.__FRESHELL_TEST_HARNESS__` object:
+
+```ts
+    recordTerminalWrite: (event: TerminalWriteEvent) => {
+      terminalWriteEvents.push({ ...event })
+      if (terminalWriteEvents.length > 1000) terminalWriteEvents.shift()
+    },
+    getTerminalWriteEvents: () => [...terminalWriteEvents],
+    clearTerminalWriteEvents: () => {
+      terminalWriteEvents.length = 0
+    },
+```
+
+- [ ] **Step 2: Record actual xterm writes in `TerminalView`**
+
+In the `createTerminalWriteQueue` call in `src/components/TerminalView.tsx`, replace:
+
+```ts
+      write: (data, onWritten) => {
+        try {
+          term.write(data, onWritten)
+        } catch {
+          // disposed
+          onWritten?.()
+        }
+      },
+```
+
+with:
+
+```ts
+      write: (data, onWritten) => {
+        const recordForTest = (phase: 'submitted' | 'written') => {
+          window.__FRESHELL_TEST_HARNESS__?.recordTerminalWrite?.({
+            terminalId: terminalIdRef.current,
+            paneId,
+            phase,
+            chars: data.length,
+            data,
+            at: performance.now(),
+          })
+        }
+        const completeWrite = () => {
+          recordForTest('written')
+          onWritten?.()
+        }
+        recordForTest('submitted')
+        try {
+          term.write(data, completeWrite)
+        } catch {
+          // disposed
+          completeWrite()
+        }
+      },
+```
+
+- [ ] **Step 3: Add Playwright helper methods**
+
+In `test/e2e-browser/helpers/test-harness.ts`, import the event type:
+
+```ts
+import type { TerminalWriteEvent } from '@/lib/test-harness'
+```
+
+Add these methods to `TestHarness`:
+
+```ts
+  async getTerminalWriteEvents(): Promise<TerminalWriteEvent[]> {
+    return this.page.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      if (!harness) throw new Error('Test harness not installed')
+      return harness.getTerminalWriteEvents?.() ?? []
+    })
+  }
+
+  async clearTerminalWriteEvents(): Promise<void> {
+    await this.page.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      if (!harness) throw new Error('Test harness not installed')
+      harness.clearTerminalWriteEvents?.()
+    })
+  }
+```
+
+- [ ] **Step 4: Create the browser replay write-progression spec**
+
+Create `test/e2e-browser/specs/opencode-replay-write-progression.spec.ts`:
+
+```ts
+import { expect, test } from '../helpers/fixtures.js'
+
+const terminalId = 'term-e2e-opencode-replay-write-progression'
+const streamId = 'stream-e2e-opencode-replay-write-progression'
+const paneId = 'pane-e2e-opencode-replay-write-progression'
+
+function createOpenCodeLikeReplay() {
+  const chunks = Array.from({ length: 96 }, (_unused, index) => (
+    index % 2 === 0
+      ? `\x1b[${30 + (index % 8)}m`
+      : `tok${index.toString().padStart(2, '0')}`
+  ))
+  const data = chunks.join('')
+  const segments = chunks.map((chunk, index) => ({
+    seqStart: index + 1,
+    seqEnd: index + 1,
+    endOffset: chunks.slice(0, index + 1).join('').length,
+    rawFrameCount: 1,
+    barrier: 'control',
+  }))
+  return { chunks, data, segments }
+}
+
+test.describe('OpenCode replay write progression', () => {
+  test('submits barrier-heavy replay to real xterm in bounded writes', async ({ page, serverInfo, harness }) => {
+    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+    await harness.waitForHarness()
+    await harness.waitForConnection()
+
+    await page.evaluate(({ tabId, paneId: targetPaneId, terminalId: targetTerminalId }) => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      if (!harness) throw new Error('Freshell test harness is not installed')
+      harness.dispatch({
+        type: 'tabs/addTab',
+        payload: {
+          id: tabId,
+          title: 'OpenCode replay write progression',
+          mode: 'opencode',
+          status: 'running',
+        },
+      })
+      harness.dispatch({
+        type: 'panes/initLayout',
+        payload: {
+          tabId,
+          paneId: targetPaneId,
+          content: {
+            kind: 'terminal',
+            mode: 'opencode',
+            shell: 'system',
+            terminalId: targetTerminalId,
+            status: 'running',
+          },
+        },
+      })
+    }, {
+      tabId: 'tab-e2e-opencode-replay-write-progression',
+      paneId,
+      terminalId,
+    })
+
+    await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: 15_000 })
+    await page.waitForFunction((targetTerminalId) => (
+      window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer(targetTerminalId) !== null
+    ), terminalId, { timeout: 15_000 })
+
+    const attach = await page.waitForFunction((targetTerminalId) => {
+      const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
+      return sent.find((msg: any) =>
+        msg?.type === 'terminal.attach'
+        && msg.terminalId === targetTerminalId
+        && typeof msg.attachRequestId === 'string'
+      ) ?? null
+    }, terminalId, { timeout: 15_000 })
+      .then((handle) => handle.jsonValue() as Promise<{ attachRequestId: string }>)
+
+    const replay = createOpenCodeLikeReplay()
+    await harness.clearTerminalWriteEvents()
+
+    await harness.receiveWsMessage({
+      type: 'terminal.attach.ready',
+      terminalId,
+      streamId,
+      headSeq: replay.chunks.length,
+      replayFromSeq: 1,
+      replayToSeq: replay.chunks.length,
+      attachRequestId: attach.attachRequestId,
+    })
+    await harness.receiveWsMessage({
+      type: 'terminal.output.batch',
+      terminalId,
+      streamId,
+      attachRequestId: attach.attachRequestId,
+      source: 'replay',
+      seqStart: 1,
+      seqEnd: replay.chunks.length,
+      data: replay.data,
+      serializedBytes: replay.data.length + 512,
+      segments: replay.segments,
+    })
+
+    await expect.poll(async () => {
+      const submitted = (await harness.getTerminalWriteEvents())
+        .filter((event) => event.phase === 'submitted' && event.terminalId === terminalId)
+      return submitted.map((event) => event.data).join('')
+    }, { timeout: 15_000 }).toBe(replay.data)
+
+    const submitted = (await harness.getTerminalWriteEvents())
+      .filter((event) => event.phase === 'submitted' && event.terminalId === terminalId)
+    expect(submitted.length).toBeLessThanOrEqual(2)
+
+    await expect.poll(async () => {
+      const written = (await harness.getTerminalWriteEvents())
+        .filter((event) => event.phase === 'written' && event.terminalId === terminalId)
+      return written.map((event) => event.data).join('')
+    }, { timeout: 15_000 }).toBe(replay.data)
+  })
+})
+```
+
+- [ ] **Step 5: Run the new e2e probe**
+
+Run:
+
+```bash
+npm run test:e2e:chromium -- test/e2e-browser/specs/opencode-replay-write-progression.spec.ts --workers=1
+```
+
+Expected after the client fix:
+
+```text
+1 passed
+```
+
+- [ ] **Step 6: Commit the browser write-progression coverage**
+
+Run:
+
+```bash
+git add src/lib/test-harness.ts src/components/TerminalView.tsx test/e2e-browser/helpers/test-harness.ts test/e2e-browser/specs/opencode-replay-write-progression.spec.ts
+git commit -m "test: cover OpenCode replay write progression in browser"
+```
+
+Expected:
+
+```text
+[test/opencode-playback-coalescing <sha>] test: cover OpenCode replay write progression in browser
+```
+
+## Task 4: Verify Existing Replay Safety Cases
 
 **Files:**
 - Test only: `test/unit/client/components/TerminalView.lifecycle.test.tsx`
 - Test only: `src/components/terminal/terminal-write-queue.ts`
 
-- [ ] **Step 1: Run the terminal lifecycle tests around output batching**
+- [ ] **Step 1: Run the terminal lifecycle suite**
 
 Run:
 
@@ -269,16 +640,6 @@ Expected:
 
 ```text
 Test Files  1 passed
-```
-
-The important protected behaviors in this file are:
-
-```text
-replays barrier-heavy OpenCode batches as bounded writes while holding checkpoints until xterm applies them
-does not checkpoint a stripped terminal.output.batch BEL segment as parser-applied
-completes attach when replay ends in a stripped terminal.output.batch BEL segment without checkpointing it
-queues stripped terminal.output.batch replay completion behind earlier replay write callbacks
-does not checkpoint a mixed renderable and stripped terminal.output.batch segment as parser-applied
 ```
 
 - [ ] **Step 2: Run the write queue tests**
@@ -295,31 +656,42 @@ Expected:
 Test Files  1 passed
 ```
 
-- [ ] **Step 3: Re-run the synthetic baseline measurement manually from the regression test result**
+- [ ] **Step 3: Run the attach sequence state tests**
 
-Use the OpenCode regression test evidence:
+Run:
+
+```bash
+npm run test:vitest -- test/unit/client/lib/terminal-attach-seq-state.test.ts --run
+```
+
+Expected:
 
 ```text
-Before fix: 96 barrier segments required 96 xterm writes, 96 xterm callbacks, and 96 RAF flushes.
-After fix: the same 96 barrier segments should submit the full replay payload in no more than 2 xterm writes before checkpointing.
+Test Files  1 passed
 ```
 
-The red test checks the after-fix invariant directly:
+- [ ] **Step 4: Run the browser write-progression e2e again**
 
-```ts
-const submittedReplay = delayedCallbacks.map(({ data: chunk }) => chunk).join('')
-expect(submittedReplay).toBe(data)
-expect(delayedCallbacks.length).toBeLessThanOrEqual(2)
+Run:
+
+```bash
+npm run test:e2e:chromium -- test/e2e-browser/specs/opencode-replay-write-progression.spec.ts --workers=1
 ```
 
-- [ ] **Step 4: Commit any verification-only test adjustment**
+Expected:
+
+```text
+1 passed
+```
+
+- [ ] **Step 5: Commit any legitimate verification-only adjustment**
 
 If no files changed during verification, do not create a commit.
 
-If a test assertion needed a legitimate adjustment, run:
+If an assertion needed a legitimate adjustment, run:
 
 ```bash
-git add test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/terminal/terminal-write-queue.test.ts
+git add test/unit/client/components/TerminalView.lifecycle.test.tsx test/e2e-browser/specs/opencode-replay-write-progression.spec.ts
 git commit -m "test: verify terminal replay coalescing safety"
 ```
 
@@ -329,7 +701,7 @@ Expected only when files changed:
 [test/opencode-playback-coalescing <sha>] test: verify terminal replay coalescing safety
 ```
 
-## Task 4: Final Verification And Branch Finish
+## Task 5: Final Verification And Branch Finish
 
 **Files:**
 - No source edits expected.
@@ -351,7 +723,7 @@ git status --short
 # no output
 
 git diff --stat origin/main...HEAD
-# includes src/components/TerminalView.tsx and test/unit/client/components/TerminalView.lifecycle.test.tsx
+# includes TerminalView, test harness, lifecycle tests, and the e2e spec
 ```
 
 - [ ] **Step 2: Run the repo-supported status check before any broad suite**
@@ -397,10 +769,11 @@ No PR was created because repo instructions require explicit approval.
 ## Self-Review Checklist
 
 - Spec coverage: The plan targets the slow playback regression only. It leaves the tab-switch reload issue out of scope because the user narrowed the request to slow playback.
+- Load-bearing coverage: The plan now includes direct coverage for the two validation gaps: stripped middle segment checkpointing and real browser/xterm write progression.
 - Placeholder scan: No unfinished placeholders or unspecified test instructions remain.
-- Type consistency: `disableWriteCoalescing` is removed from the `submitAcceptedOutput` input type, from the queue options, and from the batch barrier call site in the same task.
-- Safety: No production deploy, production restart, live host mutation, or PR creation is included.
-- Test design: The highest-value test is the existing OpenCode-style lifecycle replay regression test. The old split-write test is updated to protect parser checkpoint behavior rather than the harmful write-boundary behavior.
+- Type consistency: `disableWriteCoalescing` is removed from the `submitAcceptedOutput` input type, queue options, and batch barrier call site in the same task.
+- Safety: No production deploy, production restart, live host mutation, or PR creation is included. Playwright starts an isolated test server through existing test helpers.
+- Test design: Unit tests protect client ordering and checkpoint contracts; the browser e2e test protects the real `Terminal.write` progression that caused visible slow playback.
 
 ## Execution Handoff
 
