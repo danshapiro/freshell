@@ -1,7 +1,7 @@
 import type { CodingCliProvider } from '../coding-cli/provider.js'
 import type { ProjectGroup } from '../coding-cli/types.js'
 import type { TerminalMeta } from '../terminal-metadata-service.js'
-import { extractSnippet, searchSessionFile } from '../session-search.js'
+import { extractSnippet, searchSessionFile } from './file-search.js'
 import { MAX_DIRECTORY_PAGE_ITEMS } from '../../shared/read-models.js'
 import { matchTitleTierMetadata } from '../../shared/session-title-search.js'
 import {
