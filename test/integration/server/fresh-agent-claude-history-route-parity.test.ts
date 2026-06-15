@@ -9,7 +9,7 @@ import { FreshAgentRuntimeManager } from '../../../server/fresh-agent/runtime-ma
 import { createClaudeFreshAgentAdapter } from '../../../server/fresh-agent/adapters/claude/adapter.js'
 import {
   ClaudeFreshAgentHistoryResolutionError,
-  ClaudeFreshAgentHistoryStaleRevisionError,
+  ClaudeFreshAgentStaleHistoryRevisionError,
   createClaudeFreshAgentHistoryService,
 } from '../../../server/fresh-agent/history/claude/history-service.js'
 import type { ChatMessage } from '../../../server/session-history-loader.js'
@@ -80,7 +80,7 @@ describe('fresh-agent Claude history route parity', () => {
           case 'diverged':
             throw new ClaudeFreshAgentHistoryResolutionError('RESTORE_DIVERGED', 'Restore history diverged')
           case 'stale':
-            throw new ClaudeFreshAgentHistoryStaleRevisionError(1, 8)
+            throw new ClaudeFreshAgentStaleHistoryRevisionError(1, 8)
         }
       }),
     } as unknown as FreshAgentRuntimeAdapter
@@ -100,7 +100,7 @@ describe('fresh-agent Claude history route parity', () => {
     const historySource = {
       resolve: vi.fn().mockResolvedValue(makeResolvedHistory(35)),
     }
-    const timelineService = createClaudeFreshAgentHistoryService({
+    const historyService = createClaudeFreshAgentHistoryService({
       agentHistorySource: historySource,
     })
     const adapter = createClaudeFreshAgentAdapter({
@@ -108,7 +108,7 @@ describe('fresh-agent Claude history route parity', () => {
         getSession: vi.fn(),
         findSessionByCliSessionId: vi.fn(),
       } as any,
-      timelineService,
+      historyService,
     })
     const app = makeApp(adapter)
 

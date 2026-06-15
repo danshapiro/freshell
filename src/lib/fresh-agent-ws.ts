@@ -148,7 +148,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         ...locator,
         latestTurnId: (event.latestTurnId as string | null | undefined) ?? null,
         status: event.status as never,
-        timelineSessionId: event.timelineSessionId as string | undefined,
+        historySessionId: event.timelineSessionId as string | undefined,
         revision: event.revision as number | undefined,
         streamingActive: event.streamingActive as boolean | undefined,
         streamingText: event.streamingText as string | undefined,

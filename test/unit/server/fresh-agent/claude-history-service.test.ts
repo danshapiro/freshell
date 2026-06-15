@@ -59,7 +59,7 @@ describe('Claude fresh-agent history service', () => {
       agentHistorySource: { resolve },
     })
 
-    const firstPage = await service.getTimelinePage({
+    const firstPage = await service.getThreadTurnPage({
       sessionId: 'agent-session-1',
       priority: 'visible',
       limit: 2,
@@ -73,7 +73,7 @@ describe('Claude fresh-agent history service', () => {
     expect(firstPage.nextCursor).toBeTruthy()
     expect(resolve).toHaveBeenCalledWith('agent-session-1')
 
-    const secondPage = await service.getTimelinePage({
+    const secondPage = await service.getThreadTurnPage({
       sessionId: 'agent-session-1',
       priority: 'visible',
       cursor: firstPage.nextCursor ?? undefined,
@@ -104,7 +104,7 @@ describe('Claude fresh-agent history service', () => {
       },
     })
 
-    const page = await service.getTimelinePage({
+    const page = await service.getThreadTurnPage({
       sessionId: 'agent-session-2',
       priority: 'visible',
       limit: 1,
@@ -143,7 +143,7 @@ describe('Claude fresh-agent history service', () => {
       },
     })
 
-    const page = await service.getTimelinePage({
+    const page = await service.getThreadTurnPage({
       sessionId: 'sdk-1',
       priority: 'visible',
       limit: 1,
@@ -177,7 +177,7 @@ describe('Claude fresh-agent history service', () => {
       },
     })
 
-    const page = service.getTimelinePage({
+    const page = service.getThreadTurnPage({
       sessionId: 'agent-session-3',
       priority: 'background',
       cursor: 'not-a-valid-cursor',
@@ -198,7 +198,7 @@ describe('Claude fresh-agent history service', () => {
       },
     })
 
-    await expect(service.getTimelinePage({
+    await expect(service.getThreadTurnPage({
       sessionId: 'missing-agent',
       priority: 'visible',
       revision: 0,
@@ -218,7 +218,7 @@ describe('Claude fresh-agent history service', () => {
       },
     })
 
-    await expect(service.getTimelinePage({
+    await expect(service.getThreadTurnPage({
       sessionId: 'unavailable-agent',
       priority: 'visible',
       revision: 0,
@@ -238,7 +238,7 @@ describe('Claude fresh-agent history service', () => {
       },
     })
 
-    await expect(service.getTimelinePage({
+    await expect(service.getThreadTurnPage({
       sessionId: 'sdk-1',
       priority: 'visible',
     } as any)).rejects.toThrow('Restore revision is required')
@@ -254,7 +254,7 @@ describe('Claude fresh-agent history service', () => {
       },
     })
 
-    await expect(service.getTimelinePage({
+    await expect(service.getThreadTurnPage({
       sessionId: 'sdk-1',
       priority: 'visible',
       revision: 12,

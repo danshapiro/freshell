@@ -133,8 +133,8 @@ describe('fresh-agent-ws', () => {
 
     expect(store.getState().freshAgent.sessions['freshclaude:claude:claude-thread-1']).toEqual(expect.objectContaining({
       latestTurnId: 'turn-1',
-      timelineSessionId: 'cli-session-1',
-      timelineRevision: 7,
+      historySessionId: 'cli-session-1',
+      historyRevision: 7,
       lost: true,
       historyLoaded: false,
     }))
@@ -157,8 +157,8 @@ describe('fresh-agent-ws', () => {
       sessionType: 'freshclaude',
       provider: 'claude',
       latestTurnId: 'turn-stale',
-      timelineSessionId: '00000000-0000-4000-8000-000000000001',
-      timelineRevision: 3,
+      historySessionId: '00000000-0000-4000-8000-000000000001',
+      historyRevision: 3,
     })
   })
 

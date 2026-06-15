@@ -53,18 +53,18 @@ export type FreshAgentSessionState = FreshAgentSessionLocator & {
   status: FreshAgentSessionStatus
   snapshot?: FreshAgentSnapshot
   latestTurnId?: string | null
-  timelineSessionId?: string
-  timelineRevision?: number
+  historySessionId?: string
+  historyRevision?: number
   cliSessionId?: string
   cwd?: string
   model?: string
   tools?: Array<{ name: string }>
   turns: FreshAgentTurn[]
-  timelineItems: FreshAgentTurn[]
-  timelineBodies: Record<string, FreshAgentTurn>
-  nextTimelineCursor?: string | null
-  timelineLoading?: boolean
-  timelineError?: string
+  historyItems: FreshAgentTurn[]
+  historyBodies: Record<string, FreshAgentTurn>
+  nextHistoryCursor?: string | null
+  historyLoading?: boolean
+  historyError?: string
   streamingText: string
   streamingActive: boolean
   pendingPermissions: Record<string, FreshAgentPermissionRequest>

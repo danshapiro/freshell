@@ -82,7 +82,7 @@ describe('persistControl', () => {
 
   it('prefers a canonical durable cliSessionId over a named restore token', () => {
     const session = {
-      timelineSessionId: 'named-resume',
+      historySessionId: 'named-resume',
       cliSessionId: '00000000-0000-4000-8000-000000000321',
     }
 

@@ -116,8 +116,8 @@ function createFreshAgentSession(
     threadId: overrides.threadId ?? overrides.sessionId,
     status: 'idle',
     turns: [],
-    timelineItems: [],
-    timelineBodies: {},
+    historyItems: [],
+    historyBodies: {},
     streamingText: '',
     streamingActive: false,
     pendingPermissions: {},
@@ -492,7 +492,7 @@ describe('pane activity indicator flow (e2e)', () => {
     expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
   })
 
-  it('restores pane and tab activity from timelineSessionId when only the canonical durable id is known', () => {
+  it('restores pane and tab activity from historySessionId when only the canonical durable id is known', () => {
     const pane: FreshAgentPaneContent = {
       kind: 'fresh-agent',
       sessionType: 'freshclaude',
@@ -513,7 +513,7 @@ describe('pane activity indicator flow (e2e)', () => {
             sessionId: 'sdk-restore-1',
           })]: createFreshAgentSession({
             sessionId: 'sdk-restore-1',
-            timelineSessionId: 'canonical-session-1',
+            historySessionId: 'canonical-session-1',
             status: 'running',
             pendingPermissions: {
               'perm-1': {

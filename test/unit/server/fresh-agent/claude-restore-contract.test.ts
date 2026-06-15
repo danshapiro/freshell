@@ -37,7 +37,7 @@ describe('Claude fresh-agent restore contract', () => {
         sessionId === '00000000-0000-4000-8000-000000000111' ? liveSession : undefined
       )),
     })
-    const timelineService = createClaudeFreshAgentHistoryService({
+    const historyService = createClaudeFreshAgentHistoryService({
       agentHistorySource: historySource,
     })
     const adapter = createClaudeFreshAgentAdapter({
@@ -48,7 +48,7 @@ describe('Claude fresh-agent restore contract', () => {
         )),
       } as any,
       agentHistorySource: historySource,
-      timelineService,
+      historyService,
     })
 
     const snapshot = await adapter.getSnapshot?.({

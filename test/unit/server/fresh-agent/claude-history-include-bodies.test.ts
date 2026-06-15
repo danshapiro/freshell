@@ -97,7 +97,7 @@ describe('Claude fresh-agent history includeBodies', () => {
       },
     })
 
-    const page = await service.getTimelinePage({
+    const page = await service.getThreadTurnPage({
       sessionId: 'sess-1',
       priority: 'visible',
       revision: Date.parse('2026-03-10T10:02:00.000Z'),
@@ -118,7 +118,7 @@ describe('Claude fresh-agent history includeBodies', () => {
       },
     })
 
-    const page = await service.getTimelinePage({
+    const page = await service.getThreadTurnPage({
       sessionId: 'sdk-sess-1',
       priority: 'visible',
       includeBodies: true,
@@ -149,7 +149,7 @@ describe('Claude fresh-agent history includeBodies', () => {
       },
     })
 
-    const page = await service.getTimelinePage({
+    const page = await service.getThreadTurnPage({
       sessionId: 'sess-1',
       priority: 'visible',
       includeBodies: true,
@@ -178,7 +178,7 @@ describe('Claude fresh-agent history includeBodies', () => {
       },
     })
 
-    const page1 = await service.getTimelinePage({
+    const page1 = await service.getThreadTurnPage({
       sessionId: 'sess-1',
       priority: 'visible',
       limit: 2,
@@ -192,7 +192,7 @@ describe('Claude fresh-agent history includeBodies', () => {
       expect(page1.bodies![item.turnId]).toBeDefined()
     }
 
-    const page2 = await service.getTimelinePage({
+    const page2 = await service.getThreadTurnPage({
       sessionId: 'sess-1',
       priority: 'visible',
       cursor: page1.nextCursor!,
@@ -219,7 +219,7 @@ describe('Claude fresh-agent history includeBodies', () => {
       },
     })
 
-    const page = await service.getTimelinePage({
+    const page = await service.getThreadTurnPage({
       sessionId: 'sdk-sess-1',
       priority: 'visible',
       revision: Date.parse('2026-03-10T10:02:00.000Z'),

@@ -152,8 +152,8 @@ function createFreshAgentSession(
     threadId: overrides.threadId ?? overrides.sessionId,
     status: 'idle',
     turns: [],
-    timelineItems: [],
-    timelineBodies: {},
+    historyItems: [],
+    historyBodies: {},
     streamingText: '',
     streamingActive: false,
     pendingPermissions: {},
@@ -814,7 +814,7 @@ describe('pane header runtime metadata flow (e2e)', () => {
     })
   })
 
-  it('restores FreshClaude pane header metadata from timelineSessionId before cliSessionId exists', async () => {
+  it('restores FreshClaude pane header metadata from historySessionId before cliSessionId exists', async () => {
     fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
       projects: [
         {
@@ -895,7 +895,7 @@ describe('pane header runtime metadata flow (e2e)', () => {
             sessionId: 'sdk-session-restore',
           })]: createFreshAgentSession({
             sessionId: 'sdk-session-restore',
-            timelineSessionId: 'canonical-session-1',
+            historySessionId: 'canonical-session-1',
           }),
         },
         pendingCreates: {},

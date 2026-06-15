@@ -253,8 +253,8 @@ function createFreshClaudeSession(
     threadId: overrides.threadId ?? overrides.sessionId,
     status: 'idle',
     turns: [],
-    timelineItems: [],
-    timelineBodies: {},
+    historyItems: [],
+    historyBodies: {},
     streamingText: '',
     streamingActive: false,
     pendingPermissions: {},
@@ -2274,7 +2274,7 @@ describe('PaneContainer', () => {
       expect(screen.queryByText(/other \(stale\)\s+10%/)).not.toBeInTheDocument()
     })
 
-    it('prefers timelineSessionId over a stale resumeSessionId before cliSessionId exists', () => {
+    it('prefers historySessionId over a stale resumeSessionId before cliSessionId exists', () => {
       const node: PaneNode = {
         type: 'leaf',
         id: 'pane-fresh',
@@ -2350,7 +2350,7 @@ describe('PaneContainer', () => {
               sessionId: 'sdk-session-1',
             })]: createFreshClaudeSession({
               sessionId: 'sdk-session-1',
-              timelineSessionId: 'timeline-session-1',
+              historySessionId: 'timeline-session-1',
             }),
           },
         },
@@ -2369,7 +2369,7 @@ describe('PaneContainer', () => {
       expect(screen.queryByText(/other \(stale\)\s+10%/)).not.toBeInTheDocument()
     })
 
-    it('prefers a canonical cliSessionId over a named timelineSessionId when both exist', () => {
+    it('prefers a canonical cliSessionId over a named historySessionId when both exist', () => {
       const node: PaneNode = {
         type: 'leaf',
         id: 'pane-fresh',
@@ -2445,7 +2445,7 @@ describe('PaneContainer', () => {
               sessionId: 'sdk-session-2',
             })]: createFreshClaudeSession({
               sessionId: 'sdk-session-2',
-              timelineSessionId: 'named-resume',
+              historySessionId: 'named-resume',
               cliSessionId: '00000000-0000-4000-8000-000000000321',
             }),
           },

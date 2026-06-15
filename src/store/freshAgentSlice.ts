@@ -61,8 +61,8 @@ function createSession(locator: FreshAgentSessionPayload, status: FreshAgentSess
     threadId: locator.sessionId,
     status,
     turns: [],
-    timelineItems: [],
-    timelineBodies: {},
+    historyItems: [],
+    historyBodies: {},
     streamingText: '',
     streamingActive: false,
     pendingPermissions: {},
@@ -99,14 +99,14 @@ function resolveOrEnsureSession(
   }, status)
 }
 
-function resetHydratedTimelineState(session: FreshAgentSessionState): void {
+function resetHydratedHistoryState(session: FreshAgentSessionState): void {
   session.latestTurnId = undefined
   session.turns = []
-  session.timelineItems = []
-  session.timelineBodies = {}
-  session.nextTimelineCursor = undefined
-  session.timelineLoading = false
-  session.timelineError = undefined
+  session.historyItems = []
+  session.historyBodies = {}
+  session.nextHistoryCursor = undefined
+  session.historyLoading = false
+  session.historyError = undefined
   session.historyLoaded = false
   session.restoreFailureMessage = undefined
   session.streamingText = ''
@@ -256,7 +256,7 @@ const freshAgentSlice = createSlice({
       const session = resolveOrEnsureSession(state, action.payload)
       if (!session) return
       session.cliSessionId = action.payload.cliSessionId ?? session.cliSessionId
-      session.timelineSessionId = action.payload.cliSessionId ?? session.timelineSessionId
+      session.historySessionId = action.payload.cliSessionId ?? session.historySessionId
       session.model = action.payload.model ?? session.model
       session.cwd = action.payload.cwd ?? session.cwd
       session.tools = action.payload.tools ?? session.tools
@@ -268,7 +268,7 @@ const freshAgentSlice = createSlice({
     sessionSnapshotReceived(state, action: PayloadAction<SessionMutationPayload & {
       latestTurnId: string | null
       status: FreshAgentSessionStatus
-      timelineSessionId?: string
+      historySessionId?: string
       revision?: number
       streamingActive?: boolean
       streamingText?: string
@@ -278,18 +278,18 @@ const freshAgentSlice = createSlice({
       const shouldRestartHydration = Boolean(
         session.historyLoaded
           && action.payload.revision != null
-          && session.timelineRevision != null
-          && action.payload.revision !== session.timelineRevision,
+          && session.historyRevision != null
+          && action.payload.revision !== session.historyRevision,
       )
       if (shouldRestartHydration) {
-        resetHydratedTimelineState(session)
+        resetHydratedHistoryState(session)
         requestRestoreHydrationRestart(session)
       }
 
       session.latestTurnId = action.payload.latestTurnId
       session.status = action.payload.status
-      session.timelineSessionId = action.payload.timelineSessionId ?? session.timelineSessionId
-      session.timelineRevision = action.payload.revision ?? session.timelineRevision
+      session.historySessionId = action.payload.historySessionId ?? session.historySessionId
+      session.historyRevision = action.payload.revision ?? session.historyRevision
       session.streamingActive = action.payload.streamingActive ?? false
       session.streamingText = action.payload.streamingText ?? ''
       session.restoreFailureCode = undefined
@@ -312,10 +312,10 @@ const freshAgentSlice = createSlice({
       session.snapshot = snapshot
       session.status = snapshot.status as FreshAgentSessionStatus
       session.latestTurnId = snapshot.latestTurnId
-      session.timelineRevision = snapshot.revision
+      session.historyRevision = snapshot.revision
       session.turns = snapshot.turns
-      session.timelineItems = snapshot.turns
-      session.timelineBodies = Object.fromEntries(snapshot.turns.map((turn) => [turn.turnId, turn]))
+      session.historyItems = snapshot.turns
+      session.historyBodies = Object.fromEntries(snapshot.turns.map((turn) => [turn.turnId, turn]))
       session.pendingPermissions = Object.fromEntries(
         snapshot.pendingApprovals.map((approval) => [String(approval.requestId), approval]),
       )
@@ -376,7 +376,7 @@ const freshAgentSlice = createSlice({
       if (action.payload.code?.startsWith('RESTORE_')) {
         session.awaitingDurableHistory = false
         session.historyLoaded = true
-        session.timelineLoading = false
+        session.historyLoading = false
         session.restoreFailureCode = action.payload.code
         session.restoreFailureMessage = action.payload.message
       } else {
@@ -417,44 +417,44 @@ const freshAgentSlice = createSlice({
       const key = resolveSessionKey(state, action.payload)
       if (!key) return
       const session = state.sessions[key]
-      resetHydratedTimelineState(session)
+      resetHydratedHistoryState(session)
       session.restoreRetryCount = (session.restoreRetryCount ?? 0) + 1
     },
 
-    timelineLoadStarted(state, action: PayloadAction<SessionMutationPayload>) {
+    historyLoadStarted(state, action: PayloadAction<SessionMutationPayload>) {
       const key = resolveSessionKey(state, action.payload)
       if (!key) return
-      state.sessions[key].timelineLoading = true
-      state.sessions[key].timelineError = undefined
+      state.sessions[key].historyLoading = true
+      state.sessions[key].historyError = undefined
     },
 
-    timelinePageReceived(state, action: PayloadAction<SessionMutationPayload & {
-      turns: FreshAgentSessionState['timelineItems']
+    historyPageReceived(state, action: PayloadAction<SessionMutationPayload & {
+      turns: FreshAgentSessionState['historyItems']
       nextCursor?: string | null
       revision?: number
     }>) {
       const key = resolveSessionKey(state, action.payload)
       if (!key) return
       const session = state.sessions[key]
-      session.timelineLoading = false
+      session.historyLoading = false
       session.historyLoaded = true
-      session.timelineItems = action.payload.turns
-      session.nextTimelineCursor = action.payload.nextCursor
-      session.timelineRevision = action.payload.revision ?? session.timelineRevision
+      session.historyItems = action.payload.turns
+      session.nextHistoryCursor = action.payload.nextCursor
+      session.historyRevision = action.payload.revision ?? session.historyRevision
     },
 
-    timelineLoadFailed(state, action: PayloadAction<SessionMutationPayload & { message: string }>) {
+    historyLoadFailed(state, action: PayloadAction<SessionMutationPayload & { message: string }>) {
       const key = resolveSessionKey(state, action.payload)
       if (!key) return
       const session = state.sessions[key]
-      session.timelineLoading = false
-      session.timelineError = action.payload.message
+      session.historyLoading = false
+      session.historyError = action.payload.message
     },
 
-    turnBodyReceived(state, action: PayloadAction<SessionMutationPayload & { turn: FreshAgentSessionState['timelineItems'][number] }>) {
+    turnBodyReceived(state, action: PayloadAction<SessionMutationPayload & { turn: FreshAgentSessionState['historyItems'][number] }>) {
       const key = resolveSessionKey(state, action.payload)
       if (!key) return
-      state.sessions[key].timelineBodies[action.payload.turn.turnId] = action.payload.turn
+      state.sessions[key].historyBodies[action.payload.turn.turnId] = action.payload.turn
     },
 
     turnResult(state, action: PayloadAction<SessionMutationPayload & {
@@ -481,7 +481,7 @@ const freshAgentSlice = createSlice({
         summary: action.payload.text,
         items: [{ id: `${turnId}-text`, kind: 'text', text: action.payload.text }],
       })
-      session.timelineItems = session.turns
+      session.historyItems = session.turns
     },
     addAssistantMessage(state, action: PayloadAction<SessionMutationPayload & {
       content: Record<string, unknown>[]
@@ -501,7 +501,7 @@ const freshAgentSlice = createSlice({
         summary: summarizeFreshAgentItems(items),
         items,
       })
-      session.timelineItems = session.turns
+      session.historyItems = session.turns
       session.streamingText = ''
       session.streamingActive = false
     },
@@ -564,9 +564,9 @@ export const {
   setAvailableModels,
   setSessionStatus,
   setStreaming,
-  timelineLoadFailed,
-  timelineLoadStarted,
-  timelinePageReceived,
+  historyLoadFailed,
+  historyLoadStarted,
+  historyPageReceived,
   turnBodyReceived,
   turnResult,
 } = freshAgentSlice.actions

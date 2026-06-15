@@ -16,9 +16,9 @@ describe('Claude fresh-agent adapter', () => {
 
     const adapter = createClaudeFreshAgentAdapter({
       sdkBridge: sdkBridge as any,
-      timelineService: {
+      historyService: {
         getSnapshot: vi.fn(),
-        getTimelinePage: vi.fn(),
+        getThreadTurnPage: vi.fn(),
         getTurnBody: vi.fn(),
       } as any,
     })
@@ -69,9 +69,9 @@ describe('Claude fresh-agent adapter', () => {
 
     const adapter = createClaudeFreshAgentAdapter({
       sdkBridge: sdkBridge as any,
-      timelineService: {
+      historyService: {
         getSnapshot: vi.fn(),
-        getTimelinePage: vi.fn(),
+        getThreadTurnPage: vi.fn(),
         getTurnBody: vi.fn(),
       } as any,
     })
@@ -96,9 +96,9 @@ describe('Claude fresh-agent adapter', () => {
 
     const adapter = createClaudeFreshAgentAdapter({
       sdkBridge: sdkBridge as any,
-      timelineService: {
+      historyService: {
         getSnapshot: vi.fn(),
-        getTimelinePage: vi.fn(),
+        getThreadTurnPage: vi.fn(),
         getTurnBody: vi.fn(),
       } as any,
     })
@@ -150,16 +150,16 @@ describe('Claude fresh-agent adapter', () => {
         message: 'Live restore state diverged from durable history',
       }),
     }
-    const timelineService = {
-      getSnapshot: vi.fn().mockRejectedValue(new Error('timeline should not be loaded before live fallback')),
-      getTimelinePage: vi.fn(),
+    const historyService = {
+      getSnapshot: vi.fn().mockRejectedValue(new Error('history should not be loaded before live fallback')),
+      getThreadTurnPage: vi.fn(),
       getTurnBody: vi.fn(),
     }
 
     const adapter = createClaudeFreshAgentAdapter({
       sdkBridge: sdkBridge as any,
       agentHistorySource: agentHistorySource as any,
-      timelineService: timelineService as any,
+      historyService: historyService as any,
     })
 
     const snapshot = await adapter.getSnapshot?.({
@@ -168,7 +168,7 @@ describe('Claude fresh-agent adapter', () => {
       threadId: liveSession.cliSessionId!,
     })
 
-    expect(timelineService.getSnapshot).not.toHaveBeenCalled()
+    expect(historyService.getSnapshot).not.toHaveBeenCalled()
     expect(agentHistorySource.resolve).toHaveBeenCalledWith(liveSession.cliSessionId, {
       liveSessionOverride: liveSession,
     })

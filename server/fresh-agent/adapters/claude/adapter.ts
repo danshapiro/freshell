@@ -35,7 +35,7 @@ type ClaudeBridgePort = Pick<
 export type ClaudeFreshAgentAdapterDeps = {
   sdkBridge: ClaudeBridgePort
   agentHistorySource?: ClaudeFreshAgentHistorySource
-  timelineService?: ClaudeFreshAgentHistoryService
+  historyService?: ClaudeFreshAgentHistoryService
 }
 
 function toClaudeEffort(value: FreshAgentCreateRequest['effort']) {
@@ -96,7 +96,7 @@ function assertFreshAgentRevision(currentRevision: number, requestedRevision?: n
 }
 
 export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps): FreshAgentRuntimeAdapter {
-  const timelineService = deps.timelineService ?? (
+  const historyService = deps.historyService ?? (
     deps.agentHistorySource
       ? createClaudeFreshAgentHistoryService({ agentHistorySource: deps.agentHistorySource })
       : null
@@ -107,10 +107,10 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
   }
 
   async function loadResolved(threadId: string, revision?: number) {
-    if (!timelineService) {
-      throw new Error('Claude timeline service is not configured')
+    if (!historyService) {
+      throw new Error('Claude history service is not configured')
     }
-    return await timelineService.getSnapshot({ sessionId: threadId, revision })
+    return await historyService.getSnapshot({ sessionId: threadId, revision })
   }
 
   return {
@@ -246,10 +246,10 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
     },
 
     async getTurnPage(thread, query) {
-      if (!timelineService) {
-        throw new Error('Claude timeline service is not configured')
+      if (!historyService) {
+        throw new Error('Claude history service is not configured')
       }
-      const page = await timelineService.getTimelinePage({
+      const page = await historyService.getThreadTurnPage({
         sessionId: thread.threadId,
         cursor: typeof query.cursor === 'string' ? query.cursor : undefined,
         priority: typeof query.priority === 'string' ? query.priority as 'visible' | 'background' : undefined,
@@ -261,10 +261,10 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
     },
 
     async getTurnBody(thread, revision) {
-      if (!timelineService) {
-        throw new Error('Claude timeline service is not configured')
+      if (!historyService) {
+        throw new Error('Claude history service is not configured')
       }
-      const turn = await timelineService.getTurnBody({
+      const turn = await historyService.getTurnBody({
         sessionId: thread.threadId,
         turnId: thread.turnId,
         revision,

@@ -1,4 +1,6 @@
 // @vitest-environment node
+import fs from 'node:fs'
+import path from 'node:path'
 import express from 'express'
 import request from 'supertest'
 import { describe, expect, it, vi } from 'vitest'
@@ -7,6 +9,8 @@ import { createFreshAgentProviderRegistry } from '../../../server/fresh-agent/pr
 import { createFreshAgentRouter } from '../../../server/fresh-agent/router.js'
 import { FreshAgentRuntimeManager } from '../../../server/fresh-agent/runtime-manager.js'
 import type { FreshAgentRuntimeAdapter } from '../../../server/fresh-agent/runtime-adapter.js'
+
+const repoRoot = path.resolve(__dirname, '../../..')
 
 function createProductionFreshAgentRouteApp() {
   const adapter = {
@@ -56,6 +60,15 @@ function createProductionFreshAgentRouteApp() {
 }
 
 describe('fresh-agent removes legacy Claude history routes', () => {
+  it('does not register legacy agent-session routes in the production entrypoint', () => {
+    const source = fs.readFileSync(path.join(repoRoot, 'server/index.ts'), 'utf8')
+
+    expect(source).not.toContain('/api/agent-sessions')
+    expect(source).not.toContain('createAgentTimelineRouter')
+    expect(source).not.toContain('createAgentTimelineService')
+    expect(source).toMatch(/app\.use\('\/api', createFreshAgentRouter\(\{\s*runtimeManager: freshAgentRuntimeManager/)
+  })
+
   it('does not mount /api/agent-sessions routes while fresh-agent threads still resolve', async () => {
     const app = createProductionFreshAgentRouteApp()
 

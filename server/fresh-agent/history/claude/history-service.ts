@@ -10,15 +10,15 @@ import type {
   ClaudeFreshAgentHistoryTurn,
 } from './history-types.js'
 
-const DEFAULT_TIMELINE_LIMIT = 20
-const MAX_TIMELINE_LIMIT = MAX_FRESH_AGENT_THREAD_TURNS
+const DEFAULT_THREAD_TURN_LIMIT = 20
+const MAX_THREAD_TURN_LIMIT = MAX_FRESH_AGENT_THREAD_TURNS
 
-type TimelineCursorPayload = {
+type ThreadTurnCursorPayload = {
   offset: number
   revision: number
 }
 
-type TimelineMessageRecord = ClaudeFreshAgentHistoryCanonicalTurn & { sessionId: string }
+type HistoryMessageRecord = ClaudeFreshAgentHistoryCanonicalTurn & { sessionId: string }
 
 export type ClaudeFreshAgentHistorySnapshot = {
   sessionId: string
@@ -29,7 +29,7 @@ export type ClaudeFreshAgentHistorySnapshot = {
 
 export type ClaudeFreshAgentHistoryService = {
   getSnapshot: (query: { sessionId: string; revision?: number; signal?: AbortSignal }) => Promise<ClaudeFreshAgentHistorySnapshot>
-  getTimelinePage: (query: ClaudeFreshAgentHistoryPageQuery & { sessionId: string; signal?: AbortSignal }) => Promise<ClaudeFreshAgentHistoryPage>
+  getThreadTurnPage: (query: ClaudeFreshAgentHistoryPageQuery & { sessionId: string; signal?: AbortSignal }) => Promise<ClaudeFreshAgentHistoryPage>
   getTurnBody: (query: ClaudeFreshAgentHistoryTurnBodyQuery & { sessionId: string; turnId: string; signal?: AbortSignal }) => Promise<ClaudeFreshAgentHistoryTurn | null>
 }
 
@@ -43,7 +43,7 @@ export class ClaudeFreshAgentHistoryInvalidCursorError extends Error {
   }
 }
 
-export class ClaudeFreshAgentHistoryStaleRevisionError extends Error {
+export class ClaudeFreshAgentStaleHistoryRevisionError extends Error {
   code = 'RESTORE_STALE_REVISION' as const
 
   constructor(public readonly requestedRevision: number, public readonly actualRevision: number) {
@@ -60,13 +60,13 @@ export class ClaudeFreshAgentHistoryResolutionError extends Error {
   }
 }
 
-function encodeCursor(payload: TimelineCursorPayload): string {
+function encodeCursor(payload: ThreadTurnCursorPayload): string {
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
 }
 
-function decodeCursor(cursor: string): TimelineCursorPayload {
+function decodeCursor(cursor: string): ThreadTurnCursorPayload {
   try {
-    const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as Partial<TimelineCursorPayload>
+    const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as Partial<ThreadTurnCursorPayload>
     if (
       typeof parsed.offset !== 'number'
       || !Number.isInteger(parsed.offset)
@@ -97,7 +97,7 @@ function summarizeMessage(message: ChatMessage): string {
   return ''
 }
 
-function buildTimeline(turns: ClaudeFreshAgentHistoryCanonicalTurn[], sessionId: string): TimelineMessageRecord[] {
+function buildHistoryRecords(turns: ClaudeFreshAgentHistoryCanonicalTurn[], sessionId: string): HistoryMessageRecord[] {
   return turns
     .map((turn) => ({
       ...turn,
@@ -106,7 +106,7 @@ function buildTimeline(turns: ClaudeFreshAgentHistoryCanonicalTurn[], sessionId:
     .reverse()
 }
 
-function toTimelineItem(record: TimelineMessageRecord): ClaudeFreshAgentHistoryItem {
+function toHistoryItem(record: HistoryMessageRecord): ClaudeFreshAgentHistoryItem {
   return {
     turnId: record.turnId,
     messageId: record.messageId,
@@ -128,12 +128,12 @@ export function createClaudeFreshAgentHistoryService(
     }
   }
 
-  async function loadTimeline(queryId: string): Promise<{ sessionId: string, latestTurnId: string | null, revision: number, records: TimelineMessageRecord[] }> {
+  async function loadHistoryRecords(queryId: string): Promise<{ sessionId: string, latestTurnId: string | null, revision: number, records: HistoryMessageRecord[] }> {
     const resolved = await deps.agentHistorySource.resolve(queryId)
-    return buildResolvedTimeline(queryId, resolved)
+    return buildResolvedHistoryRecords(queryId, resolved)
   }
 
-  function buildResolvedTimeline(queryId: string, resolved: ClaudeFreshAgentHistoryRestoreResolution): { sessionId: string, latestTurnId: string | null, revision: number, records: TimelineMessageRecord[] } {
+  function buildResolvedHistoryRecords(queryId: string, resolved: ClaudeFreshAgentHistoryRestoreResolution): { sessionId: string, latestTurnId: string | null, revision: number, records: HistoryMessageRecord[] } {
     if (resolved.kind === 'missing') {
       throw new ClaudeFreshAgentHistoryResolutionError(resolved.code, 'Restore session not found')
     }
@@ -145,23 +145,23 @@ export function createClaudeFreshAgentHistoryService(
       sessionId,
       latestTurnId: resolved.latestTurnId,
       revision: resolved.revision,
-      records: buildTimeline(resolved.turns, sessionId),
+      records: buildHistoryRecords(resolved.turns, sessionId),
     }
   }
 
   return {
     async getSnapshot({ sessionId, revision, signal }) {
       throwIfAborted(signal)
-      const timeline = await loadTimeline(sessionId)
+      const history = await loadHistoryRecords(sessionId)
       throwIfAborted(signal)
-      if (revision != null && revision !== timeline.revision) {
-        throw new ClaudeFreshAgentHistoryStaleRevisionError(revision, timeline.revision)
+      if (revision != null && revision !== history.revision) {
+        throw new ClaudeFreshAgentStaleHistoryRevisionError(revision, history.revision)
       }
       return {
-        sessionId: timeline.sessionId,
-        latestTurnId: timeline.latestTurnId,
-        revision: timeline.revision,
-        turns: timeline.records
+        sessionId: history.sessionId,
+        latestTurnId: history.latestTurnId,
+        revision: history.revision,
+        turns: history.records
           .slice()
           .reverse()
           .map((record) => ({
@@ -174,38 +174,38 @@ export function createClaudeFreshAgentHistoryService(
       }
     },
 
-    async getTimelinePage(query) {
+    async getThreadTurnPage(query) {
       throwIfAborted(query.signal)
       if (query.revision == null) {
         throw new Error('Restore revision is required')
       }
-      const limit = Math.min(query.limit ?? DEFAULT_TIMELINE_LIMIT, MAX_TIMELINE_LIMIT)
+      const limit = Math.min(query.limit ?? DEFAULT_THREAD_TURN_LIMIT, MAX_THREAD_TURN_LIMIT)
       const cursor = query.cursor ? decodeCursor(query.cursor) : null
       const offset = cursor?.offset ?? 0
-      const timeline = await loadTimeline(query.sessionId)
+      const history = await loadHistoryRecords(query.sessionId)
       throwIfAborted(query.signal)
-      if (query.revision !== timeline.revision) {
-        throw new ClaudeFreshAgentHistoryStaleRevisionError(query.revision, timeline.revision)
+      if (query.revision !== history.revision) {
+        throw new ClaudeFreshAgentStaleHistoryRevisionError(query.revision, history.revision)
       }
-      if (cursor && cursor.revision !== timeline.revision) {
-        throw new ClaudeFreshAgentHistoryStaleRevisionError(cursor.revision, timeline.revision)
+      if (cursor && cursor.revision !== history.revision) {
+        throw new ClaudeFreshAgentStaleHistoryRevisionError(cursor.revision, history.revision)
       }
-      const pageItems = timeline.records.slice(offset, offset + limit)
+      const pageItems = history.records.slice(offset, offset + limit)
       const nextOffset = offset + pageItems.length
 
       const result: ClaudeFreshAgentHistoryPage = {
-        sessionId: timeline.sessionId,
-        latestTurnId: timeline.latestTurnId,
-        items: pageItems.map(toTimelineItem),
-        nextCursor: nextOffset < timeline.records.length ? encodeCursor({ offset: nextOffset, revision: timeline.revision }) : null,
-        revision: timeline.revision,
+        sessionId: history.sessionId,
+        latestTurnId: history.latestTurnId,
+        items: pageItems.map(toHistoryItem),
+        nextCursor: nextOffset < history.records.length ? encodeCursor({ offset: nextOffset, revision: history.revision }) : null,
+        revision: history.revision,
       }
 
       if (query.includeBodies) {
         const bodies: Record<string, ClaudeFreshAgentHistoryTurn> = {}
         for (const record of pageItems) {
           bodies[record.turnId] = {
-            sessionId: timeline.sessionId,
+            sessionId: history.sessionId,
             turnId: record.turnId,
             messageId: record.messageId,
             ordinal: record.ordinal,
@@ -223,15 +223,15 @@ export function createClaudeFreshAgentHistoryService(
       if (revision == null) {
         throw new Error('Restore revision is required')
       }
-      const timeline = await loadTimeline(sessionId)
-      if (revision !== timeline.revision) {
-        throw new ClaudeFreshAgentHistoryStaleRevisionError(revision, timeline.revision)
+      const history = await loadHistoryRecords(sessionId)
+      if (revision !== history.revision) {
+        throw new ClaudeFreshAgentStaleHistoryRevisionError(revision, history.revision)
       }
-      const match = timeline.records.find((record) => record.turnId === turnId)
+      const match = history.records.find((record) => record.turnId === turnId)
       if (!match) return null
 
       return {
-        sessionId: timeline.sessionId,
+        sessionId: history.sessionId,
         turnId,
         messageId: match.messageId,
         ordinal: match.ordinal,

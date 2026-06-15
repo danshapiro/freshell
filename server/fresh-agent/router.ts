@@ -18,7 +18,7 @@ import {
 import {
   ClaudeFreshAgentHistoryInvalidCursorError,
   ClaudeFreshAgentHistoryResolutionError,
-  ClaudeFreshAgentHistoryStaleRevisionError,
+  ClaudeFreshAgentStaleHistoryRevisionError,
 } from './history/claude/history-service.js'
 import { createRequestAbortSignal } from '../read-models/request-abort.js'
 import { setResponsePerfContext } from '../request-logger.js'
@@ -88,7 +88,7 @@ export function createFreshAgentRouter(deps: {
   }
 
   function sendFreshAgentError(res: any, error: unknown, options?: { sessionId?: string }) {
-    if (error instanceof ClaudeFreshAgentHistoryStaleRevisionError) {
+    if (error instanceof ClaudeFreshAgentStaleHistoryRevisionError) {
       return res.status(409).json({
         error: 'Stale restore revision',
         code: error.code,

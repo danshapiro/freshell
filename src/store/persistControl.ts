@@ -67,7 +67,7 @@ export function buildTerminalDurableSessionRefUpdate({
 }
 
 type SessionIdentityState = {
-  timelineSessionId?: string
+  historySessionId?: string
   cliSessionId?: string
 } | undefined
 
@@ -80,7 +80,7 @@ type LegacyAgentChatPersistedIdentityContent = Record<string, unknown> & {
 
 export function getPreferredResumeSessionId(session: SessionIdentityState): string | undefined {
   return getCanonicalDurableSessionId(session)
-    ?? session?.timelineSessionId
+    ?? session?.historySessionId
     ?? session?.cliSessionId
 }
 
@@ -88,8 +88,8 @@ export function getCanonicalDurableSessionId(session: SessionIdentityState): str
   if (isValidClaudeSessionId(session?.cliSessionId)) {
     return session.cliSessionId
   }
-  if (isValidClaudeSessionId(session?.timelineSessionId)) {
-    return session.timelineSessionId
+  if (isValidClaudeSessionId(session?.historySessionId)) {
+    return session.historySessionId
   }
   return undefined
 }
