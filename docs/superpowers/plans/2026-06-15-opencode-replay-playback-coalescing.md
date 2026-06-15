@@ -90,6 +90,7 @@ it('preserves parser barrier checkpoints while allowing terminal.output.batch wr
     if (onWritten) delayedCallbacks.push({ data: chunk, callback: onWritten })
   })
 
+  rafCallbacks.length = 0
   act(() => {
     messageHandler!({
       type: 'terminal.output.batch',
@@ -165,6 +166,7 @@ it('does not checkpoint across a stripped middle batch segment when adjacent ren
     if (onWritten) delayedCallbacks.push({ data: chunk, callback: onWritten })
   })
 
+  rafCallbacks.length = 0
   act(() => {
     messageHandler!({
       type: 'terminal.output.batch',
@@ -513,10 +515,9 @@ type TerminalSnapshot = {
 }
 
 function createOpenCodeLikeReplay(seqBase: number) {
+  const marker = '__FRESHELL_REPLAY_PROGRESS__'
   const chunks = Array.from({ length: 96 }, (_unused, index) => (
-    index % 2 === 0
-      ? `\x1b[${30 + (index % 8)}m`
-      : `tok${index.toString().padStart(2, '0')}`
+    `\x1b[${30 + (index % 8)}m${marker}${index.toString().padStart(2, '0')}`
   ))
   const data = chunks.join('')
   const segments = chunks.map((chunk, index) => ({
@@ -526,7 +527,7 @@ function createOpenCodeLikeReplay(seqBase: number) {
     rawFrameCount: 1,
     barrier: 'control',
   }))
-  return { chunks, data, segments }
+  return { chunks, data, marker, segments }
 }
 
 test.describe('OpenCode replay write progression', () => {
@@ -588,7 +589,7 @@ test.describe('OpenCode replay write progression', () => {
         .filter((event) =>
           event.phase === 'submitted'
           && event.terminalId === snapshot.terminalId
-          && replay.data.includes(event.data)
+          && event.data.includes(replay.marker)
         )
       return submitted.map((event) => event.data).join('')
     }, { timeout: 15_000 }).toBe(replay.data)
@@ -597,7 +598,7 @@ test.describe('OpenCode replay write progression', () => {
       .filter((event) =>
         event.phase === 'submitted'
         && event.terminalId === snapshot.terminalId
-        && replay.data.includes(event.data)
+        && event.data.includes(replay.marker)
       )
     expect(submitted.length).toBeLessThanOrEqual(2)
 
@@ -606,7 +607,7 @@ test.describe('OpenCode replay write progression', () => {
         .filter((event) =>
           event.phase === 'written'
           && event.terminalId === snapshot.terminalId
-          && replay.data.includes(event.data)
+          && event.data.includes(replay.marker)
         )
       return written.map((event) => event.data).join('')
     }, { timeout: 15_000 }).toBe(replay.data)
