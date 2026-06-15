@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   api,
-  getAgentChatCapabilities,
-  refreshAgentChatCapabilities,
+  getFreshAgentModelCapabilities,
+  refreshFreshAgentModelCapabilities,
   getFreshAgentThreadSnapshot,
   getFreshAgentTurnBody,
   getFreshAgentTurnPage,
@@ -151,6 +151,10 @@ describe('visible-first read-model helpers', () => {
     mockFetch
       .mockResolvedValueOnce(mockJsonResponse(503, {
         ok: false,
+        sessionType: 'freshclaude',
+        runtimeProvider: 'claude',
+        status: 'unavailable',
+        models: [],
         error: {
           code: 'CAPABILITY_PROBE_FAILED',
           message: 'Probe failed upstream',
@@ -159,6 +163,10 @@ describe('visible-first read-model helpers', () => {
       }))
       .mockResolvedValueOnce(mockJsonResponse(503, {
         ok: false,
+        sessionType: 'freshclaude',
+        runtimeProvider: 'claude',
+        status: 'unavailable',
+        models: [],
         error: {
           code: 'CAPABILITY_PAYLOAD_INVALID',
           message: 'Capability payload invalid',
@@ -166,22 +174,43 @@ describe('visible-first read-model helpers', () => {
         },
       }))
 
-    await expect(getAgentChatCapabilities('freshclaude')).resolves.toEqual({
+    await expect(getFreshAgentModelCapabilities('freshclaude')).resolves.toEqual({
       ok: false,
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'unavailable',
+      models: [],
       error: {
         code: 'CAPABILITY_PROBE_FAILED',
         message: 'Probe failed upstream',
         retryable: true,
       },
     })
-    await expect(refreshAgentChatCapabilities('freshclaude')).resolves.toEqual({
+    await expect(refreshFreshAgentModelCapabilities('freshclaude')).resolves.toEqual({
       ok: false,
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'unavailable',
+      models: [],
       error: {
         code: 'CAPABILITY_PAYLOAD_INVALID',
         message: 'Capability payload invalid',
         retryable: false,
       },
     })
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      1,
+      '/api/fresh-agent/model-capabilities/freshclaude',
+      expect.objectContaining({ headers: expect.any(Headers) }),
+    )
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      2,
+      '/api/fresh-agent/model-capabilities/freshclaude/refresh',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.any(Headers),
+      }),
+    )
   })
 
   it('fresh-agent helpers target the fresh-agent route family and pin provider, revision, and cursor', async () => {

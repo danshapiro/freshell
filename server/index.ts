@@ -57,8 +57,8 @@ import { SessionAssociationCoordinator } from './session-association-coordinator
 import { broadcastTerminalSessionAssociation } from './session-association-broadcast.js'
 import { collectAppliedSessionAssociations } from './session-association-updates.js'
 import { loadOrCreateServerInstanceId } from './instance-id.js'
-import { createAgentChatCapabilitiesRouter } from './agent-chat-capabilities-router.js'
-import { AgentChatCapabilityRegistry } from './agent-chat-capability-registry.js'
+import { createFreshAgentModelCapabilitiesRouter } from './fresh-agent/model-capabilities-router.js'
+import { FreshAgentModelCapabilityRegistry } from './fresh-agent/model-capability-registry.js'
 import { createSettingsRouter } from './settings-router.js'
 import { createPerfRouter } from './perf-router.js'
 import { createAiRouter } from './ai-router.js'
@@ -212,7 +212,7 @@ async function main() {
 
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
   await runCodexStartupReaper({ serverInstanceId })
-  const agentChatCapabilityRegistry = new AgentChatCapabilityRegistry()
+  const freshAgentModelCapabilityRegistry = new FreshAgentModelCapabilityRegistry()
 
   let sdkBridge: SdkBridge
 
@@ -574,8 +574,8 @@ async function main() {
     applyDebugLogging,
     validCliProviders: allCliNames,
   }))
-  app.use('/api/agent-chat/capabilities', createAgentChatCapabilitiesRouter({
-    registry: agentChatCapabilityRegistry,
+  app.use('/api/fresh-agent/model-capabilities', createFreshAgentModelCapabilitiesRouter({
+    registry: freshAgentModelCapabilityRegistry,
   }))
 
   // --- Network management endpoints ---

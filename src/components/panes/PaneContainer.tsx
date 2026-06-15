@@ -35,7 +35,7 @@ import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import type { FreshAgentPendingCreate, FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
-import { normalizeAgentChatEffortOverride, normalizeAgentChatModelSelection } from '@/store/paneTypes'
+import { normalizeFreshAgentEffortOverride, normalizeFreshAgentModelSelection } from '@/store/paneTypes'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import {
   clearPendingCreate as clearFreshAgentPendingCreate,
@@ -610,7 +610,7 @@ function PickerWrapper({
         provider: freshAgentType.runtimeProvider,
         createRequestId: nanoid(),
         status: 'creating',
-        modelSelection: normalizeAgentChatModelSelection(providerSettings?.modelSelection),
+        modelSelection: normalizeFreshAgentModelSelection(providerSettings?.modelSelection),
         model,
         ...(permissionMode ? { permissionMode } : {}),
         sandbox: freshAgentType.runtimeProvider === 'codex'
@@ -620,7 +620,7 @@ function PickerWrapper({
           freshAgentType.sessionType,
           freshAgentType.runtimeProvider,
           model,
-          normalizeAgentChatEffortOverride(providerSettings?.effort) ?? freshAgentType.defaultEffort,
+          normalizeFreshAgentEffortOverride(providerSettings?.effort) ?? freshAgentType.defaultEffort,
         ) ?? freshAgentType.defaultEffort,
         plugins: freshAgentType.runtimeProvider === 'claude' ? agentChatSettings?.defaultPlugins : undefined,
         style: providerSettings?.style ?? DEFAULT_FRESH_AGENT_STYLE,

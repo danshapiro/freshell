@@ -1,35 +1,39 @@
 import type {
-  AgentChatCapabilities,
-  AgentChatExactModelSelection,
-  AgentChatModelCapability,
-  AgentChatModelSelection,
-} from '@shared/agent-chat-capabilities'
-import { AGENT_CHAT_CAPABILITY_CACHE_TTL_MS as AGENT_CHAT_CAPABILITY_CACHE_TTL_MS_VALUE } from '@shared/agent-chat-capabilities'
+  FreshAgentModelCapabilities,
+  FreshAgentExactModelSelection,
+  FreshAgentModelCapability,
+  FreshAgentModelCapabilitiesResponse,
+  FreshAgentModelSelection,
+} from '@shared/fresh-agent-model-capabilities'
+import {
+  FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS as FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS_VALUE,
+  FreshAgentModelCapabilitiesResponseSchema,
+} from '@shared/fresh-agent-model-capabilities'
 
-export const AGENT_CHAT_CAPABILITY_CACHE_TTL_MS = AGENT_CHAT_CAPABILITY_CACHE_TTL_MS_VALUE
+export const FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS = FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS_VALUE
 
-const AGENT_CHAT_MODEL_SELECTION_OPTION_VALUE_PREFIX = '__agent_chat_selection__:'
+const FRESH_AGENT_MODEL_SELECTION_OPTION_VALUE_PREFIX = '__agent_chat_selection__:'
 
-type EncodedAgentChatSettingsModelValue =
+type EncodedFreshAgentSettingsModelValue =
   | { kind: 'provider-default' }
-  | AgentChatModelSelection
+  | FreshAgentModelSelection
 
-function encodeAgentChatSettingsModelValue(
-  value: EncodedAgentChatSettingsModelValue,
+function encodeFreshAgentSettingsModelValue(
+  value: EncodedFreshAgentSettingsModelValue,
 ): string {
-  return `${AGENT_CHAT_MODEL_SELECTION_OPTION_VALUE_PREFIX}${encodeURIComponent(JSON.stringify(value))}`
+  return `${FRESH_AGENT_MODEL_SELECTION_OPTION_VALUE_PREFIX}${encodeURIComponent(JSON.stringify(value))}`
 }
 
-function decodeAgentChatSettingsModelValue(
+function decodeFreshAgentSettingsModelValue(
   value: string,
-): EncodedAgentChatSettingsModelValue | undefined {
-  if (!value.startsWith(AGENT_CHAT_MODEL_SELECTION_OPTION_VALUE_PREFIX)) {
+): EncodedFreshAgentSettingsModelValue | undefined {
+  if (!value.startsWith(FRESH_AGENT_MODEL_SELECTION_OPTION_VALUE_PREFIX)) {
     return undefined
   }
 
   try {
     const parsed = JSON.parse(
-      decodeURIComponent(value.slice(AGENT_CHAT_MODEL_SELECTION_OPTION_VALUE_PREFIX.length)),
+      decodeURIComponent(value.slice(FRESH_AGENT_MODEL_SELECTION_OPTION_VALUE_PREFIX.length)),
     ) as unknown
     if (!parsed || typeof parsed !== 'object' || !('kind' in parsed)) {
       return undefined
@@ -56,68 +60,68 @@ function decodeAgentChatSettingsModelValue(
   return undefined
 }
 
-export const AGENT_CHAT_PROVIDER_DEFAULT_OPTION_VALUE = encodeAgentChatSettingsModelValue({
+export const FRESH_AGENT_PROVIDER_DEFAULT_MODEL_OPTION_VALUE = encodeFreshAgentSettingsModelValue({
   kind: 'provider-default',
 })
 
-export type AgentChatSettingsModelOption = {
+export type FreshAgentSettingsModelOption = {
   value: string
   label: string
   description?: string
   unavailable?: boolean
 }
 
-export type ResolvedAgentChatModelSelection =
+export type ResolvedFreshAgentModelSelection =
   | {
       source: 'provider-default'
       resolvedModelId: string
-      capability?: AgentChatModelCapability
+      capability?: FreshAgentModelCapability
       unavailableExactSelection?: undefined
     }
   | {
       source: 'tracked'
       resolvedModelId: string
-      capability?: AgentChatModelCapability
+      capability?: FreshAgentModelCapability
       unavailableExactSelection?: undefined
     }
   | {
       source: 'exact'
       resolvedModelId: string
-      capability: AgentChatModelCapability
+      capability: FreshAgentModelCapability
       unavailableExactSelection?: undefined
     }
   | {
       source: 'exact'
       resolvedModelId?: undefined
       capability?: undefined
-      unavailableExactSelection: AgentChatExactModelSelection
+      unavailableExactSelection: FreshAgentExactModelSelection
     }
 
-type ResolveAgentChatModelSelectionArgs = {
+type ResolveFreshAgentModelSelectionArgs = {
   providerDefaultModelId: string
-  capabilities?: AgentChatCapabilities
-  modelSelection?: AgentChatModelSelection
+  capabilities?: FreshAgentModelCapabilities
+  modelSelection?: FreshAgentModelSelection
 }
 
-export function getAgentChatModelCapability(
-  capabilities: AgentChatCapabilities | undefined,
+export function getFreshAgentModelCapability(
+  capabilities: FreshAgentModelCapabilities | undefined,
   modelId: string,
-): AgentChatModelCapability | undefined {
+): FreshAgentModelCapability | undefined {
   return capabilities?.models.find((model) => model.id === modelId)
 }
 
-export function resolveAgentChatModelSelection(
-  args: ResolveAgentChatModelSelectionArgs,
-): ResolvedAgentChatModelSelection {
+export function resolveFreshAgentModelSelection(
+  args: ResolveFreshAgentModelSelectionArgs,
+): ResolvedFreshAgentModelSelection {
   if (!args.modelSelection) {
     return {
       source: 'provider-default',
       resolvedModelId: args.providerDefaultModelId,
-      capability: getAgentChatModelCapability(args.capabilities, args.providerDefaultModelId),
+      capability: getFreshAgentModelCapability(args.capabilities, args.providerDefaultModelId),
     }
   }
 
-  const capability = getAgentChatModelCapability(args.capabilities, args.modelSelection.modelId)
+  const capability = getFreshAgentModelCapability(args.capabilities, args.modelSelection.modelId)
   if (args.modelSelection.kind === 'tracked') {
     return {
       source: 'tracked',
@@ -141,45 +145,51 @@ export function resolveAgentChatModelSelection(
   }
 }
 
-export function getAgentChatSupportedEffortLevels(
-  args: ResolveAgentChatModelSelectionArgs,
-): string[] {
-  return resolveAgentChatModelSelection(args).capability?.supportedEffortLevels ?? []
+export function parseFreshAgentModelCapabilitiesResponse(
+  value: unknown,
+): FreshAgentModelCapabilitiesResponse {
+  return FreshAgentModelCapabilitiesResponseSchema.parse(value)
 }
 
-export function isAgentChatCapabilitiesFresh(
-  capabilities: AgentChatCapabilities | undefined,
+export function getFreshAgentSupportedEffortLevels(
+  args: ResolveFreshAgentModelSelectionArgs,
+): string[] {
+  return resolveFreshAgentModelSelection(args).capability?.supportedEffortLevels ?? []
+}
+
+export function isFreshAgentModelCapabilitiesFresh(
+  capabilities: FreshAgentModelCapabilities | undefined,
   now: number = Date.now(),
-  ttlMs: number = AGENT_CHAT_CAPABILITY_CACHE_TTL_MS,
+  ttlMs: number = FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS,
 ): boolean {
   return Boolean(capabilities && now - capabilities.fetchedAt <= ttlMs)
 }
 
-export function getAgentChatSettingsModelValue(
-  modelSelection: AgentChatModelSelection | undefined,
-  capabilities?: AgentChatCapabilities,
+export function getFreshAgentSettingsModelValue(
+  modelSelection: FreshAgentModelSelection | undefined,
+  capabilities?: FreshAgentModelCapabilities,
 ): string {
   if (!modelSelection) {
-    return AGENT_CHAT_PROVIDER_DEFAULT_OPTION_VALUE
+    return FRESH_AGENT_PROVIDER_DEFAULT_MODEL_OPTION_VALUE
   }
 
   if (
     modelSelection.kind === 'exact'
-    && !getAgentChatModelCapability(capabilities, modelSelection.modelId)
+    && !getFreshAgentModelCapability(capabilities, modelSelection.modelId)
   ) {
-    return encodeAgentChatSettingsModelValue(modelSelection)
+    return encodeFreshAgentSettingsModelValue(modelSelection)
   }
 
-  return encodeAgentChatSettingsModelValue({
+  return encodeFreshAgentSettingsModelValue({
     kind: 'tracked',
     modelId: modelSelection.modelId,
   })
 }
 
-export function parseAgentChatSettingsModelValue(
+export function parseFreshAgentSettingsModelValue(
   value: string,
-): AgentChatModelSelection | undefined {
-  const decoded = decodeAgentChatSettingsModelValue(value)
+): FreshAgentModelSelection | undefined {
+  const decoded = decodeFreshAgentSettingsModelValue(value)
   if (decoded) {
     if (decoded.kind === 'provider-default') {
       return undefined
@@ -197,15 +207,15 @@ export function parseAgentChatSettingsModelValue(
   }
 }
 
-export function requiresAgentChatCapabilityValidation(args: {
-  modelSelection?: AgentChatModelSelection
+export function requiresFreshAgentModelCapabilityValidation(args: {
+  modelSelection?: FreshAgentModelSelection
   effort?: string
 }): boolean {
   return Boolean(args.effort) || args.modelSelection?.kind === 'exact'
 }
 
-export function isAgentChatEffortSupported(
-  capability: AgentChatModelCapability | undefined,
+export function isFreshAgentEffortSupported(
+  capability: FreshAgentModelCapability | undefined,
   effort: string | undefined,
 ): boolean {
   return Boolean(
@@ -215,8 +225,8 @@ export function isAgentChatEffortSupported(
   )
 }
 
-export function getAgentChatModelOptions(
-  capabilities: AgentChatCapabilities | undefined,
+export function getFreshAgentModelOptions(
+  capabilities: FreshAgentModelCapabilities | undefined,
 ): Array<{ value: string; displayName: string; description?: string }> | undefined {
   const options = capabilities?.models.map((model) => ({
     value: model.id,
@@ -227,24 +237,24 @@ export function getAgentChatModelOptions(
   return options.length > 0 ? options : undefined
 }
 
-export function getAgentChatSettingsModelOptions(args: ResolveAgentChatModelSelectionArgs): AgentChatSettingsModelOption[] {
-  const options: AgentChatSettingsModelOption[] = [
+export function getFreshAgentSettingsModelOptions(args: ResolveFreshAgentModelSelectionArgs): FreshAgentSettingsModelOption[] {
+  const options: FreshAgentSettingsModelOption[] = [
     {
-      value: AGENT_CHAT_PROVIDER_DEFAULT_OPTION_VALUE,
+      value: FRESH_AGENT_PROVIDER_DEFAULT_MODEL_OPTION_VALUE,
       label: 'Provider default (track latest Opus)',
       description: 'Tracks latest Opus automatically.',
     },
     ...(args.capabilities?.models.map((model) => ({
-      value: getAgentChatSettingsModelValue({ kind: 'tracked', modelId: model.id }),
+      value: getFreshAgentSettingsModelValue({ kind: 'tracked', modelId: model.id }),
       label: model.displayName,
       description: model.description,
     })) ?? []),
   ]
 
-  const resolvedSelection = resolveAgentChatModelSelection(args)
+  const resolvedSelection = resolveFreshAgentModelSelection(args)
   if (resolvedSelection.source === 'tracked' && !resolvedSelection.capability) {
     options.push({
-      value: getAgentChatSettingsModelValue({
+      value: getFreshAgentSettingsModelValue({
         kind: 'tracked',
         modelId: resolvedSelection.resolvedModelId,
       }),
@@ -255,7 +265,7 @@ export function getAgentChatSettingsModelOptions(args: ResolveAgentChatModelSele
 
   if (resolvedSelection.unavailableExactSelection) {
     options.push({
-      value: getAgentChatSettingsModelValue(
+      value: getFreshAgentSettingsModelValue(
         resolvedSelection.unavailableExactSelection,
         args.capabilities,
       ),

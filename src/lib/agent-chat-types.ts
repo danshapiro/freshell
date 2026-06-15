@@ -1,11 +1,11 @@
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
-import type { AgentChatModelSelection } from '@shared/agent-chat-capabilities'
+import type { FreshAgentModelSelection } from '@shared/fresh-agent-model-capabilities'
 import type { FreshAgentSessionType } from '@shared/fresh-agent'
 
 export type AgentChatProviderName = Extract<FreshAgentSessionType, 'freshclaude' | 'kilroy'>
 
 export type AgentChatProviderSettings = {
-  modelSelection?: AgentChatModelSelection
+  modelSelection?: FreshAgentModelSelection
   defaultPermissionMode?: string
   effort?: string
 }

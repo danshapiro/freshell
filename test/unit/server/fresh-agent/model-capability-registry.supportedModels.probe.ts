@@ -1,11 +1,11 @@
 import { query } from '@anthropic-ai/claude-agent-sdk'
 import { pathToFileURL } from 'node:url'
 
-import { AgentChatCapabilitiesSchema } from '../../../shared/agent-chat-capabilities.js'
+import { FreshAgentModelCapabilitiesSchema } from '../../../../shared/fresh-agent-model-capabilities.js'
 import {
-  normalizeAgentChatCapabilityCatalog,
-} from '../../../server/agent-chat-capability-registry.js'
-import { createClaudeSdkOptions } from '../../../server/sdk-bridge.js'
+  normalizeFreshAgentModelCapabilityCatalog,
+} from '../../../../server/fresh-agent/model-capability-registry.js'
+import { createClaudeSdkOptions } from '../../../../server/sdk-bridge.js'
 
 const PROBE_ENV = 'FRESHELL_RUN_LIVE_SUPPORTED_MODELS_PROBE'
 const PROBE_TIMEOUT_MS = 10_000
@@ -29,9 +29,11 @@ export async function runLiveSupportedModelsProbe() {
       }),
     ])
 
-    const normalizedModels = normalizeAgentChatCapabilityCatalog(rawModels)
-    const parsed = AgentChatCapabilitiesSchema.parse({
-      provider: 'freshclaude',
+    const normalizedModels = normalizeFreshAgentModelCapabilityCatalog(rawModels)
+    const parsed = FreshAgentModelCapabilitiesSchema.parse({
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
       fetchedAt: Date.now(),
       models: normalizedModels,
     })

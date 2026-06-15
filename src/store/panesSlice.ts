@@ -1,8 +1,8 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import { nanoid } from 'nanoid'
 import {
-  normalizeAgentChatEffortOverride,
-  normalizeAgentChatModelSelection,
+  normalizeFreshAgentEffortOverride,
+  normalizeFreshAgentModelSelection,
   type LivePaneContentInput,
   type PanesState,
   type PaneContent,
@@ -110,14 +110,14 @@ function normalizePaneContent(
         restoreError: existingRestoreError,
         initialCwd: input.initialCwd,
         createError: input.createError,
-        modelSelection: normalizeAgentChatModelSelection(
+        modelSelection: normalizeFreshAgentModelSelection(
           (input as { modelSelection?: unknown }).modelSelection,
           (input as { model?: unknown }).model,
         ),
         model: input.model,
         permissionMode: input.permissionMode,
         sandbox: input.sandbox,
-        effort: normalizeAgentChatEffortOverride(input.effort),
+        effort: normalizeFreshAgentEffortOverride(input.effort),
         plugins: input.plugins,
         ...(style ? { style } : {}),
         settingsDismissed: input.settingsDismissed,
@@ -151,14 +151,14 @@ function normalizePaneContent(
       ...('restoreError' in durableState && durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
       initialCwd: input.initialCwd,
       createError: input.createError,
-      modelSelection: normalizeAgentChatModelSelection(
+      modelSelection: normalizeFreshAgentModelSelection(
         (input as { modelSelection?: unknown }).modelSelection,
         (input as { model?: unknown }).model,
       ),
       model: input.model,
       permissionMode: input.permissionMode,
       sandbox: input.sandbox,
-      effort: normalizeAgentChatEffortOverride(input.effort),
+      effort: normalizeFreshAgentEffortOverride(input.effort),
       plugins: input.plugins,
       ...(style ? { style } : {}),
       settingsDismissed: input.settingsDismissed,

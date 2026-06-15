@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { AgentChatCapabilityRegistry } from '../../../server/agent-chat-capability-registry.js'
+import { FreshAgentModelCapabilityRegistry } from '../../../../server/fresh-agent/model-capability-registry.js'
 
-describe('AgentChatCapabilityRegistry', () => {
+describe('FreshAgentModelCapabilityRegistry', () => {
   let now = 1_000
   let closeMock: ReturnType<typeof vi.fn>
   let supportedModelsMock: ReturnType<typeof vi.fn>
@@ -35,7 +35,7 @@ describe('AgentChatCapabilityRegistry', () => {
       },
     ])
 
-    const registry = new AgentChatCapabilityRegistry({
+    const registry = new FreshAgentModelCapabilityRegistry({
       queryFactory,
       now: () => now,
       ttlMs: 5_000,
@@ -47,28 +47,30 @@ describe('AgentChatCapabilityRegistry', () => {
     expect(closeMock).toHaveBeenCalledTimes(1)
     expect(result).toEqual({
       ok: true,
-      capabilities: {
-        provider: 'freshclaude',
-        fetchedAt: 1_000,
-        models: [
-          {
-            id: 'opus',
-            displayName: 'Opus',
-            description: 'Primary track',
-            supportsEffort: true,
-            supportedEffortLevels: ['low', 'medium'],
-            supportsAdaptiveThinking: true,
-          },
-          {
-            id: 'haiku',
-            displayName: 'Haiku',
-            description: undefined,
-            supportsEffort: false,
-            supportedEffortLevels: [],
-            supportsAdaptiveThinking: false,
-          },
-        ],
-      },
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 1_000,
+      models: [
+        {
+          id: 'opus',
+          displayName: 'Opus',
+          provider: 'claude',
+          description: 'Primary track',
+          supportsEffort: true,
+          supportedEffortLevels: ['low', 'medium'],
+          supportsAdaptiveThinking: true,
+        },
+        {
+          id: 'haiku',
+          displayName: 'Haiku',
+          provider: 'claude',
+          description: undefined,
+          supportsEffort: false,
+          supportedEffortLevels: [],
+          supportsAdaptiveThinking: false,
+        },
+      ],
     })
   })
 
@@ -90,7 +92,7 @@ describe('AgentChatCapabilityRegistry', () => {
       },
     ])
 
-    const registry = new AgentChatCapabilityRegistry({
+    const registry = new FreshAgentModelCapabilityRegistry({
       queryFactory,
       now: () => now,
       ttlMs: 5_000,
@@ -100,28 +102,30 @@ describe('AgentChatCapabilityRegistry', () => {
 
     expect(result).toEqual({
       ok: true,
-      capabilities: {
-        provider: 'freshclaude',
-        fetchedAt: 1_000,
-        models: [
-          {
-            id: 'opus',
-            displayName: 'Opus',
-            description: undefined,
-            supportsEffort: true,
-            supportedEffortLevels: ['turbo'],
-            supportsAdaptiveThinking: true,
-          },
-          {
-            id: 'haiku',
-            displayName: 'Haiku',
-            description: undefined,
-            supportsEffort: false,
-            supportedEffortLevels: [],
-            supportsAdaptiveThinking: false,
-          },
-        ],
-      },
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 1_000,
+      models: [
+        {
+          id: 'opus',
+          displayName: 'Opus',
+          provider: 'claude',
+          description: undefined,
+          supportsEffort: true,
+          supportedEffortLevels: ['turbo'],
+          supportsAdaptiveThinking: true,
+        },
+        {
+          id: 'haiku',
+          displayName: 'Haiku',
+          provider: 'claude',
+          description: undefined,
+          supportsEffort: false,
+          supportedEffortLevels: [],
+          supportsAdaptiveThinking: false,
+        },
+      ],
     })
     expect(closeMock).toHaveBeenCalledTimes(1)
   })
@@ -132,7 +136,7 @@ describe('AgentChatCapabilityRegistry', () => {
       resolveProbe = resolve
     }))
 
-    const registry = new AgentChatCapabilityRegistry({
+    const registry = new FreshAgentModelCapabilityRegistry({
       queryFactory,
       now: () => now,
       ttlMs: 5_000,
@@ -153,8 +157,8 @@ describe('AgentChatCapabilityRegistry', () => {
     ])
 
     const [first, second] = await Promise.all([pendingA, pendingB])
-    expect(first).toMatchObject({ ok: true, capabilities: { provider: 'freshclaude' } })
-    expect(second).toMatchObject({ ok: true, capabilities: { provider: 'kilroy' } })
+    expect(first).toMatchObject({ ok: true, sessionType: 'freshclaude', runtimeProvider: 'claude' })
+    expect(second).toMatchObject({ ok: true, sessionType: 'kilroy', runtimeProvider: 'claude' })
 
     await registry.getCapabilities('freshclaude')
     expect(queryFactory).toHaveBeenCalledTimes(1)
@@ -174,10 +178,36 @@ describe('AgentChatCapabilityRegistry', () => {
     expect(queryFactory).toHaveBeenCalledTimes(2)
     expect(refreshed).toMatchObject({
       ok: true,
-      capabilities: {
-        provider: 'freshclaude',
-        models: [{ id: 'haiku' }],
-      },
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      models: [{ id: 'haiku' }],
+    })
+  })
+
+  it('serves non-Claude fresh-agent catalogs without reusing the Claude probe cache', async () => {
+    const registry = new FreshAgentModelCapabilityRegistry({
+      queryFactory,
+      now: () => now,
+      ttlMs: 5_000,
+    })
+
+    const codex = await registry.getCapabilities('freshcodex')
+    const opencode = await registry.getCapabilities('freshopencode')
+
+    expect(queryFactory).not.toHaveBeenCalled()
+    expect(codex).toMatchObject({
+      ok: true,
+      sessionType: 'freshcodex',
+      runtimeProvider: 'codex',
+      status: 'fresh',
+      models: expect.arrayContaining([expect.objectContaining({ provider: 'codex' })]),
+    })
+    expect(opencode).toMatchObject({
+      ok: true,
+      sessionType: 'freshopencode',
+      runtimeProvider: 'opencode',
+      status: 'fresh',
+      models: expect.arrayContaining([expect.objectContaining({ provider: 'opencode' })]),
     })
   })
 
@@ -191,7 +221,7 @@ describe('AgentChatCapabilityRegistry', () => {
       },
     ])
 
-    const registry = new AgentChatCapabilityRegistry({
+    const registry = new FreshAgentModelCapabilityRegistry({
       queryFactory,
       now: () => now,
       ttlMs: 5_000,
@@ -200,7 +230,7 @@ describe('AgentChatCapabilityRegistry', () => {
     const first = await registry.getCapabilities('freshclaude')
     expect(first).toMatchObject({
       ok: true,
-      capabilities: { models: [{ id: 'opus' }] },
+      models: [{ id: 'opus' }],
     })
 
     supportedModelsMock.mockRejectedValueOnce(new Error('probe failed'))
@@ -208,6 +238,10 @@ describe('AgentChatCapabilityRegistry', () => {
     const refresh = await registry.refreshCapabilities('freshclaude')
     expect(refresh).toEqual({
       ok: false,
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'unavailable',
+      models: [],
       error: {
         code: 'CAPABILITY_PROBE_FAILED',
         message: 'probe failed',
@@ -218,7 +252,7 @@ describe('AgentChatCapabilityRegistry', () => {
     const cached = await registry.getCapabilities('freshclaude')
     expect(cached).toMatchObject({
       ok: true,
-      capabilities: { models: [{ id: 'opus' }] },
+      models: [{ id: 'opus' }],
     })
   })
 
@@ -227,7 +261,7 @@ describe('AgentChatCapabilityRegistry', () => {
     try {
       supportedModelsMock.mockImplementation(() => new Promise(() => {}))
 
-      const registry = new AgentChatCapabilityRegistry({
+      const registry = new FreshAgentModelCapabilityRegistry({
         queryFactory,
         now: () => now,
         ttlMs: 5_000,
@@ -239,6 +273,10 @@ describe('AgentChatCapabilityRegistry', () => {
 
       await expect(timedOut).resolves.toEqual({
         ok: false,
+        sessionType: 'freshclaude',
+        runtimeProvider: 'claude',
+        status: 'unavailable',
+        models: [],
         error: {
           code: 'CAPABILITY_PROBE_FAILED',
           message: 'Capability probe timed out after 100ms',
@@ -265,10 +303,9 @@ describe('AgentChatCapabilityRegistry', () => {
       expect(queryFactory).toHaveBeenCalledTimes(2)
       expect(retried).toMatchObject({
         ok: true,
-        capabilities: {
-          provider: 'freshclaude',
-          models: [{ id: 'haiku' }],
-        },
+        sessionType: 'freshclaude',
+        runtimeProvider: 'claude',
+        models: [{ id: 'haiku' }],
       })
     } finally {
       vi.useRealTimers()
@@ -283,7 +320,7 @@ describe('AgentChatCapabilityRegistry', () => {
       },
     ])
 
-    const registry = new AgentChatCapabilityRegistry({
+    const registry = new FreshAgentModelCapabilityRegistry({
       queryFactory,
       now: () => now,
       ttlMs: 5_000,
@@ -293,6 +330,10 @@ describe('AgentChatCapabilityRegistry', () => {
 
     expect(result).toEqual({
       ok: false,
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'unavailable',
+      models: [],
       error: {
         code: 'CAPABILITY_PAYLOAD_INVALID',
         message: 'Capability payload is missing a model id',
@@ -311,7 +352,7 @@ describe('AgentChatCapabilityRegistry', () => {
       },
     ])
 
-    const registry = new AgentChatCapabilityRegistry({
+    const registry = new FreshAgentModelCapabilityRegistry({
       queryFactory,
       now: () => now,
       ttlMs: 5_000,
@@ -321,6 +362,10 @@ describe('AgentChatCapabilityRegistry', () => {
 
     expect(result).toEqual({
       ok: false,
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'unavailable',
+      models: [],
       error: {
         code: 'CAPABILITY_PAYLOAD_INVALID',
         message: 'Capability payload has invalid supported effort levels for opus',

@@ -18,7 +18,7 @@ import { LAYOUT_STORAGE_KEY, PANES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY, TURN_CO
 import { createLogger } from '@/lib/client-logger'
 import { flushPersistedLayoutNow } from './persistControl'
 import { sanitizeSessionRef } from '@shared/session-contract'
-import { normalizeAgentChatEffortOverride, normalizeAgentChatModelSelection } from './paneTypes'
+import { normalizeFreshAgentEffortOverride, normalizeFreshAgentModelSelection } from './paneTypes'
 import {
   loadPersistedTabRecency,
   mergeTabRecencyStatesByMax,
@@ -157,13 +157,13 @@ function migratePaneContent(content: any): any {
       return {
         ...rest,
         ...(typeof legacyModel === 'string' ? { model: legacyModel } : {}),
-        effort: normalizeAgentChatEffortOverride(content.effort),
+        effort: normalizeFreshAgentEffortOverride(content.effort),
       }
     }
     return {
       ...rest,
-      modelSelection: normalizeAgentChatModelSelection(legacyModelSelection, legacyModel),
-      effort: normalizeAgentChatEffortOverride(content.effort),
+      modelSelection: normalizeFreshAgentModelSelection(legacyModelSelection, legacyModel),
+      effort: normalizeFreshAgentEffortOverride(content.effort),
     }
   }
   if (content.kind === 'browser') {

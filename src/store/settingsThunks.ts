@@ -44,7 +44,7 @@ function normalizeCodingCliProviderPatchForApi(
   return normalizedProviderPatch
 }
 
-function normalizeAgentChatProviderPatchForApi(
+function normalizeFreshAgentProviderPatchForApi(
   providerPatch: Record<string, unknown>,
 ): Record<string, unknown> {
   const normalizedProviderPatch = { ...providerPatch }
@@ -72,7 +72,7 @@ function normalizeAgentProviderDefaultsPatchForApiSection(section: unknown): unk
     providers: Object.fromEntries(
       Object.entries(section.providers).map(([providerName, providerPatch]) => [
         providerName,
-        isRecord(providerPatch) ? normalizeAgentChatProviderPatchForApi(providerPatch) : providerPatch,
+        isRecord(providerPatch) ? normalizeFreshAgentProviderPatchForApi(providerPatch) : providerPatch,
       ]),
     ),
   }

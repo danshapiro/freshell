@@ -28,8 +28,8 @@ import { cn } from '@/lib/utils'
 import { ContextMenu } from '@/components/context-menu/ContextMenu'
 import type { MenuItem } from '@/components/context-menu/context-menu-types'
 import {
-  normalizeAgentChatEffortOverride,
-  normalizeAgentChatModelSelection,
+  normalizeFreshAgentEffortOverride,
+  normalizeFreshAgentModelSelection,
   type PaneContentInput,
   type SessionLocator,
 } from '@/store/paneTypes'
@@ -183,10 +183,10 @@ export function sanitizePaneSnapshot(
       serverInstanceId: record.serverInstanceId,
       initialCwd: payload.initialCwd as string | undefined,
       model: payload.model as string | undefined,
-      modelSelection: normalizeAgentChatModelSelection(payload.modelSelection, payload.model),
+      modelSelection: normalizeFreshAgentModelSelection(payload.modelSelection, payload.model),
       permissionMode: payload.permissionMode as string | undefined,
       sandbox: payload.sandbox as 'read-only' | 'workspace-write' | 'danger-full-access' | undefined,
-      effort: normalizeAgentChatEffortOverride(payload.effort),
+      effort: normalizeFreshAgentEffortOverride(payload.effort),
       plugins: payload.plugins as string[] | undefined,
       ...(style ? { style } : {}),
       settingsDismissed: typeof payload.settingsDismissed === 'boolean' ? payload.settingsDismissed : undefined,

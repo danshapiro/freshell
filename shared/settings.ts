@@ -1,10 +1,10 @@
 import { z } from 'zod'
 
 import {
-  AgentChatModelSelectionSchema,
-  AgentChatOpaqueStringSchema,
-  type AgentChatModelSelection,
-} from './agent-chat-capabilities.js'
+  FreshAgentModelSelectionSchema,
+  FreshAgentModelCapabilitiesOpaqueStringSchema,
+  type FreshAgentModelSelection,
+} from './fresh-agent-model-capabilities.js'
 import { sanitizeFreshAgentPluginPaths } from './fresh-agent-plugins.js'
 import { DEFAULT_ENABLED_CLI_PROVIDERS } from './coding-cli-defaults.js'
 import { normalizeTrimmedStringList } from './string-list.js'
@@ -94,7 +94,7 @@ export type CodexSandboxMode = (typeof CODEX_SANDBOX_VALUES)[number]
 export type ClaudePermissionMode = (typeof CLAUDE_PERMISSION_MODE_VALUES)[number]
 export type ExternalEditor = (typeof EXTERNAL_EDITOR_VALUES)[number]
 export type NetworkHost = (typeof NETWORK_HOST_VALUES)[number]
-export type AgentChatEffort = string
+export type FreshAgentEffort = string
 
 export type DeepPartial<T> = T extends readonly (infer U)[]
   ? U[]
@@ -117,10 +117,10 @@ export type CodingCliSettings = {
   mcpServer: boolean
 }
 
-export type AgentChatProviderDefaults = {
-  modelSelection?: AgentChatModelSelection
+export type FreshAgentProviderDefaults = {
+  modelSelection?: FreshAgentModelSelection
   defaultPermissionMode?: string
-  effort?: AgentChatEffort
+  effort?: FreshAgentEffort
   style?: FreshAgentStyle
 }
 
@@ -157,7 +157,7 @@ export type ServerSettings = {
     enabled: boolean
     initialSetupDone?: boolean
     defaultPlugins: string[]
-    providers: Partial<Record<string, AgentChatProviderDefaults>>
+    providers: Partial<Record<string, FreshAgentProviderDefaults>>
   }
   extensions: {
     disabled: string[]
@@ -294,7 +294,7 @@ type LegacyFreshAgentSettingsInput = Partial<ServerSettings['freshAgent'] & Loca
 }
 
 type FreshAgentSettingsPatchInput = Partial<ServerSettings['freshAgent'] & LocalSettings['freshAgent']> & {
-  providers?: Partial<Record<string, AgentChatProviderDefaults>>
+  providers?: Partial<Record<string, FreshAgentProviderDefaults>>
 }
 
 type FreshAgentAliasMergeOptions = {
@@ -668,23 +668,23 @@ function createCodingCliProviderConfigPatchSchema() {
     .strict()
 }
 
-function createAgentChatProviderDefaultsSchema() {
+function createFreshAgentProviderDefaultsSchema() {
   return z
     .object({
-      modelSelection: AgentChatModelSelectionSchema.optional(),
+      modelSelection: FreshAgentModelSelectionSchema.optional(),
       defaultPermissionMode: z.string().optional(),
-      effort: AgentChatOpaqueStringSchema.optional(),
+      effort: FreshAgentModelCapabilitiesOpaqueStringSchema.optional(),
       style: FreshAgentStyleSchema.optional(),
     })
     .strict()
 }
 
-function createAgentChatProviderDefaultsPatchSchema() {
+function createFreshAgentProviderDefaultsPatchSchema() {
   return z
     .object({
-      modelSelection: AgentChatModelSelectionSchema.nullable().optional(),
+      modelSelection: FreshAgentModelSelectionSchema.nullable().optional(),
       defaultPermissionMode: z.string().optional(),
-      effort: z.union([AgentChatOpaqueStringSchema, z.literal('')]).nullable().optional(),
+      effort: z.union([FreshAgentModelCapabilitiesOpaqueStringSchema, z.literal('')]).nullable().optional(),
       style: FreshAgentStyleSchema.optional(),
     })
     .strict()
@@ -723,7 +723,7 @@ export function buildServerSettingsSchema(validCliProviders?: readonly string[])
       enabled: z.boolean(),
       initialSetupDone: z.boolean().optional(),
       defaultPlugins: z.array(z.string()),
-      providers: z.record(z.string(), createAgentChatProviderDefaultsPatchSchema()),
+      providers: z.record(z.string(), createFreshAgentProviderDefaultsPatchSchema()),
     }).strict(),
     extensions: z.object({
       disabled: z.array(z.string()),
@@ -768,7 +768,7 @@ export function buildServerSettingsPatchSchema(validCliProviders?: readonly stri
       enabled: z.coerce.boolean().optional(),
       initialSetupDone: z.boolean().optional(),
       defaultPlugins: z.array(z.string()).optional(),
-      providers: z.record(z.string(), createAgentChatProviderDefaultsPatchSchema()).optional(),
+      providers: z.record(z.string(), createFreshAgentProviderDefaultsPatchSchema()).optional(),
     }).strict().optional(),
     extensions: z.object({
       disabled: z.array(z.string()).optional(),
@@ -907,7 +907,7 @@ function sanitizeFreshAgentServerSettingsPatchInput(
   rawFreshAgent: Record<string, unknown>,
 ): ServerSettingsPatch['freshAgent'] {
   const freshAgent: ServerSettingsPatch['freshAgent'] = {}
-  const freshAgentProviderDefaultsPatchSchema = createAgentChatProviderDefaultsPatchSchema()
+  const freshAgentProviderDefaultsPatchSchema = createFreshAgentProviderDefaultsPatchSchema()
 
   if (hasOwn(rawFreshAgent, 'enabled')) {
     freshAgent.enabled = !!rawFreshAgent.enabled
@@ -921,7 +921,7 @@ function sanitizeFreshAgentServerSettingsPatchInput(
   if (isRecord(rawFreshAgent.providers)) {
     const providers: NonNullable<NonNullable<ServerSettingsPatch['freshAgent']>['providers']> = {}
     for (const [providerName, providerPatch] of Object.entries(rawFreshAgent.providers)) {
-      const normalizedProviderPatchInput = normalizeLegacyAgentChatProviderDefaultsInput(providerPatch)
+      const normalizedProviderPatchInput = normalizeLegacyFreshAgentProviderDefaultsInput(providerPatch)
       const parsed = freshAgentProviderDefaultsPatchSchema.safeParse(
         normalizedProviderPatchInput,
       )
@@ -930,7 +930,7 @@ function sanitizeFreshAgentServerSettingsPatchInput(
         && isRecord(normalizedProviderPatchInput)
         && Object.keys(normalizedProviderPatchInput).length > 0
       ) {
-        const normalizedProviderPatch: AgentChatProviderDefaults = {}
+        const normalizedProviderPatch: FreshAgentProviderDefaults = {}
         if (hasOwn(normalizedProviderPatchInput, 'modelSelection')) {
           normalizedProviderPatch.modelSelection = parsed.data.modelSelection ?? undefined
         }
@@ -1172,7 +1172,7 @@ function sanitizeServerSettingsPatch(patch: ServerSettingsPatch): ServerSettings
   return sanitized
 }
 
-function normalizeLegacyAgentChatProviderDefaultsInput(
+function normalizeLegacyFreshAgentProviderDefaultsInput(
   providerPatch: unknown,
 ): Record<string, unknown> | unknown {
   if (!isRecord(providerPatch)) {

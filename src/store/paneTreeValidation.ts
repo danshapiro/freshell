@@ -1,4 +1,4 @@
-import { isAgentChatModelSelection, type PaneNode } from './paneTypes'
+import { isFreshAgentModelSelection, type PaneNode } from './paneTypes'
 import { CodexDurabilityRefSchema } from '@shared/codex-durability'
 import { isFreshAgentSessionType, resolveFreshAgentRuntimeProvider } from '@shared/fresh-agent'
 
@@ -76,7 +76,7 @@ function isPaneContentShape(content: unknown): boolean {
         && isOptionalString(content.initialCwd)
         && isOptionalString(content.model)
         && isOptionalString(content.permissionMode)
-        && (content.modelSelection === undefined || isAgentChatModelSelection(content.modelSelection))
+        && (content.modelSelection === undefined || isFreshAgentModelSelection(content.modelSelection))
         && (content.sandbox === undefined
           || content.sandbox === 'read-only'
           || content.sandbox === 'workspace-write'

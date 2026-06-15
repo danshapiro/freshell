@@ -1,20 +1,22 @@
 import { describe, expect, it } from 'vitest'
 
 import {
-  AGENT_CHAT_CAPABILITY_CACHE_TTL_MS,
-  AGENT_CHAT_PROVIDER_DEFAULT_OPTION_VALUE,
-  getAgentChatSettingsModelOptions,
-  getAgentChatSettingsModelValue,
-  getAgentChatSupportedEffortLevels,
-  isAgentChatEffortSupported,
-  isAgentChatCapabilitiesFresh,
-  parseAgentChatSettingsModelValue,
-  requiresAgentChatCapabilityValidation,
-  resolveAgentChatModelSelection,
-} from '@/lib/agent-chat-capabilities'
+  FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS,
+  FRESH_AGENT_PROVIDER_DEFAULT_MODEL_OPTION_VALUE,
+  getFreshAgentSettingsModelOptions,
+  getFreshAgentSettingsModelValue,
+  getFreshAgentSupportedEffortLevels,
+  isFreshAgentEffortSupported,
+  isFreshAgentModelCapabilitiesFresh,
+  parseFreshAgentSettingsModelValue,
+  requiresFreshAgentModelCapabilityValidation,
+  resolveFreshAgentModelSelection,
+} from '@/lib/fresh-agent-model-capabilities'
 
 const capabilities = {
-  provider: 'freshclaude',
+  sessionType: 'freshclaude',
+  runtimeProvider: 'claude',
+  status: 'fresh',
   fetchedAt: 1_234,
   models: [
     {
@@ -44,9 +46,9 @@ const capabilities = {
   ],
 } as const
 
-describe('agent-chat-capabilities helpers', () => {
+describe('fresh-agent-model-capabilities helpers', () => {
   it('resolves provider-default to the stable opus track alias', () => {
-    const resolved = resolveAgentChatModelSelection({
+    const resolved = resolveFreshAgentModelSelection({
       providerDefaultModelId: 'opus',
       capabilities,
     })
@@ -59,7 +61,7 @@ describe('agent-chat-capabilities helpers', () => {
   })
 
   it('resolves tracked aliases without local remapping', () => {
-    const resolved = resolveAgentChatModelSelection({
+    const resolved = resolveFreshAgentModelSelection({
       providerDefaultModelId: 'opus',
       capabilities,
       modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
@@ -73,7 +75,7 @@ describe('agent-chat-capabilities helpers', () => {
   })
 
   it('surfaces unavailable exact selections instead of silently healing them', () => {
-    const resolved = resolveAgentChatModelSelection({
+    const resolved = resolveFreshAgentModelSelection({
       providerDefaultModelId: 'opus',
       capabilities,
       modelSelection: { kind: 'exact', modelId: 'claude-opus-4-6' },
@@ -87,12 +89,12 @@ describe('agent-chat-capabilities helpers', () => {
   })
 
   it('derives effort options only from the resolved capability payload', () => {
-    expect(getAgentChatSupportedEffortLevels({
+    expect(getFreshAgentSupportedEffortLevels({
       providerDefaultModelId: 'opus',
       capabilities,
     })).toEqual(['turbo', 'warp'])
 
-    expect(getAgentChatSupportedEffortLevels({
+    expect(getFreshAgentSupportedEffortLevels({
       providerDefaultModelId: 'opus',
       capabilities,
       modelSelection: { kind: 'tracked', modelId: 'haiku' },
@@ -101,7 +103,9 @@ describe('agent-chat-capabilities helpers', () => {
 
   it('treats supportedEffortLevels as the effort support source of truth', () => {
     const inconsistentCapabilities = {
-      provider: 'freshclaude',
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
       fetchedAt: 2_345,
       models: [
         {
@@ -114,46 +118,46 @@ describe('agent-chat-capabilities helpers', () => {
       ],
     } as const
 
-    const resolved = resolveAgentChatModelSelection({
+    const resolved = resolveFreshAgentModelSelection({
       providerDefaultModelId: 'opus',
       capabilities: inconsistentCapabilities,
     })
 
-    expect(getAgentChatSupportedEffortLevels({
+    expect(getFreshAgentSupportedEffortLevels({
       providerDefaultModelId: 'opus',
       capabilities: inconsistentCapabilities,
     })).toEqual(['turbo'])
-    expect(isAgentChatEffortSupported(resolved.capability, 'turbo')).toBe(true)
+    expect(isFreshAgentEffortSupported(resolved.capability, 'turbo')).toBe(true)
   })
 
   it('builds settings options from provider-default, live capabilities, and unavailable exact selections', () => {
-    expect(getAgentChatSettingsModelOptions({
+    expect(getFreshAgentSettingsModelOptions({
       providerDefaultModelId: 'opus',
       capabilities,
       modelSelection: { kind: 'exact', modelId: 'claude-opus-4-6' },
     })).toEqual([
       {
-        value: AGENT_CHAT_PROVIDER_DEFAULT_OPTION_VALUE,
+        value: FRESH_AGENT_PROVIDER_DEFAULT_MODEL_OPTION_VALUE,
         label: 'Provider default (track latest Opus)',
         description: 'Tracks latest Opus automatically.',
       },
       {
-        value: getAgentChatSettingsModelValue({ kind: 'tracked', modelId: 'opus' }),
+        value: getFreshAgentSettingsModelValue({ kind: 'tracked', modelId: 'opus' }),
         label: 'Opus',
         description: 'Latest Opus track',
       },
       {
-        value: getAgentChatSettingsModelValue({ kind: 'tracked', modelId: 'opus[1m]' }),
+        value: getFreshAgentSettingsModelValue({ kind: 'tracked', modelId: 'opus[1m]' }),
         label: 'Opus 1M',
         description: 'Long context',
       },
       {
-        value: getAgentChatSettingsModelValue({ kind: 'tracked', modelId: 'haiku' }),
+        value: getFreshAgentSettingsModelValue({ kind: 'tracked', modelId: 'haiku' }),
         label: 'Haiku',
         description: 'Fast path',
       },
       {
-        value: getAgentChatSettingsModelValue(
+        value: getFreshAgentSettingsModelValue(
           { kind: 'exact', modelId: 'claude-opus-4-6' },
           capabilities,
         ),
@@ -165,7 +169,7 @@ describe('agent-chat-capabilities helpers', () => {
   })
 
   it('keeps a persisted tracked selection represented when the refreshed catalog drops it', () => {
-    expect(getAgentChatSettingsModelOptions({
+    expect(getFreshAgentSettingsModelOptions({
       providerDefaultModelId: 'opus',
       capabilities: {
         ...capabilities,
@@ -174,22 +178,22 @@ describe('agent-chat-capabilities helpers', () => {
       modelSelection: { kind: 'tracked', modelId: 'haiku' },
     })).toEqual([
       {
-        value: AGENT_CHAT_PROVIDER_DEFAULT_OPTION_VALUE,
+        value: FRESH_AGENT_PROVIDER_DEFAULT_MODEL_OPTION_VALUE,
         label: 'Provider default (track latest Opus)',
         description: 'Tracks latest Opus automatically.',
       },
       {
-        value: getAgentChatSettingsModelValue({ kind: 'tracked', modelId: 'opus' }),
+        value: getFreshAgentSettingsModelValue({ kind: 'tracked', modelId: 'opus' }),
         label: 'Opus',
         description: 'Latest Opus track',
       },
       {
-        value: getAgentChatSettingsModelValue({ kind: 'tracked', modelId: 'opus[1m]' }),
+        value: getFreshAgentSettingsModelValue({ kind: 'tracked', modelId: 'opus[1m]' }),
         label: 'Opus 1M',
         description: 'Long context',
       },
       {
-        value: getAgentChatSettingsModelValue({ kind: 'tracked', modelId: 'haiku' }),
+        value: getFreshAgentSettingsModelValue({ kind: 'tracked', modelId: 'haiku' }),
         label: 'haiku (Saved selection)',
         description: 'Saved tracked model is not in the latest capability catalog.',
       },
@@ -197,10 +201,10 @@ describe('agent-chat-capabilities helpers', () => {
   })
 
   it('maps provider-default and tracked settings values back into selection strategies', () => {
-    expect(getAgentChatSettingsModelValue(undefined)).toBe(AGENT_CHAT_PROVIDER_DEFAULT_OPTION_VALUE)
-    expect(parseAgentChatSettingsModelValue(AGENT_CHAT_PROVIDER_DEFAULT_OPTION_VALUE)).toBeUndefined()
-    expect(parseAgentChatSettingsModelValue(
-      getAgentChatSettingsModelValue({ kind: 'tracked', modelId: 'opus[1m]' }),
+    expect(getFreshAgentSettingsModelValue(undefined)).toBe(FRESH_AGENT_PROVIDER_DEFAULT_MODEL_OPTION_VALUE)
+    expect(parseFreshAgentSettingsModelValue(FRESH_AGENT_PROVIDER_DEFAULT_MODEL_OPTION_VALUE)).toBeUndefined()
+    expect(parseFreshAgentSettingsModelValue(
+      getFreshAgentSettingsModelValue({ kind: 'tracked', modelId: 'opus[1m]' }),
     )).toEqual({
       kind: 'tracked',
       modelId: 'opus[1m]',
@@ -208,51 +212,53 @@ describe('agent-chat-capabilities helpers', () => {
   })
 
   it('treats raw magic-string lookalikes as opaque tracked ids', () => {
-    expect(parseAgentChatSettingsModelValue('__provider_default__')).toEqual({
+    expect(parseFreshAgentSettingsModelValue('__provider_default__')).toEqual({
       kind: 'tracked',
       modelId: '__provider_default__',
     })
-    expect(parseAgentChatSettingsModelValue('__exact__:haiku')).toEqual({
+    expect(parseFreshAgentSettingsModelValue('__exact__:haiku')).toEqual({
       kind: 'tracked',
       modelId: '__exact__:haiku',
     })
   })
 
   it('round-trips unavailable exact settings values without downgrading them to tracked', () => {
-    const unavailableOption = getAgentChatSettingsModelOptions({
+    const unavailableOption = getFreshAgentSettingsModelOptions({
       providerDefaultModelId: 'opus',
       capabilities,
       modelSelection: { kind: 'exact', modelId: 'claude-opus-4-6' },
     }).find((option) => option.unavailable)
 
     expect(unavailableOption).toBeDefined()
-    const selection = parseAgentChatSettingsModelValue(unavailableOption!.value)
+    const selection = parseFreshAgentSettingsModelValue(unavailableOption!.value)
     expect(selection).toEqual({
       kind: 'exact',
       modelId: 'claude-opus-4-6',
     })
-    expect(requiresAgentChatCapabilityValidation({ modelSelection: selection ?? undefined })).toBe(true)
+    expect(requiresFreshAgentModelCapabilityValidation({ modelSelection: selection ?? undefined })).toBe(true)
   })
 
   it('treats fetchedAt as a bounded freshness window instead of an unused field', () => {
-    expect(isAgentChatCapabilitiesFresh(capabilities, capabilities.fetchedAt)).toBe(true)
+    expect(isFreshAgentModelCapabilitiesFresh(capabilities, capabilities.fetchedAt)).toBe(true)
     expect(
-      isAgentChatCapabilitiesFresh(
+      isFreshAgentModelCapabilitiesFresh(
         capabilities,
-        capabilities.fetchedAt + AGENT_CHAT_CAPABILITY_CACHE_TTL_MS,
+        capabilities.fetchedAt + FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS,
       ),
     ).toBe(true)
     expect(
-      isAgentChatCapabilitiesFresh(
+      isFreshAgentModelCapabilitiesFresh(
         capabilities,
-        capabilities.fetchedAt + AGENT_CHAT_CAPABILITY_CACHE_TTL_MS + 1,
+        capabilities.fetchedAt + FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS + 1,
       ),
     ).toBe(false)
   })
 
   it('builds a large capability catalog without catastrophic option-building regressions', () => {
     const largeCatalog = {
-      provider: 'freshclaude',
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
       fetchedAt: 9_999,
       models: Array.from({ length: 2_000 }, (_, index) => ({
         id: `model-${index}`,
@@ -265,7 +271,7 @@ describe('agent-chat-capabilities helpers', () => {
     } as const
 
     const start = performance.now()
-    const options = getAgentChatSettingsModelOptions({
+    const options = getFreshAgentSettingsModelOptions({
       providerDefaultModelId: 'opus',
       capabilities: largeCatalog,
     })
@@ -273,12 +279,12 @@ describe('agent-chat-capabilities helpers', () => {
 
     expect(options).toHaveLength(2_001)
     expect(options[0]).toEqual({
-      value: AGENT_CHAT_PROVIDER_DEFAULT_OPTION_VALUE,
+      value: FRESH_AGENT_PROVIDER_DEFAULT_MODEL_OPTION_VALUE,
       label: 'Provider default (track latest Opus)',
       description: 'Tracks latest Opus automatically.',
     })
     expect(options.at(-1)).toEqual({
-      value: getAgentChatSettingsModelValue({ kind: 'tracked', modelId: 'model-1999' }),
+      value: getFreshAgentSettingsModelValue({ kind: 'tracked', modelId: 'model-1999' }),
       label: 'Model 1999',
       description: 'Synthetic model 1999',
     })

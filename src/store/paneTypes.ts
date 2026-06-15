@@ -1,8 +1,8 @@
 import type { TerminalStatus, TabMode, ShellType } from './types'
 import {
-  AgentChatModelSelectionSchema,
-  type AgentChatModelSelection,
-} from '@shared/agent-chat-capabilities'
+  FreshAgentModelSelectionSchema,
+  type FreshAgentModelSelection,
+} from '@shared/fresh-agent-model-capabilities'
 import type { SessionLocator as SharedSessionLocator } from '@shared/ws-protocol'
 import type { RestoreError } from '@shared/session-contract'
 import type { CodexDurabilityRef } from '@shared/codex-durability'
@@ -11,15 +11,15 @@ import type { FreshAgentStyle } from '@shared/settings'
 
 export type SessionLocator = SharedSessionLocator
 
-export function isAgentChatModelSelection(value: unknown): value is AgentChatModelSelection {
-  return AgentChatModelSelectionSchema.safeParse(value).success
+export function isFreshAgentModelSelection(value: unknown): value is FreshAgentModelSelection {
+  return FreshAgentModelSelectionSchema.safeParse(value).success
 }
 
-export function normalizeAgentChatModelSelection(
+export function normalizeFreshAgentModelSelection(
   value: unknown,
   legacyModel?: unknown,
-): AgentChatModelSelection | undefined {
-  const parsed = AgentChatModelSelectionSchema.safeParse(value)
+): FreshAgentModelSelection | undefined {
+  const parsed = FreshAgentModelSelectionSchema.safeParse(value)
   if (parsed.success) {
     return parsed.data
   }
@@ -34,7 +34,7 @@ export function normalizeAgentChatModelSelection(
   return undefined
 }
 
-export function normalizeAgentChatEffortOverride(value: unknown): string | undefined {
+export function normalizeFreshAgentEffortOverride(value: unknown): string | undefined {
   if (typeof value !== 'string') {
     return undefined
   }
@@ -138,7 +138,7 @@ export type FreshAgentPaneContent = {
   restoreError?: RestoreError
   initialCwd?: string
   createError?: AgentChatCreateError
-  modelSelection?: AgentChatModelSelection
+  modelSelection?: FreshAgentModelSelection
   model?: string
   permissionMode?: string
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'

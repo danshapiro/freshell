@@ -4,19 +4,24 @@ import {
 } from '@anthropic-ai/claude-agent-sdk'
 
 import {
-  AGENT_CHAT_CAPABILITY_CACHE_TTL_MS,
-  AgentChatCapabilitiesResponseSchema,
-  AgentChatCapabilitiesSchema,
-  AgentChatCapabilityErrorSchema,
-  AgentChatModelCapabilitySchema,
-  type AgentChatCapabilitiesResponse,
-  type AgentChatModelCapability,
-} from '../shared/agent-chat-capabilities.js'
-import { formatModelDisplayName } from '../shared/format-model-name.js'
-import { createClaudeSdkOptions } from './sdk-bridge.js'
-import { logger } from './logger.js'
+  FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS,
+  FreshAgentModelCapabilitiesResponseSchema,
+  FreshAgentModelCapabilityErrorSchema,
+  FreshAgentModelCapabilitySchema,
+  type FreshAgentModelCapabilitiesResponse,
+  type FreshAgentModelCapability,
+} from '../../shared/fresh-agent-model-capabilities.js'
+import {
+  getFreshAgentDescriptor,
+  type FreshAgentRuntimeProvider,
+  type FreshAgentSessionType,
+} from '../../shared/fresh-agent.js'
+import { FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE } from '../../shared/fresh-agent-models.js'
+import { formatModelDisplayName } from '../../shared/format-model-name.js'
+import { createClaudeSdkOptions } from '../sdk-bridge.js'
+import { logger } from '../logger.js'
 
-const log = logger.child({ component: 'agent-chat-capability-registry' })
+const log = logger.child({ component: 'fresh-agent-model-capability-registry' })
 const DEFAULT_PROBE_TIMEOUT_MS = 10_000
 
 type ProbeQuery = Pick<SdkQuery, 'supportedModels' | 'close'>
@@ -30,14 +35,14 @@ type RegistryOptions = {
 
 type CachedCatalog = {
   fetchedAt: number
-  models: AgentChatModelCapability[]
+  models: FreshAgentModelCapability[]
 }
 
 function invalidCapabilityPayload(message: string): Error & {
   code: string
   retryable: boolean
 } {
-  return AgentChatCapabilityRegistry.createError(
+  return FreshAgentModelCapabilityRegistry.createError(
     'CAPABILITY_PAYLOAD_INVALID',
     message,
     false,
@@ -99,16 +104,19 @@ function readModelId(model: Record<string, unknown>): string {
     return id
   }
 
-  throw AgentChatCapabilityRegistry.createError(
+  throw FreshAgentModelCapabilityRegistry.createError(
     'CAPABILITY_PAYLOAD_INVALID',
     'Capability payload is missing a model id',
     false,
   )
 }
 
-function normalizeModelCapability(rawModel: unknown): AgentChatModelCapability {
+function normalizeModelCapability(
+  rawModel: unknown,
+  runtimeProvider: FreshAgentRuntimeProvider,
+): FreshAgentModelCapability {
   if (!rawModel || typeof rawModel !== 'object' || Array.isArray(rawModel)) {
-    throw AgentChatCapabilityRegistry.createError(
+    throw FreshAgentModelCapabilityRegistry.createError(
       'CAPABILITY_PAYLOAD_INVALID',
       'Capability payload must contain model objects',
       false,
@@ -139,9 +147,10 @@ function normalizeModelCapability(rawModel: unknown): AgentChatModelCapability {
       ? model.supports_adaptive_thinking
       : false
 
-  return AgentChatModelCapabilitySchema.parse({
+  return FreshAgentModelCapabilitySchema.parse({
     id,
     displayName: formatCapabilityDisplayName(rawDisplayName || id),
+    provider: runtimeProvider,
     description: typeof model.description === 'string' ? model.description : undefined,
     supportsEffort,
     supportedEffortLevels,
@@ -149,15 +158,18 @@ function normalizeModelCapability(rawModel: unknown): AgentChatModelCapability {
   })
 }
 
-export function normalizeAgentChatCapabilityCatalog(rawModels: unknown): AgentChatModelCapability[] {
+export function normalizeFreshAgentModelCapabilityCatalog(
+  rawModels: unknown,
+  runtimeProvider: FreshAgentRuntimeProvider = 'claude',
+): FreshAgentModelCapability[] {
   if (!Array.isArray(rawModels)) {
     throw invalidCapabilityPayload('Capability payload must be an array of models')
   }
 
-  return rawModels.map((rawModel) => normalizeModelCapability(rawModel))
+  return rawModels.map((rawModel) => normalizeModelCapability(rawModel, runtimeProvider))
 }
 
-export class AgentChatCapabilityRegistry {
+export class FreshAgentModelCapabilityRegistry {
   private readonly queryFactory: typeof query
   private readonly now: () => number
   private readonly ttlMs: number
@@ -168,7 +180,7 @@ export class AgentChatCapabilityRegistry {
   constructor(options: RegistryOptions = {}) {
     this.queryFactory = options.queryFactory ?? query
     this.now = options.now ?? Date.now
-    this.ttlMs = options.ttlMs ?? AGENT_CHAT_CAPABILITY_CACHE_TTL_MS
+    this.ttlMs = options.ttlMs ?? FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS
     this.probeTimeoutMs = options.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS
   }
 
@@ -179,27 +191,75 @@ export class AgentChatCapabilityRegistry {
     return Object.assign(new Error(message), { code, retryable })
   }
 
-  async getCapabilities(provider: string): Promise<AgentChatCapabilitiesResponse> {
+  async getCapabilities(sessionType: FreshAgentSessionType): Promise<FreshAgentModelCapabilitiesResponse> {
+    const descriptor = this.requireDescriptor(sessionType)
+    if (descriptor.runtimeProvider !== 'claude') {
+      return this.createStaticSuccess(sessionType, descriptor.runtimeProvider)
+    }
+
     const cached = this.cachedCatalog
     if (cached && this.now() - cached.fetchedAt <= this.ttlMs) {
-      return this.createSuccess(provider, cached)
+      return this.createSuccess(sessionType, descriptor.runtimeProvider, cached, 'cached')
     }
 
     try {
       const catalog = await this.refreshCatalog()
-      return this.createSuccess(provider, catalog)
+      return this.createSuccess(sessionType, descriptor.runtimeProvider, catalog, 'fresh')
     } catch (error) {
-      return this.createFailure(error)
+      return this.createFailure(sessionType, descriptor.runtimeProvider, error)
     }
   }
 
-  async refreshCapabilities(provider: string): Promise<AgentChatCapabilitiesResponse> {
+  async refreshCapabilities(sessionType: FreshAgentSessionType): Promise<FreshAgentModelCapabilitiesResponse> {
+    const descriptor = this.requireDescriptor(sessionType)
+    if (descriptor.runtimeProvider !== 'claude') {
+      return this.createStaticSuccess(sessionType, descriptor.runtimeProvider)
+    }
+
     try {
       const catalog = await this.refreshCatalog()
-      return this.createSuccess(provider, catalog)
+      return this.createSuccess(sessionType, descriptor.runtimeProvider, catalog, 'fresh')
     } catch (error) {
-      return this.createFailure(error)
+      return this.createFailure(sessionType, descriptor.runtimeProvider, error)
     }
+  }
+
+  private requireDescriptor(sessionType: FreshAgentSessionType) {
+    const descriptor = getFreshAgentDescriptor(sessionType)
+    if (!descriptor) {
+      throw FreshAgentModelCapabilityRegistry.createError(
+        'MODEL_CAPABILITIES_SESSION_TYPE_UNSUPPORTED',
+        `Fresh-agent session type ${sessionType} is not supported`,
+        false,
+      )
+    }
+    return descriptor
+  }
+
+  private createStaticSuccess(
+    sessionType: FreshAgentSessionType,
+    runtimeProvider: FreshAgentRuntimeProvider,
+  ): FreshAgentModelCapabilitiesResponse {
+    const models = (FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE[sessionType] ?? []).map((option) => {
+      const supportedEffortLevels = [...(option.thinkingEfforts ?? [])]
+      return FreshAgentModelCapabilitySchema.parse({
+        id: option.value,
+        displayName: option.label,
+        provider: runtimeProvider,
+        supportsEffort: supportedEffortLevels.length > 0,
+        supportedEffortLevels,
+        supportsAdaptiveThinking: supportedEffortLevels.length > 0,
+      })
+    })
+
+    return FreshAgentModelCapabilitiesResponseSchema.parse({
+      ok: true,
+      sessionType,
+      runtimeProvider,
+      status: 'fresh',
+      fetchedAt: this.now(),
+      models,
+    })
   }
 
   private async refreshCatalog(): Promise<CachedCatalog> {
@@ -239,7 +299,7 @@ export class AgentChatCapabilityRegistry {
         new Promise<never>((_, reject) => {
           timeoutId = setTimeout(() => {
             abortController.abort()
-            reject(AgentChatCapabilityRegistry.createError(
+            reject(FreshAgentModelCapabilityRegistry.createError(
               'CAPABILITY_PROBE_FAILED',
               `Capability probe timed out after ${this.probeTimeoutMs}ms`,
               true,
@@ -249,13 +309,13 @@ export class AgentChatCapabilityRegistry {
       ])
       return {
         fetchedAt: this.now(),
-        models: normalizeAgentChatCapabilityCatalog(rawModels),
+        models: normalizeFreshAgentModelCapabilityCatalog(rawModels, 'claude'),
       }
     } catch (error) {
       if (error instanceof Error && 'code' in error && 'retryable' in error) {
         throw error
       }
-      throw AgentChatCapabilityRegistry.createError(
+      throw FreshAgentModelCapabilityRegistry.createError(
         'CAPABILITY_PROBE_FAILED',
         error instanceof Error ? error.message : String(error),
         true,
@@ -272,19 +332,28 @@ export class AgentChatCapabilityRegistry {
     }
   }
 
-  private createSuccess(provider: string, catalog: CachedCatalog): AgentChatCapabilitiesResponse {
-    return AgentChatCapabilitiesResponseSchema.parse({
+  private createSuccess(
+    sessionType: FreshAgentSessionType,
+    runtimeProvider: FreshAgentRuntimeProvider,
+    catalog: CachedCatalog,
+    status: 'fresh' | 'cached',
+  ): FreshAgentModelCapabilitiesResponse {
+    return FreshAgentModelCapabilitiesResponseSchema.parse({
       ok: true,
-      capabilities: AgentChatCapabilitiesSchema.parse({
-        provider,
-        fetchedAt: catalog.fetchedAt,
-        models: catalog.models,
-      }),
+      sessionType,
+      runtimeProvider,
+      status,
+      fetchedAt: catalog.fetchedAt,
+      models: catalog.models,
     })
   }
 
-  private createFailure(error: unknown): AgentChatCapabilitiesResponse {
-    const normalized = AgentChatCapabilityErrorSchema.parse({
+  private createFailure(
+    sessionType: FreshAgentSessionType,
+    runtimeProvider: FreshAgentRuntimeProvider,
+    error: unknown,
+  ): FreshAgentModelCapabilitiesResponse {
+    const normalized = FreshAgentModelCapabilityErrorSchema.parse({
       code: typeof (error as { code?: unknown })?.code === 'string'
         ? (error as { code: string }).code
         : 'CAPABILITY_PROBE_FAILED',
@@ -294,8 +363,12 @@ export class AgentChatCapabilityRegistry {
         : true,
     })
 
-    return AgentChatCapabilitiesResponseSchema.parse({
+    return FreshAgentModelCapabilitiesResponseSchema.parse({
       ok: false,
+      sessionType,
+      runtimeProvider,
+      status: 'unavailable',
+      models: [],
       error: normalized,
     })
   }
