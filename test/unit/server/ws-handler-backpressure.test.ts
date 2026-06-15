@@ -367,7 +367,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     }
   })
 
-  it('emits structured terminal.replay.batch logs for replay batch sends', async () => {
+  it('emits aggregate terminal.replay.progress logs for replay sends', async () => {
     const registry = new FakeBrokerRegistry()
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
     registry.createTerminal('term-structured-batch')
@@ -395,29 +395,35 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     )
     vi.advanceTimersByTime(5)
 
-    expect(structuredLogs('debug', 'terminal.replay.batch')).toEqual(
+    expect(structuredLogs('debug', 'terminal.replay.progress')).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          event: 'terminal.replay.batch',
+          event: 'terminal.replay.progress',
           severity: 'debug',
+          reason: 'completed',
           terminalId: 'term-structured-batch',
           attachRequestId: 'structured-batch-attach',
           source: 'replay',
           streamId: expect.any(String),
           seqStart: 1,
           seqEnd: 8,
+          batchCount: 1,
           rawFrameCount: 8,
           dataBytes: expect.any(Number),
           serializedBytes: expect.any(Number),
-          bufferedAmount: expect.any(Number),
+          maxBufferedAmount: expect.any(Number),
+          seqLag: 0,
+          clientCount: 1,
+          durationMs: expect.any(Number),
         }),
       ]),
     )
+    expect(structuredLogs('debug', 'terminal.replay.batch')).toHaveLength(0)
 
     broker.close()
   })
 
-  it('does not emit terminal.replay.batch logs for live output batches', async () => {
+  it('does not emit terminal.replay.progress logs for live output batches', async () => {
     const registry = new FakeBrokerRegistry()
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
     registry.createTerminal('term-live-batch-observability')
@@ -455,6 +461,8 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
         source: 'live',
       }),
     ])
+    expect(structuredLogs('debug', 'terminal.replay.progress')
+      .filter((payload) => payload.terminalId === 'term-live-batch-observability')).toHaveLength(0)
     expect(structuredLogs('debug', 'terminal.replay.batch')
       .filter((payload) => payload.terminalId === 'term-live-batch-observability')).toHaveLength(0)
 
@@ -560,7 +568,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     }
   })
 
-  it('emits structured terminal.replay.backpressure_pause logs for replay pacing', async () => {
+  it('emits structured terminal.replay.backpressure_state logs for replay pacing', async () => {
     const registry = new FakeBrokerRegistry()
     registry.setReplayRingMaxBytes(4 * 1024 * 1024)
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
@@ -588,11 +596,12 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     )
     vi.advanceTimersByTime(50)
 
-    const pauseLog = structuredLogs('debug', 'terminal.replay.backpressure_pause')
+    const pauseLog = structuredLogs('debug', 'terminal.replay.backpressure_state')
       .find((payload) => payload.terminalId === 'term-structured-backpressure')
     expect(pauseLog).toEqual(expect.objectContaining({
-      event: 'terminal.replay.backpressure_pause',
+      event: 'terminal.replay.backpressure_state',
       severity: 'debug',
+      state: 'entered',
       terminalId: 'term-structured-backpressure',
       attachRequestId: 'structured-backpressure-attach',
       source: 'replay',
@@ -606,6 +615,10 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
       reason: 'websocket_buffered_amount',
     }))
     expect(pauseLog?.dataBytes).toBeGreaterThan(0)
+    expect(structuredLogs('debug', 'terminal.replay.backpressure_pause')
+      .filter((payload) => payload.terminalId === 'term-structured-backpressure')).toHaveLength(0)
+    expect(structuredLogs('debug', 'terminal_stream_replay_backpressure_pause')
+      .filter((payload) => payload.terminalId === 'term-structured-backpressure')).toHaveLength(0)
 
     broker.close()
   })
@@ -1842,7 +1855,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
-  it('rate limits foreground replay backpressure pause logs while the socket remains blocked', async () => {
+  it('rate limits foreground replay backpressure state logs while the socket remains blocked', async () => {
     const registry = new FakeBrokerRegistry()
     registry.setReplayRingMaxBytes(4 * 1024 * 1024)
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
@@ -1876,9 +1889,12 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     const pauseLogs = loggerMocks.logger.debug.mock.calls.filter(([payload]) =>
       payload
       && typeof payload === 'object'
-      && (payload as { event?: unknown }).event === 'terminal_stream_replay_backpressure_pause'
+      && (payload as { event?: unknown }).event === 'terminal.replay.backpressure_state'
+      && (payload as { terminalId?: unknown }).terminalId === 'term-foreground-log-limited'
     )
     expect(pauseLogs).toHaveLength(1)
+    expect(structuredLogs('debug', 'terminal_stream_replay_backpressure_pause')
+      .filter((payload) => payload.terminalId === 'term-foreground-log-limited')).toHaveLength(0)
 
     broker.close()
   })

@@ -22,7 +22,8 @@ describe('parseVisibleFirstServerLogs', () => {
         JSON.stringify({ event: 'http_request', path: '/api/settings' }),
         JSON.stringify({ event: 'perf_system', rssBytes: 123 }),
         JSON.stringify({ component: 'perf', event: 'http_request_slow', durationMs: 50 }),
-        JSON.stringify({ event: 'terminal.replay.batch', source: 'replay', serializedBytes: 456 }),
+        JSON.stringify({ event: 'terminal.replay.progress', source: 'replay', batchCount: 2, serializedBytes: 456 }),
+        JSON.stringify({ event: 'terminal.replay.batch', source: 'replay', serializedBytes: 123 }),
         JSON.stringify({ event: 'terminal.replay.diagnostic', source: 'replay', serializedBytes: 999 }),
         JSON.stringify({ event: 'terminal.output.gap', source: 'replay', fromSeq: 1, toSeq: 2 }),
         '{not-json',
@@ -35,7 +36,8 @@ describe('parseVisibleFirstServerLogs', () => {
     expect(result.perfEvents.length).toBeGreaterThan(0)
     expect(result.perfSystemSamples.length).toBeGreaterThan(0)
     expect(result.terminalReplayEvents).toEqual([
-      expect.objectContaining({ event: 'terminal.replay.batch', serializedBytes: 456 }),
+      expect.objectContaining({ event: 'terminal.replay.progress', serializedBytes: 456 }),
+      expect.objectContaining({ event: 'terminal.replay.batch', serializedBytes: 123 }),
     ])
     expect(result.terminalOutputEvents).toEqual([
       expect.objectContaining({ event: 'terminal.output.gap', fromSeq: 1, toSeq: 2 }),

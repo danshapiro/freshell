@@ -38,7 +38,7 @@ import {
   TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES,
   TERMINAL_WS_CATASTROPHIC_STALL_MS,
 } from './constants.js'
-import type { BrokerClientAttachment, BrokerTerminalState } from './types.js'
+import type { BrokerClientAttachment, BrokerTerminalState, ReplayProgressLogState } from './types.js'
 import type { TerminalGeometryAuthority } from '../../shared/ws-protocol.js'
 
 const log = logger.child({ component: 'terminal-stream-broker' })
@@ -61,15 +61,26 @@ const TERMINAL_FOREGROUND_REPLAY_BUFFERED_PAUSE_BYTES = Math.min(
   Math.max(1024, TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES - 1),
 )
 const CONFIGURED_REPLAY_BACKPRESSURE_LOG_RATE_LIMIT_MS = Number(
-  process.env.TERMINAL_REPLAY_BACKPRESSURE_LOG_RATE_LIMIT_MS || 1000,
+  process.env.TERMINAL_REPLAY_BACKPRESSURE_LOG_RATE_LIMIT_MS || 5000,
 )
 const TERMINAL_REPLAY_BACKPRESSURE_LOG_RATE_LIMIT_MS = Math.max(
   1,
   Number.isFinite(CONFIGURED_REPLAY_BACKPRESSURE_LOG_RATE_LIMIT_MS)
     && CONFIGURED_REPLAY_BACKPRESSURE_LOG_RATE_LIMIT_MS > 0
     ? Math.floor(CONFIGURED_REPLAY_BACKPRESSURE_LOG_RATE_LIMIT_MS)
-    : 1000,
+    : 5000,
 )
+const CONFIGURED_REPLAY_PROGRESS_LOG_INTERVAL_MS = Number(
+  process.env.TERMINAL_REPLAY_PROGRESS_LOG_INTERVAL_MS || 5000,
+)
+const TERMINAL_REPLAY_PROGRESS_LOG_INTERVAL_MS = Math.max(
+  1,
+  Number.isFinite(CONFIGURED_REPLAY_PROGRESS_LOG_INTERVAL_MS)
+    && CONFIGURED_REPLAY_PROGRESS_LOG_INTERVAL_MS > 0
+    ? Math.floor(CONFIGURED_REPLAY_PROGRESS_LOG_INTERVAL_MS)
+    : 5000,
+)
+const FOREGROUND_REPLAY_BACKPRESSURE_WARN_MS = 10_000
 const CONFIGURED_REPLAY_RETENTION_LOG_RATE_LIMIT_MS = Number(
   process.env.TERMINAL_REPLAY_RETENTION_LOG_RATE_LIMIT_MS || 1000,
 )
@@ -106,6 +117,7 @@ type ReplayBackpressurePayloadFields = {
   rawFrameCount: number
   dataBytes: number
 }
+type ReplayProgressFlushReason = 'interval' | 'completed' | 'abandoned' | 'superseded' | 'backpressure'
 
 function jsonNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
@@ -136,13 +148,6 @@ function payloadRawFrameCount(payload: JsonPayload): number {
   const seqEnd = jsonNumberField(payload, 'seqEnd')
   if (seqStart === undefined || seqEnd === undefined || seqEnd < seqStart) return 0
   return Math.max(1, Math.floor(seqEnd - seqStart + 1))
-}
-
-function batchRawFrameCount(batch: TerminalOutputBatch): number {
-  return batch.segments.reduce((sum, segment) => {
-    const frameCount = Math.max(1, Math.floor(segment.seqEnd - segment.seqStart + 1))
-    return sum + frameCount
-  }, 0)
 }
 
 function payloadBackpressureFields(payload: JsonPayload): ReplayBackpressurePayloadFields {
@@ -291,6 +296,10 @@ export class TerminalStreamBroker {
         attachment.flushTimer = null
       }
 
+      if (attachment.replayCursor || attachment.replayProgressLog) {
+        this.flushTerminalReplayProgress(terminalId, attachment, 'superseded')
+      }
+      this.clearReplayBackpressureLogState(attachment)
       attachment.mode = 'attaching'
       attachment.priority = priority
       attachment.activeAttachRequestId = attachRequestId
@@ -499,6 +508,10 @@ export class TerminalStreamBroker {
     if (attachment?.flushTimer) {
       clearTimeout(attachment.flushTimer)
       attachment.flushTimer = null
+    }
+    if (attachment) {
+      this.flushTerminalReplayProgress(terminalId, attachment, 'abandoned')
+      this.clearReplayBackpressureLogState(attachment)
     }
 
     this.streamIdentity.recordDetach(terminalId)
@@ -927,6 +940,7 @@ export class TerminalStreamBroker {
     if (gapResult === 'paused' || gapResult === 'failed') return
 
     if (cursor.nextSeq > cursor.toSeq || replay.frames.length === 0) {
+      this.flushTerminalReplayProgress(terminalId, attachment, 'completed')
       attachment.replayCursor = null
     }
 
@@ -1011,55 +1025,114 @@ export class TerminalStreamBroker {
     return true
   }
 
-  private logTerminalReplayBatch(input: {
+  private recordTerminalReplayProgress(input: {
     terminalId: string
+    attachment: BrokerClientAttachment
     attachRequestId?: string
     source: 'live' | 'replay'
     payload: JsonPayload
     result: SendJsonResult
     batch?: TerminalOutputBatch
-    envelopeIndex: number
-    envelopeCount: number
   }): void {
     if (input.source !== 'replay') return
 
+    const now = Date.now()
     const seqStart = jsonNumberField(input.payload, 'seqStart') ?? input.batch?.seqStart
     const seqEnd = jsonNumberField(input.payload, 'seqEnd') ?? input.batch?.seqEnd
     const streamId = jsonStringField(input.payload, 'streamId') ?? input.batch?.streamId
     const payloadType = jsonStringField(input.payload, 'type') ?? input.result.messageType ?? 'unknown'
     const rawFrameCount = payloadRawFrameCount(input.payload)
-    const logicalRawFrameCount = input.batch ? batchRawFrameCount(input.batch) : rawFrameCount
     const data = typeof input.payload.data === 'string' ? input.payload.data : ''
     const serializedBytes = input.result.serializedApplicationJsonBytes
       ?? jsonNumberField(input.payload, 'serializedBytes')
       ?? measureTerminalOutputPayloadBytes(input.payload)
     const bufferedAmount = input.result.bufferedAfter ?? input.result.bufferedBefore
+    const state = input.attachment.replayProgressLog ?? this.createReplayProgressLogState(now)
+    input.attachment.replayProgressLog = state
+
+    state.batchCount += 1
+    state.rawFrameCount += rawFrameCount
+    state.dataBytes += Buffer.byteLength(data, 'utf8')
+    state.serializedBytes += serializedBytes
+    state.payloadTypes.add(payloadType)
+    if (streamId) state.streamId = streamId
+    if (typeof seqStart === 'number') {
+      state.seqStart = typeof state.seqStart === 'number' ? Math.min(state.seqStart, seqStart) : seqStart
+    }
+    if (typeof seqEnd === 'number') {
+      state.seqEnd = typeof state.seqEnd === 'number' ? Math.max(state.seqEnd, seqEnd) : seqEnd
+    }
+    if (typeof bufferedAmount === 'number') {
+      state.maxBufferedAmount = typeof state.maxBufferedAmount === 'number'
+        ? Math.max(state.maxBufferedAmount, bufferedAmount)
+        : bufferedAmount
+    }
+
+    if (now - state.startedAt >= TERMINAL_REPLAY_PROGRESS_LOG_INTERVAL_MS) {
+      this.flushTerminalReplayProgress(input.terminalId, input.attachment, 'interval')
+    }
+  }
+
+  private createReplayProgressLogState(startedAt: number): ReplayProgressLogState {
+    return {
+      startedAt,
+      batchCount: 0,
+      rawFrameCount: 0,
+      dataBytes: 0,
+      serializedBytes: 0,
+      payloadTypes: new Set(),
+    }
+  }
+
+  private flushTerminalReplayProgress(
+    terminalId: string,
+    attachment: BrokerClientAttachment,
+    reason: ReplayProgressFlushReason,
+    extra: Record<string, unknown> = {},
+  ): void {
+    const state = attachment.replayProgressLog
+    if (!state || state.batchCount <= 0) return
+
+    const now = Date.now()
+    const terminalState = this.terminals.get(terminalId)
+    const cursor = attachment.replayCursor
+    const nextSeqFromProgress = typeof state.seqEnd === 'number' ? state.seqEnd + 1 : undefined
+    const nextSeq = typeof cursor?.nextSeq === 'number' && typeof nextSeqFromProgress === 'number'
+      ? Math.max(cursor.nextSeq, nextSeqFromProgress)
+      : nextSeqFromProgress ?? cursor?.nextSeq
+    const toSeq = cursor?.toSeq
+    const seqLag = typeof nextSeq === 'number' && typeof toSeq === 'number'
+      ? Math.max(0, toSeq - nextSeq + 1)
+      : undefined
+    const payloadTypes = Array.from(state.payloadTypes).sort()
+
     log.debug({
-      event: 'terminal.replay.batch',
+      event: 'terminal.replay.progress',
       severity: 'debug',
-      terminalId: input.terminalId,
-      source: input.source,
-      payloadType,
-      ...(input.attachRequestId ? { attachRequestId: input.attachRequestId } : {}),
-      ...(streamId ? { streamId } : {}),
-      ...(seqStart !== undefined ? { seqStart } : {}),
-      ...(seqEnd !== undefined ? { seqEnd } : {}),
-      rawFrameCount,
-      dataBytes: Buffer.byteLength(data, 'utf8'),
-      serializedBytes,
-      ...(typeof bufferedAmount === 'number' ? { bufferedAmount } : {}),
-      envelopeIndex: input.envelopeIndex,
-      envelopeCount: input.envelopeCount,
-      envelopeSplit: input.envelopeCount > 1,
-      ...(input.batch
-        ? {
-            logicalSeqStart: input.batch.seqStart,
-            logicalSeqEnd: input.batch.seqEnd,
-            logicalRawFrameCount,
-            legacyOutputSerializedBytes: input.batch.legacyOutputSerializedBytes,
-          }
-        : {}),
-    }, 'Terminal replay batch payload sent')
+      terminalId,
+      source: 'replay',
+      reason,
+      connectionId: attachment.ws.connectionId,
+      priority: attachment.priority,
+      clientCount: terminalState?.clients.size ?? 0,
+      ...(attachment.activeAttachRequestId ? { attachRequestId: attachment.activeAttachRequestId } : {}),
+      ...(state.streamId ? { streamId: state.streamId } : {}),
+      ...(typeof state.seqStart === 'number' ? { seqStart: state.seqStart } : {}),
+      ...(typeof state.seqEnd === 'number' ? { seqEnd: state.seqEnd } : {}),
+      ...(typeof nextSeq === 'number' ? { nextSeq } : {}),
+      ...(typeof toSeq === 'number' ? { toSeq } : {}),
+      ...(typeof seqLag === 'number' ? { seqLag } : {}),
+      batchCount: state.batchCount,
+      rawFrameCount: state.rawFrameCount,
+      dataBytes: state.dataBytes,
+      serializedBytes: state.serializedBytes,
+      ...(typeof state.maxBufferedAmount === 'number' ? { maxBufferedAmount: state.maxBufferedAmount } : {}),
+      ...(payloadTypes.length > 0 ? { payloadTypes } : {}),
+      durationMs: Math.max(0, now - state.startedAt),
+      backpressureActive: attachment.replayBackpressureActive === true,
+      ...extra,
+    }, 'Terminal replay progress summary')
+    attachment.replayProgressLog = undefined
   }
 
   private logTerminalReplayGap(input: {
@@ -1159,16 +1232,6 @@ export class TerminalStreamBroker {
               reason: result.reason,
             }
           }
-          this.logTerminalReplayBatch({
-            terminalId,
-            attachRequestId,
-            source,
-            payload,
-            result,
-            batch: frame,
-            envelopeIndex: index + 1,
-            envelopeCount: payloads.length,
-          })
         }
         return {
           status: 'sent',
@@ -1403,16 +1466,6 @@ export class TerminalStreamBroker {
           reason: result.reason,
         }
       }
-      this.logTerminalReplayBatch({
-        terminalId,
-        attachRequestId,
-        source,
-        payload,
-        result,
-        batch,
-        envelopeIndex: index + 1,
-        envelopeCount: payloads.length,
-      })
     }
     return { status: 'sent', sentFrameCount: payloads.length, sentSeqEnd: batch.seqEnd }
   }
@@ -1438,15 +1491,14 @@ export class TerminalStreamBroker {
         payloadSeqEnd,
         {
           backpressureFields: payloadBackpressureFields(payload),
-          onSent: (sendResult) => this.logTerminalReplayBatch({
+          onSent: (sendResult) => this.recordTerminalReplayProgress({
             terminalId,
+            attachment,
             attachRequestId,
             source,
             payload,
             result: sendResult,
             batch,
-            envelopeIndex: index + 1,
-            envelopeCount: payloads.length,
           }),
         },
       )
@@ -1498,7 +1550,17 @@ export class TerminalStreamBroker {
       attachment,
       prepared,
       frame.seqEnd,
-      { backpressureFields: payloadBackpressureFields(payload) },
+      {
+        backpressureFields: payloadBackpressureFields(payload),
+        onSent: (sendResult) => this.recordTerminalReplayProgress({
+          terminalId,
+          attachment,
+          attachRequestId,
+          source: 'replay',
+          payload,
+          result: sendResult,
+        }),
+      },
     )
   }
 
@@ -1523,15 +1585,14 @@ export class TerminalStreamBroker {
         payloadSeqEnd,
         {
           backpressureFields: payloadBackpressureFields(payload),
-          onSent: (sendResult) => this.logTerminalReplayBatch({
+          onSent: (sendResult) => this.recordTerminalReplayProgress({
             terminalId: input.terminalId,
+            attachment: input.attachment,
             attachRequestId: input.attachRequestId,
             source: input.source,
             payload,
             result: sendResult,
             batch: input.batch,
-            envelopeIndex: index + 1,
-            envelopeCount: payloads.length,
           }),
         },
       )
@@ -1730,7 +1791,7 @@ export class TerminalStreamBroker {
     const threshold = this.replayBufferedPauseThreshold(attachment)
     const projectedBufferedAmount = buffered + prepared.serializedApplicationJsonBytes
     if (projectedBufferedAmount <= threshold) {
-      this.resetReplayBackpressureLogState(attachment)
+      this.recordReplayBackpressureRecovery(terminalId, attachment)
       return false
     }
     this.pauseReplayForBackpressure(terminalId, attachment, {
@@ -1754,7 +1815,7 @@ export class TerminalStreamBroker {
     if (typeof buffered !== 'number') return false
     const threshold = this.replayBufferedPauseThreshold(attachment)
     if (buffered <= threshold) {
-      this.resetReplayBackpressureLogState(attachment)
+      this.recordReplayBackpressureRecovery(terminalId, attachment)
       return false
     }
     this.pauseReplayForBackpressure(terminalId, attachment, {
@@ -1797,6 +1858,20 @@ export class TerminalStreamBroker {
     const retryMs = this.replayBufferedPauseDelayMs(attachment)
     const now = Date.now()
     const lastLogAt = attachment.replayBackpressureLogLastAt
+
+    if (attachment.replayBackpressureActive !== true) {
+      attachment.replayBackpressureActive = true
+      attachment.replayBackpressureSince = now
+      attachment.replayBackpressureLogLastAt = now
+      attachment.replayBackpressureLogSuppressed = 0
+      this.logReplayBackpressureState(terminalId, attachment, 'entered', context, {
+        retryMs,
+        now,
+      })
+      this.scheduleFlush(terminalId, attachment, retryMs)
+      return
+    }
+
     if (
       typeof lastLogAt === 'number'
       && now - lastLogAt < TERMINAL_REPLAY_BACKPRESSURE_LOG_RATE_LIMIT_MS
@@ -1805,21 +1880,86 @@ export class TerminalStreamBroker {
       this.scheduleFlush(terminalId, attachment, retryMs)
       return
     }
+
     const suppressedCount = attachment.replayBackpressureLogSuppressed ?? 0
     attachment.replayBackpressureLogLastAt = now
     attachment.replayBackpressureLogSuppressed = 0
-    log.debug({
-      event: 'terminal.replay.backpressure_pause',
-      severity: 'debug',
+    const backpressureDurationMs = Math.max(0, now - (attachment.replayBackpressureSince ?? now))
+    this.logReplayBackpressureState(terminalId, attachment, 'still_blocked', context, {
+      retryMs,
+      suppressedCount,
+      now,
+    })
+    this.flushTerminalReplayProgress(terminalId, attachment, 'backpressure', {
+      backpressureDurationMs,
+      ...(suppressedCount > 0 ? { suppressedBackpressureCount: suppressedCount } : {}),
+    })
+    this.scheduleFlush(terminalId, attachment, retryMs)
+  }
+
+  private recordReplayBackpressureRecovery(
+    terminalId: string,
+    attachment: BrokerClientAttachment,
+  ): void {
+    if (attachment.replayBackpressureActive === true) {
+      const now = Date.now()
+      this.logReplayBackpressureState(terminalId, attachment, 'recovered', {}, {
+        suppressedCount: attachment.replayBackpressureLogSuppressed ?? 0,
+        now,
+      })
+    }
+    this.clearReplayBackpressureLogState(attachment)
+  }
+
+  private clearReplayBackpressureLogState(attachment: BrokerClientAttachment): void {
+    attachment.replayBackpressureLogLastAt = undefined
+    attachment.replayBackpressureLogSuppressed = 0
+    attachment.replayBackpressureActive = false
+    attachment.replayBackpressureSince = undefined
+  }
+
+  private logReplayBackpressureState(
+    terminalId: string,
+    attachment: BrokerClientAttachment,
+    state: 'entered' | 'still_blocked' | 'recovered',
+    context: Partial<{
+      bufferedAmount: number
+      threshold: number
+      serializedApplicationJsonBytes: number
+      projectedBufferedAmount: number
+      phase: 'before_send' | 'after_send'
+      seqStart: number
+      seqEnd: number
+      rawFrameCount: number
+      dataBytes: number
+    }>,
+    options: {
+      retryMs?: number
+      suppressedCount?: number
+      now: number
+    },
+  ): void {
+    const durationMs = attachment.replayBackpressureSince !== undefined
+      ? Math.max(0, options.now - attachment.replayBackpressureSince)
+      : 0
+    const level: 'debug' | 'warn' = attachment.priority === 'foreground'
+      && durationMs >= FOREGROUND_REPLAY_BACKPRESSURE_WARN_MS
+      && state !== 'entered'
+      ? 'warn'
+      : 'debug'
+    const payload = {
+      event: 'terminal.replay.backpressure_state',
+      severity: level,
+      state,
       terminalId,
       source: 'replay',
       reason: 'websocket_buffered_amount',
       connectionId: attachment.ws.connectionId,
       priority: attachment.priority,
-      retryMs,
+      ...(typeof options.retryMs === 'number' ? { retryMs: options.retryMs } : {}),
       ...(attachment.activeAttachRequestId ? { attachRequestId: attachment.activeAttachRequestId } : {}),
       ...(attachment.replayCursor?.streamId ? { streamId: attachment.replayCursor.streamId } : {}),
-      ...(suppressedCount > 0 ? { suppressedCount } : {}),
+      ...(options.suppressedCount && options.suppressedCount > 0 ? { suppressedCount: options.suppressedCount } : {}),
       ...(typeof attachment.replayCursor?.nextSeq === 'number'
         ? { nextSeq: attachment.replayCursor.nextSeq }
         : {}),
@@ -1830,34 +1970,25 @@ export class TerminalStreamBroker {
       ...(typeof context.seqEnd === 'number' ? { seqEnd: context.seqEnd } : {}),
       ...(typeof context.rawFrameCount === 'number' ? { rawFrameCount: context.rawFrameCount } : {}),
       ...(typeof context.dataBytes === 'number' ? { dataBytes: context.dataBytes } : {}),
-      bufferedAmount: context.bufferedAmount,
+      ...(typeof context.bufferedAmount === 'number' ? { bufferedAmount: context.bufferedAmount } : {}),
       ...(typeof context.projectedBufferedAmount === 'number'
         ? { projectedBufferedAmount: context.projectedBufferedAmount }
         : {}),
-      threshold: context.threshold,
+      ...(typeof context.threshold === 'number' ? { threshold: context.threshold } : {}),
       ...(typeof context.serializedApplicationJsonBytes === 'number'
         ? {
             serializedBytes: context.serializedApplicationJsonBytes,
             serializedApplicationJsonBytes: context.serializedApplicationJsonBytes,
           }
         : {}),
-      phase: context.phase,
-    }, 'Terminal replay paused for websocket backpressure')
-    log.debug({
-      event: 'terminal_stream_replay_backpressure_pause',
-      terminalId,
-      connectionId: attachment.ws.connectionId,
-      priority: attachment.priority,
-      retryMs,
-      ...(suppressedCount > 0 ? { suppressedCount } : {}),
-      ...context,
-    }, 'Terminal replay paused for websocket backpressure')
-    this.scheduleFlush(terminalId, attachment, retryMs)
-  }
-
-  private resetReplayBackpressureLogState(attachment: BrokerClientAttachment): void {
-    attachment.replayBackpressureLogLastAt = undefined
-    attachment.replayBackpressureLogSuppressed = 0
+      ...(context.phase ? { phase: context.phase } : {}),
+      durationMs,
+    }
+    if (level === 'warn') {
+      log.warn(payload, 'Terminal replay websocket backpressure state')
+    } else {
+      log.debug(payload, 'Terminal replay websocket backpressure state')
+    }
   }
 
   private prepareSendPayload(payload: unknown): PreparedJsonMessage | null {
@@ -1887,6 +2018,8 @@ export class TerminalStreamBroker {
     }
     for (const attachment of state.clients.values()) {
       if (attachment.flushTimer) clearTimeout(attachment.flushTimer)
+      this.flushTerminalReplayProgress(terminalId, attachment, 'abandoned')
+      this.clearReplayBackpressureLogState(attachment)
       this.unregisterWsTerminal(attachment.ws, terminalId)
     }
     state.clients.clear()

@@ -193,7 +193,15 @@ function resolveMaxRafGapMs(input: DerivedMetricsInput): number | undefined {
 }
 
 function isReplayBatchEvent(entry: Record<string, unknown>): boolean {
-  return entry.event === 'terminal.replay.batch' && entry.source === 'replay'
+  return (
+    entry.event === 'terminal.replay.batch'
+    || entry.event === 'terminal.replay.progress'
+  ) && entry.source === 'replay'
+}
+
+function replayBatchEventMessageCount(entry: Record<string, unknown>): number {
+  if (entry.event !== 'terminal.replay.progress') return 1
+  return nonnegativeMetric(entry.batchCount) ?? 1
 }
 
 function isReplayGapEvent(entry: Record<string, unknown>): boolean {
@@ -272,7 +280,9 @@ function resolveTerminalInputToFirstOutputMs(
 
 function resolveReplayMessageCount(input: DerivedMetricsInput, replayFrames: VisibleFirstWsObservation[]): number {
   const serverReplayBatchEvents = (input.server?.terminalReplayEvents ?? []).filter(isReplayBatchEvent)
-  return serverReplayBatchEvents.length > 0 ? serverReplayBatchEvents.length : replayFrames.length
+  return serverReplayBatchEvents.length > 0
+    ? sumMetric(serverReplayBatchEvents.map(replayBatchEventMessageCount))
+    : replayFrames.length
 }
 
 function resolveReplaySerializedBytes(input: DerivedMetricsInput, replayFrames: VisibleFirstWsObservation[]): number {

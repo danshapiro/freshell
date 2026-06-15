@@ -2,6 +2,7 @@ import fs from 'fs/promises'
 
 const TERMINAL_REPLAY_AUDIT_EVENTS = new Set([
   'terminal.replay.batch',
+  'terminal.replay.progress',
   'terminal.replay.gap',
 ])
 

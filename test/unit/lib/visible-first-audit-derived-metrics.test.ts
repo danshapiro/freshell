@@ -155,20 +155,12 @@ describe('deriveVisibleFirstMetrics', () => {
       server: {
         terminalReplayEvents: [
           {
-            event: 'terminal.replay.batch',
+            event: 'terminal.replay.progress',
             source: 'replay',
-            payloadType: 'terminal.output.batch',
             seqStart: 1,
-            seqEnd: 6,
-            serializedBytes: 400,
-          },
-          {
-            event: 'terminal.replay.batch',
-            source: 'replay',
-            payloadType: 'terminal.output',
-            seqStart: 7,
             seqEnd: 8,
-            serializedBytes: 120,
+            batchCount: 2,
+            serializedBytes: 520,
           },
           {
             event: 'terminal.replay.gap',

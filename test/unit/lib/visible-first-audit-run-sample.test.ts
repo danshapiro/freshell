@@ -65,10 +65,11 @@ function createReconnectCollectors(input: {
       perfSystemSamples: [],
       terminalReplayEvents: [
         {
-          event: 'terminal.replay.batch',
+          event: 'terminal.replay.progress',
           source: 'replay',
           seqStart: 1,
           seqEnd: 1,
+          batchCount: 1,
           serializedBytes: 120,
         },
       ],

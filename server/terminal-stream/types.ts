@@ -12,6 +12,19 @@ export type ReplayCursor = {
   streamId: string
 }
 
+export type ReplayProgressLogState = {
+  startedAt: number
+  batchCount: number
+  rawFrameCount: number
+  dataBytes: number
+  serializedBytes: number
+  payloadTypes: Set<string>
+  seqStart?: number
+  seqEnd?: number
+  streamId?: string
+  maxBufferedAmount?: number
+}
+
 export type BrokerClientAttachment = {
   ws: LiveWebSocket
   mode: BrokerClientMode
@@ -26,6 +39,9 @@ export type BrokerClientAttachment = {
   catastrophicClosed?: boolean
   replayBackpressureLogLastAt?: number
   replayBackpressureLogSuppressed?: number
+  replayBackpressureActive?: boolean
+  replayBackpressureSince?: number
+  replayProgressLog?: ReplayProgressLogState
   terminalOutputBatchV1: boolean
 }
 
