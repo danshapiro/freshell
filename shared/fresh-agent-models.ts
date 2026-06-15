@@ -68,6 +68,12 @@ export const FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE = {
       thinkingEfforts: ['minimal', 'low', 'medium', 'high', 'max'],
       defaultEffort: FRESHOPENCODE_DEFAULT_EFFORT,
     },
+    {
+      value: 'umans-ai-coding-plan/umans-kimi-k2.7',
+      label: 'Kimi k2.7',
+      thinkingEfforts: ['minimal', 'low', 'medium', 'high', 'max'],
+      defaultEffort: FRESHOPENCODE_DEFAULT_EFFORT,
+    },
   ],
 } as const satisfies Record<FreshAgentSessionType, readonly FreshAgentModelOption[]>
 
