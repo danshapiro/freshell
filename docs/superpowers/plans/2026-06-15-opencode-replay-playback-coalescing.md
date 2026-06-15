@@ -70,6 +70,12 @@ Replace the whole test with:
 
 ```ts
 it('preserves parser barrier checkpoints while allowing terminal.output.batch writes to coalesce', async () => {
+  const rafCallbacks: FrameRequestCallback[] = []
+  requestAnimationFrameSpy?.mockImplementation((cb: FrameRequestCallback) => {
+    rafCallbacks.push(cb)
+    return rafCallbacks.length
+  })
+
   const { terminalId, term } = await renderTerminalHarness({
     status: 'running',
     terminalId: 'term-output-batch-barrier',
@@ -77,7 +83,12 @@ it('preserves parser barrier checkpoints while allowing terminal.output.batch wr
   const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
   const streamId = latestStreamIdByTerminal.get(terminalId)
 
+  const delayedCallbacks: Array<{ data: string; callback: () => void }> = []
   term.write.mockClear()
+  term.write.mockImplementation((chunk: string, onWritten?: () => void) => {
+    if (onWritten) delayedCallbacks.push({ data: chunk, callback: onWritten })
+  })
+
   act(() => {
     messageHandler!({
       type: 'terminal.output.batch',
@@ -97,7 +108,26 @@ it('preserves parser barrier checkpoints while allowing terminal.output.batch wr
     })
   })
 
-  expect(terminalWriteStrings(term)).toEqual(['aBc'])
+  expect(delayedCallbacks).toEqual([])
+  expect(loadTerminalSurfaceCheckpoint(terminalId, {
+    streamId,
+    serverInstanceId: 'server-instance',
+  })).toBeNull()
+
+  act(() => {
+    rafCallbacks.shift()?.(16)
+  })
+
+  expect(delayedCallbacks.map(({ data }) => data)).toEqual(['aBc'])
+  expect(loadTerminalSurfaceCheckpoint(terminalId, {
+    streamId,
+    serverInstanceId: 'server-instance',
+  })).toBeNull()
+
+  act(() => {
+    delayedCallbacks[0]?.callback()
+  })
+
   expect(loadTerminalSurfaceCheckpoint(terminalId, {
     streamId,
     serverInstanceId: 'server-instance',
@@ -475,11 +505,13 @@ Create `test/e2e-browser/specs/opencode-replay-write-progression.spec.ts`:
 ```ts
 import { expect, test } from '../helpers/fixtures.js'
 
-const terminalId = 'term-e2e-opencode-replay-write-progression'
-const streamId = 'stream-e2e-opencode-replay-write-progression'
-const paneId = 'pane-e2e-opencode-replay-write-progression'
+type TerminalSnapshot = {
+  terminalId: string
+  streamId: string
+  attachRequestId: string
+}
 
-function createOpenCodeLikeReplay() {
+function createOpenCodeLikeReplay(seqBase: number) {
   const chunks = Array.from({ length: 96 }, (_unused, index) => (
     index % 2 === 0
       ? `\x1b[${30 + (index % 8)}m`
@@ -487,8 +519,8 @@ function createOpenCodeLikeReplay() {
   ))
   const data = chunks.join('')
   const segments = chunks.map((chunk, index) => ({
-    seqStart: index + 1,
-    seqEnd: index + 1,
+    seqStart: seqBase + index,
+    seqEnd: seqBase + index,
     endOffset: chunks.slice(0, index + 1).join('').length,
     rawFrameCount: 1,
     barrier: 'control',
@@ -497,78 +529,54 @@ function createOpenCodeLikeReplay() {
 }
 
 test.describe('OpenCode replay write progression', () => {
-  test('submits barrier-heavy replay to real xterm in bounded writes', async ({ page, serverInfo, harness }) => {
-    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
-    await harness.waitForHarness()
-    await harness.waitForConnection()
+  test('submits barrier-heavy replay to real xterm in bounded writes', async ({ freshellPage, harness, terminal }) => {
+    const page = freshellPage
+    await terminal.waitForPrompt({ timeout: 30_000 })
 
-    await page.evaluate(({ tabId, paneId: targetPaneId, terminalId: targetTerminalId }) => {
+    const snapshot = await page.waitForFunction((): TerminalSnapshot | null => {
       const harness = window.__FRESHELL_TEST_HARNESS__
-      if (!harness) throw new Error('Freshell test harness is not installed')
-      harness.dispatch({
-        type: 'tabs/addTab',
-        payload: {
-          id: tabId,
-          title: 'OpenCode replay write progression',
-          mode: 'opencode',
-          status: 'running',
-        },
-      })
-      harness.dispatch({
-        type: 'panes/initLayout',
-        payload: {
-          tabId,
-          paneId: targetPaneId,
-          content: {
-            kind: 'terminal',
-            mode: 'opencode',
-            shell: 'system',
-            terminalId: targetTerminalId,
-            status: 'running',
-          },
-        },
-      })
-    }, {
-      tabId: 'tab-e2e-opencode-replay-write-progression',
-      paneId,
-      terminalId,
-    })
-
-    await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: 15_000 })
-    await page.waitForFunction((targetTerminalId) => (
-      window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer(targetTerminalId) !== null
-    ), terminalId, { timeout: 15_000 })
-
-    const attach = await page.waitForFunction((targetTerminalId) => {
-      const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
-      return sent.find((msg: any) =>
+      const state = harness?.getState()
+      const activeTabId = state?.tabs?.activeTabId
+      const findTerminal = (node: any): any => {
+        if (!node) return undefined
+        if (node.type === 'leaf' && node.content?.kind === 'terminal') return node.content
+        if (node.type === 'split') return findTerminal(node.children?.[0]) ?? findTerminal(node.children?.[1])
+        return undefined
+      }
+      const content = findTerminal(state?.panes?.layouts?.[activeTabId])
+      if (
+        typeof content?.terminalId !== 'string'
+        || typeof content?.streamId !== 'string'
+      ) {
+        return null
+      }
+      const sent = harness?.getSentWsMessages?.() ?? []
+      const attach = [...sent].reverse().find((msg: any) =>
         msg?.type === 'terminal.attach'
-        && msg.terminalId === targetTerminalId
+        && msg.terminalId === content.terminalId
         && typeof msg.attachRequestId === 'string'
-      ) ?? null
-    }, terminalId, { timeout: 15_000 })
-      .then((handle) => handle.jsonValue() as Promise<{ attachRequestId: string }>)
+      )
+      if (!attach) return null
+      return {
+        terminalId: content.terminalId,
+        streamId: content.streamId,
+        attachRequestId: attach.attachRequestId,
+      }
+    }, { timeout: 30_000 })
+      .then((handle) => handle.jsonValue() as Promise<TerminalSnapshot>)
 
-    const replay = createOpenCodeLikeReplay()
+    const seqBase = 100_000
+    const replay = createOpenCodeLikeReplay(seqBase)
     await harness.clearTerminalWriteEvents()
 
     await harness.receiveWsMessage({
-      type: 'terminal.attach.ready',
-      terminalId,
-      streamId,
-      headSeq: replay.chunks.length,
-      replayFromSeq: 1,
-      replayToSeq: replay.chunks.length,
-      attachRequestId: attach.attachRequestId,
-    })
-    await harness.receiveWsMessage({
       type: 'terminal.output.batch',
-      terminalId,
-      streamId,
-      attachRequestId: attach.attachRequestId,
+      terminalId: snapshot.terminalId,
+      streamId: snapshot.streamId,
+      attachRequestId: snapshot.attachRequestId,
       source: 'replay',
-      seqStart: 1,
-      seqEnd: replay.chunks.length,
+      seqStart: seqBase,
+      seqEnd: seqBase + replay.chunks.length - 1,
       data: replay.data,
       serializedBytes: replay.data.length + 512,
       segments: replay.segments,
@@ -576,17 +584,17 @@ test.describe('OpenCode replay write progression', () => {
 
     await expect.poll(async () => {
       const submitted = (await harness.getTerminalWriteEvents())
-        .filter((event) => event.phase === 'submitted' && event.terminalId === terminalId)
+        .filter((event) => event.phase === 'submitted' && event.terminalId === snapshot.terminalId)
       return submitted.map((event) => event.data).join('')
     }, { timeout: 15_000 }).toBe(replay.data)
 
     const submitted = (await harness.getTerminalWriteEvents())
-      .filter((event) => event.phase === 'submitted' && event.terminalId === terminalId)
+      .filter((event) => event.phase === 'submitted' && event.terminalId === snapshot.terminalId)
     expect(submitted.length).toBeLessThanOrEqual(2)
 
     await expect.poll(async () => {
       const written = (await harness.getTerminalWriteEvents())
-        .filter((event) => event.phase === 'written' && event.terminalId === terminalId)
+        .filter((event) => event.phase === 'written' && event.terminalId === snapshot.terminalId)
       return written.map((event) => event.data).join('')
     }, { timeout: 15_000 }).toBe(replay.data)
   })
