@@ -28,8 +28,9 @@ export function buildSessionIdentityMismatchDetails(
   record: TerminalSessionIdentityRecord,
   expectedSessionRef: SessionLocator | undefined,
 ): SessionIdentityMismatchDetails {
+  const actualSessionRef = canonicalActualSessionRef(record)
   return {
     ...(expectedSessionRef ? { expectedSessionRef } : {}),
-    ...(canonicalActualSessionRef(record) ? { actualSessionRef: canonicalActualSessionRef(record) } : {}),
+    ...(actualSessionRef ? { actualSessionRef } : {}),
   }
 }

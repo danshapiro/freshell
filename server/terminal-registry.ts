@@ -46,6 +46,10 @@ import type { CodexRemoteProxyCandidate } from './coding-cli/codex-app-server/re
 import type { CodexTurnEvent } from './coding-cli/codex-app-server/client.js'
 import { collectShutdownFailures, throwShutdownFailures } from './shutdown-join.js'
 import { recordSessionLifecycleEvent } from './session-observability.js'
+import {
+  buildSessionIdentityMismatchDetails,
+  terminalMatchesExpectedSession,
+} from './terminal-session-identity.js'
 
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
 const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 512 * 1024)
@@ -605,6 +609,12 @@ export type TerminalRecord = {
 
 export type TerminalInputResult =
   | { status: 'written' }
+  | {
+    status: 'session_identity_mismatch'
+    terminalId: string
+    expectedSessionRef: SessionLocator
+    actualSessionRef?: SessionLocator
+  }
   | { status: 'blocked_codex_identity_pending'; terminalId: string }
   | { status: 'blocked_codex_identity_capture_timeout'; terminalId: string }
   | { status: 'blocked_codex_identity_unavailable'; terminalId: string; reason?: string }
@@ -613,6 +623,16 @@ export type TerminalInputResult =
   | { status: 'blocked_codex_lifecycle_loss_pending'; terminalId: string }
   | { status: 'no_terminal' }
   | { status: 'not_running' }
+
+export type TerminalResizeResult =
+  | { status: 'resized' | 'unchanged' }
+  | {
+    status: 'session_identity_mismatch'
+    terminalId: string
+    expectedSessionRef: SessionLocator
+    actualSessionRef?: SessionLocator
+  }
+  | { status: 'missing' | 'not_running' }
 
 function isCodexStartupTerminalControlInput(data: string): boolean {
   if (data.length === 0 || data.length > 128) return false
@@ -3088,9 +3108,34 @@ export class TerminalRegistry extends EventEmitter {
     return true
   }
 
+  private buildSessionIdentityMismatchResult(
+    term: TerminalRecord,
+    expectedSessionRef: SessionLocator | undefined,
+  ): Extract<TerminalInputResult, { status: 'session_identity_mismatch' }> | undefined {
+    if (!expectedSessionRef || terminalMatchesExpectedSession(term, expectedSessionRef)) {
+      return undefined
+    }
+    return {
+      status: 'session_identity_mismatch',
+      terminalId: term.terminalId,
+      expectedSessionRef,
+      ...buildSessionIdentityMismatchDetails(term, expectedSessionRef),
+    }
+  }
+
   input(terminalId: string, data: string): TerminalInputResult {
+    return this.inputIfSessionMatches(terminalId, data)
+  }
+
+  inputIfSessionMatches(
+    terminalId: string,
+    data: string,
+    expectedSessionRef?: SessionLocator,
+  ): TerminalInputResult {
     const term = this.terminals.get(terminalId)
     if (!term) return { status: 'no_terminal' }
+    const mismatch = this.buildSessionIdentityMismatchResult(term, expectedSessionRef)
+    if (mismatch) return mismatch
     if (
       term.mode === 'codex'
       && term.codexDurability?.state === 'non_restorable'
@@ -3173,9 +3218,22 @@ export class TerminalRegistry extends EventEmitter {
   }
 
   resize(terminalId: string, cols: number, rows: number): boolean {
+    const result = this.resizeIfSessionMatches(terminalId, cols, rows)
+    return result.status === 'resized' || result.status === 'unchanged'
+  }
+
+  resizeIfSessionMatches(
+    terminalId: string,
+    cols: number,
+    rows: number,
+    expectedSessionRef?: SessionLocator,
+  ): TerminalResizeResult {
     const term = this.terminals.get(terminalId)
-    if (!term || term.status !== 'running') return false
-    if (term.cols === cols && term.rows === rows) return true
+    if (!term) return { status: 'missing' }
+    const mismatch = this.buildSessionIdentityMismatchResult(term, expectedSessionRef)
+    if (mismatch) return mismatch
+    if (term.status !== 'running') return { status: 'not_running' }
+    if (term.cols === cols && term.rows === rows) return { status: 'unchanged' }
     term.cols = cols
     term.rows = rows
     try {
@@ -3183,7 +3241,7 @@ export class TerminalRegistry extends EventEmitter {
     } catch (err) {
       logger.debug({ err, terminalId }, 'resize failed')
     }
-    return true
+    return { status: 'resized' }
   }
 
   kill(terminalId: string): boolean {
