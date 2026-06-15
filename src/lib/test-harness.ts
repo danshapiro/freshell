@@ -11,6 +11,9 @@ export type TerminalWriteEvent = {
   at: number
 }
 
+const MAX_TERMINAL_WRITE_EVENTS = 1000
+const MAX_TERMINAL_WRITE_EVENT_BYTES = 1024 * 1024
+
 export interface FreshellTestHarness {
   getState: () => ReturnType<typeof appStore.getState>
   dispatch: typeof appStore.dispatch
@@ -81,6 +84,7 @@ export function installTestHarness(
   const suppressedTerminalPaneIds = new Set<string>()
   const sentWsMessages: unknown[] = []
   const terminalWriteEvents: TerminalWriteEvent[] = []
+  let terminalWriteEventBytes = 0
   const recordSentWsMessage = (msg: unknown) => {
     try {
       sentWsMessages.push(JSON.parse(JSON.stringify(msg)))
@@ -145,12 +149,22 @@ export function installTestHarness(
     },
     recordSentWsMessage,
     recordTerminalWrite: (event: TerminalWriteEvent) => {
-      terminalWriteEvents.push({ ...event })
-      if (terminalWriteEvents.length > 1000) terminalWriteEvents.shift()
+      const retainedEvent = { ...event }
+      terminalWriteEvents.push(retainedEvent)
+      terminalWriteEventBytes += retainedEvent.data.length
+      while (
+        terminalWriteEvents.length > MAX_TERMINAL_WRITE_EVENTS
+        || terminalWriteEventBytes > MAX_TERMINAL_WRITE_EVENT_BYTES
+      ) {
+        const removedEvent = terminalWriteEvents.shift()
+        if (!removedEvent) break
+        terminalWriteEventBytes -= removedEvent.data.length
+      }
     },
     getTerminalWriteEvents: () => [...terminalWriteEvents],
     clearTerminalWriteEvents: () => {
       terminalWriteEvents.length = 0
+      terminalWriteEventBytes = 0
     },
   }
 }

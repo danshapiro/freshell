@@ -1712,14 +1712,18 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       terminalInstanceId,
       write: (data, onWritten) => {
         const recordForTest = (phase: 'submitted' | 'written') => {
-          window.__FRESHELL_TEST_HARNESS__?.recordTerminalWrite?.({
-            terminalId: terminalIdRef.current,
-            paneId,
-            phase,
-            chars: data.length,
-            data,
-            at: performance.now(),
-          })
+          try {
+            window.__FRESHELL_TEST_HARNESS__?.recordTerminalWrite?.({
+              terminalId: terminalIdRef.current,
+              paneId,
+              phase,
+              chars: data.length,
+              data,
+              at: performance.now(),
+            })
+          } catch {
+            // Test harness failures must never break the terminal write path.
+          }
         }
         const completeWrite = () => {
           recordForTest('written')
@@ -1730,7 +1734,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           term.write(data, completeWrite)
         } catch {
           // disposed
-          completeWrite()
+          onWritten?.()
         }
       },
     })
