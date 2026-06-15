@@ -121,6 +121,33 @@ function getTerminalItem(items: ReturnType<typeof buildMenuItems>, id: string) {
   return item
 }
 
+const REOPEN_SESSION_TYPE_CASES = [
+  {
+    provider: 'claude',
+    cliSessionType: 'claude',
+    freshSessionType: 'freshclaude',
+    sessionId: '550e8400-e29b-41d4-a716-446655440000',
+    cliToFreshLabel: 'Reopen as freshclaude',
+    freshToCliLabel: 'Reopen as Claude CLI',
+  },
+  {
+    provider: 'codex',
+    cliSessionType: 'codex',
+    freshSessionType: 'freshcodex',
+    sessionId: 'codex-thread-1',
+    cliToFreshLabel: 'Reopen as freshcodex',
+    freshToCliLabel: 'Reopen as Codex CLI',
+  },
+  {
+    provider: 'opencode',
+    cliSessionType: 'opencode',
+    freshSessionType: 'freshopencode',
+    sessionId: 'ses_opencode_1',
+    cliToFreshLabel: 'Reopen as freshopencode',
+    freshToCliLabel: 'Reopen as OpenCode CLI',
+  },
+] as const
+
 describe('context menu global view labels', () => {
   it('includes renamed views and new tabs view in global menu', () => {
     const items = buildMenuItems(
@@ -275,6 +302,80 @@ describe('buildMenuItems - refresh items', () => {
 })
 
 describe('buildMenuItems - reopen as paired session flavor', () => {
+  for (const entry of REOPEN_SESSION_TYPE_CASES) {
+    it(`adds ${entry.cliToFreshLabel} to a ${entry.cliSessionType} CLI terminal body menu`, () => {
+      const actions = createActions()
+      const items = buildMenuItems(
+        { kind: 'terminal', tabId: 'tab-1', paneId: 'pane-1' },
+        makeCtx(actions, {
+          paneLayouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: entry.cliSessionType,
+                sessionRef: { provider: entry.provider, sessionId: entry.sessionId },
+                createRequestId: 'req-1',
+                status: 'running',
+              },
+            },
+          },
+        }),
+      )
+
+      const item = getTerminalItem(items, 'reopen-pane-as-session-type')
+      expect(item.label).toBe(entry.cliToFreshLabel)
+      item.onSelect()
+      expect(actions.reopenPaneAsSessionTarget).toHaveBeenCalledWith(expect.objectContaining({
+        provider: entry.provider,
+        sessionId: entry.sessionId,
+        sourceSessionType: entry.cliSessionType,
+        targetSessionType: entry.freshSessionType,
+      }))
+    })
+
+    it(`adds ${entry.freshToCliLabel} to a ${entry.freshSessionType} body menu using pane state`, () => {
+      const actions = createActions()
+      const items = buildMenuItems(
+        {
+          kind: 'fresh-agent',
+          tabId: 'tab-1',
+          paneId: 'pane-1',
+          provider: entry.provider,
+          sessionType: entry.freshSessionType,
+        },
+        makeCtx(actions, {
+          paneLayouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'fresh-agent',
+                sessionType: entry.freshSessionType,
+                provider: entry.provider,
+                sessionRef: { provider: entry.provider, sessionId: entry.sessionId },
+                createRequestId: 'req-1',
+                status: 'idle',
+              },
+            },
+          },
+        }),
+      )
+
+      const item = getTerminalItem(items, 'reopen-pane-as-session-type')
+      expect(item.label).toBe(entry.freshToCliLabel)
+      item.onSelect()
+      expect(actions.reopenPaneAsSessionTarget).toHaveBeenCalledWith(expect.objectContaining({
+        provider: entry.provider,
+        sessionId: entry.sessionId,
+        sourceSessionType: entry.freshSessionType,
+        targetSessionType: entry.cliSessionType,
+      }))
+      expect(items.some((candidate) => candidate.type === 'item' && candidate.id === 'fc-copy-session')).toBe(false)
+    })
+  }
+
   it('adds Reopen as freshclaude to a Claude CLI terminal body menu with a durable target payload', () => {
     const actions = createActions()
     const items = buildMenuItems(

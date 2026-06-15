@@ -406,6 +406,8 @@ export function FreshAgentView({
   const handledRefreshRequestIdRef = useRef<string | null>(null)
   const preferredResumeSessionId = getPreferredResumeSessionId(claudeSession) ?? paneContent.resumeSessionId
   const snapshotThreadId = getFreshAgentSnapshotThreadId(paneContent, claudeSession)
+  const snapshotThreadIdRef = useRef(snapshotThreadId)
+  snapshotThreadIdRef.current = snapshotThreadId
   const hasRestoreFailure = Boolean(
     paneContent.provider === 'claude'
       && paneContent.sessionId
@@ -904,15 +906,18 @@ export function FreshAgentView({
     setLoadError(null)
     const sessionId = snapshotThreadId
     const provider = paneContent.provider
+    const requestSessionType = paneContent.sessionType
     const requestCreateRequestId = paneContent.createRequestId
-    const requestAutoTitleIdentity = autoTitleIdentity
     const isStaleSnapshotRequest = () => (
       paneContentRef.current.createRequestId !== requestCreateRequestId
-      || currentAutoTitleIdentityRef.current !== requestAutoTitleIdentity
+      || paneContentRef.current.provider !== provider
+      || paneContentRef.current.sessionType !== requestSessionType
+      || snapshotThreadIdRef.current !== sessionId
     )
-    void getFreshAgentThreadSnapshot(paneContent.sessionType, provider, sessionId, { signal: controller.signal })
+    void getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, { signal: controller.signal })
       .then((next) => {
         if (isStaleSnapshotRequest()) return
+        const snapshotIdentity = currentAutoTitleIdentityRef.current
         const resolved = next as FreshAgentSnapshot
         const resolvedHasUserTurns = resolved.turns.some((turn) => turn.role === 'user')
         if (!resolvedHasUserTurns && !autoTitleSentRef.current) {
@@ -924,7 +929,7 @@ export function FreshAgentView({
         }
         const displaySnapshot = mergeSnapshotForDisplay(snapshotRef.current, resolved)
         commitSnapshot(displaySnapshot)
-        setSnapshotAutoTitleIdentity(requestAutoTitleIdentity)
+        setSnapshotAutoTitleIdentity(snapshotIdentity)
         const echo = localEchoRef.current
         if (echo) {
           const needle = echo.slice(0, 80)
@@ -1033,7 +1038,6 @@ export function FreshAgentView({
     paneContent.sessionId,
     paneContent.sessionType,
     paneId,
-    autoTitleIdentity,
     commitSnapshot,
     migratePendingAutoTitle,
     snapshotThreadId,
@@ -1342,6 +1346,9 @@ export function FreshAgentView({
       event.preventDefault()
       composerRef.current?.appendText(event.key)
     }
+    const contextSessionId = paneContent.sessionId
+      ?? (paneContent.sessionRef?.provider === paneContent.provider ? paneContent.sessionRef.sessionId : undefined)
+      ?? paneContent.resumeSessionId
     const sendInterrupt = () => {
       if (!paneContent.sessionId || !canInterrupt) return
       sendFreshAgentMessage({
@@ -1376,7 +1383,7 @@ export function FreshAgentView({
         data-style={activeStyle}
         data-tab-id={tabId}
         data-pane-id={paneId}
-        data-session-id={paneContent.sessionId}
+        data-session-id={contextSessionId}
         data-provider={paneContent.provider}
         data-session-type={paneContent.sessionType}
         style={{ '--fresh-transcript-font-size': `${terminalFontSize}px` } as CSSProperties}

@@ -19,7 +19,7 @@ export type ContextTarget =
   | { kind: 'agent-chat'; sessionId: string }
   | {
       kind: 'fresh-agent'
-      sessionId: string
+      sessionId?: string
       tabId?: string
       paneId?: string
       provider?: string

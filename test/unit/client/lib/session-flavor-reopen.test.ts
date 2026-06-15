@@ -11,7 +11,90 @@ const tab = {
   createRequestId: 'tab-req',
 } as any
 
+const REOPEN_SESSION_TYPE_CASES = [
+  {
+    provider: 'claude',
+    cliSessionType: 'claude',
+    freshSessionType: 'freshclaude',
+    sessionId: '550e8400-e29b-41d4-a716-446655440000',
+    freshLabel: 'Reopen as freshclaude',
+    cliLabel: 'Reopen as Claude CLI',
+  },
+  {
+    provider: 'codex',
+    cliSessionType: 'codex',
+    freshSessionType: 'freshcodex',
+    sessionId: 'codex-thread-1',
+    freshLabel: 'Reopen as freshcodex',
+    cliLabel: 'Reopen as Codex CLI',
+  },
+  {
+    provider: 'opencode',
+    cliSessionType: 'opencode',
+    freshSessionType: 'freshopencode',
+    sessionId: 'ses_opencode_1',
+    freshLabel: 'Reopen as freshopencode',
+    cliLabel: 'Reopen as OpenCode CLI',
+  },
+] as const
+
 describe('resolveReopenPaneSessionTarget', () => {
+  for (const entry of REOPEN_SESSION_TYPE_CASES) {
+    it(`resolves ${entry.cliSessionType} CLI panes to ${entry.freshSessionType}`, () => {
+      const content: PaneContent = {
+        kind: 'terminal',
+        mode: entry.cliSessionType,
+        terminalId: 'term-1',
+        createRequestId: 'req-1',
+        status: 'running',
+        sessionRef: { provider: entry.provider, sessionId: entry.sessionId },
+        initialCwd: '/repo',
+      }
+
+      expect(resolveReopenPaneSessionTarget({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content,
+        tab,
+        activity: { isBusy: false },
+      })).toMatchObject({
+        sourceSessionType: entry.cliSessionType,
+        targetSessionType: entry.freshSessionType,
+        provider: entry.provider,
+        sessionId: entry.sessionId,
+        label: entry.freshLabel,
+        disabled: false,
+      })
+    })
+
+    it(`resolves ${entry.freshSessionType} panes to ${entry.cliSessionType} CLI`, () => {
+      const content: PaneContent = {
+        kind: 'fresh-agent',
+        sessionType: entry.freshSessionType,
+        provider: entry.provider,
+        sessionRef: { provider: entry.provider, sessionId: entry.sessionId },
+        createRequestId: 'req-1',
+        status: 'idle',
+        initialCwd: '/repo',
+      }
+
+      expect(resolveReopenPaneSessionTarget({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content,
+        tab,
+        activity: { isBusy: false },
+      })).toMatchObject({
+        sourceSessionType: entry.freshSessionType,
+        targetSessionType: entry.cliSessionType,
+        provider: entry.provider,
+        sessionId: entry.sessionId,
+        label: entry.cliLabel,
+        disabled: false,
+      })
+    })
+  }
+
   it('resolves a Claude CLI pane to freshclaude using canonical sessionRef', () => {
     const content: PaneContent = {
       kind: 'terminal',

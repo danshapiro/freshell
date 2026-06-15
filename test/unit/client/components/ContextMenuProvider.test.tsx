@@ -71,6 +71,7 @@ vi.mock('@/lib/clipboard', () => ({
 }))
 
 const VALID_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
+const CODEX_THREAD_ID = '019ec8c9-2b12-7001-a11d-e2e089860320'
 
 function createDeferred<T>() {
   let resolve!: (value: T) => void
@@ -1029,6 +1030,78 @@ describe('ContextMenuProvider', () => {
     expect(store.getState().tabs.tabs[0].sessionMetadataByKey).toEqual({
       [`claude:${VALID_SESSION_ID}`]: {
         sessionType: 'claude',
+      },
+    })
+  })
+
+  it('reopens a restored FreshCodex pane when right-clicking transcript body content', async () => {
+    const user = userEvent.setup()
+    const store = createTestStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        provider: 'codex',
+        sessionType: 'freshcodex',
+        status: 'idle',
+        createRequestId: 'req-freshcodex',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: CODEX_THREAD_ID,
+        },
+        initialCwd: '/test/project',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.FreshAgent}
+            data-tab-id="tab-1"
+            data-pane-id="pane-1"
+            data-provider="codex"
+            data-session-type="freshcodex"
+          >
+            <div data-context="fresh-agent-transcript">FreshCodex transcript body</div>
+          </div>
+        </ContextMenuProvider>
+      </Provider>,
+    )
+
+    await user.pointer({ target: screen.getByText('FreshCodex transcript body'), keys: '[MouseRight]' })
+    await user.click(await screen.findByRole('menuitem', { name: 'Reopen as Codex CLI' }))
+
+    await waitFor(() => {
+      expect(apiMocks.setSessionMetadata).toHaveBeenCalledWith(
+        'codex',
+        CODEX_THREAD_ID,
+        'codex',
+        { sessionTypeSource: 'explicit' },
+      )
+    })
+
+    expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+      type: 'leaf',
+      content: {
+        kind: 'terminal',
+        mode: 'codex',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: CODEX_THREAD_ID,
+        },
+        initialCwd: '/test/project',
+      },
+    })
+    expect(store.getState().tabs.tabs[0].sessionMetadataByKey).toEqual({
+      [`codex:${CODEX_THREAD_ID}`]: {
+        sessionType: 'codex',
       },
     })
   })

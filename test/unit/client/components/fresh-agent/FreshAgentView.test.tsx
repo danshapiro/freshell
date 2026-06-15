@@ -319,6 +319,31 @@ describe('FreshAgentView', () => {
     expect(root).toHaveClass('fresh-agent-style-serif')
   })
 
+  it('exposes a durable sessionRef as the fresh-agent context session id', async () => {
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            createRequestId: 'req-context-session',
+            status: 'idle',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: '019ec8c9-2b12-7001-a11d-e2e089860320',
+            },
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(getFreshAgentSessionId()).toBe('019ec8c9-2b12-7001-a11d-e2e089860320'))
+  })
+
   it('only exposes the stop action while the agent is working', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({

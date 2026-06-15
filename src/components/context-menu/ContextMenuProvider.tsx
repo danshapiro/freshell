@@ -74,6 +74,7 @@ const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 
 const log = createLogger('ContextMenuProvider')
+const KNOWN_CONTEXT_IDS = new Set(Object.values(ContextIds) as ContextId[])
 
 
 type MenuState = {
@@ -99,19 +100,21 @@ type ContextMenuProviderProps = {
   children: React.ReactNode
 }
 
+function isKnownContextId(value: string | undefined): value is ContextId {
+  return !!value && KNOWN_CONTEXT_IDS.has(value as ContextId)
+}
+
 function findContextElement(start: HTMLElement | null): HTMLElement | null {
   let node: HTMLElement | null = start
   while (node) {
-    if (node.dataset?.context) return node
+    if (isKnownContextId(node.dataset?.context)) return node
     node = node.parentElement
   }
   return null
 }
 
 function resolveContextId(value: string | undefined): ContextId {
-  if (!value) return ContextIds.Global
-  const allowed = new Set(Object.values(ContextIds) as ContextId[])
-  return allowed.has(value as ContextId) ? (value as ContextId) : ContextIds.Global
+  return isKnownContextId(value) ? value : ContextIds.Global
 }
 
 function hasWaitingPrompt(

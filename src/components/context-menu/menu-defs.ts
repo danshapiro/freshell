@@ -743,11 +743,13 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       items.push(...buildReopenPaneAsItem(target.tabId, target.paneId, paneContent, tab, ctx))
     }
 
-    // Session metadata at the bottom
-    items.push(
-      { type: 'separator', id: 'fc-session-sep' },
-      { type: 'item', id: 'fc-copy-session', label: 'Copy session ID', onSelect: () => actions.copySessionId(target.sessionId) },
-    )
+    const sessionId = target.sessionId
+    if (sessionId) {
+      items.push(
+        { type: 'separator', id: 'fc-session-sep' },
+        { type: 'item', id: 'fc-copy-session', label: 'Copy session ID', onSelect: () => actions.copySessionId(sessionId) },
+      )
+    }
 
     return items
   }
