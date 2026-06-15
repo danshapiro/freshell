@@ -17,7 +17,7 @@ import { api, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
 import { consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { clearPendingCreateFailure } from '@/store/freshAgentSlice'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
-import { handleFreshAgentTransportEvent, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
+import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import {
   normalizeFreshAgentEffort,
   normalizeFreshAgentModel,
@@ -859,13 +859,6 @@ export function FreshAgentView({
         && message.sessionType === paneContent.sessionType
         && message.provider === paneContent.provider
       ) {
-        handleFreshAgentTransportEvent(dispatch, {
-          type: 'freshAgent.event',
-          sessionId: message.sessionId,
-          sessionType: message.sessionType,
-          provider: message.provider,
-          event: (message.event ?? {}) as Record<string, unknown>,
-        })
         setSnapshotRefreshNonce((value) => value + 1)
       }
       if (

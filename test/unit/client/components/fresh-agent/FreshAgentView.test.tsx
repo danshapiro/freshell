@@ -11,6 +11,7 @@ import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSet
 import { initLayout, requestPaneRefresh, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
 import { useAppSelector } from '@/store/hooks'
 import { updateTab } from '@/store/tabsSlice'
+import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import type { PaneNode } from '@/store/paneTypes'
 
 const CLAUDE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440000'
@@ -857,6 +858,103 @@ describe('FreshAgentView', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
     expect(sentFreshAgentMessages('freshAgent.send').at(-1)).toMatchObject({
       sessionId: 'ses_real_materialized_1',
+    })
+  })
+
+  it('does not double-project non-idempotent freshAgent.event messages when App and view both receive them', async () => {
+    const store = createStore()
+    const sessionId = 'thread-single-projection-owner'
+    const sessionKey = `freshcodex:codex:${sessionId}`
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: sessionId,
+      revision: 1,
+      latestTurnId: null,
+      status: 'idle',
+      summary: 'Empty thread',
+      capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: true },
+      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+      pendingApprovals: [],
+      pendingQuestions: [],
+      worktrees: [],
+      diffs: [],
+      childThreads: [],
+      turns: [],
+      extensions: {},
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-single-projection-owner',
+        sessionId,
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(onMessage).toBeTypeOf('function')
+    })
+
+    const deliverThroughAppAndMountedView = (event: Record<string, unknown>) => {
+      const message = {
+        type: 'freshAgent.event',
+        sessionId,
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        event: { sessionId, ...event },
+      }
+      let handled = false
+      act(() => {
+        handled = handleFreshAgentMessage(store.dispatch, message)
+        onMessage?.(message)
+      })
+      expect(handled).toBe(true)
+    }
+
+    deliverThroughAppAndMountedView({
+      type: 'sdk.stream',
+      event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial' } },
+    })
+    expect(store.getState().freshAgent.sessions[sessionKey].streamingText).toBe('partial')
+
+    deliverThroughAppAndMountedView({
+      type: 'sdk.assistant',
+      model: 'codex-5',
+      content: [{ type: 'text', text: 'Final answer' }],
+    })
+    const assistantSession = store.getState().freshAgent.sessions[sessionKey]
+    expect(assistantSession.turns).toHaveLength(1)
+    expect(assistantSession.turns[0]).toMatchObject({
+      role: 'assistant',
+      model: 'codex-5',
+      summary: 'Final answer',
+    })
+
+    deliverThroughAppAndMountedView({
+      type: 'sdk.result',
+      costUsd: 0.07,
+      usage: { input_tokens: 11, output_tokens: 13 },
+    })
+    expect(store.getState().freshAgent.sessions[sessionKey]).toMatchObject({
+      totalCostUsd: 0.07,
+      totalInputTokens: 11,
+      totalOutputTokens: 13,
     })
   })
 
@@ -3156,21 +3254,23 @@ describe('FreshAgentView', () => {
     const onMessage = wsMock.onMessage.mock.calls[0]?.[0]
     expect(onMessage).toBeTypeOf('function')
 
-    act(() => {
-      onMessage({
-        type: 'freshAgent.event',
+    const snapshotMessage = {
+      type: 'freshAgent.event',
+      sessionId: 'dead-session-id',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: {
+        type: 'sdk.session.snapshot',
         sessionId: 'dead-session-id',
-        sessionType: 'freshclaude',
-        provider: 'claude',
-        event: {
-          type: 'sdk.session.snapshot',
-          sessionId: 'dead-session-id',
-          latestTurnId: 'turn-1',
-          status: 'idle',
-          timelineSessionId: durableSessionId,
-          revision: 2,
-        },
-      })
+        latestTurnId: 'turn-1',
+        status: 'idle',
+        timelineSessionId: durableSessionId,
+        revision: 2,
+      },
+    }
+    act(() => {
+      handleFreshAgentMessage(store.dispatch, snapshotMessage)
+      onMessage(snapshotMessage)
     })
 
     await waitFor(() => {
@@ -3181,19 +3281,21 @@ describe('FreshAgentView', () => {
     })
     expect(screen.queryByText(/failed to parse url/i)).not.toBeInTheDocument()
 
-    act(() => {
-      onMessage({
-        type: 'freshAgent.event',
+    const lostMessage = {
+      type: 'freshAgent.event',
+      sessionId: 'dead-session-id',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: {
+        type: 'sdk.error',
         sessionId: 'dead-session-id',
-        sessionType: 'freshclaude',
-        provider: 'claude',
-        event: {
-          type: 'sdk.error',
-          sessionId: 'dead-session-id',
-          code: 'INVALID_SESSION_ID',
-          message: 'Session no longer exists',
-        },
-      })
+        code: 'INVALID_SESSION_ID',
+        message: 'Session no longer exists',
+      },
+    }
+    act(() => {
+      handleFreshAgentMessage(store.dispatch, lostMessage)
+      onMessage(lostMessage)
     })
 
     await waitFor(() => {

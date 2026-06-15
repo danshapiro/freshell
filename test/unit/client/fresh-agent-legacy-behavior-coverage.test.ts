@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -269,16 +270,18 @@ const coverageMatrix: LegacyCoverageMapping[] = [
   },
 ]
 
-const legacyLocations = [
+const deletedLegacyTestPathSnapshot = [
+  'test/e2e/agent-chat-capability-settings-flow.test.tsx',
+  'test/e2e/agent-chat-context-menu-flow.test.tsx',
+  'test/e2e/agent-chat-input-history-flow.test.tsx',
+  'test/e2e/agent-chat-polish-flow.test.tsx',
+  'test/e2e/agent-chat-restore-flow.test.tsx',
+  'test/e2e/agent-chat-resume-history-flow.test.tsx',
+  'test/e2e/agent-chat-tab-shortcut-focus.test.tsx',
+  'test/e2e/tool-coalesce.test.tsx',
   'test/unit/client/agentChatSlice.test.ts',
-  'test/unit/client/store/agentChatSlice.test.ts',
-  'test/unit/client/store/agentChatThunks.test.ts',
-  'test/unit/client/sdk-message-handler.test.ts',
-  'test/unit/client/lib/sdk-message-handler.test.ts',
-  'test/unit/client/lib/sdk-message-handler.session-lost.test.ts',
-  'test/unit/client/ws-client-sdk.test.ts',
-  'test/unit/client/components/agent-chat/AgentChatSettings.test.tsx',
   'test/unit/client/components/agent-chat/AgentChatSettings.mobile.test.tsx',
+  'test/unit/client/components/agent-chat/AgentChatSettings.test.tsx',
   'test/unit/client/components/agent-chat/AgentChatView.auto-title.test.tsx',
   'test/unit/client/components/agent-chat/AgentChatView.behavior.test.tsx',
   'test/unit/client/components/agent-chat/AgentChatView.mobile-keyboard.test.tsx',
@@ -305,29 +308,83 @@ const legacyLocations = [
   'test/unit/client/components/agent-chat/ToolStrip.test.tsx',
   'test/unit/client/components/agent-chat/tool-preview.test.ts',
   'test/unit/client/components/agent-chat/useStreamDebounce.test.ts',
-  'test/unit/client/components/context-menu/agent-chat-actions.test.ts',
-  'test/unit/client/components/context-menu/menu-defs.test.ts',
-  'test/unit/client/context-menu/menu-defs.test.ts',
-  'test/e2e/agent-chat-capability-settings-flow.test.tsx',
-  'test/e2e/agent-chat-context-menu-flow.test.tsx',
-  'test/e2e/agent-chat-input-history-flow.test.tsx',
-  'test/e2e/agent-chat-polish-flow.test.tsx',
-  'test/e2e/agent-chat-restore-flow.test.tsx',
-  'test/e2e/agent-chat-resume-history-flow.test.tsx',
-  'test/e2e/agent-chat-tab-shortcut-focus.test.tsx',
-  'test/e2e/tool-coalesce.test.tsx',
-]
+  'test/unit/client/lib/sdk-message-handler.session-lost.test.ts',
+  'test/unit/client/lib/sdk-message-handler.test.ts',
+  'test/unit/client/sdk-message-handler.test.ts',
+  'test/unit/client/store/agentChatSlice.test.ts',
+  'test/unit/client/store/agentChatThunks.test.ts',
+  'test/unit/client/ws-client-sdk.test.ts',
+] as const
+
+const focusedFreshAgentCoverageGroups = {
+  stateAndTransport: [
+    'test/unit/client/store/freshAgentSlice.test.ts',
+    'test/unit/client/lib/fresh-agent-ws.test.ts',
+  ],
+  paneExperience: [
+    'test/unit/client/components/fresh-agent/FreshAgentView.test.tsx',
+    'test/unit/client/components/fresh-agent/FreshAgentComposer.test.tsx',
+    'test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx',
+    'test/unit/client/components/fresh-agent/FreshAgentMobile.test.tsx',
+  ],
+  approvalsAndQuestions: [
+    'test/unit/client/components/fresh-agent/FreshAgentApprovalCard.test.tsx',
+    'test/unit/client/components/fresh-agent/FreshAgentQuestionBanner.test.tsx',
+  ],
+  transcriptWidgets: [
+    'test/unit/client/components/fresh-agent/FreshAgentItemCard.test.tsx',
+    'test/unit/client/components/fresh-agent/FreshAgentDiffPanel.test.tsx',
+    'test/unit/client/components/fresh-agent/FreshAgentSharedWidgets.test.tsx',
+  ],
+  contextMenu: [
+    'test/unit/client/components/context-menu/fresh-agent-actions.test.ts',
+    'test/unit/client/components/context-menu/menu-defs.test.ts',
+    'test/unit/client/context-menu/menu-defs.test.ts',
+  ],
+} satisfies Record<string, readonly string[]>
+
+const focusedFreshAgentReplacementPaths = new Set(
+  Object.values(focusedFreshAgentCoverageGroups).flat(),
+)
 
 function readRepoFile(relativePath: string): string {
   return readFileSync(join(repoRoot, relativePath), 'utf8')
 }
 
-describe('fresh-agent legacy behavior coverage', () => {
-  it('maps every legacy agent-chat test file that still exists before deletion', () => {
-    const mapped = new Set(coverageMatrix.map((entry) => entry.legacyPath))
-    const existingLegacyFiles = legacyLocations.filter((relativePath) => existsSync(join(repoRoot, relativePath)))
+function readDeletedLegacyTestPathsFromGit(): string[] {
+  const output = execFileSync('git', [
+    'diff',
+    '--diff-filter=D',
+    '--name-only',
+    'origin/main...HEAD',
+    '--',
+    'test/**/*.test.ts',
+    'test/**/*.test.tsx',
+  ], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+  })
 
-    expect(existingLegacyFiles.filter((relativePath) => !mapped.has(relativePath))).toEqual([])
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .sort()
+}
+
+function stripSourceComments(source: string): string {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1')
+}
+
+describe('fresh-agent legacy behavior coverage', () => {
+  it('maps every legacy test file deleted by the fresh-agent cleanup range', () => {
+    const mapped = new Set(coverageMatrix.map((entry) => entry.legacyPath))
+    const deletedLegacyTestPaths = readDeletedLegacyTestPathsFromGit()
+
+    expect(deletedLegacyTestPaths).toEqual([...deletedLegacyTestPathSnapshot].sort())
+    expect(deletedLegacyTestPaths.filter((relativePath) => !mapped.has(relativePath))).toEqual([])
   })
 
   it('has executable fresh-agent replacements for each legacy behavior bucket', () => {
@@ -335,10 +392,14 @@ describe('fresh-agent legacy behavior coverage', () => {
       const replacementText = entry.replacementPaths.map((relativePath) => {
         const absolutePath = join(repoRoot, relativePath)
         expect(existsSync(absolutePath), `${entry.legacyPath} replacement ${relativePath} should exist`).toBe(true)
+        expect(
+          focusedFreshAgentReplacementPaths.has(relativePath),
+          `${entry.legacyPath} replacement ${relativePath} should be one of the focused fresh-agent coverage tests`,
+        ).toBe(true)
         const content = readRepoFile(relativePath)
         expect(content, `${relativePath} should contain executable Vitest coverage`).toMatch(/\b(it|test)\s*\(/)
         expect(content, `${relativePath} should not import legacy agent-chat modules`).not.toMatch(/@\/(?:components\/agent-chat|store\/agentChat(?:Slice|Thunks|Types))/)
-        return content
+        return stripSourceComments(content)
       }).join('\n')
 
       for (const signal of entry.requiredFreshAgentSignals) {
