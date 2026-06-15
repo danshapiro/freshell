@@ -7,7 +7,11 @@ import {
   ClaudeActivityListResponseSchema,
   ClaudeActivityUpdatedSchema,
   ClaudeActivityListSchema,
+  ErrorCode,
   HelloSchema,
+  TerminalAttachSchema,
+  TerminalInputSchema,
+  TerminalResizeSchema,
   TerminalTurnCompleteSchema,
 } from '../../shared/ws-protocol.js'
 import {
@@ -19,6 +23,48 @@ import {
 const TEST_TIMEOUT_MS = 30_000
 const HOOK_TIMEOUT_MS = 30_000
 vi.setConfig({ testTimeout: TEST_TIMEOUT_MS, hookTimeout: HOOK_TIMEOUT_MS })
+
+describe('websocket protocol schemas', () => {
+  it('preserves expectedSessionRef on terminal.attach', () => {
+    const parsed = TerminalAttachSchema.parse({
+      type: 'terminal.attach',
+      terminalId: 'term-1',
+      expectedSessionRef: { provider: 'codex', sessionId: 'thread-1' },
+      intent: 'viewport_hydrate',
+      cols: 120,
+      rows: 40,
+    })
+
+    expect(parsed.expectedSessionRef).toEqual({ provider: 'codex', sessionId: 'thread-1' })
+  })
+
+  it('preserves expectedSessionRef on terminal.input', () => {
+    const parsed = TerminalInputSchema.parse({
+      type: 'terminal.input',
+      terminalId: 'term-1',
+      expectedSessionRef: { provider: 'codex', sessionId: 'thread-1' },
+      data: 'echo test',
+    })
+
+    expect(parsed.expectedSessionRef).toEqual({ provider: 'codex', sessionId: 'thread-1' })
+  })
+
+  it('preserves expectedSessionRef on terminal.resize', () => {
+    const parsed = TerminalResizeSchema.parse({
+      type: 'terminal.resize',
+      terminalId: 'term-1',
+      expectedSessionRef: { provider: 'codex', sessionId: 'thread-1' },
+      cols: 120,
+      rows: 40,
+    })
+
+    expect(parsed.expectedSessionRef).toEqual({ provider: 'codex', sessionId: 'thread-1' })
+  })
+
+  it('accepts SESSION_IDENTITY_MISMATCH as an error code', () => {
+    expect(ErrorCode.parse('SESSION_IDENTITY_MISMATCH')).toBe('SESSION_IDENTITY_MISMATCH')
+  })
+})
 
 // Mock the config-store module before importing ws-handler
 const mockConfigStore = vi.hoisted(() => ({
