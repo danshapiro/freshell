@@ -119,10 +119,12 @@ function protectCanonicalPaneResumeIdentity(remoteNode: unknown, localLayout: un
         && shouldPreserveLocalCanonicalResumeSessionId(localResumeSessionId, remoteResumeSessionId)
       ) {
         const preservedSessionRef = buildCanonicalClaudeSessionRef(localContent, localResumeSessionId)
+        const contentWithoutStaleRestoreError = { ...candidate.content }
+        delete contentWithoutStaleRestoreError.restoreError
         return {
           ...candidate,
           content: {
-            ...candidate.content,
+            ...contentWithoutStaleRestoreError,
             resumeSessionId: localResumeSessionId,
             sessionRef: preservedSessionRef,
           },

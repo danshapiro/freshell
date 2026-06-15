@@ -137,11 +137,11 @@ describe('crossTabSync', () => {
           id: 'pane-a',
           content: {
             kind: 'fresh-agent',
-              sessionType: 'freshclaude',
-              provider: 'claude',
-              createRequestId: 'req-a',
-              status: 'idle',
-              resumeSessionId: '123e4567-e89b-12d3-a456-426614174000',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-a',
+            status: 'idle',
+            resumeSessionId: '123e4567-e89b-42d3-a456-426614174000',
           },
         } as any,
       },
@@ -179,7 +179,7 @@ describe('crossTabSync', () => {
     window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: remoteRaw }))
 
     const layout = store.getState().panes.layouts['tab-1'] as any
-    expect(layout.content.resumeSessionId).toBe('123e4567-e89b-12d3-a456-426614174000')
+    expect(layout.content.resumeSessionId).toBe('123e4567-e89b-42d3-a456-426614174000')
   })
 
   it('dedupes identical persisted payloads delivered via both storage and BroadcastChannel', () => {
@@ -1047,8 +1047,9 @@ describe('crossTabSync', () => {
           type: 'leaf',
           id: 'pane-1',
           content: {
-            kind: 'agent-chat',
-            provider: 'freshclaude',
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
             createRequestId: 'req-1',
             status: 'idle',
             resumeSessionId: canonicalSessionId,
@@ -1092,8 +1093,9 @@ describe('crossTabSync', () => {
             type: 'leaf',
             id: 'pane-1',
             content: {
-              kind: 'agent-chat',
-              provider: 'freshclaude',
+              kind: 'fresh-agent',
+              sessionType: 'freshclaude',
+              provider: 'claude',
               createRequestId: 'req-1',
               status: 'idle',
               resumeSessionId: canonicalSessionId,
@@ -1142,8 +1144,9 @@ describe('crossTabSync', () => {
             type: 'leaf',
             id: 'pane-1',
             content: {
-              kind: 'agent-chat',
-              provider: 'freshclaude',
+              kind: 'fresh-agent',
+              sessionType: 'freshclaude',
+              provider: 'claude',
               createRequestId: 'req-1',
               status: 'idle',
               resumeSessionId: 'named-resume',
@@ -1164,6 +1167,11 @@ describe('crossTabSync', () => {
     window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: remoteRaw }))
 
     const paneContent = (store.getState().panes.layouts['tab-1'] as any).content
+    expect(paneContent).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+    })
     expect(paneContent.resumeSessionId).toBe(canonicalSessionId)
     expect(paneContent.sessionRef).toEqual({
       provider: 'claude',
@@ -1211,8 +1219,9 @@ describe('crossTabSync', () => {
           type: 'leaf',
           id: 'pane-1',
           content: {
-            kind: 'agent-chat',
-            provider: 'freshclaude',
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
             sessionId: 'sdk-local-current',
             createRequestId: 'req-local-current',
             status: 'running',
@@ -1251,8 +1260,9 @@ describe('crossTabSync', () => {
             type: 'leaf',
             id: 'pane-1',
             content: {
-              kind: 'agent-chat',
-              provider: 'freshclaude',
+              kind: 'fresh-agent',
+              sessionType: 'freshclaude',
+              provider: 'claude',
               sessionId: 'sdk-local-current',
               createRequestId: 'req-local-current',
               status: 'running',
@@ -1296,8 +1306,9 @@ describe('crossTabSync', () => {
             type: 'leaf',
             id: 'pane-1',
             content: {
-              kind: 'agent-chat',
-              provider: 'freshclaude',
+              kind: 'fresh-agent',
+              sessionType: 'freshclaude',
+              provider: 'claude',
               sessionId: 'sdk-remote-stale',
               createRequestId: 'req-remote-stale',
               status: 'starting',
@@ -1319,6 +1330,11 @@ describe('crossTabSync', () => {
     window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: remoteRaw }))
 
     const paneContent = (store.getState().panes.layouts['tab-1'] as any).content
+    expect(paneContent).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+    })
     expect(paneContent.resumeSessionId).toBe(canonicalSessionId)
     expect(paneContent.sessionRef).toEqual({
       provider: 'claude',
@@ -1362,8 +1378,9 @@ describe('crossTabSync', () => {
           type: 'leaf',
           id: 'pane-1',
           content: {
-            kind: 'agent-chat',
-            provider: 'freshclaude',
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
             createRequestId: 'req-1',
             status: 'idle',
             resumeSessionId: canonicalSessionId,
@@ -1397,8 +1414,9 @@ describe('crossTabSync', () => {
             type: 'leaf',
             id: 'pane-1',
             content: {
-              kind: 'agent-chat',
-              provider: 'freshclaude',
+              kind: 'fresh-agent',
+              sessionType: 'freshclaude',
+              provider: 'claude',
               createRequestId: 'req-1',
               status: 'idle',
               resumeSessionId: canonicalSessionId,
@@ -1439,8 +1457,9 @@ describe('crossTabSync', () => {
               type: 'leaf',
               id: 'pane-1',
               content: {
-                kind: 'agent-chat',
-                provider: 'freshclaude',
+                kind: 'fresh-agent',
+                sessionType: 'freshclaude',
+                provider: 'claude',
                 createRequestId: 'req-1',
                 status: 'idle',
                 resumeSessionId: 'named-resume',
@@ -1487,8 +1506,9 @@ describe('crossTabSync', () => {
               type: 'leaf',
               id: 'pane-1',
               content: {
-                kind: 'agent-chat',
-                provider: 'freshclaude',
+                kind: 'fresh-agent',
+                sessionType: 'freshclaude',
+                provider: 'claude',
                 createRequestId: 'req-1',
                 status: 'idle',
                 resumeSessionId: 'named-resume',
@@ -1511,6 +1531,11 @@ describe('crossTabSync', () => {
     })
 
     const paneContent = (store.getState().panes.layouts['tab-1'] as any).content
+    expect(paneContent).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+    })
     expect(paneContent.resumeSessionId).toBe(canonicalSessionId)
   })
 })

@@ -1272,7 +1272,7 @@ export const panesSlice = createSlice({
       reconcileRefreshRequestsForTab(state, tabId)
     },
 
-    restartAgentChatCreate: (
+    restartFreshAgentCreate: (
       state,
       action: PayloadAction<{ tabId: string; paneId: string }>
     ) => {
@@ -1636,7 +1636,7 @@ export const {
   swapPanes,
   updatePaneContent,
   mergePaneContent,
-  restartAgentChatCreate,
+  restartFreshAgentCreate,
   requestPaneRefresh,
   requestTabRefresh,
   consumePaneRefreshRequest,

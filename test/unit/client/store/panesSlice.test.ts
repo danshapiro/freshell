@@ -22,7 +22,7 @@ import panesReducer, {
   clearPaneRenameRequest,
   toggleZoom,
   clearDeadTerminals,
-  restartAgentChatCreate,
+  restartFreshAgentCreate,
   PanesState,
 } from '../../../../src/store/panesSlice'
 import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent, EditorPaneContent, ExtensionPaneContent } from '../../../../src/store/paneTypes'
@@ -512,7 +512,7 @@ describe('panesSlice', () => {
     })
   })
 
-  describe('restartAgentChatCreate', () => {
+  describe('restartFreshAgentCreate', () => {
     it('moves a fresh-agent pane into stable create-failed state until an explicit retry restarts it', () => {
       const state = panesReducer(
         stateWithLeaf('pane-agent', {
@@ -527,7 +527,7 @@ describe('panesSlice', () => {
             retryable: true,
           },
         } as any),
-        restartAgentChatCreate({ tabId: 'tab-1', paneId: 'pane-agent' }),
+        restartFreshAgentCreate({ tabId: 'tab-1', paneId: 'pane-agent' }),
       )
 
       const layout = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
