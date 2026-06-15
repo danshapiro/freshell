@@ -104,9 +104,6 @@ function createStore(overrides?: {
           freshAgent: {
             enabled: overrides?.freshClientsEnabled ?? false,
           },
-          agentChat: {
-            enabled: overrides?.freshClientsEnabled ?? false,
-          },
           logging: { debug: false },
         },
         loaded: true,

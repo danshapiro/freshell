@@ -62,7 +62,7 @@ describe('buildResumeContent', () => {
     expect(content.effort).toBeUndefined()
   })
 
-  it('returns freshopencode resume content without a Freshell permission mode', () => {
+  it('keeps legacy agentChatProviderSettings from adding a Freshopencode permission mode', () => {
     const content = buildResumeContent({
       sessionType: 'freshopencode',
       sessionId: 'ses_opencode_123',
@@ -188,7 +188,7 @@ describe('buildResumeContent', () => {
     expect('terminalId' in content).toBe(false)
   })
 
-  it('uses provider settings when provided', () => {
+  it('applies legacy agentChatProviderSettings while fresh-agent provider settings are being renamed', () => {
     const content = buildResumeContent({
       sessionType: 'freshclaude',
       sessionId: 'abc-123',

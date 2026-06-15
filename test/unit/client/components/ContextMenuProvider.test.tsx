@@ -676,7 +676,7 @@ describe('ContextMenuProvider', () => {
   it('allows native menu for links inside non-global contexts', async () => {
     const user = userEvent.setup()
     renderWithProvider(
-      <div data-context="agent-chat" data-session-id="sess-1">
+      <div data-context={ContextIds.FreshAgent} data-session-id="sess-1">
         <a href="https://example.com">Example Link</a>
       </div>
     )
@@ -1261,7 +1261,7 @@ describe('ContextMenuProvider', () => {
     expect(store.getState().tabs.tabs[0].sessionMetadataByKey).toBeUndefined()
   })
 
-  it('uses the sidebar session window for sidebar actions and preserves agent-chat session type', async () => {
+  it('uses the sidebar session window for sidebar actions and preserves fresh-agent session type', async () => {
     const user = userEvent.setup()
     const store = createStoreWithSidebarWindowAgentSession()
     render(
