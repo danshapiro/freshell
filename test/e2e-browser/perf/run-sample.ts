@@ -897,6 +897,7 @@ export async function runVisibleFirstAuditSample(
       focusedReadyMilestone: scenario.focusedReadyMilestone,
       allowedApiRouteIdsBeforeReady: scenario.allowedApiRouteIdsBeforeReady,
       allowedWsTypesBeforeReady: scenario.allowedWsTypesBeforeReady,
+      allowedFreshAgentEventTypesBeforeReady: scenario.allowedFreshAgentEventTypesBeforeReady,
       browser: collectors.browser,
       transport: collectors.transport,
       server: {

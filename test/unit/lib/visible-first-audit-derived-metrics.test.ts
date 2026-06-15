@@ -37,7 +37,7 @@ describe('deriveVisibleFirstMetrics', () => {
         ws: {
           frames: [
             { timestamp: 30, payload: JSON.stringify({ type: 'hello' }), payloadLength: 8 },
-            { timestamp: 40, payload: JSON.stringify({ type: 'sdk.session.snapshot' }), payloadLength: 9 },
+            { timestamp: 40, payload: JSON.stringify({ type: 'freshAgent.event', event: { type: 'freshAgent.session.snapshot' } }), payloadLength: 9 },
             { timestamp: 70, payload: '{"type":"unknown-route"}', payloadLength: 10 },
             { timestamp: 130, payload: JSON.stringify({ type: 'terminal.output' }), payloadLength: 11 },
           ],
@@ -51,6 +51,33 @@ describe('deriveVisibleFirstMetrics', () => {
     expect(result.wsFramesBeforeReady).toBe(3)
     expect(result.offscreenWsFramesBeforeReady).toBe(2)
     expect(result.terminalInputToFirstOutputMs).toBe(45)
+  })
+
+  it('allows only configured inner fresh-agent provider events before readiness', () => {
+    const result = deriveVisibleFirstMetrics({
+      focusedReadyMilestone: 'agent_chat.surface_visible',
+      allowedApiRouteIdsBeforeReady: ['/api/bootstrap'],
+      allowedWsTypesBeforeReady: ['hello', 'ready', 'freshAgent.event'],
+      allowedFreshAgentEventTypesBeforeReady: ['freshAgent.session.snapshot', 'freshAgent.status'],
+      browser: {
+        milestones: {
+          'agent_chat.surface_visible': 100,
+        },
+      },
+      transport: {
+        http: { requests: [] },
+        ws: {
+          frames: [
+            { timestamp: 20, payload: JSON.stringify({ type: 'freshAgent.event', event: { type: 'freshAgent.session.snapshot' } }) },
+            { timestamp: 30, payload: JSON.stringify({ type: 'freshAgent.event', event: { type: 'freshAgent.status' } }) },
+            { timestamp: 40, payload: JSON.stringify({ type: 'freshAgent.event', event: { type: 'freshAgent.permission.request' } }) },
+          ],
+        },
+      },
+    })
+
+    expect(result.wsFramesBeforeReady).toBe(3)
+    expect(result.offscreenWsFramesBeforeReady).toBe(1)
   })
 
   it('derives terminal catch-up replay metrics from structured logs, websocket evidence, and client perf events', () => {

@@ -71,20 +71,62 @@ describe('WsHandler fresh-agent ownership', () => {
     vi.mocked(configStore.snapshot).mockResolvedValue(enabledConfig())
   })
 
-  it('rejects mutating commands from a connection that did not create or attach the session', async () => {
+  it.each([
+    {
+      type: 'freshAgent.send',
+      method: 'send',
+      payload: { text: 'not allowed' },
+    },
+    {
+      type: 'freshAgent.interrupt',
+      method: 'interrupt',
+      payload: {},
+    },
+    {
+      type: 'freshAgent.compact',
+      method: 'compact',
+      payload: { instructions: 'summarize' },
+    },
+    {
+      type: 'freshAgent.approval.respond',
+      method: 'resolveApproval',
+      payload: { requestId: 'approval-1', decision: { behavior: 'allow' } },
+    },
+    {
+      type: 'freshAgent.question.respond',
+      method: 'answerQuestion',
+      payload: { requestId: 'question-1', answers: { proceed: 'yes' } },
+    },
+    {
+      type: 'freshAgent.fork',
+      method: 'fork',
+      payload: { requestId: 'fork-1', input: { prompt: 'branch' } },
+    },
+    {
+      type: 'freshAgent.kill',
+      method: 'kill',
+      payload: {},
+    },
+  ])('rejects unauthorized $type before calling the runtime manager', async ({ type, method, payload }) => {
     const runtimeManager = {
       send: vi.fn().mockResolvedValue(undefined),
+      interrupt: vi.fn().mockResolvedValue(undefined),
+      compact: vi.fn().mockResolvedValue(undefined),
+      resolveApproval: vi.fn().mockResolvedValue(undefined),
+      answerQuestion: vi.fn().mockResolvedValue(undefined),
+      fork: vi.fn().mockResolvedValue({ sessionId: 'forked-session' }),
+      kill: vi.fn().mockResolvedValue(true),
     }
     const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
 
     try {
       const { ws, messages } = await connectAndAuth(server)
       ws.send(JSON.stringify({
-        type: 'freshAgent.send',
+        type,
         sessionId: 'codex-session-owned-elsewhere',
         sessionType: 'freshcodex',
         provider: 'codex',
-        text: 'not allowed',
+        ...payload,
       }))
 
       await vi.waitFor(() => {
@@ -92,7 +134,7 @@ describe('WsHandler fresh-agent ownership', () => {
           type: 'error',
           code: 'UNAUTHORIZED',
         }))
-        expect(runtimeManager.send).not.toHaveBeenCalled()
+        expect(runtimeManager[method as keyof typeof runtimeManager]).not.toHaveBeenCalled()
       })
     } finally {
       handler.close()

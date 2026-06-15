@@ -33,6 +33,7 @@ export type AuditScenarioDefinition = {
   focusedReadyMilestone: string
   allowedApiRouteIdsBeforeReady: readonly string[]
   allowedWsTypesBeforeReady: readonly string[]
+  allowedFreshAgentEventTypesBeforeReady?: readonly string[]
   requiredMetricIds?: readonly AuditRequiredMetricId[]
   buildUrl: (context: AuditScenarioContext) => string
   seedServerHome?: () => Promise<void>
@@ -98,7 +99,16 @@ export const AUDIT_SCENARIOS: readonly AuditScenarioDefinition[] = [
     description: 'Cold boot into the seeded long-history fresh-agent session until the surface is visible.',
     focusedReadyMilestone: 'agent_chat.surface_visible',
     allowedApiRouteIdsBeforeReady: ['/api/bootstrap', '/api/fresh-agent/threads/:sessionType/:provider/:threadId/turns'],
-    allowedWsTypesBeforeReady: ['hello', 'ready', 'sdk.session.snapshot', 'sdk.status', 'sdk.stream', 'sdk.assistant', 'sdk.result', 'sdk.error', 'sdk.exit'],
+    allowedWsTypesBeforeReady: ['hello', 'ready', 'freshAgent.event'],
+    allowedFreshAgentEventTypesBeforeReady: [
+      'freshAgent.session.snapshot',
+      'freshAgent.status',
+      'freshAgent.stream',
+      'freshAgent.assistant',
+      'freshAgent.result',
+      'freshAgent.error',
+      'freshAgent.exit',
+    ],
     buildUrl: ({ token }) => buildRootUrl(token),
   },
   {

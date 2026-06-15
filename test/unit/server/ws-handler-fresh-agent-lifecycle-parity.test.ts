@@ -173,4 +173,179 @@ describe('WsHandler fresh-agent lifecycle parity', () => {
       await new Promise<void>((resolve) => server.close(() => resolve()))
     }
   })
+
+  it('does not send freshAgent.created until create has coherent runtime state', async () => {
+    let resolveCreate!: (value: unknown) => void
+    const runtimeManager = {
+      create: vi.fn().mockImplementation(() => new Promise((resolve) => {
+        resolveCreate = resolve
+      })),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const { ws, messages } = await connectAndAuth(server)
+      ws.send(JSON.stringify({
+        type: 'freshAgent.create',
+        requestId: 'req-gated-create',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        resumeSessionId: 'cli-existing',
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.create).toHaveBeenCalled()
+      })
+      expect(messages.some((message) => message.type === 'freshAgent.created')).toBe(false)
+
+      resolveCreate({
+        sessionId: 'claude-session-gated-create',
+        sessionType: 'freshclaude',
+        runtimeProvider: 'claude',
+      })
+
+      await vi.waitFor(() => {
+        expect(messages).toContainEqual(expect.objectContaining({
+          type: 'freshAgent.created',
+          requestId: 'req-gated-create',
+          sessionId: 'claude-session-gated-create',
+        }))
+        expect(runtimeManager.subscribe).toHaveBeenCalledWith(
+          { sessionId: 'claude-session-gated-create', sessionType: 'freshclaude', provider: 'claude' },
+          expect.any(Function),
+        )
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('does not subscribe or authorize mutating commands after attach restore failure', async () => {
+    const runtimeManager = {
+      attach: vi.fn().mockRejectedValue(new Error('restore failed')),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+      send: vi.fn().mockResolvedValue(undefined),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const { ws, messages } = await connectAndAuth(server)
+      ws.send(JSON.stringify({
+        type: 'freshAgent.attach',
+        sessionId: 'claude-session-missing',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        resumeSessionId: 'cli-missing',
+      }))
+
+      await vi.waitFor(() => {
+        expect(messages).toContainEqual(expect.objectContaining({
+          type: 'error',
+          code: 'INTERNAL_ERROR',
+          message: 'restore failed',
+        }))
+        expect(runtimeManager.subscribe).not.toHaveBeenCalled()
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.send',
+        sessionId: 'claude-session-missing',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        text: 'should remain unauthorized',
+      }))
+
+      await vi.waitFor(() => {
+        expect(messages).toContainEqual(expect.objectContaining({
+          type: 'error',
+          code: 'UNAUTHORIZED',
+        }))
+        expect(runtimeManager.send).not.toHaveBeenCalled()
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it.each([
+    {
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      sessionId: 'codex-thread-status-only',
+    },
+    {
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionId: 'freshopencode-req-status-only',
+    },
+  ])('normalizes $provider snapshot/status-only live provider events for the browser', async ({ sessionType, provider, sessionId }) => {
+    const listeners = new Map<string, (message: unknown) => void>()
+    const locator = { sessionId, sessionType, provider }
+    const runtimeManager = {
+      attach: vi.fn().mockResolvedValue({ sessionId, sessionType, runtimeProvider: provider }),
+      subscribe: vi.fn().mockImplementation(async (input: unknown, listener: (message: unknown) => void) => {
+        listeners.set(JSON.stringify(input), listener)
+        return () => undefined
+      }),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const { ws, messages } = await connectAndAuth(server)
+      ws.send(JSON.stringify({
+        type: 'freshAgent.attach',
+        ...locator,
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.subscribe).toHaveBeenCalledWith(locator, expect.any(Function))
+      })
+
+      const listener = listeners.get(JSON.stringify(locator))
+      listener?.({
+        type: 'sdk.session.snapshot',
+        sessionId,
+        latestTurnId: null,
+        status: 'idle',
+        revision: 1,
+      })
+      listener?.({
+        type: 'sdk.status',
+        sessionId,
+        status: 'running',
+      })
+
+      await vi.waitFor(() => {
+        expect(messages).toContainEqual({
+          type: 'freshAgent.event',
+          ...locator,
+          event: {
+            type: 'freshAgent.session.snapshot',
+            sessionId,
+            latestTurnId: null,
+            status: 'idle',
+            revision: 1,
+          },
+        })
+        expect(messages).toContainEqual({
+          type: 'freshAgent.event',
+          ...locator,
+          event: {
+            type: 'freshAgent.status',
+            sessionId,
+            status: 'running',
+          },
+        })
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
 })

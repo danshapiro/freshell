@@ -224,4 +224,85 @@ describe('fresh-agent-ws', () => {
     expect(sendEvent({ type: 'freshAgent.killed' })).toBe(true)
     expect(store.getState().freshAgent.sessions[key]).toBeUndefined()
   })
+
+  it('does not let delayed metadata downgrade newer snapshot identity', () => {
+    const store = createFreshAgentStore()
+    const sessionId = 'claude-thread-metadata-order'
+    const key = `freshclaude:claude:${sessionId}`
+    const sendEvent = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: { sessionId, ...event },
+    })
+
+    expect(sendEvent({
+      type: 'freshAgent.session.snapshot',
+      latestTurnId: 'turn-new',
+      status: 'idle',
+      timelineSessionId: 'cli-new',
+      revision: 5,
+    })).toBe(true)
+    expect(sendEvent({
+      type: 'freshAgent.session.metadata',
+      cliSessionId: 'cli-old',
+      model: 'claude-sonnet-4-6',
+      cwd: '/repo',
+    })).toBe(true)
+
+    const session = store.getState().freshAgent.sessions[key]
+    expect(session.cliSessionId).toBeUndefined()
+    expect(session).toMatchObject({
+      historySessionId: 'cli-new',
+      historyRevision: 5,
+      model: 'claude-sonnet-4-6',
+      cwd: '/repo',
+    })
+  })
+
+  it('deduplicates repeated permission and question requests by request id', () => {
+    const store = createFreshAgentStore()
+    const sessionId = 'claude-thread-interactive-dedupe'
+    const key = `freshclaude:claude:${sessionId}`
+    const sendEvent = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: { sessionId, ...event },
+    })
+
+    expect(sendEvent({ type: 'freshAgent.session.snapshot', latestTurnId: null, status: 'idle', revision: 1 })).toBe(true)
+    expect(sendEvent({
+      type: 'freshAgent.permission.request',
+      requestId: 'perm-repeat',
+      subtype: 'tool',
+      tool: { name: 'Bash', input: { command: 'pwd' } },
+    })).toBe(true)
+    expect(sendEvent({
+      type: 'freshAgent.permission.request',
+      requestId: 'perm-repeat',
+      subtype: 'tool',
+      tool: { name: 'Bash', input: { command: 'ls' } },
+    })).toBe(true)
+    expect(sendEvent({
+      type: 'freshAgent.question.request',
+      requestId: 'question-repeat',
+      questions: [{ question: 'Continue?', header: 'Confirm', options: [], multiSelect: false }],
+    })).toBe(true)
+    expect(sendEvent({
+      type: 'freshAgent.question.request',
+      requestId: 'question-repeat',
+      questions: [{ question: 'Proceed?', header: 'Confirm', options: [], multiSelect: false }],
+    })).toBe(true)
+
+    const session = store.getState().freshAgent.sessions[key]
+    expect(Object.keys(session.pendingPermissions)).toEqual(['perm-repeat'])
+    expect(session.pendingPermissions['perm-repeat']).toMatchObject({
+      input: { command: 'ls' },
+    })
+    expect(Object.keys(session.pendingQuestions)).toEqual(['question-repeat'])
+    expect(session.pendingQuestions['question-repeat'].questions[0].question).toBe('Proceed?')
+  })
 })

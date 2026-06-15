@@ -255,12 +255,21 @@ const freshAgentSlice = createSlice({
     }>) {
       const session = resolveOrEnsureSession(state, action.payload)
       if (!session) return
-      session.cliSessionId = action.payload.cliSessionId ?? session.cliSessionId
-      session.historySessionId = action.payload.cliSessionId ?? session.historySessionId
+      const metadataCliSessionId = action.payload.cliSessionId
+      const wouldDowngradeSnapshotIdentity = Boolean(
+        metadataCliSessionId
+          && session.historyRevision != null
+          && session.historySessionId
+          && session.historySessionId !== metadataCliSessionId,
+      )
+      if (metadataCliSessionId && !wouldDowngradeSnapshotIdentity) {
+        session.cliSessionId = metadataCliSessionId
+        session.historySessionId = metadataCliSessionId
+      }
       session.model = action.payload.model ?? session.model
       session.cwd = action.payload.cwd ?? session.cwd
       session.tools = action.payload.tools ?? session.tools
-      if (action.payload.cliSessionId) {
+      if (metadataCliSessionId && !wouldDowngradeSnapshotIdentity) {
         session.awaitingDurableHistory = false
       }
     },
