@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { FreshAgentTranscript } from '@/components/fresh-agent/FreshAgentTranscript'
 
 // Render markdown bodies synchronously. The real LazyMarkdown wraps MarkdownRenderer
@@ -624,6 +624,43 @@ describe('FreshAgentTranscript', () => {
     )
 
     expect(scroller.scrollTop).toBe(1200)
+  })
+
+  it('shows and clears the new-message badge when fresh-agent updates arrive away from the bottom', async () => {
+    let scrollHeight = 1000
+    const { container, rerender } = render(
+      <FreshAgentTranscript
+        turns={[{
+          id: 'turn-1',
+          role: 'assistant',
+          summary: 'first',
+          items: [{ id: 'item-1', kind: 'text', text: 'first line' }],
+        }]}
+      />,
+    )
+    const scroller = container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 200 })
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => scrollHeight })
+
+    scroller.scrollTop = 100
+    fireEvent.scroll(scroller)
+    scrollHeight = 1200
+    rerender(
+      <FreshAgentTranscript
+        turns={[{
+          id: 'turn-1',
+          role: 'assistant',
+          summary: 'first',
+          items: [{ id: 'item-1', kind: 'text', text: 'first line\nsecond line' }],
+        }]}
+      />,
+    )
+
+    const button = await screen.findByRole('button', { name: 'Scroll to bottom' })
+    await waitFor(() => expect(button).toHaveTextContent('2 new'))
+    fireEvent.click(button)
+    expect(scroller.scrollTop).toBe(1200)
+    expect(screen.queryByRole('button', { name: 'Scroll to bottom' })).not.toBeInTheDocument()
   })
 
   it('counts files changed in the settled summary', () => {

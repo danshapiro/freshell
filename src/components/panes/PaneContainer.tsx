@@ -464,7 +464,6 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       claudeActivityByTerminalId,
       opencodeActivityByTerminalId,
       paneRuntimeActivityByPaneId,
-      agentChatSessions: {},
       freshAgentSessions,
     }).isBusy
 

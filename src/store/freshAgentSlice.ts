@@ -6,6 +6,7 @@ import {
 } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import type {
+  FreshAgentContentBlock,
   FreshAgentPermissionRequest,
   FreshAgentQuestionRequest,
   FreshAgentSessionState,
@@ -114,6 +115,60 @@ function resetHydratedTimelineState(session: FreshAgentSessionState): void {
 
 function requestRestoreHydrationRestart(session: FreshAgentSessionState): void {
   session.restoreHydrationRequestId = (session.restoreHydrationRequestId ?? 0) + 1
+}
+
+function summarizeFreshAgentItems(items: FreshAgentContentBlock[]): string {
+  const text = items
+    .map((item) => {
+      if (item.kind === 'text') return item.text
+      if (item.kind === 'thinking') return item.text
+      if (item.kind === 'tool_use') return item.name
+      if (item.kind === 'tool_result') return typeof item.content === 'string' ? item.content : JSON.stringify(item.content)
+      return item.kind
+    })
+    .filter(Boolean)
+    .join(' ')
+    .trim()
+  return text || 'Agent activity'
+}
+
+function normalizeLegacyContentBlock(block: Record<string, unknown>, index: number): FreshAgentContentBlock | undefined {
+  const id = typeof block.id === 'string' && block.id.length > 0
+    ? block.id
+    : `legacy-${index}`
+
+  switch (block.type) {
+    case 'text':
+      return {
+        id,
+        kind: 'text',
+        text: typeof block.text === 'string' ? block.text : '',
+      }
+    case 'thinking':
+      return {
+        id,
+        kind: 'thinking',
+        text: typeof block.thinking === 'string' ? block.thinking : String(block.text ?? ''),
+      }
+    case 'tool_use':
+      return {
+        id,
+        kind: 'tool_use',
+        toolUseId: typeof block.id === 'string' ? block.id : id,
+        name: typeof block.name === 'string' ? block.name : 'Tool',
+        input: block.input,
+      }
+    case 'tool_result':
+      return {
+        id,
+        kind: 'tool_result',
+        toolUseId: typeof block.tool_use_id === 'string' ? block.tool_use_id : id,
+        content: block.content ?? '',
+        isError: Boolean(block.is_error),
+      }
+    default:
+      return undefined
+  }
 }
 
 const freshAgentSlice = createSlice({
@@ -402,12 +457,77 @@ const freshAgentSlice = createSlice({
       state.sessions[key].timelineBodies[action.payload.turn.turnId] = action.payload.turn
     },
 
-    turnResult() {},
-    addUserMessage() {},
-    addAssistantMessage() {},
-    setStreaming() {},
-    appendStreamDelta() {},
-    clearStreaming() {},
+    turnResult(state, action: PayloadAction<SessionMutationPayload & {
+      costUsd?: number
+      durationMs?: number
+      usage?: { input_tokens?: number; output_tokens?: number }
+    }>) {
+      const session = resolveOrEnsureSession(state, action.payload, 'idle')
+      if (!session) return
+      session.status = 'idle'
+      session.streamingActive = false
+      session.totalCostUsd += action.payload.costUsd ?? 0
+      session.totalInputTokens += action.payload.usage?.input_tokens ?? 0
+      session.totalOutputTokens += action.payload.usage?.output_tokens ?? 0
+    },
+    addUserMessage(state, action: PayloadAction<SessionMutationPayload & { text: string }>) {
+      const session = resolveOrEnsureSession(state, action.payload, 'running')
+      if (!session) return
+      const turnId = `live-user-${session.turns.length + 1}`
+      session.turns.push({
+        id: turnId,
+        turnId,
+        role: 'user',
+        summary: action.payload.text,
+        items: [{ id: `${turnId}-text`, kind: 'text', text: action.payload.text }],
+      })
+      session.timelineItems = session.turns
+    },
+    addAssistantMessage(state, action: PayloadAction<SessionMutationPayload & {
+      content: Record<string, unknown>[]
+      model?: string
+    }>) {
+      const session = resolveOrEnsureSession(state, action.payload, 'idle')
+      if (!session) return
+      const items = action.payload.content
+        .map((block, index) => normalizeLegacyContentBlock(block, index))
+        .filter((item): item is FreshAgentContentBlock => item !== undefined)
+      const turnId = `live-assistant-${session.turns.length + 1}`
+      session.turns.push({
+        id: turnId,
+        turnId,
+        role: 'assistant',
+        model: action.payload.model,
+        summary: summarizeFreshAgentItems(items),
+        items,
+      })
+      session.timelineItems = session.turns
+      session.streamingText = ''
+      session.streamingActive = false
+    },
+    setStreaming(state, action: PayloadAction<SessionMutationPayload & { active: boolean }>) {
+      const session = resolveOrEnsureSession(state, action.payload, action.payload.active ? 'running' : 'idle')
+      if (!session) return
+      session.streamingActive = action.payload.active
+      if (action.payload.active && session.status === 'idle') {
+        session.status = 'running'
+      }
+    },
+    appendStreamDelta(state, action: PayloadAction<SessionMutationPayload & { text: string }>) {
+      const session = resolveOrEnsureSession(state, action.payload, 'running')
+      if (!session) return
+      session.streamingActive = true
+      session.streamingText += action.payload.text
+      if (session.status === 'idle') {
+        session.status = 'running'
+      }
+    },
+    clearStreaming(state, action: PayloadAction<SessionMutationPayload>) {
+      const session = resolveOrEnsureSession(state, action.payload)
+      if (!session) return
+      session.streamingText = ''
+      session.streamingActive = false
+    },
     clearPendingCreateFailureForSession() {},
     sessionExited(state, action: PayloadAction<SessionMutationPayload>) {
       const key = resolveSessionKey(state, action.payload)

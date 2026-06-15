@@ -13,7 +13,6 @@ export const ContextIds = {
   HistorySession: 'history-session',
   OverviewTerminal: 'overview-terminal',
   ClaudeMessage: 'claude-message',
-  AgentChat: 'agent-chat',
   FreshAgent: 'fresh-agent',
 } as const
 

@@ -4,7 +4,6 @@ import { renderHook, act } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import freshAgentReducer, { setSessionStatus, addPermissionRequest } from '@/store/freshAgentSlice'
-import agentChatReducer from '@/store/agentChatSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import { useAgentSessionTurnCompletion } from '@/hooks/useAgentSessionTurnCompletion'
 import type { PaneNode } from '@/store/paneTypes'
@@ -32,7 +31,6 @@ function makeStore() {
     reducer: {
       panes: () => panesState as never,
       freshAgent: freshAgentReducer,
-      agentChat: agentChatReducer,
       turnCompletion: turnCompletionReducer,
     },
   })

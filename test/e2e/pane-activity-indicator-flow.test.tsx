@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest'
-import { render, screen, cleanup, within, act, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, cleanup, within, act } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import TabBar from '@/components/TabBar'
@@ -18,18 +18,16 @@ import opencodeActivityReducer, {
   removeOpencodeActivity,
   upsertOpencodeActivity,
 } from '@/store/opencodeActivitySlice'
-import agentChatReducer, { removePermission } from '@/store/agentChatSlice'
-import type { AgentChatState } from '@/store/agentChatTypes'
-import freshAgentReducer from '@/store/freshAgentSlice'
-import type { FreshAgentState } from '@/store/freshAgentTypes'
+import freshAgentReducer, { removePermission } from '@/store/freshAgentSlice'
+import type { FreshAgentSessionState, FreshAgentState } from '@/store/freshAgentTypes'
 import paneRuntimeActivityReducer, {
   clearPaneRuntimeActivity,
   type PaneRuntimeActivityState,
 } from '@/store/paneRuntimeActivitySlice'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type {
-  AgentChatPaneContent,
   BrowserPaneContent,
+  FreshAgentPaneContent,
   PaneContent,
   PaneNode,
   TerminalPaneContent,
@@ -37,13 +35,6 @@ import type {
 import type { Tab } from '@/store/types'
 
 const wsSend = vi.hoisted(() => vi.fn())
-const getAgentChatCapabilities = vi.hoisted(() => vi.fn())
-const refreshAgentChatCapabilities = vi.hoisted(() => vi.fn())
-const setSessionMetadata = vi.hoisted(() => vi.fn(() => Promise.resolve(undefined)))
-const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn((patch: unknown) => ({
-  type: 'settings/saveServerSettingsPatch',
-  payload: patch,
-})))
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -59,13 +50,6 @@ vi.mock('@/lib/api', () => ({
     patch: vi.fn().mockResolvedValue({}),
     delete: vi.fn().mockResolvedValue({}),
   },
-  getAgentChatCapabilities: (...args: unknown[]) => getAgentChatCapabilities(...args),
-  refreshAgentChatCapabilities: (...args: unknown[]) => refreshAgentChatCapabilities(...args),
-  setSessionMetadata: (...args: unknown[]) => setSessionMetadata(...args),
-}))
-
-vi.mock('@/store/settingsThunks', () => ({
-  saveServerSettingsPatch: (patch: unknown) => saveServerSettingsPatchSpy(patch),
 }))
 
 vi.mock('@/store/sessionsThunks', () => ({
@@ -84,8 +68,8 @@ vi.mock('@/components/panes/BrowserPane', () => ({
   default: ({ paneId }: { paneId: string }) => <div data-testid={`browser-${paneId}`}>browser</div>,
 }))
 
-vi.mock('@/components/agent-chat/AgentChatView', () => ({
-  default: ({ paneId }: { paneId: string }) => <div data-testid={`agent-chat-${paneId}`}>agent-chat</div>,
+vi.mock('@/components/fresh-agent/FreshAgentView', () => ({
+  default: ({ paneId }: { paneId: string }) => <div data-testid={`fresh-agent-${paneId}`}>fresh-agent</div>,
 }))
 
 vi.mock('@/components/icons/PaneIcon', () => ({
@@ -102,12 +86,47 @@ vi.mock('@/components/icons/PaneIcon', () => ({
 
 type RenderHarnessOptions = {
   tab?: Partial<Tab>
-  pane: TerminalPaneContent | BrowserPaneContent | AgentChatPaneContent
+  pane: TerminalPaneContent | BrowserPaneContent | FreshAgentPaneContent
   paneTitle?: string
   paneRuntimeActivity?: PaneRuntimeActivityState
-  agentChat?: AgentChatState
   freshAgent?: FreshAgentState
   settingsOverrides?: Record<string, unknown>
+}
+
+function createFreshAgentSession(
+  overrides: Partial<FreshAgentSessionState> & {
+    sessionId: string
+    sessionType?: FreshAgentSessionState['sessionType']
+    provider?: FreshAgentSessionState['provider']
+  },
+): FreshAgentSessionState {
+  const sessionType = overrides.sessionType ?? 'freshclaude'
+  const provider = overrides.provider ?? 'claude'
+  const sessionKey = makeFreshAgentSessionKey({
+    sessionType,
+    provider,
+    sessionId: overrides.sessionId,
+  })
+
+  return {
+    sessionKey,
+    sessionType,
+    provider,
+    sessionId: overrides.sessionId,
+    threadId: overrides.threadId ?? overrides.sessionId,
+    status: 'idle',
+    turns: [],
+    timelineItems: [],
+    timelineBodies: {},
+    streamingText: '',
+    streamingActive: false,
+    pendingPermissions: {},
+    pendingQuestions: {},
+    totalCostUsd: 0,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    ...overrides,
+  }
 }
 
 beforeAll(() => {
@@ -143,7 +162,6 @@ function renderHarness(options: RenderHarnessOptions) {
       codexActivity: codexActivityReducer,
       claudeActivity: claudeActivityReducer,
       opencodeActivity: opencodeActivityReducer,
-      agentChat: agentChatReducer,
       freshAgent: freshAgentReducer,
       paneRuntimeActivity: paneRuntimeActivityReducer,
     },
@@ -195,11 +213,6 @@ function renderHarness(options: RenderHarnessOptions) {
         liveMutationSeqByTerminalId: {},
         removedMutationSeqByTerminalId: {},
       },
-      agentChat: options.agentChat ?? {
-        sessions: {},
-        pendingCreates: {},
-        availableModels: [],
-      },
       freshAgent: options.freshAgent ?? {
         sessions: {},
         pendingCreates: {},
@@ -236,10 +249,6 @@ describe('pane activity indicator flow (e2e)', () => {
   afterEach(() => {
     cleanup()
     wsSend.mockClear()
-    getAgentChatCapabilities.mockReset()
-    refreshAgentChatCapabilities.mockReset()
-    setSessionMetadata.mockClear()
-    saveServerSettingsPatchSpy.mockClear()
   })
 
   it('shows browser loading activity as blue and clears when the pane returns to idle', () => {
@@ -276,9 +285,10 @@ describe('pane activity indicator flow (e2e)', () => {
   })
 
   it('treats freshclaude waits as non-blue but running work as blue', () => {
-    const pane: AgentChatPaneContent = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+    const pane: FreshAgentPaneContent = {
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-agent',
       sessionId: 'sess-1',
       status: 'running',
@@ -286,16 +296,15 @@ describe('pane activity indicator flow (e2e)', () => {
 
     const { store } = renderHarness({
       pane,
-      agentChat: {
+      freshAgent: {
         sessions: {
-          'sess-1': {
+          [makeFreshAgentSessionKey({
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            sessionId: 'sess-1',
+          })]: createFreshAgentSession({
             sessionId: 'sess-1',
             status: 'running',
-            messages: [],
-            timelineItems: [],
-            timelineBodies: {},
-            streamingText: '',
-            streamingActive: false,
             pendingPermissions: {
               'perm-1': {
                 requestId: 'perm-1',
@@ -303,12 +312,10 @@ describe('pane activity indicator flow (e2e)', () => {
               },
             },
             pendingQuestions: {},
-            totalCostUsd: 0,
-            totalInputTokens: 0,
-            totalOutputTokens: 0,
-          },
+          }),
         },
         pendingCreates: {},
+        pendingCreateFailures: {},
         availableModels: [],
       },
     })
@@ -318,7 +325,12 @@ describe('pane activity indicator flow (e2e)', () => {
     expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
 
     act(() => {
-      store.dispatch(removePermission({ sessionId: 'sess-1', requestId: 'perm-1' }))
+      store.dispatch(removePermission({
+        sessionId: 'sess-1',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        requestId: 'perm-1',
+      }))
     })
 
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
@@ -481,9 +493,10 @@ describe('pane activity indicator flow (e2e)', () => {
   })
 
   it('restores pane and tab activity from timelineSessionId when only the canonical durable id is known', () => {
-    const pane: AgentChatPaneContent = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+    const pane: FreshAgentPaneContent = {
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-agent',
       sessionId: 'sdk-restore-1',
       resumeSessionId: 'stale-resume',
@@ -492,17 +505,16 @@ describe('pane activity indicator flow (e2e)', () => {
 
     const { store } = renderHarness({
       pane,
-      agentChat: {
+      freshAgent: {
         sessions: {
-          'sdk-restore-1': {
+          [makeFreshAgentSessionKey({
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            sessionId: 'sdk-restore-1',
+          })]: createFreshAgentSession({
             sessionId: 'sdk-restore-1',
             timelineSessionId: 'canonical-session-1',
             status: 'running',
-            messages: [],
-            timelineItems: [],
-            timelineBodies: {},
-            streamingText: '',
-            streamingActive: false,
             pendingPermissions: {
               'perm-1': {
                 requestId: 'perm-1',
@@ -510,12 +522,10 @@ describe('pane activity indicator flow (e2e)', () => {
               },
             },
             pendingQuestions: {},
-            totalCostUsd: 0,
-            totalInputTokens: 0,
-            totalOutputTokens: 0,
-          },
+          }),
         },
         pendingCreates: {},
+        pendingCreateFailures: {},
         availableModels: [],
       },
     })
@@ -525,161 +535,16 @@ describe('pane activity indicator flow (e2e)', () => {
     expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
 
     act(() => {
-      store.dispatch(removePermission({ sessionId: 'sdk-restore-1', requestId: 'perm-1' }))
+      store.dispatch(removePermission({
+        sessionId: 'sdk-restore-1',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        requestId: 'perm-1',
+      }))
     })
 
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
     expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
   })
 
-  it('keeps FreshClaude activity blue while mid-session model changes send sdk.set-model without rewriting provider defaults', async () => {
-    const ActualAgentChatView = (
-      await vi.importActual<typeof import('@/components/agent-chat/AgentChatView')>('@/components/agent-chat/AgentChatView')
-    ).default
-
-    const pane: AgentChatPaneContent = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
-      createRequestId: 'req-agent',
-      sessionId: 'sess-1',
-      status: 'running',
-      modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
-      effort: 'turbo',
-    }
-
-    const { store } = renderHarness({
-      pane,
-      settingsOverrides: {
-        freshAgent: {
-          ...defaultSettings.freshAgent,
-          providers: {
-            freshclaude: {
-              modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
-              effort: 'turbo',
-            },
-          },
-        },
-      },
-      agentChat: {
-        sessions: {
-          'sess-1': {
-            sessionId: 'sess-1',
-            status: 'running',
-            messages: [],
-            timelineItems: [],
-            timelineBodies: {},
-            streamingText: '',
-            streamingActive: false,
-            pendingPermissions: {},
-            pendingQuestions: {},
-            totalCostUsd: 0,
-            totalInputTokens: 0,
-            totalOutputTokens: 0,
-          },
-        },
-        pendingCreates: {},
-        pendingCreateFailures: {},
-        capabilitiesByProvider: {
-          freshclaude: {
-            status: 'succeeded',
-            capabilities: {
-              provider: 'freshclaude',
-              fetchedAt: Date.now(),
-              models: [
-                {
-                  id: 'opus[1m]',
-                  displayName: 'Opus 1M',
-                  description: 'Long context window',
-                  supportsEffort: true,
-                  supportedEffortLevels: ['turbo'],
-                  supportsAdaptiveThinking: true,
-                },
-                {
-                  id: 'haiku',
-                  displayName: 'Haiku',
-                  description: 'Fast path',
-                  supportsEffort: false,
-                  supportedEffortLevels: [],
-                  supportsAdaptiveThinking: false,
-                },
-              ],
-            },
-          },
-        },
-      } as AgentChatState,
-      freshAgent: {
-        sessions: {
-          [makeFreshAgentSessionKey({ sessionType: 'freshclaude', provider: 'claude', sessionId: 'sess-1' })]: {
-            sessionKey: makeFreshAgentSessionKey({ sessionType: 'freshclaude', provider: 'claude', sessionId: 'sess-1' }),
-            sessionType: 'freshclaude',
-            provider: 'claude',
-            sessionId: 'sess-1',
-            threadId: 'sess-1',
-            status: 'running',
-            turns: [],
-            timelineItems: [],
-            timelineBodies: {},
-            streamingText: '',
-            streamingActive: false,
-            pendingPermissions: {},
-            pendingQuestions: {},
-            totalCostUsd: 0,
-            totalInputTokens: 0,
-            totalOutputTokens: 0,
-          },
-        },
-        pendingCreates: {},
-        pendingCreateFailures: {},
-        availableModels: [],
-      },
-    })
-
-    render(
-      <Provider store={store}>
-        <div data-testid="actual-agent-chat-harness">
-          <ActualAgentChatView tabId="tab-activity" paneId="pane-activity" paneContent={pane} />
-        </div>
-      </Provider>,
-    )
-
-    const paneHeader = screen.getByRole('banner', { name: 'Pane: Activity Pane' })
-    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
-    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
-
-    const agentChatHarness = screen.getByTestId('actual-agent-chat-harness')
-    const modelSelect = await within(agentChatHarness).findByLabelText('Model') as HTMLSelectElement
-    const haikuValue = Array.from(modelSelect.options).find((option) => option.text === 'Haiku')?.value
-    fireEvent.change(modelSelect, { target: { value: haikuValue } })
-
-    await waitFor(() => {
-      expect(wsSend).toHaveBeenCalledWith({
-        type: 'sdk.set-model',
-        sessionId: 'sess-1',
-        model: 'haiku',
-      })
-    })
-    await waitFor(() => {
-      expect(saveServerSettingsPatchSpy).toHaveBeenCalledTimes(2)
-      expect(saveServerSettingsPatchSpy).toHaveBeenNthCalledWith(1, {
-        freshAgent: {
-          providers: {
-            freshclaude: {
-              modelSelection: { kind: 'tracked', modelId: 'haiku' },
-            },
-          },
-        },
-      })
-    })
-    expect(saveServerSettingsPatchSpy).toHaveBeenNthCalledWith(2, {
-      freshAgent: {
-        providers: {
-          freshclaude: {
-            effort: undefined,
-          },
-        },
-      },
-    })
-    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
-    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
-  })
 })

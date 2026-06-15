@@ -78,7 +78,7 @@ describe('FreshAgentActionSheet', () => {
   })
 })
 
-describe('coarse-pointer transcript behavior', () => {
+describe('mobile coarse-pointer transcript behavior', () => {
   afterEach(() => {
     cleanup()
     vi.unstubAllGlobals()
@@ -119,7 +119,7 @@ describe('coarse-pointer transcript behavior', () => {
   })
 })
 
-describe('coarse-pointer composer behavior', () => {
+describe('mobile coarse-pointer composer keyboard behavior', () => {
   afterEach(() => {
     cleanup()
     vi.unstubAllGlobals()

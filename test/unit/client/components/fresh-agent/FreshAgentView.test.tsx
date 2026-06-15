@@ -4,14 +4,12 @@ import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { updateSettingsLocal } from '@/store/settingsSlice'
-import freshAgentReducer from '@/store/freshAgentSlice'
-import agentChatReducer from '@/store/agentChatSlice'
+import freshAgentReducer, { sessionInit, setSessionStatus } from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
 import { initLayout, requestPaneRefresh, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
 import { useAppSelector } from '@/store/hooks'
-import { sessionInit, setSessionStatus } from '@/store/agentChatSlice'
 import { updateTab } from '@/store/tabsSlice'
 import type { PaneNode } from '@/store/paneTypes'
 
@@ -38,10 +36,6 @@ vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => wsMock,
 }))
 
-vi.mock('@/components/agent-chat/AgentChatView', () => ({
-  default: ({ paneContent }: { paneContent: { provider: string } }) => <div>agent:{paneContent.provider}</div>,
-}))
-
 vi.mock('@/lib/api', async () => {
   const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api')
   return {
@@ -62,7 +56,6 @@ function createStore(tabTitleSetByUser = false) {
       panes: panesReducer,
       settings: settingsReducer,
       freshAgent: freshAgentReducer,
-      agentChat: agentChatReducer,
       tabs: tabsReducer,
     },
     preloadedState: {
@@ -187,7 +180,7 @@ afterEach(() => {
 })
 
 describe('FreshAgentView', () => {
-  it('renders freshclaude in the shared shell and answers approvals/questions over fresh-agent WS', async () => {
+  it('renders freshclaude capability prompts in the shared shell and answers approvals/questions over fresh-agent WS', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
       status: 'running',
@@ -577,6 +570,42 @@ describe('FreshAgentView', () => {
       expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', 'thread-from-ref', expect.any(Object))
     })
     expect(await screen.findByText('Codex turn')).toBeInTheDocument()
+  })
+
+  it('restores a fresh-agent split pane remount without creating a replacement session', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-split-restore',
+        sessionId: 'thread-split-restore',
+        status: 'idle',
+      },
+    }))
+
+    const first = render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await screen.findByRole('textbox', { name: 'Chat message input' })
+    first.unmount()
+    wsMock.send.mockClear()
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await screen.findByRole('textbox', { name: 'Chat message input' })
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', 'thread-split-restore', expect.any(Object))
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
   })
 
   it('acquires a session id for a new non-Claude fresh-agent pane after freshAgent.created', async () => {
@@ -2955,10 +2984,12 @@ describe('FreshAgentView', () => {
     apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('Failed to parse URL from /api/fresh-agent/threads/claude/sess-1'))
     store.dispatch(sessionInit({
       sessionId: 'sess-1',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       cliSessionId: 'cli-abc',
       model: 'claude-opus-4-6',
     }))
-    store.dispatch(setSessionStatus({ sessionId: 'sess-1', status: 'idle' }))
+    store.dispatch(setSessionStatus({ sessionId: 'sess-1', sessionType: 'freshclaude', provider: 'claude', status: 'idle' }))
 
     const paneContent = {
       kind: 'fresh-agent' as const,
@@ -3004,10 +3035,12 @@ describe('FreshAgentView', () => {
     apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('Failed to parse URL from /api/fresh-agent/threads/claude/sess-1'))
     store.dispatch(sessionInit({
       sessionId: 'sess-1',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       cliSessionId: 'cli-abc',
       model: 'claude-opus-4-6',
     }))
-    store.dispatch(setSessionStatus({ sessionId: 'sess-1', status: 'idle' }))
+    store.dispatch(setSessionStatus({ sessionId: 'sess-1', sessionType: 'freshclaude', provider: 'claude', status: 'idle' }))
     store.dispatch(updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-1', title: 'Existing title', setByUser: false }))
 
     const paneContent = {
@@ -3052,9 +3085,11 @@ describe('FreshAgentView', () => {
     apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('Failed to parse URL from /api/fresh-agent/threads/claude/sess-live-only'))
     store.dispatch(sessionInit({
       sessionId: 'sess-live-only',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       model: 'claude-opus-4-6',
     }))
-    store.dispatch(setSessionStatus({ sessionId: 'sess-live-only', status: 'idle' }))
+    store.dispatch(setSessionStatus({ sessionId: 'sess-live-only', sessionType: 'freshclaude', provider: 'claude', status: 'idle' }))
     store.dispatch(updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-1', title: 'Existing live-only pane title', setByUser: false }))
     store.dispatch(updateTab({ id: 'tab-1', updates: { title: 'Existing live-only tab title' } }))
 

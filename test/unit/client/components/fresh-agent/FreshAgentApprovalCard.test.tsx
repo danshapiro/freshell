@@ -61,6 +61,21 @@ describe('FreshAgentApprovalCard', () => {
     expect(onAlwaysAllow).toHaveBeenCalledWith('Bash')
     expect(onDeny).toHaveBeenCalledTimes(1)
   })
+
+  it('keeps mobile and desktop touch targets available for approval actions', () => {
+    render(
+      <FreshAgentApprovalCard
+        approval={{ requestId: 'req-touch', toolName: 'Bash', input: { command: 'pwd' } }}
+        onAllow={vi.fn()}
+        onAlwaysAllow={vi.fn()}
+        onDeny={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByRole('button', { name: 'Allow tool use' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Always allow Bash this session' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Deny tool use' })).toBeEnabled()
+  })
 })
 
 describe('attachmentRejection', () => {

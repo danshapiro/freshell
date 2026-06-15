@@ -3,16 +3,25 @@ import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/f
 import type { SessionRef } from '@shared/session-contract'
 import { consumeCancelledCreate } from '@/lib/create-cancellation'
 import {
+  addAssistantMessage,
+  addPermissionRequest,
+  addQuestionRequest,
+  appendStreamDelta,
   clearPendingCreateFailure,
   createFailed,
   markSessionLost,
+  removePermission,
+  removeSession,
   registerPendingCreate,
   sessionError,
   sessionCreated,
+  sessionExited,
   sessionInit,
   sessionMetadataReceived,
   sessionSnapshotReceived,
   setSessionStatus,
+  setStreaming,
+  turnResult,
 } from '@/store/freshAgentSlice'
 
 type FreshAgentCreatedMessage = {
@@ -169,6 +178,71 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         status: event.status as never,
       }))
       return true
+    case 'sdk.assistant':
+      dispatch(addAssistantMessage({
+        ...locator,
+        content: Array.isArray(event.content) ? event.content as Record<string, unknown>[] : [],
+        model: event.model as string | undefined,
+      }))
+      return true
+    case 'sdk.stream': {
+      const streamEvent = event.event as Record<string, unknown> | undefined
+      if (streamEvent?.type === 'content_block_start') {
+        dispatch(setStreaming({ ...locator, active: true }))
+      }
+      if (streamEvent?.type === 'content_block_delta') {
+        const delta = streamEvent.delta as Record<string, unknown> | undefined
+        if (delta?.type === 'text_delta') {
+          dispatch(appendStreamDelta({
+            ...locator,
+            text: delta.text as string,
+          }))
+        }
+      }
+      if (streamEvent?.type === 'content_block_stop') {
+        dispatch(setStreaming({ ...locator, active: false }))
+      }
+      return true
+    }
+    case 'sdk.result':
+      dispatch(turnResult({
+        ...locator,
+        costUsd: event.costUsd as number | undefined,
+        durationMs: event.durationMs as number | undefined,
+        usage: event.usage as { input_tokens?: number; output_tokens?: number } | undefined,
+      }))
+      return true
+    case 'sdk.permission.request': {
+      const tool = event.tool as { name?: string; input?: Record<string, unknown> } | undefined
+      dispatch(addPermissionRequest({
+        ...locator,
+        requestId: event.requestId as string,
+        toolName: tool?.name,
+        input: tool?.input,
+        providerRequest: {
+          subtype: event.subtype,
+          tool,
+        },
+      }))
+      return true
+    }
+    case 'sdk.permission.cancelled':
+      dispatch(removePermission({
+        ...locator,
+        requestId: event.requestId as string,
+      }))
+      return true
+    case 'sdk.question.request':
+      dispatch(addQuestionRequest({
+        ...locator,
+        requestId: event.requestId as string,
+        questions: event.questions as never,
+        providerRequest: event,
+      }))
+      return true
+    case 'sdk.exit':
+      dispatch(sessionExited(locator))
+      return true
     case 'sdk.error':
       if (event.code === 'INVALID_SESSION_ID') {
         dispatch(markSessionLost(locator))
@@ -179,6 +253,9 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
           message: (event.message as string) || (event.error as string) || 'Unknown error',
         }))
       }
+      return true
+    case 'sdk.killed':
+      dispatch(removeSession(locator))
       return true
     default:
       return false

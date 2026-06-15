@@ -17,3 +17,5 @@ export function isCodingAgentContent(content: PaneContent | undefined | null): b
   if (content.kind === 'terminal') return isNonShellMode(content.mode)
   return false
 }
+
+export const isCodingAgentPane = isCodingAgentContent

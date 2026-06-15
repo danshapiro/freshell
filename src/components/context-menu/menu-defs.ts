@@ -63,12 +63,12 @@ export type MenuActions = {
   copyTerminalCwd: (terminalId: string) => void
   copyMessageText: (contextEl: HTMLElement | null) => void
   copyMessageCode: (contextEl: HTMLElement | null) => void
-  copyAgentChatCodeBlock: (clickTarget: HTMLElement | null) => void
-  copyAgentChatToolInput: (clickTarget: HTMLElement | null) => void
-  copyAgentChatToolOutput: (clickTarget: HTMLElement | null) => void
-  copyAgentChatDiffNew: (clickTarget: HTMLElement | null) => void
-  copyAgentChatDiffOld: (clickTarget: HTMLElement | null) => void
-  copyAgentChatFilePath: (clickTarget: HTMLElement | null) => void
+  copyFreshAgentCodeBlock: (clickTarget: HTMLElement | null) => void
+  copyFreshAgentToolInput: (clickTarget: HTMLElement | null) => void
+  copyFreshAgentToolOutput: (clickTarget: HTMLElement | null) => void
+  copyFreshAgentDiffNew: (clickTarget: HTMLElement | null) => void
+  copyFreshAgentDiffOld: (clickTarget: HTMLElement | null) => void
+  copyFreshAgentFilePath: (clickTarget: HTMLElement | null) => void
   showKeyboardShortcuts: () => void
   openUrlInPane: (tabId: string, paneId: string, url: string) => void
   openUrlInTab: (url: string) => void
@@ -635,7 +635,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     ]
   }
 
-  if (target.kind === 'agent-chat' || target.kind === 'fresh-agent') {
+  if (target.kind === 'fresh-agent') {
     const selection = window.getSelection()
     const hasSelection = !!(selection && selection.toString().trim())
 
@@ -679,7 +679,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
           type: 'item',
           id: 'fc-copy-code-block',
           label: 'Copy code block',
-          onSelect: () => actions.copyAgentChatCodeBlock(codeBlock),
+          onSelect: () => actions.copyFreshAgentCodeBlock(codeBlock),
         },
       )
     }
@@ -693,7 +693,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
           type: 'item',
           id: isBash ? 'fc-copy-command' : 'fc-copy-input',
           label: isBash ? 'Copy command' : 'Copy input',
-          onSelect: () => actions.copyAgentChatToolInput(toolInput),
+          onSelect: () => actions.copyFreshAgentToolInput(toolInput),
         },
       )
     }
@@ -705,7 +705,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
         type: 'item',
         id: 'fc-copy-output',
         label: 'Copy output',
-        onSelect: () => actions.copyAgentChatToolOutput(toolOutput),
+        onSelect: () => actions.copyFreshAgentToolOutput(toolOutput),
       })
     }
 
@@ -717,13 +717,13 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
           type: 'item',
           id: 'fc-copy-new-version',
           label: 'Copy new version',
-          onSelect: () => actions.copyAgentChatDiffNew(diffView),
+          onSelect: () => actions.copyFreshAgentDiffNew(diffView),
         },
         {
           type: 'item',
           id: 'fc-copy-old-version',
           label: 'Copy old version',
-          onSelect: () => actions.copyAgentChatDiffOld(diffView),
+          onSelect: () => actions.copyFreshAgentDiffOld(diffView),
         },
       )
       if (filePath) {
@@ -731,7 +731,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
           type: 'item',
           id: 'fc-copy-file-path',
           label: 'Copy file path',
-          onSelect: () => actions.copyAgentChatFilePath(diffView),
+          onSelect: () => actions.copyFreshAgentFilePath(diffView),
         })
       }
     }

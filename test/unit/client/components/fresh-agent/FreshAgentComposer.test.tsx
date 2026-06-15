@@ -57,6 +57,17 @@ describe('FreshAgentComposer', () => {
     )
   })
 
+  it('completes the highlighted slash command with Tab without sending it', () => {
+    const onCommand = vi.fn()
+    render(<FreshAgentComposer commands={COMMANDS} onCommand={onCommand} />)
+
+    fireEvent.change(getInput(), { target: { value: '/for' } })
+    fireEvent.keyDown(getInput(), { key: 'Tab' })
+
+    expect(getInput().value).toBe('/fork ')
+    expect(onCommand).not.toHaveBeenCalled()
+  })
+
   it('completes @ mentions against the files API anchored at the session cwd', async () => {
     apiGet.mockResolvedValue({
       suggestions: [

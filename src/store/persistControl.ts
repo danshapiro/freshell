@@ -1,5 +1,4 @@
 import { createAction } from '@reduxjs/toolkit'
-import type { ChatSessionState } from './agentChatTypes'
 import type { CodingCliProviderName, SessionListMetadata, Tab } from './types'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { sessionMetadataKey } from '@/lib/session-metadata'
@@ -67,7 +66,10 @@ export function buildTerminalDurableSessionRefUpdate({
   }
 }
 
-type SessionIdentityState = Pick<ChatSessionState, 'timelineSessionId' | 'cliSessionId'> | undefined
+type SessionIdentityState = {
+  timelineSessionId?: string
+  cliSessionId?: string
+} | undefined
 
 type LegacyAgentChatPersistedIdentityContent = Record<string, unknown> & {
   provider?: string

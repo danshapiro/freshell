@@ -42,7 +42,6 @@ import { createLogger } from '@/lib/client-logger'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { AppView } from '@/components/Sidebar'
 import type { CodingCliProviderName, CodingCliSession, ProjectGroup } from '@/store/types'
-import type { ChatSessionState } from '@/store/agentChatTypes'
 import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 import type { ContextId } from './context-menu-constants'
@@ -52,13 +51,13 @@ import { ContextIds } from './context-menu-constants'
 import { buildMenuItems } from './menu-defs'
 import { copyDataset, isTextInputLike, parseContextTarget } from './context-menu-utils'
 import {
-  copyAgentChatCodeBlock,
-  copyAgentChatToolInput,
-  copyAgentChatToolOutput,
-  copyAgentChatDiffNew,
-  copyAgentChatDiffOld,
-  copyAgentChatFilePath,
-} from './agent-chat-copy'
+  copyFreshAgentCodeBlock,
+  copyFreshAgentToolInput,
+  copyFreshAgentToolOutput,
+  copyFreshAgentDiffNew,
+  copyFreshAgentDiffOld,
+  copyFreshAgentFilePath,
+} from './fresh-agent-copy'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import { nanoid } from 'nanoid'
 
@@ -66,7 +65,6 @@ const CONTEXT_MENU_KEYS = ['ContextMenu']
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 const EMPTY_PANE_LAST_INPUT_AT: Record<string, number | undefined> = {}
 const EMPTY_FEATURE_FLAGS: Record<string, boolean> = {}
-const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
 const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_CLAUDE_ACTIVITY_BY_ID = {}
@@ -118,7 +116,7 @@ function resolveContextId(value: string | undefined): ContextId {
 }
 
 function hasWaitingPrompt(
-  session: Pick<ChatSessionState | FreshAgentSessionState, 'pendingPermissions' | 'pendingQuestions'> | undefined,
+  session: Pick<FreshAgentSessionState, 'pendingPermissions' | 'pendingQuestions'> | undefined,
 ): boolean {
   if (!session) return false
   return Object.keys(session.pendingPermissions).length > 0
@@ -158,7 +156,6 @@ export function ContextMenuProvider({
   const appSettings = useAppSelector((s) => s.settings.settings)
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const paneLastInputAt = useAppSelector((s) => s.tabRecency?.paneLastInputAt ?? EMPTY_PANE_LAST_INPUT_AT)
-  const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
   const freshAgentSessions = useAppSelector((s) => s.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS)
   const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
   const claudeActivityByTerminalId = useAppSelector((s) => s.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID)
@@ -795,7 +792,6 @@ export function ContextMenuProvider({
           opencodeActivityByTerminalId,
           claudeActivityByTerminalId,
           paneRuntimeActivityByPaneId,
-          agentChatSessions,
           freshAgentSessions,
         })
         let hasWaitingItems = false
@@ -816,7 +812,6 @@ export function ContextMenuProvider({
 
     return result
   }, [
-    agentChatSessions,
     claudeActivityByTerminalId,
     codexActivityByTerminalId,
     freshAgentSessions,
@@ -843,7 +838,6 @@ export function ContextMenuProvider({
         opencodeActivityByTerminalId: state.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID,
         claudeActivityByTerminalId: state.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID,
         paneRuntimeActivityByPaneId: state.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID,
-        agentChatSessions: state.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS,
         freshAgentSessions: state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS,
       })
       let hasWaitingItems = false
@@ -1221,12 +1215,12 @@ export function ContextMenuProvider({
         copyTerminalCwd,
         copyMessageText,
         copyMessageCode,
-        copyAgentChatCodeBlock: copyAgentChatCodeBlock,
-        copyAgentChatToolInput: copyAgentChatToolInput,
-        copyAgentChatToolOutput: copyAgentChatToolOutput,
-        copyAgentChatDiffNew: copyAgentChatDiffNew,
-        copyAgentChatDiffOld: copyAgentChatDiffOld,
-        copyAgentChatFilePath: copyAgentChatFilePath,
+        copyFreshAgentCodeBlock,
+        copyFreshAgentToolInput,
+        copyFreshAgentToolOutput,
+        copyFreshAgentDiffNew,
+        copyFreshAgentDiffOld,
+        copyFreshAgentFilePath,
         openUrlInPane,
         openUrlInTab,
         openUrlInBrowser,

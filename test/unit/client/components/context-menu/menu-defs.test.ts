@@ -45,12 +45,12 @@ function createMockActions(): MenuActions {
     copyTerminalCwd: vi.fn(),
     copyMessageText: vi.fn(),
     copyMessageCode: vi.fn(),
-    copyAgentChatCodeBlock: vi.fn(),
-    copyAgentChatToolInput: vi.fn(),
-    copyAgentChatToolOutput: vi.fn(),
-    copyAgentChatDiffNew: vi.fn(),
-    copyAgentChatDiffOld: vi.fn(),
-    copyAgentChatFilePath: vi.fn(),
+    copyFreshAgentCodeBlock: vi.fn(),
+    copyFreshAgentToolInput: vi.fn(),
+    copyFreshAgentToolOutput: vi.fn(),
+    copyFreshAgentDiffNew: vi.fn(),
+    copyFreshAgentDiffOld: vi.fn(),
+    copyFreshAgentFilePath: vi.fn(),
     refreshTab: vi.fn(),
     refreshPane: vi.fn(),
     replacePane: vi.fn(),
@@ -151,11 +151,11 @@ describe('buildMenuItems — pane context menu', () => {
   })
 })
 
-describe('buildMenuItems — agent-chat context', () => {
-  it('returns Copy and Select all for agent-chat target', () => {
+describe('buildMenuItems — fresh-agent context', () => {
+  it('returns Copy and Select all for fresh-agent target', () => {
     const mockActions = createMockActions()
     const mockContext = createMockContext(mockActions)
-    const target: ContextTarget = { kind: 'agent-chat', sessionId: 'sess-1' }
+    const target: ContextTarget = { kind: 'fresh-agent', sessionId: 'sess-1' }
     const items = buildMenuItems(target, mockContext)
     const ids = items.filter(i => i.type === 'item').map(i => i.id)
     expect(ids).toContain('fc-copy')
@@ -165,7 +165,7 @@ describe('buildMenuItems — agent-chat context', () => {
   it('always includes Copy, Select all, and Copy session ID', () => {
     const mockActions = createMockActions()
     const mockContext = createMockContext(mockActions)
-    const target: ContextTarget = { kind: 'agent-chat', sessionId: 'sess-1' }
+    const target: ContextTarget = { kind: 'fresh-agent', sessionId: 'sess-1' }
     const items = buildMenuItems(target, mockContext)
     const actionItems = items.filter(i => i.type === 'item')
     expect(actionItems).toHaveLength(3)
@@ -178,7 +178,7 @@ describe('buildMenuItems — agent-chat context', () => {
   it('disables Copy when no selection', () => {
     const mockActions = createMockActions()
     const mockContext = createMockContext(mockActions)
-    const target: ContextTarget = { kind: 'agent-chat', sessionId: 'sess-1' }
+    const target: ContextTarget = { kind: 'fresh-agent', sessionId: 'sess-1' }
     const items = buildMenuItems(target, mockContext)
     const copyItem = items.find(i => i.type === 'item' && i.id === 'fc-copy')
     expect(copyItem).toBeDefined()
@@ -201,7 +201,7 @@ describe('buildMenuItems — clickTarget passthrough', () => {
   })
 })
 
-describe('buildMenuItems — agent-chat context-sensitive items', () => {
+describe('buildMenuItems — fresh-agent context-sensitive items', () => {
   function makeContextWithClickTarget(clickTarget: HTMLElement, contextElement?: HTMLElement) {
     const mockActions = createMockActions()
     return {
@@ -220,7 +220,7 @@ describe('buildMenuItems — agent-chat context-sensitive items', () => {
     prose.appendChild(pre)
 
     const { ctx } = makeContextWithClickTarget(code)
-    const target: ContextTarget = { kind: 'agent-chat', sessionId: 's1' }
+    const target: ContextTarget = { kind: 'fresh-agent', sessionId: 's1' }
     const items = buildMenuItems(target, ctx)
     const ids = items.filter(i => i.type === 'item').map(i => i.id)
     expect(ids).toContain('fc-copy-code-block')
@@ -233,7 +233,7 @@ describe('buildMenuItems — agent-chat context-sensitive items', () => {
     pre.textContent = 'echo hello'
 
     const { ctx } = makeContextWithClickTarget(pre)
-    const target: ContextTarget = { kind: 'agent-chat', sessionId: 's1' }
+    const target: ContextTarget = { kind: 'fresh-agent', sessionId: 's1' }
     const items = buildMenuItems(target, ctx)
     const ids = items.filter(i => i.type === 'item').map(i => i.id)
     expect(ids).toContain('fc-copy-command')
@@ -246,7 +246,7 @@ describe('buildMenuItems — agent-chat context-sensitive items', () => {
     pre.textContent = '{"pattern":"foo"}'
 
     const { ctx } = makeContextWithClickTarget(pre)
-    const target: ContextTarget = { kind: 'agent-chat', sessionId: 's1' }
+    const target: ContextTarget = { kind: 'fresh-agent', sessionId: 's1' }
     const items = buildMenuItems(target, ctx)
     const ids = items.filter(i => i.type === 'item').map(i => i.id)
     expect(ids).toContain('fc-copy-input')
@@ -259,7 +259,7 @@ describe('buildMenuItems — agent-chat context-sensitive items', () => {
     pre.textContent = 'file1.txt\nfile2.txt'
 
     const { ctx } = makeContextWithClickTarget(pre)
-    const target: ContextTarget = { kind: 'agent-chat', sessionId: 's1' }
+    const target: ContextTarget = { kind: 'fresh-agent', sessionId: 's1' }
     const items = buildMenuItems(target, ctx)
     const ids = items.filter(i => i.type === 'item').map(i => i.id)
     expect(ids).toContain('fc-copy-output')
@@ -273,7 +273,7 @@ describe('buildMenuItems — agent-chat context-sensitive items', () => {
     diff.appendChild(span)
 
     const { ctx } = makeContextWithClickTarget(span)
-    const target: ContextTarget = { kind: 'agent-chat', sessionId: 's1' }
+    const target: ContextTarget = { kind: 'fresh-agent', sessionId: 's1' }
     const items = buildMenuItems(target, ctx)
     const ids = items.filter(i => i.type === 'item').map(i => i.id)
     expect(ids).toContain('fc-copy-new-version')
@@ -284,7 +284,7 @@ describe('buildMenuItems — agent-chat context-sensitive items', () => {
   it('always includes Copy and Select all', () => {
     const div = document.createElement('div')
     const { ctx } = makeContextWithClickTarget(div)
-    const target: ContextTarget = { kind: 'agent-chat', sessionId: 's1' }
+    const target: ContextTarget = { kind: 'fresh-agent', sessionId: 's1' }
     const items = buildMenuItems(target, ctx)
     const ids = items.filter(i => i.type === 'item').map(i => i.id)
     expect(ids).toContain('fc-copy')
@@ -294,7 +294,7 @@ describe('buildMenuItems — agent-chat context-sensitive items', () => {
   it('includes "Copy session ID" after a separator', () => {
     const div = document.createElement('div')
     const { ctx } = makeContextWithClickTarget(div)
-    const target: ContextTarget = { kind: 'agent-chat', sessionId: 's1' }
+    const target: ContextTarget = { kind: 'fresh-agent', sessionId: 's1' }
     const items = buildMenuItems(target, ctx)
     const sessionIdx = items.findIndex(i => i.type === 'item' && i.id === 'fc-copy-session')
     expect(sessionIdx).toBeGreaterThan(0)

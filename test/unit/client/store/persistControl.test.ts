@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 
-import agentChatReducer, { setSessionStatus } from '@/store/agentChatSlice'
+import freshAgentReducer, { setSessionStatus } from '@/store/freshAgentSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
 import {
   persistMiddleware,
@@ -32,7 +32,7 @@ describe('persistControl', () => {
   it('flushes the persisted layout immediately when explicitly requested', () => {
     const store = configureStore({
       reducer: {
-        agentChat: agentChatReducer,
+        freshAgent: freshAgentReducer,
         tabs: tabsReducer,
         panes: panesReducer,
       },
@@ -62,7 +62,7 @@ describe('persistControl', () => {
   it('does not force immediate flush for unrelated session updates', () => {
     const store = configureStore({
       reducer: {
-        agentChat: agentChatReducer,
+        freshAgent: freshAgentReducer,
         tabs: tabsReducer,
         panes: panesReducer,
       },
@@ -70,7 +70,12 @@ describe('persistControl', () => {
     })
 
     const setItemSpy = vi.spyOn(localStorage, 'setItem')
-    store.dispatch(setSessionStatus({ sessionId: 'sdk-1', status: 'idle' }))
+    store.dispatch(setSessionStatus({
+      sessionId: 'sdk-1',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      status: 'idle',
+    }))
 
     expect(setItemSpy).not.toHaveBeenCalled()
   })

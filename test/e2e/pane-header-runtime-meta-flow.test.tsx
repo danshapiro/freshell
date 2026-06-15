@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, cleanup, act, fireEvent, within } from '@testing-library/react'
+import { render, screen, waitFor, cleanup, act } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import App from '@/App'
@@ -10,20 +10,21 @@ import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer, { setProjects } from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
-import agentChatReducer from '@/store/agentChatSlice'
+import freshAgentReducer from '@/store/freshAgentSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import tabRegistryReducer from '@/store/tabRegistrySlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer } from '@/store/networkSlice'
 import type { Tab } from '@/store/types'
-import type { AgentChatState } from '@/store/agentChatTypes'
-import type { PaneNode, TerminalPaneContent, AgentChatPaneContent } from '@/store/paneTypes'
+import type { FreshAgentSessionState, FreshAgentState } from '@/store/freshAgentTypes'
+import type { PaneNode, TerminalPaneContent, FreshAgentPaneContent } from '@/store/paneTypes'
 import {
   composeResolvedSettings,
   createDefaultServerSettings,
   resolveLocalSettings,
 } from '@shared/settings'
+import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 
 const wsMocks = vi.hoisted(() => {
   const messageHandlers = new Set<(msg: any) => void>()
@@ -52,13 +53,7 @@ const wsMocks = vi.hoisted(() => {
 
 const apiGet = vi.hoisted(() => vi.fn())
 const fetchSidebarSessionsSnapshot = vi.hoisted(() => vi.fn())
-const getAgentChatCapabilities = vi.hoisted(() => vi.fn())
-const refreshAgentChatCapabilities = vi.hoisted(() => vi.fn())
 const setSessionMetadata = vi.hoisted(() => vi.fn(() => Promise.resolve(undefined)))
-const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn((patch: unknown) => ({
-  type: 'settings/saveServerSettingsPatch',
-  payload: patch,
-})))
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -85,15 +80,9 @@ vi.mock('@/lib/api', () => ({
     patch: vi.fn().mockResolvedValue({}),
     post: vi.fn().mockResolvedValue({}),
   },
-  getAgentChatCapabilities: (...args: unknown[]) => getAgentChatCapabilities(...args),
-  refreshAgentChatCapabilities: (...args: unknown[]) => refreshAgentChatCapabilities(...args),
   setSessionMetadata: (...args: unknown[]) => setSessionMetadata(...args),
   fetchSidebarSessionsSnapshot: (options?: unknown) => fetchSidebarSessionsSnapshot(options),
   isApiUnauthorizedError: (err: any) => !!err && typeof err === 'object' && err.status === 401,
-}))
-
-vi.mock('@/store/settingsThunks', () => ({
-  saveServerSettingsPatch: (patch: unknown) => saveServerSettingsPatchSpy(patch),
 }))
 
 vi.mock('@/hooks/useTheme', () => ({
@@ -136,9 +125,45 @@ vi.mock('@/components/TerminalView', () => ({
   default: ({ paneId }: { paneId: string }) => <div data-testid={`terminal-${paneId}`}>Terminal</div>,
 }))
 
-vi.mock('@/components/agent-chat/AgentChatView', () => ({
-  default: ({ paneId }: { paneId: string }) => <div data-testid={`agent-chat-${paneId}`}>Agent Chat</div>,
+vi.mock('@/components/fresh-agent/FreshAgentView', () => ({
+  default: ({ paneId }: { paneId: string }) => <div data-testid={`fresh-agent-${paneId}`}>Fresh Agent</div>,
 }))
+
+function createFreshAgentSession(
+  overrides: Partial<FreshAgentSessionState> & {
+    sessionId: string
+    sessionType?: FreshAgentSessionState['sessionType']
+    provider?: FreshAgentSessionState['provider']
+  },
+): FreshAgentSessionState {
+  const sessionType = overrides.sessionType ?? 'freshclaude'
+  const provider = overrides.provider ?? 'claude'
+  const sessionKey = makeFreshAgentSessionKey({
+    sessionType,
+    provider,
+    sessionId: overrides.sessionId,
+  })
+
+  return {
+    sessionKey,
+    sessionType,
+    provider,
+    sessionId: overrides.sessionId,
+    threadId: overrides.threadId ?? overrides.sessionId,
+    status: 'idle',
+    turns: [],
+    timelineItems: [],
+    timelineBodies: {},
+    streamingText: '',
+    streamingActive: false,
+    pendingPermissions: {},
+    pendingQuestions: {},
+    totalCostUsd: 0,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    ...overrides,
+  }
+}
 
 function createStore(options?: {
   codexTab?: Partial<Tab>
@@ -146,8 +171,8 @@ function createStore(options?: {
   codexPane?: Partial<TerminalPaneContent>
   claudePane?: Partial<TerminalPaneContent>
   freshClaudeTab?: Partial<Tab>
-  freshClaudePane?: AgentChatPaneContent
-  agentChatState?: Partial<AgentChatState>
+  freshClaudePane?: FreshAgentPaneContent
+  freshAgentState?: Partial<FreshAgentState>
   activeTabId?: string
 }) {
   const serverSettings = createDefaultServerSettings({
@@ -240,7 +265,7 @@ function createStore(options?: {
       connection: connectionReducer,
       sessions: sessionsReducer,
       panes: panesReducer,
-      agentChat: agentChatReducer,
+      freshAgent: freshAgentReducer,
       turnCompletion: turnCompletionReducer,
       tabRegistry: tabRegistryReducer,
       terminalMeta: terminalMetaReducer,
@@ -292,11 +317,12 @@ function createStore(options?: {
       terminalMeta: {
         byTerminalId: {},
       },
-      agentChat: {
+      freshAgent: {
         sessions: {},
         pendingCreates: {},
+        pendingCreateFailures: {},
         availableModels: [],
-        ...(options?.agentChatState || {}),
+        ...(options?.freshAgentState || {}),
       },
       tabRegistry: {
         deviceId: 'device-test',
@@ -330,10 +356,7 @@ describe('pane header runtime metadata flow (e2e)', () => {
 
     fetchSidebarSessionsSnapshot.mockReset()
     fetchSidebarSessionsSnapshot.mockResolvedValue([])
-    getAgentChatCapabilities.mockReset()
-    refreshAgentChatCapabilities.mockReset()
     setSessionMetadata.mockClear()
-    saveServerSettingsPatchSpy.mockClear()
 
     apiGet.mockImplementation((url: string) => {
       if (url === '/api/bootstrap') {
@@ -669,31 +692,28 @@ describe('pane header runtime metadata flow (e2e)', () => {
         createdAt: Date.now(),
       },
       freshClaudePane: {
-        kind: 'agent-chat',
-        provider: 'freshclaude',
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
         createRequestId: 'req-fresh',
         sessionId: 'sdk-session-1',
         status: 'idle',
-      } satisfies AgentChatPaneContent,
-      agentChatState: {
+      } satisfies FreshAgentPaneContent,
+      freshAgentState: {
         sessions: {
-          'sdk-session-1': {
+          [makeFreshAgentSessionKey({
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            sessionId: 'sdk-session-1',
+          })]: createFreshAgentSession({
             sessionId: 'sdk-session-1',
             cliSessionId: 'claude-session-1',
-            status: 'idle',
-            messages: [],
-            streamingText: '',
-            streamingActive: false,
-            pendingPermissions: {},
-            pendingQuestions: {},
-            totalCostUsd: 0,
-            totalInputTokens: 0,
-            totalOutputTokens: 0,
-          },
+          }),
         },
         pendingCreates: {},
+        pendingCreateFailures: {},
         availableModels: [],
-      } satisfies Partial<AgentChatState>,
+      } satisfies Partial<FreshAgentState>,
     })
 
     store.dispatch(setProjects([
@@ -794,139 +814,6 @@ describe('pane header runtime metadata flow (e2e)', () => {
     })
   })
 
-  it('keeps FreshClaude runtime metadata visible while provider-default creates with opus and tracked changes persist', async () => {
-    const ActualAgentChatView = (
-      await vi.importActual<typeof import('@/components/agent-chat/AgentChatView')>('@/components/agent-chat/AgentChatView')
-    ).default
-
-    const freshClaudePane: AgentChatPaneContent = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
-      createRequestId: 'req-fresh-create',
-      resumeSessionId: 'claude-session-1',
-      status: 'creating',
-    }
-
-    const store = createStore({
-      activeTabId: 'tab-fresh',
-      freshClaudeTab: {
-        id: 'tab-fresh',
-        createRequestId: 'req-fresh-create',
-        title: 'FreshClaude Tab',
-        status: 'running',
-        mode: 'claude',
-        resumeSessionId: 'claude-session-1',
-        createdAt: Date.now(),
-      },
-      freshClaudePane,
-      agentChatState: {
-        sessions: {},
-        pendingCreates: {},
-        pendingCreateFailures: {},
-        capabilitiesByProvider: {
-          freshclaude: {
-            status: 'succeeded',
-            capabilities: {
-              provider: 'freshclaude',
-              fetchedAt: Date.now(),
-              models: [
-                {
-                  id: 'opus',
-                  displayName: 'Opus',
-                  description: 'Latest Opus track',
-                  supportsEffort: true,
-                  supportedEffortLevels: ['turbo'],
-                  supportsAdaptiveThinking: true,
-                },
-                {
-                  id: 'opus[1m]',
-                  displayName: 'Opus 1M',
-                  description: 'Long context window',
-                  supportsEffort: true,
-                  supportedEffortLevels: ['warp'],
-                  supportsAdaptiveThinking: true,
-                },
-              ],
-            },
-          },
-        },
-      } satisfies Partial<AgentChatState>,
-    })
-
-    store.dispatch(setProjects([
-      {
-        projectPath: '/home/user/code/freshell',
-        sessions: [
-          {
-            provider: 'claude',
-            sessionType: 'freshclaude',
-            sessionId: 'claude-session-1',
-            projectPath: '/home/user/code/freshell',
-            cwd: '/home/user/code/freshell/.worktrees/issue-163',
-            gitBranch: 'main',
-            isDirty: true,
-            lastActivityAt: 1,
-            tokenUsage: {
-              inputTokens: 10,
-              outputTokens: 5,
-              cachedTokens: 0,
-              totalTokens: 15,
-              contextTokens: 15,
-              compactThresholdTokens: 60,
-              compactPercent: 25,
-            },
-          },
-        ],
-      },
-    ] as any))
-
-    render(
-      <Provider store={store}>
-        <>
-          <TabBar />
-          <PaneContainer tabId="tab-fresh" node={store.getState().panes.layouts['tab-fresh']!} />
-          <div data-testid="actual-agent-chat-harness">
-            <ActualAgentChatView tabId="tab-fresh" paneId="pane-fresh" paneContent={freshClaudePane} />
-          </div>
-        </>
-      </Provider>
-    )
-
-    await waitFor(() => {
-      expect(screen.getByText(/freshell \(main\*\)\s+25%/)).toBeInTheDocument()
-    })
-
-    await waitFor(() => {
-      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
-        type: 'sdk.create',
-        requestId: 'req-fresh-create',
-        model: 'opus',
-      }))
-    })
-
-    const agentChatHarness = screen.getByTestId('actual-agent-chat-harness')
-    const modelSelect = await within(agentChatHarness).findByLabelText('Model') as HTMLSelectElement
-    const opusOneMillionValue = Array.from(modelSelect.options).find(
-      (option) => option.text === 'Opus 1M',
-    )?.value
-    fireEvent.change(modelSelect, {
-      target: { value: opusOneMillionValue },
-    })
-
-    await waitFor(() => {
-      expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
-        agentChat: {
-          providers: {
-            freshclaude: {
-              modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
-            },
-          },
-        },
-      })
-    })
-    expect(screen.getByText(/freshell \(main\*\)\s+25%/)).toBeInTheDocument()
-  })
-
   it('restores FreshClaude pane header metadata from timelineSessionId before cliSessionId exists', async () => {
     fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
       projects: [
@@ -992,32 +879,29 @@ describe('pane header runtime metadata flow (e2e)', () => {
         createdAt: Date.now(),
       },
       freshClaudePane: {
-        kind: 'agent-chat',
-        provider: 'freshclaude',
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
         createRequestId: 'req-fresh',
         sessionId: 'sdk-session-restore',
         resumeSessionId: 'stale-resume',
         status: 'idle',
-      } satisfies AgentChatPaneContent,
-      agentChatState: {
+      } satisfies FreshAgentPaneContent,
+      freshAgentState: {
         sessions: {
-          'sdk-session-restore': {
+          [makeFreshAgentSessionKey({
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            sessionId: 'sdk-session-restore',
+          })]: createFreshAgentSession({
             sessionId: 'sdk-session-restore',
             timelineSessionId: 'canonical-session-1',
-            status: 'idle',
-            messages: [],
-            streamingText: '',
-            streamingActive: false,
-            pendingPermissions: {},
-            pendingQuestions: {},
-            totalCostUsd: 0,
-            totalInputTokens: 0,
-            totalOutputTokens: 0,
-          },
+          }),
         },
         pendingCreates: {},
+        pendingCreateFailures: {},
         availableModels: [],
-      } satisfies Partial<AgentChatState>,
+      } satisfies Partial<FreshAgentState>,
     })
 
     render(

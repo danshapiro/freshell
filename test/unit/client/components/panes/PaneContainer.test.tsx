@@ -10,14 +10,15 @@ import connectionReducer, { ConnectionState } from '@/store/connectionSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import sessionsReducer, { applySessionsPatch, type SessionsState } from '@/store/sessionsSlice'
-import agentChatReducer, { turnResult } from '@/store/agentChatSlice'
+import freshAgentReducer, { turnResult } from '@/store/freshAgentSlice'
 import opencodeActivityReducer, { upsertOpencodeActivity } from '@/store/opencodeActivitySlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import { markTabAttention, markPaneAttention } from '@/store/turnCompletionSlice'
 import type { PanesState } from '@/store/panesSlice'
 import type { PaneNode, PaneContent, EditorPaneContent } from '@/store/paneTypes'
-import type { AgentChatState } from '@/store/agentChatTypes'
+import type { FreshAgentSessionState, FreshAgentState } from '@/store/freshAgentTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
+import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 
 const defaultCliExtensions: ClientExtensionEntry[] = [
   {
@@ -36,7 +37,6 @@ const defaultCliExtensions: ClientExtensionEntry[] = [
 const {
   mockSend,
   mockTerminalView,
-  mockAgentChatView,
   mockFreshAgentView,
   mockBrowserPane,
   browserPaneMounts,
@@ -51,9 +51,6 @@ const {
   mockSend: vi.fn(),
   mockTerminalView: vi.fn(({ tabId, paneId, hidden }: { tabId: string; paneId: string; hidden?: boolean }) => (
     <div data-testid={`terminal-${paneId}`} data-hidden={String(hidden)}>Terminal for {tabId}/{paneId}</div>
-  )),
-  mockAgentChatView: vi.fn(({ paneId }: { paneId: string }) => (
-    <div data-testid={`agent-chat-${paneId}`}>Agent Chat</div>
   )),
   mockFreshAgentView: vi.fn(({ paneId }: { paneId: string }) => (
     <div data-testid={`fresh-agent-${paneId}`}>Fresh Agent</div>
@@ -190,10 +187,6 @@ vi.mock('@/components/TerminalView', () => ({
   default: mockTerminalView,
 }))
 
-vi.mock('@/components/agent-chat/AgentChatView', () => ({
-  default: mockAgentChatView,
-}))
-
 vi.mock('@/components/fresh-agent/FreshAgentView', () => ({
   default: mockFreshAgentView,
 }))
@@ -241,11 +234,43 @@ function createTerminalContent(overrides: Partial<PaneContent & { kind: 'termina
   }
 }
 
+function createFreshClaudeSession(
+  overrides: Partial<FreshAgentSessionState> & { sessionId: string },
+): FreshAgentSessionState {
+  const sessionType = overrides.sessionType ?? 'freshclaude'
+  const provider = overrides.provider ?? 'claude'
+  const sessionKey = makeFreshAgentSessionKey({
+    sessionType,
+    provider,
+    sessionId: overrides.sessionId,
+  })
+
+  return {
+    sessionKey,
+    sessionType,
+    provider,
+    sessionId: overrides.sessionId,
+    threadId: overrides.threadId ?? overrides.sessionId,
+    status: 'idle',
+    turns: [],
+    timelineItems: [],
+    timelineBodies: {},
+    streamingText: '',
+    streamingActive: false,
+    pendingPermissions: {},
+    pendingQuestions: {},
+    totalCostUsd: 0,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    ...overrides,
+  }
+}
+
 function createStore(
   initialPanesState: Partial<PanesState> = {},
   initialConnectionState: Partial<ConnectionState> = {},
   initialSessionsState: Partial<SessionsState> = {},
-  initialAgentChatState: Partial<AgentChatState> = {},
+  initialFreshAgentState: Partial<FreshAgentState> = {},
 ) {
   return configureStore({
     reducer: {
@@ -256,7 +281,7 @@ function createStore(
       extensions: extensionsReducer,
       terminalMeta: terminalMetaReducer,
       sessions: sessionsReducer,
-      agentChat: agentChatReducer,
+      freshAgent: freshAgentReducer,
       opencodeActivity: opencodeActivityReducer,
       turnCompletion: turnCompletionReducer,
     },
@@ -299,11 +324,12 @@ function createStore(
         wsSnapshotReceived: true,
         ...initialSessionsState,
       },
-      agentChat: {
+      freshAgent: {
         sessions: {},
         pendingCreates: {},
+        pendingCreateFailures: {},
         availableModels: [],
-        ...initialAgentChatState,
+        ...initialFreshAgentState,
       },
       opencodeActivity: {
         byTerminalId: {},
@@ -332,7 +358,6 @@ describe('PaneContainer', () => {
   beforeEach(() => {
     mockSend.mockClear()
     mockTerminalView.mockClear()
-    mockAgentChatView.mockClear()
     mockFreshAgentView.mockClear()
     mockBrowserPane.mockClear()
     browserPaneMounts.length = 0
@@ -790,103 +815,6 @@ describe('PaneContainer', () => {
       expect(screen.getByTitle('Close pane')).toBeInTheDocument()
     })
 
-    it('kills and clears a pending agent-chat session using pendingCreates.sessionId', () => {
-      const node: PaneNode = {
-        type: 'leaf',
-        id: 'pane-agent',
-        content: {
-          kind: 'agent-chat',
-          provider: 'freshclaude',
-          createRequestId: 'req-1',
-          status: 'starting',
-        },
-      }
-
-      const store = createStore(
-        {
-          layouts: { 'tab-1': node },
-          activePane: { 'tab-1': 'pane-agent' },
-        },
-        {},
-        {},
-        {
-          sessions: {
-            'sdk-sess-1': {
-              sessionId: 'sdk-sess-1',
-              status: 'starting',
-              messages: [],
-              timelineItems: [],
-              timelineBodies: {},
-              streamingText: '',
-              streamingActive: false,
-              pendingPermissions: {},
-              pendingQuestions: {},
-              totalCostUsd: 0,
-              totalInputTokens: 0,
-              totalOutputTokens: 0,
-            },
-          },
-          pendingCreates: {
-            'req-1': {
-              sessionId: 'sdk-sess-1',
-              expectsHistoryHydration: true,
-            },
-          },
-        },
-      )
-
-      renderWithStore(
-        <PaneContainer tabId="tab-1" node={node} />,
-        store,
-      )
-
-      fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
-
-      expect(mockSend).toHaveBeenCalledWith({ type: 'sdk.kill', sessionId: 'sdk-sess-1' })
-      expect(store.getState().agentChat.pendingCreates['req-1']).toBeUndefined()
-    })
-
-    it('cancels pending agent-chat socket create tracking when closing before sdk.created arrives', () => {
-      const node: PaneNode = {
-        type: 'leaf',
-        id: 'pane-agent-pending',
-        content: {
-          kind: 'agent-chat',
-          provider: 'freshclaude',
-          createRequestId: 'req-agent-pending',
-          status: 'starting',
-        },
-      }
-
-      const store = createStore(
-        {
-          layouts: { 'tab-1': node },
-          activePane: { 'tab-1': 'pane-agent-pending' },
-        },
-        {},
-        {},
-        {
-          pendingCreates: {
-            'req-agent-pending': {
-              sessionId: undefined,
-              expectsHistoryHydration: false,
-            },
-          },
-        } as Partial<AgentChatState>,
-      )
-
-      renderWithStore(
-        <PaneContainer tabId="tab-1" node={node} />,
-        store,
-      )
-
-      fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
-
-      expect(cancelCreateSpy).toHaveBeenCalledWith('req-agent-pending')
-      expect(cancelWsCreateSpy).toHaveBeenCalledWith('req-agent-pending')
-      expect(mockSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.kill' }))
-    })
-
     it('closes second pane when its close button is clicked', () => {
       const pane1Id = 'pane-1'
       const pane2Id = 'pane-2'
@@ -993,7 +921,7 @@ describe('PaneContainer', () => {
               expectsHistoryHydration: false,
             },
           },
-        } as Partial<AgentChatState>,
+        } as Partial<FreshAgentState>,
       )
 
       renderWithStore(
@@ -1652,11 +1580,6 @@ describe('PaneContainer', () => {
                 enabled: true,
                 providers: freshAgentProviderSettingsByName ?? {},
               },
-              agentChat: {
-                enabled: true,
-                defaultPlugins: [],
-                providers: {},
-              },
               logging: { debug: false },
             },
             loaded: true,
@@ -2156,8 +2079,9 @@ describe('PaneContainer', () => {
         type: 'leaf',
         id: 'pane-fresh',
         content: {
-          kind: 'agent-chat',
-          provider: 'freshclaude',
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
           createRequestId: 'req-fresh',
           sessionId: 'sdk-session-1',
           status: 'idle',
@@ -2200,19 +2124,16 @@ describe('PaneContainer', () => {
         },
         {
           sessions: {
-            'sdk-session-1': {
+            [makeFreshAgentSessionKey({
+              sessionType: 'freshclaude',
+              provider: 'claude',
+              sessionId: 'sdk-session-1',
+            })]: createFreshClaudeSession({
               sessionId: 'sdk-session-1',
               cliSessionId: 'claude-session-1',
-              status: 'idle',
-              messages: [],
-              streamingText: '',
-              streamingActive: false,
-              pendingPermissions: {},
-              pendingQuestions: {},
-              totalCostUsd: 0,
               totalInputTokens: 4000,
               totalOutputTokens: 2000,
-            },
+            }),
           },
         },
       )
@@ -2230,6 +2151,8 @@ describe('PaneContainer', () => {
 
       store.dispatch(turnResult({
         sessionId: 'sdk-session-1',
+        sessionType: 'freshclaude',
+        provider: 'claude',
         usage: { input_tokens: 999999, output_tokens: 999999 },
       }))
 
@@ -2248,6 +2171,8 @@ describe('PaneContainer', () => {
 
       store.dispatch(turnResult({
         sessionId: 'sdk-session-1',
+        sessionType: 'freshclaude',
+        provider: 'claude',
         usage: { input_tokens: 500000, output_tokens: 500000 },
       }))
 
@@ -2259,8 +2184,9 @@ describe('PaneContainer', () => {
         type: 'leaf',
         id: 'pane-fresh',
         content: {
-          kind: 'agent-chat',
-          provider: 'freshclaude',
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
           createRequestId: 'req-fresh',
           sessionId: 'sdk-session-1',
           resumeSessionId: 'resume-session-2',
@@ -2323,19 +2249,14 @@ describe('PaneContainer', () => {
         },
         {
           sessions: {
-            'sdk-session-1': {
+            [makeFreshAgentSessionKey({
+              sessionType: 'freshclaude',
+              provider: 'claude',
+              sessionId: 'sdk-session-1',
+            })]: createFreshClaudeSession({
               sessionId: 'sdk-session-1',
               cliSessionId: 'cli-session-1',
-              status: 'idle',
-              messages: [],
-              streamingText: '',
-              streamingActive: false,
-              pendingPermissions: {},
-              pendingQuestions: {},
-              totalCostUsd: 0,
-              totalInputTokens: 0,
-              totalOutputTokens: 0,
-            },
+            }),
           },
         },
       )
@@ -2358,8 +2279,9 @@ describe('PaneContainer', () => {
         type: 'leaf',
         id: 'pane-fresh',
         content: {
-          kind: 'agent-chat',
-          provider: 'freshclaude',
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
           createRequestId: 'req-fresh',
           sessionId: 'sdk-session-1',
           resumeSessionId: 'resume-session-stale',
@@ -2422,19 +2344,14 @@ describe('PaneContainer', () => {
         },
         {
           sessions: {
-            'sdk-session-1': {
+            [makeFreshAgentSessionKey({
+              sessionType: 'freshclaude',
+              provider: 'claude',
+              sessionId: 'sdk-session-1',
+            })]: createFreshClaudeSession({
               sessionId: 'sdk-session-1',
               timelineSessionId: 'timeline-session-1',
-              status: 'idle',
-              messages: [],
-              streamingText: '',
-              streamingActive: false,
-              pendingPermissions: {},
-              pendingQuestions: {},
-              totalCostUsd: 0,
-              totalInputTokens: 0,
-              totalOutputTokens: 0,
-            },
+            }),
           },
         },
       )
@@ -2457,8 +2374,9 @@ describe('PaneContainer', () => {
         type: 'leaf',
         id: 'pane-fresh',
         content: {
-          kind: 'agent-chat',
-          provider: 'freshclaude',
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
           createRequestId: 'req-fresh',
           sessionId: 'sdk-session-2',
           resumeSessionId: 'resume-session-stale',
@@ -2521,20 +2439,15 @@ describe('PaneContainer', () => {
         },
         {
           sessions: {
-            'sdk-session-2': {
+            [makeFreshAgentSessionKey({
+              sessionType: 'freshclaude',
+              provider: 'claude',
+              sessionId: 'sdk-session-2',
+            })]: createFreshClaudeSession({
               sessionId: 'sdk-session-2',
               timelineSessionId: 'named-resume',
               cliSessionId: '00000000-0000-4000-8000-000000000321',
-              status: 'idle',
-              messages: [],
-              streamingText: '',
-              streamingActive: false,
-              pendingPermissions: {},
-              pendingQuestions: {},
-              totalCostUsd: 0,
-              totalInputTokens: 0,
-              totalOutputTokens: 0,
-            },
+            }),
           },
         },
       )
@@ -2557,8 +2470,9 @@ describe('PaneContainer', () => {
         type: 'leaf',
         id: 'pane-fresh',
         content: {
-          kind: 'agent-chat',
-          provider: 'freshclaude',
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
           createRequestId: 'req-fresh',
           status: 'starting',
           resumeSessionId: 'claude-session-restored',
@@ -2678,81 +2592,6 @@ describe('PaneContainer', () => {
       expect(screen.getByText(/freshell \(main\)\s+25%/)).toBeInTheDocument()
     })
 
-    it('does not add the token-budget indicator to kilroy panes', () => {
-      const node: PaneNode = {
-        type: 'leaf',
-        id: 'pane-kilroy',
-        content: {
-          kind: 'agent-chat',
-          provider: 'kilroy',
-          createRequestId: 'req-kilroy',
-          sessionId: 'sdk-session-1',
-          status: 'idle',
-        },
-      }
-
-      const store = createStore(
-        {
-          layouts: { 'tab-1': node },
-          activePane: { 'tab-1': 'pane-kilroy' },
-        },
-        {},
-        {
-          projects: [
-            {
-              projectPath: '/home/user/code/freshell',
-              sessions: [
-                {
-                  provider: 'claude',
-                  sessionType: 'freshclaude',
-                  sessionId: 'claude-session-1',
-                  projectPath: '/home/user/code/freshell',
-                  cwd: '/home/user/code/freshell',
-                  gitBranch: 'main',
-                  isDirty: true,
-                  lastActivityAt: 1,
-                  tokenUsage: {
-                    inputTokens: 10,
-                    outputTokens: 5,
-                    cachedTokens: 0,
-                    totalTokens: 15,
-                    contextTokens: 15,
-                    compactThresholdTokens: 60,
-                    compactPercent: 25,
-                  },
-                },
-              ],
-            },
-          ],
-        },
-        {
-          sessions: {
-            'sdk-session-1': {
-              sessionId: 'sdk-session-1',
-              cliSessionId: 'claude-session-1',
-              status: 'idle',
-              messages: [],
-              streamingText: '',
-              streamingActive: false,
-              pendingPermissions: {},
-              pendingQuestions: {},
-              totalCostUsd: 0,
-              totalInputTokens: 0,
-              totalOutputTokens: 0,
-            },
-          },
-        },
-      )
-
-      renderWithStore(
-        <PaneContainer tabId="tab-1" node={node} />,
-        store,
-      )
-
-      expect(screen.getByText('Kilroy')).toBeInTheDocument()
-      expect(screen.queryByText('freshell (main*)  25%')).not.toBeInTheDocument()
-      expect(screen.queryByText(/%$/)).not.toBeInTheDocument()
-    })
   })
 
   describe('refresh button integration', () => {

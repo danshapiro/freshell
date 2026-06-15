@@ -11,7 +11,7 @@ import connectionReducer from '@/store/connectionSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import sessionsReducer from '@/store/sessionsSlice'
-import agentChatReducer from '@/store/agentChatSlice'
+import freshAgentReducer from '@/store/freshAgentSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import { syncPaneTitleByTerminalId } from '@/store/paneTitleSync'
 import type { PaneNode } from '@/store/paneTypes'
@@ -64,7 +64,7 @@ function createStore(
       extensions: extensionsReducer,
       terminalMeta: terminalMetaReducer,
       sessions: sessionsReducer,
-      agentChat: agentChatReducer,
+      freshAgent: freshAgentReducer,
       turnCompletion: turnCompletionReducer,
     },
     preloadedState: {
@@ -112,9 +112,11 @@ function createStore(
         loading: false,
         error: null,
       },
-      agentChat: {
+      freshAgent: {
         pendingCreates: {},
         sessions: {},
+        pendingCreateFailures: {},
+        availableModels: [],
       },
       turnCompletion: {
         seq: 0,
@@ -228,7 +230,7 @@ describe('title sync flow', () => {
         extensions: extensionsReducer,
         terminalMeta: terminalMetaReducer,
         sessions: sessionsReducer,
-        agentChat: agentChatReducer,
+        freshAgent: freshAgentReducer,
         turnCompletion: turnCompletionReducer,
       },
       middleware: (getDefault) =>
@@ -279,8 +281,8 @@ describe('title sync flow', () => {
         extensions: { entries: [] },
         terminalMeta: { byTerminalId: {}, byTabId: {} },
         sessions: { projectGroups: [], expandedProjects: new Set(), activeTabProjectPath: null },
-        agentChat: {},
-        turnCompletion: { byProviderAndSessionId: {}, lastSeenTurnIdByProviderAndSessionId: {} },
+        freshAgent: { sessions: {}, pendingCreates: {}, pendingCreateFailures: {}, availableModels: [] },
+        turnCompletion: { seq: 0, pendingEvents: [], attentionByTab: {}, attentionByPane: {} },
       },
     })
 

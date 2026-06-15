@@ -84,8 +84,6 @@ export function parseContextTarget(contextId: ContextId, data: ContextDataset): 
       return data.terminalId ? { kind: 'overview-terminal', terminalId: data.terminalId } : null
     case ContextIds.ClaudeMessage:
       return data.sessionId ? { kind: 'claude-message', sessionId: data.sessionId, provider: data.provider } : null
-    case ContextIds.AgentChat:
-      return data.sessionId ? { kind: 'agent-chat', sessionId: data.sessionId } : null
     case ContextIds.FreshAgent:
       return data.sessionId || (data.tabId && data.paneId)
         ? {
