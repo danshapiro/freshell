@@ -30,6 +30,12 @@ type LegacyBoundaryAllowance = {
   patterns: RegExp[]
 }
 
+type SourceLine = {
+  line: string
+  lineNumber: number
+  legacyAllowance?: LegacyBoundaryAllowance
+}
+
 const legacyMigrationBoundaryAllowances: LegacyBoundaryAllowance[] = [
   {
     file: 'shared/fresh-agent.ts',
@@ -149,21 +155,79 @@ function isSdkInternalPath(file: string): boolean {
   return sdkInternalFiles.has(file) || sdkInternalPrefixes.some((prefix) => file.startsWith(prefix))
 }
 
-function findLegacyRuntimeReferences(file: string, contents: string): Finding[] {
+function formatWindowSnippet(lines: SourceLine[]): string {
+  return lines
+    .map(({ line }) => line.trim())
+    .filter(Boolean)
+    .join(' / ')
+}
+
+function buildSourceLines(file: string, contents: string): SourceLine[] {
   return contents
     .split(/\r?\n/)
-    .flatMap((line, index): Finding[] => {
-      if (!containsLegacyNeedle(line) || legacyAllowanceFor(file, line)) {
+    .map((line, index) => ({
+      line,
+      lineNumber: index + 1,
+      legacyAllowance: legacyAllowanceFor(file, line),
+    }))
+}
+
+function findMultilineLegacyRuntimeReferences(file: string, lines: SourceLine[], directLineNumbers: Set<number>): Finding[] {
+  const findings: Finding[] = []
+  const consumedLineNumbers = new Set<number>()
+  const maxAdjacentLines = 5
+
+  for (let start = 0; start < lines.length; start += 1) {
+    if (consumedLineNumbers.has(lines[start].lineNumber)) {
+      continue
+    }
+
+    for (let end = start + 1; end < Math.min(lines.length, start + maxAdjacentLines); end += 1) {
+      const window = lines.slice(start, end + 1)
+      if (window.some(({ lineNumber }) => directLineNumbers.has(lineNumber) || consumedLineNumbers.has(lineNumber))) {
+        continue
+      }
+
+      const nonMigrationBoundaryText = window
+        .map(({ line, legacyAllowance }) => legacyAllowance ? '' : line)
+        .join('\n')
+      if (!containsLegacyNeedle(nonMigrationBoundaryText)) {
+        continue
+      }
+
+      findings.push({
+        file,
+        line: window[0].lineNumber,
+        snippet: formatWindowSnippet(window),
+        reason: 'legacy agent-chat runtime reference is split across adjacent lines outside an explicit migration boundary',
+      })
+      window.forEach(({ lineNumber }) => consumedLineNumbers.add(lineNumber))
+      break
+    }
+  }
+
+  return findings
+}
+
+function findLegacyRuntimeReferences(file: string, contents: string): Finding[] {
+  const lines = buildSourceLines(file, contents)
+  const directFindings = lines
+    .flatMap(({ line, lineNumber, legacyAllowance }): Finding[] => {
+      if (!containsLegacyNeedle(line) || legacyAllowance) {
         return []
       }
 
       return [{
         file,
-        line: index + 1,
+        line: lineNumber,
         snippet: line.trim(),
         reason: 'legacy agent-chat runtime reference is not an explicit migration boundary',
       }]
     })
+  const directLineNumbers = new Set(directFindings.flatMap(({ line }) => line ? [line] : []))
+  const multilineFindings = findMultilineLegacyRuntimeReferences(file, lines, directLineNumbers)
+
+  return [...directFindings, ...multilineFindings]
 }
 
 function findSdkPublicReferences(file: string, contents: string): Finding[] {
@@ -243,6 +307,42 @@ describe('fresh-agent-only runtime architecture', () => {
           reason: 'legacy agent-chat runtime reference is not an explicit migration boundary',
         },
       ])
+    })
+
+    it('reports multiline obfuscated legacy references outside migration boundaries', () => {
+      expect(findLegacyRuntimeReferences(
+        'server/live-runtime.ts',
+        [
+          "router.use('/api/agent-' +",
+          "  'chat', router)",
+          'const key = `agent${',
+          "  'Chat'",
+          '}`',
+        ].join('\n'),
+      )).toMatchObject([
+        {
+          file: 'server/live-runtime.ts',
+          line: 1,
+          reason: 'legacy agent-chat runtime reference is split across adjacent lines outside an explicit migration boundary',
+        },
+        {
+          file: 'server/live-runtime.ts',
+          line: 3,
+          reason: 'legacy agent-chat runtime reference is split across adjacent lines outside an explicit migration boundary',
+        },
+      ])
+    })
+
+    it('does not let migration-boundary lines trigger multiline findings', () => {
+      expect(findLegacyRuntimeReferences(
+        'server/config-store.ts',
+        [
+          '  const existingAgentChat = isRecord(migrated.agentChat) ? { ...migrated.agentChat } : {}',
+          '  const existingProviders = isRecord(existingAgentChat.providers) ? { ...existingAgentChat.providers } : {}',
+          '  existingAgentChat.providers = existingProviders',
+          '  migrated.agentChat = existingAgentChat',
+        ].join('\n'),
+      )).toEqual([])
     })
   })
 
