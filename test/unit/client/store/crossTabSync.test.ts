@@ -182,6 +182,78 @@ describe('crossTabSync', () => {
     expect(layout.content.resumeSessionId).toBe('123e4567-e89b-42d3-a456-426614174000')
   })
 
+  it('drops incoming Codex runtime fields when the local pane already has a canonical sessionRef', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+
+    store.dispatch(hydratePanes({
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-a',
+          content: {
+            kind: 'terminal',
+            mode: 'codex',
+            createRequestId: 'req-a',
+            status: 'creating',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: 'thread-1',
+            },
+          },
+        } as any,
+      },
+      activePane: { 'tab-1': 'pane-a' },
+      paneTitles: {},
+    }))
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    const remoteRaw = JSON.stringify({
+      version: 3,
+      tabs: { activeTabId: null, tabs: [] },
+      panes: {
+        version: 6,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-a',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              createRequestId: 'req-b',
+              status: 'running',
+              terminalId: 'term-remote',
+              serverInstanceId: 'srv-remote',
+              streamId: 'stream-remote',
+              sessionRef: {
+                provider: 'codex',
+                sessionId: 'thread-old',
+              },
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-a' },
+        paneTitles: {},
+      },
+      tombstones: [],
+    })
+
+    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: remoteRaw }))
+
+    const layout = store.getState().panes.layouts['tab-1'] as any
+    expect(layout.content).toMatchObject({
+      sessionRef: {
+        provider: 'codex',
+        sessionId: 'thread-1',
+      },
+      terminalId: undefined,
+      serverInstanceId: undefined,
+      streamId: undefined,
+    })
+  })
+
   it('dedupes identical persisted payloads delivered via both storage and BroadcastChannel', () => {
     const dispatchSpy = vi.fn()
     const storeLike = {

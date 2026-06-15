@@ -249,12 +249,38 @@ export class TerminalStreamBroker {
     cols: number,
     rows: number,
     sinceSeq: number | undefined,
-    expectedSessionRef: SessionLocator | undefined,
-    attachRequestId?: string,
-    maxReplayBytes?: number,
-    priority: AttachPriority = 'foreground',
+    expectedSessionRefOrAttachRequestId?: SessionLocator | string,
+    attachRequestIdOrMaxReplayBytes?: string | number,
+    maxReplayBytesOrPriority?: number | AttachPriority,
+    priorityOrTerminalOutputBatchV1: AttachPriority | boolean = 'foreground',
     terminalOutputBatchV1 = false,
   ): Promise<AttachResult> {
+    const totalArgs = arguments.length
+    const usesExplicitExpectedSessionRef = Boolean(
+      expectedSessionRefOrAttachRequestId
+      && typeof expectedSessionRefOrAttachRequestId === 'object'
+      && 'provider' in expectedSessionRefOrAttachRequestId
+      && 'sessionId' in expectedSessionRefOrAttachRequestId
+    )
+    const usesNewSignature = usesExplicitExpectedSessionRef || totalArgs >= 11
+    const expectedSessionRef = usesExplicitExpectedSessionRef
+      ? expectedSessionRefOrAttachRequestId as SessionLocator
+      : undefined
+    const attachRequestId = usesNewSignature
+      ? (typeof attachRequestIdOrMaxReplayBytes === 'string' ? attachRequestIdOrMaxReplayBytes : undefined)
+      : (typeof expectedSessionRefOrAttachRequestId === 'string' ? expectedSessionRefOrAttachRequestId : undefined)
+    const maxReplayBytes = usesNewSignature
+      ? (typeof maxReplayBytesOrPriority === 'number' ? maxReplayBytesOrPriority : undefined)
+      : (typeof attachRequestIdOrMaxReplayBytes === 'number' ? attachRequestIdOrMaxReplayBytes : undefined)
+    const priority = (
+      usesNewSignature
+        ? (typeof priorityOrTerminalOutputBatchV1 === 'string' ? priorityOrTerminalOutputBatchV1 : 'foreground')
+        : (typeof maxReplayBytesOrPriority === 'string' ? maxReplayBytesOrPriority : 'foreground')
+    ) as AttachPriority
+    const batchV1 = usesNewSignature
+      ? terminalOutputBatchV1
+      : (typeof priorityOrTerminalOutputBatchV1 === 'boolean' ? priorityOrTerminalOutputBatchV1 : false)
+
     if (!isTerminalStreamAttachRequestIdWithinSerializedBudget(attachRequestId)) {
       return 'invalid_attach_request_id'
     }
@@ -329,7 +355,7 @@ export class TerminalStreamBroker {
       }
 
       const attachment = existingAttachment ?? this.getOrCreateAttachment(terminalState, ws, terminalId)
-      attachment.terminalOutputBatchV1 = terminalOutputBatchV1
+      attachment.terminalOutputBatchV1 = batchV1
 
       if (attachment.flushTimer) {
         clearTimeout(attachment.flushTimer)

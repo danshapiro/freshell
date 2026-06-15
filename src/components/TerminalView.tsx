@@ -12,7 +12,13 @@ import {
 import { shallowEqual } from 'react-redux'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
-import { consumePaneRefreshRequest, splitPane, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
+import {
+  consumePaneRefreshRequest,
+  repairCodexIdentityMismatch,
+  splitPane,
+  updatePaneContent,
+  updatePaneTitle,
+} from '@/store/panesSlice'
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
 import { recordPaneTabActivity } from '@/store/tabRecencySlice'
 import { updateSettingsLocal } from '@/store/settingsSlice'
@@ -24,7 +30,13 @@ import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { getWsClient } from '@/lib/ws-client'
 import { getTerminalTheme } from '@/lib/terminal-themes'
-import { getCreateSessionStateFromRef } from '@/components/terminal-view-utils'
+import {
+  buildCodexIdentityMismatchRepairContent,
+  buildTerminalAttachMessage,
+  buildTerminalInputMessage,
+  buildTerminalResizeMessage,
+  getCreateSessionStateFromRef,
+} from '@/components/terminal-view-utils'
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
 import { copyText, readText } from '@/lib/clipboard'
 import { registerTerminalActions } from '@/lib/pane-action-registry'
@@ -189,6 +201,13 @@ function buildSessionAssociationContentUpdates(
     resumeSessionId: undefined,
     codexDurability,
   }
+}
+
+function sessionRefsEqual(
+  left?: { provider?: string; sessionId?: string },
+  right?: { provider?: string; sessionId?: string },
+): boolean {
+  return left?.provider === right?.provider && left?.sessionId === right?.sessionId
 }
 
 type TerminalInputBlockedReason =
@@ -1017,7 +1036,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const sendInput = useCallback((data: string) => {
     const tid = terminalIdRef.current
     if (!tid) return
-    ws.send({ type: 'terminal.input', terminalId: tid, data })
+    ws.send(buildTerminalInputMessage(contentRef.current, tid, data))
   }, [ws])
 
   const translateScrollLinesToInput = useCallback((term: Terminal, lines: number): boolean => {
@@ -1322,7 +1341,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             suppressNextMatchingResizeRef.current = null
           } else if (!matchesLastSentViewport && !suppressNetworkEffects) {
             syncGeometryEpochForViewport(tid, term.cols, term.rows)
-            ws.send({ type: 'terminal.resize', terminalId: tid, cols: term.cols, rows: term.rows })
+            ws.send(buildTerminalResizeMessage(contentRef.current, tid, term.cols, term.rows))
             rememberSentViewport(tid, term.cols, term.rows)
             lastSentViewportRef.current = { terminalId: tid, cols: term.cols, rows: term.rows }
           }
@@ -2469,8 +2488,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       ? { terminalId: tid, cols, rows }
       : null
 
-    ws.send({
-      type: 'terminal.attach',
+    ws.send(buildTerminalAttachMessage({
+      content: contentRef.current,
       terminalId: tid,
       intent: effectiveIntent,
       cols,
@@ -2479,7 +2498,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       attachRequestId,
       priority: opts?.priority ?? 'foreground',
       ...(opts?.maxReplayBytes ? { maxReplayBytes: opts.maxReplayBytes } : {}),
-    })
+    }))
     rememberSentViewport(tid, cols, rows)
     lastSentViewportRef.current = { terminalId: tid, cols, rows }
     if (surfaceQuarantined) {
@@ -3540,13 +3559,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
           const attachSessionRef = (msg as { sessionRef?: TerminalPaneContent['sessionRef'] }).sessionRef
           if (attachSessionRef) {
-            const reconciled = reconcileTerminalSessionAssociation({
+            const associationResult = reconcileTerminalSessionAssociation({
               dispatch,
               getState: appStore.getState,
               terminalId: tid,
               sessionRef: attachSessionRef,
             })
-            if (reconciled) {
+            if (associationResult === 'reconciled') {
               syncContentRefWithSessionAssociation(attachSessionRef)
             }
           }
@@ -3614,13 +3633,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             ...(msg.restoreError ? { restoreError: msg.restoreError } : {}),
           })
           if (createdSessionRef) {
-            const reconciled = reconcileTerminalSessionAssociation({
+            const associationResult = reconcileTerminalSessionAssociation({
               dispatch,
               getState: appStore.getState,
               terminalId: newId,
               sessionRef: createdSessionRef,
             })
-            if (reconciled) {
+            if (associationResult === 'reconciled') {
               syncContentRefWithSessionAssociation(createdSessionRef)
             }
           }
@@ -3730,26 +3749,42 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
         // Handle one-time session association from the authoritative canonical sessionRef.
         if (msg.type === 'terminal.session.associated' && msg.terminalId === tid) {
-          const reconciled = reconcileTerminalSessionAssociation({
+          const associationResult = reconcileTerminalSessionAssociation({
             dispatch,
             getState: appStore.getState,
             terminalId: tid,
             sessionRef: msg.sessionRef,
           })
-          if (debugRef.current && reconciled) {
+          if (debugRef.current && associationResult === 'reconciled') {
             log.debug('[TRACE resumeSessionId] terminal.session.associated reconciled', {
               paneId: paneIdRef.current,
               terminalId: tid,
               sessionRef: msg.sessionRef,
             })
           }
-          if (reconciled) {
+          if (associationResult === 'reconciled') {
             syncContentRefWithSessionAssociation(msg.sessionRef)
           }
         }
 
         if (msg.type === 'terminal.codex.durability.updated' && msg.terminalId === tid) {
           const durability = msg.durability
+          const currentSessionRef = contentRef.current?.sessionRef
+          const durableMatchesCanonicalSession = currentSessionRef?.provider === 'codex'
+            && durability?.state === 'durable'
+            && durability.durableThreadId === currentSessionRef.sessionId
+          const candidateMatchesCanonicalSession = currentSessionRef?.provider === 'codex'
+            && durability?.candidate?.candidateThreadId === currentSessionRef.sessionId
+          if (currentSessionRef?.provider === 'codex' && !durableMatchesCanonicalSession && !candidateMatchesCanonicalSession) {
+            log.warn('Ignoring stale codex durability update for pane canonical session', {
+              tabId,
+              paneId: paneIdRef.current,
+              terminalId: tid,
+              expectedSessionRef: currentSessionRef,
+              durability,
+            })
+            return
+          }
           updateContent({ codexDurability: durability })
           const currentTab = tabHasSinglePaneRef.current ? tabRef.current : undefined
           if (currentTab) {
@@ -3782,6 +3817,59 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             lastInputBlockedNoticeRef.current = { reason, at: now }
             writeLocalXtermNotice(term, `\r\n[${terminalInputBlockedNotice(reason)}]\r\n`)
           }
+          return
+        }
+
+        if (msg.type === 'error' && msg.code === 'SESSION_IDENTITY_MISMATCH' && msg.terminalId === tid) {
+          const staleTerminalId = tid
+          const current = contentRef.current
+          const expectedSessionRef = sanitizeSessionRef(msg.expectedSessionRef)
+          if (!staleTerminalId || !current || current.terminalId !== staleTerminalId || !expectedSessionRef || !sessionRefsEqual(current.sessionRef, expectedSessionRef)) {
+            writeLocalXtermNotice(term, `\r\n[Resume blocked] ${msg.message || 'Terminal session identity mismatch.'}\r\n`)
+            return
+          }
+
+          const newRequestId = nanoid()
+          const repairContent = buildCodexIdentityMismatchRepairContent(current, expectedSessionRef, newRequestId)
+          if (!repairContent) return
+
+          consumeTerminalRestoreRequestId(requestIdRef.current)
+          addTerminalRestoreRequestId(newRequestId)
+          requestIdRef.current = newRequestId
+          launchAttemptRef.current = null
+          clearQuarantineRepair()
+          currentAttachRef.current = null
+          clearRateLimitRetry()
+          setIsAttaching(false)
+          dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
+          clearTerminalCursor(staleTerminalId)
+          resetParserAppliedSurface()
+          forgetSentViewport(staleTerminalId)
+          lastSentViewportRef.current = null
+          terminalIdRef.current = undefined
+          deferredAttachStateRef.current = {
+            mode: 'none',
+            pendingIntent: null,
+            pendingSinceSeq: 0,
+            pendingReason: 'initial_hydrate',
+          }
+          applySeqState(createAttachSeqState())
+          contentRef.current = {
+            ...current,
+            ...repairContent,
+          }
+          dispatch(repairCodexIdentityMismatch({
+            tabId,
+            paneId: paneIdRef.current,
+            staleTerminalId,
+            expectedSessionRef,
+            createRequestId: newRequestId,
+          }))
+          const currentTab = tabRef.current
+          if (currentTab) {
+            dispatch(updateTab({ id: currentTab.id, updates: { status: 'creating' } }))
+          }
+          writeLocalXtermNotice(term, '\r\n[Reconnecting to the expected Codex session...]\r\n')
           return
         }
 

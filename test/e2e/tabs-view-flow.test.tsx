@@ -224,7 +224,7 @@ describe('tabs view flow', () => {
     expect(copiedLayout?.content?.terminalId).toBeUndefined()
   })
 
-  it('opens same-server tab copies with an explicit live terminal handle', () => {
+  it('opens same-server tab copies without hydrating an unproven live terminal handle when a canonical sessionRef exists', () => {
     const store = configureStore({
       reducer: {
         tabs: tabsReducer,
@@ -287,7 +287,7 @@ describe('tabs view flow', () => {
       provider: 'codex',
       sessionId: 'codex-session-456',
     })
-    expect(copiedLayout?.content?.terminalId).toBe('term-local-1')
-    expect(copiedLayout?.content?.serverInstanceId).toBe('srv-local')
+    expect(copiedLayout?.content?.terminalId).toBeUndefined()
+    expect(copiedLayout?.content?.serverInstanceId).toBeUndefined()
   })
 })
