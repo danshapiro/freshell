@@ -1,7 +1,51 @@
 import { describe, it, expect } from 'vitest'
 import { collectBusySessionKeys, resolvePaneActivity } from '@/lib/pane-activity'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
+import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { Tab } from '@/store/types'
+import {
+  makeFreshAgentSessionKey,
+  type FreshAgentRuntimeProvider,
+  type FreshAgentSessionType,
+} from '@shared/fresh-agent'
+
+function freshAgentSession(input: {
+  sessionType?: FreshAgentSessionType
+  provider?: FreshAgentRuntimeProvider
+  sessionId: string
+  status?: FreshAgentSessionState['status']
+  streamingActive?: boolean
+}): FreshAgentSessionState {
+  const sessionType = input.sessionType ?? 'freshclaude'
+  const provider = input.provider ?? 'claude'
+  return {
+    sessionType,
+    provider,
+    sessionId: input.sessionId,
+    sessionKey: makeFreshAgentSessionKey({ sessionType, provider, sessionId: input.sessionId }),
+    threadId: input.sessionId,
+    status: input.status ?? 'running',
+    turns: [],
+    timelineItems: [],
+    timelineBodies: {},
+    streamingText: '',
+    streamingActive: input.streamingActive ?? true,
+    pendingPermissions: {},
+    pendingQuestions: {},
+    totalCostUsd: 0,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+  }
+}
+
+function freshAgentSessionMap(
+  lookup: { sessionType: FreshAgentSessionType; provider: FreshAgentRuntimeProvider; sessionId: string },
+  session: FreshAgentSessionState,
+): Record<string, FreshAgentSessionState> {
+  return {
+    [makeFreshAgentSessionKey(lookup)]: session,
+  }
+}
 
 describe('pane activity', () => {
   it('keeps Codex exact-match semantics and treats busy and pending as blue', () => {
@@ -18,7 +62,6 @@ describe('pane activity', () => {
     expect(resolvePaneActivity({
       paneId: 'pane-1',
       content,
-      tabTerminalId: 'term-tab',
       isOnlyPane: true,
       codexActivityByTerminalId: {
         'term-live': { terminalId: 'term-live', phase: 'busy', updatedAt: 10 },
@@ -26,13 +69,11 @@ describe('pane activity', () => {
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
-      agentChatSessions: {},
     })).toMatchObject({ isBusy: true, source: 'codex' })
 
     expect(resolvePaneActivity({
       paneId: 'pane-1',
       content,
-      tabTerminalId: 'term-tab',
       isOnlyPane: true,
       codexActivityByTerminalId: {
         'term-live': { terminalId: 'term-live', phase: 'pending', updatedAt: 10 },
@@ -40,13 +81,11 @@ describe('pane activity', () => {
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
-      agentChatSessions: {},
     })).toMatchObject({ isBusy: true, source: 'codex' })
 
     expect(resolvePaneActivity({
       paneId: 'pane-1',
       content: { ...content, terminalId: undefined },
-      tabTerminalId: undefined,
       isOnlyPane: false,
       codexActivityByTerminalId: {
         'term-foreign': { terminalId: 'term-foreign', phase: 'busy', updatedAt: 10 },
@@ -54,11 +93,10 @@ describe('pane activity', () => {
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
-      agentChatSessions: {},
     }).isBusy).toBe(false)
   })
 
-  it('does not show fresh-agent / agent-chat as busy when no live session exists (no reload blue-flash)', () => {
+  it('does not show fresh-agent panes as busy when no live session exists (no reload blue-flash)', () => {
     const freshContent = {
       kind: 'fresh-agent',
       createRequestId: 'cr',
@@ -76,27 +114,7 @@ describe('pane activity', () => {
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
-      agentChatSessions: {},
       freshAgentSessions: {},
-    }).isBusy).toBe(false)
-
-    const chatContent = {
-      kind: 'agent-chat',
-      createRequestId: 'cr',
-      provider: 'claude',
-      sessionId: 'xyz',
-      status: 'running',
-    } as never
-
-    expect(resolvePaneActivity({
-      paneId: 'p',
-      content: chatContent,
-      isOnlyPane: true,
-      codexActivityByTerminalId: {},
-      opencodeActivityByTerminalId: {},
-      claudeActivityByTerminalId: {},
-      paneRuntimeActivityByPaneId: {},
-      agentChatSessions: {},
     }).isBusy).toBe(false)
   })
 
@@ -121,7 +139,6 @@ describe('pane activity', () => {
       },
       claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
-      agentChatSessions: {},
     })).toMatchObject({ isBusy: true, source: 'opencode' })
 
     expect(resolvePaneActivity({
@@ -134,7 +151,6 @@ describe('pane activity', () => {
       },
       claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
-      agentChatSessions: {},
     }).isBusy).toBe(false)
   })
 
@@ -183,11 +199,13 @@ describe('pane activity', () => {
         type: 'leaf',
         id: 'pane-fresh',
         content: {
-          kind: 'agent-chat',
-          provider: 'freshclaude',
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
           createRequestId: 'req-fresh',
           sessionId: 'sdk-1',
           resumeSessionId: freshSessionId,
+          sessionRef: { provider: 'claude', sessionId: freshSessionId },
           status: 'running',
         },
       },
@@ -202,23 +220,10 @@ describe('pane activity', () => {
         'term-claude': { terminalId: 'term-claude', phase: 'busy', updatedAt: 1 },
       },
       paneRuntimeActivityByPaneId: {},
-      agentChatSessions: {
-        'sdk-1': {
-          sessionId: 'sdk-1',
-          cliSessionId: freshSessionId,
-          status: 'running',
-          messages: [],
-          timelineItems: [],
-          timelineBodies: {},
-          streamingText: '',
-          streamingActive: true,
-          pendingPermissions: {},
-          pendingQuestions: {},
-          totalCostUsd: 0,
-          totalInputTokens: 0,
-          totalOutputTokens: 0,
-        },
-      },
+      freshAgentSessions: freshAgentSessionMap(
+        { sessionType: 'freshclaude', provider: 'claude', sessionId: 'sdk-1' },
+        freshAgentSession({ sessionId: 'sdk-1' }),
+      ),
     })
 
     expect(busySessionKeys).toEqual([
@@ -227,7 +232,7 @@ describe('pane activity', () => {
     ])
   })
 
-  it('prefers timelineSessionId for busy freshclaude panes during restore gaps', () => {
+  it('uses the live fresh-agent session id for busy freshclaude panes during restore gaps', () => {
     const busySessionKeys = collectBusySessionKeys({
       tabs: [
         {
@@ -245,8 +250,9 @@ describe('pane activity', () => {
           type: 'leaf',
           id: 'pane-fresh',
           content: {
-            kind: 'agent-chat',
-            provider: 'freshclaude',
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
             createRequestId: 'req-fresh',
             sessionId: 'sdk-restore-1',
             resumeSessionId: 'stale-resume',
@@ -258,29 +264,16 @@ describe('pane activity', () => {
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
-      agentChatSessions: {
-        'sdk-restore-1': {
-          sessionId: 'sdk-restore-1',
-          timelineSessionId: 'canonical-session-1',
-          status: 'running',
-          messages: [],
-          timelineItems: [],
-          timelineBodies: {},
-          streamingText: '',
-          streamingActive: true,
-          pendingPermissions: {},
-          pendingQuestions: {},
-          totalCostUsd: 0,
-          totalInputTokens: 0,
-          totalOutputTokens: 0,
-        },
-      },
+      freshAgentSessions: freshAgentSessionMap(
+        { sessionType: 'freshclaude', provider: 'claude', sessionId: 'sdk-restore-1' },
+        freshAgentSession({ sessionId: 'canonical-session-1' }),
+      ),
     })
 
     expect(busySessionKeys).toEqual(['claude:canonical-session-1'])
   })
 
-  it('prefers a canonical cliSessionId over a named timelineSessionId for busy freshclaude panes', () => {
+  it('prefers an explicit sessionRef over a live fresh-agent session id', () => {
     const busySessionKeys = collectBusySessionKeys({
       tabs: [
         {
@@ -298,11 +291,13 @@ describe('pane activity', () => {
           type: 'leaf',
           id: 'pane-fresh',
           content: {
-            kind: 'agent-chat',
-            provider: 'freshclaude',
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
             createRequestId: 'req-fresh',
             sessionId: 'sdk-restore-2',
             resumeSessionId: 'stale-resume',
+            sessionRef: { provider: 'claude', sessionId: '00000000-0000-4000-8000-000000000321' },
             status: 'running',
           },
         },
@@ -311,24 +306,10 @@ describe('pane activity', () => {
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
-      agentChatSessions: {
-        'sdk-restore-2': {
-          sessionId: 'sdk-restore-2',
-          timelineSessionId: 'named-resume',
-          cliSessionId: '00000000-0000-4000-8000-000000000321',
-          status: 'running',
-          messages: [],
-          timelineItems: [],
-          timelineBodies: {},
-          streamingText: '',
-          streamingActive: true,
-          pendingPermissions: {},
-          pendingQuestions: {},
-          totalCostUsd: 0,
-          totalInputTokens: 0,
-          totalOutputTokens: 0,
-        },
-      },
+      freshAgentSessions: freshAgentSessionMap(
+        { sessionType: 'freshclaude', provider: 'claude', sessionId: 'sdk-restore-2' },
+        freshAgentSession({ sessionId: 'live-session-2' }),
+      ),
     })
 
     expect(busySessionKeys).toEqual(['claude:00000000-0000-4000-8000-000000000321'])
@@ -382,7 +363,6 @@ describe('pane activity', () => {
       },
       claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
-      agentChatSessions: {},
     })
 
     expect(busySessionKeys).toEqual([`opencode:${sessionId}`])
@@ -427,7 +407,6 @@ describe('pane activity', () => {
       },
       claudeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
-      agentChatSessions: {},
     })
 
     expect(busySessionKeys).toEqual([])
@@ -442,7 +421,6 @@ describe('pane activity', () => {
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: { t1: { terminalId: 't1', phase: 'busy', updatedAt: 1 } },
       paneRuntimeActivityByPaneId: {},
-      agentChatSessions: {},
     })
     expect(result).toEqual({ isBusy: true, source: 'claude-terminal' })
   })
@@ -455,7 +433,6 @@ describe('pane activity', () => {
       codexActivityByTerminalId: {},
       opencodeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
-      agentChatSessions: {},
     }
     expect(resolvePaneActivity({ ...base, claudeActivityByTerminalId: { t1: { terminalId: 't1', phase: 'idle', updatedAt: 1 } } }).isBusy).toBe(false)
     expect(resolvePaneActivity({ ...base, claudeActivityByTerminalId: {} }).isBusy).toBe(false)

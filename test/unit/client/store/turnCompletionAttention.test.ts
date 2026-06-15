@@ -52,7 +52,6 @@ function stateWithLayout(layout: PaneNode): RootState {
   return {
     panes: { layouts: { T: layout } },
     freshAgent: { sessions: {} },
-    agentChat: { sessions: {} },
   } as unknown as RootState
 }
 
@@ -73,19 +72,44 @@ describe('selectPaneBySessionKey', () => {
     expect(selectPaneBySessionKey(stateWithLayout(layout), 'claude:abc')).toEqual({ tabId: 'T', paneId: 'P' })
   })
 
-  it('maps an agent-chat sessionKey to its tab+pane', () => {
+  it('maps a fresh-agent sessionKey through live session state when no explicit sessionRef exists', () => {
     const layout: PaneNode = {
       type: 'leaf',
       id: 'P',
       content: {
-        kind: 'agent-chat',
+        kind: 'fresh-agent',
         createRequestId: 'cr',
+        sessionType: 'freshclaude',
         provider: 'claude',
-        sessionId: 'xyz',
-        sessionRef: { provider: 'claude', sessionId: 'xyz' },
+        sessionId: 'sdk-xyz',
       } as never,
     }
-    expect(selectPaneBySessionKey(stateWithLayout(layout), 'claude:xyz')).toEqual({ tabId: 'T', paneId: 'P' })
+    const state = {
+      panes: { layouts: { T: layout } },
+      freshAgent: {
+        sessions: {
+          'freshclaude:claude:sdk-xyz': {
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            sessionId: 'xyz',
+            sessionKey: 'freshclaude:claude:sdk-xyz',
+            threadId: 'xyz',
+            status: 'idle',
+            turns: [],
+            timelineItems: [],
+            timelineBodies: {},
+            streamingText: '',
+            streamingActive: false,
+            pendingPermissions: {},
+            pendingQuestions: {},
+            totalCostUsd: 0,
+            totalInputTokens: 0,
+            totalOutputTokens: 0,
+          },
+        },
+      },
+    } as unknown as RootState
+    expect(selectPaneBySessionKey(state, 'claude:xyz')).toEqual({ tabId: 'T', paneId: 'P' })
   })
 
   it('returns null when no pane owns the sessionKey', () => {

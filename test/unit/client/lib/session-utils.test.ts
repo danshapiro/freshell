@@ -9,7 +9,7 @@ import {
   getSessionsForHello,
 } from '@/lib/session-utils'
 import type {
-  AgentChatPaneContent,
+  FreshAgentPaneContent,
   PaneContent,
   PaneNode,
   SessionLocator,
@@ -42,18 +42,19 @@ function terminalContent(
   }
 }
 
-function agentChatContent(
+function freshAgentContent(
   options: {
     resumeSessionId?: string
     sessionRef?: SessionLocator
   } = {},
-): AgentChatPaneContent {
+): FreshAgentPaneContent {
   const identity = options.sessionRef?.sessionId ?? options.resumeSessionId ?? 'fresh'
   return {
-    kind: 'agent-chat',
-    provider: 'freshclaude',
+    kind: 'fresh-agent',
+    sessionType: 'freshclaude',
+    provider: 'claude',
     status: 'idle',
-    createRequestId: `req-chat-${identity}`,
+    createRequestId: `req-fresh-${identity}`,
     ...(options.resumeSessionId ? { resumeSessionId: options.resumeSessionId } : {}),
     ...(options.sessionRef ? { sessionRef: options.sessionRef } : {}),
   }
@@ -84,7 +85,7 @@ describe('getSessionsForHello', () => {
               })),
             ],
           },
-          'tab-2': leaf('pane-claude-background', agentChatContent({ resumeSessionId: OTHER_SESSION_ID })),
+          'tab-2': leaf('pane-claude-background', freshAgentContent({ resumeSessionId: OTHER_SESSION_ID })),
         },
         activePane: {
           'tab-1': 'pane-claude-active',
@@ -171,9 +172,11 @@ describe('collectSessionRefsFromNode', () => {
     ])
   })
 
-  it('returns empty for agent-chat panes with non-canonical Claude resume strings', () => {
-    const node = leaf('pane-chat', agentChatContent({ resumeSessionId: 'named-resume' }))
-    expect(collectSessionRefsFromNode(node)).toEqual([])
+  it('collects fresh-agent pane resume identities by runtime provider', () => {
+    const node = leaf('pane-fresh', freshAgentContent({ resumeSessionId: VALID_SESSION_ID }))
+    expect(collectSessionRefsFromNode(node)).toEqual([
+      { provider: 'claude', sessionId: VALID_SESSION_ID },
+    ])
   })
 })
 
@@ -345,7 +348,7 @@ describe('findPaneForSession', () => {
     )).toBeUndefined()
   })
 
-  it('finds an agent-chat pane by canonical Claude resume id', () => {
+  it('finds a fresh-agent pane by canonical Claude resume id', () => {
     const state = {
       tabs: {
         activeTabId: 'tab-1',
@@ -353,15 +356,15 @@ describe('findPaneForSession', () => {
       },
       panes: {
         layouts: {
-          'tab-1': leaf('pane-chat', agentChatContent({ resumeSessionId: VALID_SESSION_ID })),
+          'tab-1': leaf('pane-fresh', freshAgentContent({ resumeSessionId: VALID_SESSION_ID })),
         },
-        activePane: { 'tab-1': 'pane-chat' },
+        activePane: { 'tab-1': 'pane-fresh' },
       },
     } as unknown as RootState
 
     expect(findPaneForSession(state, { provider: 'claude', sessionId: VALID_SESSION_ID })).toEqual({
       tabId: 'tab-1',
-      paneId: 'pane-chat',
+      paneId: 'pane-fresh',
     })
   })
 

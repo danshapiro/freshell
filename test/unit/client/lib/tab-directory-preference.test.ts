@@ -18,13 +18,15 @@ function terminalLeaf(id: string, initialCwd?: string): PaneNode {
   }
 }
 
-// Helper to create an agent-chat leaf
-function chatLeaf(id: string, initialCwd?: string): PaneNode {
+// Helper to create a fresh-agent leaf
+function freshAgentLeaf(id: string, initialCwd?: string): PaneNode {
   return {
     type: 'leaf',
     id,
     content: {
-      kind: 'agent-chat', provider: 'freshclaude',
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: `cr-${id}`,
       status: 'connected',
       initialCwd,
@@ -100,9 +102,9 @@ describe('getTabDirectoryPreference', () => {
     expect(result.tabDirectories).toEqual(['/code/alpha', '/code/beta'])
   })
 
-  it('includes agent-chat pane directories', () => {
+  it('includes fresh-agent pane directories', () => {
     const node = split(
-      chatLeaf('c1', '/code/project'),
+      freshAgentLeaf('c1', '/code/project'),
       terminalLeaf('t1', '/code/project'),
     )
     const result = getTabDirectoryPreference(node)

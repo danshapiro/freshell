@@ -86,16 +86,18 @@ describe('collectPaneSnapshots', () => {
     }])
   })
 
-  it('serializes agent-chat selection strategies and explicit effort overrides', () => {
+  it('serializes fresh-agent selection strategies and explicit effort overrides', () => {
     const node: PaneNode = {
       type: 'leaf',
       id: 'pane-agent',
       content: {
-        kind: 'agent-chat',
-        provider: 'freshclaude',
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
         createRequestId: 'req-agent',
         status: 'idle',
         resumeSessionId: '00000000-0000-4000-8000-000000000123',
+        sessionRef: { provider: 'claude', sessionId: '00000000-0000-4000-8000-000000000123' },
         modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
         permissionMode: 'default',
         effort: 'turbo',
@@ -107,16 +109,21 @@ describe('collectPaneSnapshots', () => {
 
     expect(snapshots).toEqual([{
       paneId: 'pane-agent',
-      kind: 'agent-chat',
+      kind: 'fresh-agent',
       title: undefined,
       payload: {
-        provider: 'freshclaude',
-        sessionRef: undefined,
+        provider: 'claude',
+        sessionType: 'freshclaude',
+        sessionRef: { provider: 'claude', sessionId: '00000000-0000-4000-8000-000000000123' },
         initialCwd: undefined,
         modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
         permissionMode: 'default',
         effort: 'turbo',
         plugins: ['planner'],
+        settingsDismissed: undefined,
+        showThinking: undefined,
+        showTools: undefined,
+        showTimecodes: undefined,
       },
     }])
   })

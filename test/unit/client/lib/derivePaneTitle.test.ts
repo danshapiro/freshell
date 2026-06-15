@@ -60,9 +60,11 @@ describe('derivePaneTitle', () => {
     expect(derivePaneTitle(content)).toBe('Gemini')
   })
 
-  it('returns "Freshclaude" for agent-chat content', () => {
+  it('returns "Freshclaude" for fresh-agent content', () => {
     const content: PaneContent = {
-      kind: 'agent-chat', provider: 'freshclaude',
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'test',
       status: 'idle',
     }
@@ -92,10 +94,11 @@ describe('derivePaneTitle', () => {
     expect(derivePaneTitle(content)).toBe('freshell')
   })
 
-  it('returns the working-directory basename for an agent-chat pane with initialCwd', () => {
+  it('returns the working-directory basename for a freshclaude pane with initialCwd', () => {
     const content: PaneContent = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'test',
       status: 'idle',
       initialCwd: '/home/dan/code/freshell',

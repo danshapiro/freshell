@@ -6,11 +6,14 @@ const content = (c: Partial<PaneContent> & { kind: PaneContent['kind'] }): PaneC
   c as unknown as PaneContent
 
 describe('isCodingAgentContent', () => {
-  it('is true for non-shell terminal modes, fresh-agent, and agent-chat', () => {
+  it('is true for non-shell terminal modes and fresh-agent panes', () => {
     expect(isCodingAgentContent(content({ kind: 'terminal', mode: 'claude' }))).toBe(true)
     expect(isCodingAgentContent(content({ kind: 'terminal', mode: 'codex' }))).toBe(true)
-    expect(isCodingAgentContent(content({ kind: 'fresh-agent', sessionType: 'claude' }))).toBe(true)
-    expect(isCodingAgentContent(content({ kind: 'agent-chat', provider: 'claude' }))).toBe(true)
+    expect(isCodingAgentContent(content({ kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude' }))).toBe(true)
+  })
+
+  it('is false for legacy agent-chat panes after the fresh-agent UI/state migration', () => {
+    expect(isCodingAgentContent(content({ kind: 'agent-chat', provider: 'claude' }))).toBe(false)
   })
 
   it('is false for shell terminals (the critical scope boundary)', () => {
