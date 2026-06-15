@@ -382,7 +382,7 @@ describe('panesSlice', () => {
       })
     })
 
-    it('does not synthesize a portable sessionRef from a named legacy resume alias', () => {
+    it('turns a named legacy resume alias into a fresh-agent restore error', () => {
       const state = panesReducer(
         initialState,
         initLayout({
@@ -400,9 +400,35 @@ describe('panesSlice', () => {
         kind: 'fresh-agent',
         sessionType: 'freshclaude',
         provider: 'claude',
-        resumeSessionId: 'named-resume',
+        restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
       })
       expect(leaf.content.sessionRef).toBeUndefined()
+      expect(leaf.content.resumeSessionId).toBeUndefined()
+    })
+
+    it('does not recompute sessionRef for a bad legacy alias with a canonical resumeSessionId', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-1',
+          content: {
+            kind: 'agent-chat',
+            provider: 'freshclaude',
+            sessionRef: { provider: 'claude', sessionId: 'named-alias' },
+            resumeSessionId: VALID_CLAUDE_SESSION_ID,
+          },
+        }),
+      )
+
+      const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content).toMatchObject({
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
+      })
+      expect(leaf.content.sessionRef).toBeUndefined()
+      expect(leaf.content.resumeSessionId).toBeUndefined()
     })
 
     it('preserves fresh-agent style through content initialization and merge updates', () => {

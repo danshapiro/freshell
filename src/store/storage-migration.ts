@@ -22,12 +22,14 @@ import {
   PANES_SCHEMA_VERSION,
   hashPersistedLayoutRaw,
   migrateV2ToV3,
+  parseLayoutFreshAgentCommitMarker,
   readRecoverablePersistedLayoutRaw,
 } from './persistedState'
 import { BROWSER_PREFERENCES_STORAGE_KEY, LAYOUT_STORAGE_KEY } from './storage-keys'
 import {
   buildRestoreError,
   migrateLegacyTerminalDurableState,
+  type RestoreError,
   sanitizeSessionRef,
 } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
@@ -123,6 +125,24 @@ function normalizeLegacyRecoveryFailedTerminal(
   }
 }
 
+function readRestoreError(value: unknown): RestoreError | undefined {
+  return (
+    value
+    && typeof value === 'object'
+    && (value as any).code === 'RESTORE_UNAVAILABLE'
+    && typeof (value as any).reason === 'string'
+  )
+    ? value as RestoreError
+    : undefined
+}
+
+function hasFreshAgentLayoutMigrationMarkerForCurrentRaw(): boolean {
+  const raw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+  if (!raw) return false
+  const marker = parseLayoutFreshAgentCommitMarker(localStorage.getItem(LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY))
+  return marker?.migratedHash === hashPersistedLayoutRaw(raw)
+}
+
 function normalizeLayoutNode(node: unknown): unknown {
   if (!node || typeof node !== 'object') return node
   const candidate = node as Record<string, unknown>
@@ -158,6 +178,35 @@ function normalizeLayoutNode(node: unknown): unknown {
     }
 
     if (content.kind === 'fresh-agent') {
+      const existingRestoreError = readRestoreError(content.restoreError)
+      if (existingRestoreError) {
+        const {
+          sessionRef: _legacySessionRef,
+          restoreError: _legacyRestoreError,
+          ...restWithPossibleResume
+        } = content
+
+        const rest = existingRestoreError.reason === 'invalid_legacy_restore_target'
+          ? (() => {
+              const {
+                resumeSessionId: _legacyResumeSessionId,
+                timelineSessionId: _legacyTimelineSessionId,
+                cliSessionId: _legacyCliSessionId,
+                ...withoutLegacyIdentity
+              } = restWithPossibleResume
+              return withoutLegacyIdentity
+            })()
+          : restWithPossibleResume
+
+        return {
+          ...candidate,
+          content: {
+            ...rest,
+            restoreError: existingRestoreError,
+          },
+        }
+      }
+
       const provider = content.provider === 'claude' || content.provider === 'codex' || content.provider === 'opencode'
         ? content.provider
         : undefined
@@ -305,6 +354,10 @@ function migratePersistedLayout(): PersistedLayoutMigrationResult {
 }
 
 function preservePersistedLayout(): PersistedLayoutMigrationResult {
+  if (hasFreshAgentLayoutMigrationMarkerForCurrentRaw()) {
+    return 'none'
+  }
+
   const migrated = migratePersistedLayout()
   if (migrated !== 'none') {
     return migrated
@@ -320,7 +373,18 @@ function preservePersistedLayout(): PersistedLayoutMigrationResult {
 export function runStorageMigration(): void {
   try {
     const currentVersion = readStorageVersion()
-    if (currentVersion >= STORAGE_VERSION) return
+    if (currentVersion >= STORAGE_VERSION) {
+      const migratedLayout = preservePersistedLayout()
+      if (migratedLayout === 'failed') {
+        warnStructured('fresh_agent_layout_migration_aborted', {
+          key: LAYOUT_STORAGE_KEY,
+        })
+      }
+      if (migratedLayout === 'migrated') {
+        log.info('Migrated localStorage fresh-agent layout state without changing storage version.')
+      }
+      return
+    }
 
     const preservedAuthToken = localStorage.getItem(AUTH_STORAGE_KEY)
     const migratedLayout = preservePersistedLayout()

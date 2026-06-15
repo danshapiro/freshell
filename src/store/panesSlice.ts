@@ -18,7 +18,7 @@ import { loadPersistedPanes, loadPersistedTabs } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { createLogger } from '@/lib/client-logger'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
-import { RestoreErrorSchema, sanitizeSessionRef } from '@shared/session-contract'
+import { RestoreErrorSchema, sanitizeSessionRef, type RestoreError } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState } from '@shared/fresh-agent'
 import { normalizeFreshAgentStyleOverride } from '@shared/settings'
@@ -36,6 +36,11 @@ function buildPreservedSessionRef(
   _preservedResumeSessionId?: string,
 ) {
   return sanitizeSessionRef(localContent.sessionRef)
+}
+
+function readRestoreError(value: unknown): RestoreError | undefined {
+  const parsed = RestoreErrorSchema.safeParse(value)
+  return parsed.success ? parsed.data : undefined
 }
 
 /**
@@ -88,6 +93,40 @@ function normalizePaneContent(
   }
   if (input.kind === 'fresh-agent') {
     const rawFreshAgent = input as Record<string, unknown>
+    const existingRestoreError = readRestoreError(rawFreshAgent.restoreError)
+    const style = normalizeFreshAgentStyleOverride((input as { style?: unknown }).style)
+    if (existingRestoreError) {
+      return {
+        kind: 'fresh-agent',
+        sessionType: input.sessionType,
+        provider: input.provider,
+        sessionId: input.sessionId,
+        createRequestId: input.createRequestId || nanoid(),
+        status: input.status || 'creating',
+        ...(existingRestoreError.reason === 'invalid_legacy_restore_target'
+          ? {}
+          : { resumeSessionId: input.resumeSessionId }),
+        serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
+        restoreError: existingRestoreError,
+        initialCwd: input.initialCwd,
+        createError: input.createError,
+        modelSelection: normalizeAgentChatModelSelection(
+          (input as { modelSelection?: unknown }).modelSelection,
+          (input as { model?: unknown }).model,
+        ),
+        model: input.model,
+        permissionMode: input.permissionMode,
+        sandbox: input.sandbox,
+        effort: normalizeAgentChatEffortOverride(input.effort),
+        plugins: input.plugins,
+        ...(style ? { style } : {}),
+        settingsDismissed: input.settingsDismissed,
+        showThinking: typeof input.showThinking === 'boolean' ? input.showThinking : undefined,
+        showTools: typeof input.showTools === 'boolean' ? input.showTools : undefined,
+        showTimecodes: typeof input.showTimecodes === 'boolean' ? input.showTimecodes : undefined,
+      }
+    }
+
     const durableState = migrateLegacyFreshAgentDurableState({
       provider: input.provider,
       sessionRef: input.sessionRef,
@@ -98,8 +137,6 @@ function normalizePaneContent(
             : (typeof rawFreshAgent.cliSessionId === 'string' ? rawFreshAgent.cliSessionId : undefined)),
     })
     const sessionRef = durableState.sessionRef
-    const restoreError = RestoreErrorSchema.safeParse((input as { restoreError?: unknown }).restoreError)
-    const style = normalizeFreshAgentStyleOverride((input as { style?: unknown }).style)
     return {
       kind: 'fresh-agent',
       sessionType: input.sessionType,
@@ -110,9 +147,7 @@ function normalizePaneContent(
       resumeSessionId: input.resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
       serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
-      ...(restoreError.success
-        ? { restoreError: restoreError.data }
-        : ('restoreError' in durableState && durableState.restoreError ? { restoreError: durableState.restoreError } : {})),
+      ...('restoreError' in durableState && durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
       initialCwd: input.initialCwd,
       createError: input.createError,
       modelSelection: normalizeAgentChatModelSelection(

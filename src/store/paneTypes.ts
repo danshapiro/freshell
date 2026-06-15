@@ -1,5 +1,4 @@
 import type { TerminalStatus, TabMode, ShellType } from './types'
-import type { AgentChatProviderName } from '@/lib/agent-chat-types'
 import {
   AgentChatModelSelectionSchema,
   type AgentChatModelSelection,
@@ -154,34 +153,6 @@ export type FreshAgentPaneContent = {
 }
 
 /**
- * Compatibility-only shape for legacy agent-chat components and migrations.
- * This type is intentionally not part of the live PaneContent union.
- */
-export type AgentChatPaneContent = {
-  kind: 'agent-chat'
-  provider: AgentChatProviderName
-  sessionId?: string
-  createRequestId: string
-  status: SdkSessionStatus
-  resumeSessionId?: string
-  sessionRef?: SessionLocator
-  serverInstanceId?: string
-  restoreError?: RestoreError
-  initialCwd?: string
-  createError?: AgentChatCreateError
-  modelSelection?: AgentChatModelSelection
-  model?: string
-  permissionMode?: string
-  sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
-  effort?: string
-  plugins?: string[]
-  settingsDismissed?: boolean
-  showThinking?: boolean
-  showTools?: boolean
-  showTimecodes?: boolean
-}
-
-/**
  * Extension pane content — generic catch-all for extension-system panes.
  */
 export type ExtensionPaneContent = {
@@ -212,11 +183,6 @@ export type TerminalPaneInput = Omit<TerminalPaneContent, 'createRequestId' | 's
 export type EditorPaneInput = EditorPaneContent
 
 export type FreshAgentPaneInput = Omit<FreshAgentPaneContent, 'createRequestId' | 'status'> & {
-  createRequestId?: string
-  status?: SdkSessionStatus
-}
-
-export type AgentChatPaneInput = Omit<AgentChatPaneContent, 'createRequestId' | 'status'> & {
   createRequestId?: string
   status?: SdkSessionStatus
 }

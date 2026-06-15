@@ -56,6 +56,24 @@ export type FreshAgentDescriptor = {
   disabled?: boolean
 }
 
+type MigratedFreshAgentContent<T extends FreshAgentCompatibilityShape> =
+  Omit<T, 'kind' | 'provider' | 'sessionRef' | 'resumeSessionId' | 'timelineSessionId' | 'cliSessionId' | 'restoreError'> & {
+    kind: 'fresh-agent'
+    provider: FreshAgentRuntimeProvider
+    sessionType: FreshAgentSessionType
+    resumeSessionId?: string
+    sessionRef?: SessionRef
+    restoreError?: RestoreError
+  }
+
+const RESTORE_ERROR_REASONS = new Set<RestoreError['reason']>([
+  'missing_canonical_identity',
+  'invalid_legacy_restore_target',
+  'dead_live_handle',
+  'provider_runtime_failed',
+  'durable_artifact_missing',
+])
+
 export const FRESH_AGENT_DESCRIPTORS: readonly FreshAgentDescriptor[] = [
   {
     sessionType: 'freshclaude',
@@ -169,13 +187,18 @@ export function migrateLegacyFreshAgentDurableState({
   }
 }
 
+function readRestoreError(value: unknown): RestoreError | undefined {
+  if (!isRecord(value)) return undefined
+  return value.code === 'RESTORE_UNAVAILABLE'
+    && typeof value.reason === 'string'
+    && RESTORE_ERROR_REASONS.has(value.reason as RestoreError['reason'])
+    ? buildRestoreError(value.reason as RestoreError['reason'])
+    : undefined
+}
+
 export function migrateLegacyFreshAgentContent<T extends FreshAgentCompatibilityShape>(
   input: T,
-): T | (Omit<T, 'kind' | 'provider'> & {
-  kind: 'fresh-agent'
-  provider: FreshAgentRuntimeProvider
-  sessionType: FreshAgentSessionType
-}) {
+): T | MigratedFreshAgentContent<T> {
   if (!input || typeof input !== 'object') {
     return input
   }
@@ -190,6 +213,31 @@ export function migrateLegacyFreshAgentContent<T extends FreshAgentCompatibility
 
     if (!sessionType || !provider) {
       return input
+    }
+
+    const existingRestoreError = readRestoreError(input.restoreError)
+    if (existingRestoreError) {
+      const {
+        kind: _legacyKind,
+        provider: _legacyProvider,
+        sessionRef: _legacySessionRef,
+        resumeSessionId: _legacyResumeSessionId,
+        timelineSessionId: _legacyTimelineSessionId,
+        cliSessionId: _legacyCliSessionId,
+        restoreError: _legacyRestoreError,
+        ...rest
+      } = input
+
+      return {
+        ...rest,
+        kind: 'fresh-agent',
+        provider,
+        sessionType,
+        ...(existingRestoreError.reason === 'invalid_legacy_restore_target'
+          ? {}
+          : (typeof input.resumeSessionId === 'string' ? { resumeSessionId: input.resumeSessionId } : {})),
+        restoreError: existingRestoreError,
+      }
     }
 
     return {
@@ -221,17 +269,39 @@ export function migrateLegacyFreshAgentContent<T extends FreshAgentCompatibility
   })
   const hasUsableIdentity = !!durableState.sessionRef
     || (typeof input.sessionId === 'string' && input.sessionId.length > 0)
+  const existingRestoreError = readRestoreError(input.restoreError)
+  const restoreError = existingRestoreError
+    ?? durableState.restoreError
+    ?? (!sessionType || !provider || !hasUsableIdentity
+      ? buildRestoreError('invalid_legacy_restore_target')
+      : undefined)
+  const {
+    kind: _legacyKind,
+    provider: _legacyProvider,
+    sessionRef: _legacySessionRef,
+    resumeSessionId: _legacyResumeSessionId,
+    timelineSessionId: _legacyTimelineSessionId,
+    cliSessionId: _legacyCliSessionId,
+    restoreError: _legacyRestoreError,
+    ...rest
+  } = input
 
   return {
-    ...input,
+    ...rest,
     kind: 'fresh-agent',
     sessionType: sessionType ?? 'freshclaude',
     provider: provider ?? 'claude',
-    sessionRef: durableState.sessionRef,
-    restoreError: durableState.restoreError
-      ?? (!sessionType || !provider || !hasUsableIdentity
-        ? buildRestoreError('invalid_legacy_restore_target')
-        : undefined),
+    ...(restoreError
+      ? {
+          ...(restoreError.reason === 'invalid_legacy_restore_target'
+            ? {}
+            : (typeof input.resumeSessionId === 'string' ? { resumeSessionId: input.resumeSessionId } : {})),
+          restoreError,
+        }
+      : {
+          ...(typeof input.resumeSessionId === 'string' ? { resumeSessionId: input.resumeSessionId } : {}),
+          ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
+        }),
   }
 }
 

@@ -162,6 +162,57 @@ describe('storage-migration fresh-agent', () => {
     expect(localStorage.getItem(MARKER_KEY)).toContain('fresh-agent-centralization')
   })
 
+  it('migrates existing version-5 layout storage once using the fresh-agent marker', async () => {
+    const originalRaw = makeLegacyLayoutRaw()
+    const storage = createStorage()
+    Object.defineProperty(globalThis, 'localStorage', { value: storage, writable: true })
+    storage.seed(VERSION_KEY, '5')
+    storage.seed(LAYOUT_KEY, originalRaw)
+
+    const module = await import('@/store/storage-migration')
+
+    const raw = localStorage.getItem(LAYOUT_KEY)
+    expect(raw).not.toBeNull()
+    expect(raw).not.toContain('"agent-chat"')
+    expect(raw).toContain('"fresh-agent"')
+    expect(localStorage.getItem(BACKUP_KEY)).toBe(originalRaw)
+    expect(localStorage.getItem(MARKER_KEY)).toContain('fresh-agent-centralization')
+    expect(localStorage.getItem(VERSION_KEY)).toBe('5')
+
+    const firstDump = storage.dump()
+    module.runStorageMigration()
+    expect(storage.dump()).toEqual(firstDump)
+  })
+
+  it('does not restore durable identity over an invalid legacy restore error', async () => {
+    const canonical = '00000000-0000-4000-8000-000000000777'
+    const originalRaw = makeLegacyLayoutRaw({
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-alias-with-resume',
+      status: 'idle',
+      sessionRef: { provider: 'claude', sessionId: 'named-alias' },
+      resumeSessionId: canonical,
+    })
+    const storage = createStorage()
+    Object.defineProperty(globalThis, 'localStorage', { value: storage, writable: true })
+    storage.seed(VERSION_KEY, '5')
+    storage.seed(LAYOUT_KEY, originalRaw)
+
+    await import('@/store/storage-migration')
+
+    const parsed = JSON.parse(localStorage.getItem(LAYOUT_KEY)!)
+    const content = parsed.panes.layouts['tab-1'].content
+    expect(content).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
+    })
+    expect(content.sessionRef).toBeUndefined()
+    expect(content.resumeSessionId).toBeUndefined()
+  })
+
   it('aborts before touching the original layout when the backup write fails', async () => {
     const originalRaw = makeLegacyLayoutRaw()
     const storage = createStorage({

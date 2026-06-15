@@ -1,9 +1,26 @@
 import { describe, expect, it } from 'vitest'
+import { spawnSync } from 'node:child_process'
 
 import { migrateLegacyFreshAgentContent } from '@shared/fresh-agent'
 import { validatePaneTree } from '@/store/paneTreeValidation'
 
 describe('fresh-agent pane migration', () => {
+  it('keeps legacy agent-chat pane types out of live pane store boundaries', () => {
+    const result = spawnSync('rg', [
+      '-n',
+      'AgentChatPaneContent|AgentChatPaneInput',
+      'src/store/paneTypes.ts',
+      'src/lib/pane-activity.ts',
+      'src/store/persistControl.ts',
+    ], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+    })
+
+    expect(result.status).toBe(1)
+    expect(result.stdout).toBe('')
+  })
+
   it('converts legacy agent-chat pane content to fresh-agent before render', () => {
     const migrated = migrateLegacyFreshAgentContent({
       kind: 'agent-chat',
@@ -94,6 +111,27 @@ describe('fresh-agent pane migration', () => {
       restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
     })
     expect((migrated as { sessionRef?: unknown }).sessionRef).toBeUndefined()
+  })
+
+  it('keeps a bad Claude sessionRef alias as a restore error even when resumeSessionId is canonical', () => {
+    const canonical = '00000000-0000-4000-8000-000000000777'
+    const migrated = migrateLegacyFreshAgentContent({
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-alias-with-resume',
+      status: 'idle',
+      sessionRef: { provider: 'claude', sessionId: 'named-alias' },
+      resumeSessionId: canonical,
+    })
+
+    expect(migrated).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
+    })
+    expect((migrated as { sessionRef?: unknown }).sessionRef).toBeUndefined()
+    expect((migrated as { resumeSessionId?: unknown }).resumeSessionId).toBeUndefined()
   })
 
   it('preserves legacy display overrides', () => {

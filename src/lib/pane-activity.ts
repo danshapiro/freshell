@@ -5,7 +5,6 @@ import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { ChatSessionState } from '@/store/agentChatTypes'
 import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type {
-  AgentChatPaneContent,
   FreshAgentPaneContent,
   PaneContent,
   PaneNode,
@@ -16,8 +15,15 @@ import { getPreferredResumeSessionId } from '@/store/persistControl'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { Tab } from '@/store/types'
 import type { CodexActivityRecord, ClaudeActivityRecord, OpencodeActivityRecord } from '@shared/ws-protocol'
+import type { SessionRef } from '@shared/session-contract'
 
 type PaneActivitySource = 'codex' | 'opencode' | 'claude-terminal' | 'agent-chat' | 'fresh-agent' | 'browser'
+
+type LegacyAgentChatActivityContent = Record<string, unknown> & {
+  provider?: string
+  resumeSessionId?: string
+  sessionRef?: SessionRef
+}
 
 export type PaneActivityProjection = {
   isBusy: boolean
@@ -35,7 +41,7 @@ function isBrowserBusy(record: PaneRuntimeActivityRecord | undefined): boolean {
 }
 
 export function resolveAgentChatSessionKey(
-  content: AgentChatPaneContent,
+  content: LegacyAgentChatActivityContent,
   session: ChatSessionState | undefined,
 ): string | undefined {
   const explicit = content.sessionRef
@@ -66,7 +72,7 @@ export function resolveFreshAgentSessionKey(
 }
 
 export function isAgentChatBusy(
-  content: AgentChatPaneContent,
+  _content: LegacyAgentChatActivityContent,
   session: ChatSessionState | undefined,
 ): boolean {
   // No live session => not busy. The persisted content.status (which can be a

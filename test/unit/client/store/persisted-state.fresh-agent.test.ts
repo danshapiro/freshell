@@ -178,6 +178,28 @@ describe('persistedState fresh-agent migration', () => {
     expect(byPane['req-pane-alias'].sessionRef).toBeUndefined()
   })
 
+  it('keeps invalid legacy restore errors mutually exclusive with durable session refs', () => {
+    const canonical = '00000000-0000-4000-8000-000000000777'
+    const parsed = parsePersistedLayoutRaw(layoutRaw({
+      'tab-1': leaf('pane-alias-with-resume', {
+        kind: 'agent-chat',
+        provider: 'freshclaude',
+        sessionRef: { provider: 'claude', sessionId: 'named-alias' },
+        resumeSessionId: canonical,
+      }),
+    }))
+
+    const content = collectLeafContents(parsed!.panes.layouts['tab-1'])[0]
+    expect(content).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
+    })
+    expect(content.sessionRef).toBeUndefined()
+    expect(content.resumeSessionId).toBeUndefined()
+  })
+
   it('prefers the backup when the fresh-agent migration commit marker is missing', () => {
     const backupRaw = layoutRaw({
       'tab-1': leaf('pane-backup', { kind: 'terminal', mode: 'shell' }),

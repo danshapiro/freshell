@@ -3,6 +3,7 @@ import { LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY } from './stora
 import {
   buildRestoreError,
   migrateLegacyTerminalDurableState,
+  type RestoreError,
   sanitizeSessionRef,
 } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
@@ -90,6 +91,17 @@ function normalizeLegacyRecoveryFailedTerminal(
   }
 }
 
+function readRestoreError(value: unknown): RestoreError | undefined {
+  return (
+    value
+    && typeof value === 'object'
+    && (value as any).code === 'RESTORE_UNAVAILABLE'
+    && typeof (value as any).reason === 'string'
+  )
+    ? value as RestoreError
+    : undefined
+}
+
 function normalizePersistedTab(tab: Record<string, unknown>): PersistedTab {
   const mode = typeof tab.mode === 'string' ? tab.mode : undefined
   const codingCliProvider = typeof tab.codingCliProvider === 'string' ? tab.codingCliProvider : undefined
@@ -161,14 +173,7 @@ function normalizeTerminalContent(content: Record<string, unknown>): Record<stri
     sessionRef: content.sessionRef,
     resumeSessionId: typeof content.resumeSessionId === 'string' ? content.resumeSessionId : undefined,
   })
-  const existingRestoreError = (
-    content.restoreError
-    && typeof content.restoreError === 'object'
-    && (content.restoreError as any).code === 'RESTORE_UNAVAILABLE'
-    && typeof (content.restoreError as any).reason === 'string'
-  )
-    ? content.restoreError
-    : undefined
+  const existingRestoreError = readRestoreError(content.restoreError)
   const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, restoreError: _legacyRestoreError, ...rest } = content
   const codexDurability = sanitizeCodexDurabilityRef(content.codexDurability)
   const isLegacyRecoveryFailed = (
@@ -195,6 +200,32 @@ function normalizeTerminalContent(content: Record<string, unknown>): Record<stri
 }
 
 function normalizeFreshAgentContent(content: Record<string, unknown>): Record<string, unknown> {
+  const existingRestoreError = readRestoreError(content.restoreError)
+  if (existingRestoreError) {
+    const {
+      sessionRef: _legacySessionRef,
+      restoreError: _legacyRestoreError,
+      ...restWithPossibleResume
+    } = content
+
+    const rest = existingRestoreError.reason === 'invalid_legacy_restore_target'
+      ? (() => {
+          const {
+            resumeSessionId: _legacyResumeSessionId,
+            timelineSessionId: _legacyTimelineSessionId,
+            cliSessionId: _legacyCliSessionId,
+            ...withoutLegacyIdentity
+          } = restWithPossibleResume
+          return withoutLegacyIdentity
+        })()
+      : restWithPossibleResume
+
+    return {
+      ...rest,
+      restoreError: existingRestoreError,
+    }
+  }
+
   const provider = content.provider === 'claude' || content.provider === 'codex' || content.provider === 'opencode'
     ? content.provider
     : undefined
@@ -208,14 +239,6 @@ function normalizeFreshAgentContent(content: Record<string, unknown>): Record<st
           : (typeof content.cliSessionId === 'string' ? content.cliSessionId : undefined)),
     rejectNonCanonicalClaudeSessionRef: true,
   })
-  const existingRestoreError = (
-    content.restoreError
-    && typeof content.restoreError === 'object'
-    && (content.restoreError as any).code === 'RESTORE_UNAVAILABLE'
-    && typeof (content.restoreError as any).reason === 'string'
-  )
-    ? content.restoreError
-    : undefined
   const { sessionRef: _legacySessionRef, restoreError: _legacyRestoreError, ...rest } = content
 
   return {

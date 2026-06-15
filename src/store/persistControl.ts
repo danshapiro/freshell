@@ -1,6 +1,5 @@
 import { createAction } from '@reduxjs/toolkit'
 import type { ChatSessionState } from './agentChatTypes'
-import type { AgentChatPaneContent } from './paneTypes'
 import type { CodingCliProviderName, SessionListMetadata, Tab } from './types'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { sessionMetadataKey } from '@/lib/session-metadata'
@@ -69,6 +68,13 @@ export function buildTerminalDurableSessionRefUpdate({
 }
 
 type SessionIdentityState = Pick<ChatSessionState, 'timelineSessionId' | 'cliSessionId'> | undefined
+
+type LegacyAgentChatPersistedIdentityContent = Record<string, unknown> & {
+  provider?: string
+  resumeSessionId?: string
+  sessionRef?: SessionRef
+  restoreError?: unknown
+}
 
 export function getPreferredResumeSessionId(session: SessionIdentityState): string | undefined {
   return getCanonicalDurableSessionId(session)
@@ -203,11 +209,11 @@ export function buildAgentChatPersistedIdentityUpdate({
   metadataProvider,
 }: {
   session: SessionIdentityState
-  paneContent: AgentChatPaneContent
+  paneContent: LegacyAgentChatPersistedIdentityContent
   currentTab?: Tab
   metadataProvider?: CodingCliProviderName
 }): {
-  paneUpdates?: Partial<AgentChatPaneContent>
+  paneUpdates?: Partial<LegacyAgentChatPersistedIdentityContent>
   tabUpdates?: Partial<Tab>
   shouldFlush: boolean
 } | null {

@@ -7,10 +7,10 @@ import { useKeyboardInset } from '@/hooks/useKeyboardInset'
 import type { AgentChatSettingsModelOption } from '@/lib/agent-chat-capabilities'
 import type { AgentChatProviderConfig } from '@/lib/agent-chat-types'
 import { cn } from '@/lib/utils'
-import type { AgentChatPaneContent } from '@/store/paneTypes'
+import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import type { AgentChatProviderCapabilitiesState } from '@/store/agentChatTypes'
 
-type SettingsFields = Pick<AgentChatPaneContent, 'permissionMode' | 'effort'> & {
+type SettingsFields = Pick<FreshAgentPaneContent, 'permissionMode' | 'effort'> & {
   model?: string
   showThinking?: boolean
   showTools?: boolean

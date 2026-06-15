@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { nanoid } from 'nanoid'
-import type { AgentChatPaneContent } from '@/store/paneTypes'
+import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updatePaneContent, mergePaneContent, restartAgentChatCreate } from '@/store/panesSlice'
 import { updateTab } from '@/store/tabsSlice'
@@ -42,7 +42,7 @@ import {
   resolveAgentChatModelSelection,
 } from '@/lib/agent-chat-capabilities'
 import { setSessionMetadata } from '@/lib/api'
-import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { getAgentChatProviderConfig, type AgentChatProviderName } from '@/lib/agent-chat-utils'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { finalizeCodingAgentSessionName } from '@/store/codingAgentNaming'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
@@ -58,6 +58,11 @@ import {
 import { useMobile } from '@/hooks/useMobile'
 import { useKeyboardInset } from '@/hooks/useKeyboardInset'
 import { buildRestoreError } from '@shared/session-contract'
+
+type AgentChatPaneContent = Omit<FreshAgentPaneContent, 'kind' | 'provider' | 'sessionType'> & {
+  kind: 'agent-chat'
+  provider: AgentChatProviderName
+}
 
 /** Early lifecycle states that should not be re-entered once the session has advanced. */
 const EARLY_STATES = new Set(['creating', 'starting'])
