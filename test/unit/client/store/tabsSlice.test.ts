@@ -956,7 +956,7 @@ describe('tabsSlice', () => {
       expect(store.getState().tabs.activeTabId).toBe('local-fallback')
     })
 
-    it('updates title of existing tab for agent-chat session when reopened with new title', async () => {
+    it('updates title of existing tab for fresh-agent session when reopened with new title', async () => {
       const store = createOpenSessionStore('srv-local')
 
       store.dispatch(addTab({
@@ -971,7 +971,7 @@ describe('tabsSlice', () => {
       store.dispatch(initLayout({
         tabId: 'agent-tab',
         content: {
-          kind: 'agent-chat',
+          kind: 'fresh-agent',
           provider: 'freshclaude',
           sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
         },

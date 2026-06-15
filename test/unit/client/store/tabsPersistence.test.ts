@@ -431,7 +431,7 @@ describe('tabs persistence - skipPersist + strip volatile fields', () => {
                 type: 'leaf',
                 id: 'pane-1',
                 content: {
-                  kind: 'agent-chat',
+                  kind: 'fresh-agent',
                   provider: 'freshclaude',
                   createRequestId: 'req-1',
                   status: 'idle',
@@ -445,7 +445,7 @@ describe('tabs persistence - skipPersist + strip volatile fields', () => {
                 type: 'leaf',
                 id: 'pane-2',
                 content: {
-                  kind: 'agent-chat',
+                  kind: 'fresh-agent',
                   provider: 'freshclaude',
                   createRequestId: 'req-2',
                   status: 'idle',

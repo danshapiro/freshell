@@ -149,7 +149,7 @@ describe('ws sidebar snapshot refresh', () => {
             type: 'leaf',
             id: 'pane-agent',
             content: {
-              kind: 'agent-chat',
+              kind: 'fresh-agent',
               provider: 'freshclaude',
               createRequestId: 'req-agent',
               status: 'connected',

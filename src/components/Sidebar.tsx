@@ -358,7 +358,7 @@ export default function Sidebar({
       return
     }
 
-    // Resolve provider settings for agent-chat panes
+    // Resolve provider settings for fresh-agent panes
     const sessionType = item.sessionType || provider
     const agentConfig = getAgentChatProviderConfig(sessionType)
     const providerSettings = agentConfig

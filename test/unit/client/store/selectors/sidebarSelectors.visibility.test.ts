@@ -89,7 +89,7 @@ describe('filterSessionItemsByVisibility', () => {
       expect(result.map((i) => i.id)).toEqual(['1', '2'])
     })
 
-    it('keeps other agent-chat sessions visible when showNoninteractiveSessions is false', () => {
+    it('keeps other fresh-agent sessions visible when showNoninteractiveSessions is false', () => {
       const items = [
         createSessionItem({ id: '1', sessionType: 'kilroy', isNonInteractive: true }),
         createSessionItem({ id: '2' }),
