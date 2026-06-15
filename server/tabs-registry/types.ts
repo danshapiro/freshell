@@ -15,7 +15,7 @@ export const RegistryPaneKindSchema = z.enum([
 ])
 export type RegistryPaneKind = z.infer<typeof RegistryPaneKindSchema>
 
-const LEGACY_FRESH_AGENT_PANE_KIND = `agent-${'chat'}`
+const LEGACY_AGENT_CHAT_PANE_KIND = 'agent-chat'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
@@ -28,7 +28,7 @@ function stripUndefinedValues(value: Record<string, unknown>): Record<string, un
 function normalizeRegistryPaneSnapshotInput(value: unknown): unknown {
   if (
     !isRecord(value)
-    || (value.kind !== LEGACY_FRESH_AGENT_PANE_KIND && value.kind !== 'fresh-agent')
+    || (value.kind !== LEGACY_AGENT_CHAT_PANE_KIND && value.kind !== 'fresh-agent')
   ) {
     return value
   }

@@ -41,7 +41,7 @@ describe('TOOL_DESCRIPTION and INSTRUCTIONS', () => {
     expect(INSTRUCTIONS).toContain('fresh-agent')
     expect(INSTRUCTIONS).toContain('picker')
     expect(INSTRUCTIONS).toContain('- Pane kinds: terminal, editor, browser, fresh-agent (Claude/Codex/OpenCode/etc.), picker (transient).')
-    expect(INSTRUCTIONS).not.toContain(`agent-${'chat'} (legacy)`)
+    expect(INSTRUCTIONS).not.toContain('agent-chat (legacy)')
     // Picker warning
     expect(INSTRUCTIONS).toContain('Picker panes are ephemeral')
     // Targets section
