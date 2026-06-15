@@ -1730,8 +1730,27 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const writeQueue = createTerminalWriteQueue({
       terminalInstanceId,
       write: (data, onWritten) => {
+        const recordForTest = (phase: 'submitted' | 'written') => {
+          try {
+            window.__FRESHELL_TEST_HARNESS__?.recordTerminalWrite?.({
+              terminalId: terminalIdRef.current,
+              paneId,
+              phase,
+              chars: data.length,
+              data,
+              at: performance.now(),
+            })
+          } catch {
+            // Test harness failures must never break the terminal write path.
+          }
+        }
+        const completeWrite = () => {
+          recordForTest('written')
+          onWritten?.()
+        }
+        recordForTest('submitted')
         try {
-          term.write(data, onWritten)
+          term.write(data, completeWrite)
         } catch {
           // disposed
           onWritten?.()
@@ -2941,7 +2960,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           outputSource: TerminalOutputSource
           parserAppliedSeq: number
           completedAttach: boolean
-          disableWriteCoalescing?: boolean
         }) => {
           let raw = input.raw
           const frameOverlapsReplay = input.outputSource === 'replay' || Boolean(
@@ -3003,7 +3021,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             {
               mode: input.outputSource,
               generation: input.attachRequestId,
-              coalesce: input.disableWriteCoalescing ? false : undefined,
             },
           )
           if (
@@ -3247,7 +3264,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               outputSource,
               parserAppliedSeq: acceptedSegment.parserAppliedSeq,
               completedAttach: completedAttachOnBatch && index === batchSegments.length - 1,
-              disableWriteCoalescing: true,
             })
           })
           return

@@ -5101,15 +5101,28 @@ describe('TerminalView lifecycle updates', () => {
       }))
     })
 
-    it('splits terminal.output.batch writes around parser barrier segments', async () => {
+    it('preserves parser barrier checkpoints while allowing terminal.output.batch writes to coalesce', async () => {
+      const rafCallbacks: FrameRequestCallback[] = []
+      requestAnimationFrameSpy?.mockImplementation((cb: FrameRequestCallback) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      })
+
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',
         terminalId: 'term-output-batch-barrier',
+        serverInstanceId: 'server-output-batch-barrier-coalesced',
       })
       const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
       const streamId = latestStreamIdByTerminal.get(terminalId)
 
+      const delayedCallbacks: Array<{ data: string; callback: () => void }> = []
       term.write.mockClear()
+      term.write.mockImplementation((chunk: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push({ data: chunk, callback: onWritten })
+      })
+
+      rafCallbacks.length = 0
       act(() => {
         messageHandler!({
           type: 'terminal.output.batch',
@@ -5129,7 +5142,217 @@ describe('TerminalView lifecycle updates', () => {
         })
       })
 
-      expect(terminalWriteStrings(term)).toEqual(['a', 'B', 'c'])
+      expect(delayedCallbacks).toEqual([])
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-barrier-coalesced',
+      })).toBeNull()
+
+      act(() => {
+        rafCallbacks.shift()?.(16)
+      })
+
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['aBc'])
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-barrier-coalesced',
+      })).toBeNull()
+
+      act(() => {
+        delayedCallbacks[0]?.callback()
+      })
+
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-barrier-coalesced',
+      })?.parserAppliedSeq).toBe(3)
+    })
+
+    it('does not checkpoint across a stripped middle batch segment when adjacent renderable segments coalesce', async () => {
+      const rafCallbacks: FrameRequestCallback[] = []
+      requestAnimationFrameSpy?.mockImplementation((cb: FrameRequestCallback) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      })
+
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-stripped-middle-coalesced',
+        mode: 'codex',
+        serverInstanceId: 'server-output-batch-stripped-middle-coalesced',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+      expect(attachRequestId).toBeTruthy()
+      expect(streamId).toBeTruthy()
+
+      const delayedCallbacks: Array<{ data: string; callback: () => void }> = []
+      term.write.mockClear()
+      term.write.mockImplementation((chunk: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push({ data: chunk, callback: onWritten })
+      })
+
+      rafCallbacks.length = 0
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'replay',
+          seqStart: 1,
+          seqEnd: 3,
+          data: 'A\x07B',
+          serializedBytes: 256,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, rawFrameCount: 1 },
+            { seqStart: 2, seqEnd: 2, endOffset: 2, rawFrameCount: 1, barrier: 'turn_complete' },
+            { seqStart: 3, seqEnd: 3, endOffset: 3, rawFrameCount: 1 },
+          ],
+        })
+      })
+
+      expect(delayedCallbacks).toEqual([])
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-stripped-middle-coalesced',
+      })).toBeNull()
+
+      act(() => {
+        rafCallbacks.shift()?.(16)
+      })
+
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['AB'])
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-stripped-middle-coalesced',
+      })).toBeNull()
+
+      act(() => {
+        delayedCallbacks[0]?.callback()
+      })
+
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-stripped-middle-coalesced',
+      })?.parserAppliedSeq).toBe(1)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 1,
+      }))
+    })
+
+    it('replays barrier-heavy OpenCode batches as bounded writes while holding checkpoints until xterm applies them', async () => {
+      const rafCallbacks: FrameRequestCallback[] = []
+      requestAnimationFrameSpy?.mockImplementation((cb: FrameRequestCallback) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      })
+
+      const { terminalId, term, queryByText, store } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-opencode-heavy-replay',
+        mode: 'opencode',
+        serverInstanceId: 'server-output-batch-opencode-heavy-replay',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+      act(() => {
+        store.dispatch(setConnectionStatus('ready'))
+      })
+
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      const attachRequestId = attach?.attachRequestId
+      const streamId = 'stream-output-batch-opencode-heavy-replay'
+      expect(attachRequestId).toBeTruthy()
+
+      const chunks = Array.from({ length: 96 }, (_unused, index) => (
+        index % 2 === 0
+          ? `\x1b[${30 + (index % 8)}m`
+          : `tok${index.toString().padStart(2, '0')}`
+      ))
+      const data = chunks.join('')
+      const segments = chunks.map((chunk, index) => ({
+        seqStart: index + 1,
+        seqEnd: index + 1,
+        endOffset: chunks.slice(0, index + 1).join('').length,
+        rawFrameCount: 1,
+        barrier: 'control',
+      }))
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId,
+          headSeq: chunks.length,
+          replayFromSeq: 1,
+          replayToSeq: chunks.length,
+          attachRequestId,
+        })
+      })
+      expect(queryByText('Recovering terminal output...')).not.toBeNull()
+
+      const delayedCallbacks: Array<{ data: string; callback: () => void }> = []
+      rafCallbacks.length = 0
+      term.write.mockClear()
+      term.write.mockImplementation((chunk: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push({ data: chunk, callback: onWritten })
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'replay',
+          seqStart: 1,
+          seqEnd: chunks.length,
+          data,
+          serializedBytes: data.length + 512,
+          segments,
+        })
+      })
+
+      expect(term.write).not.toHaveBeenCalled()
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-opencode-heavy-replay',
+      })).toBeNull()
+
+      act(() => {
+        rafCallbacks.shift()?.(16)
+      })
+
+      const submittedReplay = delayedCallbacks.map(({ data: chunk }) => chunk).join('')
+      expect(submittedReplay).toBe(data)
+      expect(delayedCallbacks.length).toBeLessThanOrEqual(2)
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-opencode-heavy-replay',
+      })).toBeNull()
+      expect(queryByText('Recovering terminal output...')).not.toBeNull()
+
+      act(() => {
+        delayedCallbacks.forEach(({ callback }) => callback())
+      })
+
+      await waitFor(() => {
+        expect(queryByText('Recovering terminal output...')).toBeNull()
+      })
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-opencode-heavy-replay',
+      })?.parserAppliedSeq).toBe(chunks.length)
     })
 
     it('does not checkpoint a stripped terminal.output.batch BEL segment as parser-applied', async () => {
