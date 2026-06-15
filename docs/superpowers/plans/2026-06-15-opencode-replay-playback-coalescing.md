@@ -23,7 +23,7 @@
 - Create: `test/e2e-browser/specs/opencode-replay-write-progression.spec.ts`
   - Mount a real browser `TerminalView`, feed a barrier-heavy replay batch through the test WebSocket path, and assert real xterm writes are bounded.
 - Modify: `test/unit/client/components/TerminalView.lifecycle.test.tsx`
-  - Replace the old expectation that barrier segments produce separate xterm writes.
+  - Replace the old synchronous-RAF barrier test with deferred-RAF tests that can observe queued coalescing.
   - Keep the committed red OpenCode replay regression test.
   - Add a direct `A`, stripped segment, `B` checkpoint-safety regression.
 - No change: `src/components/terminal/terminal-write-queue.ts`
@@ -79,6 +79,7 @@ it('preserves parser barrier checkpoints while allowing terminal.output.batch wr
   const { terminalId, term } = await renderTerminalHarness({
     status: 'running',
     terminalId: 'term-output-batch-barrier',
+    serverInstanceId: 'server-output-batch-barrier-coalesced',
   })
   const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
   const streamId = latestStreamIdByTerminal.get(terminalId)
@@ -111,7 +112,7 @@ it('preserves parser barrier checkpoints while allowing terminal.output.batch wr
   expect(delayedCallbacks).toEqual([])
   expect(loadTerminalSurfaceCheckpoint(terminalId, {
     streamId,
-    serverInstanceId: 'server-instance',
+    serverInstanceId: 'server-output-batch-barrier-coalesced',
   })).toBeNull()
 
   act(() => {
@@ -121,7 +122,7 @@ it('preserves parser barrier checkpoints while allowing terminal.output.batch wr
   expect(delayedCallbacks.map(({ data }) => data)).toEqual(['aBc'])
   expect(loadTerminalSurfaceCheckpoint(terminalId, {
     streamId,
-    serverInstanceId: 'server-instance',
+    serverInstanceId: 'server-output-batch-barrier-coalesced',
   })).toBeNull()
 
   act(() => {
@@ -130,7 +131,7 @@ it('preserves parser barrier checkpoints while allowing terminal.output.batch wr
 
   expect(loadTerminalSurfaceCheckpoint(terminalId, {
     streamId,
-    serverInstanceId: 'server-instance',
+    serverInstanceId: 'server-output-batch-barrier-coalesced',
   })?.parserAppliedSeq).toBe(3)
 })
 ```
@@ -150,7 +151,7 @@ it('does not checkpoint across a stripped middle batch segment when adjacent ren
   const { terminalId, term } = await renderTerminalHarness({
     status: 'running',
     terminalId: 'term-output-batch-stripped-middle-coalesced',
-    mode: 'opencode',
+    mode: 'codex',
     serverInstanceId: 'server-output-batch-stripped-middle-coalesced',
   })
   const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
@@ -584,17 +585,29 @@ test.describe('OpenCode replay write progression', () => {
 
     await expect.poll(async () => {
       const submitted = (await harness.getTerminalWriteEvents())
-        .filter((event) => event.phase === 'submitted' && event.terminalId === snapshot.terminalId)
+        .filter((event) =>
+          event.phase === 'submitted'
+          && event.terminalId === snapshot.terminalId
+          && replay.data.includes(event.data)
+        )
       return submitted.map((event) => event.data).join('')
     }, { timeout: 15_000 }).toBe(replay.data)
 
     const submitted = (await harness.getTerminalWriteEvents())
-      .filter((event) => event.phase === 'submitted' && event.terminalId === snapshot.terminalId)
+      .filter((event) =>
+        event.phase === 'submitted'
+        && event.terminalId === snapshot.terminalId
+        && replay.data.includes(event.data)
+      )
     expect(submitted.length).toBeLessThanOrEqual(2)
 
     await expect.poll(async () => {
       const written = (await harness.getTerminalWriteEvents())
-        .filter((event) => event.phase === 'written' && event.terminalId === snapshot.terminalId)
+        .filter((event) =>
+          event.phase === 'written'
+          && event.terminalId === snapshot.terminalId
+          && replay.data.includes(event.data)
+        )
       return written.map((event) => event.data).join('')
     }, { timeout: 15_000 }).toBe(replay.data)
   })
