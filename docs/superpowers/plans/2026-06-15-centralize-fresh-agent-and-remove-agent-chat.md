@@ -230,6 +230,8 @@ git commit -m "Move transcript widgets into fresh-agent"
 - Modify: `shared/settings.ts:300-330`
 - Modify: `shared/settings.ts:560-590`
 - Modify: `shared/settings.ts:690-810`
+- Modify: `shared/settings.ts:240-250`
+- Modify: `shared/settings.ts:850-865`
 - Modify: `shared/settings.ts:1015-1080`
 - Modify: `shared/settings.ts:1145-1220`
 - Modify: `shared/settings.ts:1250-1420`
@@ -405,7 +407,7 @@ function readLegacyFreshAgentSettingsInput(candidate: Record<string, unknown>): 
 }
 ```
 
-First replace the existing private `mergeFreshAgentAliasObjects(agentChatInput, freshAgentInput)` implementation with an options-aware implementation. Its default options must preserve existing current behavior, while `migrateLegacyFreshAgentSettingsInput` uses `{ canonicalWins: true, fieldMergeProviders: true, preserveExplicitEmptyArrays: true }`. Do not call a helper that has not been defined in this task.
+First replace the existing private `mergeFreshAgentAliasObjects(agentChatInput, freshAgentInput)` implementation with an options-aware implementation whose parameters are named for their role, such as `legacyFreshAgentInput` and `canonicalFreshAgentInput`, not `agentChatInput`. Its default options must preserve existing current behavior, while `migrateLegacyFreshAgentSettingsInput` uses `{ canonicalWins: true, fieldMergeProviders: true, preserveExplicitEmptyArrays: true }`. Do not call a helper that has not been defined in this task.
 
 Extract the current `sanitizeServerSettingsPatch` fresh-agent block into a reusable helper such as:
 
@@ -461,7 +463,7 @@ to:
 sanitized.freshAgent = freshAgent
 ```
 
-Update `server/config-store.ts` load migration to call `migrateLegacyFreshAgentSettingsInput` before `mergeServerSettings`, then drop `agentChat` from the loaded settings object. Remove or stop using `normalizeFreshAgentCompatSettings`; do not keep a second alias merge path. Do not mirror `agentChat` back into the saved config.
+Update `server/config-store.ts` load migration to call `migrateLegacyFreshAgentSettingsInput` before `mergeServerSettings`, then drop `agentChat` from the loaded settings object. Update older migration helpers such as `migrateLegacyFreshClaudeSettings` so they write only `freshAgent` and never assign `migrated.agentChat`. Remove or stop using `normalizeFreshAgentCompatSettings`; do not keep a second alias merge path. Do not mirror `agentChat` back into the saved config.
 
 Update `server/settings-router.ts` so a live HTTP PATCH with a top-level `agentChat` key returns `400` before lower-level sanitization:
 
@@ -485,8 +487,10 @@ Update `configStore.patchSettings` so internal callers cannot persist `agentChat
 Update `resolveLocalSettings` so it uses:
 
 ```ts
-const freshAgentPatch = patch?.freshAgent
-  ?? ((patch as Record<string, unknown> | undefined)?.agentChat as LocalSettingsPatch['freshAgent'] | undefined)
+const migratedFreshAgentPatch = patch
+  ? migrateLegacyFreshAgentSettingsInput(patch as Record<string, unknown>).freshAgent
+  : undefined
+const freshAgentPatch = patch?.freshAgent ?? migratedFreshAgentPatch
 ```
 
 and returns only:
@@ -495,7 +499,7 @@ and returns only:
 freshAgent: normalizeLocalFreshAgent(mergeDefined(defaultLocalSettings.freshAgent, freshAgentPatch)),
 ```
 
-Update `src/lib/browser-preferences.ts` and `src/store/settingsSlice.ts` so legacy browser seeds are migrated on read, but every write and every Redux state shape uses only `freshAgent`.
+Update `extractLegacyLocalSettingsSeed`, `stripLocalSettings`, `src/lib/browser-preferences.ts`, and `src/store/settingsSlice.ts` so legacy browser seeds are migrated on read through `readLegacyFreshAgentSettingsInput` or `migrateLegacyFreshAgentSettingsInput`, but every write and every Redux state shape uses only `freshAgent`. Do not leave separate `raw.agentChat`, `patch.agentChat`, or `agentChatInput` settings paths outside those helper functions.
 
 - [ ] **Step 4: Update UI settings reads and writes**
 
@@ -746,7 +750,7 @@ Expected: FAIL because `agent-chat` is still accepted as a live pane kind.
 
 - [ ] **Step 3: Remove `AgentChatPaneContent` from live pane types**
 
-In `src/store/paneTypes.ts`, delete the `AgentChatPaneContent` type and update the union to:
+In `src/store/paneTypes.ts`, delete both `AgentChatPaneContent` and `AgentChatPaneInput`, then update the union to:
 
 ```ts
 export type PaneContent = TerminalPaneContent | BrowserPaneContent | EditorPaneContent
@@ -757,7 +761,7 @@ Where code needs to accept legacy raw input, use `Record<string, unknown>` and `
 
 - [ ] **Step 4: Keep one migration helper and make its output fresh-agent only**
 
-In `shared/fresh-agent.ts`, keep `migrateLegacyFreshAgentContent` but make the legacy branch total: once `input.kind === 'agent-chat'`, it must return `kind: 'fresh-agent'` for every valid object, never the original legacy input.
+In `shared/fresh-agent.ts`, keep `migrateLegacyFreshAgentContent` but make the legacy branch total: once `input.kind === 'agent-chat'`, it must return `kind: 'fresh-agent'` for every valid object, never the original legacy input. Widen `FreshAgentCompatibilityShape` or introduce a dedicated raw legacy pane input type so the helper can legally read `timelineSessionId`, `cliSessionId`, `showThinking`, `showTools`, `showTimecodes`, and other display/restore fields before returning fresh-agent content.
 
 ```ts
 if (input.kind !== 'agent-chat') {
@@ -900,6 +904,9 @@ git commit -m "Remove live agent-chat pane type"
 - Delete: `src/store/agentChatSlice.ts`
 - Delete: `src/store/agentChatThunks.ts`
 - Delete: `src/store/agentChatTypes.ts`
+- Rename/modify: `src/components/context-menu/agent-chat-copy.ts` -> `src/components/context-menu/fresh-agent-copy.ts`
+- Modify: `src/components/context-menu/ContextMenuProvider.tsx`
+- Modify: `src/components/context-menu/menu-defs.ts`
 - Delete: `test/unit/client/agentChatSlice.test.ts`
 - Delete: `test/unit/client/ws-client-sdk.test.ts`
 - Delete: `test/e2e/agent-chat-polish-flow.test.tsx`
@@ -1050,7 +1057,7 @@ git rm src/store/agentChatSlice.ts src/store/agentChatThunks.ts src/store/agentC
 git mv src/components/context-menu/agent-chat-copy.ts src/components/context-menu/fresh-agent-copy.ts
 ```
 
-Update `src/components/context-menu/menu-defs.ts` and related tests to import the renamed `fresh-agent-copy` helper.
+Rename the exported helper functions from `copyAgentChatCodeBlock`, `copyAgentChatToolInput`, `copyAgentChatToolOutput`, `copyAgentChatDiffNew`, `copyAgentChatDiffOld`, and `copyAgentChatFilePath` to `copyFreshAgentCodeBlock`, `copyFreshAgentToolInput`, `copyFreshAgentToolOutput`, `copyFreshAgentDiffNew`, `copyFreshAgentDiffOld`, and `copyFreshAgentFilePath`. Update `src/components/context-menu/ContextMenuProvider.tsx`, `src/components/context-menu/menu-defs.ts`, and related tests to import and call the renamed `fresh-agent-copy` helper. After this step, `rg -n "copyAgentChat|agent-chat-copy" src/components/context-menu test/unit/client/components/context-menu` must have no hits except deleted-test coverage inventory text.
 
 - [ ] **Step 8: Convert legacy tests, then delete only the superseded files**
 
@@ -1327,11 +1334,8 @@ import { describe, expect, it } from 'vitest'
 import { createFreshAgentRouter } from '../../../server/fresh-agent/router.js'
 import { FreshAgentRuntimeManager } from '../../../server/fresh-agent/runtime-manager.js'
 import { createFreshAgentProviderRegistry } from '../../../server/fresh-agent/provider-registry.js'
+import { RestoreResolutionError, RestoreStaleRevisionError } from '../../../server/agent-timeline/service.js'
 import type { FreshAgentRuntimeAdapter } from '../../../server/fresh-agent/runtime-adapter.js'
-
-function restoreError(code: string) {
-  return Object.assign(new Error(code), { code })
-}
 
 function makeClaudeHistoryParityAdapter(): FreshAgentRuntimeAdapter {
   return {
@@ -1340,10 +1344,10 @@ function makeClaudeHistoryParityAdapter(): FreshAgentRuntimeAdapter {
       return { sessionId: 'created' }
     },
     async getSnapshot({ threadId }) {
-      if (threadId === 'not-found') throw restoreError('RESTORE_NOT_FOUND')
-      if (threadId === 'unavailable') throw restoreError('RESTORE_UNAVAILABLE')
-      if (threadId === 'diverged') throw restoreError('RESTORE_DIVERGED')
-      if (threadId === 'stale') throw Object.assign(restoreError('RESTORE_STALE_REVISION'), { currentRevision: 2 })
+      if (threadId === 'not-found') throw new RestoreResolutionError('RESTORE_NOT_FOUND', 'Restore session not found')
+      if (threadId === 'unavailable') throw new RestoreResolutionError('RESTORE_UNAVAILABLE', 'Restore source unavailable')
+      if (threadId === 'diverged') throw new RestoreResolutionError('RESTORE_DIVERGED', 'Restore history diverged')
+      if (threadId === 'stale') throw new RestoreStaleRevisionError(1, 2)
       return { threadId, revision: 1, turns: [] }
     },
   }
@@ -1423,6 +1427,8 @@ rg -n "agent-timeline|createAgentTimelineService|AgentTimelineService|createAgen
 ```
 
 Every production hit should import from `server/fresh-agent/history/claude/*` or use the new symbol names.
+
+Update `test/integration/server/fresh-agent-claude-history-route-parity.test.ts` too: after the move it must import `ClaudeFreshAgentHistoryResolutionError` and `ClaudeFreshAgentStaleHistoryRevisionError` from `server/fresh-agent/history/claude/history-service.js`, not the old `server/agent-timeline/service.js` path. The test must continue throwing the real moved error classes, not plain `Error` objects with copied `code` fields.
 
 In `server/fresh-agent/adapters/claude/adapter.ts`, the top imports should become:
 
