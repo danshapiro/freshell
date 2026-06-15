@@ -37,6 +37,14 @@ function normalizeLayouts(layouts: Record<string, any>): Record<string, any> {
   )
 }
 
+function cloneSnapshot<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T
+}
+
+function emptySnapshot(): UiSnapshot {
+  return { tabs: [], layouts: {}, activePane: {}, activeTabId: null, paneTitles: {}, paneTitleSetByUser: {} }
+}
+
 export class LayoutStore {
   private snapshot: UiSnapshot | null = null
   private sourceConnectionId: string | null = null
@@ -180,13 +188,13 @@ export class LayoutStore {
 
   getNormalizedSnapshot(tabId?: string): UiSnapshot {
     if (!this.snapshot) {
-      return { tabs: [], layouts: {}, activePane: {}, activeTabId: null }
+      return emptySnapshot()
     }
 
-    if (!tabId) return this.snapshot
+    if (!tabId) return cloneSnapshot(this.snapshot)
 
     const tab = this.snapshot.tabs.find((item) => item.id === tabId)
-    return {
+    return cloneSnapshot({
       tabs: tab ? [tab] : [],
       activeTabId: tab ? tab.id : null,
       layouts: this.snapshot.layouts?.[tabId] ? { [tabId]: this.snapshot.layouts[tabId] } : {},
@@ -196,7 +204,7 @@ export class LayoutStore {
         ? { [tabId]: this.snapshot.paneTitleSetByUser[tabId] }
         : {},
       timestamp: this.snapshot.timestamp,
-    }
+    })
   }
 
   private ensureSnapshot(): UiSnapshot {
