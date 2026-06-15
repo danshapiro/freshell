@@ -2922,7 +2922,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           outputSource: TerminalOutputSource
           parserAppliedSeq: number
           completedAttach: boolean
-          disableWriteCoalescing?: boolean
         }) => {
           let raw = input.raw
           const frameOverlapsReplay = input.outputSource === 'replay' || Boolean(
@@ -2984,7 +2983,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             {
               mode: input.outputSource,
               generation: input.attachRequestId,
-              coalesce: input.disableWriteCoalescing ? false : undefined,
             },
           )
           if (
@@ -3228,7 +3226,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               outputSource,
               parserAppliedSeq: acceptedSegment.parserAppliedSeq,
               completedAttach: completedAttachOnBatch && index === batchSegments.length - 1,
-              disableWriteCoalescing: true,
             })
           })
           return
