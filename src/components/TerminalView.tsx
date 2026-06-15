@@ -1711,11 +1711,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const writeQueue = createTerminalWriteQueue({
       terminalInstanceId,
       write: (data, onWritten) => {
+        const recordForTest = (phase: 'submitted' | 'written') => {
+          window.__FRESHELL_TEST_HARNESS__?.recordTerminalWrite?.({
+            terminalId: terminalIdRef.current,
+            paneId,
+            phase,
+            chars: data.length,
+            data,
+            at: performance.now(),
+          })
+        }
+        const completeWrite = () => {
+          recordForTest('written')
+          onWritten?.()
+        }
+        recordForTest('submitted')
         try {
-          term.write(data, onWritten)
+          term.write(data, completeWrite)
         } catch {
           // disposed
-          onWritten?.()
+          completeWrite()
         }
       },
     })

@@ -2,6 +2,15 @@ import type { store as appStore } from '@/store/store'
 import type { PerfAuditSnapshot } from '@/lib/perf-audit-bridge'
 import type { ServerMessage } from '@shared/ws-protocol'
 
+export type TerminalWriteEvent = {
+  terminalId?: string
+  paneId?: string
+  phase: 'submitted' | 'written'
+  chars: number
+  data: string
+  at: number
+}
+
 export interface FreshellTestHarness {
   getState: () => ReturnType<typeof appStore.getState>
   dispatch: typeof appStore.dispatch
@@ -24,6 +33,9 @@ export interface FreshellTestHarness {
   getSentWsMessages?: () => unknown[]
   clearSentWsMessages?: () => void
   recordSentWsMessage?: (msg: unknown) => void
+  recordTerminalWrite?: (event: TerminalWriteEvent) => void
+  getTerminalWriteEvents?: () => TerminalWriteEvent[]
+  clearTerminalWriteEvents?: () => void
 }
 
 declare global {
@@ -68,6 +80,7 @@ export function installTestHarness(
     || (window as { __FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__?: boolean }).__FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__ === true
   const suppressedTerminalPaneIds = new Set<string>()
   const sentWsMessages: unknown[] = []
+  const terminalWriteEvents: TerminalWriteEvent[] = []
   const recordSentWsMessage = (msg: unknown) => {
     try {
       sentWsMessages.push(JSON.parse(JSON.stringify(msg)))
@@ -131,5 +144,13 @@ export function installTestHarness(
       sentWsMessages.length = 0
     },
     recordSentWsMessage,
+    recordTerminalWrite: (event: TerminalWriteEvent) => {
+      terminalWriteEvents.push({ ...event })
+      if (terminalWriteEvents.length > 1000) terminalWriteEvents.shift()
+    },
+    getTerminalWriteEvents: () => [...terminalWriteEvents],
+    clearTerminalWriteEvents: () => {
+      terminalWriteEvents.length = 0
+    },
   }
 }
