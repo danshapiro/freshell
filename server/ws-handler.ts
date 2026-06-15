@@ -97,6 +97,7 @@ import {
 } from '../shared/ws-protocol.js'
 import { LiveTerminalHandleSchema, type RestoreError } from '../shared/session-contract.js'
 import { CODEX_DURABILITY_SCHEMA_VERSION, CodexDurabilityRefSchema } from '../shared/codex-durability.js'
+import { migrateLegacyFreshAgentContent } from '../shared/fresh-agent.js'
 import { UiLayoutSyncSchema } from './agent-api/layout-schema.js'
 import type { LayoutStore } from './agent-api/layout-store.js'
 import {
@@ -330,31 +331,25 @@ function normalizeTerminalInventoryForClient(value: unknown): unknown {
 }
 
 function extractSessionLocatorsFromUiContent(content: Record<string, unknown>): SidebarSessionLocator[] {
+  const normalizedContent = migrateLegacyFreshAgentContent(content) as Record<string, unknown>
   const locators: SidebarSessionLocator[] = []
 
-  const explicit = normalizeUiSessionLocator(content.sessionRef)
+  const explicit = normalizeUiSessionLocator(normalizedContent.sessionRef)
   if (explicit) {
     locators.push(explicit)
   }
 
-  const kind = content.kind
-  if (kind === 'agent-chat') {
-    if (isNonEmptyString(content.resumeSessionId)) {
-      locators.push({ provider: 'claude', sessionId: content.resumeSessionId })
-    }
-    return locators
-  }
-
+  const kind = normalizedContent.kind
   if (kind !== 'terminal') return locators
 
-  const mode = CodingCliProviderSchema.safeParse(content.mode)
-  if (!mode.success || !isNonEmptyString(content.resumeSessionId)) {
+  const mode = CodingCliProviderSchema.safeParse(normalizedContent.mode)
+  if (!mode.success || !isNonEmptyString(normalizedContent.resumeSessionId)) {
     return locators
   }
 
   locators.push({
     provider: mode.data,
-    sessionId: content.resumeSessionId,
+    sessionId: normalizedContent.resumeSessionId,
   })
   return locators
 }

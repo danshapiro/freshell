@@ -74,10 +74,17 @@ function expectNoMessage(ws: WebSocket, predicate: (msg: any) => boolean, timeou
   })
 }
 
+function getSingleClientState(wsHandler: any): any {
+  const states = Array.from(wsHandler.clientStates.values())
+  expect(states).toHaveLength(1)
+  return states[0]
+}
+
 describe('ws sidebar snapshot refresh', () => {
   let server: http.Server | undefined
   let port: number
   let wsHandler: any
+  let layoutStore: any
 
   beforeAll(async () => {
     process.env.NODE_ENV = 'test'
@@ -92,6 +99,7 @@ describe('ws sidebar snapshot refresh', () => {
       res.statusCode = 404
       res.end()
     })
+    layoutStore = new (LayoutStore as any)()
 
     wsHandler = new (WsHandler as any)(server, new FakeRegistry() as any, {
       handshakeSnapshotProvider: async () => ({
@@ -111,7 +119,7 @@ describe('ws sidebar snapshot refresh', () => {
         ],
       }),
       serverInstanceId: 'srv-local',
-      layoutStore: new (LayoutStore as any)(),
+      layoutStore,
     })
 
     const info = await listen(server)
@@ -165,6 +173,89 @@ describe('ws sidebar snapshot refresh', () => {
       }))
 
       await expectNoMessage(ws, (m) => m.type === 'sessions.updated')
+    } finally {
+      ws.terminate()
+      await new Promise<void>((resolve) => ws.on('close', () => resolve()))
+    }
+  })
+
+  it('normalizes legacy agent-chat panes before deriving sidebar locators', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const liveLegacySessionId = '00000000-0000-4000-8000-000000000123'
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+
+      const readyPromise = waitForMessage(ws, (m) => m.type === 'ready')
+
+      ws.send(JSON.stringify({
+        type: 'hello',
+        token: 'testtoken-testtoken',
+        protocolVersion: WS_PROTOCOL_VERSION,
+      }))
+
+      await readyPromise
+
+      ws.send(JSON.stringify({
+        type: 'ui.layout.sync',
+        tabs: [{ id: 'tab-agent', title: 'agent chat' }],
+        activeTabId: 'tab-agent',
+        layouts: {
+          'tab-agent': {
+            type: 'split',
+            id: 'split-agent',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              {
+                type: 'leaf',
+                id: 'pane-live-agent',
+                content: {
+                  kind: 'agent-chat',
+                  provider: 'freshclaude',
+                  createRequestId: 'req-live-agent',
+                  status: 'connected',
+                  resumeSessionId: liveLegacySessionId,
+                },
+              },
+              {
+                type: 'leaf',
+                id: 'pane-stale-agent',
+                content: {
+                  kind: 'agent-chat',
+                  provider: 'freshclaude',
+                  createRequestId: 'req-stale-agent',
+                  status: 'connected',
+                  resumeSessionId: 'legacy-named-alias',
+                },
+              },
+            ],
+          },
+        },
+        activePane: {
+          'tab-agent': 'pane-live-agent',
+        },
+        paneTitles: {},
+        timestamp: Date.now(),
+      }))
+
+      const pongPromise = waitForMessage(ws, (m) => m.type === 'pong')
+      ws.send(JSON.stringify({ type: 'ping' }))
+      await pongPromise
+
+      const state = getSingleClientState(wsHandler)
+      expect(state.sidebarOpenSessionKeys).toEqual(new Set([`claude:${liveLegacySessionId}`]))
+      expect(state.sidebarOpenSessionKeys.has('claude:legacy-named-alias')).toBe(false)
+      expect(layoutStore.getPaneSnapshot('pane-live-agent')?.paneContent).toMatchObject({
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        sessionRef: { provider: 'claude', sessionId: liveLegacySessionId },
+      })
+      expect(layoutStore.getPaneSnapshot('pane-stale-agent')?.paneContent).toMatchObject({
+        kind: 'fresh-agent',
+        restoreError: { reason: 'invalid_legacy_restore_target' },
+      })
     } finally {
       ws.terminate()
       await new Promise<void>((resolve) => ws.on('close', () => resolve()))
