@@ -118,6 +118,28 @@ describe('OpenCode serve adapter: create + send', () => {
     expect(manager.promptAsync).toHaveBeenNthCalledWith(2, 'ses_real_1', expect.objectContaining({ parts: [{ type: 'text', text: 'second' }] }))
   })
 
+  it('does not produce an unhandled rejection when promptAsync fails while onceIdle is still pending', async () => {
+    const manager = makeFakeManager()
+    let idleReject!: (reason: Error) => void
+    manager.onceIdle = vi.fn(() => new Promise<void>((_, reject) => { idleReject = reject }))
+    manager.promptAsync = vi.fn(async () => { throw new Error('prompt rejected') })
+
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'unhandled-1', sessionType: 'freshopencode', provider: 'opencode' })
+
+    const unhandled = vi.fn()
+    process.on('unhandledRejection', unhandled)
+    try {
+      await expect(adapter.send?.('freshopencode-unhandled-1', { text: 'boom' })).rejects.toThrow('prompt rejected')
+      // Simulating the idle timeout rejection that would otherwise arrive later.
+      idleReject(new Error('idle timeout'))
+      await new Promise((r) => setTimeout(r, 10))
+      expect(unhandled).not.toHaveBeenCalled()
+    } finally {
+      process.off('unhandledRejection', unhandled)
+    }
+  })
+
   it('forwards compact instructions to the serve manager', async () => {
     const manager = makeFakeManager()
     const adapter = makeAdapter(manager)

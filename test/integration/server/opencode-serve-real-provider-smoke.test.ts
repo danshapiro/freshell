@@ -44,12 +44,14 @@ describeReal('orchestration system smoke (Kimi k2.7)', () => {
   let runtimeManager: FreshAgentRuntimeManager
   let app: express.Express
   let kimiAvailable = false
+  let ktest: typeof it = it
 
   beforeAll(async () => {
     manager = new OpencodeServeManager()
     const { baseUrl } = await manager.ensureStarted()
     const providers = await fetch(`${baseUrl}/config/providers`).then((r) => r.json() as any).catch(() => ({}))
     kimiAvailable = JSON.stringify(providers).includes('umans-kimi-k2.7')
+    ktest = kimiAvailable ? it : it.skip
     const adapter = createOpencodeFreshAgentAdapter({ serveManager: manager })
     runtimeManager = new FreshAgentRuntimeManager({
       registry: createFreshAgentProviderRegistry([
@@ -70,8 +72,7 @@ describeReal('orchestration system smoke (Kimi k2.7)', () => {
     await manager?.shutdown()
   })
 
-  it('creates a freshopencode pane, runs a Kimi turn, and captures the assistant reply', async () => {
-    if (!kimiAvailable) return // skip-quality gate when the provider is not configured
+  ktest('creates a freshopencode pane, runs a Kimi turn, and captures the assistant reply', async () => {
     const created = await request(app).post('/api/tabs').send({ agent: 'opencode', cwd: process.cwd(), model: KIMI, effort: 'low' })
     expect(created.status).toBe(200)
     const paneId = created.body.data.paneId
@@ -86,8 +87,7 @@ describeReal('orchestration system smoke (Kimi k2.7)', () => {
     expect(capture.text.toLowerCase()).toContain('smoke-ok')
   }, 90_000)
 
-  it('continues the same session across a second turn (materialized id stable)', async () => {
-    if (!kimiAvailable) return
+  ktest('continues the same session across a second turn (materialized id stable)', async () => {
     const created = await request(app).post('/api/tabs').send({ agent: 'opencode', cwd: process.cwd(), model: KIMI, effort: 'low' })
     const paneId = created.body.data.paneId
     const first = await request(app).post(`/api/panes/${paneId}/send-keys`).send({ data: 'Remember the word: pineapple. Reply ok.' })
@@ -98,8 +98,7 @@ describeReal('orchestration system smoke (Kimi k2.7)', () => {
     expect(capture.text.toLowerCase()).toContain('pineapple')
   }, 120_000)
 
-  it('paginates history via the cursor after multiple turns', async () => {
-    if (!kimiAvailable) return
+  ktest('paginates history via the cursor after multiple turns', async () => {
     const created = await request(app).post('/api/tabs').send({ agent: 'opencode', cwd: process.cwd(), model: KIMI, effort: 'low' })
     const paneId = created.body.data.paneId
     const content = (await request(app).post('/api/tabs').send({ agent: 'opencode' })).body.data // noop second pane to ensure isolation
@@ -118,8 +117,7 @@ describeReal('orchestration system smoke (Kimi k2.7)', () => {
     }
   }, 120_000)
 
-  it('forks a materialized session into a child session', async () => {
-    if (!kimiAvailable) return
+  ktest('forks a materialized session into a child session', async () => {
     const created = await request(app).post('/api/tabs').send({ agent: 'opencode', cwd: process.cwd(), model: KIMI, effort: 'low' })
     const paneId = created.body.data.paneId
     await request(app).post(`/api/panes/${paneId}/send-keys`).send({ data: 'Say ok' })

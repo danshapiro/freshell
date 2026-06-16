@@ -4,6 +4,7 @@ import express from 'express'
 import request from 'supertest'
 import { createAgentApiRouter } from '../../server/agent-api/router.js'
 import { LayoutStore } from '../../server/agent-api/layout-store.js'
+import { FreshAgentLostSessionError } from '../../server/fresh-agent/runtime-manager.js'
 
 function makeApp(overrides: { freshAgentRuntimeManager?: any } = {}) {
   const layoutStore = new LayoutStore()
@@ -61,6 +62,35 @@ describe('agent-api fresh-agent: create', () => {
     const res = await request(app).post('/api/tabs').send({ agent: 'opencode' })
     expect(res.status).toBe(503)
   })
+
+  it('rolls back the allocated tab when runtime creation fails', async () => {
+    const freshAgentRuntimeManager = {
+      create: vi.fn(async () => { throw new Error('sidecar failed to start') }),
+      send: vi.fn(async () => undefined),
+      attach: vi.fn(async () => ({ sessionId: 'ses_real_1' })),
+      getSnapshot: vi.fn(async () => ({ turns: [] })),
+    }
+    const { app, layoutStore } = makeApp({ freshAgentRuntimeManager })
+    const tabsBefore = layoutStore.getNormalizedSnapshot().tabs.length
+    const res = await request(app).post('/api/tabs').send({ agent: 'opencode', cwd: '/repo' })
+    expect(res.status).toBe(500)
+    expect(layoutStore.getNormalizedSnapshot().tabs.length).toBe(tabsBefore)
+  })
+
+  it('rolls back the allocated split pane when runtime creation fails', async () => {
+    const freshAgentRuntimeManager = {
+      create: vi.fn(async () => { throw new Error('sidecar failed to start') }),
+      send: vi.fn(async () => undefined),
+      attach: vi.fn(async () => ({ sessionId: 'ses_real_1' })),
+      getSnapshot: vi.fn(async () => ({ turns: [] })),
+    }
+    const { app, layoutStore } = makeApp({ freshAgentRuntimeManager })
+    const { paneId: basePaneId } = layoutStore.createTab({ title: 'base' })
+    const panesBefore = layoutStore.listPanes().length
+    const res = await request(app).post(`/api/panes/${basePaneId}/split`).send({ agent: 'opencode' })
+    expect(res.status).toBe(500)
+    expect(layoutStore.listPanes().length).toBe(panesBefore)
+  })
 })
 
 describe('agent-api fresh-agent: send-keys', () => {
@@ -78,8 +108,7 @@ describe('agent-api fresh-agent: send-keys', () => {
   })
 
   it('attaches on a lost session before retrying send (cross-process orchestration)', async () => {
-    const lost = Object.assign(new Error('not tracked'), { name: 'FreshAgentLostSessionError' })
-    const send = vi.fn().mockRejectedValueOnce(lost).mockResolvedValueOnce({ sessionId: 'ses_real_1' })
+    const send = vi.fn().mockRejectedValueOnce(new FreshAgentLostSessionError('not tracked')).mockResolvedValueOnce({ sessionId: 'ses_real_1' })
     const attach = vi.fn(async () => ({ sessionId: 'ses_real_1' }))
     const { app } = makeApp({ freshAgentRuntimeManager: {
       create: vi.fn(async () => ({ sessionId: 'ses_real_1', sessionType: 'freshopencode', runtimeProvider: 'opencode' })),

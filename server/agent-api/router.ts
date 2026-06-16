@@ -471,22 +471,31 @@ export function createAgentApiRouter({
 
   const createFreshAgentPane = async (
     res: any,
-    place: (paneContent: any) => { tabId: string; paneId: string } | undefined,
+    allocate: () => { tabId: string; paneId: string } | undefined,
+    rollback: (allocation: { tabId: string; paneId: string }) => void,
     broadcast: (info: { tabId: string; paneId: string; paneContent: any }) => void,
     opts: { agent: string; cwd?: string; model?: string; effort?: string; name?: string },
   ): Promise<boolean> => {
     const mapping = AGENT_SESSION_TYPES[opts.agent]
     if (!mapping) { res.status(400).json(fail(`unknown agent "${opts.agent}"`)); return true }
     if (!freshAgentRuntimeManager) { res.status(503).json(fail('fresh-agent runtime not available on this server')); return true }
+    const allocation = allocate()
+    if (!allocation) { res.status(500).json(fail('failed to allocate fresh-agent pane')); return true }
     const createRequestId = nanoid()
-    const created = await freshAgentRuntimeManager.create({
-      requestId: createRequestId,
-      sessionType: mapping.sessionType,
-      provider: mapping.provider,
-      ...(opts.cwd ? { cwd: opts.cwd } : {}),
-      ...(opts.model ? { model: opts.model } : {}),
-      ...(opts.effort ? { effort: opts.effort } : {}),
-    })
+    let created: Awaited<ReturnType<FreshAgentRuntimeManagerLike['create']>> | undefined
+    try {
+      created = await freshAgentRuntimeManager.create({
+        requestId: createRequestId,
+        sessionType: mapping.sessionType,
+        provider: mapping.provider,
+        ...(opts.cwd ? { cwd: opts.cwd } : {}),
+        ...(opts.model ? { model: opts.model } : {}),
+        ...(opts.effort ? { effort: opts.effort } : {}),
+      })
+    } catch (err: any) {
+      rollback(allocation)
+      throw err
+    }
     const paneContent = {
       kind: 'fresh-agent',
       sessionType: mapping.sessionType,
@@ -499,10 +508,9 @@ export function createAgentApiRouter({
       ...(opts.model ? { model: opts.model } : {}),
       ...(opts.effort ? { effort: opts.effort } : {}),
     }
-    const placed = place(paneContent)
-    if (!placed) { res.status(500).json(fail('failed to place fresh-agent pane')); return true }
-    broadcast({ tabId: placed.tabId, paneId: placed.paneId, paneContent })
-    res.json(ok({ tabId: placed.tabId, paneId: placed.paneId, sessionId: created.sessionId, sessionRef: created.sessionRef }, 'fresh-agent pane created'))
+    layoutStore.attachPaneContent(allocation.tabId, allocation.paneId, paneContent)
+    broadcast({ tabId: allocation.tabId, paneId: allocation.paneId, paneContent })
+    res.json(ok({ tabId: allocation.tabId, paneId: allocation.paneId, sessionId: created.sessionId, sessionRef: created.sessionRef }, 'fresh-agent pane created'))
     return true
   }
 
@@ -616,11 +624,8 @@ export function createAgentApiRouter({
     if (typeof req.body?.agent === 'string') {
       const handled = await createFreshAgentPane(
         res,
-        (paneContent) => {
-          const { tabId, paneId } = layoutStore.createTab({ title: name })
-          layoutStore.attachPaneContent(tabId, paneId, paneContent)
-          return { tabId, paneId }
-        },
+        () => layoutStore.createTab({ title: name }),
+        ({ tabId }) => { layoutStore.closeTab?.(tabId) },
         ({ tabId, paneId, paneContent }) => {
           wsHandler?.broadcastUiCommand({ command: 'tab.create', payload: { id: tabId, title: name, paneId, paneContent } })
         },
@@ -1165,16 +1170,17 @@ export function createAgentApiRouter({
       if (rejectPaneTargetError(res, resolved)) return
       const paneId = resolved.paneId || rawPaneId
       if (typeof req.body?.agent === 'string') {
+        const direction: 'horizontal' | 'vertical' = req.body?.direction || 'horizontal'
         const handled = await createFreshAgentPane(
           res,
-          (paneContent) => {
-            const result = layoutStore.splitPane({ paneId, direction: req.body?.direction || 'horizontal' })
+          () => {
+            const result = layoutStore.splitPane({ paneId, direction })
             if (!result?.tabId || !result?.newPaneId) return undefined
-            layoutStore.attachPaneContent(result.tabId, result.newPaneId, paneContent)
             return { tabId: result.tabId, paneId: result.newPaneId }
           },
+          ({ paneId: newPaneId }) => { layoutStore.closePane(newPaneId) },
           ({ tabId, paneId: newPaneId, paneContent }) => {
-            wsHandler?.broadcastUiCommand({ command: 'pane.split', payload: { tabId, paneId, direction: req.body?.direction || 'horizontal', newPaneId, newContent: paneContent } })
+            wsHandler?.broadcastUiCommand({ command: 'pane.split', payload: { tabId, paneId, direction, newPaneId, newContent: paneContent } })
           },
           { agent: req.body.agent, cwd: req.body?.cwd, model: req.body?.model, effort: req.body?.effort },
         ).catch((err: any) => { res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'Failed to split fresh-agent pane')); return true })

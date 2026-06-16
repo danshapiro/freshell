@@ -86,9 +86,13 @@ export class OpencodeServeManager {
     child.on('error', (err) => this.log.error({ err }, 'opencode serve process error'))
     child.on('close', (code) => {
       this.log.warn({ code }, 'opencode serve exited')
-      if (this.running?.child === child) {
+      const running = this.running
+      if (running?.child === child) {
         this.running = undefined
         this.startPromise = undefined
+        try { running.stopEventStream() } catch { /* ignore */ }
+        void killOwnedProcesses(running.child, running.ownershipId, this.log)
+        this.sessionEmitters.clear()
       }
     })
 
@@ -279,6 +283,8 @@ export class OpencodeServeManager {
           const { value, done } = await reader.read()
           if (done) break
           buf += decoder.decode(value, { stream: true })
+          // Normalize CRLF so '\r\n\r\n' event boundaries are treated uniformly.
+          buf = buf.replace(/\r\n/g, '\n')
           let idx: number
           while ((idx = buf.indexOf('\n\n')) >= 0) {
             const block = buf.slice(0, idx)

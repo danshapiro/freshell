@@ -121,6 +121,10 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     state.status = 'running'
     state.events.emit('event', { type: 'sdk.session.snapshot', sessionId: state.placeholderId, status: 'running' })
     const idle = serveManager.onceIdle(realId, turnTimeoutMs)
+    // If promptAsync fails and we leave via the catch(), `idle` may still
+    // reject later on its timeout timer. Attach a no-op handler now so that
+    // later rejection cannot become an unhandled rejection.
+    void idle.catch(() => {})
     try {
       await serveManager.promptAsync(realId, {
         parts: [{ type: 'text', text }],

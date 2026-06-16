@@ -196,4 +196,40 @@ describe('OpencodeServeManager fan-out', () => {
     await expect(manager.onceIdle('ses_a', 10)).rejects.toThrow(/idle/i)
     expect((manager as any).sessionEmitters.get('ses_a')?.listenerCount('event') ?? 0).toBe(0)
   })
+
+  it('normalizes CRLF SSE boundaries', async () => {
+    let push!: (e: any) => void
+    const { manager } = makeManager({
+      connectEventStream: (_url, h) => { push = (e) => h.onEvent(parseEvt(e)); return () => {} },
+    })
+    await manager.ensureStarted()
+    const seen: any[] = []
+    manager.subscribe('ses_crlf', (e) => seen.push(e))
+    push({ type: 'session.idle', properties: { sessionID: 'ses_crlf' } })
+    expect(seen.map((e) => e.kind)).toEqual(['session.idle'])
+  })
+
+  it('cleans up the event stream and session emitters when the child exits unexpectedly', async () => {
+    const child = fakeChild()
+    const stopStream = vi.fn()
+    const spawnFn = vi.fn(() => child)
+    const manager = new OpencodeServeManager({
+      spawnFn: spawnFn as any,
+      fetchFn: vi.fn(async (url: string) => {
+        if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+        return jsonResponse({})
+      }) as any,
+      allocatePort: async () => ({ hostname: '127.0.0.1', port: 47999 }),
+      connectEventStream: () => stopStream,
+      healthTimeoutMs: 1000,
+    })
+    await manager.ensureStarted()
+    manager.subscribe('ses_child', () => {})
+    expect((manager as any).sessionEmitters.size).toBeGreaterThan(0)
+    child.emit('close', 1)
+    expect(stopStream).toHaveBeenCalled()
+    expect(child.kill).toHaveBeenCalled()
+    expect((manager as any).sessionEmitters.size).toBe(0)
+    expect((manager as any).running).toBeUndefined()
+  })
 })
