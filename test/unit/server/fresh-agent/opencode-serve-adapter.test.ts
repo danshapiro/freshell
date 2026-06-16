@@ -127,3 +127,54 @@ describe('OpenCode serve adapter: create + send', () => {
     expect(manager.compact).toHaveBeenCalledWith('ses_real_1', { instructions: 'keep it short' })
   })
 })
+
+describe('OpenCode serve adapter: history reads', () => {
+  const messages = [
+    { info: { id: 'msg_user_1', role: 'user', time: { created: 1779557095868 } }, parts: [{ id: 'p1', type: 'text', text: 'reply ok' }] },
+    { info: { id: 'msg_assistant_1', role: 'assistant', providerID: 'umans-ai-coding-plan', modelID: 'umans-kimi-k2.7' }, parts: [{ id: 'p2', type: 'text', text: 'ok' }] },
+  ]
+
+  it('getSnapshot assembles HTTP messages into the normalized transcript', async () => {
+    const manager = makeFakeManager()
+    manager.getSession = vi.fn(async () => ({ id: 'ses_real_1', title: 'Kimi chat', time: { updated: 12 } }))
+    manager.listMessages = vi.fn(async () => ({ messages, nextCursor: null }))
+    const adapter = makeAdapter(manager)
+    await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1' })
+    await expect(adapter.getSnapshot?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' })).resolves.toMatchObject({
+      sessionId: 'ses_real_1', summary: 'Kimi chat', revision: 12,
+      turns: [{ turnId: 'msg_user_1', role: 'user', summary: 'reply ok' }, { turnId: 'msg_assistant_1', role: 'assistant', summary: 'ok' }],
+    })
+    expect(manager.listMessages).toHaveBeenCalledWith('ses_real_1', { limit: 200 })
+  })
+
+  it('getTurnPage forwards cursor as before= and returns nextCursor from the header', async () => {
+    const manager = makeFakeManager()
+    manager.listMessages = vi.fn(async () => ({ messages: messages.slice(0, 1), nextCursor: 'NEXT' }))
+    const adapter = makeAdapter(manager)
+    await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1' })
+    const page = await adapter.getTurnPage?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' }, { cursor: 'CUR', limit: 1, revision: 0 })
+    expect(page).toMatchObject({ nextCursor: 'NEXT', turns: [{ turnId: 'msg_user_1' }] })
+    expect(manager.listMessages).toHaveBeenCalledWith('ses_real_1', { limit: 1, before: 'CUR' })
+  })
+
+  it('getTurnBody fetches a single message and normalizes it', async () => {
+    const manager = makeFakeManager()
+    manager.getMessage = vi.fn(async () => messages[1])
+    const adapter = makeAdapter(manager)
+    await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1' })
+    await expect(adapter.getTurnBody?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1', turnId: 'msg_assistant_1' }, 12)).resolves.toMatchObject({
+      turnId: 'msg_assistant_1', role: 'assistant', items: expect.arrayContaining([expect.objectContaining({ kind: 'text', text: 'ok' })]),
+    })
+    expect(manager.getMessage).toHaveBeenCalledWith('ses_real_1', 'msg_assistant_1')
+  })
+
+  it('reports fork capability true and approvals/questions false', async () => {
+    const manager = makeFakeManager()
+    manager.getSession = vi.fn(async () => ({ id: 'ses_real_1', time: { updated: 1 } }))
+    manager.listMessages = vi.fn(async () => ({ messages: [], nextCursor: null }))
+    const adapter = makeAdapter(manager)
+    await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1' })
+    const snap: any = await adapter.getSnapshot?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' })
+    expect(snap.capabilities).toMatchObject({ fork: true, approvals: false, questions: false })
+  })
+})

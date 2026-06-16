@@ -242,7 +242,7 @@ export function normalizeOpencodeSnapshot(input: {
       interrupt: true,
       approvals: false,
       questions: false,
-      fork: false,
+      fork: true,
       worktrees: false,
       diffs: true,
       childThreads: false,
