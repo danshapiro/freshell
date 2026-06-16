@@ -212,6 +212,44 @@ describe('OpencodeServeManager fan-out', () => {
     expect((manager as any).sessionEmitters.get('ses_a')?.listenerCount('event') ?? 0).toBe(0)
   })
 
+  it('onceIdle resolves on session.status with idle for that session', async () => {
+    let push!: (e: any) => void
+    const { manager } = makeManager({
+      connectEventStream: (_url, h) => { push = (e) => h.onEvent(parseEvt(e)); return () => {} },
+    })
+    await manager.ensureStarted()
+    const idle = manager.onceIdle('ses_a', 1000)
+    push({ type: 'session.status', properties: { sessionID: 'ses_a', status: { type: 'idle' } } })
+    await expect(idle).resolves.toBeUndefined()
+    expect((manager as any).sessionEmitters.get('ses_a')?.listenerCount('event') ?? 0).toBe(0)
+  })
+
+  it('onceIdle does not resolve on session.status busy for that session', async () => {
+    let push!: (e: any) => void
+    const { manager } = makeManager({
+      connectEventStream: (_url, h) => { push = (e) => h.onEvent(parseEvt(e)); return () => {} },
+    })
+    await manager.ensureStarted()
+    const idle = manager.onceIdle('ses_a', 100)
+    push({ type: 'session.status', properties: { sessionID: 'ses_a', status: { type: 'busy' } } })
+    const pending = await new Promise<string>((resolve) => setTimeout(() => resolve('pending'), 50))
+    expect(pending).toBe('pending')
+    await expect(idle).rejects.toThrow(/idle/i)
+  })
+
+  it('onceIdle does not resolve on session.status idle for a different session', async () => {
+    let push!: (e: any) => void
+    const { manager } = makeManager({
+      connectEventStream: (_url, h) => { push = (e) => h.onEvent(parseEvt(e)); return () => {} },
+    })
+    await manager.ensureStarted()
+    const idle = manager.onceIdle('ses_a', 100)
+    push({ type: 'session.status', properties: { sessionID: 'ses_b', status: { type: 'idle' } } })
+    const pending = await new Promise<string>((resolve) => setTimeout(() => resolve('pending'), 50))
+    expect(pending).toBe('pending')
+    await expect(idle).rejects.toThrow(/idle/i)
+  })
+
   it('onceIdle rejects on timeout', async () => {
     const { manager } = makeManager({ connectEventStream: () => () => {} })
     await manager.ensureStarted()

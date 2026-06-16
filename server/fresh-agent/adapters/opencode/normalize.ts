@@ -91,6 +91,14 @@ function stripOpencodeRunArgumentQuoting(text: string): string {
   return text
 }
 
+/** OpenCode / Kimi may leak internal reasoning inside `<think>` / `<thinking>` tags.
+ * Strip both the tags and their content from assistant transcript text.
+ * User input is preserved so legitimate markup the user typed is not lost. */
+function stripThinkTags(text: string): string {
+  const after = text.replace(/<thinking\b[^>]*>[\s\S]*?<\/thinking>/gi, '').replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, '')
+  return after.length === text.length ? text : after.trim()
+}
+
 function itemFromPart(
   part: Record<string, any>,
   fallbackId: string,
@@ -99,7 +107,8 @@ function itemFromPart(
   const id = typeof part.id === 'string' && part.id.length > 0 ? part.id : fallbackId
   if (part.type === 'text') {
     const rawText = typeof part.text === 'string' ? part.text : ''
-    const text = role === 'user' ? stripOpencodeRunArgumentQuoting(rawText) : rawText
+    const stripped = role === 'user' ? rawText : stripThinkTags(rawText)
+    const text = role === 'user' ? stripOpencodeRunArgumentQuoting(stripped) : stripped
     return { id, kind: 'text', text }
   }
   if (part.type === 'reasoning') {

@@ -25,6 +25,13 @@ export type OpencodeServeMessagePage = { messages: OpencodeServeMessage[]; nextC
 
 type HealthResponse = { healthy?: boolean }
 
+function isIdleStatusEvent(event: ParsedServeEvent): boolean {
+  if (event.kind !== 'session.status') return false
+  const status = event.properties.status
+  if (!status || typeof status !== 'object' || Array.isArray(status)) return false
+  return (status as Record<string, unknown>).type === 'idle'
+}
+
 function isHealthyResponse(body: unknown): body is HealthResponse {
   return typeof body === 'object' && body !== null && (body as HealthResponse).healthy !== false
 }
@@ -285,7 +292,7 @@ export class OpencodeServeManager {
       }, timeoutMs)
       timer.unref?.()
       const handler = (event: ParsedServeEvent) => {
-        if (event.kind === 'session.idle') {
+        if (event.kind === 'session.idle' || isIdleStatusEvent(event)) {
           clearTimeout(timer)
           emitter.off('event', handler)
           resolve()
