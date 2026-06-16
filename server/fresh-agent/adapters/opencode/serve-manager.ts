@@ -221,6 +221,31 @@ export class OpencodeServeManager {
     this.emitterFor(parsed.sessionId).emit('event', parsed)
   }
 
+  subscribe(sessionId: string, listener: (event: ParsedServeEvent) => void): () => void {
+    const emitter = this.emitterFor(sessionId)
+    emitter.on('event', listener)
+    return () => emitter.off('event', listener)
+  }
+
+  onceIdle(sessionId: string, timeoutMs: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const emitter = this.emitterFor(sessionId)
+      const timer = setTimeout(() => {
+        emitter.off('event', handler)
+        reject(new Error(`Timed out after ${timeoutMs}ms waiting for OpenCode session ${sessionId} to go idle.`))
+      }, timeoutMs)
+      timer.unref?.()
+      const handler = (event: ParsedServeEvent) => {
+        if (event.kind === 'session.idle') {
+          clearTimeout(timer)
+          emitter.off('event', handler)
+          resolve()
+        }
+      }
+      emitter.on('event', handler)
+    })
+  }
+
   private startDefaultEventStream(baseUrl: string): () => void {
     const controller = new AbortController()
     void this.consumeEvents(`${baseUrl}/event`, controller.signal)

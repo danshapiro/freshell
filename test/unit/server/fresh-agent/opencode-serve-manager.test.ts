@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import { describe, expect, it, vi } from 'vitest'
+import { parseServeEvent as parseEvt } from '../../../../server/fresh-agent/adapters/opencode/serve-events.js'
 import { OpencodeServeManager } from '../../../../server/fresh-agent/adapters/opencode/serve-manager.js'
 
 function fakeChild() {
@@ -158,5 +159,41 @@ describe('OpencodeServeManager HTTP client', () => {
     })
     const { manager } = makeManager({ fetchFn: fetchFn as any })
     await expect(manager.getMessage('ses_x', 'broken')).rejects.toThrow(/opencode serve GET .*\/message\/broken → 500/)
+  })
+})
+
+describe('OpencodeServeManager fan-out', () => {
+  it('subscribe receives parsed events for its session and unsubscribe stops them', async () => {
+    let push!: (e: any) => void
+    const { manager } = makeManager({
+      connectEventStream: (_url, h) => { push = (e) => h.onEvent(parseEvt(e)); return () => {} },
+    })
+    await manager.ensureStarted()
+    const seen: any[] = []
+    const off = manager.subscribe('ses_a', (e) => seen.push(e))
+    push({ type: 'message.part.updated', properties: { sessionID: 'ses_a', part: { id: 'p' } } })
+    push({ type: 'message.part.updated', properties: { sessionID: 'ses_other', part: { id: 'q' } } })
+    off()
+    push({ type: 'session.idle', properties: { sessionID: 'ses_a' } })
+    expect(seen.map((e) => e.kind)).toEqual(['message.part.updated'])
+  })
+
+  it('onceIdle resolves on the next session.idle for that session', async () => {
+    let push!: (e: any) => void
+    const { manager } = makeManager({
+      connectEventStream: (_url, h) => { push = (e) => h.onEvent(parseEvt(e)); return () => {} },
+    })
+    await manager.ensureStarted()
+    const idle = manager.onceIdle('ses_a', 1000)
+    push({ type: 'session.idle', properties: { sessionID: 'ses_a' } })
+    await expect(idle).resolves.toBeUndefined()
+    expect((manager as any).sessionEmitters.get('ses_a')?.listenerCount('event') ?? 0).toBe(0)
+  })
+
+  it('onceIdle rejects on timeout', async () => {
+    const { manager } = makeManager({ connectEventStream: () => () => {} })
+    await manager.ensureStarted()
+    await expect(manager.onceIdle('ses_a', 10)).rejects.toThrow(/idle/i)
+    expect((manager as any).sessionEmitters.get('ses_a')?.listenerCount('event') ?? 0).toBe(0)
   })
 })
