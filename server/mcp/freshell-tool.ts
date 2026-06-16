@@ -38,7 +38,10 @@ Key actions:
 - Info: lan-info
 - Meta: health, help
 
-Common params: target (ID or name), name, mode, direction, keys, url, scope.`
+Common params: target (ID or name), name, mode, direction, keys, url, scope.
+
+Fresh agents (in-app): use new-tab/split-pane with agent="opencode" (also "claude"/"codex"), optional model=, effort=, cwd=. Then drive the pane with send-keys (the prompt; blocks until the turn completes), read it with capture-pane (returns the transcript), and optionally wait-for (reports idle). Example:
+  new-tab { agent: "opencode", model: "umans-ai-coding-plan/umans-kimi-k2.7", prompt: "Summarize README.md" }`
 
 export const INSTRUCTIONS = `Freshell is a browser-accessible terminal multiplexer and session organizer.
 
@@ -50,6 +53,11 @@ FRESHELL_URL and FRESHELL_TOKEN are already set in your environment.
 - Pane kinds: terminal, editor, browser, fresh-agent (Claude/Codex/OpenCode/etc.), picker (transient).
 - **Picker panes are ephemeral.** A freshly-created tab without mode/browser/editor starts as a picker pane while the user chooses what to launch. Once they select, the picker is replaced by the real pane with a **new pane ID**. Never target a picker pane for splits or mutations -- use mode/browser/editor params on new-tab/split-pane to skip the picker entirely.
 - Typical workflow: new-tab -> send-keys -> wait-for -> capture-pane/screenshot.
+
+## Fresh agents (in-app)
+
+- Use new-tab/split-pane with agent="opencode" (also "claude"/"codex"), optional model=, effort=, cwd=. Then drive the pane with send-keys (the prompt; blocks until the turn completes), read it with capture-pane (returns the transcript), and optionally wait-for (reports idle). Example:
+  new-tab { agent: "opencode", model: "umans-ai-coding-plan/umans-kimi-k2.7", prompt: "Summarize README.md" }
 
 ## Choosing the right action
 
@@ -248,7 +256,7 @@ async function handleDisplay(format: string, target?: string): Promise<string> {
 // ---------------------------------------------------------------------------
 
 const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> = {
-  'new-tab':         { required: [],                          optional: ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'sessionRef', 'prompt'] },
+  'new-tab':         { required: [],                          optional: ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'sessionRef', 'prompt', 'agent', 'model', 'effort'] },
   'list-tabs':       { required: [],                          optional: [] },
   'select-tab':      { required: ['target'],                  optional: [] },
   'kill-tab':        { required: ['target'],                  optional: [] },
@@ -256,7 +264,7 @@ const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> 
   'has-tab':         { required: ['target'],                  optional: [] },
   'next-tab':        { required: [],                          optional: [] },
   'prev-tab':        { required: [],                          optional: [] },
-  'split-pane':      { required: [],                          optional: ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'sessionRef'] },
+  'split-pane':      { required: [],                          optional: ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'sessionRef', 'agent', 'model', 'effort'] },
   'list-panes':      { required: [],                          optional: ['target'] },
   'select-pane':     { required: ['target'],                  optional: [] },
   'rename-pane':     { required: ['name'],                    optional: ['target'] },
@@ -424,6 +432,11 @@ Session/service:
 
 Meta:
   help            Show this reference.
+
+## Fresh agents (in-app)
+
+Use new-tab/split-pane with agent="opencode" (also "claude"/"codex"), optional model=, effort=, cwd=. Then drive the pane with send-keys (the prompt; blocks until the turn completes), read it with capture-pane (returns the transcript), and optionally wait-for (reports idle). Example:
+  new-tab { agent: "opencode", model: "umans-ai-coding-plan/umans-kimi-k2.7", prompt: "Summarize README.md" }
 
 ## Playbook: create a coding CLI tab and send a prompt
 

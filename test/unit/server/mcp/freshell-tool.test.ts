@@ -142,6 +142,29 @@ describe('executeAction -- tab actions', () => {
     }))
   })
 
+  it('forwards agent, model, and effort params on new-tab to /api/tabs', async () => {
+    mockClient.post.mockResolvedValue({
+      status: 'ok',
+      data: { tabId: 't1', paneId: 'p1', sessionId: 'freshopencode-abc' },
+    })
+
+    const result = await executeAction('new-tab', {
+      agent: 'opencode',
+      model: 'umans-ai-coding-plan/umans-kimi-k2.7',
+      effort: 'high',
+    })
+
+    expect(mockClient.post).toHaveBeenCalledWith(
+      '/api/tabs',
+      expect.objectContaining({
+        agent: 'opencode',
+        model: 'umans-ai-coding-plan/umans-kimi-k2.7',
+        effort: 'high',
+      }),
+    )
+    expect(result).toBeTruthy()
+  })
+
   it('list-tabs calls GET /api/tabs', async () => {
     mockClient.get.mockResolvedValue({ tabs: [] })
     await executeAction('list-tabs')
