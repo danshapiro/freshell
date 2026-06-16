@@ -2,6 +2,18 @@ import type { store as appStore } from '@/store/store'
 import type { PerfAuditSnapshot } from '@/lib/perf-audit-bridge'
 import type { ServerMessage } from '@shared/ws-protocol'
 
+export type TerminalWriteEvent = {
+  terminalId?: string
+  paneId?: string
+  phase: 'submitted' | 'written'
+  chars: number
+  data: string
+  at: number
+}
+
+const MAX_TERMINAL_WRITE_EVENTS = 1000
+const MAX_TERMINAL_WRITE_EVENT_BYTES = 1024 * 1024
+
 export interface FreshellTestHarness {
   getState: () => ReturnType<typeof appStore.getState>
   dispatch: typeof appStore.dispatch
@@ -24,6 +36,9 @@ export interface FreshellTestHarness {
   getSentWsMessages?: () => unknown[]
   clearSentWsMessages?: () => void
   recordSentWsMessage?: (msg: unknown) => void
+  recordTerminalWrite?: (event: TerminalWriteEvent) => void
+  getTerminalWriteEvents?: () => TerminalWriteEvent[]
+  clearTerminalWriteEvents?: () => void
 }
 
 declare global {
@@ -68,6 +83,8 @@ export function installTestHarness(
     || (window as { __FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__?: boolean }).__FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__ === true
   const suppressedTerminalPaneIds = new Set<string>()
   const sentWsMessages: unknown[] = []
+  const terminalWriteEvents: TerminalWriteEvent[] = []
+  let terminalWriteEventBytes = 0
   const recordSentWsMessage = (msg: unknown) => {
     try {
       sentWsMessages.push(JSON.parse(JSON.stringify(msg)))
@@ -131,5 +148,23 @@ export function installTestHarness(
       sentWsMessages.length = 0
     },
     recordSentWsMessage,
+    recordTerminalWrite: (event: TerminalWriteEvent) => {
+      const retainedEvent = { ...event }
+      terminalWriteEvents.push(retainedEvent)
+      terminalWriteEventBytes += retainedEvent.data.length
+      while (
+        terminalWriteEvents.length > MAX_TERMINAL_WRITE_EVENTS
+        || terminalWriteEventBytes > MAX_TERMINAL_WRITE_EVENT_BYTES
+      ) {
+        const removedEvent = terminalWriteEvents.shift()
+        if (!removedEvent) break
+        terminalWriteEventBytes -= removedEvent.data.length
+      }
+    },
+    getTerminalWriteEvents: () => [...terminalWriteEvents],
+    clearTerminalWriteEvents: () => {
+      terminalWriteEvents.length = 0
+      terminalWriteEventBytes = 0
+    },
   }
 }
