@@ -157,6 +157,48 @@ describe('OpenCode fresh-agent normalization', () => {
     })
   })
 
+  it('strips surrounding quotes from user text parts added by the OpenCode CLI', () => {
+    const turn = normalizeOpencodeTurn({
+      info: { id: 'msg-user-quoted', role: 'user' },
+      parts: [{ id: 'part-user-quoted', type: 'text', text: '"Do a directory listing."' }],
+    }, 0)
+
+    expect(turn.role).toBe('user')
+    expect(turn.items).toEqual([
+      { id: 'part-user-quoted', kind: 'text', text: 'Do a directory listing.' },
+    ])
+    expect(turn.summary).toBe('Do a directory listing.')
+  })
+
+  it('leaves unquoted user text parts unchanged', () => {
+    const turn = normalizeOpencodeTurn({
+      info: { id: 'msg-user-plain', role: 'user' },
+      parts: [{ id: 'part-user-plain', type: 'text', text: 'Do a directory listing.' }],
+    }, 0)
+
+    expect(turn.items[0]?.text).toBe('Do a directory listing.')
+    expect(turn.summary).toBe('Do a directory listing.')
+  })
+
+  it('does not strip surrounding quotes from assistant text parts', () => {
+    const turn = normalizeOpencodeTurn({
+      info: { id: 'msg-assistant-quoted', role: 'assistant' },
+      parts: [{ id: 'part-assistant-quoted', type: 'text', text: '"Hello, world."' }],
+    }, 0)
+
+    expect(turn.role).toBe('assistant')
+    expect(turn.items[0]?.text).toBe('"Hello, world."')
+  })
+
+  it('strips only one pair of surrounding quotes from user text parts', () => {
+    const turn = normalizeOpencodeTurn({
+      info: { id: 'msg-user-nested', role: 'user' },
+      parts: [{ id: 'part-user-nested', type: 'text', text: '""nested" quotes"' }],
+    }, 0)
+
+    expect(turn.items[0]?.text).toBe('"nested" quotes')
+  })
+
   it('carries turn-page nextCursor explicitly and keeps export fallback compatibility', () => {
     const explicit = normalizeOpencodeTurnPage({
       threadId: 'ses-page',

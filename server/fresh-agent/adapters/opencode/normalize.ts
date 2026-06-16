@@ -79,10 +79,21 @@ function normalizePatchChanges(files: unknown): Record<string, unknown>[] {
     .filter((value): value is Record<string, unknown> => Boolean(value))
 }
 
-function itemFromPart(part: Record<string, any>, fallbackId: string): FreshAgentTranscriptItem | undefined {
+function stripSurroundingQuotes(text: string): string {
+  if (text.length >= 2 && text.startsWith('"') && text.endsWith('"')) return text.slice(1, -1)
+  return text
+}
+
+function itemFromPart(
+  part: Record<string, any>,
+  fallbackId: string,
+  role?: FreshAgentTurn['role'],
+): FreshAgentTranscriptItem | undefined {
   const id = typeof part.id === 'string' && part.id.length > 0 ? part.id : fallbackId
   if (part.type === 'text') {
-    return { id, kind: 'text', text: typeof part.text === 'string' ? part.text : '' }
+    const rawText = typeof part.text === 'string' ? part.text : ''
+    const text = role === 'user' ? stripSurroundingQuotes(rawText) : rawText
+    return { id, kind: 'text', text }
   }
   if (part.type === 'reasoning') {
     const text = typeof part.text === 'string' ? part.text : ''
@@ -175,9 +186,10 @@ function collectOpencodePartMetadata(messages: NonNullable<OpencodeExport['messa
 export function normalizeOpencodeTurn(message: NonNullable<OpencodeExport['messages']>[number], ordinal: number): FreshAgentTurn {
   const info = message.info ?? {}
   const id = typeof info.id === 'string' && info.id.length > 0 ? info.id : `message-${ordinal}`
+  const role: FreshAgentTurn['role'] = info.role === 'user' || info.role === 'assistant' || info.role === 'system' || info.role === 'tool' ? info.role : undefined
   const parts = Array.isArray(message.parts) ? message.parts : []
   const items = parts
-    .map((part, index) => itemFromPart(part, `${id}:part-${index}`))
+    .map((part, index) => itemFromPart(part, `${id}:part-${index}`, role))
     .filter((item): item is FreshAgentTranscriptItem => Boolean(item))
   const textSummary = items.find((item) => item.kind === 'text')?.text
   const reasoningSummary = items.find((item) => item.kind === 'reasoning')?.summary?.[0]
@@ -187,7 +199,7 @@ export function normalizeOpencodeTurn(message: NonNullable<OpencodeExport['messa
     messageId: id,
     ordinal,
     source: 'durable',
-    role: info.role === 'user' || info.role === 'assistant' || info.role === 'system' || info.role === 'tool' ? info.role : undefined,
+    role,
     timestamp: typeof info.time?.created === 'number' ? new Date(info.time.created).toISOString() : undefined,
     model: modelFromInfo(info),
     summary: textSummary ?? reasoningSummary ?? '',
