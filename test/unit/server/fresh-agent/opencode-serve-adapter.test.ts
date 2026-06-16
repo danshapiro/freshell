@@ -178,3 +178,38 @@ describe('OpenCode serve adapter: history reads', () => {
     expect(snap.capabilities).toMatchObject({ fork: true, approvals: false, questions: false })
   })
 })
+
+describe('OpenCode serve adapter: control', () => {
+  async function materialized() {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-c', sessionType: 'freshopencode', provider: 'opencode' })
+    await adapter.send?.('freshopencode-req-c', { text: 'go' })
+    return { manager, adapter }
+  }
+
+  it('interrupt calls abort on the real session', async () => {
+    const { manager, adapter } = await materialized()
+    await adapter.interrupt?.('freshopencode-req-c')
+    expect(manager.abort).toHaveBeenCalledWith('ses_real_1')
+  })
+
+  it('compact calls the dedicated compact endpoint', async () => {
+    const { manager, adapter } = await materialized()
+    await adapter.compact?.('freshopencode-req-c')
+    expect(manager.compact).toHaveBeenCalledWith('ses_real_1')
+  })
+
+  it('fork returns the child session id', async () => {
+    const { adapter } = await materialized()
+    await expect(adapter.fork?.('freshopencode-req-c')).resolves.toEqual({
+      sessionId: 'ses_child_1', sessionRef: { provider: 'opencode', sessionId: 'ses_child_1' },
+    })
+  })
+
+  it('shutdown delegates to the serve manager', async () => {
+    const { manager, adapter } = await materialized()
+    await adapter.shutdown?.()
+    expect(manager.shutdown).toHaveBeenCalled()
+  })
+})

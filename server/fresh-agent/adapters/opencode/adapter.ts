@@ -254,8 +254,11 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       const state = requireState(sessionId)
       if (!state.realSessionId) return
       const instructions = input?.instructions
-      const body = instructions !== undefined ? { instructions } : undefined
-      const run = state.sendQueue.then(() => serveManager.compact(state.realSessionId!, body), () => serveManager.compact(state.realSessionId!, body))
+      const hasInstructions = instructions !== undefined
+      const run = state.sendQueue.then(
+        () => (hasInstructions ? serveManager.compact(state.realSessionId!, { instructions }) : serveManager.compact(state.realSessionId!)),
+        () => (hasInstructions ? serveManager.compact(state.realSessionId!, { instructions }) : serveManager.compact(state.realSessionId!)),
+      )
       state.sendQueue = run.catch(() => undefined)
       await run
     },
