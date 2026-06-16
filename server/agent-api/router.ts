@@ -445,6 +445,49 @@ export function createAgentApiRouter({
     return { paneId: raw }
   }
 
+  const AGENT_SESSION_TYPES: Record<string, { sessionType: string; provider: string }> = {
+    opencode: { sessionType: 'freshopencode', provider: 'opencode' },
+    claude: { sessionType: 'freshclaude', provider: 'claude' },
+    codex: { sessionType: 'freshcodex', provider: 'codex' },
+  }
+
+  const createFreshAgentPane = async (
+    res: any,
+    place: (paneContent: any) => { tabId: string; paneId: string } | undefined,
+    broadcast: (info: { tabId: string; paneId: string; paneContent: any }) => void,
+    opts: { agent: string; cwd?: string; model?: string; effort?: string; name?: string },
+  ): Promise<boolean> => {
+    const mapping = AGENT_SESSION_TYPES[opts.agent]
+    if (!mapping) { res.status(400).json(fail(`unknown agent "${opts.agent}"`)); return true }
+    if (!freshAgentRuntimeManager) { res.status(503).json(fail('fresh-agent runtime not available on this server')); return true }
+    const createRequestId = nanoid()
+    const created = await freshAgentRuntimeManager.create({
+      requestId: createRequestId,
+      sessionType: mapping.sessionType,
+      provider: mapping.provider,
+      ...(opts.cwd ? { cwd: opts.cwd } : {}),
+      ...(opts.model ? { model: opts.model } : {}),
+      ...(opts.effort ? { effort: opts.effort } : {}),
+    })
+    const paneContent = {
+      kind: 'fresh-agent',
+      sessionType: mapping.sessionType,
+      provider: mapping.provider,
+      sessionId: created.sessionId,
+      createRequestId,
+      status: 'connected',
+      ...(created.sessionRef ? { sessionRef: created.sessionRef } : {}),
+      ...(opts.cwd ? { initialCwd: opts.cwd } : {}),
+      ...(opts.model ? { model: opts.model } : {}),
+      ...(opts.effort ? { effort: opts.effort } : {}),
+    }
+    const placed = place(paneContent)
+    if (!placed) { res.status(500).json(fail('failed to place fresh-agent pane')); return true }
+    broadcast({ tabId: placed.tabId, paneId: placed.paneId, paneContent })
+    res.json(ok({ tabId: placed.tabId, paneId: placed.paneId, sessionId: created.sessionId, sessionRef: created.sessionRef }, 'fresh-agent pane created'))
+    return true
+  }
+
   const rejectPaneTargetError = (res: any, resolved: { paneId?: string; message?: string }) => {
     if (!resolved?.message || resolved.paneId) return false
     const status = resolved.message.includes('ambiguous') ? 409 : 404
@@ -552,6 +595,21 @@ export function createAgentApiRouter({
   router.post('/tabs', async (req, res) => {
     const { name, mode, shell, cwd, browser, editor, resumeSessionId, permissionMode, model, sandbox } = req.body || {}
     const requestedSessionRef = sanitizeSessionRef(req.body?.sessionRef)
+    if (typeof req.body?.agent === 'string') {
+      const handled = await createFreshAgentPane(
+        res,
+        (paneContent) => {
+          const { tabId, paneId } = layoutStore.createTab({ title: name })
+          layoutStore.attachPaneContent(tabId, paneId, paneContent)
+          return { tabId, paneId }
+        },
+        ({ tabId, paneId, paneContent }) => {
+          wsHandler?.broadcastUiCommand({ command: 'tab.create', payload: { id: tabId, title: name, paneId, paneContent } })
+        },
+        { agent: req.body.agent, cwd, model, name, effort: req.body?.effort },
+      ).catch((err: any) => { res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'Failed to create fresh-agent tab')); return true })
+      if (handled) return
+    }
     const wantsBrowser = !!browser
     const wantsEditor = !!editor
     let launch: ResolvedSpawnProviderSettings | undefined
@@ -1058,6 +1116,22 @@ export function createAgentApiRouter({
       const resolved = resolvePaneTarget(rawPaneId)
       if (rejectPaneTargetError(res, resolved)) return
       const paneId = resolved.paneId || rawPaneId
+      if (typeof req.body?.agent === 'string') {
+        const handled = await createFreshAgentPane(
+          res,
+          (paneContent) => {
+            const result = layoutStore.splitPane({ paneId, direction: req.body?.direction || 'horizontal' })
+            if (!result?.tabId || !result?.newPaneId) return undefined
+            layoutStore.attachPaneContent(result.tabId, result.newPaneId, paneContent)
+            return { tabId: result.tabId, paneId: result.newPaneId }
+          },
+          ({ tabId, paneId: newPaneId, paneContent }) => {
+            wsHandler?.broadcastUiCommand({ command: 'pane.split', payload: { tabId, paneId, direction: req.body?.direction || 'horizontal', newPaneId, newContent: paneContent } })
+          },
+          { agent: req.body.agent, cwd: req.body?.cwd, model: req.body?.model, effort: req.body?.effort },
+        ).catch((err: any) => { res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'Failed to split fresh-agent pane')); return true })
+        if (handled) return
+      }
       const direction = req.body?.direction || 'horizontal'
       const wantsBrowser = !!req.body?.browser
       const wantsEditor = !!req.body?.editor
