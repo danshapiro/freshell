@@ -92,9 +92,11 @@ function stripOpencodeRunArgumentQuoting(text: string): string {
 }
 
 /** OpenCode / Kimi may leak internal reasoning inside `<think>` / `<thinking>` tags.
- * Strip both the tags and their content so it does not render in the transcript. */
-export function stripThinkTags(text: string): string {
-  return text.replace(/<thinking\b[^>]*>[\s\S]*?<\/thinking>/gi, '').replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, '').trim()
+ * Strip both the tags and their content from assistant transcript text.
+ * User input is preserved so legitimate markup the user typed is not lost. */
+function stripThinkTags(text: string): string {
+  const after = text.replace(/<thinking\b[^>]*>[\s\S]*?<\/thinking>/gi, '').replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, '')
+  return after.length === text.length ? text : after.trim()
 }
 
 function itemFromPart(
@@ -105,12 +107,12 @@ function itemFromPart(
   const id = typeof part.id === 'string' && part.id.length > 0 ? part.id : fallbackId
   if (part.type === 'text') {
     const rawText = typeof part.text === 'string' ? part.text : ''
-    const stripped = stripThinkTags(rawText)
+    const stripped = role === 'user' ? rawText : stripThinkTags(rawText)
     const text = role === 'user' ? stripOpencodeRunArgumentQuoting(stripped) : stripped
     return { id, kind: 'text', text }
   }
   if (part.type === 'reasoning') {
-    const text = stripThinkTags(typeof part.text === 'string' ? part.text : '')
+    const text = typeof part.text === 'string' ? part.text : ''
     return { id, kind: 'reasoning', summary: text ? [text] : [], content: text ? [text] : [], text }
   }
   if (part.type === 'tool') {
