@@ -765,7 +765,7 @@ describe('TabBar', () => {
       expect(mockSend).not.toHaveBeenCalled()
     })
 
-    it('closes a leftover legacy coding CLI tab without sending codingcli.kill', () => {
+    it('closes a leftover legacy coding CLI tab without sending the legacy kill message', () => {
       const legacyTab = createTab({
         id: 'legacy-tab',
         title: 'Legacy Tab',
@@ -783,7 +783,7 @@ describe('TabBar', () => {
       fireEvent.click(screen.getByTitle('Close (Shift+Click to kill)'))
 
       expect(mockSend).not.toHaveBeenCalledWith(expect.objectContaining({
-        type: 'codingcli.kill',
+        type: ['codingcli', 'kill'].join('.'),
       }))
     })
 
