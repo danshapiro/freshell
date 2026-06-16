@@ -132,7 +132,9 @@ npm run test:vitest -- ...  # Repo-owned direct Vitest path for focused passthro
 
 **Pane System:** Tabs contain pane layouts (tree structure of splits). Each pane owns its terminal lifecycle via `createRequestId` and `terminalId`. When splitting panes, each new pane gets its own `createRequestId`, ensuring independent backend terminals. Pane content types: `terminal` (with mode, shell, status) and `browser` (with URL, devtools state).
 
-**Agent Status Indicators:** Blue/busy status is derived from provider activity slices through `resolvePaneActivity`; green/needs-attention and the idle sound flow through `recordTurnComplete` and `useTurnCompletionNotifications`. Terminal Codex turn-complete is server-authoritative via `terminal.turn.complete`, matching Claude and OpenCode. Gemini and Kimi terminal modes are status-inert until their CLIs expose a reliable turn-complete signal.
+**Agent Status Indicators:** Blue/busy status is derived from provider activity slices through `resolvePaneActivity`; green/needs-attention and the idle sound flow through `recordTurnComplete` and `useTurnCompletionNotifications`. Terminal Codex turn-complete is server-authoritative via `terminal.turn.complete`, matching Claude and OpenCode. `freshopencode` runs on a shared long-lived `opencode serve` sidecar and uses server-pushed `session.idle`/`session.status` events to drive busy/green (no longer derived from subprocess closure). Gemini and Kimi terminal modes are status-inert until their CLIs expose a reliable turn-complete signal.
+
+**Fresh-Agent Orchestration:** The REST agent API (`/api/tabs`, `/api/panes/:id/split`, `/api/panes/:id/send-keys`, `/api/panes/:id/capture`, `/api/panes/:id/wait-for`) and the MCP `freshell` tool accept `agent`/`model`/`effort` parameters to create and drive fresh-agent panes (e.g. `agent=opencode`). The orchestration layer dispatches to the registered `FreshAgentRuntimeManager`, so the same external surface works for any fresh-agent provider.
 
 ### Data Flow
 
