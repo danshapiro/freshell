@@ -79,10 +79,37 @@ function normalizePatchChanges(files: unknown): Record<string, unknown>[] {
     .filter((value): value is Record<string, unknown> => Boolean(value))
 }
 
-function itemFromPart(part: Record<string, any>, fallbackId: string): FreshAgentTranscriptItem | undefined {
+/**
+ * The OpenCode `run` subcommand stores a single positional prompt that
+ * contains spaces by wrapping it in literal double quotes. Other input paths
+ * (interactive composer, API-level sends, ACP) store the text as-is. We can
+ * therefore remove one outer pair of double quotes deterministically for user
+ * text turns without touching assistant text or legitimate inline quoting.
+ */
+function stripOpencodeRunArgumentQuoting(text: string): string {
+  if (text.length >= 2 && text.startsWith('"') && text.endsWith('"')) return text.slice(1, -1)
+  return text
+}
+
+/** OpenCode / Kimi may leak internal reasoning inside `<think>` / `<thinking>` tags.
+ * Strip both the tags and their content from assistant transcript text.
+ * User input is preserved so legitimate markup the user typed is not lost. */
+function stripThinkTags(text: string): string {
+  const after = text.replace(/<thinking\b[^>]*>[\s\S]*?<\/thinking>/gi, '').replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, '')
+  return after.length === text.length ? text : after.trim()
+}
+
+function itemFromPart(
+  part: Record<string, any>,
+  fallbackId: string,
+  role?: FreshAgentTurn['role'],
+): FreshAgentTranscriptItem | undefined {
   const id = typeof part.id === 'string' && part.id.length > 0 ? part.id : fallbackId
   if (part.type === 'text') {
-    return { id, kind: 'text', text: typeof part.text === 'string' ? part.text : '' }
+    const rawText = typeof part.text === 'string' ? part.text : ''
+    const stripped = role === 'user' ? rawText : stripThinkTags(rawText)
+    const text = role === 'user' ? stripOpencodeRunArgumentQuoting(stripped) : stripped
+    return { id, kind: 'text', text }
   }
   if (part.type === 'reasoning') {
     const text = typeof part.text === 'string' ? part.text : ''
@@ -175,9 +202,10 @@ function collectOpencodePartMetadata(messages: NonNullable<OpencodeExport['messa
 export function normalizeOpencodeTurn(message: NonNullable<OpencodeExport['messages']>[number], ordinal: number): FreshAgentTurn {
   const info = message.info ?? {}
   const id = typeof info.id === 'string' && info.id.length > 0 ? info.id : `message-${ordinal}`
+  const role: FreshAgentTurn['role'] = info.role === 'user' || info.role === 'assistant' || info.role === 'system' || info.role === 'tool' ? info.role : undefined
   const parts = Array.isArray(message.parts) ? message.parts : []
   const items = parts
-    .map((part, index) => itemFromPart(part, `${id}:part-${index}`))
+    .map((part, index) => itemFromPart(part, `${id}:part-${index}`, role))
     .filter((item): item is FreshAgentTranscriptItem => Boolean(item))
   const textSummary = items.find((item) => item.kind === 'text')?.text
   const reasoningSummary = items.find((item) => item.kind === 'reasoning')?.summary?.[0]
@@ -187,7 +215,7 @@ export function normalizeOpencodeTurn(message: NonNullable<OpencodeExport['messa
     messageId: id,
     ordinal,
     source: 'durable',
-    role: info.role === 'user' || info.role === 'assistant' || info.role === 'system' || info.role === 'tool' ? info.role : undefined,
+    role,
     timestamp: typeof info.time?.created === 'number' ? new Date(info.time.created).toISOString() : undefined,
     model: modelFromInfo(info),
     summary: textSummary ?? reasoningSummary ?? '',
@@ -223,7 +251,7 @@ export function normalizeOpencodeSnapshot(input: {
       interrupt: true,
       approvals: false,
       questions: false,
-      fork: false,
+      fork: true,
       worktrees: false,
       diffs: true,
       childThreads: false,

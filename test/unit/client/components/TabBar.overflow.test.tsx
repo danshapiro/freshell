@@ -4,7 +4,6 @@ import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import TabBar from '@/components/TabBar'
 import tabsReducer from '@/store/tabsSlice'
-import codingCliReducer from '@/store/codingCliSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
@@ -57,14 +56,12 @@ function createStore(initialState: { tabs: Tab[]; activeTabId: string | null }) 
   return configureStore({
     reducer: {
       tabs: tabsReducer,
-      codingCli: codingCliReducer,
       panes: panesReducer,
       settings: settingsReducer,
       turnCompletion: turnCompletionReducer,
     },
     preloadedState: {
       tabs: { tabs: initialState.tabs, activeTabId: initialState.activeTabId, renameRequestTabId: null },
-      codingCli: { sessions: {}, pendingRequests: {} },
       panes: { layouts: {}, activePane: {}, paneTitles: {} },
       settings: { settings: defaultSettings, loaded: true },
       turnCompletion: { seq: 0, pendingEvents: [], attentionByTab: {} },

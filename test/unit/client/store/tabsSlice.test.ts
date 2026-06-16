@@ -767,7 +767,7 @@ describe('tabsSlice', () => {
       const state = store.getState()
       const tab = state.tabs.tabs.find((candidate) => candidate.title === 'Existing Codex session')
       expect(tab).toBeTruthy()
-      expect(tab?.codingCliSessionId).toBeUndefined()
+      expect((tab as any)?.codingCliSessionId).toBeUndefined()
       expect(tab?.sessionRef).toEqual({ provider: 'codex', sessionId: 'thread-durable-1' })
 
       const layout = state.panes.layouts[tab!.id]

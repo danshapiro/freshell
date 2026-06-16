@@ -15,6 +15,7 @@ import {
 import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../coding-cli/codex-app-server/restore-decision.js'
 import { makeSessionKey } from '../coding-cli/types.js'
 import { terminalIdFromCreateError, UnknownTerminalModeError, type ProviderSettings, type TerminalInputResult } from '../terminal-registry.js'
+import { buildSessionIdentityMismatchDetails, terminalMatchesExpectedSession } from '../terminal-session-identity.js'
 import { MAX_TERMINAL_TITLE_OVERRIDE_LENGTH } from '../terminals-router.js'
 import { logger } from '../logger.js'
 import { ok, approx, fail } from './response.js'
@@ -22,6 +23,20 @@ import { renderCapture } from './capture.js'
 import { waitForMatch } from './wait-for.js'
 import { resolveScreenshotOutputPath } from './screenshot-path.js'
 import { sanitizeSessionRef } from '../../shared/session-contract.js'
+import type { LayoutStore } from './layout-store.js'
+import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '../../shared/fresh-agent.js'
+import type {
+  FreshAgentSessionLocator,
+  FreshAgentThreadLocator,
+} from '../fresh-agent/runtime-adapter.js'
+import {
+  FreshAgentContractValidationError,
+  FreshAgentLostSessionError,
+  FreshAgentRuntimeUnavailableError,
+  FreshAgentSessionLocatorMismatchError,
+  FreshAgentStaleThreadRevisionError,
+  FreshAgentUnsupportedCapabilityError,
+} from '../fresh-agent/runtime-manager.js'
 
 const truthy = (value: unknown) => value === true || value === 'true' || value === '1' || value === 'yes'
 const SYNCABLE_TERMINAL_MODES = new Set(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
@@ -36,15 +51,52 @@ class AgentRouteInputError extends Error {
 }
 
 function agentRouteErrorStatus(error: unknown): number {
-  return error instanceof CodexLaunchConfigError
+  if (error instanceof CodexLaunchConfigError
     || error instanceof AgentRouteInputError
-    || error instanceof UnknownTerminalModeError
-    ? 400
-    : 500
+    || error instanceof UnknownTerminalModeError) {
+    return 400
+  }
+  if (error instanceof FreshAgentLostSessionError) return 404
+  if (error instanceof FreshAgentUnsupportedCapabilityError
+    || error instanceof FreshAgentSessionLocatorMismatchError
+    || error instanceof FreshAgentStaleThreadRevisionError) {
+    return 409
+  }
+  if (error instanceof FreshAgentRuntimeUnavailableError) return 503
+  if (error instanceof FreshAgentContractValidationError) return 502
+  return 500
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function freshAgentErrorStatus(error: unknown): number {
+  if (error instanceof FreshAgentLostSessionError) return 404
+  if (error instanceof FreshAgentUnsupportedCapabilityError
+    || error instanceof FreshAgentSessionLocatorMismatchError
+    || error instanceof FreshAgentStaleThreadRevisionError) {
+    return 409
+  }
+  if (error instanceof FreshAgentRuntimeUnavailableError) return 503
+  if (error instanceof FreshAgentContractValidationError) return 502
+  return 500
+}
+
+const FRESH_AGENT_SEND_IDLE_TIMEOUT_MS = 600_000
+
+async function waitForFreshAgentIdle(
+  runtimeManager: NonNullable<FreshAgentRuntimeManagerLike>,
+  locator: { sessionType: string; provider: string; threadId: string },
+  deadline: number,
+): Promise<{ status: string; deadlineMissed: boolean }> {
+  while (Date.now() < deadline) {
+    const snap = await runtimeManager.getSnapshot(locator as FreshAgentThreadLocator)
+    const status = snap?.status
+    if (status === 'idle') return { status, deadlineMissed: false }
+    await new Promise((r) => setTimeout(r, 200))
+  }
+  return { status: 'unknown', deadlineMissed: true }
 }
 
 function combineWithCleanupError(primary: unknown, cleanupError: unknown): Error {
@@ -189,7 +241,44 @@ function assertCodexCreateTerminalRunning(terminal: { status?: unknown }): void 
   }
 }
 
+function formatSessionRef(sessionRef: ReturnType<typeof sanitizeSessionRef> | undefined): string {
+  if (!sessionRef) return 'unknown session'
+  return `${sessionRef.provider}:${sessionRef.sessionId}`
+}
+
+function sessionIdentityMismatchMessage(
+  expectedSessionRef: ReturnType<typeof sanitizeSessionRef> | undefined,
+  actualSessionRef: ReturnType<typeof sanitizeSessionRef> | undefined,
+): string {
+  const expected = formatSessionRef(expectedSessionRef)
+  if (!actualSessionRef) {
+    return `Terminal session identity mismatch. Expected ${expected}, but the target terminal could not prove that identity.`
+  }
+  return `Terminal session identity mismatch. Expected ${expected}, got ${formatSessionRef(actualSessionRef)}.`
+}
+
+function paneCanonicalSessionRef(
+  layoutStore: any,
+  paneId: string,
+): ReturnType<typeof sanitizeSessionRef> {
+  return sanitizeSessionRef(layoutStore.getPaneSnapshot?.(paneId)?.paneContent?.sessionRef)
+}
+
+function expectedPaneSessionRefForTerminal(
+  layoutStore: any,
+  paneId: string,
+  terminalMode: unknown,
+  requestedSessionRef: ReturnType<typeof sanitizeSessionRef>,
+): ReturnType<typeof sanitizeSessionRef> {
+  const paneSessionRef = paneCanonicalSessionRef(layoutStore, paneId)
+  if (paneSessionRef) return paneSessionRef
+  return acceptedSessionRefForMode(requestedSessionRef, typeof terminalMode === 'string' ? terminalMode : '')
+}
+
 function terminalInputFailureMessage(result: Exclude<TerminalInputResult, { status: 'written' }>): string {
+  if (result.status === 'session_identity_mismatch') {
+    return sessionIdentityMismatchMessage(result.expectedSessionRef, result.actualSessionRef)
+  }
   if (result.status === 'blocked_codex_identity_pending') {
     return 'Codex restore identity is not ready yet.'
   }
@@ -211,12 +300,35 @@ function terminalInputFailureMessage(result: Exclude<TerminalInputResult, { stat
   return 'Terminal is not running.'
 }
 
+function renderFreshAgentTranscript(snapshot: any): string {
+  const turns = Array.isArray(snapshot?.turns) ? snapshot.turns : []
+  return turns.map((turn: any) => {
+    const role = typeof turn?.role === 'string' ? turn.role : 'turn'
+    const items = Array.isArray(turn?.items) ? turn.items : []
+    const text = items
+      .map((item: any) => {
+        if (item?.kind === 'text' && typeof item.text === 'string') return item.text
+        if (item?.kind === 'reasoning' && typeof item.text === 'string') return `[reasoning] ${item.text}`
+        if (item?.kind === 'dynamic_tool') return `[tool:${item.tool ?? 'tool'} ${item.status ?? ''}]`
+        return ''
+      })
+      .filter(Boolean)
+      .join('\n')
+    return `${role}: ${text || (typeof turn?.summary === 'string' ? turn.summary : '')}`.trim()
+  }).join('\n\n')
+}
+
 function shouldWaitForCodexIdentity(payload: Record<string, unknown>): boolean {
   return truthy(payload.waitForCodexIdentity)
 }
 
 function registrySupportsEvents(registry: any): registry is {
   input: (terminalId: string, data: string) => TerminalInputResult
+  inputIfSessionMatches?: (
+    terminalId: string,
+    data: string,
+    expectedSessionRef?: ReturnType<typeof sanitizeSessionRef>,
+  ) => TerminalInputResult
   on: (event: string, handler: (...args: any[]) => void) => void
   off: (event: string, handler: (...args: any[]) => void) => void
 } {
@@ -227,9 +339,17 @@ async function sendTerminalInput(
   registry: any,
   terminalId: string,
   data: string,
-  options: { waitForCodexIdentity?: boolean } = {},
+  options: {
+    expectedSessionRef?: ReturnType<typeof sanitizeSessionRef>
+    waitForCodexIdentity?: boolean
+  } = {},
 ): Promise<TerminalInputResult> {
-  const first = registry.input(terminalId, data) as TerminalInputResult
+  const send = () => (
+    typeof registry.inputIfSessionMatches === 'function'
+      ? registry.inputIfSessionMatches(terminalId, data, options.expectedSessionRef)
+      : registry.input(terminalId, data)
+  ) as TerminalInputResult
+  const first = send()
   if (first.status !== 'blocked_codex_identity_pending' || !options.waitForCodexIdentity) {
     return first
   }
@@ -252,7 +372,7 @@ async function sendTerminalInput(
     }
     const retry = () => {
       if (settled) return
-      const next = registry.input(terminalId, data) as TerminalInputResult
+      const next = send()
       if (next.status === 'blocked_codex_identity_pending') return
       finish(next)
     }
@@ -318,6 +438,13 @@ type CodexPromptBlocker = {
   isPromptBlocked: (terminalId: string, at: number) => boolean
 }
 
+type FreshAgentRuntimeManagerLike = {
+  create: (input: any) => Promise<{ sessionId: string; sessionType: FreshAgentSessionType; runtimeProvider: FreshAgentRuntimeProvider; sessionRef?: { provider: string; sessionId: string } }>
+  send: (locator: FreshAgentSessionLocator, input: { text: string; settings?: any }) => Promise<{ sessionId?: string; sessionRef?: { provider: string; sessionId: string } } | void>
+  attach: (locator: FreshAgentSessionLocator) => Promise<{ sessionId: string; sessionRef?: { provider: string; sessionId: string } }>
+  getSnapshot: (input: FreshAgentThreadLocator) => Promise<any>
+}
+
 const parseRegex = (raw: string) => {
   if (raw.startsWith('/') && raw.lastIndexOf('/') > 0) {
     const last = raw.lastIndexOf('/')
@@ -354,6 +481,7 @@ export function createAgentApiRouter({
   codexActivityTracker,
   codexLaunchPlanner,
   assertTerminalCreateAccepted,
+  freshAgentRuntimeManager,
 }: {
   layoutStore: any
   registry: any
@@ -364,6 +492,7 @@ export function createAgentApiRouter({
   codexActivityTracker?: CodexPromptBlocker
   codexLaunchPlanner?: CodexLaunchPlanner
   assertTerminalCreateAccepted?: () => void
+  freshAgentRuntimeManager?: FreshAgentRuntimeManagerLike
 }) {
   const router = Router()
   const assertTerminalAdmission = () => {
@@ -378,6 +507,57 @@ export function createAgentApiRouter({
       }
     }
     return { paneId: raw }
+  }
+
+  const AGENT_SESSION_TYPES: Record<string, { sessionType: string; provider: string }> = {
+    opencode: { sessionType: 'freshopencode', provider: 'opencode' },
+    claude: { sessionType: 'freshclaude', provider: 'claude' },
+    codex: { sessionType: 'freshcodex', provider: 'codex' },
+  }
+
+  const createFreshAgentPane = async (
+    res: any,
+    allocate: () => { tabId: string; paneId: string } | undefined,
+    rollback: (allocation: { tabId: string; paneId: string }) => void,
+    broadcast: (info: { tabId: string; paneId: string; paneContent: any }) => void,
+    opts: { agent: string; cwd?: string; model?: string; effort?: string; name?: string },
+  ): Promise<boolean> => {
+    const mapping = AGENT_SESSION_TYPES[opts.agent]
+    if (!mapping) { res.status(400).json(fail(`unknown agent "${opts.agent}"`)); return true }
+    if (!freshAgentRuntimeManager) { res.status(503).json(fail('fresh-agent runtime not available on this server')); return true }
+    const allocation = allocate()
+    if (!allocation) { res.status(500).json(fail('failed to allocate fresh-agent pane')); return true }
+    const createRequestId = nanoid()
+    let created: Awaited<ReturnType<FreshAgentRuntimeManagerLike['create']>> | undefined
+    try {
+      created = await freshAgentRuntimeManager.create({
+        requestId: createRequestId,
+        sessionType: mapping.sessionType,
+        provider: mapping.provider,
+        ...(opts.cwd ? { cwd: opts.cwd } : {}),
+        ...(opts.model ? { model: opts.model } : {}),
+        ...(opts.effort ? { effort: opts.effort } : {}),
+      })
+    } catch (err: any) {
+      rollback(allocation)
+      throw err
+    }
+    const paneContent = {
+      kind: 'fresh-agent',
+      sessionType: mapping.sessionType,
+      provider: mapping.provider,
+      sessionId: created.sessionId,
+      createRequestId,
+      status: 'connected',
+      ...(created.sessionRef ? { sessionRef: created.sessionRef } : {}),
+      ...(opts.cwd ? { initialCwd: opts.cwd } : {}),
+      ...(opts.model ? { model: opts.model } : {}),
+      ...(opts.effort ? { effort: opts.effort } : {}),
+    }
+    layoutStore.attachPaneContent(allocation.tabId, allocation.paneId, paneContent)
+    broadcast({ tabId: allocation.tabId, paneId: allocation.paneId, paneContent })
+    res.json(ok({ tabId: allocation.tabId, paneId: allocation.paneId, sessionId: created.sessionId, sessionRef: created.sessionRef }, 'fresh-agent pane created'))
+    return true
   }
 
   const rejectPaneTargetError = (res: any, resolved: { paneId?: string; message?: string }) => {
@@ -487,6 +667,18 @@ export function createAgentApiRouter({
   router.post('/tabs', async (req, res) => {
     const { name, mode, shell, cwd, browser, editor, resumeSessionId, permissionMode, model, sandbox } = req.body || {}
     const requestedSessionRef = sanitizeSessionRef(req.body?.sessionRef)
+    if (typeof req.body?.agent === 'string') {
+      const handled = await createFreshAgentPane(
+        res,
+        () => layoutStore.createTab({ title: name }),
+        ({ tabId }) => { layoutStore.closeTab?.(tabId) },
+        ({ tabId, paneId, paneContent }) => {
+          wsHandler?.broadcastUiCommand({ command: 'tab.create', payload: { id: tabId, title: name, paneId, paneContent } })
+        },
+        { agent: req.body.agent, cwd, model, name, effort: req.body?.effort },
+      ).catch((err: any) => { res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'Failed to create fresh-agent tab')); return true })
+      if (handled) return
+    }
     const wantsBrowser = !!browser
     const wantsEditor = !!editor
     let launch: ResolvedSpawnProviderSettings | undefined
@@ -681,12 +873,22 @@ export function createAgentApiRouter({
     res.json(ok({ panes }))
   })
 
-  router.get('/panes/:id/capture', (req, res) => {
+  router.get('/panes/:id/capture', async (req, res) => {
     const rawTarget = req.params.id
     const resolved = resolvePaneTarget(rawTarget)
     if (rejectPaneTargetError(res, resolved)) return
     const paneId = resolved.paneId || rawTarget
     const paneSnapshot = layoutStore.getPaneSnapshot?.(paneId)
+    if (paneSnapshot?.kind === 'fresh-agent') {
+      const c = paneSnapshot.paneContent || {}
+      if (!freshAgentRuntimeManager) return res.status(503).json(fail('fresh-agent runtime not available on this server'))
+      try {
+        const snapshot = await freshAgentRuntimeManager.getSnapshot({ sessionType: c.sessionType, provider: c.provider, threadId: c.sessionId })
+        return res.type('text/plain').send(renderFreshAgentTranscript(snapshot))
+      } catch (err: any) {
+        return res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'fresh-agent capture failed'))
+      }
+    }
     let terminalId = paneSnapshot?.terminalId || layoutStore.resolvePaneToTerminal?.(paneId)
     const term = terminalId ? registry.get?.(terminalId) : undefined
 
@@ -725,6 +927,28 @@ export function createAgentApiRouter({
     const resolved = resolvePaneTarget(req.params.id)
     if (rejectPaneTargetError(res, resolved)) return
     const paneId = resolved.paneId || req.params.id
+
+    const faSnap = layoutStore.getPaneSnapshot?.(paneId)
+    if (faSnap?.kind === 'fresh-agent') {
+      const c = faSnap.paneContent || {}
+      if (!freshAgentRuntimeManager) return res.status(503).json(fail('fresh-agent runtime not available on this server'))
+      const rawT = req.query.T || req.query.timeout
+      const tSec = typeof rawT === 'string' ? Number(rawT) : Number.NaN
+      const deadline = Date.now() + (Number.isFinite(tSec) ? tSec * 1000 : 30000)
+      while (true) {
+        let status: string | undefined
+        try {
+          const snap = await freshAgentRuntimeManager.getSnapshot({ sessionType: c.sessionType, provider: c.provider, threadId: c.sessionId })
+          status = snap?.status
+        } catch (err) {
+          return res.status(freshAgentErrorStatus(err)).json(fail(errorMessage(err)))
+        }
+        if (status === 'idle') return res.json(ok({ matched: true, reason: 'idle' }, 'session idle'))
+        if (Date.now() >= deadline) return res.json(approx({ matched: false }, 'timeout'))
+        await new Promise((r) => setTimeout(r, 200))
+      }
+    }
+
     let terminalId = layoutStore.resolvePaneToTerminal?.(paneId)
     const term = terminalId ? registry.get?.(terminalId) : undefined
     if (!term) return res.status(404).json(fail('terminal not found'))
@@ -993,6 +1217,34 @@ export function createAgentApiRouter({
       const resolved = resolvePaneTarget(rawPaneId)
       if (rejectPaneTargetError(res, resolved)) return
       const paneId = resolved.paneId || rawPaneId
+      if (typeof req.body?.agent === 'string') {
+        const direction: 'horizontal' | 'vertical' = req.body?.direction || 'horizontal'
+        let snapshotBefore: ReturnType<LayoutStore['getNormalizedSnapshot']> | undefined
+        const handled = await createFreshAgentPane(
+          res,
+          () => {
+            snapshotBefore = layoutStore.getNormalizedSnapshot()
+            const result = layoutStore.splitPane({ paneId, direction })
+            if (!result?.tabId || !result?.newPaneId) {
+              snapshotBefore = undefined
+              return undefined
+            }
+            return { tabId: result.tabId, paneId: result.newPaneId }
+          },
+          () => {
+            if (snapshotBefore) {
+              layoutStore.updateFromUi(snapshotBefore, 'fresh-agent-split-rollback')
+            } else if (typeof layoutStore.closePane === 'function') {
+              try { layoutStore.closePane(paneId) } catch { /* ignore */ }
+            }
+          },
+          ({ tabId, paneId: newPaneId, paneContent }) => {
+            wsHandler?.broadcastUiCommand({ command: 'pane.split', payload: { tabId, paneId, direction, newPaneId, newContent: paneContent } })
+          },
+          { agent: req.body.agent, cwd: req.body?.cwd, model: req.body?.model, effort: req.body?.effort },
+        ).catch((err: any) => { res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'Failed to split fresh-agent pane')); return true })
+        if (handled) return
+      }
       const direction = req.body?.direction || 'horizontal'
       const wantsBrowser = !!req.body?.browser
       const wantsEditor = !!req.body?.editor
@@ -1336,6 +1588,17 @@ export function createAgentApiRouter({
     const tabId = target?.tabId
     if (!tabId) return res.status(404).json(fail('pane not found'))
     const attachedTerminal = registry.get?.(terminalId)
+    const requestedSessionRef = sanitizeSessionRef(req.body?.sessionRef)
+    const expectedSessionRef = expectedPaneSessionRefForTerminal(
+      layoutStore,
+      paneId,
+      attachedTerminal?.mode ?? req.body?.mode,
+      requestedSessionRef,
+    )
+    if (attachedTerminal && expectedSessionRef && !terminalMatchesExpectedSession(attachedTerminal, expectedSessionRef)) {
+      const { actualSessionRef } = buildSessionIdentityMismatchDetails(attachedTerminal, expectedSessionRef)
+      return res.status(409).json(fail(sessionIdentityMismatchMessage(expectedSessionRef, actualSessionRef)))
+    }
     const content = {
       kind: 'terminal',
       terminalId,
@@ -1343,6 +1606,7 @@ export function createAgentApiRouter({
       mode: req.body?.mode || attachedTerminal?.mode || 'shell',
       shell: req.body?.shell || attachedTerminal?.shell || 'system',
       createRequestId: nanoid(),
+      ...(expectedSessionRef ? { sessionRef: expectedSessionRef } : {}),
     }
     layoutStore.attachPaneContent(tabId, paneId, content)
     wsHandler?.broadcastUiCommand({ command: 'pane.attach', payload: { tabId, paneId, content } })
@@ -1368,15 +1632,82 @@ export function createAgentApiRouter({
     const resolved = resolvePaneTarget(req.params.id)
     if (rejectPaneTargetError(res, resolved)) return
     const paneId = resolved.paneId || req.params.id
+    const faSnapshot = layoutStore.getPaneSnapshot?.(paneId)
+    if (faSnapshot?.kind === 'fresh-agent') {
+      const c = faSnapshot.paneContent || {}
+      const text = String(req.body?.data ?? req.body?.keys ?? req.body?.text ?? '')
+      if (!text) return res.status(400).json(fail('text is required'))
+      if (!freshAgentRuntimeManager) return res.status(503).json(fail('fresh-agent runtime not available on this server'))
+      const locator = { sessionId: c.sessionId as string, sessionType: c.sessionType as string, provider: c.provider as string } as FreshAgentSessionLocator
+      const runSend = () => freshAgentRuntimeManager.send(locator, { text })
+      const snapshotLocator = { sessionType: c.sessionType as string, provider: c.provider as string, threadId: c.sessionId as string }
+      try {
+        let result
+        try {
+          result = await runSend()
+        } catch (err: any) {
+          if (err?.name === 'FreshAgentLostSessionError' && freshAgentRuntimeManager.attach) {
+            await freshAgentRuntimeManager.attach(locator)
+            result = await runSend()
+          } else {
+            throw err
+          }
+        }
+
+        // Block until the turn completes. OpenCode's send already awaits idle;
+        // Claude/Codex return when the turn starts, so we poll until idle.
+        const rawTimeout = req.body?.timeout
+        const timeoutSec = typeof rawTimeout === 'number' && Number.isFinite(rawTimeout) ? rawTimeout : (typeof rawTimeout === 'string' ? Number(rawTimeout) : Number.NaN)
+        const deadline = Date.now() + (Number.isFinite(timeoutSec) ? timeoutSec * 1000 : FRESH_AGENT_SEND_IDLE_TIMEOUT_MS)
+        const idle = await waitForFreshAgentIdle(freshAgentRuntimeManager, snapshotLocator, deadline)
+        if (idle.deadlineMissed) {
+          return res.json(approx({ paneId, sessionId: result?.sessionId ?? locator.sessionId, sessionRef: result?.sessionRef, status: idle.status }, 'prompt sent; turn did not complete within deadline'))
+        }
+
+        const finalSessionId = result?.sessionId ?? locator.sessionId
+        const finalSessionRef = result?.sessionRef
+
+        // Persist a materialized durable session back into the pane so reloads
+        // don't fall back to fragile legacy resolution.
+        if (finalSessionRef && finalSessionId !== locator.sessionId && faSnapshot.tabId) {
+          const updatedContent = { ...c, sessionId: finalSessionId, sessionRef: finalSessionRef, resumeSessionId: finalSessionId }
+          layoutStore.attachPaneContent(faSnapshot.tabId, paneId, updatedContent)
+          wsHandler?.broadcast?.({
+            type: 'freshAgent.session.materialized',
+            tabId: faSnapshot.tabId,
+            paneId,
+            sessionType: c.sessionType,
+            provider: c.provider,
+            previousSessionId: locator.sessionId,
+            sessionId: finalSessionId,
+            sessionRef: finalSessionRef,
+          })
+        }
+
+        return res.json(ok({ paneId, sessionId: finalSessionId, sessionRef: finalSessionRef, status: idle.status }, 'prompt sent'))
+      } catch (err: any) {
+        return res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'fresh-agent send failed'))
+      }
+    }
     const payload = req.body || {}
     const data = payload.data ?? payload.keys ?? payload.text ?? ''
-    let terminalId = layoutStore.resolvePaneToTerminal?.(paneId)
+    const paneSnapshot = layoutStore.getPaneSnapshot?.(paneId)
+    let terminalId = paneSnapshot?.terminalId || layoutStore.resolvePaneToTerminal?.(paneId)
     if (!terminalId && layoutStore.resolveTarget) {
       const target = layoutStore.resolveTarget(paneId)
       if (target?.paneId) terminalId = layoutStore.resolvePaneToTerminal?.(target.paneId)
     }
     if (!terminalId) return res.status(404).json(fail('terminal not found'))
+    const terminal = registry.get?.(terminalId)
+    const requestedSessionRef = sanitizeSessionRef(payload.sessionRef)
+    const expectedSessionRef = expectedPaneSessionRefForTerminal(
+      layoutStore,
+      paneId,
+      terminal?.mode ?? paneSnapshot?.paneContent?.mode,
+      requestedSessionRef,
+    )
     const inputResult = await sendTerminalInput(registry, terminalId, data, {
+      expectedSessionRef,
       waitForCodexIdentity: shouldWaitForCodexIdentity(payload),
     })
     if (inputResult.status !== 'written') {

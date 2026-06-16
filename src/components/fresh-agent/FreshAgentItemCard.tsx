@@ -234,7 +234,7 @@ function renderText(text: string, markdown = false) {
   return (
     <div
       data-markdown-body=""
-      className="prose prose-sm dark:prose-invert max-w-none [&_h1]:my-2 [&_h2]:my-1.5 [&_h3]:my-1.5 [&_p]:my-1 [&_pre]:my-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5"
+      className="prose prose-sm dark:prose-invert max-w-none [&_h1]:my-2 [&_h2]:my-1.5 [&_h3]:my-1.5 [&_p]:my-1 [&_pre]:my-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_code]:before:!content-none [&_code]:after:!content-none"
     >
       <LazyMarkdown content={visibleText} fallback={plain} />
     </div>

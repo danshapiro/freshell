@@ -22,6 +22,7 @@ export const ErrorCode = z.enum([
   'INVALID_MESSAGE',
   'UNKNOWN_MESSAGE',
   'INVALID_TERMINAL_ID',
+  'SESSION_IDENTITY_MISMATCH',
   'INVALID_SESSION_ID',
   'RESTORE_UNAVAILABLE',
   'INVALID_CREATE_REQUEST',
@@ -294,6 +295,7 @@ export const TerminalAttachPrioritySchema = z.enum([
 export const TerminalAttachSchema = z.object({
   type: z.literal('terminal.attach'),
   terminalId: z.string().min(1),
+  expectedSessionRef: SessionLocatorSchema.optional(),
   sinceSeq: z.number().int().nonnegative().optional(),
   maxReplayBytes: z.number().int().positive().optional(),
   attachRequestId: z.string().min(1).optional(),
@@ -311,12 +313,14 @@ export const TerminalDetachSchema = z.object({
 export const TerminalInputSchema = z.object({
   type: z.literal('terminal.input'),
   terminalId: z.string().min(1),
+  expectedSessionRef: SessionLocatorSchema.optional(),
   data: z.string(),
 })
 
 export const TerminalResizeSchema = z.object({
   type: z.literal('terminal.resize'),
   terminalId: z.string().min(1),
+  expectedSessionRef: SessionLocatorSchema.optional(),
   cols: z.number().int().min(2).max(1000),
   rows: z.number().int().min(2).max(500),
 })
@@ -563,6 +567,8 @@ export type ErrorMessage = {
   message: string
   requestId?: string
   terminalId?: string
+  expectedSessionRef?: SessionLocator
+  actualSessionRef?: SessionLocator
   timestamp: string
 }
 

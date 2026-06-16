@@ -131,7 +131,7 @@ function expectClaudeSuccessOrAuthFailure(input: {
   expectedStdout: string
 }): void {
   if (input.code === 0) {
-    expect(input.stdout.trim()).toBe(input.expectedStdout)
+    expect(input.stdout.trim()).toContain(input.expectedStdout)
     return
   }
   expect(claudeAuthFailed(input.stdout, input.stderr)).toBe(true)

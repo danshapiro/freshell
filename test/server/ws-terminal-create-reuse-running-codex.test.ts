@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { EventEmitter } from 'node:events'
 import WebSocket from 'ws'
+import { CODEX_DURABILITY_SCHEMA_VERSION } from '../../shared/codex-durability.js'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
 import { WsHandler } from '../../server/ws-handler'
 import { FakeCodexLaunchPlanner, DEFAULT_CODEX_REMOTE_WS_URL } from '../helpers/coding-cli/fake-codex-launch-planner.js'
@@ -295,6 +296,11 @@ class FakeRegistry extends EventEmitter {
       cols: 80,
       rows: 24,
       resumeSessionId: CODEX_SESSION_ID,
+      codexDurability: {
+        schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+        state: 'durable',
+        durableThreadId: CODEX_SESSION_ID,
+      },
       clients: new Set<WebSocket>(),
     }))
   }
@@ -503,7 +509,7 @@ describe('terminal.create reuse running codex terminal', () => {
     vi.useRealTimers()
   }, HOOK_TIMEOUT_MS)
 
-  it('reuses existing codex terminal and requires an explicit attach', async () => {
+  it('treats same-server Codex live handles without a canonical sessionRef as a fresh create', async () => {
     const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
     try {
       await waitForOpen(ws)
@@ -527,7 +533,7 @@ describe('terminal.create reuse running codex terminal', () => {
       expect(created.terminalId).toBe('term-codex-existing')
       expect(preAttachMsgs.some((m) => m.type === 'terminal.attach.ready' && m.terminalId === created.terminalId)).toBe(false)
       expect(registry.attachCalls).toHaveLength(0)
-      expect(registry.createCalls).toHaveLength(0)
+      expect(registry.createCalls).toHaveLength(1)
 
       const attachReadyPromise = waitForMessage(ws,
         (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'reuse-existing-codex-attach',
@@ -774,127 +780,6 @@ describe('terminal.create reuse running codex terminal', () => {
     }
   })
 
-  it('proof-reads captured Codex durability and resumes only after proof succeeds', async () => {
-    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-proof-'))
-    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
-    try {
-      const rolloutPath = path.join(tempDir, 'rollout.jsonl')
-      await fsp.writeFile(
-        rolloutPath,
-        '{"type":"session_meta","payload":{"id":"thread-proved"}}\n',
-        'utf8',
-      )
-      await waitForOpen(ws, PROOF_MESSAGE_TIMEOUT_MS)
-      await waitForReady(ws)
-
-      const requestId = 'codex-proved-reopen'
-      const createdPromise = waitForMessage(
-        ws,
-        (m) => m.type === 'terminal.created' && m.requestId === requestId,
-        PROOF_MESSAGE_TIMEOUT_MS,
-      )
-      const associatedPromise = waitForMessage(ws, (m) => (
-        m.type === 'terminal.session.associated'
-        && m.sessionRef?.provider === 'codex'
-        && m.sessionRef?.sessionId === 'thread-proved'
-      ), PROOF_MESSAGE_TIMEOUT_MS)
-      ws.send(JSON.stringify({
-        type: 'terminal.create',
-        requestId,
-        mode: 'codex',
-        restore: true,
-        codexDurability: {
-          schemaVersion: 1,
-          state: 'captured_pre_turn',
-          candidate: {
-            provider: 'codex',
-            candidateThreadId: 'thread-proved',
-            rolloutPath,
-            source: 'thread_started_notification',
-            capturedAt: Date.now(),
-          },
-        },
-      }))
-
-      const created = await createdPromise
-      const associated = await associatedPromise
-      expect(created).not.toHaveProperty('effectiveResumeSessionId')
-      expect(associated.terminalId).toBe(created.terminalId)
-      expect(codexLaunchPlanner.planCreateCalls[0]).toMatchObject({
-        resumeSessionId: 'thread-proved',
-      })
-      expect(registry.createCalls[0]).toMatchObject({
-        mode: 'codex',
-        resumeSessionId: 'thread-proved',
-      })
-    } finally {
-      await closeWebSocket(ws)
-      await fsp.rm(tempDir, { recursive: true, force: true })
-    }
-  }, PROOF_TEST_TIMEOUT_MS)
-
-  it('proof-reads server-stored Codex durability when the client has not persisted candidate state', async () => {
-    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-store-proof-'))
-    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
-    try {
-      const rolloutPath = path.join(tempDir, 'rollout.jsonl')
-      await fsp.writeFile(
-        rolloutPath,
-        '{"type":"session_meta","payload":{"id":"thread-store-proved"}}\n',
-        'utf8',
-      )
-      registry.durabilityRestoreRecords.push({
-        terminalId: 'old-store-terminal',
-        tabId: 'tab-bridge',
-        paneId: 'pane-bridge',
-        durability: {
-          schemaVersion: 1,
-          state: 'captured_pre_turn',
-          candidate: {
-            provider: 'codex',
-            candidateThreadId: 'thread-store-proved',
-            rolloutPath,
-            source: 'thread_started_notification',
-            capturedAt: Date.now(),
-          },
-        },
-      })
-      await waitForOpen(ws, PROOF_MESSAGE_TIMEOUT_MS)
-      await waitForReady(ws)
-
-      const requestId = 'codex-store-proved-reopen'
-      const createdPromise = waitForMessage(
-        ws,
-        (m) => m.type === 'terminal.created' && m.requestId === requestId,
-        PROOF_MESSAGE_TIMEOUT_MS,
-      )
-      ws.send(JSON.stringify({
-        type: 'terminal.create',
-        requestId,
-        mode: 'codex',
-        restore: true,
-        tabId: 'tab-bridge',
-        paneId: 'pane-bridge',
-      }))
-
-      await createdPromise
-      expect(codexLaunchPlanner.planCreateCalls[0]).toMatchObject({
-        resumeSessionId: 'thread-store-proved',
-      })
-      expect(registry.createCalls[0]).toMatchObject({
-        mode: 'codex',
-        resumeSessionId: 'thread-store-proved',
-      })
-      expect(registry.deletedDurabilityRecords).toEqual([{
-        terminalId: 'old-store-terminal',
-        reason: 'restore_proof_succeeded_created_replacement',
-      }])
-    } finally {
-      await closeWebSocket(ws)
-      await fsp.rm(tempDir, { recursive: true, force: true })
-    }
-  }, PROOF_TEST_TIMEOUT_MS)
-
   it('does not use server-stored Codex durability for non-restore fresh creates', async () => {
     const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-store-fresh-'))
     const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
@@ -950,11 +835,48 @@ describe('terminal.create reuse running codex terminal', () => {
     }
   })
 
-  it('fresh-creates with restore failure when server-stored Codex durability cannot be proved', async () => {
-    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-store-proof-missing-'))
+  it('rejects restore requests that only provide client candidate durability', async () => {
     const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
     try {
-      const rolloutPath = path.join(tempDir, 'missing.jsonl')
+      await waitForOpen(ws)
+      await waitForReady(ws)
+
+      const requestId = 'codex-candidate-only-restore'
+      const errorPromise = waitForMessage(ws, (m) => m.type === 'error' && m.requestId === requestId)
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'codex',
+        restore: true,
+        codexDurability: {
+          schemaVersion: 1,
+          state: 'captured_pre_turn',
+          candidate: {
+            provider: 'codex',
+            candidateThreadId: 'thread-store-missing',
+            rolloutPath: '/tmp/missing.jsonl',
+            source: 'thread_started_notification',
+            capturedAt: Date.now(),
+          },
+        },
+      }))
+
+      await expect(errorPromise).resolves.toMatchObject({
+        type: 'error',
+        requestId,
+        code: 'RESTORE_UNAVAILABLE',
+        message: 'Restore requires a canonical session reference.',
+      })
+      expect(codexLaunchPlanner.planCreateCalls).toHaveLength(0)
+      expect(registry.createCalls).toHaveLength(0)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  }, PROOF_TEST_TIMEOUT_MS)
+
+  it('rejects restore requests that rely on server-stored durability without a canonical sessionRef', async () => {
+    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
+    try {
       registry.durabilityRestoreRecords.push({
         terminalId: 'old-store-terminal',
         tabId: 'tab-bridge',
@@ -964,18 +886,22 @@ describe('terminal.create reuse running codex terminal', () => {
           state: 'captured_pre_turn',
           candidate: {
             provider: 'codex',
-            candidateThreadId: 'thread-store-missing',
-            rolloutPath,
+            candidateThreadId: 'thread-store-proved',
+            rolloutPath: '/tmp/rollout.jsonl',
             source: 'thread_started_notification',
             capturedAt: Date.now(),
           },
         },
       })
-      await waitForOpen(ws)
+      await waitForOpen(ws, PROOF_MESSAGE_TIMEOUT_MS)
       await waitForReady(ws)
 
-      const requestId = 'codex-store-unproved-reopen'
-      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+      const requestId = 'codex-store-proved-reopen'
+      const errorPromise = waitForMessage(
+        ws,
+        (m) => m.type === 'error' && m.requestId === requestId,
+        PROOF_MESSAGE_TIMEOUT_MS,
+      )
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId,
@@ -985,130 +911,28 @@ describe('terminal.create reuse running codex terminal', () => {
         paneId: 'pane-bridge',
       }))
 
-      const created = await createdPromise
-      expect(created).toMatchObject({
-        type: 'terminal.created',
+      await expect(errorPromise).resolves.toMatchObject({
+        type: 'error',
         requestId,
-        clearCodexDurability: true,
-        restoreError: {
-          code: 'RESTORE_UNAVAILABLE',
-          reason: 'durable_artifact_missing',
-        },
+        code: 'RESTORE_UNAVAILABLE',
+        message: 'Restore requires a canonical session reference.',
       })
-      expect(codexLaunchPlanner.planCreateCalls[0]).toMatchObject({
-        resumeSessionId: undefined,
-      })
-      expect(registry.createCalls[0]).toMatchObject({
-        mode: 'codex',
-        resumeSessionId: undefined,
-      })
-      expect(registry.deletedDurabilityRecords).toEqual([{
-        terminalId: 'old-store-terminal',
-        reason: 'restore_proof_failed_fresh_create',
-      }])
-      expect(registry.durabilityRestoreRecords).toHaveLength(0)
-    } finally {
-      await closeWebSocket(ws)
-      await fsp.rm(tempDir, { recursive: true, force: true })
-    }
-  })
-
-  it('proof-reads a same-server live Codex candidate before reattaching it', async () => {
-    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-proof-live-'))
-    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
-    try {
-      const rolloutPath = path.join(tempDir, 'rollout.jsonl')
-      await fsp.writeFile(
-        rolloutPath,
-        '{"type":"session_meta","payload":{"id":"thread-live-proved"}}\n',
-        'utf8',
-      )
-      registry.records[0].resumeSessionId = undefined
-      registry.records[0].codexDurability = {
-        schemaVersion: 1,
-        state: 'durability_unproven_after_completion',
-        candidate: {
-          provider: 'codex',
-          candidateThreadId: 'thread-live-proved',
-          rolloutPath,
-          source: 'thread_started_notification',
-          capturedAt: Date.now(),
-        },
-        turnCompletedAt: Date.now(),
-      }
-      await waitForOpen(ws)
-      const helloReady = await waitForReady(ws)
-
-      const requestId = 'codex-proved-live-reopen'
-      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
-      const associatedPromise = waitForMessage(ws, (m) => (
-        m.type === 'terminal.session.associated'
-        && m.terminalId === 'term-codex-existing'
-        && m.sessionRef?.sessionId === 'thread-live-proved'
-      ))
-      const durabilityPromise = waitForMessage(ws, (m) => (
-        m.type === 'terminal.codex.durability.updated'
-        && m.terminalId === 'term-codex-existing'
-        && m.durability?.state === 'durable'
-        && m.durability?.durableThreadId === 'thread-live-proved'
-      ))
-      const terminalsChangedPromise = waitForMessage(ws, (m) => m.type === 'terminals.changed')
-      ws.send(JSON.stringify({
-        type: 'terminal.create',
-        requestId,
-        mode: 'codex',
-        restore: true,
-        liveTerminal: {
-          terminalId: 'term-codex-existing',
-          serverInstanceId: helloReady.serverInstanceId,
-        },
-        codexDurability: registry.records[0].codexDurability,
-      }))
-
-      const created = await createdPromise
-      await associatedPromise
-      await durabilityPromise
-      await terminalsChangedPromise
-      expect(created.terminalId).toBe('term-codex-existing')
-      expect(registry.records[0].resumeSessionId).toBe('thread-live-proved')
-      expect(registry.records[0].codexDurability).toMatchObject({
-        state: 'durable',
-        durableThreadId: 'thread-live-proved',
-      })
-      expect(registry.promoteCalls).toEqual([{
-        terminalId: 'term-codex-existing',
-        durableThreadId: 'thread-live-proved',
-      }])
       expect(codexLaunchPlanner.planCreateCalls).toHaveLength(0)
       expect(registry.createCalls).toHaveLength(0)
+      expect(registry.durabilityRestoreRecords).toHaveLength(1)
     } finally {
       await closeWebSocket(ws)
-      await fsp.rm(tempDir, { recursive: true, force: true })
     }
-  })
+  }, PROOF_TEST_TIMEOUT_MS)
 
-  it('does not promote a stale same-server live Codex handle when its candidate differs', async () => {
-    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-proof-live-mismatch-'))
+  it('ignores stale same-server live Codex handles and resumes the canonical sessionRef instead', async () => {
     const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
     try {
-      const rolloutPath = path.join(tempDir, 'rollout.jsonl')
-      await fsp.writeFile(
-        rolloutPath,
-        '{"type":"session_meta","payload":{"id":"thread-proved-mismatch"}}\n',
-        'utf8',
-      )
-      registry.records[0].resumeSessionId = undefined
+      registry.records[0].resumeSessionId = 'thread-old'
       registry.records[0].codexDurability = {
-        schemaVersion: 1,
-        state: 'durability_unproven_after_completion',
-        candidate: {
-          provider: 'codex',
-          candidateThreadId: 'different-live-thread',
-          rolloutPath,
-          source: 'thread_started_notification',
-          capturedAt: Date.now(),
-        },
-        turnCompletedAt: Date.now(),
+        schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+        state: 'durable',
+        durableThreadId: 'thread-old',
       }
       await waitForOpen(ws, PROOF_MESSAGE_TIMEOUT_MS)
       const helloReady = await waitForReady(ws)
@@ -1124,130 +948,26 @@ describe('terminal.create reuse running codex terminal', () => {
         requestId,
         mode: 'codex',
         restore: true,
+        sessionRef: { provider: 'codex', sessionId: CODEX_SESSION_ID },
         liveTerminal: {
           terminalId: 'term-codex-existing',
           serverInstanceId: helloReady.serverInstanceId,
-        },
-        codexDurability: {
-          schemaVersion: 1,
-          state: 'durability_unproven_after_completion',
-          candidate: {
-            provider: 'codex',
-            candidateThreadId: 'thread-proved-mismatch',
-            rolloutPath,
-            source: 'thread_started_notification',
-            capturedAt: Date.now(),
-          },
-          turnCompletedAt: Date.now(),
         },
       }))
 
       await createdPromise
       expect(registry.promoteCalls).toEqual([])
       expect(codexLaunchPlanner.planCreateCalls[0]).toMatchObject({
-        resumeSessionId: 'thread-proved-mismatch',
+        resumeSessionId: CODEX_SESSION_ID,
       })
       expect(registry.createCalls[0]).toMatchObject({
         mode: 'codex',
-        resumeSessionId: 'thread-proved-mismatch',
+        resumeSessionId: CODEX_SESSION_ID,
       })
     } finally {
       await closeWebSocket(ws)
-      await fsp.rm(tempDir, { recursive: true, force: true })
     }
   }, PROOF_TEST_TIMEOUT_MS)
-
-  it('does not resume a captured Codex candidate when proof fails', async () => {
-    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-proof-'))
-    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
-    try {
-      const rolloutPath = path.join(tempDir, 'missing.jsonl')
-      await waitForOpen(ws)
-      await waitForReady(ws)
-
-      const requestId = 'codex-unproved-reopen'
-      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
-      ws.send(JSON.stringify({
-        type: 'terminal.create',
-        requestId,
-        mode: 'codex',
-        restore: true,
-        codexDurability: {
-          schemaVersion: 1,
-          state: 'durability_unproven_after_completion',
-          candidate: {
-            provider: 'codex',
-            candidateThreadId: 'thread-missing',
-            rolloutPath,
-            source: 'thread_started_notification',
-            capturedAt: Date.now(),
-          },
-          turnCompletedAt: Date.now(),
-        },
-      }))
-
-      const created = await createdPromise
-      expect(created).toMatchObject({
-        type: 'terminal.created',
-        requestId,
-        clearCodexDurability: true,
-        restoreError: {
-          code: 'RESTORE_UNAVAILABLE',
-          reason: 'durable_artifact_missing',
-        },
-      })
-      expect(codexLaunchPlanner.planCreateCalls[0]).toMatchObject({
-        resumeSessionId: undefined,
-      })
-      expect(registry.createCalls[0]).toMatchObject({
-        mode: 'codex',
-        resumeSessionId: undefined,
-      })
-    } finally {
-      await closeWebSocket(ws)
-      await fsp.rm(tempDir, { recursive: true, force: true })
-    }
-  })
-
-  it('attaches exact live Codex candidate when captured proof fails and live terminal exists', async () => {
-    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-proof-'))
-    const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))
-    try {
-      const rolloutPath = path.join(tempDir, 'missing-live.jsonl')
-      registry.records[0].codexDurability = {
-        schemaVersion: 1,
-        state: 'durability_unproven_after_completion',
-        candidate: {
-          provider: 'codex',
-          candidateThreadId: 'thread-live-unproved',
-          rolloutPath,
-          source: 'thread_started_notification',
-          capturedAt: Date.now(),
-        },
-        turnCompletedAt: Date.now(),
-      }
-      await waitForOpen(ws)
-      await waitForReady(ws)
-
-      const requestId = 'codex-unproved-live-reopen'
-      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
-      ws.send(JSON.stringify({
-        type: 'terminal.create',
-        requestId,
-        mode: 'codex',
-        restore: true,
-        codexDurability: registry.records[0].codexDurability,
-      }))
-
-      const created = await createdPromise
-      expect(created.terminalId).toBe('term-codex-existing')
-      expect(codexLaunchPlanner.planCreateCalls).toHaveLength(0)
-      expect(registry.createCalls).toHaveLength(0)
-    } finally {
-      await closeWebSocket(ws)
-      await fsp.rm(tempDir, { recursive: true, force: true })
-    }
-  })
 
   it('accepts Codex candidate persisted acknowledgements through the dynamic websocket schema', async () => {
     const ws = trackWebSocket(new WebSocket(`ws://127.0.0.1:${port}/ws`))

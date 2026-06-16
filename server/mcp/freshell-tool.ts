@@ -38,7 +38,10 @@ Key actions:
 - Info: lan-info
 - Meta: health, help
 
-Common params: target (ID or name), name, mode, direction, keys, url, scope.`
+Common params: target (ID or name), name, mode, direction, keys, url, scope.
+
+Fresh agents (in-app): use new-tab/split-pane with agent="opencode" (also "claude"/"codex"), optional model=, effort=, cwd=. Then drive the pane with send-keys (the prompt; blocks until the turn completes), read it with capture-pane (returns the transcript), and optionally wait-for (reports idle). Example:
+  new-tab { agent: "opencode", model: "umans-ai-coding-plan/umans-kimi-k2.7", prompt: "Summarize README.md" }`
 
 export const INSTRUCTIONS = `Freshell is a browser-accessible terminal multiplexer and session organizer.
 
@@ -50,6 +53,11 @@ FRESHELL_URL and FRESHELL_TOKEN are already set in your environment.
 - Pane kinds: terminal, editor, browser, fresh-agent (Claude/Codex/OpenCode/etc.), picker (transient).
 - **Picker panes are ephemeral.** A freshly-created tab without mode/browser/editor starts as a picker pane while the user chooses what to launch. Once they select, the picker is replaced by the real pane with a **new pane ID**. Never target a picker pane for splits or mutations -- use mode/browser/editor params on new-tab/split-pane to skip the picker entirely.
 - Typical workflow: new-tab -> send-keys -> wait-for -> capture-pane/screenshot.
+
+## Fresh agents (in-app)
+
+- Use new-tab/split-pane with agent="opencode" (also "claude"/"codex"), optional model=, effort=, cwd=. Then drive the pane with send-keys (the prompt; blocks until the turn completes), read it with capture-pane (returns the transcript), and optionally wait-for (reports idle). Example:
+  new-tab { agent: "opencode", model: "umans-ai-coding-plan/umans-kimi-k2.7", prompt: "Summarize README.md" }
 
 ## Choosing the right action
 
@@ -248,7 +256,7 @@ async function handleDisplay(format: string, target?: string): Promise<string> {
 // ---------------------------------------------------------------------------
 
 const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> = {
-  'new-tab':         { required: [],                          optional: ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'sessionRef', 'prompt'] },
+  'new-tab':         { required: [],                          optional: ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'sessionRef', 'prompt', 'agent', 'model', 'effort'] },
   'list-tabs':       { required: [],                          optional: [] },
   'select-tab':      { required: ['target'],                  optional: [] },
   'kill-tab':        { required: ['target'],                  optional: [] },
@@ -256,7 +264,7 @@ const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> 
   'has-tab':         { required: ['target'],                  optional: [] },
   'next-tab':        { required: [],                          optional: [] },
   'prev-tab':        { required: [],                          optional: [] },
-  'split-pane':      { required: [],                          optional: ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'sessionRef'] },
+  'split-pane':      { required: [],                          optional: ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'sessionRef', 'agent', 'model', 'effort'] },
   'list-panes':      { required: [],                          optional: ['target'] },
   'select-pane':     { required: ['target'],                  optional: [] },
   'rename-pane':     { required: ['name'],                    optional: ['target'] },
@@ -264,14 +272,14 @@ const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> 
   'resize-pane':     { required: ['target'],                  optional: ['x', 'y', 'sizes'] },
   'swap-pane':       { required: ['target', 'with'],          optional: [] },
   'respawn-pane':    { required: ['target'],                  optional: ['mode', 'shell', 'cwd', 'resume', 'sessionRef'] },
-  'send-keys':       { required: [],                          optional: ['target', 'keys', 'literal'] },
+  'send-keys':       { required: [],                          optional: ['target', 'keys', 'literal', 'sessionRef'] },
   'capture-pane':    { required: [],                          optional: ['target', 'S', 'J', 'e'] },
   'wait-for':        { required: [],                          optional: ['target', 'pattern', 'stable', 'exit', 'prompt', 'timeout'] },
   'run':             { required: ['command'],                 optional: ['capture', 'detached', 'timeout', 'name', 'cwd'] },
   'summarize':       { required: [],                          optional: ['target'] },
   'display':         { required: [],                          optional: ['target', 'format'] },
   'list-terminals':  { required: [],                          optional: [] },
-  'attach':          { required: ['target', 'terminalId'],    optional: [] },
+  'attach':          { required: ['target', 'terminalId'],    optional: ['sessionRef'] },
   'open-browser':    { required: ['url'],                     optional: ['name'] },
   'navigate':        { required: ['target', 'url'],           optional: [] },
   'screenshot':      { required: ['scope'],                   optional: ['target', 'name'] },
@@ -389,7 +397,7 @@ Pane commands:
   respawn-pane    Restart a pane's terminal. Params: target, mode?, shell?, cwd?, resume?, sessionRef?
 
 Terminal I/O:
-  send-keys       Send input to a pane. Params: target, keys, literal?
+  send-keys       Send input to a pane. Params: target, keys, literal?, sessionRef?
                   Token mode (default): keys=["ls","ENTER"] translates ENTER to \\r, C-C to Ctrl-C, etc.
                   Literal mode: keys="your prompt text here", literal=true sends raw string.
                   IMPORTANT: Always use literal mode for natural-language prompts or multi-word text.
@@ -403,7 +411,7 @@ Terminal I/O:
   summarize       Get AI summary of a terminal. Params: target (pane ID)
   display         Format info about a pane. Params: target?, format (#S=tab name, #P=pane ID, #I=tab ID, #{pane_index}, #{terminal_id}, #{pane_type})
   list-terminals  List all terminal processes.
-  attach          Attach a terminal to a pane. Params: target (pane ID), terminalId
+  attach          Attach a terminal to a pane. Params: target (pane ID), terminalId, sessionRef?
 
 Browser/navigation:
   open-browser    Open a URL in a new browser tab to display web pages or images.
@@ -424,6 +432,11 @@ Session/service:
 
 Meta:
   help            Show this reference.
+
+## Fresh agents (in-app)
+
+Use new-tab/split-pane with agent="opencode" (also "claude"/"codex"), optional model=, effort=, cwd=. Then drive the pane with send-keys (the prompt; blocks until the turn completes), read it with capture-pane (returns the transcript), and optionally wait-for (reports idle). Example:
+  new-tab { agent: "opencode", model: "umans-ai-coding-plan/umans-kimi-k2.7", prompt: "Summarize README.md" }
 
 ## Playbook: create a coding CLI tab and send a prompt
 
@@ -713,6 +726,7 @@ async function routeAction(
       const paneId = resolved.pane.id
       const keys = params?.keys
       const literal = params?.literal
+      const sessionRef = params?.sessionRef
       let data: string
       if (literal && typeof keys === 'string') {
         // Literal mode: send raw string
@@ -726,7 +740,10 @@ async function routeAction(
       } else {
         throw new MissingParamError('keys')
       }
-      return c.post(`/api/panes/${encodeURIComponent(paneId)}/send-keys`, { data })
+      return c.post(`/api/panes/${encodeURIComponent(paneId)}/send-keys`, {
+        data,
+        ...(sessionRef ? { sessionRef } : {}),
+      })
     }
     case 'capture-pane': {
       const rawTarget = params?.target as string | undefined
@@ -782,7 +799,11 @@ async function routeAction(
     case 'attach': {
       const target = requireParam(params, 'target')
       const terminalId = requireParam(params, 'terminalId')
-      return c.post(`/api/panes/${encodeURIComponent(target)}/attach`, { terminalId })
+      const sessionRef = params?.sessionRef
+      return c.post(`/api/panes/${encodeURIComponent(target)}/attach`, {
+        terminalId,
+        ...(sessionRef ? { sessionRef } : {}),
+      })
     }
 
     // -- Browser --

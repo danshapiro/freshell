@@ -1,50 +1,32 @@
 import { describe, expect, it, vi } from 'vitest'
-import { CODEX_DURABILITY_SCHEMA_VERSION, type CodexCandidateIdentity, type CodexDurabilityRef } from '../../../../../shared/codex-durability.js'
+import { CODEX_DURABILITY_SCHEMA_VERSION, type CodexDurabilityRef } from '../../../../../shared/codex-durability.js'
 import {
   INVALID_RAW_CODEX_RESUME_MESSAGE,
   MISSING_CODEX_SESSION_REF_MESSAGE,
+  isExactLiveCodexCandidate,
   planCodexCreateRestoreDecision,
   resolveCodexCreateRestoreDecision,
   type CodexLiveRestoreTerminal,
 } from '../../../../../server/coding-cli/codex-app-server/restore-decision.js'
-import type { CodexRolloutProofResult } from '../../../../../server/coding-cli/codex-app-server/durability-proof.js'
 
-const candidate: CodexCandidateIdentity = {
-  provider: 'codex',
-  candidateThreadId: 'thread-1',
-  rolloutPath: '/tmp/freshell-codex/rollout.jsonl',
-  source: 'restored_client_state',
-  capturedAt: 1,
-}
-
-const durability: CodexDurabilityRef = {
+const candidateDurability: CodexDurabilityRef = {
   schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
   state: 'durability_unproven_after_completion',
-  candidate,
+  candidate: {
+    provider: 'codex',
+    candidateThreadId: 'thread-candidate',
+    rolloutPath: '/tmp/freshell-codex/rollout.jsonl',
+    source: 'restored_client_state',
+    capturedAt: 1,
+  },
   turnCompletedAt: 2,
 }
 
 const durableDurability: CodexDurabilityRef = {
   schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
   state: 'durable',
-  candidate,
   durableThreadId: 'thread-durable',
   turnCompletedAt: 3,
-}
-
-const proofOk: CodexRolloutProofResult = {
-  ok: true,
-  candidateThreadId: candidate.candidateThreadId,
-  rolloutPath: candidate.rolloutPath,
-  rolloutProofId: candidate.candidateThreadId,
-}
-
-const proofMissing: CodexRolloutProofResult = {
-  ok: false,
-  reason: 'missing',
-  message: 'Codex rollout proof file does not exist.',
-  candidateThreadId: candidate.candidateThreadId,
-  rolloutPath: candidate.rolloutPath,
 }
 
 describe('Codex create/restore decision', () => {
@@ -69,7 +51,7 @@ describe('Codex create/restore decision', () => {
     })
   })
 
-  it('rejects restore requests without sessionRef, durable ref, or candidate', () => {
+  it('requires a canonical sessionRef for Codex restore', () => {
     expect(planCodexCreateRestoreDecision({ restoreRequested: true })).toEqual({
       kind: 'reject_missing_codex_session_ref',
       code: 'RESTORE_UNAVAILABLE',
@@ -77,15 +59,14 @@ describe('Codex create/restore decision', () => {
     })
   })
 
-  it('routes canonical sessionRef restores without using candidate proof', async () => {
-    const proofRollout = vi.fn(async () => proofOk)
+  it('routes canonical sessionRef restores directly', async () => {
+    const findLiveTerminalByCandidate = vi.fn()
 
     const decision = await resolveCodexCreateRestoreDecision({
       restoreRequested: true,
-      legacyResumeSessionId: 'thread-raw',
       sessionRef: { provider: 'codex', sessionId: 'thread-durable' },
-      codexDurability: durability,
-      proofRollout,
+      codexDurability: candidateDurability,
+      findLiveTerminalByCandidate,
     })
 
     expect(decision).toEqual({
@@ -93,25 +74,38 @@ describe('Codex create/restore decision', () => {
       sessionRef: { provider: 'codex', sessionId: 'thread-durable' },
       sessionId: 'thread-durable',
     })
-    expect(proofRollout).not.toHaveBeenCalled()
+    expect(findLiveTerminalByCandidate).not.toHaveBeenCalled()
   })
 
-  it('uses durable Codex durability state as a canonical restore sessionRef', () => {
+  it('ignores durable Codex durability without a canonical sessionRef', () => {
     expect(planCodexCreateRestoreDecision({
       restoreRequested: true,
-      codexDurability: {
-        schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
-        state: 'durable',
-        durableThreadId: 'thread-durable',
-      },
+      codexDurability: durableDurability,
     })).toEqual({
-      kind: 'durable_session_ref_resume',
-      sessionRef: { provider: 'codex', sessionId: 'thread-durable' },
-      sessionId: 'thread-durable',
+      kind: 'reject_missing_codex_session_ref',
+      code: 'RESTORE_UNAVAILABLE',
+      message: MISSING_CODEX_SESSION_REF_MESSAGE,
     })
   })
 
-  it('uses explicit sessionRef before durable Codex durability state', () => {
+  it('ignores candidate Codex durability without a canonical sessionRef', async () => {
+    const findLiveTerminalByCandidate = vi.fn()
+
+    const decision = await resolveCodexCreateRestoreDecision({
+      restoreRequested: true,
+      codexDurability: candidateDurability,
+      findLiveTerminalByCandidate,
+    })
+
+    expect(decision).toEqual({
+      kind: 'reject_missing_codex_session_ref',
+      code: 'RESTORE_UNAVAILABLE',
+      message: MISSING_CODEX_SESSION_REF_MESSAGE,
+    })
+    expect(findLiveTerminalByCandidate).not.toHaveBeenCalled()
+  })
+
+  it('uses explicit sessionRef before any durability evidence', () => {
     expect(planCodexCreateRestoreDecision({
       restoreRequested: true,
       sessionRef: { provider: 'codex', sessionId: 'thread-explicit' },
@@ -123,55 +117,14 @@ describe('Codex create/restore decision', () => {
     })
   })
 
-  it('uses durable Codex durability state before candidate proof', async () => {
-    const proofRollout = vi.fn(async () => proofOk)
-
-    const decision = await resolveCodexCreateRestoreDecision({
-      restoreRequested: true,
-      codexDurability: durableDurability,
-      proofRollout,
-    })
-
-    expect(decision).toEqual({
-      kind: 'durable_session_ref_resume',
-      sessionRef: { provider: 'codex', sessionId: 'thread-durable' },
-      sessionId: 'thread-durable',
-    })
-    expect(proofRollout).not.toHaveBeenCalled()
-  })
-
-  it('rejects raw legacy resume ids even when durable Codex durability is present without sessionRef', () => {
-    expect(planCodexCreateRestoreDecision({
-      restoreRequested: true,
-      legacyResumeSessionId: 'thread-raw',
-      codexDurability: durableDurability,
-    })).toEqual({
-      kind: 'reject_invalid_raw_codex_resume_request',
-      code: 'INVALID_MESSAGE',
-      message: INVALID_RAW_CODEX_RESUME_MESSAGE,
-    })
-  })
-
-  it('plans candidate proof before a restored candidate can become durable', () => {
-    expect(planCodexCreateRestoreDecision({
-      restoreRequested: true,
-      codexDurability: durability,
-    })).toEqual({
-      kind: 'proof_existing_candidate_first',
-      candidate,
-    })
-  })
-
-  it('ignores captured Codex candidates for non-restore fresh creates', () => {
+  it('fresh-creates when restore is not requested, even if durability is present', () => {
     expect(planCodexCreateRestoreDecision({
       restoreRequested: false,
-      codexDurability: durability,
+      codexDurability: candidateDurability,
     })).toEqual({
       kind: 'fresh_codex_launch',
     })
-  })
 
-  it('ignores durable Codex durability state for non-restore fresh creates', () => {
     expect(planCodexCreateRestoreDecision({
       restoreRequested: false,
       codexDurability: durableDurability,
@@ -180,100 +133,21 @@ describe('Codex create/restore decision', () => {
     })
   })
 
-  it('uses exact rollout proof as the durable session id and returns a matching live terminal when present', async () => {
+  it('matches exact live candidates only by rollout path and candidate thread id', () => {
     const liveTerminal: CodexLiveRestoreTerminal = {
       terminalId: 'term-live',
       createdAt: 10,
-      codexDurability: durability,
+      codexDurability: candidateDurability,
     }
 
-    const decision = await resolveCodexCreateRestoreDecision({
-      restoreRequested: true,
-      codexDurability: durability,
-      proofRollout: async () => proofOk,
-      findLiveTerminalByCandidate: () => liveTerminal,
-    })
+    expect(isExactLiveCodexCandidate(liveTerminal, {
+      candidateThreadId: 'thread-candidate',
+      rolloutPath: '/tmp/freshell-codex/rollout.jsonl',
+    })).toBe(true)
 
-    expect(decision).toEqual({
-      kind: 'proof_succeeded_resume_durable',
-      candidate,
-      proof: proofOk,
-      sessionId: 'thread-1',
-      liveTerminal,
-    })
-  })
-
-  it('attaches the exact live candidate when proof fails but the terminal still exists', async () => {
-    const liveTerminal: CodexLiveRestoreTerminal = {
-      terminalId: 'term-unproved-live',
-      createdAt: 10,
-      codexDurability: durability,
-    }
-
-    const decision = await resolveCodexCreateRestoreDecision({
-      restoreRequested: true,
-      codexDurability: durability,
-      proofRollout: async () => proofMissing,
-      findLiveTerminalByCandidate: () => liveTerminal,
-    })
-
-    expect(decision).toEqual({
-      kind: 'proof_failed_attach_live_candidate',
-      candidate,
-      proof: proofMissing,
-      liveTerminal,
-    })
-  })
-
-  it('fresh-creates with a restore-failed marker when candidate proof fails and no exact live terminal exists', async () => {
-    const decision = await resolveCodexCreateRestoreDecision({
-      restoreRequested: true,
-      codexDurability: durability,
-      proofRollout: async () => proofMissing,
-      findLiveTerminalByCandidate: () => undefined,
-    })
-
-    expect(decision).toEqual({
-      kind: 'proof_failed_fresh_create',
-      candidate,
-      proof: proofMissing,
-      clearCodexDurability: true,
-      restoreError: {
-        code: 'RESTORE_UNAVAILABLE',
-        reason: 'durable_artifact_missing',
-      },
-    })
-  })
-
-  it('does not accept a loose live terminal candidate returned by the caller', async () => {
-    const looseLiveTerminal: CodexLiveRestoreTerminal = {
-      terminalId: 'term-loose-live',
-      createdAt: 10,
-      codexDurability: {
-        ...durability,
-        candidate: {
-          ...candidate,
-          candidateThreadId: 'thread-other',
-        },
-      },
-    }
-
-    const decision = await resolveCodexCreateRestoreDecision({
-      restoreRequested: true,
-      codexDurability: durability,
-      proofRollout: async () => proofMissing,
-      findLiveTerminalByCandidate: () => looseLiveTerminal,
-    })
-
-    expect(decision).toEqual({
-      kind: 'proof_failed_fresh_create',
-      candidate,
-      proof: proofMissing,
-      clearCodexDurability: true,
-      restoreError: {
-        code: 'RESTORE_UNAVAILABLE',
-        reason: 'durable_artifact_missing',
-      },
-    })
+    expect(isExactLiveCodexCandidate(liveTerminal, {
+      candidateThreadId: 'thread-other',
+      rolloutPath: '/tmp/freshell-codex/rollout.jsonl',
+    })).toBe(false)
   })
 })

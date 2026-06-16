@@ -155,7 +155,7 @@ describe('pane activity', () => {
   })
 
   it('collects busy session keys from claude terminals and freshclaude panes', () => {
-    const claudeSessionId = '11111111-1111-4111-8111-111111111111'
+    const claudeResumeId = '11111111-1111-4111-8111-111111111111'
     const freshSessionId = '22222222-2222-4222-8222-222222222222'
 
     const tabs: Tab[] = [
@@ -168,7 +168,7 @@ describe('pane activity', () => {
         shell: 'system',
         createdAt: 1,
         terminalId: 'term-claude',
-        resumeSessionId: claudeSessionId,
+        resumeSessionId: claudeResumeId,
       },
       {
         id: 'tab-fresh',
@@ -192,7 +192,7 @@ describe('pane activity', () => {
           mode: 'claude',
           shell: 'system',
           terminalId: 'term-claude',
-          resumeSessionId: claudeSessionId,
+          resumeSessionId: claudeResumeId,
         },
       },
       'tab-fresh': {
@@ -227,7 +227,7 @@ describe('pane activity', () => {
     })
 
     expect(busySessionKeys).toEqual([
-      `claude:${claudeSessionId}`,
+      `claude:${claudeResumeId}`,
       `claude:${freshSessionId}`,
     ])
   })

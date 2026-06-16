@@ -157,6 +157,106 @@ describe('OpenCode fresh-agent normalization', () => {
     })
   })
 
+  it('strips surrounding quotes from user text parts added by the OpenCode CLI', () => {
+    const turn = normalizeOpencodeTurn({
+      info: { id: 'msg-user-quoted', role: 'user' },
+      parts: [{ id: 'part-user-quoted', type: 'text', text: '"Do a directory listing."' }],
+    }, 0)
+
+    expect(turn.role).toBe('user')
+    expect(turn.items).toEqual([
+      { id: 'part-user-quoted', kind: 'text', text: 'Do a directory listing.' },
+    ])
+    expect(turn.summary).toBe('Do a directory listing.')
+  })
+
+  it('leaves unquoted user text parts unchanged', () => {
+    const turn = normalizeOpencodeTurn({
+      info: { id: 'msg-user-plain', role: 'user' },
+      parts: [{ id: 'part-user-plain', type: 'text', text: 'Do a directory listing.' }],
+    }, 0)
+
+    expect(turn.items[0]?.text).toBe('Do a directory listing.')
+    expect(turn.summary).toBe('Do a directory listing.')
+  })
+
+  it('does not strip surrounding quotes from assistant text parts', () => {
+    const turn = normalizeOpencodeTurn({
+      info: { id: 'msg-assistant-quoted', role: 'assistant' },
+      parts: [{ id: 'part-assistant-quoted', type: 'text', text: '"Hello, world."' }],
+    }, 0)
+
+    expect(turn.role).toBe('assistant')
+    expect(turn.items[0]?.text).toBe('"Hello, world."')
+  })
+
+  it('strips only one pair of surrounding quotes from user text parts', () => {
+    const turn = normalizeOpencodeTurn({
+      info: { id: 'msg-user-nested', role: 'user' },
+      parts: [{ id: 'part-user-nested', type: 'text', text: '""nested" quotes"' }],
+    }, 0)
+
+    expect(turn.items[0]?.text).toBe('"nested" quotes')
+  })
+
+  it('strips leaked think/thinking tags and their content from assistant text parts', () => {
+    const turn = normalizeOpencodeTurn({
+      info: { id: 'msg-think-tags', role: 'assistant' },
+      parts: [
+        {
+          id: 'part-think',
+          type: 'text',
+          text: 'Before <think>Internal plan\n1 tool used</think> and after.',
+        },
+        {
+          id: 'part-thinking',
+          type: 'text',
+          text: 'Intro <thinking reason="plan">I could change all instances.</thinking> done.',
+        },
+      ],
+    }, 0)
+
+    expect(turn.items).toEqual([
+      { id: 'part-think', kind: 'text', text: 'Before  and after.' },
+      { id: 'part-thinking', kind: 'text', text: 'Intro  done.' },
+    ])
+  })
+
+
+  it('preserves think tags in user text parts', () => {
+    const turn = normalizeOpencodeTurn({
+      info: { id: 'msg-user-think', role: 'user' },
+      parts: [
+        { id: 'part-user-think', type: 'text', text: 'Why did the assistant say <think>secret</think>?' },
+      ],
+    }, 0)
+
+    expect(turn.items).toEqual([
+      { id: 'part-user-think', kind: 'text', text: 'Why did the assistant say <think>secret</think>?' },
+    ])
+  })
+
+  it('does not trim assistant text that has no leaked think tags', () => {
+    const turn = normalizeOpencodeTurn({
+      info: { id: 'msg-preserve-ws', role: 'assistant' },
+      parts: [{ id: 'part-ws', type: 'text', text: '  leading\n  and trailing  ' }],
+    }, 0)
+
+    expect(turn.items).toEqual([{ id: 'part-ws', kind: 'text', text: '  leading\n  and trailing  ' }])
+  })
+
+  it('leaves reasoning parts untouched', () => {
+    const text = 'I am reasoning about <think> tags.'
+    const turn = normalizeOpencodeTurn({
+      info: { id: 'msg-reasoning', role: 'assistant' },
+      parts: [{ id: 'part-reasoning', type: 'reasoning', text }],
+    }, 0)
+
+    expect(turn.items).toEqual([
+      { id: 'part-reasoning', kind: 'reasoning', summary: [text], content: [text], text },
+    ])
+  })
+
   it('carries turn-page nextCursor explicitly and keeps export fallback compatibility', () => {
     const explicit = normalizeOpencodeTurnPage({
       threadId: 'ses-page',

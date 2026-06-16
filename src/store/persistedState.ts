@@ -106,14 +106,29 @@ function readRestoreError(value: unknown): RestoreError | undefined {
 function normalizePersistedTab(tab: Record<string, unknown>): PersistedTab {
   const mode = typeof tab.mode === 'string' ? tab.mode : undefined
   const codingCliProvider = typeof tab.codingCliProvider === 'string' ? tab.codingCliProvider : undefined
+  const legacyCodingCliSessionId = typeof tab.codingCliSessionId === 'string' && tab.codingCliSessionId.length > 0
+    ? tab.codingCliSessionId
+    : undefined
+  const legacyClaudeSessionId = typeof tab.claudeSessionId === 'string' && tab.claudeSessionId.length > 0
+    ? tab.claudeSessionId
+    : undefined
   const provider = codingCliProvider || (mode && mode !== 'shell' ? mode : undefined)
+  const legacySessionId = legacyCodingCliSessionId || legacyClaudeSessionId
   const durableState = migrateLegacyTerminalDurableState({
     provider,
     sessionRef: tab.sessionRef,
-    resumeSessionId: typeof tab.resumeSessionId === 'string' ? tab.resumeSessionId : undefined,
+    resumeSessionId: typeof tab.resumeSessionId === 'string'
+      ? tab.resumeSessionId
+      : legacySessionId,
   })
   const codexDurability = sanitizeCodexDurabilityRef(tab.codexDurability)
-  const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, ...rest } = tab
+  const {
+    resumeSessionId: _resumeSessionId,
+    sessionRef: _legacySessionRef,
+    codingCliSessionId: _codingCliSessionId,
+    claudeSessionId: _claudeSessionId,
+    ...rest
+  } = tab
 
   return {
     ...rest,

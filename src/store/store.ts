@@ -4,7 +4,6 @@ import tabsReducer from './tabsSlice'
 import connectionReducer from './connectionSlice'
 import sessionsReducer from './sessionsSlice'
 import settingsReducer from './settingsSlice'
-import codingCliReducer from './codingCliSlice'
 import panesReducer from './panesSlice'
 import sessionActivityReducer from './sessionActivitySlice'
 import terminalDirectoryReducer from './terminalDirectorySlice'
@@ -43,7 +42,6 @@ export const store = configureStore({
     connection: connectionReducer,
     sessions: sessionsReducer,
     settings: settingsReducer,
-    codingCli: codingCliReducer,
     panes: panesReducer,
     sessionActivity: sessionActivityReducer,
     terminalDirectory: terminalDirectoryReducer,

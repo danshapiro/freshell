@@ -74,19 +74,28 @@ function normalizePersistedTerminalStatus(status: unknown): TerminalStatus {
 }
 
 function migrateTabFields(t: Tab): Tab {
-  const legacyClaudeSessionId = (t as any).claudeSessionId as string | undefined
+  const legacyCodingCliSessionId = typeof (t as any).codingCliSessionId === 'string'
+    ? (t as any).codingCliSessionId
+    : undefined
+  const legacyClaudeSessionId = typeof (t as any).claudeSessionId === 'string'
+    ? (t as any).claudeSessionId
+    : undefined
   // Strip legacy terminalId field from persisted data
-  const { terminalId: _legacyTerminalId, ...rest } = t as Tab & { terminalId?: unknown }
+  const {
+    terminalId: _legacyTerminalId,
+    codingCliSessionId: _legacyCodingCliSessionId,
+    claudeSessionId: _legacyClaudeSessionId,
+    ...rest
+  } = t as Tab & { terminalId?: unknown; codingCliSessionId?: unknown; claudeSessionId?: unknown }
   const codingCliProvider = t.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined)
   const provider = codingCliProvider || (t.mode !== 'shell' ? t.mode : undefined)
   const durableState = migrateLegacyTerminalDurableState({
     provider,
     sessionRef: (t as any).sessionRef,
-    resumeSessionId: t.resumeSessionId,
+    resumeSessionId: t.resumeSessionId || legacyCodingCliSessionId || legacyClaudeSessionId,
   })
   return {
     ...rest,
-    codingCliSessionId: t.codingCliSessionId || legacyClaudeSessionId,
     codingCliProvider,
     createdAt: t.createdAt || Date.now(),
     createRequestId: (t as any).createRequestId || t.id,
@@ -253,9 +262,7 @@ type AddTabPayload = {
   id?: string
   title?: string
   description?: string
-  codingCliSessionId?: string
   codingCliProvider?: CodingCliProviderName
-  claudeSessionId?: string
   status?: TerminalStatus
   mode?: TabMode
   shell?: ShellType
@@ -278,19 +285,14 @@ export const tabsSlice = createSlice({
       const payload = action.payload || {}
 
       const id = payload.id || nanoid()
-      const legacyClaudeSessionId = payload.claudeSessionId
-      const codingCliSessionId = payload.codingCliSessionId || legacyClaudeSessionId
-      const codingCliProvider =
-        payload.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined)
+      const codingCliProvider = payload.codingCliProvider
       const sessionRef = sanitizeSessionRef(payload.sessionRef)
       const tab: Tab = {
         id,
         createRequestId: payload.createRequestId || id,
         title: payload.title || `Tab ${state.tabs.length + 1}`,
         description: payload.description,
-        codingCliSessionId,
         codingCliProvider,
-        claudeSessionId: payload.claudeSessionId,
         status: payload.status || 'creating',
         mode: payload.mode || 'shell',
         shell: payload.shell || 'system',
@@ -538,7 +540,6 @@ export const reopenClosedTab = createAsyncThunk(
       mode: entry.tab.mode,
       shell: entry.tab.shell,
       initialCwd: entry.tab.initialCwd,
-      codingCliSessionId: entry.tab.codingCliSessionId,
       codingCliProvider: entry.tab.codingCliProvider,
       resumeSessionId: entry.tab.resumeSessionId,
       sessionMetadataByKey: entry.tab.sessionMetadataByKey,

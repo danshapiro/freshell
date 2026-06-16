@@ -154,7 +154,6 @@ import tabsReducer, { TabsState } from '@/store/tabsSlice'
 import settingsReducer, { defaultSettings, SettingsState } from '@/store/settingsSlice'
 import sessionsReducer, { SessionsState } from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
-import codingCliReducer from '@/store/codingCliSlice'
 import panesReducer from '@/store/panesSlice'
 import { networkReducer } from '@/store/networkSlice'
 import terminalDirectoryReducer from '@/store/terminalDirectorySlice'
@@ -210,7 +209,6 @@ function createTestStore(state: TestStoreState = {}) {
       settings: settingsReducer,
       sessions: sessionsReducer,
       connection: connectionReducer,
-      codingCli: codingCliReducer,
       panes: panesReducer,
       network: networkReducer,
       terminalDirectory: terminalDirectoryReducer,
@@ -234,9 +232,6 @@ function createTestStore(state: TestStoreState = {}) {
         projects: [],
         expandedProjects: new Set<string>(),
         ...state.sessions,
-      },
-      codingCli: {
-        sessions: {},
       },
       panes: {
         layouts: {},

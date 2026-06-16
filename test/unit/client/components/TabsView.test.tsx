@@ -215,6 +215,69 @@ describe('TabsView', () => {
     })
   })
 
+  it('does not hydrate same-server live terminal ids when a registry pane already has a canonical Codex sessionRef', () => {
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        tabRegistry: tabRegistryReducer,
+        connection: connectionReducer,
+      },
+    })
+    store.dispatch(setServerInstanceId('srv-local'))
+    store.dispatch(setTabRegistrySnapshot({
+      localOpen: [],
+      remoteOpen: [{
+        tabKey: 'remote:codex-local',
+        tabId: 'codex-local',
+        serverInstanceId: 'srv-local',
+        deviceId: 'remote',
+        deviceLabel: 'remote-device',
+        tabName: 'codex local',
+        status: 'open',
+        revision: 1,
+        createdAt: 1,
+        updatedAt: 2,
+        paneCount: 1,
+        titleSetByUser: false,
+        panes: [{
+          paneId: 'pane-codex',
+          kind: 'terminal',
+          payload: {
+            mode: 'codex',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: 'thread-1',
+            },
+            liveTerminal: {
+              terminalId: 'term-local-1',
+              serverInstanceId: 'srv-local',
+            },
+          },
+        }],
+      }],
+      closed: [],
+    }))
+
+    render(
+      <Provider store={store}>
+        <TabsView />
+      </Provider>,
+    )
+
+    fireEvent.click(screen.getByLabelText('remote-device: codex local'))
+
+    const copiedTab = store.getState().tabs.tabs.find((tab) => tab.title === 'codex local')
+    expect(copiedTab).toBeDefined()
+    const copiedLayout = copiedTab ? (store.getState().panes.layouts[copiedTab.id] as any) : undefined
+    expect(copiedLayout?.content?.sessionRef).toEqual({
+      provider: 'codex',
+      sessionId: 'thread-1',
+    })
+    expect(copiedLayout?.content?.terminalId).toBeUndefined()
+    expect(copiedLayout?.content?.serverInstanceId).toBeUndefined()
+  })
+
   it('shows context menu on right-click with appropriate items', () => {
     const store = createStore()
     render(
@@ -374,7 +437,7 @@ describe('TabsView', () => {
       provider: 'codex',
       sessionId: 'codex-session-123',
     })
-    expect(layout?.content?.serverInstanceId).toBe('srv-remote')
+    expect(layout?.content?.serverInstanceId).toBeUndefined()
   })
 
   it('shows pane kind icons with distinct colors', () => {

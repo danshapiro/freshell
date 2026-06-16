@@ -115,6 +115,8 @@ export class LayoutStore {
           return 'Freshclaude'
         case 'freshcodex':
           return 'Freshcodex'
+        case 'freshopencode':
+          return 'OpenCode'
         case 'kilroy':
           return 'Kilroy'
         default:

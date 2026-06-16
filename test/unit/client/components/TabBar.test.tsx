@@ -4,7 +4,6 @@ import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import TabBar from '@/components/TabBar'
 import tabsReducer, { TabsState } from '@/store/tabsSlice'
-import codingCliReducer, { registerCodingCliRequest } from '@/store/codingCliSlice'
 import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
 import opencodeActivityReducer, { type OpencodeActivityState } from '@/store/opencodeActivitySlice'
 import panesReducer from '@/store/panesSlice'
@@ -144,7 +143,6 @@ function createStore(
   return configureStore({
     reducer: {
       tabs: tabsReducer,
-      codingCli: codingCliReducer,
       codexActivity: codexActivityReducer,
       opencodeActivity: opencodeActivityReducer,
       panes: panesReducer,
@@ -157,10 +155,6 @@ function createStore(
         activeTabId: null,
         renameRequestTabId: null,
         ...initialState,
-      },
-      codingCli: {
-        sessions: {},
-        pendingRequests: {},
       },
       codexActivity: codexActivityState,
       opencodeActivity: opencodeActivityState,
@@ -769,6 +763,28 @@ describe('TabBar', () => {
       fireEvent.click(closeButton)
 
       expect(mockSend).not.toHaveBeenCalled()
+    })
+
+    it('closes a leftover legacy coding CLI tab without sending the legacy kill message', () => {
+      const legacyTab = createTab({
+        id: 'legacy-tab',
+        title: 'Legacy Tab',
+        mode: 'codex',
+        codingCliSessionId: 'legacy-session',
+      } as any)
+      const store = createStore({
+        tabs: [legacyTab],
+        activeTabId: 'legacy-tab',
+        renameRequestTabId: null,
+        tombstones: [],
+      })
+      renderWithStore(<TabBar />, store)
+
+      fireEvent.click(screen.getByTitle('Close (Shift+Click to kill)'))
+
+      expect(mockSend).not.toHaveBeenCalledWith(expect.objectContaining({
+        type: ['codingcli', 'kill'].join('.'),
+      }))
     })
 
     it('clicking close button stops event propagation (does not activate tab)', () => {

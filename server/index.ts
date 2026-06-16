@@ -82,6 +82,7 @@ import { registerFreshAgentThreadRoutes } from './fresh-agent/register-routes.js
 import { createClaudeFreshAgentAdapter } from './fresh-agent/adapters/claude/adapter.js'
 import { createCodexFreshAgentAdapter } from './fresh-agent/adapters/codex/adapter.js'
 import { createOpencodeFreshAgentAdapter } from './fresh-agent/adapters/opencode/adapter.js'
+import { OpencodeServeManager } from './fresh-agent/adapters/opencode/serve-manager.js'
 import {
   CodexAppServerRuntime,
   runCodexStartupReaper,
@@ -315,10 +316,12 @@ async function main() {
   const codexFreshAgentAdapter = createCodexFreshAgentAdapter({
     runtimeFactory: () => new CodexAppServerRuntime({ serverInstanceId }),
   })
-  const opencodeFreshAgentAdapter = createOpencodeFreshAgentAdapter()
+  const opencodeServeManager = new OpencodeServeManager()
+  const opencodeFreshAgentAdapter = createOpencodeFreshAgentAdapter({ serveManager: opencodeServeManager })
   const codexFreshAgentRuntime = {
     shutdown: async () => {
       await codexFreshAgentAdapter.shutdown?.()
+      await opencodeFreshAgentAdapter.shutdown?.()
     },
   }
   const freshAgentRuntimeManager = new FreshAgentRuntimeManager({
@@ -405,6 +408,7 @@ async function main() {
     codexActivityTracker: codexActivity.tracker,
     codexLaunchPlanner,
     assertTerminalCreateAccepted,
+    freshAgentRuntimeManager,
   }))
   registerFreshAgentThreadRoutes(app, {
     runtimeManager: freshAgentRuntimeManager,

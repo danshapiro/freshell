@@ -17,16 +17,10 @@ vi.mock('@/components/panes/PaneLayout', () => ({
   default: mockPaneLayout,
 }))
 
-// Mock SessionView
-vi.mock('@/components/SessionView', () => ({
-  default: () => <div data-testid="session-view" />,
-}))
-
 interface TabConfig {
   id: string
   mode: string
   codingCliProvider?: string
-  codingCliSessionId?: string
   resumeSessionId?: string
   sessionRef?: {
     provider: string
@@ -61,7 +55,7 @@ function createStore(tabs: TabConfig[], options: StoreOptions = {}) {
           status: 'running' as const,
           title: 'Test',
           codingCliProvider: t.codingCliProvider as any,
-          codingCliSessionId: t.codingCliSessionId,
+          codingCliSessionId: (t as any).codingCliSessionId,
           resumeSessionId: t.resumeSessionId,
           sessionRef: t.sessionRef,
           sessionMetadataByKey: t.sessionMetadataByKey,
@@ -132,19 +126,27 @@ describe('TabContent', () => {
   })
 
   describe('coding CLI sessions', () => {
-    it('renders SessionView when codingCliSessionId is present and no terminalId', () => {
+    it('ignores leftover codingCliSessionId when rendering tab content', () => {
       const store = createStore([
-        { id: 'tab-1', mode: 'codex', codingCliSessionId: 'coding-session-1' },
+        { id: 'legacy-leftover', mode: 'shell', codingCliSessionId: 'legacy-session' } as any,
       ])
 
-      const { getByTestId } = render(
+      const { queryByTestId } = render(
         <Provider store={store}>
-          <TabContent tabId="tab-1" />
+          <TabContent tabId="legacy-leftover" />
         </Provider>
       )
 
-      expect(getByTestId('session-view')).toBeInTheDocument()
-      expect(mockPaneLayout).not.toHaveBeenCalled()
+      expect(mockPaneLayout).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tabId: 'legacy-leftover',
+          defaultContent: expect.objectContaining({
+            kind: 'picker',
+          }),
+        }),
+        expect.anything(),
+      )
+      expect(queryByTestId('session-view')).not.toBeInTheDocument()
     })
 
     it('restores fresh-agent default content for no-layout tabs using persisted session metadata', () => {
@@ -249,6 +251,33 @@ describe('TabContent', () => {
             kind: 'terminal',
             mode: 'codex',
             sessionRef: undefined,
+          }),
+        }),
+        expect.anything(),
+      )
+    })
+
+    it('renders an explicit Codex sessionRef through PaneLayout resume content', () => {
+      const store = createStore([{
+        id: 'codex-resume',
+        mode: 'codex',
+        codingCliProvider: 'codex',
+        sessionRef: { provider: 'codex', sessionId: 'thread-durable-1' },
+      }])
+
+      render(
+        <Provider store={store}>
+          <TabContent tabId="codex-resume" />
+        </Provider>
+      )
+
+      expect(mockPaneLayout).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tabId: 'codex-resume',
+          defaultContent: expect.objectContaining({
+            kind: 'terminal',
+            mode: 'codex',
+            sessionRef: { provider: 'codex', sessionId: 'thread-durable-1' },
           }),
         }),
         expect.anything(),

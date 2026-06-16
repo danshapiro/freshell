@@ -1,6 +1,5 @@
 import { useEffect, useRef } from 'react'
 import PaneLayout from './panes/PaneLayout'
-import SessionView from './SessionView'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { useAppSelector } from '@/store/hooks'
 import type { PaneContentInput } from '@/store/paneTypes'
@@ -15,7 +14,6 @@ interface TabContentProps {
 
 export default function TabContent({ tabId, hidden }: TabContentProps) {
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
-  const hasLayout = useAppSelector((s) => !!s.panes.layouts[tabId])
   const defaultNewPane = useAppSelector((s) => s.settings.settings.panes?.defaultNewPane || 'ask')
   const previousHiddenRef = useRef(hidden)
 
@@ -27,11 +25,6 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
   }, [hidden, tabId])
 
   if (!tab) return null
-
-  // For coding CLI session views with no terminal pane, use SessionView
-  if (tab.codingCliSessionId && !hasLayout) {
-    return <SessionView sessionId={tab.codingCliSessionId} hidden={hidden} />
-  }
 
   // Build default content based on setting
   let defaultContent: PaneContentInput

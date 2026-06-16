@@ -73,6 +73,78 @@ describe('persistedState parsers', () => {
       const parsed = parsePersistedTabsRaw(raw)
       expect(parsed?.tabs.tabs[0].codexDurability).toEqual(codexDurability)
     })
+
+    it('drops raw Codex legacy session ids instead of inventing sessionRef', () => {
+      const raw = JSON.stringify({
+        version: TABS_SCHEMA_VERSION,
+        tabs: {
+          activeTabId: 'legacy-codex',
+          tabs: [{
+            id: 'legacy-codex',
+            title: 'Legacy Codex',
+            createdAt: 1,
+            mode: 'codex',
+            codingCliProvider: 'codex',
+            codingCliSessionId: 'thread-durable-1',
+          }],
+        },
+      })
+
+      const parsed = parsePersistedTabsRaw(raw)
+      expect(parsed).not.toBeNull()
+      expect(parsed!.tabs.tabs[0].id).toBe('legacy-codex')
+      expect(parsed!.tabs.tabs[0].sessionRef).toBeUndefined()
+      expect(parsed!.tabs.tabs[0].codingCliSessionId).toBeUndefined()
+      expect(parsed!.tabs.tabs[0].claudeSessionId).toBeUndefined()
+    })
+
+    it('migrates legacy claudeSessionId into sessionRef for old Claude tabs', () => {
+      const raw = JSON.stringify({
+        version: TABS_SCHEMA_VERSION,
+        tabs: {
+          activeTabId: 'legacy-claude',
+          tabs: [{
+            id: 'legacy-claude',
+            title: 'Legacy Claude',
+            createdAt: 1,
+            mode: 'claude',
+            claudeSessionId: '11111111-1111-4111-8111-111111111111',
+          }],
+        },
+      })
+
+      const parsed = parsePersistedTabsRaw(raw)
+      expect(parsed).not.toBeNull()
+      expect(parsed!.tabs.tabs[0]).toMatchObject({
+        id: 'legacy-claude',
+        sessionRef: { provider: 'claude', sessionId: '11111111-1111-4111-8111-111111111111' },
+      })
+      expect(parsed!.tabs.tabs[0].codingCliSessionId).toBeUndefined()
+      expect(parsed!.tabs.tabs[0].claudeSessionId).toBeUndefined()
+    })
+
+    it('drops unrecoverable orphan legacy session fields without rejecting the tab', () => {
+      const raw = JSON.stringify({
+        version: TABS_SCHEMA_VERSION,
+        tabs: {
+          activeTabId: 'legacy-orphan',
+          tabs: [{
+            id: 'legacy-orphan',
+            title: 'Legacy Orphan',
+            createdAt: 1,
+            mode: 'shell',
+            codingCliSessionId: 'orphan-session',
+          }],
+        },
+      })
+
+      const parsed = parsePersistedTabsRaw(raw)
+      expect(parsed).not.toBeNull()
+      expect(parsed!.tabs.tabs[0].id).toBe('legacy-orphan')
+      expect(parsed!.tabs.tabs[0].sessionRef).toBeUndefined()
+      expect(parsed!.tabs.tabs[0].codingCliSessionId).toBeUndefined()
+      expect(parsed!.tabs.tabs[0].claudeSessionId).toBeUndefined()
+    })
   })
 
   describe('parsePersistedPanesRaw', () => {
