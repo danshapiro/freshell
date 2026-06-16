@@ -37,6 +37,10 @@ export class FreshAgentUnsupportedCapabilityError extends Error {
 
 export class FreshAgentLostSessionError extends Error {
   readonly code = 'FRESH_AGENT_LOST_SESSION' as const
+  constructor(message?: string) {
+    super(message)
+    this.name = 'FreshAgentLostSessionError'
+  }
 }
 
 export class FreshAgentSessionLocatorMismatchError extends Error {
