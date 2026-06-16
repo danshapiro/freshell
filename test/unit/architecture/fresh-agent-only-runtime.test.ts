@@ -1,3 +1,4 @@
+import fs from 'node:fs'
 import { readdir, readFile } from 'node:fs/promises'
 import path from 'node:path'
 
@@ -103,6 +104,10 @@ const sdkInternalPrefixes = [
 
 function toRepoRelativePath(filePath: string): string {
   return path.relative(repoRoot, filePath).split(path.sep).join('/')
+}
+
+function readSourceSync(relativePath: string): string {
+  return fs.readFileSync(path.join(repoRoot, relativePath), 'utf8')
 }
 
 async function collectRuntimeSourceFiles(): Promise<string[]> {
@@ -366,6 +371,36 @@ describe('fresh-agent-only runtime architecture', () => {
       [...pathFindings, ...contentFindings],
       formatFindings([...pathFindings, ...contentFindings]),
     ).toEqual([])
+  })
+
+  it('does not keep a client-side codingcli create path', () => {
+    const forbiddenFiles = [
+      'src/store/codingCliThunks.ts',
+      'src/store/codingCliSlice.ts',
+      'src/components/SessionView.tsx',
+      'src/components/session/MessageBubble.tsx',
+      'src/components/session/ToolCallBlock.tsx',
+      'src/components/session/ToolResultBlock.tsx',
+    ]
+
+    for (const relativePath of forbiddenFiles) {
+      expect(fs.existsSync(path.join(repoRoot, relativePath))).toBe(false)
+    }
+
+    const storeSource = readSourceSync('src/store/store.ts')
+    expect(storeSource).not.toContain('codingCliReducer')
+    expect(storeSource).not.toContain('codingCli:')
+
+    const tabBarSource = readSourceSync('src/components/TabBar.tsx')
+    expect(tabBarSource).not.toContain("from '@/store/codingCliSlice'")
+    expect(tabBarSource).not.toContain('codingcli.kill')
+
+    const clientSources = [
+      'src/components/TabContent.tsx',
+      'src/components/TabBar.tsx',
+      'src/store/tabsSlice.ts',
+    ].map(readSourceSync).join('\n')
+    expect(clientSources).not.toContain('codingcli.create')
   })
 
   it('keeps SDK bridge protocol details out of public/browser-facing runtime source', async () => {

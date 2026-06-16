@@ -5,7 +5,7 @@ import { FreshAgentTranscript } from '@/components/fresh-agent/FreshAgentTranscr
 // Render markdown bodies synchronously. The real LazyMarkdown wraps MarkdownRenderer
 // in React.lazy + Suspense; mocking it to render MarkdownRenderer directly removes
 // the fallback->content swap so assertions don't race the chunk load. Matches the
-// mock used by the agent-chat MessageBubble tests.
+// mock used by older transcript markdown tests.
 vi.mock('@/components/markdown/LazyMarkdown', async () => {
   const { MarkdownRenderer } = await import('@/components/markdown/MarkdownRenderer')
   return {

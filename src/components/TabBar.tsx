@@ -10,7 +10,6 @@ import { getBusyPaneIdsForTab } from '@/lib/pane-activity'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTabBarScroll } from '@/hooks/useTabBarScroll'
 import TabItem from './TabItem'
-import { cancelCodingCliRequest } from '@/store/codingCliSlice'
 import { useMobile } from '@/hooks/useMobile'
 import { MobileTabStrip } from './MobileTabStrip'
 import { TabSwitcher } from './TabSwitcher'
@@ -315,15 +314,6 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
               ws.send({
                 type: messageType,
                 terminalId,
-              })
-            }
-          } else if (tab.codingCliSessionId) {
-            if (tab.status === 'creating') {
-              dispatch(cancelCodingCliRequest({ requestId: tab.codingCliSessionId }))
-            } else {
-              ws.send({
-                type: 'codingcli.kill',
-                sessionId: tab.codingCliSessionId,
               })
             }
           }

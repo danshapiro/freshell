@@ -4,7 +4,6 @@ import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import TabBar from '@/components/TabBar'
 import tabsReducer from '@/store/tabsSlice'
-import codingCliReducer from '@/store/codingCliSlice'
 import codexActivityReducer from '@/store/codexActivitySlice'
 import opencodeActivityReducer from '@/store/opencodeActivitySlice'
 import panesReducer from '@/store/panesSlice'
@@ -63,7 +62,6 @@ function createStore(options: { tabs: Tab[]; activeTabId: string | null; multiro
   return configureStore({
     reducer: {
       tabs: tabsReducer,
-      codingCli: codingCliReducer,
       codexActivity: codexActivityReducer,
       opencodeActivity: opencodeActivityReducer,
       panes: panesReducer,
@@ -72,7 +70,6 @@ function createStore(options: { tabs: Tab[]; activeTabId: string | null; multiro
     },
     preloadedState: {
       tabs: { tabs: options.tabs, activeTabId: options.activeTabId, renameRequestTabId: null },
-      codingCli: { sessions: {}, pendingRequests: {} },
       codexActivity: { byTerminalId: {}, lastSnapshotSeq: 0, liveMutationSeqByTerminalId: {}, removedMutationSeqByTerminalId: {} },
       opencodeActivity: { byTerminalId: {}, lastSnapshotSeq: 0, liveMutationSeqByTerminalId: {}, removedMutationSeqByTerminalId: {} },
       panes: { layouts: {}, activePane: {}, paneTitles: {} },
