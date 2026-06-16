@@ -408,6 +408,7 @@ async function main() {
     codexActivityTracker: codexActivity.tracker,
     codexLaunchPlanner,
     assertTerminalCreateAccepted,
+    freshAgentRuntimeManager,
   }))
   registerFreshAgentThreadRoutes(app, {
     runtimeManager: freshAgentRuntimeManager,

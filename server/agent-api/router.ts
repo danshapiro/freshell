@@ -23,6 +23,11 @@ import { renderCapture } from './capture.js'
 import { waitForMatch } from './wait-for.js'
 import { resolveScreenshotOutputPath } from './screenshot-path.js'
 import { sanitizeSessionRef } from '../../shared/session-contract.js'
+import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '../../shared/fresh-agent.js'
+import type {
+  FreshAgentSessionLocator,
+  FreshAgentThreadLocator,
+} from '../fresh-agent/runtime-adapter.js'
 
 const truthy = (value: unknown) => value === true || value === 'true' || value === '1' || value === 'yes'
 const SYNCABLE_TERMINAL_MODES = new Set(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
@@ -369,6 +374,13 @@ type CodexPromptBlocker = {
   isPromptBlocked: (terminalId: string, at: number) => boolean
 }
 
+type FreshAgentRuntimeManagerLike = {
+  create: (input: any) => Promise<{ sessionId: string; sessionType: FreshAgentSessionType; runtimeProvider: FreshAgentRuntimeProvider; sessionRef?: { provider: string; sessionId: string } }>
+  send: (locator: FreshAgentSessionLocator, input: { text: string; settings?: any }) => Promise<{ sessionId?: string; sessionRef?: { provider: string; sessionId: string } } | void>
+  attach: (locator: FreshAgentSessionLocator) => Promise<{ sessionId: string; sessionRef?: { provider: string; sessionId: string } }>
+  getSnapshot: (input: FreshAgentThreadLocator) => Promise<any>
+}
+
 const parseRegex = (raw: string) => {
   if (raw.startsWith('/') && raw.lastIndexOf('/') > 0) {
     const last = raw.lastIndexOf('/')
@@ -405,6 +417,7 @@ export function createAgentApiRouter({
   codexActivityTracker,
   codexLaunchPlanner,
   assertTerminalCreateAccepted,
+  freshAgentRuntimeManager,
 }: {
   layoutStore: any
   registry: any
@@ -415,6 +428,7 @@ export function createAgentApiRouter({
   codexActivityTracker?: CodexPromptBlocker
   codexLaunchPlanner?: CodexLaunchPlanner
   assertTerminalCreateAccepted?: () => void
+  freshAgentRuntimeManager?: FreshAgentRuntimeManagerLike
 }) {
   const router = Router()
   const assertTerminalAdmission = () => {
