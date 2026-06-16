@@ -876,6 +876,26 @@ export function createAgentApiRouter({
     const resolved = resolvePaneTarget(req.params.id)
     if (rejectPaneTargetError(res, resolved)) return
     const paneId = resolved.paneId || req.params.id
+
+    const faSnap = layoutStore.getPaneSnapshot?.(paneId)
+    if (faSnap?.kind === 'fresh-agent') {
+      const c = faSnap.paneContent || {}
+      if (!freshAgentRuntimeManager) return res.status(503).json(fail('fresh-agent runtime not available on this server'))
+      const rawT = req.query.T || req.query.timeout
+      const tSec = typeof rawT === 'string' ? Number(rawT) : Number.NaN
+      const deadline = Date.now() + (Number.isFinite(tSec) ? tSec * 1000 : 30000)
+      while (true) {
+        let status: string | undefined
+        try {
+          const snap = await freshAgentRuntimeManager.getSnapshot({ sessionType: c.sessionType, provider: c.provider, threadId: c.sessionId })
+          status = snap?.status
+        } catch { /* session may not be materialized yet */ }
+        if (status === 'idle') return res.json(ok({ matched: true, reason: 'idle' }, 'session idle'))
+        if (Date.now() >= deadline) return res.json(approx({ matched: false }, 'timeout'))
+        await new Promise((r) => setTimeout(r, 200))
+      }
+    }
+
     let terminalId = layoutStore.resolvePaneToTerminal?.(paneId)
     const term = terminalId ? registry.get?.(terminalId) : undefined
     if (!term) return res.status(404).json(fail('terminal not found'))

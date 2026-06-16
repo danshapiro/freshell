@@ -113,3 +113,17 @@ describe('agent-api fresh-agent: capture', () => {
     expect(getSnapshot).toHaveBeenCalledWith({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'freshopencode-abc' })
   })
 })
+
+describe('agent-api fresh-agent: wait-for', () => {
+  it('resolves matched when the fresh-agent snapshot reports idle', async () => {
+    const getSnapshot = vi.fn(async () => ({ status: 'idle', turns: [] }))
+    const { app } = makeApp({ freshAgentRuntimeManager: {
+      create: vi.fn(async () => ({ sessionId: 'freshopencode-abc', sessionType: 'freshopencode', runtimeProvider: 'opencode' })),
+      send: vi.fn(), attach: vi.fn(), getSnapshot,
+    } })
+    const created = await request(app).post('/api/tabs').send({ agent: 'opencode' })
+    const res = await request(app).get(`/api/panes/${created.body.data.paneId}/wait-for?timeout=2`)
+    expect(res.status).toBe(200)
+    expect(res.body.data).toMatchObject({ matched: true, reason: 'idle' })
+  })
+})
