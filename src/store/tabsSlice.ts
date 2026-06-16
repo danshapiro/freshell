@@ -262,9 +262,7 @@ type AddTabPayload = {
   id?: string
   title?: string
   description?: string
-  codingCliSessionId?: string
   codingCliProvider?: CodingCliProviderName
-  claudeSessionId?: string
   status?: TerminalStatus
   mode?: TabMode
   shell?: ShellType
@@ -287,19 +285,14 @@ export const tabsSlice = createSlice({
       const payload = action.payload || {}
 
       const id = payload.id || nanoid()
-      const legacyClaudeSessionId = payload.claudeSessionId
-      const codingCliSessionId = payload.codingCliSessionId || legacyClaudeSessionId
-      const codingCliProvider =
-        payload.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined)
+      const codingCliProvider = payload.codingCliProvider
       const sessionRef = sanitizeSessionRef(payload.sessionRef)
       const tab: Tab = {
         id,
         createRequestId: payload.createRequestId || id,
         title: payload.title || `Tab ${state.tabs.length + 1}`,
         description: payload.description,
-        codingCliSessionId,
         codingCliProvider,
-        claudeSessionId: payload.claudeSessionId,
         status: payload.status || 'creating',
         mode: payload.mode || 'shell',
         shell: payload.shell || 'system',
@@ -547,7 +540,6 @@ export const reopenClosedTab = createAsyncThunk(
       mode: entry.tab.mode,
       shell: entry.tab.shell,
       initialCwd: entry.tab.initialCwd,
-      codingCliSessionId: entry.tab.codingCliSessionId,
       codingCliProvider: entry.tab.codingCliProvider,
       resumeSessionId: entry.tab.resumeSessionId,
       sessionMetadataByKey: entry.tab.sessionMetadataByKey,
