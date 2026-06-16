@@ -79,7 +79,14 @@ function normalizePatchChanges(files: unknown): Record<string, unknown>[] {
     .filter((value): value is Record<string, unknown> => Boolean(value))
 }
 
-function stripSurroundingQuotes(text: string): string {
+/**
+ * The OpenCode `run` subcommand stores a single positional prompt that
+ * contains spaces by wrapping it in literal double quotes. Other input paths
+ * (interactive composer, API-level sends, ACP) store the text as-is. We can
+ * therefore remove one outer pair of double quotes deterministically for user
+ * text turns without touching assistant text or legitimate inline quoting.
+ */
+function stripOpencodeRunArgumentQuoting(text: string): string {
   if (text.length >= 2 && text.startsWith('"') && text.endsWith('"')) return text.slice(1, -1)
   return text
 }
@@ -92,7 +99,7 @@ function itemFromPart(
   const id = typeof part.id === 'string' && part.id.length > 0 ? part.id : fallbackId
   if (part.type === 'text') {
     const rawText = typeof part.text === 'string' ? part.text : ''
-    const text = role === 'user' ? stripSurroundingQuotes(rawText) : rawText
+    const text = role === 'user' ? stripOpencodeRunArgumentQuoting(rawText) : rawText
     return { id, kind: 'text', text }
   }
   if (part.type === 'reasoning') {
