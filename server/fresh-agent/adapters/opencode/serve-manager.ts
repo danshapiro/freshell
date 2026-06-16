@@ -149,11 +149,15 @@ export class OpencodeServeManager {
     return (await res.json()) as T
   }
 
-  async createSession(input: { title?: string; parentID?: string } = {}): Promise<{ id: string; directory?: string; title?: string }> {
+  async createSession(input: { title?: string; parentID?: string; directory?: string } = {}): Promise<{ id: string; directory?: string; title?: string }> {
+    const body: { title?: string; parentID?: string; directory?: string } = {}
+    if (input.title !== undefined) body.title = input.title
+    if (input.parentID !== undefined) body.parentID = input.parentID
+    if (input.directory !== undefined) body.directory = input.directory
     return this.json('/session', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(input),
+      body: JSON.stringify(body),
     })
   }
 
@@ -197,8 +201,12 @@ export class OpencodeServeManager {
     await this.json(`/session/${encodeURIComponent(id)}/abort`, { method: 'POST' })
   }
 
-  async compact(id: string): Promise<void> {
-    await this.json(`/session/${encodeURIComponent(id)}/compact`, { method: 'POST' })
+  async compact(id: string, body?: { instructions?: string }): Promise<void> {
+    await this.json(`/session/${encodeURIComponent(id)}/compact`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body ?? {}),
+    })
   }
 
   async fork(id: string): Promise<{ id: string }> {

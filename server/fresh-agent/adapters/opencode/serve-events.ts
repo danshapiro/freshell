@@ -16,7 +16,13 @@ export type ParsedServeEvent = {
   sessionId: string | undefined
   /** The denormalized properties payload from the source event. */
   properties: Record<string, unknown>
-  raw: Record<string, any>
+  raw: Record<string, unknown>
+}
+
+function stringProperty(value: unknown, key: string): string | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const candidate = (value as Record<string, unknown>)[key]
+  return typeof candidate === 'string' ? candidate : undefined
 }
 
 /** Normalize one decoded `GET /event` SSE payload. opencode 1.17.x nests the
@@ -24,17 +30,15 @@ export type ParsedServeEvent = {
  * (also `properties.part.sessionID` / `properties.info.sessionID`). */
 export function parseServeEvent(event: unknown): ParsedServeEvent | null {
   if (!event || typeof event !== 'object' || Array.isArray(event)) return null
-  const raw = event as Record<string, any>
+  const raw = event as Record<string, unknown>
   if (typeof raw.type !== 'string') return null
-  const props = raw.properties && typeof raw.properties === 'object'
+  const props = raw.properties && typeof raw.properties === 'object' && !Array.isArray(raw.properties)
     ? (raw.properties as Record<string, unknown>)
     : {}
   const sessionId =
-    (typeof props.sessionID === 'string' && props.sessionID)
-    || (typeof (props.part as Record<string, unknown> | undefined)?.sessionID === 'string'
-      && ((props.part as Record<string, unknown>).sessionID as string))
-    || (typeof (props.info as Record<string, unknown> | undefined)?.sessionID === 'string'
-      && ((props.info as Record<string, unknown>).sessionID as string))
+    stringProperty(props, 'sessionID')
+    || stringProperty(props.part, 'sessionID')
+    || stringProperty(props.info, 'sessionID')
     || undefined
   return { kind: raw.type, sessionId, properties: { ...props }, raw }
 }
@@ -55,8 +59,7 @@ export function serveEventToSdk(parsed: ParsedServeEvent, subscribedId: string):
     case 'session.idle':
       return { type: 'sdk.session.snapshot', sessionId: subscribedId, status: 'idle' }
     case 'session.status': {
-      const status = props.status as { type?: string } | undefined
-      const statusType = status?.type
+      const statusType = stringProperty(props.status, 'type')
       return { type: 'sdk.session.snapshot', sessionId: subscribedId, status: statusType === 'idle' ? 'idle' : 'running' }
     }
     case 'message.part.delta':
@@ -64,10 +67,7 @@ export function serveEventToSdk(parsed: ParsedServeEvent, subscribedId: string):
     case 'message.updated':
       return { type: 'sdk.session.snapshot', sessionId: subscribedId, status: 'running' }
     case 'session.error': {
-      const error = props.error as { message?: string } | undefined
-      const message = typeof error?.message === 'string'
-        ? error.message
-        : 'OpenCode session error'
+      const message = stringProperty(props.error, 'message') ?? 'OpenCode session error'
       return { type: 'sdk.error', sessionId: subscribedId, message }
     }
     default:
