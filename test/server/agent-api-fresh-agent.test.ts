@@ -92,3 +92,24 @@ describe('agent-api fresh-agent: send-keys', () => {
     expect(send).toHaveBeenCalledTimes(2)
   })
 })
+
+describe('agent-api fresh-agent: capture', () => {
+  it('renders the transcript text for a fresh-agent pane', async () => {
+    const getSnapshot = vi.fn(async () => ({
+      turns: [
+        { role: 'user', summary: 'Reply with: ok', items: [{ kind: 'text', text: 'Reply with: ok' }] },
+        { role: 'assistant', summary: 'ok', items: [{ kind: 'text', text: 'ok' }] },
+      ],
+    }))
+    const { app } = makeApp({ freshAgentRuntimeManager: {
+      create: vi.fn(async () => ({ sessionId: 'freshopencode-abc', sessionType: 'freshopencode', runtimeProvider: 'opencode' })),
+      send: vi.fn(), attach: vi.fn(), getSnapshot,
+    } })
+    const created = await request(app).post('/api/tabs').send({ agent: 'opencode' })
+    const res = await request(app).get(`/api/panes/${created.body.data.paneId}/capture`)
+    expect(res.status).toBe(200)
+    expect(res.text).toContain('user: Reply with: ok')
+    expect(res.text).toContain('assistant: ok')
+    expect(getSnapshot).toHaveBeenCalledWith({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'freshopencode-abc' })
+  })
+})

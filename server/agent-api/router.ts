@@ -254,6 +254,24 @@ function terminalInputFailureMessage(result: Exclude<TerminalInputResult, { stat
   return 'Terminal is not running.'
 }
 
+function renderFreshAgentTranscript(snapshot: any): string {
+  const turns = Array.isArray(snapshot?.turns) ? snapshot.turns : []
+  return turns.map((turn: any) => {
+    const role = typeof turn?.role === 'string' ? turn.role : 'turn'
+    const items = Array.isArray(turn?.items) ? turn.items : []
+    const text = items
+      .map((item: any) => {
+        if (item?.kind === 'text' && typeof item.text === 'string') return item.text
+        if (item?.kind === 'reasoning' && typeof item.text === 'string') return `[reasoning] ${item.text}`
+        if (item?.kind === 'dynamic_tool') return `[tool:${item.tool ?? 'tool'} ${item.status ?? ''}]`
+        return ''
+      })
+      .filter(Boolean)
+      .join('\n')
+    return `${role}: ${text || (typeof turn?.summary === 'string' ? turn.summary : '')}`.trim()
+  }).join('\n\n')
+}
+
 function shouldWaitForCodexIdentity(payload: Record<string, unknown>): boolean {
   return truthy(payload.waitForCodexIdentity)
 }
@@ -804,12 +822,22 @@ export function createAgentApiRouter({
     res.json(ok({ panes }))
   })
 
-  router.get('/panes/:id/capture', (req, res) => {
+  router.get('/panes/:id/capture', async (req, res) => {
     const rawTarget = req.params.id
     const resolved = resolvePaneTarget(rawTarget)
     if (rejectPaneTargetError(res, resolved)) return
     const paneId = resolved.paneId || rawTarget
     const paneSnapshot = layoutStore.getPaneSnapshot?.(paneId)
+    if (paneSnapshot?.kind === 'fresh-agent') {
+      const c = paneSnapshot.paneContent || {}
+      if (!freshAgentRuntimeManager) return res.status(503).json(fail('fresh-agent runtime not available on this server'))
+      try {
+        const snapshot = await freshAgentRuntimeManager.getSnapshot({ sessionType: c.sessionType, provider: c.provider, threadId: c.sessionId })
+        return res.type('text/plain').send(renderFreshAgentTranscript(snapshot))
+      } catch (err: any) {
+        return res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'fresh-agent capture failed'))
+      }
+    }
     let terminalId = paneSnapshot?.terminalId || layoutStore.resolvePaneToTerminal?.(paneId)
     const term = terminalId ? registry.get?.(terminalId) : undefined
 
