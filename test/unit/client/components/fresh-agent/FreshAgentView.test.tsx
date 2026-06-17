@@ -374,6 +374,31 @@ describe('FreshAgentView', () => {
     expect(root).toHaveClass('fresh-agent-style-serif')
   })
 
+  it('applies the mono terminal style to the view root', async () => {
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            createRequestId: 'req-render-mono',
+            sessionId: 'thread-render-mono',
+            status: 'idle',
+            style: 'mono',
+          }}
+        />
+      </Provider>,
+    )
+
+    const root = await waitFor(() => document.querySelector('[data-context="fresh-agent"]') as HTMLElement)
+    expect(root).toHaveAttribute('data-style', 'mono')
+    expect(root).toHaveClass('fresh-agent-style-mono')
+  })
+
   it('exposes a durable sessionRef as the fresh-agent context session id', async () => {
     const store = createStore()
     render(
@@ -2740,6 +2765,45 @@ describe('FreshAgentView', () => {
       freshAgent: {
         providers: {
           freshcodex: { style: 'serif' },
+        },
+      },
+    })
+  })
+
+  it('lets a Freshcodex pane choose the mono terminal style', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-mono-style',
+        sessionId: 'thread-mono-style',
+        status: 'idle',
+        style: 'sans',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentSettingsButton tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+    const styleSelect = screen.getByRole('combobox', { name: 'Style' })
+    expect(Array.from(styleSelect.querySelectorAll('option')).map((option) => option.textContent)).toEqual(['Sans', 'Serif', 'Mono'])
+
+    fireEvent.change(styleSelect, { target: { value: 'mono' } })
+
+    const layout = store.getState().panes.layouts['tab-1']
+    expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.style : null).toBe('mono')
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      freshAgent: {
+        providers: {
+          freshcodex: { style: 'mono' },
         },
       },
     })

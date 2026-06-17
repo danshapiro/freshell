@@ -208,13 +208,35 @@ describe('shared settings contract', () => {
     expect(merged.freshAgent.providers.freshclaude?.style).toBe('sans')
   })
 
+  it('accepts mono as a fresh-agent provider style default', () => {
+    const parsed = buildServerSettingsPatchSchema().parse({
+      freshAgent: {
+        providers: {
+          freshcodex: { style: 'mono' },
+        },
+      },
+    })
+
+    expect(parsed.freshAgent?.providers?.freshcodex).toEqual({ style: 'mono' })
+
+    const merged = mergeServerSettings(createDefaultServerSettings({ loggingDebug: false }), {
+      freshAgent: {
+        providers: {
+          freshcodex: { style: 'mono' },
+        },
+      },
+    })
+
+    expect(merged.freshAgent.providers.freshcodex?.style).toBe('mono')
+  })
+
   it('rejects invalid fresh-agent provider style defaults', () => {
     const schema = buildServerSettingsPatchSchema()
 
     expect(schema.safeParse({
       freshAgent: {
         providers: {
-          freshcodex: { style: 'mono' },
+          freshcodex: { style: 'script' },
         },
       },
     }).success).toBe(false)
@@ -222,7 +244,7 @@ describe('shared settings contract', () => {
     const merged = mergeServerSettings(createDefaultServerSettings({ loggingDebug: false }), {
       freshAgent: {
         providers: {
-          freshcodex: { style: 'mono' as any },
+          freshcodex: { style: 'script' as any },
         },
       },
     })
