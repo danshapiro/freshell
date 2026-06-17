@@ -246,9 +246,16 @@ In the restored-page hidden wait, keep the assertions for active shell tab, Open
 
 - [ ] **Step 4: Assert relaunch and rendered output after reveal**
 
-After revealing the OpenCode tab and calling `waitForOpenCodeSessions`, change the terminal id assertion from equality to replacement:
+After revealing the OpenCode tab, wait specifically for a running replacement terminal id:
 
 ```ts
+const [afterRefresh] = await waitForRunningTerminals(restorePage, [opencodeTab.tabId], {
+  [opencodeTab.tabId]: beforeAssociation.terminalId,
+})
+expect(afterRefresh.sessionRef).toEqual({
+  provider: 'opencode',
+  sessionId: expectedSessionId,
+})
 expect(afterRefresh.terminalId).toBeTruthy()
 expect(afterRefresh.terminalId).not.toBe(beforeAssociation.terminalId)
 ```
