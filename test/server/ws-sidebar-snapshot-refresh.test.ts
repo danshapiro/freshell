@@ -80,7 +80,7 @@ function getSingleClientState(wsHandler: any): any {
   return states[0]
 }
 
-describe('ws sidebar snapshot refresh', () => {
+describe.sequential('ws sidebar snapshot refresh', () => {
   let server: http.Server | undefined
   let port: number
   let wsHandler: any

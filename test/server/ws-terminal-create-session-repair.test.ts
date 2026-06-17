@@ -298,7 +298,7 @@ class FakeSessionRepairService extends EventEmitter {
   }
 }
 
-describe('terminal.create session repair wait', () => {
+describe.sequential('terminal.create session repair wait', () => {
   let server: http.Server | undefined
   let port: number
   let sessionRepairService: FakeSessionRepairService
