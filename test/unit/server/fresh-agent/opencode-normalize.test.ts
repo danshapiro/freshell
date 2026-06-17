@@ -199,7 +199,7 @@ describe('OpenCode fresh-agent normalization', () => {
     expect(turn.items[0]?.text).toBe('"nested" quotes')
   })
 
-  it('strips leaked think/thinking tags and their content from assistant text parts', () => {
+  it('maps balanced leaked think/thinking tags to thinking items while preserving visible assistant text', () => {
     const turn = normalizeOpencodeTurn({
       info: { id: 'msg-think-tags', role: 'assistant' },
       parts: [
@@ -217,11 +217,120 @@ describe('OpenCode fresh-agent normalization', () => {
     }, 0)!
 
     expect(turn.items).toEqual([
-      { id: 'part-think', kind: 'text', text: 'Before  and after.' },
-      { id: 'part-thinking', kind: 'text', text: 'Intro  done.' },
+      { id: 'part-think:text-0', kind: 'text', text: 'Before ' },
+      { id: 'part-think:thinking-1', kind: 'thinking', text: 'Internal plan\n1 tool used' },
+      { id: 'part-think:text-2', kind: 'text', text: ' and after.' },
+      { id: 'part-thinking:text-0', kind: 'text', text: 'Intro ' },
+      { id: 'part-thinking:thinking-1', kind: 'thinking', text: 'I could change all instances.' },
+      { id: 'part-thinking:text-2', kind: 'text', text: ' done.' },
+    ])
+    expect(turn.summary).toBe('Before  and after.\n\nIntro  done.')
+  })
+
+  it('maps malformed leading think closers in OpenCode tool turns to thinking and drops marker-only parts', () => {
+    const turn = normalizeOpencodeTurn({
+      info: { id: 'msg-leaked-tool-thinking', role: 'assistant' },
+      parts: [
+        { id: 'part-marker-only', type: 'text', text: '</think>' },
+        { id: 'part-leading-close', type: 'text', text: '</think></think>Need to edit the CSS.</think>' },
+        {
+          id: 'part-tool',
+          type: 'tool',
+          tool: 'edit',
+          state: {
+            status: 'completed',
+            input: { filePath: 'src/index.css' },
+            output: 'Edit applied successfully.',
+          },
+        },
+      ],
+    }, 0)
+
+    expect(turn.items).toEqual([
+      { id: 'part-leading-close', kind: 'thinking', text: 'Need to edit the CSS.' },
+      {
+        id: 'part-tool',
+        kind: 'dynamic_tool',
+        namespace: 'opencode',
+        tool: 'edit',
+        status: 'completed',
+        arguments: { filePath: 'src/index.css' },
+        contentItems: ['Edit applied successfully.'],
+        success: true,
+      },
     ])
   })
 
+  it('keeps final visible assistant text when a malformed leading think closer leaks outside a tool turn', () => {
+    const turn = normalizeOpencodeTurn({
+      info: { id: 'msg-final-text', role: 'assistant' },
+      parts: [{ id: 'part-final', type: 'text', text: '</think>Done. Updated the CSS.' }],
+    }, 0)
+
+    expect(turn.items).toEqual([
+      { id: 'part-final', kind: 'text', text: 'Done. Updated the CSS.' },
+    ])
+    expect(turn.summary).toBe('Done. Updated the CSS.')
+  })
+
+  it('keeps final visible assistant text when a malformed leading think closer appears after a tool', () => {
+    const turn = normalizeOpencodeTurn({
+      info: { id: 'msg-final-text-after-tool', role: 'assistant' },
+      parts: [
+        {
+          id: 'part-tool',
+          type: 'tool',
+          tool: 'edit',
+          state: { status: 'completed', input: {}, output: 'done' },
+        },
+        { id: 'part-final', type: 'text', text: '</think>Done. Updated the CSS.' },
+      ],
+    }, 0)
+
+    expect(turn.items.at(-1)).toEqual({ id: 'part-final', kind: 'text', text: 'Done. Updated the CSS.' })
+    expect(turn.summary).toBe('Done. Updated the CSS.')
+  })
+
+  it('maps unterminated leaked think tags to thinking without empty transcript text', () => {
+    const bare = normalizeOpencodeTurn({
+      info: { id: 'msg-bare-open', role: 'assistant' },
+      parts: [{ id: 'part-bare-open', type: 'text', text: '<think>' }],
+    }, 0)
+    expect(bare.items).toEqual([])
+
+    const mixed = normalizeOpencodeTurn({
+      info: { id: 'msg-open', role: 'assistant' },
+      parts: [{ id: 'part-open', type: 'text', text: 'Visible <think>hidden plan' }],
+    }, 0)
+
+    expect(mixed.items).toEqual([
+      { id: 'part-open:text-0', kind: 'text', text: 'Visible ' },
+      { id: 'part-open:thinking-1', kind: 'thinking', text: 'hidden plan' },
+    ])
+    expect(mixed.summary).toBe('Visible ')
+  })
+
+  it('maps dangling leaked think closers to thinking plus visible text', () => {
+    const turn = normalizeOpencodeTurn({
+      info: { id: 'msg-dangling-close', role: 'assistant' },
+      parts: [{ id: 'part-dangling-close', type: 'text', text: 'hidden plan</think>Visible text' }],
+    }, 0)
+
+    expect(turn.items).toEqual([
+      { id: 'part-dangling-close:thinking-0', kind: 'thinking', text: 'hidden plan' },
+      { id: 'part-dangling-close:text-1', kind: 'text', text: 'Visible text' },
+    ])
+    expect(turn.summary).toBe('Visible text')
+  })
+
+  it('rejects roleless messages even when they contain leaked think tags', () => {
+    const turn = normalizeOpencodeTurn({
+      info: { id: 'msg-unknown-role' },
+      parts: [{ id: 'part-unknown-role', type: 'text', text: 'hidden planVISIBLE text' }],
+    }, 0)
+
+    expect(turn).toBeNull()
+  })
 
   it('preserves think tags in user text parts', () => {
     const turn = normalizeOpencodeTurn({
