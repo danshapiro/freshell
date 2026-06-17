@@ -331,25 +331,30 @@ test.describe('Main window with remote server', () => {
     await mainPage.screenshot({ path: 'test-results/main-03-launcher.png' })
   })
 
-  test('ctrl-clicking an external link calls the Electron openExternal bridge', async () => {
+  test('ctrl-clicking an external link uses the system browser', async () => {
     app = await launchApp(tmpHome)
     const mainPage = await app.firstWindow()
     await mainPage.waitForLoadState('domcontentloaded')
     await mainPage.waitForTimeout(3000)
 
-    // Inject a link and override the preload-exposed bridge so we can observe
-    // the system-browser request without actually opening a browser window.
-    const openedUrl = await mainPage.evaluate(async () => {
-      let captured: string | null = null
-      ;(window as any).freshellDesktop = {
-        ...(window as any).freshellDesktop,
-        isElectron: true,
-        openExternal: (url: string) => {
-          captured = url
-          return Promise.resolve()
-        },
+    // Patch shell.openExternal in the main process so the test can observe the
+    // real IPC flow without actually launching a browser window.
+    await app.evaluate(() => {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { shell } = require('electron')
+      const original = shell.openExternal
+      ;(globalThis as any).__testOpenExternal = (url: string) => {
+        ;(globalThis as any).__openedUrl = url
+        return Promise.resolve()
       }
+      ;(globalThis as any).__restoreOpenExternal = () => {
+        shell.openExternal = original
+      }
+      shell.openExternal = (globalThis as any).__testOpenExternal
+    })
 
+    // Inject an external link and ctrl-click it in the main renderer.
+    await mainPage.evaluate(async () => {
       const link = document.createElement('a')
       link.href = 'https://example.com/freshell-test-link'
       link.target = '_blank'
@@ -357,16 +362,15 @@ test.describe('Main window with remote server', () => {
       link.textContent = 'test external link'
       document.body.appendChild(link)
 
-      await new Promise<void>((resolve) => {
-        const event = new MouseEvent('click', { ctrlKey: true, bubbles: true })
-        link.dispatchEvent(event)
-        // Let the capture handler and microtask queue run.
-        requestAnimationFrame(() => resolve())
-      })
+      const event = new MouseEvent('click', { ctrlKey: true, bubbles: true })
+      link.dispatchEvent(event)
 
-      return captured
+      // Wait for the IPC round-trip.
+      await new Promise<void>((resolve) => setTimeout(resolve, 500))
     })
 
-    expect(openedUrl).toBe('https://example.com/freshell-test-link')
+    await expect.poll(async () =>
+      app.evaluate(() => (globalThis as any).__openedUrl),
+    ).toBe('https://example.com/freshell-test-link')
   })
 })

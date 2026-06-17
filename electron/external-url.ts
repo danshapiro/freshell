@@ -19,10 +19,14 @@ export interface ExternalUrlDeps {
   shell: {
     openExternal(url: string): Promise<void>
   }
+  isAllowedSender: (event: { sender?: { id?: number } }) => boolean
 }
 
 export function registerOpenExternalHandler(deps: ExternalUrlDeps): void {
-  deps.ipcMain.handle('open-external-url', async (_event, url) => {
+  deps.ipcMain.handle('open-external-url', async (event, url) => {
+    if (!deps.isAllowedSender(event)) {
+      throw new Error(`open-external-url rejected: sender not allowed`)
+    }
     if (!isAllowedExternalUrl(url)) {
       throw new Error(`open-external-url rejected: only absolute http/https URLs are allowed, got ${JSON.stringify(url)}`)
     }

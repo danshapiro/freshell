@@ -5,7 +5,6 @@ import { consumePaneRefreshRequest, updatePaneContent } from '@/store/panesSlice
 import { clearPaneRuntimeActivity, setPaneRuntimeActivity } from '@/store/paneRuntimeActivitySlice'
 import { cn } from '@/lib/utils'
 import { copyText } from '@/lib/clipboard'
-import { openExternalUrl } from '@/lib/open-url'
 import { isLoopbackHostname } from '@/lib/url-rewrite'
 import { api } from '@/lib/api'
 import { registerBrowserActions } from '@/lib/pane-action-registry'
@@ -466,11 +465,13 @@ export default function BrowserPane({
         if (currentUrl) await copyText(currentUrl)
       },
       openExternal: () => {
-        // Open the resolved URL (with port forwarding) so it works for remote users
+        // Open the resolved URL (with port forwarding) so it works for remote users.
+        // This stays inside the Freshell session so authenticated /api/proxy and
+        // /local-file paths keep the auth cookie.
         if (resolvedSrc) {
-          openExternalUrl(resolvedSrc)
+          window.open(resolvedSrc, '_blank', 'noopener,noreferrer')
         } else if (currentUrl) {
-          openExternalUrl(currentUrl)
+          window.open(currentUrl, '_blank', 'noopener,noreferrer')
         }
       },
       toggleDevTools,

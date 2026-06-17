@@ -279,12 +279,24 @@ async function main(): Promise<void> {
   ipcMain.removeHandler('open-external-url')
 
   let pendingLaunchChooser: { candidates: LaunchServerCandidate[]; reason: string } | undefined
-  // webContents id of the launch chooser window, so choose-launch-option only
+  // webContents id of the launch window, so choose-launch-option only
   // honors requests originating from it (the API is exposed to every window).
   let chooserWebContentsId: number | undefined
 
+  // webContents id of the main Freshell window. The open-external-url handler
+  // only honors requests from this window so other renderer surfaces (wizard,
+  // launch chooser, or a compromised popup) cannot drive shell.openExternal.
+  let mainWebContentsId: number | undefined = undefined
+
   // Register system-browser link handler.
-  registerOpenExternalHandler({ ipcMain, shell })
+  registerOpenExternalHandler({
+    ipcMain,
+    shell,
+    isAllowedSender: (event) => {
+      const senderId = (event as { sender?: { id?: number } }).sender?.id
+      return mainWebContentsId !== undefined && senderId === mainWebContentsId
+    },
+  })
 
   // Register the complete-setup handler before runStartup so it is available
   // when the wizard renderer calls it via the preload API.
@@ -430,6 +442,10 @@ async function main(): Promise<void> {
   // Main window is about to be created -- leave wizard phase so the
   // consolidated window-all-closed handler can quit when appropriate.
   wizardPhase = false
+
+  // Remember the main window's webContents id so privileged IPC handlers can
+  // verify requests originate from the trusted renderer.
+  mainWebContentsId = (result.window as unknown as BrowserWindow).webContents?.id
 
   // Initialize the main process lifecycle (single-instance, close-to-tray, etc.)
   await initMainProcess({
