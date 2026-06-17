@@ -637,6 +637,30 @@ html {
   --fresh-agent-copy-font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   --fresh-agent-meta-font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   --fresh-agent-mono-font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --fresh-agent-surface: #fbfcf8;
+  --fresh-agent-panel-surface: #f2f6ee;
+  --fresh-agent-subtle-surface: #e8f0e3;
+  --fresh-agent-raised-surface: #eef4e9;
+  --fresh-agent-border: rgba(23, 111, 46, 0.28);
+  --fresh-agent-border-strong: rgba(23, 111, 46, 0.48);
+  --fresh-agent-accent: #176f2e;
+  --fresh-agent-accent-soft: rgba(23, 111, 46, 0.1);
+  --fresh-agent-danger: #b42318;
+  --fresh-agent-danger-soft: rgba(180, 35, 24, 0.1);
+  --fresh-agent-success: #176f2e;
+  --fresh-agent-success-soft: rgba(23, 111, 46, 0.1);
+  --fresh-agent-text: #17301d;
+  --fresh-agent-muted-text: #4f6b55;
+  --fresh-agent-soft-text: #657c6a;
+  --fresh-agent-terminal-text-shadow: none;
+  --fresh-agent-watermark-opacity: 0;
+  background: var(--fresh-agent-surface);
+  color: var(--fresh-agent-text);
+  font-family: var(--fresh-agent-copy-font-family);
+  text-shadow: var(--fresh-agent-terminal-text-shadow);
+}
+
+.dark .fresh-agent-style-mono {
   --fresh-agent-surface: #0a0a0a;
   --fresh-agent-panel-surface: #0d0d0d;
   --fresh-agent-subtle-surface: #131313;
@@ -652,27 +676,11 @@ html {
   --fresh-agent-text: #39ff14;
   --fresh-agent-muted-text: #5c9e4c;
   --fresh-agent-soft-text: #4a8a3c;
-  --fresh-agent-watermark-opacity: 0.04;
-  position: relative;
-  background: var(--fresh-agent-surface);
-  color: var(--fresh-agent-text);
-  font-family: var(--fresh-agent-copy-font-family);
-  text-shadow: 0 0 1px rgba(57, 255, 20, 0.25);
+  --fresh-agent-terminal-text-shadow: 0 0 1px rgba(57, 255, 20, 0.25);
 }
 
-.fresh-agent-style-mono::after {
-  content: "";
-  pointer-events: none;
-  position: absolute;
-  inset: 0;
-  background: repeating-linear-gradient(
-    to bottom,
-    transparent,
-    transparent 2px,
-    rgba(57, 255, 20, 0.03) 2px,
-    rgba(57, 255, 20, 0.03) 4px
-  );
-  z-index: 50;
+.fresh-agent-style-mono .fresh-agent-watermark {
+  display: none;
 }
 
 .fresh-agent-style-mono .fresh-agent-transcript-copy {
