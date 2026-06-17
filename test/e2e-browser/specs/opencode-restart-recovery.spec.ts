@@ -98,6 +98,7 @@ async function addTerminalTab(page: any, input: {
   requestId: string
   mode: 'opencode' | 'shell'
   title: string
+  cwd?: string
 }): Promise<void> {
   await page.evaluate((payload) => {
     const harness = window.__FRESHELL_TEST_HARNESS__
@@ -123,6 +124,7 @@ async function addTerminalTab(page: any, input: {
           shell: 'system',
           createRequestId: payload.requestId,
           status: 'creating',
+          ...(payload.cwd ? { initialCwd: payload.cwd } : {}),
         },
       },
     })
@@ -454,7 +456,9 @@ async function runRestartScenario(input: {
   const logsDir = path.join(sharedRoot, 'logs')
   const auditLogPath = path.join(sharedRoot, 'fake-opencode-audit.jsonl')
   const sharedOpencodeDataDir = path.join(sharedRoot, 'opencode-data')
+  const sharedCwd = path.join(sharedRoot, 'project')
   await installFakeOpencode(binDir)
+  await fsp.mkdir(sharedCwd, { recursive: true })
 
   const server1 = new TestServer(createServerOptions({
     binDir,
@@ -479,13 +483,13 @@ async function runRestartScenario(input: {
     ]
 
     for (const tab of opencodeTabs) {
-      await addTerminalTab(input.page, tab)
+      await addTerminalTab(input.page, { ...tab, cwd: sharedCwd })
       await waitForOpenCodeSessions(input.page, [tab.tabId])
     }
 
     const shellTab = { tabId: 'tab-shell-mixed', paneId: 'pane-shell-mixed', requestId: 'req-shell-mixed', mode: 'shell' as const, title: 'Shell Mixed' }
     if (input.includeShellPane) {
-      await addTerminalTab(input.page, shellTab)
+      await addTerminalTab(input.page, { ...shellTab, cwd: sharedCwd })
       await waitForRunningTerminals(input.page, [shellTab.tabId])
     }
 

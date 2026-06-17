@@ -2667,6 +2667,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   useEffect(() => {
     if (suppressNetworkEffects) return
     if (!isTerminal || !terminalContent) return
+    if (shouldWaitForProviderBehavior) return
     const termCandidate = termRef.current
     if (!termCandidate) return
     const term = termCandidate
@@ -4213,6 +4214,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     isTerminal,
     paneId,
     suppressNetworkEffects,
+    shouldWaitForProviderBehavior,
     terminalContent?.createRequestId,
     updateContent,
     ws,

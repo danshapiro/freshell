@@ -120,6 +120,7 @@ import TerminalView, {
   __resetLastSentViewportCacheForTests,
   isEngagementInput,
 } from '@/components/TerminalView'
+import { resetEnsureExtensionsRegistryCacheForTests } from '@/hooks/useEnsureExtensionsRegistry'
 
 describe('isEngagementInput (real-keystroke detection)', () => {
   it('treats printable characters and Enter as engagement', () => {
@@ -343,6 +344,7 @@ describe('TerminalView lifecycle updates', () => {
     terminalThemeMocks.getTerminalTheme.mockReturnValue({})
     restoreMocks.consumeTerminalRestoreRequestId.mockReset()
     restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(false)
+    resetEnsureExtensionsRegistryCacheForTests()
     terminalInstances.length = 0
     runtimeMocks.instances.length = 0
     wsMocks.onMessage.mockImplementation((callback: (msg: any) => void) => {
@@ -3539,6 +3541,8 @@ describe('TerminalView lifecycle updates', () => {
       sessionRef?: TerminalPaneContent['sessionRef']
       serverInstanceId?: string
       streamId?: string
+      waitForMessageHandler?: boolean
+      waitForTerminalInstance?: boolean
     }) {
       const tabId = 'tab-v2-stream'
       const paneId = 'pane-v2-stream'
@@ -3615,12 +3619,16 @@ describe('TerminalView lifecycle updates', () => {
         </Provider>
       )
 
-      await waitFor(() => {
-        expect(messageHandler).not.toBeNull()
-      })
-      await waitFor(() => {
-        expect(terminalInstances.length).toBeGreaterThan(0)
-      })
+      if (opts?.waitForMessageHandler !== false) {
+        await waitFor(() => {
+          expect(messageHandler).not.toBeNull()
+        })
+      }
+      if (opts?.waitForTerminalInstance !== false) {
+        await waitFor(() => {
+          expect(terminalInstances.length).toBeGreaterThan(0)
+        })
+      }
 
       if (opts?.ackInitialAttach !== false && initialStatus === 'running' && terminalId && !opts?.hidden) {
         const initialAttach = wsMocks.send.mock.calls
@@ -7171,6 +7179,78 @@ describe('TerminalView lifecycle updates', () => {
           terminalId,
           sinceSeq: 0,
           intent: 'viewport_hydrate',
+          attachRequestId: expect.any(String),
+        }))
+      })
+      expect(wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .filter((msg) => msg?.type === 'terminal.resize' && msg?.terminalId === terminalId)).toHaveLength(0)
+    })
+
+    it('arms hidden OpenCode viewport hydration after provider registry readiness', async () => {
+      localStorage.setItem('freshell.auth-token', 'test-token')
+      let resolveExtensionsFetch: (response: Response) => void = () => {}
+      const extensionsFetch = new Promise<Response>((resolve) => {
+        resolveExtensionsFetch = resolve
+      })
+      const fetchMock = vi.fn(() => extensionsFetch)
+      vi.stubGlobal('fetch', fetchMock)
+
+      const sessionRef = { provider: 'opencode', sessionId: 'ses_delayed_registry' } as const
+      const { store, tabId, paneId, terminalId, rerender } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-opencode-delayed-registry',
+        mode: 'opencode',
+        hidden: true,
+        clearSends: false,
+        ackInitialAttach: false,
+        sessionRef,
+        waitForMessageHandler: false,
+        waitForTerminalInstance: false,
+      })
+
+      expect(terminalInstances).toHaveLength(0)
+      expect(wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)).toHaveLength(0)
+      await waitFor(() => {
+        expect(fetchMock).toHaveBeenCalled()
+      })
+      expect(String(fetchMock.mock.calls[0]?.[0])).toMatch(/\/api\/extensions$/)
+
+      const readPaneContent = () => {
+        const layout = store.getState().panes.layouts[tabId]
+        return layout && layout.type === 'leaf' && layout.content.kind === 'terminal' ? layout.content : null
+      }
+      const renderVisibility = (isHidden: boolean) => (
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={readPaneContent()!} hidden={isHidden} />
+        </Provider>
+      )
+
+      wsMocks.send.mockClear()
+      await act(async () => {
+        resolveExtensionsFetch(new Response(JSON.stringify([]), { status: 200 }))
+      })
+
+      await waitFor(() => {
+        expect(terminalInstances.length).toBeGreaterThan(0)
+      })
+      expect(wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)).toHaveLength(0)
+
+      wsMocks.send.mockClear()
+      await act(async () => {
+        rerender(renderVisibility(false))
+      })
+
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'terminal.attach',
+          terminalId,
+          intent: 'viewport_hydrate',
+          priority: 'foreground',
           attachRequestId: expect.any(String),
         }))
       })
