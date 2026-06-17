@@ -637,46 +637,46 @@ html {
   --fresh-agent-copy-font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   --fresh-agent-meta-font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   --fresh-agent-mono-font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-  --fresh-agent-surface: #fbfcf8;
-  --fresh-agent-panel-surface: #f2f6ee;
-  --fresh-agent-subtle-surface: #e8f0e3;
-  --fresh-agent-raised-surface: #eef4e9;
-  --fresh-agent-border: rgba(23, 111, 46, 0.28);
-  --fresh-agent-border-strong: rgba(23, 111, 46, 0.48);
-  --fresh-agent-accent: #176f2e;
-  --fresh-agent-accent-soft: rgba(23, 111, 46, 0.1);
+  --fresh-agent-surface: #fbfaf7;
+  --fresh-agent-panel-surface: #f6f3ed;
+  --fresh-agent-subtle-surface: #eee8df;
+  --fresh-agent-raised-surface: #fffdf8;
+  --fresh-agent-border: rgba(91, 75, 60, 0.22);
+  --fresh-agent-border-strong: rgba(91, 75, 60, 0.38);
+  --fresh-agent-accent: #a04f33;
+  --fresh-agent-accent-soft: rgba(160, 79, 51, 0.11);
   --fresh-agent-danger: #b42318;
   --fresh-agent-danger-soft: rgba(180, 35, 24, 0.1);
-  --fresh-agent-success: #176f2e;
-  --fresh-agent-success-soft: rgba(23, 111, 46, 0.1);
-  --fresh-agent-text: #17301d;
-  --fresh-agent-muted-text: #4f6b55;
-  --fresh-agent-soft-text: #657c6a;
-  --fresh-agent-terminal-text-shadow: none;
+  --fresh-agent-success: #2f7d55;
+  --fresh-agent-success-soft: rgba(47, 125, 85, 0.11);
+  --fresh-agent-text: #24211d;
+  --fresh-agent-muted-text: #665d54;
+  --fresh-agent-soft-text: #857a70;
+  --fresh-agent-radius: 0.375rem;
+  --fresh-agent-radius-tight: 0.25rem;
   --fresh-agent-watermark-opacity: 0;
   background: var(--fresh-agent-surface);
   color: var(--fresh-agent-text);
   font-family: var(--fresh-agent-copy-font-family);
-  text-shadow: var(--fresh-agent-terminal-text-shadow);
+  text-shadow: none;
 }
 
 .dark .fresh-agent-style-mono {
-  --fresh-agent-surface: #0a0a0a;
-  --fresh-agent-panel-surface: #0d0d0d;
-  --fresh-agent-subtle-surface: #131313;
-  --fresh-agent-raised-surface: #101010;
-  --fresh-agent-border: rgba(57, 255, 20, 0.3);
-  --fresh-agent-border-strong: rgba(57, 255, 20, 0.55);
-  --fresh-agent-accent: #39ff14;
-  --fresh-agent-accent-soft: rgba(57, 255, 20, 0.12);
-  --fresh-agent-danger: #ff5555;
-  --fresh-agent-danger-soft: rgba(255, 85, 85, 0.12);
-  --fresh-agent-success: #39ff14;
-  --fresh-agent-success-soft: rgba(57, 255, 20, 0.12);
-  --fresh-agent-text: #39ff14;
-  --fresh-agent-muted-text: #5c9e4c;
-  --fresh-agent-soft-text: #4a8a3c;
-  --fresh-agent-terminal-text-shadow: 0 0 1px rgba(57, 255, 20, 0.25);
+  --fresh-agent-surface: #181715;
+  --fresh-agent-panel-surface: #211f1c;
+  --fresh-agent-subtle-surface: #2b2824;
+  --fresh-agent-raised-surface: #25221f;
+  --fresh-agent-border: rgba(232, 224, 215, 0.16);
+  --fresh-agent-border-strong: rgba(232, 224, 215, 0.28);
+  --fresh-agent-accent: #e09a78;
+  --fresh-agent-accent-soft: rgba(224, 154, 120, 0.14);
+  --fresh-agent-danger: #f2847d;
+  --fresh-agent-danger-soft: rgba(242, 132, 125, 0.14);
+  --fresh-agent-success: #86c39a;
+  --fresh-agent-success-soft: rgba(134, 195, 154, 0.13);
+  --fresh-agent-text: #ebe3da;
+  --fresh-agent-muted-text: #b9afa5;
+  --fresh-agent-soft-text: #92887e;
 }
 
 .fresh-agent-style-mono .fresh-agent-watermark {
@@ -716,7 +716,7 @@ html {
 }
 
 .fresh-agent-style-mono .fresh-agent-transcript-scroll {
-  gap: 0;
+  gap: 0.2rem;
   padding: 0.75rem 1rem 1rem;
 }
 
@@ -730,7 +730,7 @@ html {
 .fresh-agent-style-mono .fresh-agent-turn {
   border-left: 0;
   border-top: 1px solid var(--fresh-agent-border);
-  padding: 0.85rem 0 1rem;
+  padding: 0.9rem 0 1rem;
 }
 
 .fresh-agent-style-mono .fresh-agent-turn[data-turn-continuation="true"] {
@@ -746,13 +746,13 @@ html {
 
 .fresh-agent-style-mono .fresh-agent-turn-header {
   color: var(--fresh-agent-soft-text);
-  font-size: 0.55rem;
+  font-size: 0.62rem;
   font-weight: 500;
-  letter-spacing: 0.08em;
+  letter-spacing: 0;
   line-height: 1.25;
   margin-bottom: 0.5rem;
   max-width: 100%;
-  text-transform: uppercase;
+  text-transform: none;
 }
 
 .fresh-agent-style-mono .fresh-agent-turn-header span:first-child {
@@ -775,6 +775,7 @@ html {
 .fresh-agent-style-mono .fresh-agent-turn[data-turn-role="user"] .fresh-agent-transcript-copy {
   background: var(--fresh-agent-subtle-surface);
   border-left: 2px solid var(--fresh-agent-accent);
+  border-radius: var(--fresh-agent-radius);
   padding: 0.6rem 0.8rem;
 }
 
@@ -790,7 +791,7 @@ html {
 ) {
   background: var(--fresh-agent-panel-surface);
   border: 1px solid var(--fresh-agent-border);
-  border-radius: 0;
+  border-radius: var(--fresh-agent-radius);
   color: var(--fresh-agent-text);
   box-shadow: none;
 }
@@ -815,11 +816,11 @@ html {
 ) {
   color: var(--fresh-agent-accent);
   font-family: var(--fresh-agent-meta-font-family);
-  font-size: 0.55rem;
+  font-size: 0.65rem;
   font-weight: 500;
-  letter-spacing: 0.1em;
+  letter-spacing: 0;
   line-height: 1.2;
-  text-transform: uppercase;
+  text-transform: none;
 }
 
 .fresh-agent-style-mono .fresh-agent-approval-heading {
@@ -830,7 +831,7 @@ html {
 .fresh-agent-style-mono .fresh-agent-status-badge {
   border: 1px solid var(--fresh-agent-border-strong);
   color: var(--fresh-agent-accent);
-  border-radius: 0;
+  border-radius: var(--fresh-agent-radius-tight);
 }
 
 .fresh-agent-style-mono .fresh-agent-approval-tool {
@@ -856,7 +857,7 @@ html {
 ) {
   background: var(--fresh-agent-surface);
   border: 1px solid var(--fresh-agent-border);
-  border-radius: 0;
+  border-radius: var(--fresh-agent-radius);
   color: var(--fresh-agent-muted-text);
   font-family: var(--fresh-agent-mono-font-family);
 }
@@ -871,13 +872,13 @@ html {
 ) {
   background: transparent;
   border: 1px solid var(--fresh-agent-border);
-  border-radius: 0;
+  border-radius: var(--fresh-agent-radius-tight);
   color: var(--fresh-agent-muted-text);
   font-family: var(--fresh-agent-meta-font-family);
   font-size: 0.65rem;
   font-weight: 500;
   letter-spacing: 0;
-  text-transform: uppercase;
+  text-transform: none;
 }
 
 .fresh-agent-style-mono :where(
@@ -933,7 +934,7 @@ html {
 .fresh-agent-style-mono .fresh-agent-composer-filter-input {
   background: var(--fresh-agent-surface);
   border: 1px solid var(--fresh-agent-border);
-  border-radius: 0;
+  border-radius: var(--fresh-agent-radius-tight);
   color: var(--fresh-agent-text);
   caret-color: var(--fresh-agent-accent);
 }
@@ -959,9 +960,9 @@ html {
 .fresh-agent-style-mono .fresh-agent-activity-summary [role="status"] {
   color: var(--fresh-agent-soft-text);
   font-family: var(--fresh-agent-meta-font-family);
-  font-size: 0.55rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-size: 0.6rem;
+  letter-spacing: 0;
+  text-transform: none;
 }
 
 .fresh-agent-style-mono .fresh-agent-activity-summary [data-slot="name"] {
@@ -977,7 +978,7 @@ html {
 }
 
 .fresh-agent-style-mono :where(.fresh-agent-tool-trigger, .fresh-agent-thinking-trigger, .fresh-agent-file-diff-trigger) {
-  border-radius: 0;
+  border-radius: var(--fresh-agent-radius-tight);
   color: var(--fresh-agent-soft-text);
   padding-bottom: 0.15rem;
   padding-top: 0.15rem;
@@ -1014,7 +1015,7 @@ html {
 .fresh-agent-style-mono .fresh-agent-thinking-body {
   background: var(--fresh-agent-panel-surface);
   border: 1px solid var(--fresh-agent-border);
-  border-radius: 0;
+  border-radius: var(--fresh-agent-radius);
   color: var(--fresh-agent-muted-text);
   font-family: var(--fresh-agent-copy-font-family);
 }
@@ -1058,7 +1059,7 @@ html {
 .fresh-agent-style-mono .fresh-agent-sidebar-section {
   background: transparent;
   border: 1px solid var(--fresh-agent-border);
-  border-radius: 0;
+  border-radius: var(--fresh-agent-radius);
 }
 
 .fresh-agent-style-mono .fresh-agent-sidebar-list {
@@ -1077,7 +1078,7 @@ html {
 .fresh-agent-style-mono .fresh-agent-composer-input {
   background: var(--fresh-agent-panel-surface);
   border: 1px solid var(--fresh-agent-border);
-  border-radius: 0;
+  border-radius: var(--fresh-agent-radius);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fresh-agent-border) 45%, transparent);
   color: var(--fresh-agent-text);
   font-family: var(--fresh-agent-copy-font-family);
@@ -1099,7 +1100,7 @@ html {
 .fresh-agent-style-mono .fresh-agent-attachment {
   background: var(--fresh-agent-panel-surface);
   border: 1px solid var(--fresh-agent-border);
-  border-radius: 0;
+  border-radius: var(--fresh-agent-radius);
   color: var(--fresh-agent-muted-text);
 }
 
@@ -1122,7 +1123,7 @@ html {
 .fresh-agent-style-mono .fresh-agent-scroll-bottom {
   background: var(--fresh-agent-panel-surface);
   border: 1px solid var(--fresh-agent-border);
-  border-radius: 0;
+  border-radius: var(--fresh-agent-radius);
   bottom: 0.8rem;
   box-shadow: none;
   color: var(--fresh-agent-muted-text);
