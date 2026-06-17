@@ -400,7 +400,7 @@ html {
   color: var(--fresh-agent-text);
 }
 
-.fresh-agent-style-serif :where(.fresh-agent-approval-button-primary, .fresh-agent-composer-action[type="submit"]) {
+.fresh-agent-style-serif .fresh-agent-approval-button-primary {
   background: var(--fresh-agent-text);
   border-color: var(--fresh-agent-text);
   color: var(--fresh-agent-surface);
@@ -591,6 +591,18 @@ html {
 
 .fresh-agent-style-serif .fresh-agent-composer-action {
   background: var(--fresh-agent-panel-surface);
+}
+
+.fresh-agent-style-serif .fresh-agent-composer-action[type="submit"] {
+  background: var(--fresh-agent-text);
+  border-color: var(--fresh-agent-text);
+  color: var(--fresh-agent-surface);
+}
+
+.fresh-agent-style-serif .fresh-agent-composer-action[type="submit"]:hover:not(:disabled) {
+  background: var(--fresh-agent-text);
+  border-color: var(--fresh-agent-text);
+  color: var(--fresh-agent-surface);
 }
 
 .fresh-agent-style-serif .fresh-agent-composer-menu,
