@@ -34,4 +34,24 @@ describe('registerOpenExternalHandler', () => {
     await handler({}, 'http://example.com')
     expect(deps.shell.openExternal).toHaveBeenCalledWith('http://example.com')
   })
+
+  it('rejects non-string URLs', async () => {
+    await expect(handler({}, undefined as unknown as string)).rejects.toThrow(/only absolute http\/https URLs are allowed/)
+    expect(deps.shell.openExternal).not.toHaveBeenCalled()
+  })
+
+  it('rejects file: URLs', async () => {
+    await expect(handler({}, 'file:///etc/passwd')).rejects.toThrow(/only absolute http\/https URLs are allowed/)
+    expect(deps.shell.openExternal).not.toHaveBeenCalled()
+  })
+
+  it('rejects javascript: URLs', async () => {
+    await expect(handler({}, 'javascript:alert(1)')).rejects.toThrow(/only absolute http\/https URLs are allowed/)
+    expect(deps.shell.openExternal).not.toHaveBeenCalled()
+  })
+
+  it('rejects relative URLs', async () => {
+    await expect(handler({}, '/api/proxy/http/8080/')).rejects.toThrow(/only absolute http\/https URLs are allowed/)
+    expect(deps.shell.openExternal).not.toHaveBeenCalled()
+  })
 })

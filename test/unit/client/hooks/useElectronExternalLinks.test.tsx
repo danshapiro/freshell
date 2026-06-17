@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render } from '@testing-library/react'
+import { render, cleanup } from '@testing-library/react'
 import { useElectronExternalLinks } from '@/hooks/useElectronExternalLinks'
 
 const openExternalUrlMock = vi.hoisted(() => vi.fn())
@@ -16,10 +16,12 @@ function TestHarness() {
 
 describe('useElectronExternalLinks', () => {
   beforeEach(() => {
+    cleanup()
     openExternalUrlMock.mockClear()
   })
 
   afterEach(() => {
+    cleanup()
     vi.unstubAllGlobals()
   })
 

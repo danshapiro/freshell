@@ -330,4 +330,43 @@ test.describe('Main window with remote server', () => {
 
     await mainPage.screenshot({ path: 'test-results/main-03-launcher.png' })
   })
+
+  test('ctrl-clicking an external link calls the Electron openExternal bridge', async () => {
+    app = await launchApp(tmpHome)
+    const mainPage = await app.firstWindow()
+    await mainPage.waitForLoadState('domcontentloaded')
+    await mainPage.waitForTimeout(3000)
+
+    // Inject a link and override the preload-exposed bridge so we can observe
+    // the system-browser request without actually opening a browser window.
+    const openedUrl = await mainPage.evaluate(async () => {
+      let captured: string | null = null
+      ;(window as any).freshellDesktop = {
+        ...(window as any).freshellDesktop,
+        isElectron: true,
+        openExternal: (url: string) => {
+          captured = url
+          return Promise.resolve()
+        },
+      }
+
+      const link = document.createElement('a')
+      link.href = 'https://example.com/freshell-test-link'
+      link.target = '_blank'
+      link.rel = 'noopener noreferrer'
+      link.textContent = 'test external link'
+      document.body.appendChild(link)
+
+      await new Promise<void>((resolve) => {
+        const event = new MouseEvent('click', { ctrlKey: true, bubbles: true })
+        link.dispatchEvent(event)
+        // Let the capture handler and microtask queue run.
+        requestAnimationFrame(() => resolve())
+      })
+
+      return captured
+    })
+
+    expect(openedUrl).toBe('https://example.com/freshell-test-link')
+  })
 })
