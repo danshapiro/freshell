@@ -3370,7 +3370,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const isUnrecoverableOpenCodeViewportHydrate = msg.reason === 'replay_window_exceeded'
             && currentAttachRef.current?.intent === 'viewport_hydrate'
             && currentAttachRef.current.sinceSeq === 0
-            && !hiddenRef.current
             && contentRef.current?.mode === 'opencode'
             && contentRef.current.sessionRef?.provider === 'opencode'
           if (isUnrecoverableOpenCodeViewportHydrate && beginOpenCodeReplacementAfterExit(tid)) {

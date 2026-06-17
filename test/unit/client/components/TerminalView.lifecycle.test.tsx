@@ -19,7 +19,7 @@ import {
   loadTerminalSurfaceCheckpoint,
   saveTerminalSurfaceCheckpoint,
 } from '@/lib/terminal-cursor'
-import { resetHydrationQueueForTests } from '@/lib/hydration-queue'
+import { getHydrationQueue, resetHydrationQueueForTests } from '@/lib/hydration-queue'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { TERMINAL_CURSOR_STORAGE_KEY } from '@/store/storage-keys'
 import {
@@ -7702,6 +7702,115 @@ describe('TerminalView lifecycle updates', () => {
         expect(layout.content.sessionRef).toEqual(sessionRef)
         replacementRequestId = layout.content.createRequestId
         expect(replacementRequestId).not.toBe('req-opencode-focus-gap')
+      })
+
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'terminal.create',
+          requestId: replacementRequestId,
+          mode: 'opencode',
+          sessionRef,
+          restore: true,
+        }))
+      })
+    })
+
+    it('recreates a hidden restored OpenCode pane when background viewport hydration cannot replay startup output', async () => {
+      const sessionRef = { provider: 'opencode', sessionId: 'ses_hidden_replay_gap' } as const
+      const addedRestoreIds = new Set<string>()
+      restoreMocks.addTerminalRestoreRequestId.mockImplementation((id: string) => {
+        addedRestoreIds.add(id)
+      })
+      restoreMocks.consumeTerminalRestoreRequestId.mockImplementation((id: string) => {
+        if (addedRestoreIds.has(id)) {
+          addedRestoreIds.delete(id)
+          return true
+        }
+        return false
+      })
+
+      const { store, tabId, paneId, terminalId, rerender } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-opencode-hidden-gap',
+        mode: 'opencode',
+        hidden: true,
+        clearSends: false,
+        requestId: 'req-opencode-hidden-gap',
+        sessionRef,
+      })
+
+      wsMocks.send.mockClear()
+      act(() => {
+        getHydrationQueue().onActiveTabReady('tab-visible-neighbor', ['tab-visible-neighbor', tabId])
+      })
+
+      let attach: any
+      await waitFor(() => {
+        attach = wsMocks.send.mock.calls
+          .map(([msg]) => msg)
+          .find((msg) =>
+            msg?.type === 'terminal.attach'
+            && msg?.terminalId === terminalId
+            && msg?.intent === 'viewport_hydrate'
+            && msg?.priority === 'background'
+          )
+        expect(attach?.attachRequestId).toBeTruthy()
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 120,
+          replayFromSeq: 42,
+          replayToSeq: 120,
+          attachRequestId: attach.attachRequestId,
+        })
+      })
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 1,
+          toSeq: 41,
+          reason: 'replay_window_exceeded',
+          attachRequestId: attach.attachRequestId,
+        } as any)
+      })
+
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith({
+          type: 'terminal.kill',
+          terminalId,
+        })
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.exit',
+          terminalId,
+          exitCode: 0,
+        })
+      })
+
+      rerender(
+        <Provider store={store}>
+          <TerminalViewFromStore tabId={tabId} paneId={paneId} hidden />
+        </Provider>,
+      )
+
+      let replacementRequestId: string | undefined
+      await waitFor(() => {
+        const layout = store.getState().panes.layouts[tabId]
+        expect(layout?.type).toBe('leaf')
+        if (layout?.type !== 'leaf' || layout.content.kind !== 'terminal') {
+          throw new Error('expected terminal pane')
+        }
+        expect(layout.content.terminalId).toBeUndefined()
+        expect(layout.content.status).toBe('creating')
+        expect(layout.content.sessionRef).toEqual(sessionRef)
+        replacementRequestId = layout.content.createRequestId
+        expect(replacementRequestId).not.toBe('req-opencode-hidden-gap')
       })
 
       await waitFor(() => {
