@@ -9,6 +9,7 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import { getHoveredUrl, clearHoveredUrl } from '@/lib/terminal-hovered-url'
+import { openExternalUrl } from '@/lib/open-url'
 import type { TerminalPaneContent } from '@/store/paneTypes'
 import type { AppSettings } from '@/store/types'
 
@@ -21,6 +22,13 @@ const wsMocks = vi.hoisted(() => ({
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => wsMocks,
+}))
+
+const openExternalUrlMock = vi.hoisted(() => vi.fn())
+
+vi.mock('@/lib/open-url', () => ({
+  openExternalUrl: openExternalUrlMock,
+  shouldOpenLinkExternally: (event: MouseEvent) => event.ctrlKey || event.shiftKey,
 }))
 
 vi.mock('@/hooks/useNotificationSound', () => ({
@@ -170,6 +178,7 @@ describe('TerminalView URL click behavior', () => {
   beforeEach(() => {
     terminalInstances.length = 0
     registeredLinkProviders.length = 0
+    openExternalUrlMock.mockClear()
     windowOpenSpy = vi.spyOn(window, 'open').mockImplementation(() => null)
     vi.stubGlobal('ResizeObserver', MockResizeObserver)
   })
@@ -211,6 +220,75 @@ describe('TerminalView URL click behavior', () => {
         })
       }
     })
+    expect(windowOpenSpy).not.toHaveBeenCalled()
+  })
+
+  it('OSC 8 linkHandler.activate with ctrl held opens URL externally and does not split pane', async () => {
+    const store = createStore({ terminal: { ...defaultSettings.terminal, warnExternalLinks: false } })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId="tab-1" paneId="pane-1" paneContent={paneContent} hidden={false} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(terminalInstances).toHaveLength(1)
+    })
+
+    const handler = getLinkHandler()
+    act(() => {
+      handler.activate(new MouseEvent('click', { ctrlKey: true }), 'https://example.com')
+    })
+
+    expect(openExternalUrlMock).toHaveBeenCalledWith('https://example.com')
+    expect(store.getState().panes.layouts['tab-1'].type).toBe('leaf')
+    expect(windowOpenSpy).not.toHaveBeenCalled()
+  })
+
+  it('OSC 8 linkHandler.activate with shift held opens URL externally and does not split pane', async () => {
+    const store = createStore({ terminal: { ...defaultSettings.terminal, warnExternalLinks: false } })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId="tab-1" paneId="pane-1" paneContent={paneContent} hidden={false} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(terminalInstances).toHaveLength(1)
+    })
+
+    const handler = getLinkHandler()
+    act(() => {
+      handler.activate(new MouseEvent('click', { shiftKey: true }), 'https://example.com')
+    })
+
+    expect(openExternalUrlMock).toHaveBeenCalledWith('https://example.com')
+    expect(store.getState().panes.layouts['tab-1'].type).toBe('leaf')
+    expect(windowOpenSpy).not.toHaveBeenCalled()
+  })
+
+  it('OSC 8 linkHandler.activate with warnExternalLinks=true and ctrl held bypasses modal and opens externally', async () => {
+    const store = createStore()
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId="tab-1" paneId="pane-1" paneContent={paneContent} hidden={false} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(terminalInstances).toHaveLength(1)
+    })
+
+    const handler = getLinkHandler()
+    act(() => {
+      handler.activate(new MouseEvent('click', { ctrlKey: true }), 'https://example.com/page')
+    })
+
+    expect(openExternalUrlMock).toHaveBeenCalledWith('https://example.com/page')
+    expect(screen.queryByText('Open external link?')).not.toBeInTheDocument()
     expect(windowOpenSpy).not.toHaveBeenCalled()
   })
 
@@ -397,6 +475,33 @@ describe('TerminalView URL click behavior', () => {
         })
       }
     })
+  })
+
+  it('URL link provider activate with ctrl held opens URL externally', async () => {
+    const store = createStore({ terminal: { ...defaultSettings.terminal, warnExternalLinks: false } })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId="tab-1" paneId="pane-1" paneContent={paneContent} hidden={false} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(registeredLinkProviders.length).toBeGreaterThanOrEqual(2)
+    })
+
+    const urlProvider = getUrlLinkProvider()
+    let links: any[] | undefined
+    urlProvider.provideLinks(1, (provided) => {
+      links = provided
+    })
+
+    act(() => {
+      links![0].activate(new MouseEvent('click', { ctrlKey: true }))
+    })
+
+    expect(openExternalUrlMock).toHaveBeenCalledWith('https://detected.example.com')
+    expect(store.getState().panes.layouts['tab-1'].type).toBe('leaf')
   })
 
   it('URL link provider hover sets hovered URL in module and data attribute', async () => {

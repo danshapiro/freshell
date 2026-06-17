@@ -8,7 +8,7 @@
 // Run:   electron dist/electron/electron/entry.js
 //        (or via electron-builder's packaged app)
 
-import { app, BrowserWindow, globalShortcut, ipcMain, Tray, Menu, nativeImage } from 'electron'
+import { app, BrowserWindow, globalShortcut, ipcMain, Tray, Menu, nativeImage, shell } from 'electron'
 import path from 'path'
 import os from 'os'
 import http from 'http'
@@ -36,6 +36,7 @@ import { createChooseLaunchOptionHandler } from './launch-choice-handler.js'
 import { buildLaunchOptions } from './launch-options.js'
 import { applyProvisioningFile } from './desktop-provisioning.js'
 import { createPortAvailabilityCheck } from './port-check.js'
+import { registerOpenExternalHandler } from './external-url.js'
 import type { ForcedLaunch, LaunchServerCandidate } from './types.js'
 
 const isPortAvailable = createPortAvailabilityCheck()
@@ -275,11 +276,15 @@ async function main(): Promise<void> {
   ipcMain.removeHandler('install-update')
   ipcMain.removeHandler('get-launch-options')
   ipcMain.removeHandler('choose-launch-option')
+  ipcMain.removeHandler('open-external-url')
 
   let pendingLaunchChooser: { candidates: LaunchServerCandidate[]; reason: string } | undefined
   // webContents id of the launch chooser window, so choose-launch-option only
   // honors requests originating from it (the API is exposed to every window).
   let chooserWebContentsId: number | undefined
+
+  // Register system-browser link handler.
+  registerOpenExternalHandler({ ipcMain, shell })
 
   // Register the complete-setup handler before runStartup so it is available
   // when the wizard renderer calls it via the preload API.

@@ -21,6 +21,7 @@ import { refreshActiveSessionWindow } from '@/store/sessionsThunks'
 import { getAuthToken } from '@/lib/auth'
 import { buildShareUrl } from '@/lib/utils'
 import { copyText } from '@/lib/clipboard'
+import { openExternalUrl } from '@/lib/open-url'
 import { triggerHapticFeedback } from '@/lib/mobile-haptics'
 import { collectPaneEntries, collectTerminalIds, findPaneContent } from '@/lib/pane-utils'
 import { collectSessionRefsFromNode } from '@/lib/session-utils'
@@ -1138,7 +1139,7 @@ export function ContextMenuProvider({
   }, [dispatch])
 
   const openUrlInBrowser = useCallback((url: string) => {
-    window.open(url, '_blank', 'noopener,noreferrer')
+    openExternalUrl(url)
   }, [])
 
   const copyUrlAction = useCallback(async (url: string) => {

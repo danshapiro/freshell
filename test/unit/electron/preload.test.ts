@@ -43,6 +43,7 @@ describe('Preload API', () => {
       'isElectron',
       'onUpdateAvailable',
       'onUpdateDownloaded',
+      'openExternal',
       'platform',
       'setGlobalHotkey',
     ])
@@ -62,6 +63,7 @@ describe('Preload API', () => {
     expect(typeof exposedApi.completeSetup).toBe('function')
     expect(typeof exposedApi.getLaunchOptions).toBe('function')
     expect(typeof exposedApi.chooseLaunchOption).toBe('function')
+    expect(typeof exposedApi.openExternal).toBe('function')
   })
 
   it('getServerMode invokes correct IPC channel', () => {
@@ -107,5 +109,10 @@ describe('Preload API', () => {
     }
     exposedApi.chooseLaunchOption(choice)
     expect(mockIpcRenderer.invoke).toHaveBeenCalledWith('choose-launch-option', choice)
+  })
+
+  it('openExternal invokes correct IPC channel with URL', () => {
+    exposedApi.openExternal('https://example.com')
+    expect(mockIpcRenderer.invoke).toHaveBeenCalledWith('open-external-url', 'https://example.com')
   })
 })

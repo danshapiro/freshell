@@ -5,6 +5,7 @@ import { consumePaneRefreshRequest, updatePaneContent } from '@/store/panesSlice
 import { clearPaneRuntimeActivity, setPaneRuntimeActivity } from '@/store/paneRuntimeActivitySlice'
 import { cn } from '@/lib/utils'
 import { copyText } from '@/lib/clipboard'
+import { openExternalUrl } from '@/lib/open-url'
 import { isLoopbackHostname } from '@/lib/url-rewrite'
 import { api } from '@/lib/api'
 import { registerBrowserActions } from '@/lib/pane-action-registry'
@@ -467,9 +468,9 @@ export default function BrowserPane({
       openExternal: () => {
         // Open the resolved URL (with port forwarding) so it works for remote users
         if (resolvedSrc) {
-          window.open(resolvedSrc, '_blank', 'noopener,noreferrer')
+          openExternalUrl(resolvedSrc)
         } else if (currentUrl) {
-          window.open(currentUrl, '_blank', 'noopener,noreferrer')
+          openExternalUrl(currentUrl)
         }
       },
       toggleDevTools,

@@ -37,6 +37,7 @@ export interface FreshellDesktopApi {
   completeSetup: (config: WizardSetupConfig) => Promise<void>
   getLaunchOptions: () => Promise<any>
   chooseLaunchOption: (choice: LaunchChoice) => Promise<LaunchChoiceResult>
+  openExternal: (url: string) => Promise<void>
 }
 
 export interface ContextBridgeApi {
@@ -64,6 +65,7 @@ export function registerPreloadApi(
     completeSetup: (config: WizardSetupConfig) => ipcRenderer.invoke('complete-setup', config),
     getLaunchOptions: () => ipcRenderer.invoke('get-launch-options'),
     chooseLaunchOption: (choice: LaunchChoice) => ipcRenderer.invoke('choose-launch-option', choice),
+    openExternal: (url: string) => ipcRenderer.invoke('open-external-url', url),
   }
 
   contextBridge.exposeInMainWorld('freshellDesktop', api)
