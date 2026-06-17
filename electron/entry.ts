@@ -283,18 +283,44 @@ async function main(): Promise<void> {
   // honors requests originating from it (the API is exposed to every window).
   let chooserWebContentsId: number | undefined
 
-  // webContents id of the main Freshell window. The open-external-url handler
-  // only honors requests from this window so other renderer surfaces (wizard,
-  // launch chooser, or a compromised popup) cannot drive shell.openExternal.
+  // Identity of the main Freshell window (webContents id + expected origin).
+  // The open-external-url handler only honors requests from this window and
+  // origin so other renderer surfaces or navigations cannot drive
+  // shell.openExternal.
   let mainWebContentsId: number | undefined = undefined
+  let mainServerUrl: string | undefined = undefined
+
+  function getExpectedOrigin(): string | undefined {
+    if (!mainServerUrl) return undefined
+    try {
+      return new URL(mainServerUrl).origin
+    } catch {
+      return undefined
+    }
+  }
 
   // Register system-browser link handler.
   registerOpenExternalHandler({
     ipcMain,
     shell,
     isAllowedSender: (event) => {
-      const senderId = (event as { sender?: { id?: number } }).sender?.id
-      return mainWebContentsId !== undefined && senderId === mainWebContentsId
+      const typed = event as {
+        sender?: { id?: number }
+        senderFrame?: { url?: string }
+      }
+      const senderId = typed.sender?.id
+      if (mainWebContentsId === undefined || senderId !== mainWebContentsId) {
+        return false
+      }
+      const expectedOrigin = getExpectedOrigin()
+      if (!expectedOrigin) return false
+      const frameUrl = typed.senderFrame?.url
+      if (!frameUrl) return false
+      try {
+        return new URL(frameUrl).origin === expectedOrigin
+      } catch {
+        return false
+      }
     },
   })
 
@@ -443,9 +469,10 @@ async function main(): Promise<void> {
   // consolidated window-all-closed handler can quit when appropriate.
   wizardPhase = false
 
-  // Remember the main window's webContents id so privileged IPC handlers can
-  // verify requests originate from the trusted renderer.
+  // Remember the main window's webContents id and origin so privileged IPC
+  // handlers can verify requests originate from the trusted renderer.
   mainWebContentsId = (result.window as unknown as BrowserWindow).webContents?.id
+  mainServerUrl = result.serverUrl
 
   // Initialize the main process lifecycle (single-instance, close-to-tray, etc.)
   await initMainProcess({
