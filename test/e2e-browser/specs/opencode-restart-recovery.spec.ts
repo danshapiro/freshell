@@ -3,6 +3,8 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import WebSocket from 'ws'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { TestServer } from '../helpers/test-server.js'
 
@@ -39,14 +41,27 @@ async function installFakeOpencode(binDir: string): Promise<void> {
   await fsp.chmod(target, 0o755)
 }
 
-function createSetupHome(sharedOpencodeDataDir: string) {
+function createSetupHome(
+  sharedOpencodeDataDir: string,
+  options: { terminalScrollback?: number } = {},
+) {
   return async (homeDir: string): Promise<void> => {
     const xdgShare = path.join(homeDir, '.local', 'share')
+    const freshellDir = path.join(homeDir, '.freshell')
     const opencodeLink = path.join(xdgShare, 'opencode')
     await fsp.mkdir(xdgShare, { recursive: true })
+    await fsp.mkdir(freshellDir, { recursive: true })
     await fsp.mkdir(sharedOpencodeDataDir, { recursive: true })
     await fsp.rm(opencodeLink, { recursive: true, force: true }).catch(() => {})
     await fsp.symlink(sharedOpencodeDataDir, opencodeLink, 'dir')
+    if (typeof options.terminalScrollback === 'number') {
+      await fsp.writeFile(path.join(freshellDir, 'config.json'), JSON.stringify({
+        version: 1,
+        settings: {
+          terminal: { scrollback: options.terminalScrollback },
+        },
+      }, null, 2))
+    }
   }
 }
 
@@ -58,16 +73,21 @@ function createServerOptions(input: {
   fakeOpencodeSessionEventGatePath?: string
   port?: number
   token?: string
+  terminalScrollback?: number
+  env?: Record<string, string>
 }) {
   return {
     ...(input.port ? { port: input.port } : {}),
     ...(input.token ? { token: input.token } : {}),
-    setupHome: createSetupHome(input.sharedOpencodeDataDir),
+    setupHome: createSetupHome(input.sharedOpencodeDataDir, {
+      terminalScrollback: input.terminalScrollback,
+    }),
     env: {
       PATH: `${input.binDir}${path.delimiter}${process.env.PATH ?? ''}`,
       FAKE_OPENCODE_AUDIT_LOG: input.auditLogPath,
       ...(input.fakeOpencodeSessionEventGatePath ? { FAKE_OPENCODE_SESSION_EVENT_GATE_PATH: input.fakeOpencodeSessionEventGatePath } : {}),
       FRESHELL_LOG_DIR: input.logsDir,
+      ...(input.env ?? {}),
     },
   }
 }
@@ -239,6 +259,81 @@ async function sendInputToTerminals(page: any, snapshots: PaneSnapshot[], label 
       })
     }
   }, { items: snapshots, inputLabel: label })
+}
+
+async function sendTerminalInputOverWs(input: {
+  wsUrl: string
+  token: string
+  terminalId: string
+  data: string
+}): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const ws = new WebSocket(input.wsUrl)
+    let settled = false
+    const timeout = setTimeout(() => {
+      if (settled) return
+      settled = true
+      ws.terminate()
+      reject(new Error(`Timed out sending terminal input over websocket for ${input.terminalId}`))
+    }, 10_000)
+
+    const finish = (error?: Error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      ws.removeAllListeners()
+      try {
+        ws.close()
+      } catch {
+        // ignore close failures in test cleanup
+      }
+      if (error) {
+        reject(error)
+        return
+      }
+      resolve()
+    }
+
+    ws.on('open', () => {
+      ws.send(JSON.stringify({
+        type: 'hello',
+        token: input.token,
+        protocolVersion: WS_PROTOCOL_VERSION,
+      }))
+    })
+
+    ws.on('message', (raw) => {
+      const message = JSON.parse(String(raw))
+      if (message?.type === 'ready') {
+        ws.send(JSON.stringify({
+          type: 'terminal.input',
+          terminalId: input.terminalId,
+          data: input.data,
+        }), (error) => {
+          if (error) {
+            finish(error)
+            return
+          }
+          setTimeout(() => finish(), 250)
+        })
+        return
+      }
+      if (message?.type === 'terminal.input.blocked') {
+        finish(new Error(`Terminal input blocked for ${input.terminalId}: ${JSON.stringify(message)}`))
+        return
+      }
+      if (message?.type === 'error') {
+        finish(new Error(`Websocket input error for ${input.terminalId}: ${JSON.stringify(message)}`))
+      }
+    })
+
+    ws.on('error', (error) => finish(error instanceof Error ? error : new Error(String(error))))
+    ws.on('close', () => {
+      if (!settled) {
+        finish(new Error(`Websocket closed before terminal input completed for ${input.terminalId}`))
+      }
+    })
+  })
 }
 
 async function closeTab(page: any, tabId: string): Promise<void> {
@@ -626,6 +721,10 @@ test.describe('OpenCode restart recovery', () => {
       logsDir,
       sharedOpencodeDataDir,
       fakeOpencodeSessionEventGatePath: sessionEventGatePath,
+      terminalScrollback: 200,
+      env: {
+        CODING_CLI_MIN_REPLAY_RING_MAX_BYTES: String(64 * 1024),
+      },
     }))
 
     let restorePage: typeof page | undefined
@@ -652,6 +751,7 @@ test.describe('OpenCode restart recovery', () => {
       const launch = await waitForInitialOpenCodeLaunch(auditLogPath)
       const expectedSessionId = launch.rootSessionId!
 
+      await sendInputToTerminals(page, [beforeAssociation], `hidden-overflow-${'x'.repeat(96 * 1024)}`)
       await sendInputToTerminals(page, [beforeAssociation], 'hidden-before-refresh')
       await waitForStdinAudit(auditLogPath, [{
         tabId: opencodeTab.tabId,
@@ -683,6 +783,26 @@ test.describe('OpenCode restart recovery', () => {
 
       const context = page.context()
       await page.close()
+      for (let index = 0; index < 3; index += 1) {
+        const hiddenOverflowAfterCloseLabel = `hidden-overflow-after-close-${index}-${'x'.repeat(40 * 1024)}`
+        await sendTerminalInputOverWs({
+          wsUrl: info.wsUrl,
+          token: info.token,
+          terminalId: beforeAssociation.terminalId!,
+          data: `${hiddenOverflowAfterCloseLabel} ${opencodeTab.tabId}\n`,
+        })
+      }
+      const hiddenAfterCloseMarker = 'hidden-after-close-marker'
+      await sendTerminalInputOverWs({
+        wsUrl: info.wsUrl,
+        token: info.token,
+        terminalId: beforeAssociation.terminalId!,
+        data: `${hiddenAfterCloseMarker} ${opencodeTab.tabId}\n`,
+      })
+      await waitForStdinAudit(auditLogPath, [{
+        tabId: opencodeTab.tabId,
+        sessionId: expectedSessionId,
+      }], hiddenAfterCloseMarker)
       await fsp.writeFile(sessionEventGatePath, 'release\n', 'utf8')
       await waitForSessionEventsEmitted(auditLogPath, expectedSessionId)
       await expect.poll(async () => {
@@ -706,7 +826,7 @@ test.describe('OpenCode restart recovery', () => {
       await restoreHarness.waitForHarness()
       await restoreHarness.waitForConnection()
 
-      await restorePage.waitForFunction(({ tabId, shellTabId, expectedTerminalId, expectedSessionId }) => {
+      await restorePage.waitForFunction(({ tabId, shellTabId, expectedSessionId }) => {
         const state = window.__FRESHELL_TEST_HARNESS__?.getState()
         const findTerminal = (node: any): any => {
           if (!node) return undefined
@@ -720,13 +840,11 @@ test.describe('OpenCode restart recovery', () => {
           && tab?.sessionRef?.provider === 'opencode'
           && tab.sessionRef.sessionId === expectedSessionId
           && content?.mode === 'opencode'
-          && content.terminalId === expectedTerminalId
           && content.sessionRef?.provider === 'opencode'
           && content.sessionRef.sessionId === expectedSessionId
       }, {
         tabId: opencodeTab.tabId,
         shellTabId: shellTab.tabId,
-        expectedTerminalId: beforeAssociation.terminalId,
         expectedSessionId,
       }, { timeout: 30_000 })
 
@@ -747,12 +865,23 @@ test.describe('OpenCode restart recovery', () => {
       }, { timeout: TAB_REGISTRY_SYNC_INTERVAL_MS + 10_000 }).toBe(true)
 
       await restorePage.locator(`[data-context="tab"][data-tab-id="${opencodeTab.tabId}"]`).click()
-      const [afterRefresh] = await waitForOpenCodeSessions(restorePage, [opencodeTab.tabId])
-      expect(afterRefresh.terminalId).toBe(beforeAssociation.terminalId)
+      const [afterRefresh] = await waitForRunningTerminals(restorePage, [opencodeTab.tabId], {
+        [opencodeTab.tabId]: beforeAssociation.terminalId,
+      })
       expect(afterRefresh.sessionRef).toEqual({
         provider: 'opencode',
         sessionId: expectedSessionId,
       })
+      expect(afterRefresh.terminalId).toBeTruthy()
+      expect(afterRefresh.terminalId).not.toBe(beforeAssociation.terminalId)
+      await waitForRestoreLaunches(auditLogPath, [expectedSessionId])
+      await expect.poll(async () => {
+        const buffer = await restoreHarness.getTerminalBuffer(afterRefresh.terminalId!)
+        return buffer ?? ''
+      }, {
+        timeout: 30_000,
+        message: 'expected restored hidden OpenCode pane to render terminal content after replay-window repair',
+      }).toContain(`fake opencode ready root=${expectedSessionId}`)
       await sendInputToTerminals(restorePage, [afterRefresh], 'hidden-after-refresh')
       await waitForStdinAudit(auditLogPath, [{
         tabId: opencodeTab.tabId,
