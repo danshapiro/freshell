@@ -51,7 +51,12 @@ jobs:
           esac
 
       - name: Run tests
+        if: matrix.os != 'windows-latest'
         run: npm test
+
+      - name: Run Electron tests (Windows)
+        if: matrix.os == 'windows-latest'
+        run: npm run test:electron
 
       - name: Build Electron app
         run: npm run electron:build
