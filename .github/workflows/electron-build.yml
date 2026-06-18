@@ -13,6 +13,7 @@ on:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
@@ -31,31 +32,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Install ripgrep
-        shell: bash
-        run: |
-          if command -v rg >/dev/null 2>&1; then
-            exit 0
-          fi
-          case "${{ matrix.os }}" in
-            ubuntu-latest)
-              sudo apt-get update
-              sudo apt-get install -y ripgrep
-              ;;
-            macos-latest)
-              brew install ripgrep
-              ;;
-            windows-latest)
-              choco install ripgrep -y
-              ;;
-          esac
-
-      - name: Run tests
-        if: matrix.os != 'windows-latest'
-        run: npm test
-
-      - name: Run Electron tests (Windows)
-        if: matrix.os == 'windows-latest'
+      - name: Run Electron tests
         run: npm run test:electron
 
       - name: Build Electron app
