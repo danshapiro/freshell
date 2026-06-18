@@ -465,7 +465,9 @@ export default function BrowserPane({
         if (currentUrl) await copyText(currentUrl)
       },
       openExternal: () => {
-        // Open the resolved URL (with port forwarding) so it works for remote users
+        // Open the resolved URL (with port forwarding) so it works for remote users.
+        // This stays inside the Freshell session so authenticated /api/proxy and
+        // /local-file paths keep the auth cookie.
         if (resolvedSrc) {
           window.open(resolvedSrc, '_blank', 'noopener,noreferrer')
         } else if (currentUrl) {
