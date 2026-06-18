@@ -591,7 +591,7 @@ export type TerminalRecord = {
   codexActiveTurn?: CodexTurnEvent
   codexUnconfirmedInputAt?: number
   codexUnconfirmedInputSource?: 'resume' | 'input'
-  codexInputGate?: { state: 'identity_pending' }
+  codexInputGate?: { state: 'identity_pending'; codexUpdatePromptDismissed?: boolean }
   codexRecovery?: CodexRecoveryOptions
   codexRecoveryAttempt?: Promise<void>
   codexRecoveryAttemptSerial?: number
@@ -640,6 +640,54 @@ function isCodexStartupTerminalControlInput(data: string): boolean {
   if (/^\x1b\[\d{1,4};\d{1,4}R$/.test(data)) return true
   if (/^\x1b\[(?:\?|\>)?[\d;]{0,32}c$/.test(data)) return true
   return /^\x1b\](?:10|11|12|4;\d{1,3});rgb:[0-9a-fA-F]{1,4}\/[0-9a-fA-F]{1,4}\/[0-9a-fA-F]{1,4}(?:\x07|\x1b\\)$/.test(data)
+}
+
+const CODEX_UPDATE_PROMPT_TAIL_CHARS = 8 * 1024
+// eslint-disable-next-line no-control-regex -- terminal snapshots contain ANSI/OSC control bytes.
+const TERMINAL_CONTROL_PATTERN = /\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]/g
+
+function stripTerminalControls(data: string): string {
+  return data.replace(TERMINAL_CONTROL_PATTERN, '')
+}
+
+function hasCodexUpdatePrompt(snapshot: string): boolean {
+  const tail = snapshot.slice(-CODEX_UPDATE_PROMPT_TAIL_CHARS)
+  const text = stripTerminalControls(tail).replace(/\r/g, '\n')
+  return text.includes('Update available!')
+    && text.includes('github.com/openai/codex/releases/latest')
+    && text.includes('Update now')
+    && text.includes('Skip until next version')
+    && text.includes('Press enter to continue')
+}
+
+function isCodexUpdatePromptInput(data: string): boolean {
+  return data === '1'
+    || data === '2'
+    || data === '3'
+    || data === '1\r'
+    || data === '2\r'
+    || data === '3\r'
+    || data === '1\n'
+    || data === '2\n'
+    || data === '3\n'
+    || data === '\r'
+    || data === '\n'
+    || data === '\r\n'
+    || data === '\x1b[A'
+    || data === '\x1b[B'
+}
+
+function isCodexUpdatePromptDismissInput(data: string): boolean {
+  return data === '\r'
+    || data === '\n'
+    || data === '\r\n'
+    || data.endsWith('\r')
+    || data.endsWith('\n')
+}
+
+function isCodexStartupUpdatePromptInput(record: TerminalRecord, data: string): boolean {
+  if (record.codexInputGate?.codexUpdatePromptDismissed) return false
+  return isCodexUpdatePromptInput(data) && hasCodexUpdatePrompt(record.buffer.snapshot())
 }
 
 export type BindSessionResult =
@@ -3160,8 +3208,11 @@ export class TerminalRegistry extends EventEmitter {
       return { status: 'blocked_codex_lifecycle_loss_pending', terminalId }
     }
     if (term.codexInputGate?.state === 'identity_pending') {
-      if (isCodexStartupTerminalControlInput(data)) {
+      if (isCodexStartupTerminalControlInput(data) || isCodexStartupUpdatePromptInput(term, data)) {
         term.pty.write(data)
+        if (isCodexUpdatePromptDismissInput(data)) {
+          term.codexInputGate.codexUpdatePromptDismissed = true
+        }
         return { status: 'written' }
       }
       return { status: 'blocked_codex_identity_pending', terminalId }
