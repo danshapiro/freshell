@@ -31,6 +31,25 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install ripgrep
+        shell: bash
+        run: |
+          if command -v rg >/dev/null 2>&1; then
+            exit 0
+          fi
+          case "${{ matrix.os }}" in
+            ubuntu-latest)
+              sudo apt-get update
+              sudo apt-get install -y ripgrep
+              ;;
+            macos-latest)
+              brew install ripgrep
+              ;;
+            windows-latest)
+              choco install ripgrep -y
+              ;;
+          esac
+
       - name: Run tests
         run: npm test
 
