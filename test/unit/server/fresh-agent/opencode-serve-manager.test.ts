@@ -176,8 +176,8 @@ describe('OpencodeServeManager lifecycle', () => {
     await expect(started).rejects.toThrow(/opencode serve startup was aborted|opencode serve did not become healthy/)
     await shutdown
     expect(child.kill).toHaveBeenCalled()
-    expect((manager as any).running).toBeUndefined()
-    expect((manager as any).startPromise).toBeUndefined()
+    expect((manager as any).runningByCwd.size).toBe(0)
+    expect((manager as any).startPromiseByCwd.size).toBe(0)
   })
 })
 
@@ -533,7 +533,7 @@ describe('OpencodeServeManager fan-out', () => {
     expect(stopStream).toHaveBeenCalled()
     expect(child.kill).toHaveBeenCalled()
     expect((manager as any).sessionEmitters.size).toBe(0)
-    expect((manager as any).running).toBeUndefined()
+    expect((manager as any).runningByCwd.size).toBe(0)
   })
 
   it('default sidecar close clears unmapped emitters but preserves mapped cwd sessions', async () => {
