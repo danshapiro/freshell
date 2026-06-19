@@ -156,6 +156,28 @@ function createDeferred<T>() {
   return { promise, resolve, reject }
 }
 
+function freshopencodeSnapshot(text: string, revision: number) {
+  return {
+    sessionType: 'freshopencode',
+    provider: 'opencode',
+    threadId: 'ses_late_change',
+    sessionId: 'ses_late_change',
+    status: 'idle',
+    latestTurnId: 'msg_assistant_1',
+    revision,
+    summary: 'OpenCode done',
+    capabilities: { send: true, interrupt: true, fork: true },
+    pendingApprovals: [],
+    pendingQuestions: [],
+    diffs: [],
+    worktrees: [],
+    turns: [
+      { id: 'msg_user_1', turnId: 'msg_user_1', role: 'user', summary: 'go', items: [{ id: 'user-text', kind: 'text', text: 'go' }] },
+      { id: 'msg_assistant_1', turnId: 'msg_assistant_1', role: 'assistant', summary: text, items: [{ id: 'assistant-text', kind: 'text', text }] },
+    ],
+  }
+}
+
 beforeEach(() => {
   wsMock.send.mockReset()
   wsMock.onMessage.mockReset()
@@ -2946,6 +2968,67 @@ describe('FreshAgentView', () => {
       expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', 'thread-refresh', expect.any(Object))
     })
     expect(store.getState().panes.refreshRequestsByPane?.['tab-1']?.['pane-1']).toBeUndefined()
+  })
+
+  it('refreshes freshopencode on session.changed without reopening the bouncer', async () => {
+    const store = createStore()
+    let wsHandler: ((message: any) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      wsHandler = handler
+      return () => {}
+    })
+
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce(freshopencodeSnapshot('done', 10))
+      .mockResolvedValueOnce(freshopencodeSnapshot('done updated', 11))
+
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-late-change',
+        sessionId: 'ses_late_change',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_late_change' },
+        resumeSessionId: 'ses_late_change',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('done')).toBeInTheDocument()
+    })
+
+    act(() => {
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_late_change',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.session.changed',
+          sessionId: 'ses_late_change',
+          reason: 'opencode-message',
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText('done updated')).toBeInTheDocument()
+    })
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+    expect(getFreshAgentPaneContent(store)).toMatchObject({
+      sessionId: 'ses_late_change',
+      status: 'idle',
+    })
   })
 
   it('normalizes obsolete Freshcodex models to the default radio option', async () => {
