@@ -220,23 +220,23 @@ describe('visible-first read-model helpers', () => {
       .mockResolvedValueOnce(mockJson(codexContractTurnPage))
       .mockResolvedValueOnce(mockJson(codexContractTurnBody))
 
-    await getFreshAgentThreadSnapshot('freshcodex', 'codex', 'thread-1', { revision: 7, signal })
-    await getFreshAgentTurnPage('freshcodex', 'codex', 'thread-1', { revision: 7, cursor: 'cursor-1', limit: 20 }, { signal })
-    await getFreshAgentTurnBody('freshcodex', 'codex', 'thread-1', 'turn-1', { revision: 7, signal })
+    await getFreshAgentThreadSnapshot('freshcodex', 'codex', 'thread-1', { revision: 7, cwd: '/repo/worktree', signal })
+    await getFreshAgentTurnPage('freshcodex', 'codex', 'thread-1', { revision: 7, cursor: 'cursor-1', cwd: '/repo/worktree', limit: 20 }, { signal })
+    await getFreshAgentTurnBody('freshcodex', 'codex', 'thread-1', 'turn-1', { revision: 7, cwd: '/repo/worktree', signal })
 
     expect(mockFetch).toHaveBeenNthCalledWith(
       1,
-      '/api/fresh-agent/threads/freshcodex/codex/thread-1?revision=7',
+      '/api/fresh-agent/threads/freshcodex/codex/thread-1?revision=7&cwd=%2Frepo%2Fworktree',
       expect.objectContaining({ signal, headers: expect.any(Headers) }),
     )
     expect(mockFetch).toHaveBeenNthCalledWith(
       2,
-      '/api/fresh-agent/threads/freshcodex/codex/thread-1/turns?revision=7&cursor=cursor-1&limit=20',
+      '/api/fresh-agent/threads/freshcodex/codex/thread-1/turns?revision=7&cursor=cursor-1&cwd=%2Frepo%2Fworktree&limit=20',
       expect.objectContaining({ signal, headers: expect.any(Headers) }),
     )
     expect(mockFetch).toHaveBeenNthCalledWith(
       3,
-      '/api/fresh-agent/threads/freshcodex/codex/thread-1/turns/turn-1?revision=7',
+      '/api/fresh-agent/threads/freshcodex/codex/thread-1/turns/turn-1?revision=7&cwd=%2Frepo%2Fworktree',
       expect.objectContaining({ signal, headers: expect.any(Headers) }),
     )
   })

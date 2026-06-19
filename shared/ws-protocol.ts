@@ -425,6 +425,7 @@ export const FreshAgentAttachSchema = z.object({
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
   resumeSessionId: z.string().optional(),
+  cwd: z.string().optional(),
 })
 
 export const FreshAgentSendSchema = z.object({

@@ -670,6 +670,7 @@ describe('WsHandler fresh-agent routing', () => {
         sessionType: 'freshclaude',
         provider: 'claude',
         resumeSessionId: 'cli-session-attached',
+        cwd: '/repo/restored-worktree',
       }))
 
       await vi.waitFor(() => {
@@ -677,14 +678,25 @@ describe('WsHandler fresh-agent routing', () => {
           sessionId: 'claude-session-attached',
           sessionType: 'freshclaude',
           provider: 'claude',
+          cwd: '/repo/restored-worktree',
         })
         expect(runtimeManager.subscribe).toHaveBeenCalledWith(
-          { sessionId: 'claude-session-attached', sessionType: 'freshclaude', provider: 'claude' },
+          {
+            sessionId: 'claude-session-attached',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            cwd: '/repo/restored-worktree',
+          },
           expect.any(Function),
         )
       })
 
-      listeners.get(JSON.stringify({ sessionId: 'claude-session-attached', sessionType: 'freshclaude', provider: 'claude' }))?.({ kind: 'thread.updated', revision: 2 })
+      listeners.get(JSON.stringify({
+        sessionId: 'claude-session-attached',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        cwd: '/repo/restored-worktree',
+      }))?.({ kind: 'thread.updated', revision: 2 })
 
       await vi.waitFor(() => {
         expect(seenMessages).toContainEqual({

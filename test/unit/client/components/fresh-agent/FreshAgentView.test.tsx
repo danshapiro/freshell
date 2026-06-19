@@ -586,6 +586,7 @@ describe('FreshAgentView', () => {
             provider: 'codex',
             createRequestId: 'req-restored-codex',
             sessionRef: { provider: 'codex', sessionId: 'thread-from-ref' },
+            initialCwd: '/repo/from-ref',
             status: 'connected',
           }}
         />
@@ -593,7 +594,12 @@ describe('FreshAgentView', () => {
     )
 
     await waitFor(() => {
-      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', 'thread-from-ref', expect.any(Object))
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+        'freshcodex',
+        'codex',
+        'thread-from-ref',
+        expect.objectContaining({ cwd: '/repo/from-ref' }),
+      )
     })
     expect(await screen.findByText('Codex turn')).toBeInTheDocument()
   })

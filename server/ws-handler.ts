@@ -3158,7 +3158,12 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: this.freshAgentUnavailableMessage() })
           return
         }
-        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        const locator = {
+          sessionId: m.sessionId,
+          sessionType: m.sessionType,
+          provider: m.provider,
+          ...(m.cwd ? { cwd: m.cwd } : {}),
+        }
         try {
           await Promise.resolve(manager.attach(locator))
           this.authorizeFreshAgentSession(state, locator)

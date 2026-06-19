@@ -12,6 +12,7 @@ type FreshAgentThreadThunkLocator = {
   sessionType: FreshAgentSessionType
   provider: FreshAgentRuntimeProvider
   sessionId: string
+  cwd?: string
 }
 
 const inFlightControllers = new Set<AbortController>()
@@ -47,6 +48,7 @@ export const loadFreshAgentThreadTurns = createAsyncThunk(
           cursor: input.cursor,
           limit: input.limit,
           includeBodies: input.includeBodies,
+          cwd: input.cwd,
           signal: controller.signal,
         },
       )
@@ -88,6 +90,7 @@ export const loadFreshAgentTurnBody = createAsyncThunk(
         input.turnId,
         {
           revision: input.revision,
+          cwd: input.cwd,
           signal: controller.signal,
         },
       )

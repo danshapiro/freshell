@@ -186,6 +186,32 @@ export function createCodexFreshAgentAdapter(deps: {
   const runtimeResumeGenerationByThread = new Map<string, number>()
   const modelByTurnByThread = new Map<string, Map<string, string>>()
 
+  const rememberThreadSettings = (
+    threadId: string,
+    settings?: Partial<FreshAgentCreateRequest>,
+  ): Partial<FreshAgentCreateRequest> | undefined => {
+    if (!settings) return settingsByThread.get(threadId)
+    const definedSettings = Object.fromEntries(
+      Object.entries(settings).filter(([, value]) => value !== undefined),
+    ) as Partial<FreshAgentCreateRequest>
+    if (Object.keys(definedSettings).length === 0) return settingsByThread.get(threadId)
+    const merged = {
+      ...settingsByThread.get(threadId),
+      ...definedSettings,
+    }
+    settingsByThread.set(threadId, merged)
+    return merged
+  }
+
+  const settingsFromLocator = (
+    locator: { sessionType?: FreshAgentCreateRequest['sessionType']; cwd?: string },
+  ): Partial<FreshAgentCreateRequest> | undefined => {
+    const cwd = typeof locator.cwd === 'string' && locator.cwd.trim().length > 0
+      ? locator.cwd
+      : undefined
+    return cwd ? { sessionType: locator.sessionType, cwd } : undefined
+  }
+
   const rememberRuntimeThread = (threadId: string, runtime: CodexRuntimePort) => {
     runtimeByThread.set(threadId, runtime)
     const threadIds = threadIdsByRuntime.get(runtime) ?? new Set<string>()
@@ -228,6 +254,7 @@ export function createCodexFreshAgentAdapter(deps: {
   }
 
   const ensureRuntime = async (sessionId: string, settings?: Partial<FreshAgentCreateRequest>): Promise<CodexRuntimePort> => {
+    const effectiveSettings = rememberThreadSettings(sessionId, settings)
     const existing = getExistingRuntime(sessionId)
     if (existing) return existing
     const inflight = runtimeResumeByThread.get(sessionId)
@@ -245,14 +272,14 @@ export function createCodexFreshAgentAdapter(deps: {
     }
     resumePromise = (async () => {
       try {
-        const resumed = await runtime.resumeThread(toCodexResumeInput(sessionId, settings))
+        const resumed = await runtime.resumeThread(toCodexResumeInput(sessionId, effectiveSettings))
         if ((runtimeResumeGenerationByThread.get(sessionId) ?? 0) !== resumeGeneration) {
           await discardOwnedRuntime()
           throw new Error(`Codex app-server runtime resume was cancelled for freshcodex session ${sessionId}.`)
         }
         rememberRuntimeThread(resumed.threadId, runtime)
-        if (settings) {
-          settingsByThread.set(resumed.threadId, settings)
+        if (effectiveSettings) {
+          settingsByThread.set(resumed.threadId, effectiveSettings)
         }
         return runtime
       } catch (error) {
@@ -335,8 +362,13 @@ export function createCodexFreshAgentAdapter(deps: {
       return { sessionId: resumed.threadId, sessionRef: { provider: 'codex', sessionId: resumed.threadId } }
     },
 
+    attach(locator) {
+      rememberThreadSettings(locator.sessionId, settingsFromLocator(locator))
+      return { sessionId: locator.sessionId, sessionRef: { provider: 'codex', sessionId: locator.sessionId } }
+    },
+
     async subscribe(sessionId, listener) {
-      const runtime = await ensureRuntime(sessionId)
+      const runtime = await ensureRuntime(sessionId, settingsByThread.get(sessionId))
       if (!runtime.onThreadLifecycle) {
         throw new Error('Codex app-server runtime does not support thread lifecycle subscriptions.')
       }
@@ -477,7 +509,10 @@ export function createCodexFreshAgentAdapter(deps: {
     },
 
     async getSnapshot(thread, revision) {
-      const runtime = await ensureRuntime(thread.threadId)
+      const runtime = await ensureRuntime(
+        thread.threadId,
+        settingsFromLocator(thread) ?? settingsByThread.get(thread.threadId),
+      )
       let rawSnapshot: Record<string, any>
       try {
         rawSnapshot = await runtime.readThread({ threadId: thread.threadId, includeTurns: true })
@@ -515,7 +550,10 @@ export function createCodexFreshAgentAdapter(deps: {
     },
 
     async getTurnPage(thread, query) {
-      const runtime = await ensureRuntime(thread.threadId)
+      const runtime = await ensureRuntime(
+        thread.threadId,
+        settingsFromLocator(thread) ?? settingsByThread.get(thread.threadId),
+      )
       const rawPage = await runtime.listThreadTurns({
         threadId: thread.threadId,
         cursor: typeof query.cursor === 'string' ? query.cursor : undefined,
@@ -531,7 +569,10 @@ export function createCodexFreshAgentAdapter(deps: {
     },
 
     async getTurnBody(thread, revision) {
-      const runtime = await ensureRuntime(thread.threadId)
+      const runtime = await ensureRuntime(
+        thread.threadId,
+        settingsFromLocator(thread) ?? settingsByThread.get(thread.threadId),
+      )
       const rawTurn = await runtime.readThreadTurn({
         threadId: thread.threadId,
         turnId: thread.turnId,
