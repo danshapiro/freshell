@@ -72,6 +72,12 @@ type LocalEcho = {
   submittedTurnId?: string
 }
 
+function sameLocalEcho(a: LocalEcho | null | undefined, b: LocalEcho | null | undefined): boolean {
+  return (a?.requestId ?? null) === (b?.requestId ?? null)
+    && (a?.text ?? null) === (b?.text ?? null)
+    && (a?.submittedTurnId ?? null) === (b?.submittedTurnId ?? null)
+}
+
 type PendingSendMetadata = {
   cwd?: string
   checkpointId?: string
@@ -414,7 +420,7 @@ export function FreshAgentView({
   // Optimistic echo of the just-sent user message: the transcript renders
   // snapshot turns only, which left a 2-10s blank gap after send
   // (live-test finding). Cleared when a snapshot containing the turn lands.
-  const [localEcho, setLocalEcho] = useState<LocalEcho | null>(null)
+  const [localEcho, setLocalEchoState] = useState<LocalEcho | null>(() => paneContent.pendingLocalEcho ?? null)
   const localEchoRef = useRef<LocalEcho | null>(null)
   localEchoRef.current = localEcho
   const pendingSendMetadataRef = useRef<Map<string, PendingSendMetadata>>(new Map())
@@ -431,6 +437,25 @@ export function FreshAgentView({
   const paneContentRef = useRef(paneContent)
   const composerRef = useRef<FreshAgentComposerHandle | null>(null)
   paneContentRef.current = paneContent
+  const setLocalEcho = useCallback((next: LocalEcho | null) => {
+    setLocalEchoState(next)
+    const current = paneContentRef.current
+    if (sameLocalEcho(current.pendingLocalEcho, next)) return
+    dispatch(mergePaneContent({
+      tabId,
+      paneId,
+      updates: { pendingLocalEcho: next ?? undefined },
+    }))
+  }, [dispatch, paneId, tabId])
+  useEffect(() => {
+    const next = paneContent.pendingLocalEcho ?? null
+    if (sameLocalEcho(localEchoRef.current, next)) return
+    setLocalEchoState(next)
+  }, [
+    paneContent.pendingLocalEcho?.requestId,
+    paneContent.pendingLocalEcho?.submittedTurnId,
+    paneContent.pendingLocalEcho?.text,
+  ])
   const restoreTimeoutRef = useRef<number | null>(null)
   const createSentRef = useRef(false)
   // Session-scoped "always allow" tool names; reset with the pane, never persisted.
@@ -682,9 +707,10 @@ export function FreshAgentView({
         restoreError: undefined,
         createError: undefined,
         status: 'creating',
+        pendingLocalEcho: undefined,
       },
     }))
-  }, [commitSnapshot, dispatch, paneId, sendFreshAgentMessage, tabId])
+  }, [commitSnapshot, dispatch, paneId, sendFreshAgentMessage, setLocalEcho, tabId])
 
   const sendFork = useCallback((atTurnId?: string) => {
     const current = paneContentRef.current
@@ -1026,9 +1052,11 @@ export function FreshAgentView({
         commitSnapshot(displaySnapshot)
         setSnapshotAutoTitleIdentity(snapshotIdentity)
         const echo = localEchoRef.current
+        const landedEcho = echo
+          ? localEchoLanded(displaySnapshot.turns, echo, pendingSendMetadataRef.current.get(echo.requestId))
+          : false
         if (echo) {
-          const pending = pendingSendMetadataRef.current.get(echo.requestId)
-          if (localEchoLanded(displaySnapshot.turns, echo, pending)) setLocalEcho(null)
+          if (landedEcho) setLocalEcho(null)
         }
         const fresh = paneContentRef.current
         const nextStatus = (resolved.status as FreshAgentPaneContent['status']) ?? fresh.status
@@ -1059,6 +1087,7 @@ export function FreshAgentView({
             sessionRef: nextSessionRef,
             status: nextStatus,
             resumeSessionId: nextResumeSessionId,
+            pendingLocalEcho: landedEcho ? undefined : fresh.pendingLocalEcho,
           },
         }))
       })
@@ -1288,6 +1317,7 @@ export function FreshAgentView({
         firstMessage: text,
       }))
     }
+    const nextLocalEcho: LocalEcho = { text, requestId }
     sendFreshAgentMessage({
       type: 'freshAgent.send',
       requestId,
@@ -1303,7 +1333,15 @@ export function FreshAgentView({
         ...(getEffectiveFreshAgentEffort(current) ? { effort: getEffectiveFreshAgentEffort(current) } : {}),
       },
     })
-    setLocalEcho({ text, requestId })
+    setLocalEchoState(nextLocalEcho)
+    dispatch(mergePaneContent({
+      tabId,
+      paneId,
+      updates: {
+        ...(current.provider === 'opencode' ? { status: 'running' } : {}),
+        pendingLocalEcho: nextLocalEcho,
+      },
+    }))
   }, [dispatch, paneId, recordPendingSendMetadata, sendFreshAgentMessage, snapshotConfirmsNoUserTurns, tabId])
 
   // Flush queued messages when the turn ends. One flush per status change is

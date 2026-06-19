@@ -1340,6 +1340,64 @@ describe('FreshAgentView', () => {
     expect(transcriptTurns.at(-1)).toHaveTextContent('Done.')
   })
 
+  it('persists a pending local echo so a remounted pane keeps the submitted prompt visible', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'empty',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-pending-echo',
+        sessionId: 'freshopencode-pending-echo',
+        status: 'idle',
+      },
+    }))
+
+    const rendered = render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Do not disappear on reload' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const send = sentFreshAgentMessages('freshAgent.send').at(-1)
+    const requestId = String(send?.requestId)
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store)).toMatchObject({
+        status: 'running',
+        pendingLocalEcho: {
+          requestId,
+          text: 'Do not disappear on reload',
+        },
+      })
+    })
+    expect(screen.getByText('Do not disappear on reload')).toBeInTheDocument()
+
+    rendered.unmount()
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    expect(screen.getByText('Do not disappear on reload')).toBeInTheDocument()
+  })
+
   it('does not transmit stale Freshopencode permissionMode on create or send', async () => {
     const creatingStore = createStore()
     creatingStore.dispatch(initLayout({

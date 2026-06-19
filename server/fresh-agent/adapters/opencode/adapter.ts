@@ -151,6 +151,11 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     })
   }
 
+  function emitStatus(state: OpencodeSessionState, status: 'running' | 'idle'): void {
+    state.status = status
+    state.events.emit('event', { type: 'sdk.session.snapshot', sessionId: state.placeholderId, status })
+  }
+
   async function materializeOrSend(state: OpencodeSessionState, text: string, settings?: Partial<FreshAgentCreateRequest>): Promise<FreshAgentSendResult> {
     const normalized = settings
       ? normalizeOpencodeInput({ requestId: state.placeholderId, sessionType: 'freshopencode', provider: 'opencode', ...settings } as FreshAgentCreateRequest)
@@ -159,40 +164,37 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     const effort = normalized?.effort ?? state.effort
     const effectiveCwd = normalized?.cwd ?? state.cwd
 
-    if (!state.realSessionId) {
-      const session = await serveManager.createSession({ title: undefined, ...(effectiveCwd ? { directory: effectiveCwd } : {}) })
-      state.realSessionId = session.id
-      if (typeof session.directory === 'string' && session.directory.length > 0) state.cwd = session.directory
-      else if (effectiveCwd) state.cwd = effectiveCwd
-      remember(state)
-      bindServeStream(state)
-    }
-
-    const realId = state.realSessionId!
-    state.status = 'running'
-    state.events.emit('event', { type: 'sdk.session.snapshot', sessionId: state.placeholderId, status: 'running' })
-    const idle = serveManager.onceIdle(realId, turnTimeoutMs)
-    // If promptAsync fails and we leave via the catch(), `idle` may still
-    // reject later on its timeout timer. Attach a no-op handler now so that
-    // later rejection cannot become an unhandled rejection.
-    void idle.catch(() => {})
+    emitStatus(state, 'running')
     try {
+      if (!state.realSessionId) {
+        const session = await serveManager.createSession({ title: undefined, ...(effectiveCwd ? { directory: effectiveCwd } : {}) })
+        state.realSessionId = session.id
+        if (typeof session.directory === 'string' && session.directory.length > 0) state.cwd = session.directory
+        else if (effectiveCwd) state.cwd = effectiveCwd
+        remember(state)
+        bindServeStream(state)
+      }
+
+      const realId = state.realSessionId!
+      const idle = serveManager.onceIdle(realId, turnTimeoutMs)
+      // If promptAsync fails and we leave via the catch(), `idle` may still
+      // reject later on its timeout timer. Attach a no-op handler now so that
+      // later rejection cannot become an unhandled rejection.
+      void idle.catch(() => {})
       await promptAsyncForState(state, realId, {
         parts: [{ type: 'text', text }],
         ...(splitOpencodeModel(modelStr) ? { model: splitOpencodeModel(modelStr)! } : {}),
         ...(effort ? { variant: effort } : {}),
       })
       await idle
+      state.model = modelStr ?? state.model
+      state.effort = effort
+      emitStatus(state, 'idle')
+      return sendResult(state.realSessionId)
     } catch (error) {
-      state.status = 'idle'
-      state.events.emit('event', { type: 'sdk.session.snapshot', sessionId: state.placeholderId, status: 'idle' })
+      emitStatus(state, 'idle')
       throw error
     }
-    state.model = modelStr ?? state.model
-    state.effort = effort
-    state.status = 'idle'
-    state.events.emit('event', { type: 'sdk.session.snapshot', sessionId: state.placeholderId, status: 'idle' })
-    return sendResult(state.realSessionId)
   }
 
   async function assembleExport(
@@ -316,8 +318,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     async interrupt(sessionId) {
       const state = requireState(sessionId)
       await abortForState(state).catch((err) => log.warn({ err }, 'abort failed'))
-      state.status = 'idle'
-      state.events.emit('event', { type: 'sdk.session.snapshot', sessionId: state.placeholderId, status: 'idle' })
+      emitStatus(state, 'idle')
     },
 
     async compact(sessionId, input) {

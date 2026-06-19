@@ -3,6 +3,7 @@ import { nanoid } from 'nanoid'
 import {
   normalizeFreshAgentEffortOverride,
   normalizeFreshAgentModelSelection,
+  normalizeFreshAgentPendingLocalEcho,
   type LivePaneContentInput,
   type PanesState,
   type PaneContent,
@@ -96,6 +97,8 @@ function normalizePaneContent(
     const rawFreshAgent = input as Record<string, unknown>
     const existingRestoreError = readRestoreError(rawFreshAgent.restoreError)
     const style = normalizeFreshAgentStyleOverride((input as { style?: unknown }).style)
+    const pendingLocalEcho = normalizeFreshAgentPendingLocalEcho(rawFreshAgent.pendingLocalEcho)
+    const status = input.status || (pendingLocalEcho ? 'running' : 'creating')
     if (existingRestoreError) {
       return {
         kind: 'fresh-agent',
@@ -103,7 +106,7 @@ function normalizePaneContent(
         provider: input.provider,
         sessionId: input.sessionId,
         createRequestId: input.createRequestId || nanoid(),
-        status: input.status || 'creating',
+        status,
         ...(existingRestoreError.reason === 'invalid_legacy_restore_target'
           ? {}
           : { resumeSessionId: input.resumeSessionId }),
@@ -125,6 +128,7 @@ function normalizePaneContent(
         showThinking: typeof input.showThinking === 'boolean' ? input.showThinking : undefined,
         showTools: typeof input.showTools === 'boolean' ? input.showTools : undefined,
         showTimecodes: typeof input.showTimecodes === 'boolean' ? input.showTimecodes : undefined,
+        ...(pendingLocalEcho ? { pendingLocalEcho } : {}),
       }
     }
 
@@ -145,7 +149,7 @@ function normalizePaneContent(
       provider: input.provider,
       sessionId: input.sessionId,
       createRequestId: input.createRequestId || nanoid(),
-      status: input.status || 'creating',
+      status,
       ...(typeof input.resumeSessionId === 'string' ? { resumeSessionId: input.resumeSessionId } : {}),
       ...(sessionRef ? { sessionRef } : {}),
       serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
@@ -166,6 +170,7 @@ function normalizePaneContent(
       showThinking: typeof input.showThinking === 'boolean' ? input.showThinking : undefined,
       showTools: typeof input.showTools === 'boolean' ? input.showTools : undefined,
       showTimecodes: typeof input.showTimecodes === 'boolean' ? input.showTimecodes : undefined,
+      ...(pendingLocalEcho ? { pendingLocalEcho } : {}),
     }
   }
   if (input.kind === 'extension') {

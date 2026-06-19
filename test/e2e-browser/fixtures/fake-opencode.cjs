@@ -469,6 +469,58 @@ const server = http.createServer((req, res) => {
   }
 
   if (url.pathname === '/session') {
+    if (req.method === 'POST') {
+      appendAudit({
+        event: 'session_create_requested',
+        rootSessionId,
+        childSessionId,
+      })
+      if (process.env.FAKE_OPENCODE_HANG_SESSION_CREATE === '1') {
+        req.on('close', () => {
+          appendAudit({
+            event: 'session_create_request_closed',
+            rootSessionId,
+            childSessionId,
+          })
+        })
+        return
+      }
+      let bodyText = ''
+      req.setEncoding('utf8')
+      req.on('data', (chunk) => {
+        bodyText += chunk
+      })
+      req.on('end', () => {
+        const input = parseJsonText(bodyText) || {}
+        const now = Date.now()
+        const sessionId = `ses_http_${now}_${process.pid}`
+        const directory = typeof input.directory === 'string' && input.directory.length > 0
+          ? input.directory
+          : serverProjectDirectory()
+        const title = typeof input.title === 'string' && input.title.length > 0
+          ? input.title
+          : `Freshopencode ${sessionId}`
+        const db = openDatabase()
+        try {
+          ensureSchema(db)
+          insertSession(db, {
+            sessionId,
+            projectId: 'proj-http',
+            parentId: typeof input.parentID === 'string' ? input.parentID : null,
+            slug: sessionId,
+            directory,
+            title,
+            createdAt: now,
+            updatedAt: now,
+          })
+        } finally {
+          db.close()
+        }
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ id: sessionId, directory, title }))
+      })
+      return
+    }
     res.writeHead(200, { 'content-type': 'application/json' })
     res.end(JSON.stringify([
       { id: rootSessionId, title: `Root ${rootSessionId}` },
