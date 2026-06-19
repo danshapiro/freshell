@@ -132,6 +132,13 @@ function readRequiredCodexDisplaySecret(secret: string | undefined): string {
   throw new CodexDisplayConfigError('Codex display-turn normalization requires a non-empty adapter-supplied display-id secret.')
 }
 
+function readRequiredCodexThreadId(threadId: string | undefined): string {
+  if (typeof threadId === 'string' && threadId.trim().length > 0) {
+    return threadId
+  }
+  throw new CodexDisplayConfigError('Codex display-turn normalization requires a non-empty adapter-supplied threadId.')
+}
+
 function readCodexThreadItemType(item: Record<string, unknown>): CodexThreadItemVariant {
   const parsed = CodexThreadItemTypeSchema.safeParse(item.type)
   if (!parsed.success) {
@@ -591,7 +598,7 @@ export function normalizeCodexDisplayTurns(
   options: NormalizeCodexDisplayTurnsOptions = {},
 ): { turns: FreshAgentTurn[]; displayRows: CodexDisplayRow[] } {
   const providerTurnId = String(rawTurn.id ?? `turn:${ordinal}`)
-  const threadId = options.threadId ?? providerTurnId
+  const threadId = readRequiredCodexThreadId(options.threadId)
   const secret = readRequiredCodexDisplaySecret(options.secret)
   const model = typeof rawTurn.model === 'string' && rawTurn.model.length > 0
     ? rawTurn.model

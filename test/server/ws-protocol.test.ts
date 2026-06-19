@@ -8,6 +8,7 @@ import {
   ClaudeActivityUpdatedSchema,
   ClaudeActivityListSchema,
   ErrorCode,
+  FreshAgentSendSchema,
   HelloSchema,
   TerminalAttachSchema,
   TerminalInputSchema,
@@ -59,6 +60,17 @@ describe('websocket protocol schemas', () => {
     })
 
     expect(parsed.expectedSessionRef).toEqual({ provider: 'codex', sessionId: 'thread-1' })
+  })
+
+  it('accepts an optional freshAgent.send requestId', () => {
+    expect(FreshAgentSendSchema.parse({
+      type: 'freshAgent.send',
+      requestId: 'send-request-1',
+      sessionId: 'thread-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      text: 'Continue',
+    }).requestId).toBe('send-request-1')
   })
 
   it('accepts SESSION_IDENTITY_MISMATCH as an error code', () => {

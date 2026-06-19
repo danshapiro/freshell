@@ -96,7 +96,7 @@ describe('Codex fresh-agent normalization', () => {
           text: 'Done',
         },
       ],
-    }, 0, { secret: DISPLAY_SECRET })
+    }, 0, { threadId: THREAD_ID, secret: DISPLAY_SECRET })
 
     expect(turn).toMatchObject({
       model: 'gpt-5.4-mini',
@@ -117,7 +117,7 @@ describe('Codex fresh-agent normalization', () => {
           text: 'Done',
         },
       ],
-    }, 0, { model: 'gpt-5.4-mini', secret: DISPLAY_SECRET })
+    }, 0, { threadId: THREAD_ID, model: 'gpt-5.4-mini', secret: DISPLAY_SECRET })
 
     expect(turn.model).toBe('gpt-5.4-mini')
   })
@@ -224,6 +224,33 @@ describe('Codex fresh-agent normalization', () => {
     }, 0, {
       threadId: THREAD_ID,
     })).toThrow(/non-empty.*secret/i)
+  })
+
+  it('fails display normalization when the adapter does not supply a non-empty threadId', () => {
+    expect(() => normalizeCodexDisplayTurns({
+      id: 'turn-missing-thread',
+      status: 'completed',
+      items: [{
+        id: 'item-user',
+        type: 'userMessage',
+        content: [{ type: 'text', text: 'Prompt' }],
+      }],
+    }, 0, {
+      secret: DISPLAY_SECRET,
+      threadId: '',
+    })).toThrow(CodexDisplayConfigError)
+
+    expect(() => normalizeCodexDisplayTurns({
+      id: 'turn-missing-thread',
+      status: 'completed',
+      items: [{
+        id: 'item-user',
+        type: 'userMessage',
+        content: [{ type: 'text', text: 'Prompt' }],
+      }],
+    }, 0, {
+      secret: DISPLAY_SECRET,
+    })).toThrow(/non-empty.*threadId/i)
   })
 
   it('preserves existing display ids when unrelated rows are inserted later in the provider turn', () => {

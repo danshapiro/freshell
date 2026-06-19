@@ -1,5 +1,6 @@
 import fsp from 'fs/promises'
 import path from 'path'
+import { randomBytes } from 'node:crypto'
 import { logger } from './logger.js'
 import { getFreshellConfigDir } from './freshell-home.js'
 import {
@@ -57,6 +58,9 @@ export type UserConfig = {
   version: 1
   settings: AppSettings
   legacyLocalSettingsSeed?: LocalSettingsPatch
+  serverSecrets?: {
+    codexDisplayIdSecret?: string
+  }
   sessionOverrides: Record<string, SessionOverride>
   terminalOverrides: Record<string, TerminalOverride>
   projectColors: Record<string, string>
@@ -266,6 +270,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
 }
 
+function generateServerLocalSecret(): string {
+  return randomBytes(32).toString('base64url')
+}
+
 function migrateLegacyFreshClaudeSettings(rawSettings: Record<string, unknown>): Record<string, unknown> {
   if (!isRecord(rawSettings.freshclaude)) {
     return rawSettings
@@ -336,6 +344,14 @@ export class ConfigStore {
         ...existing,
         settings,
         legacyLocalSettingsSeed,
+        serverSecrets: isRecord(existing.serverSecrets)
+          ? {
+              ...(typeof existing.serverSecrets.codexDisplayIdSecret === 'string'
+                && existing.serverSecrets.codexDisplayIdSecret.trim().length > 0
+                ? { codexDisplayIdSecret: existing.serverSecrets.codexDisplayIdSecret }
+                : {}),
+            }
+          : undefined,
         sessionOverrides: existing.sessionOverrides || {},
         terminalOverrides: existing.terminalOverrides || {},
         projectColors: existing.projectColors || {},
@@ -371,6 +387,7 @@ export class ConfigStore {
       version: 1,
       settings: defaultSettings,
       legacyLocalSettingsSeed: undefined,
+      serverSecrets: undefined,
       sessionOverrides: {},
       terminalOverrides: {},
       projectColors: {},
@@ -417,6 +434,25 @@ export class ConfigStore {
   async getSettings(): Promise<AppSettings> {
     const cfg = await this.load()
     return cfg.settings
+  }
+
+  async getCodexDisplayIdSecret(): Promise<string> {
+    return this.writeMutex.acquire(async () => {
+      const cfg = await this.loadForWrite()
+      const existing = cfg.serverSecrets?.codexDisplayIdSecret
+      if (typeof existing === 'string' && existing.trim().length > 0) {
+        return existing
+      }
+      const secret = generateServerLocalSecret()
+      await this.saveInternal({
+        ...cfg,
+        serverSecrets: {
+          ...(cfg.serverSecrets ?? {}),
+          codexDisplayIdSecret: secret,
+        },
+      })
+      return secret
+    })
   }
 
   async getLegacyLocalSettingsSeed(): Promise<LocalSettingsPatch | undefined> {

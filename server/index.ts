@@ -313,7 +313,9 @@ async function main() {
     sdkBridge,
     agentHistorySource,
   })
+  const codexDisplayIdSecret = await configStore.getCodexDisplayIdSecret()
   const codexFreshAgentAdapter = createCodexFreshAgentAdapter({
+    displayIdSecret: codexDisplayIdSecret,
     runtimeFactory: () => new CodexAppServerRuntime({ serverInstanceId }),
   })
   const opencodeServeManager = new OpencodeServeManager()

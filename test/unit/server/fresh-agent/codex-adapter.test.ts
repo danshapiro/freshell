@@ -1,6 +1,15 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { createCodexFreshAgentAdapter } from '../../../../server/fresh-agent/adapters/codex/adapter.js'
+import { createCodexFreshAgentAdapter as createRawCodexFreshAgentAdapter } from '../../../../server/fresh-agent/adapters/codex/adapter.js'
+import { FreshAgentStaleThreadRevisionError } from '../../../../server/fresh-agent/runtime-manager.js'
+
+const DISPLAY_SECRET = 'task-3-persisted-display-secret'
+
+function createCodexFreshAgentAdapter(
+  deps: Omit<Parameters<typeof createRawCodexFreshAgentAdapter>[0], 'displayIdSecret'> & { displayIdSecret?: string },
+) {
+  return createRawCodexFreshAgentAdapter({ displayIdSecret: DISPLAY_SECRET, ...deps })
+}
 
 function makeCodexThread(id: string) {
   return {
@@ -30,6 +39,31 @@ function makeCodexTurn(id: string) {
       phase: null,
       memoryCitation: null,
     }],
+  }
+}
+
+function makeMixedCodexTurn(id: string) {
+  return {
+    id,
+    status: 'completed',
+    items: [
+      {
+        type: 'userMessage',
+        id: `${id}:user`,
+        content: [{ type: 'text', text: 'Review the diff.' }],
+      },
+      {
+        type: 'reasoning',
+        id: `${id}:reasoning`,
+        summary: ['Checking changes'],
+        content: [],
+      },
+      {
+        type: 'agentMessage',
+        id: `${id}:assistant`,
+        text: 'The patch is safe.',
+      },
+    ],
   }
 }
 
@@ -148,8 +182,7 @@ describe('Codex fresh-agent adapter', () => {
   })
 
   it('reads snapshots and turns from the official Codex thread APIs', async () => {
-    const durableTurn = makeCodexTurn('turn-1')
-    const expectedFullItem = expect.objectContaining({ kind: 'text', text: 'Codex summary' })
+    const durableTurn = makeMixedCodexTurn('turn-1')
     const runtime = {
       startThread: vi.fn(),
       resumeThread: vi.fn(),
@@ -168,23 +201,290 @@ describe('Codex fresh-agent adapter', () => {
     }
     const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
 
-    await expect(adapter.getSnapshot?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-new-1' }, 7)).resolves.toMatchObject({
+    const snapshot: any = await adapter.getSnapshot?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-new-1' }, 7)
+    expect(snapshot).toMatchObject({
       provider: 'codex',
       threadId: 'thread-new-1',
       revision: 7,
-      turns: [{ id: 'turn-1', turnId: 'turn-1' }],
     })
+    expect(snapshot.turns).toHaveLength(2)
+    expect(snapshot.turns[0]).toMatchObject({ role: 'user', ordinal: 0 })
+    expect(snapshot.turns[1]).toMatchObject({ role: 'assistant', ordinal: 1 })
+    expect(snapshot.turns[0].turnId).toMatch(/^codex-display:v1:[A-Za-z0-9_-]{22}$/)
+    expect(snapshot.turns[1].turnId).toMatch(/^codex-display:v1:[A-Za-z0-9_-]{22}$/)
+    expect(snapshot.turns[0].turnId).not.toContain('turn-1')
+    expect(snapshot.turns[0]).not.toHaveProperty('providerTurnId')
     expect(runtime.readThread).toHaveBeenCalledWith({ threadId: 'thread-new-1', includeTurns: true })
-    await expect(adapter.getTurnPage?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-new-1' }, { revision: 7 })).resolves.toMatchObject({
+    const page: any = await adapter.getTurnPage?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-new-1' }, { revision: 7 })
+    expect(page).toMatchObject({
       revision: 7,
-      turns: [{ id: 'turn-1', turnId: 'turn-1', items: [expectedFullItem] }],
-      bodies: { 'turn-1': expect.objectContaining({ items: [expectedFullItem] }) },
+      turns: [
+        expect.objectContaining({ role: 'user' }),
+        expect.objectContaining({ role: 'assistant' }),
+      ],
     })
-    await expect(adapter.getTurnBody?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-new-1', turnId: 'turn-1' }, 7)).resolves.toMatchObject({
+    expect(page.turns[1].items).toEqual([
+      expect.objectContaining({ kind: 'reasoning' }),
+      expect.objectContaining({ kind: 'text', text: 'The patch is safe.' }),
+    ])
+    expect(page.bodies[page.turns[1].turnId]).toMatchObject({ role: 'assistant' })
+    await expect(adapter.getTurnBody?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-new-1', turnId: page.turns[1].turnId }, 7)).resolves.toMatchObject({
+      turnId: page.turns[1].turnId,
+      revision: 7,
+      items: [
+        expect.objectContaining({ kind: 'reasoning' }),
+        expect.objectContaining({ kind: 'text', text: 'The patch is safe.' }),
+      ],
+    })
+    expect(runtime.readThreadTurn).toHaveBeenCalledWith({
+      threadId: 'thread-new-1',
       turnId: 'turn-1',
       revision: 7,
-      items: [expectedFullItem],
     })
+  })
+
+  it('keeps display ids short and opaque for long native ids and item ids', async () => {
+    const longProviderId = `turn-${'native-id-'.repeat(40)}`
+    const longItemId = `item-${'item-id-'.repeat(40)}`
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      readThread: vi.fn().mockResolvedValue({
+        thread: {
+          ...makeCodexThread('thread-long-ids'),
+          updatedAt: 11,
+          turns: [{
+            id: longProviderId,
+            status: 'completed',
+            items: [{ type: 'agentMessage', id: longItemId, text: 'Short public id' }],
+          }],
+        },
+      }),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    const snapshot: any = await adapter.getSnapshot?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-long-ids',
+    }, 11)
+
+    expect(snapshot.turns[0].turnId).toMatch(/^codex-display:v1:[A-Za-z0-9_-]{22}$/)
+    expect(snapshot.turns[0].turnId.length).toBeLessThan(45)
+    expect(snapshot.turns[0].turnId).not.toContain(longProviderId.slice(0, 20))
+    expect(snapshot.turns[0].turnId).not.toContain(longItemId.slice(0, 20))
+  })
+
+  it('does not pass unknown or malformed display ids to Codex body reads', async () => {
+    const durableTurn = makeMixedCodexTurn('turn-1')
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      readThread: vi.fn().mockResolvedValue({
+        thread: { ...makeCodexThread('thread-new-1'), turns: [durableTurn] },
+      }),
+      listThreadTurns: vi.fn().mockResolvedValue({
+        revision: 7,
+        nextCursor: null,
+        turns: [durableTurn],
+      }),
+      readThreadTurn: vi.fn().mockResolvedValue(durableTurn),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    await expect(adapter.getTurnBody?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+      turnId: 'codex-display:v1:not-a-valid-envelope',
+    }, 7)).resolves.toBeNull()
+    expect(runtime.readThreadTurn).not.toHaveBeenCalled()
+
+    await expect(adapter.getTurnBody?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+      turnId: 'codex-display:v1:abcdefghijklmnopqrstu1',
+    }, 7)).resolves.toBeNull()
+    expect(runtime.readThreadTurn).not.toHaveBeenCalled()
+  })
+
+  it('returns stale revision when a display body read has no matching cached revision', async () => {
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn().mockResolvedValue({
+        revision: 9,
+        nextCursor: null,
+        turns: [makeMixedCodexTurn('turn-current')],
+      }),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    await expect(adapter.getTurnBody?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+      turnId: 'codex-display:v1:abcdefghijklmnopqrstu1',
+    }, 7)).rejects.toBeInstanceOf(FreshAgentStaleThreadRevisionError)
+    expect(runtime.readThreadTurn).not.toHaveBeenCalled()
+  })
+
+  it('accepts native body ids only when they normalize to one display row', async () => {
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn()
+        .mockResolvedValueOnce(makeCodexTurn('turn-single'))
+        .mockResolvedValueOnce(makeMixedCodexTurn('turn-mixed')),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    const single: any = await adapter.getTurnBody?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+      turnId: 'turn-single',
+    }, 7)
+    expect(single.turnId).toMatch(/^codex-display:v1:/)
+    expect(single.items).toEqual([expect.objectContaining({ text: 'Codex summary' })])
+
+    await expect(adapter.getTurnBody?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+      turnId: 'turn-mixed',
+    }, 7)).rejects.toThrow(/display turns/)
+  })
+
+  it('materializes submitted input rows until Codex returns the provider user message', async () => {
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      startTurn: vi.fn().mockResolvedValue({ turnId: 'turn-submitted-1' }),
+      readThread: vi.fn()
+        .mockResolvedValueOnce({
+          thread: {
+            ...makeCodexThread('thread-new-1'),
+            updatedAt: 8,
+            turns: [{
+              id: 'turn-submitted-1',
+              status: 'inProgress',
+              items: [{ type: 'agentMessage', id: 'assistant-1', text: 'Working on it.' }],
+            }],
+          },
+        })
+        .mockResolvedValueOnce({
+          thread: {
+            ...makeCodexThread('thread-new-1'),
+            updatedAt: 9,
+            turns: [{
+              id: 'turn-submitted-1',
+              status: 'completed',
+              items: [
+                { type: 'userMessage', id: 'real-user-1', content: [{ type: 'text', text: 'Review this image' }] },
+                { type: 'agentMessage', id: 'assistant-1', text: 'Done.' },
+              ],
+            }],
+          },
+        }),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    const sendResult: any = await adapter.send?.('thread-new-1', {
+      requestId: 'send-1',
+      text: 'Review this image',
+      images: [
+        { kind: 'local', path: '/tmp/screenshot.png', mediaType: 'image/png' },
+        { kind: 'data', mediaType: 'image/png', data: 'abc123' },
+      ],
+    })
+
+    expect(sendResult).toMatchObject({
+      requestId: 'send-1',
+      submittedTurnId: expect.stringMatching(/^codex-display:v1:/),
+    })
+    expect(runtime.startTurn).toHaveBeenCalledWith(expect.objectContaining({
+      input: [
+        { type: 'text', text: 'Review this image', text_elements: [] },
+        { type: 'localImage', path: '/tmp/screenshot.png' },
+        { type: 'image', url: 'data:image/png;base64,abc123' },
+      ],
+    }))
+
+    const pendingSnapshot: any = await adapter.getSnapshot?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+    }, 8)
+    expect(pendingSnapshot.turns[0]).toMatchObject({
+      turnId: sendResult.submittedTurnId,
+      role: 'user',
+      source: 'durable',
+    })
+    expect(pendingSnapshot.turns[0].summary).toBe('Review this image')
+
+    const materializedSnapshot: any = await adapter.getSnapshot?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+    }, 9)
+    expect(materializedSnapshot.turns[0]).toMatchObject({
+      turnId: sendResult.submittedTurnId,
+      role: 'user',
+    })
+    expect(materializedSnapshot.turns.filter((turn: any) => turn.role === 'user')).toHaveLength(1)
+  })
+
+  it('keeps same-text queued submitted rows distinct by request id', async () => {
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      startTurn: vi.fn()
+        .mockResolvedValueOnce({ turnId: 'turn-submitted-1' })
+        .mockResolvedValueOnce({ turnId: 'turn-submitted-2' }),
+      readThread: vi.fn().mockResolvedValue({
+        thread: {
+          ...makeCodexThread('thread-new-1'),
+          updatedAt: 8,
+          turns: [
+            {
+              id: 'turn-submitted-1',
+              status: 'inProgress',
+              items: [{ type: 'agentMessage', id: 'assistant-1', text: 'Working.' }],
+            },
+            {
+              id: 'turn-submitted-2',
+              status: 'inProgress',
+              items: [{ type: 'agentMessage', id: 'assistant-2', text: 'Still working.' }],
+            },
+          ],
+        },
+      }),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    const first: any = await adapter.send?.('thread-new-1', { requestId: 'send-1', text: 'Same prompt' })
+    const second: any = await adapter.send?.('thread-new-1', { requestId: 'send-2', text: 'Same prompt' })
+    const snapshot: any = await adapter.getSnapshot?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+    }, 8)
+
+    const userRows = snapshot.turns.filter((turn: any) => turn.role === 'user')
+    expect(first.submittedTurnId).not.toBe(second.submittedTurnId)
+    expect(userRows.map((turn: any) => turn.turnId)).toEqual([first.submittedTurnId, second.submittedTurnId])
   })
 
   it('reads a just-created Codex thread without turns when includeTurns is not materialized yet', async () => {
@@ -428,26 +728,20 @@ describe('Codex fresh-agent adapter', () => {
       model: 'gpt-5-codex',
     })
     await adapter.send?.('thread-new-1', {
+      requestId: 'send-model-1',
       text: 'Use the small model',
       settings: { model: 'gpt-5.4-flash' },
     })
 
-    await expect(adapter.getSnapshot?.({
-      sessionType: 'freshcodex',
-      provider: 'codex',
-      threadId: 'thread-new-1',
-    }, 7)).resolves.toMatchObject({
-      turns: [
-        { id: 'turn-1' },
-        { id: 'turn-2', model: 'gpt-5.4-flash' },
-      ],
-    })
     const snapshot = await adapter.getSnapshot?.({
       sessionType: 'freshcodex',
       provider: 'codex',
       threadId: 'thread-new-1',
     }, 7) as any
+    expect(snapshot.turns).toHaveLength(3)
     expect(snapshot.turns[0]).not.toHaveProperty('model')
+    expect(snapshot.turns[1]).toMatchObject({ role: 'user', model: 'gpt-5.4-flash' })
+    expect(snapshot.turns[2]).toMatchObject({ role: 'assistant', model: 'gpt-5.4-flash' })
   })
 
   it('subscribes to Codex lifecycle notifications and projects matching thread updates', async () => {
