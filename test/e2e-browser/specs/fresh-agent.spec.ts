@@ -447,6 +447,153 @@ test.describe('Fresh Agent', () => {
     await expectFreshAgentSubmitButtonContrasted(monoRoot, '--fresh-agent-accent')
   })
 
+  test('thinking text renders lighter than the final answer across sans, serif, and mono styles', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
+    await terminal.waitForTerminal()
+    await enableClaudeAndCodex(page)
+
+    await harness.clearSentWsMessages()
+    const picker = await openPanePicker(page)
+    await suppressFreshAgentNetworkForActivePane(page)
+    await picker.getByRole('button', { name: /^Freshcodex$/i }).click({ force: true })
+    await page.getByRole('option').first().click()
+
+    // Start in serif: it has an explicit [data-markdown-body] paragraph-color
+    // override, which is the hardest case for muted thinking text.
+    let dialog = await openFreshAgentSettings(page, 'Freshcodex')
+    await dialog.getByRole('combobox', { name: /^Style$/i }).selectOption('serif')
+    await page.keyboard.press('Escape')
+    await expect(page.locator('[data-context="fresh-agent"][data-style="serif"]').last()).toBeVisible({ timeout: 10_000 })
+
+    const threadId = 'thinking-color-thread'
+    const answerText = 'The final answer body text is here.'
+    const thinkingText = 'reasoning that should look lighter than the answer'
+    await page.route(`**/api/fresh-agent/threads/freshcodex/codex/${threadId}*`, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          threadId,
+          sessionId: threadId,
+          revision: 1,
+          latestTurnId: 'turn-thinking-color',
+          status: 'idle',
+          summary: '',
+          capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: true },
+          settings: { model: 'gpt-5.4-flash', permissionMode: 'on-request', effort: 'high', plugins: [] },
+          tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+          pendingApprovals: [],
+          pendingQuestions: [],
+          worktrees: [],
+          diffs: [],
+          turns: [
+            {
+              id: 'turn-thinking-color',
+              turnId: 'turn-thinking-color',
+              role: 'assistant',
+              summary: 'done',
+              items: [
+                { id: 'item-answer', kind: 'text', text: answerText },
+                { id: 'think-1', kind: 'thinking', text: thinkingText },
+                { id: 'tool-1', kind: 'tool_use', toolUseId: 'call-1', name: 'Bash', input: { command: 'echo ok' } },
+                { id: 'result-1', kind: 'tool_result', toolUseId: 'call-1', content: 'ok', isError: false },
+              ],
+            },
+          ],
+        }),
+      })
+    })
+
+    await page.evaluate((id) => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      const state = harness?.getState()
+      const findLeaf = (node: any): any => {
+        if (!node) return null
+        if (node.type === 'leaf' && node.content?.kind === 'fresh-agent') return node
+        if (node.type === 'split') {
+          return findLeaf(node.children?.[0]) ?? findLeaf(node.children?.[1])
+        }
+        return null
+      }
+      let tabId: string | null = null
+      let leaf: any = null
+      for (const [candidateTabId, layout] of Object.entries(state?.panes?.layouts ?? {})) {
+        const candidateLeaf = findLeaf(layout)
+        if (candidateLeaf) { tabId = candidateTabId; leaf = candidateLeaf }
+      }
+      if (!tabId || !leaf) return
+      harness?.dispatch({
+        type: 'panes/updatePaneContent',
+        payload: {
+          tabId,
+          paneId: leaf.id,
+          content: {
+            ...leaf.content,
+            sessionId: id,
+            sessionRef: { provider: 'codex', sessionId: id },
+            resumeSessionId: id,
+            status: 'idle',
+            settingsDismissed: true,
+            showThinking: true,
+          },
+        },
+      })
+    }, threadId)
+
+    const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+    await expect(paneRoot.getByText(answerText)).toBeVisible({ timeout: 10_000 })
+
+    // Expand the activity strip and the Thinking disclosure so the thinking
+    // body text is in the DOM. The strip/thinking component state persists
+    // across style switches (same React instances), so re-running this is a
+    // no-op once expanded.
+    const ensureThinkingExpanded = async (root: any) => {
+      const toggle = root.getByRole('button', { name: 'Toggle activity details' })
+      if (await toggle.getAttribute('aria-expanded') !== 'true') {
+        await toggle.click()
+      }
+      const thinking = root.getByRole('button', { name: 'Thinking' })
+      await expect(thinking).toBeVisible()
+      if (await thinking.getAttribute('aria-expanded') !== 'true') {
+        await thinking.click()
+      }
+      await expect(root.getByText(thinkingText)).toBeVisible()
+    }
+    await ensureThinkingExpanded(paneRoot)
+
+    const probeColors = async (style: string) => {
+      const root = page.locator(`[data-context="fresh-agent"][data-style="${style}"]`).last()
+      await expect(root).toBeVisible({ timeout: 10_000 })
+      await ensureThinkingExpanded(root)
+      return root.evaluate((el: HTMLElement, answer: string) => {
+        const thinkingBody = el.querySelector('.fresh-agent-thinking-body')
+        const thinkingP = thinkingBody?.querySelector('p') ?? null
+        const answerP = Array.from(el.querySelectorAll('p'))
+          .find(p => p.textContent?.includes(answer)) ?? null
+        return {
+          thinkingP: thinkingP ? getComputedStyle(thinkingP).color : null,
+          thinkingBody: thinkingBody ? getComputedStyle(thinkingBody).color : null,
+          answerP: answerP ? getComputedStyle(answerP).color : null,
+        }
+      }, answerText)
+    }
+
+    for (const style of ['serif', 'sans', 'mono'] as const) {
+      if (style !== 'serif') {
+        dialog = await openFreshAgentSettings(page, 'Freshcodex')
+        await dialog.getByRole('combobox', { name: /^Style$/i }).selectOption(style)
+        await page.keyboard.press('Escape')
+      }
+      const colors = await probeColors(style)
+      // Prose inside the thinking body must not override the muted container
+      // color back to the primary answer color.
+      expect(colors.thinkingP).toBe(colors.thinkingBody)
+      // Thinking text must be visibly different from the final answer text.
+      expect(colors.thinkingP).not.toBe(colors.answerP)
+    }
+  })
+
   test('freshclaude banners render through the fresh-agent pane surface and answer over WS', async ({ freshellPage, page, harness, terminal }) => {
     await terminal.waitForTerminal()
     const { tabId, paneId } = await getActiveLeaf(harness)

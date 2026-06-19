@@ -106,6 +106,19 @@ html {
   opacity: var(--fresh-agent-watermark-opacity);
 }
 
+.fresh-agent-thinking-body [data-markdown-body] {
+  --tw-prose-body: var(--fresh-agent-muted-text);
+  --tw-prose-headings: var(--fresh-agent-muted-text);
+  --tw-prose-lead: var(--fresh-agent-muted-text);
+  --tw-prose-links: var(--fresh-agent-muted-text);
+  --tw-prose-bold: var(--fresh-agent-muted-text);
+  --tw-prose-counters: var(--fresh-agent-muted-text);
+  --tw-prose-bullets: var(--fresh-agent-muted-text);
+  --tw-prose-quotes: var(--fresh-agent-muted-text);
+  --tw-prose-captions: var(--fresh-agent-muted-text);
+  --tw-prose-code: var(--fresh-agent-muted-text);
+}
+
 .fresh-agent-style-serif {
   --fresh-agent-copy-font-family: "Literata", "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, Cambria, "Times New Roman", Times, serif;
   --fresh-agent-meta-font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
@@ -519,6 +532,14 @@ html {
   border-color: var(--fresh-agent-border);
   color: var(--fresh-agent-muted-text);
   font-family: var(--fresh-agent-copy-font-family);
+}
+
+.fresh-agent-style-serif .fresh-agent-thinking-body [data-markdown-body] :where(p, li, blockquote) {
+  color: var(--fresh-agent-muted-text);
+}
+
+.fresh-agent-style-serif .fresh-agent-thinking-body [data-markdown-body] :where(h1, h2, h3, h4) {
+  color: var(--fresh-agent-muted-text);
 }
 
 .fresh-agent-style-serif .fresh-agent-diff-title {
