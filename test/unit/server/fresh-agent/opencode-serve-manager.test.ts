@@ -393,7 +393,7 @@ describe('OpencodeServeManager HTTP client', () => {
         return jsonResponse({ id: 'ses_project', directory: '/project-a' })
       }
       if (url === 'http://127.0.0.1:48000/session/ses_unknown' && init?.method === 'GET') {
-        return jsonResponse({ id: 'ses_unknown', title: 'Unknown' })
+        throw new Error('unknown session lookup must not hit cwd sidecar')
       }
       if (url === 'http://127.0.0.1:47999/global/health') return jsonResponse({ healthy: true })
       if (url === 'http://127.0.0.1:47999/session/ses_unknown' && init?.method === 'GET') {
@@ -422,6 +422,7 @@ describe('OpencodeServeManager HTTP client', () => {
       expect.objectContaining({ cwd: '/project-a' }),
     )
     expect(spawnFn.mock.calls[1]?.[2]).not.toHaveProperty('cwd')
+    expect(fetchFn).not.toHaveBeenCalledWith('http://127.0.0.1:48000/session/ses_unknown', expect.anything())
     expect(fetchFn).toHaveBeenCalledWith('http://127.0.0.1:47999/session/ses_unknown', expect.anything())
   })
 })
@@ -578,7 +579,7 @@ describe('OpencodeServeManager fan-out', () => {
     expect((manager as any).sessionEmitters.has('ses_project')).toBe(true)
   })
 
-  it('non-default sidecar close does not delete unrelated default emitters', async () => {
+  it('non-default sidecar close removes its mapped emitter and preserves unrelated default emitters', async () => {
     const childDefault = fakeChild()
     const childProject = fakeChild()
     const spawnFn = vi.fn()
@@ -614,9 +615,12 @@ describe('OpencodeServeManager fan-out', () => {
     await manager.compact('ses_project')
     manager.subscribe('ses_project', () => {})
     expect(spawnFn).toHaveBeenCalledTimes(2)
+    expect((manager as any).sessionEmitters.has('ses_default')).toBe(true)
+    expect((manager as any).sessionEmitters.has('ses_project')).toBe(true)
 
     childProject.emit('close', 1)
 
+    expect((manager as any).sessionEmitters.has('ses_project')).toBe(false)
     expect((manager as any).sessionEmitters.has('ses_default')).toBe(true)
   })
 
