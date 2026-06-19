@@ -368,7 +368,7 @@ describe('WsHandler fresh-agent routing', () => {
         runtimeProvider: 'codex',
       }),
       subscribe: vi.fn().mockResolvedValue(() => undefined),
-      send: vi.fn().mockResolvedValue(undefined),
+      send: vi.fn().mockResolvedValue({ requestId: 'send-req-1', submittedTurnId: 'display-user-1' }),
       interrupt: vi.fn().mockResolvedValue(undefined),
       resolveApproval: vi.fn().mockResolvedValue(undefined),
       answerQuestion: vi.fn().mockResolvedValue(undefined),
@@ -397,6 +397,7 @@ describe('WsHandler fresh-agent routing', () => {
 
       ws.send(JSON.stringify({
         type: 'freshAgent.send',
+        requestId: 'send-req-1',
         sessionId: 'codex-session-2',
         sessionType: 'freshcodex',
         provider: 'codex',
@@ -442,6 +443,7 @@ describe('WsHandler fresh-agent routing', () => {
       await vi.waitFor(() => {
         const locator = { sessionId: 'codex-session-2', sessionType: 'freshcodex', provider: 'codex' }
         expect(runtimeManager.send).toHaveBeenCalledWith(locator, {
+          requestId: 'send-req-1',
           text: 'Ship it',
           images: undefined,
           settings: { cwd: '/repo', model: 'gpt-5.4-mini', effort: 'low' },
@@ -455,6 +457,11 @@ describe('WsHandler fresh-agent routing', () => {
           expect.any(Function),
         )
         expect(runtimeManager.kill).toHaveBeenCalledWith(locator)
+        expect(seenMessages).toContainEqual(expect.objectContaining({
+          type: 'freshAgent.send.accepted',
+          requestId: 'send-req-1',
+          submittedTurnId: 'display-user-1',
+        }))
         expect(seenMessages).toContainEqual(expect.objectContaining({
           type: 'freshAgent.forked',
           requestId: 'fork-req-1',

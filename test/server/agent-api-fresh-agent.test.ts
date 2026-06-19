@@ -112,12 +112,18 @@ describe('agent-api fresh-agent: create', () => {
 
 describe('agent-api fresh-agent: send-keys', () => {
   it('routes send-keys to the runtime manager for a fresh-agent pane and blocks until the turn returns', async () => {
-    const { app, freshAgentRuntimeManager } = makeApp()
+    const freshAgentRuntimeManager = {
+      create: vi.fn(async () => ({ sessionId: 'freshopencode-abc', sessionType: 'freshopencode', runtimeProvider: 'opencode', sessionRef: { provider: 'opencode', sessionId: 'freshopencode-abc' } })),
+      send: vi.fn(async () => ({ submittedTurnId: 'display-user-1' })),
+      attach: vi.fn(async () => ({ sessionId: 'ses_real_1' })),
+      getSnapshot: vi.fn(async () => ({ status: 'idle', turns: [] })),
+    }
+    const { app } = makeApp({ freshAgentRuntimeManager })
     const created = await request(app).post('/api/tabs').send({ agent: 'opencode' })
     const paneId = created.body.data.paneId
     const res = await request(app).post(`/api/panes/${paneId}/send-keys`).send({ data: 'Reply with: ok' })
     expect(res.status).toBe(200)
-    expect(res.body.data).toMatchObject({ sessionId: 'freshopencode-abc' })
+    expect(res.body.data).toMatchObject({ sessionId: 'freshopencode-abc', submittedTurnId: 'display-user-1' })
     expect(freshAgentRuntimeManager.send).toHaveBeenCalledWith(
       { sessionId: 'freshopencode-abc', sessionType: 'freshopencode', provider: 'opencode' },
       { text: 'Reply with: ok' },

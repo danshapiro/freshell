@@ -1,4 +1,7 @@
 import {
+  randomUUID,
+} from 'node:crypto'
+import {
   makeFreshAgentSessionKey,
   type FreshAgentRuntimeProvider,
   type FreshAgentSessionType,
@@ -31,8 +34,32 @@ export class FreshAgentStaleThreadRevisionError extends Error {
   }
 }
 
+export class FreshAgentUnprovableThreadRevisionError extends Error {
+  readonly code = 'UNPROVABLE_THREAD_REVISION' as const
+
+  constructor(readonly requestedRevision: number) {
+    super('Fresh-agent thread revision could not be proven from the current provider body')
+  }
+}
+
 export class FreshAgentUnsupportedCapabilityError extends Error {
   readonly code = 'FRESH_AGENT_UNSUPPORTED_CAPABILITY' as const
+}
+
+export class FreshAgentInvalidDisplayIdError extends Error {
+  readonly code = 'INVALID_DISPLAY_ID' as const
+}
+
+export class FreshAgentInvalidTurnCursorError extends Error {
+  readonly code = 'INVALID_TURN_CURSOR' as const
+}
+
+export class FreshAgentTurnNotFoundError extends Error {
+  readonly code = 'TURN_NOT_FOUND' as const
+}
+
+export class FreshAgentAmbiguousTurnBodyError extends FreshAgentUnsupportedCapabilityError {
+  readonly ambiguousCode = 'AMBIGUOUS_NATIVE_TURN_ID' as const
 }
 
 export class FreshAgentLostSessionError extends Error {
@@ -150,13 +177,20 @@ export class FreshAgentRuntimeManager {
 
   async send(
     locator: FreshAgentSessionLocator,
-    input: { text: string; images?: FreshAgentInputImage[]; settings?: FreshAgentCreateRequest },
+    input: { requestId?: string; text: string; images?: FreshAgentInputImage[]; settings?: FreshAgentCreateRequest },
   ): Promise<FreshAgentSendResult> {
     const record = this.requireSession(locator)
     if (!record.adapter.send) {
       throw new FreshAgentUnsupportedCapabilityError(`Send is not supported for ${record.sessionType}`)
     }
-    const result = await record.adapter.send(locator.sessionId, input)
+    const requestId = input.requestId ?? randomUUID()
+    const { requestId: _requestId, ...adapterInput } = input
+    Object.defineProperty(adapterInput, 'requestId', {
+      value: requestId,
+      enumerable: false,
+      configurable: true,
+    })
+    const result = await record.adapter.send(locator.sessionId, adapterInput)
     if (result?.sessionId && result.sessionId !== locator.sessionId) {
       this.sessions.set(this.key({
         sessionType: locator.sessionType,
@@ -164,7 +198,16 @@ export class FreshAgentRuntimeManager {
         sessionId: result.sessionId,
       }), record)
     }
-    return result
+    if (result?.requestId) {
+      return result
+    }
+    const wrappedResult = { ...(result ?? {}) } as Exclude<FreshAgentSendResult, void>
+    Object.defineProperty(wrappedResult, 'requestId', {
+      value: requestId,
+      enumerable: result == null,
+      configurable: true,
+    })
+    return wrappedResult
   }
 
   async interrupt(locator: FreshAgentSessionLocator) {

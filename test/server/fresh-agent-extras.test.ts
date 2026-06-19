@@ -150,15 +150,16 @@ describe('fresh-agent extras router', () => {
 
   describe('POST /send', () => {
     it('forwards to the injected runtime manager', async () => {
-      const send = vi.fn().mockResolvedValue(undefined)
+      const send = vi.fn().mockResolvedValue({ submittedTurnId: 'display-user-1' })
       const app = express()
       app.use('/api/fresh-agent', createFreshAgentExtrasRouter({ freshAgentRuntimeManager: { send } }))
 
-      await request(app)
+      const res = await request(app)
         .post('/api/fresh-agent/send')
         .send({ sessionId: 's1', sessionType: 'freshclaude', provider: 'claude', text: 'ls the cwd' })
         .expect(200)
 
+      expect(res.body).toMatchObject({ sent: true, submittedTurnId: 'display-user-1' })
       expect(send).toHaveBeenCalledWith(
         { sessionId: 's1', sessionType: 'freshclaude', provider: 'claude' },
         { text: 'ls the cwd' },
@@ -214,10 +215,22 @@ describe('fresh-agent extras router', () => {
       await fsp.writeFile(file, 'version one\n')
       const first = await request(app)
         .post('/api/fresh-agent/checkpoints')
-        .send({ cwd: dir, label: 'before refactor' })
+        .send({ cwd: dir, label: 'before refactor', requestId: 'send-request-1' })
         .expect(200)
       expect(first.body.id).toMatch(/^[0-9a-f]{40}$/)
       expect(first.body.label).toBe('before refactor')
+      expect(first.body.requestId).toBe('send-request-1')
+
+      const withTurnId = await request(app)
+        .post('/api/fresh-agent/checkpoints/metadata')
+        .send({ cwd: dir, id: first.body.id, turnId: 'display-user-1' })
+        .expect(200)
+      expect(withTurnId.body).toMatchObject({
+        id: first.body.id,
+        label: 'before refactor',
+        requestId: 'send-request-1',
+        turnId: 'display-user-1',
+      })
 
       await fsp.writeFile(file, 'version two\n')
       await request(app)
@@ -233,6 +246,10 @@ describe('fresh-agent extras router', () => {
       // Newest first, git log order.
       expect(list.body.checkpoints[0].label).toBe('after refactor')
       expect(list.body.checkpoints[1].label).toBe('before refactor')
+      expect(list.body.checkpoints[1]).toMatchObject({
+        requestId: 'send-request-1',
+        turnId: 'display-user-1',
+      })
 
       await request(app)
         .post('/api/fresh-agent/checkpoints/restore')

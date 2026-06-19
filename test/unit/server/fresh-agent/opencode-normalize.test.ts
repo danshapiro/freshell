@@ -37,7 +37,7 @@ describe('OpenCode fresh-agent normalization', () => {
           summary: 'Compacted older OpenCode context.',
         },
       ],
-    }, 0)
+    }, 0)!
 
     expect(turn.items).toEqual([
       {
@@ -70,9 +70,9 @@ describe('OpenCode fresh-agent normalization', () => {
 
   it('guards missing patch files and returns an empty completed file change', () => {
     const turn = normalizeOpencodeTurn({
-      info: { id: 'msg-patch' },
+      info: { id: 'msg-patch', role: 'assistant' },
       parts: [{ id: 'part-patch-empty', type: 'patch', diff: '@@ empty @@' }],
-    }, 0)
+    }, 0)!
 
     expect(turn.items).toEqual([
       {
@@ -161,7 +161,7 @@ describe('OpenCode fresh-agent normalization', () => {
     const turn = normalizeOpencodeTurn({
       info: { id: 'msg-user-quoted', role: 'user' },
       parts: [{ id: 'part-user-quoted', type: 'text', text: '"Do a directory listing."' }],
-    }, 0)
+    }, 0)!
 
     expect(turn.role).toBe('user')
     expect(turn.items).toEqual([
@@ -174,7 +174,7 @@ describe('OpenCode fresh-agent normalization', () => {
     const turn = normalizeOpencodeTurn({
       info: { id: 'msg-user-plain', role: 'user' },
       parts: [{ id: 'part-user-plain', type: 'text', text: 'Do a directory listing.' }],
-    }, 0)
+    }, 0)!
 
     expect(turn.items[0]?.text).toBe('Do a directory listing.')
     expect(turn.summary).toBe('Do a directory listing.')
@@ -184,7 +184,7 @@ describe('OpenCode fresh-agent normalization', () => {
     const turn = normalizeOpencodeTurn({
       info: { id: 'msg-assistant-quoted', role: 'assistant' },
       parts: [{ id: 'part-assistant-quoted', type: 'text', text: '"Hello, world."' }],
-    }, 0)
+    }, 0)!
 
     expect(turn.role).toBe('assistant')
     expect(turn.items[0]?.text).toBe('"Hello, world."')
@@ -194,7 +194,7 @@ describe('OpenCode fresh-agent normalization', () => {
     const turn = normalizeOpencodeTurn({
       info: { id: 'msg-user-nested', role: 'user' },
       parts: [{ id: 'part-user-nested', type: 'text', text: '""nested" quotes"' }],
-    }, 0)
+    }, 0)!
 
     expect(turn.items[0]?.text).toBe('"nested" quotes')
   })
@@ -214,7 +214,7 @@ describe('OpenCode fresh-agent normalization', () => {
           text: 'Intro <thinking reason="plan">I could change all instances.</thinking> done.',
         },
       ],
-    }, 0)
+    }, 0)!
 
     expect(turn.items).toEqual([
       { id: 'part-think', kind: 'text', text: 'Before  and after.' },
@@ -229,7 +229,7 @@ describe('OpenCode fresh-agent normalization', () => {
       parts: [
         { id: 'part-user-think', type: 'text', text: 'Why did the assistant say <think>secret</think>?' },
       ],
-    }, 0)
+    }, 0)!
 
     expect(turn.items).toEqual([
       { id: 'part-user-think', kind: 'text', text: 'Why did the assistant say <think>secret</think>?' },
@@ -240,7 +240,7 @@ describe('OpenCode fresh-agent normalization', () => {
     const turn = normalizeOpencodeTurn({
       info: { id: 'msg-preserve-ws', role: 'assistant' },
       parts: [{ id: 'part-ws', type: 'text', text: '  leading\n  and trailing  ' }],
-    }, 0)
+    }, 0)!
 
     expect(turn.items).toEqual([{ id: 'part-ws', kind: 'text', text: '  leading\n  and trailing  ' }])
   })
@@ -250,11 +250,63 @@ describe('OpenCode fresh-agent normalization', () => {
     const turn = normalizeOpencodeTurn({
       info: { id: 'msg-reasoning', role: 'assistant' },
       parts: [{ id: 'part-reasoning', type: 'reasoning', text }],
-    }, 0)
+    }, 0)!
 
     expect(turn.items).toEqual([
       { id: 'part-reasoning', kind: 'reasoning', summary: [text], content: [text], text },
     ])
+  })
+
+  it('keeps user and assistant messages as separate display turns with their native turnIds', () => {
+    const snapshot = normalizeOpencodeSnapshot({
+      sessionType: 'freshopencode',
+      threadId: 'ses-separated-turns',
+      exported: {
+        messages: [
+          {
+            info: { id: 'msg-user', role: 'user' },
+            parts: [{ id: 'part-user', type: 'text', text: 'Summarize the changes.' }],
+          },
+          {
+            info: { id: 'msg-assistant', role: 'assistant' },
+            parts: [{ id: 'part-assistant', type: 'text', text: 'Summarizing now.' }],
+          },
+        ],
+      },
+    })
+
+    expect(snapshot.turns).toHaveLength(2)
+    expect(snapshot.turns).toMatchObject([
+      { turnId: 'msg-user', messageId: 'msg-user', role: 'user', summary: 'Summarize the changes.' },
+      { turnId: 'msg-assistant', messageId: 'msg-assistant', role: 'assistant', summary: 'Summarizing now.' },
+    ])
+  })
+
+  it('rejects visible roleless messages instead of emitting roleless display turns', () => {
+    const message = {
+      info: { id: 'msg-roleless' },
+      parts: [{ id: 'part-roleless', type: 'text', text: 'Hidden until OpenCode provides a display role.' }],
+    }
+
+    expect(normalizeOpencodeTurn(message, 0)).toBeNull()
+
+    const snapshot = normalizeOpencodeSnapshot({
+      sessionType: 'freshopencode',
+      threadId: 'ses-roleless',
+      exported: {
+        messages: [
+          {
+            info: { id: 'msg-user', role: 'user' },
+            parts: [{ id: 'part-user', type: 'text', text: 'User input' }],
+          },
+          message,
+        ],
+      },
+    })
+
+    expect(snapshot.turns).toHaveLength(1)
+    expect(snapshot.turns[0]).toMatchObject({ turnId: 'msg-user', role: 'user' })
+    expect(snapshot.turns.some((turn) => turn.turnId === 'msg-roleless')).toBe(false)
   })
 
   it('carries turn-page nextCursor explicitly and keeps export fallback compatibility', () => {

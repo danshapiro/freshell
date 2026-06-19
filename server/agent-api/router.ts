@@ -459,7 +459,7 @@ type CodexPromptBlocker = {
 
 type FreshAgentRuntimeManagerLike = {
   create: (input: any) => Promise<{ sessionId: string; sessionType: FreshAgentSessionType; runtimeProvider: FreshAgentRuntimeProvider; sessionRef?: { provider: string; sessionId: string } }>
-  send: (locator: FreshAgentSessionLocator, input: { text: string; settings?: any }) => Promise<{ sessionId?: string; sessionRef?: { provider: string; sessionId: string } } | void>
+  send: (locator: FreshAgentSessionLocator, input: { text: string; settings?: any }) => Promise<{ sessionId?: string; submittedTurnId?: string; sessionRef?: { provider: string; sessionId: string } } | void>
   attach: (locator: FreshAgentSessionLocator) => Promise<{ sessionId: string; sessionRef?: { provider: string; sessionId: string } }>
   getSnapshot: (input: FreshAgentThreadLocator) => Promise<any>
 }
@@ -1705,7 +1705,13 @@ export function createAgentApiRouter({
         const deadline = Date.now() + (Number.isFinite(timeoutSec) ? timeoutSec * 1000 : FRESH_AGENT_SEND_IDLE_TIMEOUT_MS)
         const idle = await waitForFreshAgentIdle(freshAgentRuntimeManager, snapshotLocator, deadline)
         if (idle.deadlineMissed) {
-          return res.json(approx({ paneId, sessionId: result?.sessionId ?? locator.sessionId, sessionRef: result?.sessionRef, status: idle.status }, 'prompt sent; turn did not complete within deadline'))
+          return res.json(approx({
+            paneId,
+            sessionId: result?.sessionId ?? locator.sessionId,
+            submittedTurnId: result?.submittedTurnId,
+            sessionRef: result?.sessionRef,
+            status: idle.status,
+          }, 'prompt sent; turn did not complete within deadline'))
         }
 
         const finalSessionId = result?.sessionId ?? locator.sessionId
@@ -1728,7 +1734,13 @@ export function createAgentApiRouter({
           })
         }
 
-        return res.json(ok({ paneId, sessionId: finalSessionId, sessionRef: finalSessionRef, status: idle.status }, 'prompt sent'))
+        return res.json(ok({
+          paneId,
+          sessionId: finalSessionId,
+          submittedTurnId: result?.submittedTurnId,
+          sessionRef: finalSessionRef,
+          status: idle.status,
+        }, 'prompt sent'))
       } catch (err: any) {
         return res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'fresh-agent send failed'))
       }

@@ -90,6 +90,21 @@ describe('ConfigStore', () => {
       expect(exists).toBe(true)
     })
 
+    it('generates and persists the Codex display-id secret without exposing it in settings', async () => {
+      const store = new ConfigStore()
+
+      const secret = await store.getCodexDisplayIdSecret()
+      const settings = await store.getSettings()
+      const saved = JSON.parse(await fsp.readFile(configPath, 'utf-8'))
+      const reloaded = new ConfigStore()
+
+      expect(secret).toEqual(expect.any(String))
+      expect(secret.length).toBeGreaterThanOrEqual(32)
+      expect(saved.serverSecrets.codexDisplayIdSecret).toBe(secret)
+      expect(JSON.stringify(settings)).not.toContain(secret)
+      await expect(reloaded.getCodexDisplayIdSecret()).resolves.toBe(secret)
+    })
+
     it('creates .freshell directory if needed', async () => {
       const store = new ConfigStore()
       await store.load()
