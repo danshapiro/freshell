@@ -69,6 +69,12 @@ export const FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE = {
       defaultEffort: FRESHOPENCODE_DEFAULT_EFFORT,
     },
     {
+      value: 'opencode-go/glm-5.2',
+      label: 'GLM 5.2',
+      thinkingEfforts: ['minimal', 'low', 'medium', 'high', 'max'],
+      defaultEffort: FRESHOPENCODE_DEFAULT_EFFORT,
+    },
+    {
       value: 'umans-ai-coding-plan/umans-kimi-k2.7',
       label: 'Kimi k2.7',
       thinkingEfforts: ['minimal', 'low', 'medium', 'high', 'max'],
