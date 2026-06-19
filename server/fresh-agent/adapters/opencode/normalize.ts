@@ -21,6 +21,12 @@ type OpencodeExportWithPageMetadata = OpencodeExport & {
   nextCursor?: string | null
 }
 
+function normalizeOpencodeRole(value: unknown): FreshAgentTurn['role'] {
+  return value === 'user' || value === 'assistant' || value === 'system' || value === 'tool'
+    ? value
+    : undefined
+}
+
 function modelFromInfo(info: Record<string, any> | undefined): string | undefined {
   const providerId = info?.providerID ?? info?.model?.providerID
   const modelId = info?.modelID ?? info?.model?.modelID ?? info?.model?.id
@@ -199,14 +205,18 @@ function collectOpencodePartMetadata(messages: NonNullable<OpencodeExport['messa
   }
 }
 
-export function normalizeOpencodeTurn(message: NonNullable<OpencodeExport['messages']>[number], ordinal: number): FreshAgentTurn {
+export function normalizeOpencodeTurn(
+  message: NonNullable<OpencodeExport['messages']>[number],
+  ordinal: number,
+): FreshAgentTurn | null {
   const info = message.info ?? {}
   const id = typeof info.id === 'string' && info.id.length > 0 ? info.id : `message-${ordinal}`
-  const role: FreshAgentTurn['role'] = info.role === 'user' || info.role === 'assistant' || info.role === 'system' || info.role === 'tool' ? info.role : undefined
+  const role = normalizeOpencodeRole(info.role)
   const parts = Array.isArray(message.parts) ? message.parts : []
   const items = parts
     .map((part, index) => itemFromPart(part, `${id}:part-${index}`, role))
     .filter((item): item is FreshAgentTranscriptItem => Boolean(item))
+  if (!role && items.length > 0) return null
   const textSummary = items.find((item) => item.kind === 'text')?.text
   const reasoningSummary = items.find((item) => item.kind === 'reasoning')?.summary?.[0]
   return {
@@ -233,7 +243,9 @@ export function normalizeOpencodeSnapshot(input: {
 }): FreshAgentSnapshot {
   const info = input.exported?.info ?? {}
   const messages = Array.isArray(input.exported?.messages) ? input.exported.messages : []
-  const turns = messages.map((message, index) => normalizeOpencodeTurn(message, index))
+  const turns = messages
+    .map((message, index) => normalizeOpencodeTurn(message, index))
+    .filter((turn): turn is FreshAgentTurn => Boolean(turn))
   const sessionModel = modelFromInfo(info) ?? input.model
   const durableSessionId = typeof info.id === 'string' && info.id.length > 0 ? info.id : input.threadId
   const opencodeExtensions = collectOpencodePartMetadata(messages)
@@ -287,7 +299,9 @@ export function normalizeOpencodeTurnPage(input: {
     threadId: input.threadId,
     revision: input.revision,
     nextCursor: typeof nextCursor === 'string' ? nextCursor : null,
-    turns: messages.map((message, index) => normalizeOpencodeTurn(message, index)),
+    turns: messages
+      .map((message, index) => normalizeOpencodeTurn(message, index))
+      .filter((turn): turn is FreshAgentTurn => Boolean(turn)),
   }
 }
 
@@ -300,8 +314,10 @@ export function normalizeOpencodeTurnBody(input: {
   const messages = Array.isArray(input.exported?.messages) ? input.exported.messages : []
   const index = messages.findIndex((message) => message.info?.id === input.turnId)
   if (index < 0) return null
+  const turn = normalizeOpencodeTurn(messages[index], index)
+  if (!turn) return null
   return {
-    ...normalizeOpencodeTurn(messages[index], index),
+    ...turn,
     sessionType: 'freshopencode',
     provider: 'opencode',
     threadId: input.threadId,
