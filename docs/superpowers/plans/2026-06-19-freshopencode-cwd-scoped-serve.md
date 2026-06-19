@@ -31,6 +31,7 @@ These amendments supersede any conflicting task text below:
 
 Implementation updates required by this amendment:
 
+- Treat concrete code snippets later in this plan as subordinate to this section. If a snippet still calls `/compact`, omits idle shutdown, forgets returned `directory`, or unconditionally passes `{ cwd: undefined }`, implement the corrected behavior below instead.
 - In `OpencodeServeManager`, add an optional constructor setting such as `idleShutdownMs` and default it to a nonzero idle timeout for cwd-scoped sidecars. Tests may set it to `0` or a small value.
 - Do not route an existing session with unknown cwd to a guessed project cwd. Use the default serve route and let OpenCode's session middleware route by stored `directory`.
 - When `getSession()` or `fork()` returns a `directory`, call `rememberSessionCwd()` for that session id.
@@ -38,6 +39,24 @@ Implementation updates required by this amendment:
 - Add manager tests for `/summarize`, no-cwd restored-session routing through the default serve, returned-directory remembering, and idle sidecar shutdown.
 - Add adapter tests for both known-cwd restored sends and no-cwd restored sends. The no-cwd case should call manager methods without a third `{ cwd }` argument.
 - In the real-provider regression, prefer the existing isolated real-session harness helpers so `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, and DB path are temp-scoped and the suite remains single-threaded.
+
+Task-level override checklist:
+
+- Task 2 must update `OpencodeServeManagerOptions`, `RunningServe`, `ensureStarted`, `start`, HTTP helpers, `shutdown`, and child-close cleanup for cwd-scoped sidecars. On child close, delete emitters for sessions mapped to that cwd; when the closing sidecar is the default route, also delete unmapped emitters, because no-cwd restored sessions use the default route.
+- Task 2 must clear successful `startPromiseByCwd` entries after a sidecar has moved into `runningByCwd`.
+- Task 2 must add tests proving:
+  - `createSession({ directory })` spawns `opencode serve` with that `cwd`.
+  - different directories get different sidecars/ports.
+  - `compact()` posts to `/session/:id/summarize`.
+  - `getSession()` remembers a returned `directory`.
+  - `fork()` remembers the returned child `directory`, not just the parent route.
+  - existing-session calls with no known cwd use the default serve route.
+  - default sidecar close clears unmapped emitters, while non-default sidecar close only clears emitters for sessions mapped to that cwd.
+  - idle shutdown stops non-default sidecars after the configured timeout and does not stop the default sidecar.
+- Task 3 must update `makeFakeManager().createSession` so it returns `directory: input.directory` only when a test actually created the pane with cwd, or else update every existing arity-strict manager expectation affected by the new route argument. Do not leave tests with a fake manager that always returns `/repo` while claiming no-cwd calls stay two-argument.
+- Task 3 must ensure helper calls omit the route argument entirely when no cwd is known. History helpers must not pass `{ cwd: undefined }`.
+- Task 3 must update all existing adapter expectations affected by known cwd routing, including `promptAsync`, `abort`, `compact`, `fork`, `getSession`, `listMessages`, and `getMessage`.
+- Task 4 must avoid a static top-level `node:sqlite` import in the real-provider smoke. Use existing helper functions such as `seedOpencodeHomes()` and `waitForOpencodeDbSession()` or the same dynamic/read-only pattern already used by OpenCode history code.
 
 ---
 
