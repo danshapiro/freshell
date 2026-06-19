@@ -24,7 +24,7 @@ function makeFakeManager() {
     getSession: vi.fn(async () => ({ id: 'ses_real_1', title: 'T', time: { updated: 5 } })),
     abort: vi.fn(async () => undefined),
     compact: vi.fn(async () => undefined),
-    fork: vi.fn(async () => ({ id: 'ses_child_1' })),
+    fork: vi.fn(async (): Promise<{ id: string; directory?: string }> => ({ id: 'ses_child_1' })),
     onceIdle: vi.fn(async () => undefined),
     subscribe: vi.fn((id: string, listener: (e: unknown) => void) => {
       const e = emitterFor(id)
@@ -346,6 +346,32 @@ describe('OpenCode serve adapter: control', () => {
       'ses_child_1',
       expect.objectContaining({ parts: [{ type: 'text', text: 'child continue' }] }),
       { cwd: '/repo/control' },
+    )
+  })
+
+  it('routes forked children through the returned child directory when present', async () => {
+    const manager = makeFakeManager()
+    manager.fork.mockResolvedValueOnce({ id: 'ses_child_1', directory: '/repo/child' })
+    const adapter = makeAdapter(manager)
+
+    await adapter.attach?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionId: 'ses_parent',
+      cwd: '/repo/parent',
+    })
+
+    await expect(adapter.fork?.('ses_parent')).resolves.toEqual({
+      sessionId: 'ses_child_1',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_child_1' },
+    })
+    await adapter.send?.('ses_child_1', { text: 'child turn' })
+
+    expect(manager.fork).toHaveBeenCalledWith('ses_parent', { cwd: '/repo/parent' })
+    expect(manager.promptAsync).toHaveBeenCalledWith(
+      'ses_child_1',
+      expect.objectContaining({ parts: [{ type: 'text', text: 'child turn' }] }),
+      { cwd: '/repo/child' },
     )
   })
 

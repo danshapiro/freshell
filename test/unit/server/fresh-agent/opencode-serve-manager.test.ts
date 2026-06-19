@@ -381,6 +381,48 @@ describe('OpencodeServeManager HTTP client', () => {
     })
   })
 
+  it('falls back to the fork route cwd when the fork response omits directory', async () => {
+    const calls: Array<{ url: string; init: any }> = []
+    const childParent = fakeChild()
+    const spawnFn = vi.fn().mockReturnValueOnce(childParent)
+    const fetchFn = vi.fn(async (url: string, init: any) => {
+      calls.push({ url, init })
+      if (url === 'http://127.0.0.1:47999/global/health') return jsonResponse({ healthy: true })
+      if (url === 'http://127.0.0.1:47999/session/ses_parent/fork' && init?.method === 'POST') {
+        return jsonResponse({ id: 'ses_child' })
+      }
+      if (url === 'http://127.0.0.1:47999/session/ses_child/summarize' && init?.method === 'POST') {
+        return jsonResponse({}, { status: 204 })
+      }
+      if (url.includes('/session/ses_child/summarize')) {
+        throw new Error(`child summarize should stay on parent cwd route, got ${url}`)
+      }
+      return jsonResponse({}, { status: 404 })
+    })
+    const manager = new OpencodeServeManager({
+      spawnFn: spawnFn as any,
+      fetchFn: fetchFn as any,
+      allocatePort: vi.fn()
+        .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 47999 }),
+      connectEventStream: () => () => {},
+      healthTimeoutMs: 1000,
+    })
+
+    await expect(manager.fork('ses_parent', { cwd: '/parent' })).resolves.toMatchObject({ id: 'ses_child' })
+    await manager.compact('ses_child', { instructions: 'child summary' })
+
+    expect(spawnFn).toHaveBeenCalledTimes(1)
+    expect(spawnFn).toHaveBeenCalledWith(
+      'opencode',
+      ['serve', '--hostname', '127.0.0.1', '--port', '47999'],
+      expect.objectContaining({ cwd: '/parent' }),
+    )
+    expect(calls.find((call) => call.url.endsWith('/session/ses_child/summarize'))).toMatchObject({
+      url: 'http://127.0.0.1:47999/session/ses_child/summarize',
+      init: expect.objectContaining({ method: 'POST' }),
+    })
+  })
+
   it('uses the default serve route for unknown existing sessions even after cwd sidecars exist', async () => {
     const childProject = fakeChild()
     const childDefault = fakeChild()

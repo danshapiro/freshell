@@ -127,7 +127,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     await serveManager.compact(state.realSessionId)
   }
 
-  async function forkForState(state: OpencodeSessionState): Promise<{ id: string }> {
+  async function forkForState(state: OpencodeSessionState): Promise<{ id: string; directory?: string }> {
     if (!state.realSessionId) {
       throw new FreshAgentLostSessionError(`OpenCode session ${state.placeholderId} has not materialized; cannot fork.`)
     }
@@ -339,7 +339,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       const childState: OpencodeSessionState = {
         placeholderId: child.id,
         realSessionId: child.id,
-        cwd: state.cwd,
+        cwd: child.directory ?? state.cwd,
         model: state.model,
         effort: state.effort,
         status: 'idle',

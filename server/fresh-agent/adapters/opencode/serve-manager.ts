@@ -400,7 +400,16 @@ export class OpencodeServeManager {
       `/session/${encodeURIComponent(id)}/fork`,
       { method: 'POST' },
     )
-    if (typeof child.id === 'string') this.rememberSessionCwd(child.id, child.directory)
+    if (typeof child.id === 'string') {
+      const returnedDirectory = typeof child.directory === 'string' && child.directory.trim().length > 0
+        ? child.directory
+        : undefined
+      const fallbackDirectory = typeof route.cwd === 'string' && route.cwd.trim().length > 0
+        ? route.cwd
+        : undefined
+      const childDirectory = returnedDirectory ?? fallbackDirectory
+      if (childDirectory) this.rememberSessionCwd(child.id, childDirectory)
+    }
     return child
   }
 
