@@ -29,6 +29,11 @@ import { getCanonicalDurableSessionId, getPreferredResumeSessionId } from '@/sto
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
+import {
+  freshAgentSnapshotHasUserTurn,
+  freshAgentTurnText,
+  getFreshAgentDisplayTurnKey,
+} from '@shared/fresh-agent-turns'
 import { getFreshAgentSlashCommands, type FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
 import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
 import { isDurableProviderSessionId } from '@shared/session-flavor'
@@ -58,7 +63,42 @@ function getSnapshotIdentity(snapshot: FreshAgentSnapshot): string | null {
 }
 
 function getTurnKey(turn: FreshAgentTurn): string {
-  return (turn as { turnId?: string }).turnId ?? turn.id
+  return getFreshAgentDisplayTurnKey(turn)
+}
+
+type LocalEcho = {
+  text: string
+  requestId: string
+  submittedTurnId?: string
+}
+
+type PendingSendMetadata = {
+  cwd?: string
+  checkpointId?: string
+  submittedTurnId?: string
+  legacyAccepted?: boolean
+  metadataUpdateStarted?: boolean
+}
+
+function localEchoLanded(
+  turns: readonly FreshAgentTurn[],
+  echo: LocalEcho,
+  pending?: PendingSendMetadata,
+): boolean {
+  const needle = echo.text.slice(0, 80)
+  const submittedTurnId = echo.submittedTurnId ?? pending?.submittedTurnId
+  if (submittedTurnId) {
+    return turns.some((turn) => (
+      turn.role === 'user'
+      && getFreshAgentDisplayTurnKey(turn) === submittedTurnId
+      && freshAgentTurnText(turn).includes(needle)
+    ))
+  }
+  if (pending && !pending.legacyAccepted) return false
+  return turns.some((turn) => (
+    turn.role === 'user'
+    && freshAgentTurnText(turn).includes(needle)
+  ))
 }
 
 function isSnapshotInFlight(snapshot: FreshAgentSnapshot): boolean {
@@ -379,9 +419,10 @@ export function FreshAgentView({
   // Optimistic echo of the just-sent user message: the transcript renders
   // snapshot turns only, which left a 2-10s blank gap after send
   // (live-test finding). Cleared when a snapshot containing the turn lands.
-  const [localEcho, setLocalEcho] = useState<string | null>(null)
-  const localEchoRef = useRef<string | null>(null)
+  const [localEcho, setLocalEcho] = useState<LocalEcho | null>(null)
+  const localEchoRef = useRef<LocalEcho | null>(null)
   localEchoRef.current = localEcho
+  const pendingSendMetadataRef = useRef<Map<string, PendingSendMetadata>>(new Map())
   const descriptor = resolveFreshAgentType(paneContent.sessionType)
   // Capability-gated commands (e.g. /fork) only appear once the snapshot
   // confirms the provider supports the action.
@@ -431,7 +472,7 @@ export function FreshAgentView({
       && claudeSession?.historyLoaded !== true
       && !hasRestoreFailure,
   )
-  const hasUserTurns = useMemo(() => snapshot?.turns.some((turn) => turn.role === 'user') ?? false, [snapshot?.turns])
+  const hasUserTurns = useMemo(() => freshAgentSnapshotHasUserTurn(snapshot), [snapshot])
   const autoTitleDurableIdentity = useMemo(() => {
     const paneSessionRefId = paneContent.sessionRef?.provider === paneContent.provider
       ? paneContent.sessionRef.sessionId
@@ -487,6 +528,34 @@ export function FreshAgentView({
     }
     ws.send(message as never)
   }, [paneId, ws])
+
+  const recordPendingSendMetadata = useCallback((requestId: string, patch: PendingSendMetadata) => {
+    const current = pendingSendMetadataRef.current.get(requestId) ?? {}
+    const next: PendingSendMetadata = { ...current, ...patch }
+    pendingSendMetadataRef.current.set(requestId, next)
+    if (
+      next.metadataUpdateStarted
+      || !next.cwd
+      || !next.checkpointId
+      || !next.submittedTurnId
+    ) {
+      return
+    }
+    pendingSendMetadataRef.current.set(requestId, { ...next, metadataUpdateStarted: true })
+    void Promise
+      .resolve(api.post('/api/fresh-agent/checkpoints/metadata', {
+        cwd: next.cwd,
+        id: next.checkpointId,
+        requestId,
+        turnId: next.submittedTurnId,
+      }))
+      .catch(() => {
+        const latest = pendingSendMetadataRef.current.get(requestId)
+        if (latest) {
+          pendingSendMetadataRef.current.set(requestId, { ...latest, metadataUpdateStarted: false })
+        }
+      })
+  }, [])
 
   const migratePendingAutoTitle = useCallback((
     previousSessionId: string | undefined,
@@ -859,6 +928,24 @@ export function FreshAgentView({
         }))
       }
       if (
+        message.type === 'freshAgent.send.accepted'
+        && typeof message.requestId === 'string'
+      ) {
+        const submittedTurnId = typeof message.submittedTurnId === 'string'
+          ? message.submittedTurnId
+          : undefined
+        if (submittedTurnId) {
+          recordPendingSendMetadata(message.requestId, { submittedTurnId })
+          const echo = localEchoRef.current
+          if (echo?.requestId === message.requestId) {
+            setLocalEcho({ ...echo, submittedTurnId })
+          }
+        } else {
+          recordPendingSendMetadata(message.requestId, { legacyAccepted: true })
+        }
+        setSnapshotRefreshNonce((value) => value + 1)
+      }
+      if (
         message.type === 'freshAgent.event'
         && message.sessionId === paneContent.sessionId
         && message.sessionType === paneContent.sessionType
@@ -903,7 +990,7 @@ export function FreshAgentView({
       }
     })
     return unsubscribe
-  }, [commitSnapshot, dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, sendFreshAgentMessage, tabId, ws])
+  }, [commitSnapshot, dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, sendFreshAgentMessage, tabId, ws])
 
   useEffect(() => {
     if (!snapshotThreadId) return
@@ -929,7 +1016,7 @@ export function FreshAgentView({
         if (isStaleSnapshotRequest()) return
         const snapshotIdentity = currentAutoTitleIdentityRef.current
         const resolved = next as FreshAgentSnapshot
-        const resolvedHasUserTurns = resolved.turns.some((turn) => turn.role === 'user')
+        const resolvedHasUserTurns = freshAgentSnapshotHasUserTurn(resolved)
         if (!resolvedHasUserTurns && !autoTitleSentRef.current) {
           autoTitleFreshBoundaryRef.current = true
         }
@@ -942,13 +1029,8 @@ export function FreshAgentView({
         setSnapshotAutoTitleIdentity(snapshotIdentity)
         const echo = localEchoRef.current
         if (echo) {
-          const needle = echo.slice(0, 80)
-          const echoLanded = displaySnapshot.turns.some((turn) => (
-            turn.role === 'user' && turn.items.some((item) => (
-              item.kind === 'text' && item.text.includes(needle)
-            ))
-          ))
-          if (echoLanded) setLocalEcho(null)
+          const pending = pendingSendMetadataRef.current.get(echo.requestId)
+          if (localEchoLanded(displaySnapshot.turns, echo, pending)) setLocalEcho(null)
         }
         const fresh = paneContentRef.current
         const nextStatus = (resolved.status as FreshAgentPaneContent['status']) ?? fresh.status
@@ -1171,15 +1253,27 @@ export function FreshAgentView({
   const sendUserText = useCallback((text: string) => {
     const current = paneContentRef.current
     if (!current.sessionId) return
+    const requestId = nanoid()
+    recordPendingSendMetadata(requestId, {})
     // Checkpoint the working tree before the agent acts on this message, so
     // "rewind code to here" on this turn restores the pre-turn state. Fire and
     // forget: a failed snapshot must never block the send.
     if (current.initialCwd) {
+      recordPendingSendMetadata(requestId, { cwd: current.initialCwd })
       void Promise
-        .resolve(api.post('/api/fresh-agent/checkpoints', {
+        .resolve(api.post<CheckpointEntry>('/api/fresh-agent/checkpoints', {
           cwd: current.initialCwd,
           label: checkpointLabelForText(text),
+          requestId,
         }))
+        .then((entry) => {
+          if (entry?.id) {
+            recordPendingSendMetadata(requestId, {
+              cwd: current.initialCwd,
+              checkpointId: entry.id,
+            })
+          }
+        })
         .catch(() => { /* surfaced lazily when a rewind finds no checkpoint */ })
     }
     const isFirstMessage = !autoTitleSentRef.current
@@ -1198,6 +1292,7 @@ export function FreshAgentView({
     }
     sendFreshAgentMessage({
       type: 'freshAgent.send',
+      requestId,
       sessionId: current.sessionId,
       sessionType: current.sessionType,
       provider: current.provider,
@@ -1210,8 +1305,8 @@ export function FreshAgentView({
         ...(getEffectiveFreshAgentEffort(current) ? { effort: getEffectiveFreshAgentEffort(current) } : {}),
       },
     })
-    setLocalEcho(text)
-  }, [dispatch, paneId, sendFreshAgentMessage, snapshotConfirmsNoUserTurns, tabId])
+    setLocalEcho({ text, requestId })
+  }, [dispatch, paneId, recordPendingSendMetadata, sendFreshAgentMessage, snapshotConfirmsNoUserTurns, tabId])
 
   // Flush queued messages when the turn ends. One flush per status change is
   // enough: all queued entries are delivered in order for the next turn.
@@ -1512,11 +1607,11 @@ export function FreshAgentView({
             <FreshAgentTranscript
               turns={localEcho
                 ? [...turns, {
-                    id: '__local-echo',
-                    turnId: '__local-echo',
+                    id: `__local-echo:${localEcho.requestId}`,
+                    turnId: localEcho.submittedTurnId ?? `__local-echo:${localEcho.requestId}`,
                     role: 'user',
-                    summary: localEcho,
-                    items: [{ id: '__local-echo-item', kind: 'text', text: localEcho }],
+                    summary: localEcho.text,
+                    items: [{ id: `__local-echo-item:${localEcho.requestId}`, kind: 'text', text: localEcho.text }],
                   } as FreshAgentTurn]
                 : turns}
               canFork={canFork}

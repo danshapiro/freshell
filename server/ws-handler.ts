@@ -134,6 +134,8 @@ type FreshAgentRuntimeManagerLike = {
 }
 
 type FreshAgentSendResult = void | {
+  requestId?: string
+  submittedTurnId?: string
   sessionId?: string
   sessionRef?: { provider: string; sessionId: string }
 }
@@ -3187,7 +3189,12 @@ export class WsHandler {
         const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
         if (!this.requireFreshAgentAuthorization(ws, state, locator)) return
         try {
-          const result = await manager.send(locator, { text: m.text, images: m.images, settings: m.settings })
+          const result = await manager.send(locator, {
+            requestId: m.requestId,
+            text: m.text,
+            images: m.images,
+            settings: m.settings,
+          })
           if (result?.sessionId && result.sessionId !== m.sessionId) {
             this.authorizeFreshAgentSession(state, {
               sessionId: result.sessionId,
@@ -3208,8 +3215,15 @@ export class WsHandler {
               sessionRef: result.sessionRef ?? { provider: m.provider, sessionId: result.sessionId },
             })
           }
+          if (m.requestId) {
+            this.send(ws, {
+              type: 'freshAgent.send.accepted',
+              requestId: m.requestId,
+              submittedTurnId: result?.submittedTurnId,
+            })
+          }
         } catch (error) {
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error) })
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error), requestId: m.requestId })
         }
         return
       }

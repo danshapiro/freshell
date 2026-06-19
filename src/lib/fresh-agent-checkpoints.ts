@@ -1,6 +1,7 @@
 import type { FreshAgentTurn } from '@shared/fresh-agent-contract'
+import { freshAgentTurnText, getFreshAgentDisplayTurnKey } from '@shared/fresh-agent-turns'
 
-export type CheckpointEntry = { id: string; ts: number; label: string }
+export type CheckpointEntry = { id: string; ts: number; label: string; requestId?: string; turnId?: string }
 
 export const CHECKPOINT_LABEL_LIMIT = 120
 
@@ -10,11 +11,7 @@ export function checkpointLabelForText(text: string): string {
 }
 
 function turnLabel(turn: FreshAgentTurn): string {
-  const text = turn.items
-    .filter((item): item is Extract<FreshAgentTurn['items'][number], { kind: 'text' }> => item.kind === 'text')
-    .map((item) => item.text)
-    .join('\n\n')
-  return checkpointLabelForText(text || turn.summary || '')
+  return checkpointLabelForText(freshAgentTurnText(turn) || '')
 }
 
 /**
@@ -29,6 +26,16 @@ export function pickCheckpointForTurn(
   target: FreshAgentTurn,
 ): CheckpointEntry | null {
   if (target.role !== 'user') return null
+  const targetTurnId = getFreshAgentDisplayTurnKey(target)
+  const directTurnIdMatch = checkpoints.find((entry) => entry.turnId === targetTurnId)
+  if (directTurnIdMatch) return directTurnIdMatch
+
+  const targetRequestId = (target as FreshAgentTurn & { requestId?: unknown }).requestId
+  if (typeof targetRequestId === 'string' && targetRequestId) {
+    const requestIdMatch = checkpoints.find((entry) => entry.requestId === targetRequestId)
+    if (requestIdMatch) return requestIdMatch
+  }
+
   const label = turnLabel(target)
   if (!label) return null
 
@@ -43,7 +50,7 @@ export function pickCheckpointForTurn(
 
   // git log order is newest-first; we need oldest-first to index by ordinal.
   const matches = checkpoints
-    .filter((entry) => entry.label === label)
+    .filter((entry) => entry.label === label && entry.turnId === undefined)
     .slice()
     .reverse()
   return matches[ordinal] ?? null

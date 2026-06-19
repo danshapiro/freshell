@@ -1200,8 +1200,9 @@ describe('FreshAgentView', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
 
-    expect(wsMock.send).toHaveBeenCalledWith({
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'freshAgent.send',
+      requestId: expect.any(String),
       sessionId: 'thread-1',
       sessionType: 'freshcodex',
       provider: 'codex',
@@ -1211,10 +1212,132 @@ describe('FreshAgentView', () => {
         model: 'gpt-5.3-codex-spark',
         effort: 'max',
       },
-    })
+    }))
 
     expect(screen.queryByRole('button', { name: 'Interrupt' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Fork' })).not.toBeInTheDocument()
+  })
+
+  it('uses send acknowledgements to patch checkpoints and clear local echo only on the submitted user display turn', async () => {
+    const store = createStore()
+    const checkpoint = createDeferred<{ id: string; ts: number; label: string; requestId: string }>()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce({
+        status: 'idle',
+        summary: 'empty',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [],
+      })
+      .mockResolvedValueOnce({
+        status: 'idle',
+        summary: 'answered',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [
+          {
+            id: 'native-user-turn',
+            turnId: 'display-user-1',
+            role: 'user',
+            summary: 'Ship it',
+            items: [{ id: 'user-text-1', kind: 'text', text: 'Ship it' }],
+          },
+          {
+            id: 'native-assistant-turn',
+            turnId: 'display-assistant-1',
+            role: 'assistant',
+            summary: 'Done',
+            items: [{ id: 'assistant-text-1', kind: 'text', text: 'Done.' }],
+          },
+        ],
+      })
+    apiMock.post.mockImplementation((url: string, body: Record<string, unknown>) => {
+      if (url === '/api/fresh-agent/checkpoints') return checkpoint.promise
+      if (url === '/api/fresh-agent/checkpoints/metadata') return Promise.resolve({ ok: true, body })
+      return Promise.resolve({ title: null, source: 'none' })
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-normalized-send',
+        sessionId: 'thread-normalized-send',
+        status: 'idle',
+        initialCwd: '/repo',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Ship it' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const send = sentFreshAgentMessages('freshAgent.send').at(-1)
+    expect(send).toMatchObject({
+      type: 'freshAgent.send',
+      sessionId: 'thread-normalized-send',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      text: 'Ship it',
+    })
+    expect(send?.requestId).toEqual(expect.any(String))
+    const requestId = String(send?.requestId)
+    expect(apiMock.post).toHaveBeenCalledWith('/api/fresh-agent/checkpoints', {
+      cwd: '/repo',
+      label: 'Ship it',
+      requestId,
+    })
+    expect(screen.getByText('Ship it')).toBeInTheDocument()
+
+    expect(onMessage).toBeTypeOf('function')
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.send.accepted',
+        requestId,
+        submittedTurnId: 'display-user-1',
+      })
+    })
+    await act(async () => {
+      checkpoint.resolve({
+        id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        ts: 1,
+        label: 'Ship it',
+        requestId,
+      })
+      await Promise.resolve()
+    })
+
+    await waitFor(() => {
+      expect(apiMock.post).toHaveBeenCalledWith('/api/fresh-agent/checkpoints/metadata', {
+        cwd: '/repo',
+        id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        requestId,
+        turnId: 'display-user-1',
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByText('Done.')).toBeInTheDocument()
+    })
+    expect(screen.getAllByText('Ship it')).toHaveLength(1)
+    const transcriptTurns = screen.getAllByRole('article')
+    expect(transcriptTurns.at(-1)).toHaveTextContent('Done.')
   })
 
   it('does not transmit stale Freshopencode permissionMode on create or send', async () => {
@@ -1284,8 +1407,9 @@ describe('FreshAgentView', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
 
-    expect(wsMock.send).toHaveBeenCalledWith({
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'freshAgent.send',
+      requestId: expect.any(String),
       sessionId: 'freshopencode-req-opencode-send-policy',
       sessionType: 'freshopencode',
       provider: 'opencode',
@@ -1295,7 +1419,7 @@ describe('FreshAgentView', () => {
         model: 'opencode-go/deepseek-v4-flash',
         effort: 'max',
       },
-    })
+    }))
   })
 
   it('auto-titles the fresh-agent pane and tab from the first user message', async () => {
@@ -2100,12 +2224,19 @@ describe('FreshAgentView', () => {
       target: { value: 'New user request' },
     })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const send = sentFreshAgentMessages('freshAgent.send').at(-1)
+    const requestId = String(send?.requestId)
 
     expect(screen.getByText('Older user request')).toBeInTheDocument()
     expect(screen.getByText('Older assistant answer')).toBeInTheDocument()
 
     expect(onMessage).toBeTypeOf('function')
     act(() => {
+      onMessage?.({
+        type: 'freshAgent.send.accepted',
+        requestId,
+        submittedTurnId: 'turn-new-user',
+      })
       onMessage?.({
         type: 'freshAgent.event',
         sessionId: 'thread-partial-refresh',
