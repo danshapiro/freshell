@@ -83,6 +83,7 @@ import { useKeyboardInset } from '@/hooks/useKeyboardInset'
 import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
 import { findLocalFilePaths } from '@/lib/path-utils'
 import { findUrls } from '@/lib/url-utils'
+import { openExternalUrl, shouldOpenLinkExternally } from '@/lib/open-url'
 import { setHoveredUrl, clearHoveredUrl } from '@/lib/terminal-hovered-url'
 import { getTabSwitchShortcutDirection, getTabLifecycleAction } from '@/lib/tab-switch-shortcuts'
 import { bucketTabRecencyAt } from '@/lib/tab-recency'
@@ -1691,6 +1692,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           // Only open http/https URLs. Block javascript:, data:, and other
           // potentially dangerous schemes from OSC 8 links.
           if (!/^https?:\/\//i.test(uri)) return
+          if (shouldOpenLinkExternally(event)) {
+            openExternalUrl(uri)
+            return
+          }
           if (warnExternalLinksRef.current !== false) {
             setPendingLinkUriRef.current(uri)
           } else {
@@ -1826,6 +1831,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             activate: (event: MouseEvent) => {
               if (event && event.button !== 0) return
               if (terminalInstanceIdRef.current !== linkProviderTerminalInstanceId) return
+              if (shouldOpenLinkExternally(event)) {
+                openExternalUrl(m.url)
+                return
+              }
               if (warnExternalLinksRef.current !== false) {
                 setPendingLinkUriRef.current(m.url)
               } else {

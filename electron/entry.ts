@@ -8,7 +8,7 @@
 // Run:   electron dist/electron/electron/entry.js
 //        (or via electron-builder's packaged app)
 
-import { app, BrowserWindow, globalShortcut, ipcMain, Tray, Menu, nativeImage } from 'electron'
+import { app, BrowserWindow, globalShortcut, ipcMain, Tray, Menu, nativeImage, shell } from 'electron'
 import path from 'path'
 import os from 'os'
 import http from 'http'
@@ -36,6 +36,7 @@ import { createChooseLaunchOptionHandler } from './launch-choice-handler.js'
 import { buildLaunchOptions } from './launch-options.js'
 import { applyProvisioningFile } from './desktop-provisioning.js'
 import { createPortAvailabilityCheck } from './port-check.js'
+import { registerOpenExternalHandler } from './external-url.js'
 import type { ForcedLaunch, LaunchServerCandidate } from './types.js'
 
 const isPortAvailable = createPortAvailabilityCheck()
@@ -275,11 +276,53 @@ async function main(): Promise<void> {
   ipcMain.removeHandler('install-update')
   ipcMain.removeHandler('get-launch-options')
   ipcMain.removeHandler('choose-launch-option')
+  ipcMain.removeHandler('open-external-url')
 
   let pendingLaunchChooser: { candidates: LaunchServerCandidate[]; reason: string } | undefined
-  // webContents id of the launch chooser window, so choose-launch-option only
+  // webContents id of the launch window, so choose-launch-option only
   // honors requests originating from it (the API is exposed to every window).
   let chooserWebContentsId: number | undefined
+
+  // Identity of the main Freshell window (webContents id + expected origin).
+  // The open-external-url handler only honors requests from this window and
+  // origin so other renderer surfaces or navigations cannot drive
+  // shell.openExternal.
+  let mainWebContentsId: number | undefined = undefined
+  let mainServerUrl: string | undefined = undefined
+
+  function getExpectedOrigin(): string | undefined {
+    if (!mainServerUrl) return undefined
+    try {
+      return new URL(mainServerUrl).origin
+    } catch {
+      return undefined
+    }
+  }
+
+  // Register system-browser link handler.
+  registerOpenExternalHandler({
+    ipcMain,
+    shell,
+    isAllowedSender: (event) => {
+      const typed = event as {
+        sender?: { id?: number }
+        senderFrame?: { url?: string }
+      }
+      const senderId = typed.sender?.id
+      if (mainWebContentsId === undefined || senderId !== mainWebContentsId) {
+        return false
+      }
+      const expectedOrigin = getExpectedOrigin()
+      if (!expectedOrigin) return false
+      const frameUrl = typed.senderFrame?.url
+      if (!frameUrl) return false
+      try {
+        return new URL(frameUrl).origin === expectedOrigin
+      } catch {
+        return false
+      }
+    },
+  })
 
   // Register the complete-setup handler before runStartup so it is available
   // when the wizard renderer calls it via the preload API.
@@ -425,6 +468,11 @@ async function main(): Promise<void> {
   // Main window is about to be created -- leave wizard phase so the
   // consolidated window-all-closed handler can quit when appropriate.
   wizardPhase = false
+
+  // Remember the main window's webContents id and origin so privileged IPC
+  // handlers can verify requests originate from the trusted renderer.
+  mainWebContentsId = (result.window as unknown as BrowserWindow).webContents?.id
+  mainServerUrl = result.serverUrl
 
   // Initialize the main process lifecycle (single-instance, close-to-tray, etc.)
   await initMainProcess({

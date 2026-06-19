@@ -434,7 +434,7 @@ describe('FreshAgentTranscript', () => {
     expect(strips[0]).toHaveTextContent('1 tool used')
   })
 
-  it('coalesces consecutive activity-only assistant turns into one live activity strip', () => {
+  it('keeps consecutive activity-only assistant turns separate while marking only the latest live', () => {
     render(
       <FreshAgentTranscript
         isStreaming
@@ -485,13 +485,14 @@ describe('FreshAgentTranscript', () => {
       />,
     )
 
-    expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+    expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(3)
     expect(screen.getAllByLabelText('running')).toHaveLength(1)
     expect(screen.getByText('src/three.ts')).toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+    fireEvent.click(screen.getAllByRole('button', { name: 'Toggle activity details' })[2])
     expect(screen.getAllByLabelText('running')).toHaveLength(1)
-    expect(screen.getAllByLabelText('complete')).toHaveLength(2)
+    fireEvent.click(screen.getAllByRole('button', { name: 'Toggle activity details' })[0])
+    expect(screen.getAllByLabelText('complete').length).toBeGreaterThanOrEqual(1)
   })
 
   it('shows the speaker label once for consecutive turns from the same role', () => {
@@ -688,6 +689,39 @@ describe('FreshAgentTranscript', () => {
 
     expect(screen.getByRole('region', { name: 'Activity strip' }))
       .toHaveTextContent('1 tool used · 1 file changed')
+  })
+
+  it('keeps adjacent activity-only display turns distinct and actionable', () => {
+    const onFork = vi.fn()
+    render(
+      <FreshAgentTranscript
+        canFork
+        onForkFromTurn={onFork}
+        turns={[
+          {
+            id: 'native-turn',
+            turnId: 'display-activity-1',
+            role: 'assistant',
+            summary: 'first activity',
+            items: [{ id: 'think-1', kind: 'thinking', text: 'first thought' }],
+          },
+          {
+            id: 'native-turn',
+            turnId: 'display-activity-2',
+            role: 'assistant',
+            summary: 'second activity',
+            items: [{ id: 'think-2', kind: 'thinking', text: 'second thought' }],
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.getAllByRole('article', { name: 'Assistant transcript turn' })).toHaveLength(2)
+    expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+
+    const forkButtons = screen.getAllByRole('button', { name: 'Fork conversation from here' })
+    fireEvent.click(forkButtons[1])
+    expect(onFork).toHaveBeenCalledWith('display-activity-2')
   })
 
   it('strips system reminders without collapsing older turns', () => {

@@ -87,7 +87,7 @@ const FRESH_AGENT_SEND_IDLE_TIMEOUT_MS = 600_000
 
 async function waitForFreshAgentIdle(
   runtimeManager: NonNullable<FreshAgentRuntimeManagerLike>,
-  locator: { sessionType: string; provider: string; threadId: string },
+  locator: { sessionType: string; provider: string; threadId: string; cwd?: string },
   deadline: number,
 ): Promise<{ status: string; deadlineMissed: boolean }> {
   while (Date.now() < deadline) {
@@ -97,6 +97,25 @@ async function waitForFreshAgentIdle(
     await new Promise((r) => setTimeout(r, 200))
   }
   return { status: 'unknown', deadlineMissed: true }
+}
+
+function freshAgentPaneCwd(content: Record<string, unknown>): string | undefined {
+  const cwd = content.initialCwd
+  return typeof cwd === 'string' && cwd.trim().length > 0 ? cwd : undefined
+}
+
+function freshAgentPaneSendSettings(content: Record<string, unknown>): Record<string, unknown> | undefined {
+  const settings = {
+    cwd: freshAgentPaneCwd(content),
+    model: typeof content.model === 'string' && content.model.trim().length > 0 ? content.model : undefined,
+    permissionMode: typeof content.permissionMode === 'string' && content.permissionMode.trim().length > 0
+      ? content.permissionMode
+      : undefined,
+    sandbox: typeof content.sandbox === 'string' && content.sandbox.trim().length > 0 ? content.sandbox : undefined,
+    effort: typeof content.effort === 'string' && content.effort.trim().length > 0 ? content.effort : undefined,
+  }
+  const defined = Object.fromEntries(Object.entries(settings).filter(([, value]) => value !== undefined))
+  return Object.keys(defined).length > 0 ? defined : undefined
 }
 
 function combineWithCleanupError(primary: unknown, cleanupError: unknown): Error {
@@ -440,7 +459,7 @@ type CodexPromptBlocker = {
 
 type FreshAgentRuntimeManagerLike = {
   create: (input: any) => Promise<{ sessionId: string; sessionType: FreshAgentSessionType; runtimeProvider: FreshAgentRuntimeProvider; sessionRef?: { provider: string; sessionId: string } }>
-  send: (locator: FreshAgentSessionLocator, input: { text: string; settings?: any }) => Promise<{ sessionId?: string; sessionRef?: { provider: string; sessionId: string } } | void>
+  send: (locator: FreshAgentSessionLocator, input: { text: string; settings?: any }) => Promise<{ sessionId?: string; submittedTurnId?: string; sessionRef?: { provider: string; sessionId: string } } | void>
   attach: (locator: FreshAgentSessionLocator) => Promise<{ sessionId: string; sessionRef?: { provider: string; sessionId: string } }>
   getSnapshot: (input: FreshAgentThreadLocator) => Promise<any>
 }
@@ -883,7 +902,12 @@ export function createAgentApiRouter({
       const c = paneSnapshot.paneContent || {}
       if (!freshAgentRuntimeManager) return res.status(503).json(fail('fresh-agent runtime not available on this server'))
       try {
-        const snapshot = await freshAgentRuntimeManager.getSnapshot({ sessionType: c.sessionType, provider: c.provider, threadId: c.sessionId })
+        const snapshot = await freshAgentRuntimeManager.getSnapshot({
+          sessionType: c.sessionType,
+          provider: c.provider,
+          threadId: c.sessionId,
+          cwd: freshAgentPaneCwd(c),
+        })
         return res.type('text/plain').send(renderFreshAgentTranscript(snapshot))
       } catch (err: any) {
         return res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'fresh-agent capture failed'))
@@ -938,7 +962,12 @@ export function createAgentApiRouter({
       while (true) {
         let status: string | undefined
         try {
-          const snap = await freshAgentRuntimeManager.getSnapshot({ sessionType: c.sessionType, provider: c.provider, threadId: c.sessionId })
+          const snap = await freshAgentRuntimeManager.getSnapshot({
+            sessionType: c.sessionType,
+            provider: c.provider,
+            threadId: c.sessionId,
+            cwd: freshAgentPaneCwd(c),
+          })
           status = snap?.status
         } catch (err) {
           return res.status(freshAgentErrorStatus(err)).json(fail(errorMessage(err)))
@@ -1638,9 +1667,24 @@ export function createAgentApiRouter({
       const text = String(req.body?.data ?? req.body?.keys ?? req.body?.text ?? '')
       if (!text) return res.status(400).json(fail('text is required'))
       if (!freshAgentRuntimeManager) return res.status(503).json(fail('fresh-agent runtime not available on this server'))
-      const locator = { sessionId: c.sessionId as string, sessionType: c.sessionType as string, provider: c.provider as string } as FreshAgentSessionLocator
-      const runSend = () => freshAgentRuntimeManager.send(locator, { text })
-      const snapshotLocator = { sessionType: c.sessionType as string, provider: c.provider as string, threadId: c.sessionId as string }
+      const cwd = freshAgentPaneCwd(c)
+      const settings = freshAgentPaneSendSettings(c)
+      const locator = {
+        sessionId: c.sessionId as string,
+        sessionType: c.sessionType as string,
+        provider: c.provider as string,
+        ...(cwd ? { cwd } : {}),
+      } as FreshAgentSessionLocator
+      const runSend = () => freshAgentRuntimeManager.send(locator, {
+        text,
+        ...(settings ? { settings } : {}),
+      })
+      const snapshotLocator = {
+        sessionType: c.sessionType as string,
+        provider: c.provider as string,
+        threadId: c.sessionId as string,
+        ...(cwd ? { cwd } : {}),
+      }
       try {
         let result
         try {
@@ -1661,7 +1705,13 @@ export function createAgentApiRouter({
         const deadline = Date.now() + (Number.isFinite(timeoutSec) ? timeoutSec * 1000 : FRESH_AGENT_SEND_IDLE_TIMEOUT_MS)
         const idle = await waitForFreshAgentIdle(freshAgentRuntimeManager, snapshotLocator, deadline)
         if (idle.deadlineMissed) {
-          return res.json(approx({ paneId, sessionId: result?.sessionId ?? locator.sessionId, sessionRef: result?.sessionRef, status: idle.status }, 'prompt sent; turn did not complete within deadline'))
+          return res.json(approx({
+            paneId,
+            sessionId: result?.sessionId ?? locator.sessionId,
+            submittedTurnId: result?.submittedTurnId,
+            sessionRef: result?.sessionRef,
+            status: idle.status,
+          }, 'prompt sent; turn did not complete within deadline'))
         }
 
         const finalSessionId = result?.sessionId ?? locator.sessionId
@@ -1684,7 +1734,13 @@ export function createAgentApiRouter({
           })
         }
 
-        return res.json(ok({ paneId, sessionId: finalSessionId, sessionRef: finalSessionRef, status: idle.status }, 'prompt sent'))
+        return res.json(ok({
+          paneId,
+          sessionId: finalSessionId,
+          submittedTurnId: result?.submittedTurnId,
+          sessionRef: finalSessionRef,
+          status: idle.status,
+        }, 'prompt sent'))
       } catch (err: any) {
         return res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'fresh-agent send failed'))
       }

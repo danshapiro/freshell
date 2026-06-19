@@ -47,7 +47,7 @@ const FRESH_AGENT_FONT_SCALE_MAX = 2
 // Fresh-agent panes render 50% larger than the base UI by default.
 export const FRESH_AGENT_FONT_SCALE_DEFAULT = 1.5
 export const FRESH_AGENT_FONT_SCALE_OPTIONS = [1, 1.25, 1.5, 1.75, 2] as const
-export const FRESH_AGENT_STYLE_VALUES = ['sans', 'serif'] as const
+export const FRESH_AGENT_STYLE_VALUES = ['sans', 'serif', 'mono'] as const
 export type FreshAgentStyle = (typeof FRESH_AGENT_STYLE_VALUES)[number]
 export const DEFAULT_FRESH_AGENT_STYLE: FreshAgentStyle = 'sans'
 

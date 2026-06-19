@@ -21,6 +21,7 @@ import { refreshActiveSessionWindow } from '@/store/sessionsThunks'
 import { getAuthToken } from '@/lib/auth'
 import { buildShareUrl } from '@/lib/utils'
 import { copyText } from '@/lib/clipboard'
+import { openExternalUrl } from '@/lib/open-url'
 import { triggerHapticFeedback } from '@/lib/mobile-haptics'
 import { collectPaneEntries, collectTerminalIds, findPaneContent } from '@/lib/pane-utils'
 import { collectSessionRefsFromNode } from '@/lib/session-utils'
@@ -1013,15 +1014,19 @@ export function ContextMenuProvider({
     // --- Long-press (touch hold) detection for mobile ---
     let longPressTimer: ReturnType<typeof setTimeout> | null = null
     let touchStartPos: { x: number; y: number } | null = null
+    let suppressNextTouchEnd = false
 
     const handleTouchStart = (e: TouchEvent) => {
       const touch = e.touches[0]
       if (!touch) return
+      suppressNextTouchEnd = false
       touchStartPos = { x: touch.clientX, y: touch.clientY }
 
       longPressTimer = setTimeout(() => {
-        if (!touchStartPos) return
-        const target = document.elementFromPoint(touchStartPos.x, touchStartPos.y) as HTMLElement | null
+        longPressTimer = null
+        const startPos = touchStartPos
+        if (!startPos) return
+        const target = document.elementFromPoint(startPos.x, startPos.y) as HTMLElement | null
         if (!target) return
 
         const contextEl = findContextElement(target)
@@ -1040,8 +1045,9 @@ export function ContextMenuProvider({
         const targetObj = parsed || { kind: 'global' as const }
 
         triggerHapticFeedback()
+        suppressNextTouchEnd = true
         openMenu({
-          position: { x: touchStartPos.x, y: touchStartPos.y },
+          position: { x: startPos.x, y: startPos.y },
           target: targetObj,
           contextElement: contextEl,
           clickTarget: target,
@@ -1061,15 +1067,21 @@ export function ContextMenuProvider({
         clearTimeout(longPressTimer)
         longPressTimer = null
         touchStartPos = null
+        suppressNextTouchEnd = false
       }
     }
 
-    const handleTouchEnd = () => {
+    const handleTouchEnd = (e: TouchEvent) => {
+      const shouldSuppressRelease = suppressNextTouchEnd && e.type === 'touchend'
       if (longPressTimer) {
         clearTimeout(longPressTimer)
         longPressTimer = null
       }
       touchStartPos = null
+      suppressNextTouchEnd = false
+      if (shouldSuppressRelease) {
+        if (e.cancelable) e.preventDefault()
+      }
     }
 
     document.addEventListener('contextmenu', handleContextMenu, true)
@@ -1138,7 +1150,7 @@ export function ContextMenuProvider({
   }, [dispatch])
 
   const openUrlInBrowser = useCallback((url: string) => {
-    window.open(url, '_blank', 'noopener,noreferrer')
+    openExternalUrl(url)
   }, [])
 
   const copyUrlAction = useCallback(async (url: string) => {

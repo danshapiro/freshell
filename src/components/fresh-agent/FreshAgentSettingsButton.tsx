@@ -167,7 +167,7 @@ export function FreshAgentSettingsButton({
               >
                 {FRESH_AGENT_STYLE_VALUES.map((style) => (
                   <option key={style} value={style}>
-                    {style === 'sans' ? 'Sans' : 'Serif'}
+                    {style === 'sans' ? 'Sans' : style === 'mono' ? 'Mono' : 'Serif'}
                   </option>
                 ))}
               </select>

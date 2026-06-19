@@ -12,14 +12,19 @@ function makeFakeManager() {
     return e
   }
   return {
-    createSession: vi.fn(async () => ({ id: 'ses_real_1', directory: '/repo', title: 'T' })),
+    createSession: vi.fn(async (input?: { directory?: string }) => ({
+      id: 'ses_real_1',
+      ...(input?.directory ? { directory: input.directory } : {}),
+      title: 'T',
+    })),
+    rememberSessionCwd: vi.fn(),
     promptAsync: vi.fn(async () => undefined),
     listMessages: vi.fn(async () => ({ messages: [], nextCursor: null })),
     getMessage: vi.fn(async () => null),
     getSession: vi.fn(async () => ({ id: 'ses_real_1', title: 'T', time: { updated: 5 } })),
     abort: vi.fn(async () => undefined),
     compact: vi.fn(async () => undefined),
-    fork: vi.fn(async () => ({ id: 'ses_child_1' })),
+    fork: vi.fn(async (): Promise<{ id: string; directory?: string }> => ({ id: 'ses_child_1' })),
     onceIdle: vi.fn(async () => undefined),
     subscribe: vi.fn((id: string, listener: (e: unknown) => void) => {
       const e = emitterFor(id)
@@ -57,7 +62,7 @@ describe('OpenCode serve adapter: create + send', () => {
       parts: [{ type: 'text', text: 'reply ok' }],
       model: { providerID: 'umans-ai-coding-plan', modelID: 'umans-kimi-k2.7' },
       variant: 'high',
-    })
+    }, { cwd: '/repo' })
     expect(manager.onceIdle).toHaveBeenCalledWith('ses_real_1', expect.any(Number))
   })
 
@@ -92,6 +97,47 @@ describe('OpenCode serve adapter: create + send', () => {
     await adapter.send?.('freshopencode-cwd-1', { text: 'hi' })
     expect(manager.createSession).toHaveBeenCalledTimes(1)
     expect(manager.createSession).toHaveBeenLastCalledWith({ directory: '/project-x' })
+    expect(manager.promptAsync).toHaveBeenCalledWith(
+      'ses_real_1',
+      expect.objectContaining({ parts: [{ type: 'text', text: 'hi' }] }),
+      { cwd: '/project-x' },
+    )
+  })
+
+  it('passes restored cwd when sending to an attached durable session', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+
+    await adapter.attach?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionId: 'ses_attached_send',
+      cwd: '/repo/restored-worktree',
+    })
+    await adapter.send?.('ses_attached_send', { text: 'continue' })
+
+    expect(manager.promptAsync).toHaveBeenCalledWith(
+      'ses_attached_send',
+      { parts: [{ type: 'text', text: 'continue' }] },
+      { cwd: '/repo/restored-worktree' },
+    )
+  })
+
+  it('keeps attached no-cwd sessions sendable without a route argument', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+
+    await adapter.attach?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionId: 'ses_attached_nocwd',
+    })
+    await adapter.send?.('ses_attached_nocwd', { text: 'continue' })
+
+    expect(manager.promptAsync).toHaveBeenCalledWith(
+      'ses_attached_nocwd',
+      { parts: [{ type: 'text', text: 'continue' }] },
+    )
   })
 
   it('recovers from a failed send and still processes later sends', async () => {
@@ -133,11 +179,50 @@ describe('OpenCode serve adapter: create + send', () => {
       await expect(adapter.send?.('freshopencode-unhandled-1', { text: 'boom' })).rejects.toThrow('prompt rejected')
       // Simulating the idle timeout rejection that would otherwise arrive later.
       idleReject(new Error('idle timeout'))
-      await new Promise((r) => setTimeout(r, 10))
-      expect(unhandled).not.toHaveBeenCalled()
-    } finally {
-      process.off('unhandledRejection', unhandled)
-    }
+    await new Promise((r) => setTimeout(r, 10))
+    expect(unhandled).not.toHaveBeenCalled()
+  } finally {
+    process.off('unhandledRejection', unhandled)
+  }
+  })
+
+  it('does not return to running when OpenCode emits a late message update after idle', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'late-update', sessionType: 'freshopencode', provider: 'opencode' })
+
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-late-update', (event) => events.push(event))
+
+    await adapter.send?.('freshopencode-late-update', { text: 'go' })
+    manager._emit('ses_real_1', {
+      kind: 'session.idle',
+      sessionId: 'ses_real_1',
+      properties: { sessionID: 'ses_real_1' },
+      raw: { type: 'session.idle', properties: { sessionID: 'ses_real_1' } },
+    })
+    manager._emit('ses_real_1', {
+      kind: 'message.updated',
+      sessionId: 'ses_real_1',
+      properties: { sessionID: 'ses_real_1', info: { id: 'msg_user_1', role: 'user' } },
+      raw: { type: 'message.updated', properties: { sessionID: 'ses_real_1' } },
+    })
+
+    expect(events).toContainEqual({
+      type: 'sdk.session.snapshot',
+      sessionId: 'freshopencode-late-update',
+      status: 'idle',
+    })
+    expect(events.at(-1)).toEqual({
+      type: 'sdk.session.changed',
+      sessionId: 'freshopencode-late-update',
+      reason: 'opencode-message',
+    })
+    await expect(adapter.getSnapshot?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: 'freshopencode-late-update',
+    })).resolves.toMatchObject({ status: 'idle' })
   })
 
   it('forwards compact instructions to the serve manager', async () => {
@@ -156,38 +241,73 @@ describe('OpenCode serve adapter: history reads', () => {
     { info: { id: 'msg_assistant_1', role: 'assistant', providerID: 'umans-ai-coding-plan', modelID: 'umans-kimi-k2.7' }, parts: [{ id: 'p2', type: 'text', text: 'ok' }] },
   ]
 
+  it('remembers cwd when attaching a durable OpenCode session', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+
+    await adapter.attach?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionId: 'ses_existing_cwd',
+      cwd: '/repo/from-pane',
+    })
+
+    expect(manager.rememberSessionCwd).toHaveBeenCalledWith('ses_existing_cwd', '/repo/from-pane')
+  })
+
   it('getSnapshot assembles HTTP messages into the normalized transcript', async () => {
     const manager = makeFakeManager()
     manager.getSession = vi.fn(async () => ({ id: 'ses_real_1', title: 'Kimi chat', time: { updated: 12 } }))
     manager.listMessages = vi.fn(async () => ({ messages, nextCursor: null }))
     const adapter = makeAdapter(manager)
-    await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1' })
+    await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1', cwd: '/repo/history' })
     await expect(adapter.getSnapshot?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' })).resolves.toMatchObject({
       sessionId: 'ses_real_1', summary: 'Kimi chat', revision: 12,
       turns: [{ turnId: 'msg_user_1', role: 'user', summary: 'reply ok' }, { turnId: 'msg_assistant_1', role: 'assistant', summary: 'ok' }],
     })
-    expect(manager.listMessages).toHaveBeenCalledWith('ses_real_1', { limit: 200 })
+    expect(manager.getSession).toHaveBeenCalledWith('ses_real_1', { cwd: '/repo/history' })
+    expect(manager.listMessages).toHaveBeenCalledWith('ses_real_1', { limit: 200 }, { cwd: '/repo/history' })
+  })
+
+  it('omits history route arguments when no cwd is known', async () => {
+    const manager = makeFakeManager()
+    manager.getSession = vi.fn(async () => ({ id: 'ses_real_1', title: 'Kimi chat', time: { updated: 12 } }))
+    manager.listMessages = vi.fn(async () => ({ messages, nextCursor: null }))
+    manager.getMessage = vi.fn(async () => messages[1])
+    const adapter = makeAdapter(manager)
+
+    await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1' })
+    await adapter.getSnapshot?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' })
+    await adapter.getTurnPage?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' }, { limit: 1, revision: 0 })
+    await adapter.getTurnBody?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1', turnId: 'msg_assistant_1' }, 12)
+
+    expect(manager.getSession).toHaveBeenNthCalledWith(1, 'ses_real_1')
+    expect(manager.getSession).toHaveBeenNthCalledWith(2, 'ses_real_1')
+    expect(manager.listMessages).toHaveBeenNthCalledWith(1, 'ses_real_1', { limit: 200 })
+    expect(manager.listMessages).toHaveBeenNthCalledWith(2, 'ses_real_1', { limit: 1, before: undefined })
+    expect(manager.getMessage).toHaveBeenCalledWith('ses_real_1', 'msg_assistant_1')
   })
 
   it('getTurnPage forwards cursor as before= and returns nextCursor from the header', async () => {
     const manager = makeFakeManager()
     manager.listMessages = vi.fn(async () => ({ messages: messages.slice(0, 1), nextCursor: 'NEXT' }))
     const adapter = makeAdapter(manager)
-    await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1' })
+    await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1', cwd: '/repo/history' })
     const page = await adapter.getTurnPage?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' }, { cursor: 'CUR', limit: 1, revision: 0 })
     expect(page).toMatchObject({ nextCursor: 'NEXT', turns: [{ turnId: 'msg_user_1' }] })
-    expect(manager.listMessages).toHaveBeenCalledWith('ses_real_1', { limit: 1, before: 'CUR' })
+    expect(manager.getSession).toHaveBeenCalledWith('ses_real_1', { cwd: '/repo/history' })
+    expect(manager.listMessages).toHaveBeenCalledWith('ses_real_1', { limit: 1, before: 'CUR' }, { cwd: '/repo/history' })
   })
 
   it('getTurnBody fetches a single message and normalizes it', async () => {
     const manager = makeFakeManager()
     manager.getMessage = vi.fn(async () => messages[1])
     const adapter = makeAdapter(manager)
-    await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1' })
+    await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1', cwd: '/repo/history' })
     await expect(adapter.getTurnBody?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1', turnId: 'msg_assistant_1' }, 12)).resolves.toMatchObject({
       turnId: 'msg_assistant_1', role: 'assistant', items: expect.arrayContaining([expect.objectContaining({ kind: 'text', text: 'ok' })]),
     })
-    expect(manager.getMessage).toHaveBeenCalledWith('ses_real_1', 'msg_assistant_1')
+    expect(manager.getMessage).toHaveBeenCalledWith('ses_real_1', 'msg_assistant_1', { cwd: '/repo/history' })
   })
 
   it('reports fork capability true and approvals/questions false', async () => {
@@ -195,7 +315,7 @@ describe('OpenCode serve adapter: history reads', () => {
     manager.getSession = vi.fn(async () => ({ id: 'ses_real_1', time: { updated: 1 } }))
     manager.listMessages = vi.fn(async () => ({ messages: [], nextCursor: null }))
     const adapter = makeAdapter(manager)
-    await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1' })
+    await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1', cwd: '/repo/history' })
     const snap: any = await adapter.getSnapshot?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' })
     expect(snap.capabilities).toMatchObject({ fork: true, approvals: false, questions: false })
   })
@@ -237,6 +357,61 @@ describe('OpenCode serve adapter: control', () => {
     } finally {
       off()
     }
+  })
+
+  it('routes control operations through the known cwd', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+
+    await adapter.attach?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionId: 'ses_known_cwd',
+      cwd: '/repo/control',
+    })
+
+    await adapter.interrupt?.('ses_known_cwd')
+    await adapter.compact?.('ses_known_cwd', { instructions: 'trim' })
+    await expect(adapter.fork?.('ses_known_cwd')).resolves.toEqual({
+      sessionId: 'ses_child_1',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_child_1' },
+    })
+    await adapter.send?.('ses_child_1', { text: 'child continue' })
+
+    expect(manager.abort).toHaveBeenCalledWith('ses_known_cwd', { cwd: '/repo/control' })
+    expect(manager.compact).toHaveBeenCalledWith('ses_known_cwd', { instructions: 'trim' }, { cwd: '/repo/control' })
+    expect(manager.fork).toHaveBeenCalledWith('ses_known_cwd', { cwd: '/repo/control' })
+    expect(manager.promptAsync).toHaveBeenCalledWith(
+      'ses_child_1',
+      expect.objectContaining({ parts: [{ type: 'text', text: 'child continue' }] }),
+      { cwd: '/repo/control' },
+    )
+  })
+
+  it('routes forked children through the returned child directory when present', async () => {
+    const manager = makeFakeManager()
+    manager.fork.mockResolvedValueOnce({ id: 'ses_child_1', directory: '/repo/child' })
+    const adapter = makeAdapter(manager)
+
+    await adapter.attach?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionId: 'ses_parent',
+      cwd: '/repo/parent',
+    })
+
+    await expect(adapter.fork?.('ses_parent')).resolves.toEqual({
+      sessionId: 'ses_child_1',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_child_1' },
+    })
+    await adapter.send?.('ses_child_1', { text: 'child turn' })
+
+    expect(manager.fork).toHaveBeenCalledWith('ses_parent', { cwd: '/repo/parent' })
+    expect(manager.promptAsync).toHaveBeenCalledWith(
+      'ses_child_1',
+      expect.objectContaining({ parts: [{ type: 'text', text: 'child turn' }] }),
+      { cwd: '/repo/child' },
+    )
   })
 
   it('shutdown delegates to the serve manager', async () => {

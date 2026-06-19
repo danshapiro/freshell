@@ -58,6 +58,41 @@ async function openFreshAgentSettings(page: any, providerName: string) {
   return dialog
 }
 
+async function expectFreshAgentSubmitButtonContrasted(
+  root: any,
+  expectedBackgroundVariable = '--fresh-agent-text',
+) {
+  const styles = await root.locator('.fresh-agent-composer-action[type="submit"]').evaluate((node: HTMLElement, backgroundVariable: string) => {
+    const pane = node.closest('[data-context="fresh-agent"]') as HTMLElement | null
+    if (!pane) {
+      throw new Error('Fresh Agent pane root not found')
+    }
+
+    const resolveColor = (value: string) => {
+      const probe = document.createElement('span')
+      probe.style.color = value.trim()
+      document.body.appendChild(probe)
+      const color = getComputedStyle(probe).color
+      probe.remove()
+      return color
+    }
+
+    const buttonStyle = getComputedStyle(node)
+    const paneStyle = getComputedStyle(pane)
+    return {
+      backgroundColor: buttonStyle.backgroundColor,
+      color: buttonStyle.color,
+      expectedBackgroundColor: resolveColor(paneStyle.getPropertyValue(backgroundVariable)),
+      expectedColor: resolveColor(paneStyle.getPropertyValue('--fresh-agent-surface')),
+      panelBackgroundColor: resolveColor(paneStyle.getPropertyValue('--fresh-agent-panel-surface')),
+    }
+  }, expectedBackgroundVariable)
+
+  expect(styles.backgroundColor).toBe(styles.expectedBackgroundColor)
+  expect(styles.color).toBe(styles.expectedColor)
+  expect(styles.backgroundColor).not.toBe(styles.panelBackgroundColor)
+}
+
 test.describe('Fresh Agent', () => {
   test('pane picker hides fresh clients by default even when their CLIs are enabled', async ({ freshellPage, page, terminal }) => {
     await terminal.waitForTerminal()
@@ -307,6 +342,7 @@ test.describe('Fresh Agent', () => {
     const composerButtonFont = await freshcodexRoot.locator('.fresh-agent-composer-action').first()
       .evaluate((node) => getComputedStyle(node).fontFamily)
     expect(composerButtonFont.toLowerCase()).toContain('ibm plex mono')
+    await expectFreshAgentSubmitButtonContrasted(freshcodexRoot)
     const chromeFont = await page.locator('[data-context="tab-add"]').evaluate((node) => getComputedStyle(node).fontFamily)
     expect(chromeFont.toLowerCase()).not.toContain('georgia')
     expect(chromeFont.toLowerCase()).not.toContain('literata')
@@ -405,6 +441,10 @@ test.describe('Fresh Agent', () => {
 
     dialog = await openFreshAgentSettings(page, 'Freshcodex')
     await expect(dialog.getByRole('combobox', { name: /^Style$/i })).toHaveValue('serif')
+    await dialog.getByRole('combobox', { name: /^Style$/i }).selectOption('mono')
+    const monoRoot = page.locator('[data-context="fresh-agent"][data-style="mono"]').last()
+    await expect(monoRoot).toBeVisible({ timeout: 10_000 })
+    await expectFreshAgentSubmitButtonContrasted(monoRoot, '--fresh-agent-accent')
   })
 
   test('freshclaude banners render through the fresh-agent pane surface and answer over WS', async ({ freshellPage, page, harness, terminal }) => {

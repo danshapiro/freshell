@@ -21,6 +21,7 @@ import {
 } from './FreshAgentTurnActions'
 import { FreshAgentActionSheet } from './FreshAgentActionSheet'
 import { buildLongPressHandlers, useCoarsePointer } from '@/lib/pointer'
+import { getFreshAgentDisplayTurnKey } from '@shared/fresh-agent-turns'
 
 function getTurnLabel(turn: FreshAgentTurn, agentLabel?: string): string {
   switch (turn.role) {
@@ -221,41 +222,6 @@ function buildBlocks(
   }
   flush()
   return blocks
-}
-
-function isActivityOnlyTurn(turn: FreshAgentTurn): boolean {
-  return turn.items.length > 0 && turn.items.every(isActivityLike)
-}
-
-function mergeActivityOnlyTurns(previous: FreshAgentTurn, next: FreshAgentTurn): FreshAgentTurn {
-  return {
-    ...next,
-    id: `${previous.id}:${next.id}`,
-    turnId: next.turnId ?? next.id,
-    summary: [previous.summary, next.summary].filter(Boolean).join('\n\n'),
-    items: [...previous.items, ...next.items],
-    model: next.model ?? previous.model,
-    timestamp: next.timestamp ?? previous.timestamp,
-  }
-}
-
-function coalesceActivityOnlyTurns(turns: FreshAgentTurn[]): FreshAgentTurn[] {
-  const coalesced: FreshAgentTurn[] = []
-  for (const turn of turns) {
-    const previous = coalesced[coalesced.length - 1]
-    if (
-      previous
-      && turn.role !== 'user'
-      && previous.role === turn.role
-      && isActivityOnlyTurn(previous)
-      && isActivityOnlyTurn(turn)
-    ) {
-      coalesced[coalesced.length - 1] = mergeActivityOnlyTurns(previous, turn)
-      continue
-    }
-    coalesced.push(turn)
-  }
-  return coalesced
 }
 
 function filterTurnsForDisplay(
@@ -575,7 +541,7 @@ export function FreshAgentTranscript({
     showThinking,
   }), [showThinking])
   const displayTurns = useMemo(() => (
-    coalesceActivityOnlyTurns(filterTurnsForDisplay(turns, displayOptions))
+    filterTurnsForDisplay(turns, displayOptions)
   ), [displayOptions, turns])
   const liveActivityBlockId = useMemo(
     () => selectLiveActivityBlockId(displayTurns, isStreaming, displayOptions),
@@ -598,7 +564,7 @@ export function FreshAgentTranscript({
         }
         return `${item.id}:${item.kind}`
       }).join(',')
-      return `${turn.id}:${turn.summary?.length ?? 0}:${itemSignature}`
+      return `${getFreshAgentDisplayTurnKey(turn)}:${turn.summary?.length ?? 0}:${itemSignature}`
     }).join('|')
   ), [displayTurns])
 
@@ -642,7 +608,7 @@ export function FreshAgentTranscript({
       >
         {displayTurns.map((turn, index) => (
           <FreshAgentTurnArticle
-            key={`${turn.id}:${index}`}
+            key={`${getFreshAgentDisplayTurnKey(turn)}:${index}`}
             turn={turn}
             actions={actions}
             agentLabel={agentLabel}

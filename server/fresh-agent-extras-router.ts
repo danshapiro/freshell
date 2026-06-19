@@ -5,7 +5,7 @@ import * as fsp from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { FreshAgentRuntimeProviderSchema, FreshAgentSessionTypeSchema } from '../shared/fresh-agent-contract.js'
-import type { FreshAgentCreateRequest, FreshAgentSessionLocator } from './fresh-agent/runtime-adapter.js'
+import type { FreshAgentCreateRequest, FreshAgentSendResult, FreshAgentSessionLocator } from './fresh-agent/runtime-adapter.js'
 
 const ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024
 const EXEC_TIMEOUT_MS = 30_000
@@ -104,15 +104,83 @@ async function ensureCheckpointRepo(cwd: string): Promise<string> {
   return gitDir
 }
 
-export type CheckpointEntry = { id: string; ts: number; label: string }
+export type CheckpointEntry = { id: string; ts: number; label: string; requestId?: string; turnId?: string }
+type CheckpointMetadata = Record<string, { requestId?: string; turnId?: string }>
 
-async function createCheckpoint(cwd: string, label: string): Promise<CheckpointEntry> {
+function checkpointMetadataPath(gitDir: string): string {
+  return path.join(gitDir, 'freshell-checkpoint-metadata.json')
+}
+
+function isValidCheckpointId(id: string): boolean {
+  return /^[0-9a-f]{7,40}$/i.test(id)
+}
+
+async function readCheckpointMetadata(gitDir: string): Promise<CheckpointMetadata> {
+  try {
+    const raw = await fsp.readFile(checkpointMetadataPath(gitDir), 'utf8')
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const metadata: CheckpointMetadata = {}
+    for (const [id, value] of Object.entries(parsed)) {
+      if (!isValidCheckpointId(id) || !value || typeof value !== 'object' || Array.isArray(value)) continue
+      const entry = value as Record<string, unknown>
+      metadata[id] = {
+        ...(typeof entry.requestId === 'string' && entry.requestId ? { requestId: entry.requestId } : {}),
+        ...(typeof entry.turnId === 'string' && entry.turnId ? { turnId: entry.turnId } : {}),
+      }
+    }
+    return metadata
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {}
+    throw error
+  }
+}
+
+async function writeCheckpointMetadata(gitDir: string, metadata: CheckpointMetadata): Promise<void> {
+  const filePath = checkpointMetadataPath(gitDir)
+  const tempPath = `${filePath}.tmp-${randomUUID()}`
+  await fsp.writeFile(tempPath, `${JSON.stringify(metadata, null, 2)}\n`, 'utf8')
+  try {
+    await fsp.rename(tempPath, filePath)
+  } catch (error) {
+    await fsp.unlink(tempPath).catch(() => undefined)
+    throw error
+  }
+}
+
+async function updateCheckpointMetadata(
+  cwd: string,
+  id: string,
+  patch: { requestId?: string; turnId?: string },
+): Promise<CheckpointEntry> {
+  if (!isValidCheckpointId(id)) {
+    throw new Error('invalid checkpoint id')
+  }
+  const gitDir = await ensureCheckpointRepo(cwd)
+  const resolvedId = (await runGit([`--git-dir=${gitDir}`, 'rev-parse', '--verify', `${id}^{commit}`])).trim()
+  const metadata = await readCheckpointMetadata(gitDir)
+  metadata[resolvedId] = {
+    ...(metadata[resolvedId] ?? {}),
+    ...(patch.requestId ? { requestId: patch.requestId } : {}),
+    ...(patch.turnId ? { turnId: patch.turnId } : {}),
+  }
+  await writeCheckpointMetadata(gitDir, metadata)
+  const entries = await listCheckpoints(cwd)
+  const entry = entries.find((candidate) => candidate.id === resolvedId)
+  if (!entry) throw new Error('invalid checkpoint id')
+  return entry
+}
+
+async function createCheckpoint(cwd: string, label: string, metadata: { requestId?: string } = {}): Promise<CheckpointEntry> {
   const gitDir = await ensureCheckpointRepo(cwd)
   const base = [`--git-dir=${gitDir}`, `--work-tree=${cwd}`]
   await runGit([...base, 'add', '-A'], { cwd })
   await runGit([...base, ...CHECKPOINT_IDENTITY, 'commit', '--allow-empty', '-q', '-m', label], { cwd })
   const sha = (await runGit([`--git-dir=${gitDir}`, 'rev-parse', 'HEAD'])).trim()
-  return { id: sha, ts: Math.floor(Date.now() / 1000), label }
+  if (metadata.requestId) {
+    await updateCheckpointMetadata(cwd, sha, { requestId: metadata.requestId })
+  }
+  return { id: sha, ts: Math.floor(Date.now() / 1000), label, ...metadata }
 }
 
 async function listCheckpoints(cwd: string): Promise<CheckpointEntry[]> {
@@ -134,17 +202,18 @@ async function listCheckpoints(cwd: string): Promise<CheckpointEntry[]> {
     // Empty repo (no commits yet).
     return []
   }
+  const metadata = await readCheckpointMetadata(gitDir)
   return raw
     .split('\n')
     .filter(Boolean)
     .map((line) => {
       const [id, ts, ...rest] = line.split('\t')
-      return { id, ts: Number(ts), label: rest.join('\t') }
+      return { id, ts: Number(ts), label: rest.join('\t'), ...(metadata[id] ?? {}) }
     })
 }
 
 async function restoreCheckpoint(cwd: string, id: string): Promise<void> {
-  if (!/^[0-9a-f]{7,40}$/i.test(id)) {
+  if (!isValidCheckpointId(id)) {
     throw new Error('invalid checkpoint id')
   }
   const gitDir = await ensureCheckpointRepo(cwd)
@@ -171,7 +240,7 @@ async function restoreCheckpoint(cwd: string, id: string): Promise<void> {
 /** Structural slice of FreshAgentRuntimeManager — keeps this router
  * standalone-testable with a fake and avoids a hard import cycle. */
 export type FreshAgentSendCapable = {
-  send?: (locator: FreshAgentSessionLocator, payload: { text: string; settings?: FreshAgentCreateRequest }) => Promise<unknown>
+  send?: (locator: FreshAgentSessionLocator, payload: { text: string; settings?: FreshAgentCreateRequest }) => Promise<FreshAgentSendResult>
 }
 
 function parseSendLocator(body: unknown): FreshAgentSessionLocator | null {
@@ -267,8 +336,8 @@ export function createFreshAgentExtrasRouter(
       ? req.body.settings as FreshAgentCreateRequest
       : undefined
     try {
-      await manager.send(locator, { text, ...(settings ? { settings } : {}) })
-      res.json({ sent: true })
+      const result = await manager.send(locator, { text, ...(settings ? { settings } : {}) })
+      res.json({ sent: true, submittedTurnId: result?.submittedTurnId })
     } catch (error) {
       res.status(500).json({ error: error instanceof Error ? error.message : 'send failed' })
     }
@@ -279,6 +348,9 @@ export function createFreshAgentExtrasRouter(
     const label = typeof req.body?.label === 'string' && req.body.label.trim()
       ? req.body.label.trim().slice(0, 120)
       : 'checkpoint'
+    const requestId = typeof req.body?.requestId === 'string' && req.body.requestId.trim()
+      ? req.body.requestId.trim()
+      : undefined
     if (!cwd) {
       return res.status(400).json({ error: 'cwd is required' })
     }
@@ -288,7 +360,7 @@ export function createFreshAgentExtrasRouter(
       return res.status(400).json({ error: `cwd does not exist: ${cwd}` })
     }
     try {
-      const entry = await createCheckpoint(cwd, label)
+      const entry = await createCheckpoint(cwd, label, { ...(requestId ? { requestId } : {}) })
       res.json(entry)
     } catch (error) {
       res.status(500).json({ error: error instanceof Error ? error.message : 'checkpoint failed' })
@@ -304,6 +376,34 @@ export function createFreshAgentExtrasRouter(
       res.json({ checkpoints: await listCheckpoints(cwd) })
     } catch (error) {
       res.status(500).json({ error: error instanceof Error ? error.message : 'list failed' })
+    }
+  })
+
+  router.post('/checkpoints/metadata', async (req, res) => {
+    const cwd = typeof req.body?.cwd === 'string' ? req.body.cwd : ''
+    const id = typeof req.body?.id === 'string' ? req.body.id : ''
+    const requestId = typeof req.body?.requestId === 'string' && req.body.requestId.trim()
+      ? req.body.requestId.trim()
+      : undefined
+    const turnId = typeof req.body?.turnId === 'string' && req.body.turnId.trim()
+      ? req.body.turnId.trim()
+      : undefined
+    if (!cwd || !id) {
+      return res.status(400).json({ error: 'cwd and id are required' })
+    }
+    if (!requestId && !turnId) {
+      return res.status(400).json({ error: 'requestId or turnId is required' })
+    }
+    try {
+      await fsp.access(cwd)
+    } catch {
+      return res.status(400).json({ error: `cwd does not exist: ${cwd}` })
+    }
+    try {
+      res.json(await updateCheckpointMetadata(cwd, id, { requestId, turnId }))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'metadata update failed'
+      res.status(message.includes('invalid checkpoint id') ? 400 : 500).json({ error: message })
     }
   })
 

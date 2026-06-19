@@ -425,10 +425,12 @@ export const FreshAgentAttachSchema = z.object({
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
   resumeSessionId: z.string().optional(),
+  cwd: z.string().optional(),
 })
 
 export const FreshAgentSendSchema = z.object({
   type: z.literal('freshAgent.send'),
+  requestId: z.string().min(1).optional(),
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
@@ -862,6 +864,7 @@ export type SdkRestoreFailureCode =
 export type FreshAgentServerMessage =
   | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
   | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean }
+  | { type: 'freshAgent.send.accepted'; requestId: string; submittedTurnId?: string }
   | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
   | { type: 'freshAgent.session.materialized'; previousSessionId: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string } }
   | { type: 'freshAgent.forked'; requestId?: string; parentSessionId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }

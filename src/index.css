@@ -400,7 +400,7 @@ html {
   color: var(--fresh-agent-text);
 }
 
-.fresh-agent-style-serif :where(.fresh-agent-approval-button-primary, .fresh-agent-composer-action[type="submit"]) {
+.fresh-agent-style-serif .fresh-agent-approval-button-primary {
   background: var(--fresh-agent-text);
   border-color: var(--fresh-agent-text);
   color: var(--fresh-agent-surface);
@@ -593,6 +593,18 @@ html {
   background: var(--fresh-agent-panel-surface);
 }
 
+.fresh-agent-style-serif .fresh-agent-composer-action[type="submit"] {
+  background: var(--fresh-agent-text);
+  border-color: var(--fresh-agent-text);
+  color: var(--fresh-agent-surface);
+}
+
+.fresh-agent-style-serif .fresh-agent-composer-action[type="submit"]:hover:not(:disabled) {
+  background: var(--fresh-agent-text);
+  border-color: var(--fresh-agent-text);
+  color: var(--fresh-agent-surface);
+}
+
 .fresh-agent-style-serif .fresh-agent-composer-menu,
 .fresh-agent-style-serif .fresh-agent-queued-message,
 .fresh-agent-style-serif .fresh-agent-attachment {
@@ -630,6 +642,523 @@ html {
 }
 
 .fresh-agent-style-serif .fresh-agent-thinking-bar > div {
+  background: var(--fresh-agent-subtle-surface);
+}
+
+.fresh-agent-style-mono {
+  --fresh-agent-copy-font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --fresh-agent-meta-font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --fresh-agent-mono-font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --fresh-agent-surface: #fbfaf7;
+  --fresh-agent-panel-surface: #f6f3ed;
+  --fresh-agent-subtle-surface: #eee8df;
+  --fresh-agent-raised-surface: #fffdf8;
+  --fresh-agent-border: rgba(91, 75, 60, 0.22);
+  --fresh-agent-border-strong: rgba(91, 75, 60, 0.38);
+  --fresh-agent-accent: #a04f33;
+  --fresh-agent-accent-soft: rgba(160, 79, 51, 0.11);
+  --fresh-agent-danger: #b42318;
+  --fresh-agent-danger-soft: rgba(180, 35, 24, 0.1);
+  --fresh-agent-success: #2f7d55;
+  --fresh-agent-success-soft: rgba(47, 125, 85, 0.11);
+  --fresh-agent-text: #24211d;
+  --fresh-agent-muted-text: #665d54;
+  --fresh-agent-soft-text: #857a70;
+  --fresh-agent-radius: 0.375rem;
+  --fresh-agent-radius-tight: 0.25rem;
+  --fresh-agent-watermark-opacity: 0;
+  background: var(--fresh-agent-surface);
+  color: var(--fresh-agent-text);
+  font-family: var(--fresh-agent-copy-font-family);
+  text-shadow: none;
+}
+
+.dark .fresh-agent-style-mono {
+  --fresh-agent-surface: #181715;
+  --fresh-agent-panel-surface: #211f1c;
+  --fresh-agent-subtle-surface: #2b2824;
+  --fresh-agent-raised-surface: #25221f;
+  --fresh-agent-border: rgba(232, 224, 215, 0.16);
+  --fresh-agent-border-strong: rgba(232, 224, 215, 0.28);
+  --fresh-agent-accent: #e09a78;
+  --fresh-agent-accent-soft: rgba(224, 154, 120, 0.14);
+  --fresh-agent-danger: #f2847d;
+  --fresh-agent-danger-soft: rgba(242, 132, 125, 0.14);
+  --fresh-agent-success: #86c39a;
+  --fresh-agent-success-soft: rgba(134, 195, 154, 0.13);
+  --fresh-agent-text: #ebe3da;
+  --fresh-agent-muted-text: #b9afa5;
+  --fresh-agent-soft-text: #92887e;
+}
+
+.fresh-agent-style-mono .fresh-agent-watermark {
+  display: none;
+}
+
+.fresh-agent-style-mono .fresh-agent-transcript-copy {
+  color: var(--fresh-agent-text);
+  font-family: var(--fresh-agent-copy-font-family);
+  line-height: 1.5;
+}
+
+.fresh-agent-style-mono :where(button, input, select),
+.fresh-agent-style-mono .fresh-agent-sidebar,
+.fresh-agent-style-mono .fresh-agent-sidebar-section,
+.fresh-agent-style-mono .fresh-agent-turn-header,
+.fresh-agent-style-mono .fresh-agent-activity-strip,
+.fresh-agent-style-mono .fresh-agent-tool-block,
+.fresh-agent-style-mono .fresh-agent-diff-panel,
+.fresh-agent-style-mono .fresh-agent-composer-menu {
+  font-family: var(--fresh-agent-meta-font-family);
+}
+
+.fresh-agent-style-mono textarea {
+  font-family: var(--fresh-agent-copy-font-family);
+  line-height: 1.5;
+}
+
+.fresh-agent-style-mono .fresh-agent-transcript-copy [data-markdown-body] :where(pre, code) {
+  font-family: var(--fresh-agent-mono-font-family);
+  letter-spacing: 0;
+}
+
+.fresh-agent-style-mono .fresh-agent-layout,
+.fresh-agent-style-mono .fresh-agent-main {
+  background: var(--fresh-agent-surface);
+}
+
+.fresh-agent-style-mono .fresh-agent-transcript-scroll {
+  gap: 0.2rem;
+  padding: 0.75rem 1rem 1rem;
+}
+
+.fresh-agent-style-mono .fresh-agent-top-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem 0;
+}
+
+.fresh-agent-style-mono .fresh-agent-turn {
+  border-left: 0;
+  border-top: 1px solid var(--fresh-agent-border);
+  padding: 0.9rem 0 1rem;
+}
+
+.fresh-agent-style-mono .fresh-agent-turn[data-turn-continuation="true"] {
+  border-top: 0;
+  margin-top: -0.8rem;
+  padding-top: 0;
+}
+
+.fresh-agent-style-mono .fresh-agent-turn:first-child {
+  border-top: 0;
+  padding-top: 0.1rem;
+}
+
+.fresh-agent-style-mono .fresh-agent-turn-header {
+  color: var(--fresh-agent-soft-text);
+  font-size: 0.62rem;
+  font-weight: 500;
+  letter-spacing: 0;
+  line-height: 1.25;
+  margin-bottom: 0.5rem;
+  max-width: 100%;
+  text-transform: none;
+}
+
+.fresh-agent-style-mono .fresh-agent-turn-header span:first-child {
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fresh-agent-style-mono .fresh-agent-turn > .fresh-agent-transcript-copy,
+.fresh-agent-style-mono .fresh-agent-activity-strip {
+  max-width: 100%;
+}
+
+.fresh-agent-style-mono .fresh-agent-turn[data-turn-role="user"] .fresh-agent-turn-header {
+  color: var(--fresh-agent-accent);
+  margin-bottom: 0.25rem;
+}
+
+.fresh-agent-style-mono .fresh-agent-turn[data-turn-role="user"] .fresh-agent-transcript-copy {
+  background: var(--fresh-agent-subtle-surface);
+  border-left: 2px solid var(--fresh-agent-accent);
+  border-radius: var(--fresh-agent-radius);
+  padding: 0.6rem 0.8rem;
+}
+
+.fresh-agent-style-mono :where(
+  .fresh-agent-banner,
+  .fresh-agent-summary-card,
+  .fresh-agent-error-card,
+  .fresh-agent-session-ended-card,
+  .fresh-agent-approval-card,
+  .fresh-agent-question-card,
+  .fresh-agent-diff-panel,
+  .fresh-agent-inline-card
+) {
+  background: var(--fresh-agent-panel-surface);
+  border: 1px solid var(--fresh-agent-border);
+  border-radius: var(--fresh-agent-radius);
+  color: var(--fresh-agent-text);
+  box-shadow: none;
+}
+
+.fresh-agent-style-mono :where(.fresh-agent-banner, .fresh-agent-summary-card) {
+  color: var(--fresh-agent-muted-text);
+  font-family: var(--fresh-agent-copy-font-family);
+  line-height: 1.5;
+}
+
+.fresh-agent-style-mono .fresh-agent-approval-card,
+.fresh-agent-style-mono .fresh-agent-question-card,
+.fresh-agent-style-mono .fresh-agent-diff-panel {
+  padding: 0.75rem 0.85rem;
+}
+
+.fresh-agent-style-mono :where(
+  .fresh-agent-approval-heading,
+  .fresh-agent-question-heading,
+  .fresh-agent-diff-title,
+  .fresh-agent-sidebar-title
+) {
+  color: var(--fresh-agent-accent);
+  font-family: var(--fresh-agent-meta-font-family);
+  font-size: 0.65rem;
+  font-weight: 500;
+  letter-spacing: 0;
+  line-height: 1.2;
+  text-transform: none;
+}
+
+.fresh-agent-style-mono .fresh-agent-approval-heading {
+  text-transform: none;
+}
+
+.fresh-agent-style-mono .fresh-agent-approval-kicker,
+.fresh-agent-style-mono .fresh-agent-status-badge {
+  border: 1px solid var(--fresh-agent-border-strong);
+  color: var(--fresh-agent-accent);
+  border-radius: var(--fresh-agent-radius-tight);
+}
+
+.fresh-agent-style-mono .fresh-agent-approval-tool {
+  color: var(--fresh-agent-text);
+  font-family: var(--fresh-agent-copy-font-family);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.fresh-agent-style-mono .fresh-agent-approval-reason,
+.fresh-agent-style-mono .fresh-agent-question-text {
+  color: var(--fresh-agent-muted-text);
+  font-family: var(--fresh-agent-copy-font-family);
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
+.fresh-agent-style-mono :where(
+  .fresh-agent-approval-preview,
+  .fresh-agent-tool-body,
+  .fresh-agent-file-diff-body,
+  [data-diff]
+) {
+  background: var(--fresh-agent-surface);
+  border: 1px solid var(--fresh-agent-border);
+  border-radius: var(--fresh-agent-radius);
+  color: var(--fresh-agent-muted-text);
+  font-family: var(--fresh-agent-mono-font-family);
+}
+
+.fresh-agent-style-mono :where(
+  .fresh-agent-approval-button,
+  .fresh-agent-question-option,
+  .fresh-agent-question-submit,
+  .fresh-agent-error-action,
+  .fresh-agent-session-ended-action,
+  .fresh-agent-composer-action
+) {
+  background: transparent;
+  border: 1px solid var(--fresh-agent-border);
+  border-radius: var(--fresh-agent-radius-tight);
+  color: var(--fresh-agent-muted-text);
+  font-family: var(--fresh-agent-meta-font-family);
+  font-size: 0.65rem;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.fresh-agent-style-mono :where(
+  .fresh-agent-approval-button,
+  .fresh-agent-question-option,
+  .fresh-agent-question-submit,
+  .fresh-agent-error-action,
+  .fresh-agent-session-ended-action,
+  .fresh-agent-composer-action
+):hover:not(:disabled) {
+  background: var(--fresh-agent-accent-soft);
+  color: var(--fresh-agent-text);
+  border-color: var(--fresh-agent-accent);
+}
+
+.fresh-agent-style-mono .fresh-agent-approval-button-primary {
+  background: var(--fresh-agent-accent);
+  border-color: var(--fresh-agent-accent);
+  color: var(--fresh-agent-surface);
+  text-shadow: none;
+}
+
+.fresh-agent-style-mono .fresh-agent-approval-button-deny:hover:not(:disabled) {
+  background: var(--fresh-agent-danger-soft);
+  color: var(--fresh-agent-danger);
+  border-color: var(--fresh-agent-danger);
+}
+
+.fresh-agent-style-mono .fresh-agent-question-heading svg {
+  color: var(--fresh-agent-accent);
+}
+
+.fresh-agent-style-mono .fresh-agent-question-option {
+  background: var(--fresh-agent-surface);
+  min-width: 7.4rem;
+}
+
+.fresh-agent-style-mono .fresh-agent-question-option span:first-child {
+  color: var(--fresh-agent-text);
+  font-family: var(--fresh-agent-copy-font-family);
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+
+.fresh-agent-style-mono .fresh-agent-question-option span:last-child {
+  color: var(--fresh-agent-soft-text);
+  font-family: var(--fresh-agent-copy-font-family);
+  font-size: 0.58rem;
+  line-height: 1.35;
+}
+
+.fresh-agent-style-mono .fresh-agent-question-input,
+.fresh-agent-style-mono .fresh-agent-composer-filter-input {
+  background: var(--fresh-agent-surface);
+  border: 1px solid var(--fresh-agent-border);
+  border-radius: var(--fresh-agent-radius-tight);
+  color: var(--fresh-agent-text);
+  caret-color: var(--fresh-agent-accent);
+}
+
+.fresh-agent-style-mono .fresh-agent-activity-strip {
+  margin: 0.4rem 0 0.55rem;
+}
+
+.fresh-agent-style-mono .fresh-agent-activity-summary,
+.fresh-agent-style-mono .fresh-agent-thinking-row,
+.fresh-agent-style-mono .fresh-agent-thinking-details,
+.fresh-agent-style-mono .fresh-agent-tool-block,
+.fresh-agent-style-mono .fresh-agent-tool-result,
+.fresh-agent-style-mono .fresh-agent-file-diff {
+  border-left-color: var(--fresh-agent-border);
+}
+
+.fresh-agent-style-mono .fresh-agent-activity-summary {
+  color: var(--fresh-agent-soft-text);
+  padding: 0.1rem 0 0.1rem 0.7rem;
+}
+
+.fresh-agent-style-mono .fresh-agent-activity-summary [role="status"] {
+  color: var(--fresh-agent-soft-text);
+  font-family: var(--fresh-agent-meta-font-family);
+  font-size: 0.6rem;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.fresh-agent-style-mono .fresh-agent-activity-summary [data-slot="name"] {
+  background: transparent;
+  color: var(--fresh-agent-accent);
+  padding: 0;
+}
+
+.fresh-agent-style-mono .fresh-agent-tool-block {
+  color: var(--fresh-agent-soft-text);
+  font-size: 0.58rem;
+  margin: 0.35rem 0 0.45rem;
+}
+
+.fresh-agent-style-mono :where(.fresh-agent-tool-trigger, .fresh-agent-thinking-trigger, .fresh-agent-file-diff-trigger) {
+  border-radius: var(--fresh-agent-radius-tight);
+  color: var(--fresh-agent-soft-text);
+  padding-bottom: 0.15rem;
+  padding-top: 0.15rem;
+}
+
+.fresh-agent-style-mono :where(.fresh-agent-tool-trigger, .fresh-agent-thinking-trigger, .fresh-agent-file-diff-trigger):hover {
+  background: var(--fresh-agent-accent-soft);
+  color: var(--fresh-agent-text);
+}
+
+.fresh-agent-style-mono .fresh-agent-tool-name,
+.fresh-agent-style-mono .fresh-agent-file-diff-label {
+  color: var(--fresh-agent-text);
+  font-family: var(--fresh-agent-meta-font-family);
+}
+
+.fresh-agent-style-mono .fresh-agent-tool-preview,
+.fresh-agent-style-mono .fresh-agent-tool-result-summary,
+.fresh-agent-style-mono .fresh-agent-file-diff-status {
+  color: var(--fresh-agent-soft-text);
+  font-family: var(--fresh-agent-meta-font-family);
+}
+
+.fresh-agent-style-mono .fresh-agent-tool-status svg[aria-label="complete"] {
+  color: var(--fresh-agent-success);
+}
+
+.fresh-agent-style-mono .fresh-agent-tool-pre {
+  color: var(--fresh-agent-muted-text);
+  font-family: var(--fresh-agent-mono-font-family);
+  line-height: 1.55;
+}
+
+.fresh-agent-style-mono .fresh-agent-thinking-body {
+  background: var(--fresh-agent-panel-surface);
+  border: 1px solid var(--fresh-agent-border);
+  border-radius: var(--fresh-agent-radius);
+  color: var(--fresh-agent-muted-text);
+  font-family: var(--fresh-agent-copy-font-family);
+}
+
+.fresh-agent-style-mono .fresh-agent-diff-title {
+  margin-bottom: 0.55rem;
+}
+
+.fresh-agent-style-mono .fresh-agent-file-diff-body {
+  color: var(--fresh-agent-muted-text);
+  line-height: 1.65;
+}
+
+.fresh-agent-style-mono [data-diff] {
+  background: var(--fresh-agent-surface);
+}
+
+.fresh-agent-style-mono [data-diff] .bg-red-500\/10,
+.fresh-agent-style-mono .fresh-agent-file-diff-body .bg-destructive\/10 {
+  background: var(--fresh-agent-danger-soft);
+  color: var(--fresh-agent-danger);
+}
+
+.fresh-agent-style-mono [data-diff] .bg-green-500\/10,
+.fresh-agent-style-mono .fresh-agent-file-diff-body .bg-success\/10 {
+  background: var(--fresh-agent-success-soft);
+  color: var(--fresh-agent-success);
+}
+
+.fresh-agent-style-mono [data-diff] .text-muted-foreground,
+.fresh-agent-style-mono .fresh-agent-file-diff-body .text-muted-foreground {
+  color: var(--fresh-agent-soft-text);
+}
+
+.fresh-agent-style-mono .fresh-agent-sidebar {
+  background: var(--fresh-agent-panel-surface);
+  border-color: var(--fresh-agent-border);
+  color: var(--fresh-agent-muted-text);
+}
+
+.fresh-agent-style-mono .fresh-agent-sidebar-section {
+  background: transparent;
+  border: 1px solid var(--fresh-agent-border);
+  border-radius: var(--fresh-agent-radius);
+}
+
+.fresh-agent-style-mono .fresh-agent-sidebar-list {
+  color: var(--fresh-agent-text);
+  font-family: var(--fresh-agent-copy-font-family);
+  font-size: 0.72rem;
+  line-height: 1.45;
+}
+
+.fresh-agent-style-mono .fresh-agent-composer {
+  background: var(--fresh-agent-surface);
+  border-top: 1px solid var(--fresh-agent-border);
+  padding: 0.75rem 1rem max(env(safe-area-inset-bottom), 0.75rem);
+}
+
+.fresh-agent-style-mono .fresh-agent-composer-input {
+  background: var(--fresh-agent-panel-surface);
+  border: 1px solid var(--fresh-agent-border);
+  border-radius: var(--fresh-agent-radius);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fresh-agent-border) 45%, transparent);
+  color: var(--fresh-agent-text);
+  font-family: var(--fresh-agent-copy-font-family);
+  line-height: 1.5;
+  caret-color: var(--fresh-agent-accent);
+}
+
+.fresh-agent-style-mono .fresh-agent-composer-input::placeholder {
+  color: var(--fresh-agent-soft-text);
+  opacity: 0.7;
+}
+
+.fresh-agent-style-mono .fresh-agent-composer-action {
+  background: var(--fresh-agent-panel-surface);
+}
+
+.fresh-agent-style-mono .fresh-agent-composer-action[type="submit"] {
+  background: var(--fresh-agent-accent);
+  border-color: var(--fresh-agent-accent);
+  color: var(--fresh-agent-surface);
+  text-shadow: none;
+}
+
+.fresh-agent-style-mono .fresh-agent-composer-action[type="submit"]:hover:not(:disabled) {
+  background: var(--fresh-agent-accent);
+  border-color: var(--fresh-agent-accent);
+  color: var(--fresh-agent-surface);
+}
+
+.fresh-agent-style-mono .fresh-agent-composer-menu,
+.fresh-agent-style-mono .fresh-agent-queued-message,
+.fresh-agent-style-mono .fresh-agent-attachment {
+  background: var(--fresh-agent-panel-surface);
+  border: 1px solid var(--fresh-agent-border);
+  border-radius: var(--fresh-agent-radius);
+  color: var(--fresh-agent-muted-text);
+}
+
+.fresh-agent-style-mono .fresh-agent-composer-menu-item {
+  color: var(--fresh-agent-muted-text);
+  font-family: var(--fresh-agent-meta-font-family);
+}
+
+.fresh-agent-style-mono .fresh-agent-composer-menu-item:hover,
+.fresh-agent-style-mono .fresh-agent-composer-menu-item.bg-accent {
+  background: var(--fresh-agent-accent-soft);
+  color: var(--fresh-agent-text);
+}
+
+.fresh-agent-style-mono .fresh-agent-composer-menu-help {
+  border-color: var(--fresh-agent-border);
+  color: var(--fresh-agent-soft-text);
+}
+
+.fresh-agent-style-mono .fresh-agent-scroll-bottom {
+  background: var(--fresh-agent-panel-surface);
+  border: 1px solid var(--fresh-agent-border);
+  border-radius: var(--fresh-agent-radius);
+  bottom: 0.8rem;
+  box-shadow: none;
+  color: var(--fresh-agent-muted-text);
+  font-family: var(--fresh-agent-meta-font-family);
+  left: auto;
+  right: 1rem;
+  transform: none;
+}
+
+.fresh-agent-style-mono .fresh-agent-thinking-bar > div {
   background: var(--fresh-agent-subtle-surface);
 }
 

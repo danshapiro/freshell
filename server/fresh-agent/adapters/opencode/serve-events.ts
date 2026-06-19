@@ -45,32 +45,47 @@ export function parseServeEvent(event: unknown): ParsedServeEvent | null {
 
 export type SdkProviderEvent =
   | { type: 'sdk.session.snapshot'; sessionId: string; status: 'running' | 'idle' }
+  | { type: 'sdk.session.changed'; sessionId: string; reason: 'opencode-message' | 'opencode-status' }
   | { type: 'sdk.error'; sessionId: string; message: string }
 
+function opencodeStatusToSnapshotStatus(statusType: string | undefined): 'running' | 'idle' | undefined {
+  switch (statusType) {
+    case 'busy':
+    case 'retry':
+      return 'running'
+    case 'idle':
+      return 'idle'
+    default:
+      return undefined
+  }
+}
+
+function isOpencodeTranscriptEvent(kind: string): boolean {
+  return kind.startsWith('message.')
+}
+
 /** Map a parsed serve event to the `sdk.*` provider event the existing client
- * slice already understands. We deliberately collapse fine-grained part events
- * into a `running` snapshot: the client re-polls the HTTP transcript on every
- * `freshAgent.event`, so this yields live (per-assistant-message) updates with
- * zero client change. `subscribedId` is the id the listener subscribed with
- * (placeholder before materialization, durable `ses_` after). */
+ * slice already understands. Transcript events are invalidations, not lifecycle
+ * state: OpenCode can emit trailing message metadata after a turn is already
+ * idle, and mapping those updates to `running` leaves freshopencode bouncing. */
 export function serveEventToSdk(parsed: ParsedServeEvent, subscribedId: string): SdkProviderEvent | null {
   const props = parsed.properties
   switch (parsed.kind) {
     case 'session.idle':
       return { type: 'sdk.session.snapshot', sessionId: subscribedId, status: 'idle' }
     case 'session.status': {
-      const statusType = stringProperty(props.status, 'type')
-      return { type: 'sdk.session.snapshot', sessionId: subscribedId, status: statusType === 'idle' ? 'idle' : 'running' }
+      const status = opencodeStatusToSnapshotStatus(stringProperty(props.status, 'type'))
+      if (status) return { type: 'sdk.session.snapshot', sessionId: subscribedId, status }
+      return { type: 'sdk.session.changed', sessionId: subscribedId, reason: 'opencode-status' }
     }
-    case 'message.part.delta':
-    case 'message.part.updated':
-    case 'message.updated':
-      return { type: 'sdk.session.snapshot', sessionId: subscribedId, status: 'running' }
     case 'session.error': {
       const message = stringProperty(props.error, 'message') ?? 'OpenCode session error'
       return { type: 'sdk.error', sessionId: subscribedId, message }
     }
     default:
+      if (isOpencodeTranscriptEvent(parsed.kind)) {
+        return { type: 'sdk.session.changed', sessionId: subscribedId, reason: 'opencode-message' }
+      }
       return null
   }
 }

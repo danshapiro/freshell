@@ -119,6 +119,7 @@ function simulateTouch(
     changedTouches: [touch as any],
   })
   target.dispatchEvent(touchEvent)
+  return touchEvent
 }
 
 describe('ContextMenuProvider long-press', () => {
@@ -155,6 +156,36 @@ describe('ContextMenuProvider long-press', () => {
 
     act(() => {
       vi.advanceTimersByTime(500)
+    })
+
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+  })
+
+  it('keeps the menu open when the long-press release lands on a menu item', () => {
+    renderWithProvider(
+      <div data-context={ContextIds.Tab} data-tab-id="tab-1">
+        Tab One
+      </div>
+    )
+
+    const target = screen.getByText('Tab One')
+    elementFromPointMock.mockReturnValue(target)
+
+    act(() => {
+      simulateTouch('touchstart', target, 100, 100)
+    })
+
+    act(() => {
+      vi.advanceTimersByTime(500)
+    })
+
+    const firstItem = screen.getAllByRole('menuitem')[0]
+
+    act(() => {
+      const release = simulateTouch('touchend', firstItem, 100, 100)
+      if (!release.defaultPrevented) {
+        firstItem.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+      }
     })
 
     expect(screen.getByRole('menu')).toBeInTheDocument()

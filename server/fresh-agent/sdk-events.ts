@@ -12,6 +12,11 @@ export type FreshAgentProviderEvent =
     streamingActive?: boolean
     streamingText?: string
   }
+  | {
+    type: 'freshAgent.session.changed'
+    sessionId: string
+    reason?: string
+  }
   | { type: 'freshAgent.session.init'; sessionId: string; cliSessionId?: string; model?: string; cwd?: string; tools?: Array<{ name: string }> }
   | { type: 'freshAgent.session.metadata'; sessionId: string; cliSessionId?: string; model?: string; cwd?: string; tools?: Array<{ name: string }> }
   | { type: 'freshAgent.assistant'; sessionId: string; content: ContentBlock[]; model?: string; usage?: Usage }
@@ -35,6 +40,8 @@ export function normalizeFreshAgentProviderEvent(event: unknown): unknown {
   switch (typed.type) {
     case 'sdk.session.snapshot':
       return { ...providerEvent, type: 'freshAgent.session.snapshot' } as FreshAgentProviderEvent
+    case 'sdk.session.changed':
+      return { ...providerEvent, type: 'freshAgent.session.changed' } as FreshAgentProviderEvent
     case 'sdk.session.init':
       return { ...providerEvent, type: 'freshAgent.session.init' } as FreshAgentProviderEvent
     case 'sdk.session.metadata':
