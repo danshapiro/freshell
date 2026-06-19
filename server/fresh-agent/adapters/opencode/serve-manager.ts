@@ -12,6 +12,7 @@ type OpencodeServeLogger = Pick<pino.Logger, 'warn' | 'error'>
 const OWNERSHIP_ENV = 'FRESHELL_OPENCODE_SIDECAR_ID'
 const DEFAULT_IDLE_POLL_MS = 500
 const REQUIRED_IDLE_STATUS_POLLS = 2
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 
 export type OpencodeServeManagerOptions = {
   command?: string
@@ -24,6 +25,7 @@ export type OpencodeServeManagerOptions = {
   env?: NodeJS.ProcessEnv
   idleShutdownMs?: number
   idlePollMs?: number
+  requestTimeoutMs?: number
 }
 
 export type OpencodeServeMessage = { info: Record<string, any>; parts: Array<Record<string, any>> }
@@ -75,6 +77,13 @@ type ServeRoute = {
 
 const DEFAULT_CWD_KEY = '<inherit-process-cwd>'
 
+class OpencodeServeRequestTimeoutError extends Error {
+  constructor(method: string, requestPath: string, timeoutMs: number) {
+    super(`opencode serve ${method} ${requestPath} timed out after ${timeoutMs}ms`)
+    this.name = 'OpencodeServeRequestTimeoutError'
+  }
+}
+
 export class OpencodeServeManager {
   private readonly command: string
   private readonly spawnFn: typeof spawn
@@ -85,6 +94,7 @@ export class OpencodeServeManager {
   private readonly env: NodeJS.ProcessEnv
   private readonly idleShutdownMs: number
   private readonly idlePollMs: number
+  private readonly requestTimeoutMs: number
   private readonly log: OpencodeServeLogger = logger.child({ component: 'opencode-serve-manager' })
   /** sessionId → emitter of ParsedServeEvent (and a synthetic 'idle' event). */
   private readonly sessionEmitters = new Map<string, EventEmitter>()
@@ -105,6 +115,7 @@ export class OpencodeServeManager {
     this.env = options.env ?? process.env
     this.idleShutdownMs = options.idleShutdownMs ?? 15 * 60_000
     this.idlePollMs = options.idlePollMs ?? DEFAULT_IDLE_POLL_MS
+    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
   }
 
   private routeFromCwd(cwd?: string): { cwdKey: string; cwd?: string } {
@@ -162,6 +173,55 @@ export class OpencodeServeManager {
       void killOwnedProcesses(running.child, running.ownershipId, this.log)
     }, this.idleShutdownMs)
     running.idleTimer.unref?.()
+  }
+
+  private discardRunning(route: { cwdKey: string; cwd?: string }, reason: string): void {
+    const running = this.runningByCwd.get(route.cwdKey)
+    if (!running) return
+    this.runningByCwd.delete(route.cwdKey)
+    this.startPromiseByCwd.delete(route.cwdKey)
+    this.startAbortByCwd.delete(route.cwdKey)
+    this.forgetSessionsForCwd(route.cwdKey)
+    this.clearIdleTimer(running)
+    try { running.stopEventStream() } catch { /* ignore */ }
+    this.log.warn({ reason, cwd: route.cwd }, 'discarding opencode serve sidecar')
+    void killOwnedProcesses(running.child, running.ownershipId, this.log)
+  }
+
+  private async fetchWithRequestTimeout(
+    url: string,
+    requestPath: string,
+    init: RequestInit | undefined,
+  ): Promise<Response> {
+    if (this.requestTimeoutMs <= 0) {
+      return await this.fetchFn(url, init)
+    }
+    const controller = new AbortController()
+    let timedOut = false
+    const upstreamSignal = init?.signal
+    const abortFromUpstream = () => controller.abort()
+    if (upstreamSignal?.aborted) {
+      controller.abort()
+    } else {
+      upstreamSignal?.addEventListener('abort', abortFromUpstream, { once: true })
+    }
+    const timeout = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, this.requestTimeoutMs)
+    timeout.unref?.()
+
+    try {
+      return await this.fetchFn(url, { ...init, signal: controller.signal })
+    } catch (error) {
+      if (timedOut) {
+        throw new OpencodeServeRequestTimeoutError(init?.method ?? 'GET', requestPath, this.requestTimeoutMs)
+      }
+      throw error
+    } finally {
+      clearTimeout(timeout)
+      upstreamSignal?.removeEventListener('abort', abortFromUpstream)
+    }
   }
 
   private async withRunning<T>(
@@ -322,16 +382,23 @@ export class OpencodeServeManager {
     const resolved = route.sessionId
       ? this.routeForSession(route.sessionId, route)
       : this.routeFromCwd(route.cwd)
-    return this.withRunning(resolved, async (base) => {
-      const res = await this.fetchFn(`${base}${requestPath}`, init)
-      if (!res.ok && res.status !== 204) {
-        if (res.status === 404 && init?.notFoundValue !== undefined) return init.notFoundValue
-        const text = await res.text().catch(() => '')
-        throw new Error(`opencode serve ${init?.method ?? 'GET'} ${requestPath} → ${res.status} ${text}`)
+    try {
+      return await this.withRunning(resolved, async (base) => {
+        const res = await this.fetchWithRequestTimeout(`${base}${requestPath}`, requestPath, init)
+        if (!res.ok && res.status !== 204) {
+          if (res.status === 404 && init?.notFoundValue !== undefined) return init.notFoundValue
+          const text = await res.text().catch(() => '')
+          throw new Error(`opencode serve ${init?.method ?? 'GET'} ${requestPath} → ${res.status} ${text}`)
+        }
+        if (res.status === 204) return undefined as T
+        return (await res.json()) as T
+      })
+    } catch (error) {
+      if (error instanceof OpencodeServeRequestTimeoutError) {
+        this.discardRunning(resolved, 'request_timeout')
       }
-      if (res.status === 204) return undefined as T
-      return (await res.json()) as T
-    })
+      throw error
+    }
   }
 
   private async getSessionStatusMap(route: ServeRoute = {}, init?: RequestInit): Promise<OpencodeStatusMap> {

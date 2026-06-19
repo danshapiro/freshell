@@ -4,6 +4,16 @@ import { createOpencodeFreshAgentAdapter } from '../../../../server/fresh-agent/
 
 type FakeManager = ReturnType<typeof makeFakeManager>
 
+function createDeferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
 function makeFakeManager() {
   const sessionEmitters = new Map<string, EventEmitter>()
   const emitterFor = (id: string) => {
@@ -88,6 +98,48 @@ describe('OpenCode serve adapter: create + send', () => {
     manager._emit('ses_real_1', { kind: 'session.idle', sessionId: 'ses_real_1', raw: { type: 'session.idle', properties: { sessionID: 'ses_real_1' } } })
     expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-3', status: 'running' })
     expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-3', status: 'idle' })
+  })
+
+  it('emits running before first-send session materialization resolves', async () => {
+    const manager = makeFakeManager()
+    const createSession = createDeferred<{ id: string; directory?: string; title?: string }>()
+    manager.createSession.mockReturnValueOnce(createSession.promise)
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'slow-create', sessionType: 'freshopencode', provider: 'opencode' })
+
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-slow-create', (e) => events.push(e))
+    const send = adapter.send?.('freshopencode-slow-create', { text: 'go' })
+
+    await Promise.resolve()
+    expect(events).toContainEqual({
+      type: 'sdk.session.snapshot',
+      sessionId: 'freshopencode-slow-create',
+      status: 'running',
+    })
+    expect(manager.promptAsync).not.toHaveBeenCalled()
+
+    createSession.resolve({ id: 'ses_real_1', title: 'T' })
+    await expect(send).resolves.toEqual({
+      sessionId: 'ses_real_1',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' },
+    })
+  })
+
+  it('returns to idle when first-send session materialization fails', async () => {
+    const manager = makeFakeManager()
+    manager.createSession.mockRejectedValueOnce(new Error('session create timed out'))
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'create-fails', sessionType: 'freshopencode', provider: 'opencode' })
+
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-create-fails', (e) => events.push(e))
+
+    await expect(adapter.send?.('freshopencode-create-fails', { text: 'go' })).rejects.toThrow('session create timed out')
+    expect(events).toEqual(expect.arrayContaining([
+      { type: 'sdk.session.snapshot', sessionId: 'freshopencode-create-fails', status: 'running' },
+      { type: 'sdk.session.snapshot', sessionId: 'freshopencode-create-fails', status: 'idle' },
+    ]))
   })
 
   it('passes the effective cwd to createSession on first materialization', async () => {

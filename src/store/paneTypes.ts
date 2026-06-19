@@ -123,6 +123,26 @@ export type FreshAgentCreateError = {
   retryable?: boolean
 }
 
+export type FreshAgentPendingLocalEcho = {
+  requestId: string
+  text: string
+  submittedTurnId?: string
+}
+
+export function normalizeFreshAgentPendingLocalEcho(value: unknown): FreshAgentPendingLocalEcho | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  if (typeof record.requestId !== 'string' || record.requestId.length === 0) return undefined
+  if (typeof record.text !== 'string' || record.text.length === 0) return undefined
+  return {
+    requestId: record.requestId,
+    text: record.text,
+    ...(typeof record.submittedTurnId === 'string' && record.submittedTurnId.length > 0
+      ? { submittedTurnId: record.submittedTurnId }
+      : {}),
+  }
+}
+
 export type FreshAgentPaneContent = {
   kind: 'fresh-agent'
   sessionType: FreshAgentSessionType
@@ -150,6 +170,8 @@ export type FreshAgentPaneContent = {
   showThinking?: boolean
   showTools?: boolean
   showTimecodes?: boolean
+  /** Persisted optimistic user turn that has not yet appeared in a durable provider snapshot. */
+  pendingLocalEcho?: FreshAgentPendingLocalEcho
 }
 
 /**

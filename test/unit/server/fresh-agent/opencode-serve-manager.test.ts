@@ -260,6 +260,25 @@ describe('OpencodeServeManager HTTP client', () => {
     await expect(manager.getMessage('ses_x', 'broken')).rejects.toThrow(/opencode serve GET .*\/message\/broken → 500/)
   })
 
+  it('aborts and fails hung JSON requests instead of waiting forever', async () => {
+    let sessionSignal: AbortSignal | undefined
+    const fetchFn = vi.fn(async (url: string, init: any) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url.endsWith('/session') && init?.method === 'POST') {
+        sessionSignal = init.signal
+        return await new Promise((_, reject) => {
+          init.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+        })
+      }
+      return jsonResponse({})
+    })
+    const { manager, child } = makeManager({ fetchFn: fetchFn as any, requestTimeoutMs: 5 })
+
+    await expect(manager.createSession()).rejects.toThrow('opencode serve POST /session timed out after 5ms')
+    expect(sessionSignal?.aborted).toBe(true)
+    expect(child.kill).toHaveBeenCalled()
+  })
+
   it('posts summarize requests to a cwd sidecar learned from getSession', async () => {
     const calls: Array<{ url: string; init: any }> = []
     const childDefault = fakeChild()

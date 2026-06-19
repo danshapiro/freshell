@@ -177,7 +177,7 @@ test.describe('Freshopencode first-send reload regression', () => {
 
       const duringSend = await getFreshOpencodePaneState(page)
       expect(duringSend.sessionId).toMatch(/^freshopencode-/)
-      expect(duringSend.status).not.toBe('running')
+      expect(duringSend.status).toBe('running')
       expect(duringSend.sessionRef?.sessionId).toMatch(/^freshopencode-/)
 
       await page.reload()
