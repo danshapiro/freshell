@@ -1,3 +1,4 @@
+import fs from 'node:fs/promises'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import express from 'express'
 import request from 'supertest'
@@ -10,7 +11,12 @@ import { LayoutStore } from '../../../server/agent-api/layout-store.js'
 import { FreshAgentRuntimeManager } from '../../../server/fresh-agent/runtime-manager.js'
 import { createFreshAgentProviderRegistry } from '../../../server/fresh-agent/provider-registry.js'
 import { createOpencodeFreshAgentAdapter } from '../../../server/fresh-agent/adapters/opencode/adapter.js'
-import { resolveProviderBinary } from '../../../test/helpers/coding-cli/real-session-contract-harness.js'
+import {
+  ProbeWorkspace,
+  resolveProviderBinary,
+  seedOpencodeHomes,
+  waitForOpencodeDbSession,
+} from '../../../test/helpers/coding-cli/real-session-contract-harness.js'
 
 const opencode = await resolveProviderBinary('opencode')
 const KIMI = 'umans-ai-coding-plan/umans-kimi-k2.7'
@@ -33,6 +39,31 @@ describeReal(
           }
         } finally {
           await manager.shutdown()
+        }
+      }, 60_000)
+
+      it('creates first-run sessions in the requested cwd, not the Freshell process cwd', async () => {
+        const workspace = await ProbeWorkspace.create('freshell-opencode-real-cwd-')
+        const requestedCwd = workspace.inTemp('requested-project')
+        const homes = await seedOpencodeHomes(workspace)
+        const manager = new OpencodeServeManager({
+          env: {
+            ...process.env,
+            XDG_DATA_HOME: homes.dataHome,
+            XDG_CONFIG_HOME: homes.configHome,
+          },
+        })
+        try {
+          await fs.mkdir(requestedCwd, { recursive: true })
+          const session = await manager.createSession({ directory: requestedCwd })
+          expect(session.id).toMatch(/^ses_/)
+          expect(session.directory).toBe(requestedCwd)
+
+          const row = await waitForOpencodeDbSession(homes.dbPath, session.id)
+          expect(row.directory).toBe(requestedCwd)
+        } finally {
+          await manager.shutdown()
+          await workspace.cleanup()
         }
       }, 60_000)
     })
