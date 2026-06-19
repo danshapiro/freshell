@@ -6,7 +6,7 @@ export function getFreshAgentDisplayTurnKey(turn: Pick<FreshAgentTurn, 'turnId' 
 
 export function freshAgentTurnText(turn: Pick<FreshAgentTurn, 'summary' | 'items'>): string {
   const textItems = turn.items
-    .filter((item): item is { kind: 'text'; text: string } => item.kind === 'text')
+    .filter((item): item is Extract<FreshAgentTurn['items'][number], { kind: 'text' }> => item.kind === 'text')
     .map((item) => item.text)
   const text = textItems.join(' ')
   return textItems.length > 0 ? text : turn.summary
