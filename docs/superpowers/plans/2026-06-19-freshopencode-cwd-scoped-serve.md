@@ -18,6 +18,27 @@
 - Keep behavior changes on this dedicated worktree branch and commit focused, atomic changes.
 - Prefer integration/end-to-end tests that prove the user-visible contract.
 
+## Load-Bearing Validation Amendments
+
+These amendments supersede any conflicting task text below:
+
+- OpenCode 1.17.8 uses persisted `session.directory` as the execution/tool cwd for existing session-scoped operations. Fixing session creation directory is the critical user-visible fix.
+- Existing session-scoped operations can be sent through any healthy serve process because OpenCode loads the session row and routes by stored `directory`; cwd routing is still useful when Freshell already knows cwd, but restored no-cwd paths must remain valid through the default route.
+- Freshopencode cannot assume every restored/attached durable session has pane cwd available. When cwd is missing, do not fail the operation; use the default serve route for existing session endpoints, and remember cwd if a later `getSession` or `fork` response exposes a `directory`.
+- OpenCode 1.17.8 does not expose a JSON `/session/:id/compact` endpoint. Freshell compaction must call the current `/session/:id/summarize` route.
+- A sidecar per cwd must not live forever by default. Add a configurable idle shutdown timer for non-default cwd-scoped sidecars and cancel/reschedule it around operations.
+- Project-local OpenCode config is intentionally selected by the user's cwd. Preserve inherited global credentials/config environment, but expect provider/model/project config to vary by selected cwd.
+
+Implementation updates required by this amendment:
+
+- In `OpencodeServeManager`, add an optional constructor setting such as `idleShutdownMs` and default it to a nonzero idle timeout for cwd-scoped sidecars. Tests may set it to `0` or a small value.
+- Do not route an existing session with unknown cwd to a guessed project cwd. Use the default serve route and let OpenCode's session middleware route by stored `directory`.
+- When `getSession()` or `fork()` returns a `directory`, call `rememberSessionCwd()` for that session id.
+- Change `compact()` to POST `/session/:id/summarize`.
+- Add manager tests for `/summarize`, no-cwd restored-session routing through the default serve, returned-directory remembering, and idle sidecar shutdown.
+- Add adapter tests for both known-cwd restored sends and no-cwd restored sends. The no-cwd case should call manager methods without a third `{ cwd }` argument.
+- In the real-provider regression, prefer the existing isolated real-session harness helpers so `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, and DB path are temp-scoped and the suite remains single-threaded.
+
 ---
 
 ## File Structure
