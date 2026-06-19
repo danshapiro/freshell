@@ -143,9 +143,11 @@ export function createFreshAgentRouter(deps: {
     const query = z.object({
       priority: ReadModelPrioritySchema.optional(),
       revision: z.coerce.number().int().nonnegative().optional(),
+      cwd: z.string().trim().min(1).optional(),
     }).safeParse({
       priority: typeof req.query.priority === 'string' ? req.query.priority : undefined,
       revision: typeof req.query.revision === 'string' ? req.query.revision : undefined,
+      cwd: typeof req.query.cwd === 'string' ? req.query.cwd : undefined,
     })
 
     if (!params.success || !query.success) {
@@ -165,6 +167,7 @@ export function createFreshAgentRouter(deps: {
           provider: params.data.provider,
           threadId: params.data.threadId,
           revision: query.data.revision,
+          cwd: query.data.cwd,
         }),
       })
       setResponsePerfContext(res, {
@@ -184,6 +187,7 @@ export function createFreshAgentRouter(deps: {
       cursor: typeof req.query.cursor === 'string' ? req.query.cursor : undefined,
       priority: typeof req.query.priority === 'string' ? req.query.priority : undefined,
       revision: typeof req.query.revision === 'string' ? req.query.revision : undefined,
+      cwd: typeof req.query.cwd === 'string' ? req.query.cwd : undefined,
       limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined,
       includeBodies: typeof req.query.includeBodies === 'string' ? req.query.includeBodies : undefined,
     })
@@ -207,6 +211,7 @@ export function createFreshAgentRouter(deps: {
           cursor: query.data.cursor,
           priority: query.data.priority,
           revision: query.data.revision,
+          cwd: query.data.cwd,
           limit: query.data.limit,
           includeBodies: query.data.includeBodies,
         }),
@@ -226,6 +231,7 @@ export function createFreshAgentRouter(deps: {
     const params = TurnParamsSchema.safeParse(req.params)
     const query = FreshAgentThreadTurnBodyQuerySchema.safeParse({
       revision: typeof req.query.revision === 'string' ? req.query.revision : undefined,
+      cwd: typeof req.query.cwd === 'string' ? req.query.cwd : undefined,
     })
     if (!params.success || !query.success) {
       return res.status(400).json({
@@ -240,6 +246,7 @@ export function createFreshAgentRouter(deps: {
         provider: params.data.provider,
         threadId: params.data.threadId,
         turnId: params.data.turnId,
+        cwd: query.data.cwd,
         revision: query.data.revision,
       })
       if (!turn) {

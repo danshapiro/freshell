@@ -239,6 +239,7 @@ export class FreshAgentRuntimeManager {
     sessionType: FreshAgentSessionType
     provider: FreshAgentRuntimeProvider
     threadId: string
+    cwd?: string
     revision?: number
   }) {
     const registration = this.requireRegistration(input.sessionType, input.provider)
@@ -249,6 +250,7 @@ export class FreshAgentRuntimeManager {
       sessionType: input.sessionType,
       provider: input.provider,
       threadId: input.threadId,
+      cwd: input.cwd,
     }, input.revision)
     const parsed = FreshAgentSnapshotSchema.safeParse(snapshot)
     if (!parsed.success) {
@@ -261,6 +263,7 @@ export class FreshAgentRuntimeManager {
     sessionType: FreshAgentSessionType
     provider: FreshAgentRuntimeProvider
     threadId: string
+    cwd?: string
     cursor?: string
     priority?: string
     revision: number
@@ -272,7 +275,7 @@ export class FreshAgentRuntimeManager {
       throw new FreshAgentRuntimeUnavailableError(`No fresh-agent turn-page adapter registered for ${input.sessionType}`)
     }
     const page = await registration.adapter.getTurnPage(
-      { sessionType: input.sessionType, provider: input.provider, threadId: input.threadId },
+      { sessionType: input.sessionType, provider: input.provider, threadId: input.threadId, cwd: input.cwd },
       input,
     )
     const parsed = FreshAgentTurnPageSchema.safeParse(page)
@@ -287,6 +290,7 @@ export class FreshAgentRuntimeManager {
     provider: FreshAgentRuntimeProvider
     threadId: string
     turnId: string
+    cwd?: string
     revision: number
   }) {
     const registration = this.requireRegistration(input.sessionType, input.provider)
@@ -298,6 +302,7 @@ export class FreshAgentRuntimeManager {
         sessionType: input.sessionType,
         provider: input.provider,
         threadId: input.threadId,
+        cwd: input.cwd,
         turnId: input.turnId,
       },
       input.revision,

@@ -257,6 +257,41 @@ describe('Codex fresh-agent adapter', () => {
     expect(runtime.shutdown).toHaveBeenCalledTimes(1)
   })
 
+  it('lazily resumes a Codex runtime in the saved cwd before reading a persisted thread after server reload', async () => {
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn().mockResolvedValue({
+        threadId: 'thread-existing-cwd',
+        wsUrl: 'ws://127.0.0.1:43123',
+      }),
+      readThread: vi.fn().mockResolvedValue({
+        thread: makeCodexThread('thread-existing-cwd'),
+      }),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+      shutdown: vi.fn().mockResolvedValue(undefined),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtimeFactory: vi.fn(() => runtime) as any })
+
+    await expect(adapter.getSnapshot?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-existing-cwd',
+      cwd: '/repo/persisted-worktree',
+    } as any, 7)).resolves.toMatchObject({
+      provider: 'codex',
+      threadId: 'thread-existing-cwd',
+    })
+
+    expect(runtime.resumeThread).toHaveBeenCalledWith({
+      threadId: 'thread-existing-cwd',
+      cwd: '/repo/persisted-worktree',
+    })
+
+    await adapter.shutdown?.()
+    expect(runtime.shutdown).toHaveBeenCalledTimes(1)
+  })
+
   it('dedupes concurrent lazy runtime resumes for the same persisted thread', async () => {
     let resolveResume: ((value: { threadId: string; wsUrl: string }) => void) | undefined
     const resumePromise = new Promise<{ threadId: string; wsUrl: string }>((resolve) => {

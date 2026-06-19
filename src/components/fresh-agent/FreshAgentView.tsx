@@ -675,6 +675,7 @@ export function FreshAgentView({
         sessionType: current.sessionType,
         provider: current.provider,
         resumeSessionId: current.resumeSessionId,
+        cwd: current.initialCwd,
       })
       setSnapshotRefreshNonce((value) => value + 1)
     } else if (!hidden && (current.status === 'creating' || current.status === 'starting')) {
@@ -787,8 +788,9 @@ export function FreshAgentView({
       sessionType: paneContent.sessionType,
       provider: paneContent.provider,
       resumeSessionId: paneContent.resumeSessionId,
+      cwd: paneContent.initialCwd,
     })
-  }, [hidden, paneContent.provider, paneContent.resumeSessionId, paneContent.sessionId, paneContent.sessionType])
+  }, [hidden, paneContent.initialCwd, paneContent.provider, paneContent.resumeSessionId, paneContent.sessionId, paneContent.sessionType])
 
   useEffect(() => {
     if (typeof ws.onMessage !== 'function') return
@@ -918,7 +920,11 @@ export function FreshAgentView({
       || paneContentRef.current.sessionType !== requestSessionType
       || snapshotThreadIdRef.current !== sessionId
     )
-    void getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, { signal: controller.signal })
+    const requestCwd = paneContentRef.current.initialCwd
+    void getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, {
+      signal: controller.signal,
+      ...(requestCwd ? { cwd: requestCwd } : {}),
+    })
       .then((next) => {
         if (isStaleSnapshotRequest()) return
         const snapshotIdentity = currentAutoTitleIdentityRef.current

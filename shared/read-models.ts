@@ -78,6 +78,7 @@ export const FreshAgentThreadTurnsQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
   priority: ReadModelPrioritySchema.optional(),
   revision: z.coerce.number().int().nonnegative(),
+  cwd: z.string().trim().min(1).optional(),
   limit: z.number().int().positive().max(MAX_FRESH_AGENT_THREAD_TURNS).optional(),
   includeBodies: z.union([
     z.boolean(),
@@ -87,6 +88,7 @@ export const FreshAgentThreadTurnsQuerySchema = z.object({
 
 export const FreshAgentThreadTurnBodyQuerySchema = z.object({
   revision: z.coerce.number().int().nonnegative(),
+  cwd: z.string().trim().min(1).optional(),
 })
 
 export const RestoreStaleRevisionResponseSchema = z.object({

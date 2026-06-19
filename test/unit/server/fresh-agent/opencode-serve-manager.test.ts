@@ -58,6 +58,83 @@ describe('OpencodeServeManager lifecycle', () => {
     expect(fetchFn).toHaveBeenCalledWith('http://127.0.0.1:47999/global/health', expect.anything())
   })
 
+  it('starts the serve process in the requested session directory before creating the first session', async () => {
+    const calls: Array<{ url: string; init: any }> = []
+    const fetchFn = vi.fn(async (url: string, init: any) => {
+      calls.push({ url, init })
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true, version: '1.17.8' })
+      if (url.endsWith('/session') && init?.method === 'POST') {
+        return jsonResponse({ id: 'ses_project_x', directory: '/project-x', title: 'Project X' })
+      }
+      return jsonResponse({})
+    })
+    const { manager, spawnFn } = makeManager({ fetchFn: fetchFn as any })
+
+    const session = await manager.createSession({ directory: '/project-x' })
+
+    expect(session).toMatchObject({ id: 'ses_project_x', directory: '/project-x' })
+    expect(spawnFn).toHaveBeenCalledWith(
+      'opencode',
+      ['serve', '--hostname', '127.0.0.1', '--port', '47999'],
+      expect.objectContaining({
+        cwd: '/project-x',
+        env: expect.objectContaining({ FRESHELL_OPENCODE_SIDECAR_ID: expect.any(String) }),
+      }),
+    )
+    expect(calls.find((call) => call.url.endsWith('/session'))).toMatchObject({
+      url: 'http://127.0.0.1:47999/session',
+      init: expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ directory: '/project-x' }),
+      }),
+    })
+  })
+
+  it('uses separate serve processes for sessions created in different directories', async () => {
+    const childA = fakeChild()
+    const childB = fakeChild()
+    const spawnFn = vi.fn()
+      .mockReturnValueOnce(childA)
+      .mockReturnValueOnce(childB)
+    const fetchFn = vi.fn(async (url: string, init: any) => {
+      if (url === 'http://127.0.0.1:47999/global/health') return jsonResponse({ healthy: true })
+      if (url === 'http://127.0.0.1:48000/global/health') return jsonResponse({ healthy: true })
+      if (url === 'http://127.0.0.1:47999/session' && init?.method === 'POST') {
+        return jsonResponse({ id: 'ses_a', directory: '/project-a' })
+      }
+      if (url === 'http://127.0.0.1:48000/session' && init?.method === 'POST') {
+        return jsonResponse({ id: 'ses_b', directory: '/project-b' })
+      }
+      return jsonResponse({})
+    })
+    const manager = new OpencodeServeManager({
+      spawnFn: spawnFn as any,
+      fetchFn: fetchFn as any,
+      allocatePort: vi.fn()
+        .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 47999 })
+        .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 48000 }),
+      connectEventStream: () => () => {},
+      healthTimeoutMs: 1000,
+    })
+
+    await expect(manager.createSession({ directory: '/project-a' })).resolves.toMatchObject({ id: 'ses_a' })
+    await expect(manager.createSession({ directory: '/project-b' })).resolves.toMatchObject({ id: 'ses_b' })
+
+    expect(spawnFn).toHaveBeenCalledTimes(2)
+    expect(spawnFn).toHaveBeenNthCalledWith(
+      1,
+      'opencode',
+      ['serve', '--hostname', '127.0.0.1', '--port', '47999'],
+      expect.objectContaining({ cwd: '/project-a' }),
+    )
+    expect(spawnFn).toHaveBeenNthCalledWith(
+      2,
+      'opencode',
+      ['serve', '--hostname', '127.0.0.1', '--port', '48000'],
+      expect.objectContaining({ cwd: '/project-b' }),
+    )
+  })
+
   it('shuts down by killing the spawned process and refuses further use until restarted', async () => {
     const { manager, child } = makeManager()
     await manager.ensureStarted()
@@ -99,8 +176,8 @@ describe('OpencodeServeManager lifecycle', () => {
     await expect(started).rejects.toThrow(/opencode serve startup was aborted|opencode serve did not become healthy/)
     await shutdown
     expect(child.kill).toHaveBeenCalled()
-    expect((manager as any).running).toBeUndefined()
-    expect((manager as any).startPromise).toBeUndefined()
+    expect((manager as any).runningByCwd.size).toBe(0)
+    expect((manager as any).startPromiseByCwd.size).toBe(0)
   })
 })
 
@@ -181,6 +258,214 @@ describe('OpencodeServeManager HTTP client', () => {
     })
     const { manager } = makeManager({ fetchFn: fetchFn as any })
     await expect(manager.getMessage('ses_x', 'broken')).rejects.toThrow(/opencode serve GET .*\/message\/broken → 500/)
+  })
+
+  it('posts summarize requests to a cwd sidecar learned from getSession', async () => {
+    const calls: Array<{ url: string; init: any }> = []
+    const childDefault = fakeChild()
+    const childProject = fakeChild()
+    const spawnFn = vi.fn()
+      .mockReturnValueOnce(childDefault)
+      .mockReturnValueOnce(childProject)
+    const fetchFn = vi.fn(async (url: string, init: any) => {
+      calls.push({ url, init })
+      if (url === 'http://127.0.0.1:47999/global/health') return jsonResponse({ healthy: true })
+      if (url === 'http://127.0.0.1:47999/session/ses_known' && init?.method === 'GET') {
+        return jsonResponse({ id: 'ses_known', directory: '/project-a', title: 'Known' })
+      }
+      if (url === 'http://127.0.0.1:47999/session/ses_known/compact' && init?.method === 'POST') {
+        return jsonResponse({}, { status: 204 })
+      }
+      if (url === 'http://127.0.0.1:48000/global/health') return jsonResponse({ healthy: true })
+      if (url === 'http://127.0.0.1:48000/session/ses_known/summarize' && init?.method === 'POST') {
+        return jsonResponse({}, { status: 204 })
+      }
+      return jsonResponse({}, { status: 404 })
+    })
+    const manager = new OpencodeServeManager({
+      spawnFn: spawnFn as any,
+      fetchFn: fetchFn as any,
+      allocatePort: vi.fn()
+        .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 47999 })
+        .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 48000 }),
+      connectEventStream: () => () => {},
+      healthTimeoutMs: 1000,
+    })
+
+    await expect(manager.getSession('ses_known')).resolves.toMatchObject({ id: 'ses_known', directory: '/project-a' })
+    await manager.compact('ses_known', { instructions: 'keep it short' })
+
+    expect(spawnFn).toHaveBeenCalledTimes(2)
+    expect(spawnFn.mock.calls[0]?.[2]).not.toHaveProperty('cwd')
+    expect(spawnFn).toHaveBeenNthCalledWith(
+      2,
+      'opencode',
+      ['serve', '--hostname', '127.0.0.1', '--port', '48000'],
+      expect.objectContaining({ cwd: '/project-a' }),
+    )
+    expect(calls.find((call) => call.url.endsWith('/summarize'))).toMatchObject({
+      url: 'http://127.0.0.1:48000/session/ses_known/summarize',
+      init: expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ instructions: 'keep it short' }),
+      }),
+    })
+    expect(calls.some((call) => call.url.endsWith('/compact'))).toBe(false)
+  })
+
+  it('remembers the forked child directory for later requests instead of keeping the parent route', async () => {
+    const calls: Array<{ url: string; init: any }> = []
+    const childDefault = fakeChild()
+    const childParent = fakeChild()
+    const childFork = fakeChild()
+    const spawnFn = vi.fn()
+      .mockReturnValueOnce(childDefault)
+      .mockReturnValueOnce(childParent)
+      .mockReturnValueOnce(childFork)
+    const fetchFn = vi.fn(async (url: string, init: any) => {
+      calls.push({ url, init })
+      if (url === 'http://127.0.0.1:47999/global/health') return jsonResponse({ healthy: true })
+      if (url === 'http://127.0.0.1:47999/session/ses_parent' && init?.method === 'GET') {
+        return jsonResponse({ id: 'ses_parent', directory: '/parent' })
+      }
+      if (url === 'http://127.0.0.1:47999/session/ses_parent/fork' && init?.method === 'POST') {
+        return jsonResponse({ id: 'ses_child', directory: '/child' })
+      }
+      if (url === 'http://127.0.0.1:47999/session/ses_child/compact' && init?.method === 'POST') {
+        return jsonResponse({}, { status: 204 })
+      }
+      if (url === 'http://127.0.0.1:48000/global/health') return jsonResponse({ healthy: true })
+      if (url === 'http://127.0.0.1:48000/session/ses_parent/fork' && init?.method === 'POST') {
+        return jsonResponse({ id: 'ses_child', directory: '/child' })
+      }
+      if (url === 'http://127.0.0.1:48001/global/health') return jsonResponse({ healthy: true })
+      if (url === 'http://127.0.0.1:48001/session/ses_child/summarize' && init?.method === 'POST') {
+        return jsonResponse({}, { status: 204 })
+      }
+      return jsonResponse({}, { status: 404 })
+    })
+    const manager = new OpencodeServeManager({
+      spawnFn: spawnFn as any,
+      fetchFn: fetchFn as any,
+      allocatePort: vi.fn()
+        .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 47999 })
+        .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 48000 })
+        .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 48001 }),
+      connectEventStream: () => () => {},
+      healthTimeoutMs: 1000,
+    })
+
+    await expect(manager.getSession('ses_parent')).resolves.toMatchObject({ id: 'ses_parent', directory: '/parent' })
+    await expect(manager.fork('ses_parent')).resolves.toMatchObject({ id: 'ses_child', directory: '/child' })
+    await manager.compact('ses_child', { instructions: 'child summary' })
+
+    expect(spawnFn).toHaveBeenCalledTimes(3)
+    expect(spawnFn).toHaveBeenNthCalledWith(
+      2,
+      'opencode',
+      ['serve', '--hostname', '127.0.0.1', '--port', '48000'],
+      expect.objectContaining({ cwd: '/parent' }),
+    )
+    expect(spawnFn).toHaveBeenNthCalledWith(
+      3,
+      'opencode',
+      ['serve', '--hostname', '127.0.0.1', '--port', '48001'],
+      expect.objectContaining({ cwd: '/child' }),
+    )
+    expect(calls.find((call) => call.url.endsWith('/session/ses_child/summarize'))).toMatchObject({
+      url: 'http://127.0.0.1:48001/session/ses_child/summarize',
+      init: expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ instructions: 'child summary' }),
+      }),
+    })
+  })
+
+  it('falls back to the fork route cwd when the fork response omits directory', async () => {
+    const calls: Array<{ url: string; init: any }> = []
+    const childParent = fakeChild()
+    const spawnFn = vi.fn().mockReturnValueOnce(childParent)
+    const fetchFn = vi.fn(async (url: string, init: any) => {
+      calls.push({ url, init })
+      if (url === 'http://127.0.0.1:47999/global/health') return jsonResponse({ healthy: true })
+      if (url === 'http://127.0.0.1:47999/session/ses_parent/fork' && init?.method === 'POST') {
+        return jsonResponse({ id: 'ses_child' })
+      }
+      if (url === 'http://127.0.0.1:47999/session/ses_child/summarize' && init?.method === 'POST') {
+        return jsonResponse({}, { status: 204 })
+      }
+      if (url.includes('/session/ses_child/summarize')) {
+        throw new Error(`child summarize should stay on parent cwd route, got ${url}`)
+      }
+      return jsonResponse({}, { status: 404 })
+    })
+    const manager = new OpencodeServeManager({
+      spawnFn: spawnFn as any,
+      fetchFn: fetchFn as any,
+      allocatePort: vi.fn()
+        .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 47999 }),
+      connectEventStream: () => () => {},
+      healthTimeoutMs: 1000,
+    })
+
+    await expect(manager.fork('ses_parent', { cwd: '/parent' })).resolves.toMatchObject({ id: 'ses_child' })
+    await manager.compact('ses_child', { instructions: 'child summary' })
+
+    expect(spawnFn).toHaveBeenCalledTimes(1)
+    expect(spawnFn).toHaveBeenCalledWith(
+      'opencode',
+      ['serve', '--hostname', '127.0.0.1', '--port', '47999'],
+      expect.objectContaining({ cwd: '/parent' }),
+    )
+    expect(calls.find((call) => call.url.endsWith('/session/ses_child/summarize'))).toMatchObject({
+      url: 'http://127.0.0.1:47999/session/ses_child/summarize',
+      init: expect.objectContaining({ method: 'POST' }),
+    })
+  })
+
+  it('uses the default serve route for unknown existing sessions even after cwd sidecars exist', async () => {
+    const childProject = fakeChild()
+    const childDefault = fakeChild()
+    const spawnFn = vi.fn()
+      .mockReturnValueOnce(childProject)
+      .mockReturnValueOnce(childDefault)
+    const fetchFn = vi.fn(async (url: string, init: any) => {
+      if (url === 'http://127.0.0.1:48000/global/health') return jsonResponse({ healthy: true })
+      if (url === 'http://127.0.0.1:48000/session' && init?.method === 'POST') {
+        return jsonResponse({ id: 'ses_project', directory: '/project-a' })
+      }
+      if (url === 'http://127.0.0.1:48000/session/ses_unknown' && init?.method === 'GET') {
+        throw new Error('unknown session lookup must not hit cwd sidecar')
+      }
+      if (url === 'http://127.0.0.1:47999/global/health') return jsonResponse({ healthy: true })
+      if (url === 'http://127.0.0.1:47999/session/ses_unknown' && init?.method === 'GET') {
+        return jsonResponse({ id: 'ses_unknown', title: 'Unknown' })
+      }
+      return jsonResponse({}, { status: 404 })
+    })
+    const manager = new OpencodeServeManager({
+      spawnFn: spawnFn as any,
+      fetchFn: fetchFn as any,
+      allocatePort: vi.fn()
+        .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 48000 })
+        .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 47999 }),
+      connectEventStream: () => () => {},
+      healthTimeoutMs: 1000,
+    })
+
+    await expect(manager.createSession({ directory: '/project-a' })).resolves.toMatchObject({ id: 'ses_project' })
+    await expect(manager.getSession('ses_unknown')).resolves.toMatchObject({ id: 'ses_unknown' })
+
+    expect(spawnFn).toHaveBeenCalledTimes(2)
+    expect(spawnFn).toHaveBeenNthCalledWith(
+      1,
+      'opencode',
+      ['serve', '--hostname', '127.0.0.1', '--port', '48000'],
+      expect.objectContaining({ cwd: '/project-a' }),
+    )
+    expect(spawnFn.mock.calls[1]?.[2]).not.toHaveProperty('cwd')
+    expect(fetchFn).not.toHaveBeenCalledWith('http://127.0.0.1:48000/session/ses_unknown', expect.anything())
+    expect(fetchFn).toHaveBeenCalledWith('http://127.0.0.1:47999/session/ses_unknown', expect.anything())
   })
 })
 
@@ -290,7 +575,142 @@ describe('OpencodeServeManager fan-out', () => {
     expect(stopStream).toHaveBeenCalled()
     expect(child.kill).toHaveBeenCalled()
     expect((manager as any).sessionEmitters.size).toBe(0)
-    expect((manager as any).running).toBeUndefined()
+    expect((manager as any).runningByCwd.size).toBe(0)
+  })
+
+  it('default sidecar close clears unmapped emitters but preserves mapped cwd sessions', async () => {
+    const childDefault = fakeChild()
+    const childProject = fakeChild()
+    const spawnFn = vi.fn()
+      .mockReturnValueOnce(childDefault)
+      .mockReturnValueOnce(childProject)
+    const fetchFn = vi.fn(async (url: string, init: any) => {
+      if (url === 'http://127.0.0.1:47999/global/health') return jsonResponse({ healthy: true })
+      if (url === 'http://127.0.0.1:47999/session/ses_project' && init?.method === 'GET') {
+        return jsonResponse({ id: 'ses_project', directory: '/project-a' })
+      }
+      if (url === 'http://127.0.0.1:47999/session/ses_project/compact' && init?.method === 'POST') {
+        return jsonResponse({}, { status: 204 })
+      }
+      if (url === 'http://127.0.0.1:48000/global/health') return jsonResponse({ healthy: true })
+      if (url === 'http://127.0.0.1:48000/session/ses_project/summarize' && init?.method === 'POST') {
+        return jsonResponse({}, { status: 204 })
+      }
+      return jsonResponse({}, { status: 404 })
+    })
+    const manager = new OpencodeServeManager({
+      spawnFn: spawnFn as any,
+      fetchFn: fetchFn as any,
+      allocatePort: vi.fn()
+        .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 47999 })
+        .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 48000 }),
+      connectEventStream: () => () => {},
+      healthTimeoutMs: 1000,
+    })
+
+    await manager.ensureStarted()
+    manager.subscribe('ses_default', () => {})
+    await manager.getSession('ses_project')
+    await manager.compact('ses_project')
+    manager.subscribe('ses_project', () => {})
+    expect(spawnFn).toHaveBeenCalledTimes(2)
+
+    childDefault.emit('close', 1)
+
+    expect((manager as any).sessionEmitters.has('ses_default')).toBe(false)
+    expect((manager as any).sessionEmitters.has('ses_project')).toBe(true)
+  })
+
+  it('non-default sidecar close removes its mapped emitter and preserves unrelated default emitters', async () => {
+    const childDefault = fakeChild()
+    const childProject = fakeChild()
+    const spawnFn = vi.fn()
+      .mockReturnValueOnce(childDefault)
+      .mockReturnValueOnce(childProject)
+    const fetchFn = vi.fn(async (url: string, init: any) => {
+      if (url === 'http://127.0.0.1:47999/global/health') return jsonResponse({ healthy: true })
+      if (url === 'http://127.0.0.1:47999/session/ses_project' && init?.method === 'GET') {
+        return jsonResponse({ id: 'ses_project', directory: '/project-a' })
+      }
+      if (url === 'http://127.0.0.1:47999/session/ses_project/compact' && init?.method === 'POST') {
+        return jsonResponse({}, { status: 204 })
+      }
+      if (url === 'http://127.0.0.1:48000/global/health') return jsonResponse({ healthy: true })
+      if (url === 'http://127.0.0.1:48000/session/ses_project/summarize' && init?.method === 'POST') {
+        return jsonResponse({}, { status: 204 })
+      }
+      return jsonResponse({}, { status: 404 })
+    })
+    const manager = new OpencodeServeManager({
+      spawnFn: spawnFn as any,
+      fetchFn: fetchFn as any,
+      allocatePort: vi.fn()
+        .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 47999 })
+        .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 48000 }),
+      connectEventStream: () => () => {},
+      healthTimeoutMs: 1000,
+    })
+
+    await manager.ensureStarted()
+    manager.subscribe('ses_default', () => {})
+    await manager.getSession('ses_project')
+    await manager.compact('ses_project')
+    manager.subscribe('ses_project', () => {})
+    expect(spawnFn).toHaveBeenCalledTimes(2)
+    expect((manager as any).sessionEmitters.has('ses_default')).toBe(true)
+    expect((manager as any).sessionEmitters.has('ses_project')).toBe(true)
+
+    childProject.emit('close', 1)
+
+    expect((manager as any).sessionEmitters.has('ses_project')).toBe(false)
+    expect((manager as any).sessionEmitters.has('ses_default')).toBe(true)
+  })
+
+  it('idles out cwd sidecars without stopping the default serve', async () => {
+    vi.useFakeTimers()
+    try {
+      const childDefault = fakeChild()
+      const childProject = fakeChild()
+      const spawnFn = vi.fn()
+        .mockReturnValueOnce(childDefault)
+        .mockReturnValueOnce(childProject)
+      const fetchFn = vi.fn(async (url: string, init: any) => {
+        if (url === 'http://127.0.0.1:47999/global/health') return jsonResponse({ healthy: true })
+        if (url === 'http://127.0.0.1:47999/session/ses_project' && init?.method === 'GET') {
+          return jsonResponse({ id: 'ses_project', directory: '/project-a' })
+        }
+        if (url === 'http://127.0.0.1:47999/session/ses_project/compact' && init?.method === 'POST') {
+          return jsonResponse({}, { status: 204 })
+        }
+        if (url === 'http://127.0.0.1:48000/global/health') return jsonResponse({ healthy: true })
+        if (url === 'http://127.0.0.1:48000/session/ses_project/summarize' && init?.method === 'POST') {
+          return jsonResponse({}, { status: 204 })
+        }
+        return jsonResponse({}, { status: 404 })
+      })
+      const manager = new OpencodeServeManager({
+        spawnFn: spawnFn as any,
+        fetchFn: fetchFn as any,
+        allocatePort: vi.fn()
+          .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 47999 })
+          .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 48000 }),
+        connectEventStream: () => () => {},
+        healthTimeoutMs: 1000,
+        idleShutdownMs: 50,
+      } as any)
+
+      await manager.ensureStarted()
+      await manager.getSession('ses_project')
+      await manager.compact('ses_project')
+      expect(spawnFn).toHaveBeenCalledTimes(2)
+
+      await vi.advanceTimersByTimeAsync(51)
+
+      expect(childProject.kill).toHaveBeenCalled()
+      expect(childDefault.kill).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('parses multi-line SSE data blocks by joining data: lines', async () => {

@@ -86,6 +86,57 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     return sessionId ? { sessionId, sessionRef: { provider: 'opencode', sessionId } } : undefined
   }
 
+  function cwdRoute(cwd?: string): { cwd: string } | undefined {
+    return typeof cwd === 'string' && cwd.trim().length > 0 ? { cwd } : undefined
+  }
+
+  async function promptAsyncForState(
+    state: OpencodeSessionState,
+    realId: string,
+    body: Parameters<OpencodeServeManager['promptAsync']>[1],
+  ): Promise<void> {
+    const route = cwdRoute(state.cwd)
+    if (route) {
+      await serveManager.promptAsync(realId, body, route)
+      return
+    }
+    await serveManager.promptAsync(realId, body)
+  }
+
+  async function abortForState(state: OpencodeSessionState): Promise<void> {
+    if (!state.realSessionId) return
+    const route = cwdRoute(state.cwd)
+    if (route) {
+      await serveManager.abort(state.realSessionId, route)
+      return
+    }
+    await serveManager.abort(state.realSessionId)
+  }
+
+  async function compactForState(state: OpencodeSessionState, input?: { instructions?: string }): Promise<void> {
+    if (!state.realSessionId) return
+    const route = cwdRoute(state.cwd)
+    if (route) {
+      await serveManager.compact(state.realSessionId, input, route)
+      return
+    }
+    if (input) {
+      await serveManager.compact(state.realSessionId, input)
+      return
+    }
+    await serveManager.compact(state.realSessionId)
+  }
+
+  async function forkForState(state: OpencodeSessionState): Promise<{ id: string; directory?: string }> {
+    if (!state.realSessionId) {
+      throw new FreshAgentLostSessionError(`OpenCode session ${state.placeholderId} has not materialized; cannot fork.`)
+    }
+    const route = cwdRoute(state.cwd)
+    return route
+      ? await serveManager.fork(state.realSessionId, route)
+      : await serveManager.fork(state.realSessionId)
+  }
+
   /** Bridge serve SSE events for this state's real session into the state's
    * own EventEmitter, mapped to sdk.* and stamped with the placeholder id the
    * client first subscribed with. */
@@ -126,7 +177,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     // later rejection cannot become an unhandled rejection.
     void idle.catch(() => {})
     try {
-      await serveManager.promptAsync(realId, {
+      await promptAsyncForState(state, realId, {
         parts: [{ type: 'text', text }],
         ...(splitOpencodeModel(modelStr) ? { model: splitOpencodeModel(modelStr)! } : {}),
         ...(effort ? { variant: effort } : {}),
@@ -144,13 +195,17 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     return sendResult(state.realSessionId)
   }
 
-  async function assembleExport(realSessionId: string, query: { limit?: number; before?: string }): Promise<{ exported: OpencodeExport; nextCursor: string | null; revision: number }> {
+  async function assembleExport(
+    realSessionId: string,
+    query: { limit?: number; before?: string },
+    route?: { cwd: string },
+  ): Promise<{ exported: OpencodeExport; nextCursor: string | null; revision: number }> {
     const [session, page] = await Promise.all([
-      serveManager.getSession(realSessionId).then(
+      (route ? serveManager.getSession(realSessionId, route) : serveManager.getSession(realSessionId)).then(
         (session) => session,
         () => ({} as Record<string, unknown>),
       ),
-      serveManager.listMessages(realSessionId, query),
+      route ? serveManager.listMessages(realSessionId, query, route) : serveManager.listMessages(realSessionId, query),
     ])
     const sessionTime = session && typeof session === 'object' ? session.time : undefined
     const sessionTimeUpdated = sessionTime && typeof sessionTime === 'object' && !Array.isArray(sessionTime)
@@ -217,14 +272,25 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
 
     async attach(locator) {
       const existing = sessions.get(locator.sessionId)
-      if (existing) { remember(existing); return { sessionId: locator.sessionId, sessionRef: { provider: 'opencode', sessionId: locator.sessionId } } }
+      if (existing) {
+        if (locator.cwd) {
+          existing.cwd = locator.cwd
+          if (existing.realSessionId) serveManager.rememberSessionCwd(existing.realSessionId, locator.cwd)
+        }
+        remember(existing)
+        return { sessionId: locator.sessionId, sessionRef: { provider: 'opencode', sessionId: locator.sessionId } }
+      }
       if (isPlaceholderOpencodeSessionId(locator.sessionId) || !isRealOpencodeSessionId(locator.sessionId)) {
         throw new FreshAgentLostSessionError(`OpenCode session ${locator.sessionId} is not a durable OpenCode session.`)
       }
       const state: OpencodeSessionState = {
-        placeholderId: locator.sessionId, realSessionId: locator.sessionId, status: 'idle',
+        placeholderId: locator.sessionId,
+        realSessionId: locator.sessionId,
+        cwd: locator.cwd,
+        status: 'idle',
         events: new EventEmitter(), sendQueue: Promise.resolve(),
       }
+      if (locator.cwd) serveManager.rememberSessionCwd(locator.sessionId, locator.cwd)
       remember(state)
       bindServeStream(state)
       return { sessionId: locator.sessionId, sessionRef: { provider: 'opencode', sessionId: locator.sessionId } }
@@ -249,7 +315,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
 
     async interrupt(sessionId) {
       const state = requireState(sessionId)
-      if (state.realSessionId) await serveManager.abort(state.realSessionId).catch((err) => log.warn({ err }, 'abort failed'))
+      await abortForState(state).catch((err) => log.warn({ err }, 'abort failed'))
       state.status = 'idle'
       state.events.emit('event', { type: 'sdk.session.snapshot', sessionId: state.placeholderId, status: 'idle' })
     },
@@ -260,8 +326,8 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       const instructions = input?.instructions
       const hasInstructions = instructions !== undefined
       const run = state.sendQueue.then(
-        () => (hasInstructions ? serveManager.compact(state.realSessionId!, { instructions }) : serveManager.compact(state.realSessionId!)),
-        () => (hasInstructions ? serveManager.compact(state.realSessionId!, { instructions }) : serveManager.compact(state.realSessionId!)),
+        () => compactForState(state, hasInstructions ? { instructions } : undefined),
+        () => compactForState(state, hasInstructions ? { instructions } : undefined),
       )
       state.sendQueue = run.catch(() => undefined)
       await run
@@ -269,12 +335,11 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
 
     async fork(sessionId) {
       const state = requireState(sessionId)
-      if (!state.realSessionId) throw new FreshAgentLostSessionError(`OpenCode session ${sessionId} has not materialized; cannot fork.`)
-      const child = await serveManager.fork(state.realSessionId)
+      const child = await forkForState(state)
       const childState: OpencodeSessionState = {
         placeholderId: child.id,
         realSessionId: child.id,
-        cwd: state.cwd,
+        cwd: child.directory ?? state.cwd,
         model: state.model,
         effort: state.effort,
         status: 'idle',
@@ -303,7 +368,10 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         })
       }
       const realId = durableId(thread.threadId)
-      const { exported, revision } = await assembleExport(realId, { limit: DEFAULT_SNAPSHOT_TURN_LIMIT })
+      const route = cwdRoute(liveState?.cwd ?? thread.cwd)
+      const { exported, revision } = route
+        ? await assembleExport(realId, { limit: DEFAULT_SNAPSHOT_TURN_LIMIT }, route)
+        : await assembleExport(realId, { limit: DEFAULT_SNAPSHOT_TURN_LIMIT })
       return normalizeOpencodeSnapshot({
         sessionType: 'freshopencode', threadId: thread.threadId,
         exported: { ...exported, info: { ...(exported.info ?? {}), time: { ...((exported.info?.time) ?? {}), updated: revision } } },
@@ -317,10 +385,14 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         return normalizeOpencodeTurnPage({ threadId: thread.threadId, exported: { messages: [] }, revision: Number(query.revision) || 0, nextCursor: null })
       }
       const realId = durableId(thread.threadId)
-      const { exported, nextCursor, revision } = await assembleExport(realId, {
+      const route = cwdRoute(liveState?.cwd ?? thread.cwd)
+      const pageQuery = {
         limit: typeof query.limit === 'number' ? query.limit : DEFAULT_SNAPSHOT_TURN_LIMIT,
         before: typeof query.cursor === 'string' ? query.cursor : undefined,
-      })
+      }
+      const { exported, nextCursor, revision } = route
+        ? await assembleExport(realId, pageQuery, route)
+        : await assembleExport(realId, pageQuery)
       return normalizeOpencodeTurnPage({ threadId: thread.threadId, exported, revision, nextCursor })
     },
 
@@ -328,7 +400,10 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       const liveState = sessions.get(thread.threadId)
       if (liveState && !liveState.realSessionId) return null
       const realId = durableId(thread.threadId)
-      const message = await serveManager.getMessage(realId, thread.turnId)
+      const route = cwdRoute(liveState?.cwd ?? thread.cwd)
+      const message = route
+        ? await serveManager.getMessage(realId, thread.turnId, route)
+        : await serveManager.getMessage(realId, thread.turnId)
       if (!message) return null
       return normalizeOpencodeTurnBody({ threadId: thread.threadId, exported: { messages: [{ info: message.info, parts: message.parts }] }, turnId: thread.turnId, revision })
     },

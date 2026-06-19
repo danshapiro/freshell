@@ -37,12 +37,14 @@ export type FreshAgentThreadLocator = {
   sessionType: FreshAgentSessionType
   provider: FreshAgentRuntimeProvider
   threadId: string
+  cwd?: string
 }
 
 export type FreshAgentSessionLocator = {
   sessionType: FreshAgentSessionType
   provider: FreshAgentRuntimeProvider
   sessionId: string
+  cwd?: string
 }
 
 export type FreshAgentInputImage =
