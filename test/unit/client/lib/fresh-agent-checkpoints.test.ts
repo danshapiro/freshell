@@ -94,6 +94,30 @@ describe('pickCheckpointForTurn', () => {
     expect(pickCheckpointForTurn(checkpoints, [older, newer], newer)?.id).toBe('sha-new')
   })
 
+  it('uses label ordinal matching when saved submitted display ids no longer resolve after restart', () => {
+    const older = userTurn('old-native', 'fix the bug', 'display-old-after-restart')
+    const newer = userTurn('new-native', 'fix the bug', 'display-new-after-restart')
+    const checkpoints: CheckpointEntry[] = [
+      {
+        id: 'sha-new',
+        ts: 200,
+        label: 'fix the bug',
+        turnId: 'submitted-new-before-restart',
+        requestId: 'send-new',
+      },
+      {
+        id: 'sha-old',
+        ts: 100,
+        label: 'fix the bug',
+        turnId: 'submitted-old-before-restart',
+        requestId: 'send-old',
+      },
+    ]
+
+    expect(pickCheckpointForTurn(checkpoints, [older, newer], older)?.id).toBe('sha-old')
+    expect(pickCheckpointForTurn(checkpoints, [older, newer], newer)?.id).toBe('sha-new')
+  })
+
   it('matches a user turn to its checkpoint by label', () => {
     const turns = [userTurn('t1', 'add a test'), assistantTurn('t2')]
     expect(pickCheckpointForTurn(CHECKPOINTS, turns, turns[0])?.id).toBe('sha-2')

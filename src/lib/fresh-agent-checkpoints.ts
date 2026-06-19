@@ -14,13 +14,38 @@ function turnLabel(turn: FreshAgentTurn): string {
   return checkpointLabelForText(freshAgentTurnText(turn) || '')
 }
 
+function turnRequestId(turn: FreshAgentTurn): string | null {
+  const requestId = (turn as FreshAgentTurn & { requestId?: unknown }).requestId
+  return typeof requestId === 'string' && requestId.length > 0 ? requestId : null
+}
+
 function hasDirectCheckpoint(checkpoints: readonly CheckpointEntry[], turn: FreshAgentTurn): boolean {
   const turnId = getFreshAgentDisplayTurnKey(turn)
   if (checkpoints.some((entry) => entry.turnId === turnId)) return true
-  const requestId = (turn as FreshAgentTurn & { requestId?: unknown }).requestId
-  return typeof requestId === 'string'
-    && requestId.length > 0
-    && checkpoints.some((entry) => entry.requestId === requestId)
+  const requestId = turnRequestId(turn)
+  return requestId !== null && checkpoints.some((entry) => entry.requestId === requestId)
+}
+
+function currentUserTurnLinks(
+  turns: readonly FreshAgentTurn[],
+): { turnIds: Set<string>; requestIds: Set<string> } {
+  const turnIds = new Set<string>()
+  const requestIds = new Set<string>()
+  for (const turn of turns) {
+    if (turn.role !== 'user') continue
+    turnIds.add(getFreshAgentDisplayTurnKey(turn))
+    const requestId = turnRequestId(turn)
+    if (requestId) requestIds.add(requestId)
+  }
+  return { turnIds, requestIds }
+}
+
+function checkpointLinksCurrentTurn(
+  entry: CheckpointEntry,
+  links: { turnIds: ReadonlySet<string>; requestIds: ReadonlySet<string> },
+): boolean {
+  if (entry.turnId !== undefined && links.turnIds.has(entry.turnId)) return true
+  return entry.requestId !== undefined && links.requestIds.has(entry.requestId)
 }
 
 /**
@@ -39,8 +64,8 @@ export function pickCheckpointForTurn(
   const directTurnIdMatch = checkpoints.find((entry) => entry.turnId === targetTurnId)
   if (directTurnIdMatch) return directTurnIdMatch
 
-  const targetRequestId = (target as FreshAgentTurn & { requestId?: unknown }).requestId
-  if (typeof targetRequestId === 'string' && targetRequestId) {
+  const targetRequestId = turnRequestId(target)
+  if (targetRequestId) {
     const requestIdMatch = checkpoints.find((entry) => entry.requestId === targetRequestId)
     if (requestIdMatch) return requestIdMatch
   }
@@ -59,8 +84,9 @@ export function pickCheckpointForTurn(
   }
 
   // git log order is newest-first; we need oldest-first to index by ordinal.
+  const resolvedLinks = currentUserTurnLinks(turns)
   const matches = checkpoints
-    .filter((entry) => entry.label === label && entry.turnId === undefined)
+    .filter((entry) => entry.label === label && !checkpointLinksCurrentTurn(entry, resolvedLinks))
     .slice()
     .reverse()
   return matches[ordinal] ?? null
