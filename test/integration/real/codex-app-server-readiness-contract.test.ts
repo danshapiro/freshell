@@ -10,6 +10,7 @@ import WebSocket from 'ws'
 
 import { CodexAppServerClient, type CodexThreadLifecycleEvent } from '../../../server/coding-cli/codex-app-server/client.js'
 import { CodexAppServerRuntime } from '../../../server/coding-cli/codex-app-server/runtime.js'
+import { createCodexFreshAgentAdapter } from '../../../server/fresh-agent/adapters/codex/adapter.js'
 
 type JsonRpcNotification = {
   method: string
@@ -212,6 +213,42 @@ function isDurableReadinessEvidence(event: CodexThreadLifecycleEvent, threadId: 
 const codexProbe = await codexAvailability()
 const describeCodex = codexProbe.ready ? describe : describe.skip
 
+function readUserMessageTexts(item: Record<string, unknown>): string[] {
+  const contentTexts = Array.isArray(item.content)
+    ? item.content.flatMap((part) => {
+      if (!part || typeof part !== 'object' || Array.isArray(part)) return []
+      return typeof part.text === 'string' ? [part.text] : []
+    })
+    : []
+  if (contentTexts.length > 0) return contentTexts
+  if (typeof item.text === 'string') return [item.text]
+  if (typeof item.summary === 'string') return [item.summary]
+  return []
+}
+
+function rawTurnIncludesUserMessageText(rawTurn: Record<string, unknown>, needle: string): boolean {
+  const items = Array.isArray(rawTurn.items)
+    ? rawTurn.items.filter((item): item is Record<string, unknown> => !!item && typeof item === 'object' && !Array.isArray(item))
+    : []
+  return items.some((item) => item.type === 'userMessage' && readUserMessageTexts(item).some((text) => text.includes(needle)))
+}
+
+function findRawTurnByUserMessageText(rawTurns: unknown, needle: string): Record<string, unknown> | undefined {
+  const turns = Array.isArray(rawTurns)
+    ? rawTurns.filter((turn): turn is Record<string, unknown> => !!turn && typeof turn === 'object' && !Array.isArray(turn))
+    : []
+  return turns.find((turn) => rawTurnIncludesUserMessageText(turn, needle))
+}
+
+function displayTurnIncludesText(turn: { items?: Array<Record<string, unknown>> }, needle: string): boolean {
+  return (turn.items ?? []).some((item) => item.kind === 'text' && typeof item.text === 'string' && item.text.includes(needle))
+}
+
+function comparableDisplayTurn<T extends { ordinal?: number }>(turn: T): Omit<T, 'ordinal'> {
+  const { ordinal: _ordinal, ...rest } = turn
+  return rest
+}
+
 async function waitForSessionArtifact(codexHome: string, threadId: string, timeoutMs = 60_000): Promise<string> {
   const sessionsRoot = path.join(codexHome, 'sessions')
   const deadline = Date.now() + timeoutMs
@@ -229,6 +266,8 @@ async function waitForSessionArtifact(codexHome: string, threadId: string, timeo
 describeCodex(`real Codex app-server durable readiness contract${codexProbe.ready ? '' : ` (${codexProbe.reason})`}`, () => {
   it('emits current-generation lifecycle evidence when a durable thread is resumed', async () => {
     const { codexHome, root } = await seedIsolatedCodexHome()
+    const promptNonce = `freshell-readiness-contract-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const displayIdSecret = 'task-7-real-provider-contract-guard'
     const creationRuntime = new CodexAppServerRuntime({
       env: { CODEX_HOME: codexHome },
       startupAttemptLimit: 1,
@@ -237,6 +276,9 @@ describeCodex(`real Codex app-server durable readiness contract${codexProbe.read
     })
     let creationClient: JsonRpcClient | null = null
     let durableThreadId = ''
+    let providerUserTurnId = ''
+    let providerRevision = 0
+    let displayUserTurnIdBeforeResume = ''
 
     try {
       const ready = await creationRuntime.ensureReady()
@@ -253,7 +295,7 @@ describeCodex(`real Codex app-server durable readiness contract${codexProbe.read
       durableThreadId = parseThreadId(started)
       await creationClient.request('turn/start', {
         threadId: durableThreadId,
-        input: [{ type: 'text', text: 'Reply with exactly: freshell-readiness-contract' }],
+        input: [{ type: 'text', text: `Reply with exactly: ${promptNonce}` }],
       })
       await creationClient.waitForNotification(
         (notification) => notification.method === 'turn/completed'
@@ -268,6 +310,39 @@ describeCodex(`real Codex app-server durable readiness contract${codexProbe.read
         && notification.params?.threadId === durableThreadId,
       )
       await waitForSessionArtifact(codexHome, durableThreadId)
+
+      const creationClientApi = new CodexAppServerClient({ wsUrl: ready.wsUrl }, { requestTimeoutMs: 10_000 })
+      const creationAdapter = createCodexFreshAgentAdapter({
+        runtime: creationRuntime,
+        displayIdSecret,
+      })
+      try {
+        await creationClientApi.initialize()
+        const creationSnapshot = await creationClientApi.readThread({
+          threadId: durableThreadId,
+          includeTurns: true,
+        })
+        providerRevision = Number(creationSnapshot.thread.updatedAt ?? 0)
+        const providerUserTurn = findRawTurnByUserMessageText(creationSnapshot.thread.turns, promptNonce)
+        expect(providerUserTurn).toBeDefined()
+        expect(providerUserTurn && typeof providerUserTurn.id === 'string' ? providerUserTurn.id : '').not.toBe('')
+        providerUserTurnId = String(providerUserTurn?.id ?? '')
+
+        const creationPage = await creationAdapter.getTurnPage?.({
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          threadId: durableThreadId,
+        }, {
+          revision: providerRevision,
+          limit: 100,
+        })
+        const creationDisplayTurn = creationPage?.turns.find((turn) => turn.role === 'user' && displayTurnIncludesText(turn, promptNonce))
+        expect(creationDisplayTurn).toBeDefined()
+        displayUserTurnIdBeforeResume = creationDisplayTurn?.turnId ?? ''
+      } finally {
+        await creationClientApi.close().catch(() => undefined)
+        await creationAdapter.shutdown?.().catch(() => undefined)
+      }
     } finally {
       await creationClient?.close().catch(() => undefined)
       await creationRuntime.shutdown().catch(() => undefined)
@@ -280,6 +355,10 @@ describeCodex(`real Codex app-server durable readiness contract${codexProbe.read
       requestTimeoutMs: 60_000,
     })
     const clients: CodexAppServerClient[] = []
+    const adapter = createCodexFreshAgentAdapter({
+      runtime,
+      displayIdSecret,
+    })
 
     try {
       const ready = await runtime.ensureReady()
@@ -336,6 +415,40 @@ describeCodex(`real Codex app-server durable readiness contract${codexProbe.read
         id: olderTurnPage.turns[0]!.id,
         itemsView: 'full',
       })
+      const resumedSnapshot = await actor.readThread({
+        threadId: durableThreadId,
+        includeTurns: true,
+      })
+      const resumedRevision = Number(resumedSnapshot.thread.updatedAt ?? providerRevision)
+      const providerUserTurn = findRawTurnByUserMessageText(resumedSnapshot.thread.turns, promptNonce)
+      expect(providerUserTurn).toBeDefined()
+      expect(providerUserTurn).toMatchObject({
+        id: providerUserTurnId,
+      })
+      expect(providerUserTurn && rawTurnIncludesUserMessageText(providerUserTurn, promptNonce)).toBe(true)
+
+      const displayPage = await adapter.getTurnPage?.({
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        threadId: durableThreadId,
+      }, {
+        revision: resumedRevision,
+        limit: 100,
+      })
+      const displayUserTurn = displayPage?.turns.find((turn) => turn.role === 'user' && displayTurnIncludesText(turn, promptNonce))
+      expect(displayUserTurn).toBeDefined()
+      expect(displayUserTurn?.turnId).toBe(displayUserTurnIdBeforeResume)
+      expect(displayUserTurn?.turnId).toMatch(/^codex-display:/)
+      expect(displayUserTurn?.turnId).not.toContain(providerUserTurnId)
+
+      const displayBody = await adapter.getTurnBody?.({
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        threadId: durableThreadId,
+        turnId: displayUserTurn!.turnId,
+      }, resumedRevision)
+      expect(displayBody).toBeDefined()
+      expect(comparableDisplayTurn(displayBody!)).toEqual(comparableDisplayTurn(displayUserTurn!))
 
       const readiness = await waitForLifecycle(
         lifecycle,
@@ -352,6 +465,7 @@ describeCodex(`real Codex app-server durable readiness contract${codexProbe.read
       }
     } finally {
       await Promise.all(clients.map((client) => client.close().catch(() => undefined)))
+      await adapter.shutdown?.().catch(() => undefined)
       await runtime.shutdown().catch(() => undefined)
       await fsp.rm(root, { force: true, recursive: true }).catch(() => undefined)
     }
