@@ -43,6 +43,7 @@ Implementation updates required by this amendment:
 Task-level override checklist:
 
 - Task 2 must update `OpencodeServeManagerOptions`, `RunningServe`, `ensureStarted`, `start`, HTTP helpers, `shutdown`, and child-close cleanup for cwd-scoped sidecars. On child close, delete emitters for sessions mapped to that cwd; when the closing sidecar is the default route, also delete unmapped emitters, because no-cwd restored sessions use the default route.
+- Task 2 must add an optional `env?: NodeJS.ProcessEnv` manager option. Spawn env should be `{ ...(options.env ?? process.env), [FRESHELL_OPENCODE_SIDECAR_ID]: ownershipId }`, so real-provider tests can use isolated OpenCode homes without mutating global `process.env`.
 - Task 2 must clear successful `startPromiseByCwd` entries after a sidecar has moved into `runningByCwd`.
 - Task 2 must add tests proving:
   - `createSession({ directory })` spawns `opencode serve` with that `cwd`.
@@ -203,6 +204,8 @@ git commit -m "test: pin freshopencode serve cwd contract"
 - Produces:
   - `ensureStarted(input?: { cwd?: string }): Promise<{ baseUrl: string }>`
   - `rememberSessionCwd(sessionId: string, cwd?: string): void`
+  - `OpencodeServeManagerOptions.env?: NodeJS.ProcessEnv`
+  - `OpencodeServeManagerOptions.idleShutdownMs?: number`
   - Existing public methods still work, with optional route argument where session ids need a restored cwd fallback.
 
 - [ ] **Step 1: Add cwd route types and maps**
@@ -223,6 +226,8 @@ type RunningServe = {
   stopEventStream: () => void
   cwdKey: string
   cwd?: string
+  idleTimer?: NodeJS.Timeout
+  activeRequests: number
 }
 
 type ServeRoute = {
@@ -248,6 +253,15 @@ with:
   private readonly startAbortByCwd = new Map<string, AbortController>()
   private readonly cwdByKey = new Map<string, string | undefined>()
   private readonly sessionCwdById = new Map<string, string>()
+  private readonly env: NodeJS.ProcessEnv
+  private readonly idleShutdownMs: number
+```
+
+Add these constructor fields:
+
+```ts
+    this.env = options.env ?? process.env
+    this.idleShutdownMs = options.idleShutdownMs ?? 15 * 60_000
 ```
 
 - [ ] **Step 2: Add cwd normalization and session routing helpers**
@@ -283,6 +297,49 @@ Add these private helpers inside `OpencodeServeManager`:
       this.sessionCwdById.delete(sessionId)
       this.sessionEmitters.delete(sessionId)
     }
+    if (cwdKey === DEFAULT_CWD_KEY) {
+      for (const sessionId of this.sessionEmitters.keys()) {
+        if (!this.sessionCwdById.has(sessionId)) this.sessionEmitters.delete(sessionId)
+      }
+    }
+  }
+
+  private clearIdleTimer(running: RunningServe): void {
+    if (!running.idleTimer) return
+    clearTimeout(running.idleTimer)
+    running.idleTimer = undefined
+  }
+
+  private scheduleIdleShutdown(running: RunningServe): void {
+    this.clearIdleTimer(running)
+    if (running.cwdKey === DEFAULT_CWD_KEY || this.idleShutdownMs <= 0 || running.activeRequests > 0) return
+    running.idleTimer = setTimeout(() => {
+      if (running.activeRequests > 0) return
+      if (this.runningByCwd.get(running.cwdKey) !== running) return
+      this.runningByCwd.delete(running.cwdKey)
+      this.startPromiseByCwd.delete(running.cwdKey)
+      this.forgetSessionsForCwd(running.cwdKey)
+      try { running.stopEventStream() } catch { /* ignore */ }
+      void killOwnedProcesses(running.child, running.ownershipId, this.log)
+    }, this.idleShutdownMs)
+    running.idleTimer.unref?.()
+  }
+
+  private async withRunning<T>(
+    route: { cwdKey: string; cwd?: string },
+    fn: (baseUrl: string) => Promise<T>,
+  ): Promise<T> {
+    const { baseUrl } = await this.ensureStarted({ cwd: route.cwd })
+    const running = this.runningByCwd.get(route.cwdKey)
+    if (!running) return fn(baseUrl)
+    this.clearIdleTimer(running)
+    running.activeRequests += 1
+    try {
+      return await fn(baseUrl)
+    } finally {
+      running.activeRequests -= 1
+      this.scheduleIdleShutdown(running)
+    }
   }
 ```
 
@@ -307,6 +364,7 @@ Replace `ensureStarted()` with:
       this.startPromiseByCwd.set(route.cwdKey, promise)
     }
     const next = await this.startPromiseByCwd.get(route.cwdKey)!
+    this.startPromiseByCwd.delete(route.cwdKey)
     return { baseUrl: next.baseUrl }
   }
 ```
@@ -328,7 +386,7 @@ Change the `start` signature and spawn options:
         ['serve', '--hostname', endpoint.hostname, '--port', String(endpoint.port)],
         {
           ...(route.cwd ? { cwd: route.cwd } : {}),
-          env: { ...process.env, [OWNERSHIP_ENV]: ownershipId },
+          env: { ...this.env, [OWNERSHIP_ENV]: ownershipId },
           stdio: ['ignore', 'pipe', 'pipe'],
         },
       ) as unknown as ChildProcessWithoutNullStreams
@@ -342,6 +400,7 @@ Change the `start` signature and spawn options:
           this.runningByCwd.delete(route.cwdKey)
           this.startPromiseByCwd.delete(route.cwdKey)
           this.startAbortByCwd.delete(route.cwdKey)
+          this.clearIdleTimer(running)
           try { running.stopEventStream() } catch { /* ignore */ }
           void killOwnedProcesses(running.child, running.ownershipId, this.log)
           this.forgetSessionsForCwd(route.cwdKey)
@@ -362,8 +421,9 @@ Change the `start` signature and spawn options:
           })
         : this.startDefaultEventStream(baseUrl)
 
-      const running: RunningServe = { baseUrl, ownershipId, child, stopEventStream, cwdKey: route.cwdKey, cwd: route.cwd }
+      const running: RunningServe = { baseUrl, ownershipId, child, stopEventStream, cwdKey: route.cwdKey, cwd: route.cwd, activeRequests: 0 }
       this.runningByCwd.set(route.cwdKey, running)
+      this.scheduleIdleShutdown(running)
       return running
     } catch (err) {
       if (child) this.stopChild(child)
@@ -393,15 +453,19 @@ Replace `requireBase` and `json` with:
     requestPath: string,
     init?: RequestInit & { notFoundValue?: T },
   ): Promise<T> {
-    const base = await this.requireBase(route)
-    const res = await this.fetchFn(`${base}${requestPath}`, init)
-    if (!res.ok && res.status !== 204) {
-      if (res.status === 404 && init?.notFoundValue !== undefined) return init.notFoundValue
-      const text = await res.text().catch(() => '')
-      throw new Error(`opencode serve ${init?.method ?? 'GET'} ${requestPath} → ${res.status} ${text}`)
-    }
-    if (res.status === 204) return undefined as T
-    return (await res.json()) as T
+    const resolved = route.sessionId
+      ? this.routeForSession(route.sessionId, route)
+      : this.routeFromCwd(route.cwd)
+    return this.withRunning(resolved, async (base) => {
+      const res = await this.fetchFn(`${base}${requestPath}`, init)
+      if (!res.ok && res.status !== 204) {
+        if (res.status === 404 && init?.notFoundValue !== undefined) return init.notFoundValue
+        const text = await res.text().catch(() => '')
+        throw new Error(`opencode serve ${init?.method ?? 'GET'} ${requestPath} → ${res.status} ${text}`)
+      }
+      if (res.status === 204) return undefined as T
+      return (await res.json()) as T
+    })
   }
 ```
 
@@ -427,7 +491,11 @@ Update each caller:
   }
 
   async getSession(id: string, route: ServeRoute = {}): Promise<Record<string, any>> {
-    return this.json({ ...route, sessionId: id }, `/session/${encodeURIComponent(id)}`, { method: 'GET' })
+    const session = await this.json<Record<string, any>>({ ...route, sessionId: id }, `/session/${encodeURIComponent(id)}`, { method: 'GET' })
+    if (typeof session?.directory === 'string' && session.directory.length > 0) {
+      this.rememberSessionCwd(id, session.directory)
+    }
+    return session
   }
 
   async promptAsync(
@@ -455,18 +523,17 @@ Update each caller:
   }
 
   async compact(id: string, body?: { instructions?: string }, route: ServeRoute = {}): Promise<void> {
-    await this.json({ ...route, sessionId: id }, `/session/${encodeURIComponent(id)}/compact`, {
+    await this.json({ ...route, sessionId: id }, `/session/${encodeURIComponent(id)}/summarize`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body ?? {}),
     })
   }
 
-  async fork(id: string, route: ServeRoute = {}): Promise<{ id: string }> {
-    const child = await this.json<{ id: string }>({ ...route, sessionId: id }, `/session/${encodeURIComponent(id)}/fork`, { method: 'POST' })
+  async fork(id: string, route: ServeRoute = {}): Promise<{ id: string; directory?: string }> {
+    const child = await this.json<{ id: string; directory?: string }>({ ...route, sessionId: id }, `/session/${encodeURIComponent(id)}/fork`, { method: 'POST' })
     if (typeof child.id === 'string') {
-      const parentRoute = this.routeForSession(id, route)
-      this.rememberSessionCwd(child.id, parentRoute.cwd)
+      this.rememberSessionCwd(child.id, child.directory)
     }
     return child
   }
@@ -476,20 +543,22 @@ Update `listMessages`:
 
 ```ts
   async listMessages(id: string, query: { limit?: number; before?: string }, route: ServeRoute = {}): Promise<OpencodeServeMessagePage> {
-    const base = await this.requireBase({ ...route, sessionId: id })
-    const params = new URLSearchParams()
-    if (typeof query.limit === 'number') params.set('limit', String(query.limit))
-    if (query.before) params.set('before', query.before)
-    const qs = params.toString()
-    const url = `${base}/session/${encodeURIComponent(id)}/message${qs ? `?${qs}` : ''}`
-    const res = await this.fetchFn(url, { method: 'GET' })
-    if (!res.ok) {
-      const text = await res.text().catch(() => '')
-      throw new Error(`opencode serve GET messages → ${res.status} ${text}`)
-    }
-    const messages = (await res.json()) as OpencodeServeMessage[]
-    const nextCursor = res.headers.get('x-next-cursor') || null
-    return { messages: Array.isArray(messages) ? messages : [], nextCursor }
+    const resolved = this.routeForSession(id, route)
+    return this.withRunning(resolved, async (base) => {
+      const params = new URLSearchParams()
+      if (typeof query.limit === 'number') params.set('limit', String(query.limit))
+      if (query.before) params.set('before', query.before)
+      const qs = params.toString()
+      const url = `${base}/session/${encodeURIComponent(id)}/message${qs ? `?${qs}` : ''}`
+      const res = await this.fetchFn(url, { method: 'GET' })
+      if (!res.ok) {
+        const text = await res.text().catch(() => '')
+        throw new Error(`opencode serve GET messages → ${res.status} ${text}`)
+      }
+      const messages = (await res.json()) as OpencodeServeMessage[]
+      const nextCursor = res.headers.get('x-next-cursor') || null
+      return { messages: Array.isArray(messages) ? messages : [], nextCursor }
+    })
   }
 ```
 
@@ -517,6 +586,7 @@ Replace `shutdown()` with:
     this.startPromiseByCwd.clear()
     this.startAbortByCwd.clear()
     await Promise.all(running.map(async (entry) => {
+      this.clearIdleTimer(entry)
       try { entry.stopEventStream() } catch { /* ignore */ }
       await killOwnedProcesses(entry.child, entry.ownershipId, this.log)
     }))
@@ -581,10 +651,15 @@ git commit -m "fix: scope opencode serve processes by cwd"
 In `test/unit/server/fresh-agent/opencode-serve-adapter.test.ts`, add `rememberSessionCwd` to `makeFakeManager()`:
 
 ```ts
+    createSession: vi.fn(async (input?: { directory?: string }) => ({
+      id: 'ses_real_1',
+      ...(input?.directory ? { directory: input.directory } : {}),
+      title: 'T',
+    })),
     rememberSessionCwd: vi.fn(),
 ```
 
-Then update `FakeManager` automatically through the existing `ReturnType`.
+Replace the old always-`/repo` fake `createSession` with the conditional version above, then update `FakeManager` automatically through the existing `ReturnType`.
 
 - [ ] **Step 2: Add failing test for attach cwd registration**
 
@@ -779,18 +854,28 @@ Update control methods:
 Update history calls:
 
 ```ts
-      const { exported, revision } = await assembleExport(realId, { limit: DEFAULT_SNAPSHOT_TURN_LIMIT }, { cwd: liveState?.cwd ?? thread.cwd })
+      const route = cwdRoute(liveState?.cwd ?? thread.cwd)
+      const { exported, revision } = route
+        ? await assembleExport(realId, { limit: DEFAULT_SNAPSHOT_TURN_LIMIT }, route)
+        : await assembleExport(realId, { limit: DEFAULT_SNAPSHOT_TURN_LIMIT })
 ```
 
 ```ts
-      const { exported, nextCursor, revision } = await assembleExport(realId, {
+      const route = cwdRoute(liveState?.cwd ?? thread.cwd)
+      const pageQuery = {
         limit: typeof query.limit === 'number' ? query.limit : DEFAULT_SNAPSHOT_TURN_LIMIT,
         before: typeof query.cursor === 'string' ? query.cursor : undefined,
-      }, { cwd: liveState?.cwd ?? thread.cwd })
+      }
+      const { exported, nextCursor, revision } = route
+        ? await assembleExport(realId, pageQuery, route)
+        : await assembleExport(realId, pageQuery)
 ```
 
 ```ts
-      const message = await serveManager.getMessage(realId, thread.turnId, { cwd: liveState?.cwd ?? thread.cwd })
+      const route = cwdRoute(liveState?.cwd ?? thread.cwd)
+      const message = route
+        ? await serveManager.getMessage(realId, thread.turnId, route)
+        : await serveManager.getMessage(realId, thread.turnId)
 ```
 
 - [ ] **Step 6: Update existing adapter expectations for cwd-aware calls**
@@ -833,32 +918,22 @@ git commit -m "fix: route freshopencode operations with pane cwd"
 - Consumes: real `opencode` binary if available.
 - Produces: a no-LLM regression proving OpenCode stores new session `directory` as the selected cwd even when Freshell process cwd is different.
 
-- [ ] **Step 1: Add imports for temporary directories and SQLite**
+- [ ] **Step 1: Add isolated OpenCode helper imports**
 
 At the top of `test/integration/server/opencode-serve-real-provider-smoke.test.ts`, add:
 
 ```ts
-import { DatabaseSync } from 'node:sqlite'
 import fs from 'node:fs/promises'
-import os from 'node:os'
-import path from 'node:path'
+import {
+  ProbeWorkspace,
+  seedOpencodeHomes,
+  waitForOpencodeDbSession,
+} from '../../../test/helpers/coding-cli/real-session-contract-harness.js'
 ```
 
-- [ ] **Step 2: Add helper to read OpenCode session directory**
+- [ ] **Step 2: Use the existing temp workspace and DB wait helpers**
 
-Add below the `describeReal` constant:
-
-```ts
-function readOpencodeSessionDirectory(dbPath: string, sessionId: string): string | undefined {
-  const db = new DatabaseSync(dbPath)
-  try {
-    const row = db.prepare('select directory from session where id = ? limit 1').get(sessionId) as { directory?: string } | null
-    return row?.directory
-  } finally {
-    db.close()
-  }
-}
-```
+Do not add a static top-level `node:sqlite` import. `waitForOpencodeDbSession()` already uses the repo's supported dynamic/read-only SQLite path and waits for the OpenCode DB row to exist.
 
 - [ ] **Step 3: Add no-LLM cwd regression test**
 
@@ -866,34 +941,27 @@ Add this test inside `describe('OpencodeServeManager lifecycle', ...)`:
 
 ```ts
       it('creates first-run sessions in the requested cwd, not the Freshell process cwd', async () => {
-        const root = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-opencode-real-cwd-'))
-        const requestedCwd = path.join(root, 'requested-project')
-        const dataHome = path.join(root, 'xdg-data')
-        const configHome = path.join(root, 'xdg-config')
-        await Promise.all([
-          fs.mkdir(requestedCwd, { recursive: true }),
-          fs.mkdir(dataHome, { recursive: true }),
-          fs.mkdir(configHome, { recursive: true }),
-        ])
-        const previousDataHome = process.env.XDG_DATA_HOME
-        const previousConfigHome = process.env.XDG_CONFIG_HOME
-        process.env.XDG_DATA_HOME = dataHome
-        process.env.XDG_CONFIG_HOME = configHome
-        const manager = new OpencodeServeManager()
+        const workspace = await ProbeWorkspace.create('freshell-opencode-real-cwd-')
+        const requestedCwd = workspace.inTemp('requested-project')
+        const homes = await seedOpencodeHomes(workspace)
+        const manager = new OpencodeServeManager({
+          env: {
+            ...process.env,
+            XDG_DATA_HOME: homes.dataHome,
+            XDG_CONFIG_HOME: homes.configHome,
+          },
+        })
         try {
+          await fs.mkdir(requestedCwd, { recursive: true })
           const session = await manager.createSession({ directory: requestedCwd })
           expect(session.id).toMatch(/^ses_/)
           expect(session.directory).toBe(requestedCwd)
 
-          const dbPath = path.join(dataHome, 'opencode', 'opencode.db')
-          expect(readOpencodeSessionDirectory(dbPath, session.id)).toBe(requestedCwd)
+          const row = await waitForOpencodeDbSession(homes.dbPath, session.id)
+          expect(row.directory).toBe(requestedCwd)
         } finally {
           await manager.shutdown()
-          if (previousDataHome === undefined) delete process.env.XDG_DATA_HOME
-          else process.env.XDG_DATA_HOME = previousDataHome
-          if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME
-          else process.env.XDG_CONFIG_HOME = previousConfigHome
-          await fs.rm(root, { recursive: true, force: true })
+          await workspace.cleanup()
         }
       }, 60_000)
 ```
