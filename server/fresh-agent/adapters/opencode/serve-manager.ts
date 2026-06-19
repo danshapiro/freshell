@@ -47,12 +47,7 @@ function isIdleStatusType(type: unknown): boolean {
   return type === 'idle'
 }
 
-function isOpencodeTranscriptEvent(kind: string): boolean {
-  return kind.startsWith('message.')
-}
-
-function eventShowsSessionActivity(event: ParsedServeEvent): boolean {
-  if (isOpencodeTranscriptEvent(event.kind)) return true
+function eventShowsRunningStatusActivity(event: ParsedServeEvent): boolean {
   if (event.kind !== 'session.status') return false
   const status = event.properties.status
   if (!status || typeof status !== 'object' || Array.isArray(status)) return false
@@ -472,6 +467,7 @@ export class OpencodeServeManager {
       let observedActivity = false
       let pollInFlight = false
       let idleStatusPolls = 0
+      let warnedStatusFallbackFailure = false
 
       const cleanup = () => {
         clearTimeout(timer)
@@ -512,7 +508,10 @@ export class OpencodeServeManager {
           idleStatusPolls = 0
         } catch (err) {
           idleStatusPolls = 0
-          this.log.warn({ err, sessionId }, 'OpenCode idle status fallback failed')
+          if (!warnedStatusFallbackFailure) {
+            warnedStatusFallbackFailure = true
+            this.log.warn({ err, sessionId }, 'OpenCode idle status fallback failed')
+          }
         } finally {
           pollInFlight = false
         }
@@ -531,7 +530,7 @@ export class OpencodeServeManager {
           finish()
           return
         }
-        if (eventShowsSessionActivity(event)) {
+        if (eventShowsRunningStatusActivity(event)) {
           markActivity()
           void checkStatusMap()
         }

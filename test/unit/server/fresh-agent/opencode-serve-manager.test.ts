@@ -575,6 +575,52 @@ describe('OpencodeServeManager fan-out', () => {
     await expect(manager.onceIdle('ses_a', 30)).rejects.toThrow(/idle/i)
   })
 
+  it('onceIdle ignores late message.updated events when the status map stays absent', async () => {
+    let push!: (e: any) => void
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url.endsWith('/session/status')) return jsonResponse({})
+      return jsonResponse({})
+    })
+    const { manager } = makeManager({
+      fetchFn: fetchFn as any,
+      connectEventStream: (_url, h) => { push = (e) => h.onEvent(parseEvt(e)); return () => {} },
+      idlePollMs: 5,
+    })
+    await manager.ensureStarted()
+
+    const idle = manager.onceIdle('ses_a', 30)
+    push({ type: 'message.updated', properties: { sessionID: 'ses_a', message: { id: 'old-turn' } } })
+
+    await expect(idle).rejects.toThrow(/idle/i)
+  })
+
+  it('onceIdle waits for later running status-map evidence after a late message.updated event', async () => {
+    let push!: (e: any) => void
+    let statusCalls = 0
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url.endsWith('/session/status')) {
+        statusCalls += 1
+        if (statusCalls <= 2) return jsonResponse({})
+        if (statusCalls === 3) return jsonResponse({ ses_a: { type: 'busy' } })
+        return jsonResponse({})
+      }
+      return jsonResponse({})
+    })
+    const { manager } = makeManager({
+      fetchFn: fetchFn as any,
+      connectEventStream: (_url, h) => { push = (e) => h.onEvent(parseEvt(e)); return () => {} },
+      idlePollMs: 5,
+    })
+    await manager.ensureStarted()
+
+    const idle = manager.onceIdle('ses_a', 80)
+    push({ type: 'message.updated', properties: { sessionID: 'ses_a', message: { id: 'old-turn' } } })
+
+    await expect(idle).resolves.toBeUndefined()
+  })
+
   it('onceIdle does not resolve from a single busy signal plus one empty status-map poll', async () => {
     let push!: (e: any) => void
     let statusCalls = 0
@@ -603,6 +649,28 @@ describe('OpencodeServeManager fan-out', () => {
     ])
     expect(pending).toBe('pending')
     await expect(idle).rejects.toThrow(/idle/i)
+  })
+
+  it('onceIdle warns only once per wait when status-map fallback polling keeps failing', async () => {
+    let push!: (e: any) => void
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url.endsWith('/session/status')) throw new Error('status map unavailable')
+      return jsonResponse({})
+    })
+    const { manager } = makeManager({
+      fetchFn: fetchFn as any,
+      connectEventStream: (_url, h) => { push = (e) => h.onEvent(parseEvt(e)); return () => {} },
+      idlePollMs: 5,
+    })
+    await manager.ensureStarted()
+
+    const warnSpy = vi.spyOn((manager as any).log, 'warn').mockImplementation(() => undefined)
+    const idle = manager.onceIdle('ses_a', 35)
+    push({ type: 'session.status', properties: { sessionID: 'ses_a', status: { type: 'busy' } } })
+
+    await expect(idle).rejects.toThrow(/idle/i)
+    expect(warnSpy).toHaveBeenCalledTimes(1)
   })
 
   it('onceIdle requires a fresh consecutive idle/absent pair after a status-map poll failure', async () => {
