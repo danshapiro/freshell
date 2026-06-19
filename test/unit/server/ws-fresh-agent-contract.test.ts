@@ -34,6 +34,16 @@ describe('fresh-agent websocket contract', () => {
     })
 
     expect(normalizeFreshAgentProviderEvent({
+      type: 'sdk.session.changed',
+      sessionId: 's1',
+      reason: 'opencode-status',
+    })).toEqual({
+      type: 'freshAgent.session.changed',
+      sessionId: 's1',
+      reason: 'opencode-status',
+    })
+
+    expect(normalizeFreshAgentProviderEvent({
       type: 'freshAgent.status',
       sessionId: 's1',
       status: 'idle',

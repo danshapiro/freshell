@@ -179,11 +179,50 @@ describe('OpenCode serve adapter: create + send', () => {
       await expect(adapter.send?.('freshopencode-unhandled-1', { text: 'boom' })).rejects.toThrow('prompt rejected')
       // Simulating the idle timeout rejection that would otherwise arrive later.
       idleReject(new Error('idle timeout'))
-      await new Promise((r) => setTimeout(r, 10))
-      expect(unhandled).not.toHaveBeenCalled()
-    } finally {
-      process.off('unhandledRejection', unhandled)
-    }
+    await new Promise((r) => setTimeout(r, 10))
+    expect(unhandled).not.toHaveBeenCalled()
+  } finally {
+    process.off('unhandledRejection', unhandled)
+  }
+  })
+
+  it('does not return to running when OpenCode emits a late message update after idle', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'late-update', sessionType: 'freshopencode', provider: 'opencode' })
+
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-late-update', (event) => events.push(event))
+
+    await adapter.send?.('freshopencode-late-update', { text: 'go' })
+    manager._emit('ses_real_1', {
+      kind: 'session.idle',
+      sessionId: 'ses_real_1',
+      properties: { sessionID: 'ses_real_1' },
+      raw: { type: 'session.idle', properties: { sessionID: 'ses_real_1' } },
+    })
+    manager._emit('ses_real_1', {
+      kind: 'message.updated',
+      sessionId: 'ses_real_1',
+      properties: { sessionID: 'ses_real_1', info: { id: 'msg_user_1', role: 'user' } },
+      raw: { type: 'message.updated', properties: { sessionID: 'ses_real_1' } },
+    })
+
+    expect(events).toContainEqual({
+      type: 'sdk.session.snapshot',
+      sessionId: 'freshopencode-late-update',
+      status: 'idle',
+    })
+    expect(events.at(-1)).toEqual({
+      type: 'sdk.session.changed',
+      sessionId: 'freshopencode-late-update',
+      reason: 'opencode-message',
+    })
+    await expect(adapter.getSnapshot?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: 'freshopencode-late-update',
+    })).resolves.toMatchObject({ status: 'idle' })
   })
 
   it('forwards compact instructions to the serve manager', async () => {

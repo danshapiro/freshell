@@ -172,6 +172,8 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         streamingText: event.streamingText as string | undefined,
       }))
       return true
+    case 'freshAgent.session.changed':
+      return true
     case 'freshAgent.session.init':
       dispatch(sessionInit({
         ...locator,

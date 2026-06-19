@@ -225,6 +225,44 @@ describe('fresh-agent-ws', () => {
     expect(store.getState().freshAgent.sessions[key]).toBeUndefined()
   })
 
+  it('handles freshAgent.session.changed without mutating idle status', () => {
+    const store = createFreshAgentStore()
+    const sessionId = 'ses_opencode_idle'
+    const key = `freshopencode:opencode:${sessionId}`
+
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      event: {
+        type: 'freshAgent.session.snapshot',
+        sessionId,
+        latestTurnId: 'msg_assistant_1',
+        status: 'idle',
+        revision: 11,
+      },
+    })).toBe(true)
+
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      event: {
+        type: 'freshAgent.session.changed',
+        sessionId,
+        reason: 'opencode-message',
+      },
+    })).toBe(true)
+
+    expect(store.getState().freshAgent.sessions[key]).toMatchObject({
+      status: 'idle',
+      latestTurnId: 'msg_assistant_1',
+      historyRevision: 11,
+    })
+  })
+
   it('does not let delayed metadata downgrade newer snapshot identity', () => {
     const store = createFreshAgentStore()
     const sessionId = 'claude-thread-metadata-order'

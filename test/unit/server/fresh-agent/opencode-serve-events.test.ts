@@ -82,14 +82,68 @@ describe('serveEventToSdk', () => {
     }
     expect(serveEventToSdk(parsed, 'ses_a')).toEqual({ type: 'sdk.session.snapshot', sessionId: 'ses_a', status: 'running' })
   })
-  it('maps message.part.updated to a running snapshot (drives client re-poll)', () => {
+  it('maps message.part.updated to a transcript invalidation (drives client re-poll)', () => {
     const parsed: ParsedServeEvent = {
       kind: 'message.part.updated',
       sessionId: 'ses_a',
       properties: { sessionID: 'ses_a', part: { id: 'p', type: 'text' } },
       raw: { type: 'message.part.updated', properties: { sessionID: 'ses_a', part: { id: 'p', type: 'text' } } },
     }
-    expect(serveEventToSdk(parsed, 'ses_a')).toEqual({ type: 'sdk.session.snapshot', sessionId: 'ses_a', status: 'running' })
+    expect(serveEventToSdk(parsed, 'ses_a')).toEqual({
+      type: 'sdk.session.changed',
+      sessionId: 'ses_a',
+      reason: 'opencode-message',
+    })
+  })
+  it('maps OpenCode transcript mutation events to invalidations instead of running snapshots', () => {
+    for (const kind of ['message.part.delta', 'message.part.updated', 'message.updated', 'message.removed', 'message.part.removed']) {
+      const parsed: ParsedServeEvent = {
+        kind,
+        sessionId: 'ses_a',
+        properties: { sessionID: 'ses_a', info: { id: 'msg_1', role: 'assistant' } },
+        raw: { type: kind, properties: { sessionID: 'ses_a' } },
+      }
+
+      expect(serveEventToSdk(parsed, 'freshopencode-req-1')).toEqual({
+        type: 'sdk.session.changed',
+        sessionId: 'freshopencode-req-1',
+        reason: 'opencode-message',
+      })
+    }
+  })
+  it('maps only active OpenCode session statuses to running', () => {
+    const statusEvent = (statusType: string): ParsedServeEvent => ({
+      kind: 'session.status',
+      sessionId: 'ses_a',
+      properties: { sessionID: 'ses_a', status: { type: statusType } },
+      raw: { type: 'session.status', properties: { sessionID: 'ses_a', status: { type: statusType } } },
+    })
+
+    expect(serveEventToSdk(statusEvent('busy'), 'ses_a')).toEqual({
+      type: 'sdk.session.snapshot',
+      sessionId: 'ses_a',
+      status: 'running',
+    })
+    expect(serveEventToSdk(statusEvent('retry'), 'ses_a')).toEqual({
+      type: 'sdk.session.snapshot',
+      sessionId: 'ses_a',
+      status: 'running',
+    })
+    expect(serveEventToSdk(statusEvent('idle'), 'ses_a')).toEqual({
+      type: 'sdk.session.snapshot',
+      sessionId: 'ses_a',
+      status: 'idle',
+    })
+    expect(serveEventToSdk(statusEvent('completed'), 'ses_a')).toEqual({
+      type: 'sdk.session.changed',
+      sessionId: 'ses_a',
+      reason: 'opencode-status',
+    })
+    expect(serveEventToSdk(statusEvent('unexpected-future-status'), 'ses_a')).toEqual({
+      type: 'sdk.session.changed',
+      sessionId: 'ses_a',
+      reason: 'opencode-status',
+    })
   })
   it('maps session.error to an sdk.error', () => {
     const parsed: ParsedServeEvent = {

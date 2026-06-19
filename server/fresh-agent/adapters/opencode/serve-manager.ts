@@ -10,6 +10,8 @@ import { parseServeEvent, type ParsedServeEvent } from './serve-events.js'
 type OpencodeServeLogger = Pick<pino.Logger, 'warn' | 'error'>
 
 const OWNERSHIP_ENV = 'FRESHELL_OPENCODE_SIDECAR_ID'
+const DEFAULT_IDLE_POLL_MS = 500
+const REQUIRED_IDLE_STATUS_POLLS = 2
 
 export type OpencodeServeManagerOptions = {
   command?: string
@@ -21,18 +23,35 @@ export type OpencodeServeManagerOptions = {
   healthTimeoutMs?: number
   env?: NodeJS.ProcessEnv
   idleShutdownMs?: number
+  idlePollMs?: number
 }
 
 export type OpencodeServeMessage = { info: Record<string, any>; parts: Array<Record<string, any>> }
 export type OpencodeServeMessagePage = { messages: OpencodeServeMessage[]; nextCursor: string | null }
 
 type HealthResponse = { healthy?: boolean }
+type OpencodeStatusMap = Record<string, { type?: unknown }>
 
 function isIdleStatusEvent(event: ParsedServeEvent): boolean {
   if (event.kind !== 'session.status') return false
   const status = event.properties.status
   if (!status || typeof status !== 'object' || Array.isArray(status)) return false
   return (status as Record<string, unknown>).type === 'idle'
+}
+
+function isRunningStatusType(type: unknown): boolean {
+  return type === 'busy' || type === 'retry'
+}
+
+function isIdleStatusType(type: unknown): boolean {
+  return type === 'idle'
+}
+
+function eventShowsRunningStatusActivity(event: ParsedServeEvent): boolean {
+  if (event.kind !== 'session.status') return false
+  const status = event.properties.status
+  if (!status || typeof status !== 'object' || Array.isArray(status)) return false
+  return isRunningStatusType((status as Record<string, unknown>).type)
 }
 
 function isHealthyResponse(body: unknown): body is HealthResponse {
@@ -65,6 +84,7 @@ export class OpencodeServeManager {
   private readonly healthTimeoutMs: number
   private readonly env: NodeJS.ProcessEnv
   private readonly idleShutdownMs: number
+  private readonly idlePollMs: number
   private readonly log: OpencodeServeLogger = logger.child({ component: 'opencode-serve-manager' })
   /** sessionId → emitter of ParsedServeEvent (and a synthetic 'idle' event). */
   private readonly sessionEmitters = new Map<string, EventEmitter>()
@@ -84,6 +104,7 @@ export class OpencodeServeManager {
     this.healthTimeoutMs = options.healthTimeoutMs ?? 20_000
     this.env = options.env ?? process.env
     this.idleShutdownMs = options.idleShutdownMs ?? 15 * 60_000
+    this.idlePollMs = options.idlePollMs ?? DEFAULT_IDLE_POLL_MS
   }
 
   private routeFromCwd(cwd?: string): { cwdKey: string; cwd?: string } {
@@ -313,6 +334,10 @@ export class OpencodeServeManager {
     })
   }
 
+  private async getSessionStatusMap(route: ServeRoute = {}, init?: RequestInit): Promise<OpencodeStatusMap> {
+    return this.json<OpencodeStatusMap>(route, '/session/status', { method: 'GET', ...init })
+  }
+
   async createSession(input: { title?: string; parentID?: string; directory?: string } = {}): Promise<{ id: string; directory?: string; title?: string }> {
     const body: { title?: string; parentID?: string; directory?: string } = {}
     if (input.title !== undefined) body.title = input.title
@@ -438,16 +463,76 @@ export class OpencodeServeManager {
   onceIdle(sessionId: string, timeoutMs: number): Promise<void> {
     return new Promise((resolve, reject) => {
       const emitter = this.emitterFor(sessionId)
-      const timer = setTimeout(() => {
+      let settled = false
+      let observedActivity = false
+      let pollInFlight = false
+      let idleStatusPolls = 0
+      let warnedStatusFallbackFailure = false
+
+      const cleanup = () => {
+        clearTimeout(timer)
+        clearInterval(pollTimer)
         emitter.off('event', handler)
-        reject(new Error(`Timed out after ${timeoutMs}ms waiting for OpenCode session ${sessionId} to go idle.`))
+      }
+      const finish = () => {
+        if (settled) return
+        settled = true
+        cleanup()
+        resolve()
+      }
+      const fail = (error: Error) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(error)
+      }
+      const markActivity = () => {
+        observedActivity = true
+        idleStatusPolls = 0
+      }
+      const checkStatusMap = async () => {
+        if (settled || pollInFlight) return
+        pollInFlight = true
+        try {
+          const statuses = await this.getSessionStatusMap(this.routeForSession(sessionId))
+          const status = statuses[sessionId]
+          if (status && isRunningStatusType(status.type)) {
+            markActivity()
+            return
+          }
+          if (observedActivity && (!status || isIdleStatusType(status.type))) {
+            idleStatusPolls += 1
+            if (idleStatusPolls >= REQUIRED_IDLE_STATUS_POLLS) finish()
+            return
+          }
+          idleStatusPolls = 0
+        } catch (err) {
+          idleStatusPolls = 0
+          if (!warnedStatusFallbackFailure) {
+            warnedStatusFallbackFailure = true
+            this.log.warn({ err, sessionId }, 'OpenCode idle status fallback failed')
+          }
+        } finally {
+          pollInFlight = false
+        }
+      }
+
+      const timer = setTimeout(() => {
+        fail(new Error(`Timed out after ${timeoutMs}ms waiting for OpenCode session ${sessionId} to go idle.`))
       }, timeoutMs)
       timer.unref?.()
+
+      const pollTimer = setInterval(() => { void checkStatusMap() }, this.idlePollMs)
+      pollTimer.unref?.()
+
       const handler = (event: ParsedServeEvent) => {
         if (event.kind === 'session.idle' || isIdleStatusEvent(event)) {
-          clearTimeout(timer)
-          emitter.off('event', handler)
-          resolve()
+          finish()
+          return
+        }
+        if (eventShowsRunningStatusActivity(event)) {
+          markActivity()
+          void checkStatusMap()
         }
       }
       emitter.on('event', handler)

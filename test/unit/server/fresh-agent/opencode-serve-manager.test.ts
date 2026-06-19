@@ -535,6 +535,194 @@ describe('OpencodeServeManager fan-out', () => {
     await expect(idle).rejects.toThrow(/idle/i)
   })
 
+  it('onceIdle resolves when status-map activity drops out of the OpenCode status map', async () => {
+    let statusCalls = 0
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url.endsWith('/session/status')) {
+        statusCalls += 1
+        return statusCalls === 1
+          ? jsonResponse({ ses_a: { type: 'busy' } })
+          : jsonResponse({})
+      }
+      return jsonResponse({})
+    })
+    const { manager } = makeManager({
+      fetchFn: fetchFn as any,
+      idlePollMs: 5,
+    })
+    await manager.ensureStarted()
+
+    const idle = manager.onceIdle('ses_a', 1000)
+
+    await expect(idle).resolves.toBeUndefined()
+    expect(fetchFn).toHaveBeenCalledWith('http://127.0.0.1:47999/session/status', expect.anything())
+    expect((manager as any).sessionEmitters.get('ses_a')?.listenerCount('event') ?? 0).toBe(0)
+  })
+
+  it('onceIdle does not resolve from status-map absence before observed OpenCode activity', async () => {
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url.endsWith('/session/status')) return jsonResponse({})
+      return jsonResponse({})
+    })
+    const { manager } = makeManager({
+      fetchFn: fetchFn as any,
+      idlePollMs: 5,
+    })
+    await manager.ensureStarted()
+
+    await expect(manager.onceIdle('ses_a', 30)).rejects.toThrow(/idle/i)
+  })
+
+  it('onceIdle ignores late message.updated events when the status map stays absent', async () => {
+    let push!: (e: any) => void
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url.endsWith('/session/status')) return jsonResponse({})
+      return jsonResponse({})
+    })
+    const { manager } = makeManager({
+      fetchFn: fetchFn as any,
+      connectEventStream: (_url, h) => { push = (e) => h.onEvent(parseEvt(e)); return () => {} },
+      idlePollMs: 5,
+    })
+    await manager.ensureStarted()
+
+    const idle = manager.onceIdle('ses_a', 30)
+    push({ type: 'message.updated', properties: { sessionID: 'ses_a', message: { id: 'old-turn' } } })
+
+    await expect(idle).rejects.toThrow(/idle/i)
+  })
+
+  it('onceIdle waits for later running status-map evidence after a late message.updated event', async () => {
+    let push!: (e: any) => void
+    let statusCalls = 0
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url.endsWith('/session/status')) {
+        statusCalls += 1
+        if (statusCalls <= 2) return jsonResponse({})
+        if (statusCalls === 3) return jsonResponse({ ses_a: { type: 'busy' } })
+        return jsonResponse({})
+      }
+      return jsonResponse({})
+    })
+    const { manager } = makeManager({
+      fetchFn: fetchFn as any,
+      connectEventStream: (_url, h) => { push = (e) => h.onEvent(parseEvt(e)); return () => {} },
+      idlePollMs: 5,
+    })
+    await manager.ensureStarted()
+
+    const idle = manager.onceIdle('ses_a', 80)
+    push({ type: 'message.updated', properties: { sessionID: 'ses_a', message: { id: 'old-turn' } } })
+
+    await expect(idle).resolves.toBeUndefined()
+  })
+
+  it('onceIdle does not resolve from a single busy signal plus one empty status-map poll', async () => {
+    let push!: (e: any) => void
+    let statusCalls = 0
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url.endsWith('/session/status')) {
+        statusCalls += 1
+        if (statusCalls === 1) return jsonResponse({})
+        throw new Error('status map unavailable')
+      }
+      return jsonResponse({})
+    })
+    const { manager } = makeManager({
+      fetchFn: fetchFn as any,
+      connectEventStream: (_url, h) => { push = (e) => h.onEvent(parseEvt(e)); return () => {} },
+      idlePollMs: 5,
+    })
+    await manager.ensureStarted()
+
+    const idle = manager.onceIdle('ses_a', 40)
+    push({ type: 'session.status', properties: { sessionID: 'ses_a', status: { type: 'busy' } } })
+
+    const pending = await Promise.race([
+      idle.then(() => 'resolved', () => 'rejected'),
+      new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 15)),
+    ])
+    expect(pending).toBe('pending')
+    await expect(idle).rejects.toThrow(/idle/i)
+  })
+
+  it('onceIdle warns only once per wait when status-map fallback polling keeps failing', async () => {
+    let push!: (e: any) => void
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url.endsWith('/session/status')) throw new Error('status map unavailable')
+      return jsonResponse({})
+    })
+    const { manager } = makeManager({
+      fetchFn: fetchFn as any,
+      connectEventStream: (_url, h) => { push = (e) => h.onEvent(parseEvt(e)); return () => {} },
+      idlePollMs: 5,
+    })
+    await manager.ensureStarted()
+
+    const warnSpy = vi.spyOn((manager as any).log, 'warn').mockImplementation(() => undefined)
+    const idle = manager.onceIdle('ses_a', 35)
+    push({ type: 'session.status', properties: { sessionID: 'ses_a', status: { type: 'busy' } } })
+
+    await expect(idle).rejects.toThrow(/idle/i)
+    expect(warnSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('onceIdle requires a fresh consecutive idle/absent pair after a status-map poll failure', async () => {
+    let push!: (e: any) => void
+    let statusCalls = 0
+    let allowFifthPoll!: () => void
+    let noteFifthPollStarted!: () => void
+    const fifthPollGate = new Promise<void>((resolve) => {
+      allowFifthPoll = resolve
+    })
+    const fifthPollStarted = new Promise<void>((resolve) => {
+      noteFifthPollStarted = resolve
+    })
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url.endsWith('/session/status')) {
+        statusCalls += 1
+        if (statusCalls === 1) return jsonResponse({ ses_a: { type: 'busy' } })
+        if (statusCalls === 2) return jsonResponse({})
+        if (statusCalls === 3) throw new Error('status map unavailable')
+        if (statusCalls === 4) return jsonResponse({})
+        if (statusCalls === 5) {
+          noteFifthPollStarted()
+          await fifthPollGate
+          return jsonResponse({})
+        }
+        return jsonResponse({})
+      }
+      return jsonResponse({})
+    })
+    const { manager } = makeManager({
+      fetchFn: fetchFn as any,
+      connectEventStream: (_url, h) => { push = (e) => h.onEvent(parseEvt(e)); return () => {} },
+      idlePollMs: 5,
+    })
+    await manager.ensureStarted()
+
+    const idle = manager.onceIdle('ses_a', 100)
+    push({ type: 'session.status', properties: { sessionID: 'ses_a', status: { type: 'busy' } } })
+
+    await fifthPollStarted
+    const pending = await Promise.race([
+      idle.then(() => 'resolved', () => 'rejected'),
+      new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 15)),
+    ])
+    expect(pending).toBe('pending')
+
+    allowFifthPoll()
+    await expect(idle).resolves.toBeUndefined()
+    expect(statusCalls).toBe(5)
+  }, 1000)
+
   it('onceIdle rejects on timeout', async () => {
     const { manager } = makeManager({ connectEventStream: () => () => {} })
     await manager.ensureStarted()
