@@ -27,7 +27,6 @@ function makeFakeManager() {
       ...(input?.directory ? { directory: input.directory } : {}),
       title: 'T',
     })),
-    rememberSessionCwd: vi.fn(),
     promptAsync: vi.fn(async () => undefined),
     listMessages: vi.fn(async () => ({ messages: [], nextCursor: null })),
     getMessage: vi.fn(async () => null),
@@ -47,8 +46,12 @@ function makeFakeManager() {
   }
 }
 
-function makeAdapter(manager: FakeManager) {
-  return createOpencodeFreshAgentAdapter({ serveManager: manager as any })
+function makeAdapter(manager: FakeManager, overrides: Partial<Parameters<typeof createOpencodeFreshAgentAdapter>[0]> = {}) {
+  return createOpencodeFreshAgentAdapter({
+    serveManager: manager as any,
+    validateCwd: async () => undefined,
+    ...overrides,
+  })
 }
 
 describe('OpenCode serve adapter: create + send', () => {
@@ -73,7 +76,7 @@ describe('OpenCode serve adapter: create + send', () => {
       model: { providerID: 'umans-ai-coding-plan', modelID: 'umans-kimi-k2.7' },
       variant: 'high',
     }, { cwd: '/repo' })
-    expect(manager.onceIdle).toHaveBeenCalledWith('ses_real_1', expect.any(Number))
+    expect(manager.onceIdle).toHaveBeenCalledWith('ses_real_1', expect.any(Number), { cwd: '/repo' })
   })
 
   it('continues a materialized session on later sends without re-creating it', async () => {
@@ -170,6 +173,31 @@ describe('OpenCode serve adapter: create + send', () => {
       expect.objectContaining({ parts: [{ type: 'text', text: 'hi' }] }),
       { cwd: '/project-x' },
     )
+    expect(manager.onceIdle).toHaveBeenCalledWith('ses_real_1', expect.any(Number), { cwd: '/project-x' })
+  })
+
+  it('rejects invalid selected cwd before creating an OpenCode session', async () => {
+    const manager = makeFakeManager()
+    const validateCwd = vi.fn(async () => { throw new Error('cwd is not a directory: /missing') })
+    const adapter = makeAdapter(manager, { validateCwd } as any)
+    await adapter.create({ requestId: 'bad-cwd', sessionType: 'freshopencode', provider: 'opencode', cwd: '/missing' })
+
+    await expect(adapter.send?.('freshopencode-bad-cwd', { text: 'go' }))
+      .rejects.toThrow('cwd is not a directory: /missing')
+    expect(validateCwd).toHaveBeenCalledWith('/missing')
+    expect(manager.createSession).not.toHaveBeenCalled()
+  })
+
+  it('validates send-time cwd overrides before materialization', async () => {
+    const manager = makeFakeManager()
+    const validateCwd = vi.fn(async () => undefined)
+    const adapter = makeAdapter(manager, { validateCwd } as any)
+    await adapter.create({ requestId: 'override-cwd', sessionType: 'freshopencode', provider: 'opencode', cwd: '/old' })
+    await adapter.send?.('freshopencode-override-cwd', { text: 'go', settings: { cwd: '/new' } })
+
+    expect(validateCwd).toHaveBeenCalledWith('/new')
+    expect(manager.createSession).toHaveBeenCalledWith({ directory: '/new' })
+    expect(manager.onceIdle).toHaveBeenCalledWith('ses_real_1', expect.any(Number), { cwd: '/new' })
   })
 
   it('passes restored cwd when sending to an attached durable session', async () => {
@@ -321,20 +349,6 @@ describe('OpenCode serve adapter: history reads', () => {
     { info: { id: 'msg_user_1', role: 'user', time: { created: 1779557095868 } }, parts: [{ id: 'p1', type: 'text', text: 'reply ok' }] },
     { info: { id: 'msg_assistant_1', role: 'assistant', providerID: 'umans-ai-coding-plan', modelID: 'umans-kimi-k2.7' }, parts: [{ id: 'p2', type: 'text', text: 'ok' }] },
   ]
-
-  it('remembers cwd when attaching a durable OpenCode session', async () => {
-    const manager = makeFakeManager()
-    const adapter = makeAdapter(manager)
-
-    await adapter.attach?.({
-      sessionType: 'freshopencode',
-      provider: 'opencode',
-      sessionId: 'ses_existing_cwd',
-      cwd: '/repo/from-pane',
-    })
-
-    expect(manager.rememberSessionCwd).toHaveBeenCalledWith('ses_existing_cwd', '/repo/from-pane')
-  })
 
   it('getSnapshot assembles HTTP messages into the normalized transcript', async () => {
     const manager = makeFakeManager()

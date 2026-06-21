@@ -25,22 +25,37 @@ function stringProperty(value: unknown, key: string): string | undefined {
   return typeof candidate === 'string' ? candidate : undefined
 }
 
-/** Normalize one decoded `GET /event` SSE payload. opencode 1.17.x nests the
- * payload under `properties` and carries the session id as `properties.sessionID`
- * (also `properties.part.sessionID` / `properties.info.sessionID`). */
+function eventPayload(raw: Record<string, unknown>): Record<string, unknown> | null {
+  if (typeof raw.type === 'string') return raw
+  const payload = raw.payload
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    return payload as Record<string, unknown>
+  }
+  return null
+}
+
+function isServerControlEvent(kind: string): boolean {
+  return kind === 'server.connected' || kind === 'server.heartbeat'
+}
+
+/** Normalize one decoded OpenCode SSE payload. `/event` frames are flat
+ * `{ type, properties }`; `/global/event` wraps that shape under `payload`.
+ * Session ids appear as `properties.sessionID` (also
+ * `properties.part.sessionID` / `properties.info.sessionID`). */
 export function parseServeEvent(event: unknown): ParsedServeEvent | null {
   if (!event || typeof event !== 'object' || Array.isArray(event)) return null
-  const raw = event as Record<string, unknown>
-  if (typeof raw.type !== 'string') return null
-  const props = raw.properties && typeof raw.properties === 'object' && !Array.isArray(raw.properties)
-    ? (raw.properties as Record<string, unknown>)
+  const payload = eventPayload(event as Record<string, unknown>)
+  if (!payload || typeof payload.type !== 'string') return null
+  if (isServerControlEvent(payload.type)) return null
+  const props = payload.properties && typeof payload.properties === 'object' && !Array.isArray(payload.properties)
+    ? (payload.properties as Record<string, unknown>)
     : {}
   const sessionId =
     stringProperty(props, 'sessionID')
     || stringProperty(props.part, 'sessionID')
     || stringProperty(props.info, 'sessionID')
     || undefined
-  return { kind: raw.type, sessionId, properties: { ...props }, raw }
+  return { kind: payload.type, sessionId, properties: { ...props }, raw: payload }
 }
 
 export type SdkProviderEvent =

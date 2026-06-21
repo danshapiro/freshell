@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events'
+import { stat } from 'node:fs/promises'
 import path from 'node:path'
 import type {
   FreshAgentCreateRequest,
@@ -47,6 +48,7 @@ type CreateOpencodeFreshAgentAdapterOptions = {
   dbPath?: string
   dataHome?: string
   turnTimeoutMs?: number
+  validateCwd?: (cwd: string) => Promise<void>
 }
 
 function makePlaceholderId(requestId: string): string {
@@ -60,9 +62,17 @@ function normalizeOpencodeInput(input: FreshAgentCreateRequest): FreshAgentCreat
   return { ...input, model, effort: normalizeFreshAgentEffort(input.sessionType, 'opencode', model, input.effort) }
 }
 
+async function defaultValidateCwd(cwd: string): Promise<void> {
+  const info = await stat(cwd).catch(() => {
+    throw new Error(`OpenCode cwd is not accessible: ${cwd}`)
+  })
+  if (!info.isDirectory()) throw new Error(`OpenCode cwd is not a directory: ${cwd}`)
+}
+
 export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgentAdapterOptions): FreshAgentRuntimeAdapter {
   const serveManager = options.serveManager
   const turnTimeoutMs = options.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS
+  const validateCwd = options.validateCwd ?? defaultValidateCwd
   const dbPath = options.dbPath ?? path.join(options.dataHome ?? defaultOpencodeDataHome(), 'opencode.db')
   // Lazily create the legacy reader only if a legacy placeholder resume is attempted.
   let historyReader: OpencodeHistoryReader | undefined = options.historyReader
@@ -177,6 +187,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     emitStatus(state, 'running')
     try {
       if (!state.realSessionId) {
+        if (effectiveCwd) await validateCwd(effectiveCwd)
         const session = await serveManager.createSession({ title: undefined, ...(effectiveCwd ? { directory: effectiveCwd } : {}) })
         state.realSessionId = session.id
         if (typeof session.directory === 'string' && session.directory.length > 0) state.cwd = session.directory
@@ -187,7 +198,10 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       }
 
       const realId = state.realSessionId!
-      const idle = serveManager.onceIdle(realId, turnTimeoutMs)
+      const idleRoute = cwdRoute(state.cwd)
+      const idle = idleRoute
+        ? serveManager.onceIdle(realId, turnTimeoutMs, idleRoute)
+        : serveManager.onceIdle(realId, turnTimeoutMs)
       // If promptAsync fails and we leave via the catch(), `idle` may still
       // reject later on its timeout timer. Attach a no-op handler now so that
       // later rejection cannot become an unhandled rejection.
@@ -288,7 +302,6 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       if (existing) {
         if (locator.cwd) {
           existing.cwd = locator.cwd
-          if (existing.realSessionId) serveManager.rememberSessionCwd(existing.realSessionId, locator.cwd)
         }
         remember(existing)
         return { sessionId: locator.sessionId, sessionRef: { provider: 'opencode', sessionId: locator.sessionId } }
@@ -303,7 +316,6 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         status: 'idle',
         events: new EventEmitter(), sendQueue: Promise.resolve(),
       }
-      if (locator.cwd) serveManager.rememberSessionCwd(locator.sessionId, locator.cwd)
       remember(state)
       bindServeStream(state)
       return { sessionId: locator.sessionId, sessionRef: { provider: 'opencode', sessionId: locator.sessionId } }

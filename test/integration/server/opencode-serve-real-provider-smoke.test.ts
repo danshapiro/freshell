@@ -1,5 +1,7 @@
-import fs from 'node:fs/promises'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import os from 'node:os'
+import path from 'node:path'
+import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises'
+import { afterAll, describe, expect, it } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import {
@@ -12,10 +14,7 @@ import { FreshAgentRuntimeManager } from '../../../server/fresh-agent/runtime-ma
 import { createFreshAgentProviderRegistry } from '../../../server/fresh-agent/provider-registry.js'
 import { createOpencodeFreshAgentAdapter } from '../../../server/fresh-agent/adapters/opencode/adapter.js'
 import {
-  ProbeWorkspace,
   resolveProviderBinary,
-  seedOpencodeHomes,
-  waitForOpencodeDbSession,
 } from '../../../test/helpers/coding-cli/real-session-contract-harness.js'
 
 const opencode = await resolveProviderBinary('opencode')
@@ -26,6 +25,33 @@ describeReal(
   `opencode serve real provider${opencode.resolvedPath ? '' : ' (opencode not on PATH)'}`,
   () => {
     describe('OpencodeServeManager lifecycle', () => {
+      it('routes session creation to distinct directories through one sidecar', async () => {
+        const root = await mkdtemp(path.join(os.tmpdir(), 'freshell-opencode-routing-'))
+        const projectA = path.join(root, 'project-a')
+        const projectB = path.join(root, 'project-b')
+        const manager = new OpencodeServeManager()
+        try {
+          await mkdir(projectA)
+          await mkdir(projectB)
+
+          const sessionA = await manager.createSession({ title: 'project-a', directory: projectA })
+          const sessionB = await manager.createSession({ title: 'project-b', directory: projectB })
+
+          expect(sessionA.id).toMatch(/^ses_/)
+          expect(sessionB.id).toMatch(/^ses_/)
+          expect(sessionA.id).not.toBe(sessionB.id)
+          expect(sessionA.directory).toBe(await realpath(projectA))
+          expect(sessionB.directory).toBe(await realpath(projectB))
+
+          const first = await manager.ensureStarted()
+          const second = await manager.ensureStarted()
+          expect(second.baseUrl).toBe(first.baseUrl)
+        } finally {
+          await manager.shutdown()
+          await rm(root, { recursive: true, force: true })
+        }
+      }, 60_000)
+
       it('checks Kimi k2.7 availability and shuts the owned process down', async () => {
         const manager = new OpencodeServeManager()
         try {
@@ -39,31 +65,6 @@ describeReal(
           }
         } finally {
           await manager.shutdown()
-        }
-      }, 60_000)
-
-      it('creates first-run sessions in the requested cwd, not the Freshell process cwd', async () => {
-        const workspace = await ProbeWorkspace.create('freshell-opencode-real-cwd-')
-        const requestedCwd = workspace.inTemp('requested-project')
-        const homes = await seedOpencodeHomes(workspace)
-        const manager = new OpencodeServeManager({
-          env: {
-            ...process.env,
-            XDG_DATA_HOME: homes.dataHome,
-            XDG_CONFIG_HOME: homes.configHome,
-          },
-        })
-        try {
-          await fs.mkdir(requestedCwd, { recursive: true })
-          const session = await manager.createSession({ directory: requestedCwd })
-          expect(session.id).toMatch(/^ses_/)
-          expect(session.directory).toBe(requestedCwd)
-
-          const row = await waitForOpencodeDbSession(homes.dbPath, session.id)
-          expect(row.directory).toBe(requestedCwd)
-        } finally {
-          await manager.shutdown()
-          await workspace.cleanup()
         }
       }, 60_000)
     })
@@ -115,12 +116,19 @@ if (opencode.resolvedPath) {
 const describeRealKimi = kimiAvailable ? describe.sequential : describe.skip
 
 describeRealKimi('orchestration system smoke (Kimi k2.7)', () => {
+  let cwdRoot: string | undefined
+
   afterAll(async () => {
     await manager?.shutdown()
+    if (cwdRoot) await rm(cwdRoot, { recursive: true, force: true })
   })
 
   it('creates a freshopencode pane, runs a Kimi turn, and captures the assistant reply', async () => {
-    const created = await request(app!).post('/api/tabs').send({ agent: 'opencode', cwd: process.cwd(), model: KIMI, effort: 'low' })
+    cwdRoot = await mkdtemp(path.join(os.tmpdir(), 'freshell-opencode-kimi-cwd-'))
+    const cwd = path.join(cwdRoot, 'project')
+    await mkdir(cwd)
+
+    const created = await request(app!).post('/api/tabs').send({ agent: 'opencode', cwd, model: KIMI, effort: 'low' })
     expect(created.status).toBe(200)
     const paneId = created.body.data.paneId
     expect(created.body.data.sessionId).toMatch(/^freshopencode-/)
@@ -132,6 +140,10 @@ describeRealKimi('orchestration system smoke (Kimi k2.7)', () => {
     const capture = await request(app!).get(`/api/panes/${paneId}/capture`)
     expect(capture.status).toBe(200)
     expect(capture.text.toLowerCase()).toContain('smoke-ok')
+
+    const sessionId = send.body.data.sessionId
+    const routedSession = await manager!.getSession(sessionId, { cwd })
+    expect(routedSession.directory).toBe(await realpath(cwd))
   }, 90_000)
 
   it('continues the same session across a second turn (materialized id stable)', async () => {
