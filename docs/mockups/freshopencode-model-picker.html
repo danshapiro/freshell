@@ -1,0 +1,930 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Freshopencode Model Picker Mockup</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101014;
+      --panel: #17181d;
+      --panel-2: #1e2027;
+      --panel-3: #252833;
+      --text: #f1f2f4;
+      --muted: #a9afb8;
+      --subtle: #747b87;
+      --border: #343842;
+      --accent: #4fb38a;
+      --accent-soft: rgba(79, 179, 138, 0.16);
+      --focus: #79c7ff;
+      --danger: #f47b7b;
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.46);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.03), transparent 32rem),
+        var(--bg);
+      color: var(--text);
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    button {
+      border: 0;
+      color: inherit;
+      cursor: pointer;
+    }
+
+    .page {
+      width: min(1120px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 40px 0;
+    }
+
+    .frame {
+      display: grid;
+      grid-template-columns: minmax(260px, 330px) minmax(0, 1fr);
+      min-height: 680px;
+      border: 1px solid #2d313b;
+      background: #0d0e12;
+      box-shadow: var(--shadow);
+    }
+
+    .sidebar {
+      border-right: 1px solid #2d313b;
+      background: #14151a;
+      padding: 14px 12px;
+    }
+
+    .tabbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 34px;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .brand-mark {
+      display: grid;
+      place-items: center;
+      width: 22px;
+      height: 22px;
+      border-radius: 5px;
+      background: #232732;
+      color: var(--accent);
+      font-size: 13px;
+    }
+
+    .icon-button {
+      display: inline-grid;
+      place-items: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--muted);
+    }
+
+    .icon-button:hover,
+    .icon-button:focus-visible {
+      background: #232732;
+      color: var(--text);
+      outline: none;
+    }
+
+    .session-list {
+      display: grid;
+      gap: 4px;
+    }
+
+    .session-row {
+      display: grid;
+      grid-template-columns: 8px minmax(0, 1fr);
+      align-items: center;
+      min-height: 36px;
+      gap: 9px;
+      padding: 6px 8px;
+      border-radius: 6px;
+      color: var(--muted);
+    }
+
+    .session-row.active {
+      background: #20232c;
+      color: var(--text);
+    }
+
+    .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 999px;
+      background: var(--subtle);
+    }
+
+    .dot.busy {
+      background: #58a6ff;
+    }
+
+    .session-title {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 13px;
+    }
+
+    .workspace {
+      min-width: 0;
+      background: #101115;
+    }
+
+    .pane-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 42px;
+      border-bottom: 1px solid #2d313b;
+      padding: 0 10px 0 12px;
+      background: #15171d;
+    }
+
+    .pane-title {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+      gap: 9px;
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .provider-icon {
+      width: 18px;
+      height: 18px;
+      border-radius: 4px;
+      background: #263027;
+      object-fit: contain;
+      padding: 2px;
+    }
+
+    .pane-meta {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .settings-anchor {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .settings-popover {
+      position: absolute;
+      top: 34px;
+      right: 0;
+      z-index: 10;
+      width: min(300px, calc(100vw - 48px));
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      padding: 10px;
+    }
+
+    .settings-stack {
+      display: grid;
+      gap: 10px;
+    }
+
+    .field {
+      display: grid;
+      gap: 6px;
+    }
+
+    .field-label {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 12px;
+      font-weight: 650;
+      color: #d7dce3;
+    }
+
+    .count {
+      color: var(--subtle);
+      font-size: 11px;
+      font-weight: 500;
+    }
+
+    .select-like,
+    .model-trigger,
+    .search-input {
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid #303541;
+      border-radius: 7px;
+      background: #111217;
+      color: var(--text);
+    }
+
+    .select-like {
+      padding: 0 10px;
+    }
+
+    .model-trigger {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 8px 6px 10px;
+      text-align: left;
+    }
+
+    .model-trigger:hover,
+    .model-trigger:focus-visible {
+      border-color: var(--focus);
+      outline: none;
+    }
+
+    .current-model {
+      min-width: 0;
+    }
+
+    .current-name {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .current-id {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+    }
+
+    .chevron {
+      color: var(--muted);
+      font-size: 16px;
+    }
+
+    .surface {
+      min-height: 637px;
+      padding: 18px;
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.025), transparent 280px),
+        #0f1014;
+    }
+
+    .transcript {
+      max-width: 780px;
+      margin: 0 auto;
+      display: grid;
+      gap: 12px;
+    }
+
+    .turn {
+      border: 1px solid #2b3039;
+      border-radius: 8px;
+      background: #171920;
+      padding: 14px;
+    }
+
+    .turn-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 8px;
+    }
+
+    .turn p {
+      margin: 0;
+      color: #dde2e8;
+      font-size: 14px;
+      line-height: 1.55;
+    }
+
+    .overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 50;
+      display: none;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 80px 16px 24px;
+      background: rgba(5, 6, 8, 0.54);
+    }
+
+    .overlay.open {
+      display: flex;
+    }
+
+    .dialog {
+      width: min(560px, 100%);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .dialog-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      padding: 10px;
+      border-bottom: 1px solid #2f3440;
+      background: #191b22;
+    }
+
+    .search-wrap {
+      position: relative;
+      min-width: 0;
+    }
+
+    .search-symbol {
+      position: absolute;
+      left: 11px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--subtle);
+      font-size: 13px;
+      pointer-events: none;
+    }
+
+    .search-input {
+      padding: 0 12px 0 34px;
+      outline: none;
+    }
+
+    .search-input:focus {
+      border-color: var(--focus);
+    }
+
+    .refresh {
+      display: inline-grid;
+      place-items: center;
+      width: 36px;
+      height: 36px;
+      border-radius: 7px;
+      background: #242833;
+      color: var(--muted);
+    }
+
+    .refresh:hover,
+    .refresh:focus-visible {
+      background: #2c3240;
+      color: var(--text);
+      outline: none;
+    }
+
+    .mru {
+      padding: 10px 10px 8px;
+      border-bottom: 1px solid #2f3440;
+    }
+
+    .mru-topline {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+      margin-bottom: 7px;
+      color: var(--subtle);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .mru-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .chip {
+      max-width: 100%;
+      min-height: 30px;
+      border: 1px solid #343a46;
+      border-radius: 999px;
+      background: #20242d;
+      padding: 5px 10px;
+      color: #d9dee6;
+      font-size: 12px;
+    }
+
+    .chip.active {
+      border-color: rgba(79, 179, 138, 0.6);
+      background: var(--accent-soft);
+      color: #dff7eb;
+    }
+
+    .chip:hover,
+    .chip:focus-visible {
+      border-color: var(--focus);
+      outline: none;
+    }
+
+    .results-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 9px 12px 6px;
+      color: var(--subtle);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .result-list {
+      max-height: 382px;
+      overflow: auto;
+      padding: 0 6px 8px;
+    }
+
+    .result {
+      width: 100%;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 12px;
+      min-height: 54px;
+      border-radius: 7px;
+      background: transparent;
+      padding: 8px 9px;
+      text-align: left;
+    }
+
+    .result:hover,
+    .result.focused {
+      background: #232733;
+    }
+
+    .result.selected {
+      background: var(--accent-soft);
+    }
+
+    .result-main {
+      min-width: 0;
+    }
+
+    .result-title {
+      display: flex;
+      min-width: 0;
+      align-items: center;
+      gap: 7px;
+      margin-bottom: 3px;
+    }
+
+    .result-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .provider-badge {
+      flex: none;
+      max-width: 132px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      border: 1px solid #3c424d;
+      border-radius: 999px;
+      padding: 1px 7px;
+      color: #c4cad3;
+      background: #1b1e26;
+      font-size: 10.5px;
+      font-weight: 600;
+    }
+
+    .result-id {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+    }
+
+    .result-side {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .variant {
+      border: 1px solid #38404d;
+      border-radius: 999px;
+      padding: 2px 7px;
+      color: #bdc4ce;
+      font-size: 10.5px;
+    }
+
+    .check {
+      width: 20px;
+      color: var(--accent);
+      text-align: center;
+      font-weight: 800;
+    }
+
+    .empty {
+      padding: 38px 20px 44px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 13px;
+    }
+
+    .dialog-foot {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      border-top: 1px solid #2f3440;
+      padding: 9px 10px;
+      color: var(--subtle);
+      font-size: 11px;
+    }
+
+    .dialog-foot kbd {
+      border: 1px solid #3b414c;
+      border-radius: 4px;
+      background: #22262f;
+      padding: 1px 5px;
+      color: #c7ced8;
+      font: inherit;
+    }
+
+    @media (max-width: 820px) {
+      .page {
+        width: min(100vw - 20px, 620px);
+        padding: 16px 0;
+      }
+
+      .frame {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        display: none;
+      }
+
+      .surface {
+        padding: 12px;
+      }
+
+      .overlay {
+        padding-top: 56px;
+      }
+
+      .settings-popover {
+        width: min(300px, calc(100vw - 28px));
+      }
+    }
+
+    @media (max-width: 520px) {
+      .pane-meta {
+        display: none;
+      }
+
+      .dialog {
+        max-height: calc(100vh - 72px);
+      }
+
+      .result-list {
+        max-height: calc(100vh - 312px);
+      }
+
+      .result {
+        grid-template-columns: minmax(0, 1fr);
+        align-items: start;
+      }
+
+      .result-side {
+        justify-content: space-between;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <div class="frame">
+      <aside class="sidebar" aria-label="Sessions">
+        <div class="tabbar">
+          <div class="brand"><span class="brand-mark">F</span><span>Freshell</span></div>
+          <button class="icon-button" type="button" aria-label="New tab">+</button>
+        </div>
+        <div class="session-list">
+          <div class="session-row active"><span class="dot busy"></span><span class="session-title">Freshopencode · Model picker work</span></div>
+          <div class="session-row"><span class="dot"></span><span class="session-title">Freshcodex · Settings polish</span></div>
+          <div class="session-row"><span class="dot"></span><span class="session-title">Shell · release checks</span></div>
+        </div>
+      </aside>
+
+      <section class="workspace" aria-label="Freshopencode pane">
+        <header class="pane-header">
+          <div class="pane-title">
+            <img class="provider-icon" src="../../assets/icons/opencode.svg" alt="">
+            <span>Freshopencode</span>
+            <span class="pane-meta" id="paneModelText">DeepSeek V4 Flash · opencode-go</span>
+          </div>
+          <div class="settings-anchor">
+            <button class="icon-button" type="button" aria-label="Agent settings" aria-expanded="true">⚙</button>
+            <div class="settings-popover" role="dialog" aria-label="Agent settings">
+              <div class="settings-stack">
+                <label class="field">
+                  <span class="field-label">Style</span>
+                  <select class="select-like" aria-label="Style">
+                    <option>Sans</option>
+                    <option>Mono</option>
+                    <option>Serif</option>
+                  </select>
+                </label>
+
+                <div class="field">
+                  <span class="field-label">
+                    <span>Model</span>
+                    <span class="count" id="enabledCount">21 enabled</span>
+                  </span>
+                  <button class="model-trigger" id="openPicker" type="button" aria-haspopup="dialog">
+                    <span class="current-model">
+                      <span class="current-name" id="currentName">DeepSeek V4 Flash</span>
+                      <span class="current-id" id="currentId">opencode-go/deepseek-v4-flash</span>
+                    </span>
+                    <span class="chevron">⌘K</span>
+                  </button>
+                </div>
+
+                <label class="field">
+                  <span class="field-label">Thinking</span>
+                  <select class="select-like" aria-label="Thinking">
+                    <option>max</option>
+                    <option>high</option>
+                    <option>medium</option>
+                    <option>low</option>
+                    <option>minimal</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+          </div>
+        </header>
+
+        <div class="surface">
+          <div class="transcript">
+            <article class="turn">
+              <div class="turn-head"><span>User</span><span>11:38 AM</span></div>
+              <p>Compare the enabled Opencode model sources and propose a compact chooser for freshopencode settings.</p>
+            </article>
+            <article class="turn">
+              <div class="turn-head"><span>Assistant · DeepSeek V4 Flash</span><span>11:39 AM</span></div>
+              <p>The selector should treat provider and model as the stable identity, then use search and recency to keep the pane settings compact.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <div class="overlay open" id="overlay">
+    <section class="dialog" role="dialog" aria-modal="true" aria-label="Freshopencode model">
+      <div class="dialog-head">
+        <div class="search-wrap">
+          <span class="search-symbol">⌕</span>
+          <input class="search-input" id="searchInput" type="search" autocomplete="off" placeholder="Search enabled models" aria-label="Search enabled Freshopencode models">
+        </div>
+        <button class="refresh" type="button" aria-label="Refresh model list">↻</button>
+      </div>
+
+      <div class="mru" aria-label="Recently used models">
+        <div class="mru-topline">
+          <span>Recent</span>
+          <span>Last 5</span>
+        </div>
+        <div class="mru-list" id="mruList"></div>
+      </div>
+
+      <div class="results-head">
+        <span>Enabled models</span>
+        <span id="matchCount"></span>
+      </div>
+      <div class="result-list" id="resultList" role="listbox" aria-label="Enabled Freshopencode models"></div>
+      <div class="dialog-foot">
+        <span><kbd>↑</kbd> <kbd>↓</kbd> move · <kbd>Enter</kbd> select</span>
+        <span><kbd>Esc</kbd> close</span>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const models = [
+      { id: 'opencode-go/deepseek-v4-flash', name: 'DeepSeek V4 Flash', provider: 'opencode-go', variant: 'max' },
+      { id: 'opencode-go/deepseek-v4-pro', name: 'DeepSeek V4 Pro', provider: 'opencode-go', variant: 'max' },
+      { id: 'opencode-go/glm-5.2', name: 'GLM 5.2', provider: 'opencode-go', variant: 'max' },
+      { id: 'openrouter/glm-5.2', name: 'GLM 5.2', provider: 'openrouter', variant: 'high' },
+      { id: 'umans-ai-coding-plan/umans-kimi-k2.7', name: 'Kimi k2.7', provider: 'umans-ai-coding-plan', variant: 'max' },
+      { id: 'opencode/openai-gpt-5.2', name: 'GPT 5.2', provider: 'opencode', variant: 'high' },
+      { id: 'anthropic/claude-opus-4-6', name: 'Claude Opus 4.6', provider: 'anthropic', variant: 'high' },
+      { id: 'anthropic/claude-sonnet-4-5', name: 'Claude Sonnet 4.5', provider: 'anthropic', variant: 'high' },
+      { id: 'google/gemini-3-pro', name: 'Gemini 3 Pro', provider: 'google', variant: 'high' },
+      { id: 'opencode/minimax-m2.1', name: 'MiniMax M2.1', provider: 'opencode', variant: 'high' },
+      { id: 'groq/qwen3-coder-plus', name: 'Qwen3 Coder Plus', provider: 'groq', variant: 'medium' },
+      { id: 'lmstudio/qwen3-coder-30b-a3b', name: 'Qwen3 Coder 30B', provider: 'lmstudio', variant: 'medium' },
+      { id: 'ollama/deepseek-coder-v2', name: 'DeepSeek Coder V2', provider: 'ollama', variant: 'low' },
+      { id: 'moonshot/kimi-k2-thinking', name: 'Kimi K2 Thinking', provider: 'moonshot', variant: 'max' },
+    ];
+
+    let selectedId = 'opencode-go/deepseek-v4-flash';
+    let focusedIndex = 0;
+    let filtered = [...models];
+    let mru = [
+      'opencode-go/deepseek-v4-flash',
+      'opencode-go/glm-5.2',
+      'openrouter/glm-5.2',
+      'umans-ai-coding-plan/umans-kimi-k2.7',
+      'opencode-go/deepseek-v4-pro',
+    ];
+
+    const overlay = document.getElementById('overlay');
+    const openPicker = document.getElementById('openPicker');
+    const searchInput = document.getElementById('searchInput');
+    const resultList = document.getElementById('resultList');
+    const mruList = document.getElementById('mruList');
+    const matchCount = document.getElementById('matchCount');
+    const currentName = document.getElementById('currentName');
+    const currentId = document.getElementById('currentId');
+    const paneModelText = document.getElementById('paneModelText');
+
+    function findModel(id) {
+      return models.find((model) => model.id === id);
+    }
+
+    function modelSearchText(model) {
+      return `${model.name} ${model.id} ${model.provider}`.toLowerCase();
+    }
+
+    function choose(id) {
+      const model = findModel(id);
+      if (!model) return;
+      selectedId = id;
+      mru = [id, ...mru.filter((entry) => entry !== id)].slice(0, 5);
+      currentName.textContent = model.name;
+      currentId.textContent = model.id;
+      paneModelText.textContent = `${model.name} · ${model.provider}`;
+      renderMru();
+      renderResults();
+      closeDialog();
+    }
+
+    function openDialog() {
+      overlay.classList.add('open');
+      searchInput.value = '';
+      filterModels();
+      window.setTimeout(() => searchInput.focus(), 0);
+    }
+
+    function closeDialog() {
+      overlay.classList.remove('open');
+      openPicker.focus();
+    }
+
+    function renderMru() {
+      mruList.textContent = '';
+      for (const id of mru) {
+        const model = findModel(id);
+        if (!model) continue;
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = `chip${id === selectedId ? ' active' : ''}`;
+        chip.textContent = model.name;
+        chip.setAttribute('aria-label', `${model.name}, ${model.provider}`);
+        chip.addEventListener('click', () => choose(id));
+        mruList.append(chip);
+      }
+    }
+
+    function renderResults() {
+      resultList.textContent = '';
+      matchCount.textContent = `${filtered.length} shown`;
+      if (filtered.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = 'No enabled models match this search.';
+        resultList.append(empty);
+        return;
+      }
+
+      filtered.forEach((model, index) => {
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = [
+          'result',
+          model.id === selectedId ? 'selected' : '',
+          index === focusedIndex ? 'focused' : '',
+        ].filter(Boolean).join(' ');
+        row.setAttribute('role', 'option');
+        row.setAttribute('aria-selected', model.id === selectedId ? 'true' : 'false');
+        row.innerHTML = `
+          <span class="result-main">
+            <span class="result-title">
+              <span class="result-name"></span>
+              <span class="provider-badge"></span>
+            </span>
+            <span class="result-id"></span>
+          </span>
+          <span class="result-side">
+            <span class="variant"></span>
+            <span class="check">${model.id === selectedId ? '✓' : ''}</span>
+          </span>
+        `;
+        row.querySelector('.result-name').textContent = model.name;
+        row.querySelector('.provider-badge').textContent = model.provider;
+        row.querySelector('.result-id').textContent = model.id;
+        row.querySelector('.variant').textContent = model.variant;
+        row.addEventListener('mouseenter', () => {
+          focusedIndex = index;
+          renderResults();
+        });
+        row.addEventListener('click', () => choose(model.id));
+        resultList.append(row);
+      });
+    }
+
+    function filterModels() {
+      const query = searchInput.value.trim().toLowerCase();
+      filtered = query ? models.filter((model) => modelSearchText(model).includes(query)) : [...models];
+      focusedIndex = Math.min(focusedIndex, Math.max(filtered.length - 1, 0));
+      renderResults();
+    }
+
+    openPicker.addEventListener('click', openDialog);
+    searchInput.addEventListener('input', filterModels);
+    overlay.addEventListener('mousedown', (event) => {
+      if (event.target === overlay) closeDialog();
+    });
+    document.addEventListener('keydown', (event) => {
+      if (!overlay.classList.contains('open')) {
+        if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+          event.preventDefault();
+          openDialog();
+        }
+        return;
+      }
+
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeDialog();
+      } else if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        focusedIndex = Math.min(focusedIndex + 1, Math.max(filtered.length - 1, 0));
+        renderResults();
+      } else if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        focusedIndex = Math.max(focusedIndex - 1, 0);
+        renderResults();
+      } else if (event.key === 'Enter' && filtered[focusedIndex]) {
+        event.preventDefault();
+        choose(filtered[focusedIndex].id);
+      }
+    });
+
+    document.getElementById('enabledCount').textContent = `${models.length} enabled`;
+    renderMru();
+    filterModels();
+  </script>
+</body>
+</html>
