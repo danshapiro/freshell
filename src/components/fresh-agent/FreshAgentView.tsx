@@ -140,12 +140,26 @@ function mergeSnapshotForDisplay(
   return { ...next, turns: mergedTurns }
 }
 
-function getEffectiveFreshAgentModel(content: FreshAgentPaneContent): string | undefined {
-  return normalizeFreshAgentModel(content.sessionType, content.provider, content.model)
+function resolveEffectiveFreshAgentModel(
+  content: FreshAgentPaneContent,
+  providerDefaults?: { modelSelection?: { modelId: string } },
+): string | undefined {
+  const configuredModel = content.model
+    ?? content.modelSelection?.modelId
+    ?? providerDefaults?.modelSelection?.modelId
+  return normalizeFreshAgentModel(content.sessionType, content.provider, configuredModel)
 }
 
-function getEffectiveFreshAgentEffort(content: FreshAgentPaneContent): string | undefined {
-  return normalizeFreshAgentEffort(content.sessionType, content.provider, getEffectiveFreshAgentModel(content), content.effort)
+function getEffectiveFreshAgentEffort(
+  content: FreshAgentPaneContent,
+  providerDefaults?: { modelSelection?: { modelId: string } },
+): string | undefined {
+  return normalizeFreshAgentEffort(
+    content.sessionType,
+    content.provider,
+    resolveEffectiveFreshAgentModel(content, providerDefaults),
+    content.effort,
+  )
 }
 
 function getEffectiveFreshAgentPermissionMode(content: FreshAgentPaneContent): string | undefined {
@@ -671,13 +685,13 @@ export function FreshAgentView({
         ?? (content.sessionRef?.provider === content.provider ? content.sessionRef.sessionId : undefined),
       sessionRef: content.sessionRef,
       modelSelection: content.modelSelection,
-      model: getEffectiveFreshAgentModel(content),
+      model: resolveEffectiveFreshAgentModel(content, providerDefaults),
       ...(getEffectiveFreshAgentPermissionMode(content) ? { permissionMode: getEffectiveFreshAgentPermissionMode(content) } : {}),
       sandbox: content.sandbox,
-      effort: getEffectiveFreshAgentEffort(content),
+      effort: getEffectiveFreshAgentEffort(content, providerDefaults),
       plugins: content.plugins,
     } as const
-  }, [tabRestoreSource])
+  }, [providerDefaults, tabRestoreSource])
 
   const startNewConversation = useCallback(() => {
     const current = paneContentRef.current
@@ -1327,10 +1341,10 @@ export function FreshAgentView({
       text,
       settings: {
         ...(current.initialCwd ? { cwd: current.initialCwd } : {}),
-        ...(getEffectiveFreshAgentModel(current) ? { model: getEffectiveFreshAgentModel(current) } : {}),
+        ...(resolveEffectiveFreshAgentModel(current, providerDefaults) ? { model: resolveEffectiveFreshAgentModel(current, providerDefaults) } : {}),
         ...(getEffectiveFreshAgentPermissionMode(current) ? { permissionMode: getEffectiveFreshAgentPermissionMode(current) } : {}),
         ...(current.sandbox ? { sandbox: current.sandbox } : {}),
-        ...(getEffectiveFreshAgentEffort(current) ? { effort: getEffectiveFreshAgentEffort(current) } : {}),
+        ...(getEffectiveFreshAgentEffort(current, providerDefaults) ? { effort: getEffectiveFreshAgentEffort(current, providerDefaults) } : {}),
       },
     })
     setLocalEchoState(nextLocalEcho)
@@ -1342,7 +1356,7 @@ export function FreshAgentView({
         pendingLocalEcho: nextLocalEcho,
       },
     }))
-  }, [dispatch, paneId, recordPendingSendMetadata, sendFreshAgentMessage, snapshotConfirmsNoUserTurns, tabId])
+  }, [dispatch, paneId, providerDefaults, recordPendingSendMetadata, sendFreshAgentMessage, snapshotConfirmsNoUserTurns, tabId])
 
   // Flush queued messages when the turn ends. One flush per status change is
   // enough: all queued entries are delivered in order for the next turn.

@@ -1480,6 +1480,81 @@ describe('FreshAgentView', () => {
     }))
   })
 
+  it('creates Freshopencode panes with modelSelection when persisted model is absent after reload', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-reload-opencode-model',
+        status: 'creating',
+        modelSelection: { kind: 'exact', modelId: 'opencode-go/glm-5.2' },
+        effort: 'max',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(sentFreshAgentMessages('freshAgent.create')).toContainEqual(expect.objectContaining({
+        type: 'freshAgent.create',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        model: 'opencode-go/glm-5.2',
+        modelSelection: { kind: 'exact', modelId: 'opencode-go/glm-5.2' },
+      }))
+    })
+  })
+
+  it('sends Freshopencode messages with modelSelection when pane model is absent', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-send-opencode-model',
+        sessionId: 'freshopencode-req-send-opencode-model',
+        status: 'idle',
+        modelSelection: { kind: 'exact', modelId: 'deepseek/deepseek-v4-pro' },
+        effort: 'high',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'hello' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(sentFreshAgentMessages('freshAgent.send')).toContainEqual(expect.objectContaining({
+      type: 'freshAgent.send',
+      settings: expect.objectContaining({
+        model: 'deepseek/deepseek-v4-pro',
+        effort: 'high',
+      }),
+    }))
+  })
+
   it('auto-titles the fresh-agent pane and tab from the first user message', async () => {
     const store = createStore()
     store.dispatch(initLayout({

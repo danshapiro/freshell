@@ -19,12 +19,26 @@ import {
   type FreshAgentStyle,
 } from '@shared/settings'
 
-function getEffectiveFreshAgentModel(content: FreshAgentPaneContent): string | undefined {
-  return normalizeFreshAgentModel(content.sessionType, content.provider, content.model)
+function resolveEffectiveFreshAgentModel(
+  content: FreshAgentPaneContent,
+  providerDefaults?: { modelSelection?: { modelId: string } },
+): string | undefined {
+  const configuredModel = content.model
+    ?? content.modelSelection?.modelId
+    ?? providerDefaults?.modelSelection?.modelId
+  return normalizeFreshAgentModel(content.sessionType, content.provider, configuredModel)
 }
 
-function getEffectiveFreshAgentEffort(content: FreshAgentPaneContent): string | undefined {
-  return normalizeFreshAgentEffort(content.sessionType, content.provider, getEffectiveFreshAgentModel(content), content.effort)
+function getEffectiveFreshAgentEffort(
+  content: FreshAgentPaneContent,
+  providerDefaults?: { modelSelection?: { modelId: string } },
+): string | undefined {
+  return normalizeFreshAgentEffort(
+    content.sessionType,
+    content.provider,
+    resolveEffectiveFreshAgentModel(content, providerDefaults),
+    content.effort,
+  )
 }
 
 type PermissionModeOption = { value: string; label: string; description?: string }
@@ -66,11 +80,11 @@ export function FreshAgentSettingsButton({
   const buttonRef = useRef<HTMLButtonElement>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
 
-  const activeModel = getEffectiveFreshAgentModel(paneContent)
+  const activeModel = resolveEffectiveFreshAgentModel(paneContent, providerDefaults)
   const modelOptions = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE[paneContent.sessionType] ?? []
   const modelValue = activeModel ?? ''
   const thinkingOptions = getFreshAgentThinkingOptions(paneContent.sessionType, paneContent.provider, activeModel)
-  const thinkingValue = getEffectiveFreshAgentEffort(paneContent) ?? ''
+  const thinkingValue = getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? ''
   const descriptor = resolveFreshAgentType(paneContent.sessionType)
   const permissionModeVisible = descriptor?.settingsVisibility.permissionMode === true
   const permissionModes = permissionModeVisible
