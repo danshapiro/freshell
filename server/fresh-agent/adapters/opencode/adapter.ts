@@ -288,7 +288,6 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       if (existing) {
         if (locator.cwd) {
           existing.cwd = locator.cwd
-          if (existing.realSessionId) serveManager.rememberSessionCwd(existing.realSessionId, locator.cwd)
         }
         remember(existing)
         return { sessionId: locator.sessionId, sessionRef: { provider: 'opencode', sessionId: locator.sessionId } }
@@ -303,7 +302,6 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         status: 'idle',
         events: new EventEmitter(), sendQueue: Promise.resolve(),
       }
-      if (locator.cwd) serveManager.rememberSessionCwd(locator.sessionId, locator.cwd)
       remember(state)
       bindServeStream(state)
       return { sessionId: locator.sessionId, sessionRef: { provider: 'opencode', sessionId: locator.sessionId } }

@@ -27,7 +27,6 @@ function makeFakeManager() {
       ...(input?.directory ? { directory: input.directory } : {}),
       title: 'T',
     })),
-    rememberSessionCwd: vi.fn(),
     promptAsync: vi.fn(async () => undefined),
     listMessages: vi.fn(async () => ({ messages: [], nextCursor: null })),
     getMessage: vi.fn(async () => null),
@@ -321,20 +320,6 @@ describe('OpenCode serve adapter: history reads', () => {
     { info: { id: 'msg_user_1', role: 'user', time: { created: 1779557095868 } }, parts: [{ id: 'p1', type: 'text', text: 'reply ok' }] },
     { info: { id: 'msg_assistant_1', role: 'assistant', providerID: 'umans-ai-coding-plan', modelID: 'umans-kimi-k2.7' }, parts: [{ id: 'p2', type: 'text', text: 'ok' }] },
   ]
-
-  it('remembers cwd when attaching a durable OpenCode session', async () => {
-    const manager = makeFakeManager()
-    const adapter = makeAdapter(manager)
-
-    await adapter.attach?.({
-      sessionType: 'freshopencode',
-      provider: 'opencode',
-      sessionId: 'ses_existing_cwd',
-      cwd: '/repo/from-pane',
-    })
-
-    expect(manager.rememberSessionCwd).toHaveBeenCalledWith('ses_existing_cwd', '/repo/from-pane')
-  })
 
   it('getSnapshot assembles HTTP messages into the normalized transcript', async () => {
     const manager = makeFakeManager()
