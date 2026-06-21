@@ -277,3 +277,89 @@ export function getFreshAgentSettingsModelOptions(args: ResolveFreshAgentModelSe
 
   return options
 }
+
+export type FreshAgentModelSourceGroup = {
+  source: { id: string; displayName: string }
+  models: FreshAgentModelCapability[]
+}
+
+function compareModelCapability(a: FreshAgentModelCapability, b: FreshAgentModelCapability): number {
+  return a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' })
+    || a.id.localeCompare(b.id, undefined, { sensitivity: 'base' })
+}
+
+function sourceForCapability(model: FreshAgentModelCapability): { id: string; displayName: string } {
+  if (model.source) return model.source
+  const sourceId = model.id.includes('/') ? model.id.split('/')[0] : model.provider
+  return { id: sourceId, displayName: sourceId }
+}
+
+export function groupFreshAgentModelCapabilitiesBySource(
+  capabilities: FreshAgentModelCapabilities | undefined,
+): FreshAgentModelSourceGroup[] {
+  const bySource = new Map<string, FreshAgentModelSourceGroup>()
+  for (const model of capabilities?.models ?? []) {
+    const source = sourceForCapability(model)
+    const key = source.id
+    const group = bySource.get(key) ?? { source, models: [] }
+    group.models.push(model)
+    bySource.set(key, group)
+  }
+  return [...bySource.values()]
+    .map((group) => ({ ...group, models: [...group.models].sort(compareModelCapability) }))
+    .sort((a, b) => (
+      a.source.displayName.localeCompare(b.source.displayName, undefined, { sensitivity: 'base' })
+      || a.source.id.localeCompare(b.source.id, undefined, { sensitivity: 'base' })
+    ))
+}
+
+export function filterFreshAgentModelCapabilitiesByQuery(
+  groups: FreshAgentModelSourceGroup[],
+  query: string,
+): FreshAgentModelSourceGroup[] {
+  const tokens = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean)
+  if (tokens.length === 0) return groups
+  return groups
+    .map((group) => ({
+      source: group.source,
+      models: group.models.filter((model) => {
+        const haystack = [
+          model.id,
+          model.displayName,
+          model.description ?? '',
+          group.source.id,
+          group.source.displayName,
+        ].join(' ').toLocaleLowerCase()
+        return tokens.every((token) => haystack.includes(token))
+      }),
+    }))
+    .filter((group) => group.models.length > 0)
+}
+
+export function resolveFreshOpencodeCapabilityById(
+  capabilities: FreshAgentModelCapabilities | undefined,
+  modelId: string | undefined,
+): FreshAgentModelCapability | undefined {
+  if (!modelId) return undefined
+  return capabilities?.models.find((model) => model.id === modelId)
+}
+
+export function capFreshAgentModelSourceRows(
+  groups: FreshAgentModelSourceGroup[],
+  maxRows: number,
+): { groups: FreshAgentModelSourceGroup[]; hiddenCount: number } {
+  const cappedGroups: FreshAgentModelSourceGroup[] = []
+  let remaining = Math.max(0, maxRows)
+  let hiddenCount = 0
+  for (const group of groups) {
+    if (remaining <= 0) {
+      hiddenCount += group.models.length
+      continue
+    }
+    const models = group.models.slice(0, remaining)
+    hiddenCount += group.models.length - models.length
+    remaining -= models.length
+    if (models.length > 0) cappedGroups.push({ source: group.source, models })
+  }
+  return { groups: cappedGroups, hiddenCount }
+}

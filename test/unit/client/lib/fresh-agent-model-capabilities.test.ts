@@ -3,14 +3,18 @@ import { describe, expect, it } from 'vitest'
 import {
   FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS,
   FRESH_AGENT_PROVIDER_DEFAULT_MODEL_OPTION_VALUE,
+  capFreshAgentModelSourceRows,
+  filterFreshAgentModelCapabilitiesByQuery,
   getFreshAgentSettingsModelOptions,
   getFreshAgentSettingsModelValue,
   getFreshAgentSupportedEffortLevels,
+  groupFreshAgentModelCapabilitiesBySource,
   isFreshAgentEffortSupported,
   isFreshAgentModelCapabilitiesFresh,
   parseFreshAgentSettingsModelValue,
   requiresFreshAgentModelCapabilityValidation,
   resolveFreshAgentModelSelection,
+  resolveFreshOpencodeCapabilityById,
 } from '@/lib/fresh-agent-model-capabilities'
 
 const capabilities = {
@@ -37,14 +41,50 @@ const capabilities = {
       supportedEffortLevels: ['warp'],
       supportsAdaptiveThinking: true,
     },
+  {
+    id: 'haiku',
+    displayName: 'Haiku',
+    provider: 'claude',
+    description: 'Fast path',
+    supportsEffort: false,
+    supportedEffortLevels: [],
+    supportsAdaptiveThinking: false,
+  },
+  ],
+} as const
+
+const opencodeCapabilities = {
+  sessionType: 'freshopencode',
+  runtimeProvider: 'opencode',
+  status: 'fresh',
+  fetchedAt: 1_234,
+  models: [
     {
-      id: 'haiku',
-      displayName: 'Haiku',
-      provider: 'claude',
-      description: 'Fast path',
-      supportsEffort: false,
-      supportedEffortLevels: [],
-      supportsAdaptiveThinking: false,
+      id: 'opencode-go/glm-5.2',
+      displayName: 'GLM 5.2',
+      provider: 'opencode',
+      source: { id: 'opencode-go', displayName: 'opencode-go' },
+      supportsEffort: true,
+      supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
+      supportsAdaptiveThinking: true,
+    },
+    {
+      id: 'deepseek/deepseek-v4-flash',
+      displayName: 'DeepSeek V4 Flash',
+      provider: 'opencode',
+      source: { id: 'deepseek', displayName: 'deepseek' },
+      supportsEffort: true,
+      supportedEffortLevels: ['low', 'high'],
+      supportsAdaptiveThinking: true,
+    },
+    {
+      id: 'opencode-go/deepseek-v4-pro',
+      displayName: 'DeepSeek V4 Pro',
+      provider: 'opencode',
+      source: { id: 'opencode-go', displayName: 'opencode-go' },
+      supportsEffort: true,
+      supportedEffortLevels: ['low', 'high'],
+      supportsAdaptiveThinking: true,
     },
   ],
 } as const
@@ -294,5 +334,62 @@ describe('fresh-agent-model-capabilities helpers', () => {
       description: 'Synthetic model 1999',
     })
     expect(durationMs).toBeLessThan(1_000)
+  })
+})
+
+describe('fresh-agent-model-capabilities opencode catalog helpers', () => {
+  it('groups OpenCode capabilities by source and sorts sources and models alphabetically', () => {
+    expect(groupFreshAgentModelCapabilitiesBySource(opencodeCapabilities)).toEqual([
+      {
+        source: { id: 'deepseek', displayName: 'deepseek' },
+        models: [expect.objectContaining({ id: 'deepseek/deepseek-v4-flash' })],
+      },
+      {
+        source: { id: 'opencode-go', displayName: 'opencode-go' },
+        models: [
+          expect.objectContaining({ id: 'opencode-go/deepseek-v4-pro' }),
+          expect.objectContaining({ id: 'opencode-go/glm-5.2' }),
+        ],
+      },
+    ])
+  })
+
+  it('filters grouped OpenCode capabilities by source, display name, and model id', () => {
+    const grouped = groupFreshAgentModelCapabilitiesBySource(opencodeCapabilities)
+
+    expect(filterFreshAgentModelCapabilitiesByQuery(grouped, 'glm').flatMap((group) => group.models.map((model) => model.id))).toEqual([
+      'opencode-go/glm-5.2',
+    ])
+    expect(filterFreshAgentModelCapabilitiesByQuery(grouped, 'deepseek').map((group) => group.source.id)).toEqual([
+      'deepseek',
+      'opencode-go',
+    ])
+  })
+
+  it('resolves an OpenCode capability by stable provider-qualified id', () => {
+    expect(resolveFreshOpencodeCapabilityById(opencodeCapabilities, 'opencode-go/glm-5.2')).toEqual(
+      expect.objectContaining({ displayName: 'GLM 5.2' }),
+    )
+    expect(resolveFreshOpencodeCapabilityById(opencodeCapabilities, 'glm-5.2')).toBeUndefined()
+  })
+
+  it('caps rendered model rows while preserving source grouping order', () => {
+    const grouped = groupFreshAgentModelCapabilitiesBySource({
+      ...opencodeCapabilities,
+      models: Array.from({ length: 300 }, (_, index) => ({
+        id: `opencode-go/model-${String(index).padStart(3, '0')}`,
+        displayName: `Model ${String(index).padStart(3, '0')}`,
+        provider: 'opencode' as const,
+        source: { id: 'opencode-go', displayName: 'opencode-go' },
+        supportsEffort: true,
+        supportedEffortLevels: ['high'],
+        supportsAdaptiveThinking: true,
+      })),
+    })
+
+    const capped = capFreshAgentModelSourceRows(grouped, 250)
+
+    expect(capped.groups.flatMap((group) => group.models)).toHaveLength(250)
+    expect(capped.hiddenCount).toBe(50)
   })
 })

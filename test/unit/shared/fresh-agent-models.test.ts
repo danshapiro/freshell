@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  FRESHOPENCODE_DEFAULT_EFFORT,
+  FRESHOPENCODE_DEFAULT_MODEL,
   FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE,
   getFreshAgentThinkingOptions,
+  normalizeFreshAgentEffort,
   normalizeFreshAgentModel,
   resolveFreshAgentModelOption,
 } from '@shared/fresh-agent-models'
@@ -67,5 +70,22 @@ describe('fresh-agent-models freshopencode options', () => {
     const values = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE.freshopencode.map((o) => o.value)
 
     expect(values).toContain(KIMI_K2_7_MODEL)
+  })
+})
+
+describe('fresh-agent-models freshopencode live catalog normalization', () => {
+  it('preserves provider-qualified Freshopencode model ids from the live catalog', () => {
+    expect(normalizeFreshAgentModel('freshopencode', 'opencode', 'deepseek/deepseek-v4-pro')).toBe('deepseek/deepseek-v4-pro')
+    expect(normalizeFreshAgentModel('freshopencode', 'opencode', 'opencode-go/glm-5.2')).toBe('opencode-go/glm-5.2')
+  })
+
+  it('falls back to the Freshopencode default only for missing or blank model ids', () => {
+    expect(normalizeFreshAgentModel('freshopencode', 'opencode', undefined)).toBe(FRESHOPENCODE_DEFAULT_MODEL)
+    expect(normalizeFreshAgentModel('freshopencode', 'opencode', '   ')).toBe(FRESHOPENCODE_DEFAULT_MODEL)
+  })
+
+  it('preserves Freshopencode effort for live-catalog models not present in the static fallback list', () => {
+    expect(normalizeFreshAgentEffort('freshopencode', 'opencode', 'deepseek/deepseek-v4-pro', 'high')).toBe('high')
+    expect(normalizeFreshAgentEffort('freshopencode', 'opencode', 'deepseek/deepseek-v4-pro', undefined)).toBe(FRESHOPENCODE_DEFAULT_EFFORT)
   })
 })

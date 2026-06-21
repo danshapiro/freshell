@@ -112,8 +112,8 @@ export function normalizeFreshAgentModel(
     return normalizeFreshcodexModel(model)
   }
   if (provider === 'opencode') {
-    const options = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE[sessionType] ?? []
-    return options.find((candidate) => candidate.value === model)?.value ?? defaultModelForSession(sessionType)?.value
+    const trimmed = typeof model === 'string' ? model.trim() : ''
+    return trimmed.length > 0 ? trimmed : defaultModelForSession(sessionType)?.value
   }
   return model
 }
@@ -135,6 +135,10 @@ export function normalizeFreshAgentEffort(
   effort: string | undefined,
 ): string | undefined {
   const options = getFreshAgentThinkingOptions(sessionType, provider, model)
+  if (provider === 'opencode' && options.length === 0) {
+    const normalized = typeof effort === 'string' ? effort.trim() : ''
+    return normalized.length > 0 ? normalized : FRESHOPENCODE_DEFAULT_EFFORT
+  }
   const normalizedEffort = provider === 'codex' && effort === 'xhigh' ? 'max' : effort
   if (normalizedEffort && options.some((option) => option.value === normalizedEffort)) {
     return normalizedEffort
