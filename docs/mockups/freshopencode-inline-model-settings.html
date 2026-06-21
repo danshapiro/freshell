@@ -1,0 +1,812 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Freshopencode Inline Model Settings Mockup</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101014;
+      --panel: #17191f;
+      --panel-2: #20242d;
+      --panel-3: #252b35;
+      --text: #f2f3f5;
+      --muted: #a7adb7;
+      --subtle: #747c88;
+      --border: #343a45;
+      --accent: #4fb38a;
+      --accent-soft: rgba(79, 179, 138, 0.16);
+      --focus: #79c7ff;
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.48);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.025), transparent 28rem),
+        var(--bg);
+      color: var(--text);
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    button {
+      border: 0;
+      color: inherit;
+      cursor: pointer;
+    }
+
+    .page {
+      width: min(1120px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 40px 0;
+    }
+
+    .frame {
+      display: grid;
+      grid-template-columns: minmax(260px, 330px) minmax(0, 1fr);
+      min-height: 690px;
+      border: 1px solid #2d313b;
+      background: #0d0e12;
+      box-shadow: var(--shadow);
+    }
+
+    .sidebar {
+      border-right: 1px solid #2d313b;
+      background: #14151a;
+      padding: 14px 12px;
+    }
+
+    .tabbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 34px;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .brand-mark {
+      display: grid;
+      place-items: center;
+      width: 22px;
+      height: 22px;
+      border-radius: 5px;
+      background: #232732;
+      color: var(--accent);
+      font-size: 13px;
+    }
+
+    .icon-button {
+      display: inline-grid;
+      place-items: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--muted);
+    }
+
+    .icon-button:hover,
+    .icon-button:focus-visible {
+      background: #232732;
+      color: var(--text);
+      outline: none;
+    }
+
+    .session-list {
+      display: grid;
+      gap: 4px;
+    }
+
+    .session-row {
+      display: grid;
+      grid-template-columns: 8px minmax(0, 1fr);
+      align-items: center;
+      min-height: 36px;
+      gap: 9px;
+      padding: 6px 8px;
+      border-radius: 6px;
+      color: var(--muted);
+    }
+
+    .session-row.active {
+      background: #20232c;
+      color: var(--text);
+    }
+
+    .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 999px;
+      background: var(--subtle);
+    }
+
+    .dot.busy {
+      background: #58a6ff;
+    }
+
+    .session-title,
+    .pane-meta,
+    .model-id,
+    .result-id {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .session-title {
+      font-size: 13px;
+    }
+
+    .workspace {
+      min-width: 0;
+      background: #101115;
+    }
+
+    .pane-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 42px;
+      border-bottom: 1px solid #2d313b;
+      padding: 0 10px 0 12px;
+      background: #15171d;
+    }
+
+    .pane-title {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+      gap: 9px;
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .provider-icon {
+      width: 18px;
+      height: 18px;
+      border-radius: 4px;
+      background: #263027;
+      object-fit: contain;
+      padding: 2px;
+    }
+
+    .pane-meta {
+      min-width: 0;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .settings-anchor {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .settings-popover {
+      position: absolute;
+      top: 34px;
+      right: 0;
+      z-index: 20;
+      width: min(390px, calc(100vw - 48px));
+      max-height: min(600px, calc(100vh - 96px));
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      padding: 10px;
+    }
+
+    .settings-stack {
+      display: grid;
+      gap: 12px;
+    }
+
+    .field {
+      display: grid;
+      gap: 6px;
+    }
+
+    .field-label {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+      color: #d8dde5;
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .count {
+      color: var(--subtle);
+      font-size: 11px;
+      font-weight: 500;
+    }
+
+    .select-like,
+    .search-input {
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid #303541;
+      border-radius: 7px;
+      background: #111217;
+      color: var(--text);
+    }
+
+    .select-like {
+      padding: 0 10px;
+    }
+
+    .model-current {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 8px;
+      min-height: 42px;
+      border: 1px solid #303541;
+      border-radius: 7px;
+      background: #12141a;
+      padding: 7px 8px 7px 10px;
+    }
+
+    .model-name {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .model-id,
+    .result-id {
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+    }
+
+    .status-pill,
+    .provider-badge,
+    .variant {
+      flex: none;
+      border: 1px solid #3c424d;
+      border-radius: 999px;
+      background: #1b1e26;
+      color: #c4cad3;
+      font-size: 10.5px;
+      font-weight: 650;
+    }
+
+    .status-pill {
+      padding: 2px 7px;
+      color: #dbf3e6;
+      border-color: rgba(79, 179, 138, 0.45);
+      background: var(--accent-soft);
+    }
+
+    .recent-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+    }
+
+    .recent-button {
+      min-width: 0;
+      min-height: 36px;
+      border: 1px solid #343a46;
+      border-radius: 7px;
+      background: var(--panel-2);
+      padding: 6px 8px;
+      text-align: left;
+    }
+
+    .recent-button:hover,
+    .recent-button:focus-visible,
+    .result:hover,
+    .result.focused {
+      border-color: var(--focus);
+      background: #263040;
+      outline: none;
+    }
+
+    .recent-button.active {
+      border-color: rgba(79, 179, 138, 0.62);
+      background: var(--accent-soft);
+    }
+
+    .recent-name {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .recent-provider {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .search-wrap {
+      position: relative;
+    }
+
+    .search-symbol {
+      position: absolute;
+      left: 11px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--subtle);
+      font-size: 13px;
+      pointer-events: none;
+    }
+
+    .search-input {
+      padding: 0 12px 0 33px;
+      outline: none;
+    }
+
+    .search-input:focus {
+      border-color: var(--focus);
+    }
+
+    .model-actions {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .refresh-button {
+      display: inline-grid;
+      place-items: center;
+      width: 36px;
+      height: 36px;
+      border-radius: 7px;
+      background: var(--panel-2);
+      color: var(--muted);
+    }
+
+    .refresh-button:hover,
+    .refresh-button:focus-visible {
+      background: #2c3240;
+      color: var(--text);
+      outline: none;
+    }
+
+    .results {
+      display: grid;
+      gap: 4px;
+      max-height: 116px;
+      overflow: auto;
+      padding-right: 2px;
+    }
+
+    .result {
+      width: 100%;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      min-height: 48px;
+      border: 1px solid transparent;
+      border-radius: 7px;
+      background: transparent;
+      padding: 7px 8px;
+      text-align: left;
+    }
+
+    .result.selected {
+      border-color: rgba(79, 179, 138, 0.5);
+      background: var(--accent-soft);
+    }
+
+    .result-main {
+      min-width: 0;
+    }
+
+    .result-title {
+      display: flex;
+      min-width: 0;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 2px;
+    }
+
+    .result-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 12.5px;
+      font-weight: 700;
+    }
+
+    .provider-badge {
+      max-width: 118px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      padding: 1px 7px;
+    }
+
+    .result-side {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .variant {
+      padding: 2px 7px;
+    }
+
+    .check {
+      width: 18px;
+      color: var(--accent);
+      text-align: center;
+      font-weight: 800;
+    }
+
+    .empty {
+      padding: 20px 12px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 12px;
+    }
+
+    .surface {
+      min-height: 647px;
+      padding: 18px;
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.025), transparent 280px),
+        #0f1014;
+    }
+
+    .transcript {
+      max-width: 780px;
+      margin: 0 auto;
+      display: grid;
+      gap: 12px;
+    }
+
+    .turn {
+      border: 1px solid #2b3039;
+      border-radius: 8px;
+      background: #171920;
+      padding: 14px;
+    }
+
+    .turn-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 8px;
+    }
+
+    .turn p {
+      margin: 0;
+      color: #dde2e8;
+      font-size: 14px;
+      line-height: 1.55;
+    }
+
+    @media (max-width: 820px) {
+      .page {
+        width: min(100vw - 20px, 620px);
+        padding: 16px 0;
+      }
+
+      .frame {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        display: none;
+      }
+
+      .surface {
+        padding: 12px;
+      }
+
+      .settings-popover {
+        width: min(390px, calc(100vw - 28px));
+      }
+    }
+
+    @media (max-width: 480px) {
+      .pane-meta {
+        display: none;
+      }
+
+      .recent-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .result {
+        grid-template-columns: minmax(0, 1fr);
+        align-items: start;
+      }
+
+      .result-side {
+        justify-content: space-between;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <div class="frame">
+      <aside class="sidebar" aria-label="Sessions">
+        <div class="tabbar">
+          <div class="brand"><span class="brand-mark">F</span><span>Freshell</span></div>
+          <button class="icon-button" type="button" aria-label="New tab">+</button>
+        </div>
+        <div class="session-list">
+          <div class="session-row active"><span class="dot busy"></span><span class="session-title">Freshopencode · Model picker work</span></div>
+          <div class="session-row"><span class="dot"></span><span class="session-title">Freshcodex · Settings polish</span></div>
+          <div class="session-row"><span class="dot"></span><span class="session-title">Shell · release checks</span></div>
+        </div>
+      </aside>
+
+      <section class="workspace" aria-label="Freshopencode pane">
+        <header class="pane-header">
+          <div class="pane-title">
+            <img class="provider-icon" src="../../assets/icons/opencode.svg" alt="">
+            <span>Freshopencode</span>
+            <span class="pane-meta" id="paneModelText">DeepSeek V4 Flash · opencode-go</span>
+          </div>
+          <div class="settings-anchor">
+            <button class="icon-button" type="button" aria-label="Agent settings" aria-expanded="true">⚙</button>
+            <div class="settings-popover" role="dialog" aria-label="Agent settings">
+              <div class="settings-stack">
+                <label class="field">
+                  <span class="field-label">Style</span>
+                  <select class="select-like" aria-label="Style">
+                    <option>Sans</option>
+                    <option>Mono</option>
+                    <option>Serif</option>
+                  </select>
+                </label>
+
+                <section class="field" aria-label="Model">
+                  <div class="field-label">
+                    <span>Model</span>
+                    <span class="count" id="enabledCount">14 enabled</span>
+                  </div>
+
+                  <div class="model-current">
+                    <span>
+                      <span class="model-name" id="currentName">DeepSeek V4 Flash</span>
+                      <span class="model-id" id="currentId">opencode-go/deepseek-v4-flash</span>
+                    </span>
+                    <span class="status-pill">current</span>
+                  </div>
+
+                  <div class="field-label">
+                    <span>Recent</span>
+                    <span class="count">last 5</span>
+                  </div>
+                  <div class="recent-grid" id="recentGrid"></div>
+
+                  <div class="model-actions">
+                    <div class="search-wrap">
+                      <span class="search-symbol">⌕</span>
+                      <input class="search-input" id="searchInput" type="search" autocomplete="off" placeholder="Search enabled models" aria-label="Search enabled Freshopencode models">
+                    </div>
+                    <button class="refresh-button" type="button" aria-label="Refresh model list">↻</button>
+                  </div>
+
+                  <div class="results" id="resultList" role="listbox" aria-label="Enabled Freshopencode models"></div>
+                </section>
+
+                <label class="field">
+                  <span class="field-label">Thinking</span>
+                  <select class="select-like" aria-label="Thinking">
+                    <option>max</option>
+                    <option>high</option>
+                    <option>medium</option>
+                    <option>low</option>
+                    <option>minimal</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+          </div>
+        </header>
+
+        <div class="surface">
+          <div class="transcript">
+            <article class="turn">
+              <div class="turn-head"><span>User</span><span>11:38 AM</span></div>
+              <p>Expose enabled Opencode models without making the common settings path slower or deeper.</p>
+            </article>
+            <article class="turn">
+              <div class="turn-head"><span>Assistant · DeepSeek V4 Flash</span><span>11:39 AM</span></div>
+              <p>The settings popover can keep model selection inline: recent choices are one click away, while search handles the full enabled catalog only when needed.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    const models = [
+      { id: 'opencode-go/deepseek-v4-flash', name: 'DeepSeek V4 Flash', provider: 'opencode-go', variant: 'max' },
+      { id: 'opencode-go/glm-5.2', name: 'GLM 5.2', provider: 'opencode-go', variant: 'max' },
+      { id: 'openrouter/glm-5.2', name: 'GLM 5.2', provider: 'openrouter', variant: 'high' },
+      { id: 'umans-ai-coding-plan/umans-kimi-k2.7', name: 'Kimi k2.7', provider: 'umans-ai-coding-plan', variant: 'max' },
+      { id: 'opencode-go/deepseek-v4-pro', name: 'DeepSeek V4 Pro', provider: 'opencode-go', variant: 'max' },
+      { id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash', provider: 'deepseek', variant: 'high' },
+      { id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro', provider: 'deepseek', variant: 'high' },
+      { id: 'opencode/openai-gpt-5.2', name: 'GPT 5.2', provider: 'opencode', variant: 'high' },
+      { id: 'anthropic/claude-opus-4-6', name: 'Claude Opus 4.6', provider: 'anthropic', variant: 'high' },
+      { id: 'anthropic/claude-sonnet-4-5', name: 'Claude Sonnet 4.5', provider: 'anthropic', variant: 'high' },
+      { id: 'google/gemini-3-pro', name: 'Gemini 3 Pro', provider: 'google', variant: 'high' },
+      { id: 'opencode/minimax-m2.1', name: 'MiniMax M2.1', provider: 'opencode', variant: 'high' },
+      { id: 'groq/qwen3-coder-plus', name: 'Qwen3 Coder Plus', provider: 'groq', variant: 'medium' },
+      { id: 'glm-vast/glm-5.2-reap', name: 'GLM 5.2 REAP', provider: 'glm-vast', variant: 'max' },
+    ];
+
+    let selectedId = 'opencode-go/deepseek-v4-flash';
+    let focusedIndex = 0;
+    let filtered = [...models];
+    let recent = [
+      'opencode-go/deepseek-v4-flash',
+      'opencode-go/glm-5.2',
+      'openrouter/glm-5.2',
+      'umans-ai-coding-plan/umans-kimi-k2.7',
+      'opencode-go/deepseek-v4-pro',
+    ];
+
+    const searchInput = document.getElementById('searchInput');
+    const resultList = document.getElementById('resultList');
+    const recentGrid = document.getElementById('recentGrid');
+    const currentName = document.getElementById('currentName');
+    const currentId = document.getElementById('currentId');
+    const paneModelText = document.getElementById('paneModelText');
+    document.getElementById('enabledCount').textContent = `${models.length} enabled`;
+
+    function findModel(id) {
+      return models.find((model) => model.id === id);
+    }
+
+    function modelSearchText(model) {
+      return `${model.name} ${model.id} ${model.provider}`.toLowerCase();
+    }
+
+    function choose(id) {
+      const model = findModel(id);
+      if (!model) return;
+      selectedId = id;
+      recent = [id, ...recent.filter((entry) => entry !== id)].slice(0, 5);
+      currentName.textContent = model.name;
+      currentId.textContent = model.id;
+      paneModelText.textContent = `${model.name} · ${model.provider}`;
+      renderRecent();
+      filterModels();
+    }
+
+    function renderRecent() {
+      recentGrid.textContent = '';
+      for (const id of recent) {
+        const model = findModel(id);
+        if (!model) continue;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = `recent-button${id === selectedId ? ' active' : ''}`;
+        button.setAttribute('aria-label', `${model.name}, ${model.provider}`);
+        button.innerHTML = '<span class="recent-name"></span><span class="recent-provider"></span>';
+        button.querySelector('.recent-name').textContent = model.name;
+        button.querySelector('.recent-provider').textContent = model.provider;
+        button.addEventListener('click', () => choose(id));
+        recentGrid.append(button);
+      }
+    }
+
+    function renderResults() {
+      resultList.textContent = '';
+      if (filtered.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = 'No enabled models match this search.';
+        resultList.append(empty);
+        return;
+      }
+
+      for (const [index, model] of filtered.slice(0, 8).entries()) {
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = [
+          'result',
+          model.id === selectedId ? 'selected' : '',
+          index === focusedIndex ? 'focused' : '',
+        ].filter(Boolean).join(' ');
+        row.setAttribute('role', 'option');
+        row.setAttribute('aria-selected', model.id === selectedId ? 'true' : 'false');
+        row.innerHTML = `
+          <span class="result-main">
+            <span class="result-title">
+              <span class="result-name"></span>
+              <span class="provider-badge"></span>
+            </span>
+            <span class="result-id"></span>
+          </span>
+          <span class="result-side">
+            <span class="variant"></span>
+            <span class="check">${model.id === selectedId ? '✓' : ''}</span>
+          </span>
+        `;
+        row.querySelector('.result-name').textContent = model.name;
+        row.querySelector('.provider-badge').textContent = model.provider;
+        row.querySelector('.result-id').textContent = model.id;
+        row.querySelector('.variant').textContent = model.variant;
+        row.addEventListener('mouseenter', () => {
+          focusedIndex = index;
+          renderResults();
+        });
+        row.addEventListener('click', () => choose(model.id));
+        resultList.append(row);
+      }
+    }
+
+    function filterModels() {
+      const query = searchInput.value.trim().toLowerCase();
+      const source = query ? models.filter((model) => modelSearchText(model).includes(query)) : models;
+      filtered = source.filter((model) => query || !recent.includes(model.id));
+      focusedIndex = Math.min(focusedIndex, Math.max(filtered.length - 1, 0));
+      renderResults();
+    }
+
+    searchInput.addEventListener('input', filterModels);
+    searchInput.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        focusedIndex = Math.min(focusedIndex + 1, Math.max(filtered.length - 1, 0));
+        renderResults();
+      } else if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        focusedIndex = Math.max(focusedIndex - 1, 0);
+        renderResults();
+      } else if (event.key === 'Enter' && filtered[focusedIndex]) {
+        event.preventDefault();
+        choose(filtered[focusedIndex].id);
+      }
+    });
+
+    renderRecent();
+    filterModels();
+  </script>
+</body>
+</html>
