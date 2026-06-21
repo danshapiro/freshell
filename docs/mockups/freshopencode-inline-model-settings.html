@@ -378,7 +378,7 @@
       padding-right: 2px;
     }
 
-    .model-field.search-open .results {
+    .search-modal.open .results {
       display: grid;
     }
 
@@ -457,6 +457,62 @@
       color: var(--muted);
       text-align: center;
       font-size: 12px;
+    }
+
+    .search-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 60;
+      display: none;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 80px 16px 24px;
+      background: rgba(5, 6, 8, 0.56);
+    }
+
+    .search-modal.open {
+      display: flex;
+    }
+
+    .search-dialog {
+      width: min(560px, 100%);
+      max-height: min(680px, calc(100vh - 104px));
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .search-dialog-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      padding: 10px;
+      border-bottom: 1px solid #2f3440;
+      background: #191b22;
+    }
+
+    .dialog-close {
+      display: inline-grid;
+      place-items: center;
+      width: 36px;
+      height: 36px;
+      border-radius: 7px;
+      background: var(--panel-2);
+      color: var(--muted);
+    }
+
+    .dialog-close:hover,
+    .dialog-close:focus-visible {
+      background: #2c3240;
+      color: var(--text);
+      outline: none;
+    }
+
+    .search-dialog .results {
+      max-height: min(484px, calc(100vh - 204px));
+      padding: 8px 8px 10px;
     }
 
     .surface {
@@ -605,11 +661,9 @@
                   <div class="model-actions">
                     <div class="search-wrap">
                       <span class="search-symbol">⌕</span>
-                      <input class="search-input" id="searchInput" type="search" autocomplete="off" placeholder="Search enabled models" aria-label="Search enabled Freshopencode models">
+                      <input class="search-input" id="searchEntry" type="search" autocomplete="off" placeholder="Search enabled models" aria-label="Open Freshopencode model search">
                     </div>
                   </div>
-
-                  <div class="results" id="resultList" role="listbox" aria-label="Enabled Freshopencode models"></div>
                 </section>
               </div>
             </div>
@@ -631,6 +685,19 @@
       </section>
     </div>
   </main>
+
+  <div class="search-modal" id="searchModal" aria-hidden="true">
+    <section class="search-dialog" role="dialog" aria-modal="true" aria-label="Freshopencode model search">
+      <div class="search-dialog-head">
+        <div class="search-wrap">
+          <span class="search-symbol">⌕</span>
+          <input class="search-input" id="searchInput" type="search" autocomplete="off" placeholder="Search enabled models" aria-label="Search enabled Freshopencode models">
+        </div>
+        <button class="dialog-close" id="closeSearch" type="button" aria-label="Close model search">×</button>
+      </div>
+      <div class="results" id="resultList" role="listbox" aria-label="Enabled Freshopencode models"></div>
+    </section>
+  </div>
 
   <script>
     const models = [
@@ -661,10 +728,12 @@
       'opencode-go/deepseek-v4-pro',
     ];
 
+    const searchEntry = document.getElementById('searchEntry');
+    const searchModal = document.getElementById('searchModal');
     const searchInput = document.getElementById('searchInput');
+    const closeSearch = document.getElementById('closeSearch');
     const resultList = document.getElementById('resultList');
     const recentGrid = document.getElementById('recentGrid');
-    const modelField = document.getElementById('modelField');
     const paneModelText = document.getElementById('paneModelText');
     document.getElementById('enabledCount').textContent = `${models.length} enabled`;
 
@@ -696,6 +765,7 @@
       paneModelText.textContent = `${model.name} · ${model.provider}`;
       renderRecent();
       filterModels();
+      closeSearchModal();
     }
 
     function renderRecent() {
@@ -788,18 +858,22 @@
       renderResults();
     }
 
-    searchInput.addEventListener('focus', () => {
-      modelField.classList.add('search-open');
+    function openSearchModal() {
+      searchModal.classList.add('open');
+      searchModal.setAttribute('aria-hidden', 'false');
       filterModels();
-    });
-    searchInput.addEventListener('click', () => {
-      modelField.classList.add('search-open');
-      filterModels();
-    });
-    searchInput.addEventListener('input', () => {
-      modelField.classList.add('search-open');
-      filterModels();
-    });
+      requestAnimationFrame(() => searchInput.focus());
+    }
+
+    function closeSearchModal() {
+      if (!searchModal.classList.contains('open')) return;
+      searchModal.classList.remove('open');
+      searchModal.setAttribute('aria-hidden', 'true');
+    }
+
+    searchEntry.addEventListener('focus', openSearchModal);
+    searchEntry.addEventListener('click', openSearchModal);
+    searchInput.addEventListener('input', filterModels);
     searchInput.addEventListener('keydown', (event) => {
       if (event.key === 'ArrowDown') {
         event.preventDefault();
@@ -812,7 +886,14 @@
       } else if (event.key === 'Enter' && filtered[focusedIndex]) {
         event.preventDefault();
         choose(filtered[focusedIndex].id);
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        closeSearchModal();
       }
+    });
+    closeSearch.addEventListener('click', closeSearchModal);
+    searchModal.addEventListener('mousedown', (event) => {
+      if (event.target === searchModal) closeSearchModal();
     });
 
     renderRecent();
