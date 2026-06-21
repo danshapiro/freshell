@@ -17,6 +17,12 @@ export type FreshAgentProviderEvent =
     sessionId: string
     reason?: string
   }
+  | {
+    type: 'freshAgent.session.materialized'
+    previousSessionId: string
+    sessionId: string
+    sessionRef?: { provider: string; sessionId: string }
+  }
   | { type: 'freshAgent.session.init'; sessionId: string; cliSessionId?: string; model?: string; cwd?: string; tools?: Array<{ name: string }> }
   | { type: 'freshAgent.session.metadata'; sessionId: string; cliSessionId?: string; model?: string; cwd?: string; tools?: Array<{ name: string }> }
   | { type: 'freshAgent.assistant'; sessionId: string; content: ContentBlock[]; model?: string; usage?: Usage }

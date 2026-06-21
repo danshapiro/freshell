@@ -2,6 +2,8 @@ import type { AppDispatch } from '@/store/store'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
 import type { SessionRef } from '@shared/session-contract'
 import { consumeCancelledCreate } from '@/lib/create-cancellation'
+import { flushPersistedLayoutNow } from '@/store/persistControl'
+import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
 import {
   addAssistantMessage,
   addPermissionRequest,
@@ -10,6 +12,7 @@ import {
   clearPendingCreateFailure,
   createFailed,
   markSessionLost,
+  materializeSession as materializeFreshAgentSessionState,
   removePermission,
   removeSession,
   registerPendingCreate,
@@ -129,8 +132,27 @@ export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<strin
       }))
       return true
     }
-    case 'freshAgent.session.materialized':
+    case 'freshAgent.session.materialized': {
+      const materialized = msg as FreshAgentSessionMaterializedMessage
+      dispatch(materializeFreshAgentSessionState({
+        previousSessionId: materialized.previousSessionId,
+        sessionId: materialized.sessionId,
+        sessionType: materialized.sessionType,
+        provider: materialized.provider,
+      }))
+      dispatch(materializeFreshAgentPaneSession({
+        previousSessionId: materialized.previousSessionId,
+        sessionId: materialized.sessionId,
+        sessionType: materialized.sessionType,
+        provider: materialized.provider,
+        sessionRef: materialized.sessionRef ?? {
+          provider: materialized.provider,
+          sessionId: materialized.sessionId,
+        },
+      }))
+      dispatch(flushPersistedLayoutNow())
       return true
+    }
     case 'freshAgent.killed': {
       const killed = msg as FreshAgentKilledMessage
       dispatch(removeSession({

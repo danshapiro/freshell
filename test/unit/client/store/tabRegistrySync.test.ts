@@ -201,6 +201,75 @@ describe('tabRegistrySync', () => {
     stop()
   })
 
+  it('publishes materialized fresh-agent session refs instead of stale placeholders', () => {
+    state = {
+      ...state,
+      panes: {
+        ...state.panes,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'fresh-agent',
+              sessionType: 'freshopencode',
+              provider: 'opencode',
+              sessionId: 'freshopencode-req-sync',
+              createRequestId: 'req-sync',
+              status: 'running',
+              resumeSessionId: 'freshopencode-req-sync',
+              sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-sync' },
+            },
+          },
+        },
+        paneTitles: { 'tab-1': { 'pane-1': 'OpenCode' } },
+      },
+    }
+    const store = createStore()
+    const stop = startTabRegistrySync(store as any, ws)
+
+    expect(ws.sendTabsSyncPush.mock.calls[0][0].records[0].panes[0].payload.sessionRef).toEqual({
+      provider: 'opencode',
+      sessionId: 'freshopencode-req-sync',
+    })
+
+    ws.sendTabsSyncPush.mockClear()
+    state = {
+      ...state,
+      panes: {
+        ...state.panes,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'fresh-agent',
+              sessionType: 'freshopencode',
+              provider: 'opencode',
+              sessionId: 'ses_sync_1',
+              createRequestId: 'req-sync',
+              status: 'running',
+              resumeSessionId: 'ses_sync_1',
+              sessionRef: { provider: 'opencode', sessionId: 'ses_sync_1' },
+            },
+          },
+        },
+      },
+    }
+    for (const listener of listeners) listener()
+
+    expect(ws.sendTabsSyncPush).toHaveBeenCalledTimes(1)
+    const pushedPane = ws.sendTabsSyncPush.mock.calls[0][0].records[0].panes[0]
+    expect(pushedPane.payload.sessionRef).toEqual({
+      provider: 'opencode',
+      sessionId: 'ses_sync_1',
+    })
+    expect(pushedPane.payload).not.toHaveProperty('sessionId')
+    expect(pushedPane.payload).not.toHaveProperty('resumeSessionId')
+
+    stop()
+  })
+
   it('includes selected closed retention when querying snapshots', () => {
     state = {
       ...state,

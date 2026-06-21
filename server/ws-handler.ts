@@ -86,7 +86,7 @@ import {
   UiScreenshotResultSchema,
   WS_PROTOCOL_VERSION,
 } from '../shared/ws-protocol.js'
-import { LiveTerminalHandleSchema, type RestoreError } from '../shared/session-contract.js'
+import { LiveTerminalHandleSchema, sanitizeSessionRef, type RestoreError } from '../shared/session-contract.js'
 import { CODEX_DURABILITY_SCHEMA_VERSION, CodexDurabilityRefSchema } from '../shared/codex-durability.js'
 import { migrateLegacyFreshAgentContent } from '../shared/fresh-agent.js'
 import { UiLayoutSyncSchema } from './agent-api/layout-schema.js'
@@ -1190,6 +1190,28 @@ export class WsHandler {
     }
   }
 
+  private freshAgentMaterializedMessage(locator: FreshAgentLocator, event: unknown) {
+    const normalized = normalizeFreshAgentProviderEvent(event)
+    if (!normalized || typeof normalized !== 'object' || Array.isArray(normalized)) return undefined
+    const materialized = normalized as Record<string, unknown>
+    if (materialized.type !== 'freshAgent.session.materialized') return undefined
+    if (typeof materialized.sessionId !== 'string' || materialized.sessionId.length === 0) return undefined
+    const sessionRef = sanitizeSessionRef(materialized.sessionRef) ?? {
+      provider: locator.provider,
+      sessionId: materialized.sessionId,
+    }
+    return {
+      type: 'freshAgent.session.materialized',
+      previousSessionId: typeof materialized.previousSessionId === 'string' && materialized.previousSessionId.length > 0
+        ? materialized.previousSessionId
+        : locator.sessionId,
+      sessionId: materialized.sessionId,
+      sessionType: locator.sessionType,
+      provider: locator.provider,
+      sessionRef,
+    }
+  }
+
   private authorizeFreshAgentSession(state: ClientState, locator: FreshAgentLocator): void {
     state.freshAgentAuthorizations.add(this.freshAgentKey(locator))
   }
@@ -1257,6 +1279,21 @@ export class WsHandler {
 
     const listener = (event: unknown) => {
       if (!entry.active) return
+      const materialized = this.freshAgentMaterializedMessage(locator, event)
+      if (materialized) {
+        const materializedLocator = {
+          sessionId: materialized.sessionId,
+          sessionType: locator.sessionType,
+          provider: locator.provider,
+        }
+        this.authorizeFreshAgentSession(state, materializedLocator)
+        this.ensureFreshAgentSubscription(ws, state, materializedLocator)
+        if (materialized.sessionId !== locator.sessionId) {
+          this.cancelFreshAgentSubscription(state, locator)
+        }
+        this.safeSend(ws, materialized)
+        return
+      }
       this.safeSend(ws, this.freshAgentEventMessage(locator, event))
     }
 
@@ -3206,6 +3243,7 @@ export class WsHandler {
               sessionType: m.sessionType,
               provider: m.provider,
             })
+            this.cancelFreshAgentSubscription(state, locator)
             this.send(ws, {
               type: 'freshAgent.session.materialized',
               previousSessionId: m.sessionId,

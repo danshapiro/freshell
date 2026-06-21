@@ -156,6 +156,16 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     state.events.emit('event', { type: 'sdk.session.snapshot', sessionId: state.placeholderId, status })
   }
 
+  function emitMaterialized(state: OpencodeSessionState): void {
+    if (!state.realSessionId) return
+    state.events.emit('event', {
+      type: 'freshAgent.session.materialized',
+      previousSessionId: state.placeholderId,
+      sessionId: state.realSessionId,
+      sessionRef: { provider: 'opencode', sessionId: state.realSessionId },
+    })
+  }
+
   async function materializeOrSend(state: OpencodeSessionState, text: string, settings?: Partial<FreshAgentCreateRequest>): Promise<FreshAgentSendResult> {
     const normalized = settings
       ? normalizeOpencodeInput({ requestId: state.placeholderId, sessionType: 'freshopencode', provider: 'opencode', ...settings } as FreshAgentCreateRequest)
@@ -173,6 +183,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         else if (effectiveCwd) state.cwd = effectiveCwd
         remember(state)
         bindServeStream(state)
+        emitMaterialized(state)
       }
 
       const realId = state.realSessionId!

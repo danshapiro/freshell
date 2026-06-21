@@ -103,13 +103,17 @@ describe('OpenCode serve adapter: create + send', () => {
   it('emits running before first-send session materialization resolves', async () => {
     const manager = makeFakeManager()
     const createSession = createDeferred<{ id: string; directory?: string; title?: string }>()
+    const prompt = createDeferred<void>()
     manager.createSession.mockReturnValueOnce(createSession.promise)
+    manager.promptAsync.mockReturnValueOnce(prompt.promise)
     const adapter = makeAdapter(manager)
     await adapter.create({ requestId: 'slow-create', sessionType: 'freshopencode', provider: 'opencode' })
 
     const events: unknown[] = []
     adapter.subscribe?.('freshopencode-slow-create', (e) => events.push(e))
     const send = adapter.send?.('freshopencode-slow-create', { text: 'go' })
+    let sendSettled = false
+    void send?.finally(() => { sendSettled = true })
 
     await Promise.resolve()
     expect(events).toContainEqual({
@@ -120,6 +124,18 @@ describe('OpenCode serve adapter: create + send', () => {
     expect(manager.promptAsync).not.toHaveBeenCalled()
 
     createSession.resolve({ id: 'ses_real_1', title: 'T' })
+    await vi.waitFor(() => {
+      expect(events).toContainEqual({
+        type: 'freshAgent.session.materialized',
+        previousSessionId: 'freshopencode-slow-create',
+        sessionId: 'ses_real_1',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' },
+      })
+      expect(manager.promptAsync).toHaveBeenCalled()
+    })
+    expect(sendSettled).toBe(false)
+
+    prompt.resolve()
     await expect(send).resolves.toEqual({
       sessionId: 'ses_real_1',
       sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' },

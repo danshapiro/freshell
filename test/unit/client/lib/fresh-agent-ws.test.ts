@@ -1,14 +1,48 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import freshAgentReducer from '@/store/freshAgentSlice'
+import panesReducer, { initLayout, type PanesState } from '@/store/panesSlice'
 import { handleFreshAgentMessage, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import { cancelCreate, _resetCancelledCreates } from '@/lib/create-cancellation'
+import { flushPersistedLayoutNow } from '@/store/persistControl'
 
 function createFreshAgentStore() {
   return configureStore({
     reducer: {
       freshAgent: freshAgentReducer,
     },
+  })
+}
+
+function emptyPanesState(): PanesState {
+  return {
+    layouts: {},
+    activePane: {},
+    paneTitles: {},
+    paneTitleSetByUser: {},
+    renameRequestTabId: null,
+    renameRequestPaneId: null,
+    zoomedPane: {},
+    refreshRequestsByPane: {},
+    restoreFallbackAttemptsByPane: {},
+  }
+}
+
+function createFreshAgentPaneStore(seenActionTypes: string[] = []) {
+  const actionRecorder = () => (next: (action: unknown) => unknown) => (action: { type?: string }) => {
+    if (typeof action.type === 'string') seenActionTypes.push(action.type)
+    return next(action)
+  }
+
+  return configureStore({
+    reducer: {
+      freshAgent: freshAgentReducer,
+      panes: panesReducer,
+    },
+    preloadedState: {
+      panes: emptyPanesState(),
+    },
+    middleware: (getDefault) => getDefault().prepend(actionRecorder),
   })
 }
 
@@ -87,17 +121,91 @@ describe('fresh-agent-ws', () => {
     })
   })
 
-  it('recognizes freshAgent.session.materialized as a handled fresh-agent message', () => {
-    const store = createFreshAgentStore()
+  it('materializes FreshOpenCode pane and live session state from the global websocket handler', () => {
+    const actionTypes: string[] = []
+    const store = createFreshAgentPaneStore(actionTypes)
+    const placeholderId = 'freshopencode-req-placeholder'
+    const durableId = 'ses_real_1'
+
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionId: placeholderId,
+        createRequestId: 'req-placeholder',
+        status: 'running',
+        resumeSessionId: placeholderId,
+        sessionRef: { provider: 'opencode', sessionId: placeholderId },
+        restoreError: {
+          reason: 'fresh_agent_lost_session',
+          message: 'stale placeholder',
+        },
+      },
+    }))
+
+    registerFreshAgentCreate(store.dispatch, 'req-placeholder', {
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    })
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.created',
+      requestId: 'req-placeholder',
+      sessionId: placeholderId,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    })).toBe(true)
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId: placeholderId,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      event: {
+        type: 'freshAgent.session.snapshot',
+        sessionId: placeholderId,
+        latestTurnId: null,
+        status: 'running',
+      },
+    })).toBe(true)
 
     expect(handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.session.materialized',
-      previousSessionId: 'freshopencode-req-1',
-      sessionId: 'ses_real_1',
+      previousSessionId: placeholderId,
+      sessionId: durableId,
       sessionType: 'freshopencode',
       provider: 'opencode',
-      sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' },
+      sessionRef: { provider: 'opencode', sessionId: durableId },
     })).toBe(true)
+
+    const layout = store.getState().panes.layouts['tab-1']
+    expect(layout.type).toBe('leaf')
+    if (layout.type !== 'leaf') throw new Error('expected leaf layout')
+    expect(layout.content).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionId: durableId,
+      resumeSessionId: durableId,
+      sessionRef: { provider: 'opencode', sessionId: durableId },
+      status: 'running',
+    })
+    expect(layout.content.kind === 'fresh-agent' ? layout.content.restoreError : undefined).toBeUndefined()
+
+    expect(store.getState().freshAgent.sessions[`freshopencode:opencode:${placeholderId}`]).toBeUndefined()
+    expect(store.getState().freshAgent.sessions[`freshopencode:opencode:${durableId}`]).toMatchObject({
+      sessionId: durableId,
+      sessionKey: `freshopencode:opencode:${durableId}`,
+      threadId: durableId,
+      status: 'running',
+      lost: false,
+    })
+    expect(store.getState().freshAgent.pendingCreates['req-placeholder']).toMatchObject({
+      sessionId: durableId,
+      sessionKey: `freshopencode:opencode:${durableId}`,
+    })
+    expect(actionTypes).toContain(flushPersistedLayoutNow.type)
   })
 
   it('projects Claude freshAgent.event snapshot and lost-session transport updates into fresh-agent session state', () => {

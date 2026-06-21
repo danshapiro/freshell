@@ -479,6 +479,10 @@ describe('WsHandler fresh-agent routing', () => {
   })
 
   it('emits freshAgent.session.materialized when send returns a new session id', async () => {
+    const unsubscribeByKey = new Map<string, ReturnType<typeof vi.fn>>()
+    const placeholderLocator = { sessionId: 'freshopencode-req-1', sessionType: 'freshopencode', provider: 'opencode' }
+    const durableLocator = { sessionId: 'ses_real_1', sessionType: 'freshopencode', provider: 'opencode' }
+    const placeholderKey = JSON.stringify(placeholderLocator)
     const runtimeManager = {
       create: vi.fn().mockResolvedValue({
         sessionId: 'freshopencode-req-1',
@@ -486,7 +490,11 @@ describe('WsHandler fresh-agent routing', () => {
         runtimeProvider: 'opencode',
         sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-1' },
       }),
-      subscribe: vi.fn().mockResolvedValue(() => undefined),
+      subscribe: vi.fn().mockImplementation(async (locator: unknown) => {
+        const off = vi.fn()
+        unsubscribeByKey.set(JSON.stringify(locator), off)
+        return off
+      }),
       send: vi.fn().mockResolvedValue({
         sessionId: 'ses_real_1',
         sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' },
@@ -524,19 +532,13 @@ describe('WsHandler fresh-agent routing', () => {
       }))
 
       await vi.waitFor(() => {
-        expect(runtimeManager.send).toHaveBeenCalledWith({
-          sessionId: 'freshopencode-req-1',
-          sessionType: 'freshopencode',
-          provider: 'opencode',
-        }, {
+        expect(runtimeManager.send).toHaveBeenCalledWith(placeholderLocator, {
           text: 'Ship it',
           images: undefined,
           settings: undefined,
         })
-        expect(runtimeManager.subscribe).toHaveBeenCalledWith(
-          { sessionId: 'ses_real_1', sessionType: 'freshopencode', provider: 'opencode' },
-          expect.any(Function),
-        )
+        expect(runtimeManager.subscribe).toHaveBeenCalledWith(durableLocator, expect.any(Function))
+        expect(unsubscribeByKey.get(placeholderKey)).toHaveBeenCalledTimes(1)
         expect(seenMessages).toContainEqual({
           type: 'freshAgent.session.materialized',
           previousSessionId: 'freshopencode-req-1',
@@ -544,6 +546,77 @@ describe('WsHandler fresh-agent routing', () => {
           sessionType: 'freshopencode',
           provider: 'opencode',
           sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' },
+        })
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('forwards provider materialization events as top-level websocket materialization', async () => {
+    const listeners = new Map<string, (message: unknown) => void>()
+    const unsubscribeByKey = new Map<string, ReturnType<typeof vi.fn>>()
+    const placeholderLocator = { sessionId: 'freshopencode-req-event', sessionType: 'freshopencode', provider: 'opencode' }
+    const durableLocator = { sessionId: 'ses_event_1', sessionType: 'freshopencode', provider: 'opencode' }
+    const placeholderKey = JSON.stringify(placeholderLocator)
+    const runtimeManager = {
+      create: vi.fn().mockResolvedValue({
+        sessionId: 'freshopencode-req-event',
+        sessionType: 'freshopencode',
+        runtimeProvider: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-event' },
+      }),
+      subscribe: vi.fn().mockImplementation(async (locator: unknown, listener: (message: unknown) => void) => {
+        const key = JSON.stringify(locator)
+        listeners.set(key, listener)
+        const off = vi.fn(() => {
+          listeners.delete(key)
+        })
+        unsubscribeByKey.set(key, off)
+        return off
+      }),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const ws = await connectAndAuth(server)
+      const seenMessages: any[] = []
+      ws.on('message', (data) => {
+        seenMessages.push(JSON.parse(data.toString()))
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.create',
+        requestId: 'req-materialize-event',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.subscribe).toHaveBeenCalledWith(placeholderLocator, expect.any(Function))
+        expect(listeners.has(placeholderKey)).toBe(true)
+      })
+
+      listeners.get(placeholderKey)?.({
+        type: 'freshAgent.session.materialized',
+        previousSessionId: 'freshopencode-req-event',
+        sessionId: 'ses_event_1',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_event_1' },
+      })
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.subscribe).toHaveBeenCalledWith(durableLocator, expect.any(Function))
+        expect(unsubscribeByKey.get(placeholderKey)).toHaveBeenCalledTimes(1)
+        expect(listeners.has(placeholderKey)).toBe(false)
+        expect(seenMessages).toContainEqual({
+          type: 'freshAgent.session.materialized',
+          previousSessionId: 'freshopencode-req-event',
+          sessionId: 'ses_event_1',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          sessionRef: { provider: 'opencode', sessionId: 'ses_event_1' },
         })
       })
     } finally {

@@ -21,6 +21,10 @@ type FreshAgentSessionPayload = {
   provider: FreshAgentRuntimeProvider
 }
 
+type FreshAgentSessionMaterializedPayload = FreshAgentSessionPayload & {
+  previousSessionId: string
+}
+
 type SessionMutationPayload = {
   sessionId: string
   sessionType?: FreshAgentSessionType
@@ -311,6 +315,50 @@ const freshAgentSlice = createSlice({
       }
     },
 
+    materializeSession(state, action: PayloadAction<FreshAgentSessionMaterializedPayload>) {
+      const previousLocator = {
+        sessionId: action.payload.previousSessionId,
+        sessionType: action.payload.sessionType,
+        provider: action.payload.provider,
+      }
+      const nextLocator = {
+        sessionId: action.payload.sessionId,
+        sessionType: action.payload.sessionType,
+        provider: action.payload.provider,
+      }
+      const previousKey = sessionKey(previousLocator)
+      const nextKey = sessionKey(nextLocator)
+      const previousSession = state.sessions[previousKey]
+      const nextSession = state.sessions[nextKey]
+
+      if (previousSession || nextSession) {
+        state.sessions[nextKey] = {
+          ...(previousSession ?? createSession(nextLocator, 'connected')),
+          ...(nextSession ?? {}),
+          ...nextLocator,
+          sessionKey: nextKey,
+          threadId: action.payload.sessionId,
+          lost: false,
+          restoreFailureCode: undefined,
+          restoreFailureMessage: undefined,
+        }
+        if (previousKey !== nextKey) {
+          delete state.sessions[previousKey]
+        }
+      } else {
+        ensureSession(state, nextLocator, 'connected')
+      }
+
+      for (const pending of Object.values(state.pendingCreates)) {
+        if (pending.sessionId === action.payload.previousSessionId || pending.sessionKey === previousKey) {
+          pending.sessionId = action.payload.sessionId
+          pending.sessionKey = nextKey
+          pending.sessionType = action.payload.sessionType
+          pending.provider = action.payload.provider
+        }
+      }
+    },
+
     freshAgentSnapshotReceived(state, action: PayloadAction<{ snapshot: FreshAgentSnapshot }>) {
       const snapshot = action.payload.snapshot
       const session = ensureSession(state, {
@@ -558,6 +606,7 @@ export const {
   clearStreaming,
   createFailed,
   freshAgentSnapshotReceived,
+  materializeSession,
   markSessionLost,
   registerPendingCreate,
   removePermission,

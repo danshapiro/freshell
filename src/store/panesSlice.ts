@@ -4,12 +4,14 @@ import {
   normalizeFreshAgentEffortOverride,
   normalizeFreshAgentModelSelection,
   normalizeFreshAgentPendingLocalEcho,
+  type FreshAgentPaneContent,
   type LivePaneContentInput,
   type PanesState,
   type PaneContent,
   type PaneContentInput,
   type PaneNode,
   type PaneRefreshRequest,
+  type SessionLocator,
   type TerminalPaneContent,
 } from './paneTypes'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
@@ -31,6 +33,14 @@ const log = createLogger('PanesSlice')
 type HydratePanesMeta = {
   localLayoutPersistedAt?: number
   remoteLayoutPersistedAt?: number
+}
+
+type FreshAgentSessionMaterializedPayload = {
+  previousSessionId: string
+  sessionId: string
+  sessionType: FreshAgentPaneContent['sessionType']
+  provider: FreshAgentPaneContent['provider']
+  sessionRef?: SessionLocator
 }
 
 function buildPreservedSessionRef(
@@ -510,6 +520,38 @@ function clearRestoreFallbackAttemptForPane(state: PanesState, tabId: string, pa
   if (Object.keys(tabAttempts).length === 0) {
     delete state.restoreFallbackAttemptsByPane?.[tabId]
   }
+}
+
+function freshAgentPaneMatchesMaterializedSession(
+  content: FreshAgentPaneContent,
+  materialized: FreshAgentSessionMaterializedPayload,
+): boolean {
+  if (content.sessionType !== materialized.sessionType || content.provider !== materialized.provider) {
+    return false
+  }
+
+  return [
+    content.sessionId,
+    content.resumeSessionId,
+    content.sessionRef?.sessionId,
+  ].some((sessionId) => sessionId === materialized.previousSessionId || sessionId === materialized.sessionId)
+}
+
+function buildMaterializedFreshAgentContent(
+  content: FreshAgentPaneContent,
+  materialized: FreshAgentSessionMaterializedPayload,
+): FreshAgentPaneContent {
+  const sessionRef = sanitizeSessionRef(materialized.sessionRef) ?? {
+    provider: materialized.provider,
+    sessionId: materialized.sessionId,
+  }
+  return normalizePaneContent({
+    ...content,
+    sessionId: materialized.sessionId,
+    resumeSessionId: materialized.sessionId,
+    sessionRef,
+    restoreError: undefined,
+  }, content) as FreshAgentPaneContent
 }
 
 function sessionRefsEqual(left?: { provider?: string; sessionId?: string }, right?: { provider?: string; sessionId?: string }): boolean {
@@ -1282,6 +1324,36 @@ export const panesSlice = createSlice({
       reconcileRefreshRequestsForTab(state, tabId)
     },
 
+    materializeFreshAgentSession: (
+      state,
+      action: PayloadAction<FreshAgentSessionMaterializedPayload>
+    ) => {
+      for (const [tabId, root] of Object.entries(state.layouts)) {
+        let changed = false
+
+        function updateContent(node: PaneNode): PaneNode {
+          if (node.type === 'leaf') {
+            if (node.content.kind !== 'fresh-agent') return node
+            if (!freshAgentPaneMatchesMaterializedSession(node.content, action.payload)) return node
+            changed = true
+            return {
+              ...node,
+              content: buildMaterializedFreshAgentContent(node.content, action.payload),
+            }
+          }
+          return {
+            ...node,
+            children: [updateContent(node.children[0]), updateContent(node.children[1])],
+          }
+        }
+
+        state.layouts[tabId] = updateContent(root)
+        if (changed) {
+          reconcileRefreshRequestsForTab(state, tabId)
+        }
+      }
+    },
+
     /** Partially merge fields into existing pane content (avoids stale-ref overwrites
      *  when multiple effects dispatch in the same render batch). */
     mergePaneContent: (
@@ -1729,6 +1801,7 @@ export const {
   replacePane,
   swapPanes,
   updatePaneContent,
+  materializeFreshAgentSession,
   mergePaneContent,
   restartFreshAgentCreate,
   requestPaneRefresh,
