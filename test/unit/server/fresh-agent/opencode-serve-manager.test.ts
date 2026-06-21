@@ -749,6 +749,55 @@ describe('OpencodeServeManager fan-out', () => {
     expect((manager as any).sessionEmitters.get('ses_a')?.listenerCount('event') ?? 0).toBe(0)
   })
 
+  it('onceIdle rejects promptly when the sidecar dies mid-turn instead of waiting for the full timeout', async () => {
+    const child = fakeChild()
+    const stopStream = vi.fn()
+    const spawnFn = vi.fn(() => child)
+    const manager = new OpencodeServeManager({
+      spawnFn: spawnFn as any,
+      fetchFn: vi.fn(async (url: string) => {
+        if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+        return jsonResponse({})
+      }) as any,
+      allocatePort: async () => ({ hostname: '127.0.0.1', port: 47999 }),
+      connectEventStream: () => stopStream,
+      healthTimeoutMs: 1000,
+    })
+    await manager.ensureStarted()
+
+    const idle = manager.onceIdle('ses_dying', 600_000)
+    // Kill the sidecar mid-turn
+    child.emit('close', 1)
+
+    // Should reject within a short time, not wait 600 seconds
+    await expect(idle).rejects.toThrow(/sidecar|lost|exit|closed|unavailable/i)
+  })
+
+  it('onceIdle lost rejection cleans up its event listener', async () => {
+    const child = fakeChild()
+    const stopStream = vi.fn()
+    const spawnFn = vi.fn(() => child)
+    const manager = new OpencodeServeManager({
+      spawnFn: spawnFn as any,
+      fetchFn: vi.fn(async (url: string) => {
+        if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+        return jsonResponse({})
+      }) as any,
+      allocatePort: async () => ({ hostname: '127.0.0.1', port: 47999 }),
+      connectEventStream: () => stopStream,
+      healthTimeoutMs: 1000,
+    })
+    await manager.ensureStarted()
+
+    const emitterBefore = (manager as any).emitterFor('ses_cleanup')
+    const listenerCountBefore = emitterBefore.listenerCount('event')
+    const idle = manager.onceIdle('ses_cleanup', 600_000)
+    child.emit('close', 1)
+    await expect(idle).rejects.toThrow()
+    // The onceIdle handler must have been removed from the emitter
+    expect(emitterBefore.listenerCount('event')).toBe(listenerCountBefore)
+  })
+
   it('normalizes CRLF SSE boundaries', async () => {
     let push!: (e: any) => void
     const { manager } = makeManager({

@@ -84,6 +84,15 @@ class OpencodeServeRequestTimeoutError extends Error {
   }
 }
 
+export class OpencodeServeLostError extends Error {
+  readonly sessionId: string
+  constructor(sessionId: string) {
+    super(`opencode serve sidecar was lost while waiting for session ${sessionId} to go idle.`)
+    this.name = 'OpencodeServeLostError'
+    this.sessionId = sessionId
+  }
+}
+
 export class OpencodeServeManager {
   private readonly command: string
   private readonly spawnFn: typeof spawn
@@ -141,14 +150,24 @@ export class OpencodeServeManager {
   }
 
   private forgetSessionsForCwd(cwdKey: string): void {
+    const lostSessions: string[] = []
     for (const [sessionId, sessionCwdKey] of this.sessionCwdById.entries()) {
       if (sessionCwdKey !== cwdKey) continue
       this.sessionCwdById.delete(sessionId)
-      this.sessionEmitters.delete(sessionId)
+      lostSessions.push(sessionId)
     }
     if (cwdKey === DEFAULT_CWD_KEY) {
       for (const sessionId of this.sessionEmitters.keys()) {
-        if (!this.sessionCwdById.has(sessionId)) this.sessionEmitters.delete(sessionId)
+        if (!this.sessionCwdById.has(sessionId)) {
+          if (!lostSessions.includes(sessionId)) lostSessions.push(sessionId)
+        }
+      }
+    }
+    for (const sessionId of lostSessions) {
+      const emitter = this.sessionEmitters.get(sessionId)
+      if (emitter) {
+        emitter.emit('lost', new OpencodeServeLostError(sessionId))
+        this.sessionEmitters.delete(sessionId)
       }
     }
   }
@@ -540,6 +559,7 @@ export class OpencodeServeManager {
         clearTimeout(timer)
         clearInterval(pollTimer)
         emitter.off('event', handler)
+        emitter.off('lost', onLost)
       }
       const finish = () => {
         if (settled) return
@@ -602,7 +622,9 @@ export class OpencodeServeManager {
           void checkStatusMap()
         }
       }
+      const onLost = (err: OpencodeServeLostError) => fail(err)
       emitter.on('event', handler)
+      emitter.on('lost', onLost)
     })
   }
 
