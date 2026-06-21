@@ -260,27 +260,6 @@
       padding: 0 10px;
     }
 
-    .model-current {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      align-items: center;
-      gap: 8px;
-      min-height: 42px;
-      border: 1px solid #303541;
-      border-radius: 7px;
-      background: #12141a;
-      padding: 7px 8px 7px 10px;
-    }
-
-    .model-name {
-      display: block;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      font-size: 13px;
-      font-weight: 700;
-    }
-
     .model-id,
     .result-id {
       color: var(--muted);
@@ -288,7 +267,6 @@
       font-size: 11px;
     }
 
-    .status-pill,
     .provider-badge,
     .variant {
       flex: none;
@@ -298,13 +276,6 @@
       color: #c4cad3;
       font-size: 10.5px;
       font-weight: 650;
-    }
-
-    .status-pill {
-      padding: 2px 7px;
-      color: #dbf3e6;
-      border-color: rgba(79, 179, 138, 0.45);
-      background: var(--accent-soft);
     }
 
     .recent-grid {
@@ -335,6 +306,10 @@
     .recent-button.active {
       border-color: rgba(79, 179, 138, 0.62);
       background: var(--accent-soft);
+    }
+
+    .recent-button:nth-child(n + 5) {
+      display: none;
     }
 
     .recent-name {
@@ -379,35 +354,19 @@
     }
 
     .model-actions {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 6px;
-      align-items: center;
-    }
-
-    .refresh-button {
-      display: inline-grid;
-      place-items: center;
-      width: 36px;
-      height: 36px;
-      border-radius: 7px;
-      background: var(--panel-2);
-      color: var(--muted);
-    }
-
-    .refresh-button:hover,
-    .refresh-button:focus-visible {
-      background: #2c3240;
-      color: var(--text);
-      outline: none;
+      display: block;
     }
 
     .results {
-      display: grid;
+      display: none;
       gap: 4px;
       max-height: 116px;
       overflow: auto;
       padding-right: 2px;
+    }
+
+    .model-field.search-open .results {
+      display: grid;
     }
 
     .result {
@@ -553,6 +512,10 @@
         grid-template-columns: 1fr;
       }
 
+      .recent-button:nth-child(n + 4) {
+        display: none;
+      }
+
       .result {
         grid-template-columns: minmax(0, 1fr);
         align-items: start;
@@ -599,37 +562,6 @@
                   </select>
                 </label>
 
-                <section class="field" aria-label="Model">
-                  <div class="field-label">
-                    <span>Model</span>
-                    <span class="count" id="enabledCount">14 enabled</span>
-                  </div>
-
-                  <div class="model-current">
-                    <span>
-                      <span class="model-name" id="currentName">DeepSeek V4 Flash</span>
-                      <span class="model-id" id="currentId">opencode-go/deepseek-v4-flash</span>
-                    </span>
-                    <span class="status-pill">current</span>
-                  </div>
-
-                  <div class="field-label">
-                    <span>Recent</span>
-                    <span class="count">last 5</span>
-                  </div>
-                  <div class="recent-grid" id="recentGrid"></div>
-
-                  <div class="model-actions">
-                    <div class="search-wrap">
-                      <span class="search-symbol">⌕</span>
-                      <input class="search-input" id="searchInput" type="search" autocomplete="off" placeholder="Search enabled models" aria-label="Search enabled Freshopencode models">
-                    </div>
-                    <button class="refresh-button" type="button" aria-label="Refresh model list">↻</button>
-                  </div>
-
-                  <div class="results" id="resultList" role="listbox" aria-label="Enabled Freshopencode models"></div>
-                </section>
-
                 <label class="field">
                   <span class="field-label">Thinking</span>
                   <select class="select-like" aria-label="Thinking">
@@ -640,6 +572,24 @@
                     <option>minimal</option>
                   </select>
                 </label>
+
+                <section class="field model-field" id="modelField" aria-label="Model">
+                  <div class="field-label">
+                    <span>Model</span>
+                    <span class="count" id="enabledCount">14 enabled</span>
+                  </div>
+
+                  <div class="recent-grid" id="recentGrid"></div>
+
+                  <div class="model-actions">
+                    <div class="search-wrap">
+                      <span class="search-symbol">⌕</span>
+                      <input class="search-input" id="searchInput" type="search" autocomplete="off" placeholder="Search enabled models" aria-label="Search enabled Freshopencode models">
+                    </div>
+                  </div>
+
+                  <div class="results" id="resultList" role="listbox" aria-label="Enabled Freshopencode models"></div>
+                </section>
               </div>
             </div>
           </div>
@@ -693,8 +643,7 @@
     const searchInput = document.getElementById('searchInput');
     const resultList = document.getElementById('resultList');
     const recentGrid = document.getElementById('recentGrid');
-    const currentName = document.getElementById('currentName');
-    const currentId = document.getElementById('currentId');
+    const modelField = document.getElementById('modelField');
     const paneModelText = document.getElementById('paneModelText');
     document.getElementById('enabledCount').textContent = `${models.length} enabled`;
 
@@ -711,8 +660,6 @@
       if (!model) return;
       selectedId = id;
       recent = [id, ...recent.filter((entry) => entry !== id)].slice(0, 5);
-      currentName.textContent = model.name;
-      currentId.textContent = model.id;
       paneModelText.textContent = `${model.name} · ${model.provider}`;
       renderRecent();
       filterModels();
@@ -789,7 +736,18 @@
       renderResults();
     }
 
-    searchInput.addEventListener('input', filterModels);
+    searchInput.addEventListener('focus', () => {
+      modelField.classList.add('search-open');
+      filterModels();
+    });
+    searchInput.addEventListener('click', () => {
+      modelField.classList.add('search-open');
+      filterModels();
+    });
+    searchInput.addEventListener('input', () => {
+      modelField.classList.add('search-open');
+      filterModels();
+    });
     searchInput.addEventListener('keydown', (event) => {
       if (event.key === 'ArrowDown') {
         event.preventDefault();
