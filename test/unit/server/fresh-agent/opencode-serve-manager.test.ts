@@ -3,7 +3,7 @@ import { PassThrough } from 'node:stream'
 import { ReadableStream } from 'node:stream/web'
 import { describe, expect, it, vi } from 'vitest'
 import { parseServeEvent as parseEvt } from '../../../../server/fresh-agent/adapters/opencode/serve-events.js'
-import { OpencodeServeManager } from '../../../../server/fresh-agent/adapters/opencode/serve-manager.js'
+import { OpencodeServeManager, OpencodeServeLostError } from '../../../../server/fresh-agent/adapters/opencode/serve-manager.js'
 
 function fakeChild() {
   const child = new EventEmitter() as any
@@ -1008,5 +1008,183 @@ describe('OpencodeServeManager fan-out', () => {
     await new Promise((r) => setTimeout(r, 50))
     closeStream?.()
     expect(seen.map((e) => e.kind)).toEqual(['session.idle'])
+  })
+
+  it('idle-timer kill emits lost event and cleans up session emitters', async () => {
+    vi.useFakeTimers()
+    try {
+      const childDefault = fakeChild()
+      const childProject = fakeChild()
+      const spawnFn = vi.fn()
+        .mockReturnValueOnce(childDefault)
+        .mockReturnValueOnce(childProject)
+      const fetchFn = vi.fn(async (url: string, init: any) => {
+        if (url === 'http://127.0.0.1:47999/global/health') return jsonResponse({ healthy: true })
+        if (url === 'http://127.0.0.1:47999/session/ses_project' && init?.method === 'GET') {
+          return jsonResponse({ id: 'ses_project', directory: '/project-a' })
+        }
+        if (url === 'http://127.0.0.1:47999/session/ses_project/compact' && init?.method === 'POST') {
+          return jsonResponse({}, { status: 204 })
+        }
+        if (url === 'http://127.0.0.1:48000/global/health') return jsonResponse({ healthy: true })
+        if (url === 'http://127.0.0.1:48000/session/ses_project/summarize' && init?.method === 'POST') {
+          return jsonResponse({}, { status: 204 })
+        }
+        return jsonResponse({}, { status: 404 })
+      })
+      const manager = new OpencodeServeManager({
+        spawnFn: spawnFn as any,
+        fetchFn: fetchFn as any,
+        allocatePort: vi.fn()
+          .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 47999 })
+          .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 48000 }),
+        connectEventStream: () => () => {},
+        healthTimeoutMs: 1000,
+        idleShutdownMs: 50,
+      } as any)
+
+      await manager.ensureStarted()
+      await manager.getSession('ses_project')
+      await manager.compact('ses_project')
+      manager.subscribe('ses_project', () => {})
+
+      const lostHandler = vi.fn()
+      const emitter = (manager as any).sessionEmitters.get('ses_project')
+      emitter.on('lost', lostHandler)
+      expect((manager as any).sessionEmitters.has('ses_project')).toBe(true)
+
+      await vi.advanceTimersByTimeAsync(51)
+
+      expect(childProject.kill).toHaveBeenCalled()
+      expect(lostHandler).toHaveBeenCalledTimes(1)
+      expect(lostHandler.mock.calls[0][0]).toBeInstanceOf(OpencodeServeLostError)
+      expect((manager as any).sessionEmitters.has('ses_project')).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('idle-timer kill rejects pending onceIdle with OpencodeServeLostError', async () => {
+    vi.useFakeTimers()
+    try {
+      const childDefault = fakeChild()
+      const childProject = fakeChild()
+      const spawnFn = vi.fn()
+        .mockReturnValueOnce(childDefault)
+        .mockReturnValueOnce(childProject)
+      const fetchFn = vi.fn(async (url: string, init: any) => {
+        if (url === 'http://127.0.0.1:47999/global/health') return jsonResponse({ healthy: true })
+        if (url === 'http://127.0.0.1:47999/session/ses_project' && init?.method === 'GET') {
+          return jsonResponse({ id: 'ses_project', directory: '/project-a' })
+        }
+        if (url === 'http://127.0.0.1:47999/session/ses_project/compact' && init?.method === 'POST') {
+          return jsonResponse({}, { status: 204 })
+        }
+        if (url === 'http://127.0.0.1:48000/global/health') return jsonResponse({ healthy: true })
+        if (url === 'http://127.0.0.1:48000/session/ses_project/summarize' && init?.method === 'POST') {
+          return jsonResponse({}, { status: 204 })
+        }
+        if (url === 'http://127.0.0.1:48000/session/status') return jsonResponse({})
+        return jsonResponse({}, { status: 404 })
+      })
+      const manager = new OpencodeServeManager({
+        spawnFn: spawnFn as any,
+        fetchFn: fetchFn as any,
+        allocatePort: vi.fn()
+          .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 47999 })
+          .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 48000 }),
+        connectEventStream: () => () => {},
+        healthTimeoutMs: 1000,
+        idleShutdownMs: 50,
+        idlePollMs: 10_000,
+      } as any)
+
+      await manager.ensureStarted()
+      await manager.getSession('ses_project')
+      await manager.compact('ses_project')
+      manager.subscribe('ses_project', () => {})
+
+      const idle = manager.onceIdle('ses_project', 200)
+      idle.catch(() => {})
+
+      await vi.advanceTimersByTimeAsync(201)
+
+      await expect(idle).rejects.toThrow(/opencode serve sidecar was lost/)
+      expect((manager as any).sessionEmitters.has('ses_project')).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('OpencodeServeManager diagnostics', () => {
+  it('close handler logs both exit code and signal', async () => {
+    const { manager, child } = makeManager()
+    const warnSpy = vi.spyOn((manager as any).log, 'warn')
+    await manager.ensureStarted()
+    child.emit('close', null, 'SIGTERM')
+    const exitLog = warnSpy.mock.calls.find((c) => c[1] === 'opencode serve exited')
+    expect(exitLog?.[0]).toEqual(expect.objectContaining({ code: null, signal: 'SIGTERM' }))
+  })
+
+  it('idle-timer kill logs a distinctive message before killing', async () => {
+    vi.useFakeTimers()
+    try {
+      const childDefault = fakeChild()
+      const childProject = fakeChild()
+      const spawnFn = vi.fn()
+        .mockReturnValueOnce(childDefault)
+        .mockReturnValueOnce(childProject)
+      const fetchFn = vi.fn(async (url: string, init: any) => {
+        if (url === 'http://127.0.0.1:47999/global/health') return jsonResponse({ healthy: true })
+        if (url === 'http://127.0.0.1:47999/session/ses_project' && init?.method === 'GET') {
+          return jsonResponse({ id: 'ses_project', directory: '/project-a' })
+        }
+        if (url === 'http://127.0.0.1:47999/session/ses_project/compact' && init?.method === 'POST') {
+          return jsonResponse({}, { status: 204 })
+        }
+        if (url === 'http://127.0.0.1:48000/global/health') return jsonResponse({ healthy: true })
+        if (url === 'http://127.0.0.1:48000/session/ses_project/summarize' && init?.method === 'POST') {
+          return jsonResponse({}, { status: 204 })
+        }
+        return jsonResponse({}, { status: 404 })
+      })
+      const manager = new OpencodeServeManager({
+        spawnFn: spawnFn as any,
+        fetchFn: fetchFn as any,
+        allocatePort: vi.fn()
+          .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 47999 })
+          .mockResolvedValueOnce({ hostname: '127.0.0.1', port: 48000 }),
+        connectEventStream: () => () => {},
+        healthTimeoutMs: 1000,
+        idleShutdownMs: 50,
+      } as any)
+
+      const infoSpy = vi.spyOn((manager as any).log, 'info')
+      await manager.ensureStarted()
+      await manager.getSession('ses_project')
+      await manager.compact('ses_project')
+
+      await vi.advanceTimersByTimeAsync(51)
+
+      expect(childProject.kill).toHaveBeenCalled()
+      const killLog = infoSpy.mock.calls.find((c) =>
+        typeof c[1] === 'string' && c[1].includes('idle') && c[1].includes('kill'),
+      )
+      expect(killLog).toBeDefined()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('sidecar stderr is captured at debug level', async () => {
+    const { manager, child } = makeManager()
+    const debugSpy = vi.spyOn((manager as any).log, 'debug')
+    await manager.ensureStarted()
+    child.stderr.emit('data', Buffer.from('panic: something went wrong'))
+    expect(debugSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ chunk: 'panic: something went wrong' }),
+      'opencode serve stderr',
+    )
   })
 })
