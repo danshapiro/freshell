@@ -811,7 +811,7 @@ describe('tabsSlice', () => {
       const store = createOpenSessionStore()
 
       await store.dispatch(openSessionTab({
-        sessionId: 'opencode-session-1',
+        sessionId: 'ses_opencode_1',
         cwd: '/repo',
         provider: 'opencode',
         sessionType: 'freshopencode',
@@ -820,7 +820,7 @@ describe('tabsSlice', () => {
       const state = store.getState()
       const tab = state.tabs.tabs.find((candidate) => candidate.title === 'repo')
       expect(tab).toBeTruthy()
-      expect(tab?.sessionRef).toEqual({ provider: 'opencode', sessionId: 'opencode-session-1' })
+      expect(tab?.sessionRef).toEqual({ provider: 'opencode', sessionId: 'ses_opencode_1' })
 
       const layout = state.panes.layouts[tab!.id]
       expect(layout.type).toBe('leaf')
@@ -828,7 +828,7 @@ describe('tabsSlice', () => {
         kind: 'fresh-agent',
         sessionType: 'freshopencode',
         provider: 'opencode',
-        sessionRef: { provider: 'opencode', sessionId: 'opencode-session-1' },
+        sessionRef: { provider: 'opencode', sessionId: 'ses_opencode_1' },
       })
       expect(layout.content).not.toHaveProperty('resumeSessionId')
     })

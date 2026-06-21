@@ -77,13 +77,21 @@ export const TerminalDirectoryQuerySchema = z.object({
 export const FreshAgentThreadTurnsQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
   priority: ReadModelPrioritySchema.optional(),
-  revision: z.coerce.number().int().nonnegative(),
+  revision: z.coerce.number().int().nonnegative().optional(),
   cwd: z.string().trim().min(1).optional(),
   limit: z.number().int().positive().max(MAX_FRESH_AGENT_THREAD_TURNS).optional(),
   includeBodies: z.union([
     z.boolean(),
     z.enum(['true', 'false']).transform((v) => v === 'true'),
   ]).optional(),
+}).superRefine((value, ctx) => {
+  if (value.cursor && value.revision == null) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['revision'],
+      message: 'revision is required when cursor is provided',
+    })
+  }
 })
 
 export const FreshAgentThreadTurnBodyQuerySchema = z.object({

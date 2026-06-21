@@ -25,6 +25,8 @@ const wsMock = vi.hoisted(() => ({
 const apiMock = vi.hoisted(() => ({
   getFreshAgentThreadSnapshot: vi.fn(),
   getFreshAgentModelCapabilities: vi.fn(),
+  getFreshAgentTurnPage: vi.fn(),
+  getFreshAgentTurnBody: vi.fn(),
   post: vi.fn(),
   setSessionMetadata: vi.fn().mockResolvedValue(undefined),
 }))
@@ -45,6 +47,8 @@ vi.mock('@/lib/api', async () => {
     api: { ...actual.api, post: apiMock.post },
     getFreshAgentThreadSnapshot: apiMock.getFreshAgentThreadSnapshot,
     getFreshAgentModelCapabilities: apiMock.getFreshAgentModelCapabilities,
+    getFreshAgentTurnPage: apiMock.getFreshAgentTurnPage,
+    getFreshAgentTurnBody: apiMock.getFreshAgentTurnBody,
     setSessionMetadata: apiMock.setSessionMetadata,
   }
 })
@@ -186,10 +190,21 @@ beforeEach(() => {
   wsMock.onMessage.mockImplementation(() => () => {})
   apiMock.getFreshAgentThreadSnapshot.mockReset()
   apiMock.getFreshAgentModelCapabilities.mockReset()
+  apiMock.getFreshAgentTurnPage.mockReset()
+  apiMock.getFreshAgentTurnBody.mockReset()
   apiMock.post.mockReset()
   apiMock.setSessionMetadata.mockReset()
   apiMock.post.mockResolvedValue({ title: null, source: 'none' })
   apiMock.setSessionMetadata.mockResolvedValue(undefined)
+  apiMock.getFreshAgentTurnPage.mockResolvedValue({
+    sessionType: 'freshcodex',
+    provider: 'codex',
+    threadId: 'thread-1',
+    revision: 1,
+    nextCursor: null,
+    turns: [],
+    bodies: {},
+  })
   saveServerSettingsPatchSpy.mockClear()
   window.localStorage.removeItem('freshopencode.modelMru.v2')
   apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
@@ -1116,7 +1131,7 @@ describe('FreshAgentView', () => {
     })
   })
 
-  it('sends tab restore context when recreating a legacy freshopencode placeholder', async () => {
+  it('shows a clear error instead of recreating a legacy freshopencode placeholder', async () => {
     const store = createStore()
     store.dispatch(updateTab({
       id: 'tab-1',
@@ -1146,19 +1161,16 @@ describe('FreshAgentView', () => {
     )
 
     await waitFor(() => {
-      expect(sentFreshAgentMessages('freshAgent.create').at(-1)).toMatchObject({
-        requestId: '-gP4qyCL7bwp8-xbw9G7b',
-        sessionType: 'freshopencode',
-        provider: 'opencode',
-        cwd: '/home/dan/code',
-        resumeSessionId: 'freshopencode--gP4qyCL7bwp8-xbw9G7b',
-        legacyRestoreContext: {
-          title: 'Identifying skills from GitHub repos',
-          createdAt: 1_781_291_230_743,
-          updatedAt: expect.any(Number),
-        },
+      const content = getFreshAgentPaneContent(store)
+      expect(content.sessionRef).toBeUndefined()
+      expect(content.resumeSessionId).toBeUndefined()
+      expect(content.restoreError).toEqual({
+        code: 'RESTORE_UNAVAILABLE',
+        reason: 'invalid_legacy_restore_target',
       })
     })
+    expect(screen.getByRole('alert')).toHaveTextContent('temporary session id')
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
     expect(apiMock.getFreshAgentThreadSnapshot).not.toHaveBeenCalledWith(
       'freshopencode',
       'opencode',

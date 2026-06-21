@@ -1025,38 +1025,23 @@ export function createCodexFreshAgentAdapter(deps: {
         thread.threadId,
         settingsFromLocator(thread) ?? settingsByThread.get(thread.threadId),
       )
-      let rawSnapshot: Record<string, any>
-      try {
-        rawSnapshot = await runtime.readThread({ threadId: thread.threadId, includeTurns: true })
-      } catch (error) {
-        if (!isCodexIncludeTurnsUnavailable(error)) {
-          throw error
-        }
-        rawSnapshot = await runtime.readThread({ threadId: thread.threadId, includeTurns: false })
-      }
-      const rawThreadTurns: unknown[] = Array.isArray(rawSnapshot.thread?.turns)
-        ? rawSnapshot.thread.turns
-        : []
+      const rawSnapshot = await runtime.readThread({ threadId: thread.threadId, includeTurns: false })
       const activeTurnId = findActiveTurnId(rawSnapshot)
       if (activeTurnId) {
         activeTurnByThread.set(thread.threadId, activeTurnId)
       } else if (normalizeCodexThreadStatus(rawSnapshot.thread?.status) !== 'running') {
         activeTurnByThread.delete(thread.threadId)
       }
-      const rawTurns = rawThreadTurns
-        .filter((turn): turn is Record<string, unknown> => !!turn && typeof turn === 'object' && !Array.isArray(turn))
       const revisionNumber = Number(rawSnapshot.thread?.updatedAt ?? revision ?? 0)
-      const turns = normalizeRawTurns({
-        threadId: thread.threadId,
-        revision: revisionNumber,
-        rawTurns,
-      })
+      if (!Number.isFinite(revisionNumber)) {
+        throw new FreshAgentUnprovableThreadRevisionError(0)
+      }
       return normalizeCodexThreadSnapshot({
         threadId: thread.threadId,
         revision: revisionNumber,
         status: normalizeCodexThreadStatus(rawSnapshot.thread?.status),
         transcript: {
-          turns,
+          turns: [],
         },
         rawSnapshot,
       })
@@ -1067,10 +1052,22 @@ export function createCodexFreshAgentAdapter(deps: {
         thread.threadId,
         settingsFromLocator(thread) ?? settingsByThread.get(thread.threadId),
       )
+      let revision = typeof query.revision === 'number' ? query.revision : undefined
+      if (revision == null && typeof query.cursor !== 'string') {
+        const metadata = await runtime.readThread({ threadId: thread.threadId, includeTurns: false })
+        const metadataRevision = Number(metadata.thread?.updatedAt)
+        if (!Number.isFinite(metadataRevision)) {
+          throw new FreshAgentUnprovableThreadRevisionError(0)
+        }
+        revision = metadataRevision
+      }
+      if (revision == null) {
+        throw new FreshAgentUnprovableThreadRevisionError(0)
+      }
       return normalizeDisplayTurnPage({
         runtime,
         threadId: thread.threadId,
-        revision: Number(query.revision ?? 0),
+        revision,
         cursor: typeof query.cursor === 'string' ? query.cursor : undefined,
         limit: typeof query.limit === 'number' ? query.limit : undefined,
       })

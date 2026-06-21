@@ -383,7 +383,7 @@ describe('OpenCode serve adapter: history reads', () => {
 
     await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1' })
     await adapter.getSnapshot?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' })
-    await adapter.getTurnPage?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' }, { limit: 1, revision: 0 })
+    await adapter.getTurnPage?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' }, { limit: 1, revision: 12 })
     await adapter.getTurnBody?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1', turnId: 'msg_assistant_1' }, 12)
 
     expect(manager.getSession).toHaveBeenNthCalledWith(1, 'ses_real_1')
@@ -398,7 +398,7 @@ describe('OpenCode serve adapter: history reads', () => {
     manager.listMessages = vi.fn(async () => ({ messages: messages.slice(0, 1), nextCursor: 'NEXT' }))
     const adapter = makeAdapter(manager)
     await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1', cwd: '/repo/history' })
-    const page = await adapter.getTurnPage?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' }, { cursor: 'CUR', limit: 1, revision: 0 })
+    const page = await adapter.getTurnPage?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' }, { cursor: 'CUR', limit: 1, revision: 5 })
     expect(page).toMatchObject({ nextCursor: 'NEXT', turns: [{ turnId: 'msg_user_1' }] })
     expect(manager.getSession).toHaveBeenCalledWith('ses_real_1', { cwd: '/repo/history' })
     expect(manager.listMessages).toHaveBeenCalledWith('ses_real_1', { limit: 1, before: 'CUR' }, { cwd: '/repo/history' })

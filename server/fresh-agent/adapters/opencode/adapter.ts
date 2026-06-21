@@ -1,16 +1,14 @@
 import { EventEmitter } from 'node:events'
 import { stat } from 'node:fs/promises'
-import path from 'node:path'
 import type {
   FreshAgentCreateRequest,
   FreshAgentRuntimeAdapter,
   FreshAgentSendResult,
   FreshAgentThreadLocator,
 } from '../../runtime-adapter.js'
-import { FreshAgentLostSessionError } from '../../runtime-manager.js'
+import { FreshAgentLostSessionError, FreshAgentStaleThreadRevisionError } from '../../runtime-manager.js'
 import { normalizeFreshAgentEffort, normalizeFreshAgentModel } from '../../../../shared/fresh-agent-models.js'
 import { logger } from '../../../logger.js'
-import { defaultOpencodeDataHome } from '../../../coding-cli/providers/opencode.js'
 import {
   hashForLogs,
   recordFreshAgentObservabilityEvent,
@@ -21,16 +19,12 @@ import {
   normalizeOpencodeTurnBody,
   normalizeOpencodeTurnPage,
 } from './normalize.js'
-import { DEFAULT_SNAPSHOT_TURN_LIMIT } from './history-query.js'
-import {
-  createWorkerHistoryReader,
-  type OpencodeHistoryReader,
-} from './history-runner.js'
 import type { OpencodeServeManager } from './serve-manager.js'
 import { serveEventToSdk, splitOpencodeModel } from './serve-events.js'
 
 const OPENCODE_REAL_SESSION_ID = /^ses_/
 const OPENCODE_PLACEHOLDER_SESSION_ID = /^freshopencode-/
+const DEFAULT_SNAPSHOT_TURN_LIMIT = 200
 const DEFAULT_TURN_TIMEOUT_MS = 600_000
 
 type OpencodeSessionState = {
@@ -47,10 +41,6 @@ type OpencodeSessionState = {
 
 type CreateOpencodeFreshAgentAdapterOptions = {
   serveManager: OpencodeServeManager
-  /** Retained ONLY for legacy `freshopencode-*` placeholder resume. */
-  historyReader?: OpencodeHistoryReader
-  dbPath?: string
-  dataHome?: string
   turnTimeoutMs?: number
   validateCwd?: (cwd: string) => Promise<void>
 }
@@ -77,13 +67,6 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
   const serveManager = options.serveManager
   const turnTimeoutMs = options.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS
   const validateCwd = options.validateCwd ?? defaultValidateCwd
-  const dbPath = options.dbPath ?? path.join(options.dataHome ?? defaultOpencodeDataHome(), 'opencode.db')
-  // Lazily create the legacy reader only if a legacy placeholder resume is attempted.
-  let historyReader: OpencodeHistoryReader | undefined = options.historyReader
-  const legacyReader = (): OpencodeHistoryReader => {
-    if (!historyReader) historyReader = createWorkerHistoryReader({ dbPath })
-    return historyReader
-  }
   const log = logger.child({ component: 'freshopencode-serve-adapter' })
   const sessions = new Map<string, OpencodeSessionState>()
 
@@ -300,14 +283,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       const sessionId = normalized.resumeSessionId
       if (!sessionId) throw new Error('OpenCode resume requires a session id.')
       if (isPlaceholderOpencodeSessionId(sessionId)) {
-        const real = await resolveLegacyPlaceholder(legacyReader(), normalized, sessionId)
-        const state: OpencodeSessionState = {
-          placeholderId: sessionId, realSessionId: real, cwd: normalized.cwd, model: normalized.model,
-          effort: normalized.effort, status: 'idle', events: new EventEmitter(), sendQueue: Promise.resolve(),
-        }
-        remember(state)
-        bindServeStream(state)
-        return { sessionId: real, sessionRef: { provider: 'opencode', sessionId: real } }
+        throw new FreshAgentLostSessionError(`OpenCode session ${sessionId} is a temporary Freshopencode id. Restore requires a durable OpenCode session id that starts with ses_.`)
       }
       if (!isRealOpencodeSessionId(sessionId)) {
         throw new FreshAgentLostSessionError(`OpenCode session ${sessionId} is not a durable OpenCode session.`)
@@ -441,7 +417,16 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       const { exported, nextCursor, revision } = route
         ? await assembleExport(realId, pageQuery, route)
         : await assembleExport(realId, pageQuery)
-      return normalizeOpencodeTurnPage({ threadId: thread.threadId, exported, revision, nextCursor })
+      if (typeof query.revision === 'number' && query.revision !== revision) {
+        throw new FreshAgentStaleThreadRevisionError(revision)
+      }
+      return normalizeOpencodeTurnPage({
+        threadId: thread.threadId,
+        exported,
+        revision,
+        nextCursor,
+        includeBodies: query.includeBodies === true,
+      })
     },
 
     async getTurnBody(thread, revision) {
@@ -462,24 +447,4 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       await serveManager.shutdown()
     },
   }
-}
-
-async function resolveLegacyPlaceholder(reader: OpencodeHistoryReader, input: FreshAgentCreateRequest, placeholderId: string): Promise<string> {
-  const ctx = input.legacyRestoreContext
-  const title = typeof ctx?.title === 'string' ? ctx.title : undefined
-  const createdAt = typeof ctx?.createdAt === 'number' ? ctx.createdAt : undefined
-  const updatedAt = typeof ctx?.updatedAt === 'number' ? ctx.updatedAt : undefined
-  if (!input.cwd || (!title && createdAt === undefined && updatedAt === undefined)) {
-    throw new FreshAgentLostSessionError(`OpenCode session ${placeholderId} is not a durable OpenCode session.`)
-  }
-  let resolved: Awaited<ReturnType<OpencodeHistoryReader['resolveLegacySession']>>
-  try {
-    resolved = await reader.resolveLegacySession({ cwd: input.cwd, title, createdAt, updatedAt })
-  } catch {
-    throw new FreshAgentLostSessionError(`OpenCode session ${placeholderId} is not a durable OpenCode session.`)
-  }
-  if (!resolved?.id || !/^ses_/.test(resolved.id)) {
-    throw new FreshAgentLostSessionError(`OpenCode session ${placeholderId} is not a durable OpenCode session.`)
-  }
-  return resolved.id
 }

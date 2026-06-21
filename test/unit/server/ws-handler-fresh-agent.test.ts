@@ -96,11 +96,6 @@ describe('WsHandler fresh-agent routing', () => {
         sessionType: 'freshcodex',
         provider: 'codex',
         cwd: '/workspace',
-        legacyRestoreContext: {
-          title: 'Legacy title',
-          createdAt: 1_781_291_230_743,
-          updatedAt: 1_781_291_259_546,
-        },
       }))
       ws.send(JSON.stringify({
         type: 'terminal.create',
@@ -112,11 +107,7 @@ describe('WsHandler fresh-agent routing', () => {
         expect(runtimeManager.create).toHaveBeenCalledWith(expect.objectContaining({
           sessionType: 'freshcodex',
           provider: 'codex',
-          legacyRestoreContext: {
-            title: 'Legacy title',
-            createdAt: 1_781_291_230_743,
-            updatedAt: 1_781_291_259_546,
-          },
+          cwd: '/workspace',
         }))
         expect(seenMessages.some((message) => message.type === 'freshAgent.created')).toBe(true)
       })

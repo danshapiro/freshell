@@ -338,7 +338,7 @@ export async function getFreshAgentTurnPage(
   query: {
     cursor?: string
     priority?: string
-    revision: number
+    revision?: number
     cwd?: string
     limit?: number
     includeBodies?: boolean

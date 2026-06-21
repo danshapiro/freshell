@@ -5,6 +5,7 @@ import {
   type RestoreError,
   type SessionRef,
 } from './session-contract.js'
+import { isDurableProviderSessionId } from './session-flavor.js'
 
 export type FreshAgentSessionType = 'freshclaude' | 'freshcodex' | 'kilroy' | 'freshopencode'
 
@@ -160,6 +161,20 @@ export function migrateLegacyFreshAgentDurableState({
     ) {
       return { restoreError: buildRestoreError('invalid_legacy_restore_target') }
     }
+    if (
+      explicitSessionRef.provider === 'opencode'
+      && !isDurableProviderSessionId('opencode', explicitSessionRef.sessionId)
+    ) {
+      if (provider === 'opencode' && isDurableProviderSessionId('opencode', resumeSessionId)) {
+        return {
+          sessionRef: {
+            provider: 'opencode',
+            sessionId: resumeSessionId!,
+          },
+        }
+      }
+      return { restoreError: buildRestoreError('invalid_legacy_restore_target') }
+    }
     return { sessionRef: explicitSessionRef }
   }
 
@@ -173,6 +188,18 @@ export function migrateLegacyFreshAgentDurableState({
         sessionRef: {
           provider,
           sessionId: resumeSessionId,
+        },
+      }
+    }
+    return { restoreError: buildRestoreError('invalid_legacy_restore_target') }
+  }
+
+  if (provider === 'opencode') {
+    if (isDurableProviderSessionId(provider, resumeSessionId)) {
+      return {
+        sessionRef: {
+          provider,
+          sessionId: resumeSessionId!,
         },
       }
     }

@@ -176,21 +176,22 @@ export function createClaudeFreshAgentHistoryService(
 
     async getThreadTurnPage(query) {
       throwIfAborted(query.signal)
-      if (query.revision == null) {
-        throw new Error('Restore revision is required')
-      }
       const limit = Math.min(query.limit ?? DEFAULT_THREAD_TURN_LIMIT, MAX_THREAD_TURN_LIMIT)
       const cursor = query.cursor ? decodeCursor(query.cursor) : null
+      if (cursor && query.revision == null) {
+        throw new Error('Restore revision is required when cursor is provided')
+      }
       const offset = cursor?.offset ?? 0
       const history = await loadHistoryRecords(query.sessionId)
       throwIfAborted(query.signal)
-      if (query.revision !== history.revision) {
-        throw new ClaudeFreshAgentStaleHistoryRevisionError(query.revision, history.revision)
+      const requestedRevision = query.revision ?? history.revision
+      if (requestedRevision !== history.revision) {
+        throw new ClaudeFreshAgentStaleHistoryRevisionError(requestedRevision, history.revision)
       }
       if (cursor && cursor.revision !== history.revision) {
         throw new ClaudeFreshAgentStaleHistoryRevisionError(cursor.revision, history.revision)
       }
-      const pageItems = history.records.slice(offset, offset + limit)
+      const pageItems = history.records.slice(offset, offset + limit).reverse()
       const nextOffset = offset + pageItems.length
 
       const result: ClaudeFreshAgentHistoryPage = {

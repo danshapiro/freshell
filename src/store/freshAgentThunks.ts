@@ -15,6 +15,8 @@ type FreshAgentThreadThunkLocator = {
   cwd?: string
 }
 
+const BACKGROUND_HISTORY_MAX_PAGES_PER_BATCH = 8
+
 const inFlightControllers = new Set<AbortController>()
 
 export function _resetFreshAgentThunkControllers(): void {
@@ -28,8 +30,10 @@ export const loadFreshAgentThreadTurns = createAsyncThunk(
   'freshAgent/loadThreadTurns',
   async (
     input: FreshAgentThreadThunkLocator & {
-      revision: number
+      revision?: number
       cursor?: string
+      priority?: 'visible' | 'background'
+      requestKey?: string
       limit?: number
       includeBodies?: boolean
     },
@@ -46,6 +50,7 @@ export const loadFreshAgentThreadTurns = createAsyncThunk(
         {
           revision: input.revision,
           cursor: input.cursor,
+          priority: input.priority,
           limit: input.limit,
           includeBodies: input.includeBodies,
           cwd: input.cwd,
@@ -55,6 +60,7 @@ export const loadFreshAgentThreadTurns = createAsyncThunk(
       dispatch(historyPageReceived({
         ...input,
         turns: page.turns,
+        bodies: page.bodies ?? {},
         nextCursor: page.nextCursor,
         revision: page.revision,
       }))
@@ -68,6 +74,43 @@ export const loadFreshAgentThreadTurns = createAsyncThunk(
     } finally {
       inFlightControllers.delete(controller)
     }
+  },
+)
+
+export const backfillFreshAgentOlderHistory = createAsyncThunk(
+  'freshAgent/backfillOlderHistory',
+  async (
+    input: FreshAgentThreadThunkLocator & {
+      revision: number
+      cursor: string
+      requestKey: string
+      limit?: number
+    },
+    { dispatch },
+  ) => {
+    let cursor: string | null | undefined = input.cursor
+    let revision = input.revision
+    for (let page = 0; cursor && page < BACKGROUND_HISTORY_MAX_PAGES_PER_BATCH; page += 1) {
+      try {
+        const result = await dispatch(loadFreshAgentThreadTurns({
+          ...input,
+          revision,
+          cursor,
+          priority: 'background',
+          limit: input.limit ?? 30,
+          includeBodies: true,
+        })).unwrap()
+        cursor = result.nextCursor
+        revision = result.revision
+      } catch (error) {
+        const message = error instanceof Error && /cursor/i.test(error.message)
+          ? 'Older history cursor expired; refresh history to continue.'
+          : (error instanceof Error ? error.message : 'Failed to load older fresh-agent history')
+        dispatch(historyLoadFailed({ ...input, cursor: cursor ?? input.cursor, message }))
+        throw error
+      }
+    }
+    return { nextCursor: cursor ?? null, revision }
   },
 )
 
@@ -94,7 +137,7 @@ export const loadFreshAgentTurnBody = createAsyncThunk(
           signal: controller.signal,
         },
       )
-      dispatch(turnBodyReceived({ ...input, turn }))
+      dispatch(turnBodyReceived({ ...input, turn, revision: input.revision }))
       return turn
     } finally {
       inFlightControllers.delete(controller)

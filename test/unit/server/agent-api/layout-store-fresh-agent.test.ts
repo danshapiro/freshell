@@ -9,10 +9,10 @@ describe('LayoutStore fresh-agent content', () => {
       kind: 'fresh-agent',
       sessionType: 'freshopencode',
       provider: 'opencode',
-      sessionId: 'freshopencode-req-1',
+      sessionId: 'ses_opencode_1',
       createRequestId: 'req-1',
       status: 'connected',
-      sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-1' },
+      sessionRef: { provider: 'opencode', sessionId: 'ses_opencode_1' },
       initialCwd: '/repo',
       model: 'umans-ai-coding-plan/umans-kimi-k2.7',
       effort: 'high',
@@ -22,8 +22,8 @@ describe('LayoutStore fresh-agent content', () => {
     expect(snap?.kind).toBe('fresh-agent')
     expect(snap?.paneContent).toMatchObject({
       kind: 'fresh-agent', sessionType: 'freshopencode', provider: 'opencode',
-      sessionId: 'freshopencode-req-1', createRequestId: 'req-1',
-      sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-1' },
+      sessionId: 'ses_opencode_1', createRequestId: 'req-1',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_opencode_1' },
     })
   })
 })

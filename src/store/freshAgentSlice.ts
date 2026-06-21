@@ -4,7 +4,8 @@ import {
   type FreshAgentRuntimeProvider,
   type FreshAgentSessionType,
 } from '@shared/fresh-agent'
-import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
+import { getFreshAgentTurnIdentityKeys } from '@shared/fresh-agent-turns'
+import type { FreshAgentSnapshot, FreshAgentTurn } from '@shared/fresh-agent-contract'
 import type {
   FreshAgentContentBlock,
   FreshAgentPermissionRequest,
@@ -111,10 +112,74 @@ function resetHydratedHistoryState(session: FreshAgentSessionState): void {
   session.nextHistoryCursor = undefined
   session.historyLoading = false
   session.historyError = undefined
+  session.historyInitialLoading = false
+  session.historyOlderLoading = false
+  session.historyOlderError = undefined
+  session.historyBackfillComplete = false
+  session.historyBackfillPaused = false
+  session.historyInitialRequestKey = undefined
+  session.historyOlderRequestKey = undefined
   session.historyLoaded = false
   session.restoreFailureMessage = undefined
   session.streamingText = ''
   session.streamingActive = false
+}
+
+function mergeUniqueTurnsByIdentity(
+  first: FreshAgentTurn[],
+  second: FreshAgentTurn[],
+): FreshAgentTurn[] {
+  const seen = new Set<string>()
+  const merged: FreshAgentTurn[] = []
+  for (const turn of [...first, ...second]) {
+    const keys = getFreshAgentTurnIdentityKeys(turn)
+    if (keys.length > 0 && keys.some((key) => seen.has(key))) continue
+    for (const key of keys) seen.add(key)
+    merged.push(turn)
+  }
+  return merged
+}
+
+function mergeTurnsReplacingByIdentity(
+  existing: FreshAgentTurn[],
+  incoming: FreshAgentTurn[],
+): FreshAgentTurn[] {
+  const incomingByKey = new Map<string, FreshAgentTurn>()
+  const consumed = new Set<FreshAgentTurn>()
+  for (const turn of incoming) {
+    for (const key of getFreshAgentTurnIdentityKeys(turn)) {
+      incomingByKey.set(key, turn)
+    }
+  }
+
+  const merged = existing.map((turn) => {
+    const replacement = getFreshAgentTurnIdentityKeys(turn)
+      .map((key) => incomingByKey.get(key))
+      .find((candidate): candidate is FreshAgentTurn => Boolean(candidate))
+    if (replacement) {
+      consumed.add(replacement)
+      return replacement
+    }
+    return turn
+  })
+
+  for (const turn of incoming) {
+    if (!consumed.has(turn)) merged.push(turn)
+  }
+  return mergeUniqueTurnsByIdentity([], merged)
+}
+
+function isSnapshotStatusInFlight(status: string | undefined): boolean {
+  return status === 'running' || status === 'compacting'
+}
+
+function appendLiveTurn(session: FreshAgentSessionState, turn: FreshAgentTurn): void {
+  session.turns = mergeUniqueTurnsByIdentity(session.turns, [turn])
+  session.historyBodies[turn.turnId] = turn
+}
+
+export function selectFreshAgentTranscriptTurns(session: FreshAgentSessionState): FreshAgentTurn[] {
+  return mergeUniqueTurnsByIdentity(session.historyItems, session.turns)
 }
 
 function requestRestoreHydrationRestart(session: FreshAgentSessionState): void {
@@ -359,8 +424,17 @@ const freshAgentSlice = createSlice({
       }
     },
 
-    freshAgentSnapshotReceived(state, action: PayloadAction<{ snapshot: FreshAgentSnapshot }>) {
+    freshAgentSnapshotReceived(state, action: PayloadAction<{ snapshot: FreshAgentSnapshot; hydrateHistory?: boolean }>) {
       const snapshot = action.payload.snapshot
+      const hydrateHistory = action.payload.hydrateHistory !== false
+      const snapshotTurns = snapshot.turns ?? []
+      const pendingApprovals = snapshot.pendingApprovals ?? []
+      const pendingQuestions = snapshot.pendingQuestions ?? []
+      const tokenUsage = snapshot.tokenUsage ?? {
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+      }
       const session = ensureSession(state, {
         sessionId: snapshot.threadId,
         sessionType: snapshot.sessionType,
@@ -370,19 +444,28 @@ const freshAgentSlice = createSlice({
       session.status = snapshot.status as FreshAgentSessionStatus
       session.latestTurnId = snapshot.latestTurnId
       session.historyRevision = snapshot.revision
-      session.turns = snapshot.turns
-      session.historyItems = snapshot.turns
-      session.historyBodies = Object.fromEntries(snapshot.turns.map((turn) => [turn.turnId, turn]))
+      if (hydrateHistory) {
+        session.turns = snapshotTurns
+        session.historyItems = snapshotTurns
+        session.historyBodies = Object.fromEntries(snapshotTurns.map((turn) => [turn.turnId, turn]))
+      } else if (snapshotTurns.length > 0) {
+        session.turns = isSnapshotStatusInFlight(snapshot.status)
+          ? mergeTurnsReplacingByIdentity(session.turns, snapshotTurns)
+          : snapshotTurns
+        for (const turn of snapshotTurns) {
+          session.historyBodies[turn.turnId] = turn
+        }
+      }
       session.pendingPermissions = Object.fromEntries(
-        snapshot.pendingApprovals.map((approval) => [String(approval.requestId), approval]),
+        pendingApprovals.map((approval) => [String(approval.requestId), approval]),
       )
       session.pendingQuestions = Object.fromEntries(
-        snapshot.pendingQuestions.map((question) => [String(question.requestId), question]),
+        pendingQuestions.map((question) => [String(question.requestId), question]),
       )
-      session.totalInputTokens = snapshot.tokenUsage.inputTokens
-      session.totalOutputTokens = snapshot.tokenUsage.outputTokens
-      session.totalCostUsd = snapshot.tokenUsage.costUsd ?? 0
-      session.historyLoaded = true
+      session.totalInputTokens = tokenUsage.inputTokens
+      session.totalOutputTokens = tokenUsage.outputTokens
+      session.totalCostUsd = tokenUsage.costUsd ?? 0
+      session.historyLoaded = hydrateHistory ? true : session.historyLoaded
       session.awaitingDurableHistory = false
     },
 
@@ -478,39 +561,88 @@ const freshAgentSlice = createSlice({
       session.restoreRetryCount = (session.restoreRetryCount ?? 0) + 1
     },
 
-    historyLoadStarted(state, action: PayloadAction<SessionMutationPayload>) {
-      const key = resolveSessionKey(state, action.payload)
-      if (!key) return
-      state.sessions[key].historyLoading = true
-      state.sessions[key].historyError = undefined
+    historyLoadStarted(state, action: PayloadAction<SessionMutationPayload & {
+      cursor?: string
+      requestKey?: string
+    }>) {
+      const session = resolveOrEnsureSession(state, action.payload)
+      if (!session) return
+      session.historyLoading = true
+      if (action.payload.cursor) {
+        session.historyOlderLoading = true
+        session.historyOlderError = undefined
+        session.historyOlderRequestKey = action.payload.requestKey
+      } else {
+        session.historyInitialLoading = true
+        session.historyError = undefined
+        session.historyInitialRequestKey = action.payload.requestKey
+      }
     },
 
     historyPageReceived(state, action: PayloadAction<SessionMutationPayload & {
       turns: FreshAgentSessionState['historyItems']
+      bodies?: Record<string, FreshAgentSessionState['historyItems'][number]>
       nextCursor?: string | null
+      revision?: number
+      cursor?: string
+      requestKey?: string
+    }>) {
+      const session = resolveOrEnsureSession(state, action.payload)
+      if (!session) return
+      const expectedRequestKey = action.payload.cursor
+        ? session.historyOlderRequestKey
+        : session.historyInitialRequestKey
+      if (action.payload.requestKey && expectedRequestKey && action.payload.requestKey !== expectedRequestKey) return
+      if (session.restoreFailureMessage) return
+      const incoming = action.payload.turns
+      session.historyLoading = false
+      session.historyInitialLoading = false
+      session.historyOlderLoading = false
+      session.historyLoaded = true
+      session.historyItems = action.payload.cursor
+        ? mergeUniqueTurnsByIdentity(incoming, session.historyItems)
+        : incoming
+      for (const turn of incoming) {
+        session.historyBodies[turn.turnId] = turn
+      }
+      for (const [turnId, body] of Object.entries(action.payload.bodies ?? {})) {
+        session.historyBodies[turnId] = body
+      }
+      session.nextHistoryCursor = action.payload.nextCursor
+      session.historyRevision = action.payload.revision ?? session.historyRevision
+      session.historyBackfillComplete = action.payload.nextCursor == null
+      session.historyBackfillPaused = false
+    },
+
+    historyLoadFailed(state, action: PayloadAction<SessionMutationPayload & {
+      message: string
+      cursor?: string
+      requestKey?: string
+    }>) {
+      const session = resolveOrEnsureSession(state, action.payload)
+      if (!session) return
+      const expectedRequestKey = action.payload.cursor
+        ? session.historyOlderRequestKey
+        : session.historyInitialRequestKey
+      if (action.payload.requestKey && expectedRequestKey && action.payload.requestKey !== expectedRequestKey) return
+      session.historyLoading = false
+      if (action.payload.cursor) {
+        session.historyOlderLoading = false
+        session.historyOlderError = action.payload.message
+        session.historyBackfillPaused = true
+      } else {
+        session.historyInitialLoading = false
+        session.historyError = action.payload.message
+      }
+    },
+
+    turnBodyReceived(state, action: PayloadAction<SessionMutationPayload & {
+      turn: FreshAgentSessionState['historyItems'][number]
       revision?: number
     }>) {
       const key = resolveSessionKey(state, action.payload)
       if (!key) return
-      const session = state.sessions[key]
-      session.historyLoading = false
-      session.historyLoaded = true
-      session.historyItems = action.payload.turns
-      session.nextHistoryCursor = action.payload.nextCursor
-      session.historyRevision = action.payload.revision ?? session.historyRevision
-    },
-
-    historyLoadFailed(state, action: PayloadAction<SessionMutationPayload & { message: string }>) {
-      const key = resolveSessionKey(state, action.payload)
-      if (!key) return
-      const session = state.sessions[key]
-      session.historyLoading = false
-      session.historyError = action.payload.message
-    },
-
-    turnBodyReceived(state, action: PayloadAction<SessionMutationPayload & { turn: FreshAgentSessionState['historyItems'][number] }>) {
-      const key = resolveSessionKey(state, action.payload)
-      if (!key) return
+      if (action.payload.revision !== undefined && state.sessions[key].historyRevision !== undefined && action.payload.revision !== state.sessions[key].historyRevision) return
       state.sessions[key].historyBodies[action.payload.turn.turnId] = action.payload.turn
     },
 
@@ -531,14 +663,13 @@ const freshAgentSlice = createSlice({
       const session = resolveOrEnsureSession(state, action.payload, 'running')
       if (!session) return
       const turnId = `live-user-${session.turns.length + 1}`
-      session.turns.push({
+      appendLiveTurn(session, {
         id: turnId,
         turnId,
         role: 'user',
         summary: action.payload.text,
         items: [{ id: `${turnId}-text`, kind: 'text', text: action.payload.text }],
       })
-      session.historyItems = session.turns
     },
     addAssistantMessage(state, action: PayloadAction<SessionMutationPayload & {
       content: Record<string, unknown>[]
@@ -550,7 +681,7 @@ const freshAgentSlice = createSlice({
         .map((block, index) => normalizeLegacyContentBlock(block, index))
         .filter((item): item is FreshAgentContentBlock => item !== undefined)
       const turnId = `live-assistant-${session.turns.length + 1}`
-      session.turns.push({
+      appendLiveTurn(session, {
         id: turnId,
         turnId,
         role: 'assistant',
@@ -558,7 +689,6 @@ const freshAgentSlice = createSlice({
         summary: summarizeFreshAgentItems(items),
         items,
       })
-      session.historyItems = session.turns
       session.streamingText = ''
       session.streamingActive = false
     },

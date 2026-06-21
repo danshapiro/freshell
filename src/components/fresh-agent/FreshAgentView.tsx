@@ -15,7 +15,8 @@ import { getWsClient } from '@/lib/ws-client'
 import { createLogger } from '@/lib/client-logger'
 import { api, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
 import { consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
-import { clearPendingCreateFailure } from '@/store/freshAgentSlice'
+import { clearPendingCreateFailure, freshAgentSnapshotReceived, selectFreshAgentTranscriptTurns } from '@/store/freshAgentSlice'
+import { backfillFreshAgentOlderHistory, loadFreshAgentThreadTurns } from '@/store/freshAgentThunks'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import {
@@ -55,6 +56,7 @@ import { FreshAgentSidebar } from './FreshAgentSidebar'
 
 const EARLY_STATES = new Set(['creating', 'starting'])
 const BUSY_STATES = new Set(['running', 'compacting'])
+const INITIAL_HISTORY_TURN_LIMIT = 30
 const log = createLogger('FreshAgentView')
 
 function getSnapshotIdentity(snapshot: FreshAgentSnapshot): string | null {
@@ -150,6 +152,47 @@ function resolveEffectiveFreshAgentModel(
   return normalizeFreshAgentModel(content.sessionType, content.provider, configuredModel)
 }
 
+function normalizeSnapshotForDisplay(
+  raw: Partial<FreshAgentSnapshot>,
+  fallback: {
+    sessionType: FreshAgentSnapshot['sessionType']
+    provider: FreshAgentSnapshot['provider']
+    threadId: string
+    status: string
+  },
+): FreshAgentSnapshot {
+  return {
+    sessionType: raw.sessionType ?? fallback.sessionType,
+    provider: raw.provider ?? fallback.provider,
+    threadId: raw.threadId ?? fallback.threadId,
+    ...(raw.sessionId ? { sessionId: raw.sessionId } : {}),
+    revision: raw.revision ?? 0,
+    latestTurnId: raw.latestTurnId,
+    status: raw.status ?? fallback.status,
+    summary: raw.summary,
+    capabilities: raw.capabilities ?? {
+      send: false,
+      interrupt: false,
+      approvals: false,
+      questions: false,
+      fork: false,
+    },
+    settings: raw.settings,
+    tokenUsage: raw.tokenUsage ?? {
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+    },
+    pendingApprovals: raw.pendingApprovals ?? [],
+    pendingQuestions: raw.pendingQuestions ?? [],
+    worktrees: raw.worktrees ?? [],
+    diffs: raw.diffs ?? [],
+    childThreads: raw.childThreads ?? [],
+    turns: raw.turns ?? [],
+    extensions: raw.extensions ?? {},
+  }
+}
+
 function getEffectiveFreshAgentEffort(
   content: FreshAgentPaneContent,
   providerDefaults?: { modelSelection?: { modelId: string } },
@@ -188,6 +231,34 @@ function isFreshOpencodePlaceholderId(pane: FreshAgentPaneContent, sessionId: st
     && pane.sessionType === 'freshopencode'
     && typeof sessionId === 'string'
     && sessionId.startsWith('freshopencode-')
+}
+
+function getInvalidFreshOpencodeRestoreTarget(pane: FreshAgentPaneContent): string | undefined {
+  if (pane.provider !== 'opencode' || pane.sessionType !== 'freshopencode') return undefined
+  if (pane.sessionId) return undefined
+  const sessionRefId = pane.sessionRef?.provider === 'opencode' ? pane.sessionRef.sessionId : undefined
+  if (isFreshOpencodePlaceholderId(pane, sessionRefId)) return sessionRefId
+  if (isFreshOpencodePlaceholderId(pane, pane.resumeSessionId)) return pane.resumeSessionId
+  return undefined
+}
+
+function buildLegacyRestoreContext(tab: { title?: string; createdAt?: number; updatedAt?: number } | undefined) {
+  if (!tab) return undefined
+  const title = typeof tab.title === 'string' && tab.title.trim().length > 0
+    ? tab.title.trim()
+    : undefined
+  const createdAt = typeof tab.createdAt === 'number' && Number.isFinite(tab.createdAt)
+    ? tab.createdAt
+    : undefined
+  const updatedAt = typeof tab.updatedAt === 'number' && Number.isFinite(tab.updatedAt)
+    ? tab.updatedAt
+    : undefined
+  if (!title && createdAt === undefined && updatedAt === undefined) return undefined
+  return {
+    ...(title ? { title } : {}),
+    ...(createdAt !== undefined ? { createdAt } : {}),
+    ...(updatedAt !== undefined ? { updatedAt } : {}),
+  }
 }
 
 function getFreshAgentSnapshotThreadId(
@@ -248,25 +319,6 @@ function persistDurableFreshAgentFlavor(message: {
   })
 }
 
-function buildLegacyRestoreContext(tab: { title?: string; createdAt?: number; updatedAt?: number } | undefined) {
-  if (!tab) return undefined
-  const title = typeof tab.title === 'string' && tab.title.trim().length > 0
-    ? tab.title.trim()
-    : undefined
-  const createdAt = typeof tab.createdAt === 'number' && Number.isFinite(tab.createdAt)
-    ? tab.createdAt
-    : undefined
-  const updatedAt = typeof tab.updatedAt === 'number' && Number.isFinite(tab.updatedAt)
-    ? tab.updatedAt
-    : undefined
-  if (!title && createdAt === undefined && updatedAt === undefined) return undefined
-  return {
-    ...(title ? { title } : {}),
-    ...(createdAt !== undefined ? { createdAt } : {}),
-    ...(updatedAt !== undefined ? { updatedAt } : {}),
-  }
-}
-
 function getQuestionAgentLabel(paneContent: FreshAgentPaneContent, descriptorLabel?: string): string {
   if (paneContent.sessionType === 'kilroy') return 'Kilroy'
   switch (paneContent.provider) {
@@ -299,9 +351,12 @@ function isLostFreshOpencodeThreadError(error: unknown): boolean {
   return status === 404 && code === 'FRESH_AGENT_LOST_SESSION'
 }
 
-function getRestoreErrorMessage(reason: RestoreErrorReason): string {
+function getRestoreErrorMessage(reason: RestoreErrorReason, provider?: string): string {
   switch (reason) {
     case 'invalid_legacy_restore_target':
+      if (provider === 'opencode') {
+        return 'This Freshopencode session cannot be resumed because only a temporary session id was saved. Start a new session.'
+      }
       return 'This session cannot be resumed because Freshell only has a legacy name, not a canonical Claude session id.'
     case 'dead_live_handle':
       return 'This session cannot be resumed because the live session handle is gone and no durable session id was saved.'
@@ -491,6 +546,17 @@ export function FreshAgentView({
   const snapshotThreadId = getFreshAgentSnapshotThreadId(paneContent, claudeSession)
   const snapshotThreadIdRef = useRef(snapshotThreadId)
   snapshotThreadIdRef.current = snapshotThreadId
+  const agentHistorySession = useAppSelector((state) => {
+    if (!snapshotThreadId) return undefined
+    return state.freshAgent.sessions[makeFreshAgentSessionKey({
+      sessionId: snapshotThreadId,
+      sessionType: paneContent.sessionType,
+      provider: paneContent.provider,
+    })]
+  })
+  const transcriptTurns = agentHistorySession
+    ? selectFreshAgentTranscriptTurns(agentHistorySession)
+    : (snapshot?.turns ?? [])
   const hasRestoreFailure = Boolean(
     paneContent.provider === 'claude'
       && paneContent.sessionId
@@ -669,6 +735,25 @@ export function FreshAgentView({
     snapshotConfirmsNoUserTurns,
     snapshotConfirmsUserTurns,
   ])
+
+  useEffect(() => {
+    if (hidden || paneContent.restoreError) return
+    const invalidRestoreTarget = getInvalidFreshOpencodeRestoreTarget(paneContent)
+    if (!invalidRestoreTarget) return
+    dispatch(updatePaneContent({
+      tabId,
+      paneId,
+      content: {
+        ...paneContent,
+        sessionId: undefined,
+        resumeSessionId: undefined,
+        sessionRef: undefined,
+        restoreError: buildRestoreError('invalid_legacy_restore_target'),
+        createError: undefined,
+        status: 'idle',
+      },
+    }))
+  }, [dispatch, hidden, paneContent, paneId, tabId])
 
   const buildCreateMessage = useCallback((content: FreshAgentPaneContent) => {
     const legacyRestoreContext = content.provider === 'opencode'
@@ -1053,7 +1138,12 @@ export function FreshAgentView({
       .then((next) => {
         if (isStaleSnapshotRequest()) return
         const snapshotIdentity = currentAutoTitleIdentityRef.current
-        const resolved = next as FreshAgentSnapshot
+        const resolved = normalizeSnapshotForDisplay(next as Partial<FreshAgentSnapshot>, {
+          sessionType: requestSessionType,
+          provider,
+          threadId: sessionId,
+          status: paneContentRef.current.status,
+        })
         const resolvedHasUserTurns = freshAgentSnapshotHasUserTurn(resolved)
         if (!resolvedHasUserTurns && !autoTitleSentRef.current) {
           autoTitleFreshBoundaryRef.current = true
@@ -1064,6 +1154,7 @@ export function FreshAgentView({
         }
         const displaySnapshot = mergeSnapshotForDisplay(snapshotRef.current, resolved)
         commitSnapshot(displaySnapshot)
+        dispatch(freshAgentSnapshotReceived({ snapshot: displaySnapshot, hydrateHistory: false }))
         setSnapshotAutoTitleIdentity(snapshotIdentity)
         const echo = localEchoRef.current
         const landedEcho = echo
@@ -1177,6 +1268,73 @@ export function FreshAgentView({
     snapshotRefreshNonce,
     tabId,
   ])
+
+  useEffect(() => {
+    if (!snapshotThreadId || hidden) return
+    if (paneContent.provider === 'claude' && claudeSession?.lost) return
+    const requestSessionType = paneContent.sessionType
+    const requestProvider = paneContent.provider
+    const requestSessionId = snapshotThreadId
+    const requestCreateRequestId = paneContent.createRequestId
+    const requestRevision = snapshot?.revision
+    const requestRevisionKey = typeof requestRevision === 'number' ? String(requestRevision) : 'latest'
+    const requestKey = `${requestCreateRequestId}:${requestSessionType}:${requestProvider}:${requestSessionId}:${requestRevisionKey}`
+    const requestCwd = paneContent.initialCwd
+    const isStaleHistoryRequest = () => (
+      paneContentRef.current.createRequestId !== requestCreateRequestId
+      || paneContentRef.current.provider !== requestProvider
+      || paneContentRef.current.sessionType !== requestSessionType
+      || snapshotThreadIdRef.current !== requestSessionId
+    )
+
+    void dispatch(loadFreshAgentThreadTurns({
+      sessionType: requestSessionType,
+      provider: requestProvider,
+      sessionId: requestSessionId,
+      cwd: requestCwd,
+      revision: requestRevision,
+      limit: INITIAL_HISTORY_TURN_LIMIT,
+      includeBodies: true,
+      priority: 'visible',
+      requestKey,
+    })).unwrap()
+      .then((page) => {
+        if (isStaleHistoryRequest()) return
+        if (!page.nextCursor) return
+        return dispatch(backfillFreshAgentOlderHistory({
+          sessionType: requestSessionType,
+          provider: requestProvider,
+          sessionId: requestSessionId,
+          cwd: requestCwd,
+          revision: page.revision,
+          cursor: page.nextCursor,
+          requestKey,
+          limit: INITIAL_HISTORY_TURN_LIMIT,
+        }))
+      })
+      .catch((error: unknown) => {
+        if (isStaleHistoryRequest()) return
+        setLoadError(error instanceof Error ? error.message : 'Failed to load session history')
+      })
+  }, [
+    claudeSession?.lost,
+    dispatch,
+    hidden,
+    paneContent.createRequestId,
+    paneContent.initialCwd,
+    paneContent.provider,
+    paneContent.sessionType,
+    snapshot?.revision,
+    snapshotThreadId,
+  ])
+
+  useEffect(() => {
+    const echo = localEchoRef.current
+    if (!echo) return
+    if (localEchoLanded(transcriptTurns, echo, pendingSendMetadataRef.current.get(echo.requestId))) {
+      setLocalEcho(null)
+    }
+  }, [setLocalEcho, transcriptTurns])
 
   const claudeSessionStatus = claudeSession?.status
   useEffect(() => {
@@ -1447,8 +1605,30 @@ export function FreshAgentView({
       })
   }, [snapshot?.turns])
 
+  const loadOlderHistory = useCallback(() => {
+    if (!snapshotThreadId || !agentHistorySession?.nextHistoryCursor || typeof agentHistorySession.historyRevision !== 'number') return
+    const requestKey = agentHistorySession.historyInitialRequestKey
+      ?? `${paneContentRef.current.createRequestId}:${paneContentRef.current.sessionType}:${paneContentRef.current.provider}:${snapshotThreadId}`
+    void dispatch(backfillFreshAgentOlderHistory({
+      sessionType: paneContentRef.current.sessionType,
+      provider: paneContentRef.current.provider,
+      sessionId: snapshotThreadId,
+      cwd: paneContentRef.current.initialCwd,
+      revision: agentHistorySession.historyRevision,
+      cursor: agentHistorySession.nextHistoryCursor,
+      requestKey,
+      limit: INITIAL_HISTORY_TURN_LIMIT,
+    }))
+  }, [
+    agentHistorySession?.historyInitialRequestKey,
+    agentHistorySession?.historyRevision,
+    agentHistorySession?.nextHistoryCursor,
+    dispatch,
+    snapshotThreadId,
+  ])
+
   const content = useMemo(() => {
-    const turns = snapshot?.turns ?? []
+    const turns = transcriptTurns
     const pendingApprovals = snapshot?.pendingApprovals ?? []
     const pendingQuestions = snapshot?.pendingQuestions ?? []
     const worktrees = snapshot?.worktrees ?? []
@@ -1486,8 +1666,9 @@ export function FreshAgentView({
       : null
     const visiblePaneRestoreFailure = visibleRestoreFailure
       ? null
-      : (paneContent.restoreError ? getRestoreErrorMessage(paneContent.restoreError.reason) : null)
-    const visibleLoadError = visibleRestoreFailure || visiblePaneRestoreFailure || isRestoring ? null : loadError
+      : (paneContent.restoreError ? getRestoreErrorMessage(paneContent.restoreError.reason, paneContent.provider) : null)
+    const visibleHistoryError = agentHistorySession?.historyError ?? null
+    const visibleLoadError = visibleRestoreFailure || visiblePaneRestoreFailure || isRestoring ? null : (loadError ?? visibleHistoryError)
     const WatermarkIcon = descriptor?.icon
     const handlePanePointerUp = (event: ReactPointerEvent<HTMLElement>) => {
       if (isEditableTarget(event.target)) return
@@ -1673,6 +1854,10 @@ export function FreshAgentView({
               isStreaming={isBusy}
               onForkFromTurn={(turnId) => sendFork(turnId)}
               onRewindToTurn={paneContent.initialCwd ? rewindToTurn : undefined}
+              hasOlderHistory={Boolean(agentHistorySession?.nextHistoryCursor)}
+              isLoadingOlder={agentHistorySession?.historyOlderLoading === true}
+              historyError={agentHistorySession?.historyOlderError}
+              onLoadOlder={loadOlderHistory}
             />
             <FreshAgentComposer
               ref={composerRef}
@@ -1729,6 +1914,10 @@ export function FreshAgentView({
   }, [
     claudeSession?.restoreFailureMessage,
     activeStyle,
+    agentHistorySession?.historyError,
+    agentHistorySession?.historyOlderError,
+    agentHistorySession?.historyOlderLoading,
+    agentHistorySession?.nextHistoryCursor,
     descriptor?.icon,
     descriptor?.label,
     effectiveStatus,
@@ -1740,6 +1929,7 @@ export function FreshAgentView({
     isBusy,
     isRestoring,
     loadError,
+    loadOlderHistory,
     localEcho,
     notice,
     paneContent,
@@ -1760,6 +1950,7 @@ export function FreshAgentView({
     sendFreshAgentMessage,
     tabId,
     terminalFontSize,
+    transcriptTurns,
   ])
 
   useEffect(() => {
