@@ -24,6 +24,7 @@ const wsMock = vi.hoisted(() => ({
 
 const apiMock = vi.hoisted(() => ({
   getFreshAgentThreadSnapshot: vi.fn(),
+  getFreshAgentModelCapabilities: vi.fn(),
   post: vi.fn(),
   setSessionMetadata: vi.fn().mockResolvedValue(undefined),
 }))
@@ -43,6 +44,7 @@ vi.mock('@/lib/api', async () => {
     ...actual,
     api: { ...actual.api, post: apiMock.post },
     getFreshAgentThreadSnapshot: apiMock.getFreshAgentThreadSnapshot,
+    getFreshAgentModelCapabilities: apiMock.getFreshAgentModelCapabilities,
     setSessionMetadata: apiMock.setSessionMetadata,
   }
 })
@@ -183,11 +185,13 @@ beforeEach(() => {
   wsMock.onMessage.mockReset()
   wsMock.onMessage.mockImplementation(() => () => {})
   apiMock.getFreshAgentThreadSnapshot.mockReset()
+  apiMock.getFreshAgentModelCapabilities.mockReset()
   apiMock.post.mockReset()
   apiMock.setSessionMetadata.mockReset()
   apiMock.post.mockResolvedValue({ title: null, source: 'none' })
   apiMock.setSessionMetadata.mockResolvedValue(undefined)
   saveServerSettingsPatchSpy.mockClear()
+  window.localStorage.removeItem('freshopencode.modelMru.v2')
   apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
     status: 'idle',
     summary: 'Codex summary',
@@ -195,6 +199,51 @@ beforeEach(() => {
     diffs: [{ id: 'diff-1', title: 'README.md' }],
     worktrees: [{ id: 'wt-1', path: '/tmp/worktree', branch: 'feature/x' }],
     turns: [{ id: 'turn-1', role: 'assistant', items: [{ id: 'item-1', kind: 'text', text: 'Codex turn' }] }],
+  })
+  apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+    ok: true,
+    sessionType: 'freshopencode',
+    runtimeProvider: 'opencode',
+    status: 'fresh',
+    fetchedAt: 1_000,
+    models: [
+      {
+        id: 'opencode-go/deepseek-v4-flash',
+        displayName: 'DeepSeek V4 Flash',
+        provider: 'opencode',
+        source: { id: 'opencode-go', displayName: 'opencode-go' },
+        supportsEffort: true,
+        supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
+        supportsAdaptiveThinking: true,
+      },
+      {
+        id: 'opencode-go/glm-5.1',
+        displayName: 'GLM 5.1',
+        provider: 'opencode',
+        source: { id: 'opencode-go', displayName: 'opencode-go' },
+        supportsEffort: true,
+        supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
+        supportsAdaptiveThinking: true,
+      },
+      {
+        id: 'opencode-go/glm-5.2',
+        displayName: 'GLM 5.2',
+        provider: 'opencode',
+        source: { id: 'opencode-go', displayName: 'opencode-go' },
+        supportsEffort: true,
+        supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
+        supportsAdaptiveThinking: true,
+      },
+      {
+        id: 'umans-ai-coding-plan/umans-kimi-k2.7',
+        displayName: 'Kimi k2.7',
+        provider: 'opencode',
+        source: { id: 'umans-ai-coding-plan', displayName: 'umans-ai-coding-plan' },
+        supportsEffort: true,
+        supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
+        supportsAdaptiveThinking: true,
+      },
+    ],
   })
 })
 
@@ -3133,12 +3182,15 @@ describe('FreshAgentView', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
     expect(screen.queryByRole('combobox', { name: 'Model' })).not.toBeInTheDocument()
-    expect(screen.getByRole('radio', { name: 'DeepSeek V4 Flash' })).toBeChecked()
+    expect(await screen.findByRole('button', { name: /Current model: DeepSeek V4 Flash/i })).toBeVisible()
     expect(screen.getByRole('combobox', { name: 'Thinking level' })).toHaveValue('max')
 
-    fireEvent.click(screen.getByRole('radio', { name: 'GLM 5.1' }))
+    fireEvent.focus(screen.getByRole('searchbox', { name: /Search enabled models/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /GLM 5\.1/i }))
     await waitFor(() => {
-      expect(screen.getByRole('radio', { name: 'GLM 5.1' })).toBeChecked()
+      const layout = store.getState().panes.layouts['tab-1']
+      expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.model : null)
+        .toBe('opencode-go/glm-5.1')
     })
     fireEvent.change(screen.getByRole('combobox', { name: 'Thinking level' }), {
       target: { value: 'high' },

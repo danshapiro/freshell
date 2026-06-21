@@ -18,6 +18,7 @@ import {
   normalizeFreshAgentStyle,
   type FreshAgentStyle,
 } from '@shared/settings'
+import { FreshOpencodeModelSettings } from './FreshOpencodeModelSettings'
 
 function resolveEffectiveFreshAgentModel(
   content: FreshAgentPaneContent,
@@ -86,6 +87,7 @@ export function FreshAgentSettingsButton({
   const thinkingOptions = getFreshAgentThinkingOptions(paneContent.sessionType, paneContent.provider, activeModel)
   const thinkingValue = getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? ''
   const descriptor = resolveFreshAgentType(paneContent.sessionType)
+  const isFreshopencode = paneContent.sessionType === 'freshopencode'
   const permissionModeVisible = descriptor?.settingsVisibility.permissionMode === true
   const permissionModes = permissionModeVisible
     ? PERMISSION_MODES_BY_PROVIDER[paneContent.provider] ?? []
@@ -187,7 +189,7 @@ export function FreshAgentSettingsButton({
               </select>
             </label>
 
-            {modelOptions.length > 0 ? (
+            {!isFreshopencode && modelOptions.length > 0 ? (
               <fieldset className="space-y-1">
                 <legend className="font-medium">Model</legend>
                 <div className="space-y-1" role="radiogroup" aria-label="Model">
@@ -256,6 +258,14 @@ export function FreshAgentSettingsButton({
                   ))}
                 </select>
               </label>
+            ) : null}
+
+            {isFreshopencode ? (
+              <FreshOpencodeModelSettings
+                tabId={tabId}
+                paneId={paneId}
+                paneContent={paneContent}
+              />
             ) : null}
 
             {permissionModes.length > 0 ? (
