@@ -284,6 +284,19 @@
       gap: 6px;
     }
 
+    .recent-heading,
+    .source-heading {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+      color: var(--subtle);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
     .recent-button {
       min-width: 0;
       min-height: 36px;
@@ -367,6 +380,10 @@
 
     .model-field.search-open .results {
       display: grid;
+    }
+
+    .source-heading {
+      padding: 7px 2px 1px;
     }
 
     .result {
@@ -579,6 +596,10 @@
                     <span class="count" id="enabledCount">14 enabled</span>
                   </div>
 
+                  <div class="recent-heading">
+                    <span>Recent</span>
+                    <span>last used</span>
+                  </div>
                   <div class="recent-grid" id="recentGrid"></div>
 
                   <div class="model-actions">
@@ -655,6 +676,18 @@
       return `${model.name} ${model.id} ${model.provider}`.toLowerCase();
     }
 
+    function compareModels(a, b) {
+      return a.name.localeCompare(b.name)
+        || a.id.localeCompare(b.id);
+    }
+
+    function sortForResults(list) {
+      return [...list].sort((a, b) => (
+        a.provider.localeCompare(b.provider)
+          || compareModels(a, b)
+      ));
+    }
+
     function choose(id) {
       const model = findModel(id);
       if (!model) return;
@@ -692,7 +725,26 @@
         return;
       }
 
-      for (const [index, model] of filtered.slice(0, 8).entries()) {
+      const providerCounts = new Map();
+      for (const model of filtered) {
+        providerCounts.set(model.provider, (providerCounts.get(model.provider) ?? 0) + 1);
+      }
+
+      let previousProvider = '';
+      for (const [index, model] of filtered.entries()) {
+        if (model.provider !== previousProvider) {
+          previousProvider = model.provider;
+          const sourceHeading = document.createElement('div');
+          sourceHeading.className = 'source-heading';
+          sourceHeading.setAttribute('role', 'presentation');
+          const sourceName = document.createElement('span');
+          const sourceCount = document.createElement('span');
+          sourceName.textContent = model.provider;
+          sourceCount.textContent = `${providerCounts.get(model.provider) ?? 0}`;
+          sourceHeading.append(sourceName, sourceCount);
+          resultList.append(sourceHeading);
+        }
+
         const row = document.createElement('button');
         row.type = 'button';
         row.className = [
@@ -731,7 +783,7 @@
     function filterModels() {
       const query = searchInput.value.trim().toLowerCase();
       const source = query ? models.filter((model) => modelSearchText(model).includes(query)) : models;
-      filtered = source.filter((model) => query || !recent.includes(model.id));
+      filtered = sortForResults(source);
       focusedIndex = Math.min(focusedIndex, Math.max(filtered.length - 1, 0));
       renderResults();
     }
