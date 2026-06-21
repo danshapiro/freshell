@@ -7,7 +7,7 @@ import { allocateLocalhostPort, type LoopbackServerEndpoint } from '../../../loc
 import { logger } from '../../../logger.js'
 import { parseServeEvent, type ParsedServeEvent } from './serve-events.js'
 
-type OpencodeServeLogger = Pick<pino.Logger, 'warn' | 'error'>
+type OpencodeServeLogger = Pick<pino.Logger, 'warn' | 'error' | 'debug' | 'info'>
 
 const OWNERSHIP_ENV = 'FRESHELL_OPENCODE_SIDECAR_ID'
 const DEFAULT_IDLE_POLL_MS = 500
@@ -84,6 +84,15 @@ class OpencodeServeRequestTimeoutError extends Error {
   }
 }
 
+export class OpencodeServeLostError extends Error {
+  readonly sessionId: string
+  constructor(sessionId: string) {
+    super(`opencode serve sidecar was lost while waiting for session ${sessionId} to go idle.`)
+    this.name = 'OpencodeServeLostError'
+    this.sessionId = sessionId
+  }
+}
+
 export class OpencodeServeManager {
   private readonly command: string
   private readonly spawnFn: typeof spawn
@@ -141,14 +150,24 @@ export class OpencodeServeManager {
   }
 
   private forgetSessionsForCwd(cwdKey: string): void {
+    const lostSessions: string[] = []
     for (const [sessionId, sessionCwdKey] of this.sessionCwdById.entries()) {
       if (sessionCwdKey !== cwdKey) continue
       this.sessionCwdById.delete(sessionId)
-      this.sessionEmitters.delete(sessionId)
+      lostSessions.push(sessionId)
     }
     if (cwdKey === DEFAULT_CWD_KEY) {
       for (const sessionId of this.sessionEmitters.keys()) {
-        if (!this.sessionCwdById.has(sessionId)) this.sessionEmitters.delete(sessionId)
+        if (!this.sessionCwdById.has(sessionId)) {
+          if (!lostSessions.includes(sessionId)) lostSessions.push(sessionId)
+        }
+      }
+    }
+    for (const sessionId of lostSessions) {
+      const emitter = this.sessionEmitters.get(sessionId)
+      if (emitter) {
+        emitter.emit('lost', new OpencodeServeLostError(sessionId))
+        this.sessionEmitters.delete(sessionId)
       }
     }
   }
@@ -166,10 +185,12 @@ export class OpencodeServeManager {
       running.idleTimer = undefined
       if (running.activeRequests > 0) return
       if (this.runningByCwd.get(running.cwdKey) !== running) return
+      this.forgetSessionsForCwd(running.cwdKey)
       this.runningByCwd.delete(running.cwdKey)
       this.startPromiseByCwd.delete(running.cwdKey)
       this.startAbortByCwd.delete(running.cwdKey)
       try { running.stopEventStream() } catch { /* ignore */ }
+      this.log.info({ cwdKey: running.cwdKey }, 'killing idle opencode serve sidecar after idle timeout')
       void killOwnedProcesses(running.child, running.ownershipId, this.log)
     }, this.idleShutdownMs)
     running.idleTimer.unref?.()
@@ -282,10 +303,12 @@ export class OpencodeServeManager {
       // Drain stdout/stderr so the child's pipe buffers never back-pressure
       // and stall the serve process. Diagnostics are captured below before health.
       child.stdout?.on('data', () => {})
-      child.stderr?.on('data', () => {})
+      child.stderr?.on('data', (chunk) => {
+        this.log.debug({ chunk: chunk.toString().trim() }, 'opencode serve stderr')
+      })
       child.on('error', (err) => this.log.error({ err }, 'opencode serve process error'))
-      child.on('close', (code) => {
-        this.log.warn({ code }, 'opencode serve exited')
+      child.on('close', (code, signal) => {
+        this.log.warn({ code, signal }, 'opencode serve exited')
         const runningEntry = this.runningByCwd.get(route.cwdKey)
         if (runningEntry && runningEntry.child === child) {
           this.runningByCwd.delete(route.cwdKey)
@@ -540,6 +563,7 @@ export class OpencodeServeManager {
         clearTimeout(timer)
         clearInterval(pollTimer)
         emitter.off('event', handler)
+        emitter.off('lost', onLost)
       }
       const finish = () => {
         if (settled) return
@@ -602,7 +626,9 @@ export class OpencodeServeManager {
           void checkStatusMap()
         }
       }
+      const onLost = (err: OpencodeServeLostError) => fail(err)
       emitter.on('event', handler)
+      emitter.on('lost', onLost)
     })
   }
 

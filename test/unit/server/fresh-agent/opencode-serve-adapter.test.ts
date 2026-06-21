@@ -254,6 +254,19 @@ describe('OpenCode serve adapter: create + send', () => {
   }
   })
 
+  it('emits idle status and rejects when onceIdle rejects with a lost-session error (sidecar died)', async () => {
+    const manager = makeFakeManager()
+    manager.onceIdle = vi.fn(() => Promise.reject(new Error('opencode serve sidecar was lost.')))
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'lost-1', sessionType: 'freshopencode', provider: 'opencode' })
+
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-lost-1', (e) => events.push(e))
+
+    await expect(adapter.send?.('freshopencode-lost-1', { text: 'hi' })).rejects.toThrow(/sidecar was lost/i)
+    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-lost-1', status: 'idle' })
+  })
+
   it('does not return to running when OpenCode emits a late message update after idle', async () => {
     const manager = makeFakeManager()
     const adapter = makeAdapter(manager)
