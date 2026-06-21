@@ -175,6 +175,16 @@ describe('OpencodeServeManager lifecycle', () => {
     expect(child.stderr.listenerCount('data')).toBe(1)
   })
 
+  it('connects one global event stream by default', async () => {
+    const connectEventStream = vi.fn(() => () => {})
+    const { manager } = makeManager({ connectEventStream })
+    await manager.ensureStarted()
+    expect(connectEventStream).toHaveBeenCalledWith(
+      'http://127.0.0.1:47999/global/event',
+      expect.anything(),
+    )
+  })
+
   it('aborts an in-flight startup when shutdown is called and reaps the child', async () => {
     const fetchFn = vi.fn(async () => jsonResponse({ healthy: false }, { status: 503 }))
     const { manager, child } = makeManager({ fetchFn: fetchFn as any, healthTimeoutMs: 60_000 })

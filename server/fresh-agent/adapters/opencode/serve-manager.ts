@@ -229,7 +229,7 @@ export class OpencodeServeManager {
       }
 
       const stopEventStream = this.connectEventStream
-        ? this.connectEventStream(`${baseUrl}/event`, {
+        ? this.connectEventStream(`${baseUrl}/global/event`, {
             onEvent: (e) => this.dispatchEvent(e),
             onError: (err) => this.log.warn({ err }, 'opencode serve event stream error'),
           })
@@ -500,7 +500,7 @@ export class OpencodeServeManager {
 
   private startDefaultEventStream(baseUrl: string): () => void {
     const controller = new AbortController()
-    void this.consumeEvents(`${baseUrl}/event`, controller.signal)
+    void this.consumeEvents(`${baseUrl}/global/event`, controller.signal)
     return () => controller.abort()
   }
 

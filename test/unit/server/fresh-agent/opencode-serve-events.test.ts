@@ -51,9 +51,26 @@ describe('parseServeEvent', () => {
     const ev = { type: 'session.status', properties: { status: { type: 'idle' }, info: { sessionID: 'ses_info' } } }
     expect(parseServeEvent(ev)).toMatchObject({ kind: 'session.status', sessionId: 'ses_info' })
   })
-  it('returns undefined sessionId for server-level events', () => {
-    expect(parseServeEvent({ type: 'server.connected', properties: {} }))
-      .toMatchObject({ kind: 'server.connected', sessionId: undefined })
+  it('ignores server-level connection and heartbeat events', () => {
+    expect(parseServeEvent({ type: 'server.connected', properties: {} })).toBeNull()
+    expect(parseServeEvent({ type: 'server.heartbeat', properties: {} })).toBeNull()
+  })
+  it('parses global event envelopes by unwrapping payload', () => {
+    expect(parseServeEvent({
+      directory: '/repo',
+      payload: {
+        type: 'session.status',
+        properties: { sessionID: 'ses_global', status: { type: 'busy' } },
+      },
+    })).toMatchObject({
+      kind: 'session.status',
+      sessionId: 'ses_global',
+      properties: { sessionID: 'ses_global', status: { type: 'busy' } },
+    })
+  })
+  it('ignores global heartbeat and connected frames', () => {
+    expect(parseServeEvent({ payload: { type: 'server.connected', properties: {} } })).toBeNull()
+    expect(parseServeEvent({ payload: { type: 'server.heartbeat', properties: {} } })).toBeNull()
   })
   it('returns null for non-object / typeless input', () => {
     expect(parseServeEvent('nope')).toBeNull()
