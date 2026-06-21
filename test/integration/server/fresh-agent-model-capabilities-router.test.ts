@@ -8,8 +8,8 @@ import type { FreshAgentModelCapabilitiesResponse } from '../../../shared/fresh-
 import type { FreshAgentSessionType } from '../../../shared/fresh-agent.js'
 
 function createAppWithRegistry(registry: {
-  getCapabilities: (sessionType: FreshAgentSessionType) => Promise<FreshAgentModelCapabilitiesResponse>
-  refreshCapabilities: (sessionType: FreshAgentSessionType) => Promise<FreshAgentModelCapabilitiesResponse>
+  getCapabilities: (sessionType: FreshAgentSessionType, context?: { cwd?: string }) => Promise<FreshAgentModelCapabilitiesResponse>
+  refreshCapabilities: (sessionType: FreshAgentSessionType, context?: { cwd?: string }) => Promise<FreshAgentModelCapabilitiesResponse>
 }) {
   const app = express()
   app.use('/api/fresh-agent/model-capabilities', createFreshAgentModelCapabilitiesRouter({ registry }))
@@ -148,5 +148,21 @@ describe('fresh-agent model capabilities router', () => {
     expect(opencode.body.models).not.toEqual([
       expect.objectContaining({ provider: 'claude' }),
     ])
+  })
+
+  it('forwards cwd for Freshopencode capabilities', async () => {
+    const response = successResponse('freshopencode', 'opencode')
+    const registry = {
+      getCapabilities: vi.fn(async () => response),
+      refreshCapabilities: vi.fn(async () => response),
+    }
+    const app = createAppWithRegistry(registry)
+
+    await request(app)
+      .get('/api/fresh-agent/model-capabilities/freshopencode')
+      .query({ cwd: '/repo/project-a' })
+      .expect(200)
+
+    expect(registry.getCapabilities).toHaveBeenCalledWith('freshopencode', { cwd: '/repo/project-a' })
   })
 })

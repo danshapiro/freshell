@@ -50,6 +50,29 @@ function mockJsonResponse(status: number, value: unknown) {
   }
 }
 
+function successCapabilityResponse(
+  sessionType: string,
+  runtimeProvider: 'claude' | 'codex' | 'opencode',
+) {
+  return {
+    ok: true,
+    sessionType,
+    runtimeProvider,
+    status: 'fresh',
+    fetchedAt: 1_234,
+    models: [
+      {
+        id: `${runtimeProvider}-opus`,
+        displayName: `${runtimeProvider} Opus`,
+        provider: runtimeProvider,
+        supportsEffort: true,
+        supportedEffortLevels: ['high'],
+        supportsAdaptiveThinking: true,
+      },
+    ],
+  }
+}
+
 describe('visible-first read-model helpers', () => {
   beforeEach(() => {
     mockFetch.mockReset()
@@ -210,6 +233,17 @@ describe('visible-first read-model helpers', () => {
         method: 'POST',
         headers: expect.any(Headers),
       }),
+    )
+  })
+
+  it('passes cwd when fetching Freshopencode model capabilities', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson(successCapabilityResponse('freshopencode', 'opencode')))
+
+    await getFreshAgentModelCapabilities('freshopencode', { cwd: '/repo/project-a' })
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/fresh-agent/model-capabilities/freshopencode?cwd=%2Frepo%2Fproject-a',
+      expect.objectContaining({ headers: expect.any(Headers) }),
     )
   })
 

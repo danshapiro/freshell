@@ -18,6 +18,12 @@ import {
 } from '../../shared/fresh-agent.js'
 import { FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE } from '../../shared/fresh-agent-models.js'
 import { formatModelDisplayName } from '../../shared/format-model-name.js'
+import {
+  createOpencodeModelCatalogProvider,
+  normalizeOpencodeEnabledModelCatalog,
+  type OpencodeModelCatalogProvider,
+  type OpencodeModelCatalogRequest,
+} from './adapters/opencode/model-catalog.js'
 import { createClaudeSdkOptions } from '../sdk-bridge.js'
 import { logger } from '../logger.js'
 
@@ -26,11 +32,18 @@ const DEFAULT_PROBE_TIMEOUT_MS = 10_000
 
 type ProbeQuery = Pick<SdkQuery, 'supportedModels' | 'close'>
 
+export type CapabilityRequestContext = {
+  cwd?: string
+}
+
+type OpencodeCatalogProviderLike = Pick<OpencodeModelCatalogProvider, 'getCatalog'>
+
 type RegistryOptions = {
   queryFactory?: typeof query
   now?: () => number
   ttlMs?: number
   probeTimeoutMs?: number
+  opencodeCatalogProvider?: OpencodeCatalogProviderLike
 }
 
 type CachedCatalog = {
@@ -174,14 +187,18 @@ export class FreshAgentModelCapabilityRegistry {
   private readonly now: () => number
   private readonly ttlMs: number
   private readonly probeTimeoutMs: number
+  private readonly opencodeCatalogProvider: OpencodeCatalogProviderLike
   private cachedCatalog: CachedCatalog | null = null
   private inFlightRefresh: Promise<CachedCatalog> | null = null
+  private readonly opencodeCacheByKey = new Map<string, CachedCatalog>()
+  private readonly opencodeInFlightByKey = new Map<string, Promise<CachedCatalog>>()
 
   constructor(options: RegistryOptions = {}) {
     this.queryFactory = options.queryFactory ?? query
     this.now = options.now ?? Date.now
     this.ttlMs = options.ttlMs ?? FRESH_AGENT_MODEL_CAPABILITY_CACHE_TTL_MS
     this.probeTimeoutMs = options.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS
+    this.opencodeCatalogProvider = options.opencodeCatalogProvider ?? createOpencodeModelCatalogProvider()
   }
 
   static createError(code: string, message: string, retryable: boolean): Error & {
@@ -191,8 +208,14 @@ export class FreshAgentModelCapabilityRegistry {
     return Object.assign(new Error(message), { code, retryable })
   }
 
-  async getCapabilities(sessionType: FreshAgentSessionType): Promise<FreshAgentModelCapabilitiesResponse> {
+  async getCapabilities(
+    sessionType: FreshAgentSessionType,
+    context: CapabilityRequestContext = {},
+  ): Promise<FreshAgentModelCapabilitiesResponse> {
     const descriptor = this.requireDescriptor(sessionType)
+    if (descriptor.runtimeProvider === 'opencode') {
+      return this.getOpencodeCapabilities(sessionType, descriptor.runtimeProvider, context)
+    }
     if (descriptor.runtimeProvider !== 'claude') {
       return this.createStaticSuccess(sessionType, descriptor.runtimeProvider)
     }
@@ -210,8 +233,14 @@ export class FreshAgentModelCapabilityRegistry {
     }
   }
 
-  async refreshCapabilities(sessionType: FreshAgentSessionType): Promise<FreshAgentModelCapabilitiesResponse> {
+  async refreshCapabilities(
+    sessionType: FreshAgentSessionType,
+    context: CapabilityRequestContext = {},
+  ): Promise<FreshAgentModelCapabilitiesResponse> {
     const descriptor = this.requireDescriptor(sessionType)
+    if (descriptor.runtimeProvider === 'opencode') {
+      return this.refreshOpencodeCapabilities(sessionType, descriptor.runtimeProvider, context)
+    }
     if (descriptor.runtimeProvider !== 'claude') {
       return this.createStaticSuccess(sessionType, descriptor.runtimeProvider)
     }
@@ -221,6 +250,92 @@ export class FreshAgentModelCapabilityRegistry {
       return this.createSuccess(sessionType, descriptor.runtimeProvider, catalog, 'fresh')
     } catch (error) {
       return this.createFailure(sessionType, descriptor.runtimeProvider, error)
+    }
+  }
+
+  private opencodeCacheKey(context: CapabilityRequestContext): string {
+    const cwd = typeof context.cwd === 'string' && context.cwd.trim().length > 0
+      ? context.cwd.trim()
+      : undefined
+    return `opencode:${cwd ?? '<default>'}`
+  }
+
+  private async getOpencodeCapabilities(
+    sessionType: FreshAgentSessionType,
+    runtimeProvider: FreshAgentRuntimeProvider,
+    context: CapabilityRequestContext,
+  ): Promise<FreshAgentModelCapabilitiesResponse> {
+    const cacheKey = this.opencodeCacheKey(context)
+    const cached = this.opencodeCacheByKey.get(cacheKey)
+    if (cached && this.now() - cached.fetchedAt <= this.ttlMs) {
+      return this.createSuccess(sessionType, runtimeProvider, cached, 'cached')
+    }
+    try {
+      const catalog = await this.refreshOpencodeCatalog(cacheKey, context)
+      return this.createSuccess(sessionType, runtimeProvider, catalog, 'fresh')
+    } catch (error) {
+      return this.createFailure(sessionType, runtimeProvider, error)
+    }
+  }
+
+  private async refreshOpencodeCapabilities(
+    sessionType: FreshAgentSessionType,
+    runtimeProvider: FreshAgentRuntimeProvider,
+    context: CapabilityRequestContext,
+  ): Promise<FreshAgentModelCapabilitiesResponse> {
+    const cacheKey = this.opencodeCacheKey(context)
+    try {
+      const catalog = await this.refreshOpencodeCatalog(cacheKey, context)
+      return this.createSuccess(sessionType, runtimeProvider, catalog, 'fresh')
+    } catch (error) {
+      return this.createFailure(sessionType, runtimeProvider, error)
+    }
+  }
+
+  private async refreshOpencodeCatalog(
+    cacheKey: string,
+    context: CapabilityRequestContext,
+  ): Promise<CachedCatalog> {
+    const inFlight = this.opencodeInFlightByKey.get(cacheKey)
+    if (inFlight) return inFlight
+
+    const request: OpencodeModelCatalogRequest = {
+      ...(typeof context.cwd === 'string' && context.cwd.trim().length > 0
+        ? { cwd: context.cwd.trim() }
+        : {}),
+    }
+    const task = this.probeOpencodeCatalog(request)
+      .then((catalog) => {
+        this.opencodeCacheByKey.set(cacheKey, catalog)
+        return catalog
+      })
+      .finally(() => {
+        this.opencodeInFlightByKey.delete(cacheKey)
+      })
+
+    this.opencodeInFlightByKey.set(cacheKey, task)
+    return task
+  }
+
+  private async probeOpencodeCatalog(
+    request: OpencodeModelCatalogRequest,
+  ): Promise<CachedCatalog> {
+    try {
+      const result = await this.opencodeCatalogProvider.getCatalog(request)
+      const models = normalizeOpencodeEnabledModelCatalog(result)
+      return {
+        fetchedAt: this.now(),
+        models,
+      }
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && 'retryable' in error) {
+        throw error
+      }
+      throw FreshAgentModelCapabilityRegistry.createError(
+        'CAPABILITY_PROBE_FAILED',
+        error instanceof Error ? error.message : String(error),
+        true,
+      )
     }
   }
 

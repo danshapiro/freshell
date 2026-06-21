@@ -202,11 +202,13 @@ export async function getBootstrap(options: ApiRequestOptions = {}): Promise<any
 
 export async function getFreshAgentModelCapabilities(
   sessionType: string,
-  options: ApiRequestOptions = {},
+  options: ApiRequestOptions & { cwd?: string } = {},
 ): Promise<FreshAgentModelCapabilitiesResponse> {
+  const { cwd, ...requestOptions } = options
+  const query = cwd ? `?${new URLSearchParams({ cwd }).toString()}` : ''
   try {
     return parseFreshAgentModelCapabilitiesResponse(
-      await api.get(`/api/fresh-agent/model-capabilities/${encodeURIComponent(sessionType)}`, options),
+      await api.get(`/api/fresh-agent/model-capabilities/${encodeURIComponent(sessionType)}${query}`, requestOptions),
     )
   } catch (error) {
     const typedFailure = getTypedCapabilityFailure(error)
@@ -219,11 +221,13 @@ export async function getFreshAgentModelCapabilities(
 
 export async function refreshFreshAgentModelCapabilities(
   sessionType: string,
-  options: ApiRequestOptions = {},
+  options: ApiRequestOptions & { cwd?: string } = {},
 ): Promise<FreshAgentModelCapabilitiesResponse> {
+  const { cwd, ...requestOptions } = options
+  const query = cwd ? `?${new URLSearchParams({ cwd }).toString()}` : ''
   try {
     return parseFreshAgentModelCapabilitiesResponse(
-      await api.post(`/api/fresh-agent/model-capabilities/${encodeURIComponent(sessionType)}/refresh`, {}, options),
+      await api.post(`/api/fresh-agent/model-capabilities/${encodeURIComponent(sessionType)}/refresh${query}`, {}, requestOptions),
     )
   } catch (error) {
     const typedFailure = getTypedCapabilityFailure(error)

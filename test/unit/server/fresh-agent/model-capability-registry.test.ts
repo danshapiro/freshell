@@ -185,10 +185,19 @@ describe('FreshAgentModelCapabilityRegistry', () => {
   })
 
   it('serves non-Claude fresh-agent catalogs without reusing the Claude probe cache', async () => {
+    const getCatalog = vi.fn(async () => ({
+      providers: {
+        'opencode-go': {
+          id: 'opencode-go',
+          models: { 'glm-5.2': { id: 'glm-5.2', name: 'GLM 5.2' } },
+        },
+      },
+    }))
     const registry = new FreshAgentModelCapabilityRegistry({
       queryFactory,
       now: () => now,
       ttlMs: 5_000,
+      opencodeCatalogProvider: { getCatalog },
     })
 
     const codex = await registry.getCapabilities('freshcodex')
@@ -373,5 +382,39 @@ describe('FreshAgentModelCapabilityRegistry', () => {
       },
     })
     expect(closeMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('caches OpenCode capabilities by cwd without probing Claude or live session sidecars', async () => {
+    const getCatalog = vi.fn(async ({ cwd }: { cwd?: string }) => ({
+      providers: {
+        [cwd === '/repo/a' ? 'opencode-go' : 'google']: {
+          id: cwd === '/repo/a' ? 'opencode-go' : 'google',
+          models: {
+            [cwd === '/repo/a' ? 'glm-5.2' : 'gemini-3-pro']: {
+              id: cwd === '/repo/a' ? 'glm-5.2' : 'gemini-3-pro',
+            },
+          },
+        },
+      },
+    }))
+    const registry = new FreshAgentModelCapabilityRegistry({
+      queryFactory,
+      now: () => now,
+      ttlMs: 5_000,
+      opencodeCatalogProvider: { getCatalog },
+    })
+
+    await expect(registry.getCapabilities('freshopencode', { cwd: '/repo/a' })).resolves.toMatchObject({
+      ok: true,
+      models: [expect.objectContaining({ id: 'opencode-go/glm-5.2' })],
+    })
+    await expect(registry.getCapabilities('freshopencode', { cwd: '/repo/b' })).resolves.toMatchObject({
+      ok: true,
+      models: [expect.objectContaining({ id: 'google/gemini-3-pro' })],
+    })
+    await registry.getCapabilities('freshopencode', { cwd: '/repo/a' })
+
+    expect(getCatalog).toHaveBeenCalledTimes(2)
+    expect(queryFactory).not.toHaveBeenCalled()
   })
 })
