@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ChevronDown, ChevronRight, ChevronUp, Loader2 } from 'lucide-react'
+import { ChevronDown, ChevronRight, ChevronUp, Loader2, X } from 'lucide-react'
 import SlotReel from '@/components/fresh-agent/shared/SlotReel'
 import { getToolPreview } from '@/components/fresh-agent/shared/tool-preview'
 import { cn } from '@/lib/utils'
@@ -307,7 +307,7 @@ function selectLiveActivityBlockId(
 function FreshAgentThinkingRow({ text }: { text: string }) {
   const [expanded, setExpanded] = useState(false)
   return (
-    <div className="fresh-agent-thinking-row my-0.5 border-l-2 border-l-[hsl(var(--primary))] text-xs">
+    <div className="fresh-agent-thinking-row my-0.5 text-xs">
       <button
         type="button"
         onClick={() => setExpanded((value) => !value)}
@@ -343,6 +343,7 @@ function FreshAgentActivityStrip({
   ), [live, rows])
   const tools = activityTools(displayRows)
   const hasErrors = tools.some((tool) => tool.isError)
+  const singleToolExpand = tools.length === 1 && displayRows.length === 1
   const lastRow = displayRows[displayRows.length - 1] ?? null
   const runningTool = live ? [...tools].reverse().find((tool) => tool.status === 'running') ?? null : null
   const thinkingLive = live && lastRow?.type === 'thinking'
@@ -354,7 +355,7 @@ function FreshAgentActivityStrip({
     if (!live) return null
     return (
       <div role="region" aria-label="Activity strip" className="fresh-agent-activity-strip my-0.5">
-        <div className="fresh-agent-activity-summary flex min-w-0 items-center gap-1.5 border-l-2 border-l-[hsl(var(--primary))] px-2 py-0.5 text-xs">
+        <div className="fresh-agent-activity-summary flex min-w-0 items-center gap-1.5 px-2 py-0.5 text-xs">
           <span
             className="fresh-agent-activity-status-slot"
             data-testid="fresh-agent-activity-status-slot"
@@ -375,8 +376,8 @@ function FreshAgentActivityStrip({
       {!expanded ? (
         <div
           className={cn(
-            'fresh-agent-activity-summary flex min-w-0 items-center gap-1.5 border-l-2 px-2 py-0.5 text-xs',
-            hasErrors ? 'border-l-[hsl(var(--destructive))]' : 'border-l-[hsl(var(--primary))]',
+            'fresh-agent-activity-summary flex min-w-0 items-center gap-1.5 px-2 py-0.5 text-xs',
+            hasErrors && 'bg-destructive/10',
           )}
         >
           <button
@@ -391,9 +392,10 @@ function FreshAgentActivityStrip({
           <span
             className="fresh-agent-activity-status-slot"
             data-testid="fresh-agent-activity-status-slot"
-            aria-hidden={running ? undefined : true}
+            aria-hidden={running || hasErrors ? undefined : true}
           >
             {running ? <Loader2 className="h-3 w-3 animate-spin" aria-label="running" /> : null}
+            {!running && hasErrors ? <X className="h-3 w-3 text-destructive" aria-label="error" /> : null}
           </span>
           <SlotReel
             toolName={running ? reelName : null}
@@ -415,7 +417,7 @@ function FreshAgentActivityStrip({
           {displayRows.map((row) => (
             row.type === 'thinking'
               ? <FreshAgentThinkingRow key={row.id} text={row.text} />
-              : <FreshAgentToolBlock key={row.tool.id} tool={row.tool} initialExpanded={initialExpanded} />
+              : <FreshAgentToolBlock key={row.tool.id} tool={row.tool} initialExpanded={initialExpanded || singleToolExpand} />
           ))}
         </div>
       )}

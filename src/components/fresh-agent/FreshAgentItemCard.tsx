@@ -78,8 +78,8 @@ export function FreshAgentToolBlock({
   return (
     <div
       className={cn(
-        'fresh-agent-tool-block my-0.5 border-l-2 text-xs',
-        tool.isError ? 'border-l-[hsl(var(--destructive))]' : 'border-l-[hsl(var(--primary))]',
+        'fresh-agent-tool-block my-0.5 text-xs',
+        tool.isError && 'bg-destructive/10',
       )}
     >
       <button
@@ -251,7 +251,7 @@ export function FreshAgentMarkdownBody({ text }: { text: string }) {
 function FreshAgentThinkingDisclosure({ text }: { text: string }) {
   const [expanded, setExpanded] = useState(false)
   return (
-    <div className="fresh-agent-thinking-details border-l-2 border-l-[hsl(var(--primary))] text-xs text-muted-foreground">
+    <div className="fresh-agent-thinking-details text-xs text-muted-foreground">
       <button
         type="button"
         onClick={() => setExpanded((value) => !value)}
@@ -301,7 +301,7 @@ export function FreshAgentItemCard({
 
   if (item.kind === 'tool_result') {
     return (
-      <div className="fresh-agent-tool-result border-l-2 border-l-border px-2 py-1 text-xs">
+      <div className="fresh-agent-tool-result px-2 py-1 text-xs">
         <div className="mb-1 flex items-center gap-2 font-medium">
           Tool result
           {item.isError ? <StatusBadge value="error" /> : null}

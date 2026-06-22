@@ -101,7 +101,7 @@ describe('FreshAgentTranscript', () => {
   })
 
   it('coalesces paired tool calls into the activity strip and expands details', () => {
-    render(
+    const { container } = render(
       <FreshAgentTranscript
         turns={[
           {
@@ -123,15 +123,32 @@ describe('FreshAgentTranscript', () => {
                 content: 'README.md\nAGENTS.md',
                 isError: false,
               },
+              {
+                id: 'tool-2',
+                kind: 'tool_use',
+                toolUseId: 'call-2',
+                name: 'Bash',
+                input: { command: 'find . -name "*.ts"', description: 'Find TypeScript files' },
+              },
+              {
+                id: 'result-2',
+                kind: 'tool_result',
+                toolUseId: 'call-2',
+                content: 'src/App.tsx',
+                isError: false,
+              },
             ],
           },
         ]}
       />,
     )
 
-    expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('1 tool used')
+    expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('2 tools used')
     fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Bash tool call' }))
+    expect(container.querySelector('[data-tool-input]')).not.toBeInTheDocument()
+    const toolButtons = screen.getAllByRole('button', { name: 'Bash tool call' })
+    expect(toolButtons).toHaveLength(2)
+    fireEvent.click(toolButtons[0])
     expect(screen.getByText('find . -name "*.md"')).toBeInTheDocument()
   })
 
@@ -747,6 +764,146 @@ describe('FreshAgentTranscript', () => {
     expect(screen.getByText('visible')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Expand turn' })).not.toBeInTheDocument()
     expect(screen.queryByText(/hidden internals/)).not.toBeInTheDocument()
+  })
+
+  describe('tool notification polish (5kxd)', () => {
+    it('drops the vertical line from the activity summary while keeping left padding', () => {
+      const { container } = render(
+        <FreshAgentTranscript
+          turns={[
+            {
+              id: 'turn-1',
+              role: 'assistant',
+              summary: 'used a tool',
+              items: [
+                { id: 'tool-1', kind: 'tool_use', toolUseId: 'call-1', name: 'Bash', input: { command: 'true' } },
+                { id: 'result-1', kind: 'tool_result', toolUseId: 'call-1', content: 'ok', isError: false },
+              ],
+            },
+          ]}
+        />,
+      )
+      const summary = container.querySelector('.fresh-agent-activity-summary') as HTMLElement
+      expect(summary).toBeTruthy()
+      expect(summary.className).not.toContain('border-l-2')
+      expect(summary.className).not.toContain('border-l-[')
+      expect(summary.className).toContain('px-2')
+    })
+
+    it('expands a single-tool activity strip body in one click', () => {
+      const { container } = render(
+        <FreshAgentTranscript
+          turns={[
+            {
+              id: 'turn-1',
+              role: 'assistant',
+              summary: 'used a tool',
+              items: [
+                { id: 'tool-1', kind: 'tool_use', toolUseId: 'call-1', name: 'Bash', input: { command: 'echo hi' } },
+                { id: 'result-1', kind: 'tool_result', toolUseId: 'call-1', content: 'hi', isError: false },
+              ],
+            },
+          ]}
+        />,
+      )
+      expect(container.querySelector('[data-tool-input]')).not.toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      expect(container.querySelector('[data-tool-input]')).toHaveTextContent('echo hi')
+      expect(container.querySelector('[data-tool-output]')).toHaveTextContent('hi')
+    })
+
+    it('keeps multi-tool strip headers collapsed until individually expanded', () => {
+      const { container } = render(
+        <FreshAgentTranscript
+          turns={[
+            {
+              id: 'turn-1',
+              role: 'assistant',
+              summary: 'used two tools',
+              items: [
+                { id: 'tool-1', kind: 'tool_use', toolUseId: 'call-1', name: 'Bash', input: { command: 'echo first' } },
+                { id: 'result-1', kind: 'tool_result', toolUseId: 'call-1', content: 'first', isError: false },
+                { id: 'tool-2', kind: 'tool_use', toolUseId: 'call-2', name: 'Bash', input: { command: 'echo second' } },
+                { id: 'result-2', kind: 'tool_result', toolUseId: 'call-2', content: 'second', isError: false },
+              ],
+            },
+          ]}
+        />,
+      )
+      expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('2 tools used')
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      expect(container.querySelector('[data-tool-input]')).not.toBeInTheDocument()
+      const toolButtons = screen.getAllByRole('button', { name: 'Bash tool call' })
+      expect(toolButtons).toHaveLength(2)
+      fireEvent.click(toolButtons[0])
+      expect(container.querySelector('[data-tool-input]')).toHaveTextContent('echo first')
+      expect(container.querySelectorAll('[data-tool-input]')).toHaveLength(1)
+    })
+
+    it('preserves error state on the activity strip without the vertical line', () => {
+      render(
+        <FreshAgentTranscript
+          turns={[
+            {
+              id: 'turn-1',
+              role: 'assistant',
+              summary: 'tool failed',
+              items: [
+                { id: 'tool-1', kind: 'tool_use', toolUseId: 'call-1', name: 'Bash', input: { command: 'false' } },
+                { id: 'result-1', kind: 'tool_result', toolUseId: 'call-1', content: 'boom', isError: true },
+              ],
+            },
+          ]}
+        />,
+      )
+      const summary = screen.getByRole('region', { name: 'Activity strip' }).querySelector('.fresh-agent-activity-summary') as HTMLElement
+      expect(summary).toBeTruthy()
+      expect(summary.className).not.toContain('border-l-')
+      expect(screen.getByLabelText('error')).toBeInTheDocument()
+    })
+
+    it('drops the vertical line from the thinking row in the activity strip', () => {
+      const { container } = render(
+        <FreshAgentTranscript
+          turns={[
+            {
+              id: 'turn-1',
+              role: 'assistant',
+              summary: 'thought',
+              items: [
+                { id: 'think-1', kind: 'thinking', text: 'a thought' },
+              ],
+            },
+          ]}
+        />,
+      )
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      const thinkingRow = container.querySelector('.fresh-agent-thinking-row') as HTMLElement
+      expect(thinkingRow).toBeTruthy()
+      expect(thinkingRow.className).not.toContain('border-l-2')
+      expect(thinkingRow.className).not.toContain('border-l-[')
+    })
+
+    it('keeps the thinking row trigger left padding unchanged', () => {
+      const { container } = render(
+        <FreshAgentTranscript
+          turns={[
+            {
+              id: 'turn-1',
+              role: 'assistant',
+              summary: 'thought',
+              items: [
+                { id: 'think-1', kind: 'thinking', text: 'a thought' },
+              ],
+            },
+          ]}
+        />,
+      )
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      const trigger = container.querySelector('.fresh-agent-thinking-trigger') as HTMLElement
+      expect(trigger).toBeTruthy()
+      expect(trigger.className).toContain('px-2')
+    })
   })
 
   describe('streaming height stability (jp70)', () => {
