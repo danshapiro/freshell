@@ -731,6 +731,50 @@ describe('FreshAgentRuntimeManager', () => {
     })).rejects.toThrow(/not tracked/i)
   })
 
+  it('requires the tracked FreshOpenCode route before killing a durable session', async () => {
+    const opencodeAdapter = {
+      create: vi.fn().mockResolvedValue({ sessionId: 'ses_kill_route' }),
+      attach: vi.fn().mockResolvedValue({ sessionId: 'ses_kill_route' }),
+      kill: vi.fn().mockResolvedValue(true),
+    }
+    const registry = createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshopencode',
+        runtimeProvider: 'opencode',
+        adapter: opencodeAdapter as any,
+      },
+    ])
+    const manager = new FreshAgentRuntimeManager({ registry })
+
+    await manager.attach({
+      sessionId: 'ses_kill_route',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })
+
+    await expect(manager.kill({
+      sessionId: 'ses_kill_route',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    })).rejects.toThrow(/requires a cwd/i)
+    await expect(manager.kill({
+      sessionId: 'ses_kill_route',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/other',
+    })).rejects.toThrow(/tracked for/i)
+    expect(opencodeAdapter.kill).not.toHaveBeenCalled()
+
+    await expect(manager.kill({
+      sessionId: 'ses_kill_route',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })).resolves.toBe(true)
+    expect(opencodeAdapter.kill).toHaveBeenCalledWith('ses_kill_route')
+  })
+
   it('keeps session-type registration separate when hidden sessions share one runtime adapter', async () => {
     const claudeAdapter = {
       create: vi.fn()

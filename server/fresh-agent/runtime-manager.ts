@@ -247,7 +247,7 @@ export class FreshAgentRuntimeManager {
   }
 
   async kill(locator: FreshAgentSessionLocator): Promise<boolean> {
-    const record = this.requireSession(locator)
+    const record = await this.requireOrRecoverSession(locator)
     try {
       if (record.adapter.kill) {
         return await record.adapter.kill(locator.sessionId)
@@ -465,7 +465,6 @@ export class FreshAgentRuntimeManager {
           return await this.singleflightFreshOpenCodeAttach(locator, existing)
         }
       } else if (this.isDurableFreshOpenCode(locator)
-        && !existing.freshOpenCodeRouteCwd
         && !existing.freshOpenCodeProviderOwnedNoRoute) {
         throw new FreshAgentLostSessionError(
           `Fresh-agent session ${locator.sessionType}/${locator.provider}/${locator.sessionId} requires a cwd before mutation`,
