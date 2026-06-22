@@ -56,6 +56,7 @@ import { FreshAgentSidebar } from './FreshAgentSidebar'
 
 const EARLY_STATES = new Set(['creating', 'starting'])
 const BUSY_STATES = new Set(['running', 'compacting'])
+const SNAPSHOT_REFRESH_COALESCE_MS = 50
 const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
   'freshAgent.session.changed',
   'freshAgent.session.snapshot',
@@ -705,7 +706,7 @@ export function FreshAgentView({
     snapshotRefreshTimerRef.current = window.setTimeout(() => {
       snapshotRefreshTimerRef.current = null
       setSnapshotRefreshNonce((value) => value + 1)
-    }, 0)
+    }, SNAPSHOT_REFRESH_COALESCE_MS)
   }, [])
 
   useEffect(() => () => {
@@ -1238,6 +1239,7 @@ export function FreshAgentView({
           autoTitleSentRef.current = true
         }
         const displaySnapshot = mergeSnapshotForDisplay(snapshotRef.current, resolved)
+        const snapshotAccepted = displaySnapshot !== snapshotRef.current
         commitSnapshot(displaySnapshot)
         setSnapshotAutoTitleIdentity(snapshotIdentity)
         const echo = localEchoRef.current
@@ -1246,7 +1248,7 @@ export function FreshAgentView({
           ? localEchoLanded(displaySnapshot.turns, echo, echoPendingMetadata)
           : false
         const staleEcho = echo
-          ? shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata)
+          ? snapshotAccepted && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata)
           : false
         if (echo) {
           if (landedEcho || staleEcho) setLocalEcho(null)
