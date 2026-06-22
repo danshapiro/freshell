@@ -281,7 +281,7 @@ export class FreshAgentRuntimeManager {
         runtimeProvider: record.runtimeProvider,
         adapter: record.adapter,
         sessionId: childSessionId,
-        providerOwned: Boolean(record.freshOpenCodeProviderOwnedNoRoute && !record.freshOpenCodeRouteCwd),
+        providerOwned: true,
       }))
     }
     return forked
