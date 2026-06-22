@@ -190,6 +190,17 @@ function isFreshOpencodePlaceholderId(pane: FreshAgentPaneContent, sessionId: st
     && sessionId.startsWith('freshopencode-')
 }
 
+function getFreshOpenCodeRouteCwd(
+  pane: FreshAgentPaneContent,
+  sessionCwd?: string,
+): string | undefined {
+  if (pane.provider !== 'opencode' || pane.sessionType !== 'freshopencode') return undefined
+  const paneCwd = pane.initialCwd?.trim()
+  if (paneCwd) return paneCwd
+  const storedCwd = sessionCwd?.trim()
+  return storedCwd || undefined
+}
+
 function getFreshAgentSnapshotThreadId(
   pane: FreshAgentPaneContent,
   claudeSession: Parameters<typeof getCanonicalDurableSessionId>[0],
@@ -472,6 +483,9 @@ export function FreshAgentView({
     })
     return state.freshAgent.sessions[sessionKey]
   })
+  const freshOpenCodeRouteCwd = getFreshOpenCodeRouteCwd(paneContent, agentSession?.cwd)
+  const freshOpenCodeRouteCwdRef = useRef(freshOpenCodeRouteCwd)
+  freshOpenCodeRouteCwdRef.current = freshOpenCodeRouteCwd
   const refreshRequest = useAppSelector((state) => state.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
   const activeTabId = useAppSelector((state) => state.tabs.activeTabId)
   const activePaneId = useAppSelector((state) => state.panes.activePane[tabId])
@@ -754,11 +768,13 @@ export function FreshAgentView({
   const startNewConversation = useCallback(() => {
     const current = paneContentRef.current
     if (current.sessionId) {
+      const cwd = getFreshOpenCodeRouteCwd(current, freshOpenCodeRouteCwdRef.current)
       sendFreshAgentMessage({
         type: 'freshAgent.kill',
         sessionId: current.sessionId,
         sessionType: current.sessionType,
         provider: current.provider,
+        ...(cwd ? { cwd } : {}),
       })
     }
     commitSnapshot(null)
@@ -787,6 +803,7 @@ export function FreshAgentView({
   const sendFork = useCallback((atTurnId?: string) => {
     const current = paneContentRef.current
     if (!current.sessionId) return
+    const cwd = getFreshOpenCodeRouteCwd(current, freshOpenCodeRouteCwdRef.current)
     // The freshAgent.forked broadcast is matched on createRequestId +
     // parentSessionId by the listener below, which repoints this pane at
     // the forked session. atTurnId is best-effort: providers that can't
@@ -797,6 +814,7 @@ export function FreshAgentView({
       sessionId: current.sessionId,
       sessionType: current.sessionType,
       provider: current.provider,
+      ...(cwd ? { cwd } : {}),
       ...(atTurnId ? { input: { atTurnId } } : {}),
     })
   }, [sendFreshAgentMessage])
@@ -809,11 +827,13 @@ export function FreshAgentView({
     }
     if (command.action === 'compact') {
       if (!current.sessionId) return
+      const cwd = getFreshOpenCodeRouteCwd(current, freshOpenCodeRouteCwdRef.current)
       sendFreshAgentMessage({
         type: 'freshAgent.compact',
         sessionId: current.sessionId,
         sessionType: current.sessionType,
         provider: current.provider,
+        ...(cwd ? { cwd } : {}),
         ...(args ? { instructions: args } : {}),
       })
       return
@@ -1058,11 +1078,13 @@ export function FreshAgentView({
         && typeof message.sessionId === 'string'
       ) {
         if (message.sessionId !== paneContent.sessionId) {
+          const cwd = getFreshOpenCodeRouteCwd(paneContent, agentSession?.cwd)
           sendFreshAgentMessage({
             type: 'freshAgent.kill',
             sessionId: paneContent.sessionId,
             sessionType: paneContent.sessionType,
             provider: paneContent.provider,
+            ...(cwd ? { cwd } : {}),
           })
         }
         commitSnapshot(null)
@@ -1086,7 +1108,7 @@ export function FreshAgentView({
       }
     })
     return unsubscribe
-  }, [commitSnapshot, dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, sendFreshAgentMessage, tabId, ws])
+  }, [agentSession?.cwd, commitSnapshot, dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, sendFreshAgentMessage, tabId, ws])
 
   useEffect(() => {
     if (!snapshotThreadId) return
@@ -1374,6 +1396,7 @@ export function FreshAgentView({
     const current = paneContentRef.current
     if (!current.sessionId) return
     const requestId = nanoid()
+    const routeCwd = getFreshOpenCodeRouteCwd(current, freshOpenCodeRouteCwdRef.current)
     recordPendingSendMetadata(requestId, {})
     // Checkpoint the working tree before the agent acts on this message, so
     // "rewind code to here" on this turn restores the pre-turn state. Fire and
@@ -1417,6 +1440,7 @@ export function FreshAgentView({
       sessionId: current.sessionId,
       sessionType: current.sessionType,
       provider: current.provider,
+      ...(routeCwd ? { cwd: routeCwd } : {}),
       text,
       settings: {
         ...(current.initialCwd ? { cwd: current.initialCwd } : {}),
@@ -1456,6 +1480,7 @@ export function FreshAgentView({
     if (!pendingApprovalsFromSnapshot || pendingApprovalsFromSnapshot.length === 0) return
     const current = paneContentRef.current
     if (!current.sessionId) return
+    const cwd = getFreshOpenCodeRouteCwd(current, freshOpenCodeRouteCwdRef.current)
     for (const approval of pendingApprovalsFromSnapshot) {
       if (approval.toolName && alwaysAllowToolsRef.current.has(approval.toolName)) {
         sendFreshAgentMessage({
@@ -1463,6 +1488,7 @@ export function FreshAgentView({
           sessionId: current.sessionId,
           sessionType: current.sessionType,
           provider: current.provider,
+          ...(cwd ? { cwd } : {}),
           requestId: approval.requestId,
           decision: { behavior: 'allow', updatedInput: {} },
         })
@@ -1580,6 +1606,7 @@ export function FreshAgentView({
         sessionId: paneContent.sessionId,
         sessionType: paneContent.sessionType,
         provider: paneContent.provider,
+        ...(freshOpenCodeRouteCwd ? { cwd: freshOpenCodeRouteCwd } : {}),
       })
     }
     const respondToApproval = (requestId: string | number, allow: boolean) => {
@@ -1590,6 +1617,7 @@ export function FreshAgentView({
         sessionId: paneContent.sessionId,
         sessionType: paneContent.sessionType,
         provider: paneContent.provider,
+        ...(freshOpenCodeRouteCwd ? { cwd: freshOpenCodeRouteCwd } : {}),
         requestId,
         decision: allow
           ? { behavior: 'allow', updatedInput: {} }
@@ -1712,6 +1740,7 @@ export function FreshAgentView({
                       sessionId: paneContent.sessionId,
                       sessionType: paneContent.sessionType,
                       provider: paneContent.provider,
+                      ...(freshOpenCodeRouteCwd ? { cwd: freshOpenCodeRouteCwd } : {}),
                       requestId: question.requestId,
                       answers,
                     })

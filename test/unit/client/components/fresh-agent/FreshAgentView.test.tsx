@@ -329,6 +329,73 @@ describe('FreshAgentView', () => {
     })
   })
 
+  it('routes FreshOpenCode approval and question responses through the pane cwd', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'running',
+      summary: 'OpenCode summary',
+      capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: true },
+      pendingApprovals: [{
+        requestId: 'approval-route',
+        toolName: 'Bash',
+        input: { command: 'pwd' },
+      }],
+      pendingQuestions: [{
+        requestId: 'question-route',
+        questions: [{
+          header: 'Next step',
+          question: 'Continue?',
+          options: [{ label: 'Yes', description: 'Proceed' }],
+          multiSelect: false,
+        }],
+      }],
+      turns: [],
+    })
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshopencode',
+            provider: 'opencode',
+            createRequestId: 'req-route-responses',
+            sessionId: 'ses_route_responses',
+            initialCwd: '/repo/route-aware',
+            status: 'running',
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert', { name: /permission request for bash/i })).toBeInTheDocument()
+    })
+    fireEvent.click(screen.getByRole('button', { name: /allow tool use/i }))
+    fireEvent.click(screen.getByRole('button', { name: 'Yes' }))
+
+    expect(wsMock.send).toHaveBeenCalledWith({
+      type: 'freshAgent.approval.respond',
+      sessionId: 'ses_route_responses',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/route-aware',
+      requestId: 'approval-route',
+      decision: { behavior: 'allow', updatedInput: {} },
+    })
+    expect(wsMock.send).toHaveBeenCalledWith({
+      type: 'freshAgent.question.respond',
+      sessionId: 'ses_route_responses',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/route-aware',
+      requestId: 'question-route',
+      answers: { 'Continue?': 'Yes' },
+    })
+  })
+
   it('honors pane display overrides ahead of global fresh-agent settings', async () => {
     const store = createStore()
     store.dispatch(updateSettingsLocal({
@@ -553,6 +620,43 @@ describe('FreshAgentView', () => {
     )
 
     expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+  })
+
+  it('routes FreshOpenCode interrupt through the pane cwd', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'running',
+      capabilities: { send: false, interrupt: true, fork: true },
+      turns: [],
+    })
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshopencode',
+            provider: 'opencode',
+            createRequestId: 'req-stop-route',
+            sessionId: 'ses_stop_route',
+            initialCwd: '/repo/route-aware',
+            status: 'running',
+          }}
+        />
+      </Provider>,
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop' }))
+
+    expect(wsMock.send).toHaveBeenCalledWith({
+      type: 'freshAgent.interrupt',
+      sessionId: 'ses_stop_route',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/route-aware',
+    })
   })
 
   it('marks the fresh-agent body with pane and session flavor context metadata', async () => {
@@ -2946,6 +3050,7 @@ describe('FreshAgentView', () => {
         provider: 'opencode',
         createRequestId: 'req-compact',
         sessionId: 'freshopencode-req-compact',
+        initialCwd: '/repo/route-aware',
         status: 'idle',
       },
     }))
@@ -2969,7 +3074,96 @@ describe('FreshAgentView', () => {
       sessionId: 'freshopencode-req-compact',
       sessionType: 'freshopencode',
       provider: 'opencode',
+      cwd: '/repo/route-aware',
       instructions: 'keep implementation notes',
+    })
+  })
+
+  it('routes FreshOpenCode new-conversation kill through the pane cwd', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-new-route',
+        sessionId: 'ses_new_route',
+        initialCwd: '/repo/route-aware',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled())
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: '/new' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(wsMock.send).toHaveBeenCalledWith({
+      type: 'freshAgent.kill',
+      sessionId: 'ses_new_route',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/route-aware',
+    })
+  })
+
+  it('routes FreshOpenCode forks through the pane cwd', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'idle',
+      summary: 'OpenCode summary',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [
+        {
+          id: 'turn-route-fork',
+          turnId: 'turn-route-fork',
+          role: 'assistant',
+          summary: 'Ready to fork',
+          items: [{ id: 'item-route-fork', kind: 'text', text: 'Ready to fork' }],
+        },
+      ],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-fork-route',
+        sessionId: 'ses_fork_route',
+        initialCwd: '/repo/route-aware',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Fork conversation from here' }))
+
+    expect(wsMock.send).toHaveBeenCalledWith({
+      type: 'freshAgent.fork',
+      requestId: 'req-fork-route',
+      sessionId: 'ses_fork_route',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/route-aware',
+      input: { atTurnId: 'turn-route-fork' },
     })
   })
 

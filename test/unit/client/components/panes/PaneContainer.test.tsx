@@ -894,6 +894,44 @@ describe('PaneContainer', () => {
       })
     })
 
+    it('sends the pane cwd when a FreshOpenCode pane is closed', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-freshopencode',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          createRequestId: 'req-freshopencode-close',
+          sessionId: 'ses_freshopencode_close',
+          initialCwd: '/repo/route-aware',
+          status: 'connected',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-freshopencode' },
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
+
+      expect(mockSend).toHaveBeenCalledWith({
+        type: 'freshAgent.kill',
+        sessionId: 'ses_freshopencode_close',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/repo/route-aware',
+      })
+    })
+
     it('cancels a pending fresh-agent create when the pane closes before session creation finishes', () => {
       const node: PaneNode = {
         type: 'leaf',

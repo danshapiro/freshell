@@ -67,6 +67,18 @@ const EMPTY_FRESH_AGENT_PENDING_CREATES: Record<string, FreshAgentPendingCreate>
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 const EditorPane = lazy(() => withChunkErrorRecovery(import('./EditorPane')))
 
+function getFreshOpenCodePaneRouteCwd(content: PaneContent): string | undefined {
+  if (
+    content.kind !== 'fresh-agent'
+    || content.provider !== 'opencode'
+    || content.sessionType !== 'freshopencode'
+  ) {
+    return undefined
+  }
+  const cwd = content.initialCwd?.trim()
+  return cwd || undefined
+}
+
 interface PaneContainerProps {
   tabId: string
   node: PaneNode
@@ -290,11 +302,13 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       const pendingSessionId = pendingCreate?.sessionId
       const sessionId = content.sessionId || pendingSessionId
       if (sessionId) {
+        const cwd = getFreshOpenCodePaneRouteCwd(content)
         ws.send({
           type: 'freshAgent.kill',
           sessionId,
           sessionType: content.sessionType,
           provider: content.provider,
+          ...(cwd ? { cwd } : {}),
         })
       } else {
         cancelCreate(content.createRequestId)
