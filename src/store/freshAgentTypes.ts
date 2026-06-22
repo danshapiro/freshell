@@ -44,6 +44,7 @@ export type FreshAgentPendingCreate = {
   sessionKey?: string
   sessionType?: FreshAgentSessionType
   provider?: FreshAgentRuntimeProvider
+  cwd?: string
   expectsHistoryHydration: boolean
 }
 

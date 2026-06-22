@@ -1,7 +1,7 @@
 import type { AppDispatch } from '@/store/store'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
 import type { SessionRef } from '@shared/session-contract'
-import { consumeCancelledCreate } from '@/lib/create-cancellation'
+import { consumeCancelledCreate, consumeCreateRoute, rememberCreateRoute } from '@/lib/create-cancellation'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
 import {
@@ -87,12 +87,15 @@ export function registerFreshAgentCreate(
     sessionRef?: SessionRef
     sessionType: FreshAgentSessionType
     provider: FreshAgentRuntimeProvider
+    cwd?: string
   },
 ): void {
+  rememberCreateRoute(requestId, { cwd: options.cwd })
   dispatch(registerPendingCreate({
     requestId,
     sessionType: options.sessionType,
     provider: options.provider,
+    cwd: options.cwd,
     expectsHistoryHydration: Boolean(options.resumeSessionId || options.sessionRef),
   }))
   dispatch(clearPendingCreateFailure({ requestId }))
@@ -103,6 +106,7 @@ export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<strin
     case 'freshAgent.created': {
       const created = msg as FreshAgentCreatedMessage
       const provider = created.provider ?? created.runtimeProvider
+      const route = consumeCreateRoute(created.requestId)
       if (consumeCancelledCreate(created.requestId)) {
         if (provider) {
           ws?.send({
@@ -110,6 +114,7 @@ export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<strin
             sessionId: created.sessionId,
             sessionType: created.sessionType,
             provider,
+            ...(route?.cwd ? { cwd: route.cwd } : {}),
           })
         }
         return true
@@ -124,6 +129,7 @@ export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<strin
     }
     case 'freshAgent.create.failed': {
       const failed = msg as FreshAgentCreateFailedMessage
+      consumeCreateRoute(failed.requestId)
       dispatch(createFailed({
         requestId: failed.requestId,
         code: failed.code,

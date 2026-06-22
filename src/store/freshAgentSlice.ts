@@ -184,6 +184,7 @@ const freshAgentSlice = createSlice({
       expectsHistoryHydration: boolean
       sessionType?: FreshAgentSessionType
       provider?: FreshAgentRuntimeProvider
+      cwd?: string
     }>) {
       const current = state.pendingCreates[action.payload.requestId]
       state.pendingCreates[action.payload.requestId] = {
@@ -191,6 +192,7 @@ const freshAgentSlice = createSlice({
         sessionKey: current?.sessionKey,
         sessionType: action.payload.sessionType ?? current?.sessionType,
         provider: action.payload.provider ?? current?.provider,
+        cwd: action.payload.cwd ?? current?.cwd,
         expectsHistoryHydration: action.payload.expectsHistoryHydration,
       }
     },
@@ -219,6 +221,7 @@ const freshAgentSlice = createSlice({
         : session.status
       session.historyLoaded = !expectsHistoryHydration
       session.awaitingDurableHistory = expectsHistoryHydration
+      if (pending?.cwd) session.cwd = pending.cwd
       session.restoreRetryCount = 0
       session.restoreFailureCode = undefined
       session.restoreFailureMessage = undefined
@@ -229,6 +232,7 @@ const freshAgentSlice = createSlice({
         sessionKey: key,
         sessionType,
         provider,
+        cwd: pending?.cwd,
         expectsHistoryHydration,
       }
     },

@@ -43,6 +43,7 @@ import {
 } from '@/store/freshAgentSlice'
 import { DEFAULT_FRESH_AGENT_STYLE } from '@shared/settings'
 import { cancelCreate } from '@/lib/create-cancellation'
+import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
 import type { ProjectGroup, CodingCliSession } from '@/store/types'
@@ -66,18 +67,6 @@ const EMPTY_ATTENTION_BY_PANE: Record<string, boolean> = {}
 const EMPTY_FRESH_AGENT_PENDING_CREATES: Record<string, FreshAgentPendingCreate> = {}
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 const EditorPane = lazy(() => withChunkErrorRecovery(import('./EditorPane')))
-
-function getFreshOpenCodePaneRouteCwd(content: PaneContent): string | undefined {
-  if (
-    content.kind !== 'fresh-agent'
-    || content.provider !== 'opencode'
-    || content.sessionType !== 'freshopencode'
-  ) {
-    return undefined
-  }
-  const cwd = content.initialCwd?.trim()
-  return cwd || undefined
-}
 
 interface PaneContainerProps {
   tabId: string
@@ -302,7 +291,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       const pendingSessionId = pendingCreate?.sessionId
       const sessionId = content.sessionId || pendingSessionId
       if (sessionId) {
-        const cwd = getFreshOpenCodePaneRouteCwd(content)
+        const cwd = getFreshOpenCodeRouteCwd(content, { freshAgentSessions, sessionId })
         ws.send({
           type: 'freshAgent.kill',
           sessionId,
@@ -326,7 +315,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     // Extension panes: V1 leaves server extensions running until freshell shutdown.
     // Future: stop singleton server when its last pane closes.
     dispatch(closePaneWithCleanup({ tabId, paneId }))
-  }, [dispatch, freshAgentPendingCreates, tabId, ws])
+  }, [dispatch, freshAgentPendingCreates, freshAgentSessions, tabId, ws])
 
   const handleFocus = useCallback((paneId: string) => {
     // Decision 1: visiting any pane of the tab (a click into it) dismisses the

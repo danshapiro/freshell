@@ -102,6 +102,36 @@ describe('fresh-agent-ws', () => {
     expect(store.getState().freshAgent.sessions['freshcodex:codex:thread-orphan']).toBeUndefined()
   })
 
+  it('routes a cancelled late FreshOpenCode create cleanup through the original cwd', () => {
+    const store = createFreshAgentStore()
+    const ws = { send: vi.fn() }
+
+    registerFreshAgentCreate(store.dispatch, 'req-opencode-orphan', {
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/route-aware',
+    })
+    cancelCreate('req-opencode-orphan')
+
+    const handled = handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.created',
+      requestId: 'req-opencode-orphan',
+      sessionId: 'ses_orphan',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    }, ws)
+
+    expect(handled).toBe(true)
+    expect(ws.send).toHaveBeenCalledWith({
+      type: 'freshAgent.kill',
+      sessionId: 'ses_orphan',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/route-aware',
+    })
+    expect(store.getState().freshAgent.sessions['freshopencode:opencode:ses_orphan']).toBeUndefined()
+  })
+
   it('handles freshAgent.create.failed', () => {
     const store = createFreshAgentStore()
 

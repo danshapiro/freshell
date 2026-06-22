@@ -11,6 +11,7 @@ import connectionReducer from '@/store/connectionSlice'
 import settingsReducer from '@/store/settingsSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import tabRecencyReducer from '@/store/tabRecencySlice'
+import freshAgentReducer, { sessionInit } from '@/store/freshAgentSlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
@@ -24,6 +25,11 @@ const defaultCliExtensions: ClientExtensionEntry[] = [
     name: 'codex', version: '1.0.0', label: 'Codex CLI', description: '', category: 'cli',
     picker: { shortcut: 'X' },
     cli: { supportsModel: true, supportsSandbox: true, supportsResume: true, resumeCommandTemplate: ['codex', 'resume', '{{sessionId}}'] },
+  },
+  {
+    name: 'opencode', version: '1.0.0', label: 'OpenCode CLI', description: '', category: 'cli',
+    picker: { shortcut: 'O' },
+    cli: { supportsResume: true, resumeCommandTemplate: ['opencode', 'run', '--session', '{{sessionId}}'] },
   },
 ]
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
@@ -72,6 +78,7 @@ vi.mock('@/lib/clipboard', () => ({
 
 const VALID_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 const CODEX_THREAD_ID = '019ec8c9-2b12-7001-a11d-e2e089860320'
+const OPENCODE_SESSION_ID = 'ses_context_reopen'
 
 function createDeferred<T>() {
   let resolve!: (value: T) => void
@@ -92,6 +99,7 @@ function createTestStore(options?: { platform?: string | null }) {
       connection: connectionReducer,
       settings: settingsReducer,
       extensions: extensionsReducer,
+      freshAgent: freshAgentReducer,
     },
     middleware: (getDefaultMiddleware) =>
       getDefaultMiddleware({ serializableCheck: false }),
@@ -1102,6 +1110,88 @@ describe('ContextMenuProvider', () => {
     expect(store.getState().tabs.tabs[0].sessionMetadataByKey).toEqual({
       [`codex:${CODEX_THREAD_ID}`]: {
         sessionType: 'codex',
+      },
+    })
+  })
+
+  it('reopens a recovered FreshOpenCode pane with session-state cwd and kills the old pane route', async () => {
+    const user = userEvent.setup()
+    const store = createTestStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        provider: 'opencode',
+        sessionType: 'freshopencode',
+        status: 'idle',
+        createRequestId: 'req-freshopencode',
+        sessionId: OPENCODE_SESSION_ID,
+        sessionRef: {
+          provider: 'opencode',
+          sessionId: OPENCODE_SESSION_ID,
+        },
+      },
+    }))
+    store.dispatch(sessionInit({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionId: OPENCODE_SESSION_ID,
+      cwd: '/repo/session-state',
+    }))
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.FreshAgent}
+            data-tab-id="tab-1"
+            data-pane-id="pane-1"
+            data-provider="opencode"
+            data-session-type="freshopencode"
+          >
+            <div data-context="fresh-agent-transcript">FreshOpenCode transcript body</div>
+          </div>
+        </ContextMenuProvider>
+      </Provider>,
+    )
+
+    await user.pointer({ target: screen.getByText('FreshOpenCode transcript body'), keys: '[MouseRight]' })
+    await user.click(await screen.findByRole('menuitem', { name: 'Reopen as OpenCode CLI' }))
+
+    await waitFor(() => {
+      expect(apiMocks.setSessionMetadata).toHaveBeenCalledWith(
+        'opencode',
+        OPENCODE_SESSION_ID,
+        'opencode',
+        { sessionTypeSource: 'explicit' },
+      )
+    })
+    await waitFor(() => {
+      expect(wsMocks.send).toHaveBeenCalledWith({
+        type: 'freshAgent.kill',
+        sessionId: OPENCODE_SESSION_ID,
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/repo/session-state',
+      })
+    })
+
+    expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+      type: 'leaf',
+      content: {
+        kind: 'terminal',
+        mode: 'opencode',
+        sessionRef: {
+          provider: 'opencode',
+          sessionId: OPENCODE_SESSION_ID,
+        },
+        initialCwd: '/repo/session-state',
       },
     })
   })

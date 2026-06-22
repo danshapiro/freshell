@@ -40,6 +40,7 @@ import {
   type ReopenPaneActivity,
   type ReopenPaneSessionTarget,
 } from '@/lib/session-flavor-reopen'
+import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 import { createLogger } from '@/lib/client-logger'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { AppView } from '@/components/Sidebar'
@@ -869,6 +870,7 @@ export function ContextMenuProvider({
         tab,
         content,
         target,
+        freshAgentSessions: state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS,
         providerSettings: state.settings.settings.freshAgent?.providers?.[target.targetSessionType],
       }
     }
@@ -911,14 +913,31 @@ export function ContextMenuProvider({
       return
     }
 
+    const resolvedCwd = latest.target.cwd ?? getFreshOpenCodeRouteCwd(
+      latest.content,
+      {
+        freshAgentSessions: latest.freshAgentSessions,
+        sessionId: latest.target.sessionId,
+      },
+    )
+
     if (latest.content.kind === 'terminal' && latest.content.terminalId) {
       ws.send({ type: 'terminal.kill', terminalId: latest.content.terminalId })
     } else if (latest.content.kind === 'fresh-agent' && latest.content.sessionId) {
+      const cwd = getFreshOpenCodeRouteCwd(
+        latest.content,
+        {
+          freshAgentSessions: latest.freshAgentSessions,
+          sessionId: latest.content.sessionId,
+          fallbackCwd: resolvedCwd,
+        },
+      )
       ws.send({
         type: 'freshAgent.kill',
         sessionId: latest.content.sessionId,
         sessionType: latest.content.sessionType,
         provider: latest.content.provider,
+        ...(cwd ? { cwd } : {}),
       })
     }
 
@@ -928,7 +947,7 @@ export function ContextMenuProvider({
       content: buildResumeContent({
         sessionType: latest.target.targetSessionType,
         sessionId: latest.target.sessionId,
-        cwd: latest.target.cwd,
+        cwd: resolvedCwd,
         freshAgentProviderSettings: latest.providerSettings,
       }),
     }))
