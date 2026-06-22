@@ -127,7 +127,7 @@ describe('fresh-agent router', () => {
       .get('/api/fresh-agent/threads/freshcodex/codex/thread-new-1/turns?limit=1')
       .expect(200)
     expect(firstPage.body.turns).toHaveLength(1)
-    expect(firstPage.body.turns[0]).toMatchObject({ role: 'user' })
+    expect(firstPage.body.turns[0]).toMatchObject({ role: 'assistant' })
     expect(firstPage.body.nextCursor).toMatch(/^codex-cursor:v1:/)
     expect(JSON.stringify(firstPage.body)).not.toContain('providerTurnId')
 
@@ -136,7 +136,7 @@ describe('fresh-agent router', () => {
       .query({ revision: '7', limit: '1', cursor: firstPage.body.nextCursor })
       .expect(200)
     expect(secondPage.body.turns).toHaveLength(1)
-    expect(secondPage.body.turns[0]).toMatchObject({ role: 'assistant' })
+    expect(secondPage.body.turns[0]).toMatchObject({ role: 'user' })
     expect(JSON.stringify(secondPage.body)).not.toContain('providerTurnId')
 
     const body = await request(app)
@@ -144,7 +144,7 @@ describe('fresh-agent router', () => {
       .expect(200)
     expect(body.body).toMatchObject({
       turnId: secondPage.body.turns[0].turnId,
-      role: 'assistant',
+      role: 'user',
       threadId: 'thread-new-1',
       revision: 7,
     })

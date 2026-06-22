@@ -36,6 +36,7 @@ export const loadFreshAgentThreadTurns = createAsyncThunk(
       requestKey?: string
       limit?: number
       includeBodies?: boolean
+      suppressFailureDispatch?: boolean
     },
     { dispatch },
   ) => {
@@ -66,10 +67,12 @@ export const loadFreshAgentThreadTurns = createAsyncThunk(
       }))
       return page
     } catch (error) {
-      dispatch(historyLoadFailed({
-        ...input,
-        message: error instanceof Error ? error.message : 'Failed to load fresh-agent history',
-      }))
+      if (!input.suppressFailureDispatch) {
+        dispatch(historyLoadFailed({
+          ...input,
+          message: error instanceof Error ? error.message : 'Failed to load fresh-agent history',
+        }))
+      }
       throw error
     } finally {
       inFlightControllers.delete(controller)
@@ -99,6 +102,7 @@ export const backfillFreshAgentOlderHistory = createAsyncThunk(
           priority: 'background',
           limit: input.limit ?? 30,
           includeBodies: true,
+          suppressFailureDispatch: true,
         })).unwrap()
         cursor = result.nextCursor
         revision = result.revision

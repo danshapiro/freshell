@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import reducer, {
   createFailed,
+  freshAgentSnapshotReceived,
   historyLoadStarted,
   historyPageReceived,
   registerPendingCreate,
+  selectFreshAgentTranscriptTurns,
   sessionCreated,
   sessionError,
   sessionInit,
@@ -13,11 +15,12 @@ import reducer, {
 } from '@/store/freshAgentSlice'
 import type { FreshAgentTurn } from '@shared/fresh-agent-contract'
 
-function turn(turnId: string, summary = turnId, messageId = turnId): FreshAgentTurn {
+function turn(turnId: string, summary = turnId, messageId = turnId, ordinal?: number): FreshAgentTurn {
   return {
     id: turnId,
     turnId,
     messageId,
+    ...(ordinal !== undefined ? { ordinal } : {}),
     role: 'assistant',
     summary,
     items: [{ id: `${turnId}-text`, kind: 'text', text: summary }],
@@ -183,5 +186,39 @@ describe('freshAgentSlice', () => {
     expect(state.sessions[key].historyItems.map((item) => item.turnId)).toEqual(['turn-1', 'turn-2', 'turn-3'])
     expect(state.sessions[key].historyRevision).toBe(2)
     expect(state.sessions[key].nextHistoryCursor).toBe('cursor-v2')
+  })
+
+  it('does not append older snapshot-only turns after a loaded newest page', () => {
+    const loc = { sessionId: 'thread-order', sessionType: 'freshclaude' as const, provider: 'claude' as const }
+    const key = makeFreshAgentSessionKey(loc)
+    let state = reducer(undefined, freshAgentSnapshotReceived({
+      hydrateHistory: false,
+      snapshot: {
+        sessionType: loc.sessionType,
+        provider: loc.provider,
+        threadId: loc.sessionId,
+        latestTurnId: 'turn-4',
+        status: 'idle',
+        revision: 9,
+        turns: [
+          turn('turn-1', 'older one', 'message-1', 1),
+          turn('turn-2', 'older two', 'message-2', 2),
+          turn('turn-3', 'newest loaded', 'message-3', 3),
+          turn('turn-4', 'new live result', 'message-4', 4),
+        ],
+      },
+    }))
+    state = reducer(state, historyPageReceived({
+      ...loc,
+      requestKey: 'first-page',
+      turns: [turn('turn-3', 'newest loaded', 'message-3', 3)],
+      nextCursor: 'older-cursor',
+      revision: 9,
+    }))
+
+    expect(selectFreshAgentTranscriptTurns(state.sessions[key]).map((item) => item.turnId)).toEqual([
+      'turn-3',
+      'turn-4',
+    ])
   })
 })

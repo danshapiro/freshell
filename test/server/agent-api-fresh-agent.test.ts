@@ -14,6 +14,7 @@ function makeApp(overrides: { freshAgentRuntimeManager?: any } = {}) {
     send: vi.fn(async () => undefined),
     attach: vi.fn(async () => ({ sessionId: 'ses_real_1' })),
     getSnapshot: vi.fn(async () => ({ status: 'idle', turns: [] })),
+    getTurnPage: vi.fn(async () => ({ revision: 1, nextCursor: null, turns: [], bodies: {} })),
   }
   const app = express()
   app.use(express.json())
@@ -179,21 +180,102 @@ describe('agent-api fresh-agent: send-keys', () => {
 describe('agent-api fresh-agent: capture', () => {
   it('renders the transcript text for a fresh-agent pane', async () => {
     const getSnapshot = vi.fn(async () => ({
+      status: 'idle',
+      turns: [],
+    }))
+    const getTurnPage = vi.fn(async () => ({
+      revision: 10,
+      nextCursor: null,
       turns: [
         { role: 'user', summary: 'Reply with: ok', items: [{ kind: 'text', text: 'Reply with: ok' }] },
         { role: 'assistant', summary: 'ok', items: [{ kind: 'text', text: 'ok' }] },
       ],
+      bodies: {},
     }))
     const { app } = makeApp({ freshAgentRuntimeManager: {
       create: vi.fn(async () => ({ sessionId: 'freshopencode-abc', sessionType: 'freshopencode', runtimeProvider: 'opencode' })),
-      send: vi.fn(), attach: vi.fn(), getSnapshot,
+      send: vi.fn(), attach: vi.fn(), getSnapshot, getTurnPage,
     } })
     const created = await request(app).post('/api/tabs').send({ agent: 'opencode' })
     const res = await request(app).get(`/api/panes/${created.body.data.paneId}/capture`)
     expect(res.status).toBe(200)
     expect(res.text).toContain('user: Reply with: ok')
     expect(res.text).toContain('assistant: ok')
-    expect(getSnapshot).toHaveBeenCalledWith({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'freshopencode-abc' })
+    expect(getSnapshot).not.toHaveBeenCalled()
+    expect(getTurnPage).toHaveBeenCalledWith({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: 'freshopencode-abc',
+      limit: 200,
+      includeBodies: true,
+      priority: 'visible',
+    })
+  })
+
+  it('walks all fresh-agent transcript pages before rendering capture text', async () => {
+    const getTurnPage = vi.fn()
+      .mockResolvedValueOnce({
+        revision: 10,
+        nextCursor: 'older-page',
+        turns: [
+          { role: 'user', summary: 'Middle request', items: [{ kind: 'text', text: 'Middle request' }] },
+          { role: 'assistant', summary: 'Newest answer', items: [{ kind: 'text', text: 'Newest answer' }] },
+        ],
+        bodies: {},
+      })
+      .mockResolvedValueOnce({
+        revision: 10,
+        nextCursor: null,
+        turns: [
+          { role: 'assistant', summary: 'Oldest answer', items: [{ kind: 'text', text: 'Oldest answer' }] },
+        ],
+        bodies: {},
+      })
+    const { app } = makeApp({ freshAgentRuntimeManager: {
+      create: vi.fn(async () => ({ sessionId: 'freshopencode-abc', sessionType: 'freshopencode', runtimeProvider: 'opencode' })),
+      send: vi.fn(),
+      attach: vi.fn(),
+      getSnapshot: vi.fn(async () => ({ status: 'idle', turns: [] })),
+      getTurnPage,
+    } })
+    const created = await request(app).post('/api/tabs').send({ agent: 'opencode' })
+    const res = await request(app).get(`/api/panes/${created.body.data.paneId}/capture`)
+
+    expect(res.status).toBe(200)
+    expect(res.text.indexOf('assistant: Oldest answer')).toBeLessThan(res.text.indexOf('user: Middle request'))
+    expect(res.text.indexOf('user: Middle request')).toBeLessThan(res.text.indexOf('assistant: Newest answer'))
+    expect(getTurnPage).toHaveBeenNthCalledWith(1, {
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: 'freshopencode-abc',
+      limit: 200,
+      includeBodies: true,
+      priority: 'visible',
+    })
+    expect(getTurnPage).toHaveBeenNthCalledWith(2, {
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: 'freshopencode-abc',
+      cursor: 'older-page',
+      revision: 10,
+      limit: 200,
+      includeBodies: true,
+      priority: 'visible',
+    })
+  })
+
+  it('returns a clear error when the canonical transcript pager is unavailable', async () => {
+    const { app } = makeApp({ freshAgentRuntimeManager: {
+      create: vi.fn(async () => ({ sessionId: 'freshopencode-abc', sessionType: 'freshopencode', runtimeProvider: 'opencode' })),
+      send: vi.fn(),
+      attach: vi.fn(),
+      getSnapshot: vi.fn(async () => ({ status: 'idle', turns: [{ role: 'assistant', items: [{ kind: 'text', text: 'old path' }] }] })),
+    } })
+    const created = await request(app).post('/api/tabs').send({ agent: 'opencode' })
+    const res = await request(app).get(`/api/panes/${created.body.data.paneId}/capture`)
+
+    expect(res.status).toBe(503)
+    expect(res.body.message).toContain('fresh-agent transcript paging not available')
   })
 })
 

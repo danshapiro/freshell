@@ -556,9 +556,12 @@ export function FreshAgentView({
   })
   const agentHistorySessionRef = useRef(agentHistorySession)
   agentHistorySessionRef.current = agentHistorySession
-  const transcriptTurns = agentHistorySession
-    ? selectFreshAgentTranscriptTurns(agentHistorySession)
-    : (snapshot?.turns ?? [])
+  const snapshotTurns = snapshot?.turns
+  const transcriptTurns = useMemo(() => (
+    agentHistorySession
+      ? selectFreshAgentTranscriptTurns(agentHistorySession)
+      : (snapshotTurns ?? [])
+  ), [agentHistorySession, snapshotTurns])
   const hasRestoreFailure = Boolean(
     paneContent.provider === 'claude'
       && paneContent.sessionId
@@ -574,7 +577,9 @@ export function FreshAgentView({
       && claudeSession?.historyLoaded !== true
       && !hasRestoreFailure,
   )
-  const hasUserTurns = useMemo(() => freshAgentSnapshotHasUserTurn(snapshot), [snapshot])
+  const hasUserTurns = useMemo(() => (
+    transcriptTurns.some((turn) => typeof turn.role === 'string' && turn.role.trim().toLowerCase() === 'user')
+  ), [transcriptTurns])
   const autoTitleDurableIdentity = useMemo(() => {
     const paneSessionRefId = paneContent.sessionRef?.provider === paneContent.provider
       ? paneContent.sessionRef.sessionId
@@ -613,7 +618,11 @@ export function FreshAgentView({
   ])
   const [snapshotAutoTitleIdentity, setSnapshotAutoTitleIdentity] = useState<string | null>(null)
   const hasCurrentSnapshot = snapshot !== null && snapshotAutoTitleIdentity === autoTitleIdentity
-  const snapshotConfirmsNoUserTurns = hasCurrentSnapshot && !hasUserTurns
+  const transcriptHistoryLoaded = agentHistorySession?.historyLoaded === true
+  const snapshotIncludesTranscriptTurns = Boolean(snapshot?.turns && snapshot.turns.length > 0)
+  const snapshotConfirmsNoUserTurns = hasCurrentSnapshot
+    && !hasUserTurns
+    && (snapshotIncludesTranscriptTurns || transcriptHistoryLoaded)
   const snapshotConfirmsUserTurns = hasCurrentSnapshot && hasUserTurns
   const currentAutoTitleIdentityRef = useRef(autoTitleIdentity)
   currentAutoTitleIdentityRef.current = autoTitleIdentity

@@ -4,7 +4,7 @@ import {
   type FreshAgentRuntimeProvider,
   type FreshAgentSessionType,
 } from '@shared/fresh-agent'
-import { getFreshAgentTurnIdentityKeys } from '@shared/fresh-agent-turns'
+import { getFreshAgentTurnIdentityKeys, isTemporaryFreshAgentTurnId } from '@shared/fresh-agent-turns'
 import type { FreshAgentSnapshot, FreshAgentTurn } from '@shared/fresh-agent-contract'
 import type {
   FreshAgentContentBlock,
@@ -179,7 +179,37 @@ function appendLiveTurn(session: FreshAgentSessionState, turn: FreshAgentTurn): 
 }
 
 export function selectFreshAgentTranscriptTurns(session: FreshAgentSessionState): FreshAgentTurn[] {
-  return mergeUniqueTurnsByIdentity(session.historyItems, session.turns)
+  if (session.historyItems.length === 0) {
+    return session.turns
+  }
+
+  const loadedKeys = new Set(session.historyItems.flatMap(getFreshAgentTurnIdentityKeys))
+  const loadedOrdinals = session.historyItems
+    .map((turn) => turn.ordinal)
+    .filter((ordinal): ordinal is number => typeof ordinal === 'number')
+  const maxLoadedOrdinal = loadedOrdinals.length > 0 ? Math.max(...loadedOrdinals) : undefined
+  const loadedTimestamps = session.historyItems
+    .map((turn) => (turn.timestamp ? Date.parse(turn.timestamp) : Number.NaN))
+    .filter(Number.isFinite)
+  const maxLoadedTimestamp = loadedTimestamps.length > 0 ? Math.max(...loadedTimestamps) : undefined
+
+  const liveOrNewTurns = session.turns.filter((turn) => {
+    if (getFreshAgentTurnIdentityKeys(turn).some((key) => loadedKeys.has(key))) {
+      return false
+    }
+    if (maxLoadedOrdinal !== undefined && typeof turn.ordinal === 'number') {
+      return turn.ordinal > maxLoadedOrdinal
+    }
+    if (maxLoadedTimestamp !== undefined && turn.timestamp) {
+      const timestamp = Date.parse(turn.timestamp)
+      if (Number.isFinite(timestamp)) return timestamp > maxLoadedTimestamp
+    }
+    return turn.source === 'live'
+      || isTemporaryFreshAgentTurnId(turn.turnId)
+      || isTemporaryFreshAgentTurnId(turn.id)
+  })
+
+  return mergeUniqueTurnsByIdentity(session.historyItems, liveOrNewTurns)
 }
 
 function requestRestoreHydrationRestart(session: FreshAgentSessionState): void {

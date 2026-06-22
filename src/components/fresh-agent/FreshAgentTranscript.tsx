@@ -557,6 +557,8 @@ export function FreshAgentTranscript({
   const displayTurns = useMemo(() => (
     filterTurnsForDisplay(turns, displayOptions)
   ), [displayOptions, turns])
+  const displayTurnsRef = useRef(displayTurns)
+  displayTurnsRef.current = displayTurns
   const liveActivityBlockId = useMemo(
     () => selectLiveActivityBlockId(displayTurns, isStreaming, displayOptions),
     [displayOptions, displayTurns, isStreaming],
@@ -606,14 +608,15 @@ export function FreshAgentTranscript({
   useLayoutEffect(() => {
     const node = scrollerRef.current
     if (!node) return
-    const firstKey = displayTurns[0] ? getFreshAgentDisplayTurnKey(displayTurns[0]) : null
-    const lastKey = displayTurns.at(-1) ? getFreshAgentDisplayTurnKey(displayTurns.at(-1)!) : null
+    const currentDisplayTurns = displayTurnsRef.current
+    const firstKey = currentDisplayTurns[0] ? getFreshAgentDisplayTurnKey(currentDisplayTurns[0]) : null
+    const lastKey = currentDisplayTurns.at(-1) ? getFreshAgentDisplayTurnKey(currentDisplayTurns.at(-1)!) : null
     const previous = layoutRef.current
     const prependedOlderHistory = Boolean(
       previous
         && firstKey !== previous.firstKey
         && lastKey === previous.lastKey
-        && displayTurns.length > previous.count,
+        && currentDisplayTurns.length > previous.count,
     )
 
     if (atBottom) {
@@ -627,10 +630,10 @@ export function FreshAgentTranscript({
     layoutRef.current = {
       firstKey,
       lastKey,
-      count: displayTurns.length,
+      count: currentDisplayTurns.length,
       scrollHeight: node.scrollHeight,
     }
-  }, [atBottom, displayTurns, transcriptSignature])
+  }, [atBottom, transcriptSignature])
 
   return (
     <div className="relative min-h-0 flex-1">

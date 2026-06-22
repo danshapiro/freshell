@@ -3708,6 +3708,76 @@ describe('FreshAgentView', () => {
     }))
   })
 
+  it('does not auto-title a restored freshcodex pane after an empty metadata snapshot when history has user turns', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'codex-restored-title',
+      status: 'idle',
+      summary: 'metadata only',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [],
+    })
+    apiMock.getFreshAgentTurnPage.mockResolvedValueOnce({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'codex-restored-title',
+      revision: 4,
+      nextCursor: null,
+      turns: [{
+        id: 'turn-existing-user',
+        turnId: 'turn-existing-user',
+        role: 'user',
+        summary: 'Existing request',
+        items: [{ id: 'item-existing-user', kind: 'text', text: 'Existing request' }],
+      }],
+      bodies: {},
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-restored-codex-title',
+        sessionId: 'codex-restored-title',
+        sessionRef: { provider: 'codex', sessionId: 'codex-restored-title' },
+        status: 'idle',
+      },
+    }))
+    store.dispatch(updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-1', title: 'Existing Codex pane title', setByUser: false }))
+    store.dispatch(updateTab({ id: 'tab-1', updates: { title: 'Existing Codex tab title' } }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Existing request')).toBeInTheDocument()
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+
+    wsMock.send.mockClear()
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Do not rename restored codex' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    await waitFor(() => {
+      expect(sentFreshAgentMessages('freshAgent.send').at(-1)).toMatchObject({
+        sessionId: 'codex-restored-title',
+        text: 'Do not rename restored codex',
+      })
+    })
+    const state = store.getState()
+    expect(state.panes.paneTitles?.['tab-1']?.['pane-1']).toBe('Existing Codex pane title')
+    expect(state.tabs.tabs.find((tab) => tab.id === 'tab-1')?.title).toBe('Existing Codex tab title')
+  })
+
   it('recreates a lost freshclaude session through fresh-agent transport events with the durable resume id', async () => {
     const store = createStore()
     const durableSessionId = '00000000-0000-4000-8000-000000000441'
