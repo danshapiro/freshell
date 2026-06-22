@@ -310,4 +310,74 @@ describe('FreshAgentSettingsButton', () => {
     expect(screen.queryByRole('searchbox', { name: /Search enabled models/i })).not.toBeInTheDocument()
     expect(screen.queryByRole('dialog', { name: /Choose Freshopencode model/i })).not.toBeInTheDocument()
   })
+
+  it('traps Tab focus in the Freshopencode model modal, closes on Escape, and restores focus', async () => {
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue({
+      ok: true,
+      sessionType: 'freshopencode',
+      runtimeProvider: 'opencode',
+      status: 'fresh',
+      fetchedAt: 1_234,
+      models: [
+        {
+          id: 'opencode-go/glm-5.2',
+          displayName: 'GLM 5.2',
+          provider: 'opencode',
+          source: { id: 'opencode-go', displayName: 'opencode-go' },
+          supportsEffort: true,
+          supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
+          supportsAdaptiveThinking: true,
+        },
+        {
+          id: 'deepseek/deepseek-v4-pro',
+          displayName: 'DeepSeek V4 Pro',
+          provider: 'opencode',
+          source: { id: 'deepseek', displayName: 'deepseek' },
+          supportsEffort: true,
+          supportedEffortLevels: ['low', 'high'],
+          supportsAdaptiveThinking: true,
+        },
+      ],
+    })
+    const store = createFreshopencodeStoreWithModel('opencode-go/glm-5.2')
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentSettingsButton tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+    const entrySearch = await screen.findByRole('searchbox', { name: /Search enabled models/i })
+    fireEvent.focus(entrySearch)
+
+    const dialog = await screen.findByRole('dialog', { name: /Choose Freshopencode model/i })
+    expect(dialog).toBeVisible()
+
+    const filterInput = screen.getByRole('searchbox', { name: /Filter enabled models/i })
+    const focusables = Array.from(
+      dialog.querySelectorAll<HTMLElement>('button, input, [href], select, textarea, [tabindex]:not([tabindex="-1"])'),
+    ).filter((el) => !el.hasAttribute('disabled') && !el.getAttribute('aria-hidden'))
+    const first = focusables[0]
+    const last = focusables[focusables.length - 1]
+    expect(first).toBe(filterInput)
+
+    expect(filterInput).toHaveFocus()
+
+    last.focus()
+    expect(document.activeElement).toBe(last)
+    fireEvent.keyDown(dialog, { key: 'Tab' })
+    expect(document.activeElement).toBe(first)
+
+    first.focus()
+    expect(document.activeElement).toBe(first)
+    fireEvent.keyDown(dialog, { key: 'Tab', shiftKey: true })
+    expect(document.activeElement).toBe(last)
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog', { name: /Choose Freshopencode model/i })).not.toBeInTheDocument()
+    })
+    expect(screen.getByRole('dialog', { name: 'Agent settings' })).toBeVisible()
+  })
 })

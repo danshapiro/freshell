@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
@@ -25,6 +26,19 @@ import type {
 } from '@shared/fresh-agent-model-capabilities'
 
 const MAX_RENDERED_MODEL_ROWS = 250
+
+function getFocusable(container: HTMLElement): HTMLElement[] {
+  const selectors = [
+    'button',
+    '[href]',
+    'input',
+    'select',
+    'textarea',
+    '[tabindex]:not([tabindex="-1"])',
+  ]
+  return Array.from(container.querySelectorAll<HTMLElement>(selectors.join(',')))
+    .filter((el) => !el.hasAttribute('disabled') && !el.getAttribute('aria-hidden'))
+}
 
 function resolveEffectiveModel(
   content: FreshAgentPaneContent,
@@ -58,6 +72,8 @@ export function FreshOpencodeModelSettings({
   const [modalOpen, setModalOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
   const modalSearchRef = useRef<HTMLInputElement>(null)
+  const dialogRef = useRef<HTMLDivElement>(null)
+  const previousFocusRef = useRef<HTMLElement | null>(null)
 
   const capabilities: FreshAgentModelCapabilities | undefined = response?.ok ? response : undefined
   const unavailable = response?.ok === false
@@ -97,6 +113,7 @@ export function FreshOpencodeModelSettings({
 
   useEffect(() => {
     if (!modalOpen) return
+    previousFocusRef.current = document.activeElement as HTMLElement | null
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.stopPropagation()
@@ -110,6 +127,7 @@ export function FreshOpencodeModelSettings({
     return () => {
       document.removeEventListener('keydown', handleKeyDown, { capture: true })
       window.clearTimeout(focusTimer)
+      previousFocusRef.current?.focus()
     }
   }, [modalOpen])
 
@@ -206,20 +224,43 @@ export function FreshOpencodeModelSettings({
           onClick={() => setModalOpen(true)}
         />
       ) : null}
-      {modalOpen ? (
+      {modalOpen ? createPortal(
         <div
           className="fixed inset-0 flex items-center justify-center bg-black/50 z-[60] p-4"
-          onMouseDown={() => setModalOpen(false)}
+          onMouseDown={(e) => { e.stopPropagation(); setModalOpen(false) }}
           role="presentation"
           tabIndex={-1}
         >
           {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
           <div
+            ref={dialogRef}
             role="dialog"
             aria-modal="true"
             aria-label="Choose Freshopencode model"
             className="flex max-h-[80vh] w-full max-w-lg flex-col overflow-hidden rounded-lg border border-border bg-background shadow-lg"
             onMouseDown={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key !== 'Tab') return
+              const dialog = dialogRef.current
+              if (!dialog) return
+              const focusables = getFocusable(dialog)
+              if (focusables.length === 0) {
+                e.preventDefault()
+                return
+              }
+              const first = focusables[0]
+              const last = focusables[focusables.length - 1]
+              const active = document.activeElement as HTMLElement | null
+              if (e.shiftKey) {
+                if (active === first || !dialog.contains(active)) {
+                  e.preventDefault()
+                  last.focus()
+                }
+              } else if (active === last) {
+                e.preventDefault()
+                first.focus()
+              }
+            }}
           >
             <div className="border-b border-border p-3">
               <input
@@ -261,7 +302,8 @@ export function FreshOpencodeModelSettings({
               ) : null}
             </div>
           </div>
-        </div>
+        </div>,
+        document.body,
       ) : null}
     </div>
   )

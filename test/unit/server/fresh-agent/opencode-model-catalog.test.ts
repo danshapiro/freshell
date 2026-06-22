@@ -104,4 +104,48 @@ describe('OpenCode model catalog provider', () => {
     ])
     expect(JSON.stringify(models)).not.toMatch(/must-not-leak|authorization|apiKey|description/)
   })
+
+  it('fast-fails when the serve child exits before becoming healthy (does not wait for the full timeout)', async () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => {
+      queueMicrotask(() => child.emit('exit', 1))
+      return child
+    })
+    const fetchFn = vi.fn(async () => jsonResponse({}, { status: 503 }))
+    const provider = createOpencodeModelCatalogProvider({
+      spawnFn: spawnFn as any,
+      fetchFn: fetchFn as any,
+      allocatePort: async () => ({ hostname: '127.0.0.1', port: 48124 }),
+      healthTimeoutMs: 5000,
+      requestTimeoutMs: 100,
+    })
+
+    const start = Date.now()
+    await expect(provider.getCatalog({ cwd: '/repo/project-a' })).rejects.toThrow(/exited with code 1/)
+    const elapsed = Date.now() - start
+    expect(elapsed).toBeLessThan(4000)
+    expect(child.kill).toHaveBeenCalled()
+  })
+
+  it('fast-fails when the serve child emits an error (e.g. ENOENT) before becoming healthy', async () => {
+    const child = fakeChild()
+    const spawnFn = vi.fn(() => {
+      queueMicrotask(() => child.emit('error', Object.assign(new Error('spawn opencode ENOENT'), { code: 'ENOENT' })))
+      return child
+    })
+    const fetchFn = vi.fn(async () => jsonResponse({}, { status: 503 }))
+    const provider = createOpencodeModelCatalogProvider({
+      spawnFn: spawnFn as any,
+      fetchFn: fetchFn as any,
+      allocatePort: async () => ({ hostname: '127.0.0.1', port: 48125 }),
+      healthTimeoutMs: 5000,
+      requestTimeoutMs: 100,
+    })
+
+    const start = Date.now()
+    await expect(provider.getCatalog({ cwd: '/repo/project-a' })).rejects.toThrow(/ENOENT/)
+    const elapsed = Date.now() - start
+    expect(elapsed).toBeLessThan(4000)
+    expect(child.kill).toHaveBeenCalled()
+  })
 })

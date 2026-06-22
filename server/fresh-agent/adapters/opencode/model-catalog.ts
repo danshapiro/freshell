@@ -100,8 +100,28 @@ export function createOpencodeModelCatalogProvider(
     }
     const deadline = Date.now() + healthTimeoutMs
     let stderr = ''
+    let childExitError: Error | undefined
     const onStderr = (chunk: Buffer | string) => { stderr += String(chunk) }
+    const onExit = (code: number | null, signalName: string | null) => {
+      if (childExitError) return
+      childExitError = new Error(
+        signalName
+          ? `opencode catalog serve exited with signal ${signalName}`
+          : `opencode catalog serve exited with code ${code}`,
+      )
+      exitReject(childExitError)
+    }
+    const onError = (err: Error) => {
+      if (childExitError) return
+      childExitError = err
+      exitReject(err)
+    }
+    let exitReject: (err: Error) => void = () => {}
+    const exitPromise = new Promise<never>((_, reject) => { exitReject = reject })
+    exitPromise.catch(() => { /* prevent unhandled rejection if no racer is awaiting */ })
     child.stderr?.on('data', onStderr)
+    child.on('exit', onExit)
+    child.on('error', onError)
     try {
       while (Date.now() < deadline) {
         if (signal.aborted) {
@@ -113,22 +133,34 @@ export function createOpencodeModelCatalogProvider(
           throw new Error(`opencode catalog serve failed to start on ${baseUrl}: ${stderr.trim()}`)
         }
         try {
-          const res = await fetchFn(`${baseUrl}/global/health`, { method: 'GET' })
+          const res = await Promise.race([
+            fetchFn(`${baseUrl}/global/health`, { method: 'GET' }),
+            exitPromise,
+          ])
           if (res.ok) {
             const body = await res.json().catch(() => ({}))
             if (typeof body === 'object' && body !== null && (body as { healthy?: unknown }).healthy !== false) {
               return
             }
           }
-        } catch {
+        } catch (error) {
+          if (childExitError) {
+            stopChild()
+            throw childExitError
+          }
           // not up yet
         }
-        await new Promise((r) => setTimeout(r, DEFAULT_HEALTH_POLL_INTERVAL_MS))
+        await Promise.race([
+          new Promise((r) => setTimeout(r, DEFAULT_HEALTH_POLL_INTERVAL_MS)),
+          exitPromise,
+        ])
       }
       stopChild()
       throw new Error(`opencode catalog serve did not become healthy within ${healthTimeoutMs}ms`)
     } finally {
       child.stderr?.off('data', onStderr)
+      child.off('exit', onExit)
+      child.off('error', onError)
     }
   }
 
