@@ -1,5 +1,15 @@
 import { EventEmitter } from 'node:events'
 import { describe, expect, it, vi } from 'vitest'
+
+const observabilityMocks = vi.hoisted(() => ({
+  recordFreshAgentObservabilityEvent: vi.fn(),
+}))
+
+vi.mock('../../../../server/fresh-agent/observability.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../../server/fresh-agent/observability.js')>()
+  return { ...actual, recordFreshAgentObservabilityEvent: observabilityMocks.recordFreshAgentObservabilityEvent }
+})
+
 import { createOpencodeFreshAgentAdapter } from '../../../../server/fresh-agent/adapters/opencode/adapter.js'
 
 type FakeManager = ReturnType<typeof makeFakeManager>
@@ -513,5 +523,127 @@ describe('OpenCode serve adapter: control', () => {
     const { manager, adapter } = await materialized()
     await adapter.shutdown?.()
     expect(manager.shutdown).toHaveBeenCalled()
+  })
+})
+
+describe('OpenCode serve adapter: status observability', () => {
+  function findStatusEvents(): Array<Record<string, unknown>> {
+    return observabilityMocks.recordFreshAgentObservabilityEvent.mock.calls
+      .map(([event]) => event as Record<string, unknown>)
+      .filter((event) => event.kind === 'fresh_agent_opencode_status_observed')
+  }
+
+  it('logs running and idle status from adapter emitStatus during a send', async () => {
+    observabilityMocks.recordFreshAgentObservabilityEvent.mockClear()
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'obs-1', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo' })
+    await adapter.send?.('freshopencode-obs-1', { text: 'go' })
+
+    const statusEvents = findStatusEvents()
+    const running = statusEvents.find((e) => e.status === 'running')
+    const idle = statusEvents.find((e) => e.status === 'idle')
+    expect(running).toBeDefined()
+    expect(idle).toBeDefined()
+    expect(running!.source).toBe('adapter')
+    expect(idle!.source).toBe('adapter')
+    expect(running!.provider).toBe('opencode')
+    // Session id is hashed, not raw
+    expect(JSON.stringify(running)).not.toContain('ses_real_1')
+    expect(JSON.stringify(idle)).not.toContain('ses_real_1')
+  })
+
+  it('logs idle status from adapter emitStatus when send fails', async () => {
+    observabilityMocks.recordFreshAgentObservabilityEvent.mockClear()
+    const manager = makeFakeManager()
+    manager.createSession.mockRejectedValueOnce(new Error('boom'))
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'obs-fail', sessionType: 'freshopencode', provider: 'opencode' })
+
+    await expect(adapter.send?.('freshopencode-obs-fail', { text: 'go' })).rejects.toThrow('boom')
+
+    const statusEvents = findStatusEvents()
+    const running = statusEvents.find((e) => e.status === 'running')
+    const idle = statusEvents.find((e) => e.status === 'idle')
+    expect(running).toBeDefined()
+    expect(idle).toBeDefined()
+  })
+
+  it('logs status from SSE session.idle with source=sse and opencodeEventKind', async () => {
+    observabilityMocks.recordFreshAgentObservabilityEvent.mockClear()
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'obs-sse', sessionType: 'freshopencode', provider: 'opencode' })
+    await adapter.send?.('freshopencode-obs-sse', { text: 'go' })
+    observabilityMocks.recordFreshAgentObservabilityEvent.mockClear()
+
+    manager._emit('ses_real_1', {
+      kind: 'session.idle',
+      sessionId: 'ses_real_1',
+      properties: { sessionID: 'ses_real_1' },
+      raw: { type: 'session.idle', properties: { sessionID: 'ses_real_1' } },
+    })
+
+    const statusEvents = findStatusEvents()
+    expect(statusEvents).toHaveLength(1)
+    expect(statusEvents[0].status).toBe('idle')
+    expect(statusEvents[0].source).toBe('sse')
+    expect(statusEvents[0].opencodeEventKind).toBe('session.idle')
+    expect(JSON.stringify(statusEvents[0])).not.toContain('ses_real_1')
+  })
+
+  it('logs status from SSE session.status busy with source=sse', async () => {
+    observabilityMocks.recordFreshAgentObservabilityEvent.mockClear()
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'obs-sse-busy', sessionType: 'freshopencode', provider: 'opencode' })
+    await adapter.send?.('freshopencode-obs-sse-busy', { text: 'go' })
+    observabilityMocks.recordFreshAgentObservabilityEvent.mockClear()
+
+    manager._emit('ses_real_1', {
+      kind: 'session.status',
+      sessionId: 'ses_real_1',
+      properties: { sessionID: 'ses_real_1', status: { type: 'busy' } },
+      raw: { type: 'session.status', properties: { sessionID: 'ses_real_1', status: { type: 'busy' } } },
+    })
+
+    const statusEvents = findStatusEvents()
+    expect(statusEvents).toHaveLength(1)
+    expect(statusEvents[0].status).toBe('running')
+    expect(statusEvents[0].source).toBe('sse')
+    expect(statusEvents[0].opencodeEventKind).toBe('session.status')
+  })
+
+  it('does not log status for non-snapshot SSE events like message.updated', async () => {
+    observabilityMocks.recordFreshAgentObservabilityEvent.mockClear()
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'obs-msg', sessionType: 'freshopencode', provider: 'opencode' })
+    await adapter.send?.('freshopencode-obs-msg', { text: 'go' })
+    observabilityMocks.recordFreshAgentObservabilityEvent.mockClear()
+
+    manager._emit('ses_real_1', {
+      kind: 'message.updated',
+      sessionId: 'ses_real_1',
+      properties: { sessionID: 'ses_real_1' },
+      raw: { type: 'message.updated', properties: { sessionID: 'ses_real_1' } },
+    })
+
+    const statusEvents = findStatusEvents()
+    expect(statusEvents).toHaveLength(0)
+  })
+
+  it('includes cwdHash when cwd is known', async () => {
+    observabilityMocks.recordFreshAgentObservabilityEvent.mockClear()
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'obs-cwd', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo/work' })
+    await adapter.send?.('freshopencode-obs-cwd', { text: 'go' })
+
+    const statusEvents = findStatusEvents()
+    const running = statusEvents.find((e) => e.status === 'running')
+    expect(running).toBeDefined()
+    expect(running!.cwdHash).toBeDefined()
+    expect(running!.cwdHash).not.toBe('/repo/work')
   })
 })

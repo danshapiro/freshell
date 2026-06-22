@@ -12,6 +12,10 @@ import { normalizeFreshAgentEffort, normalizeFreshAgentModel } from '../../../..
 import { logger } from '../../../logger.js'
 import { defaultOpencodeDataHome } from '../../../coding-cli/providers/opencode.js'
 import {
+  hashForLogs,
+  recordFreshAgentObservabilityEvent,
+} from '../../observability.js'
+import {
   type OpencodeExport,
   normalizeOpencodeSnapshot,
   normalizeOpencodeTurnBody,
@@ -155,7 +159,19 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     state.unsubscribeServe = serveManager.subscribe(state.realSessionId, (parsed) => {
       const mapped = serveEventToSdk(parsed, state.placeholderId)
       if (mapped) {
-        if (mapped.type === 'sdk.session.snapshot') state.status = mapped.status === 'idle' ? 'idle' : 'running'
+        if (mapped.type === 'sdk.session.snapshot') {
+          const status: 'running' | 'idle' = mapped.status === 'idle' ? 'idle' : 'running'
+          state.status = status
+          recordFreshAgentObservabilityEvent({
+            kind: 'fresh_agent_opencode_status_observed',
+            provider: 'opencode',
+            sessionIdHash: hashForLogs(state.realSessionId ?? state.placeholderId),
+            status,
+            source: 'sse',
+            opencodeEventKind: parsed.kind,
+            ...(state.cwd ? { cwdHash: hashForLogs(state.cwd) } : {}),
+          })
+        }
         state.events.emit('event', mapped)
       }
     })
@@ -164,6 +180,14 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
   function emitStatus(state: OpencodeSessionState, status: 'running' | 'idle'): void {
     state.status = status
     state.events.emit('event', { type: 'sdk.session.snapshot', sessionId: state.placeholderId, status })
+    recordFreshAgentObservabilityEvent({
+      kind: 'fresh_agent_opencode_status_observed',
+      provider: 'opencode',
+      sessionIdHash: hashForLogs(state.realSessionId ?? state.placeholderId),
+      status,
+      source: 'adapter',
+      ...(state.cwd ? { cwdHash: hashForLogs(state.cwd) } : {}),
+    })
   }
 
   function emitMaterialized(state: OpencodeSessionState): void {
