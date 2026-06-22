@@ -103,7 +103,7 @@ export const backfillFreshAgentOlderHistory = createAsyncThunk(
         cursor = result.nextCursor
         revision = result.revision
       } catch (error) {
-        const message = error instanceof Error && /cursor/i.test(error.message)
+        const message = error instanceof Error && /(cursor|stale|revision)/i.test(error.message)
           ? 'Older history cursor expired; refresh history to continue.'
           : (error instanceof Error ? error.message : 'Failed to load older fresh-agent history')
         dispatch(historyLoadFailed({ ...input, cursor: cursor ?? input.cursor, message }))

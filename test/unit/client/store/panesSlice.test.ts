@@ -463,6 +463,35 @@ describe('panesSlice', () => {
       expect(leaf.content.resumeSessionId).toBeUndefined()
     })
 
+    it('marks invalid fresh-agent restore targets idle instead of connected', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-1',
+          content: {
+            kind: 'fresh-agent',
+            sessionType: 'freshopencode',
+            provider: 'opencode',
+            sessionId: 'freshopencode-req-opencode',
+            sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-opencode' },
+            createRequestId: 'req-opencode',
+            status: 'connected',
+          },
+        }),
+      )
+
+      const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content).toMatchObject({
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        status: 'idle',
+        restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
+      })
+      expect(leaf.content.sessionRef).toBeUndefined()
+      expect(leaf.content.resumeSessionId).toBeUndefined()
+    })
+
     it('preserves fresh-agent style through content initialization and merge updates', () => {
       const state = panesReducer(undefined, initLayout({
         tabId: 'tab-style',

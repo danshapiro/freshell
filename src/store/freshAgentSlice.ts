@@ -595,22 +595,36 @@ const freshAgentSlice = createSlice({
       if (action.payload.requestKey && expectedRequestKey && action.payload.requestKey !== expectedRequestKey) return
       if (session.restoreFailureMessage) return
       const incoming = action.payload.turns
+      const loadingOlderPage = Boolean(action.payload.cursor)
+      const hadHistoryItems = session.historyItems.length > 0
+      const previousRevision = session.historyRevision
+      const nextRevision = action.payload.revision ?? previousRevision
+      const revisionChanged = previousRevision !== undefined
+        && nextRevision !== undefined
+        && previousRevision !== nextRevision
       session.historyLoading = false
       session.historyInitialLoading = false
       session.historyOlderLoading = false
       session.historyLoaded = true
-      session.historyItems = action.payload.cursor
+      session.historyItems = loadingOlderPage
         ? mergeUniqueTurnsByIdentity(incoming, session.historyItems)
-        : incoming
+        : hadHistoryItems
+          ? mergeTurnsReplacingByIdentity(session.historyItems, incoming)
+          : incoming
       for (const turn of incoming) {
         session.historyBodies[turn.turnId] = turn
       }
       for (const [turnId, body] of Object.entries(action.payload.bodies ?? {})) {
         session.historyBodies[turnId] = body
       }
-      session.nextHistoryCursor = action.payload.nextCursor
-      session.historyRevision = action.payload.revision ?? session.historyRevision
-      session.historyBackfillComplete = action.payload.nextCursor == null
+      if (loadingOlderPage || !hadHistoryItems || revisionChanged) {
+        session.nextHistoryCursor = action.payload.nextCursor
+        session.historyBackfillComplete = action.payload.nextCursor == null
+      } else if (action.payload.nextCursor == null) {
+        session.nextHistoryCursor = null
+        session.historyBackfillComplete = true
+      }
+      session.historyRevision = nextRevision
       session.historyBackfillPaused = false
     },
 

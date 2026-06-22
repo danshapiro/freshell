@@ -260,6 +260,7 @@ export function migrateLegacyFreshAgentContent<T extends FreshAgentCompatibility
         kind: 'fresh-agent',
         provider,
         sessionType,
+        status: 'idle',
         ...(existingRestoreError.reason === 'invalid_legacy_restore_target'
           ? {}
           : (typeof input.resumeSessionId === 'string' ? { resumeSessionId: input.resumeSessionId } : {})),
@@ -295,7 +296,7 @@ export function migrateLegacyFreshAgentContent<T extends FreshAgentCompatibility
       provider,
       sessionType,
       ...(durableState.restoreError
-        ? { restoreError: durableState.restoreError }
+        ? { status: 'idle', restoreError: durableState.restoreError }
         : {
             ...(typeof input.resumeSessionId === 'string' ? { resumeSessionId: input.resumeSessionId } : {}),
             ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
@@ -348,6 +349,7 @@ export function migrateLegacyFreshAgentContent<T extends FreshAgentCompatibility
     provider: provider ?? 'claude',
     ...(restoreError
       ? {
+          status: 'idle',
           ...(restoreError.reason === 'invalid_legacy_restore_target'
             ? {}
             : (typeof input.resumeSessionId === 'string' ? { resumeSessionId: input.resumeSessionId } : {})),

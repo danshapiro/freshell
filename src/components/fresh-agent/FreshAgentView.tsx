@@ -554,6 +554,8 @@ export function FreshAgentView({
       provider: paneContent.provider,
     })]
   })
+  const agentHistorySessionRef = useRef(agentHistorySession)
+  agentHistorySessionRef.current = agentHistorySession
   const transcriptTurns = agentHistorySession
     ? selectFreshAgentTranscriptTurns(agentHistorySession)
     : (snapshot?.turns ?? [])
@@ -1170,7 +1172,8 @@ export function FreshAgentView({
           : undefined
         const nextSessionId = snapshotSessionRef?.sessionId ?? fresh.sessionId
         const nextSessionRef = snapshotSessionRef ?? fresh.sessionRef
-        const nextResumeSessionId = snapshotSessionRef?.sessionId ?? fresh.resumeSessionId ?? sessionId
+        const durableRequestSessionId = isDurableProviderSessionId(provider, sessionId) ? sessionId : undefined
+        const nextResumeSessionId = snapshotSessionRef?.sessionId ?? fresh.resumeSessionId ?? durableRequestSessionId
         if (snapshotSessionRef) {
           migratePendingAutoTitle(fresh.sessionId, snapshotSessionRef.sessionId, provider)
         }
@@ -1276,10 +1279,10 @@ export function FreshAgentView({
     const requestProvider = paneContent.provider
     const requestSessionId = snapshotThreadId
     const requestCreateRequestId = paneContent.createRequestId
-    const requestRevision = snapshot?.revision
-    const requestRevisionKey = typeof requestRevision === 'number' ? String(requestRevision) : 'latest'
-    const requestKey = `${requestCreateRequestId}:${requestSessionType}:${requestProvider}:${requestSessionId}:${requestRevisionKey}`
+    const requestRefreshNonce = snapshotRefreshNonce
+    const requestKey = `${requestCreateRequestId}:${requestSessionType}:${requestProvider}:${requestSessionId}:${requestRefreshNonce}`
     const requestCwd = paneContent.initialCwd
+    const shouldAutoBackfill = agentHistorySessionRef.current?.historyLoaded !== true
     const isStaleHistoryRequest = () => (
       paneContentRef.current.createRequestId !== requestCreateRequestId
       || paneContentRef.current.provider !== requestProvider
@@ -1292,7 +1295,6 @@ export function FreshAgentView({
       provider: requestProvider,
       sessionId: requestSessionId,
       cwd: requestCwd,
-      revision: requestRevision,
       limit: INITIAL_HISTORY_TURN_LIMIT,
       includeBodies: true,
       priority: 'visible',
@@ -1300,7 +1302,7 @@ export function FreshAgentView({
     })).unwrap()
       .then((page) => {
         if (isStaleHistoryRequest()) return
-        if (!page.nextCursor) return
+        if (!shouldAutoBackfill || !page.nextCursor) return
         return dispatch(backfillFreshAgentOlderHistory({
           sessionType: requestSessionType,
           provider: requestProvider,
@@ -1324,7 +1326,7 @@ export function FreshAgentView({
     paneContent.initialCwd,
     paneContent.provider,
     paneContent.sessionType,
-    snapshot?.revision,
+    snapshotRefreshNonce,
     snapshotThreadId,
   ])
 

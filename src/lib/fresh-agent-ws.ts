@@ -1,5 +1,9 @@
-import type { AppDispatch } from '@/store/store'
-import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
+import type { AppDispatch, RootState } from '@/store/store'
+import {
+  makeFreshAgentSessionKey,
+  type FreshAgentRuntimeProvider,
+  type FreshAgentSessionType,
+} from '@shared/fresh-agent'
 import type { SessionRef } from '@shared/session-contract'
 import { consumeCancelledCreate } from '@/lib/create-cancellation'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
@@ -140,16 +144,24 @@ export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<strin
         sessionType: materialized.sessionType,
         provider: materialized.provider,
       }))
-      dispatch(materializeFreshAgentPaneSession({
-        previousSessionId: materialized.previousSessionId,
-        sessionId: materialized.sessionId,
-        sessionType: materialized.sessionType,
-        provider: materialized.provider,
-        sessionRef: materialized.sessionRef ?? {
-          provider: materialized.provider,
+      dispatch((innerDispatch: AppDispatch, getState: () => RootState) => {
+        const sessionKey = makeFreshAgentSessionKey({
           sessionId: materialized.sessionId,
-        },
-      }))
+          sessionType: materialized.sessionType,
+          provider: materialized.provider,
+        })
+        innerDispatch(materializeFreshAgentPaneSession({
+          previousSessionId: materialized.previousSessionId,
+          sessionId: materialized.sessionId,
+          sessionType: materialized.sessionType,
+          provider: materialized.provider,
+          sessionRef: materialized.sessionRef ?? {
+            provider: materialized.provider,
+            sessionId: materialized.sessionId,
+          },
+          status: getState().freshAgent.sessions[sessionKey]?.status,
+        }))
+      })
       dispatch(flushPersistedLayoutNow())
       return true
     }

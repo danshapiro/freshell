@@ -65,6 +65,19 @@ function makeAdapter(manager: FakeManager, overrides: Partial<Parameters<typeof 
 }
 
 describe('OpenCode serve adapter: create + send', () => {
+  it('rejects temporary Freshopencode ids on resume instead of treating them as durable sessions', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+
+    await expect(adapter.resume?.({
+      requestId: 'resume-placeholder',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      resumeSessionId: 'freshopencode-resume-placeholder',
+    })).rejects.toThrow('temporary Freshopencode id')
+    expect(manager.getSession).not.toHaveBeenCalled()
+  })
+
   it('creates a placeholder, materializes on first send via POST /session, and awaits idle', async () => {
     const manager = makeFakeManager()
     const adapter = makeAdapter(manager)

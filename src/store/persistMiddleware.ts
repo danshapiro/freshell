@@ -220,6 +220,7 @@ function stripTransientSessionFields(content: any): any {
 
   return {
     ...rest,
+    ...(content.kind === 'fresh-agent' && content.restoreError ? { status: 'idle' } : {}),
     ...(invalidFreshAgentSessionRef
       ? {
           status: 'idle',
