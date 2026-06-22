@@ -73,4 +73,71 @@ describe('FreshAgentItemCard', () => {
     fireEvent.click(trigger)
     expect(container.querySelector('[data-tool-output]')).toBeInTheDocument()
   })
+
+  describe('tool notification polish (5kxd)', () => {
+    it('drops the vertical line from the tool block while keeping trigger padding', () => {
+      const { container } = render(
+        <FreshAgentToolBlock
+          tool={{
+            id: 'tool-1',
+            name: 'Bash',
+            input: { command: 'true' },
+            status: 'complete',
+          }}
+        />,
+      )
+      const toolBlock = container.querySelector('.fresh-agent-tool-block') as HTMLElement
+      expect(toolBlock).toBeTruthy()
+      expect(toolBlock.className).not.toContain('border-l-2')
+      expect(toolBlock.className).not.toContain('border-l-[')
+      const trigger = screen.getByRole('button', { name: 'Bash tool call' })
+      expect(trigger.className).toContain('px-2')
+    })
+
+    it('preserves error state on the tool block without the vertical line', () => {
+      const { container } = render(
+        <FreshAgentToolBlock
+          tool={{
+            id: 'tool-1',
+            name: 'Bash',
+            input: { command: 'false' },
+            output: 'boom',
+            isError: true,
+            status: 'complete',
+          }}
+        />,
+      )
+      const toolBlock = container.querySelector('.fresh-agent-tool-block') as HTMLElement
+      expect(toolBlock).toBeTruthy()
+      expect(toolBlock.className).not.toContain('border-l-')
+      expect(screen.getByLabelText('error')).toBeInTheDocument()
+      const summary = screen.getByText('(error)')
+      expect(summary.className).toContain('text-destructive')
+    })
+
+    it('drops the vertical line from the thinking disclosure', () => {
+      const { container } = render(
+        <FreshAgentItemCard
+          item={{ id: 'think-1', kind: 'thinking', text: 'a thought' }}
+        />,
+      )
+      const disclosure = container.querySelector('.fresh-agent-thinking-details') as HTMLElement
+      expect(disclosure).toBeTruthy()
+      expect(disclosure.className).not.toContain('border-l-2')
+      expect(disclosure.className).not.toContain('border-l-[')
+    })
+
+    it('drops the vertical line from the tool result card', () => {
+      const { container } = render(
+        <FreshAgentItemCard
+          item={{ id: 'result-1', kind: 'tool_result', content: 'ok', isError: false }}
+        />,
+      )
+      const card = container.querySelector('.fresh-agent-tool-result') as HTMLElement
+      expect(card).toBeTruthy()
+      expect(card.className).not.toContain('border-l-2')
+      expect(card.className).not.toContain('border-l-')
+      expect(card.className).toContain('px-2')
+    })
+  })
 })

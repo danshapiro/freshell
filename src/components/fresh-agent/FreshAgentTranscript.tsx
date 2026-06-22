@@ -1,5 +1,5 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ChevronDown, ChevronRight, Loader2 } from 'lucide-react'
+import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
+import { ChevronDown, ChevronRight, ChevronUp, Loader2, X } from 'lucide-react'
 import SlotReel from '@/components/fresh-agent/shared/SlotReel'
 import { getToolPreview } from '@/components/fresh-agent/shared/tool-preview'
 import { cn } from '@/lib/utils'
@@ -227,11 +227,17 @@ function buildBlocks(
 function filterTurnsForDisplay(
   turns: FreshAgentTurn[],
   options: TranscriptDisplayOptions,
+  isStreaming: boolean,
 ): FreshAgentTurn[] {
   return turns
-    .map((turn) => {
+    .map((turn, index) => {
       const items = turn.items.filter((item) => shouldDisplayTranscriptItem(item, options))
-      if (turn.items.length > 0 && items.length === 0) return null
+      if (turn.items.length > 0 && items.length === 0) {
+        if (isStreaming && index === turns.length - 1) {
+          return { ...turn, items: [] }
+        }
+        return null
+      }
       return items === turn.items ? turn : { ...turn, items }
     })
     .filter((turn): turn is FreshAgentTurn => turn !== null)
@@ -288,14 +294,20 @@ function selectLiveActivityBlockId(
     }
   })
 
-  if (isStreaming) return latestActivityBlockId
+  if (isStreaming) {
+    const lastTurn = turns[turns.length - 1]
+    if (lastTurn && !lastTurn.items.some((item) => shouldDisplayTranscriptItem(item, options))) {
+      return null
+    }
+    return latestActivityBlockId
+  }
   return latestTrailingThinkingBlockId
 }
 
 function FreshAgentThinkingRow({ text }: { text: string }) {
   const [expanded, setExpanded] = useState(false)
   return (
-    <div className="fresh-agent-thinking-row my-0.5 border-l-2 border-l-[hsl(var(--primary))] text-xs">
+    <div className="fresh-agent-thinking-row my-0.5 text-xs">
       <button
         type="button"
         onClick={() => setExpanded((value) => !value)}
@@ -331,6 +343,7 @@ function FreshAgentActivityStrip({
   ), [live, rows])
   const tools = activityTools(displayRows)
   const hasErrors = tools.some((tool) => tool.isError)
+  const singleToolExpand = tools.length === 1 && displayRows.length === 1
   const lastRow = displayRows[displayRows.length - 1] ?? null
   const runningTool = live ? [...tools].reverse().find((tool) => tool.status === 'running') ?? null : null
   const thinkingLive = live && lastRow?.type === 'thinking'
@@ -338,7 +351,22 @@ function FreshAgentActivityStrip({
   const activeTool = runningTool ?? liveTool
   const running = live && (activeTool !== null || thinkingLive)
 
-  if (displayRows.length === 0) return null
+  if (displayRows.length === 0) {
+    if (!live) return null
+    return (
+      <div role="region" aria-label="Activity strip" className="fresh-agent-activity-strip my-0.5">
+        <div className="fresh-agent-activity-summary flex min-w-0 items-center gap-1.5 px-2 py-0.5 text-xs">
+          <span
+            className="fresh-agent-activity-status-slot"
+            data-testid="fresh-agent-activity-status-slot"
+          >
+            <Loader2 className="h-3 w-3 animate-spin" aria-label="running" />
+          </span>
+          <SlotReel toolName={null} previewText={null} settledText={undefined} />
+        </div>
+      </div>
+    )
+  }
 
   const reelName = activeTool ? activeTool.name : thinkingLive ? 'Thinking' : null
   const reelPreview = activeTool ? getToolPreview(activeTool.name, activeTool.input) : null
@@ -348,8 +376,8 @@ function FreshAgentActivityStrip({
       {!expanded ? (
         <div
           className={cn(
-            'fresh-agent-activity-summary flex min-w-0 items-center gap-1.5 border-l-2 px-2 py-0.5 text-xs',
-            hasErrors ? 'border-l-[hsl(var(--destructive))]' : 'border-l-[hsl(var(--primary))]',
+            'fresh-agent-activity-summary flex min-w-0 items-center gap-1.5 px-2 py-0.5 text-xs',
+            hasErrors && 'bg-destructive/10',
           )}
         >
           <button
@@ -364,9 +392,10 @@ function FreshAgentActivityStrip({
           <span
             className="fresh-agent-activity-status-slot"
             data-testid="fresh-agent-activity-status-slot"
-            aria-hidden={running ? undefined : true}
+            aria-hidden={running || hasErrors ? undefined : true}
           >
             {running ? <Loader2 className="h-3 w-3 animate-spin" aria-label="running" /> : null}
+            {!running && hasErrors ? <X className="h-3 w-3 text-destructive" aria-label="error" /> : null}
           </span>
           <SlotReel
             toolName={running ? reelName : null}
@@ -388,7 +417,7 @@ function FreshAgentActivityStrip({
           {displayRows.map((row) => (
             row.type === 'thinking'
               ? <FreshAgentThinkingRow key={row.id} text={row.text} />
-              : <FreshAgentToolBlock key={row.tool.id} tool={row.tool} initialExpanded={initialExpanded} />
+              : <FreshAgentToolBlock key={row.tool.id} tool={row.tool} initialExpanded={initialExpanded || singleToolExpand} />
           ))}
         </div>
       )}
@@ -415,6 +444,8 @@ function FreshAgentTurnArticle({
   continuation,
   liveActivityBlockId,
   displayOptions,
+  isStreamingLastTurn,
+  index,
 }: {
   turn: FreshAgentTurn
   actions: TurnActionProps
@@ -425,6 +456,8 @@ function FreshAgentTurnArticle({
   continuation: boolean
   liveActivityBlockId: string | null
   displayOptions: TranscriptDisplayOptions
+  isStreamingLastTurn: boolean
+  index: number
 }) {
   const isUser = turn.role === 'user'
   const blocks = buildBlocks(turn.items, displayOptions)
@@ -446,6 +479,7 @@ function FreshAgentTurnArticle({
         continuation && 'mt-1.5',
       )}
       data-turn-role={turn.role}
+      data-turn-index={index}
       data-turn-continuation={continuation ? 'true' : 'false'}
       aria-label={`${turnLabel} transcript turn`}
       onContextMenu={(event) => {
@@ -502,23 +536,30 @@ function FreshAgentTurnArticle({
           // showed literal backticks (live-test finding) — render markdown.
           <FreshAgentMarkdownBody text={turn.summary ?? ''} />
         )}
+        {isStreamingLastTurn && blocks.length === 0 ? (
+          <FreshAgentActivityStrip rows={[]} live initialExpanded={showTools} />
+        ) : null}
       </div>
     </article>
   )
 }
 
-export function FreshAgentTranscript({
-  turns,
-  canFork = false,
-  agentLabel,
-  showModel = false,
-  showThinking = true,
-  showTools = false,
-  showTimecodes,
-  isStreaming = false,
-  onForkFromTurn,
-  onRewindToTurn,
-}: {
+const AT_BOTTOM_THRESHOLD = 24
+const TRANSCRIPT_LINE_HEIGHT = 40
+const TRANSCRIPT_PAGE_OVERLAP = 40
+
+function computeAtBottom(node: HTMLElement): boolean {
+  return node.scrollHeight - node.scrollTop - node.clientHeight < AT_BOTTOM_THRESHOLD
+}
+
+export type FreshAgentTranscriptHandle = {
+  scrollByLine: (direction: 1 | -1) => void
+  scrollByPage: (direction: 1 | -1) => void
+  scrollToTop: () => void
+  scrollToBottom: () => void
+}
+
+export type FreshAgentTranscriptProps = {
   turns: FreshAgentTurn[]
   canFork?: boolean
   agentLabel?: string
@@ -529,20 +570,34 @@ export function FreshAgentTranscript({
   isStreaming?: boolean
   onForkFromTurn?: (turnId: string) => void
   onRewindToTurn?: (turn: FreshAgentTurn) => void
-}) {
+}
+
+export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, FreshAgentTranscriptProps>(function FreshAgentTranscript({
+  turns,
+  canFork = false,
+  agentLabel,
+  showModel = false,
+  showThinking = true,
+  showTools = false,
+  showTimecodes,
+  isStreaming = false,
+  onForkFromTurn,
+  onRewindToTurn,
+}, ref) {
   const scrollerRef = useRef<HTMLDivElement | null>(null)
   const [atBottom, setAtBottom] = useState(true)
   const [newMessages, setNewMessages] = useState(0)
   const [contextMenu, setContextMenu] = useState<FreshAgentTurnContextMenuState>(null)
   const [sheetTurn, setSheetTurn] = useState<FreshAgentTurn | null>(null)
+  const [glomTarget, setGlomTarget] = useState<{ index: number; text: string } | null>(null)
   const coarsePointer = useCoarsePointer()
   const resolvedShowTimecodes = showTimecodes ?? showModel
   const displayOptions = useMemo<TranscriptDisplayOptions>(() => ({
     showThinking,
   }), [showThinking])
   const displayTurns = useMemo(() => (
-    filterTurnsForDisplay(turns, displayOptions)
-  ), [displayOptions, turns])
+    filterTurnsForDisplay(turns, displayOptions, isStreaming)
+  ), [displayOptions, turns, isStreaming])
   const liveActivityBlockId = useMemo(
     () => selectLiveActivityBlockId(displayTurns, isStreaming, displayOptions),
     [displayOptions, displayTurns, isStreaming],
@@ -568,6 +623,39 @@ export function FreshAgentTranscript({
     }).join('|')
   ), [displayTurns])
 
+  const recomputeGlom = useCallback(() => {
+    const scroller = scrollerRef.current
+    if (!scroller) {
+      setGlomTarget(null)
+      return
+    }
+    const scrollerTop = scroller.getBoundingClientRect().top
+    const userTurnEls = scroller.querySelectorAll<HTMLElement>('[data-turn-role="user"]')
+    let target: { index: number; text: string } | null = null
+    userTurnEls.forEach((el) => {
+      if (el.getBoundingClientRect().top < scrollerTop) {
+        const indexAttr = el.getAttribute('data-turn-index')
+        if (indexAttr == null) return
+        const index = Number(indexAttr)
+        if (Number.isNaN(index)) return
+        const turn = displayTurns[index]
+        if (!turn) return
+        const text = turnPlainText(turn)
+        if (!text) return
+        target = { index, text }
+      }
+    })
+    setGlomTarget(target)
+  }, [displayTurns])
+
+  const handleGlomClick = useCallback(() => {
+    if (!glomTarget) return
+    const scroller = scrollerRef.current
+    if (!scroller) return
+    const el = scroller.querySelector<HTMLElement>(`[data-turn-index="${glomTarget.index}"]`)
+    el?.scrollIntoView?.({ block: 'start' })
+  }, [glomTarget])
+
   const handleTurnContextMenu = useCallback((event: React.MouseEvent, turn: FreshAgentTurn) => {
     setContextMenu({ x: event.clientX, y: event.clientY, turn })
   }, [])
@@ -584,6 +672,35 @@ export function FreshAgentTranscript({
     onOpenActions: coarsePointer ? handleOpenActions : undefined,
   }), [canFork, coarsePointer, handleOpenActions, handleTurnContextMenu, onForkFromTurn, onRewindToTurn])
 
+  useImperativeHandle(ref, () => ({
+    scrollByLine: (direction) => {
+      const node = scrollerRef.current
+      if (!node) return
+      node.scrollTop += direction * TRANSCRIPT_LINE_HEIGHT
+      setAtBottom(computeAtBottom(node))
+    },
+    scrollByPage: (direction) => {
+      const node = scrollerRef.current
+      if (!node) return
+      const delta = Math.max(1, node.clientHeight - TRANSCRIPT_PAGE_OVERLAP)
+      node.scrollTop += direction * delta
+      setAtBottom(computeAtBottom(node))
+    },
+    scrollToTop: () => {
+      const node = scrollerRef.current
+      if (!node) return
+      node.scrollTop = 0
+      setAtBottom(computeAtBottom(node))
+    },
+    scrollToBottom: () => {
+      const node = scrollerRef.current
+      if (!node) return
+      node.scrollTop = node.scrollHeight
+      setAtBottom(true)
+      setNewMessages(0)
+    },
+  }), [])
+
   useEffect(() => {
     const node = scrollerRef.current
     if (!node) return
@@ -595,6 +712,10 @@ export function FreshAgentTranscript({
     }
   }, [atBottom, transcriptSignature])
 
+  useEffect(() => {
+    recomputeGlom()
+  }, [recomputeGlom, transcriptSignature])
+
   return (
     <div className="relative min-h-0 flex-1">
       <div
@@ -603,7 +724,8 @@ export function FreshAgentTranscript({
         data-context="fresh-agent-transcript"
         onScroll={(event) => {
           const node = event.currentTarget
-          setAtBottom(node.scrollHeight - node.scrollTop - node.clientHeight < 24)
+          setAtBottom(computeAtBottom(node))
+          recomputeGlom()
         }}
       >
         {displayTurns.map((turn, index) => (
@@ -618,9 +740,23 @@ export function FreshAgentTranscript({
             continuation={index > 0 && displayTurns[index - 1]?.role === turn.role}
             liveActivityBlockId={liveActivityBlockId}
             displayOptions={displayOptions}
+            isStreamingLastTurn={isStreaming && index === displayTurns.length - 1}
+            index={index}
           />
         ))}
       </div>
+      {glomTarget ? (
+        <button
+          type="button"
+          className="fresh-agent-glom-chip absolute left-3 right-3 top-0 z-20 flex items-center gap-1.5 overflow-hidden border-b border-border bg-background/95 px-2 py-1 text-[11px] text-muted-foreground shadow-sm backdrop-blur"
+          onClick={handleGlomClick}
+          aria-label={`Jump to your message: ${glomTarget.text}`}
+          title={glomTarget.text}
+        >
+          <ChevronUp className="h-3 w-3 shrink-0" aria-hidden="true" />
+          <span className="min-w-0 flex-1 truncate">{glomTarget.text}</span>
+        </button>
+      ) : null}
       <FreshAgentTurnContextMenu
         state={contextMenu}
         canFork={canFork}
@@ -654,6 +790,6 @@ export function FreshAgentTranscript({
       ) : null}
     </div>
   )
-}
+})
 
 export default memo(FreshAgentTranscript)

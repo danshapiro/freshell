@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, fireEvent, cleanup, act } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent, createEvent, cleanup, act } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
@@ -8,7 +8,7 @@ import freshAgentReducer, { sessionInit, setSessionStatus } from '@/store/freshA
 import tabsReducer from '@/store/tabsSlice'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
-import { initLayout, requestPaneRefresh, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
+import { initLayout, requestPaneRefresh, setActivePane, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
 import { useAppSelector } from '@/store/hooks'
 import { updateTab } from '@/store/tabsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
@@ -184,6 +184,9 @@ beforeEach(() => {
   wsMock.send.mockReset()
   wsMock.onMessage.mockReset()
   wsMock.onMessage.mockImplementation(() => () => {})
+  window.sessionStorage.clear()
+  window.localStorage.removeItem('fresh-agent-prompt-history:freshcodex')
+  window.localStorage.removeItem('fresh-agent-prompt-history:freshclaude')
   apiMock.getFreshAgentThreadSnapshot.mockReset()
   apiMock.getFreshAgentModelCapabilities.mockReset()
   apiMock.post.mockReset()
@@ -4137,5 +4140,241 @@ describe('FreshAgentView transcript font size', () => {
     })
 
     expect(root.style.getPropertyValue('--fresh-transcript-font-size')).toBe('20px')
+  })
+
+  describe('transcript keyboard scroll (faz3)', () => {
+    async function setupScrollablePane(initialScrollTop = 500) {
+      const store = createStore()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+        status: 'idle',
+        capabilities: { send: true, interrupt: true, fork: false },
+        turns: [
+          { id: 'turn-0', role: 'user', items: [{ id: 'item-0', kind: 'text', text: 'User message' }] },
+          { id: 'turn-1', role: 'assistant', items: [{ id: 'item-1', kind: 'text', text: 'Assistant reply' }] },
+        ],
+      })
+      render(
+        <Provider store={store}>
+          <FreshAgentView
+            tabId="tab-1"
+            paneId="pane-1"
+            paneContent={{
+              kind: 'fresh-agent',
+              sessionType: 'freshcodex',
+              provider: 'codex',
+              createRequestId: 'req-scroll-test',
+              sessionId: 'thread-scroll-test',
+              status: 'idle',
+            }}
+          />
+        </Provider>,
+      )
+      await waitFor(() => expect(screen.getByText('Assistant reply')).toBeInTheDocument())
+      const root = document.querySelector('[data-context="fresh-agent"]') as HTMLElement
+      const scroller = document.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+      Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 200 })
+      Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => 1000 })
+      scroller.scrollTop = initialScrollTop
+      fireEvent.scroll(scroller)
+      return { root, scroller }
+    }
+
+    it('scrolls down by one line on ArrowDown when the pane root has focus', async () => {
+      const { root, scroller } = await setupScrollablePane(500)
+      const event = createEvent.keyDown(root, { key: 'ArrowDown' })
+      fireEvent(root, event)
+      expect(event.defaultPrevented).toBe(true)
+      expect(scroller.scrollTop).toBe(540)
+    })
+
+    it('scrolls up by one line on ArrowUp when the pane root has focus', async () => {
+      const { root, scroller } = await setupScrollablePane(500)
+      const event = createEvent.keyDown(root, { key: 'ArrowUp' })
+      fireEvent(root, event)
+      expect(event.defaultPrevented).toBe(true)
+      expect(scroller.scrollTop).toBe(460)
+    })
+
+    it('scrolls down by one page on PageDown when the pane root has focus', async () => {
+      const { root, scroller } = await setupScrollablePane(100)
+      const event = createEvent.keyDown(root, { key: 'PageDown' })
+      fireEvent(root, event)
+      expect(event.defaultPrevented).toBe(true)
+      expect(scroller.scrollTop).toBe(260)
+    })
+
+    it('scrolls up by one page on PageUp when the pane root has focus', async () => {
+      const { root, scroller } = await setupScrollablePane(500)
+      const event = createEvent.keyDown(root, { key: 'PageUp' })
+      fireEvent(root, event)
+      expect(event.defaultPrevented).toBe(true)
+      expect(scroller.scrollTop).toBe(340)
+    })
+
+    it('jumps to top on Home when the pane root has focus', async () => {
+      const { root, scroller } = await setupScrollablePane(500)
+      const event = createEvent.keyDown(root, { key: 'Home' })
+      fireEvent(root, event)
+      expect(event.defaultPrevented).toBe(true)
+      expect(scroller.scrollTop).toBe(0)
+    })
+
+    it('jumps to bottom on End when the pane root has focus', async () => {
+      const { root, scroller } = await setupScrollablePane(500)
+      const event = createEvent.keyDown(root, { key: 'End' })
+      fireEvent(root, event)
+      expect(event.defaultPrevented).toBe(true)
+      expect(scroller.scrollTop).toBe(1000)
+    })
+
+    it('does not scroll or preventDefault when the composer textarea has focus', async () => {
+      const { scroller } = await setupScrollablePane(500)
+      const textbox = screen.getByRole('textbox', { name: 'Chat message input' })
+      const before = scroller.scrollTop
+      for (const key of ['ArrowDown', 'ArrowUp', 'PageDown', 'PageUp', 'Home', 'End']) {
+        const event = createEvent.keyDown(textbox, { key })
+        fireEvent(textbox, event)
+        expect(event.defaultPrevented).toBe(false)
+        expect(scroller.scrollTop).toBe(before)
+      }
+    })
+
+    it('dismisses the scroll-to-bottom button after pressing End', async () => {
+      const { root } = await setupScrollablePane(500)
+      expect(screen.getByRole('button', { name: 'Scroll to bottom' })).toBeInTheDocument()
+      fireEvent(root, createEvent.keyDown(root, { key: 'End' }))
+      await waitFor(() => {
+        expect(screen.queryByRole('button', { name: 'Scroll to bottom' })).not.toBeInTheDocument()
+      })
+    })
+
+    it('shows the scroll-to-bottom button after pressing Home', async () => {
+      const { root } = await setupScrollablePane(800)
+      expect(screen.queryByRole('button', { name: 'Scroll to bottom' })).not.toBeInTheDocument()
+      fireEvent(root, createEvent.keyDown(root, { key: 'Home' }))
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Scroll to bottom' })).toBeInTheDocument()
+      })
+    })
+
+    it('shows the scroll-to-bottom button after pressing PageUp', async () => {
+      const { root } = await setupScrollablePane(800)
+      expect(screen.queryByRole('button', { name: 'Scroll to bottom' })).not.toBeInTheDocument()
+      fireEvent(root, createEvent.keyDown(root, { key: 'PageUp' }))
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Scroll to bottom' })).toBeInTheDocument()
+      })
+    })
+
+    it('does not regress the plain-text key funnel into the composer', async () => {
+      const { root } = await setupScrollablePane(500)
+      const textbox = screen.getByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+      fireEvent(root, createEvent.keyDown(root, { key: 'h' }))
+      expect(textbox.value).toBe('h')
+    })
+  })
+
+  describe('composer focus on pane activation (0bc6)', () => {
+    async function flushFrames() {
+      await act(async () => {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+      })
+    }
+
+    function renderFocusPane(options?: { sessionId?: string; status?: string }) {
+      const store = createStore()
+      const sessionId = options && 'sessionId' in options ? options.sessionId : 'thread-focus-0bc6'
+      render(
+        <Provider store={store}>
+          <FreshAgentView
+            tabId="tab-1"
+            paneId="pane-1"
+            paneContent={{
+              kind: 'fresh-agent',
+              sessionType: 'freshcodex',
+              provider: 'codex',
+              createRequestId: 'req-focus-0bc6',
+              sessionId,
+              status: options?.status ?? 'idle',
+            }}
+          />
+        </Provider>,
+      )
+      return { store }
+    }
+
+    it('focuses the composer exactly once when the pane becomes the active pane of the active tab', async () => {
+      const { store } = renderFocusPane()
+      const textbox = await screen.findByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+      await waitFor(() => expect(textbox).not.toBeDisabled())
+      await flushFrames()
+      const focusSpy = vi.spyOn(textbox, 'focus')
+
+      act(() => {
+        store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+      })
+
+      await waitFor(() => expect(focusSpy).toHaveBeenCalledTimes(1))
+      expect(document.activeElement).toBe(textbox)
+    })
+
+    it('does not re-focus the composer when it already has focus on activation', async () => {
+      const { store } = renderFocusPane()
+      const textbox = await screen.findByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+      await waitFor(() => expect(textbox).not.toBeDisabled())
+      act(() => {
+        store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+      })
+      await waitFor(() => expect(document.activeElement).toBe(textbox))
+
+      const focusSpy = vi.spyOn(textbox, 'focus')
+      act(() => {
+        store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-other' }))
+      })
+      act(() => {
+        store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+      })
+      await flushFrames()
+
+      expect(focusSpy).not.toHaveBeenCalled()
+      expect(document.activeElement).toBe(textbox)
+    })
+
+    it('does not steal focus from another editable element inside the pane on activation', async () => {
+      const { store } = renderFocusPane()
+      const textbox = await screen.findByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+      await waitFor(() => expect(textbox).not.toBeDisabled())
+      const root = document.querySelector('[data-context="fresh-agent"]') as HTMLElement
+      const other = document.createElement('input')
+      other.setAttribute('aria-label', 'Other editable')
+      root.appendChild(other)
+      other.focus()
+      expect(document.activeElement).toBe(other)
+
+      const focusSpy = vi.spyOn(textbox, 'focus')
+      act(() => {
+        store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+      })
+      await flushFrames()
+
+      expect(focusSpy).not.toHaveBeenCalled()
+      expect(document.activeElement).toBe(other)
+      root.removeChild(other)
+    })
+
+    it('leaves focus on the pane root when the composer is disabled on activation', async () => {
+      const { store } = renderFocusPane({ sessionId: undefined, status: 'creating' })
+      const root = await waitFor(() => document.querySelector('[data-context="fresh-agent"]') as HTMLElement)
+      const textbox = screen.getByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+      expect(textbox).toBeDisabled()
+      const focusSpy = vi.spyOn(textbox, 'focus')
+
+      act(() => {
+        store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+      })
+
+      await waitFor(() => expect(document.activeElement).toBe(root))
+      expect(focusSpy).not.toHaveBeenCalled()
+    })
   })
 })
