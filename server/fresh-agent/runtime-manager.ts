@@ -132,19 +132,43 @@ export class FreshAgentRuntimeManager {
 
   async attach(input: FreshAgentSessionLocator): Promise<FreshAgentCreateResult> {
     const registration = this.requireRegistration(input.sessionType, input.provider)
+    const key = this.key(input)
+    const existing = this.sessions.get(key)
+    if (existing) {
+      if (existing.sessionType !== input.sessionType || existing.runtimeProvider !== registration.runtimeProvider) {
+        throw new FreshAgentSessionLocatorMismatchError(
+          `Fresh-agent session ${input.sessionId} is tracked as ${existing.sessionType}/${existing.runtimeProvider}, not ${input.sessionType}/${registration.runtimeProvider}`,
+        )
+      }
+      const cwd = this.routeCwd(input)
+      if (this.isDurableFreshOpenCode({
+        sessionType: input.sessionType,
+        provider: registration.runtimeProvider,
+        sessionId: input.sessionId,
+      }) && cwd && existing.freshOpenCodeRouteCwd && existing.freshOpenCodeRouteCwd !== cwd) {
+        throw new FreshAgentSessionLocatorMismatchError(
+          `Fresh-agent session ${input.sessionId} is tracked for ${existing.freshOpenCodeRouteCwd}, not ${cwd}`,
+        )
+      }
+    }
     const attached = registration.adapter.attach
       ? await registration.adapter.attach(input)
       : { sessionId: input.sessionId }
     const sessionId = attached.sessionId
+    const attachedKey = this.key({ ...input, sessionId })
 
-    this.sessions.set(this.key({ ...input, sessionId }), this.recordForSession({
-      sessionType: input.sessionType,
-      runtimeProvider: registration.runtimeProvider,
-      adapter: registration.adapter,
-      sessionId,
-      cwd: input.cwd,
-      providerOwned: false,
-    }))
+    if (existing && attachedKey === key && !this.routeCwd(input)) {
+      this.sessions.set(attachedKey, existing)
+    } else {
+      this.sessions.set(attachedKey, this.recordForSession({
+        sessionType: input.sessionType,
+        runtimeProvider: registration.runtimeProvider,
+        adapter: registration.adapter,
+        sessionId,
+        cwd: input.cwd,
+        providerOwned: false,
+      }))
+    }
 
     return {
       sessionId,

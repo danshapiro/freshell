@@ -108,16 +108,8 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     return typeof cwd === 'string' && cwd.trim().length > 0 ? { cwd } : undefined
   }
 
-  async function ensureMutableRoute(state: OpencodeSessionState): Promise<void> {
-    const realId = state.realSessionId
-    if (!realId) return
-    const cwd = state.cwd
-    if (state.providerCreatedInThisAdapter && (!cwd || cwd.trim().length === 0)) return
-    if (!cwd || cwd.trim().length === 0) {
-      throw new FreshAgentLostSessionError(`OpenCode session ${realId} requires a cwd before it can be mutated after recovery.`)
-    }
+  async function validateSessionRoute(realId: string, cwd: string): Promise<string> {
     const expected = await canonicalizePath(cwd)
-    if (state.routeValidatedCwd === expected) return
     await validateCwd(cwd)
     const session = await serveManager.getSession(realId, { cwd })
     if (typeof session?.id === 'string' && session.id !== realId) {
@@ -131,7 +123,20 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     if (expected !== actual) {
       throw new FreshAgentLostSessionError(`OpenCode session ${realId} belongs to ${reportedDirectory}, not ${cwd}.`)
     }
-    state.routeValidatedCwd = expected
+    return expected
+  }
+
+  async function ensureMutableRoute(state: OpencodeSessionState): Promise<void> {
+    const realId = state.realSessionId
+    if (!realId) return
+    const cwd = state.cwd
+    if (state.providerCreatedInThisAdapter && (!cwd || cwd.trim().length === 0)) return
+    if (!cwd || cwd.trim().length === 0) {
+      throw new FreshAgentLostSessionError(`OpenCode session ${realId} requires a cwd before it can be mutated after recovery.`)
+    }
+    const expected = await canonicalizePath(cwd)
+    if (state.routeValidatedCwd === expected) return
+    state.routeValidatedCwd = await validateSessionRoute(realId, cwd)
   }
 
   async function reconcileStatus(state: OpencodeSessionState): Promise<void> {
@@ -407,8 +412,13 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       const existing = sessions.get(locator.sessionId)
       if (existing) {
         if (locator.cwd) {
+          const routeValidatedCwd = await validateSessionRoute(
+            existing.realSessionId ?? locator.sessionId,
+            locator.cwd,
+          )
           if (existing.cwd !== locator.cwd) existing.routeValidatedCwd = undefined
           existing.cwd = locator.cwd
+          existing.routeValidatedCwd = routeValidatedCwd
         }
         remember(existing)
         await reconcileStatus(existing)
@@ -423,6 +433,9 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         cwd: locator.cwd,
         status: 'idle',
         events: new EventEmitter(), sendQueue: Promise.resolve(),
+      }
+      if (locator.cwd) {
+        state.routeValidatedCwd = await validateSessionRoute(locator.sessionId, locator.cwd)
       }
       remember(state)
       bindServeStream(state)
@@ -485,8 +498,9 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       return { sessionId: child.id, sessionRef: { provider: 'opencode', sessionId: child.id } }
     },
 
-    kill(sessionId) {
+    async kill(sessionId) {
       const state = requireState(sessionId)
+      await ensureMutableRoute(state)
       try { state.unsubscribeServe?.() } catch { /* ignore */ }
       sessions.delete(state.placeholderId)
       if (state.realSessionId) sessions.delete(state.realSessionId)

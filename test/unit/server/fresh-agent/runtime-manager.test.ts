@@ -753,6 +753,25 @@ describe('FreshAgentRuntimeManager', () => {
       cwd: '/repo/safe',
     })
 
+    await expect(manager.attach({
+      sessionId: 'ses_kill_route',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    })).resolves.toEqual({
+      sessionId: 'ses_kill_route',
+      sessionType: 'freshopencode',
+      runtimeProvider: 'opencode',
+    })
+    expect(opencodeAdapter.attach).toHaveBeenCalledTimes(2)
+
+    await expect(manager.attach({
+      sessionId: 'ses_kill_route',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/other',
+    })).rejects.toThrow(/tracked for/i)
+    expect(opencodeAdapter.attach).toHaveBeenCalledTimes(2)
+
     await expect(manager.kill({
       sessionId: 'ses_kill_route',
       sessionType: 'freshopencode',

@@ -307,7 +307,7 @@ describe('OpenCode serve adapter: create + send', () => {
     )
   })
 
-  it('rejects recovered durable session mutation when OpenCode reports a different directory', async () => {
+  it('rejects recovered durable session attach when OpenCode reports a different directory', async () => {
     const manager = makeFakeManager()
     manager.getSession.mockResolvedValueOnce({
       id: 'ses_wrong',
@@ -321,13 +321,21 @@ describe('OpenCode serve adapter: create + send', () => {
       sessionType: 'freshopencode',
       provider: 'opencode',
       cwd: '/repo/safe',
-    })).resolves.toEqual({
-      sessionId: 'ses_wrong',
-      sessionRef: { provider: 'opencode', sessionId: 'ses_wrong' },
+    })).rejects.toThrow(/belongs to|directory/i)
+    expect(manager.promptAsync).not.toHaveBeenCalled()
+  })
+
+  it('rejects kill for no-cwd recovered durable sessions', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+
+    await adapter.attach?.({
+      sessionId: 'ses_kill_no_cwd',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
     })
 
-    await expect(adapter.send?.('ses_wrong', { text: 'must not send' })).rejects.toThrow(/belongs to|directory/i)
-    expect(manager.promptAsync).not.toHaveBeenCalled()
+    await expect(adapter.kill?.('ses_kill_no_cwd')).rejects.toThrow(/cwd/i)
   })
 
   it('marks recovered durable sessions running only when OpenCode status is busy or retry', async () => {
@@ -582,7 +590,7 @@ describe('OpenCode serve adapter: history reads', () => {
 
   it('getSnapshot assembles HTTP messages into the normalized transcript', async () => {
     const manager = makeFakeManager()
-    manager.getSession = vi.fn(async () => ({ id: 'ses_real_1', title: 'Kimi chat', time: { updated: 12 } }))
+    manager.getSession = vi.fn(async () => ({ id: 'ses_real_1', directory: '/repo/history', title: 'Kimi chat', time: { updated: 12 } }))
     manager.listMessages = vi.fn(async () => ({ messages, nextCursor: null }))
     const adapter = makeAdapter(manager)
     await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1', cwd: '/repo/history' })
@@ -637,7 +645,7 @@ describe('OpenCode serve adapter: history reads', () => {
 
   it('reports fork capability true and approvals/questions false', async () => {
     const manager = makeFakeManager()
-    manager.getSession = vi.fn(async () => ({ id: 'ses_real_1', time: { updated: 1 } }))
+    manager.getSession = vi.fn(async () => ({ id: 'ses_real_1', directory: '/repo/history', time: { updated: 1 } }))
     manager.listMessages = vi.fn(async () => ({ messages: [], nextCursor: null }))
     const adapter = makeAdapter(manager)
     await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1', cwd: '/repo/history' })
