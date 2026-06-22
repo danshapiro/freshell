@@ -329,6 +329,11 @@ export class OpencodeServeManager {
     return this.json<OpencodeStatusMap>(withRoute('/session/status', route), { method: 'GET', ...init })
   }
 
+  async getSessionStatus(sessionId: string, route: ServeRoute = {}): Promise<{ type?: unknown } | undefined> {
+    const statuses = await this.getSessionStatusMap(route)
+    return statuses[sessionId]
+  }
+
   async createSession(input: { title?: string; parentID?: string; directory?: string } = {}): Promise<{ id: string; directory?: string; title?: string }> {
     const body: { title?: string; parentID?: string } = {}
     if (input.title !== undefined) body.title = input.title

@@ -40,7 +40,13 @@ function makeFakeManager() {
     promptAsync: vi.fn(async () => undefined),
     listMessages: vi.fn(async () => ({ messages: [], nextCursor: null })),
     getMessage: vi.fn(async () => null),
-    getSession: vi.fn(async () => ({ id: 'ses_real_1', title: 'T', time: { updated: 5 } })),
+    getSession: vi.fn(async (id: string, route?: { cwd?: string }) => ({
+      id,
+      ...(route?.cwd ? { directory: route.cwd } : {}),
+      title: 'T',
+      time: { updated: 5 },
+    })),
+    getSessionStatus: vi.fn(async () => undefined),
     abort: vi.fn(async () => undefined),
     compact: vi.fn(async () => undefined),
     fork: vi.fn(async (): Promise<{ id: string; directory?: string }> => ({ id: 'ses_child_1' })),
@@ -60,6 +66,7 @@ function makeAdapter(manager: FakeManager, overrides: Partial<Parameters<typeof 
   return createOpencodeFreshAgentAdapter({
     serveManager: manager as any,
     validateCwd: async () => undefined,
+    canonicalizePath: async (value: string) => value,
     ...overrides,
   })
 }
@@ -222,6 +229,7 @@ describe('OpenCode serve adapter: create + send', () => {
     })
     await adapter.send?.('ses_attached_send', { text: 'continue' })
 
+    expect(manager.getSession).toHaveBeenCalledWith('ses_attached_send', { cwd: '/repo/restored-worktree' })
     expect(manager.promptAsync).toHaveBeenCalledWith(
       'ses_attached_send',
       { parts: [{ type: 'text', text: 'continue' }] },
@@ -229,21 +237,105 @@ describe('OpenCode serve adapter: create + send', () => {
     )
   })
 
-  it('keeps attached no-cwd sessions sendable without a route argument', async () => {
+  it('keeps no-cwd recovered durable sessions readable but not sendable', async () => {
     const manager = makeFakeManager()
+    manager.getSession.mockResolvedValueOnce({
+      id: 'ses_no_cwd',
+      time: { updated: 10 },
+    })
+    manager.listMessages.mockResolvedValueOnce({ messages: [], nextCursor: null })
+    const adapter = makeAdapter(manager)
+
+    await expect(adapter.attach?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionId: 'ses_no_cwd',
+    })).resolves.toEqual({
+      sessionId: 'ses_no_cwd',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_no_cwd' },
+    })
+
+    await expect(adapter.getSnapshot?.({
+      threadId: 'ses_no_cwd',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    })).resolves.toEqual(expect.objectContaining({ threadId: 'ses_no_cwd' }))
+
+    await expect(adapter.send?.('ses_no_cwd', { text: 'must not send' })).rejects.toThrow(/cwd/i)
+    expect(manager.promptAsync).not.toHaveBeenCalled()
+  })
+
+  it('validates a recovered durable session directory before mutating it', async () => {
+    const manager = makeFakeManager()
+    manager.getSession.mockResolvedValueOnce({
+      id: 'ses_recovered',
+      directory: '/repo/safe',
+      time: { updated: 10 },
+    })
+    const adapter = makeAdapter(manager, { canonicalizePath: async (value: string) => value } as any)
+
+    await expect(adapter.attach?.({
+      sessionId: 'ses_recovered',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })).resolves.toEqual({
+      sessionId: 'ses_recovered',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_recovered' },
+    })
+
+    await adapter.send?.('ses_recovered', { text: 'continue' })
+    expect(manager.getSession).toHaveBeenCalledWith('ses_recovered', { cwd: '/repo/safe' })
+    expect(manager.promptAsync).toHaveBeenCalledWith(
+      'ses_recovered',
+      expect.objectContaining({ parts: [{ type: 'text', text: 'continue' }] }),
+      { cwd: '/repo/safe' },
+    )
+  })
+
+  it('rejects recovered durable session mutation when OpenCode reports a different directory', async () => {
+    const manager = makeFakeManager()
+    manager.getSession.mockResolvedValueOnce({
+      id: 'ses_wrong',
+      directory: '/repo/other',
+      time: { updated: 10 },
+    })
+    const adapter = makeAdapter(manager, { canonicalizePath: async (value: string) => value } as any)
+
+    await expect(adapter.attach?.({
+      sessionId: 'ses_wrong',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })).resolves.toEqual({
+      sessionId: 'ses_wrong',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_wrong' },
+    })
+
+    await expect(adapter.send?.('ses_wrong', { text: 'must not send' })).rejects.toThrow(/belongs to|directory/i)
+    expect(manager.promptAsync).not.toHaveBeenCalled()
+  })
+
+  it('marks recovered durable sessions running only when OpenCode status is busy or retry', async () => {
+    const manager = makeFakeManager()
+    manager.getSessionStatus = vi.fn(async () => ({ type: 'busy' }))
     const adapter = makeAdapter(manager)
 
     await adapter.attach?.({
+      sessionId: 'ses_busy',
       sessionType: 'freshopencode',
       provider: 'opencode',
-      sessionId: 'ses_attached_nocwd',
+      cwd: '/repo/safe',
     })
-    await adapter.send?.('ses_attached_nocwd', { text: 'continue' })
+    const snapshot = await adapter.getSnapshot?.({
+      threadId: 'ses_busy',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    }) as any
 
-    expect(manager.promptAsync).toHaveBeenCalledWith(
-      'ses_attached_nocwd',
-      { parts: [{ type: 'text', text: 'continue' }] },
-    )
+    expect(snapshot.status).toBe('running')
+    expect(manager.getSessionStatus).toHaveBeenCalledWith('ses_busy', { cwd: '/repo/safe' })
   })
 
   it('recovers from a failed send and still processes later sends', async () => {
@@ -483,6 +575,7 @@ describe('OpenCode serve adapter: control', () => {
     })
     await adapter.send?.('ses_child_1', { text: 'child continue' })
 
+    expect(manager.getSession).toHaveBeenCalledWith('ses_known_cwd', { cwd: '/repo/control' })
     expect(manager.abort).toHaveBeenCalledWith('ses_known_cwd', { cwd: '/repo/control' })
     expect(manager.compact).toHaveBeenCalledWith('ses_known_cwd', { instructions: 'trim' }, { cwd: '/repo/control' })
     expect(manager.fork).toHaveBeenCalledWith('ses_known_cwd', { cwd: '/repo/control' })

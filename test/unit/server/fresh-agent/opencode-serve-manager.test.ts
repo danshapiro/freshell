@@ -200,6 +200,26 @@ describe('OpencodeServeManager lifecycle', () => {
 })
 
 describe('OpencodeServeManager HTTP client', () => {
+  it('returns one session status entry from the routed status map', async () => {
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url === 'http://127.0.0.1:47999/session/status?directory=%2Frepo%2Fsafe') {
+        return jsonResponse({
+          ses_safe: { type: 'busy' },
+          ses_other: { type: 'idle' },
+        })
+      }
+      return jsonResponse({})
+    })
+    const { manager } = makeManager({ fetchFn: fetchFn as any })
+
+    await expect(manager.getSessionStatus('ses_safe', { cwd: '/repo/safe' })).resolves.toEqual({ type: 'busy' })
+    expect(fetchFn).toHaveBeenCalledWith(
+      'http://127.0.0.1:47999/session/status?directory=%2Frepo%2Fsafe',
+      expect.anything(),
+    )
+  })
+
   it('creates a session and posts a prompt_async with model object + variant', async () => {
     const calls: Array<{ url: string; init: any }> = []
     const fetchFn = vi.fn(async (url: string, init: any) => {
