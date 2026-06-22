@@ -802,7 +802,7 @@ export class TerminalStreamBroker {
 
   private appendOutputFrames(terminalId: string, data: string): ReplayFrame[] {
     const state = this.getOrCreateTerminalState(terminalId)
-    let streamId = this.streamIdentity.ensureStream(terminalId)
+    const streamId = this.streamIdentity.ensureStream(terminalId)
     const fragments = fragmentTerminalOutputForPayloadBudget({
       data,
       maxSerializedBytes: TERMINAL_STREAM_BATCH_MAX_BYTES,
@@ -818,13 +818,12 @@ export class TerminalStreamBroker {
     })
     const frames: ReplayFrame[] = []
     for (const fragment of fragments) {
-      const fragmentStreamId = streamId
       frames.push(state.replayRing.append(fragment, { streamId }))
-      const retainedStreamId = this.handleReplayRetentionLoss(terminalId, state, fragmentStreamId)
-      if (retainedStreamId) {
-        this.retagFrames(frames, fragmentStreamId, retainedStreamId)
-        streamId = retainedStreamId
-      }
+    }
+
+    const retainedStreamId = this.handleReplayRetentionLoss(terminalId, state, streamId)
+    if (retainedStreamId) {
+      this.retagFrames(frames, streamId, retainedStreamId)
     }
     return frames
   }
