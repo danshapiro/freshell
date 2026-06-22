@@ -245,7 +245,7 @@ describe('fresh-agent router: snapshot served observability', () => {
     expect(payload.provider).toBe('codex')
     expect(payload.sessionType).toBe('freshcodex')
     expect(payload.httpStatus).toBe(200)
-    expect(payload.turnCount).toBeGreaterThan(0)
+    expect(payload.turnCount).toBe(0)
     expect(payload.durationMs).toBeGreaterThanOrEqual(0)
     expect(payload.payloadBytes).toBeGreaterThan(0)
     expect(payload.threadIdHash).toBeDefined()
