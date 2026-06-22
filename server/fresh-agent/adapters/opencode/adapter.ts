@@ -137,25 +137,41 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
   async function reconcileStatus(state: OpencodeSessionState): Promise<void> {
     const realId = state.realSessionId
     if (!realId) return
+    state.status = 'idle'
     const getSessionStatus = (serveManager as { getSessionStatus?: (sessionId: string, route?: { cwd?: string }) => Promise<{ type?: unknown } | undefined> }).getSessionStatus
-    if (typeof getSessionStatus !== 'function') return
+    const logContext = {
+      provider: 'opencode',
+      sessionIdHash: hashForLogs(realId),
+      ...(state.cwd ? { cwdHash: hashForLogs(state.cwd) } : {}),
+    }
+    if (typeof getSessionStatus !== 'function') {
+      log.warn({
+        ...logContext,
+        reason: 'missing_get_session_status',
+      }, 'opencode status reconciliation skipped')
+      return
+    }
     try {
       const status = await getSessionStatus.call(serveManager, realId, cwdRoute(state.cwd) ?? {})
-      if (!status || typeof status !== 'object' || Array.isArray(status)) return
+      if (!status || typeof status !== 'object' || Array.isArray(status) || typeof status.type !== 'string') {
+        log.warn({
+          ...logContext,
+          reason: 'malformed_session_status',
+          status,
+        }, 'opencode status reconciliation received malformed status')
+        return
+      }
       const type = status.type
       if (type === 'busy' || type === 'retry') {
         state.status = 'running'
         return
       }
-      if (type === 'idle') {
-        state.status = 'idle'
-      }
+      if (type === 'idle') return
     } catch (err) {
       log.warn({
+        ...logContext,
         err,
-        provider: 'opencode',
-        sessionIdHash: hashForLogs(realId),
-        ...(state.cwd ? { cwdHash: hashForLogs(state.cwd) } : {}),
+        reason: 'get_session_status_failed',
       }, 'opencode status reconciliation failed')
     }
   }

@@ -5,10 +5,24 @@ const observabilityMocks = vi.hoisted(() => ({
   recordFreshAgentObservabilityEvent: vi.fn(),
 }))
 
+const loggerMocks = vi.hoisted(() => {
+  const logger = {
+    child: vi.fn(),
+    warn: vi.fn(),
+    info: vi.fn(),
+    debug: vi.fn(),
+    error: vi.fn(),
+  }
+  logger.child.mockReturnValue(logger)
+  return { logger }
+})
+
 vi.mock('../../../../server/fresh-agent/observability.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../../../server/fresh-agent/observability.js')>()
   return { ...actual, recordFreshAgentObservabilityEvent: observabilityMocks.recordFreshAgentObservabilityEvent }
 })
+
+vi.mock('../../../../server/logger.js', () => ({ logger: loggerMocks.logger }))
 
 import { createOpencodeFreshAgentAdapter } from '../../../../server/fresh-agent/adapters/opencode/adapter.js'
 
@@ -336,6 +350,120 @@ describe('OpenCode serve adapter: create + send', () => {
 
     expect(snapshot.status).toBe('running')
     expect(manager.getSessionStatus).toHaveBeenCalledWith('ses_busy', { cwd: '/repo/safe' })
+  })
+
+  it('resets an existing attached session back to idle when status reconciliation is malformed', async () => {
+    loggerMocks.logger.warn.mockClear()
+    const manager = makeFakeManager()
+    manager.getSessionStatus = vi.fn()
+      .mockResolvedValueOnce({ type: 'busy' })
+      .mockResolvedValueOnce({ nope: 'bad' })
+    const adapter = makeAdapter(manager)
+
+    await adapter.attach?.({
+      sessionId: 'ses_cached',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })
+    await expect(adapter.getSnapshot?.({
+      threadId: 'ses_cached',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })).resolves.toMatchObject({ status: 'running' })
+
+    await adapter.attach?.({
+      sessionId: 'ses_cached',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })
+
+    await expect(adapter.getSnapshot?.({
+      threadId: 'ses_cached',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })).resolves.toMatchObject({ status: 'idle' })
+    expect(loggerMocks.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'malformed_session_status' }),
+      'opencode status reconciliation received malformed status',
+    )
+  })
+
+  it('keeps recovered sessions idle and warns when getSessionStatus is missing', async () => {
+    loggerMocks.logger.warn.mockClear()
+    const manager = makeFakeManager()
+    delete (manager as Partial<FakeManager>).getSessionStatus
+    const adapter = makeAdapter(manager)
+
+    await adapter.attach?.({
+      sessionId: 'ses_no_helper',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })
+
+    await expect(adapter.getSnapshot?.({
+      threadId: 'ses_no_helper',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })).resolves.toMatchObject({ status: 'idle' })
+    expect(loggerMocks.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'missing_get_session_status' }),
+      'opencode status reconciliation skipped',
+    )
+  })
+
+  it('keeps resumed sessions idle when getSessionStatus throws and still does not fail resume', async () => {
+    loggerMocks.logger.warn.mockClear()
+    const manager = makeFakeManager()
+    manager.getSessionStatus = vi.fn(async () => { throw new Error('status failed') })
+    const adapter = makeAdapter(manager)
+
+    await expect(adapter.resume?.({
+      resumeSessionId: 'ses_resume_throw',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })).resolves.toEqual({
+      sessionId: 'ses_resume_throw',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_resume_throw' },
+    })
+
+    await expect(adapter.getSnapshot?.({
+      threadId: 'ses_resume_throw',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })).resolves.toMatchObject({ status: 'idle' })
+    expect(loggerMocks.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'get_session_status_failed' }),
+      'opencode status reconciliation failed',
+    )
+  })
+
+  it('marks resumed durable sessions running when OpenCode reports retry', async () => {
+    const manager = makeFakeManager()
+    manager.getSessionStatus = vi.fn(async () => ({ type: 'retry' }))
+    const adapter = makeAdapter(manager)
+
+    await adapter.resume?.({
+      resumeSessionId: 'ses_resume_retry',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })
+
+    await expect(adapter.getSnapshot?.({
+      threadId: 'ses_resume_retry',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })).resolves.toMatchObject({ status: 'running' })
+    expect(manager.getSessionStatus).toHaveBeenCalledWith('ses_resume_retry', { cwd: '/repo/safe' })
   })
 
   it('recovers from a failed send and still processes later sends', async () => {
