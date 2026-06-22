@@ -4,7 +4,7 @@
 
 **Goal:** Make FreshOpenCode panes recover safely after a Freshell process restart, without sending prompts to the wrong OpenCode project, and remove the duplicate snapshot and terminal retention-loss storms covered by kata `zrrj`.
 
-**Architecture:** Recovery is FreshOpenCode-specific and route-safe. A durable `ses_*` id is necessary but not sufficient: recovered attach/resume must also validate the OpenCode session directory against the pane's expected cwd before any mutation is allowed. WebSocket mutations carry enough route data to recover on demand, while client snapshot refreshes become scoped and coalesced.
+**Architecture:** Recovery is FreshOpenCode-specific and route-safe. A durable `ses_*` id is necessary but not sufficient: any recovered provider mutation must validate the OpenCode session directory against the pane's expected cwd before it sends, interrupts, compacts, or forks. WebSocket mutations carry enough route data to recover on demand, while client snapshot refreshes become scoped and coalesced.
 
 **Tech Stack:** React 18, Redux Toolkit, TypeScript, Express/WebSocket `ws`, NodeNext/ESM, Vitest, Playwright browser e2e harness, fake OpenCode serve fixture.
 
@@ -42,7 +42,7 @@
 - Modify `server/ws-handler.ts`: build route-aware locators, track pending attach per socket, wait on same-session pending attach before mutation auth, and emit scoped accepted messages.
 - Modify `server/fresh-agent/runtime-manager.ts`: add FreshOpenCode-only singleflight recovery for missing `ses_*` sessions with cwd.
 - Modify `server/fresh-agent/adapters/opencode/serve-manager.ts`: expose route-aware session status helper if still needed by implementation/tests.
-- Modify `server/fresh-agent/adapters/opencode/adapter.ts`: validate recovered real sessions against expected cwd before registering mutable state; reconcile status after validation.
+- Modify `server/fresh-agent/adapters/opencode/adapter.ts`: keep durable attaches readable, validate recovered real sessions against expected cwd at mutation time, and reconcile status as a read-only best-effort signal.
 - Modify `test/e2e-browser/fixtures/fake-opencode.cjs`: make fake serve route-aware enough to prove FreshOpenCode restart recovery.
 - Modify `server/terminal-stream/broker.ts`: coalesce retention-loss stream identity replacement only after tests prove one replacement preserves output/gap semantics.
 - Test `test/unit/server/fresh-agent/opencode-serve-adapter.test.ts`: route validation, missing/mismatched cwd fail-closed, status reconciliation.
@@ -56,7 +56,7 @@
 
 ---
 
-## Task 1: Route-Safe OpenCode Rebind
+## Task 1: Route-Safe OpenCode Mutation Guard
 
 **Files:**
 - Modify: `server/fresh-agent/adapters/opencode/adapter.ts`
@@ -66,22 +66,23 @@
 
 **Interfaces:**
 - Produces: `OpencodeServeManager.getSessionStatus(sessionId: string, route?: { cwd?: string }): Promise<{ type?: unknown } | undefined>`.
-- Produces: adapter attach/resume behavior that rejects recovered `ses_*` mutation state without a validated cwd.
+- Produces: adapter attach/resume behavior that can rebuild read-only local state for durable `ses_*` sessions without cwd.
+- Produces: adapter mutation behavior that validates a recovered `ses_*` against the expected cwd before provider mutation.
 - Consumes: existing `OpencodeServeManager.getSession(id, route)` and `FreshAgentSessionLocator.cwd`.
 
-- [ ] **Step 1: Write failing tests for recovered route validation**
+- [ ] **Step 1: Write failing tests for mutation-boundary route validation**
 
 Add tests to `test/unit/server/fresh-agent/opencode-serve-adapter.test.ts`:
 
 ```ts
-it('validates a recovered durable session directory before making it sendable', async () => {
+it('validates a recovered durable session directory before mutating it', async () => {
   const manager = makeFakeManager()
   manager.getSession.mockResolvedValueOnce({
     id: 'ses_recovered',
     directory: '/repo/safe',
     time: { updated: 10 },
   })
-  const adapter = makeAdapter(manager)
+  const adapter = makeAdapter(manager, { canonicalizePath: async (value: string) => value } as any)
 
   await expect(adapter.attach?.({
     sessionId: 'ses_recovered',
@@ -102,78 +103,122 @@ it('validates a recovered durable session directory before making it sendable', 
   )
 })
 
-it('rejects recovered durable sessions without cwd before registering mutable state', async () => {
+it('keeps no-cwd recovered durable sessions readable but not sendable', async () => {
   const manager = makeFakeManager()
+  manager.getSession.mockResolvedValueOnce({
+    id: 'ses_no_cwd',
+    time: { updated: 10 },
+  })
+  manager.listMessages.mockResolvedValueOnce({ messages: [], nextCursor: null })
   const adapter = makeAdapter(manager)
 
   await expect(adapter.attach?.({
     sessionId: 'ses_no_cwd',
     sessionType: 'freshopencode',
     provider: 'opencode',
-  })).rejects.toThrow(/cwd/i)
+  })).resolves.toEqual({
+    sessionId: 'ses_no_cwd',
+    sessionRef: { provider: 'opencode', sessionId: 'ses_no_cwd' },
+  })
+  await expect(adapter.getSnapshot?.({
+    threadId: 'ses_no_cwd',
+    sessionType: 'freshopencode',
+    provider: 'opencode',
+  })).resolves.toEqual(expect.objectContaining({ threadId: 'ses_no_cwd' }))
 
-  await expect(adapter.send?.('ses_no_cwd', { text: 'must not send' })).rejects.toThrow(/not available|not tracked/i)
-  expect(manager.getSession).not.toHaveBeenCalled()
+  await expect(adapter.send?.('ses_no_cwd', { text: 'must not send' })).rejects.toThrow(/cwd/i)
   expect(manager.promptAsync).not.toHaveBeenCalled()
 })
 
-it('rejects recovered durable sessions when OpenCode reports a different directory', async () => {
+it('rejects recovered durable session mutation when OpenCode reports a different directory', async () => {
   const manager = makeFakeManager()
   manager.getSession.mockResolvedValueOnce({
     id: 'ses_wrong',
     directory: '/repo/other',
     time: { updated: 10 },
   })
-  const adapter = makeAdapter(manager)
+  const adapter = makeAdapter(manager, { canonicalizePath: async (value: string) => value } as any)
 
   await expect(adapter.attach?.({
     sessionId: 'ses_wrong',
     sessionType: 'freshopencode',
     provider: 'opencode',
     cwd: '/repo/safe',
-  })).rejects.toThrow(/directory/i)
+  })).resolves.toEqual({
+    sessionId: 'ses_wrong',
+    sessionRef: { provider: 'opencode', sessionId: 'ses_wrong' },
+  })
 
-  await expect(adapter.send?.('ses_wrong', { text: 'must not send' })).rejects.toThrow(/not available|not tracked/i)
+  await expect(adapter.send?.('ses_wrong', { text: 'must not send' })).rejects.toThrow(/belongs to|directory/i)
   expect(manager.promptAsync).not.toHaveBeenCalled()
 })
 ```
 
 Run: `npm run test:vitest -- --run test/unit/server/fresh-agent/opencode-serve-adapter.test.ts`
-Expected: FAIL because attach currently does not validate cwd and no-cwd attach is sendable.
+Expected: FAIL because recovered mutation currently sends without validating the reported directory, and no-cwd recovered sessions remain sendable.
 
 - [ ] **Step 2: Implement recovered route validation**
 
-In `server/fresh-agent/adapters/opencode/adapter.ts`, import `realpath` from `node:fs/promises` and add a helper near `cwdRoute`:
+In `server/fresh-agent/adapters/opencode/adapter.ts`, import `realpath` from `node:fs/promises`, extend `CreateOpencodeFreshAgentAdapterOptions`, and add state for validation:
 
 ```ts
-async function canonicalPath(value: string): Promise<string> {
-  return await realpath(value)
+type CreateOpencodeFreshAgentAdapterOptions = {
+  serveManager: OpencodeServeManager
+  turnTimeoutMs?: number
+  validateCwd?: (cwd: string) => Promise<void>
+  canonicalizePath?: (cwd: string) => Promise<string>
 }
 
-async function validateRecoveredSessionRoute(sessionId: string, cwd: string | undefined): Promise<string> {
-  if (!cwd || cwd.trim().length === 0) {
-    throw new FreshAgentLostSessionError(`OpenCode session ${sessionId} requires a cwd before it can be recovered for mutation.`)
-  }
-  await validateCwd(cwd)
-  const session = await serveManager.getSession(sessionId, { cwd })
-  const reportedDirectory = typeof session?.directory === 'string' ? session.directory : undefined
-  if (!reportedDirectory) {
-    throw new FreshAgentLostSessionError(`OpenCode session ${sessionId} did not report a directory.`)
-  }
-  const [expected, actual] = await Promise.all([canonicalPath(cwd), canonicalPath(reportedDirectory)])
-  if (expected !== actual) {
-    throw new FreshAgentLostSessionError(`OpenCode session ${sessionId} belongs to ${reportedDirectory}, not ${cwd}.`)
-  }
-  return actual
+const canonicalizePath = options.canonicalizePath ?? realpath
+
+type OpencodeSessionState = {
+  placeholderId: string
+  realSessionId?: string
+  cwd?: string
+  routeValidatedCwd?: string
+  ...
 }
 ```
 
-Call this helper in real-session `resume()` and `attach()` before `remember(state)` and `bindServeStream(state)`. For an existing state, validate before replacing `existing.cwd` with a new cwd; if the new cwd mismatches, keep the old state unchanged and throw.
+Add a helper near `cwdRoute`:
+
+```ts
+async function ensureMutableRoute(state: OpencodeSessionState): Promise<void> {
+  const realId = state.realSessionId
+  if (!realId) return
+  const cwd = state.cwd
+  if (!cwd || cwd.trim().length === 0) {
+    throw new FreshAgentLostSessionError(`OpenCode session ${realId} requires a cwd before it can be mutated after recovery.`)
+  }
+  const expected = await canonicalizePath(cwd)
+  if (state.routeValidatedCwd === expected) return
+  await validateCwd(cwd)
+  const session = await serveManager.getSession(realId, { cwd })
+  if (typeof session?.id === 'string' && session.id !== realId) {
+    throw new FreshAgentLostSessionError(`OpenCode session lookup for ${realId} returned ${session.id}.`)
+  }
+  const reportedDirectory = typeof session?.directory === 'string' ? session.directory : undefined
+  if (!reportedDirectory) {
+    throw new FreshAgentLostSessionError(`OpenCode session ${realId} did not report a directory.`)
+  }
+  const actual = await canonicalizePath(reportedDirectory)
+  if (expected !== actual) {
+    throw new FreshAgentLostSessionError(`OpenCode session ${realId} belongs to ${reportedDirectory}, not ${cwd}.`)
+  }
+  state.routeValidatedCwd = expected
+}
+```
+
+Call `ensureMutableRoute(state)` inside `materializeOrSend` after a real id exists and before `promptAsyncForState`. Also call it in `abortForState`, `compactForState`, and `forkForState` before provider mutation. Do not call it in shared `attach()`, `resume()`, `getSnapshot()`, `getTurnPage()`, or `getTurnBody()`; read-only history viewing must still work for legacy sessions without cwd.
+
+When `createSession()` materializes a new session and returns a directory, set `state.routeValidatedCwd = await canonicalizePath(state.cwd)` after `state.cwd` is assigned, because this is the provider-created route.
+
+Update existing adapter tests that attach a real session and then mutate it to have `manager.getSession` return a matching `directory`, or pass `canonicalizePath: async (value) => value` where fake paths are used. Keep existing read-only history tests no-cwd-compatible; change only the old no-cwd-sendable assertion to expect mutation rejection.
 
 Run: `npm run test:vitest -- --run test/unit/server/fresh-agent/opencode-serve-adapter.test.ts`
 Expected: PASS for the new route validation tests.
 
-- [ ] **Step 3: Add attach-time status reconciliation after validation**
+- [ ] **Step 3: Add attach-time status reconciliation without requiring mutation validation**
 
 Add a public helper to `server/fresh-agent/adapters/opencode/serve-manager.ts`:
 
@@ -189,7 +234,6 @@ Add adapter tests:
 ```ts
 it('marks recovered durable sessions running only when OpenCode status is busy or retry', async () => {
   const manager = makeFakeManager()
-  manager.getSession.mockResolvedValueOnce({ id: 'ses_busy', directory: '/repo/safe', time: { updated: 10 } })
   manager.getSessionStatus = vi.fn(async () => ({ type: 'busy' }))
   const adapter = makeAdapter(manager)
 
@@ -212,6 +256,7 @@ it('marks recovered durable sessions running only when OpenCode status is busy o
 ```
 
 Implement a `reconcileStatus(state)` helper that maps `busy` and `retry` to `running`, maps `idle` to `idle`, and leaves failures/unknowns as non-running. Log a structured warning on failure; do not throw after route validation succeeds.
+Call it after real-session `attach()` and `resume()` remember local state. This is a read-only best-effort status query; it must not make a no-cwd read-only attach fail.
 
 Run: `npm run test:vitest -- --run test/unit/server/fresh-agent/opencode-serve-adapter.test.ts test/unit/server/fresh-agent/opencode-serve-manager.test.ts`
 Expected: PASS.
@@ -521,6 +566,8 @@ In `shared/ws-protocol.ts`:
 In `server/ws-handler.ts`, add a helper:
 
 ```ts
+import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '../shared/fresh-agent.js'
+
 private freshAgentLocatorFromMessage(m: {
   sessionId: string
   sessionType: FreshAgentSessionType
@@ -547,10 +594,16 @@ Expected: tests compile, accepted locator assertions still fail until Step 3.
 
 - [ ] **Step 3: Implement pending attach authorization**
 
-Add to client state:
+Add to the `ClientState` type and to client-state initialization:
 
 ```ts
 pendingFreshAgentAttachByKey: Map<string, Promise<void>>
+```
+
+Initialize it beside the existing Fresh Agent authorization/subscription maps:
+
+```ts
+pendingFreshAgentAttachByKey: new Map(),
 ```
 
 In `freshAgent.attach`:
@@ -864,18 +917,16 @@ Expected: FAIL because current code can emit multiple stream changes inside one 
 In `server/terminal-stream/broker.ts`, change `appendOutputFrames` so fragments are appended first, and retention loss is consumed once after the loop:
 
 ```ts
-let retainedSuffixStreamId = streamId
 for (const fragment of fragments) {
-  retainedSuffixStreamId = streamId
   frames.push(state.replayRing.append(fragment, { streamId }))
 }
-const retainedStreamId = this.handleReplayRetentionLoss(terminalId, state, retainedSuffixStreamId)
+const retainedStreamId = this.handleReplayRetentionLoss(terminalId, state, streamId)
 if (retainedStreamId) {
   this.retagFrames(frames, streamId, retainedStreamId)
 }
 ```
 
-If the replay test shows this loses a retained suffix boundary, adjust to track the first retained suffix stream id after loss, but keep the externally visible stream-change count at one per raw append.
+If the replay test shows this loses a retained suffix boundary, adjust the broker to track the retained suffix boundary explicitly, but keep the externally visible stream-change count at one per raw append.
 
 Run: `npm run test:vitest -- --run test/unit/server/ws-handler-backpressure.test.ts`
 Expected: PASS.
