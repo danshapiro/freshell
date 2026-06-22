@@ -58,6 +58,29 @@ describe('FreshAgentTranscript', () => {
     expect(onLoadOlder).toHaveBeenCalledTimes(1)
   })
 
+  it('renders initial history loading before restored turns arrive', () => {
+    render(<FreshAgentTranscript turns={[]} isInitialLoading />)
+
+    expect(screen.getByRole('status')).toHaveTextContent('Restoring history')
+  })
+
+  it('can label expired older-history recovery as refresh', () => {
+    const onLoadOlder = vi.fn()
+
+    render(
+      <FreshAgentTranscript
+        turns={[]}
+        hasOlderHistory
+        historyError="Older history cursor expired"
+        historyErrorActionLabel="Refresh"
+        onLoadOlder={onLoadOlder}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    expect(onLoadOlder).toHaveBeenCalledTimes(1)
+  })
+
   it('uses the pane agent label for assistant turns when provided', () => {
     render(
       <FreshAgentTranscript

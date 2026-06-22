@@ -19,6 +19,14 @@ const BACKGROUND_HISTORY_MAX_PAGES_PER_BATCH = 8
 
 const inFlightControllers = new Set<AbortController>()
 
+function errorMessage(error: unknown): string | undefined {
+  if (error instanceof Error) return error.message
+  if (error && typeof error === 'object' && typeof (error as { message?: unknown }).message === 'string') {
+    return (error as { message: string }).message
+  }
+  return undefined
+}
+
 export function _resetFreshAgentThunkControllers(): void {
   for (const controller of inFlightControllers) {
     controller.abort()
@@ -70,7 +78,7 @@ export const loadFreshAgentThreadTurns = createAsyncThunk(
       if (!input.suppressFailureDispatch) {
         dispatch(historyLoadFailed({
           ...input,
-          message: error instanceof Error ? error.message : 'Failed to load fresh-agent history',
+          message: errorMessage(error) ?? 'Failed to load fresh-agent history',
         }))
       }
       throw error
@@ -107,9 +115,10 @@ export const backfillFreshAgentOlderHistory = createAsyncThunk(
         cursor = result.nextCursor
         revision = result.revision
       } catch (error) {
-        const message = error instanceof Error && /(cursor|stale|revision)/i.test(error.message)
+        const rawMessage = errorMessage(error)
+        const message = rawMessage && /(cursor|stale|revision)/i.test(rawMessage)
           ? 'Older history cursor expired; refresh history to continue.'
-          : (error instanceof Error ? error.message : 'Failed to load older fresh-agent history')
+          : (rawMessage ?? 'Failed to load older fresh-agent history')
         dispatch(historyLoadFailed({ ...input, cursor: cursor ?? input.cursor, message }))
         throw error
       }

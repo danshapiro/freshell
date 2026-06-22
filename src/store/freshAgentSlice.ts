@@ -605,6 +605,7 @@ const freshAgentSlice = createSlice({
       } else {
         session.historyInitialLoading = true
         session.historyError = undefined
+        session.historyOlderError = undefined
         session.historyInitialRequestKey = action.payload.requestKey
       }
     },

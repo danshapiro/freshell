@@ -26,4 +26,42 @@ describe('LayoutStore fresh-agent content', () => {
       sessionRef: { provider: 'opencode', sessionId: 'ses_opencode_1' },
     })
   })
+
+  it('normalizes legacy freshopencode placeholders when a UI layout snapshot is stored', () => {
+    const store = new LayoutStore()
+    store.updateFromUi({
+      tabs: [{ id: 'tab-1', title: 'OpenCode' }],
+      activeTabId: 'tab-1',
+      activePane: { 'tab-1': 'pane-1' },
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-1',
+          content: {
+            kind: 'fresh-agent',
+            sessionType: 'freshopencode',
+            provider: 'opencode',
+            sessionId: 'freshopencode-req-legacy',
+            resumeSessionId: 'freshopencode-req-legacy',
+            sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-legacy' },
+            status: 'connected',
+          },
+        },
+      },
+    }, 'conn-1')
+
+    const snap = store.getPaneSnapshot('pane-1')
+    expect(snap?.paneContent).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      status: 'idle',
+      restoreError: {
+        code: 'RESTORE_UNAVAILABLE',
+        reason: 'invalid_legacy_restore_target',
+      },
+    })
+    expect(snap?.paneContent?.sessionRef).toBeUndefined()
+    expect(snap?.paneContent?.resumeSessionId).toBeUndefined()
+  })
 })

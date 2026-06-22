@@ -518,9 +518,11 @@ export function FreshAgentTranscript({
   isStreaming = false,
   onForkFromTurn,
   onRewindToTurn,
+  isInitialLoading = false,
   hasOlderHistory = false,
   isLoadingOlder = false,
   historyError,
+  historyErrorActionLabel = 'Retry',
   onLoadOlder,
 }: {
   turns: FreshAgentTurn[]
@@ -533,9 +535,11 @@ export function FreshAgentTranscript({
   isStreaming?: boolean
   onForkFromTurn?: (turnId: string) => void
   onRewindToTurn?: (turn: FreshAgentTurn) => void
+  isInitialLoading?: boolean
   hasOlderHistory?: boolean
   isLoadingOlder?: boolean
   historyError?: string
+  historyErrorActionLabel?: string
   onLoadOlder?: () => void | Promise<void>
 }) {
   const scrollerRef = useRef<HTMLDivElement | null>(null)
@@ -658,7 +662,7 @@ export function FreshAgentTranscript({
                     className="shrink-0 rounded border border-border/70 px-2 py-0.5 text-foreground"
                     onClick={loadOlder}
                   >
-                    Retry
+                    {historyErrorActionLabel}
                   </button>
                 ) : null}
               </div>
@@ -673,6 +677,16 @@ export function FreshAgentTranscript({
                 {isLoadingOlder ? 'Loading older' : 'Load older'}
               </button>
             )}
+          </div>
+        ) : null}
+        {isInitialLoading && displayTurns.length === 0 ? (
+          <div
+            className="flex min-h-24 items-center justify-center gap-2 text-xs text-muted-foreground"
+            role="status"
+            aria-live="polite"
+          >
+            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+            <span>Restoring history</span>
           </div>
         ) : null}
         {displayTurns.map((turn, index) => (

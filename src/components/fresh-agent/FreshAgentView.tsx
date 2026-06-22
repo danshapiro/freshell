@@ -59,6 +59,10 @@ const BUSY_STATES = new Set(['running', 'compacting'])
 const INITIAL_HISTORY_TURN_LIMIT = 30
 const log = createLogger('FreshAgentView')
 
+function shouldRefreshHistoryForOlderError(message: string | undefined): boolean {
+  return typeof message === 'string' && /(cursor|stale|revision|expired)/i.test(message)
+}
+
 function getSnapshotIdentity(snapshot: FreshAgentSnapshot): string | null {
   if (!snapshot.sessionType || !snapshot.provider || !snapshot.threadId) return null
   return `${snapshot.sessionType}:${snapshot.provider}:${snapshot.threadId}`
@@ -1617,7 +1621,12 @@ export function FreshAgentView({
   }, [snapshot?.turns])
 
   const loadOlderHistory = useCallback(() => {
-    if (!snapshotThreadId || !agentHistorySession?.nextHistoryCursor || typeof agentHistorySession.historyRevision !== 'number') return
+    if (!snapshotThreadId) return
+    if (shouldRefreshHistoryForOlderError(agentHistorySession?.historyOlderError)) {
+      setSnapshotRefreshNonce((value) => value + 1)
+      return
+    }
+    if (!agentHistorySession?.nextHistoryCursor || typeof agentHistorySession.historyRevision !== 'number') return
     const requestKey = agentHistorySession.historyInitialRequestKey
       ?? `${paneContentRef.current.createRequestId}:${paneContentRef.current.sessionType}:${paneContentRef.current.provider}:${snapshotThreadId}`
     void dispatch(backfillFreshAgentOlderHistory({
@@ -1631,6 +1640,7 @@ export function FreshAgentView({
       limit: INITIAL_HISTORY_TURN_LIMIT,
     }))
   }, [
+    agentHistorySession?.historyOlderError,
     agentHistorySession?.historyInitialRequestKey,
     agentHistorySession?.historyRevision,
     agentHistorySession?.nextHistoryCursor,
@@ -1865,9 +1875,11 @@ export function FreshAgentView({
               isStreaming={isBusy}
               onForkFromTurn={(turnId) => sendFork(turnId)}
               onRewindToTurn={paneContent.initialCwd ? rewindToTurn : undefined}
+              isInitialLoading={agentHistorySession?.historyInitialLoading === true && !localEcho}
               hasOlderHistory={Boolean(agentHistorySession?.nextHistoryCursor)}
               isLoadingOlder={agentHistorySession?.historyOlderLoading === true}
               historyError={agentHistorySession?.historyOlderError}
+              historyErrorActionLabel={shouldRefreshHistoryForOlderError(agentHistorySession?.historyOlderError) ? 'Refresh' : 'Retry'}
               onLoadOlder={loadOlderHistory}
             />
             <FreshAgentComposer
@@ -1928,6 +1940,7 @@ export function FreshAgentView({
     agentHistorySession?.historyError,
     agentHistorySession?.historyOlderError,
     agentHistorySession?.historyOlderLoading,
+    agentHistorySession?.historyInitialLoading,
     agentHistorySession?.nextHistoryCursor,
     descriptor?.icon,
     descriptor?.label,

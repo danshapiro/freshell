@@ -3778,6 +3778,86 @@ describe('FreshAgentView', () => {
     expect(state.tabs.tabs.find((tab) => tab.id === 'tab-1')?.title).toBe('Existing Codex tab title')
   })
 
+  it('refreshes newest restored history instead of retrying an expired older cursor', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'codex-stale-cursor',
+      status: 'idle',
+      summary: 'metadata only',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [],
+    })
+    apiMock.getFreshAgentTurnPage
+      .mockResolvedValueOnce({
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        threadId: 'codex-stale-cursor',
+        revision: 1,
+        nextCursor: 'stale-cursor',
+        turns: [{
+          id: 'turn-newest',
+          turnId: 'turn-newest',
+          role: 'assistant',
+          summary: 'Newest restored turn',
+          items: [{ id: 'item-newest', kind: 'text', text: 'Newest restored turn' }],
+        }],
+        bodies: {},
+      })
+      .mockRejectedValueOnce(new Error('STALE_THREAD_REVISION latest revision 2'))
+      .mockResolvedValueOnce({
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        threadId: 'codex-stale-cursor',
+        revision: 2,
+        nextCursor: null,
+        turns: [{
+          id: 'turn-refreshed',
+          turnId: 'turn-refreshed',
+          role: 'assistant',
+          summary: 'Refreshed newest turn',
+          items: [{ id: 'item-refreshed', kind: 'text', text: 'Refreshed newest turn' }],
+        }],
+        bodies: {},
+      })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-stale-cursor',
+        sessionId: 'codex-stale-cursor',
+        sessionRef: { provider: 'codex', sessionId: 'codex-stale-cursor' },
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Refresh' }))
+
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentTurnPage).toHaveBeenCalledTimes(3)
+    })
+    expect(apiMock.getFreshAgentTurnPage.mock.calls[1][3]).toMatchObject({
+      cursor: 'stale-cursor',
+      revision: 1,
+      priority: 'background',
+    })
+    expect(apiMock.getFreshAgentTurnPage.mock.calls[2][3]).toMatchObject({
+      cursor: undefined,
+      priority: 'visible',
+      includeBodies: true,
+    })
+  })
+
   it('recreates a lost freshclaude session through fresh-agent transport events with the durable resume id', async () => {
     const store = createStore()
     const durableSessionId = '00000000-0000-4000-8000-000000000441'

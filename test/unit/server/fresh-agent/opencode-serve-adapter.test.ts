@@ -417,6 +417,39 @@ describe('OpenCode serve adapter: history reads', () => {
     expect(manager.listMessages).toHaveBeenCalledWith('ses_real_1', { limit: 1, before: 'CUR' }, { cwd: '/repo/history' })
   })
 
+  it('getTurnPage rejects stale revisions clearly', async () => {
+    const manager = makeFakeManager()
+    manager.getSession = vi.fn(async () => ({ id: 'ses_real_1', title: 'Kimi chat', time: { updated: 12 } }))
+    manager.listMessages = vi.fn(async () => ({ messages: messages.slice(0, 1), nextCursor: null }))
+    const adapter = makeAdapter(manager)
+    await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1', cwd: '/repo/history' })
+
+    await expect(adapter.getTurnPage?.(
+      { sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' },
+      { limit: 1, revision: 11 },
+    )).rejects.toMatchObject({
+      code: 'STALE_THREAD_REVISION',
+      currentRevision: 12,
+    })
+  })
+
+  it('getTurnPage returns full bodies keyed by turn id when requested', async () => {
+    const manager = makeFakeManager()
+    manager.getSession = vi.fn(async () => ({ id: 'ses_real_1', title: 'Kimi chat', time: { updated: 12 } }))
+    manager.listMessages = vi.fn(async () => ({ messages, nextCursor: null }))
+    const adapter = makeAdapter(manager)
+    await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1', cwd: '/repo/history' })
+
+    const page: any = await adapter.getTurnPage?.(
+      { sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' },
+      { includeBodies: true, revision: 12 },
+    )
+
+    expect(Object.keys(page.bodies)).toEqual(['msg_user_1', 'msg_assistant_1'])
+    expect(page.bodies.msg_user_1).toMatchObject({ turnId: 'msg_user_1', role: 'user' })
+    expect(page.bodies.msg_assistant_1).toMatchObject({ turnId: 'msg_assistant_1', role: 'assistant' })
+  })
+
   it('getTurnBody fetches a single message and normalizes it', async () => {
     const manager = makeFakeManager()
     manager.getMessage = vi.fn(async () => messages[1])
