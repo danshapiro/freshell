@@ -24,6 +24,7 @@ type TerminalInvalidationDeps = {
   setTimeout?: typeof setTimeout
   clearTimeout?: typeof clearTimeout
   refreshDelayMs?: number
+  handleRecoverableTerminalIds?: (terminalIds: string[]) => void
   /**
    * Invoked when a fire-and-forget background refresh rejects. The refresh
    * thunks re-throw on failure (callers that await them rely on this), but the
@@ -75,7 +76,12 @@ export function createTerminalInvalidationHandler(deps: TerminalInvalidationDeps
   }
 
   return {
-    handle(msg: { type?: unknown; upsert?: unknown; remove?: unknown }): boolean {
+    handle(msg: {
+      type?: unknown
+      upsert?: unknown
+      remove?: unknown
+      recoverableTerminalIds?: unknown
+    }): boolean {
       if (msg.type === 'terminal.meta.updated') {
         const upsert = Array.isArray(msg.upsert)
           ? msg.upsert.filter(isTerminalMetaRecord)
@@ -100,6 +106,14 @@ export function createTerminalInvalidationHandler(deps: TerminalInvalidationDeps
       }
 
       if (msg.type === 'terminals.changed') {
+        const recoverableTerminalIds = Array.isArray(msg.recoverableTerminalIds)
+          ? msg.recoverableTerminalIds.filter((terminalId): terminalId is string => (
+              typeof terminalId === 'string' && terminalId.length > 0
+            ))
+          : []
+        if (recoverableTerminalIds.length > 0) {
+          deps.handleRecoverableTerminalIds?.(recoverableTerminalIds)
+        }
         scheduleRefresh()
         return true
       }

@@ -60,7 +60,7 @@ import { X, Copy, Check, PanelLeft, AlertTriangle } from 'lucide-react'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
-import { clearDeadTerminals } from '@/store/panesSlice'
+import { clearDeadTerminals, clearTerminalLiveHandles } from '@/store/panesSlice'
 import { addTerminalFreshRecoveryRequestId, addTerminalRestoreRequestId } from '@/lib/terminal-restore'
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
@@ -789,6 +789,65 @@ export default function App() {
         }
       }
 
+      const collectTerminalPaneTargets = (terminalIds: string[]) => {
+        const terminalIdSet = new Set(terminalIds)
+        const layouts = appStore.getState().panes.layouts
+        const targets: Array<{ tabId: string; paneId: string }> = []
+        for (const [tabId, layout] of Object.entries(layouts)) {
+          ;(function walk(node: any) {
+            if (!node) return
+            if (node.type === 'leaf') {
+              if (
+                node.content?.kind === 'terminal' &&
+                node.content.terminalId &&
+                terminalIdSet.has(node.content.terminalId)
+              ) {
+                targets.push({ tabId, paneId: node.id })
+              }
+              return
+            }
+            if (node.type === 'split' && Array.isArray(node.children)) {
+              for (const child of node.children) walk(child)
+            }
+          })(layout)
+        }
+        return targets
+      }
+
+      const findPaneById = (layout: any, paneId: string): any | undefined => {
+        if (!layout) return undefined
+        if (layout.type === 'leaf') return layout.id === paneId ? layout : undefined
+        if (layout.type === 'split' && Array.isArray(layout.children)) {
+          for (const child of layout.children) {
+            const found = findPaneById(child, paneId)
+            if (found) return found
+          }
+        }
+        return undefined
+      }
+
+      const registerPendingTerminalRecoveriesForTargets = (targets: Array<{ tabId: string; paneId: string }>) => {
+        const state = appStore.getState()
+        const fallbackAttempts = state.panes.restoreFallbackAttemptsByPane || {}
+        for (const target of targets) {
+          const pane = findPaneById(state.panes.layouts[target.tabId], target.paneId)
+          const content = pane?.content
+          if (content?.kind !== 'terminal' || content.status !== 'creating' || !content.createRequestId) continue
+          const fallbackAttempt = fallbackAttempts[target.tabId]?.[target.paneId]
+          if (
+            fallbackAttempt?.requestId === content.createRequestId &&
+            !content.sessionRef
+          ) {
+            addTerminalFreshRecoveryRequestId(
+              content.createRequestId,
+              'fresh_after_restore_unavailable',
+            )
+          } else if (content.sessionRef) {
+            addTerminalRestoreRequestId(content.createRequestId)
+          }
+        }
+      }
+
       const terminalInvalidationHandler = createTerminalInvalidationHandler({
         dispatch: (action) => appStore.dispatch(action as any),
         upsertTerminalMeta,
@@ -796,6 +855,20 @@ export default function App() {
         patchSessionRunningStateFromTerminalMeta,
         queueActiveSessionWindowRefresh: () => queueActiveSessionWindowRefresh() as any,
         fetchTerminalDirectoryWindow: (payload) => fetchTerminalDirectoryWindow(payload) as any,
+        handleRecoverableTerminalIds: (terminalIds) => {
+          const targets = collectTerminalPaneTargets(terminalIds)
+          if (targets.length === 0) return
+          const removedSet = new Set(terminalIds)
+          const currentLiveIds = appStore.getState().connection.liveTerminalIds
+          if (currentLiveIds) {
+            dispatch(setLiveTerminalIds(currentLiveIds.filter((terminalId) => !removedSet.has(terminalId))))
+          }
+          dispatch(clearTerminalLiveHandles({ terminalIds }))
+          for (const terminalId of terminalIds) {
+            dispatch(removeTerminalMeta(terminalId))
+          }
+          registerPendingTerminalRecoveriesForTargets(targets)
+        },
         onRefreshError: (error, source) => log.debug(
           source === 'session-window'
             ? 'active session window background refresh failed'

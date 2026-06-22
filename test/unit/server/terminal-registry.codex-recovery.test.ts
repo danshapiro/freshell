@@ -236,7 +236,11 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
     expect(replacementSidecar.adopt).not.toHaveBeenCalled()
     await vi.waitFor(() => expect(record.status).toBe('exited'), { timeout: 3000 })
     expect(registry.get(record.terminalId)?.exitCode).toBe(0)
-    expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 0 })
+    expect(exited).toHaveBeenCalledWith({
+      terminalId: record.terminalId,
+      exitCode: 0,
+      recoverableForRestore: true,
+    })
   })
 
   it('recovers a durable Codex terminal when the visible PTY exits cleanly during an active turn', async () => {
@@ -316,7 +320,11 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
     expect(planCreate).toHaveBeenCalled()
     await vi.waitFor(() => expect(record.status).toBe('exited'), { timeout: 3000 })
     expect(registry.get(record.terminalId)?.exitCode).toBe(0)
-    expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 0 })
+    expect(exited).toHaveBeenCalledWith({
+      terminalId: record.terminalId,
+      exitCode: 0,
+      recoverableForRestore: true,
+    })
   })
 
   it('keeps recovering clean PTY exits after handoff while the active turn remains in progress', async () => {
@@ -434,7 +442,11 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
     expect(replacementSidecar.adopt).not.toHaveBeenCalled()
     await vi.waitFor(() => expect(record.status).toBe('exited'), { timeout: 3000 })
     expect(registry.get(record.terminalId)?.exitCode).toBe(0)
-    expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 0 })
+    expect(exited).toHaveBeenCalledWith({
+      terminalId: record.terminalId,
+      exitCode: 0,
+      recoverableForRestore: true,
+    })
   })
 
   it('does not let an unidentified turn-completed event clear a different active turn before clean exit', async () => {
@@ -554,7 +566,11 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
     expect(currentSidecar.readThreadTurn).not.toHaveBeenCalled()
     expect(planCreate).not.toHaveBeenCalled()
     expect(replacementSidecar.adopt).not.toHaveBeenCalled()
-    expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 0 })
+    expect(exited).toHaveBeenCalledWith({
+      terminalId: record.terminalId,
+      exitCode: 0,
+      recoverableForRestore: true,
+    })
   })
 
   it('recovers a clean PTY exit when a restored thread has an in-progress turn snapshot', async () => {
@@ -743,7 +759,11 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
     })
     expect(replacementSidecar.adopt).not.toHaveBeenCalled()
     expect(planCreate).not.toHaveBeenCalled()
-    expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 0 })
+    expect(exited).toHaveBeenCalledWith({
+      terminalId: record.terminalId,
+      exitCode: 0,
+      recoverableForRestore: true,
+    })
   })
 
   it('recovers when a resumed clean exit sees a turn appear after recent user input', async () => {
@@ -952,7 +972,11 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
     })
     expect(replacementSidecar.adopt).not.toHaveBeenCalled()
     expect(planCreate).not.toHaveBeenCalled()
-    expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 0 })
+    expect(exited).toHaveBeenCalledWith({
+      terminalId: record.terminalId,
+      exitCode: 0,
+      recoverableForRestore: true,
+    })
   })
 
   it('blocks input while a clean-exit active-turn decision is in flight', async () => {
@@ -1063,7 +1087,11 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
     expect(planCreate).not.toHaveBeenCalled()
     expect(replacementSidecar.adopt).not.toHaveBeenCalled()
     await vi.waitFor(() => expect(record.status).toBe('exited'), { timeout: 3000 })
-    expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 0 })
+    expect(exited).toHaveBeenCalledWith({
+      terminalId: record.terminalId,
+      exitCode: 0,
+      recoverableForRestore: true,
+    })
   })
 
   it('matches active turns by the promoted durable thread when a stale candidate remains', async () => {
@@ -1438,7 +1466,11 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
     expect(planCreate).toHaveBeenCalled()
     await vi.waitFor(() => expect(record.status).toBe('exited'), { timeout: 3000 })
     expect(registry.get(record.terminalId)?.exitCode).toBe(0)
-    expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 0 })
+    expect(exited).toHaveBeenCalledWith({
+      terminalId: record.terminalId,
+      exitCode: 0,
+      recoverableForRestore: true,
+    })
   })
 
   it('keeps a recovered Codex clean exit final when it happens before recovery bookkeeping settles', async () => {
@@ -1476,7 +1508,11 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
     expect(planCreate).toHaveBeenCalled()
     await vi.waitFor(() => expect(record.status).toBe('exited'), { timeout: 3000 })
     expect(registry.get(record.terminalId)?.exitCode).toBe(0)
-    expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 0 })
+    expect(exited).toHaveBeenCalledWith({
+      terminalId: record.terminalId,
+      exitCode: 0,
+      recoverableForRestore: true,
+    })
   })
 
   it('keeps lifecycle-loss recovery running when the current PTY exits cleanly', async () => {
@@ -1621,7 +1657,11 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
     })
     expect(planCreate).not.toHaveBeenCalled()
     await vi.waitFor(() => expect(record.status).toBe('exited'), { timeout: 3000 })
-    expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 0 })
+    expect(exited).toHaveBeenCalledWith({
+      terminalId: record.terminalId,
+      exitCode: 0,
+      recoverableForRestore: true,
+    })
     expect(planCreate).not.toHaveBeenCalled()
   })
 
@@ -1940,6 +1980,10 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
 
     expect(planCreate).not.toHaveBeenCalled()
     expect(record.status).toBe('exited')
-    expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 9 })
+    expect(exited).toHaveBeenCalledWith({
+      terminalId: record.terminalId,
+      exitCode: 9,
+      recoverableForRestore: true,
+    })
   })
 })

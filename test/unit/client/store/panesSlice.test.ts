@@ -22,6 +22,7 @@ import panesReducer, {
   clearPaneRenameRequest,
   toggleZoom,
   clearDeadTerminals,
+  clearTerminalLiveHandles,
   restartFreshAgentCreate,
   repairCodexIdentityMismatch,
   PanesState,
@@ -2790,6 +2791,55 @@ describe('panesSlice', () => {
   })
 
   describe('clearDeadTerminals', () => {
+    it('clears only explicitly removed terminal handles and preserves durable restore state', () => {
+      const state = stateWithLayout({
+        'tab-1': {
+          type: 'leaf',
+          id: 'p1',
+          content: {
+            kind: 'terminal',
+            mode: 'codex',
+            createRequestId: 'req-dead',
+            status: 'running',
+            terminalId: 'term-dead',
+            serverInstanceId: 'srv-old',
+            streamId: 'stream-old',
+            sessionRef: { provider: 'codex', sessionId: 'codex-thread-1' },
+          },
+        } as any,
+        'tab-2': {
+          type: 'leaf',
+          id: 'p2',
+          content: {
+            kind: 'terminal',
+            mode: 'shell',
+            createRequestId: 'req-alive',
+            status: 'running',
+            terminalId: 'term-alive',
+          },
+        } as any,
+      })
+
+      const next = panesReducer(state, clearTerminalLiveHandles({ terminalIds: ['term-dead'] }))
+      const dead = next.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      const alive = next.layouts['tab-2'] as Extract<PaneNode, { type: 'leaf' }>
+
+      expect((dead.content as TerminalPaneContent).terminalId).toBeUndefined()
+      expect((dead.content as TerminalPaneContent).status).toBe('creating')
+      expect((dead.content as TerminalPaneContent).createRequestId).not.toBe('req-dead')
+      expect((dead.content as TerminalPaneContent).serverInstanceId).toBeUndefined()
+      expect((dead.content as TerminalPaneContent).streamId).toBeUndefined()
+      expect((dead.content as TerminalPaneContent).sessionRef).toEqual({
+        provider: 'codex',
+        sessionId: 'codex-thread-1',
+      })
+      expect(next.restoreFallbackAttemptsByPane?.['tab-1']?.['p1']).toBeUndefined()
+
+      expect((alive.content as TerminalPaneContent).terminalId).toBe('term-alive')
+      expect((alive.content as TerminalPaneContent).status).toBe('running')
+      expect((alive.content as TerminalPaneContent).createRequestId).toBe('req-alive')
+    })
+
     it('clears terminal IDs not in the live list', () => {
       const state: PanesState = {
         layouts: {

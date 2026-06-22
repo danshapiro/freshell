@@ -569,6 +569,7 @@ export type ErrorMessage = {
   message: string
   requestId?: string
   terminalId?: string
+  terminalExitCode?: number
   expectedSessionRef?: SessionLocator
   actualSessionRef?: SessionLocator
   timestamp: string
@@ -702,6 +703,7 @@ export type TerminalInputBlockedMessage = {
 export type TerminalsChangedMessage = {
   type: 'terminals.changed'
   revision: number
+  recoverableTerminalIds?: string[]
 }
 
 export type TerminalMetaUpdatedMessage = z.infer<typeof TerminalMetaUpdatedSchema>

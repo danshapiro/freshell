@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest'
+import { EventEmitter } from 'events'
 import http from 'http'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
@@ -39,7 +40,7 @@ function listen(server: http.Server, timeoutMs = HOOK_TIMEOUT_MS): Promise<{ por
   })
 }
 
-class FakeRegistry {
+class FakeRegistry extends EventEmitter {
   private terminals: any[] = []
 
   detach() {
@@ -542,6 +543,45 @@ describe('ws handshake snapshot', () => {
         'running',
         'exited',
       ])
+    } finally {
+      await closeWs(ws)
+    }
+  })
+
+  it('broadcasts recoverable terminal ids when the registry reports a recoverable terminal exit', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws, 10_000)
+
+      const changedPromise = waitForMessage(ws, (m) => m.type === 'terminals.changed', 10_000)
+      registry.emit('terminal.exit', {
+        terminalId: 'term-detached-dead',
+        exitCode: 0,
+        recoverableForRestore: true,
+      })
+
+      await expect(changedPromise).resolves.toEqual({
+        type: 'terminals.changed',
+        revision: 1,
+        recoverableTerminalIds: ['term-detached-dead'],
+      })
+    } finally {
+      await closeWs(ws)
+    }
+  })
+
+  it('does not broadcast terminals.changed from non-recoverable registry terminal exits', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws, 10_000)
+
+      registry.emit('terminal.exit', { terminalId: 'term-normal-exit', exitCode: 0 })
+
+      await expectNoMessage(ws, (m) => m.type === 'terminals.changed')
     } finally {
       await closeWs(ws)
     }

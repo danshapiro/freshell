@@ -528,9 +528,13 @@ export class WsHandler {
   // The runtime validator is authoritative here; we keep the field typed broadly because
   // the dynamic provider schemas widen discriminated-union inference beyond what TS/Zod model well.
   private clientMessageSchema: z.ZodTypeAny
-  private onTerminalExitBound = (payload: { terminalId?: string }) => {
+  private onTerminalExitBound = (payload: { terminalId?: string; recoverableForRestore?: boolean }) => {
     if (!payload?.terminalId) return
     this.forgetCreatedRequestIdsForTerminal(payload.terminalId)
+    if (!payload.recoverableForRestore) return
+    this.broadcastTerminalsChanged({
+      recoverableTerminalIds: [payload.terminalId],
+    })
   }
   private onCodexDurabilityUpdatedBound = (payload: { terminalId?: string; durability?: unknown }) => {
     if (!payload?.terminalId || payload.durability === undefined) return
@@ -1460,6 +1464,7 @@ export class WsHandler {
       message: string
       requestId?: string
       terminalId?: string
+      terminalExitCode?: number
       expectedSessionRef?: { provider: string; sessionId: string }
       actualSessionRef?: { provider: string; sessionId: string }
     },
@@ -1471,6 +1476,7 @@ export class WsHandler {
       message: params.message,
       requestId: params.requestId,
       terminalId: params.terminalId,
+      ...(typeof params.terminalExitCode === 'number' ? { terminalExitCode: params.terminalExitCode } : {}),
       expectedSessionRef: params.expectedSessionRef,
       actualSessionRef: params.actualSessionRef,
       timestamp: nowIso(),
@@ -2449,6 +2455,7 @@ export class WsHandler {
             message: formatExitedTerminalAttachMessage(record),
             requestId: m.attachRequestId,
             terminalId: m.terminalId,
+            terminalExitCode: record.exitCode,
           })
           return
         }
@@ -2538,6 +2545,7 @@ export class WsHandler {
               message: formatExitedTerminalAttachMessage(latestRecord),
               requestId: m.attachRequestId,
               terminalId: m.terminalId,
+              terminalExitCode: latestRecord.exitCode,
             })
             return
           }
@@ -3436,11 +3444,14 @@ export class WsHandler {
     })
   }
 
-  broadcastTerminalsChanged(): void {
+  broadcastTerminalsChanged(options: { recoverableTerminalIds?: string[] } = {}): void {
     this.terminalsRevision += 1
+    const recoverableTerminalIds = (options.recoverableTerminalIds || [])
+      .filter((terminalId): terminalId is string => typeof terminalId === 'string' && terminalId.length > 0)
     this.broadcastAuthenticated({
       type: 'terminals.changed',
       revision: this.terminalsRevision,
+      ...(recoverableTerminalIds.length > 0 ? { recoverableTerminalIds } : {}),
     })
   }
 

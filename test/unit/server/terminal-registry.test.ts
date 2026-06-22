@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { isLinuxPath, getSystemShell, escapeCmdExe, buildSpawnSpec, TerminalRegistry, isWsl, isWindowsLike, modeSupportsResume, buildTerminalSessionRef, UnknownTerminalModeError } from '../../../server/terminal-registry'
 import { isValidClaudeSessionId } from '../../../server/claude-session-id'
+import { defaultSettings } from '../../../server/config-store'
 import { CODEX_DURABILITY_SCHEMA_VERSION } from '../../../shared/codex-durability'
 import * as fs from 'fs'
 import os from 'os'
@@ -2044,6 +2045,97 @@ describe('TerminalRegistry', () => {
 
       expect(exited).toHaveBeenCalledTimes(1)
       expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 0 })
+    })
+
+    it('marks idle detached auto-kill exits as recoverable for restore', async () => {
+      const exited = vi.fn()
+      registry.on('terminal.exit', exited)
+      registry.setSettings({
+        ...defaultSettings,
+        safety: {
+          ...defaultSettings.safety,
+          autoKillIdleMinutes: 1,
+        },
+      })
+      const record = registry.create({ mode: 'shell', cwd: '/home/user/project' })
+      record.lastActivityAt = Date.now() - 61_000
+
+      await registry.enforceIdleKillsForTest()
+
+      expect(exited).toHaveBeenCalledWith({
+        terminalId: record.terminalId,
+        exitCode: 0,
+        recoverableForRestore: true,
+      })
+    })
+
+    it('marks detached durable PTY exits as recoverable for restore', async () => {
+      const exited = vi.fn()
+      registry.on('terminal.exit', exited)
+      const durableExit = registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+        resumeSessionId: '019ede4a-c03c-70a1-832c-ecabfaed4767',
+      })
+      durableExit.codexDurability = {
+        schemaVersion: 1,
+        state: 'durable',
+        durableThreadId: '019ede4a-c03c-70a1-832c-ecabfaed4767',
+      }
+      const pty = await import('node-pty')
+      const durablePty = vi.mocked(pty.spawn).mock.results.at(-1)?.value
+      const onExitCallback = durablePty.onExit.mock.calls[0][0]
+
+      onExitCallback({ exitCode: 0, signal: 0 })
+
+      await vi.waitFor(() => {
+        expect(exited).toHaveBeenCalledWith({
+          terminalId: durableExit.terminalId,
+          exitCode: 0,
+          recoverableForRestore: true,
+        })
+      })
+    })
+
+    it('does not mark non-durable PTY exit, attached durable PTY exit, or explicit kill as recoverable for restore', async () => {
+      const exited = vi.fn()
+      registry.on('terminal.exit', exited)
+      const nonDurableExit = registry.create({ mode: 'shell', cwd: '/home/user/project' })
+      const attachedDurableExit = registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+        resumeSessionId: '019ede4a-c03c-70a1-832c-ecabfaed4767',
+      })
+      attachedDurableExit.codexDurability = {
+        schemaVersion: 1,
+        state: 'durable',
+        durableThreadId: '019ede4a-c03c-70a1-832c-ecabfaed4767',
+      }
+      registry.attach(attachedDurableExit.terminalId, { send: vi.fn(), bufferedAmount: 0 } as any)
+      const explicitKill = registry.create({ mode: 'shell', cwd: '/home/user/project' })
+      const pty = await import('node-pty')
+      const nonDurablePty = vi.mocked(pty.spawn).mock.results.at(-3)?.value
+      const attachedDurablePty = vi.mocked(pty.spawn).mock.results.at(-2)?.value
+
+      nonDurablePty.onExit.mock.calls[0][0]({ exitCode: 7, signal: 0 })
+      attachedDurablePty.onExit.mock.calls[0][0]({ exitCode: 0, signal: 0 })
+      registry.kill(explicitKill.terminalId)
+
+      expect(exited).toHaveBeenCalledWith({
+        terminalId: nonDurableExit.terminalId,
+        exitCode: 7,
+      })
+      await vi.waitFor(() => {
+        expect(exited).toHaveBeenCalledWith({
+          terminalId: attachedDurableExit.terminalId,
+          exitCode: 0,
+        })
+      })
+      expect(exited).toHaveBeenCalledWith({
+        terminalId: explicitKill.terminalId,
+        exitCode: 0,
+      })
+      expect(exited.mock.calls.some(([payload]) => payload?.recoverableForRestore === true)).toBe(false)
     })
 
     it('clients and buffer receive PTY output', async () => {

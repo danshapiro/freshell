@@ -522,6 +522,32 @@ function clearRestoreFallbackAttemptForPane(state: PanesState, tabId: string, pa
   }
 }
 
+function clearTerminalContentForRecreate(
+  state: PanesState,
+  node: Extract<PaneNode, { type: 'leaf' }>,
+  tabId: string,
+): void {
+  if (node.content?.kind !== 'terminal' || !node.content.terminalId) return
+  const staleTerminalId = node.content.terminalId
+  const nextRequestId = nanoid()
+  node.content.terminalId = undefined
+  node.content.serverInstanceId = undefined
+  node.content.streamId = undefined
+  node.content.status = 'creating'
+  node.content.createRequestId = nextRequestId
+  if (!sanitizeSessionRef(node.content.sessionRef)) {
+    if (!state.restoreFallbackAttemptsByPane) state.restoreFallbackAttemptsByPane = {}
+    if (!state.restoreFallbackAttemptsByPane[tabId]) state.restoreFallbackAttemptsByPane[tabId] = {}
+    state.restoreFallbackAttemptsByPane[tabId][node.id] = {
+      staleTerminalId,
+      requestId: nextRequestId,
+      reason: 'dead_live_handle_without_session_ref',
+    }
+  } else {
+    clearRestoreFallbackAttemptForPane(state, tabId, node.id)
+  }
+}
+
 function freshAgentPaneMatchesMaterializedSession(
   content: FreshAgentPaneContent,
   materialized: FreshAgentSessionMaterializedPayload,
@@ -1705,24 +1731,7 @@ export const panesSlice = createSlice({
             node.content.terminalId &&
             !liveSet.has(node.content.terminalId)
           ) {
-            const staleTerminalId = node.content.terminalId
-            const nextRequestId = nanoid()
-            node.content.terminalId = undefined
-            node.content.serverInstanceId = undefined
-            node.content.streamId = undefined
-            node.content.status = 'creating'
-            node.content.createRequestId = nextRequestId
-            if (!sanitizeSessionRef(node.content.sessionRef)) {
-              if (!state.restoreFallbackAttemptsByPane) state.restoreFallbackAttemptsByPane = {}
-              if (!state.restoreFallbackAttemptsByPane[tabId]) state.restoreFallbackAttemptsByPane[tabId] = {}
-              state.restoreFallbackAttemptsByPane[tabId][node.id] = {
-                staleTerminalId,
-                requestId: nextRequestId,
-                reason: 'dead_live_handle_without_session_ref',
-              }
-            } else {
-              clearRestoreFallbackAttemptForPane(state, tabId, node.id)
-            }
+            clearTerminalContentForRecreate(state, node, tabId)
             return true
           }
           return false
@@ -1739,6 +1748,30 @@ export const panesSlice = createSlice({
 
       for (const [tabId, layout] of Object.entries(state.layouts)) {
         clearDeadInNode(layout, tabId)
+      }
+    },
+
+    clearTerminalLiveHandles: (state, action: PayloadAction<{ terminalIds: string[] }>) => {
+      const removedSet = new Set(action.payload.terminalIds.filter(Boolean))
+
+      function clearInNode(node: PaneNode, tabId: string): void {
+        if (node.type === 'leaf') {
+          if (
+            node.content?.kind === 'terminal' &&
+            node.content.terminalId &&
+            removedSet.has(node.content.terminalId)
+          ) {
+            clearTerminalContentForRecreate(state, node, tabId)
+          }
+          return
+        }
+        if (node.type === 'split' && Array.isArray(node.children)) {
+          for (const child of node.children) clearInNode(child, tabId)
+        }
+      }
+
+      for (const [tabId, layout] of Object.entries(state.layouts)) {
+        clearInNode(layout, tabId)
       }
     },
 
@@ -1816,6 +1849,7 @@ export const {
   clearPaneRenameRequest,
   toggleZoom,
   clearDeadTerminals,
+  clearTerminalLiveHandles,
   repairCodexIdentityMismatch,
 } = panesSlice.actions
 

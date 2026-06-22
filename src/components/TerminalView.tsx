@@ -2881,6 +2881,38 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         writeLocalXtermNotice(term, `\r\n${prefix} ${message}\r\n`)
       }
 
+      const settleCleanRestoreStartupExit = (terminalId: string, message?: string) => {
+        clearRateLimitRetry()
+        clearQuarantineRepair()
+        setIsAttaching(false)
+        currentAttachRef.current = null
+        launchAttemptRef.current = null
+        deferredAttachStateRef.current = {
+          mode: 'none',
+          pendingIntent: null,
+          pendingSinceSeq: 0,
+          pendingReason: 'initial_hydrate',
+        }
+        dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
+        clearTerminalCursor(terminalId)
+        resetParserAppliedSurface()
+        forgetSentViewport(terminalId)
+        lastSentViewportRef.current = null
+        terminalIdRef.current = undefined
+        applySeqState(createAttachSeqState())
+        updateContent({
+          terminalId: undefined,
+          streamId: undefined,
+          status: 'exited',
+          restoreError: undefined,
+        })
+        const currentTab = tabRef.current
+        if (currentTab) {
+          dispatch(updateTab({ id: currentTab.id, updates: { status: 'exited' } }))
+        }
+        writeLocalXtermNotice(term, `\r\n[Restored terminal exited cleanly${message ? `: ${message}` : ''}]\r\n`)
+      }
+
       unsub = ws.onMessage((msg) => {
         const tid = terminalIdRef.current
         const reqId = requestIdRef.current
@@ -3718,6 +3750,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const launchAttempt = launchAttemptRef.current
           const exitedDuringLaunch = launchAttempt?.terminalId === tid && !launchAttempt.attachReady
           if (exitedDuringLaunch) {
+            if (
+              launchAttempt.restore &&
+              msg.exitCode === 0 &&
+              contentRef.current?.sessionRef
+            ) {
+              settleCleanRestoreStartupExit(tid)
+              return
+            }
             const exitSuffix = typeof msg.exitCode === 'number' ? ` (exit ${msg.exitCode})` : ''
             const message = launchAttempt.restore
               ? `The restored terminal exited before it finished starting${exitSuffix}. Fix the underlying CLI or working directory, then refresh to retry.`
@@ -3980,6 +4020,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             && !launchAttempt.attachReady
           )
           if (failedDuringLaunch) {
+            if (
+              launchAttempt?.restore &&
+              msg.terminalExitCode === 0 &&
+              current?.sessionRef &&
+              currentTerminalId
+            ) {
+              settleCleanRestoreStartupExit(currentTerminalId, msg.message)
+              return
+            }
             failLaunch(msg.message || 'The terminal failed before it finished starting.', launchAttempt!.restore, currentTerminalId)
             return
           }

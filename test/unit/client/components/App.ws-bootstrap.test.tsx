@@ -1039,6 +1039,107 @@ describe('App WS bootstrap recovery', () => {
     })
   })
 
+  it('restores an unmounted durable pane when terminals.changed removes its live terminal', async () => {
+    const sessionRef = {
+      provider: 'codex',
+      sessionId: 'codex-detached-thread-1',
+    }
+    const unrelatedSessionRef = {
+      provider: 'codex',
+      sessionId: 'codex-unrelated-thread-1',
+    }
+    const store = createStore({
+      tabs: [{
+        id: 'tab-detached-codex',
+        mode: 'codex',
+        status: 'running',
+        sessionRef,
+      }],
+      panes: {
+        layouts: {
+          'tab-detached-codex': {
+            type: 'split',
+            id: 'split-detached-codex',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              {
+                type: 'leaf',
+                id: 'pane-detached-codex',
+                content: {
+                  kind: 'terminal',
+                  createRequestId: 'req-detached-old',
+                  status: 'running',
+                  mode: 'codex',
+                  shell: 'system',
+                  terminalId: 'term-detached-dead',
+                  serverInstanceId: 'srv-old',
+                  streamId: 'stream-old',
+                  sessionRef,
+                },
+              },
+              {
+                type: 'leaf',
+                id: 'pane-unrelated-creating',
+                content: {
+                  kind: 'terminal',
+                  createRequestId: 'req-unrelated-existing',
+                  status: 'creating',
+                  mode: 'codex',
+                  shell: 'system',
+                  sessionRef: unrelatedSessionRef,
+                },
+              },
+            ],
+          },
+        },
+        activePane: { 'tab-detached-codex': 'pane-detached-codex' },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).toBeTypeOf('function')
+    })
+
+    act(() => {
+      messageHandler?.({
+        type: 'terminals.changed',
+        revision: 7,
+        recoverableTerminalIds: ['term-detached-dead'],
+      })
+    })
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts['tab-detached-codex']
+      if (!layout || layout.type !== 'split') throw new Error('expected split layout')
+      const recoveredPane = layout.children[0]
+      const unrelatedPane = layout.children[1]
+      if (recoveredPane.type !== 'leaf' || unrelatedPane.type !== 'leaf') throw new Error('expected leaf panes')
+      const recoveredContent = recoveredPane.content
+      const unrelatedContent = unrelatedPane.content
+      if (recoveredContent.kind !== 'terminal' || unrelatedContent.kind !== 'terminal') {
+        throw new Error('expected terminal panes')
+      }
+
+      expect(recoveredContent.terminalId).toBeUndefined()
+      expect(recoveredContent.serverInstanceId).toBeUndefined()
+      expect(recoveredContent.streamId).toBeUndefined()
+      expect(recoveredContent.status).toBe('creating')
+      expect(recoveredContent.createRequestId).not.toBe('req-detached-old')
+      expect(recoveredContent.sessionRef).toEqual(sessionRef)
+      expect(unrelatedContent.createRequestId).toBe('req-unrelated-existing')
+      expect(terminalRestoreMocks.addTerminalRestoreRequestId).toHaveBeenCalledWith(recoveredContent.createRequestId)
+      expect(terminalRestoreMocks.addTerminalRestoreRequestId).not.toHaveBeenCalledWith('req-unrelated-existing')
+      expect(terminalRestoreMocks.addTerminalFreshRecoveryRequestId).not.toHaveBeenCalled()
+    })
+  })
+
   it.each(['terminal.session.associated', 'terminal.attach.ready'] as const)(
     'persists OpenCode sessionRef from %s without TerminalView mounted',
     async (type) => {

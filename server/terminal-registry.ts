@@ -706,6 +706,10 @@ type TerminalRegistryOptions = {
   serverInstanceId?: string
 }
 
+type TerminalKillOptions = {
+  recoverableForRestore?: boolean
+}
+
 export class ChunkRingBuffer {
   private chunks: string[] = []
   private size = 0
@@ -1318,7 +1322,7 @@ export class TerminalRegistry extends EventEmitter {
 
       if (idleMinutes >= killMinutes) {
         logger.info({ terminalId: term.terminalId }, 'Auto-killing idle detached terminal')
-        this.kill(term.terminalId)
+        this.kill(term.terminalId, { recoverableForRestore: true })
       }
     }
   }
@@ -1380,6 +1384,7 @@ export class TerminalRegistry extends EventEmitter {
     record.lastActivityAt = now
     record.exitedAt = now
     cleanupMcpConfig(record.terminalId, record.mode, record.mcpCwd)
+    const recoverableForRestore = record.clients.size === 0 && !!buildTerminalSessionRef(record)
     for (const client of record.clients) {
       this.flushOutputBuffer(client)
       this.safeSend(client, { type: 'terminal.exit', terminalId: record.terminalId, exitCode: event.exitCode }, { terminalId: record.terminalId, perf: record.perf })
@@ -1389,7 +1394,11 @@ export class TerminalRegistry extends EventEmitter {
     record.pendingSnapshotClients.clear()
     this.recordTerminalExitWithoutDurableSession(record, event.exitCode, 'pty_exit')
     this.releaseBinding(record.terminalId, 'exit')
-    this.emit('terminal.exit', { terminalId: record.terminalId, exitCode: event.exitCode })
+    this.emit('terminal.exit', {
+      terminalId: record.terminalId,
+      exitCode: event.exitCode,
+      ...(recoverableForRestore ? { recoverableForRestore: true } : {}),
+    })
     this.forgetCodexDurabilityStoreRecord(record, 'pty_exit')
     void this.releaseCodexSidecar(record).catch(() => undefined)
     this.reapExitedTerminals()
@@ -3295,7 +3304,7 @@ export class TerminalRegistry extends EventEmitter {
     return { status: 'resized' }
   }
 
-  kill(terminalId: string): boolean {
+  kill(terminalId: string, options: TerminalKillOptions = {}): boolean {
     const term = this.terminals.get(terminalId)
     if (!term) return false
     if (term.status === 'exited') {
@@ -3323,7 +3332,11 @@ export class TerminalRegistry extends EventEmitter {
     term.pendingSnapshotClients.clear()
     this.recordTerminalExitWithoutDurableSession(term, term.exitCode, 'user_final_close')
     this.releaseBinding(terminalId, 'exit')
-    this.emit('terminal.exit', { terminalId, exitCode: term.exitCode })
+    this.emit('terminal.exit', {
+      terminalId,
+      exitCode: term.exitCode,
+      ...(options.recoverableForRestore ? { recoverableForRestore: true } : {}),
+    })
     this.forgetCodexDurabilityStoreRecord(term, 'user_final_close')
     void this.releaseCodexSidecar(term).catch(() => undefined)
     this.reapExitedTerminals()

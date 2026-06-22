@@ -99,6 +99,39 @@ describe('createTerminalInvalidationHandler', () => {
     expect(dispatch).toHaveBeenCalledWith(refresh.activeSessionWindowRefreshThunk)
   })
 
+  it('forwards recoverable terminal ids from terminals.changed before coalesced refresh', async () => {
+    vi.useFakeTimers()
+    const dispatch = vi.fn()
+    const refresh = createRefreshDoubles()
+    const handleRecoverableTerminalIds = vi.fn()
+    const handler = createTerminalInvalidationHandler({
+      dispatch,
+      upsertTerminalMeta,
+      removeTerminalMeta,
+      patchSessionRunningStateFromTerminalMeta,
+      queueActiveSessionWindowRefresh: refresh.queueActiveSessionWindowRefresh,
+      fetchTerminalDirectoryWindow: refresh.fetchTerminalDirectoryWindow,
+      setTimeout: globalThis.setTimeout,
+      clearTimeout: globalThis.clearTimeout,
+      refreshDelayMs: 50,
+      handleRecoverableTerminalIds,
+    })
+
+    const handled = handler.handle({
+      type: 'terminals.changed',
+      revision: 12,
+      recoverableTerminalIds: ['term-dead', '', 42, 'term-other'],
+    })
+
+    expect(handled).toBe(true)
+    expect(handleRecoverableTerminalIds).toHaveBeenCalledWith(['term-dead', 'term-other'])
+    expect(refresh.fetchTerminalDirectoryWindow).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(50)
+    expect(refresh.fetchTerminalDirectoryWindow).toHaveBeenCalledTimes(1)
+    expect(refresh.queueActiveSessionWindowRefresh).toHaveBeenCalledTimes(1)
+  })
+
   it('flushes a pending refresh before a user-initiated sidebar attach', async () => {
     vi.useFakeTimers()
     const dispatch = vi.fn()

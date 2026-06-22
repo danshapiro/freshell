@@ -2492,6 +2492,7 @@ describe('TerminalView lifecycle updates', () => {
         code: 'INVALID_TERMINAL_ID',
         message: 'OpenCode exited during startup (exit 1). Last output: execvp(3) failed.: No such file or directory',
         terminalId: 'term-restore-startup-failure',
+        terminalExitCode: 1,
       })
     })
 
@@ -2508,6 +2509,200 @@ describe('TerminalView lifecycle updates', () => {
     expect(tab?.status).toBe('error')
     expectTerminalWriteContaining(term, '[Restore failed]')
     expectTerminalWriteContaining(term, 'execvp(3) failed.: No such file or directory')
+  })
+
+  it('settles a clean restored attach startup exit as exited', async () => {
+    const tabId = 'tab-clean-restore-attach-exit'
+    const paneId = 'pane-clean-restore-attach-exit'
+    const sessionRef = {
+      provider: 'opencode',
+      sessionId: 'ses_clean_restore_attach_exit',
+    }
+    restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(true)
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-clean-restore-attach-exit',
+      status: 'creating',
+      mode: 'opencode',
+      shell: 'system',
+      sessionRef,
+      restoreError: { reason: 'dead_live_handle' },
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'opencode',
+            status: 'creating',
+            title: 'OpenCode',
+            titleSetByUser: false,
+            createRequestId: 'req-clean-restore-attach-exit',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    const term = terminalInstances[0]
+    wsMocks.send.mockClear()
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.created',
+        requestId: 'req-clean-restore-attach-exit',
+        terminalId: 'term-clean-restore-attach-exit',
+        createdAt: Date.now(),
+      })
+    })
+
+    wsMocks.send.mockClear()
+
+    act(() => {
+      messageHandler!({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'OpenCode exited during startup (exit 0). Last output: done',
+        terminalId: 'term-clean-restore-attach-exit',
+        terminalExitCode: 0,
+      })
+    })
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: TerminalPaneContent }
+      expect(layout.content.status).toBe('exited')
+      expect(layout.content.terminalId).toBeUndefined()
+      expect(layout.content.streamId).toBeUndefined()
+      expect(layout.content.restoreError).toBeUndefined()
+    })
+
+    const tab = store.getState().tabs.tabs.find((entry) => entry.id === tabId)
+    expect(tab?.status).toBe('exited')
+    expect(terminalWriteStrings(term).some((entry) => entry.includes('[Restore failed]'))).toBe(false)
+    expectTerminalWriteContaining(term, '[Restored terminal exited cleanly')
+  })
+
+  it('settles a clean restored direct startup exit as exited', async () => {
+    const tabId = 'tab-clean-restore-direct-exit'
+    const paneId = 'pane-clean-restore-direct-exit'
+    const sessionRef = {
+      provider: 'opencode',
+      sessionId: 'ses_clean_restore_direct_exit',
+    }
+    restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(true)
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-clean-restore-direct-exit',
+      status: 'creating',
+      mode: 'opencode',
+      shell: 'system',
+      sessionRef,
+      restoreError: { reason: 'dead_live_handle' },
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'opencode',
+            status: 'creating',
+            title: 'OpenCode',
+            titleSetByUser: false,
+            createRequestId: 'req-clean-restore-direct-exit',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    const term = terminalInstances[0]
+    wsMocks.send.mockClear()
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.created',
+        requestId: 'req-clean-restore-direct-exit',
+        terminalId: 'term-clean-restore-direct-exit',
+        createdAt: Date.now(),
+      })
+    })
+
+    wsMocks.send.mockClear()
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.exit',
+        terminalId: 'term-clean-restore-direct-exit',
+        exitCode: 0,
+      })
+    })
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: TerminalPaneContent }
+      expect(layout.content.status).toBe('exited')
+      expect(layout.content.terminalId).toBeUndefined()
+      expect(layout.content.streamId).toBeUndefined()
+      expect(layout.content.restoreError).toBeUndefined()
+    })
+
+    const tab = store.getState().tabs.tabs.find((entry) => entry.id === tabId)
+    expect(tab?.status).toBe('exited')
+    expect(terminalWriteStrings(term).some((entry) => entry.includes('[Restore failed]'))).toBe(false)
+    expectTerminalWriteContaining(term, '[Restored terminal exited cleanly')
   })
 
   it('marks startup exit before first attach as a launch failure', async () => {

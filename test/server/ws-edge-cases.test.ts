@@ -686,6 +686,36 @@ describe('WebSocket edge cases', () => {
 
       close()
     })
+
+    it('includes structured exit code when a cleanly exited terminal is attached', async () => {
+      const { ws, close } = await createAuthenticatedConnection()
+
+      const terminalId = await createTerminal(ws, 'attach-clean-startup-exit')
+      registry.simulateExit(terminalId, 0)
+
+      ws.send(JSON.stringify({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        cols: 120,
+        rows: 40,
+      }))
+
+      const error = await waitForMessage(
+        ws,
+        (m) => m.type === 'error' && m.code === 'INVALID_TERMINAL_ID' && m.terminalId === terminalId,
+      )
+
+      expect(error).toEqual(expect.objectContaining({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        terminalId,
+        terminalExitCode: 0,
+      }))
+
+      close()
+    })
   })
 
   describe('Partial message handling', () => {
