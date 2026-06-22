@@ -106,8 +106,9 @@ export class FreshAgentRuntimeManager {
       ?? (input.sessionRef?.provider === registration.runtimeProvider ? input.sessionRef.sessionId : undefined)
     const createInput = resumeSessionId ? { ...input, resumeSessionId } : input
 
-    const created = resumeSessionId && registration.adapter.resume
-      ? await registration.adapter.resume(createInput)
+    const usedResume = Boolean(resumeSessionId && registration.adapter.resume)
+    const created = usedResume
+      ? await registration.adapter.resume!(createInput)
       : await registration.adapter.create(createInput)
     this.sessions.set(this.key({
       sessionType: input.sessionType,
@@ -119,7 +120,7 @@ export class FreshAgentRuntimeManager {
       adapter: registration.adapter,
       sessionId: created.sessionId,
       cwd: input.cwd,
-      providerOwned: true,
+      providerOwned: !usedResume,
     }))
     return {
       sessionId: created.sessionId,
