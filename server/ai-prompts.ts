@@ -45,7 +45,7 @@ export const PROMPTS = {
     defaultPrompt: [
       'Generate a title for a tab that contains the coding agent for this conversation.',
       'Only the first word or two will show, so most specific and informative words first.',
-      'Start with the repo abbreviated, then the noun. E.g. if we\'re investigating a crash in freshell that happens when you mention sardines, "FS sardine crash investigation" because FS is freshell, sardine is specific, crash is less specific, and investigation is common to almost all tabs.',
+      'E.g. if we\'re investigating a crash in freshell that happens when you mention sardines, "Sardine crash investigation" because sardine is specific, crash is less specific, and investigation is common to almost all tabs.',
       'Return ONLY the title text. No quotes, no markdown, no explanation.',
     ].join('\n'),
     build: (firstMessage: string, customPrompt?: string) => {
