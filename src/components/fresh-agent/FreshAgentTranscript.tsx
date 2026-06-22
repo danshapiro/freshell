@@ -227,11 +227,17 @@ function buildBlocks(
 function filterTurnsForDisplay(
   turns: FreshAgentTurn[],
   options: TranscriptDisplayOptions,
+  isStreaming: boolean,
 ): FreshAgentTurn[] {
   return turns
-    .map((turn) => {
+    .map((turn, index) => {
       const items = turn.items.filter((item) => shouldDisplayTranscriptItem(item, options))
-      if (turn.items.length > 0 && items.length === 0) return null
+      if (turn.items.length > 0 && items.length === 0) {
+        if (isStreaming && index === turns.length - 1) {
+          return { ...turn, items: [] }
+        }
+        return null
+      }
       return items === turn.items ? turn : { ...turn, items }
     })
     .filter((turn): turn is FreshAgentTurn => turn !== null)
@@ -288,7 +294,13 @@ function selectLiveActivityBlockId(
     }
   })
 
-  if (isStreaming) return latestActivityBlockId
+  if (isStreaming) {
+    const lastTurn = turns[turns.length - 1]
+    if (lastTurn && !lastTurn.items.some((item) => shouldDisplayTranscriptItem(item, options))) {
+      return null
+    }
+    return latestActivityBlockId
+  }
   return latestTrailingThinkingBlockId
 }
 
@@ -338,7 +350,22 @@ function FreshAgentActivityStrip({
   const activeTool = runningTool ?? liveTool
   const running = live && (activeTool !== null || thinkingLive)
 
-  if (displayRows.length === 0) return null
+  if (displayRows.length === 0) {
+    if (!live) return null
+    return (
+      <div role="region" aria-label="Activity strip" className="fresh-agent-activity-strip my-0.5">
+        <div className="fresh-agent-activity-summary flex min-w-0 items-center gap-1.5 border-l-2 border-l-[hsl(var(--primary))] px-2 py-0.5 text-xs">
+          <span
+            className="fresh-agent-activity-status-slot"
+            data-testid="fresh-agent-activity-status-slot"
+          >
+            <Loader2 className="h-3 w-3 animate-spin" aria-label="running" />
+          </span>
+          <SlotReel toolName={null} previewText={null} settledText={undefined} />
+        </div>
+      </div>
+    )
+  }
 
   const reelName = activeTool ? activeTool.name : thinkingLive ? 'Thinking' : null
   const reelPreview = activeTool ? getToolPreview(activeTool.name, activeTool.input) : null
@@ -415,6 +442,7 @@ function FreshAgentTurnArticle({
   continuation,
   liveActivityBlockId,
   displayOptions,
+  isStreamingLastTurn,
   index,
 }: {
   turn: FreshAgentTurn
@@ -426,6 +454,7 @@ function FreshAgentTurnArticle({
   continuation: boolean
   liveActivityBlockId: string | null
   displayOptions: TranscriptDisplayOptions
+  isStreamingLastTurn: boolean
   index: number
 }) {
   const isUser = turn.role === 'user'
@@ -505,6 +534,9 @@ function FreshAgentTurnArticle({
           // showed literal backticks (live-test finding) — render markdown.
           <FreshAgentMarkdownBody text={turn.summary ?? ''} />
         )}
+        {isStreamingLastTurn && blocks.length === 0 ? (
+          <FreshAgentActivityStrip rows={[]} live initialExpanded={showTools} />
+        ) : null}
       </div>
     </article>
   )
@@ -545,8 +577,8 @@ export function FreshAgentTranscript({
     showThinking,
   }), [showThinking])
   const displayTurns = useMemo(() => (
-    filterTurnsForDisplay(turns, displayOptions)
-  ), [displayOptions, turns])
+    filterTurnsForDisplay(turns, displayOptions, isStreaming)
+  ), [displayOptions, turns, isStreaming])
   const liveActivityBlockId = useMemo(
     () => selectLiveActivityBlockId(displayTurns, isStreaming, displayOptions),
     [displayOptions, displayTurns, isStreaming],
@@ -660,6 +692,7 @@ export function FreshAgentTranscript({
             continuation={index > 0 && displayTurns[index - 1]?.role === turn.role}
             liveActivityBlockId={liveActivityBlockId}
             displayOptions={displayOptions}
+            isStreamingLastTurn={isStreaming && index === displayTurns.length - 1}
             index={index}
           />
         ))}

@@ -749,6 +749,161 @@ describe('FreshAgentTranscript', () => {
     expect(screen.queryByText(/hidden internals/)).not.toBeInTheDocument()
   })
 
+  describe('streaming height stability (jp70)', () => {
+    const thinkingOnly = (turnId: string, thinkId: string, text: string) => ({
+      id: turnId,
+      role: 'assistant' as const,
+      summary: 'thinking',
+      items: [{ id: thinkId, kind: 'thinking' as const, text }],
+    })
+
+    const withTool = (turnId: string, thinkId: string, text: string, toolId: string, callId: string) => ({
+      id: turnId,
+      role: 'assistant' as const,
+      summary: 'thinking + tool',
+      items: [
+        { id: thinkId, kind: 'thinking' as const, text },
+        { id: toolId, kind: 'tool_use' as const, toolUseId: callId, name: 'Bash', input: { command: 'true' } },
+      ],
+    })
+
+    it('keeps the streaming last turn even when all items are filtered out', () => {
+      render(
+        <FreshAgentTranscript
+          isStreaming
+          showThinking={false}
+          turns={[thinkingOnly('turn-1', 'think-1', 'hidden reasoning')]}
+        />,
+      )
+
+      expect(screen.getByRole('article', { name: 'Assistant transcript turn' })).toBeInTheDocument()
+    })
+
+    it('renders a live activity strip placeholder when no displayable rows exist during streaming', () => {
+      render(
+        <FreshAgentTranscript
+          isStreaming
+          showThinking={false}
+          turns={[thinkingOnly('turn-1', 'think-1', 'hidden reasoning')]}
+        />,
+      )
+
+      const strip = screen.getByRole('region', { name: 'Activity strip' })
+      expect(strip).toBeInTheDocument()
+      expect(strip.className).toContain('my-0.5')
+      expect(screen.getByLabelText('running')).toBeInTheDocument()
+    })
+
+    it('keeps the live activity strip present across empty/non-empty displayRows transitions', () => {
+      const { rerender } = render(
+        <FreshAgentTranscript
+          isStreaming
+          showThinking={false}
+          turns={[thinkingOnly('turn-1', 'think-1', 'reasoning')]}
+        />,
+      )
+
+      const assertStripPresent = () => {
+        const strip = screen.getByRole('region', { name: 'Activity strip' })
+        expect(strip).toBeInTheDocument()
+        expect(strip.className).toContain('my-0.5')
+        expect(screen.getByLabelText('running')).toBeInTheDocument()
+      }
+
+      assertStripPresent()
+
+      rerender(
+        <FreshAgentTranscript
+          isStreaming
+          showThinking={false}
+          turns={[withTool('turn-1', 'think-1', 'reasoning', 'tool-1', 'call-1')]}
+        />,
+      )
+      assertStripPresent()
+
+      rerender(
+        <FreshAgentTranscript
+          isStreaming
+          showThinking={false}
+          turns={[thinkingOnly('turn-2', 'think-2', 'more reasoning')]}
+        />,
+      )
+      assertStripPresent()
+
+      rerender(
+        <FreshAgentTranscript
+          isStreaming
+          showThinking={false}
+          turns={[withTool('turn-2', 'think-2', 'more reasoning', 'tool-2', 'call-2')]}
+        />,
+      )
+      assertStripPresent()
+    })
+
+    it('does not show a second running indicator on an earlier turn when the streaming last turn has no displayable items', () => {
+      render(
+        <FreshAgentTranscript
+          isStreaming
+          showThinking={false}
+          turns={[
+            {
+              id: 'turn-1',
+              role: 'assistant',
+              summary: 'used a tool',
+              items: [
+                {
+                  id: 'tool-1',
+                  kind: 'tool_use',
+                  toolUseId: 'call-1',
+                  name: 'Bash',
+                  input: { command: 'true' },
+                },
+                { id: 'result-1', kind: 'tool_result', toolUseId: 'call-1', content: 'ok', isError: false },
+              ],
+            },
+            thinkingOnly('turn-2', 'think-2', 'hidden reasoning'),
+          ]}
+        />,
+      )
+
+      expect(screen.getAllByLabelText('running')).toHaveLength(1)
+      const strips = screen.getAllByRole('region', { name: 'Activity strip' })
+      expect(strips).toHaveLength(2)
+      expect(strips[0]).toHaveTextContent('1 tool used')
+    })
+
+    it('drops a non-streaming turn when all items are filtered out', () => {
+      render(
+        <FreshAgentTranscript
+          showThinking={false}
+          turns={[thinkingOnly('turn-1', 'think-1', 'hidden reasoning')]}
+        />,
+      )
+
+      expect(screen.queryByRole('article', { name: 'Assistant transcript turn' })).not.toBeInTheDocument()
+    })
+
+    it('does not resnap autoscroll when re-rendering with the same streaming items', () => {
+      let scrollHeight = 1000
+      const turn = thinkingOnly('turn-1', 'think-1', 'hidden reasoning')
+      const { container, rerender } = render(
+        <FreshAgentTranscript isStreaming showThinking={false} turns={[turn]} />,
+      )
+      const scroller = container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+      Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 200 })
+      Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => scrollHeight })
+      scroller.scrollTop = 1000
+      fireEvent.scroll(scroller)
+
+      expect(scroller.scrollTop).toBe(1000)
+
+      scrollHeight = 1200
+      rerender(<FreshAgentTranscript isStreaming showThinking={false} turns={[turn]} />)
+
+      expect(scroller.scrollTop).toBe(1000)
+    })
+  })
+
   describe('user turn glom chip', () => {
     const TRANSCRIPT = [
       {
