@@ -1,4 +1,16 @@
 // @vitest-environment node
+//
+// This file spawns the REAL Codex app-server binary and verifies EXTERNAL
+// provider behavior (durable thread lifecycle, resume readiness, display ID
+// stability). It does NOT test Freshell code. It is gated by
+// FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 because it is environment-dependent,
+// can flake due to external process behavior, and must not block the
+// coordinated suite.
+//
+// To run it: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- \
+//   run test/integration/real/codex-app-server-readiness-contract.test.ts \
+//   --config vitest.server.config.ts
+//
 import fsp from 'node:fs/promises'
 import { execFile } from 'node:child_process'
 import os from 'node:os'
@@ -211,7 +223,8 @@ function isDurableReadinessEvidence(event: CodexThreadLifecycleEvent, threadId: 
 }
 
 const codexProbe = await codexAvailability()
-const describeCodex = codexProbe.ready ? describe : describe.skip
+const realProviderContractsEnabled = process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS === '1'
+const describeCodex = (codexProbe.ready && realProviderContractsEnabled) ? describe : describe.skip
 
 function readUserMessageTexts(item: Record<string, unknown>): string[] {
   const contentTexts = Array.isArray(item.content)
@@ -265,7 +278,7 @@ async function waitForSessionArtifact(codexHome: string, threadId: string, timeo
   throw new Error('Timed out waiting for the durable Codex session artifact.')
 }
 
-describeCodex(`real Codex app-server durable readiness contract${codexProbe.ready ? '' : ` (${codexProbe.reason})`}`, () => {
+describeCodex(`real Codex app-server durable readiness contract${codexProbe.ready ? '' : ` (${codexProbe.reason})`}${realProviderContractsEnabled ? '' : ` (opt-in: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1)`}`, () => {
   it('emits current-generation lifecycle evidence when a durable thread is resumed', async () => {
     const { codexHome, root } = await seedIsolatedCodexHome()
     const promptNonce = `freshell-readiness-contract-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`

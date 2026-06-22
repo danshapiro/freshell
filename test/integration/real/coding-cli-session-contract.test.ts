@@ -1,4 +1,23 @@
 // @vitest-environment node
+//
+// This file has two kinds of tests:
+//
+// 1. Freshell tests (always run): "loads the checked-in lab note facts" and
+//    "emits provenance-gated ownership reports" validate Freshell's own
+//    checked-in lab note and harness process-ownership reporting.
+//
+// 2. External provider contract tests (opt-in): The codex, claude, and
+//    opencode sections below spawn the REAL provider binaries and verify
+//    EXTERNAL provider behavior (session identity, transcript durability,
+//    rename semantics) against the checked-in lab note. They do NOT test
+//    Freshell code. They are gated by FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1
+//    because they are environment-dependent, can flake due to external
+//    process behavior, and must not block the coordinated suite.
+//
+//    To run them: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- \
+//      run test/integration/real/coding-cli-session-contract.test.ts \
+//      --config vitest.server.config.ts
+//
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -142,6 +161,11 @@ const claudeProbe = await claudeAvailability()
 const opencodeProbe = opencodeAvailability()
 const itWithProcOwnership = process.platform === 'linux' ? it : it.skip
 
+const realProviderContractsEnabled = process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS === '1'
+const realProviderSkipReason = realProviderContractsEnabled
+  ? ''
+  : 'Skipping external provider contract tests: set FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 to run them.'
+
 describe.sequential('coding cli real provider session contract', () => {
   it('loads the checked-in lab note facts and date rationale', async () => {
     expect(note.capturedOn).toBe('2026-04-26')
@@ -182,8 +206,8 @@ describe.sequential('coding cli real provider session contract', () => {
     }
   }, 30_000)
 
-  const describeCodex = codexProbe.ready ? describe.sequential : describe.skip
-  describeCodex(`codex${codexProbe.ready ? '' : ` (${codexProbe.reason})`}`, () => {
+  const describeCodex = (codexProbe.ready && realProviderContractsEnabled) ? describe.sequential : describe.skip
+  describeCodex(`codex${codexProbe.ready ? '' : ` (${codexProbe.reason})`}${realProviderContractsEnabled ? '' : ` (opt-in: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1)`}`, () => {
     it('detects a local binary and uses the expected remote bootstrap forms', async () => {
       const codexPath = requireAvailableBinary(codexBinary, codexProbe)
       expectLocalBinary(codexBinary)
@@ -267,8 +291,8 @@ describe.sequential('coding cli real provider session contract', () => {
 
   })
 
-  const describeClaude = claudeProbe.ready ? describe.sequential : describe.skip
-  describeClaude(`claude${claudeProbe.ready ? '' : ` (${claudeProbe.reason})`}`, () => {
+  const describeClaude = (claudeProbe.ready && realProviderContractsEnabled) ? describe.sequential : describe.skip
+  describeClaude(`claude${claudeProbe.ready ? '' : ` (${claudeProbe.reason})`}${realProviderContractsEnabled ? '' : ` (opt-in: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1)`}`, () => {
     it('detects a local binary and version', async () => {
       requireAvailableBinary(claudeBinary, claudeProbe)
       expectLocalBinary(claudeBinary)
@@ -585,8 +609,8 @@ describe.sequential('coding cli real provider session contract', () => {
     }, 180_000)
   })
 
-  const describeOpencode = opencodeProbe.ready ? describe.sequential : describe.skip
-  describeOpencode(`opencode${opencodeProbe.ready ? '' : ` (${opencodeProbe.reason})`}`, () => {
+  const describeOpencode = (opencodeProbe.ready && realProviderContractsEnabled) ? describe.sequential : describe.skip
+  describeOpencode(`opencode${opencodeProbe.ready ? '' : ` (${opencodeProbe.reason})`}${realProviderContractsEnabled ? '' : ` (opt-in: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1)`}`, () => {
     it('detects a local binary and version', async () => {
       requireAvailableBinary(opencodeBinary, opencodeProbe)
       expectLocalBinary(opencodeBinary)
