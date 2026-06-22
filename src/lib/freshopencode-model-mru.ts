@@ -179,3 +179,23 @@ export function buildFreshOpencodeVisibleMru(args: {
 
   return items.slice(0, maxVisible)
 }
+
+/** Remove MRU entries whose (cwdKey, id) is not present in the live
+ * enabled catalog, so stale entries do not reappear after TTL expiry. */
+export function pruneFreshOpencodeModelMru(
+  capabilities: FreshAgentModelCapabilities,
+  cwdKey: string,
+  storage?: Storage,
+): void {
+  const resolved = resolveStorage(storage)
+  if (!resolved) return
+
+  const liveIds = new Set(capabilities.models.map((model) => model.id))
+  const entries = loadFreshOpencodeModelMru(storage)
+  const pruned = entries.filter(
+    (entry) => !(entry.cwdKey === cwdKey && !liveIds.has(entry.id)),
+  )
+  if (pruned.length < entries.length) {
+    saveEntries(resolved, pruned)
+  }
+}

@@ -15,6 +15,7 @@ import {
 import {
   buildFreshOpencodeVisibleMru,
   loadFreshOpencodeModelMru,
+  pruneFreshOpencodeModelMru,
   recordFreshOpencodeModelUse,
 } from '@/lib/freshopencode-model-mru'
 import { normalizeFreshAgentModel } from '@/lib/fresh-agent-registry'
@@ -91,6 +92,9 @@ export function FreshOpencodeModelSettings({
           const currentModel = resolveFreshOpencodeCapabilityById(result, currentModelId)
           if (currentModel && cwdKey) {
             recordFreshOpencodeModelUse(currentModel, cwdKey)
+          }
+          if (cwdKey) {
+            pruneFreshOpencodeModelMru(result, cwdKey)
           }
         }
       })

@@ -132,7 +132,7 @@ export function createOpencodeModelCatalogProvider(
         }
         try {
           const res = await Promise.race([
-            fetchFn(`${baseUrl}/global/health`, { method: 'GET' }),
+            fetchWithTimeout(`${baseUrl}/global/health`, '/global/health', { method: 'GET' }),
             exitPromise,
           ])
           if (res.ok) {
