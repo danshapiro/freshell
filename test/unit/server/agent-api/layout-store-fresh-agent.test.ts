@@ -9,10 +9,10 @@ describe('LayoutStore fresh-agent content', () => {
       kind: 'fresh-agent',
       sessionType: 'freshopencode',
       provider: 'opencode',
-      sessionId: 'ses_opencode_1',
+      sessionId: 'freshopencode-req-1',
       createRequestId: 'req-1',
       status: 'connected',
-      sessionRef: { provider: 'opencode', sessionId: 'ses_opencode_1' },
+      sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-1' },
       initialCwd: '/repo',
       model: 'umans-ai-coding-plan/umans-kimi-k2.7',
       effort: 'high',
@@ -22,46 +22,8 @@ describe('LayoutStore fresh-agent content', () => {
     expect(snap?.kind).toBe('fresh-agent')
     expect(snap?.paneContent).toMatchObject({
       kind: 'fresh-agent', sessionType: 'freshopencode', provider: 'opencode',
-      sessionId: 'ses_opencode_1', createRequestId: 'req-1',
-      sessionRef: { provider: 'opencode', sessionId: 'ses_opencode_1' },
+      sessionId: 'freshopencode-req-1', createRequestId: 'req-1',
+      sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-1' },
     })
-  })
-
-  it('normalizes legacy freshopencode placeholders when a UI layout snapshot is stored', () => {
-    const store = new LayoutStore()
-    store.updateFromUi({
-      tabs: [{ id: 'tab-1', title: 'OpenCode' }],
-      activeTabId: 'tab-1',
-      activePane: { 'tab-1': 'pane-1' },
-      layouts: {
-        'tab-1': {
-          type: 'leaf',
-          id: 'pane-1',
-          content: {
-            kind: 'fresh-agent',
-            sessionType: 'freshopencode',
-            provider: 'opencode',
-            sessionId: 'freshopencode-req-legacy',
-            resumeSessionId: 'freshopencode-req-legacy',
-            sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-legacy' },
-            status: 'connected',
-          },
-        },
-      },
-    }, 'conn-1')
-
-    const snap = store.getPaneSnapshot('pane-1')
-    expect(snap?.paneContent).toMatchObject({
-      kind: 'fresh-agent',
-      sessionType: 'freshopencode',
-      provider: 'opencode',
-      status: 'idle',
-      restoreError: {
-        code: 'RESTORE_UNAVAILABLE',
-        reason: 'invalid_legacy_restore_target',
-      },
-    })
-    expect(snap?.paneContent?.sessionRef).toBeUndefined()
-    expect(snap?.paneContent?.resumeSessionId).toBeUndefined()
   })
 })

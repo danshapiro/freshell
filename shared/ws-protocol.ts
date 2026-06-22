@@ -404,6 +404,11 @@ export const FreshAgentCreateSchema = z.object({
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']).optional(),
   cwd: z.string().optional(),
+  legacyRestoreContext: z.object({
+    title: z.string().min(1).optional(),
+    createdAt: z.number().finite().optional(),
+    updatedAt: z.number().finite().optional(),
+  }).optional(),
   resumeSessionId: z.string().optional(),
   model: z.string().optional(),
   permissionMode: z.string().optional(),

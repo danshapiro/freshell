@@ -84,8 +84,6 @@ function freshAgentErrorStatus(error: unknown): number {
 }
 
 const FRESH_AGENT_SEND_IDLE_TIMEOUT_MS = 600_000
-const FRESH_AGENT_CAPTURE_TURN_LIMIT = 200
-const FRESH_AGENT_CAPTURE_MAX_PAGES = 1000
 
 async function waitForFreshAgentIdle(
   runtimeManager: NonNullable<FreshAgentRuntimeManagerLike>,
@@ -321,8 +319,8 @@ function terminalInputFailureMessage(result: Exclude<TerminalInputResult, { stat
   return 'Terminal is not running.'
 }
 
-function renderFreshAgentTranscript(input: any): string {
-  const turns = Array.isArray(input?.turns) ? input.turns : []
+function renderFreshAgentTranscript(snapshot: any): string {
+  const turns = Array.isArray(snapshot?.turns) ? snapshot.turns : []
   return turns.map((turn: any) => {
     const role = typeof turn?.role === 'string' ? turn.role : 'turn'
     const items = Array.isArray(turn?.items) ? turn.items : []
@@ -337,48 +335,6 @@ function renderFreshAgentTranscript(input: any): string {
       .join('\n')
     return `${role}: ${text || (typeof turn?.summary === 'string' ? turn.summary : '')}`.trim()
   }).join('\n\n')
-}
-
-async function captureFreshAgentTranscript(
-  runtimeManager: NonNullable<FreshAgentRuntimeManagerLike>,
-  input: FreshAgentThreadLocator,
-): Promise<{ turns: any[] }> {
-  if (!runtimeManager.getTurnPage) {
-    throw new Error('fresh-agent transcript paging not available on this server')
-  }
-  const pages: any[][] = []
-  const seenCursors = new Set<string>()
-  let cursor: string | undefined
-  let revision: number | undefined
-
-  for (let pageIndex = 0; pageIndex < FRESH_AGENT_CAPTURE_MAX_PAGES; pageIndex += 1) {
-    const page = await runtimeManager.getTurnPage({
-      ...input,
-      ...(cursor ? { cursor } : {}),
-      ...(revision !== undefined ? { revision } : {}),
-      limit: FRESH_AGENT_CAPTURE_TURN_LIMIT,
-      includeBodies: true,
-      priority: 'visible',
-    })
-    pages.push(Array.isArray(page?.turns) ? page.turns : [])
-    if (revision === undefined && typeof page?.revision === 'number' && Number.isFinite(page.revision)) {
-      revision = page.revision
-    }
-
-    const nextCursor = typeof page?.nextCursor === 'string' && page.nextCursor.length > 0
-      ? page.nextCursor
-      : undefined
-    if (!nextCursor) {
-      return { turns: pages.reverse().flat() }
-    }
-    if (seenCursors.has(nextCursor)) {
-      throw new Error('fresh-agent transcript paging returned a repeated cursor')
-    }
-    seenCursors.add(nextCursor)
-    cursor = nextCursor
-  }
-
-  throw new Error(`fresh-agent transcript exceeded ${FRESH_AGENT_CAPTURE_MAX_PAGES} pages`)
 }
 
 function shouldWaitForCodexIdentity(payload: Record<string, unknown>): boolean {
@@ -506,7 +462,6 @@ type FreshAgentRuntimeManagerLike = {
   send: (locator: FreshAgentSessionLocator, input: { text: string; settings?: any }) => Promise<{ sessionId?: string; submittedTurnId?: string; sessionRef?: { provider: string; sessionId: string } } | void>
   attach: (locator: FreshAgentSessionLocator) => Promise<{ sessionId: string; sessionRef?: { provider: string; sessionId: string } }>
   getSnapshot: (input: FreshAgentThreadLocator) => Promise<any>
-  getTurnPage?: (input: FreshAgentThreadLocator & { cursor?: string; revision?: number; limit?: number; includeBodies?: boolean; priority?: string }) => Promise<any>
 }
 
 const parseRegex = (raw: string) => {
@@ -946,15 +901,14 @@ export function createAgentApiRouter({
     if (paneSnapshot?.kind === 'fresh-agent') {
       const c = paneSnapshot.paneContent || {}
       if (!freshAgentRuntimeManager) return res.status(503).json(fail('fresh-agent runtime not available on this server'))
-      if (!freshAgentRuntimeManager.getTurnPage) return res.status(503).json(fail('fresh-agent transcript paging not available on this server'))
       try {
-        const transcript = await captureFreshAgentTranscript(freshAgentRuntimeManager, {
+        const snapshot = await freshAgentRuntimeManager.getSnapshot({
           sessionType: c.sessionType,
           provider: c.provider,
           threadId: c.sessionId,
           cwd: freshAgentPaneCwd(c),
         })
-        return res.type('text/plain').send(renderFreshAgentTranscript(transcript))
+        return res.type('text/plain').send(renderFreshAgentTranscript(snapshot))
       } catch (err: any) {
         return res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'fresh-agent capture failed'))
       }

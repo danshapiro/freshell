@@ -3138,6 +3138,7 @@ export class WsHandler {
               sessionType: m.sessionType,
               provider: m.provider,
               cwd: m.cwd,
+              legacyRestoreContext: m.legacyRestoreContext,
               resumeSessionId: m.resumeSessionId,
               sessionRef: m.sessionRef,
               model: m.model,

@@ -6,6 +6,11 @@ export type FreshAgentCreateRequest = {
   sessionType: FreshAgentSessionType
   provider?: FreshAgentRuntimeProvider
   cwd?: string
+  legacyRestoreContext?: {
+    title?: string
+    createdAt?: number
+    updatedAt?: number
+  }
   resumeSessionId?: string
   sessionRef?: { provider: string; sessionId: string }
   model?: string

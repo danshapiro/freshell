@@ -41,7 +41,6 @@ type FreshAgentSessionMaterializedPayload = {
   sessionType: FreshAgentPaneContent['sessionType']
   provider: FreshAgentPaneContent['provider']
   sessionRef?: SessionLocator
-  status?: FreshAgentPaneContent['status']
 }
 
 function buildPreservedSessionRef(
@@ -110,7 +109,6 @@ function normalizePaneContent(
     const style = normalizeFreshAgentStyleOverride((input as { style?: unknown }).style)
     const pendingLocalEcho = normalizeFreshAgentPendingLocalEcho(rawFreshAgent.pendingLocalEcho)
     const status = input.status || (pendingLocalEcho ? 'running' : 'creating')
-    const normalizedStatus = existingRestoreError ? 'idle' : status
     if (existingRestoreError) {
       return {
         kind: 'fresh-agent',
@@ -118,7 +116,7 @@ function normalizePaneContent(
         provider: input.provider,
         sessionId: input.sessionId,
         createRequestId: input.createRequestId || nanoid(),
-        status: normalizedStatus,
+        status,
         ...(existingRestoreError.reason === 'invalid_legacy_restore_target'
           ? {}
           : { resumeSessionId: input.resumeSessionId }),
@@ -578,7 +576,6 @@ function buildMaterializedFreshAgentContent(
     sessionId: materialized.sessionId,
     resumeSessionId: materialized.sessionId,
     sessionRef,
-    status: materialized.status ?? content.status,
     restoreError: undefined,
   }, content) as FreshAgentPaneContent
 }

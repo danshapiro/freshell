@@ -17,8 +17,7 @@ import {
 import { LAYOUT_STORAGE_KEY, PANES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY, TURN_COMPLETION_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 import { flushPersistedLayoutNow } from './persistControl'
-import { buildRestoreError, sanitizeSessionRef } from '@shared/session-contract'
-import { isDurableProviderSessionId } from '@shared/session-flavor'
+import { sanitizeSessionRef } from '@shared/session-contract'
 import { normalizeFreshAgentEffortOverride, normalizeFreshAgentModelSelection } from './paneTypes'
 import {
   loadPersistedTabRecency,
@@ -205,12 +204,6 @@ function stripTransientSessionFields(content: any): any {
   if (content.kind !== 'terminal' && content.kind !== 'fresh-agent') return content
 
   const sessionRef = sanitizeSessionRef(content.sessionRef)
-  const invalidFreshAgentSessionRef = Boolean(
-    content.kind === 'fresh-agent'
-      && sessionRef
-      && !isDurableProviderSessionId(sessionRef.provider, sessionRef.sessionId),
-  )
-  const durableSessionRef = invalidFreshAgentSessionRef ? undefined : sessionRef
   const {
     resumeSessionId: _resumeSessionId,
     sessionRef: _legacySessionRef,
@@ -220,17 +213,10 @@ function stripTransientSessionFields(content: any): any {
 
   return {
     ...rest,
-    ...(content.kind === 'fresh-agent' && content.restoreError ? { status: 'idle' } : {}),
-    ...(invalidFreshAgentSessionRef
-      ? {
-          status: 'idle',
-          restoreError: buildRestoreError('invalid_legacy_restore_target'),
-        }
-      : {}),
-    ...(content.kind === 'fresh-agent' && !durableSessionRef && typeof content.serverInstanceId === 'string' && typeof content.sessionId === 'string'
+    ...(content.kind === 'fresh-agent' && !sessionRef && typeof content.serverInstanceId === 'string' && typeof content.sessionId === 'string'
       ? { sessionId: content.sessionId }
       : {}),
-    ...(durableSessionRef ? { sessionRef: durableSessionRef } : {}),
+    ...(sessionRef ? { sessionRef } : {}),
   }
 }
 

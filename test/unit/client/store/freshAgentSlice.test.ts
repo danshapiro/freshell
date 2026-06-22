@@ -2,30 +2,13 @@ import { describe, expect, it } from 'vitest'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import reducer, {
   createFailed,
-  freshAgentSnapshotReceived,
-  historyLoadStarted,
-  historyPageReceived,
   registerPendingCreate,
-  selectFreshAgentTranscriptTurns,
   sessionCreated,
   sessionError,
   sessionInit,
   sessionSnapshotReceived,
   setSessionStatus,
 } from '@/store/freshAgentSlice'
-import type { FreshAgentTurn } from '@shared/fresh-agent-contract'
-
-function turn(turnId: string, summary = turnId, messageId = turnId, ordinal?: number): FreshAgentTurn {
-  return {
-    id: turnId,
-    turnId,
-    messageId,
-    ...(ordinal !== undefined ? { ordinal } : {}),
-    role: 'assistant',
-    summary,
-    items: [{ id: `${turnId}-text`, kind: 'text', text: summary }],
-  }
-}
 
 describe('freshAgentSlice busy/streaming clearing', () => {
   const loc = { sessionId: 'abc', sessionType: 'freshclaude' as const, provider: 'claude' as const }
@@ -103,122 +86,5 @@ describe('freshAgentSlice', () => {
       retryable: true,
     })
     expect(state.sessions).toEqual({})
-  })
-
-  it('preserves older loaded turns when a newest-page refresh arrives', () => {
-    const loc = { sessionId: 'thread-1', sessionType: 'freshcodex' as const, provider: 'codex' as const }
-    const key = makeFreshAgentSessionKey(loc)
-    let state = reducer(undefined, historyLoadStarted({ ...loc, requestKey: 'first' }))
-    state = reducer(state, historyPageReceived({
-      ...loc,
-      requestKey: 'first',
-      turns: [turn('turn-2', 'second'), turn('turn-3', 'third')],
-      nextCursor: 'cursor-after-newest',
-      revision: 5,
-    }))
-    state = reducer(state, historyPageReceived({
-      ...loc,
-      cursor: 'cursor-after-newest',
-      turns: [turn('turn-1', 'first')],
-      nextCursor: 'cursor-after-older',
-      revision: 5,
-    }))
-
-    state = reducer(state, historyPageReceived({
-      ...loc,
-      requestKey: 'first',
-      turns: [turn('turn-3', 'third updated'), turn('turn-4', 'fourth')],
-      nextCursor: 'cursor-after-newest-refresh',
-      revision: 5,
-    }))
-
-    expect(state.sessions[key].historyItems.map((item) => item.turnId)).toEqual([
-      'turn-1',
-      'turn-2',
-      'turn-3',
-      'turn-4',
-    ])
-    expect(state.sessions[key].historyItems[2]?.summary).toBe('third updated')
-    expect(state.sessions[key].nextHistoryCursor).toBe('cursor-after-older')
-  })
-
-  it('ignores stale newest-page responses by request key', () => {
-    const loc = { sessionId: 'thread-2', sessionType: 'freshcodex' as const, provider: 'codex' as const }
-    const key = makeFreshAgentSessionKey(loc)
-    let state = reducer(undefined, historyLoadStarted({ ...loc, requestKey: 'newer' }))
-
-    state = reducer(state, historyPageReceived({
-      ...loc,
-      requestKey: 'older',
-      turns: [turn('turn-stale')],
-      nextCursor: null,
-      revision: 1,
-    }))
-
-    expect(state.sessions[key].historyItems).toEqual([])
-    expect(state.sessions[key].historyLoaded).toBe(false)
-  })
-
-  it('keeps older loaded turns but resets the older cursor when the first-page revision changes', () => {
-    const loc = { sessionId: 'thread-3', sessionType: 'freshcodex' as const, provider: 'codex' as const }
-    const key = makeFreshAgentSessionKey(loc)
-    let state = reducer(undefined, historyPageReceived({
-      ...loc,
-      turns: [turn('turn-2')],
-      nextCursor: 'cursor-v1',
-      revision: 1,
-    }))
-    state = reducer(state, historyPageReceived({
-      ...loc,
-      cursor: 'cursor-v1',
-      turns: [turn('turn-1')],
-      nextCursor: 'older-cursor-v1',
-      revision: 1,
-    }))
-
-    state = reducer(state, historyPageReceived({
-      ...loc,
-      turns: [turn('turn-2', 'second updated'), turn('turn-3')],
-      nextCursor: 'cursor-v2',
-      revision: 2,
-    }))
-
-    expect(state.sessions[key].historyItems.map((item) => item.turnId)).toEqual(['turn-1', 'turn-2', 'turn-3'])
-    expect(state.sessions[key].historyRevision).toBe(2)
-    expect(state.sessions[key].nextHistoryCursor).toBe('cursor-v2')
-  })
-
-  it('does not append older snapshot-only turns after a loaded newest page', () => {
-    const loc = { sessionId: 'thread-order', sessionType: 'freshclaude' as const, provider: 'claude' as const }
-    const key = makeFreshAgentSessionKey(loc)
-    let state = reducer(undefined, freshAgentSnapshotReceived({
-      hydrateHistory: false,
-      snapshot: {
-        sessionType: loc.sessionType,
-        provider: loc.provider,
-        threadId: loc.sessionId,
-        latestTurnId: 'turn-4',
-        status: 'idle',
-        revision: 9,
-        turns: [
-          turn('turn-1', 'older one', 'message-1', 1),
-          turn('turn-2', 'older two', 'message-2', 2),
-          turn('turn-3', 'newest loaded', 'message-3', 3),
-          turn('turn-4', 'new live result', 'message-4', 4),
-        ],
-      },
-    }))
-    state = reducer(state, historyPageReceived({
-      ...loc,
-      requestKey: 'first-page',
-      turns: [turn('turn-3', 'newest loaded', 'message-3', 3)],
-      nextCursor: 'older-cursor',
-      revision: 9,
-    }))
-
-    expect(selectFreshAgentTranscriptTurns(state.sessions[key]).map((item) => item.turnId)).toEqual([
-      'turn-3',
-      'turn-4',
-    ])
   })
 })

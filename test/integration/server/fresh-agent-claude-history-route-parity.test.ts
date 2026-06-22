@@ -119,7 +119,7 @@ describe('fresh-agent Claude history route parity', () => {
     expect(defaultPage.body.revision).toBe(7)
     expect(defaultPage.body.turns).toHaveLength(20)
     expect(defaultPage.body.turns.map((turn: { turnId: string }) => turn.turnId)).toEqual(
-      Array.from({ length: 20 }, (_, offset) => `turn-${15 + offset}`),
+      Array.from({ length: 20 }, (_, offset) => `turn-${34 - offset}`),
     )
     expect(defaultPage.body.nextCursor).toEqual(expect.any(String))
 
@@ -135,7 +135,7 @@ describe('fresh-agent Claude history route parity', () => {
     expect(inlineBodies.status).toBe(200)
     expect(inlineBodies.body.revision).toBe(7)
     expect(inlineBodies.body.nextCursor).toEqual(expect.any(String))
-    expect(inlineBodies.body.turns.map((turn: { turnId: string }) => turn.turnId)).toEqual(['turn-33', 'turn-34'])
+    expect(inlineBodies.body.turns.map((turn: { turnId: string }) => turn.turnId)).toEqual(['turn-34', 'turn-33'])
     expect(Object.keys(inlineBodies.body.bodies).sort()).toEqual(['turn-33', 'turn-34'])
     expect(inlineBodies.body.bodies['turn-34'].items[0]).toMatchObject({
       kind: 'text',
@@ -161,13 +161,7 @@ describe('fresh-agent Claude history route parity', () => {
     const unpinnedPage = await request(app)
       .get('/api/fresh-agent/threads/freshclaude/claude/thread-parity/turns')
 
-    expect(unpinnedPage.status).toBe(200)
-    expect(unpinnedPage.body.revision).toBe(7)
-
-    const cursorWithoutRevision = await request(app)
-      .get(`/api/fresh-agent/threads/freshclaude/claude/thread-parity/turns?cursor=${encodeURIComponent(defaultPage.body.nextCursor)}`)
-
-    expect(cursorWithoutRevision.status).toBe(400)
+    expect(unpinnedPage.status).toBe(400)
 
     const unpinnedTurnBody = await request(app)
       .get('/api/fresh-agent/threads/freshclaude/claude/thread-parity/turns/turn-34')

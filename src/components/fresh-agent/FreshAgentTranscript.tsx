@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronDown, ChevronRight, Loader2 } from 'lucide-react'
 import SlotReel from '@/components/fresh-agent/shared/SlotReel'
 import { getToolPreview } from '@/components/fresh-agent/shared/tool-preview'
@@ -518,12 +518,6 @@ export function FreshAgentTranscript({
   isStreaming = false,
   onForkFromTurn,
   onRewindToTurn,
-  isInitialLoading = false,
-  hasOlderHistory = false,
-  isLoadingOlder = false,
-  historyError,
-  historyErrorActionLabel = 'Retry',
-  onLoadOlder,
 }: {
   turns: FreshAgentTurn[]
   canFork?: boolean
@@ -535,20 +529,8 @@ export function FreshAgentTranscript({
   isStreaming?: boolean
   onForkFromTurn?: (turnId: string) => void
   onRewindToTurn?: (turn: FreshAgentTurn) => void
-  isInitialLoading?: boolean
-  hasOlderHistory?: boolean
-  isLoadingOlder?: boolean
-  historyError?: string
-  historyErrorActionLabel?: string
-  onLoadOlder?: () => void | Promise<void>
 }) {
   const scrollerRef = useRef<HTMLDivElement | null>(null)
-  const layoutRef = useRef<{
-    firstKey: string | null
-    lastKey: string | null
-    count: number
-    scrollHeight: number
-  } | null>(null)
   const [atBottom, setAtBottom] = useState(true)
   const [newMessages, setNewMessages] = useState(0)
   const [contextMenu, setContextMenu] = useState<FreshAgentTurnContextMenuState>(null)
@@ -561,8 +543,6 @@ export function FreshAgentTranscript({
   const displayTurns = useMemo(() => (
     filterTurnsForDisplay(turns, displayOptions)
   ), [displayOptions, turns])
-  const displayTurnsRef = useRef(displayTurns)
-  displayTurnsRef.current = displayTurns
   const liveActivityBlockId = useMemo(
     () => selectLiveActivityBlockId(displayTurns, isStreaming, displayOptions),
     [displayOptions, displayTurns, isStreaming],
@@ -604,38 +584,14 @@ export function FreshAgentTranscript({
     onOpenActions: coarsePointer ? handleOpenActions : undefined,
   }), [canFork, coarsePointer, handleOpenActions, handleTurnContextMenu, onForkFromTurn, onRewindToTurn])
 
-  const loadOlder = useCallback(() => {
-    if (!hasOlderHistory || isLoadingOlder) return
-    void onLoadOlder?.()
-  }, [hasOlderHistory, isLoadingOlder, onLoadOlder])
-
-  useLayoutEffect(() => {
+  useEffect(() => {
     const node = scrollerRef.current
     if (!node) return
-    const currentDisplayTurns = displayTurnsRef.current
-    const firstKey = currentDisplayTurns[0] ? getFreshAgentDisplayTurnKey(currentDisplayTurns[0]) : null
-    const lastKey = currentDisplayTurns.at(-1) ? getFreshAgentDisplayTurnKey(currentDisplayTurns.at(-1)!) : null
-    const previous = layoutRef.current
-    const prependedOlderHistory = Boolean(
-      previous
-        && firstKey !== previous.firstKey
-        && lastKey === previous.lastKey
-        && currentDisplayTurns.length > previous.count,
-    )
-
     if (atBottom) {
       node.scrollTop = node.scrollHeight
       setNewMessages(0)
-    } else if (prependedOlderHistory && previous) {
-      node.scrollTop += node.scrollHeight - previous.scrollHeight
     } else {
       setNewMessages((count) => count + 1)
-    }
-    layoutRef.current = {
-      firstKey,
-      lastKey,
-      count: currentDisplayTurns.length,
-      scrollHeight: node.scrollHeight,
     }
   }, [atBottom, transcriptSignature])
 
@@ -648,47 +604,8 @@ export function FreshAgentTranscript({
         onScroll={(event) => {
           const node = event.currentTarget
           setAtBottom(node.scrollHeight - node.scrollTop - node.clientHeight < 24)
-          if (node.scrollTop < 48) loadOlder()
         }}
       >
-        {hasOlderHistory || historyError ? (
-          <div className="fresh-agent-history-controls sticky top-0 z-10 mb-2 flex justify-center py-1">
-            {historyError ? (
-              <div className="flex max-w-full items-center gap-2 rounded-md border border-destructive/50 bg-background px-3 py-1.5 text-xs text-destructive shadow-sm">
-                <span className="truncate">{historyError}</span>
-                {hasOlderHistory ? (
-                  <button
-                    type="button"
-                    className="shrink-0 rounded border border-border/70 px-2 py-0.5 text-foreground"
-                    onClick={loadOlder}
-                  >
-                    {historyErrorActionLabel}
-                  </button>
-                ) : null}
-              </div>
-            ) : (
-              <button
-                type="button"
-                className="flex items-center gap-1 rounded-full border border-border bg-background px-3 py-1 text-xs shadow-sm"
-                onClick={loadOlder}
-                disabled={isLoadingOlder}
-              >
-                {isLoadingOlder ? <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" /> : null}
-                {isLoadingOlder ? 'Loading older' : 'Load older'}
-              </button>
-            )}
-          </div>
-        ) : null}
-        {isInitialLoading && displayTurns.length === 0 ? (
-          <div
-            className="flex min-h-24 items-center justify-center gap-2 text-xs text-muted-foreground"
-            role="status"
-            aria-live="polite"
-          >
-            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-            <span>Restoring history</span>
-          </div>
-        ) : null}
         {displayTurns.map((turn, index) => (
           <FreshAgentTurnArticle
             key={`${getFreshAgentDisplayTurnKey(turn)}:${index}`}

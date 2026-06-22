@@ -409,23 +409,20 @@ export function normalizeOpencodeTurnPage(input: {
   exported?: OpencodeExportWithPageMetadata
   revision: number
   nextCursor?: string | null
-  includeBodies?: boolean
 }): FreshAgentTurnPage {
   const messages = Array.isArray(input.exported?.messages) ? input.exported.messages : []
   const nextCursor = Object.prototype.hasOwnProperty.call(input, 'nextCursor')
     ? input.nextCursor
     : input.exported?.nextCursor
-  const turns = messages
-    .map((message, index) => normalizeOpencodeTurn(message, index))
-    .filter((turn): turn is FreshAgentTurn => Boolean(turn))
   return {
     sessionType: 'freshopencode',
     provider: 'opencode',
     threadId: input.threadId,
     revision: input.revision,
     nextCursor: typeof nextCursor === 'string' ? nextCursor : null,
-    turns,
-    ...(input.includeBodies ? { bodies: Object.fromEntries(turns.map((turn) => [turn.turnId, turn])) } : {}),
+    turns: messages
+      .map((message, index) => normalizeOpencodeTurn(message, index))
+      .filter((turn): turn is FreshAgentTurn => Boolean(turn)),
   }
 }
 

@@ -65,19 +65,6 @@ function makeAdapter(manager: FakeManager, overrides: Partial<Parameters<typeof 
 }
 
 describe('OpenCode serve adapter: create + send', () => {
-  it('rejects temporary Freshopencode ids on resume instead of treating them as durable sessions', async () => {
-    const manager = makeFakeManager()
-    const adapter = makeAdapter(manager)
-
-    await expect(adapter.resume?.({
-      requestId: 'resume-placeholder',
-      sessionType: 'freshopencode',
-      provider: 'opencode',
-      resumeSessionId: 'freshopencode-resume-placeholder',
-    })).rejects.toThrow('temporary Freshopencode id')
-    expect(manager.getSession).not.toHaveBeenCalled()
-  })
-
   it('creates a placeholder, materializes on first send via POST /session, and awaits idle', async () => {
     const manager = makeFakeManager()
     const adapter = makeAdapter(manager)
@@ -396,7 +383,7 @@ describe('OpenCode serve adapter: history reads', () => {
 
     await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1' })
     await adapter.getSnapshot?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' })
-    await adapter.getTurnPage?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' }, { limit: 1, revision: 12 })
+    await adapter.getTurnPage?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' }, { limit: 1, revision: 0 })
     await adapter.getTurnBody?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1', turnId: 'msg_assistant_1' }, 12)
 
     expect(manager.getSession).toHaveBeenNthCalledWith(1, 'ses_real_1')
@@ -411,43 +398,10 @@ describe('OpenCode serve adapter: history reads', () => {
     manager.listMessages = vi.fn(async () => ({ messages: messages.slice(0, 1), nextCursor: 'NEXT' }))
     const adapter = makeAdapter(manager)
     await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1', cwd: '/repo/history' })
-    const page = await adapter.getTurnPage?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' }, { cursor: 'CUR', limit: 1, revision: 5 })
+    const page = await adapter.getTurnPage?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' }, { cursor: 'CUR', limit: 1, revision: 0 })
     expect(page).toMatchObject({ nextCursor: 'NEXT', turns: [{ turnId: 'msg_user_1' }] })
     expect(manager.getSession).toHaveBeenCalledWith('ses_real_1', { cwd: '/repo/history' })
     expect(manager.listMessages).toHaveBeenCalledWith('ses_real_1', { limit: 1, before: 'CUR' }, { cwd: '/repo/history' })
-  })
-
-  it('getTurnPage rejects stale revisions clearly', async () => {
-    const manager = makeFakeManager()
-    manager.getSession = vi.fn(async () => ({ id: 'ses_real_1', title: 'Kimi chat', time: { updated: 12 } }))
-    manager.listMessages = vi.fn(async () => ({ messages: messages.slice(0, 1), nextCursor: null }))
-    const adapter = makeAdapter(manager)
-    await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1', cwd: '/repo/history' })
-
-    await expect(adapter.getTurnPage?.(
-      { sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' },
-      { limit: 1, revision: 11 },
-    )).rejects.toMatchObject({
-      code: 'STALE_THREAD_REVISION',
-      currentRevision: 12,
-    })
-  })
-
-  it('getTurnPage returns full bodies keyed by turn id when requested', async () => {
-    const manager = makeFakeManager()
-    manager.getSession = vi.fn(async () => ({ id: 'ses_real_1', title: 'Kimi chat', time: { updated: 12 } }))
-    manager.listMessages = vi.fn(async () => ({ messages, nextCursor: null }))
-    const adapter = makeAdapter(manager)
-    await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1', cwd: '/repo/history' })
-
-    const page: any = await adapter.getTurnPage?.(
-      { sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' },
-      { includeBodies: true, revision: 12 },
-    )
-
-    expect(Object.keys(page.bodies)).toEqual(['msg_user_1', 'msg_assistant_1'])
-    expect(page.bodies.msg_user_1).toMatchObject({ turnId: 'msg_user_1', role: 'user' })
-    expect(page.bodies.msg_assistant_1).toMatchObject({ turnId: 'msg_assistant_1', role: 'assistant' })
   })
 
   it('getTurnBody fetches a single message and normalizes it', async () => {

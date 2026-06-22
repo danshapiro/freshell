@@ -25,8 +25,6 @@ const wsMock = vi.hoisted(() => ({
 const apiMock = vi.hoisted(() => ({
   getFreshAgentThreadSnapshot: vi.fn(),
   getFreshAgentModelCapabilities: vi.fn(),
-  getFreshAgentTurnPage: vi.fn(),
-  getFreshAgentTurnBody: vi.fn(),
   post: vi.fn(),
   setSessionMetadata: vi.fn().mockResolvedValue(undefined),
 }))
@@ -47,8 +45,6 @@ vi.mock('@/lib/api', async () => {
     api: { ...actual.api, post: apiMock.post },
     getFreshAgentThreadSnapshot: apiMock.getFreshAgentThreadSnapshot,
     getFreshAgentModelCapabilities: apiMock.getFreshAgentModelCapabilities,
-    getFreshAgentTurnPage: apiMock.getFreshAgentTurnPage,
-    getFreshAgentTurnBody: apiMock.getFreshAgentTurnBody,
     setSessionMetadata: apiMock.setSessionMetadata,
   }
 })
@@ -190,21 +186,10 @@ beforeEach(() => {
   wsMock.onMessage.mockImplementation(() => () => {})
   apiMock.getFreshAgentThreadSnapshot.mockReset()
   apiMock.getFreshAgentModelCapabilities.mockReset()
-  apiMock.getFreshAgentTurnPage.mockReset()
-  apiMock.getFreshAgentTurnBody.mockReset()
   apiMock.post.mockReset()
   apiMock.setSessionMetadata.mockReset()
   apiMock.post.mockResolvedValue({ title: null, source: 'none' })
   apiMock.setSessionMetadata.mockResolvedValue(undefined)
-  apiMock.getFreshAgentTurnPage.mockResolvedValue({
-    sessionType: 'freshcodex',
-    provider: 'codex',
-    threadId: 'thread-1',
-    revision: 1,
-    nextCursor: null,
-    turns: [],
-    bodies: {},
-  })
   saveServerSettingsPatchSpy.mockClear()
   window.localStorage.removeItem('freshopencode.modelMru.v2')
   apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
@@ -1131,7 +1116,7 @@ describe('FreshAgentView', () => {
     })
   })
 
-  it('shows a clear error instead of recreating a legacy freshopencode placeholder', async () => {
+  it('sends tab restore context when recreating a legacy freshopencode placeholder', async () => {
     const store = createStore()
     store.dispatch(updateTab({
       id: 'tab-1',
@@ -1161,16 +1146,19 @@ describe('FreshAgentView', () => {
     )
 
     await waitFor(() => {
-      const content = getFreshAgentPaneContent(store)
-      expect(content.sessionRef).toBeUndefined()
-      expect(content.resumeSessionId).toBeUndefined()
-      expect(content.restoreError).toEqual({
-        code: 'RESTORE_UNAVAILABLE',
-        reason: 'invalid_legacy_restore_target',
+      expect(sentFreshAgentMessages('freshAgent.create').at(-1)).toMatchObject({
+        requestId: '-gP4qyCL7bwp8-xbw9G7b',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/home/dan/code',
+        resumeSessionId: 'freshopencode--gP4qyCL7bwp8-xbw9G7b',
+        legacyRestoreContext: {
+          title: 'Identifying skills from GitHub repos',
+          createdAt: 1_781_291_230_743,
+          updatedAt: expect.any(Number),
+        },
       })
     })
-    expect(screen.getByRole('alert')).toHaveTextContent('temporary session id')
-    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
     expect(apiMock.getFreshAgentThreadSnapshot).not.toHaveBeenCalledWith(
       'freshopencode',
       'opencode',
@@ -3706,156 +3694,6 @@ describe('FreshAgentView', () => {
       sessionId: 'sess-live-only',
       text: 'Do not retitle this live-only established chat',
     }))
-  })
-
-  it('does not auto-title a restored freshcodex pane after an empty metadata snapshot when history has user turns', async () => {
-    const store = createStore()
-    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
-      sessionType: 'freshcodex',
-      provider: 'codex',
-      threadId: 'codex-restored-title',
-      status: 'idle',
-      summary: 'metadata only',
-      capabilities: { send: true, interrupt: true, fork: true },
-      turns: [],
-    })
-    apiMock.getFreshAgentTurnPage.mockResolvedValueOnce({
-      sessionType: 'freshcodex',
-      provider: 'codex',
-      threadId: 'codex-restored-title',
-      revision: 4,
-      nextCursor: null,
-      turns: [{
-        id: 'turn-existing-user',
-        turnId: 'turn-existing-user',
-        role: 'user',
-        summary: 'Existing request',
-        items: [{ id: 'item-existing-user', kind: 'text', text: 'Existing request' }],
-      }],
-      bodies: {},
-    })
-    store.dispatch(initLayout({
-      tabId: 'tab-1',
-      paneId: 'pane-1',
-      content: {
-        kind: 'fresh-agent',
-        sessionType: 'freshcodex',
-        provider: 'codex',
-        createRequestId: 'req-restored-codex-title',
-        sessionId: 'codex-restored-title',
-        sessionRef: { provider: 'codex', sessionId: 'codex-restored-title' },
-        status: 'idle',
-      },
-    }))
-    store.dispatch(updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-1', title: 'Existing Codex pane title', setByUser: false }))
-    store.dispatch(updateTab({ id: 'tab-1', updates: { title: 'Existing Codex tab title' } }))
-
-    render(
-      <Provider store={store}>
-        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
-      </Provider>,
-    )
-
-    await waitFor(() => {
-      expect(screen.getByText('Existing request')).toBeInTheDocument()
-      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
-    })
-
-    wsMock.send.mockClear()
-    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
-      target: { value: 'Do not rename restored codex' },
-    })
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
-
-    await waitFor(() => {
-      expect(sentFreshAgentMessages('freshAgent.send').at(-1)).toMatchObject({
-        sessionId: 'codex-restored-title',
-        text: 'Do not rename restored codex',
-      })
-    })
-    const state = store.getState()
-    expect(state.panes.paneTitles?.['tab-1']?.['pane-1']).toBe('Existing Codex pane title')
-    expect(state.tabs.tabs.find((tab) => tab.id === 'tab-1')?.title).toBe('Existing Codex tab title')
-  })
-
-  it('refreshes newest restored history instead of retrying an expired older cursor', async () => {
-    const store = createStore()
-    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
-      sessionType: 'freshcodex',
-      provider: 'codex',
-      threadId: 'codex-stale-cursor',
-      status: 'idle',
-      summary: 'metadata only',
-      capabilities: { send: true, interrupt: true, fork: true },
-      turns: [],
-    })
-    apiMock.getFreshAgentTurnPage
-      .mockResolvedValueOnce({
-        sessionType: 'freshcodex',
-        provider: 'codex',
-        threadId: 'codex-stale-cursor',
-        revision: 1,
-        nextCursor: 'stale-cursor',
-        turns: [{
-          id: 'turn-newest',
-          turnId: 'turn-newest',
-          role: 'assistant',
-          summary: 'Newest restored turn',
-          items: [{ id: 'item-newest', kind: 'text', text: 'Newest restored turn' }],
-        }],
-        bodies: {},
-      })
-      .mockRejectedValueOnce(new Error('STALE_THREAD_REVISION latest revision 2'))
-      .mockResolvedValueOnce({
-        sessionType: 'freshcodex',
-        provider: 'codex',
-        threadId: 'codex-stale-cursor',
-        revision: 2,
-        nextCursor: null,
-        turns: [{
-          id: 'turn-refreshed',
-          turnId: 'turn-refreshed',
-          role: 'assistant',
-          summary: 'Refreshed newest turn',
-          items: [{ id: 'item-refreshed', kind: 'text', text: 'Refreshed newest turn' }],
-        }],
-        bodies: {},
-      })
-    store.dispatch(initLayout({
-      tabId: 'tab-1',
-      paneId: 'pane-1',
-      content: {
-        kind: 'fresh-agent',
-        sessionType: 'freshcodex',
-        provider: 'codex',
-        createRequestId: 'req-stale-cursor',
-        sessionId: 'codex-stale-cursor',
-        sessionRef: { provider: 'codex', sessionId: 'codex-stale-cursor' },
-        status: 'idle',
-      },
-    }))
-
-    render(
-      <Provider store={store}>
-        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
-      </Provider>,
-    )
-
-    fireEvent.click(await screen.findByRole('button', { name: 'Refresh' }))
-
-    await waitFor(() => {
-      expect(apiMock.getFreshAgentTurnPage).toHaveBeenCalledTimes(3)
-    })
-    expect(apiMock.getFreshAgentTurnPage.mock.calls[1][3]).toMatchObject({
-      cursor: 'stale-cursor',
-      revision: 1,
-      priority: 'background',
-    })
-    expect(apiMock.getFreshAgentTurnPage.mock.calls[2][3]).toMatchObject({
-      cursor: undefined,
-      priority: 'visible',
-      includeBodies: true,
-    })
   })
 
   it('recreates a lost freshclaude session through fresh-agent transport events with the durable resume id', async () => {

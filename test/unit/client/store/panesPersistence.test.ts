@@ -168,43 +168,6 @@ describe('Panes Persistence Integration', () => {
     expect(layoutAfter).toEqual(layoutBefore)
   })
 
-  it('persists non-durable Freshopencode session refs as clear restore errors', () => {
-    const store = configureStore({
-      reducer: {
-        tabs: tabsReducer,
-        panes: panesReducer,
-      },
-      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
-    })
-
-    store.dispatch(addTab({ mode: 'opencode' }))
-    const tabId = store.getState().tabs.tabs[0].id
-    store.dispatch(initLayout({
-      tabId,
-      content: {
-        kind: 'fresh-agent',
-        sessionType: 'freshopencode',
-        provider: 'opencode',
-        createRequestId: 'req-opencode',
-        sessionId: 'freshopencode-req-opencode',
-        sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-opencode' },
-        status: 'connected',
-      },
-    }))
-    vi.runAllTimers()
-
-    const raw = localStorage.getItem('freshell.layout.v3')!
-    const persisted = JSON.parse(raw)
-    const content = persisted.panes.layouts[tabId].content
-    expect(content.sessionRef).toBeUndefined()
-    expect(content.sessionId).toBeUndefined()
-    expect(content.status).toBe('idle')
-    expect(content.restoreError).toEqual({
-      code: 'RESTORE_UNAVAILABLE',
-      reason: 'invalid_legacy_restore_target',
-    })
-  })
-
   it('initial state loads from localStorage without explicit hydration', () => {
     // 1. First session: Create state and persist it
     const store1 = configureStore({

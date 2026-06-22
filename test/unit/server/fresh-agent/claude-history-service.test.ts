@@ -51,7 +51,7 @@ function toResolvedHistory(sessionId: string, timelineSessionId: string | undefi
 }
 
 describe('Claude fresh-agent history service', () => {
-  it('returns the newest timeline chunk in reading order with a cursor for older turns', async () => {
+  it('returns recent-first timeline pages with a cursor', async () => {
     const resolve = vi.fn().mockResolvedValue({
       ...toResolvedHistory('agent-session-1', undefined),
     })
@@ -67,8 +67,8 @@ describe('Claude fresh-agent history service', () => {
     })
 
     expect(firstPage.items.map((item) => item.summary)).toEqual([
-      'middle assistant turn',
       'latest user turn',
+      'middle assistant turn',
     ])
     expect(firstPage.nextCursor).toBeTruthy()
     expect(resolve).toHaveBeenCalledWith('agent-session-1')
@@ -228,7 +228,7 @@ describe('Claude fresh-agent history service', () => {
     })
   })
 
-  it('allows initial timeline-page reads to omit the restore revision', async () => {
+  it('rejects timeline-page reads that omit the accepted restore revision', async () => {
     const service = createClaudeFreshAgentHistoryService({
       agentHistorySource: {
         resolve: vi.fn().mockResolvedValue({
@@ -241,32 +241,6 @@ describe('Claude fresh-agent history service', () => {
     await expect(service.getThreadTurnPage({
       sessionId: 'sdk-1',
       priority: 'visible',
-    })).resolves.toMatchObject({
-      revision: 13,
-    })
-  })
-
-  it('rejects timeline-page cursor reads that omit the accepted restore revision', async () => {
-    const service = createClaudeFreshAgentHistoryService({
-      agentHistorySource: {
-        resolve: vi.fn().mockResolvedValue({
-          ...toResolvedHistory('sdk-1', '00000000-0000-4000-8000-000000000001'),
-          revision: 13,
-        }),
-      },
-    })
-
-    const firstPage = await service.getThreadTurnPage({
-      sessionId: 'sdk-1',
-      priority: 'visible',
-      limit: 1,
-      revision: 13,
-    })
-
-    await expect(service.getThreadTurnPage({
-      sessionId: 'sdk-1',
-      priority: 'visible',
-      cursor: firstPage.nextCursor ?? undefined,
     } as any)).rejects.toThrow('Restore revision is required')
   })
 

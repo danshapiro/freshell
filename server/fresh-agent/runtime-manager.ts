@@ -309,7 +309,7 @@ export class FreshAgentRuntimeManager {
     cwd?: string
     cursor?: string
     priority?: string
-    revision?: number
+    revision: number
     limit?: number
     includeBodies?: boolean
   }) {

@@ -275,20 +275,8 @@ describe('visible-first read-model helpers', () => {
     )
   })
 
-  it('allows first-page thread-turn requests to omit the restore revision', async () => {
-    const signal = new AbortController().signal
-    mockFetch.mockResolvedValueOnce(mockJson({ items: [], nextCursor: null }))
-
-    await getFreshAgentThreadTurns('session-1', { priority: 'visible' }, { signal })
-
-    expect(mockFetch).toHaveBeenCalledWith(
-      '/api/fresh-agent/threads/freshclaude/claude/session-1/turns?priority=visible',
-      expect.objectContaining({ signal, headers: expect.any(Headers) }),
-    )
-  })
-
-  it('rejects thread-turn cursor requests that omit the pinned restore revision', async () => {
-    await expect(getFreshAgentThreadTurns('session-1', { priority: 'visible', cursor: 'cursor-1' }, { signal: new AbortController().signal }))
+  it('rejects thread-turn requests that omit the pinned restore revision', async () => {
+    await expect(getFreshAgentThreadTurns('session-1', { priority: 'visible' }, { signal: new AbortController().signal }))
       .rejects
       .toMatchObject({
         name: 'ZodError',

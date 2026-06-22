@@ -71,7 +71,6 @@ type CodexRuntimePort = {
     cursor?: string
     limit?: number
     itemsView?: 'notLoaded' | 'summary' | 'full'
-    sortDirection?: 'asc' | 'desc'
   }) => Promise<Record<string, any>>
   readThreadTurn: (input: { threadId: string; turnId: string; revision?: number }) => Promise<Record<string, any>>
 }
@@ -264,22 +263,7 @@ function isCodexIncludeTurnsUnavailable(error: unknown): boolean {
     || error.message.includes('not materialized yet')
 }
 
-function nonEmptyString(value: unknown): string | undefined {
-  return typeof value === 'string' && value.length > 0 ? value : undefined
-}
-
 function findActiveTurnId(rawSnapshot: Record<string, any>): string | undefined {
-  const thread = rawSnapshot.thread && typeof rawSnapshot.thread === 'object' && !Array.isArray(rawSnapshot.thread)
-    ? rawSnapshot.thread as Record<string, unknown>
-    : {}
-  const status = thread.status && typeof thread.status === 'object' && !Array.isArray(thread.status)
-    ? thread.status as Record<string, unknown>
-    : {}
-  const metadataTurnId = nonEmptyString(status.activeTurnId)
-    ?? nonEmptyString(status.turnId)
-    ?? nonEmptyString(thread.activeTurnId)
-  if (metadataTurnId) return metadataTurnId
-
   const turns = Array.isArray(rawSnapshot.thread?.turns) ? rawSnapshot.thread.turns : []
   for (let index = turns.length - 1; index >= 0; index -= 1) {
     const turn = turns[index]
@@ -541,33 +525,18 @@ export function createCodexFreshAgentAdapter(deps: {
     let providerCursor: string | null | undefined
     let backwardsCursor: string | null | undefined
 
-    const finishPage = (nextCursor: string | null, pageBackwardsCursor: string | null) => {
-      const readingOrderTurns = turns.slice().reverse()
-      return FreshAgentTurnPageSchema.parse({
-        sessionType: 'freshcodex',
-        provider: 'codex',
-        threadId: input.threadId,
-        revision: input.revision,
-        nextCursor,
-        backwardsCursor: pageBackwardsCursor,
-        turns: readingOrderTurns.map((turn, index) => ({ ...turn, ordinal: index })),
-        bodies: Object.fromEntries(readingOrderTurns.map((turn) => [turn.turnId, turn])),
-      })
-    }
-
     const appendTurnRows = (rawTurn: Record<string, unknown>, offset: number, providerCursorAfterTurn: string | null) => {
       const normalized = normalizeSingleRawTurn({
         threadId: input.threadId,
         revision: input.revision,
         rawTurn,
       })
-      const newestFirstRows = normalized.turns.slice().reverse()
-      const availableRows = newestFirstRows.slice(offset)
+      const availableRows = normalized.turns.slice(offset)
       const remainingSlots = limit - turns.length
       const selectedRows = availableRows.slice(0, remainingSlots)
       turns.push(...selectedRows)
       const nextDisplayOffset = offset + selectedRows.length
-      if (nextDisplayOffset < newestFirstRows.length) {
+      if (nextDisplayOffset < normalized.turns.length) {
         return createDisplayCursor({
           threadId: input.threadId,
           revision: input.revision,
@@ -600,7 +569,16 @@ export function createCodexFreshAgentAdapter(deps: {
       if (cursor.rawTurn) {
         const nextCursor = appendTurnRows(cursor.rawTurn, cursor.nextDisplayOffset, cursor.providerCursor)
         if (turns.length >= limit || nextCursor || !cursor.providerCursor) {
-          return finishPage(nextCursor, null)
+          return FreshAgentTurnPageSchema.parse({
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            threadId: input.threadId,
+            revision: input.revision,
+            nextCursor,
+            backwardsCursor: null,
+            turns: turns.map((turn, index) => ({ ...turn, ordinal: index })),
+            bodies: Object.fromEntries(turns.map((turn) => [turn.turnId, turn])),
+          })
         }
       }
     }
@@ -611,7 +589,6 @@ export function createCodexFreshAgentAdapter(deps: {
         ...(providerCursor ? { cursor: providerCursor } : {}),
         limit: 1,
         itemsView: 'full',
-        sortDirection: 'desc',
       })
       const pageRevision = Number(rawPage.revision ?? input.revision)
       if (pageRevision !== input.revision) {
@@ -628,12 +605,30 @@ export function createCodexFreshAgentAdapter(deps: {
       }
       const nextCursor = appendTurnRows(rawTurns[0], 0, providerCursor)
       if (turns.length >= limit || nextCursor) {
-        return finishPage(nextCursor, backwardsCursor ?? null)
+        return FreshAgentTurnPageSchema.parse({
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          threadId: input.threadId,
+          revision: input.revision,
+          nextCursor,
+          backwardsCursor: backwardsCursor ?? null,
+          turns: turns.map((turn, index) => ({ ...turn, ordinal: index })),
+          bodies: Object.fromEntries(turns.map((turn) => [turn.turnId, turn])),
+        })
       }
       if (!providerCursor) break
     }
 
-    return finishPage(null, backwardsCursor ?? null)
+    return FreshAgentTurnPageSchema.parse({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: input.threadId,
+      revision: input.revision,
+      nextCursor: null,
+      backwardsCursor: backwardsCursor ?? null,
+      turns: turns.map((turn, index) => ({ ...turn, ordinal: index })),
+      bodies: Object.fromEntries(turns.map((turn) => [turn.turnId, turn])),
+    })
   }
 
   const findDisplayIndexEntry = (threadId: string, revision: number, displayTurnId: string): DisplayIndexEntry | undefined => {
@@ -653,7 +648,6 @@ export function createCodexFreshAgentAdapter(deps: {
         ...(cursor ? { cursor } : {}),
         limit: 100,
         itemsView: 'full',
-        sortDirection: 'desc',
       })
       const currentRevision = Number(rawPage.revision ?? revision)
       normalizeRawPage({ threadId, revision: currentRevision, rawPage })
@@ -1031,23 +1025,38 @@ export function createCodexFreshAgentAdapter(deps: {
         thread.threadId,
         settingsFromLocator(thread) ?? settingsByThread.get(thread.threadId),
       )
-      const rawSnapshot = await runtime.readThread({ threadId: thread.threadId, includeTurns: false })
+      let rawSnapshot: Record<string, any>
+      try {
+        rawSnapshot = await runtime.readThread({ threadId: thread.threadId, includeTurns: true })
+      } catch (error) {
+        if (!isCodexIncludeTurnsUnavailable(error)) {
+          throw error
+        }
+        rawSnapshot = await runtime.readThread({ threadId: thread.threadId, includeTurns: false })
+      }
+      const rawThreadTurns: unknown[] = Array.isArray(rawSnapshot.thread?.turns)
+        ? rawSnapshot.thread.turns
+        : []
       const activeTurnId = findActiveTurnId(rawSnapshot)
       if (activeTurnId) {
         activeTurnByThread.set(thread.threadId, activeTurnId)
       } else if (normalizeCodexThreadStatus(rawSnapshot.thread?.status) !== 'running') {
         activeTurnByThread.delete(thread.threadId)
       }
+      const rawTurns = rawThreadTurns
+        .filter((turn): turn is Record<string, unknown> => !!turn && typeof turn === 'object' && !Array.isArray(turn))
       const revisionNumber = Number(rawSnapshot.thread?.updatedAt ?? revision ?? 0)
-      if (!Number.isFinite(revisionNumber)) {
-        throw new FreshAgentUnprovableThreadRevisionError(0)
-      }
+      const turns = normalizeRawTurns({
+        threadId: thread.threadId,
+        revision: revisionNumber,
+        rawTurns,
+      })
       return normalizeCodexThreadSnapshot({
         threadId: thread.threadId,
         revision: revisionNumber,
         status: normalizeCodexThreadStatus(rawSnapshot.thread?.status),
         transcript: {
-          turns: [],
+          turns,
         },
         rawSnapshot,
       })
@@ -1058,22 +1067,10 @@ export function createCodexFreshAgentAdapter(deps: {
         thread.threadId,
         settingsFromLocator(thread) ?? settingsByThread.get(thread.threadId),
       )
-      let revision = typeof query.revision === 'number' ? query.revision : undefined
-      if (revision == null && typeof query.cursor !== 'string') {
-        const metadata = await runtime.readThread({ threadId: thread.threadId, includeTurns: false })
-        const metadataRevision = Number(metadata.thread?.updatedAt)
-        if (!Number.isFinite(metadataRevision)) {
-          throw new FreshAgentUnprovableThreadRevisionError(0)
-        }
-        revision = metadataRevision
-      }
-      if (revision == null) {
-        throw new FreshAgentUnprovableThreadRevisionError(0)
-      }
       return normalizeDisplayTurnPage({
         runtime,
         threadId: thread.threadId,
-        revision,
+        revision: Number(query.revision ?? 0),
         cursor: typeof query.cursor === 'string' ? query.cursor : undefined,
         limit: typeof query.limit === 'number' ? query.limit : undefined,
       })

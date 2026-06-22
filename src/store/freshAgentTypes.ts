@@ -65,13 +65,6 @@ export type FreshAgentSessionState = FreshAgentSessionLocator & {
   nextHistoryCursor?: string | null
   historyLoading?: boolean
   historyError?: string
-  historyInitialLoading?: boolean
-  historyOlderLoading?: boolean
-  historyOlderError?: string
-  historyBackfillComplete?: boolean
-  historyBackfillPaused?: boolean
-  historyInitialRequestKey?: string
-  historyOlderRequestKey?: string
   streamingText: string
   streamingActive: boolean
   pendingPermissions: Record<string, FreshAgentPermissionRequest>

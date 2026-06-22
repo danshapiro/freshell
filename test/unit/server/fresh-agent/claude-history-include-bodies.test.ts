@@ -78,12 +78,6 @@ describe('FreshAgentThreadTurnsQuerySchema includeBodies parsing', () => {
     expect(result.includeBodies).toBeUndefined()
   })
 
-  it('allows initial pages to omit revision but requires revision with a cursor', () => {
-    expect(FreshAgentThreadTurnsQuerySchema.parse({ priority: 'visible' }).revision).toBeUndefined()
-    expect(() => FreshAgentThreadTurnsQuerySchema.parse({ priority: 'visible', cursor: 'cursor-1' })).toThrow(/revision/)
-    expect(FreshAgentThreadTurnsQuerySchema.parse({ priority: 'visible', cursor: 'cursor-1', revision: 7 }).revision).toBe(7)
-  })
-
   it('rejects invalid string values for includeBodies', () => {
     expect(() => FreshAgentThreadTurnsQuerySchema.parse({ includeBodies: 'abc', priority: 'visible', revision: 7 })).toThrow()
     expect(() => FreshAgentThreadTurnsQuerySchema.parse({ includeBodies: '0', priority: 'visible', revision: 7 })).toThrow()

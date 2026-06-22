@@ -253,7 +253,7 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
         sessionId: thread.threadId,
         cursor: typeof query.cursor === 'string' ? query.cursor : undefined,
         priority: typeof query.priority === 'string' ? query.priority as 'visible' | 'background' : undefined,
-        revision: typeof query.revision === 'number' ? query.revision : undefined,
+        revision: Number(query.revision),
         limit: typeof query.limit === 'number' ? query.limit : undefined,
         includeBodies: query.includeBodies === true,
       })

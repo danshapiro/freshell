@@ -35,52 +35,6 @@ describe('FreshAgentTranscript', () => {
     expect(screen.getByText('Hello from Fresh Agent')).toBeInTheDocument()
   })
 
-  it('renders load-older controls and retries older history errors', () => {
-    const onLoadOlder = vi.fn()
-
-    render(
-      <FreshAgentTranscript
-        turns={[
-          {
-            id: 'turn-1',
-            role: 'assistant',
-            items: [{ id: 'item-1', kind: 'text', text: 'Newest visible turn' }],
-          },
-        ]}
-        hasOlderHistory
-        historyError="Older history cursor expired"
-        onLoadOlder={onLoadOlder}
-      />,
-    )
-
-    expect(screen.getByText('Older history cursor expired')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
-    expect(onLoadOlder).toHaveBeenCalledTimes(1)
-  })
-
-  it('renders initial history loading before restored turns arrive', () => {
-    render(<FreshAgentTranscript turns={[]} isInitialLoading />)
-
-    expect(screen.getByRole('status')).toHaveTextContent('Restoring history')
-  })
-
-  it('can label expired older-history recovery as refresh', () => {
-    const onLoadOlder = vi.fn()
-
-    render(
-      <FreshAgentTranscript
-        turns={[]}
-        hasOlderHistory
-        historyError="Older history cursor expired"
-        historyErrorActionLabel="Refresh"
-        onLoadOlder={onLoadOlder}
-      />,
-    )
-
-    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
-    expect(onLoadOlder).toHaveBeenCalledTimes(1)
-  })
-
   it('uses the pane agent label for assistant turns when provided', () => {
     render(
       <FreshAgentTranscript

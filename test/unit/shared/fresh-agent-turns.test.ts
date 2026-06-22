@@ -5,8 +5,6 @@ import {
   freshAgentSnapshotHasUserTurn,
   freshAgentTurnText,
   getFreshAgentDisplayTurnKey,
-  getFreshAgentTurnIdentityKeys,
-  isTemporaryFreshAgentTurnId,
 } from '../../../shared/fresh-agent-turns.js'
 
 describe('fresh-agent display turn helpers', () => {
@@ -87,27 +85,5 @@ describe('fresh-agent display turn helpers', () => {
       items: [],
       providerTurnId: 'legacy-id',
     })).toThrow()
-  })
-
-  it('ignores temporary display ids but keeps durable message identity keys', () => {
-    expect(isTemporaryFreshAgentTurnId('live-user-1')).toBe(true)
-    expect(isTemporaryFreshAgentTurnId('__local-echo:req-1')).toBe(true)
-    expect(isTemporaryFreshAgentTurnId('turn-durable-1')).toBe(false)
-
-    expect(getFreshAgentTurnIdentityKeys({
-      id: 'live-user-1',
-      turnId: '__local-echo:req-1',
-      messageId: 'message-1',
-    })).toEqual(['message:message-1'])
-
-    expect(getFreshAgentTurnIdentityKeys({
-      id: 'turn-durable-1',
-      turnId: 'display-durable-1',
-      messageId: 'message-1',
-    })).toEqual([
-      'turn:display-durable-1',
-      'turn:turn-durable-1',
-      'message:message-1',
-    ])
   })
 })
