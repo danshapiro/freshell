@@ -17,6 +17,16 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 const TEST_AUTH_TOKEN = 'testtoken-testtoken'
 
+function createDeferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
 function enabledConfig() {
   const settings = createDefaultServerSettings({ loggingDebug: false })
   settings.freshAgent.enabled = true
@@ -182,6 +192,141 @@ describe('WsHandler fresh-agent ownership', () => {
           images: undefined,
           settings: undefined,
         })
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('waits for same-socket attach before sending a raced FreshOpenCode prompt', async () => {
+    const attach = createDeferred<{ sessionId: string; runtimeProvider: string }>()
+    const runtimeManager = {
+      attach: vi.fn(() => attach.promise),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+      send: vi.fn().mockResolvedValue(undefined),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const { ws, messages } = await connectAndAuth(server)
+      ws.send(JSON.stringify({
+        type: 'freshAgent.attach',
+        sessionId: 'ses_race',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/repo/safe',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_race' },
+      }))
+      ws.send(JSON.stringify({
+        type: 'freshAgent.send',
+        requestId: 'send-after-attach',
+        sessionId: 'ses_race',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/repo/safe',
+        text: 'continue',
+      }))
+
+      await vi.waitFor(() => expect(runtimeManager.attach).toHaveBeenCalled())
+      expect(runtimeManager.send).not.toHaveBeenCalled()
+
+      attach.resolve({ sessionId: 'ses_race', runtimeProvider: 'opencode' })
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.send).toHaveBeenCalledWith({
+          sessionId: 'ses_race',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          cwd: '/repo/safe',
+        }, expect.objectContaining({
+          requestId: 'send-after-attach',
+          text: 'continue',
+        }))
+      })
+      expect(messages).toContainEqual(expect.objectContaining({
+        type: 'freshAgent.send.accepted',
+        requestId: 'send-after-attach',
+        sessionId: 'ses_race',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+      }))
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('fails closed when a raced durable FreshOpenCode send uses a different cwd than the attach', async () => {
+    const attach = createDeferred<{ sessionId: string; runtimeProvider: string }>()
+    const runtimeManager = {
+      attach: vi.fn(() => attach.promise),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+      send: vi.fn().mockResolvedValue(undefined),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const { ws, messages } = await connectAndAuth(server)
+      ws.send(JSON.stringify({
+        type: 'freshAgent.attach',
+        sessionId: 'ses_race',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/repo/a',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_race' },
+      }))
+      ws.send(JSON.stringify({
+        type: 'freshAgent.send',
+        requestId: 'send-mismatch',
+        sessionId: 'ses_race',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/repo/b',
+        text: 'mismatch',
+      }))
+
+      await vi.waitFor(() => expect(runtimeManager.attach).toHaveBeenCalled())
+      expect(runtimeManager.send).not.toHaveBeenCalled()
+
+      attach.resolve({ sessionId: 'ses_race', runtimeProvider: 'opencode' })
+
+      await vi.waitFor(() => {
+        expect(messages).toContainEqual(expect.objectContaining({
+          type: 'error',
+          code: 'UNAUTHORIZED',
+          requestId: 'send-mismatch',
+        }))
+      })
+      expect(runtimeManager.send).not.toHaveBeenCalledWith(expect.objectContaining({
+        sessionId: 'ses_race',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/repo/b',
+      }), expect.anything())
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.send',
+        requestId: 'send-authorized',
+        sessionId: 'ses_race',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/repo/a',
+        text: 'authorized',
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.send).toHaveBeenCalledWith({
+          sessionId: 'ses_race',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          cwd: '/repo/a',
+        }, expect.objectContaining({
+          requestId: 'send-authorized',
+          text: 'authorized',
+        }))
       })
     } finally {
       handler.close()

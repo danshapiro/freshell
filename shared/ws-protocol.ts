@@ -426,6 +426,7 @@ export const FreshAgentAttachSchema = z.object({
   provider: z.enum(['claude', 'codex', 'opencode']),
   resumeSessionId: z.string().optional(),
   cwd: z.string().optional(),
+  sessionRef: SessionLocatorSchema.optional(),
 })
 
 export const FreshAgentSendSchema = z.object({
@@ -434,6 +435,7 @@ export const FreshAgentSendSchema = z.object({
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
+  cwd: z.string().optional(),
   text: z.string().min(1),
   settings: z.object({
     cwd: z.string().min(1).optional(),
@@ -453,6 +455,7 @@ export const FreshAgentInterruptSchema = z.object({
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
+  cwd: z.string().optional(),
 })
 
 export const FreshAgentCompactSchema = z.object({
@@ -460,6 +463,7 @@ export const FreshAgentCompactSchema = z.object({
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
+  cwd: z.string().optional(),
   instructions: z.string().trim().min(1).optional(),
 })
 
@@ -468,6 +472,7 @@ export const FreshAgentApprovalRespondSchema = z.object({
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
+  cwd: z.string().optional(),
   requestId: z.union([z.string().min(1), z.number().int()]),
   decision: z.record(z.string(), z.unknown()),
 })
@@ -477,6 +482,7 @@ export const FreshAgentQuestionRespondSchema = z.object({
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
+  cwd: z.string().optional(),
   requestId: z.union([z.string().min(1), z.number().int()]),
   answers: z.record(z.string(), z.string()),
 })
@@ -486,6 +492,7 @@ export const FreshAgentKillSchema = z.object({
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
+  cwd: z.string().optional(),
 })
 
 export const FreshAgentForkSchema = z.object({
@@ -494,6 +501,7 @@ export const FreshAgentForkSchema = z.object({
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
+  cwd: z.string().optional(),
   input: z.record(z.string(), z.unknown()).optional(),
 })
 
@@ -866,7 +874,7 @@ export type SdkRestoreFailureCode =
 export type FreshAgentServerMessage =
   | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
   | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean }
-  | { type: 'freshAgent.send.accepted'; requestId: string; submittedTurnId?: string }
+  | { type: 'freshAgent.send.accepted'; requestId: string; sessionId: string; sessionType: string; provider: string; submittedTurnId?: string }
   | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
   | { type: 'freshAgent.session.materialized'; previousSessionId: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string } }
   | { type: 'freshAgent.forked'; requestId?: string; parentSessionId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }

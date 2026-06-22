@@ -88,7 +88,11 @@ import {
 } from '../shared/ws-protocol.js'
 import { LiveTerminalHandleSchema, sanitizeSessionRef, type RestoreError } from '../shared/session-contract.js'
 import { CODEX_DURABILITY_SCHEMA_VERSION, CodexDurabilityRefSchema } from '../shared/codex-durability.js'
-import { migrateLegacyFreshAgentContent } from '../shared/fresh-agent.js'
+import {
+  migrateLegacyFreshAgentContent,
+  type FreshAgentRuntimeProvider,
+  type FreshAgentSessionType,
+} from '../shared/fresh-agent.js'
 import { UiLayoutSyncSchema } from './agent-api/layout-schema.js'
 import type { LayoutStore } from './agent-api/layout-store.js'
 import {
@@ -144,6 +148,7 @@ type FreshAgentLocator = {
   sessionId: string
   sessionType: string
   provider: string
+  cwd?: string
 }
 
 type FreshAgentCreatedRecord = {
@@ -151,6 +156,7 @@ type FreshAgentCreatedRecord = {
   sessionType: string
   provider: string
   runtimeProvider: string
+  cwd?: string
   sessionRef?: { provider: string; sessionId: string }
 }
 
@@ -445,7 +451,8 @@ type ClientState = {
   codingCliSessions: Set<string>
   codingCliSubscriptions: Map<string, () => void>
   freshAgentSubscriptions: Map<string, FreshAgentSubscriptionEntry>
-  freshAgentAuthorizations: Set<string>
+  freshAgentAuthorizations: Map<string, { cwd?: string }>
+  pendingFreshAgentAttachByKey: Map<string, { cwd?: string; promise: Promise<void> }>
   wsErrorLogs: Map<string, WsErrorLogEntry>
   interestedSessions: Set<string>
   sidebarOpenSessionKeys: Set<string>
@@ -1096,7 +1103,8 @@ export class WsHandler {
       codingCliSessions: new Set(),
       codingCliSubscriptions: new Map(),
       freshAgentSubscriptions: new Map(),
-      freshAgentAuthorizations: new Set(),
+      freshAgentAuthorizations: new Map(),
+      pendingFreshAgentAttachByKey: new Map(),
       wsErrorLogs: new Map(),
       interestedSessions: new Set(),
       sidebarOpenSessionKeys: new Set(),
@@ -1184,6 +1192,38 @@ export class WsHandler {
     return `${locator.sessionType}:${locator.provider}:${locator.sessionId}`
   }
 
+  private requiresFreshOpenCodeRouteAuthorization(locator: FreshAgentLocator): boolean {
+    return locator.sessionType === 'freshopencode'
+      && locator.provider === 'opencode'
+      && locator.sessionId.startsWith('ses_')
+      && typeof locator.cwd === 'string'
+      && locator.cwd.trim().length > 0
+  }
+
+  private freshAgentAuthorizationKey(locator: FreshAgentLocator): string {
+    if (!this.requiresFreshOpenCodeRouteAuthorization(locator)) return this.freshAgentKey(locator)
+    const cwd = typeof locator.cwd === 'string' && locator.cwd.trim().length > 0 ? locator.cwd : ''
+    return `${this.freshAgentKey(locator)}:${cwd}`
+  }
+
+  private freshAgentLocatorFromMessage(m: {
+    sessionId: string
+    sessionType: FreshAgentSessionType
+    provider: FreshAgentRuntimeProvider
+    cwd?: string
+    settings?: { cwd?: string }
+  }): FreshAgentLocator {
+    const cwd = typeof m.cwd === 'string' && m.cwd.trim().length > 0
+      ? m.cwd
+      : (typeof m.settings?.cwd === 'string' && m.settings.cwd.trim().length > 0 ? m.settings.cwd : undefined)
+    return {
+      sessionId: m.sessionId,
+      sessionType: m.sessionType,
+      provider: m.provider,
+      ...(cwd ? { cwd } : {}),
+    }
+  }
+
   private freshAgentEventMessage(locator: FreshAgentLocator, event: unknown) {
     return {
       type: 'freshAgent.event',
@@ -1217,11 +1257,13 @@ export class WsHandler {
   }
 
   private authorizeFreshAgentSession(state: ClientState, locator: FreshAgentLocator): void {
-    state.freshAgentAuthorizations.add(this.freshAgentKey(locator))
+    state.freshAgentAuthorizations.set(this.freshAgentAuthorizationKey(locator), {
+      ...(locator.cwd ? { cwd: locator.cwd } : {}),
+    })
   }
 
   private isFreshAgentAuthorized(state: ClientState, locator: FreshAgentLocator): boolean {
-    return state.freshAgentAuthorizations.has(this.freshAgentKey(locator))
+    return state.freshAgentAuthorizations.has(this.freshAgentAuthorizationKey(locator))
   }
 
   private requireFreshAgentAuthorization(
@@ -1233,6 +1275,26 @@ export class WsHandler {
     this.sendError(ws, {
       code: 'UNAUTHORIZED',
       message: 'Not authorized for this Fresh Agent session',
+    })
+    return false
+  }
+
+  private async waitForFreshAgentAuthorization(
+    ws: LiveWebSocket,
+    state: ClientState,
+    locator: FreshAgentLocator,
+    requestId?: string,
+  ): Promise<boolean> {
+    if (this.isFreshAgentAuthorized(state, locator)) return true
+    const pending = state.pendingFreshAgentAttachByKey.get(this.freshAgentAuthorizationKey(locator))
+    if (pending) {
+      await pending.promise.catch(() => undefined)
+      if (this.isFreshAgentAuthorized(state, locator)) return true
+    }
+    this.sendError(ws, {
+      code: 'UNAUTHORIZED',
+      message: 'Not authorized for this Fresh Agent session',
+      ...(requestId ? { requestId } : {}),
     })
     return false
   }
@@ -1289,6 +1351,7 @@ export class WsHandler {
           sessionId: materialized.sessionId,
           sessionType: locator.sessionType,
           provider: locator.provider,
+          ...(locator.cwd ? { cwd: locator.cwd } : {}),
         }
         this.authorizeFreshAgentSession(state, materializedLocator)
         this.ensureFreshAgentSubscription(ws, state, materializedLocator)
@@ -3102,21 +3165,23 @@ export class WsHandler {
         await this.withFreshAgentCreateLock(m.requestId, async () => {
           const cached = this.createdFreshAgentByRequestId.get(m.requestId)
           if (cached) {
-            this.authorizeFreshAgentSession(state, {
+            const cachedLocator = {
               sessionId: cached.sessionId,
               sessionType: cached.sessionType,
               provider: cached.runtimeProvider,
-            })
+              ...(cached.cwd ? { cwd: cached.cwd } : {}),
+            }
+            this.authorizeFreshAgentSession(state, cachedLocator)
             this.send(ws, {
               type: 'freshAgent.created',
               requestId: m.requestId,
-              ...cached,
-            })
-            this.ensureFreshAgentSubscription(ws, state, {
               sessionId: cached.sessionId,
               sessionType: cached.sessionType,
-              provider: cached.runtimeProvider,
+              provider: cached.provider,
+              runtimeProvider: cached.runtimeProvider,
+              ...(cached.sessionRef ? { sessionRef: cached.sessionRef } : {}),
             })
+            this.ensureFreshAgentSubscription(ws, state, cachedLocator)
             return
           }
 
@@ -3159,24 +3224,27 @@ export class WsHandler {
               sessionType: result.sessionType ?? m.sessionType,
               provider: runtimeProvider,
               runtimeProvider,
+              ...(m.cwd ? { cwd: m.cwd } : {}),
               ...(result.sessionRef ? { sessionRef: result.sessionRef } : {}),
             }
             this.createdFreshAgentByRequestId.set(m.requestId, record)
-            this.authorizeFreshAgentSession(state, {
+            const recordLocator = {
               sessionId: record.sessionId,
               sessionType: record.sessionType,
               provider: record.runtimeProvider,
-            })
+              ...(record.cwd ? { cwd: record.cwd } : {}),
+            }
+            this.authorizeFreshAgentSession(state, recordLocator)
             this.send(ws, {
               type: 'freshAgent.created',
               requestId: m.requestId,
-              ...record,
-            })
-            this.ensureFreshAgentSubscription(ws, state, {
               sessionId: record.sessionId,
               sessionType: record.sessionType,
-              provider: record.runtimeProvider,
+              provider: record.provider,
+              runtimeProvider: record.runtimeProvider,
+              ...(record.sessionRef ? { sessionRef: record.sessionRef } : {}),
             })
+            this.ensureFreshAgentSubscription(ws, state, recordLocator)
           } catch (error) {
             log.warn({
               err: error instanceof Error ? error : new Error(String(error)),
@@ -3205,22 +3273,33 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: this.freshAgentUnavailableMessage() })
           return
         }
-        const locator = {
-          sessionId: m.sessionId,
-          sessionType: m.sessionType,
-          provider: m.provider,
-          ...(m.cwd ? { cwd: m.cwd } : {}),
-        }
+        const locator = this.freshAgentLocatorFromMessage(m)
+        const authorizationKey = this.freshAgentAuthorizationKey(locator)
+        const attachPromise = Promise.resolve(manager.attach({
+          ...locator,
+          ...(m.sessionRef ? { sessionRef: m.sessionRef } : {}),
+        }))
+          .then(() => {
+            this.authorizeFreshAgentSession(state, locator)
+            this.ensureFreshAgentSubscription(ws, state, locator)
+          })
+        state.pendingFreshAgentAttachByKey.set(authorizationKey, {
+          ...(locator.cwd ? { cwd: locator.cwd } : {}),
+          promise: attachPromise,
+        })
         try {
-          await Promise.resolve(manager.attach(locator))
-          this.authorizeFreshAgentSession(state, locator)
-          this.ensureFreshAgentSubscription(ws, state, locator)
+          await attachPromise
         } catch (error) {
           log.warn({
             err: error instanceof Error ? error : new Error(String(error)),
             ...locator,
           }, 'freshAgent.attach failed')
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error) })
+        } finally {
+          const pending = state.pendingFreshAgentAttachByKey.get(authorizationKey)
+          if (pending?.promise === attachPromise) {
+            state.pendingFreshAgentAttachByKey.delete(authorizationKey)
+          }
         }
         return
       }
@@ -3231,8 +3310,8 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: this.freshAgentUnavailableMessage() })
           return
         }
-        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
-        if (!this.requireFreshAgentAuthorization(ws, state, locator)) return
+        const locator = this.freshAgentLocatorFromMessage(m)
+        if (!await this.waitForFreshAgentAuthorization(ws, state, locator, m.requestId)) return
         try {
           const result = await manager.send(locator, {
             requestId: m.requestId,
@@ -3241,16 +3320,14 @@ export class WsHandler {
             settings: m.settings,
           })
           if (result?.sessionId && result.sessionId !== m.sessionId) {
-            this.authorizeFreshAgentSession(state, {
+            const materializedLocator = {
               sessionId: result.sessionId,
               sessionType: m.sessionType,
               provider: m.provider,
-            })
-            this.ensureFreshAgentSubscription(ws, state, {
-              sessionId: result.sessionId,
-              sessionType: m.sessionType,
-              provider: m.provider,
-            })
+              ...(locator.cwd ? { cwd: locator.cwd } : {}),
+            }
+            this.authorizeFreshAgentSession(state, materializedLocator)
+            this.ensureFreshAgentSubscription(ws, state, materializedLocator)
             this.cancelFreshAgentSubscription(state, locator)
             this.send(ws, {
               type: 'freshAgent.session.materialized',
@@ -3265,6 +3342,9 @@ export class WsHandler {
             this.send(ws, {
               type: 'freshAgent.send.accepted',
               requestId: m.requestId,
+              sessionId: locator.sessionId,
+              sessionType: locator.sessionType,
+              provider: locator.provider,
               submittedTurnId: result?.submittedTurnId,
             })
           }
@@ -3280,7 +3360,7 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: this.freshAgentUnavailableMessage() })
           return
         }
-        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        const locator = this.freshAgentLocatorFromMessage(m)
         if (!this.requireFreshAgentAuthorization(ws, state, locator)) return
         try {
           await manager.interrupt(locator)
@@ -3296,7 +3376,7 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: this.freshAgentUnavailableMessage() })
           return
         }
-        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        const locator = this.freshAgentLocatorFromMessage(m)
         if (!this.requireFreshAgentAuthorization(ws, state, locator)) return
         try {
           await manager.compact(locator, { instructions: m.instructions })
@@ -3312,7 +3392,7 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: this.freshAgentUnavailableMessage() })
           return
         }
-        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        const locator = this.freshAgentLocatorFromMessage(m)
         if (!this.requireFreshAgentAuthorization(ws, state, locator)) return
         try {
           await manager.resolveApproval(locator, m.requestId, m.decision)
@@ -3328,7 +3408,7 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: this.freshAgentUnavailableMessage() })
           return
         }
-        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        const locator = this.freshAgentLocatorFromMessage(m)
         if (!this.requireFreshAgentAuthorization(ws, state, locator)) return
         try {
           await manager.answerQuestion(locator, m.requestId, m.answers)
@@ -3344,7 +3424,7 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: this.freshAgentUnavailableMessage() })
           return
         }
-        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        const locator = this.freshAgentLocatorFromMessage(m)
         if (!this.requireFreshAgentAuthorization(ws, state, locator)) return
         try {
           const forked = await manager.fork(locator, m.input)
@@ -3353,11 +3433,13 @@ export class WsHandler {
             ? forkedRecord.threadId
             : (typeof forkedRecord.sessionId === 'string' ? forkedRecord.sessionId : undefined)
           if (forkedSessionId) {
-            this.authorizeFreshAgentSession(state, {
+            const forkedLocator = {
               sessionId: forkedSessionId,
               sessionType: m.sessionType,
               provider: m.provider,
-            })
+              ...(locator.cwd ? { cwd: locator.cwd } : {}),
+            }
+            this.authorizeFreshAgentSession(state, forkedLocator)
             this.send(ws, {
               type: 'freshAgent.forked',
               requestId: m.requestId,
@@ -3368,11 +3450,7 @@ export class WsHandler {
               runtimeProvider: m.provider,
               sessionRef: { provider: m.provider, sessionId: forkedSessionId },
             })
-            this.ensureFreshAgentSubscription(ws, state, {
-              sessionId: forkedSessionId,
-              sessionType: m.sessionType,
-              provider: m.provider,
-            })
+            this.ensureFreshAgentSubscription(ws, state, forkedLocator)
           }
         } catch (error) {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error) })
@@ -3386,13 +3464,13 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: this.freshAgentUnavailableMessage() })
           return
         }
-        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        const locator = this.freshAgentLocatorFromMessage(m)
         if (!this.requireFreshAgentAuthorization(ws, state, locator)) return
         this.cancelFreshAgentSubscription(state, locator)
         try {
           const success = await manager.kill(locator)
           this.clearFreshAgentCreateCachesForSession(m.sessionId)
-          state.freshAgentAuthorizations.delete(this.freshAgentKey(locator))
+          state.freshAgentAuthorizations.delete(this.freshAgentAuthorizationKey(locator))
           this.send(ws, {
             type: 'freshAgent.killed',
             sessionId: m.sessionId,

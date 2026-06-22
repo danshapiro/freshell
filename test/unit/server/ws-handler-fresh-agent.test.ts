@@ -442,7 +442,10 @@ describe('WsHandler fresh-agent routing', () => {
 
       await vi.waitFor(() => {
         const locator = { sessionId: 'codex-session-2', sessionType: 'freshcodex', provider: 'codex' }
-        expect(runtimeManager.send).toHaveBeenCalledWith(locator, {
+        expect(runtimeManager.send).toHaveBeenCalledWith({
+          ...locator,
+          cwd: '/repo',
+        }, {
           requestId: 'send-req-1',
           text: 'Ship it',
           images: undefined,
@@ -460,6 +463,9 @@ describe('WsHandler fresh-agent routing', () => {
         expect(seenMessages).toContainEqual(expect.objectContaining({
           type: 'freshAgent.send.accepted',
           requestId: 'send-req-1',
+          sessionId: 'codex-session-2',
+          sessionType: 'freshcodex',
+          provider: 'codex',
           submittedTurnId: 'display-user-1',
         }))
         expect(seenMessages).toContainEqual(expect.objectContaining({
@@ -469,6 +475,74 @@ describe('WsHandler fresh-agent routing', () => {
           sessionId: 'forked-session',
           sessionType: 'freshcodex',
           provider: 'codex',
+        }))
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('allows non-FreshOpenCode sessions created without cwd to send with settings.cwd', async () => {
+    const runtimeManager = {
+      create: vi.fn().mockResolvedValue({
+        sessionId: 'codex-session-cwd-upgrade',
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+      }),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+      send: vi.fn().mockResolvedValue({ submittedTurnId: 'turn-1' }),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const ws = await connectAndAuth(server)
+      const seenMessages: any[] = []
+      ws.on('message', (data) => {
+        seenMessages.push(JSON.parse(data.toString()))
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.create',
+        requestId: 'req-cwd-upgrade',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.create).toHaveBeenCalled()
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.send',
+        requestId: 'send-cwd-upgrade',
+        sessionId: 'codex-session-cwd-upgrade',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        text: 'continue',
+        settings: { cwd: '/repo/allowed' },
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.send).toHaveBeenCalledWith({
+          sessionId: 'codex-session-cwd-upgrade',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          cwd: '/repo/allowed',
+        }, {
+          requestId: 'send-cwd-upgrade',
+          text: 'continue',
+          images: undefined,
+          settings: { cwd: '/repo/allowed' },
+        })
+        expect(seenMessages).toContainEqual(expect.objectContaining({
+          type: 'freshAgent.send.accepted',
+          requestId: 'send-cwd-upgrade',
+          sessionId: 'codex-session-cwd-upgrade',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          submittedTurnId: 'turn-1',
         }))
       })
     } finally {
