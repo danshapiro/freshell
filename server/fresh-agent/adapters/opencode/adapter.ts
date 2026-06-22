@@ -411,14 +411,13 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     async attach(locator) {
       const existing = sessions.get(locator.sessionId)
       if (existing) {
-        if (locator.cwd) {
-          const routeValidatedCwd = await validateSessionRoute(
-            existing.realSessionId ?? locator.sessionId,
-            locator.cwd,
-          )
+        if (locator.cwd && existing.realSessionId) {
+          const routeValidatedCwd = await validateSessionRoute(existing.realSessionId, locator.cwd)
           if (existing.cwd !== locator.cwd) existing.routeValidatedCwd = undefined
           existing.cwd = locator.cwd
           existing.routeValidatedCwd = routeValidatedCwd
+        } else if (locator.cwd) {
+          existing.cwd = locator.cwd
         }
         remember(existing)
         await reconcileStatus(existing)

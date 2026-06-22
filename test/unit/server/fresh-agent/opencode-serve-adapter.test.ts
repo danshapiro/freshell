@@ -251,6 +251,26 @@ describe('OpenCode serve adapter: create + send', () => {
     )
   })
 
+  it('does not validate a placeholder attach before first materialization', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+
+    await adapter.create({ requestId: 'placeholder-attach', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo/placeholder' })
+    await expect(adapter.attach?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionId: 'freshopencode-placeholder-attach',
+      cwd: '/repo/placeholder',
+    })).resolves.toEqual({
+      sessionId: 'freshopencode-placeholder-attach',
+      sessionRef: { provider: 'opencode', sessionId: 'freshopencode-placeholder-attach' },
+    })
+    expect(manager.getSession).not.toHaveBeenCalled()
+
+    await adapter.send?.('freshopencode-placeholder-attach', { text: 'materialize' })
+    expect(manager.createSession).toHaveBeenCalledWith({ directory: '/repo/placeholder' })
+  })
+
   it('keeps no-cwd recovered durable sessions readable but not sendable', async () => {
     const manager = makeFakeManager()
     manager.getSession.mockResolvedValueOnce({
