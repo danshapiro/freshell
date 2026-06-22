@@ -211,7 +211,7 @@ test.describe('Freshopencode model picker', () => {
     expect(thinkingIndex).toBeGreaterThan(styleIndex)
     expect(modelIndex).toBeGreaterThan(thinkingIndex)
 
-    await expect(dialog.getByRole('dialog', { name: 'Choose Freshopencode model' })).toHaveCount(0)
+    await expect(page.getByRole('dialog', { name: 'Choose Freshopencode model' })).toHaveCount(0)
     const mruTiles = dialog.getByRole('button', { name: /(Use model|Current model):/i })
     await expect(mruTiles).toHaveCount(4)
     await expect(dialog.getByRole('heading', { name: 'deepseek' })).toHaveCount(0)
@@ -226,7 +226,7 @@ test.describe('Freshopencode model picker', () => {
 
     const searchEntry = dialog.getByRole('searchbox', { name: /Search enabled models/i })
     await searchEntry.click()
-    const modal = dialog.getByRole('dialog', { name: 'Choose Freshopencode model' })
+    const modal = page.getByRole('dialog', { name: 'Choose Freshopencode model' })
     await expect(modal).toBeVisible({ timeout: 10_000 })
 
     const headingTexts = await modal.getByRole('heading').allTextContents()
