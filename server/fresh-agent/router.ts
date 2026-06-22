@@ -29,6 +29,10 @@ import { createRequestAbortSignal } from '../read-models/request-abort.js'
 import { setResponsePerfContext } from '../request-logger.js'
 import { recordSessionLifecycleEvent } from '../session-observability.js'
 import {
+  hashForLogs,
+  recordFreshAgentObservabilityEvent,
+} from './observability.js'
+import {
   defaultReadModelScheduler,
   isReadModelAbortError,
   type ReadModelWorkScheduler,
@@ -182,6 +186,7 @@ export function createFreshAgentRouter(deps: {
     }
 
     const signal = createRequestAbortSignal(req, res)
+    const snapshotStart = Date.now()
     try {
       const snapshot = await readModelScheduler.schedule({
         lane: query.data.priority ?? 'visible',
@@ -194,11 +199,29 @@ export function createFreshAgentRouter(deps: {
           cwd: query.data.cwd,
         }),
       })
+      const payloadBytes = Buffer.byteLength(JSON.stringify(snapshot), 'utf8')
       setResponsePerfContext(res, {
         readModelLane: query.data.priority ?? 'visible',
-        responsePayloadBytes: Buffer.byteLength(JSON.stringify(snapshot), 'utf8'),
+        responsePayloadBytes: payloadBytes,
       })
       res.json(snapshot)
+      const snapshotAny = snapshot as Record<string, unknown>
+      const turns = Array.isArray(snapshotAny.turns) ? snapshotAny.turns as unknown[] : []
+      const latestTurnId = typeof snapshotAny.latestTurnId === 'string' ? snapshotAny.latestTurnId : undefined
+      const revision = typeof snapshotAny.revision === 'number' ? snapshotAny.revision : undefined
+      recordFreshAgentObservabilityEvent({
+        kind: 'fresh_agent_snapshot_served',
+        sessionType: params.data.sessionType,
+        provider: params.data.provider,
+        threadIdHash: hashForLogs(params.data.threadId),
+        httpStatus: 200,
+        durationMs: Date.now() - snapshotStart,
+        payloadBytes,
+        turnCount: turns.length,
+        ...(latestTurnId ? { lastTurnIdHash: hashForLogs(latestTurnId) } : {}),
+        ...(revision !== undefined ? { revision } : {}),
+        ...(query.data.cwd ? { cwdHash: hashForLogs(query.data.cwd) } : {}),
+      })
     } catch (error) {
       if (signal.aborted || isReadModelAbortError(error)) return
       return sendFreshAgentError(res, error, { sessionId: params.data.threadId })

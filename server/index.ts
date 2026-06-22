@@ -79,6 +79,7 @@ import { resolveStartupBanner } from './startup-banner.js'
 import { createFreshAgentProviderRegistry } from './fresh-agent/provider-registry.js'
 import { FreshAgentRuntimeManager } from './fresh-agent/runtime-manager.js'
 import { registerFreshAgentThreadRoutes } from './fresh-agent/register-routes.js'
+import { createFreshAgentSnapshotRateLimitMiddleware } from './fresh-agent/observability.js'
 import { createClaudeFreshAgentAdapter } from './fresh-agent/adapters/claude/adapter.js'
 import { createCodexFreshAgentAdapter } from './fresh-agent/adapters/codex/adapter.js'
 import { createOpencodeFreshAgentAdapter } from './fresh-agent/adapters/opencode/adapter.js'
@@ -151,6 +152,11 @@ async function main() {
     isReady: () => startupState.isReady(),
     startedAt: new Date(SERVER_STARTED_AT),
   }))
+
+  // Fresh-agent snapshot rate-limit observability (registered before the
+  // global rate limiter so 429s on snapshot routes are captured with
+  // semantic metadata: sessionType, provider, threadIdHash).
+  app.use('/api/fresh-agent/threads', createFreshAgentSnapshotRateLimitMiddleware())
 
   // Basic rate limiting for /api
   app.use(
