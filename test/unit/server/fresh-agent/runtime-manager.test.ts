@@ -283,6 +283,38 @@ describe('FreshAgentRuntimeManager', () => {
     expect(opencodeAdapter.send).not.toHaveBeenCalled()
   })
 
+  it('keeps a directly resumed no-cwd durable FreshOpenCode session read-only until cwd is supplied', async () => {
+    const opencodeAdapter = {
+      create: vi.fn(),
+      resume: vi.fn().mockResolvedValue({ sessionId: 'ses_resumed_no_route' }),
+      send: vi.fn().mockResolvedValue(undefined),
+    }
+    const registry = createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshopencode',
+        runtimeProvider: 'opencode',
+        adapter: opencodeAdapter as any,
+      },
+    ])
+    const manager = new FreshAgentRuntimeManager({ registry })
+
+    await manager.resume({
+      requestId: 'req-resume-no-route',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      resumeSessionId: 'ses_resumed_no_route',
+    })
+
+    await expect(manager.send({
+      sessionId: 'ses_resumed_no_route',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    }, { text: 'must not send' })).rejects.toThrow(/cwd|route|not tracked|not available/i)
+
+    expect(opencodeAdapter.resume).toHaveBeenCalled()
+    expect(opencodeAdapter.send).not.toHaveBeenCalled()
+  })
+
   it('hydrates adapter state when attaching a restored session before send and compact', async () => {
     const opencodeAdapter = {
       create: vi.fn().mockResolvedValue({ sessionId: 'opencode-created-1' }),
