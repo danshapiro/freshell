@@ -629,6 +629,112 @@ describe('WsHandler fresh-agent routing', () => {
     }
   })
 
+  it('does not replay stale placeholder create state after a materialized durable session is killed', async () => {
+    const runtimeManager = {
+      create: vi.fn()
+        .mockResolvedValueOnce({
+          sessionId: 'freshopencode-req-stale-1',
+          sessionType: 'freshopencode',
+          runtimeProvider: 'opencode',
+          sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-stale-1' },
+        })
+        .mockResolvedValueOnce({
+          sessionId: 'freshopencode-req-stale-2',
+          sessionType: 'freshopencode',
+          runtimeProvider: 'opencode',
+          sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-stale-2' },
+        }),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+      send: vi.fn().mockResolvedValue({
+        sessionId: 'ses_stale_1',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_stale_1' },
+      }),
+      kill: vi.fn().mockResolvedValue(true),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const ws = await connectAndAuth(server)
+      const seenMessages: any[] = []
+      ws.on('message', (data) => {
+        seenMessages.push(JSON.parse(data.toString()))
+      })
+
+      const createMessage = {
+        type: 'freshAgent.create',
+        requestId: 'req-stale-replay',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+      }
+
+      ws.send(JSON.stringify(createMessage))
+
+      await vi.waitFor(() => {
+        expect(seenMessages).toContainEqual(expect.objectContaining({
+          type: 'freshAgent.created',
+          requestId: 'req-stale-replay',
+          sessionId: 'freshopencode-req-stale-1',
+        }))
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.send',
+        sessionId: 'freshopencode-req-stale-1',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        text: 'materialize',
+      }))
+
+      await vi.waitFor(() => {
+        expect(seenMessages).toContainEqual(expect.objectContaining({
+          type: 'freshAgent.session.materialized',
+          previousSessionId: 'freshopencode-req-stale-1',
+          sessionId: 'ses_stale_1',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+        }))
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.kill',
+        sessionId: 'ses_stale_1',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.kill).toHaveBeenCalledWith({
+          sessionId: 'ses_stale_1',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+        })
+      })
+
+      ws.send(JSON.stringify(createMessage))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.create).toHaveBeenCalledTimes(2)
+        const created = seenMessages.filter((message) => (
+          message.type === 'freshAgent.created'
+          && message.requestId === 'req-stale-replay'
+        ))
+        expect(created).toHaveLength(2)
+        expect(created[1]).toEqual(expect.objectContaining({
+          requestId: 'req-stale-replay',
+          sessionId: 'freshopencode-req-stale-2',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          runtimeProvider: 'opencode',
+          sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-stale-2' },
+        }))
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
   it('forwards provider materialization events as top-level websocket materialization', async () => {
     const listeners = new Map<string, (message: unknown) => void>()
     const unsubscribeByKey = new Map<string, ReturnType<typeof vi.fn>>()

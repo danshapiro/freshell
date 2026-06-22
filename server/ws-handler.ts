@@ -158,12 +158,20 @@ type FreshAgentCreatedRecord = {
   runtimeProvider: string
   cwd?: string
   sessionRef?: { provider: string; sessionId: string }
+  sessionLineage: string[]
 }
 
 type FreshAgentSubscriptionEntry = {
   active: boolean
   off?: () => void
   pending?: Promise<void>
+}
+
+type FreshAgentAuthorizationEntry = FreshAgentLocator
+
+type PendingFreshAgentAttachEntry = FreshAgentLocator & {
+  active: boolean
+  promise: Promise<void>
 }
 
 type WsErrorLogEntry = {
@@ -451,8 +459,8 @@ type ClientState = {
   codingCliSessions: Set<string>
   codingCliSubscriptions: Map<string, () => void>
   freshAgentSubscriptions: Map<string, FreshAgentSubscriptionEntry>
-  freshAgentAuthorizations: Map<string, { cwd?: string }>
-  pendingFreshAgentAttachByKey: Map<string, { cwd?: string; promise: Promise<void> }>
+  freshAgentAuthorizations: Map<string, FreshAgentAuthorizationEntry>
+  pendingFreshAgentAttachByKey: Map<string, PendingFreshAgentAttachEntry>
   wsErrorLogs: Map<string, WsErrorLogEntry>
   interestedSessions: Set<string>
   sidebarOpenSessionKeys: Set<string>
@@ -977,7 +985,7 @@ export class WsHandler {
 
   private clearFreshAgentCreateCachesForSession(sessionId: string): void {
     for (const [requestId, cached] of this.createdFreshAgentByRequestId.entries()) {
-      if (cached.sessionId === sessionId) {
+      if (cached.sessionId === sessionId || cached.sessionLineage.includes(sessionId)) {
         this.createdFreshAgentByRequestId.delete(requestId)
       }
     }
@@ -1257,13 +1265,90 @@ export class WsHandler {
   }
 
   private authorizeFreshAgentSession(state: ClientState, locator: FreshAgentLocator): void {
-    state.freshAgentAuthorizations.set(this.freshAgentAuthorizationKey(locator), {
-      ...(locator.cwd ? { cwd: locator.cwd } : {}),
-    })
+    state.freshAgentAuthorizations.set(this.freshAgentAuthorizationKey(locator), { ...locator })
   }
 
   private isFreshAgentAuthorized(state: ClientState, locator: FreshAgentLocator): boolean {
     return state.freshAgentAuthorizations.has(this.freshAgentAuthorizationKey(locator))
+  }
+
+  private sameFreshAgentSession(
+    left: Pick<FreshAgentLocator, 'sessionId' | 'sessionType' | 'provider'>,
+    right: Pick<FreshAgentLocator, 'sessionId' | 'sessionType' | 'provider'>,
+  ): boolean {
+    return left.sessionId === right.sessionId
+      && left.sessionType === right.sessionType
+      && left.provider === right.provider
+  }
+
+  private retireFreshAgentAuthorizations(state: ClientState, locator: FreshAgentLocator): void {
+    for (const [key, authorization] of state.freshAgentAuthorizations.entries()) {
+      if (!this.sameFreshAgentSession(authorization, locator)) continue
+      state.freshAgentAuthorizations.delete(key)
+    }
+  }
+
+  private retirePendingFreshAgentAttaches(state: ClientState, locator: FreshAgentLocator): void {
+    for (const [key, pending] of state.pendingFreshAgentAttachByKey.entries()) {
+      if (!this.sameFreshAgentSession(pending, locator)) continue
+      pending.active = false
+      state.pendingFreshAgentAttachByKey.delete(key)
+    }
+  }
+
+  private retireFreshAgentSessionState(state: ClientState, locator: FreshAgentLocator): void {
+    this.cancelFreshAgentSubscription(state, locator)
+    this.retireFreshAgentAuthorizations(state, locator)
+    this.retirePendingFreshAgentAttaches(state, locator)
+  }
+
+  private updateFreshAgentCreateCachesForMaterialization(
+    previousSessionIds: string[],
+    sessionId: string,
+    sessionRef?: { provider: string; sessionId: string },
+  ): void {
+    const previousIds = new Set(previousSessionIds)
+    for (const [requestId, cached] of this.createdFreshAgentByRequestId.entries()) {
+      const lineage = cached.sessionLineage.length > 0 ? cached.sessionLineage : [cached.sessionId]
+      const matchesLineage = cached.sessionId === sessionId
+        || previousIds.has(cached.sessionId)
+        || lineage.some((lineageSessionId) => previousIds.has(lineageSessionId))
+      if (!matchesLineage) continue
+      this.createdFreshAgentByRequestId.set(requestId, {
+        ...cached,
+        sessionId,
+        ...(sessionRef ? { sessionRef } : {}),
+        sessionLineage: Array.from(new Set([...lineage, ...previousIds, sessionId])),
+      })
+    }
+  }
+
+  private materializeFreshAgentSession(
+    ws: LiveWebSocket,
+    state: ClientState,
+    locator: FreshAgentLocator,
+    next: {
+      previousSessionId?: string
+      sessionId: string
+      sessionRef?: { provider: string; sessionId: string }
+    },
+  ): FreshAgentLocator {
+    const materializedLocator = {
+      sessionId: next.sessionId,
+      sessionType: locator.sessionType,
+      provider: locator.provider,
+      ...(locator.cwd ? { cwd: locator.cwd } : {}),
+    }
+    const sessionRef = next.sessionRef ?? { provider: locator.provider, sessionId: next.sessionId }
+    this.retireFreshAgentSessionState(state, locator)
+    this.authorizeFreshAgentSession(state, materializedLocator)
+    this.ensureFreshAgentSubscription(ws, state, materializedLocator)
+    this.updateFreshAgentCreateCachesForMaterialization(
+      [locator.sessionId, ...(next.previousSessionId ? [next.previousSessionId] : [])],
+      next.sessionId,
+      sessionRef,
+    )
+    return materializedLocator
   }
 
   private requireFreshAgentAuthorization(
@@ -1347,17 +1432,11 @@ export class WsHandler {
       if (!entry.active) return
       const materialized = this.freshAgentMaterializedMessage(locator, event)
       if (materialized) {
-        const materializedLocator = {
+        this.materializeFreshAgentSession(ws, state, locator, {
+          previousSessionId: materialized.previousSessionId,
           sessionId: materialized.sessionId,
-          sessionType: locator.sessionType,
-          provider: locator.provider,
-          ...(locator.cwd ? { cwd: locator.cwd } : {}),
-        }
-        this.authorizeFreshAgentSession(state, materializedLocator)
-        this.ensureFreshAgentSubscription(ws, state, materializedLocator)
-        if (materialized.sessionId !== locator.sessionId) {
-          this.cancelFreshAgentSubscription(state, locator)
-        }
+          sessionRef: materialized.sessionRef,
+        })
         this.safeSend(ws, materialized)
         return
       }
@@ -3226,6 +3305,7 @@ export class WsHandler {
               runtimeProvider,
               ...(m.cwd ? { cwd: m.cwd } : {}),
               ...(result.sessionRef ? { sessionRef: result.sessionRef } : {}),
+              sessionLineage: [result.sessionId],
             }
             this.createdFreshAgentByRequestId.set(m.requestId, record)
             const recordLocator = {
@@ -3275,18 +3355,23 @@ export class WsHandler {
         }
         const locator = this.freshAgentLocatorFromMessage(m)
         const authorizationKey = this.freshAgentAuthorizationKey(locator)
+        let pendingEntry: PendingFreshAgentAttachEntry
         const attachPromise = Promise.resolve(manager.attach({
           ...locator,
           ...(m.sessionRef ? { sessionRef: m.sessionRef } : {}),
         }))
           .then(() => {
+            const current = state.pendingFreshAgentAttachByKey.get(authorizationKey)
+            if (current !== pendingEntry || !current?.active) return
             this.authorizeFreshAgentSession(state, locator)
             this.ensureFreshAgentSubscription(ws, state, locator)
           })
-        state.pendingFreshAgentAttachByKey.set(authorizationKey, {
-          ...(locator.cwd ? { cwd: locator.cwd } : {}),
+        pendingEntry = {
+          ...locator,
+          active: true,
           promise: attachPromise,
-        })
+        }
+        state.pendingFreshAgentAttachByKey.set(authorizationKey, pendingEntry)
         try {
           await attachPromise
         } catch (error) {
@@ -3297,7 +3382,7 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error) })
         } finally {
           const pending = state.pendingFreshAgentAttachByKey.get(authorizationKey)
-          if (pending?.promise === attachPromise) {
+          if (pending === pendingEntry) {
             state.pendingFreshAgentAttachByKey.delete(authorizationKey)
           }
         }
@@ -3320,15 +3405,11 @@ export class WsHandler {
             settings: m.settings,
           })
           if (result?.sessionId && result.sessionId !== m.sessionId) {
-            const materializedLocator = {
+            this.materializeFreshAgentSession(ws, state, locator, {
+              previousSessionId: m.sessionId,
               sessionId: result.sessionId,
-              sessionType: m.sessionType,
-              provider: m.provider,
-              ...(locator.cwd ? { cwd: locator.cwd } : {}),
-            }
-            this.authorizeFreshAgentSession(state, materializedLocator)
-            this.ensureFreshAgentSubscription(ws, state, materializedLocator)
-            this.cancelFreshAgentSubscription(state, locator)
+              sessionRef: result.sessionRef,
+            })
             this.send(ws, {
               type: 'freshAgent.session.materialized',
               previousSessionId: m.sessionId,
@@ -3466,11 +3547,10 @@ export class WsHandler {
         }
         const locator = this.freshAgentLocatorFromMessage(m)
         if (!this.requireFreshAgentAuthorization(ws, state, locator)) return
-        this.cancelFreshAgentSubscription(state, locator)
         try {
           const success = await manager.kill(locator)
+          this.retireFreshAgentSessionState(state, locator)
           this.clearFreshAgentCreateCachesForSession(m.sessionId)
-          state.freshAgentAuthorizations.delete(this.freshAgentAuthorizationKey(locator))
           this.send(ws, {
             type: 'freshAgent.killed',
             sessionId: m.sessionId,

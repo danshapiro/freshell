@@ -334,4 +334,80 @@ describe('WsHandler fresh-agent ownership', () => {
       await new Promise<void>((resolve) => server.close(() => resolve()))
     }
   })
+
+  it('retires all same-session durable FreshOpenCode authorizations after kill', async () => {
+    const runtimeManager = {
+      attach: vi.fn().mockResolvedValue({ sessionId: 'ses_kill_1', runtimeProvider: 'opencode' }),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+      kill: vi.fn().mockResolvedValue(true),
+      interrupt: vi.fn().mockResolvedValue(undefined),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const { ws, messages } = await connectAndAuth(server)
+      ws.send(JSON.stringify({
+        type: 'freshAgent.attach',
+        sessionId: 'ses_kill_1',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_kill_1' },
+      }))
+      ws.send(JSON.stringify({
+        type: 'freshAgent.attach',
+        sessionId: 'ses_kill_1',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/repo/a',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_kill_1' },
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.attach).toHaveBeenCalledTimes(2)
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.kill',
+        sessionId: 'ses_kill_1',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/repo/a',
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.kill).toHaveBeenCalledWith({
+          sessionId: 'ses_kill_1',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          cwd: '/repo/a',
+        })
+        expect(messages).toContainEqual(expect.objectContaining({
+          type: 'freshAgent.killed',
+          sessionId: 'ses_kill_1',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          success: true,
+        }))
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.interrupt',
+        sessionId: 'ses_kill_1',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+      }))
+
+      await vi.waitFor(() => {
+        expect(messages).toContainEqual(expect.objectContaining({
+          type: 'error',
+          code: 'UNAUTHORIZED',
+        }))
+      })
+      expect(runtimeManager.interrupt).not.toHaveBeenCalled()
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
 })
