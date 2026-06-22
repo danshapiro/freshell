@@ -3,6 +3,16 @@ import { describe, expect, it, vi } from 'vitest'
 import { FreshAgentRuntimeManager } from '../../../../server/fresh-agent/runtime-manager.js'
 import { createFreshAgentProviderRegistry } from '../../../../server/fresh-agent/provider-registry.js'
 
+function createDeferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
 function makeSnapshot(sessionType: 'freshclaude' | 'kilroy', provider: 'claude', threadId: string) {
   return {
     sessionType,
@@ -287,6 +297,228 @@ describe('FreshAgentRuntimeManager', () => {
     })
     expect(opencodeAdapter.send).toHaveBeenCalledWith('opencode-restored-1', { text: 'reply ok' })
     expect(opencodeAdapter.compact).toHaveBeenCalledWith('opencode-restored-1', { instructions: 'keep decisions' })
+  })
+
+  it('recovers a missing FreshOpenCode durable session with cwd before mutation', async () => {
+    const opencodeAdapter = {
+      create: vi.fn(),
+      attach: vi.fn().mockResolvedValue({ sessionId: 'ses_restored' }),
+      send: vi.fn().mockResolvedValue(undefined),
+      interrupt: vi.fn().mockResolvedValue(undefined),
+      compact: vi.fn().mockResolvedValue(undefined),
+      fork: vi.fn().mockResolvedValue({ sessionId: 'ses_child' }),
+      answerQuestion: vi.fn().mockResolvedValue(undefined),
+      resolveApproval: vi.fn().mockResolvedValue(undefined),
+    }
+    const registry = createFreshAgentProviderRegistry([{
+      sessionType: 'freshopencode',
+      runtimeProvider: 'opencode',
+      adapter: opencodeAdapter as any,
+    }])
+    const manager = new FreshAgentRuntimeManager({ registry })
+    const locator = {
+      sessionId: 'ses_restored',
+      sessionType: 'freshopencode' as const,
+      provider: 'opencode' as const,
+      cwd: '/repo/safe',
+    }
+
+    await manager.send(locator, { text: 'continue' })
+    await manager.interrupt(locator)
+    await manager.compact(locator, { instructions: 'keep decisions' })
+    await manager.fork(locator)
+    await manager.answerQuestion(locator, 'req-question', { choice: 'yes' })
+    await manager.resolveApproval(locator, 'req-approval', { action: 'approve' })
+
+    expect(opencodeAdapter.attach).toHaveBeenCalledTimes(1)
+    expect(opencodeAdapter.attach).toHaveBeenCalledWith(locator)
+    expect(opencodeAdapter.send).toHaveBeenCalledWith('ses_restored', { text: 'continue' })
+    expect(opencodeAdapter.interrupt).toHaveBeenCalledWith('ses_restored')
+    expect(opencodeAdapter.compact).toHaveBeenCalledWith('ses_restored', { instructions: 'keep decisions' })
+    expect(opencodeAdapter.fork).toHaveBeenCalledWith('ses_restored', undefined)
+    expect(opencodeAdapter.answerQuestion).toHaveBeenCalledWith('ses_restored', 'req-question', { choice: 'yes' })
+    expect(opencodeAdapter.resolveApproval).toHaveBeenCalledWith('ses_restored', 'req-approval', { action: 'approve' })
+  })
+
+  it('does not recover placeholders, missing cwd, or non-OpenCode providers', async () => {
+    const opencodeAdapter = {
+      create: vi.fn(),
+      attach: vi.fn(),
+      send: vi.fn(),
+    }
+    const codexAdapter = {
+      create: vi.fn(),
+      attach: vi.fn(),
+      send: vi.fn(),
+    }
+    const registry = createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshopencode',
+        runtimeProvider: 'opencode',
+        adapter: opencodeAdapter as any,
+      },
+      {
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+        adapter: codexAdapter as any,
+      },
+    ])
+    const manager = new FreshAgentRuntimeManager({ registry })
+
+    await expect(manager.send({
+      sessionId: 'freshopencode-temp',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    }, { text: 'no' })).rejects.toThrow(/not tracked|not available/i)
+    await expect(manager.send({
+      sessionId: 'ses_missing_cwd',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    }, { text: 'no' })).rejects.toThrow(/not tracked|cwd|not available/i)
+    await expect(manager.send({
+      sessionId: 'codex-thread',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    }, { text: 'no' })).rejects.toThrow(/not tracked/i)
+
+    expect(opencodeAdapter.attach).not.toHaveBeenCalled()
+    expect(codexAdapter.attach).not.toHaveBeenCalled()
+  })
+
+  it('enriches an existing FreshOpenCode record with cwd before mutating', async () => {
+    const opencodeAdapter = {
+      create: vi.fn().mockResolvedValue({ sessionId: 'ses_existing' }),
+      attach: vi.fn().mockResolvedValue({ sessionId: 'ses_existing' }),
+      send: vi.fn().mockResolvedValue(undefined),
+    }
+    const registry = createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshopencode',
+        runtimeProvider: 'opencode',
+        adapter: opencodeAdapter as any,
+      },
+    ])
+    const manager = new FreshAgentRuntimeManager({ registry })
+
+    await manager.create({ requestId: 'req-existing', sessionType: 'freshopencode', provider: 'opencode', prompt: 'start' } as any)
+    await manager.send({
+      sessionId: 'ses_existing',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    }, { text: 'continue' })
+
+    expect(opencodeAdapter.attach).toHaveBeenCalledWith({
+      sessionId: 'ses_existing',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })
+    expect(opencodeAdapter.send).toHaveBeenCalledWith('ses_existing', { text: 'continue' })
+  })
+
+  it('singleflights concurrent FreshOpenCode recovery for the same cwd', async () => {
+    const attachDeferred = createDeferred<{ sessionId: string }>()
+    const opencodeAdapter = {
+      create: vi.fn(),
+      attach: vi.fn(() => attachDeferred.promise),
+      send: vi.fn().mockResolvedValue(undefined),
+    }
+    const registry = createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshopencode',
+        runtimeProvider: 'opencode',
+        adapter: opencodeAdapter as any,
+      },
+    ])
+    const manager = new FreshAgentRuntimeManager({ registry })
+    const locator = {
+      sessionId: 'ses_one',
+      sessionType: 'freshopencode' as const,
+      provider: 'opencode' as const,
+      cwd: '/repo',
+    }
+
+    const first = manager.send(locator, { text: 'one' })
+    const second = manager.send(locator, { text: 'two' })
+
+    await Promise.resolve()
+
+    expect(opencodeAdapter.attach).toHaveBeenCalledTimes(1)
+
+    attachDeferred.resolve({ sessionId: 'ses_one' })
+
+    await Promise.all([first, second])
+
+    expect(opencodeAdapter.send).toHaveBeenCalledTimes(2)
+  })
+
+  it('rejects concurrent FreshOpenCode recovery when the same session key arrives with a different cwd', async () => {
+    const attachDeferred = createDeferred<{ sessionId: string }>()
+    const opencodeAdapter = {
+      create: vi.fn(),
+      attach: vi.fn(() => attachDeferred.promise),
+      send: vi.fn().mockResolvedValue(undefined),
+    }
+    const registry = createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshopencode',
+        runtimeProvider: 'opencode',
+        adapter: opencodeAdapter as any,
+      },
+    ])
+    const manager = new FreshAgentRuntimeManager({ registry })
+
+    const first = manager.send({
+      sessionId: 'ses_one',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/one',
+    }, { text: 'one' })
+
+    await Promise.resolve()
+
+    await expect(manager.send({
+      sessionId: 'ses_one',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/two',
+    }, { text: 'two' })).rejects.toThrow('/repo/one')
+
+    attachDeferred.resolve({ sessionId: 'ses_one' })
+    await first
+  })
+
+  it('rejects a later FreshOpenCode mutation when the tracked cwd differs', async () => {
+    const opencodeAdapter = {
+      create: vi.fn().mockResolvedValue({ sessionId: 'ses_existing' }),
+      attach: vi.fn().mockResolvedValue({ sessionId: 'ses_existing' }),
+      send: vi.fn().mockResolvedValue(undefined),
+    }
+    const registry = createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshopencode',
+        runtimeProvider: 'opencode',
+        adapter: opencodeAdapter as any,
+      },
+    ])
+    const manager = new FreshAgentRuntimeManager({ registry })
+
+    await manager.create({ requestId: 'req-existing-cwd', sessionType: 'freshopencode', provider: 'opencode' } as any)
+    await manager.send({
+      sessionId: 'ses_existing',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/one',
+    }, { text: 'continue' })
+
+    await expect(manager.send({
+      sessionId: 'ses_existing',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/two',
+    }, { text: 'mismatch' })).rejects.toThrow('/repo/one')
   })
 
   it('routes freshAgent.kill through the tracked adapter and removes the session', async () => {
