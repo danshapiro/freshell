@@ -335,6 +335,44 @@ describe('WsHandler fresh-agent ownership', () => {
     }
   })
 
+  it('does not subscribe a pending FreshOpenCode attach after its socket closes', async () => {
+    const attach = createDeferred<{ sessionId: string; runtimeProvider: string }>()
+    const runtimeManager = {
+      attach: vi.fn(() => attach.promise),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const { ws } = await connectAndAuth(server)
+      ws.send(JSON.stringify({
+        type: 'freshAgent.attach',
+        sessionId: 'ses_closed',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/repo/closed',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_closed' },
+      }))
+
+      await vi.waitFor(() => expect(runtimeManager.attach).toHaveBeenCalled())
+
+      const closed = new Promise<void>((resolve) => ws.once('close', () => resolve()))
+      ws.close()
+      await closed
+
+      attach.resolve({ sessionId: 'ses_closed', runtimeProvider: 'opencode' })
+      await Promise.resolve()
+      await Promise.resolve()
+      await new Promise<void>((resolve) => setImmediate(resolve))
+
+      expect(runtimeManager.subscribe).not.toHaveBeenCalled()
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
   it('retires all same-session durable FreshOpenCode authorizations after kill', async () => {
     const runtimeManager = {
       attach: vi.fn().mockResolvedValue({ sessionId: 'ses_kill_1', runtimeProvider: 'opencode' }),

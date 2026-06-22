@@ -1162,6 +1162,7 @@ export class WsHandler {
       off()
     }
     state.codingCliSubscriptions.clear()
+    this.cancelPendingFreshAgentAttaches(state)
     this.cancelAllFreshAgentSubscriptions(state)
     this.flushWsErrorLogSummaries(state, 'connection_close')
 
@@ -1294,6 +1295,13 @@ export class WsHandler {
       pending.active = false
       state.pendingFreshAgentAttachByKey.delete(key)
     }
+  }
+
+  private cancelPendingFreshAgentAttaches(state: ClientState): void {
+    for (const pending of state.pendingFreshAgentAttachByKey.values()) {
+      pending.active = false
+    }
+    state.pendingFreshAgentAttachByKey.clear()
   }
 
   private retireFreshAgentSessionState(state: ClientState, locator: FreshAgentLocator): void {
@@ -3361,6 +3369,7 @@ export class WsHandler {
           ...(m.sessionRef ? { sessionRef: m.sessionRef } : {}),
         }))
           .then(() => {
+            if (this.clientStates.get(ws) !== state) return
             const current = state.pendingFreshAgentAttachByKey.get(authorizationKey)
             if (current !== pendingEntry || !current?.active) return
             this.authorizeFreshAgentSession(state, locator)
@@ -3375,6 +3384,7 @@ export class WsHandler {
         try {
           await attachPromise
         } catch (error) {
+          if (this.clientStates.get(ws) !== state) return
           log.warn({
             err: error instanceof Error ? error : new Error(String(error)),
             ...locator,
