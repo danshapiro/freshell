@@ -30,17 +30,19 @@
 - OpenCode provides the needed read-only validation surface: `GET /session/:sessionID?directory=<cwd>` returns session info with a `directory` field. Freshell must compare the returned directory to the expected cwd; the query parameter alone is not enough.
 - Freshell already stores the route source for materialized FreshOpenCode panes: `FreshAgentPaneContent.initialCwd` plus durable `sessionRef`.
 - `FreshAgentSessionLocator` already supports `cwd`; the missing work is to carry it through WebSocket mutation messages and use it for FreshOpenCode-only recovery.
+- Existing durable route data is not end-to-end today: reconnect, mutation messages, and runtime recovery must explicitly carry or enrich cwd before mutation.
 - Existing fake OpenCode serve coverage is not enough for route-safe restart proof. The fixture must add route-aware session read, prompt, message, status, and audit behavior.
 - Current WebSocket attach/send can race because message handlers run concurrently and authorization is granted only after attach resolves.
-- Current client `freshAgent.send.accepted` is unscoped and every `freshAgent.event` triggers a snapshot fetch.
+- Current WebSocket authorization keys ignore cwd. Pending attach and mutation authorization must use an identical route-aware locator, or explicitly reject a cwd mismatch.
+- Current client `freshAgent.send.accepted` is unscoped and every `freshAgent.event` triggers a snapshot fetch; scoped accepted messages alone do not clear stale local echo on recovered idle snapshots.
 - Terminal retention-loss coalescing is not proven by existing tests; implement it test-first and keep replay/gap invariants explicit.
 
 ## File Structure
 
 - Modify `shared/ws-protocol.ts`: add `cwd` and `sessionRef` where needed on Fresh Agent messages, and add locator fields to `freshAgent.send.accepted`.
 - Modify `src/components/fresh-agent/FreshAgentView.tsx`: send cwd/sessionRef on attach and mutations, resend attach on reconnect, scope/coalesce snapshot invalidations, and clear stale local echo on recovered idle snapshots.
-- Modify `server/ws-handler.ts`: build route-aware locators, track pending attach per socket, wait on same-session pending attach before mutation auth, and emit scoped accepted messages.
-- Modify `server/fresh-agent/runtime-manager.ts`: add FreshOpenCode-only singleflight recovery for missing `ses_*` sessions with cwd.
+- Modify `server/ws-handler.ts`: build route-aware locators, track route-aware pending attach and mutation authorization per socket, wait on identical-route pending attach before mutation auth, reject cwd mismatches, and emit scoped accepted messages.
+- Modify `server/fresh-agent/runtime-manager.ts`: add FreshOpenCode-only singleflight recovery/enrichment for missing or no-route `ses_*` sessions with cwd.
 - Modify `server/fresh-agent/adapters/opencode/serve-manager.ts`: expose route-aware session status helper if still needed by implementation/tests.
 - Modify `server/fresh-agent/adapters/opencode/adapter.ts`: keep durable attaches readable, validate recovered real sessions against expected cwd at mutation time, and reconcile status as a read-only best-effort signal.
 - Modify `test/e2e-browser/fixtures/fake-opencode.cjs`: make fake serve route-aware enough to prove FreshOpenCode restart recovery.
@@ -176,6 +178,7 @@ type OpencodeSessionState = {
   realSessionId?: string
   cwd?: string
   routeValidatedCwd?: string
+  providerCreatedInThisAdapter?: boolean
   ...
 }
 ```
@@ -187,6 +190,7 @@ async function ensureMutableRoute(state: OpencodeSessionState): Promise<void> {
   const realId = state.realSessionId
   if (!realId) return
   const cwd = state.cwd
+  if (state.providerCreatedInThisAdapter && (!cwd || cwd.trim().length === 0)) return
   if (!cwd || cwd.trim().length === 0) {
     throw new FreshAgentLostSessionError(`OpenCode session ${realId} requires a cwd before it can be mutated after recovery.`)
   }
@@ -209,11 +213,11 @@ async function ensureMutableRoute(state: OpencodeSessionState): Promise<void> {
 }
 ```
 
-Call `ensureMutableRoute(state)` inside `materializeOrSend` after a real id exists and before `promptAsyncForState`. Also call it in `abortForState`, `compactForState`, and `forkForState` before provider mutation. Do not call it in shared `attach()`, `resume()`, `getSnapshot()`, `getTurnPage()`, or `getTurnBody()`; read-only history viewing must still work for legacy sessions without cwd.
+Call `ensureMutableRoute(state)` inside `materializeOrSend` after a real id exists and before creating the `onceIdle` promise or calling `promptAsyncForState`. Also call it in `abortForState`, `compactForState`, and `forkForState` before provider mutation. Do not call it in shared `attach()`, `resume()`, `getSnapshot()`, `getTurnPage()`, or `getTurnBody()`; read-only history viewing must still work for legacy sessions without cwd.
 
-When `createSession()` materializes a new session and returns a directory, set `state.routeValidatedCwd = await canonicalizePath(state.cwd)` after `state.cwd` is assigned, because this is the provider-created route.
+When `createSession()` materializes a new session, set `state.providerCreatedInThisAdapter = true` after assigning the real id. This marks the session as safe for mutation in this server process only when no cwd was supplied, because Freshell just created it through this adapter. If a cwd is present later, do not use the provider-created shortcut; validate that cwd against `getSession()` before mutation. If `createSession()` also returns a directory and `state.cwd` is assigned, set `state.routeValidatedCwd = await canonicalizePath(state.cwd)`.
 
-Update existing adapter tests that attach a real session and then mutate it to have `manager.getSession` return a matching `directory`, or pass `canonicalizePath: async (value) => value` where fake paths are used. Keep existing read-only history tests no-cwd-compatible; change only the old no-cwd-sendable assertion to expect mutation rejection.
+Update existing adapter tests that attach/resume a recovered real session and then mutate it to have `manager.getSession` return a matching `directory`, or pass `canonicalizePath: async (value) => value` where fake paths are used. Keep freshly-created no-cwd sessions sendable; those tests should continue to assert no route argument is sent. Keep existing read-only history tests no-cwd-compatible; change only the old no-cwd recovered attach sendable assertion to expect mutation rejection.
 
 Run: `npm run test:vitest -- --run test/unit/server/fresh-agent/opencode-serve-adapter.test.ts`
 Expected: PASS for the new route validation tests.
@@ -271,7 +275,8 @@ Expected: PASS.
 
 **Interfaces:**
 - Produces: missing-session recovery only for `freshopencode/opencode/ses_*` with non-empty `cwd`.
-- Produces: singleflight recovery keyed by existing fresh-agent session key plus cwd mismatch protection.
+- Produces: route enrichment for an already tracked FreshOpenCode session when a later mutation locator supplies cwd.
+- Produces: singleflight recovery/enrichment keyed by existing fresh-agent session key plus cwd mismatch protection.
 - Consumes: adapter `attach(locator)` route validation from Task 1.
 
 - [ ] **Step 1: Write failing tests for FreshOpenCode-only recovery**
@@ -340,6 +345,34 @@ it('does not recover placeholders, missing cwd, or non-OpenCode providers', asyn
   expect(opencodeAdapter.attach).not.toHaveBeenCalled()
   expect(codexAdapter.attach).not.toHaveBeenCalled()
 })
+
+it('enriches an existing FreshOpenCode record with cwd before mutating', async () => {
+  const opencodeAdapter = {
+    create: vi.fn().mockResolvedValue({ sessionId: 'ses_existing' }),
+    attach: vi.fn().mockResolvedValue({ sessionId: 'ses_existing' }),
+    send: vi.fn().mockResolvedValue(undefined),
+  }
+  const registry = createFreshAgentProviderRegistry([
+    { sessionType: 'freshopencode', runtimeProvider: 'opencode', adapter: opencodeAdapter as any },
+  ])
+  const manager = new FreshAgentRuntimeManager({ registry })
+
+  await manager.create({ sessionType: 'freshopencode', provider: 'opencode', prompt: 'start' } as any)
+  await manager.send({
+    sessionId: 'ses_existing',
+    sessionType: 'freshopencode',
+    provider: 'opencode',
+    cwd: '/repo/safe',
+  }, { text: 'continue' })
+
+  expect(opencodeAdapter.attach).toHaveBeenCalledWith({
+    sessionId: 'ses_existing',
+    sessionType: 'freshopencode',
+    provider: 'opencode',
+    cwd: '/repo/safe',
+  })
+  expect(opencodeAdapter.send).toHaveBeenCalledWith('ses_existing', { text: 'continue' })
+})
 ```
 
 Run: `npm run test:vitest -- --run test/unit/server/fresh-agent/runtime-manager.test.ts`
@@ -350,6 +383,13 @@ Expected: FAIL because missing sessions are never recovered.
 In `server/fresh-agent/runtime-manager.ts`, add:
 
 ```ts
+type SessionRecord = {
+  sessionType: FreshAgentSessionType
+  runtimeProvider: FreshAgentRuntimeProvider
+  adapter: FreshAgentRuntimeAdapter
+  freshOpenCodeRouteCwd?: string
+}
+
 private readonly freshOpencodeRecoveries = new Map<string, { cwd: string; promise: Promise<SessionRecord> }>()
 
 private canRecoverFreshOpenCode(locator: FreshAgentSessionLocator): locator is FreshAgentSessionLocator & { cwd: string } {
@@ -371,6 +411,17 @@ private async requireOrRecoverSession(locator: FreshAgentSessionLocator): Promis
       throw new FreshAgentSessionLocatorMismatchError(
         `Fresh-agent session ${locator.sessionId} is tracked as ${existing.sessionType}/${existing.runtimeProvider}, not ${locator.sessionType}/${locator.provider}`,
       )
+    }
+    if (this.canRecoverFreshOpenCode(locator)) {
+      if (existing.freshOpenCodeRouteCwd && existing.freshOpenCodeRouteCwd !== locator.cwd) {
+        throw new FreshAgentSessionLocatorMismatchError(
+          `Fresh-agent session ${locator.sessionId} is tracked for ${existing.freshOpenCodeRouteCwd}, not ${locator.cwd}`,
+        )
+      }
+      if (!existing.freshOpenCodeRouteCwd) {
+        if (!existing.adapter.attach) return existing
+        await this.singleflightFreshOpenCodeAttach(locator, existing)
+      }
     }
     return existing
   }
@@ -396,6 +447,7 @@ private async requireOrRecoverSession(locator: FreshAgentSessionLocator): Promis
       sessionType: locator.sessionType,
       runtimeProvider: registration.runtimeProvider,
       adapter: registration.adapter,
+      freshOpenCodeRouteCwd: locator.cwd,
     }
     this.sessions.set(key, record)
     return record
@@ -410,6 +462,8 @@ private async requireOrRecoverSession(locator: FreshAgentSessionLocator): Promis
   }
 }
 ```
+
+Factor the shared attach/enrichment body into `singleflightFreshOpenCodeAttach(locator, existingRecord?)` rather than duplicating it for missing and existing records. On success, set `record.freshOpenCodeRouteCwd = locator.cwd`. This is what makes `settings.cwd` on `freshAgent.send` insufficient by itself: the runtime must use the cwd-bearing locator to enrich adapter state before `adapter.send()` runs.
 
 Use this helper in `send`, `interrupt`, `compact`, `fork`, `answerQuestion`, and `resolveApproval`. Keep `kill` strict unless tests show a user-facing need; killing a lost OpenCode record is local cleanup and must not mutate provider state without route proof.
 
@@ -469,7 +523,8 @@ Expected: PASS.
 
 **Interfaces:**
 - Produces: all Fresh Agent mutation messages can carry `cwd?: string`; `freshAgent.attach` can carry `sessionRef`.
-- Produces: same-socket mutations wait for pending attach before authorization.
+- Produces: same-socket mutations wait for pending attach only when session id, provider, type, and cwd match.
+- Produces: cwd mismatch on a raced or already-authorized mutation fails closed instead of reusing a weaker session-id-only authorization.
 - Produces: `freshAgent.send.accepted` includes `sessionId`, `sessionType`, and `provider`.
 
 - [ ] **Step 1: Write failing protocol/server tests**
@@ -542,6 +597,11 @@ it('waits for same-socket attach before sending a raced FreshOpenCode prompt', a
 })
 ```
 
+Add a sibling test that attaches `ses_race` with `cwd: '/repo/a'`, races a `freshAgent.send` for the same `ses_race` with `cwd: '/repo/b'`, resolves the attach, and expects:
+- `runtimeManager.send` is not called.
+- An `UNAUTHORIZED` or locator-mismatch error is sent for the raced request.
+- The authorized `/repo/a` locator remains usable.
+
 Run: `npm run test:vitest -- --run test/unit/server/ws-handler-fresh-agent-ownership.test.ts test/unit/server/ws-handler-fresh-agent.test.ts`
 Expected: FAIL because send is unauthorized while attach is pending and accepted lacks locator fields.
 
@@ -563,10 +623,12 @@ In `shared/ws-protocol.ts`:
 }
 ```
 
-In `server/ws-handler.ts`, add a helper:
+In `server/ws-handler.ts`, extend the existing `FreshAgentLocator` type with `cwd?: string`, then add a helper:
 
 ```ts
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '../shared/fresh-agent.js'
+
+// Add cwd?: string to the existing FreshAgentLocator type near the top of ws-handler.ts.
 
 private freshAgentLocatorFromMessage(m: {
   sessionId: string
@@ -588,6 +650,18 @@ private freshAgentLocatorFromMessage(m: {
 ```
 
 Use it for every Fresh Agent mutation case.
+When emitting `freshAgent.send.accepted`, populate the accepted locator fields from the same locator used for `manager.send`:
+
+```ts
+this.send(ws, {
+  type: 'freshAgent.send.accepted',
+  requestId: m.requestId,
+  sessionId: locator.sessionId,
+  sessionType: locator.sessionType,
+  provider: locator.provider,
+  submittedTurnId: result?.submittedTurnId,
+})
+```
 
 Run: `npm run test:vitest -- --run test/unit/server/ws-handler-fresh-agent.test.ts`
 Expected: tests compile, accepted locator assertions still fail until Step 3.
@@ -597,19 +671,30 @@ Expected: tests compile, accepted locator assertions still fail until Step 3.
 Add to the `ClientState` type and to client-state initialization:
 
 ```ts
-pendingFreshAgentAttachByKey: Map<string, Promise<void>>
+freshAgentAuthorizations: Map<string, { cwd?: string }>
+pendingFreshAgentAttachByKey: Map<string, { cwd?: string; promise: Promise<void> }>
 ```
 
 Initialize it beside the existing Fresh Agent authorization/subscription maps:
 
 ```ts
+freshAgentAuthorizations: new Map(),
 pendingFreshAgentAttachByKey: new Map(),
+```
+
+Replace the current `Set<string>` authorization with the map above. Keep subscriptions keyed by `freshAgentKey(locator)`, because subscriptions are a stream fanout concern. Use a route-aware key for authorization and pending attach:
+
+```ts
+private freshAgentRouteKey(locator: FreshAgentLocator): string {
+  const cwd = typeof locator.cwd === 'string' && locator.cwd.trim().length > 0 ? locator.cwd : ''
+  return `${this.freshAgentKey(locator)}:${cwd}`
+}
 ```
 
 In `freshAgent.attach`:
 - Build locator with cwd.
 - Create `attachPromise` before awaiting manager attach.
-- Store it by `freshAgentKey(locator)`.
+- Store it by `freshAgentRouteKey(locator)` with its cwd.
 - On success, authorize and subscribe.
 - On failure, send an error and do not authorize.
 - In `finally`, delete only the same promise.
@@ -624,9 +709,9 @@ private async waitForFreshAgentAuthorization(
   requestId?: string,
 ): Promise<boolean> {
   if (this.isFreshAgentAuthorized(state, locator)) return true
-  const pending = state.pendingFreshAgentAttachByKey.get(this.freshAgentKey(locator))
+  const pending = state.pendingFreshAgentAttachByKey.get(this.freshAgentRouteKey(locator))
   if (pending) {
-    await pending.catch(() => undefined)
+    await pending.promise.catch(() => undefined)
     if (this.isFreshAgentAuthorized(state, locator)) return true
   }
   this.sendError(ws, {
@@ -638,7 +723,7 @@ private async waitForFreshAgentAuthorization(
 }
 ```
 
-Use it for `send`; use it for other async mutation cases where tests are added. Keep failed attach from authorizing.
+`authorizeFreshAgentSession` and `isFreshAgentAuthorized` must use `freshAgentRouteKey(locator)`. This means an attach without cwd authorizes only no-cwd mutations; it does not authorize a cwd-bearing recovered mutation. Use `waitForFreshAgentAuthorization` for `send`; use it for other async mutation cases where tests are added. Keep failed attach from authorizing.
 
 Run: `npm run test:vitest -- --run test/unit/server/ws-handler-fresh-agent-ownership.test.ts test/unit/server/ws-handler-fresh-agent.test.ts`
 Expected: PASS.
@@ -827,6 +912,7 @@ Expected: PASS.
 **Interfaces:**
 - Produces: fake OpenCode serve endpoints needed to prove route-safe FreshOpenCode recovery.
 - Produces: e2e smoke that starts/stops only isolated `TestServer` instances, never the self-hosted Freshell server.
+- Produces: fake audit records for both accepted and rejected route lookups/mutations, so the test proves fail-closed behavior.
 
 - [ ] **Step 1: Extend fake serve routes test-first through e2e expectations**
 
@@ -849,6 +935,18 @@ expect(auditEvents).toContainEqual(expect.objectContaining({
 }))
 ```
 
+Also add a fake-fixture expectation or unit helper that sets `FAKE_OPENCODE_REQUIRE_DIRECTORY_ROUTE=1`, calls a routed endpoint with a missing or mismatched `directory`, and requires an audit entry like:
+
+```ts
+expect(auditEvents).toContainEqual(expect.objectContaining({
+  event: 'serve_prompt_async',
+  sessionId,
+  routeDirectory: '/repo/wrong',
+  storedDirectory: cwd,
+  ok: false,
+}))
+```
+
 Run the new spec target:
 `npm run test:e2e -- test/e2e-browser/specs/freshopencode-restart-recovery.spec.ts`
 Expected: FAIL because the fixture/spec do not exist or fake endpoints return 404.
@@ -863,7 +961,7 @@ In `test/e2e-browser/fixtures/fake-opencode.cjs`:
 - Add `GET /session/:id/message?directory=<cwd>` and `GET /session/:id/message/:messageId?directory=<cwd>` for snapshot/turn body reads.
 - Add `/global/event` SSE alias for current event behavior.
 - Add route-aware `/session/status?directory=<cwd>` audit entries.
-- Add optional env `FAKE_OPENCODE_REQUIRE_DIRECTORY_ROUTE=1`; when enabled, missing or mismatched route returns 409 and audits `ok: false`.
+- Add optional env `FAKE_OPENCODE_REQUIRE_DIRECTORY_ROUTE=1`; when enabled, missing or mismatched route returns 409 and audits `ok: false` for read and mutation endpoints.
 
 Run focused e2e spec again.
 Expected: PASS after implementation.
@@ -907,7 +1005,20 @@ expect(outputs.every((payload) => payload.streamId === streamChanges[0].streamId
 expect(outputs.map((payload) => payload.data).join('')).toHaveLength(200 * 1024)
 ```
 
-Add a replay attach after the large append and assert either a replay gap or retained frames use the final stream id consistently.
+Add a replay attach after the large append and assert concrete replay invariants:
+
+```ts
+const replayPayloads = wsAfterLoss.send.mock.calls
+  .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+const replayReady = replayPayloads.find((payload) => payload?.type === 'terminal.attach.ready')
+const replayOutputs = replayPayloads.filter((payload) => payload?.type === 'terminal.output')
+const replayGaps = replayPayloads.filter((payload) => payload?.type === 'terminal.output.gap')
+
+expect(replayReady?.streamId).toBe(finalStreamId)
+expect(replayOutputs.every((payload) => payload.streamId === finalStreamId)).toBe(true)
+expect(replayGaps.every((payload) => payload.streamId === finalStreamId)).toBe(true)
+expect(replayPayloads.some((payload) => payload.streamId === ready.streamId)).toBe(false)
+```
 
 Run: `npm run test:vitest -- --run test/unit/server/ws-handler-backpressure.test.ts`
 Expected: FAIL because current code can emit multiple stream changes inside one raw append.
