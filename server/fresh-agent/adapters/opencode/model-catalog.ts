@@ -94,9 +94,7 @@ export function createOpencodeModelCatalogProvider(
     signal: AbortSignal,
   ): Promise<void> {
     const stopChild = () => {
-      if (!child.killed) {
-        try { child.kill() } catch { /* already gone */ }
-      }
+      killChildGroup(child)
     }
     const deadline = Date.now() + healthTimeoutMs
     let stderr = ''
@@ -172,13 +170,15 @@ export function createOpencodeModelCatalogProvider(
       : undefined
     const endpoint = await allocatePort()
     const baseUrl = `http://${endpoint.hostname}:${endpoint.port}`
+    const args = ['serve', '--pure', '--hostname', endpoint.hostname, '--port', String(endpoint.port)]
     const child = spawnFn(
       command,
-      ['serve', '--hostname', endpoint.hostname, '--port', String(endpoint.port)],
+      args,
       {
         ...(cwd ? { cwd } : {}),
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
+        detached: true,
       },
     ) as unknown as ChildProcessWithoutNullStreams
     child.stdout?.on('data', () => {})
@@ -197,9 +197,7 @@ export function createOpencodeModelCatalogProvider(
       const raw = await res.json()
       return { providers: readProviderRecord(raw) }
     } finally {
-      if (!child.killed) {
-        try { child.kill() } catch { /* already gone */ }
-      }
+      killChildGroup(child)
     }
   }
 
@@ -208,6 +206,18 @@ export function createOpencodeModelCatalogProvider(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+/** Kill the child's entire process group if possible (Linux/macOS),
+ * falling back to child.kill() otherwise. */
+function killChildGroup(child: ChildProcessWithoutNullStreams): void {
+  if (child.killed) return
+  try {
+    if (child.pid !== undefined) process.kill(-child.pid, 'SIGTERM')
+    else child.kill()
+  } catch {
+    try { child.kill() } catch { /* already gone */ }
+  }
 }
 
 function readRecord(value: unknown): Record<string, unknown> | undefined {
@@ -229,22 +239,48 @@ function cleanDisplayName(value: string): string {
   return stripped
 }
 
+/** Normalize the `providers` field to a Record keyed by provider id.
+ * opencode 1.17.x serves providers as an array of Info objects, but
+ * schemas may also use an object record. Accept both formats. */
+function readProvidersField(rawProviders: unknown): Record<string, unknown> {
+  if (isRecord(rawProviders)) {
+    return { ...rawProviders }
+  }
+  if (Array.isArray(rawProviders)) {
+    const record: Record<string, unknown> = {}
+    for (const entry of rawProviders) {
+      if (isRecord(entry)) {
+        const id = readNonEmptyString(entry.id)
+        if (id) record[id] = entry
+      }
+    }
+    return record
+  }
+  return {}
+}
+
 function readProviderRecord(raw: unknown): Record<string, unknown> {
   if (!isRecord(raw)) return {}
-  const rawProviders = raw.providers
-  return isRecord(rawProviders) ? { ...rawProviders } : {}
+  return readProvidersField(raw.providers)
 }
 
 function readProviderMap(raw: unknown): Map<string, unknown> {
-  const providers = new Map<string, unknown>()
-  if (!isRecord(raw)) return providers
+  const result = new Map<string, unknown>()
+  if (!isRecord(raw)) return result
   const rawProviders = raw.providers
   if (isRecord(rawProviders)) {
     for (const [key, value] of Object.entries(rawProviders)) {
-      providers.set(key, value)
+      result.set(key, value)
+    }
+  } else if (Array.isArray(rawProviders)) {
+    for (const entry of rawProviders) {
+      if (isRecord(entry)) {
+        const id = readNonEmptyString(entry.id)
+        if (id) result.set(id, entry)
+      }
     }
   }
-  return providers
+  return result
 }
 
 function readModelEntries(provider: Record<string, unknown>): Map<string, unknown> {

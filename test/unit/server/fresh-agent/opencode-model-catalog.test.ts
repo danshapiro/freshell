@@ -60,7 +60,7 @@ describe('OpenCode model catalog provider', () => {
     })
     expect(spawnFn).toHaveBeenCalledWith(
       'opencode',
-      ['serve', '--hostname', '127.0.0.1', '--port', '48123'],
+      ['serve', '--pure', '--hostname', '127.0.0.1', '--port', '48123'],
       expect.objectContaining({ cwd: '/repo/project-a' }),
     )
     expect(fetchFn).toHaveBeenCalledWith('http://127.0.0.1:48123/config/providers', expect.anything())
@@ -147,5 +147,58 @@ describe('OpenCode model catalog provider', () => {
     const elapsed = Date.now() - start
     expect(elapsed).toBeLessThan(4000)
     expect(child.kill).toHaveBeenCalled()
+  })
+
+  it('normalizes array-format providers from opencode 1.17.x /config/providers', () => {
+    const models = normalizeOpencodeEnabledModelCatalog({
+      providers: [
+        {
+          id: 'deepseek',
+          name: 'deepseek',
+          models: {
+            'deepseek-v4-pro': { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
+            'deepseek-v4-flash': { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+          },
+        },
+        {
+          id: 'opencode-go',
+          name: 'opencode-go',
+          models: {
+            'glm-5.2': { id: 'glm-5.2', name: 'GLM 5.2' },
+          },
+        },
+      ],
+      default: { 'opencode-go': 'glm-5.2' },
+    })
+
+    expect(models).toEqual([
+      {
+        id: 'deepseek/deepseek-v4-flash',
+        displayName: 'DeepSeek V4 Flash',
+        provider: 'opencode',
+        source: { id: 'deepseek', displayName: 'deepseek' },
+        supportsEffort: true,
+        supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
+        supportsAdaptiveThinking: true,
+      },
+      {
+        id: 'deepseek/deepseek-v4-pro',
+        displayName: 'DeepSeek V4 Pro',
+        provider: 'opencode',
+        source: { id: 'deepseek', displayName: 'deepseek' },
+        supportsEffort: true,
+        supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
+        supportsAdaptiveThinking: true,
+      },
+      {
+        id: 'opencode-go/glm-5.2',
+        displayName: 'GLM 5.2',
+        provider: 'opencode',
+        source: { id: 'opencode-go', displayName: 'opencode-go' },
+        supportsEffort: true,
+        supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
+        supportsAdaptiveThinking: true,
+      },
+    ])
   })
 })
