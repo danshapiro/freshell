@@ -290,6 +290,9 @@ export function createCodexFreshAgentAdapter(deps: {
   }
   const displayIdSecret = deps.displayIdSecret
   const activeTurnByThread = new Map<string, string>()
+  // Per-thread (not per-subscription) so the monotonic turn-complete clamp survives a WS
+  // reconnect, matching how Claude/OpenCode keep it on session state.
+  const lastTurnCompleteAtByThread = new Map<string, number>()
   const settingsByThread = new Map<string, Partial<FreshAgentCreateRequest>>()
   const runtimeByThread = new Map<string, CodexRuntimePort>()
   const threadIdsByRuntime = new Map<CodexRuntimePort, Set<string>>()
@@ -669,6 +672,7 @@ export function createCodexFreshAgentAdapter(deps: {
 
   const clearThreadState = (threadId: string) => {
     activeTurnByThread.delete(threadId)
+    lastTurnCompleteAtByThread.delete(threadId)
     settingsByThread.delete(threadId)
     modelByTurnByThread.delete(threadId)
     submittedInputsByThread.delete(threadId)
@@ -900,7 +904,6 @@ export function createCodexFreshAgentAdapter(deps: {
       // app-server fires turn/completed for interrupts too, carrying the authoritative
       // outcome inline at params.turn.status, so we chime only for a positive
       // completion ('completed') and never on interrupt/failure.
-      let lastTurnCompleteAt: number | undefined
       const offTurnCompleted = runtime.onTurnCompleted?.((event) => {
         if (event.threadId !== sessionId) return
         // turn/completed fires for interrupts/failures too, so chime only on a positive
@@ -910,8 +913,8 @@ export function createCodexFreshAgentAdapter(deps: {
         const params = event.params as { status?: unknown; turn?: { status?: unknown } } | undefined
         const status = params?.turn?.status ?? params?.status
         if (status !== 'completed') return
-        const at = nextMonotonicTurnCompleteAt(lastTurnCompleteAt, Date.now())
-        lastTurnCompleteAt = at
+        const at = nextMonotonicTurnCompleteAt(lastTurnCompleteAtByThread.get(sessionId), Date.now())
+        lastTurnCompleteAtByThread.set(sessionId, at)
         listener({ type: 'sdk.turn.complete', sessionId, at })
       })
 

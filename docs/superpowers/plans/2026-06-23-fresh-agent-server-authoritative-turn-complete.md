@@ -99,12 +99,18 @@ older-or-equal `at` is dropped.
 per-turn identity: two genuine completions can land in the same millisecond, and the
 system clock can step backwards (NTP correction) — both would make a real later
 completion look `<= last` and be dropped as a replay, recreating the missed-chime
-class. So each emit site (`sdk-bridge`, opencode adapter, codex subscription) clamps
-its session's `at` to be strictly greater than the previous one via the shared
-`nextMonotonicTurnCompleteAt` helper. This keeps the wall-clock-seeded value (so
-restart monotonicity still holds — a new process's `Date.now()` is already past any
-pre-restart `at`) while guaranteeing distinct turns never collide or regress within a
-process.
+class. So each emit site clamps its session's `at` to be strictly greater than the
+previous one via the shared `nextMonotonicTurnCompleteAt` helper. This keeps the
+wall-clock-seeded value (so restart monotonicity still holds — a new process's
+`Date.now()` is already past any pre-restart `at`) while guaranteeing distinct turns
+never collide or regress within a process.
+
+The clamp state must live on **per-session** server state, never per-subscription:
+the client store's dedupe survives a WS reconnect, but fresh-agent subscriptions are
+torn down and recreated on reconnect. So `sdk-bridge` keeps it on `SdkSessionState`,
+the opencode adapter on `OpencodeSessionState`, and the codex adapter on a per-thread
+`lastTurnCompleteAtByThread` map (not the `subscribe()` closure) — otherwise a same-ms
+or backward-clock completion right after a reconnect would be dropped for codex.
 
 ### What was deleted
 
@@ -147,6 +153,8 @@ monotonic `at <= last` guard.
   on a flat `params.status` completion and skips a flat `interrupted`; the
   waiting-for-approval edge does not swallow a later server completion (separate dedupe
   namespace).
+- Unit (review follow-ups, round 3): codex keeps the monotonic `at` clamp per thread
+  across a re-subscribe (WS reconnect), not per subscription.
 - e2e: WS `freshAgent.turn.complete` → `handleFreshAgentMessage` →
   `applyFreshAgentCompletion` → `useTurnCompletionNotifications` chimes once +
   highlights, ignores replays, re-chimes on the next real turn.

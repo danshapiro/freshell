@@ -1197,6 +1197,47 @@ describe('Codex fresh-agent adapter', () => {
     expect(ats[1]).toBeGreaterThan(ats[0])
   })
 
+  it('keeps the turn-complete clock monotonic per thread across a re-subscribe (WS reconnect)', async () => {
+    // WS fresh-agent subscriptions are torn down and recreated on reconnect, but the
+    // client store's dedupe state survives. The monotonic `at` clamp must therefore live
+    // on per-thread adapter state (like Claude/OpenCode session state), not the subscribe
+    // closure, or a same-ms / backward-clock completion right after a reconnect is dropped.
+    let turnCompletedHandler: ((event: any) => void) | undefined
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      onThreadLifecycle: vi.fn(() => vi.fn()),
+      onTurnCompleted: vi.fn((handler) => {
+        turnCompletedHandler = handler
+        return vi.fn()
+      }),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(9000)
+    try {
+      const firstListener = vi.fn()
+      const unsub1 = await adapter.subscribe?.('thread-new-1', firstListener)
+      turnCompletedHandler?.({ threadId: 'thread-new-1', params: { threadId: 'thread-new-1', turn: { id: 't1', status: 'completed' } } })
+      unsub1?.()
+
+      // Reconnect: a brand-new subscription to the same thread, same wall-clock ms.
+      const secondListener = vi.fn()
+      await adapter.subscribe?.('thread-new-1', secondListener)
+      turnCompletedHandler?.({ threadId: 'thread-new-1', params: { threadId: 'thread-new-1', turn: { id: 't2', status: 'completed' } } })
+
+      const firstAt = firstListener.mock.calls.map(([e]) => e).find((e) => e?.type === 'sdk.turn.complete')?.at
+      const secondAt = secondListener.mock.calls.map(([e]) => e).find((e) => e?.type === 'sdk.turn.complete')?.at
+      expect(firstAt).toBe(9000)
+      expect(secondAt).toBeGreaterThan(firstAt)
+    } finally {
+      nowSpy.mockRestore()
+    }
+  })
+
   it('lazily resumes a Codex runtime before subscribing to a persisted thread after server reload', async () => {
     let lifecycleHandler: ((event: any) => void) | undefined
     const off = vi.fn()
