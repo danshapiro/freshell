@@ -400,6 +400,14 @@ export const CodexTurnCompletedNotificationSchema = z.object({
   params: z.object({
     threadId: z.string().min(1),
     turnId: z.string().min(1).optional(),
+    // The real app-server reports the authoritative outcome inline as the completed
+    // turn object (status 'completed' | 'interrupted' | 'failed'). turn/completed
+    // fires for interrupts too, so consumers must read turn.status to chime only on
+    // a positive completion rather than treating the bare notification as success.
+    turn: z.object({
+      id: z.string().min(1).optional(),
+      status: CodexTurnStatusSchema.optional(),
+    }).passthrough().optional(),
   }).passthrough(),
 }).passthrough()
 

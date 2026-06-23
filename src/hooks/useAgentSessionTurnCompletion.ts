@@ -2,16 +2,13 @@ import { useEffect, useRef } from 'react'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { collectPaneEntries } from '@/lib/pane-utils'
-import {
-  isFreshAgentBusy,
-  resolveFreshAgentSessionKey,
-} from '@/lib/pane-activity'
+import { resolveFreshAgentSessionKey } from '@/lib/pane-activity'
 import { recordTurnComplete } from '@/store/turnCompletionSlice'
 import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 
 const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
 
-type SessionEdgeState = { wasBusy: boolean; hadPending: boolean }
+type SessionEdgeState = { hadPending: boolean }
 
 function hasWaitingItems(session: FreshAgentSessionState | undefined): boolean {
   if (!session) return false
@@ -20,17 +17,20 @@ function hasWaitingItems(session: FreshAgentSessionState | undefined): boolean {
 }
 
 /**
- * Bridges SDK-driven fresh-agent panes into the existing
- * GREEN/SOUND pipeline. Watches each SDK pane's busy/pending edges and fires
- * recordTurnComplete on:
- *  - a real busy -> idle transition (turn complete), and
- *  - a 0 -> >=1 pending permission/question transition (waiting-for-approval).
+ * Bridges the fresh-agent "waiting-for-approval" edge into the GREEN/SOUND pipeline.
+ * Fires recordTurnComplete on a 0 -> >=1 pending permission/question transition.
+ *
+ * Turn COMPLETION (a finished turn) is no longer derived here: it is
+ * server-authoritative via the discrete freshAgent.turn.complete event
+ * (applyFreshAgentCompletion). Differentiating the client-side busy level to recover
+ * a completion edge was the source of premature (flicker), missed (fast-turn), and
+ * stale-color chimes, so that path is intentionally gone.
  *
  * The synthetic terminalId is the pane's `provider:sessionId` session key, which
  * recordTurnComplete only uses as a dedupe key (markTab/PaneAttention key on
  * tabId/paneId). Never fires on the FIRST observation of a session, so tab
- * restore / snapshot hydration of an already-idle or already-pending session
- * does not produce a spurious green/sound.
+ * restore / snapshot hydration of an already-pending session does not produce a
+ * spurious green/sound.
  */
 export function useAgentSessionTurnCompletion(): void {
   const dispatch = useAppDispatch()
@@ -46,24 +46,17 @@ export function useAgentSessionTurnCompletion(): void {
       if (!layout) continue
       for (const entry of collectPaneEntries(layout)) {
         const content = entry.content
-        let sessionKey: string | undefined
-        let isBusy = false
-        let hasPending = false
+        if (content.kind !== 'fresh-agent') continue
 
-        if (content.kind === 'fresh-agent') {
-          const session = content.sessionId
-            ? freshAgentSessions[makeFreshAgentSessionKey({
-              sessionType: content.sessionType,
-              provider: content.provider,
-              sessionId: content.sessionId,
-            })]
-            : undefined
-          sessionKey = resolveFreshAgentSessionKey(content, session)
-          isBusy = isFreshAgentBusy(content, session)
-          hasPending = hasWaitingItems(session)
-        } else {
-          continue
-        }
+        const session = content.sessionId
+          ? freshAgentSessions[makeFreshAgentSessionKey({
+            sessionType: content.sessionType,
+            provider: content.provider,
+            sessionId: content.sessionId,
+          })]
+          : undefined
+        const sessionKey = resolveFreshAgentSessionKey(content, session)
+        const hasPending = hasWaitingItems(session)
 
         if (!sessionKey) continue
         seen.add(sessionKey)
@@ -71,8 +64,8 @@ export function useAgentSessionTurnCompletion(): void {
         const prev = prevRef.current.get(sessionKey)
         if (prev === undefined) {
           // First observation: initialize without firing (avoids spurious green on
-          // restore / snapshot hydration of an already-finished or pending session).
-          prevRef.current.set(sessionKey, { wasBusy: isBusy, hadPending: hasPending })
+          // restore / snapshot hydration of an already-pending session).
+          prevRef.current.set(sessionKey, { hadPending: hasPending })
           continue
         }
 
@@ -84,17 +77,9 @@ export function useAgentSessionTurnCompletion(): void {
             terminalId: sessionKey,
             at: Date.now(),
           }))
-        } else if (prev.wasBusy && !isBusy && !hasPending) {
-          // Turn complete: an observed busy -> idle with nothing pending.
-          dispatch(recordTurnComplete({
-            tabId,
-            paneId: entry.paneId,
-            terminalId: sessionKey,
-            at: Date.now(),
-          }))
         }
 
-        prevRef.current.set(sessionKey, { wasBusy: isBusy, hadPending: hasPending })
+        prevRef.current.set(sessionKey, { hadPending: hasPending })
       }
     }
 

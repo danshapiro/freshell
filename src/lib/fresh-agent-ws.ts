@@ -4,6 +4,7 @@ import type { SessionRef } from '@shared/session-contract'
 import { consumeCancelledCreate, consumeCreateRoute, rememberCreateRoute } from '@/lib/create-cancellation'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
+import { applyFreshAgentCompletion } from '@/store/turnCompletionThunks'
 import {
   addAssistantMessage,
   addPermissionRequest,
@@ -224,6 +225,13 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       dispatch(setSessionStatus({
         ...locator,
         status: event.status as never,
+      }))
+      return true
+    case 'freshAgent.turn.complete':
+      dispatch(applyFreshAgentCompletion({
+        provider: locator.provider,
+        sessionId,
+        at: typeof event.at === 'number' ? event.at : Date.now(),
       }))
       return true
     case 'freshAgent.assistant':

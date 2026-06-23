@@ -65,6 +65,9 @@ type CodexRuntimePort = {
   interruptTurn?: (input: CodexTurnInterruptParams) => Promise<void>
   shutdown?: () => Promise<void>
   onThreadLifecycle?: (handler: (event: CodexThreadLifecycleEvent) => void) => () => void
+  onTurnCompleted?: (
+    handler: (event: { threadId: string; turnId?: string; params: Record<string, unknown> }) => void,
+  ) => () => void
   readThread: (input: { threadId: string; includeTurns?: boolean }) => Promise<Record<string, any>>
   listThreadTurns: (input: {
     threadId: string
@@ -867,7 +870,7 @@ export function createCodexFreshAgentAdapter(deps: {
       if (!runtime.onThreadLifecycle) {
         throw new Error('Codex app-server runtime does not support thread lifecycle subscriptions.')
       }
-      return runtime.onThreadLifecycle((event) => {
+      const offLifecycle = runtime.onThreadLifecycle((event) => {
         if (event.kind === 'thread_started') {
           if (event.thread.id !== sessionId) return
           listener(makeCodexStatusEvent(sessionId, event.thread.status, event.thread.updatedAt))
@@ -891,6 +894,22 @@ export function createCodexFreshAgentAdapter(deps: {
         }
         listener(makeCodexStatusEvent(sessionId, event.status))
       })
+
+      // Server-authoritative turn-complete edge for the GREEN/SOUND pipeline. The
+      // app-server fires turn/completed for interrupts too, carrying the authoritative
+      // outcome inline at params.turn.status, so we chime only for a positive
+      // completion ('completed') and never on interrupt/failure.
+      const offTurnCompleted = runtime.onTurnCompleted?.((event) => {
+        if (event.threadId !== sessionId) return
+        const turn = event.params?.turn as { status?: unknown } | undefined
+        if (turn?.status !== 'completed') return
+        listener({ type: 'sdk.turn.complete', sessionId, at: Date.now() })
+      })
+
+      return () => {
+        offLifecycle()
+        offTurnCompleted?.()
+      }
     },
 
     async send(sessionId, input) {

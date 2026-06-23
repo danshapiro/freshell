@@ -45,20 +45,18 @@ function render(store: ReturnType<typeof makeStore>) {
 const claudeRunning = { sessionId: 'abc', sessionType: 'freshclaude' as const, provider: 'claude' as const }
 
 describe('useAgentSessionTurnCompletion', () => {
-  it('fires green+attention once on a fresh-agent running -> idle transition', () => {
+  it('does NOT fire on a busy -> idle transition (turn completion is server-authoritative)', () => {
+    // Turn completion green/sound now flows from the server-authoritative
+    // freshAgent.turn.complete edge (applyFreshAgentCompletion), not from
+    // differentiating the client-side busy level. The hook must not re-derive it.
     const store = makeStore()
     act(() => { store.dispatch(setSessionStatus({ ...claudeRunning, status: 'running' })) })
     render(store)
-    // first observation (running) does not fire
     expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
 
     act(() => { store.dispatch(setSessionStatus({ ...claudeRunning, status: 'idle' })) })
 
-    // The hook dispatches recordTurnComplete (-> pendingEvents); attention marking
-    // is done downstream by useTurnCompletionNotifications.
-    const events = store.getState().turnCompletion.pendingEvents
-    expect(events).toHaveLength(1)
-    expect(events[0]).toMatchObject({ tabId: TAB, paneId: PANE, terminalId: 'claude:abc' })
+    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
   })
 
   it('does NOT fire when the session is already idle on first observation (restore/hydration)', () => {

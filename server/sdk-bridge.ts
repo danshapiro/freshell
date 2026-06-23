@@ -461,6 +461,17 @@ export class SdkBridge extends EventEmitter {
           costUsd: rMsg.total_cost_usd,
           usage,
         })
+        // Server-authoritative turn-complete edge for the GREEN/SOUND pipeline.
+        // Only a positively-completed turn ('success') chimes; interrupts yield no
+        // result message at all, and tool-only/error turns surface a non-success
+        // subtype, so this never fires green on an aborted or errored turn.
+        if (rMsg.subtype === 'success') {
+          this.broadcastToSession(sessionId, {
+            type: 'sdk.turn.complete',
+            sessionId,
+            at: Date.now(),
+          })
+        }
         break
       }
 

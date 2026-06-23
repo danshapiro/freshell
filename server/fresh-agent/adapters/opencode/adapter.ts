@@ -324,6 +324,10 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       state.model = modelStr ?? state.model
       state.effort = effort
       emitStatus(state, 'idle')
+      // Server-authoritative turn-complete edge for the GREEN/SOUND pipeline. This is
+      // the ONLY positive-completion path: the catch below (abort/interrupt/sidecar
+      // loss) and the serve SSE idle relay deliberately do not chime.
+      state.events.emit('event', { type: 'sdk.turn.complete', sessionId: state.placeholderId, at: Date.now() })
       return sendResult(state.realSessionId)
     } catch (error) {
       emitStatus(state, 'idle')

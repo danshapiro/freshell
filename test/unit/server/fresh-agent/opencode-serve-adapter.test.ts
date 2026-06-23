@@ -134,6 +134,37 @@ describe('OpenCode serve adapter: create + send', () => {
     expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-3', status: 'idle' })
   })
 
+  it('emits exactly one server-authoritative sdk.turn.complete on a successful send', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-tc', sessionType: 'freshopencode', provider: 'opencode' })
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-req-tc', (e) => events.push(e))
+    await adapter.send?.('freshopencode-req-tc', { text: 'go' })
+    // A second idle snapshot relayed from the serve SSE must NOT produce a second completion.
+    manager._emit('ses_real_1', { kind: 'session.idle', sessionId: 'ses_real_1', raw: { type: 'session.idle', properties: { sessionID: 'ses_real_1' } } })
+
+    const completions = events.filter((e): e is { type: string; sessionId: string; at: number } =>
+      !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')
+    expect(completions).toHaveLength(1)
+    expect(completions[0].sessionId).toBe('freshopencode-req-tc')
+    expect(typeof completions[0].at).toBe('number')
+  })
+
+  it('does NOT emit sdk.turn.complete when a send aborts (onceIdle rejects)', async () => {
+    const manager = makeFakeManager()
+    manager.onceIdle = vi.fn(() => Promise.reject(new Error('opencode serve sidecar was lost.')))
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-abort', sessionType: 'freshopencode', provider: 'opencode' })
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-req-abort', (e) => events.push(e))
+    await expect(adapter.send?.('freshopencode-req-abort', { text: 'go' })).rejects.toThrow()
+
+    // The catch path still returns the pane to idle (clearing blue) but must not chime.
+    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-abort', status: 'idle' })
+    expect(events.find((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')).toBeUndefined()
+  })
+
   it('emits running before first-send session materialization resolves', async () => {
     const manager = makeFakeManager()
     const createSession = createDeferred<{ id: string; directory?: string; title?: string }>()

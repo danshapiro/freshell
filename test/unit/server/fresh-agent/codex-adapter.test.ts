@@ -1080,6 +1080,58 @@ describe('Codex fresh-agent adapter', () => {
     expect(off).toHaveBeenCalledTimes(1)
   })
 
+  it('emits a server-authoritative sdk.turn.complete only for a completed turn on the subscribed thread', async () => {
+    let turnCompletedHandler: ((event: any) => void) | undefined
+    const offLifecycle = vi.fn()
+    const offTurnCompleted = vi.fn()
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      onThreadLifecycle: vi.fn(() => offLifecycle),
+      onTurnCompleted: vi.fn((handler) => {
+        turnCompletedHandler = handler
+        return offTurnCompleted
+      }),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+    const listener = vi.fn()
+
+    const unsubscribe = await adapter.subscribe?.('thread-new-1', listener)
+    expect(runtime.onTurnCompleted).toHaveBeenCalledWith(expect.any(Function))
+
+    // Real codex turn/completed carries the authoritative status inline at params.turn.status.
+    // A completed turn on a different thread is ignored.
+    turnCompletedHandler?.({
+      threadId: 'other-thread',
+      params: { threadId: 'other-thread', turn: { id: 'turn-x', status: 'completed' } },
+    })
+    expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.turn.complete' }))
+
+    // An interrupted turn on the subscribed thread must NOT chime.
+    turnCompletedHandler?.({
+      threadId: 'thread-new-1',
+      params: { threadId: 'thread-new-1', turn: { id: 'turn-1', status: 'interrupted' } },
+    })
+    expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.turn.complete' }))
+
+    // A completed turn on the subscribed thread chimes exactly once.
+    turnCompletedHandler?.({
+      threadId: 'thread-new-1',
+      params: { threadId: 'thread-new-1', turn: { id: 'turn-2', status: 'completed' } },
+    })
+    const completeCalls = listener.mock.calls.filter(([event]) => event?.type === 'sdk.turn.complete')
+    expect(completeCalls).toHaveLength(1)
+    expect(completeCalls[0][0]).toMatchObject({ type: 'sdk.turn.complete', sessionId: 'thread-new-1' })
+    expect(typeof completeCalls[0][0].at).toBe('number')
+
+    unsubscribe?.()
+    expect(offLifecycle).toHaveBeenCalledTimes(1)
+    expect(offTurnCompleted).toHaveBeenCalledTimes(1)
+  })
+
   it('lazily resumes a Codex runtime before subscribing to a persisted thread after server reload', async () => {
     let lifecycleHandler: ((event: any) => void) | undefined
     const off = vi.fn()
