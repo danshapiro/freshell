@@ -514,6 +514,129 @@ describe('FreshAgentTranscript', () => {
     expect(screen.getAllByLabelText('complete').length).toBeGreaterThanOrEqual(1)
   })
 
+  it('folds Claude user-role tool results into the assistant activity instead of attributing them to You', () => {
+    const { container } = render(
+      <FreshAgentTranscript
+        agentLabel="Freshclaude"
+        turns={[
+          {
+            id: 'turn-user-1',
+            role: 'user',
+            summary: 'request',
+            items: [{ id: 'item-user-1', kind: 'text', text: 'Check the plan file' }],
+          },
+          {
+            id: 'turn-agent-tool',
+            role: 'assistant',
+            summary: 'reading',
+            items: [
+              { id: 'item-agent-1', kind: 'text', text: 'Let me check that.' },
+              {
+                id: 'tool-read-1',
+                kind: 'tool_use',
+                toolUseId: 'call-read-1',
+                name: 'Read',
+                input: { file_path: 'docs/plan.md' },
+              },
+            ],
+          },
+          {
+            id: 'turn-tool-result',
+            role: 'user',
+            summary: 'Tool result',
+            items: [
+              { id: 'result-read-1', kind: 'tool_result', toolUseId: 'call-read-1', content: '# Plan', isError: false },
+            ],
+          },
+          {
+            id: 'turn-agent-final',
+            role: 'assistant',
+            summary: 'done',
+            items: [{ id: 'item-agent-2', kind: 'text', text: 'Plan file checked.' }],
+          },
+        ]}
+      />,
+    )
+
+    const visibleHeaders = Array.from(container.querySelectorAll('.fresh-agent-turn-header'))
+      .map((node) => node.textContent?.trim())
+      .filter(Boolean)
+    expect(visibleHeaders).toEqual(['You', 'Freshclaude'])
+    expect(container.querySelectorAll('[data-turn-role="user"] .fresh-agent-activity-strip')).toHaveLength(0)
+    expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('1 tool used')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+    expect(screen.getByText('docs/plan.md')).toBeInTheDocument()
+    expect(container.querySelector('[data-tool-output]')).toHaveTextContent('# Plan')
+  })
+
+  it('coalesces adjacent Claude tool-use/result exchanges without rendering synthetic You turns', () => {
+    const { container } = render(
+      <FreshAgentTranscript
+        agentLabel="Freshclaude"
+        turns={[
+          {
+            id: 'turn-user-1',
+            role: 'user',
+            summary: 'request',
+            items: [{ id: 'item-user-1', kind: 'text', text: 'Read both files' }],
+          },
+          {
+            id: 'turn-agent-read-1',
+            role: 'assistant',
+            summary: 'Read',
+            items: [{
+              id: 'tool-read-1',
+              kind: 'tool_use',
+              toolUseId: 'call-read-1',
+              name: 'Read',
+              input: { file_path: 'src/one.ts' },
+            }],
+          },
+          {
+            id: 'turn-tool-result-1',
+            role: 'user',
+            summary: 'Tool result',
+            items: [{ id: 'result-read-1', kind: 'tool_result', toolUseId: 'call-read-1', content: 'one', isError: false }],
+          },
+          {
+            id: 'turn-agent-read-2',
+            role: 'assistant',
+            summary: 'Read',
+            items: [{
+              id: 'tool-read-2',
+              kind: 'tool_use',
+              toolUseId: 'call-read-2',
+              name: 'Read',
+              input: { file_path: 'src/two.ts' },
+            }],
+          },
+          {
+            id: 'turn-tool-result-2',
+            role: 'user',
+            summary: 'Tool result',
+            items: [{ id: 'result-read-2', kind: 'tool_result', toolUseId: 'call-read-2', content: 'two', isError: false }],
+          },
+          {
+            id: 'turn-agent-final',
+            role: 'assistant',
+            summary: 'done',
+            items: [{ id: 'item-agent-final', kind: 'text', text: 'Both files are checked.' }],
+          },
+        ]}
+      />,
+    )
+
+    const visibleHeaders = Array.from(container.querySelectorAll('.fresh-agent-turn-header'))
+      .map((node) => node.textContent?.trim())
+      .filter(Boolean)
+    expect(visibleHeaders).toEqual(['You', 'Freshclaude'])
+    expect(container.querySelectorAll('[data-turn-role="user"] .fresh-agent-activity-strip')).toHaveLength(0)
+    const strips = screen.getAllByRole('region', { name: 'Activity strip' })
+    expect(strips).toHaveLength(2)
+    expect(strips.every((strip) => strip.textContent?.includes('1 tool used'))).toBe(true)
+  })
+
   it('shows the speaker label once for consecutive turns from the same role', () => {
     const { container } = render(
       <FreshAgentTranscript

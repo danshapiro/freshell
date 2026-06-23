@@ -6,6 +6,7 @@ import type {
 import type { QuestionDefinition, SdkSessionState } from '../../../sdk-bridge-types.js'
 import type { SdkSessionStatus } from '../../../sdk-bridge-types.js'
 import type { ContentBlock } from '../../../../shared/ws-protocol.js'
+import { extractUserAuthoredText, isSystemContext } from '../../../coding-cli/utils.js'
 import {
   FreshAgentSnapshotSchema,
   FreshAgentTurnBodySchema,
@@ -107,9 +108,63 @@ function blockSummary(blocks: ContentBlock[]): string {
   return ''
 }
 
+function itemSummary(items: FreshAgentNormalizedItem[]): string {
+  const textItem = items.find((item): item is Extract<FreshAgentNormalizedItem, { kind: 'text' }> => (
+    item.kind === 'text' && item.text.trim().length > 0
+  ))
+  if (textItem) return textItem.text.trim().slice(0, 140)
+
+  const thinkingItem = items.find((item): item is Extract<FreshAgentNormalizedItem, { kind: 'thinking' }> => (
+    item.kind === 'thinking' && item.text.trim().length > 0
+  ))
+  if (thinkingItem) return thinkingItem.text.trim().slice(0, 140)
+
+  const toolItem = items.find((item): item is Extract<FreshAgentNormalizedItem, { kind: 'tool_use' }> => (
+    item.kind === 'tool_use'
+  ))
+  if (toolItem) return toolItem.name.slice(0, 140)
+
+  return ''
+}
+
+function normalizeClaudeItem(
+  role: FreshAgentNormalizedTurn['role'],
+  turnId: string,
+  block: ContentBlock,
+  index: number,
+): FreshAgentNormalizedItem | null {
+  const id = `${turnId}:item:${index}`
+  switch (block.type) {
+    case 'text': {
+      const text = role === 'user' ? extractUserAuthoredText(block.text) : block.text
+      return text ? { id, kind: 'text', text } : null
+    }
+    case 'thinking':
+      return { id, kind: 'thinking', text: block.thinking }
+    case 'tool_use':
+      return { id, kind: 'tool_use', toolUseId: block.id, name: block.name, input: block.input }
+    case 'tool_result':
+      return {
+        id,
+        kind: 'tool_result',
+        toolUseId: block.tool_use_id,
+        content: block.content,
+        isError: Boolean(block.is_error),
+      }
+  }
+}
+
 export function normalizeClaudeTurn(
   input: Pick<ClaudeFreshAgentHistoryTurn, 'turnId' | 'messageId' | 'ordinal' | 'source' | 'message'>,
-): FreshAgentNormalizedTurn {
+): FreshAgentNormalizedTurn | null {
+  const items = input.message.content
+    .map((block, index) => normalizeClaudeItem(input.message.role, input.turnId, block, index))
+    .filter((item): item is FreshAgentNormalizedItem => item !== null)
+
+  if (input.message.role === 'user' && items.length === 0) {
+    return null
+  }
+
   return {
     id: input.turnId,
     turnId: input.turnId,
@@ -119,27 +174,13 @@ export function normalizeClaudeTurn(
     role: input.message.role,
     ...(input.message.timestamp ? { timestamp: input.message.timestamp } : {}),
     ...(input.message.model ? { model: input.message.model } : {}),
-    summary: blockSummary(input.message.content),
-    items: input.message.content.map((block, index) => {
-      const id = `${input.turnId}:item:${index}`
-      switch (block.type) {
-        case 'text':
-          return { id, kind: 'text', text: block.text }
-        case 'thinking':
-          return { id, kind: 'thinking', text: block.thinking }
-        case 'tool_use':
-          return { id, kind: 'tool_use', toolUseId: block.id, name: block.name, input: block.input }
-        case 'tool_result':
-          return {
-            id,
-            kind: 'tool_result',
-            toolUseId: block.tool_use_id,
-            content: block.content,
-            isError: Boolean(block.is_error),
-          }
-      }
-    }),
+    summary: itemSummary(items) || blockSummary(input.message.content),
+    items,
   }
+}
+
+function isSyntheticUserTimelineItem(item: Pick<ClaudeFreshAgentHistoryPage['items'][number], 'role' | 'summary'>): boolean {
+  return item.role === 'user' && isSystemContext(item.summary)
 }
 
 function normalizePendingApprovals(liveSession?: SdkSessionState): FreshAgentPendingApproval[] {
@@ -169,7 +210,9 @@ export function normalizeClaudeThreadSnapshot(input: {
   status: SdkSessionStatus
 }): FreshAgentClaudeSnapshot {
   const sessionId = input.liveSession?.sessionId ?? input.resolved.liveSessionId ?? input.threadId
-  const turns = input.resolved.turns.map((turn) => normalizeClaudeTurn(turn))
+  const turns = input.resolved.turns
+    .map((turn) => normalizeClaudeTurn(turn))
+    .filter((turn): turn is FreshAgentNormalizedTurn => turn !== null)
   const inputTokens = input.liveSession?.totalInputTokens ?? 0
   const outputTokens = input.liveSession?.totalOutputTokens ?? 0
   return FreshAgentSnapshotSchema.parse({
@@ -178,7 +221,7 @@ export function normalizeClaudeThreadSnapshot(input: {
     threadId: input.threadId,
     sessionId,
     revision: input.resolved.revision,
-    latestTurnId: input.resolved.latestTurnId,
+    latestTurnId: turns.at(-1)?.turnId ?? null,
     status: input.status,
     capabilities: {
       send: true,
@@ -216,13 +259,22 @@ export function normalizeClaudeTurnPage(input: {
   threadId: string
   page: ClaudeFreshAgentHistoryPage
 }): FreshAgentClaudeTurnPage {
+  const items = input.page.items.filter((item) => !isSyntheticUserTimelineItem(item))
+  const bodies = input.page.bodies
+    ? Object.fromEntries(
+        Object.entries(input.page.bodies)
+          .map(([turnId, turn]) => [turnId, normalizeClaudeTurn(turn)] as const)
+          .filter((entry): entry is readonly [string, FreshAgentNormalizedTurn] => entry[1] !== null),
+      )
+    : undefined
+
   return FreshAgentTurnPageSchema.parse({
     sessionType: 'freshclaude',
     provider: 'claude',
     threadId: input.threadId,
     revision: input.page.revision,
     nextCursor: input.page.nextCursor,
-    turns: input.page.items.map((item) => ({
+    turns: items.map((item) => ({
       id: item.turnId,
       turnId: item.turnId,
       messageId: item.messageId,
@@ -233,11 +285,7 @@ export function normalizeClaudeTurnPage(input: {
       summary: item.summary,
       items: [],
     })),
-    ...(input.page.bodies ? {
-      bodies: Object.fromEntries(
-        Object.entries(input.page.bodies).map(([turnId, turn]) => [turnId, normalizeClaudeTurn(turn)]),
-      ),
-    } : {}),
+    ...(bodies ? { bodies } : {}),
   }) as FreshAgentClaudeTurnPage
 }
 
@@ -246,8 +294,10 @@ export function normalizeClaudeTurnBody(input: {
   revision: number
   threadId: string
 }) {
+  const turn = normalizeClaudeTurn(input.turn)
+  if (!turn) return null
   return FreshAgentTurnBodySchema.parse({
-    ...normalizeClaudeTurn(input.turn),
+    ...turn,
     sessionType: 'freshclaude',
     provider: 'claude',
     threadId: input.threadId,

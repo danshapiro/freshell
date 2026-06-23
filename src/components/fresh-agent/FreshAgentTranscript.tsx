@@ -224,6 +224,40 @@ function buildBlocks(
   return blocks
 }
 
+function isSyntheticToolResultTurn(turn: FreshAgentTurn): boolean {
+  return turn.role === 'user'
+    && turn.items.length > 0
+    && turn.items.every((item) => item.kind === 'tool_result')
+}
+
+function appendTurnItems(previous: FreshAgentTurn, next: FreshAgentTurn): FreshAgentTurn {
+  return {
+    ...previous,
+    id: `${previous.id}:${next.id}`,
+    summary: [previous.summary, next.summary].filter(Boolean).join('\n\n'),
+    items: [...previous.items, ...next.items],
+    model: next.model ?? previous.model,
+    timestamp: next.timestamp ?? previous.timestamp,
+  }
+}
+
+function coalesceSyntheticToolResultTurns(turns: FreshAgentTurn[]): FreshAgentTurn[] {
+  const coalesced: FreshAgentTurn[] = []
+  for (const turn of turns) {
+    const previous = coalesced[coalesced.length - 1]
+    if (isSyntheticToolResultTurn(turn)) {
+      if (previous?.role === 'assistant') {
+        coalesced[coalesced.length - 1] = appendTurnItems(previous, turn)
+      } else {
+        coalesced.push({ ...turn, role: 'tool' })
+      }
+      continue
+    }
+    coalesced.push(turn)
+  }
+  return coalesced
+}
+
 function filterTurnsForDisplay(
   turns: FreshAgentTurn[],
   options: TranscriptDisplayOptions,
@@ -596,7 +630,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
     showThinking,
   }), [showThinking])
   const displayTurns = useMemo(() => (
-    filterTurnsForDisplay(turns, displayOptions, isStreaming)
+    filterTurnsForDisplay(coalesceSyntheticToolResultTurns(turns), displayOptions, isStreaming)
   ), [displayOptions, turns, isStreaming])
   const liveActivityBlockId = useMemo(
     () => selectLiveActivityBlockId(displayTurns, isStreaming, displayOptions),

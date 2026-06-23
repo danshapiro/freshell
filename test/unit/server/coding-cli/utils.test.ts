@@ -41,6 +41,16 @@ describe('isSystemContext()', () => {
       expect(isSystemContext('# agents.md instructions')).toBe(true)
       expect(isSystemContext('# INSTRUCTIONS')).toBe(true)
     })
+
+    it('detects Claude Code skill instruction payloads', () => {
+      expect(isSystemContext([
+        'Base directory for this skill: /home/dan/.claude/skills/fresheyes',
+        '',
+        '# Fresh Eyes - Independent Code Review',
+        '',
+        'Invoke an independent model to perform a code review.',
+      ].join('\n'))).toBe(true)
+    })
   })
 
   describe('bracketed agent modes', () => {
@@ -218,5 +228,15 @@ describe('extractUserAuthoredText()', () => {
 
   it('does not treat plain AGENTS instruction text as a user request', () => {
     expect(extractUserAuthoredText('# AGENTS.md instructions\n\nFollow these rules...')).toBeUndefined()
+  })
+
+  it('does not treat Claude Code skill instruction payloads as user requests', () => {
+    expect(extractUserAuthoredText([
+      'Base directory for this skill: /home/dan/.claude/skills/fresheyes',
+      '',
+      '# Fresh Eyes - Independent Code Review',
+      '',
+      'Invoke an independent model to perform a code review.',
+    ].join('\n'))).toBeUndefined()
   })
 })
