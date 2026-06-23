@@ -480,7 +480,14 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       // Mark before aborting so the in-flight send (parked on onceIdle) sees the abort and
       // suppresses its turn-complete chime when the abort-triggered idle resolves it.
       state.turnAborted = true
-      await abortForState(state)
+      try {
+        await abortForState(state)
+      } catch (error) {
+        // The abort never landed, so the turn may still complete normally — clear the flag
+        // so a genuine completion is not silently swallowed.
+        state.turnAborted = false
+        throw error
+      }
       emitStatus(state, 'idle')
     },
 

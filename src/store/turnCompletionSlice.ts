@@ -103,6 +103,13 @@ const turnCompletionSlice = createSlice({
         seq: state.seq,
       })
     },
+    // Cleared on a real server restart (not a plain reconnect). The new process has no
+    // buffered events to replay, and its wall clock may be behind a clamp-inflated
+    // pre-restart `at`, so dropping the per-terminal `at` baseline lets the first genuine
+    // post-restart completion through instead of swallowing it as a stale replay.
+    resetCompletionDedupeBaselines(state) {
+      state.lastAtByTerminalId = {}
+    },
     consumeTurnCompleteEvents(state, action: PayloadAction<{ throughSeq: number }>) {
       const { throughSeq } = action.payload
       if (throughSeq <= 0) return
@@ -129,6 +136,7 @@ const turnCompletionSlice = createSlice({
 
 export const {
   recordTurnComplete,
+  resetCompletionDedupeBaselines,
   consumeTurnCompleteEvents,
   markTabAttention,
   clearTabAttention,

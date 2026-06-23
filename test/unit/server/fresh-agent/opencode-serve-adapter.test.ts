@@ -218,6 +218,30 @@ describe('OpenCode serve adapter: create + send', () => {
     expect(completions).toHaveLength(1)
   })
 
+  it('still chimes when an interrupt abort request fails and the turn then completes normally', async () => {
+    // If the abort POST fails, the turn was NOT actually interrupted and may complete
+    // normally. The abort flag must not stick, or a real completion gets no green/sound.
+    const manager = makeFakeManager()
+    let resolveIdle: (() => void) | undefined
+    manager.onceIdle = vi.fn(() => new Promise<void>((resolve) => { resolveIdle = resolve }))
+    manager.abort = vi.fn(async () => { throw new Error('abort failed') })
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-af', sessionType: 'freshopencode', provider: 'opencode' })
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-req-af', (e) => events.push(e))
+
+    const sendPromise = adapter.send?.('freshopencode-req-af', { text: 'go' })
+    await vi.waitFor(() => expect(manager.onceIdle).toHaveBeenCalled())
+
+    await expect(adapter.interrupt?.('freshopencode-req-af')).rejects.toThrow('abort failed')
+    // Abort failed → the turn proceeds and completes normally.
+    resolveIdle?.()
+    await sendPromise
+
+    const completions = events.filter((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')
+    expect(completions).toHaveLength(1)
+  })
+
   it('does NOT emit sdk.turn.complete when a send aborts (onceIdle rejects)', async () => {
     const manager = makeFakeManager()
     manager.onceIdle = vi.fn(() => Promise.reject(new Error('opencode serve sidecar was lost.')))

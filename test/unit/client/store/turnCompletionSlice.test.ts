@@ -7,6 +7,7 @@ import reducer, {
   markTabAttention,
   markPaneAttention,
   recordTurnComplete,
+  resetCompletionDedupeBaselines,
   type TurnCompletionState,
 } from '@/store/turnCompletionSlice'
 import panesReducer from '@/store/panesSlice'
@@ -161,6 +162,23 @@ describe('turnCompletionSlice', () => {
     expect(state.pendingEvents).toEqual([])
     expect(state.seq).toBe(0)
     expect(state.lastAppliedCompletionSeqByTerminalId?.['term-1']).toBe(9)
+  })
+
+  it('resetCompletionDedupeBaselines clears the at baseline (so a post-restart lower at re-fires) but preserves attention', () => {
+    // Across a real server restart the client store survives, but the fresh process may
+    // stamp a lower wall-clock `at` than the (possibly clamp-inflated) pre-restart value.
+    // Resetting the baseline lets that genuine completion through instead of dropping it.
+    let state = reducer(undefined, recordTurnComplete({ tabId: 't', paneId: 'p', terminalId: 'opencode:ses', at: 5000 }))
+    state = reducer(state, markTabAttention({ tabId: 't' }))
+    expect(state.pendingEvents).toHaveLength(1)
+
+    state = reducer(state, resetCompletionDedupeBaselines())
+    // Unacknowledged attention must survive a restart.
+    expect(state.attentionByTab['t']).toBe(true)
+
+    // A lower `at` would have been dropped as stale without the reset.
+    state = reducer(state, recordTurnComplete({ tabId: 't', paneId: 'p', terminalId: 'opencode:ses', at: 1000 }))
+    expect(state.pendingEvents.some((e) => e.at === 1000)).toBe(true)
   })
 
   it('consumes pending events up through the handled sequence', () => {

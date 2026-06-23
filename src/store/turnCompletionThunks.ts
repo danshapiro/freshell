@@ -44,10 +44,11 @@ export type ApplyFreshAgentCompletionPayload = {
  * discrete turn-complete edge ONLY on a positive completion, so the client no longer
  * derives green/sound from the busy level. We resolve the owning tab/pane from the
  * `provider:sessionId` session key and fold the event into the GREEN/SOUND pipeline
- * via the `at`-monotonic dedupe regime (no completionSeq): a wall-clock `at` is
- * inherently monotonic across a server restart, so a resumed durable session cannot
- * swallow real completions, and the discrete edge is never replayed from a snapshot
- * so a reconnect cannot re-green.
+ * via the `at`-monotonic dedupe regime (no completionSeq). The discrete edge is never
+ * replayed from a snapshot, so a reconnect cannot re-green, and a stale/older `at` is
+ * dropped. Across a real server restart the client clears the per-terminal `at`
+ * baselines (resetCompletionDedupeBaselines), so a resumed durable session whose fresh
+ * process stamps a lower wall-clock `at` is not swallowed.
  */
 export function applyFreshAgentCompletion(payload: ApplyFreshAgentCompletionPayload) {
   return (dispatch: AppDispatch, getState: () => RootState): void => {

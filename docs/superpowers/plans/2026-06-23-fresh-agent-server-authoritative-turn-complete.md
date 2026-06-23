@@ -44,8 +44,9 @@ Validated empirically against the real binaries before implementing:
   per-session `turnAborted` flag. `onceIdle` resolves on *any* idle — including the
   idle that an interrupt's abort triggers (it does **not** reject) — so `interrupt()`
   sets `turnAborted` before aborting and the send suppresses its chime when that idle
-  resolves; each new turn resets the flag. The catch path (sidecar loss / timeout) and
-  the serve SSE idle relay also never chime.
+  resolves; each new turn resets the flag, and a *failed* abort clears it again (the turn
+  was not actually stopped, so its genuine completion must still chime). The catch path
+  (sidecar loss / timeout) and the serve SSE idle relay also never chime.
 - **freshcodex** (`server/fresh-agent/adapters/codex/adapter.ts`): the app-server
   `turn/completed` notification. **Empirical finding:** `turn/completed` fires for
   interrupts too, and carries the authoritative outcome inline at
@@ -84,16 +85,24 @@ latter silently dropped every chime on restored Claude sessions. OpenCode and Co
 keep `content.sessionId === sessionRef.sessionId`, so they were unaffected (which is
 why the original OpenCode-only test missed it).
 
-**Dedupe regime: `at`-monotonic (no `completionSeq`).** This is the key
-restart-safety decision. A wall-clock `at` is inherently monotonic across a server
-restart, so a resumed *durable* fresh-agent session (same `sessionId` after a
-deploy) cannot swallow real completions — unlike a per-session counter, which
-resets to 0 on restart while the client's persisted `lastApplied` survives
-(the "restart-swallow" failure). Terminals avoid that by getting a fresh
-`nanoid` terminalId on restart; fresh-agent sessions keep their durable id, so the
-counter approach is unsafe here. The discrete edge is never re-derived from a
+**Dedupe regime: `at`-monotonic (no `completionSeq`).** A wall-clock `at` avoids the
+counter "restart-swallow": a per-session counter resets to 0 on restart while the
+client's dedupe state survives, so a resumed *durable* fresh-agent session (same
+`sessionId` after a deploy) would swallow real completions. Terminals dodge that by
+getting a fresh `nanoid` terminalId on restart; fresh-agent sessions keep their durable
+id, so the counter approach is unsafe here. The discrete edge is never re-derived from a
 snapshot level, so a reconnect cannot re-green, and a replayed/stale event with an
 older-or-equal `at` is dropped.
+
+Wall-clock `at` is *not* unconditionally monotonic across a restart, though: the
+per-session clamp below can push `at` above real wall time (a large backward clock step
+keeps `at` ahead until wall time recovers), and a fresh process then stamps a lower `at`.
+To close that residual restart-swallow, the client **clears the per-terminal `at`
+baselines on a real server restart** (`resetCompletionDedupeBaselines`, dispatched from
+the bootId-change branch in `App.tsx`). This is safe precisely because the discrete edge
+is never re-derived from a snapshot and a fresh process replays nothing — so there is no
+stale completion to re-green, and the first genuine post-restart completion is accepted.
+A plain reconnect (same `bootId`) keeps the baselines, preserving replay dedupe.
 
 **Server-side per-session monotonic clamp.** Raw `Date.now()` is not a reliable
 per-turn identity: two genuine completions can land in the same millisecond, and the
@@ -155,6 +164,10 @@ monotonic `at <= last` guard.
   namespace).
 - Unit (review follow-ups, round 3): codex keeps the monotonic `at` clamp per thread
   across a re-subscribe (WS reconnect), not per subscription.
+- Unit (review follow-ups, round 4): opencode still chimes when an interrupt's abort
+  request fails and the turn then completes normally; `resetCompletionDedupeBaselines`
+  clears the per-terminal `at` baseline (so a lower post-restart `at` re-fires) while
+  preserving unacknowledged attention.
 - e2e: WS `freshAgent.turn.complete` → `handleFreshAgentMessage` →
   `applyFreshAgentCompletion` → `useTurnCompletionNotifications` chimes once +
   highlights, ignores replays, re-chimes on the next real turn.

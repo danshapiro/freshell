@@ -1,6 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type TouchEvent as ReactTouchEvent } from 'react'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { setStatus, setError, setErrorCode, setServerInstanceId, setBootId, setServerRestarted, setLiveTerminalIds, setPlatform, setAvailableClis, setFeatureFlags } from '@/store/connectionSlice'
+import { resetCompletionDedupeBaselines } from '@/store/turnCompletionSlice'
 import { setLocalSettings, setServerSettings } from '@/store/settingsSlice'
 import {
   markWsSnapshotReceived,
@@ -907,6 +908,10 @@ export default function App() {
           dispatch(setServerRestarted(serverRestarted))
           if (serverRestarted) {
             dispatch(setLiveTerminalIds([]))
+            // The fresh process replays nothing and may stamp a lower wall-clock `at` than
+            // a clamp-inflated pre-restart value; drop the per-terminal `at` baselines so a
+            // resumed durable session's next real completion is not swallowed as a replay.
+            dispatch(resetCompletionDedupeBaselines())
           }
           dispatch(resetWsSnapshotReceived())
           // If App registered late and missed a prior invalidation, a fresh HTTP baseline
