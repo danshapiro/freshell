@@ -689,6 +689,27 @@ describe('OpenCode serve adapter: control', () => {
     expect(manager.abort).toHaveBeenCalledWith('ses_real_1')
   })
 
+  it('rejects interrupt for no-cwd recovered durable sessions', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+
+    await adapter.attach?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionId: 'ses_interrupt_no_cwd',
+    })
+
+    await expect(adapter.interrupt?.('ses_interrupt_no_cwd')).rejects.toThrow(/cwd/i)
+    expect(manager.abort).not.toHaveBeenCalled()
+  })
+
+  it('rejects interrupt when OpenCode abort fails', async () => {
+    const { manager, adapter } = await materialized()
+    manager.abort.mockRejectedValueOnce(new Error('abort failed upstream'))
+
+    await expect(adapter.interrupt?.('freshopencode-req-c')).rejects.toThrow('abort failed upstream')
+  })
+
   it('compact calls the dedicated compact endpoint', async () => {
     const { manager, adapter } = await materialized()
     await adapter.compact?.('freshopencode-req-c')

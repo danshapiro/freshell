@@ -1303,6 +1303,7 @@ export class WsHandler {
   }
 
   private retirePendingFreshAgentAttaches(state: ClientState, locator: FreshAgentLocator): void {
+    if (!state.pendingFreshAgentAttachByKey) return
     for (const [key, pending] of state.pendingFreshAgentAttachByKey.entries()) {
       if (!this.sameFreshAgentSession(pending, locator)) continue
       pending.active = false
@@ -1311,6 +1312,7 @@ export class WsHandler {
   }
 
   private cancelPendingFreshAgentAttaches(state: ClientState): void {
+    if (!state.pendingFreshAgentAttachByKey) return
     for (const pending of state.pendingFreshAgentAttachByKey.values()) {
       pending.active = false
     }
@@ -3432,8 +3434,9 @@ export class WsHandler {
             images: m.images,
             settings: m.settings,
           })
+          let acceptedLocator = locator
           if (result?.sessionId && result.sessionId !== m.sessionId) {
-            this.materializeFreshAgentSession(ws, state, locator, {
+            acceptedLocator = this.materializeFreshAgentSession(ws, state, locator, {
               previousSessionId: m.sessionId,
               sessionId: result.sessionId,
               sessionRef: result.sessionRef,
@@ -3451,9 +3454,10 @@ export class WsHandler {
             this.send(ws, {
               type: 'freshAgent.send.accepted',
               requestId: m.requestId,
-              sessionId: locator.sessionId,
-              sessionType: locator.sessionType,
-              provider: locator.provider,
+              sessionId: acceptedLocator.sessionId,
+              sessionType: acceptedLocator.sessionType,
+              provider: acceptedLocator.provider,
+              ...(acceptedLocator.cwd ? { cwd: acceptedLocator.cwd } : {}),
               submittedTurnId: result?.submittedTurnId,
             })
           }

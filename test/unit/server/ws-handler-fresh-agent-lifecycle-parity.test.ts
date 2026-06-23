@@ -140,11 +140,18 @@ describe('WsHandler fresh-agent lifecycle parity', () => {
         })
       })
 
-      listeners.get(JSON.stringify({
+      const createSubscriptionLocator = {
         sessionId: 'claude-session-parity',
         sessionType: 'freshclaude',
         provider: 'claude',
-      }))?.({
+        cwd: '/repo',
+      }
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.subscribe).toHaveBeenCalledWith(createSubscriptionLocator, expect.any(Function))
+      })
+
+      listeners.get(JSON.stringify(createSubscriptionLocator))?.({
         type: 'sdk.session.snapshot',
         sessionId: 'claude-session-parity',
         latestTurnId: 'turn-1',

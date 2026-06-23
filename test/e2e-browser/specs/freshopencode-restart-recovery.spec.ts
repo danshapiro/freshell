@@ -250,6 +250,17 @@ async function expectAuditedRouteUse(input: {
   })
 }
 
+async function expectNoSessionCreateAfter(input: {
+  auditLogPath: string
+  afterEventCount: number
+}): Promise<void> {
+  const events = (await readAuditEvents(input.auditLogPath)).slice(input.afterEventCount)
+  expect(events.filter((event) =>
+    event.event === 'session_create_requested'
+    || event.event === 'session_created'
+  )).toEqual([])
+}
+
 async function latestServeLaunchForPid(auditLogPath: string, pid: number): Promise<FakeAuditEvent> {
   const events = await readAuditEvents(auditLogPath)
   const launch = events.findLast((event) =>
@@ -432,6 +443,10 @@ test.describe('Freshopencode restart recovery', () => {
         auditLogPath,
         sessionId,
         routeDirectory: cwd,
+        afterEventCount: eventCountBeforeRestart,
+      })
+      await expectNoSessionCreateAfter({
+        auditLogPath,
         afterEventCount: eventCountBeforeRestart,
       })
 

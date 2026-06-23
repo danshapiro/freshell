@@ -461,7 +461,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
 
     async interrupt(sessionId) {
       const state = requireState(sessionId)
-      await abortForState(state).catch((err) => log.warn({ err }, 'abort failed'))
+      await abortForState(state)
       emitStatus(state, 'idle')
     },
 

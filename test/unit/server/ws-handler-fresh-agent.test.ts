@@ -542,6 +542,7 @@ describe('WsHandler fresh-agent routing', () => {
           sessionId: 'codex-session-cwd-upgrade',
           sessionType: 'freshcodex',
           provider: 'codex',
+          cwd: '/repo/allowed',
           submittedTurnId: 'turn-1',
         }))
       })
@@ -599,6 +600,7 @@ describe('WsHandler fresh-agent routing', () => {
 
       ws.send(JSON.stringify({
         type: 'freshAgent.send',
+        requestId: 'send-materialize',
         sessionId: 'freshopencode-req-1',
         sessionType: 'freshopencode',
         provider: 'opencode',
@@ -607,6 +609,7 @@ describe('WsHandler fresh-agent routing', () => {
 
       await vi.waitFor(() => {
         expect(runtimeManager.send).toHaveBeenCalledWith(placeholderLocator, {
+          requestId: 'send-materialize',
           text: 'Ship it',
           images: undefined,
           settings: undefined,
@@ -620,6 +623,13 @@ describe('WsHandler fresh-agent routing', () => {
           sessionType: 'freshopencode',
           provider: 'opencode',
           sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' },
+        })
+        expect(seenMessages).toContainEqual({
+          type: 'freshAgent.send.accepted',
+          requestId: 'send-materialize',
+          sessionId: 'ses_real_1',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
         })
       })
     } finally {
