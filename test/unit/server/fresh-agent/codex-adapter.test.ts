@@ -1132,6 +1132,37 @@ describe('Codex fresh-agent adapter', () => {
     expect(offTurnCompleted).toHaveBeenCalledTimes(1)
   })
 
+  it('chimes for a flat params.status completion shape and skips a flat interrupted', async () => {
+    // The app-server client passes the notification params straight through, and the
+    // repo's own client tests model turn/completed as a FLAT { threadId, turnId, status }
+    // (status at params.status, not params.turn.status). Freshcodex must detect that shape
+    // too, or green/sound silently never fires.
+    let turnCompletedHandler: ((event: any) => void) | undefined
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      onThreadLifecycle: vi.fn(() => vi.fn()),
+      onTurnCompleted: vi.fn((handler) => {
+        turnCompletedHandler = handler
+        return vi.fn()
+      }),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+    const listener = vi.fn()
+    await adapter.subscribe?.('thread-new-1', listener)
+
+    turnCompletedHandler?.({ threadId: 'thread-new-1', params: { threadId: 'thread-new-1', turnId: 'turn-1', status: 'interrupted' } })
+    expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.turn.complete' }))
+
+    turnCompletedHandler?.({ threadId: 'thread-new-1', params: { threadId: 'thread-new-1', turnId: 'turn-2', status: 'completed' } })
+    const completeCalls = listener.mock.calls.filter(([event]) => event?.type === 'sdk.turn.complete')
+    expect(completeCalls).toHaveLength(1)
+    expect(completeCalls[0][0]).toMatchObject({ type: 'sdk.turn.complete', sessionId: 'thread-new-1' })
+  })
+
   it('stamps a strictly-increasing at on successive completed turns even within the same millisecond', async () => {
     let turnCompletedHandler: ((event: any) => void) | undefined
     const runtime = {

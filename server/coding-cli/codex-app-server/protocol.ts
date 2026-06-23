@@ -408,6 +408,9 @@ export const CodexTurnCompletedNotificationSchema = z.object({
       id: z.string().min(1).optional(),
       status: CodexTurnStatusSchema.optional(),
     }).passthrough().optional(),
+    // Some app-server forms report the outcome flat at params.status instead of inline
+    // under turn; consumers read params.turn?.status ?? params.status.
+    status: CodexTurnStatusSchema.optional(),
   }).passthrough(),
 }).passthrough()
 

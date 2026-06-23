@@ -40,17 +40,24 @@ Validated empirically against the real binaries before implementing:
   stream error → `sdk.error` + `sdk.status idle`. So `subtype === 'success'` is a
   clean, unambiguous positive edge.
 - **freshopencode** (`server/fresh-agent/adapters/opencode/adapter.ts`): the
-  success-only `emitStatus(state, 'idle')` path after `await idle` resolves. The
-  catch path (abort / interrupt / sidecar loss) and the serve SSE idle relay
-  deliberately do not chime.
+  success-only `emitStatus(state, 'idle')` path after `await idle` resolves, gated on a
+  per-session `turnAborted` flag. `onceIdle` resolves on *any* idle — including the
+  idle that an interrupt's abort triggers (it does **not** reject) — so `interrupt()`
+  sets `turnAborted` before aborting and the send suppresses its chime when that idle
+  resolves; each new turn resets the flag. The catch path (sidecar loss / timeout) and
+  the serve SSE idle relay also never chime.
 - **freshcodex** (`server/fresh-agent/adapters/codex/adapter.ts`): the app-server
   `turn/completed` notification. **Empirical finding:** `turn/completed` fires for
   interrupts too, and carries the authoritative outcome inline at
   `params.turn.status` (`'completed' | 'interrupted' | 'failed'`). We register
-  `onTurnCompleted` in `subscribe` and chime only when
-  `params.turn.status === 'completed'` — no extra read-back round-trip. The
-  protocol schema (`CodexTurnCompletedNotificationSchema`) was extended to declare
-  the inline `turn.status` contract.
+  `onTurnCompleted` in `subscribe` and chime only on a positive completion — no extra
+  read-back round-trip. The authoritative status appears either inline at
+  `params.turn.status` (codex-cli 0.142.0, probed live) **or** flat at `params.status`
+  (the shape the app-server client tests model), so we read
+  `params.turn?.status ?? params.status` and require `=== 'completed'`; either shape is
+  detected and interrupts/failures at either location are excluded. The protocol schema
+  (`CodexTurnCompletedNotificationSchema`) declares both the inline `turn.status` and the
+  flat `status` contract.
 
 ### Transport
 
@@ -103,7 +110,12 @@ process.
 
 `useAgentSessionTurnCompletion` no longer derives turn completion from the busy
 level. It retains only the "waiting-for-approval" edge (a 0→≥1 pending
-permission/question transition), which is a distinct attention concern.
+permission/question transition), which is a distinct attention concern. That edge
+records under a **distinct dedupe namespace** (`provider:sessionId#waiting`): it is
+stamped with the *client* clock, and for opencode/codex it would otherwise share the
+server completion's `provider:sessionId` entry — letting an approval stamped ahead of
+the server clock (common on a remote client) swallow the real completion via the
+monotonic `at <= last` guard.
 
 ## Spike findings (empirical, real binaries)
 
@@ -125,11 +137,16 @@ permission/question transition), which is a distinct attention concern.
   opencode (exactly one on success, none on abort); codex adapter (only
   `turn.status === 'completed'`, scoped to the subscribed thread); client thunk +
   transport routing + `at`-monotonic dedupe; hook no longer fires on busy→idle.
-- Unit (review follow-ups): client routes a Claude completion keyed by the runtime
-  handle when the pane carries a durable `sessionRef` (identity match);
+- Unit (review follow-ups, round 1): client routes a Claude completion keyed by the
+  runtime handle when the pane carries a durable `sessionRef` (identity match);
   `nextMonotonicTurnCompleteAt` clamps same-ms/backward-clock; each emit site
   (claude/opencode/codex) stamps a strictly-increasing `at` across successive
   same-millisecond completions.
+- Unit (review follow-ups, round 2): opencode does not chime on an interrupt even
+  though `onceIdle` resolves, and resumes chiming on the next clean turn; codex chimes
+  on a flat `params.status` completion and skips a flat `interrupted`; the
+  waiting-for-approval edge does not swallow a later server completion (separate dedupe
+  namespace).
 - e2e: WS `freshAgent.turn.complete` → `handleFreshAgentMessage` →
   `applyFreshAgentCompletion` → `useTurnCompletionNotifications` chimes once +
   highlights, ignores replays, re-chimes on the next real turn.

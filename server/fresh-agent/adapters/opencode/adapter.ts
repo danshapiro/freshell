@@ -48,6 +48,8 @@ type OpencodeSessionState = {
   unsubscribeServe?: () => void
   /** Last emitted turn-complete `at`, kept per session so the edge stays strictly monotonic. */
   lastTurnCompleteAt?: number
+  /** Set by interrupt() so the in-flight send suppresses its chime when idle resolves. */
+  turnAborted?: boolean
 }
 
 type CreateOpencodeFreshAgentAdapterOptions = {
@@ -291,6 +293,8 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     const effort = normalized?.effort ?? state.effort
     const effectiveCwd = normalized?.cwd ?? state.cwd
 
+    // A fresh turn starts un-aborted; interrupt() flips this while we are parked on idle.
+    state.turnAborted = false
     emitStatus(state, 'running')
     try {
       if (!state.realSessionId) {
@@ -327,12 +331,15 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       state.model = modelStr ?? state.model
       state.effort = effort
       emitStatus(state, 'idle')
-      // Server-authoritative turn-complete edge for the GREEN/SOUND pipeline. This is
-      // the ONLY positive-completion path: the catch below (abort/interrupt/sidecar
-      // loss) and the serve SSE idle relay deliberately do not chime.
-      const completionAt = nextMonotonicTurnCompleteAt(state.lastTurnCompleteAt, Date.now())
-      state.lastTurnCompleteAt = completionAt
-      state.events.emit('event', { type: 'sdk.turn.complete', sessionId: state.placeholderId, at: completionAt })
+      // Server-authoritative turn-complete edge for the GREEN/SOUND pipeline. onceIdle
+      // resolves on ANY idle — including the idle an interrupt's abort triggers — so a
+      // positive completion requires that the turn was NOT interrupted. (The catch below
+      // for abort/interrupt/sidecar loss and the serve SSE idle relay also never chime.)
+      if (!state.turnAborted) {
+        const completionAt = nextMonotonicTurnCompleteAt(state.lastTurnCompleteAt, Date.now())
+        state.lastTurnCompleteAt = completionAt
+        state.events.emit('event', { type: 'sdk.turn.complete', sessionId: state.placeholderId, at: completionAt })
+      }
       return sendResult(state.realSessionId)
     } catch (error) {
       emitStatus(state, 'idle')
@@ -470,6 +477,9 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
 
     async interrupt(sessionId) {
       const state = requireState(sessionId)
+      // Mark before aborting so the in-flight send (parked on onceIdle) sees the abort and
+      // suppresses its turn-complete chime when the abort-triggered idle resolves it.
+      state.turnAborted = true
       await abortForState(state)
       emitStatus(state, 'idle')
     },

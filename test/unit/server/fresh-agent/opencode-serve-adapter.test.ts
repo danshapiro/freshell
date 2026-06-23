@@ -171,6 +171,53 @@ describe('OpenCode serve adapter: create + send', () => {
     expect(ats[1]).toBeGreaterThan(ats[0])
   })
 
+  it('does NOT emit sdk.turn.complete when the in-flight turn is interrupted, even though onceIdle resolves on the abort-triggered idle', async () => {
+    // interrupt() aborts the turn; the sidecar then emits session.idle, which RESOLVES
+    // onceIdle (it does not reject). Without tracking the abort, the success path would
+    // fire a false chime/green for an interrupted turn.
+    const manager = makeFakeManager()
+    let resolveIdle: (() => void) | undefined
+    manager.onceIdle = vi.fn(() => new Promise<void>((resolve) => { resolveIdle = resolve }))
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-int', sessionType: 'freshopencode', provider: 'opencode' })
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-req-int', (e) => events.push(e))
+
+    const sendPromise = adapter.send?.('freshopencode-req-int', { text: 'go' })
+    await vi.waitFor(() => expect(manager.onceIdle).toHaveBeenCalled())
+
+    await adapter.interrupt?.('freshopencode-req-int')
+    resolveIdle?.()
+    await sendPromise
+
+    const completions = events.filter((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')
+    expect(completions).toHaveLength(0)
+    // The interrupt still returns the pane to idle (clears blue) — it just must not chime.
+    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-int', status: 'idle' })
+  })
+
+  it('resumes chiming on the next completed turn after an interrupt', async () => {
+    const manager = makeFakeManager()
+    let resolveIdle: (() => void) | undefined
+    manager.onceIdle = vi.fn(() => new Promise<void>((resolve) => { resolveIdle = resolve }))
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-int2', sessionType: 'freshopencode', provider: 'opencode' })
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-req-int2', (e) => events.push(e))
+
+    const interrupted = adapter.send?.('freshopencode-req-int2', { text: 'one' })
+    await vi.waitFor(() => expect(manager.onceIdle).toHaveBeenCalledTimes(1))
+    await adapter.interrupt?.('freshopencode-req-int2')
+    resolveIdle?.()
+    await interrupted
+
+    // A subsequent clean turn (no interrupt) must chime again — the abort flag must not stick.
+    manager.onceIdle = vi.fn(async () => undefined)
+    await adapter.send?.('freshopencode-req-int2', { text: 'two' })
+    const completions = events.filter((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')
+    expect(completions).toHaveLength(1)
+  })
+
   it('does NOT emit sdk.turn.complete when a send aborts (onceIdle rejects)', async () => {
     const manager = makeFakeManager()
     manager.onceIdle = vi.fn(() => Promise.reject(new Error('opencode serve sidecar was lost.')))

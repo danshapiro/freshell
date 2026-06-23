@@ -26,11 +26,13 @@ function hasWaitingItems(session: FreshAgentSessionState | undefined): boolean {
  * a completion edge was the source of premature (flicker), missed (fast-turn), and
  * stale-color chimes, so that path is intentionally gone.
  *
- * The synthetic terminalId is the pane's `provider:sessionId` session key, which
- * recordTurnComplete only uses as a dedupe key (markTab/PaneAttention key on
- * tabId/paneId). Never fires on the FIRST observation of a session, so tab
- * restore / snapshot hydration of an already-pending session does not produce a
- * spurious green/sound.
+ * The synthetic terminalId is the pane's `provider:sessionId` session key with a
+ * `#waiting` suffix, which recordTurnComplete only uses as a dedupe key
+ * (markTab/PaneAttention key on tabId/paneId). The suffix keeps this client-clock edge
+ * in a separate dedupe namespace from the server turn-complete (`provider:sessionId`),
+ * so an approval can never suppress a real completion via the monotonic `at` guard.
+ * Never fires on the FIRST observation of a session, so tab restore / snapshot hydration
+ * of an already-pending session does not produce a spurious green/sound.
  */
 export function useAgentSessionTurnCompletion(): void {
   const dispatch = useAppDispatch()
@@ -74,7 +76,11 @@ export function useAgentSessionTurnCompletion(): void {
           dispatch(recordTurnComplete({
             tabId,
             paneId: entry.paneId,
-            terminalId: sessionKey,
+            // Distinct dedupe namespace from the server turn-complete (whose terminalId is
+            // `provider:sessionId`). This edge uses the CLIENT clock; mixing it into the
+            // server-completion entry would let an approval stamped ahead of the server
+            // clock (common on a remote client) swallow the real completion as `at <= last`.
+            terminalId: `${sessionKey}#waiting`,
             at: Date.now(),
           }))
         }

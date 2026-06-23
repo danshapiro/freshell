@@ -903,8 +903,13 @@ export function createCodexFreshAgentAdapter(deps: {
       let lastTurnCompleteAt: number | undefined
       const offTurnCompleted = runtime.onTurnCompleted?.((event) => {
         if (event.threadId !== sessionId) return
-        const turn = event.params?.turn as { status?: unknown } | undefined
-        if (turn?.status !== 'completed') return
+        // turn/completed fires for interrupts/failures too, so chime only on a positive
+        // completion. The authoritative status appears either inline at params.turn.status
+        // (codex-cli 0.142.0, probed live) or flat at params.status (the shape the
+        // app-server client tests model); accept either so neither version silently fails.
+        const params = event.params as { status?: unknown; turn?: { status?: unknown } } | undefined
+        const status = params?.turn?.status ?? params?.status
+        if (status !== 'completed') return
         const at = nextMonotonicTurnCompleteAt(lastTurnCompleteAt, Date.now())
         lastTurnCompleteAt = at
         listener({ type: 'sdk.turn.complete', sessionId, at })
