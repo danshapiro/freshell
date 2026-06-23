@@ -838,6 +838,17 @@ describe('OpenCode serve adapter: control', () => {
     expect(manager.compact).toHaveBeenCalledWith('ses_real_1')
   })
 
+  it('emits a server-authoritative sdk.turn.complete on a successful compact', async () => {
+    // Removing the client busy->idle derivation left compact (a user-visible /compact
+    // command) with no completion edge; like a normal send it must green/chime when done.
+    const { adapter } = await materialized()
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-req-c', (e) => events.push(e))
+    await adapter.compact?.('freshopencode-req-c', { instructions: 'trim' })
+    const completions = events.filter((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')
+    expect(completions).toHaveLength(1)
+  })
+
   it('fork registers child state so the child session can be sent/subscribed', async () => {
     const { manager, adapter } = await materialized()
     await expect(adapter.fork?.('freshopencode-req-c')).resolves.toEqual({

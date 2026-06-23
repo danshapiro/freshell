@@ -46,7 +46,10 @@ Validated empirically against the real binaries before implementing:
   sets `turnAborted` before aborting and the send suppresses its chime when that idle
   resolves; each new turn resets the flag, and a *failed* abort clears it again (the turn
   was not actually stopped, so its genuine completion must still chime). The catch path
-  (sidecar loss / timeout) and the serve SSE idle relay also never chime.
+  (sidecar loss / timeout) and the serve SSE idle relay also never chime. `/compact`
+  takes the same await-idle + emit path (it is a user-visible turn and chimed before the
+  client busy→idle derivation was removed; Claude `/compact` is a normal turn and already
+  chimes).
 - **freshcodex** (`server/fresh-agent/adapters/codex/adapter.ts`): the app-server
   `turn/completed` notification. **Empirical finding:** `turn/completed` fires for
   interrupts too, and carries the authoritative outcome inline at
@@ -109,10 +112,11 @@ per-turn identity: two genuine completions can land in the same millisecond, and
 system clock can step backwards (NTP correction) — both would make a real later
 completion look `<= last` and be dropped as a replay, recreating the missed-chime
 class. So each emit site clamps its session's `at` to be strictly greater than the
-previous one via the shared `nextMonotonicTurnCompleteAt` helper. This keeps the
-wall-clock-seeded value (so restart monotonicity still holds — a new process's
-`Date.now()` is already past any pre-restart `at`) while guaranteeing distinct turns
-never collide or regress within a process.
+previous one via the shared `nextMonotonicTurnCompleteAt` helper. This guarantees
+distinct turns never collide or regress *within a process*. It does **not** by itself
+guarantee monotonicity across a restart (the clamp can push `at` ahead of real wall
+time, and a fresh process may stamp a lower value) — the client-side baseline reset
+described above closes that gap.
 
 The clamp state must live on **per-session** server state, never per-subscription:
 the client store's dedupe survives a WS reconnect, but fresh-agent subscriptions are
@@ -168,6 +172,9 @@ monotonic `at <= last` guard.
   request fails and the turn then completes normally; `resetCompletionDedupeBaselines`
   clears the per-terminal `at` baseline (so a lower post-restart `at` re-fires) while
   preserving unacknowledged attention.
+- Unit (review follow-ups, round 5): opencode `/compact` emits a server-authoritative
+  completion edge on success (it previously greened via the removed client busy→idle
+  derivation).
 - e2e: WS `freshAgent.turn.complete` → `handleFreshAgentMessage` →
   `applyFreshAgentCompletion` → `useTurnCompletionNotifications` chimes once +
   highlights, ignores replays, re-chimes on the next real turn.

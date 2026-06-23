@@ -213,16 +213,32 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
   async function compactForState(state: OpencodeSessionState, input?: { instructions?: string }): Promise<void> {
     if (!state.realSessionId) return
     await ensureMutableRoute(state)
+    const realId = state.realSessionId
     const route = cwdRoute(state.cwd)
-    if (route) {
-      await serveManager.compact(state.realSessionId, input, route)
-      return
+    // Compact is a user-visible turn: it must green/chime on completion like a send. Set up
+    // the idle waiter before issuing the request so we don't miss the idle, and gate the
+    // chime on turnAborted so an interrupt during compact does not falsely complete.
+    state.turnAborted = false
+    emitStatus(state, 'running')
+    const idle = route
+      ? serveManager.onceIdle(realId, turnTimeoutMs, route)
+      : serveManager.onceIdle(realId, turnTimeoutMs)
+    void idle.catch(() => {})
+    try {
+      if (route) await serveManager.compact(realId, input, route)
+      else if (input) await serveManager.compact(realId, input)
+      else await serveManager.compact(realId)
+      await idle
+      emitStatus(state, 'idle')
+      if (!state.turnAborted) {
+        const completionAt = nextMonotonicTurnCompleteAt(state.lastTurnCompleteAt, Date.now())
+        state.lastTurnCompleteAt = completionAt
+        state.events.emit('event', { type: 'sdk.turn.complete', sessionId: state.placeholderId, at: completionAt })
+      }
+    } catch (error) {
+      emitStatus(state, 'idle')
+      throw error
     }
-    if (input) {
-      await serveManager.compact(state.realSessionId, input)
-      return
-    }
-    await serveManager.compact(state.realSessionId)
   }
 
   async function forkForState(state: OpencodeSessionState): Promise<{ id: string; directory?: string }> {
