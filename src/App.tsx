@@ -38,7 +38,6 @@ import { useOrientation } from '@/hooks/useOrientation'
 import { useFullscreen } from '@/hooks/useFullscreen'
 import { useElectronExternalLinks } from '@/hooks/useElectronExternalLinks'
 import { useTurnCompletionNotifications } from '@/hooks/useTurnCompletionNotifications'
-import { useAgentSessionTurnCompletion } from '@/hooks/useAgentSessionTurnCompletion'
 import { useDrag } from '@use-gesture/react'
 import { installCrossTabSync } from '@/store/crossTabSync'
 import { startTabRegistrySync } from '@/store/tabRegistrySync'
@@ -156,7 +155,6 @@ const ReadyMessageSchema = z.object({
 export default function App() {
   useThemeEffect()
   useTurnCompletionNotifications()
-  useAgentSessionTurnCompletion()
   useElectronExternalLinks()
 
   const dispatch = useAppDispatch()
