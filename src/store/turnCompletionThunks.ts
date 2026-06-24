@@ -66,6 +66,41 @@ export function applyFreshAgentCompletion(payload: ApplyFreshAgentCompletionPayl
   }
 }
 
+export type ApplyFreshAgentWaitingPayload = {
+  provider: string
+  sessionId: string
+  at: number
+}
+
+/**
+ * Server-authoritative fresh-agent "waiting for approval/question" edge. Mirrors
+ * applyFreshAgentCompletion but records under a distinct `#waiting` terminalId so the
+ * approval attention can never poison (or be poisoned by) the turn-complete dedupe
+ * bucket via the monotonic `at` guard. Only Claude/kilroy ever emit this today.
+ *
+ * Like the completion edge, the server buffers and replays this only to the FIRST
+ * subscriber of a session (so a create-then-attach gap still greens once); a
+ * reconnecting client gets NO replay and rehydrates pending state from the session
+ * snapshot, which carries no waiting edge — so a still-pending approval does not
+ * spuriously re-green on reconnect (matching the deleted hook's first-observation
+ * suppression).
+ */
+export function applyFreshAgentWaiting(payload: ApplyFreshAgentWaitingPayload) {
+  return (dispatch: AppDispatch, getState: () => RootState): void => {
+    const state = getState()
+    const sessionKey = `${payload.provider}:${payload.sessionId}`
+    const location = findFreshAgentPaneBySessionKey(state, sessionKey)
+    if (!location) return
+
+    dispatch(recordTurnComplete({
+      tabId: location.tabId,
+      paneId: location.paneId,
+      terminalId: `${sessionKey}#waiting`,
+      at: payload.at,
+    }))
+  }
+}
+
 function findFreshAgentPaneBySessionKey(
   state: RootState,
   sessionKey: string,

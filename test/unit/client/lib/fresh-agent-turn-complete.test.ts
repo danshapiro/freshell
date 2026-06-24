@@ -5,6 +5,34 @@ import turnCompletionReducer from '@/store/turnCompletionSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import type { PaneNode } from '@/store/paneTypes'
 
+// Claude pane fixtures for waiting tests (waiting is Claude/kilroy-only)
+const RUNTIME_ID = 'claude-runtime-nanoid'
+const DURABLE_ID = '11111111-2222-4333-8444-555555555555'
+const claudeLeaf: PaneNode = {
+  type: 'leaf',
+  id: 'pane-claude',
+  content: {
+    kind: 'fresh-agent', createRequestId: 'cr-claude', sessionType: 'freshclaude',
+    provider: 'claude', sessionId: RUNTIME_ID, sessionRef: { provider: 'claude', sessionId: DURABLE_ID },
+  } as never,
+}
+function makeClaudeStore() {
+  return configureStore({
+    reducer: {
+      panes: () => ({ layouts: { 'tab-claude': claudeLeaf }, activePane: {} }) as never,
+      tabs: () => ({ activeTabId: 'tab-claude' }) as never,
+      freshAgent: freshAgentReducer,
+      turnCompletion: turnCompletionReducer,
+    },
+  })
+}
+function waitingMessage(at: number) {
+  return {
+    type: 'freshAgent.event', sessionId: RUNTIME_ID, sessionType: 'freshclaude', provider: 'claude',
+    event: { type: 'freshAgent.turn.waiting', sessionId: RUNTIME_ID, at },
+  }
+}
+
 const TAB = 'tab-1'
 const PANE = 'pane-1'
 const SESSION_ID = 'ses_real_1'
@@ -118,9 +146,9 @@ describe('server-authoritative fresh-agent turn completion (client)', () => {
     // lives in content.sessionRef. The server keys the completion event by the runtime
     // handle it subscribed with, so the lookup must match the runtime handle and not only
     // the sessionRef-preferred key (which would silently drop the chime).
-    const RUNTIME_ID = 'claude-runtime-nanoid'
-    const DURABLE_ID = '11111111-2222-4333-8444-555555555555'
-    const claudeLeaf: PaneNode = {
+    const localRuntimeId = 'claude-runtime-nanoid'
+    const localDurableId = '11111111-2222-4333-8444-555555555555'
+    const localClaudeLeaf: PaneNode = {
       type: 'leaf',
       id: 'pane-claude',
       content: {
@@ -128,13 +156,13 @@ describe('server-authoritative fresh-agent turn completion (client)', () => {
         createRequestId: 'cr-claude',
         sessionType: 'freshclaude',
         provider: 'claude',
-        sessionId: RUNTIME_ID,
-        sessionRef: { provider: 'claude', sessionId: DURABLE_ID },
+        sessionId: localRuntimeId,
+        sessionRef: { provider: 'claude', sessionId: localDurableId },
       } as never,
     }
     const store = configureStore({
       reducer: {
-        panes: () => ({ layouts: { 'tab-claude': claudeLeaf }, activePane: {} }) as never,
+        panes: () => ({ layouts: { 'tab-claude': localClaudeLeaf }, activePane: {} }) as never,
         tabs: () => ({ activeTabId: 'tab-claude' }) as never,
         freshAgent: freshAgentReducer,
         turnCompletion: turnCompletionReducer,
@@ -143,15 +171,48 @@ describe('server-authoritative fresh-agent turn completion (client)', () => {
 
     const handled = handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.event',
-      sessionId: RUNTIME_ID,
+      sessionId: localRuntimeId,
       sessionType: 'freshclaude',
       provider: 'claude',
-      event: { type: 'freshAgent.turn.complete', sessionId: RUNTIME_ID, at: 1000 },
+      event: { type: 'freshAgent.turn.complete', sessionId: localRuntimeId, at: 1000 },
     })
     expect(handled).toBe(true)
 
     const events = store.getState().turnCompletion.pendingEvents
     expect(events).toHaveLength(1)
-    expect(events[0]).toMatchObject({ tabId: 'tab-claude', paneId: 'pane-claude', terminalId: `claude:${RUNTIME_ID}` })
+    expect(events[0]).toMatchObject({ tabId: 'tab-claude', paneId: 'pane-claude', terminalId: `claude:${localRuntimeId}` })
+  })
+})
+
+describe('server-authoritative fresh-agent waiting edge (client)', () => {
+  it('routes freshAgent.turn.waiting to recordTurnComplete under the #waiting namespace (runtime-handle key)', () => {
+    const store = makeClaudeStore()
+    const handled = handleFreshAgentMessage(store.dispatch, waitingMessage(1000))
+    expect(handled).toBe(true)
+    const events = store.getState().turnCompletion.pendingEvents
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({ tabId: 'tab-claude', paneId: 'pane-claude', terminalId: `claude:${RUNTIME_ID}#waiting`, at: 1000 })
+  })
+
+  it('a waiting edge does NOT suppress a later completion edge (separate dedupe namespace)', () => {
+    const store = makeClaudeStore()
+    handleFreshAgentMessage(store.dispatch, waitingMessage(5000))
+    // A completion with a SMALLER at must still record (different terminalId bucket).
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event', sessionId: RUNTIME_ID, sessionType: 'freshclaude', provider: 'claude',
+      event: { type: 'freshAgent.turn.complete', sessionId: RUNTIME_ID, at: 1000 },
+    })
+    const events = store.getState().turnCompletion.pendingEvents
+    expect(events.map((e) => e.terminalId).sort())
+      .toEqual([`claude:${RUNTIME_ID}`, `claude:${RUNTIME_ID}#waiting`].sort())
+  })
+
+  it('drops a malformed waiting edge without a numeric at', () => {
+    const store = makeClaudeStore()
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event', sessionId: RUNTIME_ID, sessionType: 'freshclaude', provider: 'claude',
+      event: { type: 'freshAgent.turn.waiting', sessionId: RUNTIME_ID },
+    })
+    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
   })
 })

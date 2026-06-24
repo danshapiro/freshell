@@ -5,7 +5,7 @@ import { createLogger } from '@/lib/client-logger'
 import { consumeCancelledCreate, consumeCreateRoute, rememberCreateRoute } from '@/lib/create-cancellation'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
-import { applyFreshAgentCompletion } from '@/store/turnCompletionThunks'
+import { applyFreshAgentCompletion, applyFreshAgentWaiting } from '@/store/turnCompletionThunks'
 import {
   addAssistantMessage,
   addPermissionRequest,
@@ -239,6 +239,18 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         return true
       }
       dispatch(applyFreshAgentCompletion({
+        provider: locator.provider,
+        sessionId,
+        at: event.at,
+      }))
+      return true
+    }
+    case 'freshAgent.turn.waiting': {
+      if (typeof event.at !== 'number' || !Number.isFinite(event.at)) {
+        log.warn('dropping malformed freshAgent.turn.waiting without a numeric at', { sessionId, at: event.at })
+        return true
+      }
+      dispatch(applyFreshAgentWaiting({
         provider: locator.provider,
         sessionId,
         at: event.at,
