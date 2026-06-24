@@ -1447,4 +1447,133 @@ describe('SdkBridge', () => {
       }
     })
   })
+
+  describe('sdk.turn.waiting edge', () => {
+    it('emits one sdk.turn.waiting on the 0->1 pending-approval edge, not on a second concurrent request', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp', permissionMode: 'default' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+      await new Promise((r) => setTimeout(r, 50))
+      const waiting = () => received.filter((m) => m.type === 'sdk.turn.waiting')
+
+      // First permission while nothing pending -> exactly one waiting edge with a numeric at.
+      const p1 = mockCanUseTool('Bash', { command: 'ls' }, { signal: new AbortController().signal, toolUseID: 'tool-1' })
+      await new Promise((r) => setTimeout(r, 50))
+      expect(waiting()).toHaveLength(1)
+      expect(Number.isFinite(waiting()[0].at)).toBe(true)
+      const perm1 = received.find((m) => m.type === 'sdk.permission.request')
+
+      // Second permission while p1 still pending -> NO new waiting edge (already waiting).
+      const p2 = mockCanUseTool('Edit', { file_path: '/tmp/x' }, { signal: new AbortController().signal, toolUseID: 'tool-2' })
+      await new Promise((r) => setTimeout(r, 50))
+      expect(waiting()).toHaveLength(1)
+
+      // Resolve both so the parked canUseTool promises settle (avoid open handles).
+      bridge.respondPermission(session.sessionId, perm1.requestId, { behavior: 'allow', updatedInput: {} })
+      const perm2 = received.filter((m) => m.type === 'sdk.permission.request')[1]
+      bridge.respondPermission(session.sessionId, perm2.requestId, { behavior: 'allow', updatedInput: {} })
+      await Promise.all([p1, p2])
+    })
+
+    it('emits a fresh, strictly-greater sdk.turn.waiting on a new 0->1 edge after pending clears', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp', permissionMode: 'default' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+      await new Promise((r) => setTimeout(r, 50))
+      const waiting = () => received.filter((m) => m.type === 'sdk.turn.waiting')
+
+      const p1 = mockCanUseTool('Bash', { command: 'ls' }, { signal: new AbortController().signal, toolUseID: 'tool-1' })
+      await new Promise((r) => setTimeout(r, 50))
+      expect(waiting()).toHaveLength(1)
+      const firstAt = waiting()[0].at
+      const perm1 = received.find((m) => m.type === 'sdk.permission.request')
+      bridge.respondPermission(session.sessionId, perm1.requestId, { behavior: 'allow', updatedInput: {} })
+      await p1
+
+      // Pending empty again -> next request is a fresh 0->1 edge with a strictly greater at.
+      const p2 = mockCanUseTool('Bash', { command: 'pwd' }, { signal: new AbortController().signal, toolUseID: 'tool-2' })
+      await new Promise((r) => setTimeout(r, 50))
+      expect(waiting()).toHaveLength(2)
+      expect(waiting()[1].at).toBeGreaterThan(firstAt)
+      const perm2 = received.filter((m) => m.type === 'sdk.permission.request')[1]
+      bridge.respondPermission(session.sessionId, perm2.requestId, { behavior: 'allow', updatedInput: {} })
+      await p2
+    })
+
+    it('emits sdk.turn.waiting on a 0->1 AskUserQuestion edge too (not just permissions)', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp', permissionMode: 'default' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+      await new Promise((r) => setTimeout(r, 50))
+
+      const questions = [{ question: 'Which option?', header: 'Choice', options: [{ label: 'A', description: 'Option A' }], multiSelect: false }]
+      const q = mockCanUseTool('AskUserQuestion', { questions }, { signal: new AbortController().signal, toolUseID: 'tool-q1' })
+      await new Promise((r) => setTimeout(r, 50))
+      expect(received.filter((m) => m.type === 'sdk.turn.waiting')).toHaveLength(1)
+      const qMsg = received.find((m) => m.type === 'sdk.question.request')
+      bridge.respondQuestion(session.sessionId, qMsg.requestId, { 'Which option?': 'A' })
+      await q
+    })
+
+    it('treats permissions and questions as ONE combined waiting set (no cross-type re-chime)', async () => {
+      // The edge is 0->1 over the COMBINED pending set (permissions OR questions). An impl that
+      // checks only one map per handler would double-chime when a question lands while a
+      // permission is pending (or vice versa). Prove both cross-type directions.
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp', permissionMode: 'default' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+      await new Promise((r) => setTimeout(r, 50))
+      const waiting = () => received.filter((m) => m.type === 'sdk.turn.waiting')
+
+      // Permission first (0->1) -> one waiting edge.
+      const p = mockCanUseTool('Bash', { command: 'ls' }, { signal: new AbortController().signal, toolUseID: 'tool-1' })
+      await new Promise((r) => setTimeout(r, 50))
+      expect(waiting()).toHaveLength(1)
+
+      // Question while the permission is still pending -> NO new waiting edge (combined set already >=1).
+      const questions = [{ question: 'Which?', header: 'H', options: [{ label: 'A', description: 'A' }], multiSelect: false }]
+      const q = mockCanUseTool('AskUserQuestion', { questions }, { signal: new AbortController().signal, toolUseID: 'tool-q' })
+      await new Promise((r) => setTimeout(r, 50))
+      expect(waiting()).toHaveLength(1)
+
+      const perm = received.find((m) => m.type === 'sdk.permission.request')
+      const qMsg = received.find((m) => m.type === 'sdk.question.request')
+      bridge.respondPermission(session.sessionId, perm.requestId, { behavior: 'allow', updatedInput: {} })
+      bridge.respondQuestion(session.sessionId, qMsg.requestId, { Which: 'A' })
+      await Promise.all([p, q])
+    })
+
+    it('combined waiting set — the REVERSE direction (question first, then permission) also does not re-chime', async () => {
+      // Symmetry matters: an impl that checks the combined set in handleAskUserQuestion but only
+      // pendingPermissions in handlePermissionRequest would pass the permission-first test yet
+      // still double-chime here. Both handlers must read the combined (permissions + questions) set.
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp', permissionMode: 'default' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+      await new Promise((r) => setTimeout(r, 50))
+      const waiting = () => received.filter((m) => m.type === 'sdk.turn.waiting')
+
+      // Question first (0->1) -> one waiting edge.
+      const questions = [{ question: 'Which?', header: 'H', options: [{ label: 'A', description: 'A' }], multiSelect: false }]
+      const q = mockCanUseTool('AskUserQuestion', { questions }, { signal: new AbortController().signal, toolUseID: 'tool-q' })
+      await new Promise((r) => setTimeout(r, 50))
+      expect(waiting()).toHaveLength(1)
+
+      // Permission while the question is still pending -> NO new waiting edge.
+      const p = mockCanUseTool('Bash', { command: 'ls' }, { signal: new AbortController().signal, toolUseID: 'tool-1' })
+      await new Promise((r) => setTimeout(r, 50))
+      expect(waiting()).toHaveLength(1)
+
+      const qMsg = received.find((m) => m.type === 'sdk.question.request')
+      const perm = received.find((m) => m.type === 'sdk.permission.request')
+      bridge.respondQuestion(session.sessionId, qMsg.requestId, { Which: 'A' })
+      bridge.respondPermission(session.sessionId, perm.requestId, { behavior: 'allow', updatedInput: {} })
+      await Promise.all([p, q])
+    })
+  })
 })

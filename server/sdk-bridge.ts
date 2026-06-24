@@ -505,6 +505,19 @@ export class SdkBridge extends EventEmitter {
     }
   }
 
+  /**
+   * Server-authoritative "waiting for approval/question" edge for the GREEN/SOUND
+   * pipeline. Fires only on the 0 -> >=1 pending transition (mirrors the deleted
+   * client hook's count-based edge), covering both permission and question requests.
+   * Uses a per-session monotonic `at` independent of the turn-complete clock; the
+   * client routes it under a distinct `#waiting` dedupe namespace.
+   */
+  private emitWaitingEdge(sessionId: string, state: SdkSessionState): void {
+    const at = nextMonotonicTurnCompleteAt(state.lastWaitingAt, Date.now())
+    state.lastWaitingAt = at
+    this.broadcastToSession(sessionId, { type: 'sdk.turn.waiting', sessionId, at })
+  }
+
   private async handlePermissionRequest(
     sessionId: string,
     toolName: string,
@@ -522,6 +535,7 @@ export class SdkBridge extends EventEmitter {
     if (!state) return { behavior: 'deny', message: 'Session not found' }
 
     const requestId = nanoid()
+    const wasIdle = state.pendingPermissions.size === 0 && state.pendingQuestions.size === 0
 
     return new Promise((resolve) => {
       state.pendingPermissions.set(requestId, {
@@ -545,6 +559,8 @@ export class SdkBridge extends EventEmitter {
         blockedPath: options.blockedPath,
         decisionReason: options.decisionReason,
       })
+
+      if (wasIdle) this.emitWaitingEdge(sessionId, state)
     })
   }
 
@@ -590,6 +606,8 @@ export class SdkBridge extends EventEmitter {
       return { behavior: 'allow', updatedInput: input }
     }
 
+    const wasIdle = state.pendingPermissions.size === 0 && state.pendingQuestions.size === 0
+
     return new Promise((resolve) => {
       state.pendingQuestions.set(requestId, {
         originalInput: input,
@@ -603,6 +621,8 @@ export class SdkBridge extends EventEmitter {
         requestId,
         questions,
       })
+
+      if (wasIdle) this.emitWaitingEdge(sessionId, state)
     })
   }
 
