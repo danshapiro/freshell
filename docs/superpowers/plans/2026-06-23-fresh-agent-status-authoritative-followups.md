@@ -46,6 +46,8 @@
 
 **Why:** The freshcodex adapter subscribes only to `onThreadLifecycle` and `onTurnCompleted`. If the codex app-server process exits or its client disconnects mid-turn WITHOUT a `thread_closed`/`thread_status_changed`, the adapter emits nothing and the pane stays BLUE forever. The real runtime (`CodexAppServerRuntime`) already exposes `onExit(handler)` (gated on `!shutdownRequested`, so a normal `adapter.shutdown()`/`kill()` does NOT fire it), but `CodexRuntimePort` hides it so the adapter can't call it.
 
+**Scope decision — subscription-scoped is correct and complete (validated):** The handler is registered inside `subscribe()`, so it only fires while a client is actively subscribed. This is the right scope because BLUE is only *shown* when a client is subscribed — there is no stuck-BLUE to clear during an offline window. The remaining concern ("a sidecar exit while offline leaves a stale `runtimeByThread` entry, and the next `ensureRuntime()` returns a dead runtime") is NOT a real bug: the child-exit handler nulls the runtime's `child`/`ready`/`ensureReadyPromise`/`readyCwd` (`runtime.ts:1220-1225`), and EVERY runtime operation calls `ensureReady()`, which sees `ready === null` and lazily restarts the child via `startRuntime` (`runtime.ts:744-769`). So on reconnect, `ensureRuntime()` returns the cached runtime and its next `resumeThread` transparently restarts it — the exact path the existing test "lazily resumes a Codex runtime before subscribing to a persisted thread after server reload" already covers. Reuse self-heals; no scope expansion (runtime-lifetime `onExit`) is needed. When the handler DOES fire (online), it additionally calls `releaseRuntime` so the next send allocates a fresh runtime — a clean equivalent of the lazy-restart path.
+
 **Files:**
 - Modify: `server/fresh-agent/adapters/codex/adapter.ts:49-80` (port type) and `:873-925` (`subscribe`)
 - Test: `test/unit/server/fresh-agent/codex-adapter.test.ts`
@@ -374,6 +376,35 @@ it('treats permissions and questions as ONE combined waiting set (no cross-type 
   const qMsg = received.find((m) => m.type === 'sdk.question.request')
   bridge.respondPermission(session.sessionId, perm.requestId, { behavior: 'allow', updatedInput: {} })
   bridge.respondQuestion(session.sessionId, qMsg.requestId, { Which: 'A' })
+  await Promise.all([p, q])
+})
+
+it('combined waiting set — the REVERSE direction (question first, then permission) also does not re-chime', async () => {
+  // Symmetry matters: an impl that checks the combined set in handleAskUserQuestion but only
+  // pendingPermissions in handlePermissionRequest would pass the permission-first test yet
+  // still double-chime here. Both handlers must read the combined (permissions + questions) set.
+  mockKeepStreamOpen = true
+  const session = await bridge.createSession({ cwd: '/tmp', permissionMode: 'default' })
+  const received: any[] = []
+  bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+  await new Promise((r) => setTimeout(r, 50))
+  const waiting = () => received.filter((m) => m.type === 'sdk.turn.waiting')
+
+  // Question first (0->1) -> one waiting edge.
+  const questions = [{ question: 'Which?', header: 'H', options: [{ label: 'A', description: 'A' }], multiSelect: false }]
+  const q = mockCanUseTool('AskUserQuestion', { questions }, { signal: new AbortController().signal, toolUseID: 'tool-q' })
+  await new Promise((r) => setTimeout(r, 50))
+  expect(waiting()).toHaveLength(1)
+
+  // Permission while the question is still pending -> NO new waiting edge.
+  const p = mockCanUseTool('Bash', { command: 'ls' }, { signal: new AbortController().signal, toolUseID: 'tool-1' })
+  await new Promise((r) => setTimeout(r, 50))
+  expect(waiting()).toHaveLength(1)
+
+  const qMsg = received.find((m) => m.type === 'sdk.question.request')
+  const perm = received.find((m) => m.type === 'sdk.permission.request')
+  bridge.respondQuestion(session.sessionId, qMsg.requestId, { Which: 'A' })
+  bridge.respondPermission(session.sessionId, perm.requestId, { behavior: 'allow', updatedInput: {} })
   await Promise.all([p, q])
 })
 ```
@@ -711,10 +742,14 @@ it('greens + chimes exactly once when the server pushes freshAgent.turn.waiting'
 })
 ```
 
-- [ ] **Step 3: Run to verify it fails, then passes**
+- [ ] **Step 3: Run the e2e — it PASSES (this is the end-to-end acceptance guard, not a RED-first unit)**
+
+This task runs AFTER B1–B4, so the full chain is wired and the e2e PASSES on first run. That is intentional: the RED→GREEN discipline for the waiting feature already happened at the UNIT level — B3's `fresh-agent-turn-complete.test.ts` router test genuinely fails before the `freshAgent.turn.waiting` case/thunk exist and passes after. B5 is the integration test that proves the WS→reducer→notification chain end-to-end; it adds no production code, so it is not itself a RED-first cycle.
 
 Run: `npm run test:vitest -- run test/e2e/fresh-agent-turn-complete-notification.test.tsx -t "freshAgent.turn.waiting"`
-Expected: FAIL before B1–B3 are wired (the client router has no `freshAgent.turn.waiting` case yet → no attention/chime); PASS after B1–B3. (Because this task runs after B1–B4, write the test, confirm it FAILS if you stub out the router case, then confirm it PASSES with the real wiring — the RED is the absence of the router case proven in B3.)
+Expected: PASS.
+
+Optional dependence check (executable, not a contrived edit): to confirm the e2e genuinely exercises the new wiring, run it against the pre-feature client router — `git stash` is not appropriate here (committed work); instead trust the B3 unit RED as the dependence proof. Do NOT add a temporary stub as a "step".
 
 - [ ] **Step 4: Run the full file (regression)**
 
