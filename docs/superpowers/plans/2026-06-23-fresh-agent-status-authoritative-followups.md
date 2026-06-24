@@ -724,7 +724,7 @@ function turnWaiting(at: number) {
 }
 ```
 
-- [ ] **Step 2: Write the failing e2e**
+- [ ] **Step 2: Write the e2e acceptance test (passes after B1–B4; not RED-first)**
 
 ```ts
 it('greens + chimes exactly once when the server pushes freshAgent.turn.waiting', async () => {
