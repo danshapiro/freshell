@@ -32,6 +32,9 @@ function makeManager(overrides: Partial<Parameters<typeof OpencodeServeManager>[
     return jsonResponse({})
   })
   const manager = new OpencodeServeManager({
+    // Isolate from host process.env so tests asserting the 'opencode' default
+    // command don't break when a developer has OPENCODE_CMD set in their shell.
+    env: {},
     spawnFn: spawnFn as any,
     fetchFn: fetchFn as any,
     allocatePort: async () => ({ hostname: '127.0.0.1', port: 47999 }),
@@ -56,6 +59,26 @@ describe('OpencodeServeManager lifecycle', () => {
       expect.objectContaining({ env: expect.objectContaining({ FRESHELL_OPENCODE_SIDECAR_ID: expect.any(String) }) }),
     )
     expect(fetchFn).toHaveBeenCalledWith('http://127.0.0.1:47999/global/health', expect.anything())
+  })
+
+  it('honors the OPENCODE_CMD env var to override the serve binary (parity with CODEX_CMD/CLAUDE_CMD)', async () => {
+    const { manager, spawnFn } = makeManager({ env: { OPENCODE_CMD: '/custom/opencode-bin' } })
+    await manager.ensureStarted()
+    expect(spawnFn).toHaveBeenCalledWith(
+      '/custom/opencode-bin',
+      ['serve', '--hostname', '127.0.0.1', '--port', '47999'],
+      expect.objectContaining({ env: expect.objectContaining({ FRESHELL_OPENCODE_SIDECAR_ID: expect.any(String) }) }),
+    )
+  })
+
+  it('falls back to the default opencode command when OPENCODE_CMD is unset', async () => {
+    const { manager, spawnFn } = makeManager({ env: {} })
+    await manager.ensureStarted()
+    expect(spawnFn).toHaveBeenCalledWith(
+      'opencode',
+      ['serve', '--hostname', '127.0.0.1', '--port', '47999'],
+      expect.objectContaining({ env: expect.objectContaining({ FRESHELL_OPENCODE_SIDECAR_ID: expect.any(String) }) }),
+    )
   })
 
   it('routes the requested session directory without changing the serve process cwd', async () => {
@@ -125,6 +148,7 @@ describe('OpencodeServeManager lifecycle', () => {
       return jsonResponse({})
     })
     const manager = new OpencodeServeManager({
+      env: {},
       spawnFn: spawnFn as any,
       fetchFn: fetchFn as any,
       allocatePort: vi.fn().mockResolvedValue({ hostname: '127.0.0.1', port: 47999 }),
@@ -435,6 +459,7 @@ describe('OpencodeServeManager HTTP client', () => {
       return jsonResponse({}, { status: 404 })
     })
     const manager = new OpencodeServeManager({
+      env: {},
       spawnFn: spawnFn as any,
       fetchFn: fetchFn as any,
       allocatePort: vi.fn()

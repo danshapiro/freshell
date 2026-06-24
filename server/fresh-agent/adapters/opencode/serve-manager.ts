@@ -112,13 +112,13 @@ export class OpencodeServeManager {
   private shutdownRequested = false
 
   constructor(options: OpencodeServeManagerOptions = {}) {
-    this.command = options.command ?? 'opencode'
+    this.env = options.env ?? process.env
+    this.command = options.command ?? (this.env.OPENCODE_CMD || 'opencode')
     this.spawnFn = options.spawnFn ?? spawn
     this.fetchFn = options.fetchFn ?? fetch
     this.allocatePort = options.allocatePort ?? allocateLocalhostPort
     this.connectEventStream = options.connectEventStream
     this.healthTimeoutMs = options.healthTimeoutMs ?? 20_000
-    this.env = options.env ?? process.env
     this.idlePollMs = options.idlePollMs ?? DEFAULT_IDLE_POLL_MS
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
   }

@@ -1132,6 +1132,67 @@ describe('Codex fresh-agent adapter', () => {
     expect(offTurnCompleted).toHaveBeenCalledTimes(1)
   })
 
+  it('emits a snapshot event after a codex turn completes so the client re-fetches the committed transcript', async () => {
+    let lifecycleHandler: ((event: any) => void) | undefined
+    let turnCompletedHandler: ((event: any) => void) | undefined
+    const offLifecycle = vi.fn()
+    const offTurnCompleted = vi.fn()
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      onThreadLifecycle: vi.fn((handler: any) => {
+        lifecycleHandler = handler
+        return offLifecycle
+      }),
+      onTurnCompleted: vi.fn((handler: any) => {
+        turnCompletedHandler = handler
+        return offTurnCompleted
+      }),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+    const listener = vi.fn()
+
+    const unsubscribe = await adapter.subscribe?.('thread-new-1', listener)
+
+    expect(runtime.onThreadLifecycle).toHaveBeenCalledWith(expect.any(Function))
+    expect(runtime.onTurnCompleted).toHaveBeenCalledWith(expect.any(Function))
+
+    // thread_status_changed(idle) fires BEFORE the completed turn is committed
+    // to the app-server's thread history, so the client re-fetches but gets
+    // an empty transcript. This produces one idle snapshot.
+    lifecycleHandler?.({
+      kind: 'thread_status_changed',
+      threadId: 'thread-new-1',
+      status: { type: 'idle' },
+    })
+
+    const idleSnapshotsBeforeCompletion = listener.mock.calls.filter(
+      ([event]: any[]) => event?.type === 'sdk.session.snapshot' && event?.status === 'idle',
+    )
+    expect(idleSnapshotsBeforeCompletion).toHaveLength(1)
+
+    // onTurnCompleted fires AFTER the turn is committed to the thread history.
+    // The adapter must emit another snapshot-invalidating event so the client
+    // re-fetches and renders the committed transcript (parity with freshopencode).
+    turnCompletedHandler?.({ threadId: 'thread-new-1', turnId: 'turn-1', params: {} })
+
+    const idleSnapshotsAfterCompletion = listener.mock.calls.filter(
+      ([event]: any[]) => event?.type === 'sdk.session.snapshot' && event?.status === 'idle',
+    )
+    expect(idleSnapshotsAfterCompletion).toHaveLength(2)
+
+    // Turn-completed events for other threads must not trigger emission.
+    turnCompletedHandler?.({ threadId: 'other-thread', turnId: 'turn-2', params: {} })
+    expect(idleSnapshotsAfterCompletion).toHaveLength(2)
+
+    unsubscribe?.()
+    expect(offLifecycle).toHaveBeenCalledTimes(1)
+    expect(offTurnCompleted).toHaveBeenCalledTimes(1)
+  })
+
   it('chimes for a flat params.status completion shape and skips a flat interrupted', async () => {
     // The app-server client passes the notification params straight through, and the
     // repo's own client tests model turn/completed as a FLAT { threadId, turnId, status }

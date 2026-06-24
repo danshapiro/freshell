@@ -205,7 +205,7 @@ export class FreshAgentRuntimeManager {
   }
 
   async subscribe(locator: FreshAgentSessionLocator, listener: (message: unknown) => void) {
-    const record = this.requireSession(locator)
+    const record = await this.requireOrRecoverSession(locator)
     if (!record.adapter.subscribe) {
       throw new FreshAgentUnsupportedCapabilityError(`Subscribe is not supported for ${record.sessionType}`)
     }

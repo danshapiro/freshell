@@ -394,6 +394,40 @@ describe('FreshAgentRuntimeManager', () => {
     expect(opencodeAdapter.compact).toHaveBeenCalledWith('opencode-restored-1', { instructions: 'keep decisions' })
   })
 
+  it('recovers (attaches) a not-yet-registered FreshOpenCode session on subscribe instead of throwing (materialization race)', async () => {
+    const listener = vi.fn()
+    const off = vi.fn()
+    const opencodeAdapter = {
+      create: vi.fn().mockResolvedValue({ sessionId: 'freshopencode-req-1' }),
+      attach: vi.fn().mockResolvedValue({ sessionId: 'ses_materialized_1' }),
+      subscribe: vi.fn().mockReturnValue(off),
+      send: vi.fn().mockResolvedValue(undefined),
+    }
+    const registry = createFreshAgentProviderRegistry([{
+      sessionType: 'freshopencode',
+      runtimeProvider: 'opencode',
+      adapter: opencodeAdapter as any,
+    }])
+    const manager = new FreshAgentRuntimeManager({ registry })
+
+    // Simulate the materialization race: the real session id is not yet registered
+    // with the runtime manager (adapter.send hasn't resolved) when subscribe is
+    // called for the materialized real id. This must recover via attach rather
+    // than throwing "is not tracked" (which would leak to the client as an error).
+    await expect(manager.subscribe(
+      { sessionId: 'ses_materialized_1', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo/safe' },
+      listener,
+    )).resolves.toBe(off)
+
+    expect(opencodeAdapter.attach).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'ses_materialized_1',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    }))
+    expect(opencodeAdapter.subscribe).toHaveBeenCalledWith('ses_materialized_1', listener)
+  })
+
   it('recovers a missing FreshOpenCode durable session with cwd before mutation', async () => {
     const opencodeAdapter = {
       create: vi.fn(),

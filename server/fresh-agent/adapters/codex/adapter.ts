@@ -900,16 +900,22 @@ export function createCodexFreshAgentAdapter(deps: {
         listener(makeCodexStatusEvent(sessionId, event.status))
       })
 
-      // Server-authoritative turn-complete edge for the GREEN/SOUND pipeline. The
-      // app-server fires turn/completed for interrupts too, carrying the authoritative
-      // outcome inline at params.turn.status, so we chime only for a positive
-      // completion ('completed') and never on interrupt/failure.
+      // onTurnCompleted fires after the turn is committed to the app-server's
+      // thread history. thread_status_changed(idle) can fire BEFORE that commit,
+      // leaving the client with an empty transcript. Emit an idle snapshot here
+      // to make the client re-fetch the committed transcript (parity with
+      // freshopencode's post-idle emit).
       const offTurnCompleted = runtime.onTurnCompleted?.((event) => {
         if (event.threadId !== sessionId) return
-        // turn/completed fires for interrupts/failures too, so chime only on a positive
-        // completion. The authoritative status appears either inline at params.turn.status
-        // (codex-cli 0.142.0, probed live) or flat at params.status (the shape the
-        // app-server client tests model); accept either so neither version silently fails.
+        activeTurnByThread.delete(sessionId)
+        listener(makeCodexStatusEvent(sessionId, 'idle'))
+
+        // Server-authoritative turn-complete edge for the GREEN/SOUND pipeline.
+        // turn/completed fires for interrupts/failures too, so chime only on a
+        // positive completion. The authoritative status appears either inline at
+        // params.turn.status (codex-cli 0.142.0, probed live) or flat at
+        // params.status (the shape the app-server client tests model); accept
+        // either so neither version silently fails.
         const params = event.params as { status?: unknown; turn?: { status?: unknown } } | undefined
         const status = params?.turn?.status ?? params?.status
         if (status !== 'completed') return
@@ -917,7 +923,6 @@ export function createCodexFreshAgentAdapter(deps: {
         lastTurnCompleteAtByThread.set(sessionId, at)
         listener({ type: 'sdk.turn.complete', sessionId, at })
       })
-
       return () => {
         offLifecycle()
         offTurnCompleted?.()

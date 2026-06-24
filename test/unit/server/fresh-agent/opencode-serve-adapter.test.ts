@@ -110,6 +110,37 @@ describe('OpenCode serve adapter: create + send', () => {
     expect(manager.onceIdle).toHaveBeenCalledWith('ses_real_1', expect.any(Number), { cwd: '/repo' })
   })
 
+  it('attach during an in-flight send reuses the materialized state (no duplicate serve subscription)', async () => {
+    const idle = createDeferred<void>()
+    const manager = makeFakeManager()
+    manager.onceIdle = vi.fn(() => idle.promise)
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-race', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo' })
+
+    // Start the send: it materializes (remember + bindServeStream subscribes once),
+    // emits freshAgent.session.materialized, then parks at `await idle`.
+    const sendPromise = adapter.send?.('freshopencode-req-race', { text: 'go' })
+    // Wait until materialization is done and the send is in-flight at await idle
+    // (promptAsync called => past emitMaterialized, before onceIdle resolves).
+    await vi.waitFor(() => expect(manager.promptAsync).toHaveBeenCalledWith('ses_real_1', expect.anything(), expect.anything()))
+
+    // Concurrently attach the real id while the send is still in-flight. attach
+    // MUST find the already-remembered state (existing-branch) and NOT bind a
+    // second serve stream. This pins concurrent attach idempotency: exactly one
+    // serve subscription for the real id, regardless of when attach arrives
+    // during the send lifecycle.
+    const attached = await adapter.attach?.({
+      sessionId: 'ses_real_1', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo',
+    })
+    expect(attached).toEqual({ sessionId: 'ses_real_1', sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' } })
+    expect(manager.subscribe).toHaveBeenCalledTimes(1)
+    expect(manager.subscribe).toHaveBeenCalledWith('ses_real_1', expect.any(Function))
+
+    // The in-flight send still completes with the correct result once idle resolves.
+    idle.resolve()
+    await expect(sendPromise).resolves.toEqual({ sessionId: 'ses_real_1', sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' } })
+  })
+
   it('continues a materialized session on later sends without re-creating it', async () => {
     const manager = makeFakeManager()
     const adapter = makeAdapter(manager)
@@ -592,6 +623,35 @@ describe('OpenCode serve adapter: create + send', () => {
     expect(loggerMocks.logger.warn).toHaveBeenCalledWith(
       expect.objectContaining({ reason: 'malformed_session_status' }),
       'opencode status reconciliation received malformed status',
+    )
+  })
+
+  it('treats a session absent from the status map as idle (no malformed warning)', async () => {
+    loggerMocks.logger.warn.mockClear()
+    const manager = makeFakeManager()
+    // The opencode /session/status map only reports active (busy/retry) sessions;
+    // an idle session is absent (undefined). This must NOT be treated as malformed
+    // (it matches the serve manager's onceIdle semantics).
+    manager.getSessionStatus = vi.fn(async () => undefined)
+    const adapter = makeAdapter(manager)
+
+    await adapter.attach?.({
+      sessionId: 'ses_idle_absent',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })
+
+    await expect(adapter.getSnapshot?.({
+      threadId: 'ses_idle_absent',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })).resolves.toMatchObject({ status: 'idle' })
+    expect(manager.getSessionStatus).toHaveBeenCalledWith('ses_idle_absent', { cwd: '/repo/safe' })
+    expect(loggerMocks.logger.warn).not.toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'malformed_session_status' }),
+      expect.any(String),
     )
   })
 
