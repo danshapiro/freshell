@@ -46,7 +46,7 @@
 - Consumes: `setSessionStatus({ sessionId, sessionType, provider, status })` from `src/store/freshAgentSlice.ts`.
 - Consumes: `collectPaneEntries(layout)` from `src/lib/pane-utils.ts`.
 - Produces: `FreshAgentSessionState.statusVersion`, a monotonic in-memory status freshness counter that increments on every reducer-driven status write, including same-value writes.
-- Produces: an accepted freshcodex REST snapshot updates only `freshAgent.sessions[makeFreshAgentSessionKey(...)]status` unless any mounted pane for that same freshcodex session has unresolved local echo that makes an idle snapshot unsafe to apply, or the global session status version changed while the REST request was in flight.
+- Produces: an accepted freshcodex REST snapshot updates only `freshAgent.sessions[makeFreshAgentSessionKey(...)]status` unless any same-session pane present in `state.panes.layouts` has unresolved local echo that makes an idle snapshot unsafe to apply, or the global session status version changed while the REST request was in flight.
 
 - [ ] **Step 1: Write the failing status-version reducer tests**
 
@@ -54,7 +54,7 @@ In `test/unit/client/store/freshAgentSlice.test.ts`, add focused reducer tests p
 
 - `setSessionStatus({ status: 'running' })` creates or updates `statusVersion`.
 - A second same-value `setSessionStatus({ status: 'running' })` increments `statusVersion` again.
-- `freshAgentSnapshotReceived` and any other reducer in `src/store/freshAgentSlice.ts` that writes `session.status` also advances `statusVersion`.
+- `freshAgentSnapshotReceived` and any other reducer in `src/store/freshAgentSlice.ts` that writes a new status event to `session.status` also advances `statusVersion`. Session identity materialization should preserve the existing version unless it intentionally emits a new status event.
 
 These tests are intentionally not string-copy tests. They protect the ordering contract used by `FreshAgentView`: a status event with the same string value must still be observable as newer than an older REST request.
 
@@ -293,9 +293,12 @@ function writeSessionStatus(session: FreshAgentSessionState, status: FreshAgentS
 }
 ```
 
-Replace every direct reducer assignment to `session.status` or `state.sessions[key].status` with `writeSessionStatus(...)`. This must include same-value assignments, because a same-value `running` status from WebSocket is still a newer server-side event for the REST stale-response guard. Keep initial `createSession(...)` status assignment as initialization, not as a status event.
+Replace every reducer status-event assignment to `session.status` or `state.sessions[key].status` with `writeSessionStatus(...)`. This must include same-value assignments, because a same-value `running` status from WebSocket is still a newer server-side event for the REST stale-response guard. Keep initial `createSession(...)` status assignment as initialization, not as a status event.
+
+For `materializeSession`, which builds a migrated session through object spread rather than a direct `session.status = ...` assignment, preserve the existing `statusVersion` when it is only moving the session identity. If that reducer intentionally changes the status in the same operation, call `writeSessionStatus(...)` after creating the migrated session and cover that behavior in the reducer test.
 
 Do not persist the version outside Redux state or derive it from wall clock time. This guard is an in-memory ordering token for races within one client runtime.
+If existing reducer tests deep-equal full session objects, update the expected object to include `statusVersion` rather than weakening the assertion. Do not delete coverage to accommodate the new field.
 
 - [ ] **Step 5: Implement the reconciliation**
 
@@ -327,6 +330,8 @@ Add a selector near the other `useAppSelector` calls:
       ))
     })
   })
+  const hasUnresolvedLocalEchoForSessionRef = useRef(false)
+  hasUnresolvedLocalEchoForSessionRef.current = hasUnresolvedLocalEchoForSession
 ```
 
 Track the latest global fresh-agent session status in a ref:
@@ -349,7 +354,7 @@ Place that line just before calling `getFreshAgentThreadSnapshot(...)`, so it ca
 Then, inside the `.then(...)` callback after `nextStatus` is computed:
 
 ```ts
-const hasBlockingLocalEchoForSession = hasUnresolvedLocalEchoForSession
+const hasBlockingLocalEchoForSession = hasUnresolvedLocalEchoForSessionRef.current
 const sessionStatus = nextStatus === 'create-failed' ? null : nextStatus
 const snapshotIsBusy = sessionStatus === 'running' || sessionStatus === 'compacting'
 const statusChangedSinceRequest = agentSessionStatusVersionRef.current !== requestAgentSessionStatusVersion
@@ -381,7 +386,7 @@ Do not dispatch `freshAgentSnapshotReceived` here. The bug is stale status, and 
 
 Keep this dispatch after `isStaleSnapshotRequest()` returns false. Use the status from the raw `resolved` snapshot, but keep history display merging local to the component.
 
-Add `hasUnresolvedLocalEchoForSession` to the dependency list for the snapshot-loading `useEffect`, because the async reconciliation guard reads it.
+Do not add `hasUnresolvedLocalEchoForSession` to the snapshot-loading `useEffect` dependency list. That effect is intentionally identity-only and reads non-identity values through refs to avoid self-triggered duplicate snapshot fetches. The async reconciliation guard must read `hasUnresolvedLocalEchoForSessionRef.current` when the REST snapshot resolves.
 
 Keep the `if (...)` condition inline as shown rather than moving it into a separate `shouldReconcileSessionStatus` boolean. TypeScript needs the direct `sessionStatus && nextSessionId` guard to narrow `status` to `FreshAgentSessionStatus` and `sessionId` to `string` for `setSessionStatus(...)`.
 
@@ -395,10 +400,10 @@ provider === 'codex'
 && nextStatus !== 'create-failed'
 && nextStatus !== 'running'
 && nextStatus !== 'compacting'
-&& hasUnresolvedLocalEchoForSession
+&& hasUnresolvedLocalEchoForSessionRef.current
 ```
 
-This preserves the status during the window after a user send in any mounted pane for the same session but before the server snapshot contains that turn.
+This preserves the status during the window after a user send in any same-session pane in `state.panes.layouts` but before the server snapshot contains that turn.
 The guard is intentionally conservative: if the current pane's echo landed but a sibling pane for the same session still has unresolved `pendingLocalEcho`, do not reconcile idle yet. One extra fallback poll after the echo clears is preferable to incorrectly idling a session with an in-flight sibling send.
 
 The guard must also not dispatch non-busy status when `agentSessionStatusVersionRef.current !== requestAgentSessionStatusVersion`, because that means a newer global status arrived while the REST request was in flight.
@@ -437,7 +442,7 @@ Expected: PASS.
 Run:
 
 ```bash
-git add src/store/freshAgentTypes.ts src/store/freshAgentSlice.ts src/components/fresh-agent/FreshAgentView.tsx test/unit/client/store/freshAgentSlice.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
+git add src/store/freshAgentTypes.ts src/store/freshAgentSlice.ts src/components/fresh-agent/FreshAgentView.tsx test/unit/client/store/freshAgentSlice.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx docs/superpowers/plans/2026-06-25-freshcodex-bounce-and-recovery.md
 git commit -m "fix(fresh-agent): reconcile REST snapshots into live status"
 ```
 
@@ -630,7 +635,7 @@ Expected: PASS.
 Run:
 
 ```bash
-git add server/terminal-registry.ts test/unit/server/terminal-registry.codex-sidecar.test.ts
+git add server/terminal-registry.ts test/unit/server/terminal-registry.codex-sidecar.test.ts docs/superpowers/plans/2026-06-25-freshcodex-bounce-and-recovery.md
 git commit -m "fix(codex): bound durable recovery retries"
 ```
 
