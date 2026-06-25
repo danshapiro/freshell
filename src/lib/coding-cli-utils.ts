@@ -60,11 +60,24 @@ export function isNonShellMode(mode?: string): boolean {
 
 export type ResumeCommandProvider = string
 
+const BUILTIN_RESUME_COMMAND_TEMPLATES: Record<string, string[]> = {
+  claude: ['claude', '--resume', '{{sessionId}}'],
+  codex: ['codex', 'resume', '{{sessionId}}'],
+  opencode: ['opencode', '--session', '{{sessionId}}'],
+}
+
+function getResumeCommandTemplate(
+  provider: string,
+  extensions?: ClientExtensionEntry[],
+): string[] | undefined {
+  const ext = extensions?.find(e => e.name === provider && e.category === 'cli')
+  if (ext) return ext.cli?.resumeCommandTemplate
+  return BUILTIN_RESUME_COMMAND_TEMPLATES[provider]
+}
+
 export function isResumeCommandProvider(value?: string, extensions?: ClientExtensionEntry[]): value is ResumeCommandProvider {
   if (!value) return false
-  if (!extensions) return false
-  const ext = extensions.find(e => e.name === value && e.category === 'cli')
-  return !!ext?.cli?.supportsResume
+  return !!getResumeCommandTemplate(value, extensions)
 }
 
 /**
@@ -79,9 +92,9 @@ export function buildResumeCommand(
   extensions?: ClientExtensionEntry[],
 ): string | null {
   if (!sessionId || !provider) return null
-  const ext = extensions?.find(e => e.name === provider && e.category === 'cli')
-  if (!ext?.cli?.resumeCommandTemplate) return null
-  return ext.cli.resumeCommandTemplate
+  const template = getResumeCommandTemplate(provider, extensions)
+  if (!template) return null
+  return template
     .map(arg => arg.replace('{{sessionId}}', sessionId))
     .join(' ')
 }

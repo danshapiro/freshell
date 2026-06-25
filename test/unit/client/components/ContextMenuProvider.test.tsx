@@ -1515,6 +1515,35 @@ describe('ContextMenuProvider', () => {
     expect(clipboardMocks.copyText).toHaveBeenCalledWith(`claude --resume ${VALID_SESSION_ID}`)
   })
 
+  it('keeps built-in sidebar resume command available before extension registry hydration', async () => {
+    const user = userEvent.setup()
+    const store = createStoreWithSession()
+    store.dispatch({ type: 'extensions/setRegistry', payload: [] })
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.SidebarSession}
+            data-session-id={VALID_SESSION_ID}
+            data-provider="claude"
+          >
+            Sidebar Session
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Sidebar Session'), keys: '[MouseRight]' })
+    await user.click(screen.getByRole('menuitem', { name: 'Copy resume command' }))
+
+    expect(clipboardMocks.copyText).toHaveBeenCalledWith(`claude --resume ${VALID_SESSION_ID}`)
+  })
+
   it('copies session metadata with minute-bucketed open-tab recency', async () => {
     const user = userEvent.setup()
     const store = configureStore({
@@ -1911,6 +1940,85 @@ describe('ContextMenuProvider', () => {
     await user.click(screen.getByRole('menuitem', { name: 'Copy resume command' }))
 
     expect(clipboardMocks.copyText).toHaveBeenCalledWith(`claude --resume ${VALID_SESSION_ID}`)
+  })
+
+  it('keeps built-in pane header resume command available before extension registry hydration', async () => {
+    const user = userEvent.setup()
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        sessions: sessionsReducer,
+        connection: connectionReducer,
+        settings: settingsReducer,
+        extensions: extensionsReducer,
+      },
+      middleware: (getDefaultMiddleware) =>
+        getDefaultMiddleware({ serializableCheck: false }),
+      preloadedState: {
+        tabs: {
+          tabs: [
+            {
+              id: 'tab-1',
+              createRequestId: 'tab-1',
+              title: 'Codex',
+              status: 'running',
+              mode: 'codex',
+              createdAt: 1,
+            },
+          ],
+          activeTabId: 'tab-1',
+          renameRequestTabId: null,
+        },
+        extensions: {
+          entries: [],
+        },
+        panes: {
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: 'codex',
+                status: 'running',
+                resumeSessionId: 'codex-session-123',
+              },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+          paneTitles: {},
+        },
+        sessions: {
+          projects: [],
+          expandedProjects: new Set<string>(),
+        },
+        connection: {
+          status: 'ready',
+          platform: null,
+        },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div data-context={ContextIds.Pane} data-tab-id="tab-1" data-pane-id="pane-1">
+            Pane Header
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Pane Header'), keys: '[MouseRight]' })
+    await user.click(screen.getByRole('menuitem', { name: 'Copy resume command' }))
+
+    expect(clipboardMocks.copyText).toHaveBeenCalledWith('codex resume codex-session-123')
   })
 
   it('does not show resume command on shell pane header context menu', async () => {
