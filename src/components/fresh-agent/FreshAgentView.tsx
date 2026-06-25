@@ -1758,11 +1758,6 @@ export function FreshAgentView({
               {isRestoring ? (
                 <FreshAgentApprovalBanner text="Restoring session..." />
               ) : null}
-              {snapshot?.summary ? (
-                <div className="fresh-agent-summary-card rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
-                  {snapshot.summary}
-                </div>
-              ) : null}
               {pendingCreateFailure || paneContent.createError ? (
                 <div className="fresh-agent-error-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm">
                   <FreshAgentApprovalBanner text={(pendingCreateFailure ?? paneContent.createError)?.message ?? 'Create failed'} />

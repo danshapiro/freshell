@@ -85,6 +85,28 @@ describe('Codex fresh-agent normalization', () => {
     expect(snapshot.diffs[0]).toMatchObject({ path: 'src/app.ts' })
   })
 
+  it('does not promote the first transcript turn into a snapshot summary', () => {
+    const snapshot = normalizeCodexThreadSnapshot({
+      threadId: 'thread-codex-1',
+      revision: 1,
+      status: 'idle',
+      transcript: {
+        turns: [
+          {
+            id: 'turn-user-1',
+            turnId: 'turn-user-1',
+            role: 'user',
+            summary: 'Do not pin the first user request',
+            items: [{ id: 'turn-user-1:item-0', kind: 'text', text: 'Do not pin the first user request' }],
+          },
+        ],
+      },
+      rawSnapshot: {},
+    })
+
+    expect(snapshot.summary).toBe('')
+  })
+
   it('surfaces the Codex turn model in the shared turn state for single-row turns', () => {
     const turn = normalizeCodexTurn({
       id: 'turn-1',

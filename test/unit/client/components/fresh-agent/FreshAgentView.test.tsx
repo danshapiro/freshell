@@ -460,6 +460,42 @@ describe('FreshAgentView', () => {
     expect(screen.getByText(new Date('2026-06-15T12:34:56.000Z').toLocaleTimeString())).toBeInTheDocument()
   })
 
+  it('does not pin the provider snapshot summary above the transcript', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'idle',
+      summary: 'Do not pin this session summary',
+      capabilities: { send: true, interrupt: true, fork: false },
+      turns: [{
+        id: 'turn-summary-visibility',
+        turnId: 'turn-summary-visibility',
+        role: 'assistant',
+        summary: 'Visible transcript answer',
+        items: [{ id: 'item-summary-visibility', kind: 'text', text: 'Visible transcript answer' }],
+      }],
+    })
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-no-summary-pin',
+            sessionId: CLAUDE_THREAD_ID,
+            status: 'connected',
+          }}
+        />
+      </Provider>,
+    )
+
+    expect(await screen.findByText('Visible transcript answer')).toBeInTheDocument()
+    expect(screen.queryByText('Do not pin this session summary')).not.toBeInTheDocument()
+  })
+
   it('shows the provider watermark behind the workspace and redirects pane typing into the composer', async () => {
     const store = createStore()
     store.dispatch(initLayout({
