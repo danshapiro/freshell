@@ -100,19 +100,32 @@ function localEchoLanded(
   turns: readonly FreshAgentTurn[],
   echo: LocalEcho,
   pending?: PendingSendMetadata,
+  options: {
+    allowTextMatch?: boolean
+    previousTurns?: readonly FreshAgentTurn[]
+  } = {},
 ): boolean {
   const needle = echo.text.slice(0, 80)
   const submittedTurnId = echo.submittedTurnId ?? pending?.submittedTurnId
-  if (submittedTurnId) {
-    return turns.some((turn) => (
-      turn.role === 'user'
-      && getFreshAgentDisplayTurnKey(turn) === submittedTurnId
-    ))
-  }
-  if (pending && !pending.legacyAccepted) return false
+  const previousTurnKeys = options.previousTurns
+    ? new Set(options.previousTurns.map(getTurnKey))
+    : null
+  const canMatchText = Boolean(needle) && (
+    options.allowTextMatch === true
+    || pending?.legacyAccepted === true
+    || !pending
+  )
   return turns.some((turn) => (
     turn.role === 'user'
-    && freshAgentTurnText(turn).includes(needle)
+    && (
+      (submittedTurnId ? getFreshAgentDisplayTurnKey(turn) === submittedTurnId : false)
+      || (turn as { requestId?: unknown }).requestId === echo.requestId
+      || (
+        canMatchText
+        && (!previousTurnKeys || !previousTurnKeys.has(getTurnKey(turn)))
+        && freshAgentTurnText(turn).includes(needle)
+      )
+    )
   ))
 }
 
@@ -1238,14 +1251,18 @@ export function FreshAgentView({
           autoTitleFreshBoundaryRef.current = false
           autoTitleSentRef.current = true
         }
-        const displaySnapshot = mergeSnapshotForDisplay(snapshotRef.current, resolved)
-        const snapshotAccepted = displaySnapshot !== snapshotRef.current
+        const previousSnapshot = snapshotRef.current
+        const displaySnapshot = mergeSnapshotForDisplay(previousSnapshot, resolved)
+        const snapshotAccepted = displaySnapshot !== previousSnapshot
         commitSnapshot(displaySnapshot)
         setSnapshotAutoTitleIdentity(snapshotIdentity)
         const echo = localEchoRef.current
         const echoPendingMetadata = echo ? pendingSendMetadataRef.current.get(echo.requestId) : undefined
         const landedEcho = echo
-          ? localEchoLanded(displaySnapshot.turns, echo, echoPendingMetadata)
+          ? localEchoLanded(displaySnapshot.turns, echo, echoPendingMetadata, {
+              allowTextMatch: snapshotAccepted,
+              previousTurns: previousSnapshot?.turns,
+            })
           : false
         const staleEcho = echo
           ? snapshotAccepted && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata)
@@ -1757,11 +1774,6 @@ export function FreshAgentView({
             <div className="fresh-agent-top-stack space-y-2 px-3 pt-3">
               {isRestoring ? (
                 <FreshAgentApprovalBanner text="Restoring session..." />
-              ) : null}
-              {snapshot?.summary ? (
-                <div className="fresh-agent-summary-card rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
-                  {snapshot.summary}
-                </div>
               ) : null}
               {pendingCreateFailure || paneContent.createError ? (
                 <div className="fresh-agent-error-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm">

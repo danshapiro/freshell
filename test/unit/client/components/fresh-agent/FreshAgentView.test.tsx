@@ -460,6 +460,42 @@ describe('FreshAgentView', () => {
     expect(screen.getByText(new Date('2026-06-15T12:34:56.000Z').toLocaleTimeString())).toBeInTheDocument()
   })
 
+  it('does not pin the provider snapshot summary above the transcript', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'idle',
+      summary: 'Do not pin this session summary',
+      capabilities: { send: true, interrupt: true, fork: false },
+      turns: [{
+        id: 'turn-summary-visibility',
+        turnId: 'turn-summary-visibility',
+        role: 'assistant',
+        summary: 'Visible transcript answer',
+        items: [{ id: 'item-summary-visibility', kind: 'text', text: 'Visible transcript answer' }],
+      }],
+    })
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-no-summary-pin',
+            sessionId: CLAUDE_THREAD_ID,
+            status: 'connected',
+          }}
+        />
+      </Provider>,
+    )
+
+    expect(await screen.findByText('Visible transcript answer')).toBeInTheDocument()
+    expect(screen.queryByText('Do not pin this session summary')).not.toBeInTheDocument()
+  })
+
   it('shows the provider watermark behind the workspace and redirects pane typing into the composer', async () => {
     const store = createStore()
     store.dispatch(initLayout({
@@ -3972,6 +4008,103 @@ describe('FreshAgentView', () => {
     })
     expect(screen.queryByText('Orphan prompt')).not.toBeInTheDocument()
     expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+  })
+
+  it('clears local echo as soon as a fresh snapshot contains the submitted text', async () => {
+    const store = createStore()
+    let wsHandler: ((message: any) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      wsHandler = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_echo_landed_by_text',
+        revision: 1,
+        status: 'idle',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [],
+      })
+      .mockResolvedValueOnce({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_echo_landed_by_text',
+        revision: 2,
+        status: 'running',
+        capabilities: { send: false, interrupt: true, fork: true },
+        turns: [
+          {
+            id: 'turn-real-user',
+            turnId: 'turn-real-user',
+            role: 'user',
+            summary: 'Do the thing',
+            items: [{ id: 'item-real-user', kind: 'text', text: 'Do the thing' }],
+          },
+          {
+            id: 'turn-real-assistant',
+            turnId: 'turn-real-assistant',
+            role: 'assistant',
+            summary: 'Working',
+            items: [{ id: 'item-real-assistant', kind: 'text', text: 'Working' }],
+          },
+        ],
+      })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-echo-landed-by-text',
+        sessionId: 'ses_echo_landed_by_text',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_echo_landed_by_text' },
+        resumeSessionId: 'ses_echo_landed_by_text',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Do the thing' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const send = sentFreshAgentMessages('freshAgent.send').at(-1)
+    const requestId = String(send?.requestId)
+    expect(screen.getByText('Do the thing')).toBeInTheDocument()
+
+    act(() => {
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_echo_landed_by_text',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.session.snapshot',
+          sessionId: 'ses_echo_landed_by_text',
+          status: 'running',
+          latestTurnId: 'turn-real-assistant',
+          revision: 2,
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText('Working')).toBeInTheDocument()
+    })
+    expect(screen.getAllByText('Do the thing')).toHaveLength(1)
+    expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+    expect(sentFreshAgentMessages('freshAgent.send').at(-1)?.requestId).toBe(requestId)
   })
 
   it('keeps local echo when an older snapshot response is ignored after send acceptance', async () => {

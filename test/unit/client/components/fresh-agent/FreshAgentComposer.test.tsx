@@ -207,6 +207,30 @@ describe('FreshAgentComposer', () => {
     expect(screen.getByRole('tooltip')).toHaveTextContent('Send message')
   })
 
+  it('shows queued message counts without pinning queued text above the composer', () => {
+    const onCancelQueued = vi.fn()
+    render(
+      <FreshAgentComposer
+        commands={COMMANDS}
+        queuedMessages={[
+          'Do not pin my newest message at the bottom',
+          'Keep this queued follow-up private until expanded',
+        ]}
+        onCancelQueued={onCancelQueued}
+      />,
+    )
+
+    const queuedStatus = screen.getByRole('status', { name: 'Queued messages' })
+    expect(queuedStatus).toHaveTextContent('2 queued')
+    expect(screen.queryByText('Do not pin my newest message at the bottom')).not.toBeInTheDocument()
+    expect(screen.queryByText('Keep this queued follow-up private until expanded')).not.toBeInTheDocument()
+
+    const removeButtons = screen.getAllByRole('button', { name: /Remove queued message/ })
+    expect(removeButtons).toHaveLength(2)
+    fireEvent.click(removeButtons[0])
+    expect(onCancelQueued).toHaveBeenCalledWith(0)
+  })
+
   describe('state-aware disabled behavior', () => {
     it('shows the provided placeholder instead of the generic read-only text', () => {
       render(

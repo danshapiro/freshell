@@ -760,7 +760,7 @@ export function normalizeCodexThreadSnapshot(input: {
     threadId: input.threadId,
     revision: input.revision,
     status: input.status,
-    summary: input.rawSnapshot.summary ?? input.rawSnapshot.thread?.preview ?? input.transcript.turns[0]?.summary ?? '',
+    summary: input.rawSnapshot.summary ?? input.rawSnapshot.thread?.preview ?? '',
     capabilities: {
       send: !isRunning,
       interrupt: isRunning,

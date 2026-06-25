@@ -561,27 +561,25 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
       ) : null}
 
       {queuedMessages.length > 0 ? (
-        <div className="fresh-agent-queued-messages mb-2 space-y-1" role="list" aria-label="Queued messages">
-          {queuedMessages.map((message, index) => (
-            <div
-              key={`${index}-${message.slice(0, 16)}`}
-              role="listitem"
-              className="fresh-agent-queued-message flex items-center gap-2 rounded-md border border-dashed border-border/70 px-2 py-1 text-xs text-muted-foreground"
-            >
-              <span className="shrink-0">queued</span>
-              <span className="min-w-0 flex-1 truncate">{message}</span>
-              {onCancelQueued ? (
+        <div className="fresh-agent-queued-message mb-2 flex items-center gap-2 rounded-md border border-dashed border-border/70 px-2 py-1 text-xs text-muted-foreground">
+          <span role="status" aria-label="Queued messages" className="min-w-0 flex-1">
+            {queuedMessages.length} queued
+          </span>
+          {onCancelQueued ? (
+            <span className="flex shrink-0 items-center gap-1" role="group" aria-label="Queued message actions">
+              {queuedMessages.map((_, index) => (
                 <button
+                  key={index}
                   type="button"
-                  className="-m-2 shrink-0 p-2 hover:text-destructive sm:m-0 sm:p-0"
+                  className="-m-2 p-2 hover:text-destructive sm:m-0 sm:p-0"
                   aria-label={`Remove queued message ${index + 1}`}
                   onClick={() => onCancelQueued(index)}
                 >
                   <X className="h-3 w-3" />
                 </button>
-              ) : null}
-            </div>
-          ))}
+              ))}
+            </span>
+          ) : null}
         </div>
       ) : null}
 
