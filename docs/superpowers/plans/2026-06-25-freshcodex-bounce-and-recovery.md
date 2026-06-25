@@ -60,7 +60,7 @@ These tests are intentionally not string-copy tests. They protect the ordering c
 
 - [ ] **Step 2: Write the failing component regression tests**
 
-In `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`, add these tests near the existing snapshot refresh tests:
+In `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`, add these tests near the existing snapshot refresh tests. Wrap external store dispatches that must trigger React re-renders, and deferred snapshot resolution, in `act(...)` using the local test-file pattern. Do not rely on unwrapped `store.dispatch(...)` to update `agentSessionStatusVersionRef.current` before the REST promise continuation runs.
 
 ```tsx
   it('clears stale running session state when a freshcodex REST snapshot reports idle', async () => {
@@ -118,7 +118,10 @@ In `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`, add these 
       expect.objectContaining({ cwd: '/home/dan/code/freshell' }),
     )
 
-    await new Promise((resolve) => setTimeout(resolve, 3_500))
+    // Do not leave this as a real 3.5s sleep. Use the suite's fake-timer
+    // pattern for the poll-stop assertion, or omit this assertion if fake
+    // timers conflict with the component harness; global status becoming idle
+    // is the behavior that stops the fallback polling path.
     expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
   })
 
@@ -186,7 +189,7 @@ In `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`, add these 
     )
 
     await waitFor(() => {
-      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      expect(getFreshAgentPaneContent(store).status).toBe('idle')
     })
     expect(store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]?.status).toBe('running')
   })
@@ -228,25 +231,29 @@ In `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`, add these 
       expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
     })
     const versionAtRequest = store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]?.statusVersion
-    store.dispatch(setSessionStatus({
-      sessionId,
-      sessionType: 'freshcodex',
-      provider: 'codex',
-      status: 'running',
-    }))
+    await act(async () => {
+      store.dispatch(setSessionStatus({
+        sessionId,
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        status: 'running',
+      }))
+    })
     expect(store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]?.statusVersion).toBeGreaterThan(versionAtRequest ?? -1)
-    snapshot.resolve({
-      sessionType: 'freshcodex',
-      provider: 'codex',
-      threadId: sessionId,
-      sessionId,
-      status: 'idle',
-      revision: 125,
-      latestTurnId: null,
-      capabilities: { send: true, interrupt: true, fork: true },
-      turns: [],
-      pendingApprovals: [],
-      pendingQuestions: [],
+    await act(async () => {
+      snapshot.resolve({
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        threadId: sessionId,
+        sessionId,
+        status: 'idle',
+        revision: 125,
+        latestTurnId: null,
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [],
+        pendingApprovals: [],
+        pendingQuestions: [],
+      })
     })
 
     await waitFor(() => {
@@ -261,8 +268,8 @@ In `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`, add these 
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/client/store/freshAgentSlice.test.ts -t "statusVersion"
-npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx -t "freshcodex REST snapshot reports idle"
+npm run test:vitest -- run test/unit/client/store/freshAgentSlice.test.ts
+npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx -t "freshcodex REST snapshot|same-valued running session status|unresolved local echo"
 ```
 
 Expected: FAIL because the slice has no `statusVersion`, and because the pane content becomes idle but `freshAgent.sessions[freshcodex:codex:<sessionId>].status` remains `running`, so the 3-second fallback poll keeps firing.
@@ -325,6 +332,8 @@ Add a selector near the other `useAppSelector` calls:
 Track the latest global fresh-agent session status in a ref:
 
 ```ts
+  const agentSessionStatusRef = useRef(agentSession?.status)
+  agentSessionStatusRef.current = agentSession?.status
   const agentSessionStatusVersionRef = useRef(agentSession?.statusVersion ?? 0)
   agentSessionStatusVersionRef.current = agentSession?.statusVersion ?? 0
 ```
@@ -341,20 +350,24 @@ Then, inside the `.then(...)` callback after `nextStatus` is computed:
 
 ```ts
 const hasBlockingLocalEchoForSession = hasUnresolvedLocalEchoForSession
-  && !landedEcho
-  && !staleEcho
 const sessionStatus = nextStatus === 'create-failed' ? null : nextStatus
 const snapshotIsBusy = sessionStatus === 'running' || sessionStatus === 'compacting'
 const statusChangedSinceRequest = agentSessionStatusVersionRef.current !== requestAgentSessionStatusVersion
-const shouldReconcileSessionStatus = sessionStatus
+const currentSessionStatus = agentSessionStatusRef.current ?? fresh.status
+const wouldRegressStatus = sessionStatus
+  ? isStatusRegression(currentSessionStatus, sessionStatus)
+  : false
+if (
+  sessionStatus
+  && nextSessionId
   && provider === 'codex'
   && requestSessionType === 'freshcodex'
-  && nextSessionId
+  && !wouldRegressStatus
   && (
     snapshotIsBusy
     || (!hasBlockingLocalEchoForSession && !statusChangedSinceRequest)
   )
-if (shouldReconcileSessionStatus) {
+) {
   dispatch(setSessionStatus({
     sessionId: nextSessionId,
     sessionType: requestSessionType,
@@ -370,6 +383,8 @@ Keep this dispatch after `isStaleSnapshotRequest()` returns false. Use the statu
 
 Add `hasUnresolvedLocalEchoForSession` to the dependency list for the snapshot-loading `useEffect`, because the async reconciliation guard reads it.
 
+Keep the `if (...)` condition inline as shown rather than moving it into a separate `shouldReconcileSessionStatus` boolean. TypeScript needs the direct `sessionStatus && nextSessionId` guard to narrow `status` to `FreshAgentSessionStatus` and `sessionId` to `string` for `setSessionStatus(...)`.
+
 - [ ] **Step 5a: Keep idle reconciliation blocked while local echo is unresolved**
 
 The guard must not dispatch idle when all of these are true:
@@ -381,11 +396,10 @@ provider === 'codex'
 && nextStatus !== 'running'
 && nextStatus !== 'compacting'
 && hasUnresolvedLocalEchoForSession
-&& !landedEcho
-&& !staleEcho
 ```
 
 This preserves the status during the window after a user send in any mounted pane for the same session but before the server snapshot contains that turn.
+The guard is intentionally conservative: if the current pane's echo landed but a sibling pane for the same session still has unresolved `pendingLocalEcho`, do not reconcile idle yet. One extra fallback poll after the echo clears is preferable to incorrectly idling a session with an in-flight sibling send.
 
 The guard must also not dispatch non-busy status when `agentSessionStatusVersionRef.current !== requestAgentSessionStatusVersion`, because that means a newer global status arrived while the REST request was in flight.
 
@@ -402,8 +416,8 @@ Do not use status-string equality as the freshness guard; same-value `running` u
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/client/store/freshAgentSlice.test.ts -t "statusVersion"
-npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx -t "freshcodex REST snapshot reports idle"
+npm run test:vitest -- run test/unit/client/store/freshAgentSlice.test.ts
+npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx -t "freshcodex REST snapshot|same-valued running session status|unresolved local echo"
 ```
 
 Expected: PASS.
@@ -508,7 +522,7 @@ Do not add a test that resets the counter merely because `runCodexRecoveryAttemp
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts -t "blocks lifecycle-loss durable recovery after configured consecutive candidate exits" --config vitest.server.config.ts
+npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts --config vitest.server.config.ts
 ```
 
 Expected: FAIL because `CodexRecoveryOptions` has no `maxConsecutiveFailures` and the recovery loop retries forever.
@@ -560,7 +574,7 @@ In the retryable-error branch, before logging and waiting for the next retry, in
         record.codexRecoveryConsecutiveFailures = failureCount
         const maxConsecutiveFailures = Math.max(
           1,
-          record.codexRecovery.maxConsecutiveFailures
+          record.codexRecovery?.maxConsecutiveFailures
             ?? CODEX_DURABLE_RECOVERY_MAX_CONSECUTIVE_FAILURES,
         )
         if (failureCount >= maxConsecutiveFailures) {
@@ -596,7 +610,7 @@ Update the stale blocked-recovery log text in `startCodexDurableRecovery(...)` f
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts -t "blocks lifecycle-loss durable recovery after configured consecutive candidate exits" --config vitest.server.config.ts
+npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts --config vitest.server.config.ts
 ```
 
 Expected: PASS.
