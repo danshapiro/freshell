@@ -25,6 +25,7 @@ class FakeBuffer {
 class FakeRegistry extends EventEmitter {
   private records = new Map<string, any>()
   private counter = 0
+  private replayRingMaxChars: number | undefined
 
   create(opts: any) {
     const terminalId = `term-stream-${++this.counter}`
@@ -46,6 +47,14 @@ class FakeRegistry extends EventEmitter {
 
   get(terminalId: string) {
     return this.records.get(terminalId) || null
+  }
+
+  setReplayRingMaxChars(next: number | undefined) {
+    this.replayRingMaxChars = next
+  }
+
+  getReplayRingMaxChars() {
+    return this.replayRingMaxChars
   }
 
   attach(terminalId: string, ws: WebSocket, opts?: { suppressOutput?: boolean }) {
@@ -243,6 +252,45 @@ function collectMessages(ws: WebSocket, durationMs: number): Promise<any[]> {
   })
 }
 
+function normalizeReplayFrames(messages: any[]): {
+  seqStart: number
+  seqEnd: number
+  data: string
+} {
+  const replayOutputs = messages.filter((msg) =>
+    msg.type === 'terminal.output' || msg.type === 'terminal.output.batch',
+  )
+  expect(replayOutputs.length).toBeGreaterThan(0)
+
+  const normalizedSegments = replayOutputs.flatMap((msg) => {
+    if (msg.type === 'terminal.output.batch') {
+      let previousOffset = 0
+      return msg.segments.map((segment: any) => {
+        const endOffset = Number(segment.endOffset)
+        const data = String(msg.data).slice(previousOffset, endOffset)
+        previousOffset = endOffset
+        return {
+          seqStart: segment.seqStart as number,
+          seqEnd: segment.seqEnd as number,
+          data,
+        }
+      })
+    }
+
+    return [{
+      seqStart: msg.seqStart as number,
+      seqEnd: msg.seqEnd as number,
+      data: String(msg.data),
+    }]
+  })
+
+  return {
+    seqStart: normalizedSegments[0]!.seqStart,
+    seqEnd: normalizedSegments[normalizedSegments.length - 1]!.seqEnd,
+    data: normalizedSegments.map((segment) => segment.data).join(''),
+  }
+}
+
 async function createAuthenticatedConnection(
   port: number,
   opts?: { terminalOutputBatchV1?: boolean },
@@ -270,7 +318,7 @@ async function createAuthenticatedConnection(
   }
 }
 
-async function createTerminal(ws: WebSocket, requestId: string): Promise<{ terminalId: string }> {
+async function createTerminal(ws: WebSocket, requestId: string): Promise<{ terminalId: string; ready: any }> {
   ws.send(JSON.stringify({
     type: 'terminal.create',
     requestId,
@@ -283,7 +331,7 @@ async function createTerminal(ws: WebSocket, requestId: string): Promise<{ termi
   sendAttach(ws, terminalId)
   const ready = await waitForMessage(ws, (msg) => msg.type === 'terminal.attach.ready' && msg.terminalId === terminalId)
   expect(ready.terminalId).toBe(terminalId)
-  return { terminalId }
+  return { terminalId, ready }
 }
 
 function sendAttach(
@@ -596,6 +644,83 @@ describe('terminal stream v2 replay', () => {
       if (originalReplayRingMaxBytes === undefined) delete process.env.TERMINAL_REPLAY_RING_MAX_BYTES
       else process.env.TERMINAL_REPLAY_RING_MAX_BYTES = originalReplayRingMaxBytes
     }
+  })
+
+  it('reconnects from evicted history with a same-stream replay gap and no stream change', async () => {
+    registry.setReplayRingMaxChars(6)
+    const { ws: ws1, close: close1 } = await createAuthenticatedConnection(port)
+    const { terminalId, ready: seedReady } = await createTerminal(ws1, 'stable-retention-create')
+    const seedStreamId = seedReady.streamId
+    expect(seedStreamId).toEqual(expect.any(String))
+
+    for (const chunk of ['aaa', 'bbb', 'ccc']) {
+      registry.simulateOutput(terminalId, chunk)
+    }
+    await waitForMessage(
+      ws1,
+      (msg) => msg.type === 'terminal.output' && msg.terminalId === terminalId && msg.seqEnd >= 3,
+    )
+
+    const { ws: wsReconnect, close: closeReconnect } = await createAuthenticatedConnection(port)
+    const observed: any[] = []
+    const onReconnectMessage = (data: WebSocket.Data) => {
+      observed.push(JSON.parse(data.toString()))
+    }
+    wsReconnect.on('message', onReconnectMessage)
+    const reconnectReadyPromise = waitForMessage(
+      wsReconnect,
+      (msg) => msg.type === 'terminal.attach.ready' && msg.terminalId === terminalId,
+    )
+    const gapPromise = waitForMessage(
+      wsReconnect,
+      (msg) => msg.type === 'terminal.output.gap' && msg.terminalId === terminalId,
+    )
+    const replayTailPromise = waitForMessage(
+      wsReconnect,
+      (msg) =>
+        (msg.type === 'terminal.output' || msg.type === 'terminal.output.batch')
+        && msg.terminalId === terminalId
+        && msg.seqEnd === 3,
+    )
+
+    sendAttach(wsReconnect, terminalId, {
+      sinceSeq: 0,
+      attachRequestId: 'stable-retention-reconnect',
+    })
+
+    const reconnectReady = await reconnectReadyPromise
+    const gap = await gapPromise
+    const output = await replayTailPromise
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    wsReconnect.off('message', onReconnectMessage)
+    const replayTail = normalizeReplayFrames(
+      observed.filter((msg) =>
+        msg.terminalId === terminalId
+        && (msg.type === 'terminal.output' || msg.type === 'terminal.output.batch'),
+      ),
+    )
+
+    expect(observed.filter((msg) => msg.type === 'terminal.stream.changed')).toEqual([])
+    expect(reconnectReady.streamId).toBe(seedStreamId)
+    expect(reconnectReady.replayFromSeq).toBe(2)
+    expect(reconnectReady.replayToSeq).toBe(3)
+    expect(gap).toMatchObject({
+      terminalId,
+      streamId: seedStreamId,
+      reason: 'replay_window_exceeded',
+      fromSeq: 1,
+      toSeq: 1,
+      attachRequestId: 'stable-retention-reconnect',
+    })
+    expect(output.streamId).toBe(seedStreamId)
+    expect(replayTail).toEqual({
+      seqStart: 2,
+      seqEnd: 3,
+      data: 'bbbccc',
+    })
+
+    await close1()
+    await closeReconnect()
   })
 
   it('rejects attachRequestId values too large for terminal.output serialized payload budgets', async () => {

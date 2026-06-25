@@ -145,6 +145,22 @@ describe('terminal-attach-seq-state', () => {
     expect(frame.state.pendingReplay).toBeNull()
   })
 
+  it('treats same-stream replay gaps as lost history without making later output unsafe to accept', () => {
+    let state = beginAttach(createAttachSeqState({ lastSeq: 0 }))
+    state = onAttachReady(state, { headSeq: 8, replayFromSeq: 6, replayToSeq: 8 })
+
+    const gap = onOutputGap(state, { fromSeq: 1, toSeq: 5 })
+    expect(gap.state.knownLostRanges).toEqual([{ fromSeq: 1, toSeq: 5 }])
+    expect(gap.surfaceSafeForDeltaReplay).toBe(false)
+    expect(gap.requiresSurfaceQuarantine).toBe(true)
+
+    const frame = expectAcceptedFrame(onOutputFrame(gap.state, { seqStart: 6, seqEnd: 8 }))
+    expect(frame.freshReset).toBe(false)
+    expect(frame.state.lastSeq).toBe(8)
+    expect(frame.state.pendingReplay).toBeNull()
+    expect(markParserAppliedSeq(frame.state, 8).parserAppliedSeq).toBe(0)
+  })
+
   it('clears pending replay when a gap covers replay tail', () => {
     let state = beginAttach(createAttachSeqState({ lastSeq: 0 }))
     state = onAttachReady(state, { headSeq: 8, replayFromSeq: 6, replayToSeq: 8 })
