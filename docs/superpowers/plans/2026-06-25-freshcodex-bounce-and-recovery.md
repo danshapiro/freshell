@@ -457,7 +457,7 @@ git commit -m "fix(fresh-agent): reconcile REST snapshots into live status"
 - Produces: optional `maxConsecutiveFailures?: number` on `CodexRecoveryOptions`, defaulting to 5 when omitted and clamped to at least 1.
 - Produces: `TerminalRecord.codexRecoveryConsecutiveFailures?: number`, incremented for all retryable recovery failures and reset to 0 only after a replacement PTY/sidecar is actually published.
 
-- [ ] **Step 1: Write the failing recovery backstop test**
+- [x] **Step 1: Write the failing recovery backstop test**
 
 In `test/unit/server/terminal-registry.codex-sidecar.test.ts`, add this test near the existing repeated-candidate-exit tests:
 
@@ -510,7 +510,7 @@ In `test/unit/server/terminal-registry.codex-sidecar.test.ts`, add this test nea
   })
 ```
 
-- [ ] **Step 2: Add the remaining recovery-budget regression tests**
+- [x] **Step 2: Add the remaining recovery-budget regression tests**
 
 In `test/unit/server/terminal-registry.codex-sidecar.test.ts`, add focused tests for these cases:
 
@@ -522,7 +522,7 @@ In `test/unit/server/terminal-registry.codex-sidecar.test.ts`, add focused tests
 
 Do not add a test that resets the counter merely because `runCodexRecoveryAttempt(...)` returns. Some return paths mean the attempt was abandoned because the terminal was closed, replaced, or otherwise made ineligible; those must not count as successful publication.
 
-- [ ] **Step 3: Run the focused server tests to verify RED**
+- [x] **Step 3: Run the focused server tests to verify RED**
 
 Run:
 
@@ -532,7 +532,7 @@ npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test
 
 Expected: FAIL because `CodexRecoveryOptions` has no `maxConsecutiveFailures` and the recovery loop retries forever.
 
-- [ ] **Step 4: Add the bounded recovery implementation**
+- [x] **Step 4: Add the bounded recovery implementation**
 
 In `server/terminal-registry.ts`, update `CodexRecoveryOptions`:
 
@@ -610,7 +610,7 @@ Update the stale blocked-recovery log text in `startCodexDurableRecovery(...)` f
 'Codex durable recovery is blocked by a previous recovery failure'
 ```
 
-- [ ] **Step 5: Run the focused server tests to verify GREEN**
+- [x] **Step 5: Run the focused server tests to verify GREEN**
 
 Run:
 
@@ -620,7 +620,7 @@ npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test
 
 Expected: PASS.
 
-- [ ] **Step 6: Run nearby server recovery tests**
+- [x] **Step 6: Run nearby server recovery tests**
 
 Run:
 
@@ -630,7 +630,7 @@ npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit Task 2**
+- [x] **Step 7: Commit Task 2**
 
 Run:
 

@@ -151,6 +151,22 @@ function createFakeSidecar(options: {
   }
 }
 
+function createCandidateExitPlanCreate() {
+  const planCreate = vi.fn(async () => {
+    const attempt = planCreate.mock.calls.length
+    return {
+      sessionId: 'thread-1',
+      remote: { wsUrl: `ws://127.0.0.1:${43124 + attempt}` },
+      sidecar: createFakeSidecar({
+        adopt: async () => {
+          mockPtyProcess.instances[attempt]._emitExit(42)
+        },
+      }),
+    }
+  })
+  return planCreate
+}
+
 describe('TerminalRegistry Codex sidecar ownership', () => {
   beforeEach(() => {
     mockPtyProcess.instances = []
@@ -1923,6 +1939,240 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
 
     expect(maxActiveCandidates).toBe(1)
     await registry.killAndWait(term.terminalId)
+  })
+
+  it('blocks lifecycle-loss durable recovery after configured consecutive candidate exits', async () => {
+    const registry = new TerminalRegistry()
+    const exited = vi.fn()
+    registry.on('terminal.exit', exited)
+    const currentSidecar = createFakeSidecar()
+    const planCreate = createCandidateExitPlanCreate()
+    const term = registry.create({
+      mode: 'codex',
+      resumeSessionId: 'thread-1',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar: currentSidecar,
+          recovery: {
+            planCreate,
+            retryDelayMs: 0,
+            maxConsecutiveFailures: 3,
+          },
+        },
+      } as any,
+    })
+    mockPtyProcess.instances[0].autoExitOnKill = false
+
+    try {
+      currentSidecar.emitLifecycleLoss({ method: 'thread/closed', threadId: 'thread-1' })
+
+      await vi.waitFor(() => expect(planCreate).toHaveBeenCalledTimes(3))
+      await vi.waitFor(() => {
+        expect(registry.get(term.terminalId)?.codexRecoveryBlockedError?.message).toContain('failed 3 consecutive times')
+      })
+      await vi.waitFor(() => expect(registry.get(term.terminalId)?.status).toBe('exited'))
+      expect(exited).toHaveBeenCalledWith({ terminalId: term.terminalId, exitCode: 0 })
+
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      expect(planCreate).toHaveBeenCalledTimes(3)
+    } finally {
+      await registry.killAndWait(term.terminalId).catch(() => undefined)
+    }
+  })
+
+  it('uses a default durable recovery budget of five consecutive failures', async () => {
+    const registry = new TerminalRegistry()
+    const currentSidecar = createFakeSidecar()
+    const planCreate = createCandidateExitPlanCreate()
+    const term = registry.create({
+      mode: 'codex',
+      resumeSessionId: 'thread-1',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar: currentSidecar,
+          recovery: { planCreate, retryDelayMs: 0 },
+        },
+      } as any,
+    })
+
+    try {
+      currentSidecar.emitLifecycleLoss({ method: 'thread/closed', threadId: 'thread-1' })
+
+      await vi.waitFor(() => expect(planCreate).toHaveBeenCalledTimes(5))
+      await vi.waitFor(() => {
+        expect(registry.get(term.terminalId)?.codexRecoveryBlockedError?.message).toContain('failed 5 consecutive times')
+      })
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      expect(planCreate).toHaveBeenCalledTimes(5)
+    } finally {
+      await registry.killAndWait(term.terminalId).catch(() => undefined)
+    }
+  })
+
+  it('clamps an invalid durable recovery budget to one consecutive failure', async () => {
+    const registry = new TerminalRegistry()
+    const currentSidecar = createFakeSidecar()
+    const planCreate = createCandidateExitPlanCreate()
+    const term = registry.create({
+      mode: 'codex',
+      resumeSessionId: 'thread-1',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar: currentSidecar,
+          recovery: { planCreate, retryDelayMs: 0, maxConsecutiveFailures: 0 },
+        },
+      } as any,
+    })
+
+    try {
+      currentSidecar.emitLifecycleLoss({ method: 'thread/closed', threadId: 'thread-1' })
+
+      await vi.waitFor(() => expect(planCreate).toHaveBeenCalledTimes(1))
+      await vi.waitFor(() => {
+        expect(registry.get(term.terminalId)?.codexRecoveryBlockedError?.message).toContain('failed 1 consecutive times')
+      })
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      expect(planCreate).toHaveBeenCalledTimes(1)
+    } finally {
+      await registry.killAndWait(term.terminalId).catch(() => undefined)
+    }
+  })
+
+  it('shares one durable recovery budget across mixed retryable failures', async () => {
+    const registry = new TerminalRegistry()
+    const currentSidecar = createFakeSidecar()
+    const planCreate = vi.fn(async () => {
+      const attempt = planCreate.mock.calls.length
+      if (attempt === 1) {
+        throw new Error('candidate planning failed')
+      }
+      return {
+        sessionId: 'thread-1',
+        remote: { wsUrl: `ws://127.0.0.1:${43124 + attempt}` },
+        sidecar: createFakeSidecar({
+          adopt: async () => {
+            if (attempt === 2) {
+              mockPtyProcess.instances[attempt]._emitExit(42)
+            } else {
+              throw new Error('candidate adopt failed')
+            }
+          },
+        }),
+      }
+    })
+    const term = registry.create({
+      mode: 'codex',
+      resumeSessionId: 'thread-1',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar: currentSidecar,
+          recovery: { planCreate, retryDelayMs: 0, maxConsecutiveFailures: 3 },
+        },
+      } as any,
+    })
+
+    try {
+      currentSidecar.emitLifecycleLoss({ method: 'thread/closed', threadId: 'thread-1' })
+
+      await vi.waitFor(() => expect(planCreate).toHaveBeenCalledTimes(3))
+      await vi.waitFor(() => {
+        expect(registry.get(term.terminalId)?.codexRecoveryBlockedError?.message).toContain('failed 3 consecutive times')
+      })
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      expect(planCreate).toHaveBeenCalledTimes(3)
+    } finally {
+      await registry.killAndWait(term.terminalId).catch(() => undefined)
+    }
+  })
+
+  it('resets the durable recovery budget after publishing a replacement worker', async () => {
+    const registry = new TerminalRegistry()
+    const currentSidecar = createFakeSidecar()
+    const publishedSidecars: ReturnType<typeof createFakeSidecar>[] = []
+    const planCreate = vi.fn(async () => {
+      const attempt = planCreate.mock.calls.length
+      const shouldFail = attempt === 1 || attempt === 2 || attempt === 4 || attempt === 5
+      const sidecar = createFakeSidecar({
+        adopt: async () => {
+          if (shouldFail) {
+            mockPtyProcess.instances[attempt]._emitExit(42)
+          }
+        },
+      })
+      if (!shouldFail) {
+        publishedSidecars.push(sidecar)
+      }
+      return {
+        sessionId: 'thread-1',
+        remote: { wsUrl: `ws://127.0.0.1:${43124 + attempt}` },
+        sidecar,
+      }
+    })
+    const term = registry.create({
+      mode: 'codex',
+      resumeSessionId: 'thread-1',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar: currentSidecar,
+          recovery: { planCreate, retryDelayMs: 0, maxConsecutiveFailures: 3 },
+        },
+      } as any,
+    })
+
+    try {
+      currentSidecar.emitLifecycleLoss({ method: 'thread/closed', threadId: 'thread-1' })
+      await vi.waitFor(() => expect(planCreate).toHaveBeenCalledTimes(3))
+      await vi.waitFor(() => expect(publishedSidecars).toHaveLength(1))
+      expect(registry.get(term.terminalId)?.status).toBe('running')
+
+      publishedSidecars[0].emitLifecycleLoss({ method: 'thread/closed', threadId: 'thread-1' })
+      await vi.waitFor(() => expect(planCreate).toHaveBeenCalledTimes(6))
+      await vi.waitFor(() => expect(publishedSidecars).toHaveLength(2))
+
+      expect(registry.get(term.terminalId)?.codexRecoveryBlockedError).toBeUndefined()
+      expect(registry.get(term.terminalId)?.status).toBe('running')
+    } finally {
+      await registry.killAndWait(term.terminalId).catch(() => undefined)
+    }
+  })
+
+  it('finalizes PTY-exit-triggered durable recovery after exhausting the retry budget', async () => {
+    const registry = new TerminalRegistry()
+    const exited = vi.fn()
+    registry.on('terminal.exit', exited)
+    const currentSidecar = createFakeSidecar()
+    const planCreate = createCandidateExitPlanCreate()
+    const term = registry.create({
+      mode: 'codex',
+      resumeSessionId: 'thread-1',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar: currentSidecar,
+          recovery: { planCreate, retryDelayMs: 0, maxConsecutiveFailures: 2 },
+        },
+      } as any,
+    })
+
+    try {
+      mockPtyProcess.instances[0]._emitExit(42)
+
+      await vi.waitFor(() => expect(planCreate).toHaveBeenCalledTimes(2))
+      await vi.waitFor(() => {
+        expect(registry.get(term.terminalId)?.codexRecoveryBlockedError?.message).toContain('failed 2 consecutive times')
+      })
+      await vi.waitFor(() => expect(registry.get(term.terminalId)?.status).toBe('exited'))
+      expect(exited).toHaveBeenCalledWith(expect.objectContaining({ terminalId: term.terminalId, exitCode: 42 }))
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      expect(planCreate).toHaveBeenCalledTimes(2)
+    } finally {
+      await registry.killAndWait(term.terminalId).catch(() => undefined)
+    }
   })
 
   it('final close during a pending recovery launch prevents later recovery', async () => {
