@@ -139,27 +139,48 @@ function findIndexedSessionById(
   return undefined
 }
 
-function resolveFreshClaudeRuntimeMeta(
+function resolveFreshAgentRuntimeMeta(
   indexedProjects: ProjectGroup[],
   content: FreshAgentPaneContent,
   session: FreshAgentSessionState | undefined,
 ): PaneRuntimeMeta | undefined {
-  if (content.provider !== 'claude') return undefined
-
   const provider = content.provider
-  const indexedSessionId = getPreferredResumeSessionId(session) ?? content.resumeSessionId
-  if (!provider || !indexedSessionId) return undefined
+  const sessionId = getPreferredResumeSessionId(session) ?? content.resumeSessionId
 
-  const indexed = findIndexedSessionById(indexedProjects, provider, indexedSessionId)
-  if (!indexed) return undefined
+  if (provider && sessionId) {
+    const indexed = findIndexedSessionById(indexedProjects, provider, sessionId)
+    if (indexed) {
+      return {
+        cwd: indexed.cwd,
+        checkoutRoot: indexed.projectPath,
+        repoRoot: indexed.projectPath,
+        branch: indexed.gitBranch,
+        isDirty: indexed.isDirty,
+        tokenUsage: indexed.tokenUsage,
+      }
+    }
+  }
 
+  if (!session) return undefined
+
+  let branch: string | undefined
+  if (session.snapshot?.worktrees?.length) {
+    branch = session.snapshot.worktrees[0].branch
+  }
+
+  const snapshotTokenUsage = session.snapshot?.tokenUsage
   return {
-    cwd: indexed.cwd,
-    checkoutRoot: indexed.projectPath,
-    repoRoot: indexed.projectPath,
-    branch: indexed.gitBranch,
-    isDirty: indexed.isDirty,
-    tokenUsage: indexed.tokenUsage,
+    cwd: session.cwd,
+    checkoutRoot: session.cwd,
+    branch,
+    tokenUsage: snapshotTokenUsage && {
+      inputTokens: snapshotTokenUsage.inputTokens,
+      outputTokens: snapshotTokenUsage.outputTokens,
+      cachedTokens: snapshotTokenUsage.cachedTokens ?? 0,
+      totalTokens: snapshotTokenUsage.totalTokens,
+      ...(snapshotTokenUsage.contextTokens !== undefined && { contextTokens: snapshotTokenUsage.contextTokens }),
+      ...(snapshotTokenUsage.compactPercent !== undefined && { compactPercent: snapshotTokenUsage.compactPercent }),
+    },
   }
 }
 
@@ -430,25 +451,21 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
           initialCwd: paneInitialCwd,
         })
         : node.content.kind === 'fresh-agent'
-          ? (
-            node.content.provider === 'claude'
+          ? resolveFreshAgentRuntimeMeta(
+            indexedProjects,
+            {
+              ...node.content,
+              effort: normalizeFreshAgentEffort(
+                node.content.sessionType,
+                node.content.provider,
+                node.content.model,
+                node.content.effort,
+              ),
+            },
+            node.content.sessionId
+              ? freshAgentSessions[`${node.content.sessionType}:${node.content.provider}:${node.content.sessionId}`]
+              : undefined,
           )
-            ? resolveFreshClaudeRuntimeMeta(
-              indexedProjects,
-              {
-                ...node.content,
-                effort: normalizeFreshAgentEffort(
-                  node.content.sessionType,
-                  node.content.provider,
-                  node.content.model,
-                  node.content.effort,
-                ),
-              },
-              node.content.sessionId
-                ? freshAgentSessions[`${node.content.sessionType}:${node.content.provider}:${node.content.sessionId}`]
-                : undefined,
-            )
-            : undefined
         : undefined
     const paneMetaLabel =
       paneRuntimeMeta

@@ -73,6 +73,8 @@ vi.mock('lucide-react', () => ({
   Square: ({ className }: { className?: string }) => <svg data-testid="square-icon" className={className} />,
   Search: ({ className }: { className?: string }) => <svg data-testid="search-icon" className={className} />,
   RefreshCw: ({ className }: { className?: string }) => <svg data-testid="refresh-icon" className={className} />,
+  FilePen: () => null,
+  FileSearch: () => null,
 }))
 
 vi.mock('@/components/TerminalView', () => ({ default: mockTerminalView }))

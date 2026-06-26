@@ -1,11 +1,12 @@
 import { useRef, useEffect } from 'react'
-import { X, Maximize2, Minimize2, Search, RefreshCw, SquareTerminal } from 'lucide-react'
+import { X, Maximize2, Minimize2, Search, RefreshCw, SquareTerminal, Terminal, FileSearch, Globe, FilePen, FileText } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { getTerminalStatusIconClassName } from '@/lib/terminal-status-indicator'
 import type { TerminalStatus } from '@/store/types'
 import type { PaneContent } from '@/store/paneTypes'
-import { useAppDispatch } from '@/store/hooks'
+import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { splitPane } from '@/store/panesSlice'
+import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import PaneIcon from '@/components/icons/PaneIcon'
 import FreshAgentSettingsButton from '@/components/fresh-agent/FreshAgentSettingsButton'
 import FreshAgentContextMeter from '@/components/fresh-agent/FreshAgentContextMeter'
@@ -34,6 +35,44 @@ interface PaneHeaderProps {
   onDoubleClick?: () => void
   onSearch?: () => void
   onRefresh?: () => void
+}
+
+const FRESH_AGENT_TOOL_ICONS: Record<string, React.ComponentType<{ className?: string }>> = {
+  Bash: Terminal,
+  Read: FileText,
+  Write: FilePen,
+  Edit: FilePen,
+  Glob: FileSearch,
+  Grep: FileSearch,
+  WebFetch: Globe,
+  WebSearch: Globe,
+}
+
+function FreshAgentToolIcons({
+  content,
+}: {
+  content: Extract<PaneContent, { kind: 'fresh-agent' }>
+}) {
+  const sessionKey = content.sessionId ? makeFreshAgentSessionKey({
+    sessionId: content.sessionId,
+    sessionType: content.sessionType,
+    provider: content.provider,
+  }) : undefined
+  const tools = useAppSelector((state) =>
+    sessionKey ? state.freshAgent?.sessions?.[sessionKey]?.tools : undefined,
+  )
+
+  if (!tools?.length) return null
+
+  return (
+    <span className="inline-flex shrink-0 items-center gap-0.5 text-muted-foreground/60" title={tools.map((t) => t.name).join(', ')}>
+      {tools.map((tool) => {
+        const Icon = FRESH_AGENT_TOOL_ICONS[tool.name]
+        if (!Icon) return null
+        return <Icon key={tool.name} className="h-3 w-3" aria-label={tool.name} />
+      })}
+    </span>
+  )
 }
 
 function FreshAgentOpenTerminalButton({
@@ -188,6 +227,7 @@ export default function PaneHeader({
 
         {content.kind === 'fresh-agent' && (
           <>
+            <FreshAgentToolIcons content={content} />
             {/* Cwd/prompt-derived titles make the three fresh clients look
                 identical — pin the agent identity in the header. */}
             <span

@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup } from '@testing-library/react'
+import { Provider } from 'react-redux'
+import { configureStore } from '@reduxjs/toolkit'
 import PaneHeader from '@/components/panes/PaneHeader'
+import freshAgentReducer, { sessionInit } from '@/store/freshAgentSlice'
 import { formatPaneRuntimeLabel, formatPaneRuntimeTooltip } from '@/lib/format-terminal-title-meta'
 
 vi.mock('lucide-react', () => ({
@@ -22,6 +25,24 @@ vi.mock('lucide-react', () => ({
   RefreshCw: ({ className }: { className?: string }) => (
     <svg data-testid="refresh-icon" className={className} />
   ),
+  Terminal: ({ className }: { className?: string }) => (
+    <svg data-testid="terminal-icon" className={className} />
+  ),
+  FileSearch: ({ className }: { className?: string }) => (
+    <svg data-testid="filesearch-icon" className={className} />
+  ),
+  Globe: ({ className }: { className?: string }) => (
+    <svg data-testid="globe-icon" className={className} />
+  ),
+  FilePen: ({ className }: { className?: string }) => (
+    <svg data-testid="filepen-icon" className={className} />
+  ),
+  FileText: ({ className }: { className?: string }) => (
+    <svg data-testid="filetext-icon" className={className} />
+  ),
+  SquareTerminal: ({ className }: { className?: string }) => (
+    <svg data-testid="square-terminal-icon" className={className} />
+  ),
 }))
 
 vi.mock('@/components/icons/PaneIcon', () => ({
@@ -30,8 +51,23 @@ vi.mock('@/components/icons/PaneIcon', () => ({
   ),
 }))
 
+vi.mock('@/components/fresh-agent/FreshAgentSettingsButton', () => ({
+  default: () => <button data-testid="settings-button-stub" />,
+}))
+
 function makeTerminalContent(mode = 'shell') {
   return { kind: 'terminal' as const, mode, shell: 'system' as const, createRequestId: 'r1', status: 'running' as const }
+}
+
+function makeFreshAgentContent(sessionId = 'thread-1') {
+  return {
+    kind: 'fresh-agent' as const,
+    sessionType: 'freshclaude' as const,
+    provider: 'claude' as const,
+    sessionId,
+    createRequestId: 'req-1',
+    status: 'idle' as const,
+  }
 }
 
 describe('PaneHeader', () => {
@@ -868,6 +904,58 @@ describe('PaneHeader', () => {
 
       fireEvent.click(screen.getByTitle('Maximize pane'))
       expect(onToggleZoom).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('fresh-agent tool icons', () => {
+    it('renders an icon for each known tool used by the session', () => {
+      const store = configureStore({
+        reducer: { freshAgent: freshAgentReducer },
+      })
+      store.dispatch(sessionInit({
+        sessionId: 'thread-1',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        tools: [{ name: 'Bash' }, { name: 'Read' }, { name: 'Glob' }, { name: 'WebFetch' }],
+      }))
+
+      render(
+        <Provider store={store}>
+          <PaneHeader
+            title="Claude"
+            status="idle"
+            isActive={true}
+            onClose={vi.fn()}
+            content={makeFreshAgentContent()}
+          />
+        </Provider>,
+      )
+
+      expect(screen.getByTestId('terminal-icon')).toBeInTheDocument()
+      expect(screen.getByTestId('filetext-icon')).toBeInTheDocument()
+      expect(screen.getByTestId('filesearch-icon')).toBeInTheDocument()
+      expect(screen.getByTestId('globe-icon')).toBeInTheDocument()
+      expect(screen.getByTitle('Bash, Read, Glob, WebFetch')).toBeInTheDocument()
+    })
+
+    it('renders no tool icons when the session has no tools', () => {
+      const store = configureStore({
+        reducer: { freshAgent: freshAgentReducer },
+      })
+
+      const { container } = render(
+        <Provider store={store}>
+          <PaneHeader
+            title="Claude"
+            status="idle"
+            isActive={true}
+            onClose={vi.fn()}
+            content={makeFreshAgentContent()}
+          />
+        </Provider>,
+      )
+
+      expect(container.querySelector('[title="Bash"]')).toBeNull()
     })
   })
 })

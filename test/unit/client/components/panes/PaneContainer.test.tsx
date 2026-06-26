@@ -17,6 +17,7 @@ import { markTabAttention, markPaneAttention } from '@/store/turnCompletionSlice
 import type { PanesState } from '@/store/panesSlice'
 import type { PaneNode, PaneContent, EditorPaneContent } from '@/store/paneTypes'
 import type { FreshAgentSessionState, FreshAgentState } from '@/store/freshAgentTypes'
+import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 
@@ -180,6 +181,8 @@ vi.mock('lucide-react', () => ({
   Settings: ({ className }: { className?: string }) => (
     <svg data-testid="settings-icon" className={className} />
   ),
+  FilePen: () => null,
+  FileSearch: () => null,
 }))
 
 // Mock TerminalView component to avoid xterm.js dependencies
@@ -264,6 +267,36 @@ function createFreshClaudeSession(
     totalOutputTokens: 0,
     ...overrides,
   }
+}
+
+function makeSnapshot(
+  opts: {
+    tokenUsage: FreshAgentSnapshot['tokenUsage']
+    worktrees?: FreshAgentSnapshot['worktrees']
+  },
+): FreshAgentSnapshot {
+  return {
+    sessionType: 'freshclaude',
+    provider: 'claude',
+    threadId: 'thread-1',
+    revision: 1,
+    status: 'idle',
+    capabilities: {
+      send: true,
+      interrupt: true,
+      approvals: true,
+      questions: true,
+      fork: false,
+    },
+    tokenUsage: opts.tokenUsage,
+    pendingApprovals: [],
+    pendingQuestions: [],
+    worktrees: opts.worktrees ?? [],
+    diffs: [],
+    childThreads: [],
+    turns: [],
+    extensions: {},
+  } as FreshAgentSnapshot
 }
 
 function createStore(
@@ -2681,6 +2714,238 @@ describe('PaneContainer', () => {
       expect(screen.getByText(/freshell \(main\)\s+25%/)).toBeInTheDocument()
     })
 
+  })
+
+  describe('FreshAgent runtime metadata snapshot fallback', () => {
+    it('derives header meta from session.snapshot for a non-Claude provider (codex)', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-codex',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-codex',
+          sessionId: 'codex-sess-1',
+          status: 'idle',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-codex' },
+        },
+        {},
+        { projects: [] },
+        {
+          sessions: {
+            [makeFreshAgentSessionKey({
+              sessionType: 'freshcodex',
+              provider: 'codex',
+              sessionId: 'codex-sess-1',
+            })]: createFreshClaudeSession({
+              sessionId: 'codex-sess-1',
+              sessionType: 'freshcodex',
+              provider: 'codex',
+              cwd: '/home/user/code/freshell',
+              snapshot: makeSnapshot({
+                tokenUsage: {
+                  inputTokens: 100,
+                  outputTokens: 50,
+                  cachedTokens: 20,
+                  totalTokens: 170,
+                  compactPercent: 30,
+                },
+                worktrees: [{ id: 'wt-1', path: '/home/user/code/freshell', branch: 'dev' }],
+              }),
+            }),
+          },
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      const meta = screen.getByText(/freshell \(dev\)\s+30%/)
+      expect(meta).toBeInTheDocument()
+      expect(meta).toHaveAttribute(
+        'title',
+        'Directory: /home/user/code/freshell\nbranch: dev',
+      )
+    })
+
+    it('falls back to session.snapshot for a Claude pane with no indexed session', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-claude-fallback',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          createRequestId: 'req-claude',
+          sessionId: 'claude-sess-1',
+          status: 'idle',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-claude-fallback' },
+        },
+        {},
+        { projects: [] },
+        {
+          sessions: {
+            [makeFreshAgentSessionKey({
+              sessionType: 'freshclaude',
+              provider: 'claude',
+              sessionId: 'claude-sess-1',
+            })]: createFreshClaudeSession({
+              sessionId: 'claude-sess-1',
+              cwd: '/home/user/code/myproject',
+              snapshot: makeSnapshot({
+                tokenUsage: {
+                  inputTokens: 200,
+                  outputTokens: 100,
+                  totalTokens: 300,
+                  compactPercent: 45,
+                },
+                worktrees: [{ id: 'wt-1', path: '/home/user/code/myproject', branch: 'feature-x' }],
+              }),
+            }),
+          },
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      const meta = screen.getByText(/myproject \(feature-x\)\s+45%/)
+      expect(meta).toBeInTheDocument()
+      expect(meta).toHaveAttribute(
+        'title',
+        'Directory: /home/user/code/myproject\nbranch: feature-x',
+      )
+    })
+
+    it('shapes tokenUsage from session.snapshot, defaulting cachedTokens to 0 and passing through compactPercent', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-opencode',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          createRequestId: 'req-opencode',
+          sessionId: 'opencode-sess-1',
+          status: 'idle',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-opencode' },
+        },
+        {},
+        { projects: [] },
+        {
+          sessions: {
+            [makeFreshAgentSessionKey({
+              sessionType: 'freshopencode',
+              provider: 'opencode',
+              sessionId: 'opencode-sess-1',
+            })]: createFreshClaudeSession({
+              sessionId: 'opencode-sess-1',
+              sessionType: 'freshopencode',
+              provider: 'opencode',
+              cwd: '/home/user/code/workdir',
+              snapshot: makeSnapshot({
+                tokenUsage: {
+                  inputTokens: 500,
+                  outputTokens: 250,
+                  totalTokens: 750,
+                  compactPercent: 60,
+                },
+                worktrees: [{ id: 'wt-1', path: '/home/user/code/workdir', branch: 'main' }],
+              }),
+            }),
+          },
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      const meta = screen.getByText(/workdir \(main\)\s+60%/)
+      expect(meta).toBeInTheDocument()
+      expect(meta).toHaveAttribute(
+        'title',
+        'Directory: /home/user/code/workdir\nbranch: main',
+      )
+    })
+
+    it('omits the percent label when session.snapshot tokenUsage has no compactPercent', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-opencode-no-pct',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          createRequestId: 'req-opencode-2',
+          sessionId: 'opencode-sess-2',
+          status: 'idle',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-opencode-no-pct' },
+        },
+        {},
+        { projects: [] },
+        {
+          sessions: {
+            [makeFreshAgentSessionKey({
+              sessionType: 'freshopencode',
+              provider: 'opencode',
+              sessionId: 'opencode-sess-2',
+            })]: createFreshClaudeSession({
+              sessionId: 'opencode-sess-2',
+              sessionType: 'freshopencode',
+              provider: 'opencode',
+              cwd: '/home/user/code/notedir',
+              snapshot: makeSnapshot({
+                tokenUsage: {
+                  inputTokens: 10,
+                  outputTokens: 5,
+                  totalTokens: 15,
+                },
+                worktrees: [{ id: 'wt-1', path: '/home/user/code/notedir', branch: 'trunk' }],
+              }),
+            }),
+          },
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      expect(screen.getByText(/notedir \(trunk\)/)).toBeInTheDocument()
+      expect(screen.queryByText(/%\s*$/)).not.toBeInTheDocument()
+    })
   })
 
   describe('refresh button integration', () => {

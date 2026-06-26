@@ -23,6 +23,12 @@ vi.mock('lucide-react', () => ({
   RefreshCw: ({ className }: { className?: string }) => (
     <svg data-testid="refresh-icon" className={className} />
   ),
+  Terminal: () => null,
+  FileText: () => null,
+  Globe: () => null,
+  SquareTerminal: () => null,
+  FilePen: () => null,
+  FileSearch: () => null,
 }))
 
 vi.mock('@/components/icons/PaneIcon', () => ({
