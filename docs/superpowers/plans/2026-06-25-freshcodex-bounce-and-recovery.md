@@ -648,7 +648,7 @@ git commit -m "fix(codex): bound durable recovery retries"
 - Consumes: Task 1 and Task 2 commits.
 - Produces: one branch that passes focused tests, typecheck, and the coordinated full check.
 
-- [ ] **Step 1: Run focused client and server coverage together**
+- [x] **Step 1: Run focused client and server coverage together**
 
 Run:
 
@@ -659,7 +659,7 @@ npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test
 
 Expected: PASS for both commands.
 
-- [ ] **Step 2: Run lint/type/full coordinated verification**
+- [x] **Step 2: Run lint/type/full coordinated verification**
 
 Run:
 
@@ -669,7 +669,7 @@ FRESHELL_TEST_SUMMARY="freshcodex bounce and bounded codex recovery" npm run che
 
 Expected: PASS.
 
-- [ ] **Step 3: Inspect the branch diff**
+- [x] **Step 3: Inspect the branch diff**
 
 Run:
 
@@ -680,7 +680,7 @@ git status --short --branch
 
 Expected: only the planned source/test/plan files are changed, and the worktree is clean after commits.
 
-- [ ] **Step 4: Commit any verification-only follow-up**
+- [x] **Step 4: Commit any verification-only follow-up**
 
 If Step 1 or Step 2 required small fixes, commit them:
 
