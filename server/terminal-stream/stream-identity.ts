@@ -1,9 +1,7 @@
 import { randomUUID } from 'node:crypto'
 
 export type TerminalStreamReplacementReason =
-  | 'new_pty_session'
   | 'codex_pty_recovery'
-  | 'retention_lost'
   | 'server_restart_incompatible_retention'
 
 export type TerminalStreamIdentityTracker = {

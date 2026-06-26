@@ -623,7 +623,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
-  it('emits structured terminal.replay.retention logs when retention loss rotates stream identity', async () => {
+  it('logs replay retention without rotating stream identity', async () => {
     const registry = new FakeBrokerRegistry()
     registry.setReplayRingMaxBytes(6)
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
@@ -649,20 +649,20 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
       terminalId: 'term-structured-retention',
       attachRequestIds: ['structured-retention-attach'],
       attachmentCount: 1,
-      previousStreamId: ready.streamId,
-      streamId: expect.any(String),
+      streamId: ready.streamId,
       reason: 'retention_lost',
       retainedBytes: expect.any(Number),
       maxBytes: 6,
       tailSeq: expect.any(Number),
       headSeq: expect.any(Number),
     }))
+    expect(retentionLogs[0]?.previousStreamId).toBeUndefined()
     expect(retentionLogs[0]?.attachRequestId).toBeUndefined()
 
     broker.close()
   })
 
-  it('coalesces retention-loss stream replacement for one raw append and replays the retained tail on the final stream', async () => {
+  it('keeps one raw append on the current stream when replay retention evicts older frames', async () => {
     const registry = new FakeBrokerRegistry()
     registry.setReplayRingMaxBytes(18 * 1024)
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
@@ -690,19 +690,9 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     const streamChanges = livePayloads.filter((payload) => payload.type === 'terminal.stream.changed')
     const liveOutputs = livePayloads.filter((payload) => payload.type === 'terminal.output')
 
-    expect(streamChanges).toEqual([
-      expect.objectContaining({
-        terminalId,
-        reason: 'retention_lost',
-        attachRequestId: 'retention-live-attach',
-        streamId: expect.any(String),
-      }),
-    ])
-    const finalStreamId = streamChanges[0].streamId
-    expect(finalStreamId).not.toBe(initialReady.streamId)
+    expect(streamChanges).toEqual([])
     expect(liveOutputs.length).toBeGreaterThan(1)
-    expect(liveOutputs.every((payload) => payload.streamId === finalStreamId)).toBe(true)
-    expect(liveOutputs.every((payload) => payload.streamId !== initialReady.streamId)).toBe(true)
+    expect(liveOutputs.every((payload) => payload.streamId === initialReady.streamId)).toBe(true)
 
     const wsReplay = createMockWs()
     await broker.attach(
@@ -726,25 +716,53 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     expect(replayReady).toEqual(expect.objectContaining({
       terminalId,
       attachRequestId: 'retention-replay-attach',
-      streamId: finalStreamId,
+      streamId: initialReady.streamId,
     }))
     expect(replayGaps).toEqual([
       expect.objectContaining({
         terminalId,
         attachRequestId: 'retention-replay-attach',
-        streamId: finalStreamId,
+        streamId: initialReady.streamId,
         reason: 'replay_window_exceeded',
       }),
     ])
     expect(replayOutputs.length).toBeGreaterThan(0)
-    expect(replayOutputs.every((payload) => payload.streamId === finalStreamId)).toBe(true)
+    expect(replayOutputs.every((payload) => payload.streamId === initialReady.streamId)).toBe(true)
 
-    const streamBearingReplayPayloads = replayPayloads.filter((payload) => (
-      payload.type === 'terminal.attach.ready'
-      || payload.type === 'terminal.output'
-      || payload.type === 'terminal.output.gap'
-    ))
-    expect(streamBearingReplayPayloads.every((payload) => payload.streamId !== initialReady.streamId)).toBe(true)
+    broker.close()
+  })
+
+  it('does not emit stream-change churn during sustained replay retention evictions', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(6)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    const terminalId = 'term-retention-sustained'
+    registry.createTerminal(terminalId)
+
+    const ws = createMockWs()
+    await broker.attach(ws as any, terminalId, 'viewport_hydrate', 80, 24, 0, 'retention-sustained-attach')
+    const ready = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(ready?.streamId).toEqual(expect.any(String))
+    ws.send.mockClear()
+
+    for (let i = 0; i < 50; i += 1) {
+      registry.emit('terminal.output.raw', { terminalId, data: `x${String(i).padStart(2, '0')}`, at: Date.now() })
+    }
+    vi.advanceTimersByTime(5)
+
+    const payloads = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+    const outputs = payloads.filter((payload) => payload?.type === 'terminal.output')
+    expect(payloads.filter((payload) => payload?.type === 'terminal.stream.changed')).toEqual([])
+    expect(outputs.length).toBeGreaterThan(0)
+    expect(outputs.every((payload) => payload.streamId === ready.streamId)).toBe(true)
+
+    const retentionLogs = structuredLogs('warn', 'terminal.replay.retention')
+      .filter((payload) => payload.terminalId === terminalId)
+    expect(retentionLogs.length).toBeGreaterThan(0)
+    expect(retentionLogs.every((payload) => payload.streamId === ready.streamId)).toBe(true)
 
     broker.close()
   })
@@ -1343,7 +1361,48 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
-  it('notifies active clients when retention loss rotates live stream identity', async () => {
+  it('keeps a paced replay cursor on the same stream when retention moves before replay drains', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(12)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    const terminalId = 'term-retention-replay-cursor'
+    registry.createTerminal(terminalId)
+
+    for (const data of ['aaa', 'bbb', 'ccc', 'ddd']) {
+      registry.emit('terminal.output.raw', { terminalId, data, at: Date.now() })
+    }
+
+    const ws = createMockWs({ bufferedAmount: 1024 * 1024 })
+    await broker.attach(ws as any, terminalId, 'viewport_hydrate', 80, 24, 0, 'cursor-retention-attach')
+    const payloadsAfterAttach = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+    const ready = payloadsAfterAttach.find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(ready?.streamId).toEqual(expect.any(String))
+    ws.send.mockClear()
+
+    registry.emit('terminal.output.raw', { terminalId, data: 'eee', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId, data: 'fff', at: Date.now() })
+    ws.bufferedAmount = 0
+    vi.advanceTimersByTime(5)
+
+    const payloads = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+    expect(payloads.filter((payload) => payload?.type === 'terminal.stream.changed')).toEqual([])
+    const replayGap = payloads.find((payload) => payload?.type === 'terminal.output.gap')
+    expect(replayGap).toMatchObject({
+      terminalId,
+      streamId: ready.streamId,
+      reason: 'replay_window_exceeded',
+      attachRequestId: 'cursor-retention-attach',
+    })
+    const replayOutputs = payloads.filter((payload) => payload?.type === 'terminal.output')
+    expect(replayOutputs.length).toBeGreaterThan(0)
+    expect(replayOutputs.every((payload) => payload.streamId === ready.streamId)).toBe(true)
+
+    broker.close()
+  })
+
+  it('keeps active clients on the same stream when replay retention evicts older frames', async () => {
     const registry = new FakeBrokerRegistry()
     registry.setReplayRingMaxBytes(6)
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
@@ -1365,34 +1424,17 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
 
     const payloads = ws.send.mock.calls
       .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
-    const streamChangedIndex = payloads.findIndex((payload) =>
-      payload?.type === 'terminal.stream.changed' && payload.reason === 'retention_lost'
-    )
-    const cccOutputIndex = payloads.findIndex((payload) =>
-      payload?.type === 'terminal.output' && payload.data === 'ccc'
-    )
-    const streamChanged = payloads[streamChangedIndex]
-    const cccOutput = payloads[cccOutputIndex]
+    const streamChanges = payloads.filter((payload) => payload?.type === 'terminal.stream.changed')
+    const outputs = payloads.filter((payload) => payload?.type === 'terminal.output')
 
-    expect(streamChanged).toMatchObject({
-      terminalId: 'term-live-retention-change',
-      reason: 'retention_lost',
-      attachRequestId: 'live-retention-attach',
-      streamId: expect.any(String),
-    })
-    expect(streamChanged.streamId).not.toBe(ready.streamId)
-    expect(cccOutput).toMatchObject({
-      terminalId: 'term-live-retention-change',
-      data: 'ccc',
-      streamId: streamChanged.streamId,
-      attachRequestId: 'live-retention-attach',
-    })
-    expect(cccOutputIndex).toBeGreaterThan(streamChangedIndex)
+    expect(streamChanges).toEqual([])
+    expect(outputs.map((payload) => payload.data)).toEqual(['aaa', 'bbb', 'ccc'])
+    expect(outputs.every((payload) => payload.streamId === ready.streamId)).toBe(true)
 
     broker.close()
   })
 
-  it('retags queued live output when retention loss rotates stream identity before flush', async () => {
+  it('keeps queued live output on the same stream across replay retention', async () => {
     const registry = new FakeBrokerRegistry()
     registry.setReplayRingMaxBytes(6)
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
@@ -1413,31 +1455,20 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
 
     const payloads = ws.send.mock.calls
       .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
-    const streamChangedIndex = payloads.findIndex((payload) =>
-      payload?.type === 'terminal.stream.changed' && payload.reason === 'retention_lost'
-    )
-    const streamChanged = payloads[streamChangedIndex]
+    const streamChanges = payloads.filter((payload) => payload?.type === 'terminal.stream.changed')
     const outputs = payloads.filter((payload) => payload?.type === 'terminal.output')
 
-    expect(streamChanged).toMatchObject({
-      terminalId: 'term-live-retention-queued',
-      reason: 'retention_lost',
-      attachRequestId: 'live-retention-queued-attach',
-      streamId: expect.any(String),
-    })
-    expect(streamChanged.streamId).not.toBe(ready.streamId)
+    expect(streamChanges).toEqual([])
     expect(outputs.map((payload) => payload.data)).toEqual(['aaa', 'bbb', 'ccc'])
-    expect(outputs.every((payload) => payload.streamId === streamChanged.streamId)).toBe(true)
-    expect(outputs.every((payload) => payload.streamId !== ready.streamId)).toBe(true)
+    expect(outputs.every((payload) => payload.streamId === ready.streamId)).toBe(true)
     for (const output of outputs) {
-      expect(payloads.indexOf(output)).toBeGreaterThan(streamChangedIndex)
       expect(output.attachRequestId).toBe('live-retention-queued-attach')
     }
 
     broker.close()
   })
 
-  it('retags returned live fragments when retention loss rotates stream identity before enqueue', async () => {
+  it('keeps fragmented live output on the same stream across replay retention', async () => {
     const registry = new FakeBrokerRegistry()
     registry.setReplayRingMaxBytes(64 * 1024)
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
@@ -1462,24 +1493,18 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
 
     const payloads = ws.send.mock.calls
       .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
-    const streamChanges = payloads.filter((payload) =>
-      payload?.type === 'terminal.stream.changed' && payload.reason === 'retention_lost'
-    )
+    const streamChanges = payloads.filter((payload) => payload?.type === 'terminal.stream.changed')
     const outputs = payloads.filter((payload) => payload?.type === 'terminal.output')
-    const finalStreamId = streamChanges.at(-1)?.streamId
 
-    expect(streamChanges.length).toBeGreaterThan(0)
-    expect(finalStreamId).toEqual(expect.any(String))
-    expect(finalStreamId).not.toBe(ready.streamId)
+    expect(streamChanges).toEqual([])
     expect(outputs.length).toBeGreaterThan(0)
-    expect(outputs.every((payload) => payload.streamId === finalStreamId)).toBe(true)
-    expect(outputs.every((payload) => payload.streamId !== ready.streamId)).toBe(true)
+    expect(outputs.every((payload) => payload.streamId === ready.streamId)).toBe(true)
     expect(outputs.map((payload) => payload.data).join('')).toHaveLength(200 * 1024)
 
     broker.close()
   })
 
-  it('retags retained replay frames when retention loss rotates stream identity', async () => {
+  it('replays retained frames on the same stream after replay retention eviction', async () => {
     const registry = new FakeBrokerRegistry()
     registry.setReplayRingMaxBytes(6)
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
@@ -1512,15 +1537,16 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
 
     const payloadsAfterLoss = wsAfterLoss.send.mock.calls
       .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+    const streamChangesAfterLoss = payloadsAfterLoss.filter((payload) => payload?.type === 'terminal.stream.changed')
     const readyAfterLoss = payloadsAfterLoss
       .find((payload) => payload?.type === 'terminal.attach.ready')
-    expect(readyAfterLoss?.streamId).toEqual(expect.any(String))
-    expect(readyAfterLoss.streamId).not.toBe(initialStreamId)
+    expect(streamChangesAfterLoss).toEqual([])
+    expect(readyAfterLoss?.streamId).toBe(initialStreamId)
 
     const gapAfterLoss = payloadsAfterLoss
       .find((payload) => payload?.type === 'terminal.output.gap')
     expect(gapAfterLoss).toMatchObject({
-      streamId: readyAfterLoss.streamId,
+      streamId: initialStreamId,
       fromSeq: 1,
       toSeq: 1,
       reason: 'replay_window_exceeded',
@@ -1529,8 +1555,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     const replayOutputsAfterLoss = payloadsAfterLoss
       .filter((payload) => payload?.type === 'terminal.output')
     expect(replayOutputsAfterLoss.map((payload) => String(payload.data)).join('')).toBe('bbbccc')
-    expect(replayOutputsAfterLoss.every((payload) => payload.streamId === readyAfterLoss.streamId)).toBe(true)
-    expect(replayOutputsAfterLoss.every((payload) => payload.streamId !== initialStreamId)).toBe(true)
+    expect(replayOutputsAfterLoss.every((payload) => payload.streamId === initialStreamId)).toBe(true)
 
     broker.close()
   })

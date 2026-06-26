@@ -137,22 +137,6 @@ export class ClientOutputQueue {
     return this.pendingGaps.length > 0 || this.frames.length > 0
   }
 
-  retagPendingStream(fromStreamId: string, toStreamId: string): void {
-    if (!fromStreamId || !toStreamId || fromStreamId === toStreamId) return
-
-    for (const frame of this.frames) {
-      if (frame.streamId === fromStreamId) {
-        frame.streamId = toStreamId
-      }
-    }
-
-    for (const gap of this.pendingGaps) {
-      if (gap.streamId === fromStreamId) {
-        gap.streamId = toStreamId
-      }
-    }
-  }
-
   peekDroppedBytes(): number {
     return this.droppedBytes
   }

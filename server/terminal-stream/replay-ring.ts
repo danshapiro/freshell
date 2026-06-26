@@ -82,10 +82,6 @@ export class ReplayRing {
     return this.storage.consumeRetentionLoss()
   }
 
-  retagRetainedStreamSuffix(fromStreamId: string, toStreamId: string): void {
-    this.storage.retagRetainedStreamSuffix(fromStreamId, toStreamId)
-  }
-
   replaySince(sinceSeq?: number): { frames: ReplayFrame[]; missedFromSeq?: number } {
     return this.storage.replaySince(sinceSeq)
   }

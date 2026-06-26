@@ -86,14 +86,6 @@ export class ReplayDeque {
     return retentionLossPending
   }
 
-  retagRetainedStreamSuffix(fromStreamId: string, toStreamId: string): void {
-    for (let index = this.frames.length - 1; index >= this.startIndex; index -= 1) {
-      const frame = this.frames[index]
-      if (frame.streamId !== fromStreamId) break
-      frame.streamId = toStreamId
-    }
-  }
-
   replaySince(sinceSeq?: number): { frames: ReplayFrame[]; missedFromSeq?: number } {
     const normalizedSinceSeq = this.normalizeSinceSeq(sinceSeq)
     const missedFromSeq = this.missedFromSeq(normalizedSinceSeq)

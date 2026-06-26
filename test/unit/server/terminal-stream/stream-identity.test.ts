@@ -13,15 +13,15 @@ describe('terminal stream identity', () => {
     expect(tracker.ensureStream('term-1')).toBe(initial)
   })
 
-  it('changes stream id on pty replacement and incompatible retention loss', () => {
+  it('changes stream id on pty replacement and incompatible restart recovery', () => {
     const tracker = createTerminalStreamIdentityTracker()
     const initial = tracker.ensureStream('term-1')
 
-    const afterRecovery = tracker.replaceStream('term-1', 'codex_pty_recovery')
-    const afterRetentionLoss = tracker.replaceStream('term-1', 'retention_lost')
+    const afterCodexRecovery = tracker.replaceStream('term-1', 'codex_pty_recovery')
+    const afterRestartRecovery = tracker.replaceStream('term-1', 'server_restart_incompatible_retention')
 
-    expect(afterRecovery).not.toBe(initial)
-    expect(afterRetentionLoss).not.toBe(afterRecovery)
+    expect(afterCodexRecovery).not.toBe(initial)
+    expect(afterRestartRecovery).not.toBe(afterCodexRecovery)
   })
 
   it('uses fixed-length opaque stream ids across replacements', () => {
@@ -29,7 +29,7 @@ describe('terminal stream identity', () => {
     const ids = [
       tracker.ensureStream('term-variable-length-name'),
       tracker.replaceStream('term-variable-length-name', 'codex_pty_recovery'),
-      tracker.replaceStream('term-variable-length-name', 'retention_lost'),
+      tracker.replaceStream('term-variable-length-name', 'server_restart_incompatible_retention'),
     ]
 
     expect(new Set(ids).size).toBe(ids.length)

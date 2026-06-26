@@ -698,7 +698,7 @@ export class TerminalStreamBroker {
       this.terminals.set(terminalId, state)
     } else {
       state.replayRing.setMaxBytes(replayRingMaxBytes)
-      this.handleReplayRetentionLoss(terminalId, state, this.streamIdentity.ensureStream(terminalId))
+      this.handleReplayRetentionLoss(terminalId, state)
     }
     return state
   }
@@ -821,20 +821,8 @@ export class TerminalStreamBroker {
       frames.push(state.replayRing.append(fragment, { streamId }))
     }
 
-    const retainedStreamId = this.handleReplayRetentionLoss(terminalId, state, streamId)
-    if (retainedStreamId) {
-      this.retagFrames(frames, streamId, retainedStreamId)
-    }
+    this.handleReplayRetentionLoss(terminalId, state)
     return frames
-  }
-
-  private retagFrames(frames: ReplayFrame[], fromStreamId: string, toStreamId: string): void {
-    if (!fromStreamId || !toStreamId || fromStreamId === toStreamId) return
-    for (const frame of frames) {
-      if (frame.streamId === fromStreamId) {
-        frame.streamId = toStreamId
-      }
-    }
   }
 
   private scheduleFlush(
@@ -1288,10 +1276,9 @@ export class TerminalStreamBroker {
   private logTerminalReplayRetention(input: {
     terminalId: string
     streamId: string
-    previousStreamId?: string
     attachRequestIds: string[]
     attachmentCount: number
-    reason: TerminalStreamReplacementReason
+    reason: 'retention_lost'
     retainedBytes: number
     maxBytes: number
     tailSeq: number
@@ -1303,7 +1290,6 @@ export class TerminalStreamBroker {
       severity: 'warn',
       terminalId: input.terminalId,
       streamId: input.streamId,
-      ...(input.previousStreamId ? { previousStreamId: input.previousStreamId } : {}),
       attachRequestIds: input.attachRequestIds,
       attachmentCount: input.attachmentCount,
       reason: input.reason,
@@ -1315,7 +1301,7 @@ export class TerminalStreamBroker {
         ? { suppressedCount: input.suppressedCount }
         : {}),
     }
-    log.warn(basePayload, 'Terminal replay retention loss changed stream identity')
+    log.warn(basePayload, 'Terminal replay retention evicted old output')
   }
 
   private sendFrame(
@@ -2183,19 +2169,10 @@ export class TerminalStreamBroker {
   }
 
   private replaceStreamIdentity(terminalId: string, reason: TerminalStreamReplacementReason): string {
-    const previousStreamId = this.streamIdentity.getStream(terminalId)
     const streamId = this.streamIdentity.replaceStream(terminalId, reason)
     const state = this.terminals.get(terminalId)
     if (state) {
       for (const attachment of state.clients.values()) {
-        if (previousStreamId && reason === 'retention_lost') {
-          attachment.queue.retagPendingStream(previousStreamId, streamId)
-          for (const frame of attachment.attachStaging) {
-            if (frame.streamId === previousStreamId) {
-              frame.streamId = streamId
-            }
-          }
-        }
         this.sendStreamChanged(
           attachment.ws,
           terminalId,
@@ -2258,12 +2235,9 @@ export class TerminalStreamBroker {
   private handleReplayRetentionLoss(
     terminalId: string,
     state: BrokerTerminalState,
-    retainedSuffixStreamId: string,
-  ): string | undefined {
-    if (!state.replayRing.consumeRetentionLoss()) return undefined
-    const previousStreamId = this.streamIdentity.getStream(terminalId)
-    const streamId = this.replaceStreamIdentity(terminalId, 'retention_lost')
-    state.replayRing.retagRetainedStreamSuffix(retainedSuffixStreamId, streamId)
+  ): void {
+    if (!state.replayRing.consumeRetentionLoss()) return
+    const streamId = this.streamIdentity.ensureStream(terminalId)
     const now = Date.now()
     const lastLogAt = state.replayRetentionLogLastAt
     if (
@@ -2271,7 +2245,7 @@ export class TerminalStreamBroker {
       && now - lastLogAt < TERMINAL_REPLAY_RETENTION_LOG_RATE_LIMIT_MS
     ) {
       state.replayRetentionLogSuppressed = (state.replayRetentionLogSuppressed ?? 0) + 1
-      return streamId
+      return
     }
     const suppressedCount = state.replayRetentionLogSuppressed ?? 0
     state.replayRetentionLogLastAt = now
@@ -2279,7 +2253,6 @@ export class TerminalStreamBroker {
     this.logTerminalReplayRetention({
       terminalId,
       streamId,
-      ...(previousStreamId ? { previousStreamId } : {}),
       attachRequestIds: [...state.clients.values()]
         .map((attachment) => attachment.activeAttachRequestId)
         .filter((attachRequestId): attachRequestId is string => Boolean(attachRequestId)),
@@ -2291,7 +2264,6 @@ export class TerminalStreamBroker {
       headSeq: state.replayRing.headSeq(),
       ...(suppressedCount > 0 ? { suppressedCount } : {}),
     })
-    return streamId
   }
 
   private withTerminalLock(terminalId: string, task: () => Promise<void>): Promise<void> {

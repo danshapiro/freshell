@@ -242,33 +242,4 @@ describe('ClientOutputQueue', () => {
     })
   })
 
-  it('retags queued frames and pending gaps when stream identity rotates before flush', () => {
-    const queue = new ClientOutputQueue(2)
-    queue.enqueue(frame(1, '1', 'stream-old'))
-    queue.enqueue(frame(2, '2', 'stream-old'))
-    queue.enqueue(frame(3, '3', 'stream-old'))
-
-    queue.retagPendingStream('stream-old', 'stream-new')
-
-    const batch = queue.nextBatch(64)
-    const gaps = batch.filter(isGapEvent)
-    const dataFrames = batch.filter((entry): entry is ReplayFrame => entry.type !== 'gap')
-
-    expect(gaps).toEqual([
-      {
-        type: 'gap',
-        fromSeq: 1,
-        toSeq: 1,
-        streamId: 'stream-new',
-        reason: 'queue_overflow',
-      },
-    ])
-    expect(dataFrames).toHaveLength(1)
-    expect(dataFrames[0]).toMatchObject({
-      seqStart: 2,
-      seqEnd: 3,
-      data: '23',
-      streamId: 'stream-new',
-    })
-  })
 })
