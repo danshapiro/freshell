@@ -25,6 +25,19 @@ function stringProperty(value: unknown, key: string): string | undefined {
   return typeof candidate === 'string' ? candidate : undefined
 }
 
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined
+}
+
+function opencodeErrorMessage(value: unknown): string | undefined {
+  if (typeof value === 'string') return nonEmptyString(value)
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  return nonEmptyString(record.message)
+    ?? stringProperty(record.data, 'message')
+    ?? nonEmptyString(record.error)
+}
+
 function eventPayload(raw: Record<string, unknown>): Record<string, unknown> | null {
   if (typeof raw.type === 'string') return raw
   const payload = raw.payload
@@ -94,7 +107,7 @@ export function serveEventToSdk(parsed: ParsedServeEvent, subscribedId: string):
       return { type: 'sdk.session.changed', sessionId: subscribedId, reason: 'opencode-status' }
     }
     case 'session.error': {
-      const message = stringProperty(props.error, 'message') ?? 'OpenCode session error'
+      const message = opencodeErrorMessage(props.error) ?? 'OpenCode session error'
       return { type: 'sdk.error', sessionId: subscribedId, message }
     }
     default:
