@@ -61,6 +61,7 @@ const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
   'freshAgent.session.changed',
   'freshAgent.session.snapshot',
   'freshAgent.result',
+  'freshAgent.turn.complete',
   'freshAgent.permission.request',
   'freshAgent.permission.cancelled',
   'freshAgent.question.request',
@@ -577,6 +578,7 @@ export function FreshAgentView({
   const [loadError, setLoadError] = useState<string | null>(null)
   const [snapshotRefreshNonce, setSnapshotRefreshNonce] = useState(0)
   const snapshotRefreshTimerRef = useRef<number | null>(null)
+  const snapshotRefreshFollowUpRef = useRef(false)
   const [queuedMessages, setQueuedMessages] = useState<string[]>([])
   // Transient, self-clearing banner for action feedback (rewind, shell errors).
   const [notice, setNotice] = useState<string | null>(null)
@@ -714,12 +716,19 @@ export function FreshAgentView({
     ws.send(message as never)
   }, [paneId, ws])
 
-  const scheduleSnapshotRefresh = useCallback(() => {
-    if (snapshotRefreshTimerRef.current !== null) return
-    snapshotRefreshTimerRef.current = window.setTimeout(() => {
+  const scheduleSnapshotRefresh = useCallback((options?: { followUpIfPending?: boolean }) => {
+    if (snapshotRefreshTimerRef.current !== null) {
+      if (options?.followUpIfPending) snapshotRefreshFollowUpRef.current = true
+      return
+    }
+    const fireRefresh = () => {
       snapshotRefreshTimerRef.current = null
       setSnapshotRefreshNonce((value) => value + 1)
-    }, SNAPSHOT_REFRESH_COALESCE_MS)
+      if (!snapshotRefreshFollowUpRef.current) return
+      snapshotRefreshFollowUpRef.current = false
+      snapshotRefreshTimerRef.current = window.setTimeout(fireRefresh, SNAPSHOT_REFRESH_COALESCE_MS)
+    }
+    snapshotRefreshTimerRef.current = window.setTimeout(fireRefresh, SNAPSHOT_REFRESH_COALESCE_MS)
   }, [])
 
   useEffect(() => () => {
@@ -727,6 +736,7 @@ export function FreshAgentView({
       window.clearTimeout(snapshotRefreshTimerRef.current)
       snapshotRefreshTimerRef.current = null
     }
+    snapshotRefreshFollowUpRef.current = false
   }, [])
 
   const recordPendingSendMetadata = useCallback((requestId: string, patch: PendingSendMetadata) => {
@@ -1170,13 +1180,15 @@ export function FreshAgentView({
         } else {
           recordPendingSendMetadata(message.requestId, { legacyAccepted: true })
         }
-        scheduleSnapshotRefresh()
+        scheduleSnapshotRefresh({ followUpIfPending: true })
       }
       if (
         isSnapshotInvalidatingFreshAgentEvent(message)
         && locatorMatchesPane(message, paneContentRef.current, freshOpenCodeRouteCwdRef.current)
       ) {
-        scheduleSnapshotRefresh()
+        scheduleSnapshotRefresh({
+          followUpIfPending: readMessageEventType(message) === 'freshAgent.turn.complete',
+        })
       }
       if (
         message.type === 'freshAgent.forked'

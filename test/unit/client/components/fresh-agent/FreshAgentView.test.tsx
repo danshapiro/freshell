@@ -3913,6 +3913,123 @@ describe('FreshAgentView', () => {
     })
   })
 
+  it('performs a follow-up freshopencode refresh when final send acceptance lands during an earlier invalidation debounce', async () => {
+    const store = createStore()
+    let wsHandler: ((message: any) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      wsHandler = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_final_race',
+        status: 'idle',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [],
+      })
+      .mockResolvedValueOnce({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_final_race',
+        revision: 2,
+        status: 'idle',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [
+          {
+            id: 'turn-final-user',
+            turnId: 'turn-final-user',
+            role: 'user',
+            summary: 'Race final prompt',
+            items: [{ id: 'item-final-user', kind: 'text', text: 'Race final prompt' }],
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_final_race',
+        revision: 3,
+        status: 'idle',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [
+          {
+            id: 'turn-final-user',
+            turnId: 'turn-final-user',
+            role: 'user',
+            summary: 'Race final prompt',
+            items: [{ id: 'item-final-user', kind: 'text', text: 'Race final prompt' }],
+          },
+          {
+            id: 'turn-final-assistant',
+            turnId: 'turn-final-assistant',
+            role: 'assistant',
+            summary: 'Final answer after durable history catches up',
+            items: [{ id: 'item-final-assistant', kind: 'text', text: 'Final answer after durable history catches up' }],
+          },
+        ],
+      })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-final-race',
+        sessionId: 'ses_final_race',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_final_race' },
+        resumeSessionId: 'ses_final_race',
+        initialCwd: '/repo/final-race',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Race final prompt' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const send = sentFreshAgentMessages('freshAgent.send').at(-1)
+    const requestId = String(send?.requestId)
+
+    act(() => {
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_final_race',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.session.changed',
+          sessionId: 'ses_final_race',
+          reason: 'opencode-message',
+        },
+      })
+      wsHandler?.({
+        type: 'freshAgent.send.accepted',
+        requestId,
+        sessionId: 'ses_final_race',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/repo/final-race',
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText('Final answer after durable history catches up')).toBeInTheDocument()
+    })
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3)
+  })
+
   it('clears stale local echo after an idle recovered snapshot without the submitted turn', async () => {
     const store = createStore()
     let wsHandler: ((message: any) => void) | undefined
