@@ -90,6 +90,8 @@ class FakeProxy {
   readonly wsUrl: string
   readonly upstreamWsUrl: string
   readonly requireCandidatePersistence: boolean
+  readonly pauseCandidateCapture = vi.fn()
+  readonly resumeCandidateCapture = vi.fn()
 
   constructor(options: FakeProxyOptions) {
     this.upstreamWsUrl = options.upstreamWsUrl
@@ -414,5 +416,21 @@ describe('CodexLaunchPlanner', () => {
     await planner.planCreate({ resumeSessionId: 'thread-ready', cwd: '/repo/resume' })
 
     expect(runtime.ensureReadyCwdCalls).toEqual(['/repo/resume'])
+  })
+
+  it('forwards candidate capture pause and resume through the sidecar', async () => {
+    const runtime = new FakeRuntime('ws://127.0.0.1:43026', 'thread-pause')
+    const proxies: FakeProxy[] = []
+    const planner = createPlanner(() => runtime as any, proxies)
+
+    const plan = await planner.planCreate({ cwd: '/repo/pause' })
+
+    ;(plan.sidecar as any).pauseCandidateCapture('startup_update_prompt')
+    ;(plan.sidecar as any).resumeCandidateCapture('startup_update_prompt_skipped')
+
+    expect(proxies[0].pauseCandidateCapture).toHaveBeenCalledWith('startup_update_prompt')
+    expect(proxies[0].resumeCandidateCapture).toHaveBeenCalledWith('startup_update_prompt_skipped')
+
+    await plan.sidecar.shutdown()
   })
 })

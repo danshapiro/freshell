@@ -1,5 +1,5 @@
 import WebSocket, { WebSocketServer } from 'ws'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { CodexRemoteProxy } from '../../../../../server/coding-cli/codex-app-server/remote-proxy.js'
 
 type UpstreamHandle = {
@@ -14,15 +14,19 @@ const upstreams = new Set<UpstreamHandle>()
 const proxies = new Set<CodexRemoteProxy>()
 
 afterEach(async () => {
-  await Promise.all([...proxies].map(async (proxy) => {
-    proxies.delete(proxy)
-    await proxy.close()
-  }))
-  await Promise.all([...upstreams].map(async (upstream) => {
-    upstreams.delete(upstream)
-    for (const socket of upstream.sockets) socket.close()
-    await new Promise<void>((resolve) => upstream.server.close(() => resolve()))
-  }))
+  try {
+    await Promise.all([...proxies].map(async (proxy) => {
+      proxies.delete(proxy)
+      await proxy.close()
+    }))
+    await Promise.all([...upstreams].map(async (upstream) => {
+      upstreams.delete(upstream)
+      for (const socket of upstream.sockets) socket.close()
+      await new Promise<void>((resolve) => upstream.server.close(() => resolve()))
+    }))
+  } finally {
+    vi.useRealTimers()
+  }
 })
 
 async function startUpstream(handler?: (socket: WebSocket, message: any) => void): Promise<UpstreamHandle> {
@@ -323,6 +327,46 @@ describe('CodexRemoteProxy', () => {
     await delay(50)
 
     expect(upstream.messages).toHaveLength(0)
+    expect(repairTriggers).toContainEqual({ kind: 'candidate_capture_timeout' })
+  })
+
+  it('pauses candidate capture timeout and ignores timer rearm attempts while paused', () => {
+    vi.useFakeTimers()
+    const proxy = new CodexRemoteProxy({
+      upstreamWsUrl: 'ws://127.0.0.1:1',
+      candidateCaptureTimeoutMs: 1_000,
+    })
+    proxies.add(proxy)
+    const repairTriggers: unknown[] = []
+    proxy.onRepairTrigger((event) => repairTriggers.push(event))
+
+    ;(proxy as any).ensureCandidateCaptureTimer()
+    proxy.pauseCandidateCapture('startup_update_prompt')
+    ;(proxy as any).ensureCandidateCaptureTimer()
+
+    vi.advanceTimersByTime(5_000)
+
+    expect(repairTriggers).toEqual([])
+  })
+
+  it('resumes candidate capture timeout so a later timeout still fires', () => {
+    vi.useFakeTimers()
+    const proxy = new CodexRemoteProxy({
+      upstreamWsUrl: 'ws://127.0.0.1:1',
+      candidateCaptureTimeoutMs: 1_000,
+    })
+    proxies.add(proxy)
+    const repairTriggers: unknown[] = []
+    proxy.onRepairTrigger((event) => repairTriggers.push(event))
+
+    proxy.pauseCandidateCapture('startup_update_prompt')
+    ;(proxy as any).ensureCandidateCaptureTimer()
+    vi.advanceTimersByTime(5_000)
+    expect(repairTriggers).toEqual([])
+
+    proxy.resumeCandidateCapture('startup_update_prompt_skipped')
+    vi.advanceTimersByTime(1_000)
+
     expect(repairTriggers).toContainEqual({ kind: 'candidate_capture_timeout' })
   })
 

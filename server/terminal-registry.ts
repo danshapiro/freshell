@@ -577,6 +577,8 @@ export type TerminalRecord = {
     | 'watchPath'
     | 'unwatchPath'
     | 'markCandidatePersisted'
+    | 'pauseCandidateCapture'
+    | 'resumeCandidateCapture'
     | 'readThreadTurn'
     | 'listThreadTurns'
   >
@@ -695,9 +697,13 @@ function observeCodexStartupOutput(record: TerminalRecord, data: string, now: nu
   if (gate?.state !== 'identity_pending') return
   gate.startupOutputTail = `${gate.startupOutputTail ?? ''}${data}`.slice(-CODEX_STARTUP_UPDATE_PROMPT_TAIL_CHARS)
   if (!hasCodexStartupUpdatePrompt(gate.startupOutputTail)) return
+  const firstDetection = !gate.startupUpdatePrompt
   gate.startupUpdatePrompt = {
     detectedAt: gate.startupUpdatePrompt?.detectedAt ?? now,
     lastMatchedAt: now,
+  }
+  if (firstDetection) {
+    record.codexSidecar?.pauseCandidateCapture?.('codex_startup_update_prompt')
   }
 }
 
@@ -729,6 +735,7 @@ function handleCodexStartupUpdatePromptInput(record: TerminalRecord, data: strin
     if (choice.choice === 'update_now') {
       record.codexInputGate = { state: 'update_running', startedAt: now }
     } else {
+      record.codexSidecar?.resumeCandidateCapture?.('codex_startup_update_skipped')
       clearCodexStartupUpdatePromptState(gate)
     }
     return true
@@ -1425,12 +1432,20 @@ export class TerminalRegistry extends EventEmitter {
     })
   }
 
+  private clearCodexInputGate(record: TerminalRecord): void {
+    if (record.codexInputGate?.state === 'identity_pending' && record.codexInputGate.startupUpdatePrompt) {
+      record.codexSidecar?.resumeCandidateCapture?.('codex_input_gate_cleared')
+    }
+    record.codexInputGate = undefined
+  }
+
   private finishTerminalPtyExit(
     record: TerminalRecord,
     event: { exitCode: number; signal?: number },
   ): void {
     this.clearCodexPendingCleanExitFinalizer(record)
     this.markCodexRecoveryFinalClose(record)
+    this.clearCodexInputGate(record)
     record.status = 'exited'
     record.exitCode = event.exitCode
     const now = Date.now()
@@ -2149,8 +2164,8 @@ export class TerminalRegistry extends EventEmitter {
     }
     const storedDurability = this.codexDurabilityRecordToRef(stored)
     record.codexDurability = storedDurability
-    record.codexInputGate = undefined
     record.codexSidecar?.markCandidatePersisted?.()
+    this.clearCodexInputGate(record)
     this.armCodexRolloutWatch(record)
     logger.info({
       terminalId,
@@ -2184,7 +2199,7 @@ export class TerminalRegistry extends EventEmitter {
     }
     try {
       const stored = await this.writeCodexDurability(record, durability)
-      record.codexInputGate = undefined
+      this.clearCodexInputGate(record)
       this.broadcastCodexDurability(record, stored)
     } catch (err) {
       logger.error({ err, terminalId, reason }, 'Failed to persist non-restorable Codex identity state')
@@ -3012,6 +3027,7 @@ export class TerminalRegistry extends EventEmitter {
 
       record.codexSidecarLifecycleUnsubscribe?.()
       record.codexSidecarLifecycleUnsubscribe = undefined
+      this.clearCodexInputGate(record)
       record.pty = candidate.pty
       this.emit('terminal.stream.replaced', {
         terminalId: record.terminalId,
@@ -3342,8 +3358,8 @@ export class TerminalRegistry extends EventEmitter {
   releaseCodexInputGateForTest(terminalId: string): boolean {
     const term = this.terminals.get(terminalId)
     if (!term) return false
-    term.codexInputGate = undefined
     term.codexSidecar?.markCandidatePersisted?.()
+    this.clearCodexInputGate(term)
     return true
   }
 
@@ -3382,6 +3398,7 @@ export class TerminalRegistry extends EventEmitter {
       return true
     }
     this.markCodexRecoveryFinalClose(term)
+    this.clearCodexInputGate(term)
     cleanupMcpConfig(terminalId, term.mode, term.mcpCwd)
     try {
       term.pty.kill()

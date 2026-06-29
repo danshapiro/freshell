@@ -92,6 +92,8 @@ function createFakeSidecar(options: {
     adopt: vi.fn(options.adopt ?? (async () => undefined)),
     shutdown: vi.fn(options.shutdown ?? (async () => undefined)),
     markCandidatePersisted: vi.fn(),
+    pauseCandidateCapture: vi.fn(),
+    resumeCandidateCapture: vi.fn(),
     watchPath: vi.fn(async (targetPath: string) => ({ path: targetPath })),
     unwatchPath: vi.fn(async () => undefined),
     onCandidate: vi.fn((handler: (event: any) => void) => {
@@ -289,12 +291,13 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
 
   it('allows Codex update prompt menu replies without the optional update banner', () => {
     const registry = new TerminalRegistry()
+    const sidecar = createFakeSidecar()
     const term = registry.create({
       mode: 'codex',
       providerSettings: {
         codexAppServer: {
           wsUrl: 'ws://127.0.0.1:43123',
-          sidecar: createFakeSidecar(),
+          sidecar,
         },
       } as any,
     })
@@ -310,12 +313,70 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       'Press enter to continue\r\n',
     ].join(''))
 
+    expect(sidecar.pauseCandidateCapture).toHaveBeenCalledWith('codex_startup_update_prompt')
+
     expect(registry.input(term.terminalId, '2')).toEqual({ status: 'written' })
+    expect(sidecar.resumeCandidateCapture).toHaveBeenCalledWith('codex_startup_update_skipped')
     expect(pty.write).toHaveBeenLastCalledWith('2')
     expect(registry.input(term.terminalId, 'hello\r')).toEqual({
       status: 'blocked_codex_identity_pending',
       terminalId: term.terminalId,
     })
+  })
+
+  it('pauses candidate capture once when a Codex startup update prompt is detected', () => {
+    const registry = new TerminalRegistry()
+    const sidecar = createFakeSidecar()
+    const term = registry.create({
+      mode: 'codex',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar,
+        },
+      } as any,
+    })
+
+    const pty = mockPtyProcess.instances[0]
+    pty._emitData([
+      'Release notes: https://github.com/openai/codex/releases/latest\r\n',
+      '› 1. Update now (runs `npm install -g @openai/codex`)\r\n',
+      '  2. Skip\r\n',
+      '  3. Skip until next version\r\n',
+      'Press enter to continue\r\n',
+    ].join(''))
+    pty._emitData('Still waiting at the same update prompt\r\n')
+
+    expect(sidecar.pauseCandidateCapture).toHaveBeenCalledTimes(1)
+    expect(sidecar.pauseCandidateCapture).toHaveBeenCalledWith('codex_startup_update_prompt')
+  })
+
+  it('does not resume candidate capture when the Codex startup update choice starts the updater', () => {
+    const registry = new TerminalRegistry()
+    const sidecar = createFakeSidecar()
+    const term = registry.create({
+      mode: 'codex',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar,
+        },
+      } as any,
+    })
+
+    const pty = mockPtyProcess.instances[0]
+    pty._emitData([
+      'Release notes: https://github.com/openai/codex/releases/latest\r\n',
+      '› 1. Update now (runs `npm install -g @openai/codex`)\r\n',
+      '  2. Skip\r\n',
+      '  3. Skip until next version\r\n',
+      'Press enter to continue\r\n',
+    ].join(''))
+
+    expect(registry.input(term.terminalId, '1')).toEqual({ status: 'written' })
+
+    expect(sidecar.resumeCandidateCapture).not.toHaveBeenCalled()
+    expect(pty.write).toHaveBeenLastCalledWith('1')
   })
 
   it('detects the Codex update prompt across split PTY chunks with terminal controls', () => {

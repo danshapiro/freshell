@@ -29,6 +29,8 @@ type CodexRuntimeLike = Pick<
 export type CodexLaunchSidecar = {
   adopt(input: { terminalId: string; generation: number }): Promise<void>
   markCandidatePersisted?(): void
+  pauseCandidateCapture?(reason: string): void
+  resumeCandidateCapture?(reason: string): void
   onCandidate?(handler: (candidate: CodexRemoteProxyCandidate) => void): () => void
   onTurnStarted?(handler: (event: CodexTurnEvent) => void): () => void
   onTurnCompleted?(handler: (event: CodexTurnEvent) => void): () => void
@@ -73,6 +75,8 @@ type CodexLaunchProxy = Pick<
   | 'start'
   | 'close'
   | 'markCandidatePersisted'
+  | 'pauseCandidateCapture'
+  | 'resumeCandidateCapture'
   | 'onCandidate'
   | 'onTurnStarted'
   | 'onTurnCompleted'
@@ -237,6 +241,8 @@ export class CodexLaunchPlanner {
         this.failedSidecarShutdowns.delete(sidecar)
       },
       markCandidatePersisted: () => getProxy()?.markCandidatePersisted(),
+      pauseCandidateCapture: (reason) => getProxy()?.pauseCandidateCapture(reason),
+      resumeCandidateCapture: (reason) => getProxy()?.resumeCandidateCapture(reason),
       onCandidate: (handler) => getProxy()?.onCandidate(handler) ?? (() => undefined),
       onTurnStarted: (handler) => getProxy()?.onTurnStarted(handler) ?? (() => undefined),
       onTurnCompleted: (handler) => getProxy()?.onTurnCompleted(handler) ?? (() => undefined),

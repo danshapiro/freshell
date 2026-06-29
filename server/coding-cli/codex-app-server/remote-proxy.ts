@@ -60,6 +60,7 @@ export class CodexRemoteProxy {
   private endpoint: LoopbackServerEndpoint | null = null
   private candidatePersisted = false
   private candidateCaptureFailed = false
+  private candidateCapturePaused = false
   private candidateCaptureTimer: NodeJS.Timeout | null = null
   private readonly pendingTurnStarts = new Set<PendingTurnStart>()
   private readonly connections = new Set<ProxyConnection>()
@@ -149,6 +150,22 @@ export class CodexRemoteProxy {
       connection.client.close()
       connection.upstream.close()
     }
+  }
+
+  pauseCandidateCapture(reason: string): void {
+    if (!this.requireCandidatePersistence) return
+    if (this.candidatePersisted || this.candidateCaptureFailed) return
+    this.candidateCapturePaused = true
+    this.clearCandidateCaptureTimer()
+    log.info({ reason }, 'Paused Codex restore identity candidate-capture timeout')
+  }
+
+  resumeCandidateCapture(reason: string): void {
+    if (!this.requireCandidatePersistence) return
+    if (this.candidatePersisted || this.candidateCaptureFailed) return
+    this.candidateCapturePaused = false
+    this.ensureCandidateCaptureTimer()
+    log.info({ reason }, 'Resumed Codex restore identity candidate-capture timeout')
   }
 
   onCandidate(handler: (candidate: CodexRemoteProxyCandidate) => void): () => void {
@@ -457,7 +474,7 @@ export class CodexRemoteProxy {
 
   private ensureCandidateCaptureTimer(): void {
     if (!this.requireCandidatePersistence) return
-    if (this.candidatePersisted || this.candidateCaptureTimer) return
+    if (this.candidatePersisted || this.candidateCaptureFailed || this.candidateCapturePaused || this.candidateCaptureTimer) return
     this.candidateCaptureTimer = setTimeout(() => {
       this.failCandidateCapture('Freshell timed out before Codex restore identity was captured.')
     }, this.candidateCaptureTimeoutMs)
