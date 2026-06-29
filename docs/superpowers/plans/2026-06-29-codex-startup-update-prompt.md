@@ -374,7 +374,7 @@ Normalize terminal text with existing `stripTerminalControls()` and newline-pres
 
 ```ts
 text.includes('github.com/openai/codex/releases/latest')
-/(?:^|\n)[ \t]*[›>]?[ \t]*1[.)][ \t]*Update now[ \t]*\(runs[ \t]+`?[^`\n]*(?:npm|bun|brew)[^`\n]*`?\)/i
+/(?:^|\n)[ \t]*[›>]?[ \t]*1[.)][ \t]*Update now[ \t]*\(runs[ \t]+[^)\n]+\)/i
 /(?:^|\n)[ \t]*[›>]?[ \t]*2[.)][ \t]*Skip\b/i
 /(?:^|\n)[ \t]*[›>]?[ \t]*3[.)][ \t]*Skip until next version\b/i
 /Press\s+enter\s+to\s+continue/i

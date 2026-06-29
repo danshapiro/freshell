@@ -681,7 +681,7 @@ function normalizeCodexStartupUpdatePromptText(data: string): string {
 function hasCodexStartupUpdatePrompt(text: string): boolean {
   const normalized = normalizeCodexStartupUpdatePromptText(text)
   return normalized.includes('github.com/openai/codex/releases/latest')
-    && /(?:^|\n)[ \t]*[\u203a>]?[ \t]*1[.)][ \t]*Update now[ \t]*\(runs[ \t]+`?[^`\n]*(?:npm|bun|brew)[^`\n]*`?\)/i.test(normalized)
+    && /(?:^|\n)[ \t]*[\u203a>]?[ \t]*1[.)][ \t]*Update now[ \t]*\(runs[ \t]+[^)\n]+\)/i.test(normalized)
     && /(?:^|\n)[ \t]*[\u203a>]?[ \t]*2[.)][ \t]*Skip\b/i.test(normalized)
     && /(?:^|\n)[ \t]*[\u203a>]?[ \t]*3[.)][ \t]*Skip until next version\b/i.test(normalized)
     && /Press\s+enter\s+to\s+continue/i.test(normalized)

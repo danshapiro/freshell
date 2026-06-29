@@ -169,10 +169,13 @@ function createCandidateExitPlanCreate() {
   return planCreate
 }
 
-function emitCodexStartupUpdatePrompt(pty: { _emitData(data: string): void }): void {
+function emitCodexStartupUpdatePrompt(
+  pty: { _emitData(data: string): void },
+  command = 'npm install -g @openai/codex',
+): void {
   pty._emitData([
     'Release notes: https://github.com/openai/codex/releases/latest\r\n',
-    '› 1. Update now (runs `npm install -g @openai/codex`)\r\n',
+    `› 1. Update now (runs \`${command}\`)\r\n`,
     '  2. Skip\r\n',
     '  3. Skip until next version\r\n',
     'Press enter to continue\r\n',
@@ -639,6 +642,28 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
 
     expect(registry.input(term.terminalId, '\r')).toEqual({ status: 'written' })
     expect(pty.write).toHaveBeenLastCalledWith('\r')
+  })
+
+  it.each([
+    ['standalone Unix', "sh -c 'curl -fsSL https://chatgpt.com/codex/install.sh | sh'"],
+    ['standalone Windows', "powershell -ExecutionPolicy Bypass -c 'irm https://chatgpt.com/codex/install.ps1 | iex'"],
+  ])('detects the Codex update prompt for %s install commands', (_label, command) => {
+    const registry = new TerminalRegistry()
+    const term = registry.create({
+      mode: 'codex',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar: createFakeSidecar(),
+        },
+      } as any,
+    })
+
+    const pty = mockPtyProcess.instances[0]
+    emitCodexStartupUpdatePrompt(pty, command)
+
+    expect(registry.input(term.terminalId, '2')).toEqual({ status: 'written' })
+    expect(pty.write).toHaveBeenLastCalledWith('2')
   })
 
   it('keeps a detected Codex update prompt answerable after a long idle', () => {
