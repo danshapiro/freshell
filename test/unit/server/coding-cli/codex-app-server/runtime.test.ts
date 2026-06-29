@@ -292,7 +292,7 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     expect(runtime.status()).toBe('running')
   })
 
-  it('disables Codex apps while starting Freshell-managed app-server processes', async () => {
+  it('uses managed Codex config while starting Freshell-managed app-server processes', async () => {
     const tempDir = await makeTempDir()
     const argLogPath = path.join(tempDir, 'argv.json')
     const runtime = createRuntime({
@@ -310,7 +310,9 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
 
     expect(args).toContain('-c')
     expect(args).toContain('features.apps=false')
+    expect(args).toContain('check_for_update_on_startup=false')
     expect(args.indexOf('features.apps=false')).toBeLessThan(args.indexOf('app-server'))
+    expect(args.indexOf('check_for_update_on_startup=false')).toBeLessThan(args.indexOf('app-server'))
     expect(args).toContain('--listen')
   })
 

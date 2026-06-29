@@ -962,7 +962,7 @@ describe('buildSpawnSpec Unix paths', () => {
       expect(spec.args.slice(-2)).toEqual(['resume', 'session-123'])
     })
 
-    it('disables Codex apps for Freshell-managed remote launches', () => {
+    it('uses managed Codex config for Freshell-managed remote launches', () => {
       delete process.env.CODEX_CMD
 
       const spec = buildSpawnSpec('codex', '/home/user/project', 'system', undefined, {
@@ -971,21 +971,24 @@ describe('buildSpawnSpec Unix paths', () => {
         },
       })
 
-      expect(spec.args.slice(0, 4)).toEqual([
+      expect(spec.args.slice(0, 6)).toEqual([
         '--remote',
         'ws://127.0.0.1:4567',
         '-c',
         'features.apps=false',
+        '-c',
+        'check_for_update_on_startup=false',
       ])
       expectCodexMcpArgs(spec.args)
     })
 
-    it('does not disable Codex apps for ordinary Codex launches', () => {
+    it('does not apply managed Codex config to ordinary Codex launches', () => {
       delete process.env.CODEX_CMD
 
       const spec = buildSpawnSpec('codex', '/home/user/project', 'system')
 
       expect(spec.args).not.toContain('features.apps=false')
+      expect(spec.args).not.toContain('check_for_update_on_startup=false')
       expect(spec.args).not.toContain('--remote')
       expectCodexMcpArgs(spec.args)
     })
