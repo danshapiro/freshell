@@ -102,7 +102,7 @@ it('renders fresh-agent identity as the leftmost visible header item before CLI-
 
   const banner = screen.getByRole('banner', { name: 'Pane: freshell' })
   const identity = screen.getByText('freshcodex')
-  const metadata = screen.getByText('freshell (main)  56%')
+  const metadata = screen.getByText(/freshell \(main\)\s+56%/)
 
   expect(banner).toContainElement(identity)
   expect(banner).toContainElement(metadata)
