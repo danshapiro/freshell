@@ -5,15 +5,50 @@ import request from 'supertest'
 import { createAgentApiRouter } from '../../server/agent-api/router'
 
 it('sends input to a pane terminal', async () => {
+  const input = vi.fn(() => ({ status: 'written' }))
   const app = express()
   app.use(express.json())
   app.use('/api', createAgentApiRouter({
     layoutStore: { resolvePaneToTerminal: () => 'term_1' },
-    registry: { input: () => ({ status: 'written' }) },
+    registry: { input },
   }))
 
   const res = await request(app).post('/api/panes/p1/send-keys').send({ data: 'ls\r' })
   expect(res.body.status).toBe('ok')
+  expect(input).toHaveBeenCalledWith('term_1', 'ls\r')
+})
+
+it('prefers raw data over keys when both are supplied', async () => {
+  const input = vi.fn(() => ({ status: 'written' }))
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: { resolvePaneToTerminal: () => 'term_1' },
+    registry: { input },
+  }))
+
+  const res = await request(app).post('/api/panes/p1/send-keys').send({
+    data: 'raw ENTER',
+    keys: 'ENTER',
+  })
+
+  expect(res.body.status).toBe('ok')
+  expect(input).toHaveBeenCalledWith('term_1', 'raw ENTER')
+})
+
+it('preserves raw text fallback when data and keys are absent', async () => {
+  const input = vi.fn(() => ({ status: 'written' }))
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: { resolvePaneToTerminal: () => 'term_1' },
+    registry: { input },
+  }))
+
+  const res = await request(app).post('/api/panes/p1/send-keys').send({ text: 'plain text' })
+
+  expect(res.body.status).toBe('ok')
+  expect(input).toHaveBeenCalledWith('term_1', 'plain text')
 })
 
 it('normalizes REST send-keys token strings through the shared key translator', async () => {
