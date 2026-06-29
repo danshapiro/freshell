@@ -309,7 +309,7 @@ Expected: FAIL because `electron/renderer-recovery.ts` does not exist.
 
 Implement `registerRendererRecovery()` so it:
 - Attaches handlers to `webContents` for `render-process-gone`, `did-fail-load`, `unresponsive`, and `responsive`.
-- Logs `main_window_renderer_gone`, `main_window_initial_load_failed`, `main_window_navigation_failed`, `main_window_unresponsive`, `main_window_responsive`, `main_window_recovery_started`, `main_window_recovery_succeeded`, `main_window_recovery_failed`, `main_window_recovery_skipped`, `main_window_recovery_reload_unavailable`, and `main_window_recovery_circuit_open`.
+- Logs `main_window_renderer_gone`, `main_window_navigation_failed`, `main_window_unresponsive`, `main_window_responsive`, `main_window_recovery_started`, `main_window_recovery_succeeded`, `main_window_recovery_failed`, `main_window_recovery_skipped`, `main_window_recovery_reload_unavailable`, and `main_window_recovery_circuit_open`. Task 3 owns the initial startup `loadURL().catch(...)` path and its `main_window_initial_load_failed` event.
 - Runs the first recovery attempt immediately. If recovery fails and another event requests recovery, retry attempts use delays `[250, 1000, 3000]` ms and a window of 60 seconds with at most 3 recovery attempts.
 - Calls `window.webContents.reload()` for `render-process-gone` and sustained `unresponsive` recovery because Electron documents reload as the post-crash fresh-renderer path. If `webContents.reload` is unavailable or `webContents` is destroyed, fall back to `window.loadURL(loadUrl)` and log `main_window_recovery_reload_unavailable`.
 - Calls `window.loadURL(loadUrl)` for recoverable main-frame `did-fail-load` events because there may not be a successfully loaded current page to reload.
