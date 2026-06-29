@@ -1,6 +1,8 @@
 import path from 'path'
 import { buildLocalProbeUrls, discoverLocalServers, normalizeServerUrl } from './launch-discovery.js'
 import { chooseLaunchAction } from './launch-policy.js'
+import { redactUrlForLog, type ElectronMainLogger } from './main-process-logger.js'
+import { registerRendererRecovery, type RecoverableWebContents } from './renderer-recovery.js'
 import { resolveCandidateToken } from './token-resolver.js'
 import type { DesktopConfig, ForcedLaunch, LaunchServerCandidate } from './types.js'
 import type { DaemonManager } from './daemon/daemon-manager.js'
@@ -20,6 +22,7 @@ export interface BrowserWindowLike {
   on(event: string, callback: (...args: any[]) => void): void
   getBounds?(): { x: number; y: number; width: number; height: number }
   isMaximized?(): boolean
+  webContents?: RecoverableWebContents
 }
 
 export interface BrowserWindowConstructor {
@@ -46,6 +49,8 @@ export interface StartupContext {
   /** Read AUTH_TOKEN from the .env file in configDir. Returns undefined if not found. */
   readEnvToken?: (envPath: string) => Promise<string | undefined>
   discoverLaunchCandidates?: () => Promise<LaunchServerCandidate[]>
+  mainProcessLogger?: ElectronMainLogger
+  rendererRecoveryVerifier?: () => Promise<void>
   /**
    * An explicit chooser selection to honor for this launch. When set, startup
    * skips discovery and policy and performs exactly this action.
@@ -118,6 +123,14 @@ async function checkRemoteAuthenticated(
   }
 }
 
+function sanitizeStartupFallbackErrorMessage(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err)
+  return message.replace(
+    /([?&]?(?:token|authorization|password|secret)=)[^\s&]+/gi,
+    '[REDACTED]',
+  )
+}
+
 async function loadMainWindow(
   ctx: StartupContext,
   serverUrl: string,
@@ -147,12 +160,23 @@ async function loadMainWindow(
   }
 
   void window.loadURL(loadUrl).catch((err) => {
+    if (ctx.mainProcessLogger) {
+      ctx.mainProcessLogger.log({
+        severity: 'error',
+        event: 'main_window_initial_load_failed',
+        serverUrl,
+        loadUrl,
+        error: err,
+      })
+      return
+    }
+
     console.error(JSON.stringify({
       severity: 'error',
       component: 'electron-startup',
-      event: 'main_window_load_failed',
-      serverUrl,
-      error: err instanceof Error ? err.message : String(err),
+      event: 'main_window_initial_load_failed',
+      serverUrl: redactUrlForLog(serverUrl),
+      error: sanitizeStartupFallbackErrorMessage(err),
     }))
   })
 
@@ -195,6 +219,27 @@ async function loadMainWindow(
   const updateCheckTimer = setTimeout(() => {
     void ctx.updateManager.checkForUpdates()
   }, 10_000)
+
+  if (ctx.mainProcessLogger) {
+    if (window.webContents) {
+      registerRendererRecovery({
+        window,
+        loadUrl,
+        serverUrl,
+        logger: ctx.mainProcessLogger,
+        verifyRecovered: ctx.rendererRecoveryVerifier,
+        setTimeout,
+        clearTimeout,
+      })
+    } else {
+      ctx.mainProcessLogger.log({
+        severity: 'warn',
+        event: 'main_window_recovery_unavailable',
+        serverUrl,
+        loadUrl,
+      })
+    }
+  }
 
   return { type: 'main', serverUrl, window, updateCheckTimer }
 }

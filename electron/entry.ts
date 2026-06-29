@@ -37,12 +37,191 @@ import { buildLaunchOptions } from './launch-options.js'
 import { applyProvisioningFile } from './desktop-provisioning.js'
 import { createPortAvailabilityCheck } from './port-check.js'
 import { registerOpenExternalHandler } from './external-url.js'
+import { createElectronMainLogger } from './main-process-logger.js'
 import type { ForcedLaunch, LaunchServerCandidate } from './types.js'
+import type { RecoverableWebContents } from './renderer-recovery.js'
 
 const isPortAvailable = createPortAvailabilityCheck()
 
 const isDev = process.env.ELECTRON_DEV === '1'
 const configDir = path.join(os.homedir(), '.freshell')
+const mainProcessLogger = createElectronMainLogger({ configDir })
+
+type EntryBrowserWindow = InstanceType<typeof BrowserWindow>
+type WindowListener = { event: string; callback: (...args: any[]) => void }
+
+function createRecoverableEntryWindow(
+  options: Record<string, any>,
+  preloadPath: string,
+  onWebContentsChanged: (webContentsId: number) => void,
+): BrowserWindowLike {
+  const windowListeners: WindowListener[] = []
+  const webContentsListeners: WindowListener[] = []
+  let lastLoadUrl: string | undefined
+  let activeWindow: EntryBrowserWindow
+  let replacingWindow = false
+
+  const createNativeWindow = (nativeOptions: Record<string, any>) => {
+    const win = new BrowserWindow({
+      ...nativeOptions,
+      webPreferences: {
+        ...nativeOptions.webPreferences,
+        preload: preloadPath,
+      },
+    })
+
+    for (const { event, callback } of windowListeners) {
+      win.on(event as any, callback)
+    }
+    for (const { event, callback } of webContentsListeners) {
+      win.webContents.on(event as any, callback)
+    }
+
+    return win
+  }
+
+  const getRecoveryUrl = (fallbackWindow: EntryBrowserWindow): string | undefined => {
+    if (lastLoadUrl) return lastLoadUrl
+    try {
+      return fallbackWindow.webContents.getURL()
+    } catch {
+      return undefined
+    }
+  }
+
+  const replaceCrashedWindow = async () => {
+    if (replacingWindow) return
+    replacingWindow = true
+
+    let recoveryUrl: string | undefined
+    let replacement: EntryBrowserWindow | undefined
+
+    try {
+      const crashedWindow = activeWindow
+      recoveryUrl = getRecoveryUrl(crashedWindow)
+      if (!recoveryUrl) {
+        throw new Error('main window recovery URL unavailable')
+      }
+
+      const bounds = crashedWindow.getBounds()
+      const wasVisible = crashedWindow.isVisible()
+      const wasFocused = crashedWindow.isFocused()
+      const wasMaximized = crashedWindow.isMaximized()
+      replacement = createNativeWindow({
+        ...options,
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height,
+        show: false,
+      })
+
+      await replacement.loadURL(recoveryUrl)
+      activeWindow = replacement
+      onWebContentsChanged(replacement.webContents.id)
+
+      if (wasMaximized) {
+        replacement.maximize()
+      }
+      if (wasVisible) {
+        replacement.show()
+      }
+      if (wasFocused) {
+        replacement.focus()
+      }
+      if (!crashedWindow.isDestroyed()) {
+        crashedWindow.destroy()
+      }
+    } catch (error) {
+      if (replacement && !replacement.isDestroyed()) {
+        replacement.destroy()
+      }
+      mainProcessLogger.log({
+        severity: 'error',
+        event: 'main_window_replacement_failed',
+        loadUrl: recoveryUrl,
+        error,
+      })
+      throw error
+    } finally {
+      replacingWindow = false
+    }
+  }
+
+  activeWindow = createNativeWindow(options)
+  onWebContentsChanged(activeWindow.webContents.id)
+
+  const webContentsProxy: RecoverableWebContents = {
+    get id() {
+      return activeWindow.webContents.id
+    },
+    on(event, callback) {
+      webContentsListeners.push({ event, callback })
+      activeWindow.webContents.on(event as any, callback)
+    },
+    getURL() {
+      return activeWindow.webContents.getURL()
+    },
+    isDestroyed() {
+      return activeWindow.webContents.isDestroyed()
+    },
+    reload() {
+      return replaceCrashedWindow()
+    },
+    forcefullyCrashRenderer() {
+      activeWindow.webContents.forcefullyCrashRenderer()
+    },
+  }
+
+  const windowProxy = {
+    get webContents() {
+      return webContentsProxy
+    },
+    loadURL(url: string, loadOptions?: Parameters<EntryBrowserWindow['loadURL']>[1]) {
+      lastLoadUrl = url
+      return activeWindow.loadURL(url, loadOptions)
+    },
+    show() {
+      activeWindow.show()
+    },
+    hide() {
+      activeWindow.hide()
+    },
+    focus() {
+      activeWindow.focus()
+    },
+    maximize() {
+      activeWindow.maximize()
+    },
+    isVisible() {
+      return activeWindow.isVisible()
+    },
+    isFocused() {
+      return activeWindow.isFocused()
+    },
+    isDestroyed() {
+      return activeWindow.isDestroyed()
+    },
+    getBounds() {
+      return activeWindow.getBounds()
+    },
+    isMaximized() {
+      return activeWindow.isMaximized()
+    },
+    isMinimized() {
+      return activeWindow.isMinimized()
+    },
+    restore() {
+      activeWindow.restore()
+    },
+    on(event: string, callback: (...args: any[]) => void) {
+      windowListeners.push({ event, callback })
+      activeWindow.on(event as any, callback)
+    },
+  }
+
+  return windowProxy as BrowserWindowLike
+}
 
 /** True during the wizard flow; prevents app.quit() on window-all-closed. */
 let wizardPhase = true
@@ -58,6 +237,12 @@ async function main(): Promise<void> {
   // Wait for Electron to be ready before creating any BrowserWindow or using
   // Electron APIs that require the app to be initialized.
   await app.whenReady()
+  mainProcessLogger.log({
+    severity: 'info',
+    event: 'electron_main_started',
+    appVersion: app.getVersion(),
+    isDev,
+  })
 
   // Consolidated window-all-closed handler: during the wizard phase we keep
   // the app alive so main() can re-run after the wizard closes. Once the main
@@ -143,6 +328,7 @@ async function main(): Promise<void> {
     port,
     resourcesPath,
     configDir,
+    mainProcessLogger,
     platform: process.platform,
     fetchHealthCheck: (url: string): Promise<boolean> => {
       // Use Node's http module instead of global fetch() — Electron's main
@@ -206,15 +392,13 @@ async function main(): Promise<void> {
       }
     },
     createBrowserWindow: (options) => {
-      const win = new BrowserWindow({
-        ...options,
-        webPreferences: {
-          ...options.webPreferences,
-          preload: path.join(__dirname, 'preload.js'),
+      return createRecoverableEntryWindow(
+        options,
+        path.join(__dirname, 'preload.js'),
+        (webContentsId) => {
+          mainWebContentsId = webContentsId
         },
-      })
-      // Cast to BrowserWindowLike -- Electron's BrowserWindow satisfies the interface
-      return win as unknown as BrowserWindowLike
+      )
     },
     createTray: () => {
       const iconPath = resolveTrayIconPath({

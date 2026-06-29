@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { EventEmitter } from 'events'
 import path from 'path'
 import { runStartup, type StartupContext, type BrowserWindowLike } from '../../../electron/startup.js'
 import type { DesktopConfig } from '../../../electron/types.js'
@@ -20,6 +21,31 @@ function createMockWindow(): BrowserWindowLike {
     isVisible: vi.fn().mockImplementation(() => visible),
     isFocused: vi.fn().mockImplementation(() => focused),
     on: vi.fn(),
+  }
+}
+
+function createMockWindowWithWebContents(): BrowserWindowLike & {
+  webContents: EventEmitter & {
+    on: ReturnType<typeof vi.fn>
+    reload: ReturnType<typeof vi.fn>
+    getURL: ReturnType<typeof vi.fn>
+    emit: (event: string, ...args: any[]) => boolean
+  }
+} {
+  const window = createMockWindow()
+  const emitter = new EventEmitter()
+  const originalOn = emitter.on.bind(emitter)
+  const originalEmit = emitter.emit.bind(emitter)
+  const webContents = Object.assign(emitter, {
+    on: vi.fn(originalOn),
+    reload: vi.fn(),
+    getURL: vi.fn().mockReturnValue('http://localhost:3001/'),
+    emit: originalEmit,
+  })
+
+  return {
+    ...window,
+    webContents,
   }
 }
 
@@ -624,6 +650,129 @@ describe('runStartup', () => {
     const ctx = createDefaultContext()
     await runStartup(ctx)
     expect(ctx.hotkeyManager.register).toHaveBeenCalledWith('CommandOrControl+`', expect.any(Function))
+  })
+
+  it('registers renderer recovery for the main window and reloads the crashed renderer', async () => {
+    const mockWindow = createMockWindowWithWebContents()
+    const logger = { log: vi.fn() }
+    const ctx = createDefaultContext({
+      createBrowserWindow: vi.fn().mockReturnValue(mockWindow),
+      mainProcessLogger: logger,
+      rendererRecoveryVerifier: vi.fn().mockResolvedValue(undefined),
+      readEnvToken: vi.fn().mockResolvedValue('env token+with&chars'),
+    })
+
+    const result = await runStartup(ctx)
+    expect(result.type).toBe('main')
+
+    mockWindow.webContents.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 9 })
+    await vi.runOnlyPendingTimersAsync()
+
+    expect(mockWindow.webContents.reload).toHaveBeenCalledTimes(1)
+    expect(ctx.serverSpawner.start).toHaveBeenCalledTimes(1)
+    expect(ctx.serverSpawner.stop).not.toHaveBeenCalled()
+  })
+
+  it('reuses the same authenticated URL for recoverable main-frame load failures', async () => {
+    const mockWindow = createMockWindowWithWebContents()
+    const logger = { log: vi.fn() }
+    const ctx = createDefaultContext({
+      createBrowserWindow: vi.fn().mockReturnValue(mockWindow),
+      mainProcessLogger: logger,
+      rendererRecoveryVerifier: vi.fn().mockResolvedValue(undefined),
+      readEnvToken: vi.fn().mockResolvedValue('env token+with&chars'),
+    })
+
+    const result = await runStartup(ctx)
+    expect(result.type).toBe('main')
+
+    mockWindow.webContents.emit('did-fail-load', {}, -102, 'CONNECTION_REFUSED', 'http://localhost:3001/', true)
+    await vi.runOnlyPendingTimersAsync()
+
+    expect(mockWindow.loadURL).toHaveBeenLastCalledWith('http://localhost:3001?token=env%20token%2Bwith%26chars')
+    expect(ctx.serverSpawner.start).toHaveBeenCalledTimes(1)
+    expect(ctx.serverSpawner.stop).not.toHaveBeenCalled()
+  })
+
+  it('logs an explicit warning when recovery cannot attach because webContents is unavailable', async () => {
+    const logger = { log: vi.fn() }
+    await runStartup(createDefaultContext({ mainProcessLogger: logger }))
+    expect(logger.log).toHaveBeenCalledWith(expect.objectContaining({
+      severity: 'warn',
+      event: 'main_window_recovery_unavailable',
+    }))
+  })
+
+  it('logs main_window_initial_load_failed through the main-process logger with the authenticated load URL', async () => {
+    const mockWindow = createMockWindowWithWebContents()
+    const error = new Error('initial load failed')
+    ;(mockWindow.loadURL as ReturnType<typeof vi.fn>).mockRejectedValue(error)
+    const logger = { log: vi.fn() }
+    const ctx = createDefaultContext({
+      createBrowserWindow: vi.fn().mockReturnValue(mockWindow),
+      mainProcessLogger: logger,
+      rendererRecoveryVerifier: vi.fn().mockResolvedValue(undefined),
+      readEnvToken: vi.fn().mockResolvedValue('token-abc'),
+    })
+
+    const result = await runStartup(ctx)
+    expect(result.type).toBe('main')
+    await Promise.resolve()
+
+    expect(logger.log).toHaveBeenCalledWith({
+      severity: 'error',
+      event: 'main_window_initial_load_failed',
+      serverUrl: 'http://localhost:3001',
+      loadUrl: 'http://localhost:3001?token=token-abc',
+      error,
+    })
+  })
+
+  it('logs a sanitized fallback error when the initial load fails without a main-process logger', async () => {
+    const mockWindow = createMockWindow()
+    const error = new Error('failed to load http://remote.example:3001/?token=saved-remote-token&workspace=main')
+    ;(mockWindow.loadURL as ReturnType<typeof vi.fn>).mockRejectedValue(error)
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const ctx = createDefaultContext({
+      desktopConfig: {
+        serverMode: 'remote',
+        port: 3001,
+        remoteUrl: 'http://remote.example:3001/?token=saved-remote-token&workspace=main',
+        remoteToken: 'token-abc',
+        knownServers: [],
+        alwaysAskOnLaunch: false,
+        globalHotkey: 'CommandOrControl+`',
+        startOnLogin: false,
+        minimizeToTray: true,
+        setupCompleted: true,
+      },
+      createBrowserWindow: vi.fn().mockReturnValue(mockWindow),
+      fetchHealthCheck: vi.fn().mockResolvedValue(true),
+      fetchAuthenticated: vi.fn().mockResolvedValue(true),
+    })
+
+    const result = await runStartup(ctx)
+    expect(result.type).toBe('main')
+    await Promise.resolve()
+
+    expect(consoleErrorSpy).toHaveBeenCalledTimes(1)
+    const [payload] = consoleErrorSpy.mock.calls[0] ?? []
+    expect(typeof payload).toBe('string')
+    expect(payload).toContain('"event":"main_window_initial_load_failed"')
+    expect(payload).not.toContain('token=saved-remote-token')
+    expect(payload).not.toContain('token-abc')
+    expect(payload).not.toContain('saved-remote-token')
+
+    const parsed = JSON.parse(payload as string) as Record<string, unknown>
+    expect(parsed).toMatchObject({
+      severity: 'error',
+      component: 'electron-startup',
+      event: 'main_window_initial_load_failed',
+      serverUrl: 'http://remote.example:3001/?token=%5BREDACTED%5D&workspace=main',
+    })
+    expect(parsed).not.toHaveProperty('loadUrl')
+
+    consoleErrorSpy.mockRestore()
   })
 
   describe('hotkey quake-style toggle', () => {

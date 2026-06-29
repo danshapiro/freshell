@@ -10,6 +10,7 @@ import { test, expect, _electron as electron, type ElectronApplication, type Pag
 import path from 'path'
 import fs from 'fs'
 import os from 'os'
+import { TestServer } from '../e2e-browser/helpers/test-server.js'
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '..', '..')
 
@@ -47,6 +48,10 @@ function createTempHome(desktopConfig?: Record<string, unknown>): string {
     )
   }
   return tmpHome
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function writeDesktopEnv(tmpHome: string): void {
@@ -106,7 +111,13 @@ async function waitForWindowUrl(
   while (Date.now() - start < timeoutMs) {
     for (const win of app.windows()) {
       if (pattern.test(win.url())) {
-        return win
+        try {
+          await win.evaluate(() => true)
+          return win
+        } catch {
+          // A crashed renderer can keep its last URL in Playwright. Keep
+          // polling until Electron exposes the recovered window target.
+        }
       }
     }
     await new Promise(r => setTimeout(r, 500))
@@ -128,6 +139,109 @@ function remoteConfig() {
     setupCompleted: true,
   }
 }
+
+// ---------------------------------------------------------------------------
+// Test: Renderer crash recovery
+// ---------------------------------------------------------------------------
+
+test.describe('Renderer crash recovery', () => {
+  let app: ElectronApplication | undefined
+  let server: TestServer | undefined
+  let tmpHome: string | undefined
+
+  test.afterEach(async () => {
+    if (app) {
+      await app.evaluate(() => {
+        ;(globalThis as any).__restoreOpenExternal?.()
+      }).catch(() => {})
+      await app.close().catch(() => {})
+      app = undefined
+    }
+    if (server) {
+      await server.stop().catch(() => {})
+      server = undefined
+    }
+    if (tmpHome) {
+      fs.rmSync(tmpHome, { recursive: true, force: true })
+      tmpHome = undefined
+    }
+  })
+
+  test('recovers the main Freshell UI after the renderer process crashes', async () => {
+    server = new TestServer()
+    const serverInfo = await server.start()
+    tmpHome = createTempHome({
+      serverMode: 'remote',
+      port: serverInfo.port,
+      remoteUrl: serverInfo.baseUrl,
+      remoteToken: serverInfo.token,
+      knownServers: [],
+      alwaysAskOnLaunch: false,
+      globalHotkey: 'CommandOrControl+`',
+      startOnLogin: false,
+      minimizeToTray: true,
+      setupCompleted: true,
+    })
+
+    app = await launchApp(tmpHome, true)
+    const firstWindow = await app.firstWindow()
+    await firstWindow.waitForLoadState('domcontentloaded')
+    await expect(firstWindow.locator('text=New Tab').first()).toBeVisible({ timeout: 30_000 })
+
+    const crashed = firstWindow.waitForEvent('crash', { timeout: 10_000 }).catch(() => undefined)
+    await app.evaluate(({ BrowserWindow }) => {
+      BrowserWindow.getAllWindows()[0].webContents.forcefullyCrashRenderer()
+    })
+    await crashed
+
+    const recoveredWindow = await waitForWindowUrl(
+      app,
+      new RegExp(`^${escapeRegExp(serverInfo.baseUrl)}(?:[/?#]|$)`),
+      60_000,
+    )
+    await recoveredWindow.waitForLoadState('domcontentloaded')
+    await expect(recoveredWindow.locator('text=New Tab').first()).toBeVisible({ timeout: 30_000 })
+
+    await app.evaluate(({ shell }) => {
+      const original = shell.openExternal
+      ;(globalThis as any).__testOpenExternal = (url: string) => {
+        ;(globalThis as any).__openedUrl = url
+        return Promise.resolve()
+      }
+      ;(globalThis as any).__restoreOpenExternal = () => {
+        shell.openExternal = original
+      }
+      shell.openExternal = (globalThis as any).__testOpenExternal
+    })
+
+    await recoveredWindow.evaluate(async () => {
+      const link = document.createElement('a')
+      link.href = 'https://example.com/freshell-recovery-ipc'
+      link.target = '_blank'
+      link.rel = 'noopener noreferrer'
+      link.textContent = 'test recovery external link'
+      document.body.appendChild(link)
+
+      const event = new MouseEvent('click', { ctrlKey: true, bubbles: true })
+      link.dispatchEvent(event)
+
+      await new Promise<void>((resolve) => setTimeout(resolve, 500))
+    })
+
+    await expect.poll(async () =>
+      app!.evaluate(() => (globalThis as any).__openedUrl),
+    ).toBe('https://example.com/freshell-recovery-ipc')
+
+    await expect.poll(() => {
+      const logsDir = path.join(tmpHome!, '.freshell', 'logs')
+      if (!fs.existsSync(logsDir)) return ''
+      return fs.readdirSync(logsDir)
+        .filter((fileName) => /^electron-main\..*\.jsonl$/.test(fileName))
+        .map((fileName) => fs.readFileSync(path.join(logsDir, fileName), 'utf-8'))
+        .join('\n')
+    }, { timeout: 30_000 }).toContain('main_window_recovery_succeeded')
+  })
+})
 
 // ---------------------------------------------------------------------------
 // Test: Wizard Flow
@@ -339,9 +453,7 @@ test.describe('Main window with remote server', () => {
 
     // Patch shell.openExternal in the main process so the test can observe the
     // real IPC flow without actually launching a browser window.
-    await app.evaluate(() => {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { shell } = require('electron')
+    await app.evaluate(({ shell }) => {
       const original = shell.openExternal
       ;(globalThis as any).__testOpenExternal = (url: string) => {
         ;(globalThis as any).__openedUrl = url
