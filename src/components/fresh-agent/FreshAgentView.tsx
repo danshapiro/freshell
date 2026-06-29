@@ -15,7 +15,7 @@ import { getWsClient } from '@/lib/ws-client'
 import { createLogger } from '@/lib/client-logger'
 import { api, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
 import { consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
-import { clearPendingCreateFailure } from '@/store/freshAgentSlice'
+import { clearPendingCreateFailure, setSessionStatus } from '@/store/freshAgentSlice'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
@@ -25,7 +25,7 @@ import {
   resolveFreshAgentType,
 } from '@/lib/fresh-agent-registry'
 import { cn } from '@/lib/utils'
-import { paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
+import { collectPaneEntries, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { getCanonicalDurableSessionId, getPreferredResumeSessionId } from '@/store/persistControl'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
@@ -562,6 +562,25 @@ export function FreshAgentView({
     })
     return state.freshAgent.sessions[sessionKey]
   })
+  const hasUnresolvedLocalEchoForSession = useAppSelector((state) => {
+    if (!paneContent.sessionId) return false
+    return Object.values(state.panes.layouts).some((layout) => {
+      if (!layout) return false
+      return collectPaneEntries(layout).some(({ content }) => (
+        content.kind === 'fresh-agent'
+        && content.provider === paneContent.provider
+        && content.sessionType === paneContent.sessionType
+        && content.sessionId === paneContent.sessionId
+        && !!content.pendingLocalEcho
+      ))
+    })
+  })
+  const hasUnresolvedLocalEchoForSessionRef = useRef(false)
+  hasUnresolvedLocalEchoForSessionRef.current = hasUnresolvedLocalEchoForSession
+  const agentSessionStatusRef = useRef(agentSession?.status)
+  agentSessionStatusRef.current = agentSession?.status
+  const agentSessionStatusVersionRef = useRef(agentSession?.statusVersion ?? 0)
+  agentSessionStatusVersionRef.current = agentSession?.statusVersion ?? 0
   const freshOpenCodeRouteCwd = getFreshOpenCodeRouteCwd(paneContent, { sessionCwd: agentSession?.cwd })
   const freshOpenCodeRouteCwdRef = useRef(freshOpenCodeRouteCwd)
   freshOpenCodeRouteCwdRef.current = freshOpenCodeRouteCwd
@@ -1247,6 +1266,7 @@ export function FreshAgentView({
       || snapshotThreadIdRef.current !== sessionId
     )
     const requestCwd = paneContentRef.current.initialCwd
+    const requestAgentSessionStatusVersion = agentSessionStatusVersionRef.current
     void getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, {
       signal: controller.signal,
       ...(requestCwd ? { cwd: requestCwd } : {}),
@@ -1292,6 +1312,32 @@ export function FreshAgentView({
         const nextResumeSessionId = snapshotSessionRef?.sessionId ?? fresh.resumeSessionId ?? sessionId
         if (snapshotSessionRef) {
           migratePendingAutoTitle(fresh.sessionId, snapshotSessionRef.sessionId, provider)
+        }
+        const hasBlockingLocalEchoForSession = hasUnresolvedLocalEchoForSessionRef.current
+        const sessionStatus = nextStatus === 'create-failed' ? null : nextStatus
+        const snapshotIsBusy = sessionStatus === 'running' || sessionStatus === 'compacting'
+        const statusChangedSinceRequest = agentSessionStatusVersionRef.current !== requestAgentSessionStatusVersion
+        const currentSessionStatus = agentSessionStatusRef.current ?? fresh.status
+        const wouldRegressStatus = sessionStatus
+          ? isStatusRegression(currentSessionStatus, sessionStatus)
+          : false
+        if (
+          sessionStatus
+          && nextSessionId
+          && provider === 'codex'
+          && requestSessionType === 'freshcodex'
+          && !wouldRegressStatus
+          && (
+            snapshotIsBusy
+            || (!hasBlockingLocalEchoForSession && !statusChangedSinceRequest)
+          )
+        ) {
+          dispatch(setSessionStatus({
+            sessionId: nextSessionId,
+            sessionType: requestSessionType,
+            provider,
+            status: sessionStatus,
+          }))
         }
         if (
           nextStatus === fresh.status

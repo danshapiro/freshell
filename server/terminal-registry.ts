@@ -63,6 +63,7 @@ const MAX_OUTPUT_BUFFER_CHARS = Number(process.env.MAX_OUTPUT_BUFFER_CHARS || pr
 const MAX_OUTPUT_FRAME_CHARS = Math.max(1, Number(process.env.MAX_OUTPUT_FRAME_CHARS || 8192))
 const CODEX_CLEAN_EXIT_RECENT_INPUT_GRACE_MS = Math.max(0, Number(process.env.CODEX_CLEAN_EXIT_RECENT_INPUT_GRACE_MS || 750))
 const CODEX_CLEAN_EXIT_LIFECYCLE_LOSS_GRACE_MS = Math.max(0, Number(process.env.CODEX_CLEAN_EXIT_LIFECYCLE_LOSS_GRACE_MS || 2000))
+const CODEX_DURABLE_RECOVERY_MAX_CONSECUTIVE_FAILURES = 5
 const perfConfig = getPerfConfig()
 
 // TerminalMode is now a wider type -- any string is valid as a mode name.
@@ -260,6 +261,7 @@ export type CodexRecoveryLaunchInput = {
 export type CodexRecoveryOptions = {
   planCreate(input: CodexRecoveryLaunchInput): Promise<CodexLaunchPlan>
   retryDelayMs?: number
+  maxConsecutiveFailures?: number
 }
 
 export type CodexDurabilityRestoreRecord = {
@@ -595,6 +597,7 @@ export type TerminalRecord = {
   codexRecovery?: CodexRecoveryOptions
   codexRecoveryAttempt?: Promise<void>
   codexRecoveryAttemptSerial?: number
+  codexRecoveryConsecutiveFailures?: number
   codexLifecycleLossProofPending?: boolean
   codexCleanExitDecisionPending?: boolean
   codexRecoveryRetry?: { timer: NodeJS.Timeout; resolve: () => void }
@@ -2517,7 +2520,7 @@ export class TerminalRegistry extends EventEmitter {
     if (record.codexRecoveryBlockedError) {
       logger.error(
         { err: record.codexRecoveryBlockedError, terminalId: record.terminalId, trigger },
-        'Codex durable recovery is blocked by a previous sidecar teardown failure',
+        'Codex durable recovery is blocked by a previous recovery failure',
       )
       return false
     }
@@ -2800,8 +2803,23 @@ export class TerminalRegistry extends EventEmitter {
           this.blockCodexRecovery(record, err)
           throw err
         }
+        const failureCount = (record.codexRecoveryConsecutiveFailures ?? 0) + 1
+        record.codexRecoveryConsecutiveFailures = failureCount
+        const maxConsecutiveFailures = Math.max(
+          1,
+          record.codexRecovery?.maxConsecutiveFailures
+            ?? CODEX_DURABLE_RECOVERY_MAX_CONSECUTIVE_FAILURES,
+        )
+        if (failureCount >= maxConsecutiveFailures) {
+          const blocked = new Error(
+            `Codex durable recovery failed ${failureCount} consecutive times; refusing to retry forever.`,
+          ) as Error & { cause?: unknown }
+          blocked.cause = err
+          this.blockCodexRecovery(record, blocked)
+          throw blocked
+        }
         logger.warn(
-          { err, terminalId, resumeSessionId: record.resumeSessionId },
+          { err, terminalId, resumeSessionId: record.resumeSessionId, failureCount, maxConsecutiveFailures },
           'Codex durable recovery candidate failed; retrying after teardown',
         )
       }
@@ -2958,6 +2976,7 @@ export class TerminalRegistry extends EventEmitter {
       record.codexRecoveryRetiringPty = undefined
       record.codexRecoveryAttempt = undefined
       published = true
+      record.codexRecoveryConsecutiveFailures = 0
 
       try {
         let oldPtyExited = false

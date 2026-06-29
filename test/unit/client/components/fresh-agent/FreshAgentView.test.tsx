@@ -2577,6 +2577,207 @@ describe('FreshAgentView', () => {
     expect(screen.getByText('Loaded assistant turn')).toBeInTheDocument()
   })
 
+  it('clears stale running session state when a freshcodex REST snapshot reports idle', async () => {
+    const store = createStore()
+    const sessionId = '019efd2e-3270-71d0-a3c9-e097537be604'
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: sessionId,
+      sessionId,
+      status: 'idle',
+      revision: 123,
+      latestTurnId: null,
+      capabilities: { send: true, interrupt: true, fork: true },
+      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+      turns: [],
+      pendingApprovals: [],
+      pendingQuestions: [],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        sessionId,
+        sessionRef: { provider: 'codex', sessionId },
+        resumeSessionId: sessionId,
+        createRequestId: 'req-freshcodex-stale-running',
+        status: 'running',
+        initialCwd: '/home/dan/code/freshell',
+      },
+    }))
+    store.dispatch(setSessionStatus({
+      sessionId,
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      status: 'running',
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]?.status).toBe('idle')
+    })
+    expect(getFreshAgentPaneContent(store).status).toBe('idle')
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+      'freshcodex',
+      'codex',
+      sessionId,
+      expect.objectContaining({ cwd: '/home/dan/code/freshell' }),
+    )
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not clear running session state from a freshcodex REST snapshot while another pane for the same session has unresolved local echo', async () => {
+    const store = createStore()
+    const sessionId = '019efd2e-3270-71d0-a3c9-e097537be604'
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: sessionId,
+      sessionId,
+      status: 'idle',
+      revision: 124,
+      latestTurnId: null,
+      capabilities: { send: true, interrupt: true, fork: true },
+      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+      turns: [],
+      pendingApprovals: [],
+      pendingQuestions: [],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        sessionId,
+        sessionRef: { provider: 'codex', sessionId },
+        resumeSessionId: sessionId,
+        createRequestId: 'req-freshcodex-current',
+        status: 'running',
+        initialCwd: '/home/dan/code/freshell',
+      },
+    }))
+    store.dispatch(initLayout({
+      tabId: 'tab-2',
+      paneId: 'pane-2',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        sessionId,
+        sessionRef: { provider: 'codex', sessionId },
+        resumeSessionId: sessionId,
+        createRequestId: 'req-freshcodex-sibling',
+        status: 'running',
+        initialCwd: '/home/dan/code/freshell',
+        pendingLocalEcho: {
+          requestId: 'req-local-send',
+          text: 'still sending',
+        },
+      },
+    }))
+    store.dispatch(setSessionStatus({
+      sessionId,
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      status: 'running',
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store).status).toBe('idle')
+    })
+    expect(store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]?.status).toBe('running')
+  })
+
+  it('does not let an older idle REST response overwrite a newer same-valued running session status', async () => {
+    const store = createStore()
+    const sessionId = 'thread-rest-race'
+    const snapshot = createDeferred<Record<string, unknown>>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValueOnce(snapshot.promise)
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        sessionId,
+        sessionRef: { provider: 'codex', sessionId },
+        resumeSessionId: sessionId,
+        createRequestId: 'req-rest-race',
+        status: 'running',
+        initialCwd: '/home/dan/code/freshell',
+      },
+    }))
+    store.dispatch(setSessionStatus({
+      sessionId,
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      status: 'running',
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+    })
+    const versionAtRequest = (
+      store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`] as { statusVersion?: number } | undefined
+    )?.statusVersion
+    await act(async () => {
+      store.dispatch(setSessionStatus({
+        sessionId,
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        status: 'running',
+      }))
+    })
+    expect((
+      store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`] as { statusVersion?: number } | undefined
+    )?.statusVersion).toBeGreaterThan(versionAtRequest ?? -1)
+    await act(async () => {
+      snapshot.resolve({
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        threadId: sessionId,
+        sessionId,
+        status: 'idle',
+        revision: 125,
+        latestTurnId: null,
+        capabilities: { send: true, interrupt: true, fork: true },
+        tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+        turns: [],
+        pendingApprovals: [],
+        pendingQuestions: [],
+      })
+    })
+
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store).status).toBe('idle')
+    })
+    expect(store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]?.status).toBe('running')
+  })
+
   it('preserves loaded transcript history when a submit refresh returns only the in-flight turn', async () => {
     const store = createStore()
     let onMessage: ((message: Record<string, unknown>) => void) | undefined

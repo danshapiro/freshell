@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import reducer, {
   createFailed,
+  freshAgentSnapshotReceived,
+  materializeSession,
   registerPendingCreate,
   sessionCreated,
   sessionError,
@@ -41,6 +43,60 @@ describe('freshAgentSlice busy/streaming clearing', () => {
 })
 
 describe('freshAgentSlice', () => {
+  const codexLoc = { sessionId: 'thread-status-version', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+  const codexKey = makeFreshAgentSessionKey(codexLoc)
+
+  it('increments statusVersion for same-valued setSessionStatus updates', () => {
+    let state = reducer(undefined, setSessionStatus({ ...codexLoc, status: 'running' }))
+    expect(state.sessions[codexKey].status).toBe('running')
+    expect((state.sessions[codexKey] as { statusVersion?: number }).statusVersion).toBe(1)
+
+    state = reducer(state, setSessionStatus({ ...codexLoc, status: 'running' }))
+    expect(state.sessions[codexKey].status).toBe('running')
+    expect((state.sessions[codexKey] as { statusVersion?: number }).statusVersion).toBe(2)
+  })
+
+  it('increments statusVersion for snapshot status events and preserves it across identity materialization', () => {
+    let state = reducer(undefined, sessionSnapshotReceived({
+      ...codexLoc,
+      latestTurnId: null,
+      status: 'running',
+      revision: 1,
+    }))
+    expect((state.sessions[codexKey] as { statusVersion?: number }).statusVersion).toBe(1)
+
+    state = reducer(state, freshAgentSnapshotReceived({
+      snapshot: {
+        ...codexLoc,
+        threadId: codexLoc.sessionId,
+        revision: 2,
+        latestTurnId: null,
+        status: 'idle',
+        capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: true },
+        tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+        pendingApprovals: [],
+        pendingQuestions: [],
+        worktrees: [],
+        diffs: [],
+        childThreads: [],
+        turns: [],
+        extensions: {},
+      },
+    }))
+    expect(state.sessions[codexKey].status).toBe('idle')
+    expect((state.sessions[codexKey] as { statusVersion?: number }).statusVersion).toBe(2)
+
+    state = reducer(state, materializeSession({
+      previousSessionId: codexLoc.sessionId,
+      sessionId: 'thread-status-version-materialized',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    }))
+    const materializedKey = 'freshcodex:codex:thread-status-version-materialized'
+    expect(state.sessions[materializedKey].status).toBe('idle')
+    expect((state.sessions[materializedKey] as { statusVersion?: number }).statusVersion).toBe(2)
+  })
+
   it('tracks pending creates and resolves them into sessions', () => {
     let state = reducer(undefined, registerPendingCreate({
       requestId: 'req-1',

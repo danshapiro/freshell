@@ -52,6 +52,7 @@ export type FreshAgentSessionState = FreshAgentSessionLocator & {
   sessionKey: string
   threadId: string
   status: FreshAgentSessionStatus
+  statusVersion?: number
   snapshot?: FreshAgentSnapshot
   latestTurnId?: string | null
   historySessionId?: string

@@ -64,6 +64,7 @@ function createSession(locator: FreshAgentSessionPayload, status: FreshAgentSess
     sessionKey: key,
     threadId: locator.sessionId,
     status,
+    statusVersion: 0,
     turns: [],
     historyItems: [],
     historyBodies: {},
@@ -76,6 +77,11 @@ function createSession(locator: FreshAgentSessionPayload, status: FreshAgentSess
     totalOutputTokens: 0,
     historyLoaded: false,
   }
+}
+
+function writeSessionStatus(session: FreshAgentSessionState, status: FreshAgentSessionStatus): void {
+  session.status = status
+  session.statusVersion = (session.statusVersion ?? 0) + 1
 }
 
 function ensureSession(
@@ -216,9 +222,11 @@ const freshAgentSlice = createSlice({
       const key = sessionKey(locator)
       const expectsHistoryHydration = pending?.expectsHistoryHydration ?? false
       const session = ensureSession(state, locator, 'connected')
-      session.status = session.status === 'starting' || session.status === 'creating'
-        ? 'connected'
-        : session.status
+      if (session.status === 'starting' || session.status === 'creating') {
+        writeSessionStatus(session, 'connected')
+      } else {
+        writeSessionStatus(session, session.status)
+      }
       session.historyLoaded = !expectsHistoryHydration
       session.awaitingDurableHistory = expectsHistoryHydration
       if (pending?.cwd) session.cwd = pending.cwd
@@ -251,7 +259,7 @@ const freshAgentSlice = createSlice({
       session.tools = action.payload.tools
       session.awaitingDurableHistory = action.payload.cliSessionId ? false : session.awaitingDurableHistory
       if (session.status === 'creating' || session.status === 'starting') {
-        session.status = 'connected'
+        writeSessionStatus(session, 'connected')
       }
     },
 
@@ -304,7 +312,7 @@ const freshAgentSlice = createSlice({
       }
 
       session.latestTurnId = action.payload.latestTurnId
-      session.status = action.payload.status
+      writeSessionStatus(session, action.payload.status)
       session.historySessionId = action.payload.historySessionId ?? session.historySessionId
       session.historyRevision = action.payload.revision ?? session.historyRevision
       session.streamingActive = action.payload.streamingActive ?? false
@@ -371,7 +379,7 @@ const freshAgentSlice = createSlice({
         provider: snapshot.provider,
       }, snapshot.status as FreshAgentSessionStatus)
       session.snapshot = snapshot
-      session.status = snapshot.status as FreshAgentSessionStatus
+      writeSessionStatus(session, snapshot.status as FreshAgentSessionStatus)
       session.latestTurnId = snapshot.latestTurnId
       session.historyRevision = snapshot.revision
       session.turns = snapshot.turns
@@ -393,7 +401,7 @@ const freshAgentSlice = createSlice({
     setSessionStatus(state, action: PayloadAction<SessionMutationPayload & { status: FreshAgentSessionStatus }>) {
       const session = resolveOrEnsureSession(state, action.payload, action.payload.status)
       if (!session) return
-      session.status = action.payload.status
+      writeSessionStatus(session, action.payload.status)
       // A terminal/idle status ends the turn: clear streaming too, else busy stays
       // true (isFreshAgentBusy = streamingActive || running) and the pane is stuck
       // blue after a natural stream-end / freshAgent.status:idle broadcast.
@@ -445,7 +453,7 @@ const freshAgentSlice = createSlice({
         // active 'running'/'starting' status to idle so the pane does not stay blue.
         session.streamingActive = false
         if (session.status === 'running' || session.status === 'starting') {
-          session.status = 'idle'
+          writeSessionStatus(session, 'idle')
         }
       }
     },
@@ -525,7 +533,7 @@ const freshAgentSlice = createSlice({
     }>) {
       const session = resolveOrEnsureSession(state, action.payload, 'idle')
       if (!session) return
-      session.status = 'idle'
+      writeSessionStatus(session, 'idle')
       session.streamingActive = false
       session.totalCostUsd += action.payload.costUsd ?? 0
       session.totalInputTokens += action.payload.usage?.input_tokens ?? 0
@@ -571,7 +579,7 @@ const freshAgentSlice = createSlice({
       if (!session) return
       session.streamingActive = action.payload.active
       if (action.payload.active && session.status === 'idle') {
-        session.status = 'running'
+        writeSessionStatus(session, 'running')
       }
     },
     appendStreamDelta(state, action: PayloadAction<SessionMutationPayload & { text: string }>) {
@@ -580,7 +588,7 @@ const freshAgentSlice = createSlice({
       session.streamingActive = true
       session.streamingText += action.payload.text
       if (session.status === 'idle') {
-        session.status = 'running'
+        writeSessionStatus(session, 'running')
       }
     },
     clearStreaming(state, action: PayloadAction<SessionMutationPayload>) {
@@ -593,7 +601,7 @@ const freshAgentSlice = createSlice({
     sessionExited(state, action: PayloadAction<SessionMutationPayload>) {
       const key = resolveSessionKey(state, action.payload)
       if (!key) return
-      state.sessions[key].status = 'exited'
+      writeSessionStatus(state.sessions[key], 'exited')
     },
   },
 })
