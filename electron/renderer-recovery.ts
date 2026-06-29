@@ -12,7 +12,7 @@ export interface RecoverableWebContents {
   on(event: string, callback: (...args: any[]) => void): void
   getURL?: () => string
   isDestroyed?: () => boolean
-  reload?: () => void
+  reload?: () => void | Promise<void>
   forcefullyCrashRenderer?: () => void
 }
 
@@ -132,7 +132,7 @@ export function registerRendererRecovery(options: RendererRecoveryOptions): void
       return
     }
 
-    webContents.reload()
+    await webContents.reload()
   }
 
   const startRecovery = (request: RecoveryRequest) => {

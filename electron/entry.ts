@@ -156,7 +156,7 @@ function createRecoverableEntryWindow(
       return activeWindow.webContents.isDestroyed()
     },
     reload() {
-      void replaceCrashedWindow()
+      return replaceCrashedWindow()
     },
     forcefullyCrashRenderer() {
       activeWindow.webContents.forcefullyCrashRenderer()

@@ -345,4 +345,39 @@ describe('registerRendererRecovery', () => {
       event: 'main_window_recovery_succeeded',
     }))
   })
+
+  it('does not log success until an async renderer reload resolves', async () => {
+    let resolveReload!: () => void
+    window.webContents.reload.mockReturnValue(new Promise<void>((resolve) => {
+      resolveReload = resolve
+    }))
+
+    registerRendererRecovery({
+      window,
+      loadUrl,
+      serverUrl,
+      logger,
+      setTimeout,
+      clearTimeout,
+    })
+
+    window.webContents.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 133 })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(logger.log).not.toHaveBeenCalledWith(expect.objectContaining({
+      event: 'main_window_recovery_succeeded',
+    }))
+    expect(window.show).not.toHaveBeenCalled()
+    expect(window.focus).not.toHaveBeenCalled()
+
+    resolveReload()
+
+    await vi.waitFor(() => {
+      expect(logger.log).toHaveBeenCalledWith(expect.objectContaining({
+        event: 'main_window_recovery_succeeded',
+      }))
+    })
+    expect(window.show).toHaveBeenCalledTimes(1)
+    expect(window.focus).toHaveBeenCalledTimes(1)
+  })
 })
