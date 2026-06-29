@@ -35,6 +35,7 @@ import {
 } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState } from '@shared/fresh-agent'
+import { normalizeFreshAgentPaneModelSelection } from './paneTypes'
 
 const log = createLogger('StorageMigration')
 
@@ -222,10 +223,28 @@ function normalizeLayoutNode(node: unknown): unknown {
         rejectNonCanonicalClaudeSessionRef: true,
       })
       const { sessionRef: _legacySessionRef, restoreError: _legacyRestoreError, ...rest } = content
+      const restWithNormalizedModel = content.sessionType === 'freshopencode' && content.provider === 'opencode'
+        ? (() => {
+            const {
+              model: legacyModel,
+              modelSelection: legacyModelSelection,
+              ...withoutModel
+            } = rest
+            return {
+              ...withoutModel,
+              modelSelection: normalizeFreshAgentPaneModelSelection({
+                sessionType: content.sessionType,
+                provider: content.provider,
+                modelSelection: legacyModelSelection,
+                legacyModel,
+              }),
+            }
+          })()
+        : rest
       return {
         ...candidate,
         content: {
-          ...rest,
+          ...restWithNormalizedModel,
           ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
           ...('restoreError' in durableState && durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
         },

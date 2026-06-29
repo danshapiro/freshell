@@ -34,6 +34,28 @@ export function normalizeFreshAgentModelSelection(
   return undefined
 }
 
+const LEGACY_FRESHOPENCODE_DEFAULT_MODEL = 'opencode-go/deepseek-v4-flash'
+
+export function normalizeFreshAgentPaneModelSelection(args: {
+  sessionType?: unknown
+  provider?: unknown
+  modelSelection?: unknown
+  legacyModel?: unknown
+}): FreshAgentModelSelection | undefined {
+  const explicitSelection = normalizeFreshAgentModelSelection(args.modelSelection)
+  if (explicitSelection) return explicitSelection
+
+  if (
+    args.sessionType === 'freshopencode'
+    && args.provider === 'opencode'
+    && typeof args.legacyModel === 'string'
+    && args.legacyModel.trim() === LEGACY_FRESHOPENCODE_DEFAULT_MODEL
+  ) {
+    return undefined
+  }
+  return normalizeFreshAgentModelSelection(undefined, args.legacyModel)
+}
+
 export function normalizeFreshAgentEffortOverride(value: unknown): string | undefined {
   if (typeof value !== 'string') {
     return undefined

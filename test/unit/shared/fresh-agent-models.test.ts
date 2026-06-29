@@ -12,7 +12,16 @@ import {
 
 describe('fresh-agent-models freshopencode options', () => {
   const GLM_5_2_MODEL = 'opencode-go/glm-5.2'
+  const DEEPSEEK_V4_FLASH_MODEL = 'opencode-go/deepseek-v4-flash'
   const KIMI_K2_7_MODEL = 'umans-ai-coding-plan/umans-kimi-k2.7'
+
+  it('uses GLM 5.2 as the Freshopencode default model', () => {
+    expect(FRESHOPENCODE_DEFAULT_MODEL).toBe(GLM_5_2_MODEL)
+    expect(FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE.freshopencode[0]).toMatchObject({
+      value: GLM_5_2_MODEL,
+      label: 'GLM 5.2',
+    })
+  })
 
   it('includes GLM 5.2 as a selectable Freshopencode model', () => {
     const option = resolveFreshAgentModelOption('freshopencode', GLM_5_2_MODEL)
@@ -41,6 +50,13 @@ describe('fresh-agent-models freshopencode options', () => {
     const values = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE.freshopencode.map((o) => o.value)
 
     expect(values).toContain(GLM_5_2_MODEL)
+  })
+
+  it('keeps DeepSeek V4 Flash selectable without making it the default', () => {
+    const values = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE.freshopencode.map((o) => o.value)
+
+    expect(values).toContain(DEEPSEEK_V4_FLASH_MODEL)
+    expect(FRESHOPENCODE_DEFAULT_MODEL).not.toBe(DEEPSEEK_V4_FLASH_MODEL)
   })
 
   it('includes Kimi k2.7 as a selectable Freshopencode model', () => {

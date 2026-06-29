@@ -5,6 +5,8 @@ import panesReducer, { initLayout, type PanesState } from '@/store/panesSlice'
 import { handleFreshAgentMessage, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import { cancelCreate, _resetCancelledCreates } from '@/lib/create-cancellation'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
+import { normalizeFreshAgentProviderEvent } from '../../../../server/fresh-agent/sdk-events'
+import { parseServeEvent, serveEventToSdk } from '../../../../server/fresh-agent/adapters/opencode/serve-events'
 
 function createFreshAgentStore() {
   return configureStore({
@@ -398,6 +400,57 @@ describe('fresh-agent-ws', () => {
       status: 'idle',
       latestTurnId: 'msg_assistant_1',
       historyRevision: 11,
+    })
+  })
+
+  it('bubbles OpenCode APIError data.message into FreshOpenCode UI-facing state', () => {
+    const store = createFreshAgentStore()
+    const sessionId = 'ses_opencode_billing'
+    const key = `freshopencode:opencode:${sessionId}`
+    const billingMessage = 'Insufficient balance. Manage your billing here: https://opencode.ai/workspace/wrk_01K7GPZSP6NGNSHF5ZHKBTVHVF/billing'
+    const sendEvent = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      event: { sessionId, ...event },
+    })
+
+    expect(sendEvent({ type: 'freshAgent.session.snapshot', latestTurnId: null, status: 'running', revision: 1 })).toBe(true)
+
+    const parsed = parseServeEvent({
+      type: 'session.error',
+      properties: {
+        sessionID: sessionId,
+        error: {
+          name: 'APIError',
+          data: {
+            message: billingMessage,
+            statusCode: 402,
+            isRetryable: false,
+          },
+        },
+      },
+    })
+    if (!parsed) throw new Error('expected parsed OpenCode session.error')
+
+    const sdkEvent = serveEventToSdk(parsed, sessionId)
+    expect(sdkEvent).toEqual({ type: 'sdk.error', sessionId, message: billingMessage })
+    const normalized = normalizeFreshAgentProviderEvent(sdkEvent)
+    expect(normalized).toEqual({ type: 'freshAgent.error', sessionId, message: billingMessage })
+
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      event: normalized as Record<string, unknown>,
+    })).toBe(true)
+
+    expect(store.getState().freshAgent.sessions[key]).toMatchObject({
+      status: 'idle',
+      streamingActive: false,
+      lastError: billingMessage,
     })
   })
 

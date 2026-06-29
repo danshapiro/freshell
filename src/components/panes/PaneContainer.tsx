@@ -607,12 +607,20 @@ function PickerWrapper({
       const providerDefaultModel = typeof providerSettings?.modelSelection?.modelId === 'string'
         ? providerSettings.modelSelection.modelId
         : undefined
+      const runtimeProviderConfiguredModel = settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.model
+      const runtimeProviderModel = typeof runtimeProviderConfiguredModel === 'string'
+        && runtimeProviderConfiguredModel.trim().length > 0
+        ? runtimeProviderConfiguredModel
+        : undefined
       const configuredModel = freshAgentType.runtimeProvider === 'codex' || freshAgentType.runtimeProvider === 'opencode'
         ? providerDefaultModel
-          ?? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.model
+          ?? runtimeProviderModel
           ?? freshAgentType.defaultModel
         : freshAgentType.defaultModel
       const model = normalizeFreshAgentModel(freshAgentType.sessionType, freshAgentType.runtimeProvider, configuredModel) ?? configuredModel
+      const shouldPersistPaneModel = freshAgentType.runtimeProvider !== 'opencode'
+        || providerDefaultModel !== undefined
+        || runtimeProviderModel !== undefined
       const permissionMode = freshAgentType.settingsVisibility.permissionMode === false
         ? undefined
         : providerSettings?.defaultPermissionMode
@@ -628,7 +636,7 @@ function PickerWrapper({
         createRequestId: nanoid(),
         status: 'creating',
         modelSelection: normalizeFreshAgentModelSelection(providerSettings?.modelSelection),
-        model,
+        ...(shouldPersistPaneModel ? { model } : {}),
         ...(permissionMode ? { permissionMode } : {}),
         sandbox: freshAgentType.runtimeProvider === 'codex'
           ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.sandbox

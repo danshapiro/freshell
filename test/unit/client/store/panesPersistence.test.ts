@@ -781,6 +781,79 @@ describe('version 5 migration (drop claude-chat panes)', () => {
     })
     expect(content.effort).toBe('high')
   })
+
+  it('drops stale legacy Freshopencode pane defaults instead of preserving DeepSeek', () => {
+    localStorage.setItem('freshell.layout.v3', JSON.stringify({
+      version: 3,
+      tabs: { tabs: [{ id: 'tab1', title: 'Tab 1' }], activeTabId: 'tab1' },
+      panes: {
+        version: 6,
+        layouts: {
+          tab1: {
+            type: 'leaf',
+            id: 'pane1',
+            content: {
+              kind: 'fresh-agent',
+              sessionType: 'freshopencode',
+              provider: 'opencode',
+              createRequestId: 'req1',
+              status: 'idle',
+              model: 'opencode-go/deepseek-v4-flash',
+              effort: 'max',
+            },
+          },
+        },
+        activePane: { tab1: 'pane1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+
+    const persisted = loadPersistedPanes()
+    const content = (persisted!.layouts.tab1 as any).content
+
+    expect(content.model).toBeUndefined()
+    expect(content.modelSelection).toBeUndefined()
+    expect(content.effort).toBe('max')
+  })
+
+  it('preserves explicit Freshopencode DeepSeek pane selections', () => {
+    localStorage.setItem('freshell.layout.v3', JSON.stringify({
+      version: 3,
+      tabs: { tabs: [{ id: 'tab1', title: 'Tab 1' }], activeTabId: 'tab1' },
+      panes: {
+        version: 6,
+        layouts: {
+          tab1: {
+            type: 'leaf',
+            id: 'pane1',
+            content: {
+              kind: 'fresh-agent',
+              sessionType: 'freshopencode',
+              provider: 'opencode',
+              createRequestId: 'req1',
+              status: 'idle',
+              model: 'opencode-go/deepseek-v4-flash',
+              modelSelection: { kind: 'exact', modelId: 'opencode-go/deepseek-v4-flash' },
+              effort: 'max',
+            },
+          },
+        },
+        activePane: { tab1: 'pane1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+
+    const persisted = loadPersistedPanes()
+    const content = (persisted!.layouts.tab1 as any).content
+
+    expect(content.model).toBeUndefined()
+    expect(content.modelSelection).toEqual({ kind: 'exact', modelId: 'opencode-go/deepseek-v4-flash' })
+    expect(content.effort).toBe('max')
+  })
 })
 
 import { BROWSER_PREFERENCES_STORAGE_KEY } from '../../../../src/store/storage-keys'

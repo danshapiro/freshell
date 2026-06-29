@@ -25,6 +25,7 @@ vi.mock('../../../../server/fresh-agent/observability.js', async (importOriginal
 vi.mock('../../../../server/logger.js', () => ({ logger: loggerMocks.logger }))
 
 import { createOpencodeFreshAgentAdapter } from '../../../../server/fresh-agent/adapters/opencode/adapter.js'
+import { FRESHOPENCODE_DEFAULT_MODEL } from '../../../../shared/fresh-agent-models.js'
 
 type FakeManager = ReturnType<typeof makeFakeManager>
 
@@ -108,6 +109,22 @@ describe('OpenCode serve adapter: create + send', () => {
       variant: 'high',
     }, { cwd: '/repo' })
     expect(manager.onceIdle).toHaveBeenCalledWith('ses_real_1', expect.any(Number), { cwd: '/repo' })
+  })
+
+  it('uses the Freshopencode default model when create omits an explicit model', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+    await adapter.create({
+      requestId: 'req-default-model', sessionType: 'freshopencode', provider: 'opencode',
+      cwd: '/repo',
+    })
+
+    await adapter.send?.('freshopencode-req-default-model', { text: 'reply ok' })
+
+    expect(FRESHOPENCODE_DEFAULT_MODEL).toBe('opencode-go/glm-5.2')
+    expect(manager.promptAsync).toHaveBeenCalledWith('ses_real_1', expect.objectContaining({
+      model: { providerID: 'opencode-go', modelID: 'glm-5.2' },
+    }), { cwd: '/repo' })
   })
 
   it('attach during an in-flight send reuses the materialized state (no duplicate serve subscription)', async () => {

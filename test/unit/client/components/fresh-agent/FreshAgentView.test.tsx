@@ -3,7 +3,7 @@ import { render, screen, waitFor, fireEvent, createEvent, cleanup, act } from '@
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
-import settingsReducer, { updateSettingsLocal } from '@/store/settingsSlice'
+import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from '@/store/settingsSlice'
 import freshAgentReducer, { sessionInit, setSessionStatus } from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
@@ -1764,6 +1764,47 @@ describe('FreshAgentView', () => {
         provider: 'opencode',
         model: 'opencode-go/glm-5.2',
         modelSelection: { kind: 'exact', modelId: 'opencode-go/glm-5.2' },
+      }))
+    })
+  })
+
+  it('creates Freshopencode panes with the saved provider model when the pane has no model preference', async () => {
+    const store = createStore()
+    store.dispatch(previewServerSettingsPatch({
+      freshAgent: {
+        providers: {
+          freshopencode: {
+            modelSelection: { kind: 'exact', modelId: 'umans-ai-coding-plan/umans-kimi-k2.7' },
+            effort: 'high',
+          },
+        },
+      },
+    }))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-provider-default-opencode-model',
+        status: 'creating',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(sentFreshAgentMessages('freshAgent.create')).toContainEqual(expect.objectContaining({
+        type: 'freshAgent.create',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        model: 'umans-ai-coding-plan/umans-kimi-k2.7',
+        effort: 'high',
       }))
     })
   })
@@ -3911,6 +3952,123 @@ describe('FreshAgentView', () => {
     await waitFor(() => {
       expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
     })
+  })
+
+  it('performs a follow-up freshopencode refresh when final send acceptance lands during an earlier invalidation debounce', async () => {
+    const store = createStore()
+    let wsHandler: ((message: any) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      wsHandler = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_final_race',
+        status: 'idle',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [],
+      })
+      .mockResolvedValueOnce({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_final_race',
+        revision: 2,
+        status: 'idle',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [
+          {
+            id: 'turn-final-user',
+            turnId: 'turn-final-user',
+            role: 'user',
+            summary: 'Race final prompt',
+            items: [{ id: 'item-final-user', kind: 'text', text: 'Race final prompt' }],
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_final_race',
+        revision: 3,
+        status: 'idle',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [
+          {
+            id: 'turn-final-user',
+            turnId: 'turn-final-user',
+            role: 'user',
+            summary: 'Race final prompt',
+            items: [{ id: 'item-final-user', kind: 'text', text: 'Race final prompt' }],
+          },
+          {
+            id: 'turn-final-assistant',
+            turnId: 'turn-final-assistant',
+            role: 'assistant',
+            summary: 'Final answer after durable history catches up',
+            items: [{ id: 'item-final-assistant', kind: 'text', text: 'Final answer after durable history catches up' }],
+          },
+        ],
+      })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-final-race',
+        sessionId: 'ses_final_race',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_final_race' },
+        resumeSessionId: 'ses_final_race',
+        initialCwd: '/repo/final-race',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Race final prompt' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const send = sentFreshAgentMessages('freshAgent.send').at(-1)
+    const requestId = String(send?.requestId)
+
+    act(() => {
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_final_race',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.session.changed',
+          sessionId: 'ses_final_race',
+          reason: 'opencode-message',
+        },
+      })
+      wsHandler?.({
+        type: 'freshAgent.send.accepted',
+        requestId,
+        sessionId: 'ses_final_race',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/repo/final-race',
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText('Final answer after durable history catches up')).toBeInTheDocument()
+    })
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3)
   })
 
   it('clears stale local echo after an idle recovered snapshot without the submitted turn', async () => {
