@@ -501,6 +501,32 @@ describe('PaneHeader', () => {
       expect(paneIcon.getAttribute('class')).toContain('text-blue-500')
       expect(paneIcon.getAttribute('class')).not.toContain('animate-pulse')
     })
+
+    it('applies blue text color to the fresh-agent identity when busy is true', () => {
+      render(
+        <Provider store={makeFreshAgentStore()}>
+          <PaneHeader
+            title="freshell"
+            status="running"
+            isActive={true}
+            busy={true}
+            onClose={vi.fn()}
+            content={{
+              kind: 'fresh-agent',
+              sessionType: 'freshcodex',
+              provider: 'codex',
+              sessionId: 'fresh-session-1',
+              createRequestId: 'fresh-req-1',
+              status: 'running',
+            }}
+          />
+        </Provider>,
+      )
+
+      const identity = screen.getByText('freshcodex')
+      expect(identity.getAttribute('class')).toContain('text-blue-500')
+      expect(screen.queryByTestId('pane-icon')).toBeNull()
+    })
   })
 
   describe('interactions', () => {

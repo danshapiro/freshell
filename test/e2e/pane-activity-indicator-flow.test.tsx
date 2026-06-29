@@ -245,6 +245,16 @@ function getVisibleSinglePaneTab() {
   return tab
 }
 
+function expectFreshAgentHeaderBusy(paneHeader: HTMLElement, expectedBusy: boolean) {
+  const identity = within(paneHeader).getByText('freshclaude')
+  const className = identity.getAttribute('class') ?? ''
+  if (expectedBusy) {
+    expect(className).toContain('text-blue-500')
+  } else {
+    expect(className).not.toContain('text-blue-500')
+  }
+}
+
 describe('pane activity indicator flow (e2e)', () => {
   afterEach(() => {
     cleanup()
@@ -321,7 +331,7 @@ describe('pane activity indicator flow (e2e)', () => {
     })
 
     const paneHeader = screen.getByRole('banner', { name: 'Pane: Activity Pane' })
-    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+    expectFreshAgentHeaderBusy(paneHeader, false)
     expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
 
     act(() => {
@@ -333,7 +343,7 @@ describe('pane activity indicator flow (e2e)', () => {
       }))
     })
 
-    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    expectFreshAgentHeaderBusy(paneHeader, true)
     expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
   })
 
@@ -531,7 +541,7 @@ describe('pane activity indicator flow (e2e)', () => {
     })
 
     const paneHeader = screen.getByRole('banner', { name: 'Pane: Activity Pane' })
-    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+    expectFreshAgentHeaderBusy(paneHeader, false)
     expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
 
     act(() => {
@@ -543,7 +553,7 @@ describe('pane activity indicator flow (e2e)', () => {
       }))
     })
 
-    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    expectFreshAgentHeaderBusy(paneHeader, true)
     expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
   })
 

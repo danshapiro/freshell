@@ -106,7 +106,10 @@ export default function PaneHeader({
       <div className="min-w-0 flex flex-1 items-center gap-1.5">
         {isFreshAgentPane && !isRenaming ? (
           <span
-            className="shrink-0 text-sm text-muted-foreground"
+            className={cn(
+              'shrink-0 text-sm',
+              busy && status === 'running' ? 'text-blue-500' : 'text-muted-foreground',
+            )}
             title={`${content.sessionType} session`}
           >
             {content.sessionType}
