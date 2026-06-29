@@ -6,6 +6,7 @@ import type { TerminalStatus } from '@/store/types'
 import type { PaneContent } from '@/store/paneTypes'
 import PaneIcon from '@/components/icons/PaneIcon'
 import FreshAgentSettingsButton from '@/components/fresh-agent/FreshAgentSettingsButton'
+import { derivePaneTitle } from '@/lib/derivePaneTitle'
 
 interface PaneHeaderProps {
   tabId?: string
@@ -58,8 +59,20 @@ export default function PaneHeader({
 }: PaneHeaderProps) {
   const inputRef = useRef<HTMLInputElement>(null)
   const isFreshAgentPane = content.kind === 'fresh-agent'
-  const visibleTitle = isFreshAgentPane ? (metaLabel ?? title) : title
-  const visibleTitleTooltip = isFreshAgentPane ? (metaTooltip || metaLabel || title) : title
+  const freshAgentDerivedTitle = isFreshAgentPane ? derivePaneTitle(content) : undefined
+  const freshAgentTitle = title.trim()
+  const freshAgentTitleMatchesMeta = isFreshAgentPane
+    && !!metaLabel
+    && !!freshAgentTitle
+    && (metaLabel === freshAgentTitle || metaLabel.startsWith(`${freshAgentTitle} `))
+  const isFreshAgentDefaultTitle = isFreshAgentPane && (title === freshAgentDerivedTitle || freshAgentTitleMatchesMeta)
+  const freshAgentTitleRepeatsIdentity = isFreshAgentPane && freshAgentTitle.toLowerCase() === content.sessionType
+  const freshAgentTitleLabel = isFreshAgentPane && freshAgentTitle
+    ? (!isFreshAgentDefaultTitle || (!metaLabel && !freshAgentTitleRepeatsIdentity) ? title : undefined)
+    : undefined
+  const freshAgentMetaLabel = isFreshAgentPane && metaLabel && metaLabel !== freshAgentTitleLabel
+    ? metaLabel
+    : undefined
   const refreshButton = onRefresh ? (
     <button
       onClick={(e) => {
@@ -127,9 +140,28 @@ export default function PaneHeader({
             aria-label="Rename pane"
             aria-invalid={renameError ? true : undefined}
           />
+        ) : isFreshAgentPane ? (
+          <>
+            {freshAgentTitleLabel ? (
+              <span className="block min-w-0 truncate" title={title}>
+                {freshAgentTitleLabel}
+              </span>
+            ) : null}
+            {freshAgentMetaLabel ? (
+              <span
+                className={cn(
+                  'block min-w-0 truncate',
+                  freshAgentTitleLabel ? 'text-muted-foreground' : undefined,
+                )}
+                title={metaTooltip || freshAgentMetaLabel}
+              >
+                {freshAgentMetaLabel}
+              </span>
+            ) : null}
+          </>
         ) : (
-          <span className="block min-w-0 truncate" title={visibleTitleTooltip}>
-            {visibleTitle}
+          <span className="block min-w-0 truncate" title={title}>
+            {title}
           </span>
         )}
       </div>

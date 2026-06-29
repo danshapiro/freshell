@@ -210,6 +210,98 @@ describe('PaneHeader', () => {
       ).toBeTruthy()
     })
 
+    it('keeps a custom fresh-agent pane title visible before CLI-style metadata', () => {
+      render(
+        <Provider store={makeFreshAgentStore()}>
+          <PaneHeader
+            tabId="tab-1"
+            paneId="pane-1"
+            title="Ops desk"
+            metaLabel="freshell (main)  56%"
+            metaTooltip="Directory: /home/dan/code/freshell"
+            status="running"
+            isActive={true}
+            onClose={vi.fn()}
+            content={{
+              kind: 'fresh-agent',
+              sessionType: 'freshcodex',
+              provider: 'codex',
+              sessionId: 'fresh-session-1',
+              createRequestId: 'fresh-req-1',
+              status: 'idle',
+              initialCwd: '/home/dan/code/freshell',
+            }}
+          />
+        </Provider>,
+      )
+
+      const identity = screen.getByText('freshcodex')
+      const customTitle = screen.getByText('Ops desk')
+      const metadata = screen.getByText(/freshell \(main\)\s+56%/)
+
+      expect(
+        identity.compareDocumentPosition(customTitle) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy()
+      expect(
+        customTitle.compareDocumentPosition(metadata) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy()
+      expect(metadata).toHaveAttribute('title', 'Directory: /home/dan/code/freshell')
+    })
+
+    it('does not duplicate the default fresh-agent title when CLI-style metadata is available', () => {
+      render(
+        <Provider store={makeFreshAgentStore()}>
+          <PaneHeader
+            tabId="tab-1"
+            paneId="pane-1"
+            title="freshell"
+            metaLabel="freshell (main)  56%"
+            status="running"
+            isActive={true}
+            onClose={vi.fn()}
+            content={{
+              kind: 'fresh-agent',
+              sessionType: 'freshcodex',
+              provider: 'codex',
+              sessionId: 'fresh-session-1',
+              createRequestId: 'fresh-req-1',
+              status: 'idle',
+              initialCwd: '/home/dan/code/freshell',
+            }}
+          />
+        </Provider>,
+      )
+
+      expect(screen.getByText('freshcodex')).toBeInTheDocument()
+      expect(screen.getByText(/freshell \(main\)\s+56%/)).toBeInTheDocument()
+      expect(screen.queryByText('freshell')).toBeNull()
+    })
+
+    it('omits the redundant default label when a fresh-agent pane has no cwd metadata yet', () => {
+      render(
+        <Provider store={makeFreshAgentStore()}>
+          <PaneHeader
+            tabId="tab-1"
+            paneId="pane-1"
+            title="Freshcodex"
+            status="creating"
+            isActive={true}
+            onClose={vi.fn()}
+            content={{
+              kind: 'fresh-agent',
+              sessionType: 'freshcodex',
+              provider: 'codex',
+              createRequestId: 'fresh-req-1',
+              status: 'creating',
+            }}
+          />
+        </Provider>,
+      )
+
+      expect(screen.getByText('freshcodex')).toBeInTheDocument()
+      expect(screen.queryByText('Freshcodex')).toBeNull()
+    })
+
     it.each([
       ['freshclaude', 'claude'],
       ['freshcodex', 'codex'],
