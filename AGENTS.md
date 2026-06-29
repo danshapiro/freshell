@@ -50,7 +50,9 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 
 - Never use broad kill patterns (for example `pkill -f "tsx watch server/index.ts"`, `pkill -f vite`, `pkill node`).
 - Start manual worktree servers on a unique port and record their PID, then stop only that PID.
-- Dev mode example (source + Vite): `PORT=3344 npm run dev:server > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid`
+- Dev mode example (full hot reload — Vite client HMR + tsx-watch server): `NODE_ENV=development PORT=3344 npm run dev > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid`, then open `http://localhost:5173/?token=<AUTH_TOKEN from .env>` (Vite proxies `/api` + `/ws` to the server port).
+  - `NODE_ENV=development` is required: a lingering `NODE_ENV=production` in the shell (e.g. left by `npm start`) makes `isDev` false, so the server skips the Vite path and `/` 404s on `client/index.html`.
+  - Server-only hot reload (no client UI): `PORT=3344 npm run dev:server ...` instead.
 - Production mode example (built dist): `PORT=3344 npm start > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid`
   - **NEVER run `node dist/server/index.js` directly** — use `npm start` which sets `NODE_ENV=production`; without it the server prints the Vite port (5173) in the startup URL even though Vite isn't running
 - Example stop: `kill "$(cat /tmp/freshell-3344.pid)" && rm -f /tmp/freshell-3344.pid`
