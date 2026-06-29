@@ -2998,6 +2998,7 @@ export class TerminalRegistry extends EventEmitter {
       const oldPty = record.pty
       const oldSidecar = record.codexSidecar
       record.codexRecoveryRetiringPty = oldPty
+      this.clearCodexInputGate(record)
       if (oldSidecar) {
         try {
           await this.trackSidecarShutdown(
@@ -3027,7 +3028,6 @@ export class TerminalRegistry extends EventEmitter {
 
       record.codexSidecarLifecycleUnsubscribe?.()
       record.codexSidecarLifecycleUnsubscribe = undefined
-      this.clearCodexInputGate(record)
       record.pty = candidate.pty
       this.emit('terminal.stream.replaced', {
         terminalId: record.terminalId,

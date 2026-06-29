@@ -352,23 +352,20 @@ describe('CodexRemoteProxy', () => {
     await socketClosed(tui)
   })
 
-  it('resumes candidate capture timeout so a later timeout still fires', () => {
-    vi.useFakeTimers()
-    const proxy = new CodexRemoteProxy({
-      upstreamWsUrl: 'ws://127.0.0.1:1',
-      candidateCaptureTimeoutMs: 1_000,
+  it('resumes candidate capture timeout so a later timeout still fires', async () => {
+    const upstream = await startUpstream()
+    const proxy = await startProxy(upstream.wsUrl, {
+      candidateCaptureTimeoutMs: 20,
     })
-    proxies.add(proxy)
     const repairTriggers: unknown[] = []
     proxy.onRepairTrigger((event) => repairTriggers.push(event))
 
     proxy.pauseCandidateCapture('startup_update_prompt')
-    ;(proxy as any).ensureCandidateCaptureTimer()
-    vi.advanceTimersByTime(5_000)
+    await delay(50)
     expect(repairTriggers).toEqual([])
 
     proxy.resumeCandidateCapture('startup_update_prompt_skipped')
-    vi.advanceTimersByTime(1_000)
+    await delay(50)
 
     expect(repairTriggers).toContainEqual({ kind: 'candidate_capture_timeout' })
   })

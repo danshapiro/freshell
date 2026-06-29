@@ -521,9 +521,17 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     expect(registry.get(term.terminalId)?.codexInputGate).toBeUndefined()
   })
 
-  it('resumes paused candidate capture when recovery replacement clears a stale startup update gate', async () => {
+  it('resumes paused candidate capture before retiring sidecar shutdown during recovery replacement', async () => {
     const registry = new TerminalRegistry()
-    const currentSidecar = createFakeSidecar()
+    const order: string[] = []
+    const currentSidecar = createFakeSidecar({
+      shutdown: async () => {
+        order.push('shutdown')
+      },
+    })
+    currentSidecar.resumeCandidateCapture.mockImplementation(() => {
+      order.push('resume')
+    })
     const replacementSidecar = createFakeSidecar()
     const planCreate = vi.fn(async () => ({
       sessionId: 'thread-1',
@@ -555,6 +563,8 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
 
     await vi.waitFor(() => expect(replacementSidecar.adopt).toHaveBeenCalledWith({ terminalId: term.terminalId, generation: 1 }))
     expect(currentSidecar.resumeCandidateCapture).toHaveBeenCalledWith('codex_input_gate_cleared')
+    expect(currentSidecar.shutdown).toHaveBeenCalledTimes(1)
+    expect(order).toEqual(['resume', 'shutdown'])
     expect(registry.get(term.terminalId)?.codexInputGate).toBeUndefined()
   })
 
