@@ -25,6 +25,7 @@ import { resolveScreenshotOutputPath } from './screenshot-path.js'
 import { sanitizeSessionRef } from '../../shared/session-contract.js'
 import type { LayoutStore } from './layout-store.js'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '../../shared/fresh-agent.js'
+import { translateKeys } from '../cli/keys.js'
 import type {
   FreshAgentSessionLocator,
   FreshAgentThreadLocator,
@@ -236,6 +237,14 @@ function acceptedSessionRefForMode(
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0
+}
+
+function normalizeTerminalInputPayload(payload: Record<string, unknown>): string {
+  if (typeof payload.data === 'string') return payload.data
+  if (Array.isArray(payload.keys)) return translateKeys(payload.keys.map(String))
+  if (typeof payload.keys === 'string') return translateKeys([payload.keys])
+  if (typeof payload.text === 'string') return payload.text
+  return ''
 }
 
 async function adoptCodexLaunch(
@@ -1746,7 +1755,7 @@ export function createAgentApiRouter({
       }
     }
     const payload = req.body || {}
-    const data = payload.data ?? payload.keys ?? payload.text ?? ''
+    const data = normalizeTerminalInputPayload(payload)
     const paneSnapshot = layoutStore.getPaneSnapshot?.(paneId)
     let terminalId = paneSnapshot?.terminalId || layoutStore.resolvePaneToTerminal?.(paneId)
     if (!terminalId && layoutStore.resolveTarget) {

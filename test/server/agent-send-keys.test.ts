@@ -16,6 +16,36 @@ it('sends input to a pane terminal', async () => {
   expect(res.body.status).toBe('ok')
 })
 
+it('normalizes REST send-keys token strings through the shared key translator', async () => {
+  const input = vi.fn(() => ({ status: 'written' }))
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: { resolvePaneToTerminal: () => 'term_1' },
+    registry: { input },
+  }))
+
+  const res = await request(app).post('/api/panes/p1/send-keys').send({ keys: 'ENTER' })
+
+  expect(res.body.status).toBe('ok')
+  expect(input).toHaveBeenCalledWith('term_1', '\r')
+})
+
+it('normalizes REST send-keys token arrays through the shared key translator', async () => {
+  const input = vi.fn(() => ({ status: 'written' }))
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: { resolvePaneToTerminal: () => 'term_1' },
+    registry: { input },
+  }))
+
+  const res = await request(app).post('/api/panes/p1/send-keys').send({ keys: ['2', 'ENTER'] })
+
+  expect(res.body.status).toBe('ok')
+  expect(input).toHaveBeenCalledWith('term_1', '2\r')
+})
+
 it('resolves tmux-style target to a pane before sending', async () => {
   const input = vi.fn(() => ({ status: 'written' }))
   const app = express()
