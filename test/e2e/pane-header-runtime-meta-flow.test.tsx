@@ -810,6 +810,7 @@ describe('pane header runtime metadata flow (e2e)', () => {
     })
 
     await waitFor(() => {
+      expect(screen.getByText('freshclaude')).toBeInTheDocument()
       expect(screen.getByText(/freshell \(main\*\)\s+50%/)).toBeInTheDocument()
     })
   })

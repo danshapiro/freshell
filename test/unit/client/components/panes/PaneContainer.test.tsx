@@ -2749,7 +2749,7 @@ describe('PaneContainer', () => {
         store,
       )
 
-      expect(screen.getByTitle('Kilroy session')).toHaveTextContent('Kilroy')
+      expect(screen.getByTitle('kilroy session')).toHaveTextContent('kilroy')
       expect(screen.getByText(/freshell \(main\)\s+25%/)).toBeInTheDocument()
     })
 
@@ -3098,6 +3098,32 @@ describe('PaneContainer', () => {
       )
 
       expect(screen.getByTitle('Refresh pane')).toBeInTheDocument()
+    })
+
+    it('does not render refresh button for fresh-agent pane without a session id', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'fresh-req-1',
+          status: 'idle',
+        },
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': node },
+        activePane: { 'tab-1': 'pane-1' },
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      expect(screen.queryByTitle('Refresh pane')).toBeNull()
     })
 
     it('clicking refresh button dispatches requestPaneRefresh to Redux store', () => {

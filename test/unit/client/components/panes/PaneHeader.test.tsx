@@ -3,8 +3,9 @@ import { render, screen, fireEvent, cleanup } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import PaneHeader from '@/components/panes/PaneHeader'
-import freshAgentReducer, { sessionInit } from '@/store/freshAgentSlice'
+import freshAgentReducer, { freshAgentSnapshotReceived, sessionInit } from '@/store/freshAgentSlice'
 import { formatPaneRuntimeLabel, formatPaneRuntimeTooltip } from '@/lib/format-terminal-title-meta'
+import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 
 vi.mock('lucide-react', () => ({
   X: ({ className }: { className?: string }) => (
@@ -52,22 +53,51 @@ vi.mock('@/components/icons/PaneIcon', () => ({
 }))
 
 vi.mock('@/components/fresh-agent/FreshAgentSettingsButton', () => ({
-  default: () => <button data-testid="settings-button-stub" />,
+  default: () => (
+    <button type="button" aria-label="Agent settings" title="Agent settings" data-testid="settings-button-stub" />
+  ),
 }))
 
 function makeTerminalContent(mode = 'shell') {
   return { kind: 'terminal' as const, mode, shell: 'system' as const, createRequestId: 'r1', status: 'running' as const }
 }
 
-function makeFreshAgentContent(sessionId = 'thread-1') {
+function makeFreshAgentStore() {
+  return configureStore({
+    reducer: { freshAgent: freshAgentReducer },
+  })
+}
+
+function makeFreshAgentSnapshot(
+  overrides: Partial<FreshAgentSnapshot> & {
+    threadId: string
+    sessionType: FreshAgentSnapshot['sessionType']
+    provider: FreshAgentSnapshot['provider']
+    tokenUsage: FreshAgentSnapshot['tokenUsage']
+  },
+): FreshAgentSnapshot {
   return {
-    kind: 'fresh-agent' as const,
-    sessionType: 'freshclaude' as const,
-    provider: 'claude' as const,
-    sessionId,
-    createRequestId: 'req-1',
-    status: 'idle' as const,
-  }
+    threadId: overrides.threadId,
+    sessionType: overrides.sessionType,
+    provider: overrides.provider,
+    revision: overrides.revision ?? 1,
+    status: overrides.status ?? 'idle',
+    capabilities: overrides.capabilities ?? {
+      send: true,
+      interrupt: true,
+      approvals: true,
+      questions: true,
+      fork: false,
+    },
+    tokenUsage: overrides.tokenUsage,
+    pendingApprovals: overrides.pendingApprovals ?? [],
+    pendingQuestions: overrides.pendingQuestions ?? [],
+    worktrees: overrides.worktrees ?? [],
+    diffs: overrides.diffs ?? [],
+    childThreads: overrides.childThreads ?? [],
+    turns: overrides.turns ?? [],
+    extensions: overrides.extensions ?? {},
+  } as FreshAgentSnapshot
 }
 
 describe('PaneHeader', () => {
@@ -139,6 +169,181 @@ describe('PaneHeader', () => {
       ).toBeInTheDocument()
       expect(screen.getByTitle('Maximize pane')).toBeInTheDocument()
       expect(screen.getByTitle('Close pane')).toBeInTheDocument()
+    })
+
+    it('renders fresh-agent identity as the leftmost visible header item before CLI-style metadata', () => {
+      render(
+        <Provider store={makeFreshAgentStore()}>
+          <PaneHeader
+            tabId="tab-1"
+            paneId="pane-1"
+            title="freshell"
+            metaLabel="freshell (main)  56%"
+            metaTooltip="Directory: /home/dan/code/freshell"
+            status="running"
+            isActive={true}
+            onClose={vi.fn()}
+            onRefresh={vi.fn()}
+            onToggleZoom={vi.fn()}
+            content={{
+              kind: 'fresh-agent',
+              sessionType: 'freshcodex',
+              provider: 'codex',
+              sessionId: 'fresh-session-1',
+              createRequestId: 'fresh-req-1',
+              status: 'idle',
+            }}
+          />
+        </Provider>,
+      )
+
+      const banner = screen.getByRole('banner', { name: 'Pane: freshell' })
+      const identity = screen.getByText('freshcodex')
+      const metadata = screen.getByText(/freshell \(main\)\s+56%/)
+
+      expect(banner).toContainElement(identity)
+      expect(banner).toContainElement(metadata)
+      expect(screen.queryByTestId('pane-icon')).toBeNull()
+      expect(screen.getAllByText(/freshell/)).toHaveLength(1)
+      expect(
+        identity.compareDocumentPosition(metadata) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy()
+    })
+
+    it.each([
+      ['freshclaude', 'claude'],
+      ['freshcodex', 'codex'],
+      ['freshopencode', 'opencode'],
+      ['kilroy', 'claude'],
+    ] as const)('renders %s as the fresh-agent header identity', (sessionType, provider) => {
+      render(
+        <Provider store={makeFreshAgentStore()}>
+          <PaneHeader
+            tabId="tab-1"
+            paneId="pane-1"
+            title="freshell"
+            metaLabel="freshell (main)  56%"
+            status="running"
+            isActive={true}
+            onClose={vi.fn()}
+            content={{
+              kind: 'fresh-agent',
+              sessionType,
+              provider,
+              sessionId: `${sessionType}-session`,
+              createRequestId: `${sessionType}-req`,
+              status: 'idle',
+            }}
+          />
+        </Provider>,
+      )
+
+      expect(screen.getByText(sessionType)).toBeInTheDocument()
+    })
+
+    it('renders fresh-agent controls in settings refresh zoom close order without open-terminal or context-meter controls', () => {
+      const store = makeFreshAgentStore()
+      store.dispatch(sessionInit({
+        sessionId: 'fresh-session-1',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        tools: [{ name: 'Bash' }, { name: 'Read' }, { name: 'Glob' }, { name: 'WebFetch' }],
+      }))
+      store.dispatch(freshAgentSnapshotReceived({
+        snapshot: makeFreshAgentSnapshot({
+          threadId: 'fresh-session-1',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          tokenUsage: {
+            inputTokens: 1200,
+            outputTokens: 300,
+            totalTokens: 1500,
+            contextTokens: 1500,
+            compactPercent: 56,
+          },
+        }),
+      }))
+
+      render(
+        <Provider store={store}>
+          <PaneHeader
+            tabId="tab-1"
+            paneId="pane-1"
+            title="freshell"
+            metaLabel="freshell (main)  56%"
+            status="running"
+            isActive={true}
+            onClose={vi.fn()}
+            onRefresh={vi.fn()}
+            onSearch={vi.fn()}
+            onToggleZoom={vi.fn()}
+            content={{
+              kind: 'fresh-agent',
+              sessionType: 'freshcodex',
+              provider: 'codex',
+              sessionId: 'fresh-session-1',
+              createRequestId: 'fresh-req-1',
+              status: 'idle',
+            }}
+          />
+        </Provider>,
+      )
+
+      const actionLabels = screen.getAllByRole('button').map((button) =>
+        button.getAttribute('aria-label') || button.getAttribute('title'),
+      )
+
+      expect(actionLabels).toEqual([
+        'Agent settings',
+        'Refresh pane',
+        'Maximize pane',
+        'Close pane',
+      ])
+      expect(screen.queryByTitle('Bash, Read, Glob, WebFetch')).toBeNull()
+      expect(screen.queryByTestId('terminal-icon')).toBeNull()
+      expect(screen.queryByTestId('filetext-icon')).toBeNull()
+      expect(screen.queryByTestId('filesearch-icon')).toBeNull()
+      expect(screen.queryByTestId('globe-icon')).toBeNull()
+      expect(screen.queryByTitle('Search in terminal')).toBeNull()
+      expect(screen.queryByLabelText('Open terminal at session directory')).toBeNull()
+      expect(screen.queryByRole('status', { name: /context/i })).toBeNull()
+      expect(screen.queryByText(/ctx/i)).toBeNull()
+    })
+
+    it('omits refresh from the fresh-agent control order when no refresh handler is provided', () => {
+      render(
+        <Provider store={makeFreshAgentStore()}>
+          <PaneHeader
+            tabId="tab-1"
+            paneId="pane-1"
+            title="freshell"
+            metaLabel="freshell (main)"
+            status="running"
+            isActive={true}
+            onClose={vi.fn()}
+            onToggleZoom={vi.fn()}
+            content={{
+              kind: 'fresh-agent',
+              sessionType: 'freshcodex',
+              provider: 'codex',
+              sessionId: 'fresh-session-1',
+              createRequestId: 'fresh-req-1',
+              status: 'idle',
+            }}
+          />
+        </Provider>,
+      )
+
+      const actionLabels = screen.getAllByRole('button').map((button) =>
+        button.getAttribute('aria-label') || button.getAttribute('title'),
+      )
+
+      expect(actionLabels).toEqual([
+        'Agent settings',
+        'Maximize pane',
+        'Close pane',
+      ])
+      expect(screen.queryByText(/ctx/i)).toBeNull()
     })
   })
 
@@ -907,55 +1112,4 @@ describe('PaneHeader', () => {
     })
   })
 
-  describe('fresh-agent tool icons', () => {
-    it('renders an icon for each known tool used by the session', () => {
-      const store = configureStore({
-        reducer: { freshAgent: freshAgentReducer },
-      })
-      store.dispatch(sessionInit({
-        sessionId: 'thread-1',
-        sessionType: 'freshclaude',
-        provider: 'claude',
-        tools: [{ name: 'Bash' }, { name: 'Read' }, { name: 'Glob' }, { name: 'WebFetch' }],
-      }))
-
-      render(
-        <Provider store={store}>
-          <PaneHeader
-            title="Claude"
-            status="idle"
-            isActive={true}
-            onClose={vi.fn()}
-            content={makeFreshAgentContent()}
-          />
-        </Provider>,
-      )
-
-      expect(screen.getByTestId('terminal-icon')).toBeInTheDocument()
-      expect(screen.getByTestId('filetext-icon')).toBeInTheDocument()
-      expect(screen.getByTestId('filesearch-icon')).toBeInTheDocument()
-      expect(screen.getByTestId('globe-icon')).toBeInTheDocument()
-      expect(screen.getByTitle('Bash, Read, Glob, WebFetch')).toBeInTheDocument()
-    })
-
-    it('renders no tool icons when the session has no tools', () => {
-      const store = configureStore({
-        reducer: { freshAgent: freshAgentReducer },
-      })
-
-      const { container } = render(
-        <Provider store={store}>
-          <PaneHeader
-            title="Claude"
-            status="idle"
-            isActive={true}
-            onClose={vi.fn()}
-            content={makeFreshAgentContent()}
-          />
-        </Provider>,
-      )
-
-      expect(container.querySelector('[title="Bash"]')).toBeNull()
-    })
-  })
 })
