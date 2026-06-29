@@ -339,7 +339,7 @@ it('blocks update prompt arrow navigation rather than tracking highlight state',
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts -t "Codex update prompt|similar non-prompt|stale update prompt|arrow navigation"
+npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts -t "Codex update prompt|startup prompt state|similar non-prompt|stale update prompt|arrow navigation|terminal startup control"
 ```
 
 Expected: FAIL because the current detector requires `Update available!`, scans scrollback at input time, and has no live prompt state.
@@ -375,7 +375,7 @@ const CODEX_STARTUP_UPDATE_PROMPT_TAIL_CHARS = 8 * 1024
 const CODEX_STARTUP_UPDATE_PROMPT_TTL_MS = 10 * 60 * 1000
 ```
 
-Normalize terminal text with existing `stripTerminalControls()` and whitespace normalization. Implement `hasCodexStartupUpdatePrompt(text: string)` so it requires all of:
+Normalize terminal text with existing `stripTerminalControls()` and newline-preserving whitespace normalization: convert `\r` to `\n` and normalize spaces/tabs, but do not collapse newlines because the detector anchors on line starts. Implement `hasCodexStartupUpdatePrompt(text: string)` so it requires all of:
 
 ```ts
 text.includes('github.com/openai/codex/releases/latest')
@@ -411,14 +411,14 @@ Bare Enter/newline accepts Codex's default `Update now` selection:
 '\r', '\n', '\r\n' -> write original enter byte, set update_running
 ```
 
-Do not accept normal text. Do not forward arrow navigation. Do not use `record.buffer.snapshot()` for prompt detection.
+Do not accept normal text. Do not forward arrow navigation. Do not use `record.buffer.snapshot()` for prompt detection. Preserve the existing `isCodexStartupTerminalControlInput(data)` path for cursor reports, device attributes, focus, and OSC color replies while identity is pending.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts -t "Codex update prompt|similar non-prompt|stale update prompt|arrow navigation"
+npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts -t "Codex update prompt|startup prompt state|similar non-prompt|stale update prompt|arrow navigation|terminal startup control"
 ```
 
 Expected: PASS.
@@ -530,7 +530,7 @@ resumeCandidateCapture(reason: string): void {
 
 Update `ensureCandidateCaptureTimer()` so it returns without arming when `candidateCapturePaused` is true.
 
-Expose those methods through `CodexLaunchProxy`, `CodexLaunchSidecar`, and the launch-planner sidecar object.
+Expose those methods through `CodexLaunchProxy`, `CodexLaunchSidecar`, the launch-planner sidecar object, and the `TerminalRecord.codexSidecar` `Pick<CodexLaunchSidecar, ...>` in `server/terminal-registry.ts`.
 
 In `server/terminal-registry.ts`, call `record.codexSidecar?.pauseCandidateCapture?.('codex_startup_update_prompt')` only the first time a live update prompt is detected for that prompt instance. On skip or skip-until-next-version, call `record.codexSidecar?.resumeCandidateCapture?.('codex_startup_update_skipped')`. Do not resume on `Update now`; the terminal is expected to run updater and exit/restart instead of capturing identity.
 
