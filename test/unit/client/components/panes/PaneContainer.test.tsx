@@ -2340,6 +2340,92 @@ describe('PaneContainer', () => {
       expect(screen.queryByText(/%$/)).not.toBeInTheDocument()
     })
 
+    it('keeps a custom fresh-agent pane title visible alongside runtime metadata', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-fresh',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          createRequestId: 'req-fresh',
+          sessionId: 'sdk-session-1',
+          status: 'idle',
+          initialCwd: '/home/user/code/freshell',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-fresh' },
+          paneTitles: { 'tab-1': { 'pane-fresh': 'Ops desk' } },
+          paneTitleSetByUser: { 'tab-1': { 'pane-fresh': true } },
+        },
+        {},
+        {
+          projects: [
+            {
+              projectPath: '/home/user/code/freshell',
+              sessions: [
+                {
+                  provider: 'claude',
+                  sessionType: 'freshclaude',
+                  sessionId: 'claude-session-1',
+                  projectPath: '/home/user/code/freshell',
+                  cwd: '/home/user/code/freshell',
+                  gitBranch: 'main',
+                  isDirty: false,
+                  lastActivityAt: 1,
+                  tokenUsage: {
+                    inputTokens: 10,
+                    outputTokens: 5,
+                    cachedTokens: 0,
+                    totalTokens: 15,
+                    contextTokens: 15,
+                    compactThresholdTokens: 60,
+                    compactPercent: 25,
+                  },
+                },
+              ],
+            },
+          ],
+        },
+        {
+          sessions: {
+            [makeFreshAgentSessionKey({
+              sessionType: 'freshclaude',
+              provider: 'claude',
+              sessionId: 'sdk-session-1',
+            })]: createFreshClaudeSession({
+              sessionId: 'sdk-session-1',
+              cliSessionId: 'claude-session-1',
+            }),
+          },
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      const banner = screen.getByRole('banner', { name: 'Pane: Ops desk' })
+      const identity = screen.getByText('freshclaude')
+      const customTitle = screen.getByText('Ops desk')
+      const meta = screen.getByText(/freshell \(main\)\s+25%/)
+
+      expect(banner).toContainElement(identity)
+      expect(banner).toContainElement(customTitle)
+      expect(banner).toContainElement(meta)
+      expect(
+        identity.compareDocumentPosition(customTitle) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy()
+      expect(
+        customTitle.compareDocumentPosition(meta) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy()
+    })
+
     it('prefers cliSessionId over resumeSessionId when both identities exist', () => {
       const node: PaneNode = {
         type: 'leaf',
