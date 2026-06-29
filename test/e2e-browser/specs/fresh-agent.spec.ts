@@ -44,8 +44,9 @@ async function suppressFreshAgentNetworkForActivePane(page: any) {
 }
 
 async function openFreshAgentSettings(page: any, providerName: string) {
+  const headerIdentity = providerName.toLowerCase()
   const pane = page.getByRole('group').filter({
-    has: page.getByText(providerName, { exact: true }),
+    has: page.getByText(headerIdentity, { exact: true }),
   }).last()
   await expect(pane).toBeVisible({ timeout: 10_000 })
 
@@ -890,7 +891,7 @@ test.describe('Fresh Agent', () => {
     await page.getByRole('button', { name: /^Freshcodex$/i }).click()
     await page.getByRole('option').first().click()
     await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible()
-    await expect(page.getByText('Freshcodex', { exact: true })).toBeVisible()
+    await expect(page.getByText('freshcodex', { exact: true })).toBeVisible()
 
     await page.evaluate(({ currentTabId, currentPaneId }) => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({
@@ -915,7 +916,7 @@ test.describe('Fresh Agent', () => {
       currentPaneId: activePaneId,
     })
 
-    await expect(page.getByText('Freshcodex session')).toBeVisible()
+    await expect(page.getByText('Codex transcript')).toBeVisible()
     await expect(page.getByText(/feature\/fresh-agent/)).toBeVisible()
     await expect(page.getByText('README.md')).toBeVisible()
     await expect(page.getByText('review-1')).toBeVisible()
@@ -928,7 +929,7 @@ test.describe('Fresh Agent', () => {
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await harness.waitForHarness()
     await harness.waitForConnection()
-    await expect(page.getByText('Freshcodex session')).toBeVisible()
+    await expect(page.getByText('Codex transcript')).toBeVisible()
     await expect(page.getByText(/feature\/fresh-agent/)).toBeVisible()
   })
 })
