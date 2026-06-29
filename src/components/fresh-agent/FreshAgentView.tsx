@@ -176,7 +176,7 @@ function mergeSnapshotForDisplay(
 
 function resolveEffectiveFreshAgentModel(
   content: FreshAgentPaneContent,
-  providerDefaults?: { modelSelection?: { modelId: string } },
+  providerDefaults?: { modelSelection?: { modelId: string }; effort?: string },
 ): string | undefined {
   const configuredModel = content.model
     ?? content.modelSelection?.modelId
@@ -186,13 +186,13 @@ function resolveEffectiveFreshAgentModel(
 
 function getEffectiveFreshAgentEffort(
   content: FreshAgentPaneContent,
-  providerDefaults?: { modelSelection?: { modelId: string } },
+  providerDefaults?: { modelSelection?: { modelId: string }; effort?: string },
 ): string | undefined {
   return normalizeFreshAgentEffort(
     content.sessionType,
     content.provider,
     resolveEffectiveFreshAgentModel(content, providerDefaults),
-    content.effort,
+    content.effort ?? providerDefaults?.effort,
   )
 }
 

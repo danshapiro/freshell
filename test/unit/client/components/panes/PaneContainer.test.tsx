@@ -1645,7 +1645,7 @@ describe('PaneContainer', () => {
       providerSettingsByName?: Record<string, { cwd?: string; permissionMode?: string; model?: string; effort?: string }>,
       enabledProviders: string[] = ['claude'],
       availableClis: Record<string, boolean> = { claude: true },
-      freshAgentProviderSettingsByName?: Record<string, { effort?: string }>,
+      freshAgentProviderSettingsByName?: Record<string, { effort?: string; modelSelection?: { kind: 'exact'; modelId: string } }>,
     ) {
       return configureStore({
         reducer: {
@@ -1843,7 +1843,7 @@ describe('PaneContainer', () => {
       })
     })
 
-    it('enables Freshopencode from the picker with OpenCode defaults', async () => {
+    it('enables Freshopencode from the picker without persisting the built-in model fallback', async () => {
       const node = createPickerNode('pane-1')
       const store = createStoreWithClaude(node, undefined, undefined, ['claude', 'opencode'], { claude: true, opencode: true })
       mockApiPost.mockResolvedValueOnce({ valid: true, resolvedPath: '/home/user/freshopencode-project' })
@@ -1868,7 +1868,8 @@ describe('PaneContainer', () => {
           expect(paneContent.sessionType).toBe('freshopencode')
           expect(paneContent.provider).toBe('opencode')
           expect(paneContent.initialCwd).toBe('/home/user/freshopencode-project')
-          expect(paneContent.model).toBe('opencode-go/glm-5.2')
+          expect(paneContent.model).toBeUndefined()
+          expect(paneContent.modelSelection).toBeUndefined()
           expect(paneContent.effort).toBe('max')
           expect(paneContent.permissionMode).toBeUndefined()
         }
@@ -1876,6 +1877,44 @@ describe('PaneContainer', () => {
 
       expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
         codingCli: { providers: { opencode: { cwd: '/home/user/freshopencode-project' } } },
+      })
+    })
+
+    it('uses the saved Freshopencode model choice for new panes', async () => {
+      const node = createPickerNode('pane-1')
+      const store = createStoreWithClaude(
+        node,
+        undefined,
+        undefined,
+        ['claude', 'opencode'],
+        { claude: true, opencode: true },
+        { freshopencode: { modelSelection: { kind: 'exact', modelId: 'umans-ai-coding-plan/umans-kimi-k2.7' }, effort: 'high' } },
+      )
+      mockApiPost.mockResolvedValueOnce({ valid: true, resolvedPath: '/home/user/freshopencode-project' })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: 'Freshopencode' }))
+      fireEvent.transitionEnd(getPickerContainer())
+
+      const input = screen.getByLabelText('Starting directory for Freshopencode')
+      fireEvent.change(input, { target: { value: '/home/user/freshopencode-project' } })
+      fireEvent.keyDown(input, { key: 'Enter' })
+
+      await waitFor(() => {
+        const state = store.getState().panes
+        const paneContent = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
+        expect(paneContent.kind).toBe('fresh-agent')
+        if (paneContent.kind === 'fresh-agent') {
+          expect(paneContent.sessionType).toBe('freshopencode')
+          expect(paneContent.provider).toBe('opencode')
+          expect(paneContent.model).toBe('umans-ai-coding-plan/umans-kimi-k2.7')
+          expect(paneContent.modelSelection).toEqual({ kind: 'exact', modelId: 'umans-ai-coding-plan/umans-kimi-k2.7' })
+          expect(paneContent.effort).toBe('high')
+        }
       })
     })
 

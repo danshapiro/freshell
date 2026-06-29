@@ -3,7 +3,7 @@ import { render, screen, waitFor, fireEvent, createEvent, cleanup, act } from '@
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
-import settingsReducer, { updateSettingsLocal } from '@/store/settingsSlice'
+import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from '@/store/settingsSlice'
 import freshAgentReducer, { sessionInit, setSessionStatus } from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
@@ -1764,6 +1764,47 @@ describe('FreshAgentView', () => {
         provider: 'opencode',
         model: 'opencode-go/glm-5.2',
         modelSelection: { kind: 'exact', modelId: 'opencode-go/glm-5.2' },
+      }))
+    })
+  })
+
+  it('creates Freshopencode panes with the saved provider model when the pane has no model preference', async () => {
+    const store = createStore()
+    store.dispatch(previewServerSettingsPatch({
+      freshAgent: {
+        providers: {
+          freshopencode: {
+            modelSelection: { kind: 'exact', modelId: 'umans-ai-coding-plan/umans-kimi-k2.7' },
+            effort: 'high',
+          },
+        },
+      },
+    }))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-provider-default-opencode-model',
+        status: 'creating',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(sentFreshAgentMessages('freshAgent.create')).toContainEqual(expect.objectContaining({
+        type: 'freshAgent.create',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        model: 'umans-ai-coding-plan/umans-kimi-k2.7',
+        effort: 'high',
       }))
     })
   })
