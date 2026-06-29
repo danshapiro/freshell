@@ -3271,6 +3271,35 @@ export class TerminalRegistry extends EventEmitter {
     return this.inputIfSessionMatches(terminalId, data)
   }
 
+  private writeTerminalInput(
+    record: TerminalRecord,
+    data: string,
+    options: { markCodexUnconfirmedInput?: boolean } = {},
+  ): void {
+    const now = Date.now()
+    record.lastActivityAt = now
+    if (record.perf) {
+      record.perf.inBytes += data.length
+      record.perf.inChunks += 1
+      record.perf.lastInputBytes = data.length
+      record.perf.pendingInputBytes += data.length
+      record.perf.pendingInputCount += 1
+      if (record.perf.pendingInputAt === undefined) {
+        record.perf.pendingInputAt = now
+      }
+    }
+    if (record.mode === 'codex' && options.markCodexUnconfirmedInput !== false) {
+      record.codexUnconfirmedInputAt = now
+      record.codexUnconfirmedInputSource = 'input'
+    }
+    record.pty.write(data)
+    this.emit('terminal.input.raw', {
+      terminalId: record.terminalId,
+      data,
+      at: now,
+    } satisfies TerminalInputRawEvent)
+  }
+
   inputIfSessionMatches(
     terminalId: string,
     data: string,
@@ -3312,28 +3341,11 @@ export class TerminalRegistry extends EventEmitter {
       if (handleCodexStartupUpdatePromptInput(term, data, now)) return { status: 'written' }
       return { status: 'blocked_codex_identity_pending', terminalId }
     }
-    const now = Date.now()
-    term.lastActivityAt = now
-    if (term.perf) {
-      term.perf.inBytes += data.length
-      term.perf.inChunks += 1
-      term.perf.lastInputBytes = data.length
-      term.perf.pendingInputBytes += data.length
-      term.perf.pendingInputCount += 1
-      if (term.perf.pendingInputAt === undefined) {
-        term.perf.pendingInputAt = now
-      }
+    if (term.codexInputGate?.state === 'update_running') {
+      this.writeTerminalInput(term, data, { markCodexUnconfirmedInput: false })
+      return { status: 'written' }
     }
-    if (term.mode === 'codex') {
-      term.codexUnconfirmedInputAt = now
-      term.codexUnconfirmedInputSource = 'input'
-    }
-    term.pty.write(data)
-    this.emit('terminal.input.raw', {
-      terminalId,
-      data,
-      at: now,
-    } satisfies TerminalInputRawEvent)
+    this.writeTerminalInput(term, data)
     return { status: 'written' }
   }
 

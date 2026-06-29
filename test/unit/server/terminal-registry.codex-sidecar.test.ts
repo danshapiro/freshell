@@ -389,6 +389,60 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     expect(pty.write).toHaveBeenLastCalledWith('1')
   })
 
+  it('allows updater input after selecting Update now from the startup prompt', () => {
+    const registry = new TerminalRegistry()
+    const term = registry.create({
+      mode: 'codex',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar: createFakeSidecar(),
+        },
+      } as any,
+    })
+
+    const pty = mockPtyProcess.instances[0]
+    const rawInputs: Array<{ terminalId: string; data: string; at: number }> = []
+    registry.on('terminal.input.raw', (event) => {
+      rawInputs.push(event)
+    })
+    emitCodexStartupUpdatePrompt(pty)
+
+    expect(registry.input(term.terminalId, '1')).toEqual({ status: 'written' })
+    expect(pty.write).toHaveBeenLastCalledWith('1')
+    expect(registry.input(term.terminalId, 'y\r')).toEqual({ status: 'written' })
+    expect(pty.write).toHaveBeenLastCalledWith('y\r')
+    expect(registry.get(term.terminalId)?.codexUnconfirmedInputAt).toBeUndefined()
+    expect(registry.get(term.terminalId)?.codexUnconfirmedInputSource).toBeUndefined()
+    expect(rawInputs).toContainEqual(expect.objectContaining({
+      terminalId: term.terminalId,
+      data: 'y\r',
+      at: expect.any(Number),
+    }))
+  })
+
+  it('keeps the candidate capture timeout paused during update prompt and updater lifecycle', () => {
+    const registry = new TerminalRegistry()
+    const sidecar = createFakeSidecar()
+    const term = registry.create({
+      mode: 'codex',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar,
+        },
+      } as any,
+    })
+
+    const pty = mockPtyProcess.instances[0]
+    emitCodexStartupUpdatePrompt(pty)
+
+    expect(sidecar.pauseCandidateCapture).toHaveBeenCalledWith('codex_startup_update_prompt')
+    expect(registry.input(term.terminalId, '1')).toEqual({ status: 'written' })
+    expect(sidecar.resumeCandidateCapture).not.toHaveBeenCalled()
+    expect(registry.input(term.terminalId, 'y\r')).toEqual({ status: 'written' })
+  })
+
   it('resumes candidate capture when the Codex startup update choice skips until next version', () => {
     const registry = new TerminalRegistry()
     const sidecar = createFakeSidecar()
