@@ -380,4 +380,32 @@ describe('registerRendererRecovery', () => {
     expect(window.show).toHaveBeenCalledTimes(1)
     expect(window.focus).toHaveBeenCalledTimes(1)
   })
+
+  it('logs recovery failure without success when an async renderer reload rejects', async () => {
+    window.webContents.reload.mockRejectedValue(new Error('replacement load failed'))
+
+    registerRendererRecovery({
+      window,
+      loadUrl,
+      serverUrl,
+      logger,
+      setTimeout,
+      clearTimeout,
+    })
+
+    window.webContents.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 133 })
+    await vi.advanceTimersByTimeAsync(0)
+
+    await vi.waitFor(() => {
+      expect(logger.log).toHaveBeenCalledWith(expect.objectContaining({
+        severity: 'error',
+        event: 'main_window_recovery_failed',
+      }))
+    })
+    expect(logger.log).not.toHaveBeenCalledWith(expect.objectContaining({
+      event: 'main_window_recovery_succeeded',
+    }))
+    expect(window.show).not.toHaveBeenCalled()
+    expect(window.focus).not.toHaveBeenCalled()
+  })
 })

@@ -77,7 +77,6 @@ function createRecoverableEntryWindow(
       win.webContents.on(event as any, callback)
     }
 
-    onWebContentsChanged(win.webContents.id)
     return win
   }
 
@@ -94,19 +93,21 @@ function createRecoverableEntryWindow(
     if (replacingWindow) return
     replacingWindow = true
 
-    const crashedWindow = activeWindow
-    const recoveryUrl = getRecoveryUrl(crashedWindow)
-    if (!recoveryUrl) {
-      replacingWindow = false
-      return
-    }
+    let recoveryUrl: string | undefined
+    let replacement: EntryBrowserWindow | undefined
 
     try {
+      const crashedWindow = activeWindow
+      recoveryUrl = getRecoveryUrl(crashedWindow)
+      if (!recoveryUrl) {
+        throw new Error('main window recovery URL unavailable')
+      }
+
       const bounds = crashedWindow.getBounds()
       const wasVisible = crashedWindow.isVisible()
       const wasFocused = crashedWindow.isFocused()
       const wasMaximized = crashedWindow.isMaximized()
-      const replacement = createNativeWindow({
+      replacement = createNativeWindow({
         ...options,
         x: bounds.x,
         y: bounds.y,
@@ -115,8 +116,9 @@ function createRecoverableEntryWindow(
         show: false,
       })
 
-      activeWindow = replacement
       await replacement.loadURL(recoveryUrl)
+      activeWindow = replacement
+      onWebContentsChanged(replacement.webContents.id)
 
       if (wasMaximized) {
         replacement.maximize()
@@ -131,20 +133,28 @@ function createRecoverableEntryWindow(
         crashedWindow.destroy()
       }
     } catch (error) {
+      if (replacement && !replacement.isDestroyed()) {
+        replacement.destroy()
+      }
       mainProcessLogger.log({
         severity: 'error',
         event: 'main_window_replacement_failed',
         loadUrl: recoveryUrl,
         error,
       })
+      throw error
     } finally {
       replacingWindow = false
     }
   }
 
   activeWindow = createNativeWindow(options)
+  onWebContentsChanged(activeWindow.webContents.id)
 
   const webContentsProxy: RecoverableWebContents = {
+    get id() {
+      return activeWindow.webContents.id
+    },
     on(event, callback) {
       webContentsListeners.push({ event, callback })
       activeWindow.webContents.on(event as any, callback)

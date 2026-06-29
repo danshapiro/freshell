@@ -453,9 +453,7 @@ test.describe('Main window with remote server', () => {
 
     // Patch shell.openExternal in the main process so the test can observe the
     // real IPC flow without actually launching a browser window.
-    await app.evaluate(() => {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { shell } = require('electron')
+    await app.evaluate(({ shell }) => {
       const original = shell.openExternal
       ;(globalThis as any).__testOpenExternal = (url: string) => {
         ;(globalThis as any).__openedUrl = url

@@ -9,6 +9,7 @@ export interface RecoverableBrowserWindow {
 }
 
 export interface RecoverableWebContents {
+  readonly id?: number
   on(event: string, callback: (...args: any[]) => void): void
   getURL?: () => string
   isDestroyed?: () => boolean
