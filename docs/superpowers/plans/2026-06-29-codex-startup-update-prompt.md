@@ -1,6 +1,6 @@
 # Codex Startup Update Prompt Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Status:** Implemented on `fix/codex-managed-update-prompt`. This document is retained as the completed implementation runbook, not as pending instructions. A final review changed Task 2 from the original freshness-TTL design to the shipped TTL-free design: once Freshell has detected the Codex startup update prompt, the prompt remains answerable until the user chooses an option or the Codex input gate is cleared.
 
 **Goal:** Allow users and supported automation surfaces to accept, skip, or run Codex CLI startup updates in terminal-mode Codex panes while Freshell is still waiting for Codex restore identity capture.
 
@@ -65,7 +65,7 @@
 - Produces: visible terminal launch args that contain only `-c`, `features.apps=false`.
 - Produces: hidden app-server launch args that contain only `-c`, `features.apps=false`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `test/unit/server/terminal-registry.test.ts`, change the managed remote-launch expectation so only `features.apps=false` is asserted in the first four arg positions and the update-check flag is explicitly absent:
 
@@ -87,7 +87,7 @@ expect(args).not.toContain('check_for_update_on_startup=false')
 expect(args.indexOf('features.apps=false')).toBeLessThan(args.indexOf('app-server'))
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run:
 
@@ -97,7 +97,7 @@ npm run test:vitest -- run test/unit/server/terminal-registry.test.ts test/unit/
 
 Expected: FAIL because visible terminal launch args still include `check_for_update_on_startup=false`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Change `server/coding-cli/codex-managed-config.ts` to:
 
@@ -108,7 +108,7 @@ export const CODEX_MANAGED_REMOTE_CONFIG_ARGS = [
 ] as const
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run:
 
@@ -118,7 +118,7 @@ npm run test:vitest -- run test/unit/server/terminal-registry.test.ts test/unit/
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server/coding-cli/codex-managed-config.ts test/unit/server/terminal-registry.test.ts test/unit/server/coding-cli/codex-app-server/runtime.test.ts
@@ -138,14 +138,14 @@ git commit -m "fix(codex): keep managed update checks enabled"
 - Produces: per-terminal `codexInputGate` union with:
   - `state: 'identity_pending'`
   - optional live `startupOutputTail`
-  - optional `startupUpdatePrompt` with `detectedAt` and `lastMatchedAt`
-  - `state: 'update_running'` with `startedAt`
+  - optional `startupUpdatePrompt: true`
+  - `state: 'update_running'`
 - Produces helper behavior:
-  - `observeCodexStartupOutput(record, data, now)` updates a bounded live-output tail only while identity is pending.
+  - `observeCodexStartupOutput(record, data)` updates a bounded live-output tail only while identity is pending.
   - `hasCodexStartupUpdatePrompt(text)` detects the update prompt without requiring `Update available!`.
-  - `handleCodexStartupUpdatePromptInput(record, data, now)` forwards only menu/control input and transitions state.
+  - `handleCodexStartupUpdatePromptInput(record, data)` forwards only menu/control input and transitions state.
 
-- [ ] **Step 1: Write failing update-prompt tests**
+- [x] **Step 1: Write failing update-prompt tests**
 
 In `test/unit/server/terminal-registry.codex-sidecar.test.ts`, replace the existing `allows Codex update prompt menu replies while restore identity is pending` test and add focused tests covering:
 
@@ -334,7 +334,7 @@ it('blocks update prompt arrow navigation rather than tracking highlight state',
 })
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run:
 
@@ -344,7 +344,7 @@ npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test
 
 Expected: FAIL because the current detector requires `Update available!`, scans scrollback at input time, and has no live prompt state.
 
-- [ ] **Step 3: Implement live prompt state**
+- [x] **Step 3: Implement live prompt state**
 
 In `server/terminal-registry.ts`, replace the old `codexUpdatePromptDismissed` field and scrollback input detector with these concepts:
 
@@ -355,14 +355,10 @@ type CodexInputGate =
   | {
       state: 'identity_pending'
       startupOutputTail?: string
-      startupUpdatePrompt?: {
-        detectedAt: number
-        lastMatchedAt: number
-      }
+      startupUpdatePrompt?: true
     }
   | {
       state: 'update_running'
-      startedAt: number
     }
 ```
 
@@ -372,35 +368,35 @@ Use a bounded live-output tail:
 
 ```ts
 const CODEX_STARTUP_UPDATE_PROMPT_TAIL_CHARS = 8 * 1024
-const CODEX_STARTUP_UPDATE_PROMPT_TTL_MS = 10 * 60 * 1000
 ```
 
 Normalize terminal text with existing `stripTerminalControls()` and newline-preserving whitespace normalization: convert `\r` to `\n` and normalize spaces/tabs, but do not collapse newlines because the detector anchors on line starts. Implement `hasCodexStartupUpdatePrompt(text: string)` so it requires all of:
 
 ```ts
 text.includes('github.com/openai/codex/releases/latest')
-/(?:^|\n)\s*[›> ]*\s*1[.)]\s*Update now\s*\(runs\s+`?[^`\n]*(?:npm|bun|brew)[^`\n]*`?\)/i
-/(?:^|\n)\s*[›> ]*\s*2[.)]\s*Skip\b/i
-/(?:^|\n)\s*[›> ]*\s*3[.)]\s*Skip until next version\b/i
+/(?:^|\n)[ \t]*[›>]?[ \t]*1[.)][ \t]*Update now[ \t]*\(runs[ \t]+`?[^`\n]*(?:npm|bun|brew)[^`\n]*`?\)/i
+/(?:^|\n)[ \t]*[›>]?[ \t]*2[.)][ \t]*Skip\b/i
+/(?:^|\n)[ \t]*[›>]?[ \t]*3[.)][ \t]*Skip until next version\b/i
 /Press\s+enter\s+to\s+continue/i
 ```
 
-Add `observeCodexStartupOutput(record, data, now)` and call it from both PTY `onData` handlers immediately after `record.buffer.append(data)` and before `this.emit('terminal.output.raw', ...)` or any direct client send path. It should update `startupOutputTail` only when `record.codexInputGate?.state === 'identity_pending'`, and set or refresh `startupUpdatePrompt` when `hasCodexStartupUpdatePrompt()` matches the live tail.
+Add `observeCodexStartupOutput(record, data)` and call it from both PTY `onData` handlers immediately after `record.buffer.append(data)` and before `this.emit('terminal.output.raw', ...)` or any direct client send path. It should update `startupOutputTail` only when `record.codexInputGate?.state === 'identity_pending'`, and set `startupUpdatePrompt` when `hasCodexStartupUpdatePrompt()` matches the live tail.
 
 Implement prompt input handling:
 
 ```ts
-function isCodexStartupUpdatePromptFresh(gate: CodexInputGate | undefined, now: number): boolean {
+function hasActiveCodexStartupUpdatePrompt(gate: CodexInputGate | undefined): boolean {
   return gate?.state === 'identity_pending'
     && !!gate.startupUpdatePrompt
-    && now - gate.startupUpdatePrompt.lastMatchedAt <= CODEX_STARTUP_UPDATE_PROMPT_TTL_MS
 }
 ```
+
+Do not expire a detected startup update prompt on wall-clock time alone. The visible Codex prompt remains answerable even if the user leaves it idle for a long time; otherwise Freshell can age into a state where menu selections are blocked while candidate capture remains paused.
 
 Do not forward arrow keys in this special state. Numeric keys complete immediately. If a combined numeric+newline payload such as `2\r` or `3\n` arrives, forward only the numeric byte because the numeric byte completes the Codex menu selection:
 
 ```ts
-'1', '1\r', '1\n', '1\r\n' -> write '1', set codexInputGate = { state: 'update_running', startedAt: now }
+'1', '1\r', '1\n', '1\r\n' -> write '1', set codexInputGate = { state: 'update_running' }
 '2', '2\r', '2\n', '2\r\n' -> write '2', clear startup update prompt/tail, stay identity_pending
 '3', '3\r', '3\n', '3\r\n' -> write '3', clear startup update prompt/tail, stay identity_pending
 ```
@@ -408,12 +404,12 @@ Do not forward arrow keys in this special state. Numeric keys complete immediate
 Bare Enter/newline accepts Codex's default `Update now` selection:
 
 ```ts
-'\r', '\n', '\r\n' -> write original enter byte, set update_running
+'\r', '\n', '\r\n' -> write original enter byte, set codexInputGate = { state: 'update_running' }
 ```
 
 Do not accept normal text. Do not forward arrow navigation. Do not use `record.buffer.snapshot()` for prompt detection. Preserve the existing `isCodexStartupTerminalControlInput(data)` path for cursor reports, device attributes, focus, and OSC color replies while identity is pending.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run:
 
@@ -423,11 +419,11 @@ npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test
 
 Expected: PASS.
 
-- [ ] **Step 5: Refactor**
+- [x] **Step 5: Refactor**
 
 Keep helper names specific to startup update prompts. Do not introduce a generic interstitial framework unless tests force it.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add server/terminal-registry.ts test/unit/server/terminal-registry.codex-sidecar.test.ts
@@ -451,7 +447,7 @@ git commit -m "fix(codex): gate startup update prompt from live output"
 - Produces: `pauseCandidateCapture?(reason: string): void` and `resumeCandidateCapture?(reason: string): void` on `CodexLaunchSidecar`.
 - Produces: terminal registry calls to pause when a live update prompt is detected or updater lifecycle begins, and resume when skip/skip-until-next-version returns to normal identity capture.
 
-- [ ] **Step 1: Write failing remote-proxy timer tests**
+- [x] **Step 1: Write failing remote-proxy timer tests**
 
 In `test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts`, add tests with fake timers that prove:
 
@@ -467,11 +463,11 @@ proxy.resumeCandidateCapture('startup_update_prompt_skipped')
 
 re-arms the timer so a later timeout still fires if no candidate is persisted.
 
-- [ ] **Step 2: Write failing launch-planner sidecar exposure test**
+- [x] **Step 2: Write failing launch-planner sidecar exposure test**
 
 In `test/unit/server/coding-cli/codex-app-server/launch-planner.test.ts`, extend the fake proxy to expose pause/resume spies and assert the planned sidecar forwards `pauseCandidateCapture()` and `resumeCandidateCapture()` to the proxy.
 
-- [ ] **Step 3: Write failing terminal-registry pause/resume tests**
+- [x] **Step 3: Write failing terminal-registry pause/resume tests**
 
 In `test/unit/server/terminal-registry.codex-sidecar.test.ts`, extend `createFakeSidecar()` to include `pauseCandidateCapture` and `resumeCandidateCapture` spies. Add tests proving:
 
@@ -494,7 +490,7 @@ registry.input(term.terminalId, '1')
 expect(sidecar.resumeCandidateCapture).not.toHaveBeenCalled()
 ```
 
-- [ ] **Step 4: Run tests to verify they fail**
+- [x] **Step 4: Run tests to verify they fail**
 
 Run:
 
@@ -504,7 +500,7 @@ npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-p
 
 Expected: FAIL because pause/rearm hooks do not exist.
 
-- [ ] **Step 5: Implement pause/rearm hooks**
+- [x] **Step 5: Implement pause/rearm hooks**
 
 In `server/coding-cli/codex-app-server/remote-proxy.ts`, add public methods:
 
@@ -547,7 +543,7 @@ private clearCodexInputGate(record: TerminalRecord): void {
 
 Use it on candidate capture/failure, terminal finalization, and PTY recovery replacement so prompt/updater state cannot leak across terminal generations. For `update_running`, do not resume candidate capture before clearing; the updater path is intentionally not returning to the old capture deadline.
 
-- [ ] **Step 6: Run tests to verify they pass**
+- [x] **Step 6: Run tests to verify they pass**
 
 Run:
 
@@ -557,7 +553,7 @@ npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-p
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add server/coding-cli/codex-app-server/remote-proxy.ts server/coding-cli/codex-app-server/launch-planner.ts server/terminal-registry.ts test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts test/unit/server/coding-cli/codex-app-server/launch-planner.test.ts test/unit/server/terminal-registry.codex-sidecar.test.ts
@@ -578,7 +574,7 @@ git commit -m "fix(codex): pause identity timeout for startup update prompt"
   - normal terminal input forwarding while `update_running`
   - pre-identity exits without a preceding update selection still follow existing failure behavior
 
-- [ ] **Step 1: Write failing lifecycle tests**
+- [x] **Step 1: Write failing lifecycle tests**
 
 Add tests in `test/unit/server/terminal-registry.codex-sidecar.test.ts`:
 
@@ -644,7 +640,7 @@ it('keeps the candidate capture timeout paused during update prompt and updater 
 
 Keep the existing timeout test that proves no update prompt still returns `blocked_codex_identity_capture_timeout` after `candidate_capture_timeout`.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run:
 
@@ -654,7 +650,7 @@ npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test
 
 Expected: FAIL because `update_running` input is still blocked.
 
-- [ ] **Step 3: Implement updater lifecycle behavior**
+- [x] **Step 3: Implement updater lifecycle behavior**
 
 In `inputIfSessionMatches()`, before the `identity_pending` block, add explicit `update_running` handling that writes normal terminal input without marking Codex unconfirmed user prompt input:
 
@@ -679,7 +675,7 @@ The helper must preserve the current perf accounting, `lastActivityAt`, `pty.wri
 
 Do not ignore `candidate_capture_timeout` in the repair handler. Task 3 prevents that timeout from firing during an active update prompt/updater by pausing the proxy timer. If the timeout event is received, keep the existing failure behavior.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run:
 
@@ -689,7 +685,7 @@ npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server/terminal-registry.ts test/unit/server/terminal-registry.codex-sidecar.test.ts
@@ -712,7 +708,7 @@ git commit -m "fix(codex): treat startup update as updater lifecycle"
   - `keys: string[]` becomes `translateKeys(keys.map(String))`.
   - `keys: string` becomes `translateKeys([keys])`.
 
-- [ ] **Step 1: Write failing REST normalization tests**
+- [x] **Step 1: Write failing REST normalization tests**
 
 In `test/server/agent-send-keys.test.ts`, add:
 
@@ -752,7 +748,7 @@ it('normalizes REST send-keys token arrays through the shared key translator', a
 
 Also keep the existing `data` raw-path test unchanged.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run:
 
@@ -762,7 +758,7 @@ npm run test:vitest -- run test/server/agent-send-keys.test.ts
 
 Expected: FAIL because the REST route currently forwards `keys` raw.
 
-- [ ] **Step 3: Implement normalization**
+- [x] **Step 3: Implement normalization**
 
 In `server/agent-api/router.ts`, add:
 
@@ -794,7 +790,7 @@ with:
 const data = normalizeTerminalInputPayload(payload)
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run:
 
@@ -804,7 +800,7 @@ npm run test:vitest -- run test/server/agent-send-keys.test.ts
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server/agent-api/router.ts test/server/agent-send-keys.test.ts
@@ -822,7 +818,7 @@ git commit -m "fix(agent-api): normalize REST send-keys tokens"
 - Consumes all previous tasks.
 - Produces a coherent branch diff with focused and broad verification evidence.
 
-- [ ] **Step 1: Run the focused regression suite**
+- [x] **Step 1: Run the focused regression suite**
 
 Run:
 
@@ -832,7 +828,7 @@ npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test
 
 Expected: PASS.
 
-- [ ] **Step 2: Run project check through the coordinator**
+- [x] **Step 2: Run project check through the coordinator**
 
 Run:
 
@@ -842,7 +838,7 @@ FRESHELL_TEST_SUMMARY="codex startup update prompt regression verification" npm 
 
 Expected: PASS.
 
-- [ ] **Step 3: Inspect final diff**
+- [x] **Step 3: Inspect final diff**
 
 Run:
 
@@ -853,7 +849,7 @@ git diff --check origin/main...HEAD
 
 Expected: no whitespace errors; diff is limited to the files listed in this plan plus the plan file.
 
-- [ ] **Step 4: Commit any final fixes**
+- [x] **Step 4: Commit any final fixes**
 
 If Step 1, Step 2, or Step 3 requires fixes, make the minimal fix, re-run the affected focused test, and commit:
 

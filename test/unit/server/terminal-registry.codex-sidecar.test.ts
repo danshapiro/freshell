@@ -606,11 +606,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     const record = registry.get(term.terminalId)! as any
     record.codexInputGate = {
       state: 'identity_pending',
-      createdAt: Date.now(),
-      startupUpdatePrompt: {
-        detectedAt: Date.now(),
-        lastMatchedAt: Date.now(),
-      },
+      startupUpdatePrompt: true,
     }
 
     currentSidecar.emitLifecycleLoss({ method: 'thread/closed', threadId: 'thread-1' })
