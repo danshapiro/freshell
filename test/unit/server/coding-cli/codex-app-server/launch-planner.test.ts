@@ -126,7 +126,7 @@ function createPlanner(
     proxyFactory: (options: FakeProxyOptions) => {
       const proxy = new FakeProxy(options)
       proxies.push(proxy)
-      return proxy as any
+      return proxy
     },
   })
 }
@@ -425,8 +425,8 @@ describe('CodexLaunchPlanner', () => {
 
     const plan = await planner.planCreate({ cwd: '/repo/pause' })
 
-    ;(plan.sidecar as any).pauseCandidateCapture('startup_update_prompt')
-    ;(plan.sidecar as any).resumeCandidateCapture('startup_update_prompt_skipped')
+    plan.sidecar.pauseCandidateCapture!('startup_update_prompt')
+    plan.sidecar.resumeCandidateCapture!('startup_update_prompt_skipped')
 
     expect(proxies[0].pauseCandidateCapture).toHaveBeenCalledWith('startup_update_prompt')
     expect(proxies[0].resumeCandidateCapture).toHaveBeenCalledWith('startup_update_prompt_skipped')

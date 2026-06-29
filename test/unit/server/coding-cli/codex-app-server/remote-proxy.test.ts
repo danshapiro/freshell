@@ -330,23 +330,26 @@ describe('CodexRemoteProxy', () => {
     expect(repairTriggers).toContainEqual({ kind: 'candidate_capture_timeout' })
   })
 
-  it('pauses candidate capture timeout and ignores timer rearm attempts while paused', () => {
-    vi.useFakeTimers()
-    const proxy = new CodexRemoteProxy({
-      upstreamWsUrl: 'ws://127.0.0.1:1',
-      candidateCaptureTimeoutMs: 1_000,
+  it('keeps candidate capture paused when a real client connection would otherwise rearm the timer', async () => {
+    const upstream = await startUpstream()
+    const proxy = await startProxy(upstream.wsUrl, {
+      candidateCaptureTimeoutMs: 20,
     })
-    proxies.add(proxy)
     const repairTriggers: unknown[] = []
     proxy.onRepairTrigger((event) => repairTriggers.push(event))
 
-    ;(proxy as any).ensureCandidateCaptureTimer()
     proxy.pauseCandidateCapture('startup_update_prompt')
-    ;(proxy as any).ensureCandidateCaptureTimer()
+    const tui = await connect(proxy.wsUrl)
 
-    vi.advanceTimersByTime(5_000)
+    await delay(50)
 
+    expect(tui.readyState).toBe(WebSocket.OPEN)
+    expect(upstream.sockets.size).toBe(1)
+    expect(upstream.messages).toEqual([])
     expect(repairTriggers).toEqual([])
+
+    tui.close()
+    await socketClosed(tui)
   })
 
   it('resumes candidate capture timeout so a later timeout still fires', () => {
@@ -368,6 +371,60 @@ describe('CodexRemoteProxy', () => {
     vi.advanceTimersByTime(1_000)
 
     expect(repairTriggers).toContainEqual({ kind: 'candidate_capture_timeout' })
+  })
+
+  it('leaves pause and resume as no-ops after candidate persistence', () => {
+    vi.useFakeTimers()
+    const proxy = new CodexRemoteProxy({
+      upstreamWsUrl: 'ws://127.0.0.1:1',
+      candidateCaptureTimeoutMs: 1_000,
+    })
+    proxies.add(proxy)
+    const repairTriggers: unknown[] = []
+    proxy.onRepairTrigger((event) => repairTriggers.push(event))
+
+    proxy.markCandidatePersisted()
+    proxy.pauseCandidateCapture('after_persistence')
+    proxy.resumeCandidateCapture('after_persistence')
+    vi.advanceTimersByTime(5_000)
+
+    expect(repairTriggers).toEqual([])
+  })
+
+  it('leaves pause and resume as no-ops after candidate timeout failure', () => {
+    vi.useFakeTimers()
+    const proxy = new CodexRemoteProxy({
+      upstreamWsUrl: 'ws://127.0.0.1:1',
+      candidateCaptureTimeoutMs: 1_000,
+    })
+    proxies.add(proxy)
+    const repairTriggers: unknown[] = []
+    proxy.onRepairTrigger((event) => repairTriggers.push(event))
+
+    proxy.failCandidateCapture()
+    proxy.pauseCandidateCapture('after_timeout_failure')
+    proxy.resumeCandidateCapture('after_timeout_failure')
+    vi.advanceTimersByTime(5_000)
+
+    expect(repairTriggers).toEqual([{ kind: 'candidate_capture_timeout' }])
+  })
+
+  it('leaves pause and resume as no-ops when candidate persistence is not required', () => {
+    vi.useFakeTimers()
+    const proxy = new CodexRemoteProxy({
+      upstreamWsUrl: 'ws://127.0.0.1:1',
+      candidateCaptureTimeoutMs: 1_000,
+      requireCandidatePersistence: false,
+    })
+    proxies.add(proxy)
+    const repairTriggers: unknown[] = []
+    proxy.onRepairTrigger((event) => repairTriggers.push(event))
+
+    proxy.pauseCandidateCapture('durable_resume')
+    proxy.resumeCandidateCapture('durable_resume')
+    vi.advanceTimersByTime(5_000)
+
+    expect(repairTriggers).toEqual([])
   })
 
   it('does not arm the no-client candidate-capture timeout for durable resumes', async () => {

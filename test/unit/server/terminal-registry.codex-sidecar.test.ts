@@ -169,6 +169,16 @@ function createCandidateExitPlanCreate() {
   return planCreate
 }
 
+function emitCodexStartupUpdatePrompt(pty: { _emitData(data: string): void }): void {
+  pty._emitData([
+    'Release notes: https://github.com/openai/codex/releases/latest\r\n',
+    '› 1. Update now (runs `npm install -g @openai/codex`)\r\n',
+    '  2. Skip\r\n',
+    '  3. Skip until next version\r\n',
+    'Press enter to continue\r\n',
+  ].join(''))
+}
+
 describe('TerminalRegistry Codex sidecar ownership', () => {
   beforeEach(() => {
     mockPtyProcess.instances = []
@@ -377,6 +387,175 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
 
     expect(sidecar.resumeCandidateCapture).not.toHaveBeenCalled()
     expect(pty.write).toHaveBeenLastCalledWith('1')
+  })
+
+  it('resumes candidate capture when the Codex startup update choice skips until next version', () => {
+    const registry = new TerminalRegistry()
+    const sidecar = createFakeSidecar()
+    const term = registry.create({
+      mode: 'codex',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar,
+        },
+      } as any,
+    })
+
+    const pty = mockPtyProcess.instances[0]
+    emitCodexStartupUpdatePrompt(pty)
+
+    expect(registry.input(term.terminalId, '3')).toEqual({ status: 'written' })
+
+    expect(sidecar.resumeCandidateCapture).toHaveBeenCalledWith('codex_startup_update_skipped')
+    expect(pty.write).toHaveBeenLastCalledWith('3')
+    expect(registry.input(term.terminalId, 'hello\r')).toEqual({
+      status: 'blocked_codex_identity_pending',
+      terminalId: term.terminalId,
+    })
+  })
+
+  it('resumes paused candidate capture when candidate capture succeeds and clears the startup update gate', async () => {
+    const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
+    try {
+      const registry = new TerminalRegistry(undefined, undefined, undefined, {
+        codexDurabilityStore: new CodexDurabilityStore({ dir: durabilityDir }),
+        serverInstanceId: 'srv-test',
+      })
+      const sidecar = createFakeSidecar()
+      const term = registry.create({
+        mode: 'codex',
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
+          },
+        } as any,
+      })
+      emitCodexStartupUpdatePrompt(mockPtyProcess.instances[0])
+      sidecar.resumeCandidateCapture.mockClear()
+
+      sidecar.emitCandidate({
+        source: 'thread_start_response',
+        thread: {
+          id: 'thread-cleanup-success',
+          path: path.join(durabilityDir, 'rollout.jsonl'),
+          ephemeral: false,
+        },
+      })
+
+      await vi.waitFor(() => expect(sidecar.markCandidatePersisted).toHaveBeenCalledTimes(1))
+      expect(sidecar.resumeCandidateCapture).toHaveBeenCalledWith('codex_input_gate_cleared')
+      expect(registry.get(term.terminalId)?.codexInputGate).toBeUndefined()
+    } finally {
+      await removeTempDir(durabilityDir)
+    }
+  })
+
+  it('resumes paused candidate capture when candidate capture persistence fails and clears the startup update gate', async () => {
+    const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
+    class StoreWithFirstWriteFailure extends CodexDurabilityStore {
+      override async write(...args: Parameters<CodexDurabilityStore['write']>) {
+        if (args[0].candidate?.candidateThreadId === 'thread-cleanup-failure') {
+          throw new Error('candidate write failed')
+        }
+        return super.write(...args)
+      }
+    }
+
+    try {
+      const registry = new TerminalRegistry(undefined, undefined, undefined, {
+        codexDurabilityStore: new StoreWithFirstWriteFailure({ dir: durabilityDir }),
+        serverInstanceId: 'srv-test',
+      })
+      const sidecar = createFakeSidecar()
+      const term = registry.create({
+        mode: 'codex',
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
+          },
+        } as any,
+      })
+      emitCodexStartupUpdatePrompt(mockPtyProcess.instances[0])
+      sidecar.resumeCandidateCapture.mockClear()
+
+      sidecar.emitCandidate({
+        source: 'thread_start_response',
+        thread: {
+          id: 'thread-cleanup-failure',
+          path: path.join(durabilityDir, 'rollout.jsonl'),
+          ephemeral: false,
+        },
+      })
+
+      await vi.waitFor(() => expect(registry.get(term.terminalId)?.status).toBe('exited'))
+      expect(sidecar.resumeCandidateCapture).toHaveBeenCalledWith('codex_input_gate_cleared')
+      expect(registry.get(term.terminalId)?.codexInputGate).toBeUndefined()
+    } finally {
+      await removeTempDir(durabilityDir)
+    }
+  })
+
+  it('resumes paused candidate capture when terminal finalization clears the startup update gate', async () => {
+    const registry = new TerminalRegistry()
+    const sidecar = createFakeSidecar()
+    const term = registry.create({
+      mode: 'codex',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar,
+        },
+      } as any,
+    })
+    const pty = mockPtyProcess.instances[0]
+    emitCodexStartupUpdatePrompt(pty)
+    sidecar.resumeCandidateCapture.mockClear()
+
+    pty._emitExit(0)
+
+    await vi.waitFor(() => expect(registry.get(term.terminalId)?.status).toBe('exited'))
+    expect(sidecar.resumeCandidateCapture).toHaveBeenCalledWith('codex_input_gate_cleared')
+    expect(registry.get(term.terminalId)?.codexInputGate).toBeUndefined()
+  })
+
+  it('resumes paused candidate capture when recovery replacement clears a stale startup update gate', async () => {
+    const registry = new TerminalRegistry()
+    const currentSidecar = createFakeSidecar()
+    const replacementSidecar = createFakeSidecar()
+    const planCreate = vi.fn(async () => ({
+      sessionId: 'thread-1',
+      remote: { wsUrl: 'ws://127.0.0.1:43124' },
+      sidecar: replacementSidecar,
+    }))
+    const term = registry.create({
+      mode: 'codex',
+      resumeSessionId: 'thread-1',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar: currentSidecar,
+          recovery: { planCreate, retryDelayMs: 0 },
+        },
+      } as any,
+    })
+    const record = registry.get(term.terminalId)! as any
+    record.codexInputGate = {
+      state: 'identity_pending',
+      createdAt: Date.now(),
+      startupUpdatePrompt: {
+        detectedAt: Date.now(),
+        lastMatchedAt: Date.now(),
+      },
+    }
+
+    currentSidecar.emitLifecycleLoss({ method: 'thread/closed', threadId: 'thread-1' })
+
+    await vi.waitFor(() => expect(replacementSidecar.adopt).toHaveBeenCalledWith({ terminalId: term.terminalId, generation: 1 }))
+    expect(currentSidecar.resumeCandidateCapture).toHaveBeenCalledWith('codex_input_gate_cleared')
+    expect(registry.get(term.terminalId)?.codexInputGate).toBeUndefined()
   })
 
   it('detects the Codex update prompt across split PTY chunks with terminal controls', () => {
