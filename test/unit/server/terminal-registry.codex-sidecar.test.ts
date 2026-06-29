@@ -287,7 +287,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     })
   })
 
-  it('allows Codex update prompt menu replies while restore identity is pending', () => {
+  it('allows Codex update prompt menu replies without the optional update banner', () => {
     const registry = new TerminalRegistry()
     const term = registry.create({
       mode: 'codex',
@@ -301,10 +301,9 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
 
     const pty = mockPtyProcess.instances[0]
     pty._emitData([
-      '\x1b[1mUpdate available! 0.140.0 -> 0.141.0\x1b[0m\r\n',
       'Release notes: https://github.com/openai/codex/releases/latest\r\n',
       '\r\n',
-      '> 1. Update now (runs `npm install -g @openai/codex`)\r\n',
+      '› 1. Update now (runs `npm install -g @openai/codex`)\r\n',
       '  2. Skip\r\n',
       '  3. Skip until next version\r\n',
       '\r\n',
@@ -313,12 +312,152 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
 
     expect(registry.input(term.terminalId, '2')).toEqual({ status: 'written' })
     expect(pty.write).toHaveBeenLastCalledWith('2')
-    expect(registry.input(term.terminalId, '\r')).toEqual({ status: 'written' })
-    expect(pty.write).toHaveBeenLastCalledWith('\r')
     expect(registry.input(term.terminalId, 'hello\r')).toEqual({
       status: 'blocked_codex_identity_pending',
       terminalId: term.terminalId,
     })
+  })
+
+  it('detects the Codex update prompt across split PTY chunks with terminal controls', () => {
+    const registry = new TerminalRegistry()
+    const term = registry.create({
+      mode: 'codex',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar: createFakeSidecar(),
+        },
+      } as any,
+    })
+
+    const pty = mockPtyProcess.instances[0]
+    pty._emitData('\x1b[1mRelease notes: https://github.com/openai/codex/releases/latest\x1b[0m\r\n')
+    pty._emitData('› 1. Update now (runs `npm install -g @openai/codex`)\r\n')
+    pty._emitData('  2. Skip\r\n')
+    pty._emitData('  3. Skip until next version\r\n')
+    pty._emitData('Press enter to continue\r\n')
+
+    expect(registry.input(term.terminalId, '\r')).toEqual({ status: 'written' })
+    expect(pty.write).toHaveBeenLastCalledWith('\r')
+  })
+
+  it('updates startup prompt state before any client-visible output can trigger reentrant input', () => {
+    const registry = new TerminalRegistry()
+    const term = registry.create({
+      mode: 'codex',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar: createFakeSidecar(),
+        },
+      } as any,
+    })
+
+    const pty = mockPtyProcess.instances[0]
+    const client = {
+      readyState: 1,
+      send: vi.fn((payload: string) => {
+        if (payload.includes('Press enter to continue')) {
+          registry.input(term.terminalId, '2')
+        }
+      }),
+      close: vi.fn(),
+    } as any
+
+    registry.attach(term.terminalId, client)
+    pty._emitData([
+      'Release notes: https://github.com/openai/codex/releases/latest\r\n',
+      '› 1. Update now (runs `npm install -g @openai/codex`)\r\n',
+      '  2. Skip\r\n',
+      '  3. Skip until next version\r\n',
+      'Press enter to continue\r\n',
+    ].join(''))
+
+    expect(pty.write).toHaveBeenCalledWith('2')
+  })
+
+  it('does not open the Codex identity gate for similar non-prompt release text', () => {
+    const registry = new TerminalRegistry()
+    const term = registry.create({
+      mode: 'codex',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar: createFakeSidecar(),
+        },
+      } as any,
+    })
+
+    const pty = mockPtyProcess.instances[0]
+    pty._emitData([
+      'Release notes: https://github.com/openai/codex/releases/latest\r\n',
+      'Press enter to continue reading the changelog\r\n',
+    ].join(''))
+
+    expect(registry.input(term.terminalId, '\r')).toEqual({
+      status: 'blocked_codex_identity_pending',
+      terminalId: term.terminalId,
+    })
+  })
+
+  it('does not reuse stale update prompt output after a skip selection', () => {
+    const registry = new TerminalRegistry()
+    const term = registry.create({
+      mode: 'codex',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar: createFakeSidecar(),
+        },
+      } as any,
+    })
+
+    const pty = mockPtyProcess.instances[0]
+    pty._emitData([
+      'Release notes: https://github.com/openai/codex/releases/latest\r\n',
+      '› 1. Update now (runs `npm install -g @openai/codex`)\r\n',
+      '  2. Skip\r\n',
+      '  3. Skip until next version\r\n',
+      'Press enter to continue\r\n',
+    ].join(''))
+
+    expect(registry.input(term.terminalId, '2')).toEqual({ status: 'written' })
+    pty._emitData('Codex starting normally now\r\n')
+
+    expect(registry.input(term.terminalId, '\r')).toEqual({
+      status: 'blocked_codex_identity_pending',
+      terminalId: term.terminalId,
+    })
+  })
+
+  it('blocks update prompt arrow navigation rather than tracking highlight state', () => {
+    const registry = new TerminalRegistry()
+    const term = registry.create({
+      mode: 'codex',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar: createFakeSidecar(),
+        },
+      } as any,
+    })
+
+    const pty = mockPtyProcess.instances[0]
+    pty._emitData([
+      'Release notes: https://github.com/openai/codex/releases/latest\r\n',
+      '› 1. Update now (runs `npm install -g @openai/codex`)\r\n',
+      '  2. Skip\r\n',
+      '  3. Skip until next version\r\n',
+      'Press enter to continue\r\n',
+    ].join(''))
+
+    expect(registry.input(term.terminalId, '\x1b[B')).toEqual({
+      status: 'blocked_codex_identity_pending',
+      terminalId: term.terminalId,
+    })
+    expect(registry.input(term.terminalId, '\r')).toEqual({ status: 'written' })
+    expect(pty.write).toHaveBeenLastCalledWith('\r')
+    expect(registry.input(term.terminalId, 'y\r')).toEqual({ status: 'written' })
   })
 
   it('keeps reporting the Codex identity capture timeout after closing the failed terminal', async () => {

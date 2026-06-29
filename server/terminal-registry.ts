@@ -593,7 +593,7 @@ export type TerminalRecord = {
   codexActiveTurn?: CodexTurnEvent
   codexUnconfirmedInputAt?: number
   codexUnconfirmedInputSource?: 'resume' | 'input'
-  codexInputGate?: { state: 'identity_pending'; codexUpdatePromptDismissed?: boolean }
+  codexInputGate?: CodexInputGate
   codexRecovery?: CodexRecoveryOptions
   codexRecoveryAttempt?: Promise<void>
   codexRecoveryAttemptSerial?: number
@@ -645,7 +645,29 @@ function isCodexStartupTerminalControlInput(data: string): boolean {
   return /^\x1b\](?:10|11|12|4;\d{1,3});rgb:[0-9a-fA-F]{1,4}\/[0-9a-fA-F]{1,4}\/[0-9a-fA-F]{1,4}(?:\x07|\x1b\\)$/.test(data)
 }
 
-const CODEX_UPDATE_PROMPT_TAIL_CHARS = 8 * 1024
+type CodexStartupUpdateChoice = 'update_now' | 'skip' | 'skip_until_next_version'
+
+type CodexInputGate =
+  | {
+      state: 'identity_pending'
+      startupOutputTail?: string
+      startupUpdatePrompt?: {
+        detectedAt: number
+        lastMatchedAt: number
+      }
+    }
+  | {
+      state: 'update_running'
+      startedAt: number
+    }
+
+const CODEX_STARTUP_UPDATE_PROMPT_TAIL_CHARS = 8 * 1024
+const CODEX_STARTUP_UPDATE_PROMPT_TTL_MS = 10 * 60 * 1000
+const CODEX_STARTUP_UPDATE_CHOICE_BY_KEY: Record<'1' | '2' | '3', CodexStartupUpdateChoice> = {
+  '1': 'update_now',
+  '2': 'skip',
+  '3': 'skip_until_next_version',
+}
 // eslint-disable-next-line no-control-regex -- terminal snapshots contain ANSI/OSC control bytes.
 const TERMINAL_CONTROL_PATTERN = /\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]/g
 
@@ -653,44 +675,72 @@ function stripTerminalControls(data: string): string {
   return data.replace(TERMINAL_CONTROL_PATTERN, '')
 }
 
-function hasCodexUpdatePrompt(snapshot: string): boolean {
-  const tail = snapshot.slice(-CODEX_UPDATE_PROMPT_TAIL_CHARS)
-  const text = stripTerminalControls(tail).replace(/\r/g, '\n')
-  return text.includes('Update available!')
-    && text.includes('github.com/openai/codex/releases/latest')
-    && text.includes('Update now')
-    && text.includes('Skip until next version')
-    && text.includes('Press enter to continue')
+function normalizeCodexStartupUpdatePromptText(data: string): string {
+  return stripTerminalControls(data)
+    .replace(/\r/g, '\n')
+    .replace(/[ \t]+/g, ' ')
 }
 
-function isCodexUpdatePromptInput(data: string): boolean {
-  return data === '1'
-    || data === '2'
-    || data === '3'
-    || data === '1\r'
-    || data === '2\r'
-    || data === '3\r'
-    || data === '1\n'
-    || data === '2\n'
-    || data === '3\n'
-    || data === '\r'
-    || data === '\n'
-    || data === '\r\n'
-    || data === '\x1b[A'
-    || data === '\x1b[B'
+function hasCodexStartupUpdatePrompt(text: string): boolean {
+  const normalized = normalizeCodexStartupUpdatePromptText(text)
+  return normalized.includes('github.com/openai/codex/releases/latest')
+    && /(?:^|\n)\s*[\u203a> ]*\s*1[.)]\s*Update now\s*\(runs\s+`?[^`\n]*(?:npm|bun|brew)[^`\n]*`?\)/i.test(normalized)
+    && /(?:^|\n)\s*[\u203a> ]*\s*2[.)]\s*Skip\b/i.test(normalized)
+    && /(?:^|\n)\s*[\u203a> ]*\s*3[.)]\s*Skip until next version\b/i.test(normalized)
+    && /Press\s+enter\s+to\s+continue/i.test(normalized)
 }
 
-function isCodexUpdatePromptDismissInput(data: string): boolean {
-  return data === '\r'
-    || data === '\n'
-    || data === '\r\n'
-    || data.endsWith('\r')
-    || data.endsWith('\n')
+function observeCodexStartupOutput(record: TerminalRecord, data: string, now: number): void {
+  const gate = record.codexInputGate
+  if (gate?.state !== 'identity_pending') return
+  gate.startupOutputTail = `${gate.startupOutputTail ?? ''}${data}`.slice(-CODEX_STARTUP_UPDATE_PROMPT_TAIL_CHARS)
+  if (!hasCodexStartupUpdatePrompt(gate.startupOutputTail)) return
+  gate.startupUpdatePrompt = {
+    detectedAt: gate.startupUpdatePrompt?.detectedAt ?? now,
+    lastMatchedAt: now,
+  }
 }
 
-function isCodexStartupUpdatePromptInput(record: TerminalRecord, data: string): boolean {
-  if (record.codexInputGate?.codexUpdatePromptDismissed) return false
-  return isCodexUpdatePromptInput(data) && hasCodexUpdatePrompt(record.buffer.snapshot())
+function isCodexStartupUpdatePromptFresh(gate: CodexInputGate | undefined, now: number): boolean {
+  return gate?.state === 'identity_pending'
+    && !!gate.startupUpdatePrompt
+    && now - gate.startupUpdatePrompt.lastMatchedAt <= CODEX_STARTUP_UPDATE_PROMPT_TTL_MS
+}
+
+function parseCodexStartupUpdatePromptChoice(data: string): { key: '1' | '2' | '3'; choice: CodexStartupUpdateChoice } | undefined {
+  const match = /^([123])(?:\r\n|\r|\n)?$/.exec(data)
+  if (!match) return undefined
+  const key = match[1] as '1' | '2' | '3'
+  return { key, choice: CODEX_STARTUP_UPDATE_CHOICE_BY_KEY[key] }
+}
+
+function clearCodexStartupUpdatePromptState(gate: Extract<CodexInputGate, { state: 'identity_pending' }>): void {
+  gate.startupOutputTail = undefined
+  gate.startupUpdatePrompt = undefined
+}
+
+function handleCodexStartupUpdatePromptInput(record: TerminalRecord, data: string, now: number): boolean {
+  const gate = record.codexInputGate
+  if (!isCodexStartupUpdatePromptFresh(gate, now) || gate?.state !== 'identity_pending') return false
+
+  const choice = parseCodexStartupUpdatePromptChoice(data)
+  if (choice) {
+    record.pty.write(choice.key)
+    if (choice.choice === 'update_now') {
+      record.codexInputGate = { state: 'update_running', startedAt: now }
+    } else {
+      clearCodexStartupUpdatePromptState(gate)
+    }
+    return true
+  }
+
+  if (data === '\r' || data === '\n' || data === '\r\n') {
+    record.pty.write(data)
+    record.codexInputGate = { state: 'update_running', startedAt: now }
+    return true
+  }
+
+  return false
 }
 
 export type BindSessionResult =
@@ -1581,6 +1631,7 @@ export class TerminalRegistry extends EventEmitter {
       const now = Date.now()
       record.lastActivityAt = now
       record.buffer.append(data)
+      observeCodexStartupOutput(record, data, now)
       this.emit('terminal.output.raw', {
         terminalId,
         data,
@@ -3053,6 +3104,7 @@ export class TerminalRegistry extends EventEmitter {
       const now = Date.now()
       record.lastActivityAt = now
       record.buffer.append(data)
+      observeCodexStartupOutput(record, data, now)
       this.emit('terminal.output.raw', {
         terminalId: record.terminalId,
         data,
@@ -3236,13 +3288,12 @@ export class TerminalRegistry extends EventEmitter {
       return { status: 'blocked_codex_lifecycle_loss_pending', terminalId }
     }
     if (term.codexInputGate?.state === 'identity_pending') {
-      if (isCodexStartupTerminalControlInput(data) || isCodexStartupUpdatePromptInput(term, data)) {
+      const now = Date.now()
+      if (isCodexStartupTerminalControlInput(data)) {
         term.pty.write(data)
-        if (isCodexUpdatePromptDismissInput(data)) {
-          term.codexInputGate.codexUpdatePromptDismissed = true
-        }
         return { status: 'written' }
       }
+      if (handleCodexStartupUpdatePromptInput(term, data, now)) return { status: 'written' }
       return { status: 'blocked_codex_identity_pending', terminalId }
     }
     const now = Date.now()
