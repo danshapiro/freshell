@@ -310,9 +310,8 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
 
     expect(args).toContain('-c')
     expect(args).toContain('features.apps=false')
-    expect(args).toContain('check_for_update_on_startup=false')
+    expect(args).not.toContain('check_for_update_on_startup=false')
     expect(args.indexOf('features.apps=false')).toBeLessThan(args.indexOf('app-server'))
-    expect(args.indexOf('check_for_update_on_startup=false')).toBeLessThan(args.indexOf('app-server'))
     expect(args).toContain('--listen')
   })
 

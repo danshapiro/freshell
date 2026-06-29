@@ -971,14 +971,13 @@ describe('buildSpawnSpec Unix paths', () => {
         },
       })
 
-      expect(spec.args.slice(0, 6)).toEqual([
+      expect(spec.args.slice(0, 4)).toEqual([
         '--remote',
         'ws://127.0.0.1:4567',
         '-c',
         'features.apps=false',
-        '-c',
-        'check_for_update_on_startup=false',
       ])
+      expect(spec.args).not.toContain('check_for_update_on_startup=false')
       expectCodexMcpArgs(spec.args)
     })
 
