@@ -645,6 +645,37 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     expect(pty.write).toHaveBeenLastCalledWith('\r')
   })
 
+  it('keeps a detected Codex update prompt answerable after a long idle', () => {
+    const now = new Date('2026-06-29T12:00:00.000Z').getTime()
+    const dateNow = vi.spyOn(Date, 'now')
+    try {
+      dateNow.mockReturnValue(now)
+      const sidecar = createFakeSidecar()
+      const registry = new TerminalRegistry()
+      const term = registry.create({
+        mode: 'codex',
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
+          },
+        } as any,
+      })
+
+      const pty = mockPtyProcess.instances[0]
+      emitCodexStartupUpdatePrompt(pty)
+      sidecar.resumeCandidateCapture.mockClear()
+
+      dateNow.mockReturnValue(now + (20 * 60 * 1000))
+      expect(registry.input(term.terminalId, '3')).toEqual({ status: 'written' })
+
+      expect(pty.write).toHaveBeenLastCalledWith('3')
+      expect(sidecar.resumeCandidateCapture).toHaveBeenCalledWith('codex_startup_update_skipped')
+    } finally {
+      dateNow.mockRestore()
+    }
+  })
+
   it('updates startup prompt state before any client-visible output can trigger reentrant input', () => {
     const registry = new TerminalRegistry()
     const term = registry.create({

@@ -664,7 +664,6 @@ type CodexInputGate =
     }
 
 const CODEX_STARTUP_UPDATE_PROMPT_TAIL_CHARS = 8 * 1024
-const CODEX_STARTUP_UPDATE_PROMPT_TTL_MS = 10 * 60 * 1000
 const CODEX_STARTUP_UPDATE_CHOICE_BY_KEY: Record<'1' | '2' | '3', CodexStartupUpdateChoice> = {
   '1': 'update_now',
   '2': 'skip',
@@ -707,10 +706,9 @@ function observeCodexStartupOutput(record: TerminalRecord, data: string, now: nu
   }
 }
 
-function isCodexStartupUpdatePromptFresh(gate: CodexInputGate | undefined, now: number): boolean {
+function hasActiveCodexStartupUpdatePrompt(gate: CodexInputGate | undefined): boolean {
   return gate?.state === 'identity_pending'
     && !!gate.startupUpdatePrompt
-    && now - gate.startupUpdatePrompt.lastMatchedAt <= CODEX_STARTUP_UPDATE_PROMPT_TTL_MS
 }
 
 function parseCodexStartupUpdatePromptChoice(data: string): { key: '1' | '2' | '3'; choice: CodexStartupUpdateChoice } | undefined {
@@ -727,7 +725,7 @@ function clearCodexStartupUpdatePromptState(gate: Extract<CodexInputGate, { stat
 
 function handleCodexStartupUpdatePromptInput(record: TerminalRecord, data: string, now: number): boolean {
   const gate = record.codexInputGate
-  if (!isCodexStartupUpdatePromptFresh(gate, now) || gate?.state !== 'identity_pending') return false
+  if (!hasActiveCodexStartupUpdatePrompt(gate) || gate?.state !== 'identity_pending') return false
 
   const choice = parseCodexStartupUpdatePromptChoice(data)
   if (choice) {
