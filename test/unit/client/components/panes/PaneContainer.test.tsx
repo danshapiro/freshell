@@ -2426,6 +2426,46 @@ describe('PaneContainer', () => {
       ).toBeTruthy()
     })
 
+    it('falls back to the fresh-agent initial cwd when richer runtime metadata has not arrived', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-fresh',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-fresh',
+          sessionId: 'codex-session-1',
+          resumeSessionId: 'codex-session-1',
+          status: 'idle',
+          initialCwd: '/home/user/code/freshell',
+        },
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': node },
+        activePane: { 'tab-1': 'pane-fresh' },
+        paneTitles: { 'tab-1': { 'pane-fresh': 'Freshcodex' } },
+        paneTitleSetByUser: { 'tab-1': {} },
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      const banner = screen.getByRole('banner', { name: 'Pane: freshell' })
+      const identity = screen.getByText('freshcodex')
+      const meta = screen.getByText('freshell')
+
+      expect(banner).toContainElement(identity)
+      expect(banner).toContainElement(meta)
+      expect(meta).toHaveAttribute('title', 'Directory: /home/user/code/freshell')
+      expect(
+        identity.compareDocumentPosition(meta) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy()
+    })
+
     it('prefers cliSessionId over resumeSessionId when both identities exist', () => {
       const node: PaneNode = {
         type: 'leaf',

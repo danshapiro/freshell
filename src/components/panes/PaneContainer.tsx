@@ -13,7 +13,7 @@ import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
 import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-utils'
 import { isFreshAgentProviderName, getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
-import { normalizeFreshAgentEffort, normalizeFreshAgentModel, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
+import { getFreshAgentLabel, normalizeFreshAgentEffort, normalizeFreshAgentModel, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { clearDraft } from '@/lib/draft-store'
 import { getTerminalActions } from '@/lib/pane-action-registry'
 import { buildPaneRefreshTarget } from '@/lib/pane-utils'
@@ -56,6 +56,7 @@ import type { SessionLocator } from '@shared/ws-protocol'
 
 // Stable empty object to avoid selector memoization issues
 const EMPTY_PANE_TITLES: Record<string, string> = {}
+const EMPTY_PANE_TITLE_SET_BY_USER: Record<string, boolean> = {}
 const EMPTY_TERMINAL_META_BY_ID: Record<string, TerminalMetaRecord> = {}
 const EMPTY_PROJECTS: ProjectGroup[] = []
 const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
@@ -161,7 +162,14 @@ function resolveFreshAgentRuntimeMeta(
     }
   }
 
-  if (!session) return undefined
+  if (!session) {
+    return content.initialCwd
+      ? {
+          cwd: content.initialCwd,
+          checkoutRoot: content.initialCwd,
+        }
+      : undefined
+  }
 
   let branch: string | undefined
   if (session.snapshot?.worktrees?.length) {
@@ -169,9 +177,10 @@ function resolveFreshAgentRuntimeMeta(
   }
 
   const snapshotTokenUsage = session.snapshot?.tokenUsage
+  const cwd = session.cwd ?? content.initialCwd
   return {
-    cwd: session.cwd,
-    checkoutRoot: session.cwd,
+    cwd,
+    checkoutRoot: cwd,
     branch,
     tokenUsage: snapshotTokenUsage && {
       inputTokens: snapshotTokenUsage.inputTokens,
@@ -184,11 +193,29 @@ function resolveFreshAgentRuntimeMeta(
   }
 }
 
+function resolveStoredTitleForDisplay(
+  content: PaneContent,
+  storedTitle: string | undefined,
+  setByUser: boolean | undefined,
+): string | undefined {
+  if (content.kind !== 'fresh-agent' || setByUser || !storedTitle) return storedTitle
+
+  const normalizedStoredTitle = storedTitle.trim().toLowerCase()
+  const legacyProviderTitle = getFreshAgentLabel(content.sessionType).trim().toLowerCase()
+  const providerIdentity = content.sessionType.trim().toLowerCase()
+  if (normalizedStoredTitle === legacyProviderTitle || normalizedStoredTitle === providerIdentity) {
+    return undefined
+  }
+
+  return storedTitle
+}
+
 export default function PaneContainer({ tabId, node, hidden }: PaneContainerProps) {
   const dispatch = useAppDispatch()
   const activePane = useAppSelector((s) => s.panes.activePane[tabId])
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const paneTitles = useAppSelector((s) => s.panes.paneTitles[tabId] ?? EMPTY_PANE_TITLES)
+  const paneTitleSetByUser = useAppSelector((s) => s.panes.paneTitleSetByUser?.[tabId] ?? EMPTY_PANE_TITLE_SET_BY_USER)
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const terminalMetaById = useAppSelector(
     (s) => s.terminalMeta?.byTerminalId ?? EMPTY_TERMINAL_META_BY_ID
@@ -244,12 +271,17 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     // Only handle the request if this PaneContainer renders the target pane as a leaf
     if (node.type !== 'leaf' || node.id !== renameRequestPaneId) return
 
-    const currentTitle = getPaneDisplayTitle(node.content, paneTitles[node.id], extensionEntries)
+    const storedTitle = resolveStoredTitleForDisplay(
+      node.content,
+      paneTitles[node.id],
+      paneTitleSetByUser[node.id],
+    )
+    const currentTitle = getPaneDisplayTitle(node.content, storedTitle, extensionEntries)
     setRenamingPaneId(node.id)
     setRenameValue(currentTitle)
     setRenameError(null)
     dispatch(clearPaneRenameRequest())
-  }, [renameRequestTabId, renameRequestPaneId, tabId, node, paneTitles, extensionEntries, dispatch])
+  }, [renameRequestTabId, renameRequestPaneId, tabId, node, paneTitles, paneTitleSetByUser, extensionEntries, dispatch])
 
   const startRename = useCallback((paneId: string, currentTitle: string) => {
     setRenamingPaneId(paneId)
@@ -410,7 +442,11 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
 
   // Render a leaf pane
   if (node.type === 'leaf') {
-    const explicitTitle = paneTitles[node.id]
+    const explicitTitle = resolveStoredTitleForDisplay(
+      node.content,
+      paneTitles[node.id],
+      paneTitleSetByUser[node.id],
+    )
     const paneTitle = getPaneDisplayTitle(node.content, explicitTitle, extensionEntries)
     const paneStatus = node.content.kind === 'terminal'
       ? node.content.status
