@@ -22,6 +22,7 @@
 - Use red/green/refactor: prove the existing flake, apply the smallest production fix, then stress the affected tests.
 - Do not mark tests skipped, weaken assertions, or lower coverage.
 - Do not restart the self-hosted Freshell server.
+- The user explicitly requested "land that on main via pr too" for this flake branch, so PR creation approval is already satisfied for this branch/change.
 
 ---
 
@@ -40,17 +41,17 @@
 Run:
 
 ```bash
-for i in $(seq 1 20); do
+for i in $(seq 1 50); do
   echo "run $i"
   npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx -t "transcript keyboard scroll" >/tmp/fresh-agent-scroll-loop-$i.log 2>&1 || {
     cat /tmp/fresh-agent-scroll-loop-$i.log
     exit 1
   }
 done
-echo "20 focused scroll runs passed"
+echo "50 focused scroll runs passed without reproducing the known flake"
 ```
 
-Expected before the fix: at least one run can fail with either PageDown receiving `1000` instead of `260`, or PageUp receiving `1000` instead of `340`. This proves a late auto-scroll-to-bottom write can win the race.
+Expected before the fix: at least one run can fail with either PageDown receiving `1000` instead of `260`, or PageUp receiving `1000` instead of `340`. This proves a late auto-scroll-to-bottom write can win the race. If all 50 runs pass, stop and record the red step as inconclusive rather than claiming a fresh red result; the existing captured reproduction remains `PageDown expected 260 but received 1000` from the earlier 20-run loop.
 
 - [ ] **Step 2: Confirm the test command fails when Vitest fails**
 
@@ -64,20 +65,10 @@ Expected: command exits nonzero with `No test files found`. This is the negative
 
 - [ ] **Step 3: Move transcript auto-scroll DOM writes into a layout effect**
 
-In `src/components/fresh-agent/FreshAgentTranscript.tsx`, add `useLayoutEffect` to the React import:
+In `src/components/fresh-agent/FreshAgentTranscript.tsx`, add `useLayoutEffect` to the existing React import while preserving the file's single-line import style:
 
 ```ts
-import {
-  forwardRef,
-  memo,
-  useCallback,
-  useEffect,
-  useImperativeHandle,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react'
+import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react'
 ```
 
 Then change only the auto-scroll effect from `useEffect` to `useLayoutEffect`:
@@ -188,6 +179,28 @@ Expected: no whitespace errors and only expected branch tracking/status output.
 
 - [ ] **Step 4: Push and create PR**
 
+Create the PR body file:
+
+```bash
+cat > /tmp/fresh-agent-scroll-flake-pr.md <<'EOF'
+## Summary
+- move FreshAgentTranscript's auto-scroll-to-bottom DOM write from a passive effect to a layout effect
+- keep the FreshAgentView keyboard scroll contract unchanged
+- document the root cause: a late passive auto-scroll could reset the transcript to `scrollHeight` after PageUp/PageDown test setup changed scroll position
+
+## Verification
+- npm run test:vitest -- run test/unit/client/components/fresh-agent/__intentional_missing_file__.test.tsx (expected exit 1 negative control)
+- npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx -t "transcript keyboard scroll"
+- 30-run focused transcript keyboard scroll loop
+- npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
+- npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx
+- FRESHELL_TEST_SUMMARY='verify fresh-agent scroll flake stabilization' npm run check
+- git diff --check HEAD
+EOF
+```
+
+Then push and open the PR. This is allowed because the user explicitly requested PR landing for this branch/change.
+
 Run:
 
 ```bash
@@ -208,8 +221,10 @@ gh pr checks <PR_NUMBER> --watch --interval 30
 gh pr merge <PR_NUMBER> --squash --delete-branch \
   --subject "Stabilize fresh-agent transcript scroll timing" --body ""
 cd /home/dan/code/freshell
+git status --short --branch
+git checkout main
 git fetch origin main --prune
 git merge --ff-only origin/main
 ```
 
-Expected: PR checks pass, GitHub merges to `main`, and local `main` fast-forwards without a merge commit.
+Expected: PR checks pass, GitHub merges to `main`, the primary checkout is clean and on `main`, and local `main` fast-forwards without a merge commit.
