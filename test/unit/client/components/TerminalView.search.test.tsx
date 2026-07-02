@@ -354,4 +354,42 @@ describe('TerminalView search', () => {
       expect.objectContaining({ allowProposedApi: true }),
     )
   })
+
+  it('suppresses xterm DEL parser noise while forwarding other errors', async () => {
+    const { store, tabId, paneId, paneContent } = createTestStore()
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(capturedTerminalOptions).not.toBeNull()
+    })
+
+    const logger = capturedTerminalOptions?.logger as {
+      error?: (message: string, ...args: unknown[]) => void
+    } | undefined
+    expect(logger?.error).toBeTypeOf('function')
+
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      logger!.error!('Parsing error: ', { code: 127, currentState: 0 })
+      logger!.error!('Parsing error: ', { code: 127, currentState: 4 })
+      logger!.error!('Something else', { code: 127, currentState: 0 })
+
+      expect(consoleErrorSpy).toHaveBeenCalledTimes(2)
+      expect(consoleErrorSpy).toHaveBeenNthCalledWith(1, 'xterm.js: Parsing error: ', {
+        code: 127,
+        currentState: 4,
+      })
+      expect(consoleErrorSpy).toHaveBeenNthCalledWith(2, 'xterm.js: Something else', {
+        code: 127,
+        currentState: 0,
+      })
+    } finally {
+      consoleErrorSpy.mockRestore()
+    }
+  })
 })

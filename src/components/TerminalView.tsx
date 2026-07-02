@@ -129,7 +129,7 @@ import {
 } from '@/components/terminal/terminal-write-queue'
 import { nanoid } from 'nanoid'
 import { cn } from '@/lib/utils'
-import { Terminal } from '@xterm/xterm'
+import { Terminal, type ILogger } from '@xterm/xterm'
 import { Loader2 } from 'lucide-react'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { PaneContent, PaneContentInput, PaneRefreshRequest, TerminalPaneContent } from '@/store/paneTypes'
@@ -174,6 +174,51 @@ const TERMINAL_OUTPUT_BATCH_BARRIER_REASONS = new Set([
   'gap',
   'geometry',
 ])
+
+function isXtermGroundDelParserNoise(message: string | Error, args: unknown[]): boolean {
+  if (typeof message !== 'string' || message.trim() !== 'Parsing error:') return false
+  const state = args[0]
+  return !!state
+    && typeof state === 'object'
+    && (state as { code?: unknown }).code === 0x7f
+    && (state as { currentState?: unknown }).currentState === 0
+}
+
+function forwardXtermLog(
+  method: keyof ILogger,
+  message: string | Error,
+  args: unknown[],
+): void {
+  const prefixedMessage = `xterm.js: ${String(message)}`
+  switch (method) {
+    case 'trace':
+      console.trace(prefixedMessage, ...args)
+      break
+    case 'debug':
+      console.debug(prefixedMessage, ...args)
+      break
+    case 'info':
+      console.info(prefixedMessage, ...args)
+      break
+    case 'warn':
+      console.warn(prefixedMessage, ...args)
+      break
+    case 'error':
+      console.error(prefixedMessage, ...args)
+      break
+  }
+}
+
+const xtermLogger: ILogger = {
+  trace: (message, ...args) => forwardXtermLog('trace', message, args),
+  debug: (message, ...args) => forwardXtermLog('debug', message, args),
+  info: (message, ...args) => forwardXtermLog('info', message, args),
+  warn: (message, ...args) => forwardXtermLog('warn', message, args),
+  error: (message, ...args) => {
+    if (isXtermGroundDelParserNoise(message, args)) return
+    forwardXtermLog('error', message, args)
+  },
+}
 
 function viewportHydrateReplayOptions(content?: TerminalPaneContent | null): { maxReplayBytes: number } | undefined {
   return content?.mode === 'opencode'
@@ -1682,6 +1727,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       fontSize: settings.terminal.fontSize,
       fontFamily: resolveTerminalFontFamily(settings.terminal.fontFamily),
       lineHeight: settings.terminal.lineHeight,
+      logger: xtermLogger,
       scrollback: settings.terminal.scrollback,
       theme: resolvedTheme,
       minimumContrastRatio: resolveMinimumContrastRatio(resolvedTheme),
