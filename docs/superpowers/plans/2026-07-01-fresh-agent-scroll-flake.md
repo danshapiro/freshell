@@ -8,6 +8,12 @@
 
 **Tech Stack:** React 18, TypeScript, Vitest, Testing Library, jsdom.
 
+**Load-Bearing Validation Notes:**
+- The observed `scrollTop = 1000` flake was validated as a late transcript auto-scroll write: PageDown only calls `scrollByPage(1)`, the test's mocked `scrollHeight` is `1000`, and the only non-user-action writer that can set exactly `scrollHeight` is the passive auto-scroll effect in `FreshAgentTranscript`.
+- React's official `useLayoutEffect` contract says it runs after DOM commit and before repaint, and state updates scheduled from it are processed before paint. This validates using a layout effect for the scroll DOM write, with the caveat that the synchronous work must remain tightly scoped.
+- The existing `atBottom` model is sufficient for this flake because the handle and scroll event recompute from the actual scroller. Broader `newMessages` semantics are out of scope for this fix.
+- `npm run test:vitest` is a coordinator passthrough and repeated loop runs are fresh executions. Do not use a no-matching `-t` selector as a negative control because this Vitest version exits `0` when all tests are skipped.
+
 ## Global Constraints
 
 - Work in `.worktrees/fresh-agent-scroll-flake` on branch `fix/fresh-agent-scroll-flake`.
@@ -46,7 +52,17 @@ echo "20 focused scroll runs passed"
 
 Expected before the fix: at least one run can fail with either PageDown receiving `1000` instead of `260`, or PageUp receiving `1000` instead of `340`. This proves a late auto-scroll-to-bottom write can win the race.
 
-- [ ] **Step 2: Move transcript auto-scroll DOM writes into a layout effect**
+- [ ] **Step 2: Confirm the test command fails when Vitest fails**
+
+Run:
+
+```bash
+npm run test:vitest -- run test/unit/client/components/fresh-agent/__intentional_missing_file__.test.tsx
+```
+
+Expected: command exits nonzero with `No test files found`. This is the negative control for the loop harness. Do not use a no-matching `-t` selector; Vitest reports skipped tests and exits `0`.
+
+- [ ] **Step 3: Move transcript auto-scroll DOM writes into a layout effect**
 
 In `src/components/fresh-agent/FreshAgentTranscript.tsx`, add `useLayoutEffect` to the React import:
 
@@ -81,7 +97,7 @@ Then change only the auto-scroll effect from `useEffect` to `useLayoutEffect`:
 
 Leave the later `recomputeGlom()` effect as `useEffect`; it computes decoration state and does not need to block input/paint.
 
-- [ ] **Step 3: Run the focused scroll tests once**
+- [ ] **Step 4: Run the focused scroll tests once**
 
 Run:
 
@@ -91,7 +107,7 @@ npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentVie
 
 Expected: all 11 transcript keyboard scroll tests pass.
 
-- [ ] **Step 4: Stress the formerly flaky path**
+- [ ] **Step 5: Stress the formerly flaky path**
 
 Run:
 
@@ -108,7 +124,7 @@ echo "30 focused scroll runs passed"
 
 Expected after the fix: every run passes.
 
-- [ ] **Step 5: Run the full affected test file**
+- [ ] **Step 6: Run the full affected test file**
 
 Run:
 
@@ -118,7 +134,7 @@ npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentVie
 
 Expected: the full `FreshAgentView.test.tsx` file passes.
 
-- [ ] **Step 6: Commit the production fix**
+- [ ] **Step 7: Commit the production fix**
 
 Run:
 
