@@ -612,6 +612,25 @@ export type TerminalRecord = {
   }
 }
 
+export type TerminalRegistryDiagnosticCounts = {
+  terminals: {
+    total: number
+    running: number
+    exited: number
+    byMode: Record<string, { total: number; running: number; exited: number }>
+  }
+  codex: {
+    total: number
+    running: number
+    runningWithSidecar: number
+    runningWithPublishedSidecar: number
+    recoveryAttempts: number
+    recoveryBlocked: number
+    sidecarShutdownsPending: number
+    sidecarShutdownsFailed: number
+  }
+}
+
 export type TerminalInputResult =
   | { status: 'written' }
   | {
@@ -3567,6 +3586,68 @@ export class TerminalRegistry extends EventEmitter {
       ...await collectShutdownFailures([...sidecarShutdowns]),
     ]
     throwShutdownFailures(failures, 'Codex registry shutdown work failed.')
+  }
+
+  getDiagnosticCounts(): TerminalRegistryDiagnosticCounts {
+    const byMode: TerminalRegistryDiagnosticCounts['terminals']['byMode'] = {}
+    let running = 0
+    let exited = 0
+    let codexTotal = 0
+    let codexRunning = 0
+    let runningWithSidecar = 0
+    let runningWithPublishedSidecar = 0
+    let recoveryAttempts = 0
+    let recoveryBlocked = 0
+
+    for (const term of this.terminals.values()) {
+      const modeCounts = byMode[term.mode] ?? { total: 0, running: 0, exited: 0 }
+      modeCounts.total += 1
+      if (term.status === 'running') {
+        running += 1
+        modeCounts.running += 1
+      } else {
+        exited += 1
+        modeCounts.exited += 1
+      }
+      byMode[term.mode] = modeCounts
+
+      if (term.mode === 'codex') {
+        codexTotal += 1
+        if (term.status === 'running') codexRunning += 1
+        if (term.status === 'running' && term.codexSidecar) runningWithSidecar += 1
+        if (term.status === 'running' && term.codexSidecar && term.codexSidecarLifecyclePublished) {
+          runningWithPublishedSidecar += 1
+        }
+        if (term.codexRecoveryAttempt) recoveryAttempts += 1
+        if (term.codexRecoveryBlockedError) recoveryBlocked += 1
+      }
+    }
+
+    let sidecarShutdownsPending = 0
+    let sidecarShutdownsFailed = 0
+    for (const entry of this.sidecarShutdowns.values()) {
+      if (entry.status === 'pending') sidecarShutdownsPending += 1
+      if (entry.status === 'failed') sidecarShutdownsFailed += 1
+    }
+
+    return {
+      terminals: {
+        total: this.terminals.size,
+        running,
+        exited,
+        byMode,
+      },
+      codex: {
+        total: codexTotal,
+        running: codexRunning,
+        runningWithSidecar,
+        runningWithPublishedSidecar,
+        recoveryAttempts,
+        recoveryBlocked,
+        sidecarShutdownsPending,
+        sidecarShutdownsFailed,
+      },
+    }
   }
 
   list(): Array<{
