@@ -30,6 +30,7 @@
 
 **Files:**
 - Modify: `src/components/fresh-agent/FreshAgentTranscript.tsx`
+- Modify: `test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx`
 - Test: `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`
 
 **Interfaces:**
@@ -63,7 +64,74 @@ npm run test:vitest -- run test/unit/client/components/fresh-agent/__intentional
 
 Expected: command exits nonzero with `No test files found`. This is the negative control for the loop harness. Do not use a no-matching `-t` selector; Vitest reports skipped tests and exits `0`.
 
-- [ ] **Step 3: Move transcript auto-scroll DOM writes into a layout effect**
+- [ ] **Step 3: Add the deterministic regression test**
+
+In `test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx`, extend the imports:
+
+```ts
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { createRoot, type Root } from 'react-dom/client'
+import { flushSync } from 'react-dom'
+import { FreshAgentTranscript, type FreshAgentTranscriptHandle } from '@/components/fresh-agent/FreshAgentTranscript'
+```
+
+Add this test near the existing transcript auto-scroll tests:
+
+```tsx
+  it('does not let a deferred initial auto-scroll clobber an imperative page scroll', async () => {
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    let root: Root | null = null
+    const transcriptRef = { current: null as FreshAgentTranscriptHandle | null }
+
+    flushSync(() => {
+      root = createRoot(container)
+      root.render(
+        <FreshAgentTranscript
+          ref={transcriptRef}
+          turns={[
+            { id: 'turn-0', role: 'user', items: [{ id: 'item-0', kind: 'text', text: 'User message' }] },
+            { id: 'turn-1', role: 'assistant', items: [{ id: 'item-1', kind: 'text', text: 'Assistant reply' }] },
+          ]}
+        />,
+      )
+    })
+
+    try {
+      const scroller = container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+      Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 200 })
+      Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => 1000 })
+      scroller.scrollTop = 100
+
+      transcriptRef.current?.scrollByPage(1)
+      expect(scroller.scrollTop).toBe(260)
+
+      await act(async () => {})
+
+      expect(scroller.scrollTop).toBe(260)
+    } finally {
+      await act(async () => {
+        root?.unmount()
+      })
+      container.remove()
+    }
+  })
+```
+
+This is behavioral coverage, not a hook-implementation assertion: it proves a page scroll performed before passive effects flush remains at `260` after those effects flush.
+
+- [ ] **Step 4: Run the deterministic regression test red**
+
+Run:
+
+```bash
+npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx -t "does not let a deferred initial auto-scroll clobber an imperative page scroll"
+```
+
+Expected before the production fix: FAIL because the current passive auto-scroll effect flushes after the imperative page scroll and resets `scrollTop` to `1000`.
+
+- [ ] **Step 5: Move transcript auto-scroll DOM writes into a layout effect**
 
 In `src/components/fresh-agent/FreshAgentTranscript.tsx`, add `useLayoutEffect` to the existing React import while preserving the file's single-line import style:
 
@@ -88,7 +156,17 @@ Then change only the auto-scroll effect from `useEffect` to `useLayoutEffect`:
 
 Leave the later `recomputeGlom()` effect as `useEffect`; it computes decoration state and does not need to block input/paint.
 
-- [ ] **Step 4: Run the focused scroll tests once**
+- [ ] **Step 6: Run the deterministic regression test green**
+
+Run:
+
+```bash
+npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx -t "does not let a deferred initial auto-scroll clobber an imperative page scroll"
+```
+
+Expected after the production fix: PASS because no deferred passive auto-scroll write remains to clobber the page scroll.
+
+- [ ] **Step 7: Run the focused scroll tests once**
 
 Run:
 
@@ -98,24 +176,24 @@ npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentVie
 
 Expected: all 11 transcript keyboard scroll tests pass.
 
-- [ ] **Step 5: Stress the formerly flaky path**
+- [ ] **Step 8: Stress the formerly flaky path**
 
 Run:
 
 ```bash
-for i in $(seq 1 30); do
+for i in $(seq 1 50); do
   echo "run $i"
   npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx -t "transcript keyboard scroll" >/tmp/fresh-agent-scroll-loop-after-$i.log 2>&1 || {
     cat /tmp/fresh-agent-scroll-loop-after-$i.log
     exit 1
   }
 done
-echo "30 focused scroll runs passed"
+echo "50 focused scroll runs passed"
 ```
 
-Expected after the fix: every run passes.
+Expected after the fix: every run passes. This loop is supplementary probabilistic stress; the deterministic regression test above is the primary red/green proof.
 
-- [ ] **Step 6: Run the full affected test file**
+- [ ] **Step 9: Run the full affected test file**
 
 Run:
 
@@ -125,12 +203,12 @@ npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentVie
 
 Expected: the full `FreshAgentView.test.tsx` file passes.
 
-- [ ] **Step 7: Commit the production fix**
+- [ ] **Step 10: Commit the production fix**
 
 Run:
 
 ```bash
-git add src/components/fresh-agent/FreshAgentTranscript.tsx
+git add src/components/fresh-agent/FreshAgentTranscript.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx
 git commit -m "fix: stabilize fresh-agent transcript scroll timing"
 ```
 
@@ -185,13 +263,15 @@ Create the PR body file:
 cat > /tmp/fresh-agent-scroll-flake-pr.md <<'EOF'
 ## Summary
 - move FreshAgentTranscript's auto-scroll-to-bottom DOM write from a passive effect to a layout effect
+- add a deterministic regression test that flushes passive effects after an imperative page scroll
 - keep the FreshAgentView keyboard scroll contract unchanged
 - document the root cause: a late passive auto-scroll could reset the transcript to `scrollHeight` after PageUp/PageDown test setup changed scroll position
 
 ## Verification
 - npm run test:vitest -- run test/unit/client/components/fresh-agent/__intentional_missing_file__.test.tsx (expected exit 1 negative control)
+- npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx -t "does not let a deferred initial auto-scroll clobber an imperative page scroll" (red before fix, green after fix)
 - npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx -t "transcript keyboard scroll"
-- 30-run focused transcript keyboard scroll loop
+- 50-run focused transcript keyboard scroll loop
 - npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
 - npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx
 - FRESHELL_TEST_SUMMARY='verify fresh-agent scroll flake stabilization' npm run check
