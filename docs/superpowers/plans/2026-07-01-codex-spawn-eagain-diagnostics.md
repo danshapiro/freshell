@@ -19,6 +19,7 @@
 - Runtime diagnostics must be read-only and best-effort. A failed diagnostic probe must not mask the original Codex launch failure.
 - Sidecar metadata diagnostics must be bounded and labeled as metadata-record counts, not live sidecar counts.
 - Registry diagnostics must mean registry-owned terminals and registry-owned Codex sidecars, not planner-owned pre-adoption sidecars or metadata records.
+- WebSocket tests that mock `server/logger` must preserve every logger export consumed during `ws-handler` module load, including `sessionLifecycleLogger`, because `session-observability.ts` captures that logger in a module-level sink.
 - Baseline: after installing dev dependencies in the worktree, `FRESHELL_TEST_SUMMARY='baseline retry after local dev dependency install for codex spawn diagnostics worktree' npm test` passed.
 
 ---
@@ -44,7 +45,7 @@
 - Modify `test/unit/server/coding-cli/codex-app-server/runtime.test.ts`
   - Adds a focused `EAGAIN` spawn failure regression test.
 - Modify `test/server/ws-protocol.test.ts`
-  - Adds a logger mock, fake registry diagnostic counts, and a focused WebSocket failure-log regression test proving terminal counts and retryable classification reach structured logs.
+  - Adds a complete logger mock, fake registry diagnostic counts, and a focused WebSocket failure-log regression test proving terminal counts and retryable classification reach structured logs.
 
 ## Task 1: Runtime Retryable Spawn Diagnostics
 
@@ -462,6 +463,7 @@ In `watchChildError`, copy retryable metadata onto the launch error:
 ```ts
         const code = (base as NodeJS.ErrnoException).code
         ;(launchError as Error & { code?: string; cause?: unknown; retryable?: boolean }).code = code
+        ;(launchError as Error & { code?: string; cause?: unknown; retryable?: boolean }).cause = base
         ;(launchError as Error & { code?: string; cause?: unknown; retryable?: boolean }).retryable =
           isRetryableSpawnCode(code)
 ```
@@ -543,9 +545,12 @@ const mockLogger = vi.hoisted(() => {
 
 vi.mock('../../server/logger', () => ({
   logger: mockLogger,
+  sessionLifecycleLogger: mockLogger,
   withLogContext: vi.fn((_ctx: any, fn: () => unknown) => fn()),
 }))
 ```
+
+The `sessionLifecycleLogger` export is required. `server/session-observability.ts` captures it in a module-level sink while `ws-handler.ts` imports session observability, and `terminal.create` records `terminal_create_requested` before the create try/catch.
 
 Reset the logger calls in `beforeEach()`:
 
@@ -670,6 +675,7 @@ Add this test near existing terminal-create failure tests:
       expect(String(error.message)).toContain('retryable resource exhaustion (EAGAIN)')
 
       const failureLog = mockLogger.warn.mock.calls.find((call) => call[1] === 'terminal.create failed')
+      const diagnosticProcess = failureLog?.[0]?.diagnostics?.process as any
       expect(failureLog?.[0]).toEqual(expect.objectContaining({
         err: retryableError,
         connectionId: expect.any(String),
@@ -697,10 +703,12 @@ Add this test near existing terminal-create failure tests:
               rss: expect.any(Number),
               heapUsed: expect.any(Number),
             }),
-            fdCount: expect.any(Number),
           }),
         }),
       }))
+      if (process.platform === 'linux') {
+        expect(diagnosticProcess.fdCount).toEqual(expect.any(Number))
+      }
     } finally {
       codexLaunchPlanner.planCreate = originalPlanCreate as any
       await closeWebSocket(ws)
@@ -896,4 +904,3 @@ git commit -m "fix: add Codex spawn failure diagnostics"
 - Spec coverage: The plan implements recommendation #4 by adding retryable spawn classification, process/resource diagnostics, registry-owned terminal counts, registry-owned Codex sidecar counts, bounded sidecar metadata-record counts, and structured failure logs. It does not implement replay retention, settings refresh, or proxy-log rate limiting because those were separate recommendations.
 - Placeholder scan: No placeholder steps remain; code snippets include exact file paths, commands, and expected results.
 - Type consistency: `TerminalRegistryDiagnosticCounts`, `CodexAppServerLaunchDiagnostics`, `CodexAppServerProcessDiagnostics`, and the WebSocket diagnostic helper names are consistent across tasks.
-
