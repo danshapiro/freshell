@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { FreshAgentTranscript } from '@/components/fresh-agent/FreshAgentTranscript'
+import { useLayoutEffect, useRef } from 'react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { createRoot, type Root } from 'react-dom/client'
+import { flushSync } from 'react-dom'
+import { FreshAgentTranscript, type FreshAgentTranscriptHandle } from '@/components/fresh-agent/FreshAgentTranscript'
 
 // Render markdown bodies synchronously. The real LazyMarkdown wraps MarkdownRenderer
 // in React.lazy + Suspense; mocking it to render MarkdownRenderer directly removes
@@ -767,6 +770,59 @@ describe('FreshAgentTranscript', () => {
     )
 
     expect(scroller.scrollTop).toBe(1200)
+  })
+
+  it('does not let a deferred initial auto-scroll clobber an imperative page scroll', async () => {
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    let root: Root | null = null
+    const afterImperativeScroll: number[] = []
+
+    function Harness() {
+      const transcriptRef = useRef<FreshAgentTranscriptHandle | null>(null)
+
+      useLayoutEffect(() => {
+        // Model a consumer scroll that happens after DOM commit but before the
+        // transcript's passive effects flush.
+        const scroller = container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+        Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 200 })
+        Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => 1000 })
+        scroller.scrollTop = 100
+
+        transcriptRef.current?.scrollByPage(1)
+        afterImperativeScroll.push(scroller.scrollTop)
+      }, [])
+
+      return (
+        <FreshAgentTranscript
+          ref={transcriptRef}
+          turns={[
+            { id: 'turn-0', role: 'user', items: [{ id: 'item-0', kind: 'text', text: 'User message' }] },
+            { id: 'turn-1', role: 'assistant', items: [{ id: 'item-1', kind: 'text', text: 'Assistant reply' }] },
+          ]}
+        />
+      )
+    }
+
+    flushSync(() => {
+      root = createRoot(container)
+      root.render(<Harness />)
+    })
+
+    try {
+      const scroller = container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+      expect(afterImperativeScroll).toEqual([260])
+      expect(scroller.scrollTop).toBe(260)
+
+      await act(async () => {})
+
+      expect(scroller.scrollTop).toBe(260)
+    } finally {
+      await act(async () => {
+        root?.unmount()
+      })
+      container.remove()
+    }
   })
 
   it('shows and clears the new-message badge when fresh-agent updates arrive away from the bottom', async () => {
