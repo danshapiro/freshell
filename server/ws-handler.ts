@@ -507,11 +507,20 @@ async function buildTerminalCreateFailureDiagnostics(
   registry: TerminalRegistry,
   error: unknown,
 ): Promise<Record<string, unknown>> {
-  return {
-    process: await collectCodexAppServerProcessDiagnostics(),
-    registry: registry.getDiagnosticCounts(),
+  const diagnostics: Record<string, unknown> = {
     launch: getCodexAppServerLaunchErrorDetails(error),
   }
+  try {
+    diagnostics.process = await collectCodexAppServerProcessDiagnostics()
+  } catch (diagnosticsError) {
+    diagnostics.processProbeError = errorMessage(diagnosticsError)
+  }
+  try {
+    diagnostics.registry = registry.getDiagnosticCounts()
+  } catch (diagnosticsError) {
+    diagnostics.registryProbeError = errorMessage(diagnosticsError)
+  }
+  return diagnostics
 }
 
 class TerminalCreateAdmissionError extends Error {}

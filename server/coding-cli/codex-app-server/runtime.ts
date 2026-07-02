@@ -1188,6 +1188,8 @@ export class CodexAppServerRuntime {
           unreadable += 1
         }
       }
+    } catch {
+      unreadable += 1
     } finally {
       await dir.close().catch(() => undefined)
     }
@@ -1383,7 +1385,15 @@ export class CodexAppServerRuntime {
       throw lastError ?? new Error('Codex app-server startup was cancelled because the sidecar is shutting down.')
     }
 
-    const diagnostics = await this.collectLaunchDiagnostics()
+    let diagnostics: CodexAppServerLaunchDiagnostics | undefined
+    try {
+      diagnostics = await this.collectLaunchDiagnostics()
+    } catch (diagnosticsError) {
+      logger.warn(
+        { err: diagnosticsError, launchErr: lastError },
+        'Codex app-server startup diagnostic collection failed',
+      )
+    }
     const code = lastLaunchDetails.code ?? getErrorCode(lastError)
     const retryable = lastLaunchDetails.retryable ?? isRetryableCodexAppServerLaunchError(lastError)
     const retryablePrefix = retryable && code
@@ -1394,13 +1404,13 @@ export class CodexAppServerRuntime {
         err: lastError,
         code,
         retryable,
-        diagnostics,
+        ...(diagnostics ? { diagnostics } : {}),
       },
       'Codex app-server startup failed after all attempts',
     )
     throw new CodexAppServerStartupError(
       `Failed to start Codex app-server on a loopback endpoint after ${this.startupAttemptLimit} attempts:${retryablePrefix} ${lastError?.message ?? 'unknown error'}`,
-      { code, retryable, diagnostics, cause: lastError },
+      { code, retryable, ...(diagnostics ? { diagnostics } : {}), cause: lastError },
     )
   }
 
