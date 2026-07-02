@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import http from 'node:http'
+import { EventEmitter } from 'node:events'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -1289,6 +1290,59 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     runtimes.add(runtime)
 
     await expect(runtime.ensureReady()).rejects.toThrow(/failed to launch codex app-server sidecar|enoent/i)
+  })
+
+  it('classifies spawn EAGAIN as retryable and attaches bounded launch diagnostics', async () => {
+    const metadataDir = await makeTempDir()
+    const spawnError = Object.assign(new Error('spawn codex EAGAIN'), { code: 'EAGAIN' })
+    const spawnProcess = vi.fn(() => {
+      const fakeChild = new EventEmitter() as any
+      fakeChild.stdout = { resume: vi.fn() }
+      fakeChild.stderr = { resume: vi.fn() }
+      fakeChild.exitCode = null
+      fakeChild.signalCode = null
+      queueMicrotask(() => fakeChild.emit('error', spawnError))
+      return fakeChild
+    })
+    const runtime = new CodexAppServerRuntime({
+      command: 'codex',
+      metadataDir,
+      spawnProcess: spawnProcess as any,
+      startupAttemptLimit: 2,
+      startupAttemptTimeoutMs: 100,
+    })
+    runtimes.add(runtime)
+
+    let caught: unknown
+    await runtime.ensureReady().catch((error) => {
+      caught = error
+    })
+
+    expect(caught).toMatchObject({
+      code: 'EAGAIN',
+      retryable: true,
+      diagnostics: expect.objectContaining({
+        process: expect.objectContaining({
+          pid: process.pid,
+          memory: expect.objectContaining({
+            rss: expect.any(Number),
+            heapUsed: expect.any(Number),
+          }),
+          fdCount: expect.any(Number),
+          processCount: expect.any(Number),
+        }),
+        sidecars: expect.objectContaining({
+          metadataDir,
+          metadataRecords: expect.objectContaining({
+            total: 0,
+            capReached: false,
+          }),
+        }),
+      }),
+    })
+    expect(caught).toBeInstanceOf(Error)
+    expect((caught as Error).message).toMatch(/retryable resource exhaustion.*EAGAIN/i)
+    expect(spawnProcess).toHaveBeenCalledTimes(2)
   })
 
   it('normalizes Windows drive cwd to the WSL mount before spawning the Codex app-server sidecar', async () => {

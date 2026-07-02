@@ -74,7 +74,8 @@ type ActiveOwnership = {
   metadata: CodexSidecarOwnershipMetadata
 }
 
-type ChildProcessHandle = ReturnType<typeof spawn>
+type SpawnProcess = typeof spawn
+type ChildProcessHandle = ReturnType<SpawnProcess>
 
 type RuntimeOptions = {
   command?: string
@@ -90,6 +91,76 @@ type RuntimeOptions = {
   ownershipIdFactory?: () => string
   metadataWriter?: (filePath: string, metadata: CodexSidecarOwnershipMetadata) => Promise<void>
   processIdentityReader?: (pid: number) => Promise<WrapperIdentity | null>
+  spawnProcess?: SpawnProcess
+}
+
+export type CodexAppServerProcessDiagnostics = {
+  pid: number
+  platform: NodeJS.Platform
+  uptimeSeconds: number
+  memory: NodeJS.MemoryUsage
+  resourceUsage?: ReturnType<typeof process.resourceUsage>
+  fdCount?: number
+  processCount?: number
+  loadavg?: string
+  meminfo?: {
+    memTotalKb?: number
+    memFreeKb?: number
+    memAvailableKb?: number
+    swapTotalKb?: number
+    swapFreeKb?: number
+  }
+  limits?: {
+    maxProcesses?: string
+    maxOpenFiles?: string
+  }
+  probeErrors?: Record<string, string>
+}
+
+export type CodexAppServerLaunchDiagnostics = {
+  process: CodexAppServerProcessDiagnostics
+  runtime: {
+    command: string
+    startupAttemptLimit: number
+    startupAttemptTimeoutMs: number
+    status: RuntimeStatus
+    hasActiveChild: boolean
+    activeChildPid?: number
+    activeOwnershipId?: string
+  }
+  sidecars: {
+    metadataDir: string
+    metadataRecords: {
+      total: number
+      currentServer: number
+      otherServer: number
+      malformed: number
+      unreadable: number
+      oversized: number
+      cap: number
+      capReached: boolean
+    }
+  }
+}
+
+export type CodexAppServerLaunchErrorDetails = {
+  code?: string
+  retryable?: boolean
+  diagnostics?: CodexAppServerLaunchDiagnostics
+}
+
+class CodexAppServerStartupError extends Error {
+  code?: string
+  retryable?: boolean
+  diagnostics?: CodexAppServerLaunchDiagnostics
+
+  constructor(message: string, details: CodexAppServerLaunchErrorDetails & { cause?: unknown } = {}) {
+    super(message, { cause: details.cause })
+    this.name = 'CodexAppServerStartupError'
+    this.code = details.code
+    this.retryable = details.retryable
+    this.diagnostics = details.diagnostics
+  }
 }
 
 export type ReapOrphanedSidecarsOptions = {
@@ -110,10 +181,136 @@ const DEFAULT_STARTUP_ATTEMPT_TIMEOUT_MS = 3_000
 const STARTUP_POLL_MS = 50
 const DEFAULT_TERMINATE_GRACE_MS = 1_000
 const OWNERSHIP_SCHEMA_VERSION = 1
+const LAUNCH_DIAGNOSTIC_METADATA_RECORD_CAP = 100
+const LAUNCH_DIAGNOSTIC_METADATA_RECORD_MAX_BYTES = 16 * 1024
 export const DEFAULT_CODEX_SIDECAR_METADATA_DIR = path.join(os.homedir(), '.freshell', 'codex-sidecars')
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function errorCause(error: unknown): unknown {
+  return error && typeof error === 'object' ? (error as { cause?: unknown }).cause : undefined
+}
+
+function getErrorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object') return undefined
+  const code = (error as { code?: unknown }).code
+  return typeof code === 'string' ? code : undefined
+}
+
+function isRetryableSpawnCode(code: string | undefined): boolean {
+  return code === 'EAGAIN' || code === 'EMFILE' || code === 'ENFILE' || code === 'ENOMEM'
+}
+
+export function getCodexAppServerLaunchErrorDetails(error: unknown): CodexAppServerLaunchErrorDetails {
+  const seen = new Set<unknown>()
+  let current = error
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current)
+    const details = current as CodexAppServerLaunchErrorDetails
+    const code = typeof details.code === 'string' ? details.code : undefined
+    const retryable = typeof details.retryable === 'boolean' ? details.retryable : undefined
+    const diagnostics = details.diagnostics
+    if (code || retryable !== undefined || diagnostics) {
+      return {
+        ...(code ? { code } : {}),
+        ...(retryable !== undefined ? { retryable } : {}),
+        ...(diagnostics ? { diagnostics } : {}),
+      }
+    }
+    current = errorCause(current)
+  }
+  return {}
+}
+
+export function isRetryableCodexAppServerLaunchError(error: unknown): boolean {
+  const details = getCodexAppServerLaunchErrorDetails(error)
+  if (details.retryable === true) return true
+  return isRetryableSpawnCode(details.code)
+}
+
+function parseMeminfo(raw: string): CodexAppServerProcessDiagnostics['meminfo'] {
+  const values = new Map<string, number>()
+  for (const line of raw.split('\n')) {
+    const match = /^([A-Za-z_()]+):\s+(\d+)\s+kB/.exec(line)
+    if (match) values.set(match[1], Number(match[2]))
+  }
+  return {
+    memTotalKb: values.get('MemTotal'),
+    memFreeKb: values.get('MemFree'),
+    memAvailableKb: values.get('MemAvailable'),
+    swapTotalKb: values.get('SwapTotal'),
+    swapFreeKb: values.get('SwapFree'),
+  }
+}
+
+function parseLimits(raw: string): CodexAppServerProcessDiagnostics['limits'] {
+  const limits: CodexAppServerProcessDiagnostics['limits'] = {}
+  for (const line of raw.split('\n')) {
+    if (line.startsWith('Max processes')) limits.maxProcesses = line.trim()
+    if (line.startsWith('Max open files')) limits.maxOpenFiles = line.trim()
+  }
+  return limits
+}
+
+async function readTextFile(pathname: string): Promise<string> {
+  return fsp.readFile(pathname, 'utf8')
+}
+
+async function countDirectoryEntries(
+  pathname: string,
+  cap: number,
+  onlyNumeric = false,
+): Promise<{ count: number; capReached: boolean }> {
+  let count = 0
+  let capReached = false
+  const dir = await fsp.opendir(pathname)
+  try {
+    for await (const entry of dir) {
+      if (onlyNumeric && !/^\d+$/.test(entry.name)) continue
+      if (count >= cap) {
+        capReached = true
+        break
+      }
+      count += 1
+    }
+  } finally {
+    await dir.close().catch(() => undefined)
+  }
+  return { count, capReached }
+}
+
+export async function collectCodexAppServerProcessDiagnostics(): Promise<CodexAppServerProcessDiagnostics> {
+  const probeErrors: Record<string, string> = {}
+  const safe = async <T>(name: string, fn: () => Promise<T>): Promise<T | undefined> => {
+    try {
+      return await fn()
+    } catch (error) {
+      probeErrors[name] = error instanceof Error ? error.message : String(error)
+      return undefined
+    }
+  }
+
+  const fdCount = await safe('fdCount', async () => (await countDirectoryEntries('/proc/self/fd', 10_000)).count)
+  const processCount = await safe('processCount', async () => (await countDirectoryEntries('/proc', 100_000, true)).count)
+  const loadavg = await safe('loadavg', async () => (await readTextFile('/proc/loadavg')).trim())
+  const meminfoRaw = await safe('meminfo', async () => readTextFile('/proc/meminfo'))
+  const limitsRaw = await safe('limits', async () => readTextFile('/proc/self/limits'))
+
+  return {
+    pid: process.pid,
+    platform: process.platform,
+    uptimeSeconds: process.uptime(),
+    memory: process.memoryUsage(),
+    resourceUsage: process.resourceUsage?.(),
+    ...(fdCount !== undefined ? { fdCount } : {}),
+    ...(processCount !== undefined ? { processCount } : {}),
+    ...(loadavg ? { loadavg } : {}),
+    ...(meminfoRaw ? { meminfo: parseMeminfo(meminfoRaw) } : {}),
+    ...(limitsRaw ? { limits: parseLimits(limitsRaw) } : {}),
+    ...(Object.keys(probeErrors).length > 0 ? { probeErrors } : {}),
+  }
 }
 
 function defaultMetadataDir(): string {
@@ -709,6 +906,7 @@ export class CodexAppServerRuntime {
   private readonly ownershipIdFactory: () => string
   private readonly metadataWriter: (filePath: string, metadata: CodexSidecarOwnershipMetadata) => Promise<void>
   private readonly processIdentityReader: (pid: number) => Promise<WrapperIdentity | null>
+  private readonly spawnProcess: SpawnProcess
   private readyCwd: string | undefined
   private ensureReadyCwd: string | undefined
 
@@ -726,6 +924,7 @@ export class CodexAppServerRuntime {
     this.ownershipIdFactory = options.ownershipIdFactory ?? (() => `codex-sidecar-${randomUUID()}`)
     this.metadataWriter = options.metadataWriter ?? atomicWriteJson
     this.processIdentityReader = options.processIdentityReader ?? readProcessIdentity
+    this.spawnProcess = options.spawnProcess ?? spawn
   }
 
   status(): RuntimeStatus {
@@ -937,12 +1136,100 @@ export class CodexAppServerRuntime {
     await this.stopActiveChild()
   }
 
+  private async collectSidecarMetadataDiagnostics(): Promise<CodexAppServerLaunchDiagnostics['sidecars']['metadataRecords']> {
+    let total = 0
+    let currentServer = 0
+    let otherServer = 0
+    let malformed = 0
+    let unreadable = 0
+    let oversized = 0
+    let capReached = false
+
+    const dir = await fsp.opendir(this.metadataDir).catch(() => null)
+    if (!dir) {
+      return {
+        total,
+        currentServer,
+        otherServer,
+        malformed,
+        unreadable,
+        oversized,
+        cap: LAUNCH_DIAGNOSTIC_METADATA_RECORD_CAP,
+        capReached,
+      }
+    }
+
+    try {
+      for await (const entry of dir) {
+        if (!entry.isFile() || !entry.name.endsWith('.json')) continue
+        if (total >= LAUNCH_DIAGNOSTIC_METADATA_RECORD_CAP) {
+          capReached = true
+          break
+        }
+        total += 1
+
+        const filePath = path.join(this.metadataDir, entry.name)
+        try {
+          const stat = await fsp.stat(filePath)
+          if (stat.size > LAUNCH_DIAGNOSTIC_METADATA_RECORD_MAX_BYTES) {
+            oversized += 1
+            continue
+          }
+          const raw = await fsp.readFile(filePath, 'utf8')
+          const parsed = JSON.parse(raw) as Partial<CodexSidecarOwnershipMetadata>
+          if (parsed.schemaVersion !== OWNERSHIP_SCHEMA_VERSION || typeof parsed.serverInstanceId !== 'string') {
+            malformed += 1
+          } else if (parsed.serverInstanceId === this.serverInstanceId) {
+            currentServer += 1
+          } else {
+            otherServer += 1
+          }
+        } catch {
+          unreadable += 1
+        }
+      }
+    } finally {
+      await dir.close().catch(() => undefined)
+    }
+
+    return {
+      total,
+      currentServer,
+      otherServer,
+      malformed,
+      unreadable,
+      oversized,
+      cap: LAUNCH_DIAGNOSTIC_METADATA_RECORD_CAP,
+      capReached,
+    }
+  }
+
+  private async collectLaunchDiagnostics(): Promise<CodexAppServerLaunchDiagnostics> {
+    return {
+      process: await collectCodexAppServerProcessDiagnostics(),
+      runtime: {
+        command: this.command,
+        startupAttemptLimit: this.startupAttemptLimit,
+        startupAttemptTimeoutMs: this.startupAttemptTimeoutMs,
+        status: this.statusValue,
+        hasActiveChild: !!this.child,
+        ...(this.child?.pid ? { activeChildPid: this.child.pid } : {}),
+        ...(this.ownership?.metadata.ownershipId ? { activeOwnershipId: this.ownership.metadata.ownershipId } : {}),
+      },
+      sidecars: {
+        metadataDir: this.metadataDir,
+        metadataRecords: await this.collectSidecarMetadataDiagnostics(),
+      },
+    }
+  }
+
   private async startRuntime(cwd: CodexAppServerLaunchCwd): Promise<ReadyState> {
     await assertProcOwnershipProofAvailable()
     await assertCodexAppServerLaunchCwdReachable(cwd)
     await this.waitForOwnershipTeardown()
     await this.assertNoBlockedOwnership('start a new Codex app-server sidecar')
     let lastError: Error | undefined
+    let lastLaunchDetails: CodexAppServerLaunchErrorDetails = {}
 
     for (let attempt = 1; attempt <= this.startupAttemptLimit; attempt += 1) {
       if (this.shutdownRequested) {
@@ -954,7 +1241,7 @@ export class CodexAppServerRuntime {
       }
       const wsUrl = `ws://${endpoint.hostname}:${endpoint.port}`
       const ownershipId = this.ownershipIdFactory()
-      const child = spawn(this.command, [
+      const child = this.spawnProcess(this.command, [
         ...this.commandArgs,
         ...CODEX_MANAGED_REMOTE_CONFIG_ARGS,
         'app-server',
@@ -1065,6 +1352,10 @@ export class CodexAppServerRuntime {
         }
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error))
+        const currentDetails = getCodexAppServerLaunchErrorDetails(lastError)
+        if (currentDetails.code || currentDetails.retryable !== undefined || currentDetails.diagnostics) {
+          lastLaunchDetails = currentDetails
+        }
         const client = this.client
         if (client) {
           await client.close().catch(() => undefined)
@@ -1092,8 +1383,24 @@ export class CodexAppServerRuntime {
       throw lastError ?? new Error('Codex app-server startup was cancelled because the sidecar is shutting down.')
     }
 
-    throw new Error(
-      `Failed to start Codex app-server on a loopback endpoint after ${this.startupAttemptLimit} attempts: ${lastError?.message ?? 'unknown error'}`,
+    const diagnostics = await this.collectLaunchDiagnostics()
+    const code = lastLaunchDetails.code ?? getErrorCode(lastError)
+    const retryable = lastLaunchDetails.retryable ?? isRetryableCodexAppServerLaunchError(lastError)
+    const retryablePrefix = retryable && code
+      ? ` Last failure was retryable resource exhaustion (${code}).`
+      : ''
+    logger.warn(
+      {
+        err: lastError,
+        code,
+        retryable,
+        diagnostics,
+      },
+      'Codex app-server startup failed after all attempts',
+    )
+    throw new CodexAppServerStartupError(
+      `Failed to start Codex app-server on a loopback endpoint after ${this.startupAttemptLimit} attempts:${retryablePrefix} ${lastError?.message ?? 'unknown error'}`,
+      { code, retryable, diagnostics, cause: lastError },
     )
   }
 
@@ -1194,9 +1501,11 @@ export class CodexAppServerRuntime {
       child.once('error', (error) => {
         const base = error instanceof Error ? error : new Error(String(error))
         const launchError = new Error(`Failed to launch Codex app-server sidecar: ${base.message}`)
-        ;(launchError as Error & { code?: string; cause?: unknown }).code =
-          (base as NodeJS.ErrnoException).code
-        ;(launchError as Error & { code?: string; cause?: unknown }).cause = base
+        const code = (base as NodeJS.ErrnoException).code
+        ;(launchError as Error & { code?: string; cause?: unknown; retryable?: boolean }).code = code
+        ;(launchError as Error & { code?: string; cause?: unknown; retryable?: boolean }).cause = base
+        ;(launchError as Error & { code?: string; cause?: unknown; retryable?: boolean }).retryable =
+          isRetryableSpawnCode(code)
         if (this.child === child) {
           this.child = null
           this.ready = null

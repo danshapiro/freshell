@@ -39,6 +39,10 @@ import type { ServerSettings } from '../shared/settings.js'
 import { stripAnsi } from './ai-prompts.js'
 import type { CodexLaunchPlan, CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
 import {
+  collectCodexAppServerProcessDiagnostics,
+  getCodexAppServerLaunchErrorDetails,
+} from './coding-cli/codex-app-server/runtime.js'
+import {
   CODEX_INITIAL_LAUNCH_ATTEMPTS,
   planCodexLaunchWithRetry,
 } from './coding-cli/codex-app-server/launch-retry.js'
@@ -497,6 +501,17 @@ function createScreenshotError(code: ScreenshotErrorCode, message: string): Erro
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+async function buildTerminalCreateFailureDiagnostics(
+  registry: TerminalRegistry,
+  error: unknown,
+): Promise<Record<string, unknown>> {
+  return {
+    process: await collectCodexAppServerProcessDiagnostics(),
+    registry: registry.getDiagnosticCounts(),
+    launch: getCodexAppServerLaunchErrorDetails(error),
+  }
 }
 
 class TerminalCreateAdmissionError extends Error {}
@@ -2569,7 +2584,16 @@ export class WsHandler {
           if (state.createdByRequestId.get(m.requestId) === REPAIR_PENDING_SENTINEL) {
             state.createdByRequestId.delete(m.requestId)
           }
-          log.warn({ err, connectionId: ws.connectionId }, 'terminal.create failed')
+          const diagnostics = await buildTerminalCreateFailureDiagnostics(this.registry, err)
+          log.warn({
+            err,
+            connectionId: ws.connectionId,
+            requestId: m.requestId,
+            mode: m.mode,
+            cwd: m.cwd,
+            terminalId: cleanupTerminalId,
+            diagnostics,
+          }, 'terminal.create failed')
           this.sendError(ws, {
             code: err instanceof CodexLaunchConfigError
               ? 'INVALID_MESSAGE'

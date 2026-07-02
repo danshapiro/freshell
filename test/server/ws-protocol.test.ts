@@ -88,6 +88,24 @@ vi.mock('../../server/config-store', () => ({
   configStore: mockConfigStore,
 }))
 
+const mockLogger = vi.hoisted(() => {
+  const logger = {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    child: vi.fn(),
+  }
+  logger.child.mockReturnValue(logger)
+  return logger
+})
+
+vi.mock('../../server/logger', () => ({
+  logger: mockLogger,
+  sessionLifecycleLogger: mockLogger,
+  withLogContext: vi.fn((_ctx: any, fn: () => unknown) => fn()),
+}))
+
 function defaultConfigSnapshot() {
   return {
     version: 1,
@@ -266,6 +284,51 @@ class FakeRegistry {
     this.publishCalls.push(terminalId)
   }
 
+  getDiagnosticCounts() {
+    let running = 0
+    const byMode: Record<string, { total: number; running: number; exited: number }> = {}
+    let codexTotal = 0
+    let codexRunning = 0
+    let runningWithSidecar = 0
+
+    for (const rec of this.records.values()) {
+      const modeCounts = byMode[rec.mode] ?? { total: 0, running: 0, exited: 0 }
+      modeCounts.total += 1
+      if (rec.status === 'running') {
+        running += 1
+        modeCounts.running += 1
+      } else {
+        modeCounts.exited += 1
+      }
+      byMode[rec.mode] = modeCounts
+
+      if (rec.mode === 'codex') {
+        codexTotal += 1
+        if (rec.status === 'running') codexRunning += 1
+        if (rec.status === 'running' && rec.codexSidecar) runningWithSidecar += 1
+      }
+    }
+
+    return {
+      terminals: {
+        total: this.records.size,
+        running,
+        exited: this.records.size - running,
+        byMode,
+      },
+      codex: {
+        total: codexTotal,
+        running: codexRunning,
+        runningWithSidecar,
+        runningWithPublishedSidecar: 0,
+        recoveryAttempts: 0,
+        recoveryBlocked: 0,
+        sidecarShutdownsPending: 0,
+        sidecarShutdownsFailed: 0,
+      },
+    }
+  }
+
   list() {
     return Array.from(this.records.values()).map((r) => ({
       terminalId: r.terminalId,
@@ -408,6 +471,12 @@ describe('ws protocol', () => {
     mockConfigStore.snapshot.mockResolvedValue(defaultConfigSnapshot())
     mockConfigStore.pushRecentDirectory.mockReset()
     mockConfigStore.pushRecentDirectory.mockResolvedValue(undefined)
+    mockLogger.debug.mockClear()
+    mockLogger.info.mockClear()
+    mockLogger.warn.mockClear()
+    mockLogger.error.mockClear()
+    mockLogger.child.mockClear()
+    mockLogger.child.mockReturnValue(mockLogger)
     registry.records.clear()
     registry.createCalls = []
     registry.inputCalls = []
@@ -680,6 +749,109 @@ describe('ws protocol', () => {
       expect(codexLaunchPlanner.sidecar.adoptCalls).toEqual([])
     } finally {
       registry.create = originalCreate as any
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('logs terminal and resource diagnostics when Codex terminal.create fails from retryable spawn pressure', async () => {
+    const retryableError = Object.assign(new Error('Failed to start Codex app-server on a loopback endpoint after 2 attempts: Last failure was retryable resource exhaustion (EAGAIN). Failed to launch Codex app-server sidecar: spawn codex EAGAIN'), {
+      code: 'EAGAIN',
+      retryable: true,
+      diagnostics: {
+        process: {
+          pid: process.pid,
+          platform: process.platform,
+          uptimeSeconds: 123,
+          memory: { rss: 111, heapTotal: 222, heapUsed: 333, external: 444, arrayBuffers: 555 },
+          fdCount: 9,
+          processCount: 99,
+        },
+        runtime: {
+          command: 'codex',
+          startupAttemptLimit: 2,
+          startupAttemptTimeoutMs: 3000,
+          status: 'stopped',
+          hasActiveChild: false,
+        },
+        sidecars: {
+          metadataDir: '/tmp/freshell-codex-sidecars-test',
+          metadataRecords: {
+            total: 7,
+            currentServer: 3,
+            otherServer: 4,
+            malformed: 0,
+            unreadable: 0,
+            oversized: 0,
+            cap: 100,
+            capReached: false,
+          },
+        },
+      },
+    })
+    const originalPlanCreate = codexLaunchPlanner.planCreate.bind(codexLaunchPlanner)
+    codexLaunchPlanner.planCreate = vi.fn(async (input: any) => {
+      codexLaunchPlanner.planCreateCalls.push(input)
+      throw retryableError
+    }) as any
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+    await waitForMessage(ws, (msg) => msg.type === 'ready', 5000)
+
+    try {
+      const requestId = 'codex-eagain-diagnostics'
+      ws.send(JSON.stringify({ type: 'terminal.create', requestId, mode: 'codex' }))
+      const error = await waitForMessage(
+        ws,
+        (msg) => msg.type === 'error' && msg.requestId === requestId,
+        5000,
+      )
+
+      expect(error).toMatchObject({
+        type: 'error',
+        code: 'PTY_SPAWN_FAILED',
+        requestId,
+      })
+      expect(String(error.message)).toContain('retryable resource exhaustion (EAGAIN)')
+
+      const failureLog = mockLogger.warn.mock.calls.find((call) => call[1] === 'terminal.create failed')
+      const diagnosticProcess = failureLog?.[0]?.diagnostics?.process as any
+      expect(failureLog?.[0]).toEqual(expect.objectContaining({
+        err: retryableError,
+        connectionId: expect.any(String),
+        requestId,
+        mode: 'codex',
+        diagnostics: expect.objectContaining({
+          launch: expect.objectContaining({
+            code: 'EAGAIN',
+            retryable: true,
+            diagnostics: retryableError.diagnostics,
+          }),
+          registry: expect.objectContaining({
+            terminals: expect.objectContaining({
+              total: expect.any(Number),
+              running: expect.any(Number),
+              byMode: expect.any(Object),
+            }),
+            codex: expect.objectContaining({
+              runningWithSidecar: expect.any(Number),
+              sidecarShutdownsPending: expect.any(Number),
+            }),
+          }),
+          process: expect.objectContaining({
+            memory: expect.objectContaining({
+              rss: expect.any(Number),
+              heapUsed: expect.any(Number),
+            }),
+          }),
+        }),
+      }))
+      if (process.platform === 'linux') {
+        expect(diagnosticProcess.fdCount).toEqual(expect.any(Number))
+      }
+    } finally {
+      codexLaunchPlanner.planCreate = originalPlanCreate as any
       await closeWebSocket(ws)
     }
   })
