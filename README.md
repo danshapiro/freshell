@@ -24,14 +24,10 @@
 - **Desktop, laptop, phone** — Run on your main machine, then work on your project anywhere via VPN or Tailscale.
 - **Speak with the dead** — Resume any Claude, Codex, or OpenCode session from any device (even if you weren't using freshell to run it)
 - **Fancy tabs** — Auto-name from terminal content, drag-and-drop reorder, and per-pane type icons so you know what's in each tab
-- **Freshclaude** — An interactive alternative to Claude CLI that works with your Anthropic subscription. Rich chat UI with collapsible tool strips, token budget display, and full session persistence.
-- **Extension system** — Add new pane types, CLI integrations, and server-side services via manifest-based extensions. Enable and disable from the Extensions management page.
+- **TUI Optional** — Use Claude Code, Codex, and OpenCode without living inside their terminal UIs. Freshell's browser panes get rid of ASCII box-drawing noise and add instant scrolling, typography choices, collapsible tool output, preserved history, and more.
 - **Self-configuring workspace** — Just ask Claude or Codex to open a browser in a pane, or create a tab with four subagents. Built-in tmux-like API and skill makes it simple.
-- **Live pane headers** — See your active directory, git branch, and context usage in every pane title bar, updating live as you work
-- **Activity notifications** — Configurable attention indicators (highlight, pulse, darken) on tabs and pane headers when a coding CLI finishes its turn, with click or type dismiss modes
-- **AI-powered session titles** — Right-click any session and generate a Gemini-powered title based on conversation content
-- **Progressive sidebar search** — Two-phase search with instant local results followed by deep server-side content search
-- **Mobile responsive** — Auto-collapsing sidebar and overlay navigation for phones and tablets
+- **Headers that tell you what's up** — AI naming, branch, tokens left, active directory, and more in every pane title bar, updating live as you work.
+- **Activity notifications** — They boop when they're ready for you, optionally.
 
 ## Quick Start
 
@@ -48,97 +44,6 @@ npm run serve
 ```
 
 On first run, freshell auto-generates a `.env` file with a secure random `AUTH_TOKEN`. The token is printed to the console at startup — open the URL shown to connect.
-
-## Prerequisites
-
-Node.js 18+ (20+ recommended) and platform build tools for native modules (`windows-build-tools` on Windows, Xcode CLI Tools on macOS, `build-essential python3` on Linux).
-
-> **Note:** On native Windows, terminals default to WSL. Set `WINDOWS_SHELL=cmd` or `WINDOWS_SHELL=powershell` to use a native Windows shell instead.
-
-## Usage
-
-```bash
-npm run dev     # Development with hot reload
-npm run serve   # Production build and run
-```
-
-`npm run serve` is intended for `main`. If you run it from another branch, Freshell asks for confirmation in an interactive terminal and refuses in non-interactive shells unless `FRESHELL_ALLOW_NON_MAIN_SERVE=1` is set.
-
-## Keyboard Shortcuts
-
-<!-- Canonical source: src/lib/keyboard-shortcuts.ts -->
-
-| Shortcut | Action |
-|----------|--------|
-| `Alt+T` | New tab |
-| `Alt+W` | Close tab |
-| `Alt+H` / `Alt+Shift+T` | Reopen closed tab |
-| `Ctrl+Shift+[` / `Alt+[` | Previous tab |
-| `Ctrl+Shift+]` / `Alt+]` | Next tab |
-| `Ctrl+Shift+ArrowLeft` | Move tab left |
-| `Ctrl+Shift+ArrowRight` | Move tab right |
-| `Ctrl+Shift+C` | Copy selection (in terminal) |
-| `Ctrl+V` / `Ctrl+Shift+V` | Paste (in terminal) |
-| `Ctrl+F` | Search (in terminal) |
-| `Shift+Enter` | Newline (in terminal) |
-| `Cmd/Ctrl+End` | Scroll to bottom (in terminal) |
-| `Right-click` / `Shift+F10` | Context menu |
-
-## Configuration
-
-### Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `AUTH_TOKEN` | Auto | Authentication token (auto-generated on first run, min 16 chars) |
-| `PORT` | No | Server port (default: 3001) |
-| `ALLOWED_ORIGINS` | No | Auto-managed CORS origins for the active server bind host and LAN IPs |
-| `EXTRA_ALLOWED_ORIGINS` | No | Comma-separated custom CORS origins preserved across runtime origin rebuilds |
-| `CLAUDE_HOME` | No | Path to Claude config directory (default: `~/.claude`) |
-| `CODEX_HOME` | No | Path to Codex config directory (default: `~/.codex`) |
-| `WINDOWS_SHELL` | No | Windows shell: `wsl` (default), `cmd`, or `powershell` |
-| `WSL_DISTRO` | No | WSL distribution name (Windows only) |
-| `CLAUDE_CMD` | No | Claude CLI command override |
-| `CODEX_CMD` | No | Codex CLI command override |
-| `OPENCODE_CMD` | No | OpenCode CLI command override |
-| `GEMINI_CMD` | No | Gemini CLI command override |
-| `KIMI_CMD` | No | Kimi CLI command override |
-| `GOOGLE_GENERATIVE_AI_API_KEY` | No | Gemini API key for AI-powered terminal summaries |
-
-### Coding CLI Providers
-
-Freshell indexes local session history and can launch terminals for these coding CLIs:
-
-| Provider | Session history | Launch terminals | Home directory |
-|----------|:-:|:-:|----------------|
-| **Claude Code** | Yes | Yes | `~/.claude` |
-| **Codex** | Yes | Yes | `~/.codex` |
-| **OpenCode** | Yes | Yes | `XDG_DATA_HOME/opencode` (or platform default) |
-| **Gemini** | — | Yes | — |
-| **Kimi** | — | Yes | — |
-
-Enable/disable providers and set defaults in the Settings UI or via `~/.freshell/config.json`.
-OpenCode sessions are discovered directly from OpenCode's local session database, so existing OpenCode work can be resumed from freshell without importing anything manually.
-
-OpenCode permissions are controlled by the OpenCode configuration for the OS user running freshell. Freshell does not set `OPENCODE_PERMISSION` or pass `--dangerously-skip-permissions` for OpenCode sessions; OS filesystem permissions remain the hard boundary.
-
-## Tech Stack
-
-- **Frontend**: React 18, Redux Toolkit, Tailwind CSS, xterm.js, Monaco Editor, Zod, lucide-react
-- **Backend**: Express, WebSocket (ws), node-pty, Pino, Chokidar, Zod
-- **Build**: Vite, TypeScript
-- **Testing**: Vitest, Testing Library, supertest, superwstest
-- **AI**: Vercel AI SDK with Google Gemini
-
-## Extensions
-
-Freshell supports custom pane types via extensions. Three categories are available:
-
-- **Client** — Static HTML/JS served by freshell (no server needed)
-- **Server** — Your own HTTP server, managed by freshell with automatic port allocation
-- **CLI** — Any terminal tool wrapped as a pane
-
-Drop a directory with a `freshell.json` manifest into `~/.freshell/extensions/` and restart freshell. See [`examples/extensions/`](examples/extensions/) for working examples of each type.
 
 ## Contributing
 
