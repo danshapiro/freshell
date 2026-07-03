@@ -4,7 +4,7 @@
 
 **Goal:** Make terminal Codex `/fork` memory-safe in Freshell without breaking the terminal Codex TUI route or silently losing Freshell-owned proxy state.
 
-**Architecture:** Keep request compaction and large-frame memory safety inside the terminal Codex remote proxy, with one narrow TerminalRegistry handoff for the new thread identity created by `/fork`. The proxy will use byte-level JSON-RPC envelope scanning, a byte-level `thread/fork` request rewriter that forces `excludeTurns: true` without full-frame parsing, method-specific bounded side-effect extractors for the small fields Freshell owns, raw forwarding for traffic Freshell does not own, and fail-closed recovery only when a required side effect cannot be recovered safely.
+**Architecture:** Keep request compaction and large-frame memory safety inside the terminal Codex remote proxy, with one explicit TerminalRegistry state transition for the new thread identity created by `/fork`. The proxy will first prove a byte-level JSON-RPC envelope scanner, a `thread/fork` request rewriter, and bounded side-effect extractors against differential and adversarial fixtures; only after those helpers are proven will it integrate them into proxy forwarding. Large frames Freshell does not own are raw-forwarded only below a measured cap, while stateful frames either produce the same local side effects as small frames or fail closed.
 
 **Tech Stack:** Node.js 22, TypeScript/ESM, `ws` 8.19, Zod schemas in `server/coding-cli/codex-app-server/protocol.ts`, Vitest through `npm run test:vitest`, opt-in real Codex contracts gated by `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1`.
 
@@ -21,7 +21,11 @@ Plan revision evidence changed the implementation direction:
 - Terminal `/fork` can move the Codex TUI to a new thread through a `thread/fork` response. `terminal-registry.ts` currently ignores mismatched candidates after the initial restore identity, which is correct for accidental startup races but wrong for an intentional fork handoff. A memory-safe `/fork` that leaves Freshell bound to the old parent thread would satisfy the OOM symptom while breaking durable terminal identity.
 - `test/fixtures/coding-cli/codex-app-server/schema-inventory.ts` lists many other Codex server notifications and server requests. Those are forwarded to the TUI, but Freshell's terminal proxy does not currently derive local state from them.
 - Baseline verification passed: `npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts` passed with 15 tests.
-- The load-bearing review falsified the old assumption that all valid client and state-bearing upstream frames fit under fixed 8 MiB parse caps. Do not add a client-wide reject cap or depend on `MAX_PROXY_PARSE_BYTES` as a claim about normal Codex traffic.
+- The load-bearing review falsified two implementation assumptions:
+  - `terminal-registry.ts` does not support fork handoff through the existing candidate path. It returns early when `resumeSessionId` exists and ignores mismatched candidates after one candidate has been persisted. Fork must become a deliberate source-specific transition.
+  - A 64 MiB frame is not safe if the proxy converts it to a string and parses it. The memory-safety claim must be proven for the new raw-forward path, not inferred from the old implementation.
+- Local investigation during plan revision 5 confirmed that `ws` 8.19 defaults `maxPayload` to 100 MiB, enforces payload length before message emission, and emits text messages as `Buffer` objects. A disposable raw WebSocket proxy under `node --max-old-space-size=128` forwarded 8, 16, 32, 48, and 64 MiB text JSON frames without full parsing or stringification; the 64 MiB case completed with about 6 MB JS heap used, about 268 MB RSS, and about 136 MB external memory. This supports keeping 64 MiB only as a raw-forward cap that must be guarded by a constrained-heap regression test.
+- No streaming JSON parser dependency exists in `package.json`. Keep the scanner/extractor code local and small, but prove it before integration with adversarial fixtures and differential tests against `JSON.parse` on bounded frames.
 
 Use this policy instead:
 
@@ -42,8 +46,8 @@ Use this policy instead:
   - `thread/status/changed`: `params.threadId`, `params.status.type`
 - If a stateful upstream frame cannot be fully parsed and the required bounded side-effect extractor also cannot recover the owned fields, fail closed with structured logging, `proxy_error` or candidate-capture failure as appropriate, and socket closure. Do not forward it as a successful normal frame.
 - Treat `thread/fork` response candidates as intentional thread handoffs. Preserve the existing startup-race protection for ordinary mismatched `thread_start_response` and `thread_started_notification` candidates, but let a valid `thread_fork_response` replace the terminal's Codex durability candidate, release the old session binding, and require the normal rollout proof before the forked thread becomes durable.
-- Raw-forward oversized non-state upstream frames only up to a raw-forward limit that is proven at the limit boundary by a constrained-heap child-process stress test. Treat that limit as an operational memory-safety cap, not as proof that larger frames are invalid. Frames above it fail closed to preserve the Freshell server.
-- The opt-in real terminal TUI `/fork` contract is required before completion. If the installed Codex TUI cannot continue after receiving a compact fork response without `thread.turns`, stop and revise the production approach.
+- Raw-forward oversized non-state upstream frames only up to a raw-forward limit that is proven at the limit boundary by a constrained-heap child-process stress test using the actual proxy. Treat that limit as an operational memory-safety cap, not as proof that larger frames are invalid. Frames above it fail closed to preserve the Freshell server.
+- The opt-in real terminal TUI `/fork` contract is required before completion in any environment with `codex` and local Codex credentials. Plan revision 5 confirmed this workspace has `codex` 0.142.5 plus `~/.codex/auth.json` and `~/.codex/config.toml`, so the executor must run the opt-in contract here. If the installed Codex TUI cannot continue after receiving a compact fork response without `thread.turns`, stop and revise the production approach.
 
 No user decision is required for this revision. The remaining proofs are local automated tests and the opt-in real Codex contract.
 
@@ -59,9 +63,11 @@ No user decision is required for this revision. The remaining proofs are local a
 
 - Create: `test/unit/server/coding-cli/codex-app-server/json-rpc-envelope.test.ts`
   - Scanner contract and malformed-frame coverage.
+  - Differential corpus comparing scanner output to `JSON.parse` for bounded generated JSON-RPC messages.
 
 - Create: `test/unit/server/coding-cli/codex-app-server/json-rpc-side-effects.test.ts`
   - Fork rewrite and side-effect extractor coverage, including large payloads with nested `id`, `method`, and `turns`.
+  - Differential corpus comparing bounded extractor output to existing Zod-backed behavior for bounded frames.
 
 - Modify: `server/coding-cli/codex-app-server/remote-proxy.ts`
   - Preserve raw frame data and text/binary framing.
@@ -85,7 +91,7 @@ No user decision is required for this revision. The remaining proofs are local a
   - Regression coverage for fork candidate handoff replacing the old durable identity while ordinary mismatched startup candidates remain ignored.
 
 - Create: `test/unit/server/coding-cli/codex-app-server/remote-proxy-large-forward-child.ts`
-  - Constrained-heap stress fixture proving large non-state raw forwarding does not full-parse or full-stringify the frame.
+  - Constrained-heap stress fixture proving the actual proxy forwards large non-state frames below `MAX_RAW_FORWARD_BYTES` without full-parse or full-stringify and fail-closes frames above the cap.
 
 - Create: `test/integration/real/codex-remote-fork-contract.test.ts`
   - Opt-in real terminal Codex TUI `/fork` contract using `codex --remote`, `node-pty`, an isolated `CODEX_HOME`, `CODEX_MANAGED_REMOTE_CONFIG_ARGS`, and a controlled WebSocket app-server.
@@ -111,7 +117,7 @@ No user decision is required for this revision. The remaining proofs are local a
 - A `thread/fork` response with a valid deterministic rollout path is an intentional Codex terminal identity handoff: the old session binding is released, the forked thread becomes the current candidate, stale proof state is cleared, and the normal rollout proof must pass before the forked thread is marked durable.
 - A mismatched candidate from `thread_start_response` or `thread_started_notification` after an initial candidate is already persisted remains ignored; fork handoff must not weaken the startup-race protection.
 - `fs/changed` extraction may collapse an oversized `changedPaths` array to `[]` only after extracting the watch id. This is conservative because terminal registry treats an empty changed path list as a durability proof request rather than as "no change."
-- Raw forwarding for non-state upstream frames is allowed only under `MAX_RAW_FORWARD_BYTES` after the constrained-heap stress test passes.
+- Raw forwarding for non-state upstream frames is allowed only under `MAX_RAW_FORWARD_BYTES` after the constrained-heap stress test passes against the actual proxy implementation.
 - Logs remain structured and must not include full request or response bodies.
 
 ## Constants
@@ -124,7 +130,20 @@ export const MAX_RAW_FORWARD_BYTES = 64 * 1024 * 1024
 export const MAX_SCANNED_TOKEN_BYTES = 8 * 1024
 ```
 
-`MAX_FULL_PARSE_BYTES` is only a threshold for choosing between existing Zod-backed full parsing and bounded extraction. It is not a validity limit and must not cause large valid client requests to be rejected. `MAX_RAW_FORWARD_BYTES` is an operational server memory-safety cap for frames Freshell does not own. `MAX_SCANNED_TOKEN_BYTES` limits individual key/string token accumulation in scanners and rewriters, not whole-frame size.
+`MAX_FULL_PARSE_BYTES` is only a threshold for choosing between existing Zod-backed full parsing and bounded extraction. It is not a validity limit and must not cause large valid client requests to be rejected. `MAX_RAW_FORWARD_BYTES` is an operational server memory-safety cap for frames Freshell does not own; keep 64 MiB only if the constrained-heap actual-proxy fixture in Task 6 passes at `MAX_RAW_FORWARD_BYTES - 1024`, otherwise lower the constant to the highest passing boundary and update the above-cap test to match. `MAX_SCANNED_TOKEN_BYTES` limits individual key/string token accumulation in scanners and rewriters, not whole-frame size.
+
+## Proven Inputs For This Plan
+
+- Existing focused proxy baseline is green before implementation: `npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts` passed 15 tests during plan revision 5.
+- `server/coding-cli/codex-app-server/remote-proxy.ts` is the OOM-prone path: both `handleClientMessage` and `handleUpstreamMessage` call `parseJson(raw)`, and `parseJson` calls `JSON.parse(raw.toString())`.
+- `server/coding-cli/codex-app-server/protocol.ts` defines `CodexThreadForkParamsSchema.excludeTurns` and `CodexThreadOperationResultSchema.thread`, so compact fork requests and compact operation responses are first-class protocol shapes locally.
+- `server/fresh-agent/adapters/codex/adapter.ts` already sends `excludeTurns: true` for fresh-agent forks.
+- `shared/codex-durability.ts` currently omits `thread_fork_response` from `CodexCandidateSourceSchema`.
+- `server/terminal-registry.ts` currently drops fork-like identity changes: `persistCodexCandidateSerial` returns immediately when `record.resumeSessionId` exists and logs/ignores mismatched candidates when `record.codexDurability.candidate` already exists.
+- `server/terminal-registry.ts` already has the primitives needed for a narrow handoff: `buildCodexDurabilityRef`, `replaceCodexDurabilityStoreRecord`, `releaseBinding(..., 'rebind', ...)`, `unwatchCodexRollout`, `armCodexRolloutWatch`, and the existing rollout proof path that binds only after proof success.
+- `node_modules/ws/lib/websocket-server.js` and `node_modules/ws/lib/websocket.js` show the default `maxPayload` is 100 MiB. `node_modules/ws/lib/receiver.js` shows payload-length enforcement before emission and text messages emitted as `Buffer` objects.
+- A disposable raw WebSocket proxy experiment under `node --max-old-space-size=128` forwarded 64 MiB text JSON frames as buffers without full parse/stringify. The actual implementation must reproduce this through the Task 6 child-process fixture before depending on the cap.
+- `codex --version` reports `codex-cli 0.142.5` in this workspace, and both `~/.codex/auth.json` and `~/.codex/config.toml` exist, so the opt-in real terminal TUI fork contract is expected to run rather than skip during execution.
 
 ## Implementation Tasks
 
@@ -148,6 +167,7 @@ Add tests for:
 - malformed JSON
 - no `JSON.parse` calls
 - no full-frame `Buffer.prototype.toString` on large buffers
+- a deterministic generated corpus of bounded JSON-RPC objects where scanner output is compared with `JSON.parse` for top-level `id` and `method`
 
 - [ ] **Step 2: Run tests to verify red**
 
@@ -169,6 +189,7 @@ Implement `scanJsonRpcEnvelope(raw)` as a byte-level state machine:
 - ignore nested properties
 - return `{}` or a partial envelope on malformed or unsupported values
 - limit individual scanned tokens with `MAX_SCANNED_TOKEN_BYTES`
+- expose enough instrumentation in tests, not production behavior, to prove large-buffer scanner tests do not call `JSON.parse` or full-frame `toString`
 
 - [ ] **Step 4: Run scanner tests to verify green**
 
@@ -205,6 +226,7 @@ Add tests proving `rewriteThreadForkExcludeTurns(raw)`:
 - preserves unrelated top-level fields and params fields
 - rewrites large fork requests without `JSON.parse` or full-frame `toString`
 - returns a structured failure for malformed frames or a non-object params value
+- matches `JSON.parse` plus an object-level `excludeTurns: true` rewrite for a deterministic generated corpus of bounded valid fork requests
 
 - [ ] **Step 2: Write failing side-effect extractor tests**
 
@@ -219,6 +241,7 @@ Add tests proving large frames can recover:
 - `fs/changed` watch id with an oversized path list collapsed to `[]`
 
 Also add negative tests proving nested decoy fields do not win over the owned path and malformed/unrecoverable frames return failure.
+For every bounded valid side-effect fixture, add a paired differential assertion: parse the same frame through existing Zod schemas and verify the bounded extractor returns the same candidate, turn event, lifecycle event, or repair trigger fields that Freshell owns.
 
 - [ ] **Step 3: Run tests to verify red**
 
@@ -367,6 +390,7 @@ In `handleUpstreamMessage`:
 - scan top-level id and method
 - if scanned id matches a pending method, capture and delete that pending method
 - if frame bytes exceed `MAX_RAW_FORWARD_BYTES`, fail closed before forwarding
+- ensure the proxy-side `WebSocketServer` and upstream `WebSocket` client set `maxPayload: MAX_RAW_FORWARD_BYTES` so `ws` rejects above-cap messages before application handlers receive them where possible
 - if frame bytes are under `MAX_FULL_PARSE_BYTES`, keep existing full-parse/Zod behavior
 - if frame is large and stateful, call the matching bounded extractor and emit the same side effects as the existing parsed path
 - if the extractor succeeds, forward the original frame
@@ -448,7 +472,7 @@ Implement the handoff as a narrow source-specific path:
 - emit `thread_fork_response` from `remote-proxy.ts` for small and large `thread/fork` responses after matching the pending top-level response id
 - in `persistCodexCandidateSerial`, keep the existing mismatched-candidate ignore path for non-fork sources
 - for `thread_fork_response`, validate the candidate with `buildCodexDurabilityRef`
-- release the current binding with reason `rebind`, clear `resumeSessionId`, clear stale Codex active turn/unconfirmed-input/proof state, replace durability with the forked candidate in `captured_pre_turn`, arm the new rollout watch, and broadcast durability
+- release the current binding with reason `rebind` using the old durable `resumeSessionId` or `durableThreadId`, clear `resumeSessionId`, clear stale Codex active turn/unconfirmed-input/proof state, replace durability with the forked candidate in `captured_pre_turn`, unwatch the old rollout path, arm the new rollout watch, and broadcast durability
 - do not mark the forked thread durable or send `terminal.session.associated` until the normal rollout proof succeeds
 - if the fork candidate is invalid, log and ignore it without changing the existing durable identity
 
@@ -487,7 +511,7 @@ Create a fixture that:
 - asserts the TUI receives the same byte length
 - exits non-zero if the process OOMs, times out, parses the body, or loses the response
 
-Use a payload at the limit boundary, not merely a conveniently large sample. Build a text JSON-RPC response buffer with total byte length `MAX_RAW_FORWARD_BYTES - 1024` so the successful path proves the actual configured cap. Generate it from `Buffer` chunks instead of constructing a huge JS string, and have the upstream send it as a text WebSocket frame with `{ binary: false }`.
+Use a payload at the limit boundary, not merely a conveniently large sample. Build a text JSON-RPC response buffer with total byte length `MAX_RAW_FORWARD_BYTES - 1024` so the successful path proves the actual configured cap. Generate it from `Buffer` chunks instead of constructing a huge JS string, have the upstream send it as a text WebSocket frame with `{ binary: false }`, and assert the client receives `isBinary === false`.
 
 - [ ] **Step 2: Add the parent Vitest case**
 
@@ -514,6 +538,8 @@ npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-p
 ```
 
 Expected before the raw-forward path is complete: FAIL by child OOM, timeout, or explicit assertion. Expected after Task 4 implementation is complete: PASS and report the forwarded byte length, `isBinary === false`, and an RSS/heap sample that confirms the proxy did not materialize the payload as a parsed JS object.
+
+If this fails at the 64 MiB boundary after the no-parse path is implemented, do not weaken the test. Lower `MAX_RAW_FORWARD_BYTES` to the highest passing boundary found by the child fixture, update both boundary tests, and document the measured RSS/heap output in the implementation report.
 
 - [ ] **Step 4: Add the above-cap child-process case**
 
@@ -567,7 +593,7 @@ Run:
 FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/integration/real/codex-remote-fork-contract.test.ts --config vitest.server.config.ts
 ```
 
-Expected: PASS when `codex` and local auth/config are available. A protocol failure is a blocker and means the production approach must be revised before continuing.
+Expected: PASS in this workspace because `codex` and local auth/config are available. A protocol failure is a blocker and means the production approach must be revised before continuing. If a future execution environment lacks `codex` or credentials, stop and report `USER_DECISION_REQUIRED` for the missing real-provider proof instead of treating the opt-in contract as optional completion evidence.
 
 - [ ] **Step 3: Run the default skipped contract path**
 
@@ -619,7 +645,7 @@ Run:
 FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/integration/real/codex-remote-fork-contract.test.ts --config vitest.server.config.ts
 ```
 
-Expected: PASS or a documented skip for missing local `codex` or auth/config. A protocol failure is a blocker.
+Expected: PASS in this workspace. If `codex` or auth/config are unexpectedly missing, stop and report the missing proof; do not accept a skip as completion evidence for the terminal TUI compatibility risk. A protocol failure is a blocker.
 
 - [ ] **Step 4: Run the repo check**
 
@@ -663,5 +689,5 @@ git commit -m "chore: finalize codex fork oom fix"
 - Pending method attribution is based only on top-level JSON-RPC ids, including ids after large results.
 - Large state-bearing frames either produce the same Freshell-owned side effects as small frames or fail closed with recovery; none are silently ignored.
 - Existing candidate capture, turn notification, fs-change, lifecycle, and duplicate interrupt behavior remains covered and passing.
-- The opt-in real Codex TUI `/fork` contract passes locally, or execution stops with the exact protocol failure.
+- The opt-in real Codex TUI `/fork` contract passes locally in this workspace, or execution stops with the exact missing-proof or protocol failure.
 - `npm run check` passes before handoff.
