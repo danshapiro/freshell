@@ -30,7 +30,7 @@ Use this revised policy instead:
 - Client frames larger than `MAX_CLIENT_PARSE_BYTES` are rejected before forwarding, because client frames are where the proxy must decide request method, pending response attribution, `turn/start` holding, duplicate interrupt acks, and `thread/fork` rewriting.
 - Terminal `thread/fork` requests under the client parse cap are parsed, rewritten to `excludeTurns: true`, and forwarded as compact JSON.
 - Upstream frames are first attributed with a byte-level top-level JSON-RPC scanner. Full `JSON.parse` is allowed only under `MAX_PROXY_PARSE_BYTES`.
-- Oversized upstream state-bearing frames are not treated as successful normal traffic. The proxy logs structured metadata, emits the relevant repair/lifecycle signal, closes the proxied connection, and lets terminal recovery or non-restorable handling run. For a pre-persistence oversized `thread/start` response or `thread/started` notification, fail candidate capture rather than opening the input gate without a durable identity.
+- Oversized upstream state-bearing frames are not treated as successful normal traffic. The proxy logs structured metadata, emits the relevant repair/lifecycle signal, closes the proxied connection, and lets terminal recovery or non-restorable handling run. For a pre-persistence oversized `thread/start` response or `thread/started` notification, fail candidate capture rather than opening the input gate without a durable identity. After candidate persistence, or when candidate persistence is disabled, the same oversized frames must still close the proxied connection and emit repair/lifecycle handling; `failCandidateCapture()` is not sufficient in those states because it intentionally no-ops.
 - Oversized upstream non-state frames, including `thread/fork` responses, may be raw-forwarded only up to `MAX_RAW_FORWARD_BYTES`, only after a constrained-heap child-process stress test proves the path does not call full-frame `toString()` or `JSON.parse` and does not exceed the child heap limit.
 - Any upstream frame above `MAX_RAW_FORWARD_BYTES` fail-closes. This is intentionally conservative: surviving the server OOM matters more than forwarding an arbitrarily huge payload.
 - The real TUI `/fork` contract is a required compatibility proof. If it fails because the installed Codex TUI needs `thread.turns` in the fork response, stop and revise the production approach before handoff.
@@ -87,6 +87,7 @@ No user decision is required. The next proofs are local: unit tests, a constrain
 - A response whose top-level id appears after a large result must still clear the matching pending method.
 - Oversized `thread/fork` responses are non-state frames. They may be raw-forwarded only under `MAX_RAW_FORWARD_BYTES` and only after the constrained-heap test passes.
 - Oversized `thread/start`, `thread/started`, `turn/started`, `turn/completed`, `fs/changed`, `thread/closed`, and `thread/status/changed` frames are state-bearing. They must fail-close instead of being silently forwarded as successful normal traffic.
+- `failCandidateCapture()` may only be the complete fail-close action while candidate capture is still required and not yet resolved. In all other lifecycle states, oversized candidate-bearing frames must close both proxied sockets and emit a repair trigger.
 - Small candidate capture, turn notification, fs-change, lifecycle, and duplicate interrupt messages must continue to behave exactly as current tests assert.
 - Logs remain structured and must not include full request or response bodies.
 
@@ -470,8 +471,12 @@ Add tests proving:
 
 - a large `thread/fork` response with top-level id after `result` is raw-forwarded under `MAX_RAW_FORWARD_BYTES`, clears `pendingMethods`, and does not call `JSON.parse` or full-frame `Buffer.prototype.toString`
 - nested `result.id` does not clear `pendingMethods`
-- an oversized `thread/start` response does not forward as a normal successful frame, emits repair/lifecycle handling, and closes the proxied sockets
+- an oversized `thread/start` response before candidate persistence fails candidate capture and closes rather than opening the input gate
+- an oversized `thread/start` response after candidate persistence closes the proxied sockets and emits a repair trigger instead of calling a no-op candidate-capture path
+- an oversized `thread/start` response when `requireCandidatePersistence: false` closes the proxied sockets and emits a repair trigger instead of being dropped
 - an oversized `thread/started` notification before candidate persistence fails candidate capture and closes rather than opening the input gate
+- an oversized `thread/started` notification after candidate persistence closes the proxied sockets and emits a repair trigger instead of calling a no-op candidate-capture path
+- an oversized `thread/started` notification when `requireCandidatePersistence: false` closes the proxied sockets and emits a repair trigger instead of being dropped
 - oversized `turn/started`, `turn/completed`, `fs/changed`, `thread/closed`, and `thread/status/changed` notifications fail-close instead of silently skipping local side effects
 - normal small `thread/started`, `turn/started`, `turn/completed`, `fs/changed`, `thread/closed`, and `thread/status/changed` still emit the current handlers
 - a frame above `MAX_RAW_FORWARD_BYTES` fail-closes even if it is non-state
@@ -504,13 +509,17 @@ Implement `failUnsafeUpstreamFrame` as fail-closed behavior, not a normal forwar
 private failUnsafeUpstreamFrame(connection: ProxyConnection, method: string | undefined, reason: string): void {
   const error = new Error(`Unsafe oversized Codex app-server frame${method ? ` for ${method}` : ''}: ${reason}`)
   log.warn({ method, reason, proxyWsUrl: this.endpoint ? this.wsUrl : undefined }, 'Closing Codex remote proxy after unsafe oversized frame')
-  if (method === 'thread/start' || method === 'thread/started') {
+  const isCandidateBearing = method === 'thread/start' || method === 'thread/started'
+  const canFailCandidateCapture = this.requireCandidatePersistence
+    && !this.candidatePersisted
+    && !this.candidateCaptureFailed
+  if (isCandidateBearing && canFailCandidateCapture) {
     this.failCandidateCapture('Freshell could not safely capture Codex restore identity from an oversized app-server frame.')
-  } else {
-    this.emitRepairTrigger({ kind: 'proxy_error', error })
-    connection.client.close()
-    connection.upstream.close()
+    return
   }
+  this.emitRepairTrigger({ kind: 'proxy_error', error })
+  connection.client.close()
+  connection.upstream.close()
 }
 ```
 
@@ -615,13 +624,13 @@ git commit -m "test: stress codex proxy large response forwarding"
 
 - [ ] **Step 1: Write the skipped contract test**
 
-Follow the existing real-provider pattern in `test/integration/real/codex-app-server-readiness-contract.test.ts`: skip unless `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1` and `codex` is available. Import `CodexRemoteProxy`, `MAX_CLIENT_PARSE_BYTES`, and `CODEX_MANAGED_REMOTE_CONFIG_ARGS` so the contract uses the same proxy and launch flags as terminal Codex.
+Follow the existing real-provider pattern in `test/integration/real/codex-app-server-readiness-contract.test.ts`: skip unless `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1` and `codex` is available. Copy the user's `~/.codex/auth.json` and `~/.codex/config.toml` into a temporary isolated `CODEX_HOME`, skip with a clear reason if either source file is unavailable, and remove the temporary root in test cleanup. Import `CodexRemoteProxy`, `MAX_CLIENT_PARSE_BYTES`, and `CODEX_MANAGED_REMOTE_CONFIG_ARGS` so the contract uses the same proxy and launch flags as terminal Codex.
 
 The test should:
 
 - start a controlled WebSocket app-server on localhost
 - start `CodexRemoteProxy` with the controlled app-server as `upstreamWsUrl`
-- launch `codex --remote <proxy.wsUrl> ...CODEX_MANAGED_REMOTE_CONFIG_ARGS --no-alt-screen` through `node-pty`
+- launch `codex --remote <proxy.wsUrl> ...CODEX_MANAGED_REMOTE_CONFIG_ARGS --no-alt-screen` through `node-pty` with the isolated `CODEX_HOME` in the spawned process environment
 - respond to `initialize`, `thread/start`, and common bootstrap methods with minimal valid results
 - wait until a root thread is started
 - write `/fork\r` to the PTY
