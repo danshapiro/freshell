@@ -4,7 +4,7 @@
 
 **Goal:** Make terminal Codex `/fork` memory-safe in Freshell without breaking the terminal Codex TUI route or silently losing Freshell-owned proxy state.
 
-**Architecture:** Keep the production fix inside the terminal Codex remote proxy, but stop treating fixed parse caps as proof that valid Codex frames are small. The proxy will use byte-level JSON-RPC envelope scanning, a byte-level `thread/fork` request rewriter that forces `excludeTurns: true` without full-frame parsing, method-specific bounded side-effect extractors for the small fields Freshell owns, raw forwarding for traffic Freshell does not own, and fail-closed recovery only when a required side effect cannot be recovered safely.
+**Architecture:** Keep request compaction and large-frame memory safety inside the terminal Codex remote proxy, with one narrow TerminalRegistry handoff for the new thread identity created by `/fork`. The proxy will use byte-level JSON-RPC envelope scanning, a byte-level `thread/fork` request rewriter that forces `excludeTurns: true` without full-frame parsing, method-specific bounded side-effect extractors for the small fields Freshell owns, raw forwarding for traffic Freshell does not own, and fail-closed recovery only when a required side effect cannot be recovered safely.
 
 **Tech Stack:** Node.js 22, TypeScript/ESM, `ws` 8.19, Zod schemas in `server/coding-cli/codex-app-server/protocol.ts`, Vitest through `npm run test:vitest`, opt-in real Codex contracts gated by `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1`.
 
@@ -18,6 +18,7 @@ Plan revision evidence changed the implementation direction:
 - `protocol.ts` proves `thread/fork.params.excludeTurns` is already in the local schema, and fresh-agent Codex already uses `excludeTurns: true` in `server/fresh-agent/adapters/codex/adapter.ts`.
 - `remote-proxy.ts` owns stateful side effects for `thread/start` responses, `thread/started`, `turn/started`, `turn/completed`, `fs/changed`, `thread/closed`, and `thread/status/changed`.
 - `terminal-registry.ts` consumes those side effects for candidate persistence, turn durability, rollout proof, and lifecycle loss. Dropping them silently is not safe.
+- Terminal `/fork` can move the Codex TUI to a new thread through a `thread/fork` response. `terminal-registry.ts` currently ignores mismatched candidates after the initial restore identity, which is correct for accidental startup races but wrong for an intentional fork handoff. A memory-safe `/fork` that leaves Freshell bound to the old parent thread would satisfy the OOM symptom while breaking durable terminal identity.
 - `test/fixtures/coding-cli/codex-app-server/schema-inventory.ts` lists many other Codex server notifications and server requests. Those are forwarded to the TUI, but Freshell's terminal proxy does not currently derive local state from them.
 - Baseline verification passed: `npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts` passed with 15 tests.
 - The load-bearing review falsified the old assumption that all valid client and state-bearing upstream frames fit under fixed 8 MiB parse caps. Do not add a client-wide reject cap or depend on `MAX_PROXY_PARSE_BYTES` as a claim about normal Codex traffic.
@@ -33,12 +34,14 @@ Use this policy instead:
 - For upstream frames, scan first. Full `JSON.parse` is an optimization only for small frames, never the only correctness path.
 - For stateful upstream frames that are too large for full parsing, use method-specific bounded extractors for just the fields Freshell owns:
   - `thread/start` response and `thread/started`: `thread.id`, `thread.path`, `thread.ephemeral`
+  - `thread/fork` response: `thread.id`, `thread.path`, `thread.ephemeral`
   - `turn/started`: `params.threadId`, `params.turnId`
   - `turn/completed`: `params.threadId`, `params.turnId`, `params.status`, `params.turn.status`
   - `fs/changed`: `params.watchId`, and bounded `changedPaths`; if `changedPaths` is too large but `watchId` is known, emit an empty `changedPaths` array to conservatively request durability proof
   - `thread/closed`: `params.threadId`
   - `thread/status/changed`: `params.threadId`, `params.status.type`
 - If a stateful upstream frame cannot be fully parsed and the required bounded side-effect extractor also cannot recover the owned fields, fail closed with structured logging, `proxy_error` or candidate-capture failure as appropriate, and socket closure. Do not forward it as a successful normal frame.
+- Treat `thread/fork` response candidates as intentional thread handoffs. Preserve the existing startup-race protection for ordinary mismatched `thread_start_response` and `thread_started_notification` candidates, but let a valid `thread_fork_response` replace the terminal's Codex durability candidate, release the old session binding, and require the normal rollout proof before the forked thread becomes durable.
 - Raw-forward oversized non-state upstream frames only up to a raw-forward limit that is proven at the limit boundary by a constrained-heap child-process stress test. Treat that limit as an operational memory-safety cap, not as proof that larger frames are invalid. Frames above it fail closed to preserve the Freshell server.
 - The opt-in real terminal TUI `/fork` contract is required before completion. If the installed Codex TUI cannot continue after receiving a compact fork response without `thread.turns`, stop and revise the production approach.
 
@@ -64,11 +67,22 @@ No user decision is required for this revision. The remaining proofs are local a
   - Preserve raw frame data and text/binary framing.
   - Use scanner attribution for pending methods and turn/start hold.
   - Force `thread/fork.params.excludeTurns = true` through the byte-level rewriter.
+  - Emit candidate side effects from `thread/fork` responses with source `thread_fork_response`.
   - Use bounded side-effect extractors before fail-closing large stateful upstream frames.
   - Raw-forward non-state upstream frames under the tested raw-forward limit.
 
+- Modify: `shared/codex-durability.ts`
+  - Add `thread_fork_response` as a valid Codex candidate source.
+
+- Modify: `server/terminal-registry.ts`
+  - Add deliberate Codex fork identity handoff handling for candidates whose source is `thread_fork_response`.
+  - Preserve existing initial-candidate mismatch protection for non-fork candidates.
+
 - Modify: `test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts`
-  - Regression coverage for fork rewriting, large valid client forwarding, stateful side-effect recovery, fail-closed unrecoverable state frames, raw forwarding, frame type preservation, pending id attribution, and duplicate interrupt behavior.
+  - Regression coverage for fork rewriting, fork response candidate emission, large valid client forwarding, stateful side-effect recovery, fail-closed unrecoverable state frames, raw forwarding, frame type preservation, pending id attribution, and duplicate interrupt behavior.
+
+- Modify: `test/unit/server/terminal-registry.codex-sidecar.test.ts`
+  - Regression coverage for fork candidate handoff replacing the old durable identity while ordinary mismatched startup candidates remain ignored.
 
 - Create: `test/unit/server/coding-cli/codex-app-server/remote-proxy-large-forward-child.ts`
   - Constrained-heap stress fixture proving large non-state raw forwarding does not full-parse or full-stringify the frame.
@@ -93,7 +107,9 @@ No user decision is required for this revision. The remaining proofs are local a
 - The proxy must never run full `JSON.parse` or full-frame `raw.toString()` on large frames.
 - Pending method attribution must use only top-level JSON-RPC ids. Nested `id` fields inside `params`, `result`, `thread`, or `turns` must not set or clear pending methods.
 - A response whose top-level id appears after a large result must still clear the matching pending method.
-- Large `thread/start`, `thread/started`, `turn/started`, `turn/completed`, `fs/changed`, `thread/closed`, and `thread/status/changed` frames either emit the same Freshell-owned side effects as small frames or fail closed. They are never silently raw-forwarded as successful normal traffic.
+- Large `thread/start`, `thread/fork`, `thread/started`, `turn/started`, `turn/completed`, `fs/changed`, `thread/closed`, and `thread/status/changed` frames either emit the same Freshell-owned side effects as small frames or fail closed. They are never silently raw-forwarded as successful normal traffic.
+- A `thread/fork` response with a valid deterministic rollout path is an intentional Codex terminal identity handoff: the old session binding is released, the forked thread becomes the current candidate, stale proof state is cleared, and the normal rollout proof must pass before the forked thread is marked durable.
+- A mismatched candidate from `thread_start_response` or `thread_started_notification` after an initial candidate is already persisted remains ignored; fork handoff must not weaken the startup-race protection.
 - `fs/changed` extraction may collapse an oversized `changedPaths` array to `[]` only after extracting the watch id. This is conservative because terminal registry treats an empty changed path list as a durability proof request rather than as "no change."
 - Raw forwarding for non-state upstream frames is allowed only under `MAX_RAW_FORWARD_BYTES` after the constrained-heap stress test passes.
 - Logs remain structured and must not include full request or response bodies.
@@ -195,6 +211,7 @@ Add tests proving `rewriteThreadForkExcludeTurns(raw)`:
 Add tests proving large frames can recover:
 
 - candidate from `thread/start` response with `result.thread.turns` before top-level id
+- candidate from `thread/fork` response with `result.thread.turns` before top-level id
 - candidate from `thread/started` notification with a huge `thread.turns`
 - turn started and completed metadata when the turn body is huge
 - `thread/closed` and `thread/status/changed` lifecycle metadata
@@ -321,6 +338,7 @@ git commit -m "fix: compact codex fork requests without rejecting large clients"
 Add tests proving:
 
 - a large `thread/fork` response with top-level id after `result` is raw-forwarded and clears `pendingMethods`
+- small and large `thread/fork` responses recover and emit a `thread_fork_response` candidate before forwarding
 - nested `result.id` does not clear `pendingMethods`
 - large `thread/start` responses recover and emit candidate side effects before forwarding
 - large `thread/started` notifications recover candidate and lifecycle side effects before forwarding
@@ -358,7 +376,7 @@ In `handleUpstreamMessage`:
 Stateful methods are:
 
 ```ts
-const STATEFUL_RESPONSE_METHODS = new Set(['thread/start'])
+const STATEFUL_RESPONSE_METHODS = new Set(['thread/start', 'thread/fork'])
 const STATEFUL_NOTIFICATION_METHODS = new Set([
   'thread/started',
   'turn/started',
@@ -371,7 +389,7 @@ const STATEFUL_NOTIFICATION_METHODS = new Set([
 
 Implement fail-closed behavior:
 
-- candidate-bearing frame before candidate persistence: `failCandidateCapture('Freshell could not safely capture Codex restore identity from an oversized app-server frame.')`
+- candidate-bearing `thread/start` or `thread/fork` frame before required identity capture can complete: `failCandidateCapture('Freshell could not safely capture Codex restore identity from an oversized app-server frame.')`
 - all other unrecoverable stateful or above-cap frames: structured warning, `emitRepairTrigger({ kind: 'proxy_error', error })`, close client and upstream
 
 - [ ] **Step 4: Run focused tests to verify green**
@@ -391,7 +409,67 @@ git add server/coding-cli/codex-app-server/remote-proxy.ts test/unit/server/codi
 git commit -m "fix: recover codex proxy side effects from large frames"
 ```
 
-### Task 5: Add A Constrained-Heap Large-Forward Stress Test
+### Task 5: Preserve Codex Terminal Identity Across Fork Handoffs
+
+**Files:**
+- Modify: `shared/codex-durability.ts`
+- Modify: `server/terminal-registry.ts`
+- Modify: `test/unit/server/terminal-registry.codex-sidecar.test.ts`
+- Modify: `test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts`
+
+- [ ] **Step 1: Add failing fork identity tests**
+
+Add tests proving:
+
+- `CodexRemoteProxy` emits a candidate with `source: 'thread_fork_response'` when a `thread/fork` response contains `result.thread.id`, `result.thread.path`, and `result.thread.ephemeral`
+- a terminal with an existing durable Codex identity accepts a valid `thread_fork_response` candidate as an intentional handoff
+- the handoff releases the old session binding, clears stale `durableThreadId`, stale `turnCompletedAt`, stale proof failure, and in-flight proof state, writes the forked candidate as `captured_pre_turn`, arms the new rollout watch, and broadcasts `terminal.codex.durability.updated`
+- the forked thread is not broadcast as `terminal.session.associated` until the normal rollout proof succeeds
+- after the next forked-thread `turn/completed` and rollout proof success, the terminal binds to the forked thread and broadcasts the new session association
+- ordinary mismatched `thread_start_response` and `thread_started_notification` candidates after initial persistence are still ignored and keep the existing warning behavior
+- invalid fork candidates without an absolute rollout path are ignored and do not unbind the old durable identity
+
+- [ ] **Step 2: Run tests to verify red**
+
+Run:
+
+```bash
+npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts --testNamePattern "fork.*identity|thread_fork_response|mismatched Codex restore identity"
+```
+
+Expected: FAIL because `thread_fork_response` is not a valid candidate source and terminal registry currently ignores all mismatched candidates after initial persistence.
+
+- [ ] **Step 3: Implement fork handoff**
+
+Implement the handoff as a narrow source-specific path:
+
+- add `thread_fork_response` to `CodexCandidateSourceSchema`
+- extend `CodexRemoteProxyCandidate['source']` with `thread_fork_response`
+- emit `thread_fork_response` from `remote-proxy.ts` for small and large `thread/fork` responses after matching the pending top-level response id
+- in `persistCodexCandidateSerial`, keep the existing mismatched-candidate ignore path for non-fork sources
+- for `thread_fork_response`, validate the candidate with `buildCodexDurabilityRef`
+- release the current binding with reason `rebind`, clear `resumeSessionId`, clear stale Codex active turn/unconfirmed-input/proof state, replace durability with the forked candidate in `captured_pre_turn`, arm the new rollout watch, and broadcast durability
+- do not mark the forked thread durable or send `terminal.session.associated` until the normal rollout proof succeeds
+- if the fork candidate is invalid, log and ignore it without changing the existing durable identity
+
+- [ ] **Step 4: Run focused tests to verify green**
+
+Run:
+
+```bash
+npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts --testNamePattern "fork.*identity|thread_fork_response|mismatched Codex restore identity"
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add shared/codex-durability.ts server/terminal-registry.ts test/unit/server/terminal-registry.codex-sidecar.test.ts test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts
+git commit -m "fix: preserve codex terminal identity after fork"
+```
+
+### Task 6: Add A Constrained-Heap Large-Forward Stress Test
 
 **Files:**
 - Create: `test/unit/server/coding-cli/codex-app-server/remote-proxy-large-forward-child.ts`
@@ -458,7 +536,7 @@ git add test/unit/server/coding-cli/codex-app-server/remote-proxy-large-forward-
 git commit -m "test: stress codex proxy large response forwarding"
 ```
 
-### Task 6: Add The Opt-In Real TUI Fork Contract
+### Task 7: Add The Opt-In Real TUI Fork Contract
 
 **Files:**
 - Create: `test/integration/real/codex-remote-fork-contract.test.ts`
@@ -477,8 +555,9 @@ The test must:
 - write `/fork\r` to the PTY
 - capture the upstream `thread/fork` request after proxy rewriting
 - assert the upstream request contains `excludeTurns: true`
-- respond with a minimal fork result that omits `turns`
+- respond with a minimal fork result that omits `turns` but includes a deterministic forked thread id and rollout path
 - assert the TUI stays alive long enough to accept a follow-up harmless key or exit command
+- assert the proxy emits `thread_fork_response`; TerminalRegistry durability handoff remains covered by the focused tests in Task 5
 
 - [ ] **Step 2: Run the contract opt-in**
 
@@ -507,7 +586,7 @@ git add test/integration/real/codex-remote-fork-contract.test.ts
 git commit -m "test: add codex remote fork contract"
 ```
 
-### Task 7: Final Verification
+### Task 8: Final Verification
 
 **Files:**
 - Verify only
@@ -522,7 +601,17 @@ npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/json-rpc
 
 Expected: PASS.
 
-- [ ] **Step 2: Run the opt-in real fork contract when Codex is available**
+- [ ] **Step 2: Run focused TerminalRegistry fork identity tests**
+
+Run:
+
+```bash
+npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts --config vitest.server.config.ts --testNamePattern "fork.*identity|mismatched Codex restore identity"
+```
+
+Expected: PASS.
+
+- [ ] **Step 3: Run the opt-in real fork contract when Codex is available**
 
 Run:
 
@@ -532,7 +621,7 @@ FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/integrati
 
 Expected: PASS or a documented skip for missing local `codex` or auth/config. A protocol failure is a blocker.
 
-- [ ] **Step 3: Run the repo check**
+- [ ] **Step 4: Run the repo check**
 
 Coordinate through the repo wrapper:
 
@@ -542,7 +631,7 @@ FRESHELL_TEST_SUMMARY="codex fork oom bounded proxy extraction" npm run check
 
 Expected: PASS.
 
-- [ ] **Step 4: Inspect final diff**
+- [ ] **Step 5: Inspect final diff**
 
 Run:
 
@@ -553,12 +642,12 @@ git diff --check origin/main...HEAD
 
 Expected: only the planned files changed; no whitespace errors.
 
-- [ ] **Step 5: Commit any final cleanup**
+- [ ] **Step 6: Commit any final cleanup**
 
 If verification required small cleanup:
 
 ```bash
-git add server/coding-cli/codex-app-server/json-rpc-envelope.ts server/coding-cli/codex-app-server/json-rpc-side-effects.ts server/coding-cli/codex-app-server/remote-proxy.ts test/unit/server/coding-cli/codex-app-server/json-rpc-envelope.test.ts test/unit/server/coding-cli/codex-app-server/json-rpc-side-effects.test.ts test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts test/unit/server/coding-cli/codex-app-server/remote-proxy-large-forward-child.ts test/integration/real/codex-remote-fork-contract.test.ts
+git add shared/codex-durability.ts server/terminal-registry.ts server/coding-cli/codex-app-server/json-rpc-envelope.ts server/coding-cli/codex-app-server/json-rpc-side-effects.ts server/coding-cli/codex-app-server/remote-proxy.ts test/unit/server/terminal-registry.codex-sidecar.test.ts test/unit/server/coding-cli/codex-app-server/json-rpc-envelope.test.ts test/unit/server/coding-cli/codex-app-server/json-rpc-side-effects.test.ts test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts test/unit/server/coding-cli/codex-app-server/remote-proxy-large-forward-child.ts test/integration/real/codex-remote-fork-contract.test.ts
 git commit -m "chore: finalize codex fork oom fix"
 ```
 
@@ -568,6 +657,7 @@ git commit -m "chore: finalize codex fork oom fix"
 - Large valid non-fork client requests are not rejected solely because they are large.
 - Large fork requests are compacted without full-frame JSON parsing.
 - Large fork responses under the proven raw-forward cap reach the TUI without full proxy-side JSON parsing or full-frame `toString()`.
+- Terminal fork responses update Freshell's Codex durable identity to the forked thread candidate without marking it durable before rollout proof.
 - Upstream frames above `MAX_RAW_FORWARD_BYTES` fail closed instead of risking server OOM.
 - The proxy preserves text/binary WebSocket frame semantics.
 - Pending method attribution is based only on top-level JSON-RPC ids, including ids after large results.
