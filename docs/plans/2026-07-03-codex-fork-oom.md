@@ -80,6 +80,7 @@ No user decision is required. The user approved implementing the safer behavior,
 - Candidate capture from small `thread/start` responses and `thread/started` notifications must still work.
 - Turn started/completed, fs changed, and thread lifecycle side effects from small notifications must still work.
 - Oversized side-effect-bearing messages must be forwarded even when local side effects are skipped; Freshell must not parse them just to preserve local side effects.
+- Oversized non-fork client requests must not bypass existing proxy-owned safety behavior. In particular, an oversized `turn/start` must still be held while candidate persistence is required, and must be released only after `markCandidatePersisted()`.
 - Logs must remain structured and must never include full request or response bodies.
 
 ## Implementation Tasks
@@ -263,30 +264,33 @@ it('forwards terminal thread/fork responses without full proxy-side JSON parsing
   const rawFrame = nextRawMessageFrame(tui)
   const parseSpy = vi.spyOn(JSON, 'parse')
   parseSpy.mockClear()
-  const response = JSON.stringify({
-    id: 31,
-    result: {
-      thread: {
-        id: 'thread-fork-1',
-        path: '/tmp/codex/fork.jsonl',
-        turns: Array.from({ length: 3_000 }, (_, index) => ({
-          id: `turn-${index}`,
-          items: [{ type: 'text', text: `large response body ${index} ${'x'.repeat(512)}` }],
-        })),
+  try {
+    const response = JSON.stringify({
+      id: 31,
+      result: {
+        thread: {
+          id: 'thread-fork-1',
+          path: '/tmp/codex/fork.jsonl',
+          turns: Array.from({ length: 3_000 }, (_, index) => ({
+            id: `turn-${index}`,
+            items: [{ type: 'text', text: `large response body ${index} ${'x'.repeat(512)}` }],
+          })),
+        },
       },
-    },
-  })
-  for (const socket of upstream.sockets) socket.send(response)
+    })
+    for (const socket of upstream.sockets) socket.send(response)
 
-  const frame = await rawFrame
-  expect(frame.isBinary).toBe(false)
-  expect(frame.raw.toString()).toBe(response)
-  const parsedPayloads = parseSpy.mock.calls.map(([payload]) => (
-    typeof payload === 'string' ? payload : String(payload)
-  ))
-  expect(parsedPayloads).not.toContain(response)
-  expect(parsedPayloads.every((payload) => payload.length < 256)).toBe(true)
-  parseSpy.mockRestore()
+    const frame = await rawFrame
+    expect(frame.isBinary).toBe(false)
+    expect(frame.raw.toString()).toBe(response)
+    const parsedPayloads = parseSpy.mock.calls.map(([payload]) => (
+      typeof payload === 'string' ? payload : String(payload)
+    ))
+    expect(parsedPayloads).not.toContain(response)
+    expect(parsedPayloads.every((payload) => payload.length < 256)).toBe(true)
+  } finally {
+    parseSpy.mockRestore()
+  }
 })
 ```
 
@@ -326,6 +330,21 @@ it('attributes large responses when the top-level id appears after result', asyn
 
   expect(candidates).toEqual([])
 
+  for (const socket of upstream.sockets) {
+    socket.send(JSON.stringify({
+      id: 'pending-thread-start',
+      result: {
+        thread: {
+          id: 'thread-stale',
+          path: '/tmp/codex/stale.jsonl',
+          ephemeral: false,
+        },
+      },
+    }))
+  }
+  await delay(25)
+  expect(candidates).toEqual([])
+
   tui.send(JSON.stringify({ id: 'after-large', method: 'thread/start', params: {} }))
   await waitForCondition(() => {
     expect(upstream.messages).toHaveLength(2)
@@ -358,7 +377,7 @@ it('attributes large responses when the top-level id appears after result', asyn
 })
 ```
 
-The expected `candidates` value stays empty after the large response because the side-effect parse cap will intentionally skip oversized `thread/start` candidate extraction. The important assertion is that the proxy did find and clear the late top-level id, so the later small `thread/start` response still attributes normally.
+The expected `candidates` value stays empty after the large response because the side-effect parse cap will intentionally skip oversized `thread/start` candidate extraction. Sending the second small response with the same id proves the proxy did find and clear the late top-level id: if it failed to clear `pending-thread-start`, that stale response would incorrectly emit a candidate. The later `after-large` request proves normal response attribution still works after the oversized frame.
 
 - [ ] **Step 4: Add the nested-id safety test**
 
@@ -451,7 +470,57 @@ it('rejects oversized thread/fork requests instead of parsing or forwarding them
 
 If `nextResponseWithIdWithin` is typed only for numbers, generalize it to `id: string | number`.
 
-- [ ] **Step 6: Run the new tests to verify red**
+- [ ] **Step 6: Add the oversized held turn/start regression test**
+
+This protects existing restore-identity gating while avoiding full request parsing for oversized non-fork frames:
+
+```ts
+it('holds oversized turn/start requests without full proxy-side JSON parsing', async () => {
+  const upstream = await startUpstream()
+  const proxy = await startProxy(upstream.wsUrl, {
+    candidateCaptureTimeoutMs: 1_000,
+  })
+  const tui = await connect(proxy.wsUrl)
+
+  const giantRequest = JSON.stringify({
+    id: 'giant-turn-start',
+    method: 'turn/start',
+    params: {
+      threadId: 'thread-1',
+      prompt: 'x'.repeat(10 * 1024 * 1024),
+    },
+  })
+  const parseSpy = vi.spyOn(JSON, 'parse')
+  parseSpy.mockClear()
+  try {
+    tui.send(giantRequest)
+
+    await delay(25)
+    expect(upstream.messages).toEqual([])
+    const parsedPayloads = parseSpy.mock.calls.map(([payload]) => (
+      typeof payload === 'string' ? payload : String(payload)
+    ))
+    expect(parsedPayloads).not.toContain(giantRequest)
+    expect(parsedPayloads.every((payload) => payload.length < 256)).toBe(true)
+  } finally {
+    parseSpy.mockRestore()
+  }
+
+  proxy.markCandidatePersisted()
+  await waitForCondition(() => {
+    expect(upstream.messages).toHaveLength(1)
+  })
+  expect(upstream.messages[0]).toMatchObject({
+    id: 'giant-turn-start',
+    method: 'turn/start',
+    params: {
+      threadId: 'thread-1',
+    },
+  })
+})
+```
+
+- [ ] **Step 7: Run the new tests to verify red**
 
 Run each new test name individually with `--testNamePattern`, or run the file:
 
@@ -459,7 +528,7 @@ Run each new test name individually with `--testNamePattern`, or run the file:
 npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts
 ```
 
-Expected: the parse-spy, late-id, and oversized-request tests FAIL before the scanner/refactor because the current proxy parses every upstream frame and does not cap fork request parsing. The nested-id test may already PASS against the current full parser; keep it because it protects against an unsafe prefix or regex scanner during refactor.
+Expected: the parse-spy, late-id, oversized-fork-request, and oversized-held-`turn/start` tests FAIL before the scanner/refactor because the current proxy parses every client and upstream frame and does not cap fork request parsing. The nested-id test may already PASS against the current full parser; keep it because it protects against an unsafe prefix or regex scanner during refactor.
 
 ### Task 3: Implement Safe Frames, Caps, And Full-Frame Envelope Scanning
 
@@ -620,7 +689,9 @@ For small frames, keep full parse behavior where needed:
 
 - Parse normal requests under `MAX_CLIENT_PARSE_BYTES` so existing `completedTurnInterrupt`, fork rewrite, and held `turn/start` behavior remain intact.
 - If `method === 'thread/fork'` and the frame is over `MAX_CLIENT_PARSE_BYTES`, send a JSON-RPC error with the scanned id and return without forwarding.
-- If the frame is over the cap and is not a fork request, forward raw with scanned method/id bookkeeping only when possible. Do not call `completedTurnInterrupt` on an oversized request.
+- If the frame is over the cap and is not a fork request, keep scanned method/id bookkeeping but do not full-parse the body and do not call `completedTurnInterrupt`.
+- If an oversized non-fork request is `turn/start` and candidate persistence is still required, hold the raw `ProxyFrame` exactly like a normal `turn/start`; release it only after `markCandidatePersisted()`.
+- If an oversized non-fork request is not a held `turn/start`, forward the raw `ProxyFrame`.
 
 Add a clear JSON-RPC error message:
 
