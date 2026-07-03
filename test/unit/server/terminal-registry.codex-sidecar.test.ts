@@ -59,7 +59,7 @@ vi.mock('../../../server/logger', () => {
   return { logger, sessionLifecycleLogger: logger }
 })
 
-import { TerminalRegistry } from '../../../server/terminal-registry.js'
+import { TerminalRegistry, buildTerminalSessionRef } from '../../../server/terminal-registry.js'
 import { CodexDurabilityStore } from '../../../server/coding-cli/codex-app-server/durability-store.js'
 import { logger } from '../../../server/logger.js'
 import { CODEX_DURABILITY_SCHEMA_VERSION } from '../../../shared/codex-durability.js'
@@ -902,6 +902,158 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       })
     } finally {
       now.mockRestore()
+    }
+  })
+
+  it('stages a fork candidate for a durable terminal without replacing the old restore identity', async () => {
+    const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
+    try {
+      const store = new CodexDurabilityStore({ dir: durabilityDir })
+      const registry = new TerminalRegistry(undefined, undefined, undefined, {
+        codexDurabilityStore: store,
+        serverInstanceId: 'srv-test',
+      })
+      const sidecar = createFakeSidecar()
+      const term = registry.create({
+        mode: 'codex',
+        resumeSessionId: 'thread-parent',
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
+          },
+        } as any,
+      })
+      const sent: unknown[] = []
+      registry.attach(term.terminalId, {
+        readyState: 1,
+        bufferedAmount: 0,
+        send: vi.fn((message: string) => sent.push(JSON.parse(message))),
+      } as any)
+      await store.write({
+        schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+        state: 'durable',
+        durableThreadId: 'thread-parent',
+        terminalId: term.terminalId,
+        serverInstanceId: 'srv-test',
+        updatedAt: 100,
+      })
+
+      const forkRolloutPath = path.join(durabilityDir, 'fork-child.jsonl')
+      sidecar.emitCandidate({
+        source: 'thread_fork_response',
+        thread: {
+          id: 'thread-child',
+          path: forkRolloutPath,
+          ephemeral: false,
+        },
+      })
+
+      await vi.waitFor(() => expect(sidecar.markCandidatePersisted).toHaveBeenCalledTimes(1))
+      const record = registry.get(term.terminalId)!
+      expect(record.resumeSessionId).toBe('thread-parent')
+      expect(buildTerminalSessionRef(record)).toEqual({ provider: 'codex', sessionId: 'thread-parent' })
+      expect(record.codexDurability).toMatchObject({
+        state: 'durable',
+        durableThreadId: 'thread-parent',
+      })
+      expect((record as any).codexForkHandoff).toMatchObject({
+        state: 'fork_handoff_staged',
+        candidate: {
+          candidateThreadId: 'thread-child',
+          rolloutPath: forkRolloutPath,
+          source: 'thread_fork_response',
+        },
+      })
+      await expect(store.read(term.terminalId)).resolves.toMatchObject({
+        state: 'durable',
+        durableThreadId: 'thread-parent',
+      })
+      expect(sent).not.toContainEqual(expect.objectContaining({
+        type: 'terminal.session.associated',
+        sessionRef: { provider: 'codex', sessionId: 'thread-child' },
+      }))
+    } finally {
+      await removeTempDir(durabilityDir)
+    }
+  })
+
+  it('commits a staged fork handoff only after child rollout proof succeeds', async () => {
+    const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
+    try {
+      const store = new CodexDurabilityStore({ dir: durabilityDir })
+      const registry = new TerminalRegistry(undefined, undefined, undefined, {
+        codexDurabilityStore: store,
+        serverInstanceId: 'srv-test',
+      })
+      const sidecar = createFakeSidecar()
+      const term = registry.create({
+        mode: 'codex',
+        resumeSessionId: 'thread-parent',
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
+          },
+        } as any,
+      })
+      const sent: unknown[] = []
+      registry.attach(term.terminalId, {
+        readyState: 1,
+        bufferedAmount: 0,
+        send: vi.fn((message: string) => sent.push(JSON.parse(message))),
+      } as any)
+      await store.write({
+        schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+        state: 'durable',
+        durableThreadId: 'thread-parent',
+        terminalId: term.terminalId,
+        serverInstanceId: 'srv-test',
+        updatedAt: 100,
+      })
+
+      const forkRolloutPath = path.join(durabilityDir, 'fork-child.jsonl')
+      await fsp.writeFile(
+        forkRolloutPath,
+        `${JSON.stringify({ type: 'session_meta', payload: { id: 'thread-child' } })}\n`,
+      )
+      sidecar.emitCandidate({
+        source: 'thread_fork_response',
+        thread: {
+          id: 'thread-child',
+          path: forkRolloutPath,
+          ephemeral: false,
+        },
+      })
+      await vi.waitFor(() => expect(sidecar.markCandidatePersisted).toHaveBeenCalledTimes(1))
+
+      sidecar.emitTurnStarted({ threadId: 'thread-child', turnId: 'turn-child-1', params: {} })
+      await vi.waitFor(() => expect((registry.get(term.terminalId) as any).codexForkHandoff).toMatchObject({
+        state: 'fork_turn_in_progress_unproven',
+      }))
+      expect(registry.get(term.terminalId)?.resumeSessionId).toBe('thread-parent')
+
+      sidecar.emitTurnCompleted({ threadId: 'thread-child', turnId: 'turn-child-1', params: {} })
+
+      await vi.waitFor(() => {
+        const record = registry.get(term.terminalId)!
+        expect(record.resumeSessionId).toBe('thread-child')
+        expect(record.codexDurability).toMatchObject({
+          state: 'durable',
+          durableThreadId: 'thread-child',
+        })
+        expect((record as any).codexForkHandoff).toBeUndefined()
+      })
+      await expect(store.read(term.terminalId)).resolves.toMatchObject({
+        state: 'durable',
+        durableThreadId: 'thread-child',
+      })
+      expect(sent).toContainEqual(expect.objectContaining({
+        type: 'terminal.session.associated',
+        sessionRef: { provider: 'codex', sessionId: 'thread-child' },
+      }))
+    } finally {
+      await removeTempDir(durabilityDir)
     }
   })
 

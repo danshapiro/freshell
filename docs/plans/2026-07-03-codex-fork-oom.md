@@ -27,7 +27,11 @@ Plan revision evidence changed the implementation direction:
 - Local investigation during plan revision 5 confirmed that `ws` 8.19 defaults `maxPayload` to 100 MiB, enforces payload length before message emission, and emits text messages as `Buffer` objects. A disposable raw WebSocket proxy under `node --max-old-space-size=128` forwarded 8, 16, 32, 48, and 64 MiB text JSON frames without full parsing or stringification; the 64 MiB case completed with about 6 MB JS heap used, about 268 MB RSS, and about 136 MB external memory. This supports keeping 64 MiB only as a raw-forward cap that must be guarded by a constrained-heap regression test.
 - No streaming JSON parser dependency exists in `package.json`. Keep the scanner/extractor code local and small, but prove it before integration with adversarial fixtures and differential tests against `JSON.parse` on bounded frames.
 - Follow-up read-only review confirmed that `releaseBinding()` immediately clears `resumeSessionId`, while Codex restore/session references and durable recovery depend on the old `resumeSessionId` remaining authoritative. Releasing the old binding at fork-candidate time is unsafe because the forked thread is not durable until rollout proof succeeds.
-- The actual real `thread/fork` response shape is not locally proven. `CodexThreadSchema.path` is optional and nullable, existing real-provider coverage proves only `thread/start.thread.path`, and `client.forkThread()` currently discards all fork response fields except `thread.id`. The implementation must first prove which fork response thread field carries the durable rollout path before treating any alias as valid.
+- Pre-implementation contract runs proved the current real shapes for Codex 0.142.5:
+  - A just-created empty parent thread cannot be forked by the app-server; `thread/fork` fails with `no rollout found for thread id ...`. The real fork-shape contract must materialize the parent with one completed turn before forking.
+  - With `excludeTurns: true` against a materialized parent, the real app-server `thread/fork` response carries the child durable path at `result.thread.path`; no `rolloutPath` or `rollout_path` alias is needed.
+  - The real terminal TUI rejects a compact fork response that omits `result.thread.turns` with `thread/fork response decode error: missing field turns`.
+  - The real terminal TUI accepts the same compact fork response when the proxy/app-server response includes `result.thread.turns: []`.
 
 Use this policy instead:
 
@@ -42,7 +46,7 @@ Use this policy instead:
 - For frames larger than `MAX_FULL_PARSE_BYTES`, do not call full-frame `JSON.parse`, `JSON.stringify`, or `raw.toString()`. `JSON.stringify` is allowed only for small proxy-generated errors/acks, never to reconstruct a forwarded frame.
 - For stateful upstream frames that are too large for full parsing, use method-specific bounded extractors for just the fields Freshell owns:
   - `thread/start` response and `thread/started`: `thread.id`, `thread.path`, `thread.ephemeral`
-  - `thread/fork` response: `thread.id`, `thread.<provenForkPathField>`, `thread.ephemeral`
+  - `thread/fork` response: `thread.id`, `thread.path`, `thread.ephemeral`
   - `turn/started`: `params.threadId`, `params.turnId`
   - `turn/completed`: `params.threadId`, `params.turnId`, `params.status`, `params.turn.status`
   - `fs/changed`: `params.watchId`, and bounded `changedPaths`; if `changedPaths` is too large but `watchId` is known, emit an empty `changedPaths` array to conservatively request durability proof
@@ -50,16 +54,17 @@ Use this policy instead:
   - `thread/status/changed`: `params.threadId`, `params.status.type`
 - If a stateful upstream frame cannot be fully parsed and the required bounded side-effect extractor also cannot recover the owned fields, fail closed with structured logging, `proxy_error` or candidate-capture failure as appropriate, and socket closure. Do not forward it as a successful normal frame.
 - Treat `thread/fork` response candidates as intentional staged handoffs, not immediate rebinds. Preserve the existing startup-race protection for ordinary mismatched `thread_start_response` and `thread_started_notification` candidates.
-- A `thread_fork_response` candidate is valid only when it is matched by top-level JSON-RPC id to a forwarded `thread/fork` request, uses `result.thread.id`, uses the same response thread's `provenForkPathField`, has a nonempty absolute path, has `ephemeral !== true`, and the child thread id differs from the old durable/resume/request parent id. If multiple path-like fields are present, they must agree exactly after normalization; disagreement, missing/null/relative path, same-as-parent id, or `ephemeral: true` makes the candidate invalid.
+- A `thread_fork_response` candidate is valid only when it is matched by top-level JSON-RPC id to a forwarded `thread/fork` request, uses `result.thread.id`, uses the same response thread's `path`, has a nonempty absolute path, has `ephemeral !== true`, and the child thread id differs from the old durable/resume/request parent id. If multiple path-like fields are present, they must agree exactly after normalization; disagreement, missing/null/relative path, same-as-parent id, or `ephemeral: true` makes the candidate invalid.
+- Because current Codex TUI requires `thread.turns` in fork operation responses, the proxy must normalize the TUI-facing `thread/fork` response to include `result.thread.turns: []` when upstream omitted it due to `excludeTurns: true`. This response normalization must be bounded and must not re-expand or fetch historical turns.
 - A fork handoff has these required states, whether represented as a transient `TerminalRecord` subobject or equivalent code: `fork_handoff_staged`, `fork_turn_in_progress_unproven`, `fork_proof_checking`, `fork_durable_committed`, and `fork_handoff_failed`. In the staged/proof states, the old `resumeSessionId`, old session binding, and old durable store record remain authoritative for restore/recovery.
 - The proxy-side `fork_handoff` gate starts before forwarding the matching `thread/fork` response to the TUI. TerminalRegistry may call `markCandidatePersisted()` only after it has staged the fork candidate and can attribute fork-thread events to that staged candidate. This releases queued post-fork traffic; it does not mean the fork is durable.
 - During a fork handoff gate, queue bounded, raw-frame-preserving post-fork stateful client traffic, not only `turn/start`. At minimum this includes `turn/start`, `turn/steer`, `turn/interrupt`, nested `thread/fork`, `thread/compact/start`, and other thread-mutating methods. Queue or fail closed stateful upstream notifications attributable to the fork thread until the staged candidate is installed. Allow only the rewritten `thread/fork` request, the matching `thread/fork` response after candidate extraction and gate setup, and clearly non-state/global traffic under the raw-forward cap.
 - Do not call `releaseBinding()`, clear `resumeSessionId`, replace the old durable identity, or broadcast `terminal.session.associated` when the fork candidate is merely staged. On proof success, commit atomically: rebind from the old durable thread to the proven fork thread, set `resumeSessionId` and `durableThreadId` to the fork id, write the new durable record, clear staged handoff/proof state, unwatch stale rollout paths, and then broadcast the new session association. There must be no externally visible unbound interval.
 - On invalid candidate, persistence failure, timeout, queue overflow, or proof failure, preserve the old durable binding and store record, fail/close the proxy before accepting more post-fork traffic, and do not let the terminal continue under an untracked fork identity.
 - Raw-forward oversized non-state frames only up to a raw-forward limit that is proven at the limit boundary by a constrained-heap child-process stress test using the actual proxy. Treat that limit as an operational memory-safety cap, not as proof that larger frames are invalid. Frames above it fail closed in both client-to-upstream and upstream-to-client directions to preserve the Freshell server.
-- The opt-in real app-server fork-shape contract is required before implementing path extraction. The opt-in real terminal TUI `/fork` contract is required before completion in any environment with `codex` and local Codex credentials. Plan revision 5 confirmed this workspace has `codex` 0.142.5 plus `~/.codex/auth.json` and `~/.codex/config.toml`, so the executor must run both opt-in contracts here. If the installed Codex TUI cannot continue after receiving a compact fork response without `thread.turns`, or if the real app-server fork response lacks a deterministic path field, stop and revise the production approach.
+- The opt-in real app-server fork-shape and real terminal TUI fork contracts have now run in this workspace with `codex` 0.142.5 plus local auth/config. Implementation may rely on `result.thread.path` for fork candidate extraction and must preserve TUI compatibility by injecting `turns: []` into compact fork responses forwarded to the TUI.
 
-No user decision is required for this revision. The remaining proofs are local automated tests, one opt-in real app-server fork-shape contract, one opt-in real TUI compatibility contract, and the opt-in constrained-heap final gate. Keep ordinary implementation iterations resource-light by using bounded generated fixtures and small test-cap overrides; reserve 64 MiB actual-proxy stress for the final gate.
+No user decision is required for this revision. The remaining proof before completion is the opt-in constrained-heap final gate. Keep ordinary implementation iterations resource-light by using bounded generated fixtures and small test-cap overrides; reserve 64 MiB actual-proxy stress for the final gate.
 
 ## File Structure
 
@@ -70,6 +75,7 @@ No user decision is required for this revision. The remaining proofs are local a
 - Create: `server/coding-cli/codex-app-server/json-rpc-side-effects.ts`
   - Byte-level bounded extractors for the small fields Freshell owns in large stateful upstream frames.
   - Byte-level `thread/fork` request rewriter that forces `params.excludeTurns = true`.
+  - Bounded `thread/fork` response normalizer that injects `result.thread.turns: []` for the TUI when upstream omitted turns.
 
 - Create: `test/unit/server/coding-cli/codex-app-server/json-rpc-envelope.test.ts`
   - Scanner contract and malformed-frame coverage.
@@ -86,6 +92,7 @@ No user decision is required for this revision. The remaining proofs are local a
   - Fail closed if a fork handoff gate times out or TerminalRegistry never acknowledges it; do not silently forward post-fork user input against the old durable identity.
   - Use scanner attribution for pending methods and identity-gate holds.
   - Force `thread/fork.params.excludeTurns = true` through the byte-level rewriter.
+  - Normalize matching `thread/fork` responses before forwarding them to the TUI so `result.thread.turns` is an empty array when upstream omitted it.
   - Emit candidate side effects from `thread/fork` responses with source `thread_fork_response`.
   - Use bounded side-effect extractors before fail-closing large stateful upstream frames.
   - Raw-forward non-state frames under the tested raw-forward limit and fail closed above the cap in both directions.
@@ -125,6 +132,7 @@ No user decision is required for this revision. The remaining proofs are local a
 - Terminal `thread/fork` requests sent upstream must preserve original JSON-RPC fields and params except `params.excludeTurns` is always `true`.
 - If the TUI sends `excludeTurns: false` or `excludeTurns: null`, upstream receives `excludeTurns: true`.
 - If the TUI omits `params`, upstream receives a params object containing `excludeTurns: true`.
+- Upstream compact `thread/fork` responses may omit `result.thread.turns`; the TUI-facing response must include `result.thread.turns: []`. Codex 0.142.5 rejects a missing `turns` field during fork bootstrap.
 - A large valid non-fork client request below `MAX_RAW_FORWARD_BYTES` is not rejected merely because of size.
 - Raw-forwarding means forwarding the original frame bytes with the original WebSocket `isBinary` flag. Held identity-gate frames preserve their original raw bytes and original text/binary framing until candidate persistence releases them. Rewritten `thread/fork` frames preserve framing and all original bytes except the minimal `params.excludeTurns: true` mutation.
 - Duplicate `turn/interrupt` acks remain best-effort. They are synthesized only when the proxy can safely identify `threadId` and `turnId`; otherwise the request forwards to upstream.
@@ -133,8 +141,8 @@ No user decision is required for this revision. The remaining proofs are local a
 - A response whose top-level id appears after a large result must still clear the matching pending method.
 - Large `thread/start`, `thread/fork`, `thread/started`, `turn/started`, `turn/completed`, `fs/changed`, `thread/closed`, and `thread/status/changed` frames either emit the same Freshell-owned side effects as small frames or fail closed. They are never silently raw-forwarded as successful normal traffic.
 - Duplicate or escaped keys in any frame the proxy must transform or use for Freshell-owned side effects must be handled deterministically. If the scanner/rewriter cannot match bounded `JSON.parse` semantics for that bounded fixture, it must classify the frame as unsafe and fail closed rather than forwarding an uncompacted fork or silently dropping side effects.
-- Terminology: `thread.<provenForkPathField>` is the Codex fork-response wire field proven by the real fork-shape contract; `rolloutPath` is Freshell's durability-store name. Implementation must not read or emit wire `rolloutPath`/`rollout_path` for fork candidates unless the real fork-shape contract proves that exact field.
-- A `thread_fork_response` candidate is valid only when matched by top-level JSON-RPC id to a forwarded `thread/fork` request, uses `result.thread.id`, uses the same response thread's `provenForkPathField`, has a nonempty absolute path, has `ephemeral !== true`, and the child thread id differs from the old durable/resume/request parent id.
+- Terminology: `thread.path` is the Codex fork-response wire field proven by the real fork-shape contract; `rolloutPath` is Freshell's durability-store name. Implementation must not read or emit wire `rolloutPath`/`rollout_path` for fork candidates unless a future real fork-shape contract proves that exact field.
+- A `thread_fork_response` candidate is valid only when matched by top-level JSON-RPC id to a forwarded `thread/fork` request, uses `result.thread.id`, uses the same response thread's `path`, has a nonempty absolute path, has `ephemeral !== true`, and the child thread id differs from the old durable/resume/request parent id.
 - If multiple path-like fields are present, they must agree exactly after normalization; disagreement is an invalid fork candidate. Missing/null/relative path, `ephemeral: true`, same-as-parent id, or alias conflict must not call `markCandidatePersisted()`.
 - A `thread/fork` response with a valid deterministic rollout path is an intentional Codex terminal identity handoff, but it is staged first. Persist the staged fork candidate in transient TerminalRegistry state, make registry event matching accept the staged fork candidate, and release the proxy's fork gate only after that state is installed. Do not call `releaseBinding()`, clear `resumeSessionId`, replace the old durable identity, or broadcast `terminal.session.associated` until rollout proof for the forked thread succeeds.
 - The required fork handoff lifecycle is: `fork_handoff_staged` after a valid candidate is installed; `fork_turn_in_progress_unproven` after a fork-thread `turn/started`; `fork_proof_checking` after fork-thread completion or rollout-path change triggers proof; `fork_durable_committed` only after proof succeeds; and `fork_handoff_failed` for invalid candidate, persistence failure, timeout, queue overflow, proxy loss, or proof failure. These names may be represented as explicit enum values or equivalent structured state, but tests must prove each transition.
@@ -173,14 +181,21 @@ export const MAX_IDENTITY_GATE_HELD_BYTES = MAX_RAW_FORWARD_BYTES
 - Existing focused proxy baseline is green before implementation: `npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts` passed 15 tests during plan revision 5.
 - `server/coding-cli/codex-app-server/remote-proxy.ts` is the OOM-prone path: both `handleClientMessage` and `handleUpstreamMessage` call `parseJson(raw)`, and `parseJson` calls `JSON.parse(raw.toString())`.
 - `server/coding-cli/codex-app-server/protocol.ts` defines `CodexThreadForkParamsSchema.excludeTurns` and `CodexThreadOperationResultSchema.thread`, so compact fork requests and compact operation responses are first-class protocol shapes locally.
-- `server/coding-cli/codex-app-server/protocol.ts` also defines `CodexThreadSchema.path` as optional/nullable with a default of `null`. The exact real `thread/fork` response path field is unproven until the fork-shape contract runs.
+- `server/coding-cli/codex-app-server/protocol.ts` also defines `CodexThreadSchema.path` as optional/nullable with a default of `null`. The opt-in real fork-shape contract now proves current Codex 0.142.5 compact fork responses use `result.thread.path` for the child rollout path after the parent has one completed turn.
 - `server/fresh-agent/adapters/codex/adapter.ts` already sends `excludeTurns: true` for fresh-agent forks.
 - `shared/codex-durability.ts` currently omits `thread_fork_response` from `CodexCandidateSourceSchema`.
 - `server/terminal-registry.ts` currently drops fork-like identity changes: `persistCodexCandidateSerial` returns immediately when `record.resumeSessionId` exists and logs/ignores mismatched candidates when `record.codexDurability.candidate` already exists.
 - `server/terminal-registry.ts` already has some primitives needed for a narrow handoff: `buildCodexDurabilityRef`, `replaceCodexDurabilityStoreRecord`, `unwatchCodexRollout`, `armCodexRolloutWatch`, and the existing rollout proof path that binds only after proof success. It must not use `releaseBinding(..., 'rebind', ...)` until proof success, because `releaseBinding()` clears `resumeSessionId`.
 - `node_modules/ws/lib/websocket-server.js` and `node_modules/ws/lib/websocket.js` show the default `maxPayload` is 100 MiB. `node_modules/ws/lib/receiver.js` shows payload-length enforcement before emission and text messages emitted as `Buffer` objects.
 - A disposable raw WebSocket proxy experiment under `node --max-old-space-size=128` forwarded 64 MiB text JSON frames as buffers without full parse/stringify. The actual implementation must reproduce this through the Task 6 child-process fixture before depending on the cap.
-- `codex --version` reports `codex-cli 0.142.5` in this workspace, and both `~/.codex/auth.json` and `~/.codex/config.toml` exist, so the opt-in real app-server fork-shape contract and real terminal TUI fork contract are expected to run rather than skip during execution.
+- `codex --version` reports `codex-cli 0.142.5` in this workspace, and both `~/.codex/auth.json` and `~/.codex/config.toml` exist. Both opt-in real contracts ran locally:
+  - `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/integration/real/codex-app-server-fork-shape-contract.test.ts --config vitest.server.config.ts` passed after adding one minimal parent turn; the initial no-turn version failed with `no rollout found for thread id ...`.
+  - `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/integration/real/codex-remote-fork-contract.test.ts --config vitest.server.config.ts` passed with a fake app-server response that includes `result.thread.turns: []`; the same contract failed when `turns` was omitted with `thread/fork response decode error: missing field turns`.
+- Pre-implementation red tests are installed and intentionally failing until production code is implemented:
+  - `npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/json-rpc-envelope.test.ts --config vitest.server.config.ts` fails 8 tests on the scanner placeholder.
+  - `npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/json-rpc-side-effects.test.ts --config vitest.server.config.ts` fails 9 tests on request rewrite, fork candidate extraction, and TUI response-normalization placeholders.
+  - `npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts -t "thread/fork|root array|post-fork"` fails because the current proxy forwards `excludeTurns:false`, forwards root batches, does not inject `turns: []`, and does not stage fork candidates.
+  - `npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts --config vitest.server.config.ts -t "fork candidate|fork handoff"` fails because the current registry ignores `thread_fork_response` candidates when `resumeSessionId` is already set.
 
 ## Implementation Tasks
 
@@ -189,15 +204,16 @@ export const MAX_IDENTITY_GATE_HELD_BYTES = MAX_RAW_FORWARD_BYTES
 **Files:**
 - Create: `test/integration/real/codex-app-server-fork-shape-contract.test.ts`
 
-- [ ] **Step 1: Write the opt-in fork-shape contract**
+- [x] **Step 1: Write the opt-in fork-shape contract**
 
-Follow the existing real-provider contract pattern and skip unless `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1`, `codex` is available, and local Codex credentials/config are available. Use an isolated temporary `CODEX_HOME` and clean it in test cleanup. Do not start a model turn; this contract only proves the app-server control-plane wire shape.
+Follow the existing real-provider contract pattern and skip unless `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1`, `codex` is available, and local Codex credentials/config are available. Use an isolated temporary `CODEX_HOME` and clean it in test cleanup. The contract uses exactly one minimal parent turn because the real app-server will not fork an empty thread without a rollout.
 
 The test must:
 
 - connect to a real Codex app-server/runtime with local credentials
 - send `initialize`
 - send `thread/start` with a deterministic cwd and capture the parent `result.thread`
+- send one minimal `turn/start` and wait for parent `turn/completed`
 - send `thread/fork` with `excludeTurns: true`
 - capture the raw fork response and assert:
   - the fork response has top-level JSON-RPC id matching the fork request
@@ -206,11 +222,11 @@ The test must:
   - the durable path field is present, non-null, absolute, and belongs to the same `result.thread`
   - `ephemeral !== true`
   - if more than one path-like field exists (`path`, `rolloutPath`, `rollout_path`), all present path-like fields agree exactly after normalization
-  - `turns` may be absent when `excludeTurns: true`
+  - `turns` may be absent or present when `excludeTurns: true`; this app-server proof does not decide the TUI-facing response shape
 
-Record the proven wire field name in the test description and implementation comments as `provenForkPathField`. The production extractor must use the same field unless this contract is updated with evidence for a different real shape.
+Record the proven wire field name in the test description and implementation comments as `result.thread.path`. The production extractor must use `path` unless this contract is updated with evidence for a different real shape.
 
-- [ ] **Step 2: Run the opt-in fork-shape contract before implementation**
+- [x] **Step 2: Run the opt-in fork-shape contract before implementation**
 
 Run:
 
@@ -218,9 +234,9 @@ Run:
 FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/integration/real/codex-app-server-fork-shape-contract.test.ts --config vitest.server.config.ts
 ```
 
-Expected: PASS in this workspace because `codex` and local auth/config are available. If the real fork response uses an unplanned field, has no deterministic absolute path, marks the fork ephemeral, returns the same id as the parent, or requires `turns`, stop and revise this plan before implementing extraction or handoff logic.
+Expected: PASS in this workspace because `codex` and local auth/config are available. This passed and proved `result.thread.path`. If a future run uses an unplanned field, has no deterministic absolute path, marks the fork ephemeral, or returns the same id as the parent, stop and revise this plan before implementing extraction or handoff logic.
 
-- [ ] **Step 3: Run the default skipped contract path**
+- [x] **Step 3: Run the default skipped contract path**
 
 Run:
 
@@ -230,11 +246,11 @@ npm run test:vitest -- run test/integration/real/codex-app-server-fork-shape-con
 
 Expected: PASS with the test skipped when the opt-in env var is absent.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit pre-implementation evidence**
 
 ```bash
 git add test/integration/real/codex-app-server-fork-shape-contract.test.ts
-git commit -m "test: prove codex fork response shape"
+git commit -m "test: add codex fork oom preimplementation contracts"
 ```
 
 ### Task 1: Add A Tested JSON-RPC Envelope Scanner
@@ -331,7 +347,7 @@ Add tests proving large frames can recover:
 
 - candidate from `thread/start` response with `result.thread.turns` before top-level id
 - candidate from `thread/fork` response with `result.thread.turns` before top-level id
-- candidate from `thread/fork` response using the `provenForkPathField` established in Task 0
+- candidate from `thread/fork` response using `result.thread.path`, established in Task 0
 - candidate from `thread/started` notification with a huge `thread.turns`
 - turn started and completed metadata when the turn body is huge
 - `thread/closed` and `thread/status/changed` lifecycle metadata
@@ -342,6 +358,16 @@ Also add negative tests proving nested decoy fields do not win over the owned pa
 Add fork-candidate negative tests for nested decoy parent ids/paths in `turns`, `path: null`, `ephemeral: true`, same-as-parent child id, conflicting path aliases, root arrays, duplicate owned keys with ambiguous semantics, and top-level response id after a large `result`.
 For every bounded valid side-effect fixture, add a paired differential assertion: parse the same frame through existing Zod schemas and verify the bounded extractor returns the same candidate, turn event, lifecycle event, or repair trigger fields that Freshell owns.
 
+- [ ] **Step 2b: Write failing TUI fork-response normalization tests**
+
+Add tests proving `normalizeThreadForkResponseForTui(raw)`:
+
+- adds `result.thread.turns: []` when upstream omitted it from a compact `thread/fork` response
+- preserves an existing bounded `turns` array
+- preserves unrelated response fields and thread metadata
+- rejects root arrays/batches
+- fails closed on duplicate owned keys if it cannot preserve bounded `JSON.parse` semantics
+
 - [ ] **Step 3: Run tests to verify red**
 
 Run:
@@ -350,7 +376,7 @@ Run:
 npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/json-rpc-side-effects.test.ts --config vitest.server.config.ts
 ```
 
-Expected: FAIL because the module does not exist.
+Expected: FAIL because the helper module currently contains placeholder exports only.
 
 - [ ] **Step 4: Implement the rewriter and extractors**
 
@@ -360,7 +386,8 @@ Use byte-level scanning helpers. Do not introduce a general JSON parser. Keep he
 - top-level `params` object for fork rewrite
 - `result.thread` for `thread/start` responses
 - `params.thread` and selected `params` fields for notifications
-- the `provenForkPathField` from Task 0 for `thread/fork` candidates; do not accept unproven path aliases in production extraction
+- `result.thread.path` from Task 0 for `thread/fork` candidates; do not accept unproven path aliases in production extraction
+- `result.thread.turns` insertion for TUI-facing `thread/fork` responses when upstream omitted it due to `excludeTurns: true`
 
 Return discriminated results such as:
 
@@ -562,7 +589,7 @@ git commit -m "fix: recover codex proxy side effects from large frames"
 
 Add tests proving:
 
-- `CodexRemoteProxy` emits a candidate with `source: 'thread_fork_response'` when a `thread/fork` response contains `result.thread.id`, `result.thread.<provenForkPathField>`, and `result.thread.ephemeral`
+- `CodexRemoteProxy` emits a candidate with `source: 'thread_fork_response'` when a `thread/fork` response contains `result.thread.id`, `result.thread.path`, and `result.thread.ephemeral`
 - a terminal with an existing durable Codex identity accepts a valid `thread_fork_response` candidate as an intentional staged handoff
 - staging the handoff does not release the old session binding, does not clear `resumeSessionId`, does not replace the old durable store record, and does not broadcast `terminal.session.unbound` or `terminal.session.associated`
 - staging the handoff records a transient fork candidate with state `fork_handoff_staged`, arms the new rollout watch, and makes `codexCandidateMatches` accept the forked thread for turn/lifecycle attribution while the old durable identity remains recoverable
@@ -594,7 +621,7 @@ Implement the handoff as a narrow source-specific path:
 - extend `CodexRemoteProxyCandidate['source']` with `thread_fork_response`
 - emit `thread_fork_response` from `remote-proxy.ts` for small and large `thread/fork` responses after matching the pending top-level response id
 - in `persistCodexCandidateSerial`, keep the existing mismatched-candidate ignore path for non-fork sources
-- for `thread_fork_response`, validate the candidate with a fork-specific helper that enforces the `provenForkPathField`, absolute path, `ephemeral !== true`, child id differs from parent/old durable id, and path-alias agreement
+- for `thread_fork_response`, validate the candidate with a fork-specific helper that enforces `result.thread.path`, absolute path, `ephemeral !== true`, child id differs from parent/old durable id, and path-alias agreement
 - add a transient `record.codexForkHandoff` or equivalent structured state that stores the staged fork candidate, the old durable session id, the old durability ref, staged/proof timestamps, and the handoff state
 - do not call `releaseBinding()`, do not clear `resumeSessionId`, and do not replace the old durable store record when staging the fork candidate
 - make `codexCandidateMatches` and fork proof routing accept `record.codexForkHandoff.candidateThreadId` while preserving old durable recovery through `resumeSessionId`
@@ -639,7 +666,7 @@ Create a fixture that:
   - a large non-state response whose top-level id appears after a large `result`
   - an above-cap non-state response
 - accepts a cap argument so ordinary tests can run the exact code path with a small cap override, while the final gate runs at the real `MAX_RAW_FORWARD_BYTES`
-- for the `thread/fork` mode, sends a `thread/fork` request, has upstream assert the rewritten request contains `excludeTurns: true`, then sends a large response with `result.thread.id`, `result.thread.<provenForkPathField>`, `result.thread.ephemeral`, and a huge `result.thread.turns` decoy before the top-level id
+- for the `thread/fork` mode, sends a `thread/fork` request, has upstream assert the rewritten request contains `excludeTurns: true`, then sends a large response with `result.thread.id`, `result.thread.path`, `result.thread.ephemeral`, and a huge nested decoy before the top-level id; the TUI-facing response still receives `result.thread.turns: []`
 - subscribe to `proxy.onCandidate`, assert the `thread_fork_response` candidate, and call `proxy.markCandidatePersisted()` in the child fixture before sending any follow-up `turn/start` traffic; this proves the fork gate can be released without depending on TerminalRegistry in the stress fixture
 - for the non-state modes, sends a request with a method outside `STATEFUL_RESPONSE_METHODS` such as `model/list`, then has upstream send the large or above-cap response with the matching top-level id after the large `result`
 - asserts the TUI receives the same byte length for both below-cap success modes and that the proxy emits `thread_fork_response` for the stateful fork mode
@@ -731,26 +758,21 @@ git commit -m "test: stress codex proxy large response forwarding"
 **Files:**
 - Create: `test/integration/real/codex-remote-fork-contract.test.ts`
 
-- [ ] **Step 1: Write the skipped contract test**
+- [x] **Step 1: Write the skipped contract test**
 
 Follow the existing real-provider pattern in `test/integration/real/codex-app-server-readiness-contract.test.ts`: skip unless `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1` and `codex` is available. Use an isolated temporary `CODEX_HOME`; copy `~/.codex/auth.json` and `~/.codex/config.toml` when available, and skip with a clear reason when required local Codex credentials are unavailable. Clean the temporary root in test cleanup.
 
 The test must:
 
 - start a controlled WebSocket app-server on localhost
-- start `CodexRemoteProxy` with that app-server as `upstreamWsUrl`
-- subscribe to proxy candidates and call `proxy.markCandidatePersisted()` after observing the root `thread_start_response` and the later `thread_fork_response`, mirroring TerminalRegistry's positive persistence acknowledgement so the real TUI contract tests compact fork compatibility rather than hanging on the intentional identity gate
-- launch `codex --remote <proxy.wsUrl> ...CODEX_MANAGED_REMOTE_CONFIG_ARGS --no-alt-screen` through `node-pty`
-- respond to `initialize`, `thread/start`, and common bootstrap requests with minimal valid results; the `thread/start` result must include a deterministic absolute rollout path so the startup candidate can be acknowledged
-- wait until a root thread is started
-- write `/fork\r` to the PTY
-- capture the upstream `thread/fork` request after proxy rewriting
-- assert the upstream request contains `excludeTurns: true`
-- respond with a minimal fork result that omits `turns` but includes a deterministic forked thread id and rollout path under the `provenForkPathField`
+- launch `codex --remote <app-server.wsUrl> ...CODEX_MANAGED_REMOTE_CONFIG_ARGS --no-alt-screen fork <parentThreadId>` through `node-pty`
+- respond to `initialize`, `account/read`, model/skills/plugin/bootstrap requests, `thread/read`, `thread/fork`, `turn/start`, and `thread/turns/list` with minimal valid results
+- capture the TUI's `thread/fork` request and assert it targets the deterministic parent thread id
+- respond with a minimal fork result that includes `turns: []` plus a deterministic forked thread id and rollout path under `path`
 - assert the TUI stays alive long enough to accept a follow-up harmless key or exit command
-- assert the proxy emits `thread_fork_response`; TerminalRegistry durability handoff remains covered by the focused tests in Task 5
+- keep this as a direct TUI compatibility contract. Freshell proxy rewrite, `thread_fork_response` emission, and TerminalRegistry durability handoff remain covered by the focused red tests in Tasks 4 and 5.
 
-- [ ] **Step 2: Run the contract opt-in**
+- [x] **Step 2: Run the contract opt-in**
 
 Run:
 
@@ -758,9 +780,9 @@ Run:
 FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/integration/real/codex-remote-fork-contract.test.ts --config vitest.server.config.ts
 ```
 
-Expected: PASS in this workspace because `codex` and local auth/config are available. A protocol failure is a blocker and means the production approach must be revised before continuing. If a future execution environment lacks `codex` or credentials, stop and report `USER_DECISION_REQUIRED` for the missing real-provider proof instead of treating the opt-in contract as optional completion evidence.
+Expected: PASS in this workspace because `codex` and local auth/config are available. This passed with `result.thread.turns: []`; the same contract failed when the compact fork response omitted `turns` with `thread/fork response decode error: missing field turns`. A future protocol failure is a blocker and means the production approach must be revised before continuing. If a future execution environment lacks `codex` or credentials, stop and report `USER_DECISION_REQUIRED` for the missing real-provider proof instead of treating the opt-in contract as optional completion evidence.
 
-- [ ] **Step 3: Run the default skipped contract path**
+- [x] **Step 3: Run the default skipped contract path**
 
 Run:
 
@@ -770,11 +792,11 @@ npm run test:vitest -- run test/integration/real/codex-remote-fork-contract.test
 
 Expected: PASS with the test skipped when the opt-in env var is absent.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit pre-implementation evidence**
 
 ```bash
 git add test/integration/real/codex-remote-fork-contract.test.ts
-git commit -m "test: add codex remote fork contract"
+git commit -m "test: add codex fork oom preimplementation contracts"
 ```
 
 ### Task 8: Final Verification

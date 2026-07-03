@@ -510,4 +510,123 @@ describe('CodexRemoteProxy', () => {
     await delay(25)
     expect(interruptRequests).toHaveLength(1)
   })
+
+  it('forces terminal thread/fork requests to exclude turns before forwarding upstream', async () => {
+    const upstream = await startUpstream()
+    const proxy = await startProxy(upstream.wsUrl, {
+      requireCandidatePersistence: false,
+    })
+    const tui = await connect(proxy.wsUrl)
+
+    tui.send(JSON.stringify({
+      id: 21,
+      method: 'thread/fork',
+      params: {
+        threadId: 'thread-parent',
+        cwd: '/repo',
+        excludeTurns: false,
+        nested: { excludeTurns: false },
+      },
+    }))
+
+    await vi.waitFor(() => expect(upstream.messages).toHaveLength(1))
+    expect(upstream.messages[0]).toEqual({
+      id: 21,
+      method: 'thread/fork',
+      params: {
+        threadId: 'thread-parent',
+        cwd: '/repo',
+        excludeTurns: true,
+        nested: { excludeTurns: false },
+      },
+    })
+  })
+
+  it('treats root array batches as unsafe instead of forwarding possible fork traffic', async () => {
+    const upstream = await startUpstream()
+    const proxy = await startProxy(upstream.wsUrl, {
+      requireCandidatePersistence: false,
+    })
+    const tui = await connect(proxy.wsUrl)
+
+    tui.send(JSON.stringify([
+      { id: 31, method: 'thread/fork', params: { threadId: 'thread-parent' } },
+    ]))
+
+    await delay(50)
+    expect(upstream.messages).toEqual([])
+  })
+
+  it('stages fork response candidates and holds post-fork stateful traffic until persistence is acknowledged', async () => {
+    const upstream = await startUpstream((socket, message) => {
+      if (message.method === 'thread/fork') {
+        socket.send(JSON.stringify({
+          id: message.id,
+          result: {
+            thread: {
+              id: 'thread-child',
+              path: '/tmp/codex/fork-child-rollout.jsonl',
+              ephemeral: false,
+            },
+          },
+        }))
+      }
+    })
+    const proxy = await startProxy(upstream.wsUrl, {
+      requireCandidatePersistence: false,
+    })
+    const candidates: unknown[] = []
+    proxy.onCandidate((candidate) => candidates.push(candidate))
+    const tui = await connect(proxy.wsUrl)
+    const forkResponse = nextMessageFrame(tui)
+
+    tui.send(JSON.stringify({
+      id: 41,
+      method: 'thread/fork',
+      params: { threadId: 'thread-parent', excludeTurns: false },
+    }))
+
+    await expect(forkResponse).resolves.toMatchObject({
+      isBinary: false,
+      message: {
+        id: 41,
+        result: {
+          thread: {
+            id: 'thread-child',
+            path: '/tmp/codex/fork-child-rollout.jsonl',
+            turns: [],
+          },
+        },
+      },
+    })
+    expect(candidates).toEqual([
+      {
+        source: 'thread_fork_response',
+        thread: {
+          id: 'thread-child',
+          path: '/tmp/codex/fork-child-rollout.jsonl',
+          ephemeral: false,
+        },
+      },
+    ])
+
+    tui.send(JSON.stringify({
+      id: 42,
+      method: 'turn/start',
+      params: {
+        threadId: 'thread-child',
+        input: [{ type: 'text', text: 'held until staged' }],
+      },
+    }))
+
+    await delay(50)
+    expect(upstream.messages).toHaveLength(1)
+    proxy.markCandidatePersisted()
+    await vi.waitFor(() => expect(upstream.messages).toHaveLength(2))
+    expect(upstream.messages[1]).toMatchObject({
+      id: 42,
+      method: 'turn/start',
+      params: { threadId: 'thread-child' },
+    })
+  })
 })
