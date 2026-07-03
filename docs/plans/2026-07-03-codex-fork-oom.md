@@ -30,7 +30,7 @@ Plan revision evidence changed the implementation direction:
 Use this policy instead:
 
 - Never full-parse a frame solely to route or attribute it. Use a byte-level top-level JSON-RPC scanner for `id` and `method`.
-- Do not reject all large client frames. Large valid `initialize`, `thread/start`, `thread/resume`, `turn/start`, or other requests should raw-forward unless the proxy must transform them.
+- Do not reject all large client frames. Large valid `initialize`, `thread/start`, `thread/resume`, `turn/start`, or other requests below `MAX_RAW_FORWARD_BYTES` should raw-forward unless the proxy must transform them. Frames above the cap fail closed in either direction because the cap is the server memory-safety boundary, not an upstream-only policy.
 - Always transform terminal `thread/fork` requests to include `params.excludeTurns: true`. Implement this as a byte-level JSON object rewrite, not as `JSON.parse` plus `JSON.stringify`, so a large but valid fork request does not require materializing params as JS objects.
 - If a `thread/fork` request is malformed enough that the rewriter cannot safely force `excludeTurns: true`, return a JSON-RPC error and do not forward it. Forwarding an un-compacted fork request reintroduces the crash class.
 - Hold `turn/start` before candidate persistence using only the scanned top-level method and id. Do not require parsing `turn/start.params`.
@@ -48,7 +48,7 @@ Use this policy instead:
 - Treat `thread/fork` response candidates as intentional thread handoffs. Preserve the existing startup-race protection for ordinary mismatched `thread_start_response` and `thread_started_notification` candidates, but let a valid `thread_fork_response` replace the terminal's Codex durability candidate, release the old session binding, and require the normal rollout proof before the forked thread becomes durable.
 - A fork handoff must also be a user-input gate, not only a registry state update. The proxy emits a fork candidate while handling the upstream fork response, but TerminalRegistry persists that candidate asynchronously. Without a second gate, the TUI can receive the fork response, immediately send `turn/start` for the new thread, and have the turn events ignored because Freshell is still bound to the parent identity. Generalize the existing candidate-persistence gate so `thread/fork` responses start a source-aware `fork_handoff` gate; subsequent `turn/start` requests are held until TerminalRegistry positively acknowledges the fork candidate through `markCandidatePersisted()`, or the proxy fails closed. This fork gate applies even when `requireCandidatePersistence: false`, because resumed Codex terminals skip startup capture but still need safe `/fork` identity handoff.
 - Do not continue a terminal after an invalid `thread_fork_response` candidate. Preserving the old durable identity after the TUI has moved to a forked thread would silently bind future activity to the wrong Codex session. If the fork response cannot yield a deterministic absolute rollout path, keep the old store record intact but fail the proxy connection before accepting post-fork user input, with structured `proxy_error` repair signaling rather than marking the old identity non-restorable.
-- Raw-forward oversized non-state upstream frames only up to a raw-forward limit that is proven at the limit boundary by a constrained-heap child-process stress test using the actual proxy. Treat that limit as an operational memory-safety cap, not as proof that larger frames are invalid. Frames above it fail closed to preserve the Freshell server.
+- Raw-forward oversized non-state frames only up to a raw-forward limit that is proven at the limit boundary by a constrained-heap child-process stress test using the actual proxy. Treat that limit as an operational memory-safety cap, not as proof that larger frames are invalid. Frames above it fail closed in both client-to-upstream and upstream-to-client directions to preserve the Freshell server.
 - The opt-in real terminal TUI `/fork` contract is required before completion in any environment with `codex` and local Codex credentials. Plan revision 5 confirmed this workspace has `codex` 0.142.5 plus `~/.codex/auth.json` and `~/.codex/config.toml`, so the executor must run the opt-in contract here. If the installed Codex TUI cannot continue after receiving a compact fork response without `thread.turns`, stop and revise the production approach.
 
 No user decision is required for this revision. The remaining proofs are local automated tests and the opt-in real Codex contract.
@@ -80,7 +80,7 @@ No user decision is required for this revision. The remaining proofs are local a
   - Force `thread/fork.params.excludeTurns = true` through the byte-level rewriter.
   - Emit candidate side effects from `thread/fork` responses with source `thread_fork_response`.
   - Use bounded side-effect extractors before fail-closing large stateful upstream frames.
-  - Raw-forward non-state upstream frames under the tested raw-forward limit.
+  - Raw-forward non-state frames under the tested raw-forward limit and fail closed above the cap in both directions.
 
 - Modify: `shared/codex-durability.ts`
   - Add `thread_fork_response` as a valid Codex candidate source.
@@ -112,7 +112,7 @@ No user decision is required for this revision. The remaining proofs are local a
 - Terminal `thread/fork` requests sent upstream must preserve original JSON-RPC fields and params except `params.excludeTurns` is always `true`.
 - If the TUI sends `excludeTurns: false` or `excludeTurns: null`, upstream receives `excludeTurns: true`.
 - If the TUI omits `params`, upstream receives a params object containing `excludeTurns: true`.
-- A large valid non-fork client request is not rejected merely because of size.
+- A large valid non-fork client request below `MAX_RAW_FORWARD_BYTES` is not rejected merely because of size.
 - Held `turn/start` frames preserve their original raw bytes and original text/binary framing until candidate persistence releases them.
 - Duplicate `turn/interrupt` acks remain best-effort. They are synthesized only when the proxy can safely identify `threadId` and `turnId`; otherwise the request forwards to upstream.
 - The proxy must never run full `JSON.parse` or full-frame `raw.toString()` on large frames.
@@ -126,7 +126,7 @@ No user decision is required for this revision. The remaining proofs are local a
 - A `thread_fork_response` candidate without a deterministic absolute rollout path must not keep the terminal running under the old durable identity. The registry keeps the old store record untouched, but the proxy times out or fails the fork handoff gate and emits `proxy_error`/socket closure before user input is accepted on the untracked fork.
 - A mismatched candidate from `thread_start_response` or `thread_started_notification` after an initial candidate is already persisted remains ignored; fork handoff must not weaken the startup-race protection.
 - `fs/changed` extraction may collapse an oversized `changedPaths` array to `[]` only after extracting the watch id. This is conservative because terminal registry treats an empty changed path list as a durability proof request rather than as "no change."
-- Raw forwarding for non-state upstream frames is allowed only under `MAX_RAW_FORWARD_BYTES` after the constrained-heap stress test passes against the actual proxy implementation.
+- Raw forwarding for non-state frames is allowed only under `MAX_RAW_FORWARD_BYTES` after the constrained-heap stress test passes against the actual proxy implementation; above-cap frames fail closed regardless of direction.
 - Logs remain structured and must not include full request or response bodies.
 
 ## Constants
@@ -139,7 +139,7 @@ export const MAX_RAW_FORWARD_BYTES = 64 * 1024 * 1024
 export const MAX_SCANNED_TOKEN_BYTES = 8 * 1024
 ```
 
-`MAX_FULL_PARSE_BYTES` is only a threshold for choosing between existing Zod-backed full parsing and bounded extraction. It is not a validity limit and must not cause large valid client requests to be rejected. `MAX_RAW_FORWARD_BYTES` is an operational server memory-safety cap for frames Freshell does not own; keep 64 MiB only if the constrained-heap actual-proxy fixture in Task 6 passes at `MAX_RAW_FORWARD_BYTES - 1024`, otherwise lower the constant to the highest passing boundary and update the above-cap test to match. `MAX_SCANNED_TOKEN_BYTES` limits individual key/string token accumulation in scanners and rewriters, not whole-frame size.
+`MAX_FULL_PARSE_BYTES` is only a threshold for choosing between existing Zod-backed full parsing and bounded extraction. It is not a validity limit and must not cause otherwise valid client requests below `MAX_RAW_FORWARD_BYTES` to be rejected. `MAX_RAW_FORWARD_BYTES` is an operational server memory-safety cap for frames Freshell does not own in either direction; keep 64 MiB only if the constrained-heap actual-proxy fixture in Task 6 passes at `MAX_RAW_FORWARD_BYTES - 1024`, otherwise lower the constant to the highest passing boundary and update the above-cap tests to match. `MAX_SCANNED_TOKEN_BYTES` limits individual key/string token accumulation in scanners and rewriters, not whole-frame size.
 
 ## Proven Inputs For This Plan
 
@@ -312,7 +312,8 @@ Add tests proving:
 
 - text and binary upstream frames are forwarded with their original `isBinary` flag
 - held `turn/start` text frames preserve text framing after release
-- large valid non-fork client requests raw-forward rather than receiving a size error
+- large valid non-fork client requests below `MAX_RAW_FORWARD_BYTES` raw-forward rather than receiving a size error
+- above-cap client requests fail closed with `proxy_error` instead of reaching upstream
 - large `turn/start` requests are held and then raw-forwarded after `markCandidatePersisted()`
 - held `turn/start` requests identify whether they are waiting on `initial_capture` or `fork_handoff`, and both gate reasons release through the same `markCandidatePersisted()` acknowledgement path
 - large `thread/fork` requests are rewritten to include `excludeTurns: true`
@@ -325,7 +326,7 @@ Add tests proving:
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts --testNamePattern "frame|large valid|thread/fork|turn/start|turn/interrupt"
+npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts --testNamePattern "frame|large valid|above-cap|thread/fork|turn/start|turn/interrupt"
 ```
 
 Expected: FAIL because the current proxy full-parses and stringifies every frame.
@@ -342,7 +343,8 @@ In `remote-proxy.ts`:
 - hold `turn/start` by scanned method/id without parsing params whenever an identity gate is active
 - call `rewriteThreadForkExcludeTurns(raw, isBinary)` for `thread/fork`; forward the rewritten frame on success and send a JSON-RPC error on failure
 - keep small-frame duplicate interrupt ack behavior through existing Zod parsing under `MAX_FULL_PARSE_BYTES`
-- forward large non-fork requests raw
+- forward large non-fork requests raw when they are below `MAX_RAW_FORWARD_BYTES`
+- fail closed above-cap client frames with structured logging and `proxy_error`
 
 - [ ] **Step 4: Run focused tests to verify green**
 
@@ -383,14 +385,14 @@ Add tests proving:
 - large `thread/closed` and `thread/status/changed` notifications recover lifecycle/lifecycle-loss side effects before forwarding
 - unrecoverable large stateful upstream frames close both sockets and emit candidate-capture failure or `proxy_error`, depending on lifecycle state
 - small stateful frames still use the current Zod-backed behavior
-- frames above `MAX_RAW_FORWARD_BYTES` fail closed even when non-state
+- frames above `MAX_RAW_FORWARD_BYTES` fail closed even when non-state, for both client and upstream frames
 
 - [ ] **Step 2: Run tests to verify red**
 
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts --testNamePattern "large thread/fork|large thread/start|large thread/started|large turn|large fs|large thread/status|raw forward cap|unrecoverable"
+npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts --testNamePattern "large thread/fork|large thread/start|large thread/started|large turn|large fs|large thread/status|raw forward cap|above-cap|unrecoverable"
 ```
 
 Expected: FAIL because the current proxy has no bounded upstream side-effect recovery.
@@ -403,7 +405,7 @@ In `handleUpstreamMessage`:
 - scan top-level id and method
 - if scanned id matches a pending method, capture and delete that pending method
 - if frame bytes exceed `MAX_RAW_FORWARD_BYTES`, fail closed before forwarding
-- ensure the proxy-side `WebSocketServer` and upstream `WebSocket` client set `maxPayload: MAX_RAW_FORWARD_BYTES` so `ws` rejects above-cap messages before application handlers receive them where possible
+- ensure the proxy-side `WebSocketServer` and upstream `WebSocket` client set `maxPayload: MAX_RAW_FORWARD_BYTES` so `ws` rejects above-cap messages before application handlers receive them where possible, and normalize both paths to the same `proxy_error` repair signal
 - if frame bytes are under `MAX_FULL_PARSE_BYTES`, keep existing full-parse/Zod behavior
 - if frame is large and stateful, call the matching bounded extractor and emit the same side effects as the existing parsed path
 - when a `thread/fork` response yields a candidate, begin a `fork_handoff` identity gate before forwarding the response to the TUI; release the gate only when TerminalRegistry calls `markCandidatePersisted()`
@@ -429,7 +431,7 @@ Implement fail-closed behavior:
 
 - candidate-bearing `thread/start` or `thread/fork` frame before required identity capture can complete: `failCandidateCapture('Freshell could not safely capture Codex restore identity from an oversized app-server frame.')`
 - fork handoff timeout after the original identity was already durable: structured warning, `emitRepairTrigger({ kind: 'proxy_error', error })`, fail any held `turn/start` request with a JSON-RPC error explaining the fork identity was not persisted, and close client and upstream; do not emit `candidate_capture_timeout`
-- all other unrecoverable stateful or above-cap frames: structured warning, `emitRepairTrigger({ kind: 'proxy_error', error })`, close client and upstream
+- all other unrecoverable stateful or above-cap frames in either direction: structured warning, `emitRepairTrigger({ kind: 'proxy_error', error })`, close client and upstream
 
 - [ ] **Step 4: Run focused tests to verify green**
 
@@ -703,13 +705,13 @@ git commit -m "chore: finalize codex fork oom fix"
 ## Completion Criteria
 
 - Terminal `thread/fork` upstream requests always include `excludeTurns: true`.
-- Large valid non-fork client requests are not rejected solely because they are large.
+- Large valid non-fork client requests below `MAX_RAW_FORWARD_BYTES` are not rejected solely because they are large.
 - Large fork requests are compacted without full-frame JSON parsing.
 - Large fork responses under the proven raw-forward cap reach the TUI without full proxy-side JSON parsing or full-frame `toString()`.
 - Terminal fork responses update Freshell's Codex durable identity to the forked thread candidate without marking it durable before rollout proof.
 - Immediate post-fork `turn/start` requests are held until the forked identity is persisted, including for resumed terminals whose startup identity capture was disabled with `requireCandidatePersistence: false`.
 - Invalid fork candidates do not unbind the old durable identity and do not allow the terminal to continue accepting untracked post-fork input.
-- Upstream frames above `MAX_RAW_FORWARD_BYTES` fail closed instead of risking server OOM.
+- Frames above `MAX_RAW_FORWARD_BYTES` fail closed instead of risking server OOM.
 - The proxy preserves text/binary WebSocket frame semantics.
 - Pending method attribution is based only on top-level JSON-RPC ids, including ids after large results.
 - Large state-bearing frames either produce the same Freshell-owned side effects as small frames or fail closed with recovery; none are silently ignored.
