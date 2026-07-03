@@ -4,7 +4,7 @@
 
 **Goal:** Make terminal Codex `/fork` memory-safe in Freshell without breaking the Codex TUI protocol or losing essential proxy lifecycle behavior.
 
-**Architecture:** Keep the behavior in the terminal Codex remote proxy, but split the risky work into a tested JSON-RPC envelope scanner and bounded message parsing. The proxy will force `thread/fork.params.excludeTurns = true`, reject unrewritable oversized fork requests, raw-forward oversized upstream frames, and emit repair/lifecycle signals instead of silently dropping essential local side effects.
+**Architecture:** Keep the behavior in the terminal Codex remote proxy, but split the risky work into a tested JSON-RPC envelope scanner and bounded message parsing. The proxy will force `thread/fork.params.excludeTurns = true`, reject unrewritable oversized fork requests, raw-forward oversized upstream frames, and emit repair/lifecycle signals instead of silently dropping essential local side effects. The real TUI contract exercises the same terminal route Freshell launches in production: Codex TUI -> `CodexRemoteProxy` -> controlled app-server.
 
 **Tech Stack:** Node.js 22, TypeScript/ESM, `ws`, Zod schemas in `server/coding-cli/codex-app-server/protocol.ts`, Vitest through `npm run test:vitest`, opt-in real Codex contracts gated by `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1`.
 
@@ -25,8 +25,8 @@ The revised design avoids the unproven parts of the earlier plan:
 
 - Build a dedicated byte-level JSON-RPC envelope scanner in a small module with heavy tests before using it in the proxy. It extracts only top-level `id` and `method`, ignores nested `id` fields, handles escaped strings, and does not materialize nested JSON values.
 - Keep full `JSON.parse` only below explicit caps. Oversized messages are forwarded raw with the original text/binary flag.
-- Do not silently skip essential side effects on oversized upstream messages. Oversized `thread/fork` responses have no Freshell-owned side effect and may be raw-forwarded. Oversized side-effect methods (`thread/start`, `thread/started`, `turn/started`, `turn/completed`, `fs/changed`, `thread/closed`, `thread/status/changed`) must either be parsed under the cap or trigger the existing repair/lifecycle path via `proxy_error` while still forwarding the frame to the TUI.
-- Prove terminal TUI `/fork` compatibility before relying on it. Add an opt-in real Codex contract that launches the installed Codex TUI against a controlled app-server/proxy, sends `/fork`, captures the real request, verifies it is small enough for the cap, verifies the upstream request receives `excludeTurns: true`, and verifies the TUI remains connected after a minimal fork response. If that contract cannot run in the executor environment, keep the unit-level memory-safety fix but report the unavailable real-provider proof explicitly before PR creation.
+- Do not silently skip essential side effects on oversized upstream messages. Oversized `thread/fork` responses have no Freshell-owned side effect and may be raw-forwarded. Oversized side-effect response methods (`thread/start`) and oversized side-effect notification methods (`thread/started`, `turn/started`, `turn/completed`, `fs/changed`, `thread/closed`, `thread/status/changed`) must either be parsed under the cap or trigger the existing repair/lifecycle path via `proxy_error` while still forwarding the frame to the TUI.
+- Prove terminal TUI `/fork` compatibility before relying on it. Add an opt-in real Codex contract that launches the installed Codex TUI against a `CodexRemoteProxy` connected to a controlled app-server, sends `/fork`, captures the upstream request after proxy rewriting, verifies it is small enough for the cap, verifies the upstream request receives `excludeTurns: true`, and verifies the TUI remains connected after a minimal fork response. Do not add a production test hook only to observe the pre-rewrite TUI frame; unit tests cover false-to-true rewriting, while the real contract should prove the actual launched route remains usable. If that contract cannot run in the executor environment, keep the unit-level memory-safety fix but report the unavailable real-provider proof explicitly before PR creation.
 
 No user decision is required now. The next proofs are implementable locally with the installed `codex` binary and repo test harnesses; if they fail, execution should stop with the failing evidence.
 
@@ -54,7 +54,7 @@ No user decision is required now. The next proofs are implementable locally with
 - Create: `test/integration/real/codex-remote-fork-contract.test.ts`
   - Opt-in real-provider contract for terminal TUI `/fork`.
   - Skips unless `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1` and `codex` is on `PATH`.
-  - Uses an isolated `CODEX_HOME`, a controlled WebSocket app-server, and `node-pty` to drive the TUI.
+  - Uses an isolated `CODEX_HOME`, `CodexRemoteProxy`, a controlled WebSocket app-server, and `node-pty` to drive the TUI.
 
 - Do not modify: `server/fresh-agent/adapters/codex/adapter.ts`
   - Fresh-agent Codex already uses `excludeTurns: true`; this remains supporting evidence only.
@@ -80,12 +80,15 @@ No user decision is required now. The next proofs are implementable locally with
 
 ## Constants
 
-Use named constants in `remote-proxy.ts`:
+Use exported named constants in `remote-proxy.ts` so the real contract can assert against the same request-size cap the proxy enforces:
 
 ```ts
-const MAX_CLIENT_PARSE_BYTES = 8 * 1024 * 1024
-const MAX_UPSTREAM_SIDE_EFFECT_PARSE_BYTES = 8 * 1024 * 1024
-const SIDE_EFFECT_METHODS = new Set([
+export const MAX_CLIENT_PARSE_BYTES = 8 * 1024 * 1024
+export const MAX_UPSTREAM_SIDE_EFFECT_PARSE_BYTES = 8 * 1024 * 1024
+const SIDE_EFFECT_RESPONSE_METHODS = new Set([
+  'thread/start',
+])
+const SIDE_EFFECT_NOTIFICATION_METHODS = new Set([
   'thread/started',
   'turn/started',
   'turn/completed',
@@ -487,6 +490,7 @@ Use `vi.spyOn(JSON, 'parse')`, send a `thread/fork` request, then have upstream 
 
 Add tests for:
 
+- oversized `thread/start` response is forwarded and emits `proxy_error` because it may carry the restore-identity candidate
 - oversized `thread/started` notification is forwarded and emits `proxy_error`
 - oversized `turn/completed` notification is forwarded and emits `proxy_error`
 - normal small `thread/started`, `turn/started`, `turn/completed`, `fs/changed`, `thread/closed`, and `thread/status/changed` still emit the current handlers
@@ -507,7 +511,8 @@ In `handleUpstreamMessage`, after scanning:
 
 - clear `pendingMethods` when a scanned top-level id matches
 - if a response is oversized and the matched pending method is `thread/fork`, raw-forward and return
-- if a notification or response method is side-effect-bearing and oversized, raw-forward, emit `proxy_error`, and return
+- if an oversized response matches `SIDE_EFFECT_RESPONSE_METHODS`, raw-forward, emit `proxy_error`, and return
+- if an oversized notification method matches `SIDE_EFFECT_NOTIFICATION_METHODS`, raw-forward, emit `proxy_error`, and return
 - otherwise raw-forward oversized frames without parsing
 
 Small frames keep using the existing Zod-backed side-effect handlers.
@@ -536,18 +541,19 @@ git commit -m "test: cover codex fork response memory safety"
 
 - [ ] **Step 1: Write the skipped contract test**
 
-Follow the existing real-provider pattern in `test/integration/real/codex-app-server-readiness-contract.test.ts`: skip unless `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1` and `codex` is available.
+Follow the existing real-provider pattern in `test/integration/real/codex-app-server-readiness-contract.test.ts`: skip unless `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1` and `codex` is available. Import `CodexRemoteProxy`, `MAX_CLIENT_PARSE_BYTES`, and `CODEX_MANAGED_REMOTE_CONFIG_ARGS` so the contract uses the same proxy and launch flags as terminal Codex.
 
 The test should:
 
 - start a controlled WebSocket app-server on localhost
-- launch `codex --remote <ws> --no-alt-screen` through `node-pty`
+- start `CodexRemoteProxy` with the controlled app-server as `upstreamWsUrl`
+- launch `codex --remote <proxy.wsUrl> ...CODEX_MANAGED_REMOTE_CONFIG_ARGS --no-alt-screen` through `node-pty`
 - respond to `initialize`, `thread/start`, and common bootstrap methods with minimal valid results
 - wait until a root thread is started
 - write `/fork\r` to the PTY
-- capture the real `thread/fork` request before proxy rewriting
-- assert the request body is below `MAX_CLIENT_PARSE_BYTES`
-- assert the proxy forwards `excludeTurns: true`
+- capture the `thread/fork` request received by the controlled upstream after proxy rewriting
+- assert the upstream request body byte length is below `MAX_CLIENT_PARSE_BYTES`
+- assert the upstream request includes `excludeTurns: true`
 - respond with a minimal fork result without `turns`
 - assert the TUI stays alive long enough to accept a follow-up harmless key or exit command
 
