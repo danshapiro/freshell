@@ -822,7 +822,7 @@ Expected: PASS under the default JSDOM/client Vitest config.
 
 - [ ] **Step 2: Run the focused server/integration regression pack**
 
-Run: `npm run test:vitest -- --config vitest.server.config.ts test/unit/server/session-metadata-store.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/integration/server/session-metadata-api.test.ts`
+Run: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/session-metadata-store.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/integration/server/session-metadata-api.test.ts`
 
 Expected: PASS under the server/node Vitest config.
 
@@ -848,7 +848,7 @@ Expected: the diff covers the full branch and only includes the planned server, 
 
 ```bash
 npm run test:vitest -- test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/store/selectors/sidebarSelectors.visibility.test.ts test/e2e/open-tab-session-sidebar-visibility.test.tsx
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/session-metadata-store.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/integration/server/session-metadata-api.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/session-metadata-store.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/integration/server/session-metadata-api.test.ts
 FRESHELL_TEST_SUMMARY="session sidebar title hardening" npm test
 git add server/session-metadata-store.ts server/coding-cli/session-indexer.ts src/store/selectors/sidebarSelectors.ts test/unit/server/session-metadata-store.test.ts test/integration/server/session-metadata-api.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/store/selectors/sidebarSelectors.visibility.test.ts test/e2e/open-tab-session-sidebar-visibility.test.tsx
 git commit -m "fix: harden session sidebar title recovery"

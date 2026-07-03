@@ -226,7 +226,7 @@ git commit -m "perf(markdown): lazy-load markdown renderer for editor preview an
 ### Task 3: Set and Test a Realistic Vite Chunk Warning Limit
 
 **Files:**
-- Modify: `vite.config.ts`
+- Modify: `config/vite/vite.config.ts`
 - Modify: `test/unit/vite-config.test.ts`
 
 **Step 1: Write failing config test**
@@ -248,7 +248,7 @@ Expected: FAIL (property not set yet).
 
 **Step 3: Implement config change**
 
-Set chunk warning limit in `vite.config.ts`:
+Set chunk warning limit in `config/vite/vite.config.ts`:
 
 ```ts
 build: {
@@ -270,7 +270,7 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add vite.config.ts test/unit/vite-config.test.ts
+git add config/vite/vite.config.ts test/unit/vite-config.test.ts
 git commit -m "build(vite): set explicit chunk warning limit aligned to current app baseline"
 ```
 

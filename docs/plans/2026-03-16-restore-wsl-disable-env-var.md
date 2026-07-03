@@ -133,7 +133,7 @@ describe('FRESHELL_DISABLE_WSL_PORT_FORWARD', () => {
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/wsl-port-forward.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/wsl-port-forward.test.ts
 ```
 
 Expected: FAIL because `WslPortForwardingPlan` and `WslPortForwardingTeardownPlan` do not have a `disabled` status, and the env var check does not exist.
@@ -201,7 +201,7 @@ Apply the same pattern to `computeWslPortForwardingPlanAsync`, `computeWslPortFo
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/wsl-port-forward.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/wsl-port-forward.test.ts
 ```
 
 Expected: PASS
@@ -235,7 +235,7 @@ Note: the mock for `isPortReachable` must be imported and `vi.mocked` at the tes
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/network-manager.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/network-manager.test.ts
 ```
 
 Expected: FAIL because `NetworkManager.getStatus()` checks `wslPlan.status === 'ready'` and does not handle `disabled`.
@@ -269,7 +269,7 @@ No change needed in the runtime code since the equality check is sufficient, but
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/network-manager.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/network-manager.test.ts
 ```
 
 Expected: PASS
@@ -326,7 +326,7 @@ it('returns no-op when WSL port forwarding teardown is disabled by env var', asy
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/integration/server/network-api.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/integration/server/network-api.test.ts
 ```
 
 Expected: FAIL because `resolveRepairAction` and `resolveRemoteAccessDisableAction` in `network-router.ts` do not handle `disabled` as a plan status — the code only checks for `error`, `noop`, and `not-wsl2`.
@@ -394,7 +394,7 @@ Same reasoning — `disabled` is not `ready`.
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/integration/server/network-api.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/integration/server/network-api.test.ts
 ```
 
 Expected: PASS
@@ -409,7 +409,7 @@ Expected: PASS
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/integration/server/wsl-port-forward.test.ts test/integration/server/logger.separation.harness.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/integration/server/wsl-port-forward.test.ts test/integration/server/logger.separation.harness.test.ts
 ```
 
 Expected: PASS. Specifically:
@@ -422,7 +422,7 @@ Expected: PASS. Specifically:
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/wsl-port-forward.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/wsl-port-forward.test.ts
 ```
 
 Expected: PASS
@@ -432,7 +432,7 @@ Expected: PASS
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/network-manager.test.ts test/integration/server/network-api.test.ts test/unit/server/network-access.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/network-manager.test.ts test/integration/server/network-api.test.ts test/unit/server/network-access.test.ts
 ```
 
 Expected: PASS

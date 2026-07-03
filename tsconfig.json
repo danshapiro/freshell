@@ -36,6 +36,6 @@
   "include": [
     "src",
     "shared",
-    "vite.config.ts"
+    "config/vite/vite.config.ts"
   ]
 }

@@ -288,7 +288,7 @@ describe('convertWslDrivePathToWindowsPath', () => {
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/launch-cwd.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/launch-cwd.test.ts
 ```
 
 Expected: FAIL with an import error because `server/launch-cwd.ts` does not exist.
@@ -448,7 +448,7 @@ export function resolveLaunchCwd(
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/launch-cwd.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/launch-cwd.test.ts
 ```
 
 Expected: PASS.
@@ -542,7 +542,7 @@ In the same file, add this test inside `describe('buildSpawnSpec MCP injection',
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/terminal-registry.test.ts -t "buildSpawnSpec WSL paths|buildSpawnSpec MCP injection"
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/terminal-registry.test.ts -t "buildSpawnSpec WSL paths|buildSpawnSpec MCP injection"
 ```
 
 Expected: PASS before the refactor. These tests lock behavior before moving conversion code into the shared resolver.
@@ -643,7 +643,7 @@ Expected: no output. If output remains, remove only the unused local declaration
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/terminal-registry.test.ts -t "buildSpawnSpec WSL paths|buildSpawnSpec MCP injection"
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/terminal-registry.test.ts -t "buildSpawnSpec WSL paths|buildSpawnSpec MCP injection"
 ```
 
 Expected: PASS.
@@ -789,7 +789,7 @@ In the same file, add these tests after `it('rejects with a launch error instead
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/codex-app-server/runtime.test.ts -t "Windows drive cwd|missing converted sidecar cwd"
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/codex-app-server/runtime.test.ts -t "Windows drive cwd|missing converted sidecar cwd"
 ```
 
 Expected:
@@ -912,7 +912,7 @@ with:
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/codex-app-server/runtime.test.ts -t "Windows drive cwd|missing converted sidecar cwd|command is missing"
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/codex-app-server/runtime.test.ts -t "Windows drive cwd|missing converted sidecar cwd|command is missing"
 ```
 
 Expected: PASS. The existing missing-command test must still pass, proving cwd validation did not mask binary-not-found errors.
@@ -938,7 +938,7 @@ Expected: commit succeeds with only Codex runtime files staged.
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/launch-cwd.test.ts test/unit/server/terminal-registry.test.ts test/unit/server/coding-cli/codex-app-server/runtime.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/launch-cwd.test.ts test/unit/server/terminal-registry.test.ts test/unit/server/coding-cli/codex-app-server/runtime.test.ts
 ```
 
 Expected: PASS.

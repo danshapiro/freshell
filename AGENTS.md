@@ -104,7 +104,7 @@ npm run test:vitest -- ...  # Repo-owned direct Vitest path for focused passthro
 External provider contract tests (`test/integration/real/`) spawn real `claude`, `codex`, and `opencode` binaries to verify external provider behavior, not Freshell code. They are opt-in and skipped by default to avoid blocking the coordinated suite on environment-dependent flakiness:
 ```bash
 FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- \
-  run test/integration/real/ --config vitest.server.config.ts
+  run test/integration/real/ --config config/vitest/vitest.server.config.ts
 ```
 
 ## Architecture

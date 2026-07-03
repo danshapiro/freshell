@@ -4,7 +4,7 @@
 
 The agreed testing strategy is to use the existing full test suite (unit, integration, Electron, E2E browser tests) plus manual Electron app validation. The implementation plan proposes 5 discrete bug fixes, all touching the `electron/` module layer. The existing test infrastructure is well-suited:
 
-- **Electron unit tests** (`vitest.electron.config.ts`, `test/unit/electron/`) already cover `startup.ts`, `main.ts`, `server-spawner.ts`, and `window-state.ts` with dependency-injected mocks. All 5 fixes are testable through these harnesses with no new infrastructure required.
+- **Electron unit tests** (`config/vitest/vitest.electron.config.ts`, `test/unit/electron/`) already cover `startup.ts`, `main.ts`, `server-spawner.ts`, and `window-state.ts` with dependency-injected mocks. All 5 fixes are testable through these harnesses with no new infrastructure required.
 - **Full suite regression** (`npm test`, `npm run test:electron`) validates nothing else broke.
 - **E2E browser tests** (Playwright, `test/e2e-browser/`) verify the web client's auth flow (`auth.spec.ts`), which is the downstream consumer of the `?token=` URL parameter that Task 5 fixes. These tests already pass the token via URL and confirm the connection reaches `ready` state.
 - **Manual Electron validation** is still needed for the final packaged `.exe`, since the test suite cannot run inside a packaged Electron app. This covers the integration between `entry.ts` (the only untested file, by design) and the DI modules.
@@ -18,7 +18,7 @@ No strategy adjustments are needed. The plan's interfaces match what the strateg
 ### 1. Wizard-to-main transition completes without app exit on Windows/Linux
 
 - **Type:** scenario
-- **Harness:** Electron unit tests (`vitest.electron.config.ts`)
+- **Harness:** Electron unit tests (`config/vitest/vitest.electron.config.ts`)
 - **Preconditions:** `setupCompleted: false` on first call, then `setupCompleted: true` on recursive `main()` call. Platform is `win32` (non-macOS). Both `entry.ts`'s consolidated handler and `main.ts` are involved.
 - **Actions:**
   1. Call `runStartup` with `setupCompleted: false` — returns `{ type: 'wizard' }`.
@@ -32,7 +32,7 @@ No strategy adjustments are needed. The plan's interfaces match what the strateg
 ### 2. Windows node binary path resolves to node.exe
 
 - **Type:** scenario
-- **Harness:** Electron unit tests (`vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
+- **Harness:** Electron unit tests (`config/vitest/vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
 - **Preconditions:** Production mode (`isDev: false`), `resourcesPath` set to a Windows-style path, `platform: 'win32'` in `StartupContext`, `setupCompleted: true`, server mode `app-bound`.
 - **Actions:**
   1. Create context with `platform: 'win32'` and `resourcesPath: 'C:\\Program Files\\Freshell\\resources'`.
@@ -45,7 +45,7 @@ No strategy adjustments are needed. The plan's interfaces match what the strateg
 ### 3. Linux/macOS node binary path resolves to node (no .exe)
 
 - **Type:** regression
-- **Harness:** Electron unit tests (`vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
+- **Harness:** Electron unit tests (`config/vitest/vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
 - **Preconditions:** Production mode, `platform: 'linux'`, `resourcesPath: '/app/resources'`.
 - **Actions:**
   1. Create context with `platform: 'linux'`.
@@ -58,7 +58,7 @@ No strategy adjustments are needed. The plan's interfaces match what the strateg
 ### 4. Server CWD is set to configDir when spawning in production mode
 
 - **Type:** integration
-- **Harness:** Electron unit tests (`vitest.electron.config.ts`, `test/unit/electron/server-spawner.test.ts`)
+- **Harness:** Electron unit tests (`config/vitest/vitest.electron.config.ts`, `test/unit/electron/server-spawner.test.ts`)
 - **Preconditions:** `createServerSpawner()` instance, production spawn mode options with `configDir: '/home/user/.freshell'`.
 - **Actions:**
   1. Call `spawner.start()` with production spawn mode and `configDir: '/home/user/.freshell'`.
@@ -70,7 +70,7 @@ No strategy adjustments are needed. The plan's interfaces match what the strateg
 ### 5. Server CWD is set to configDir when spawning in dev mode
 
 - **Type:** integration
-- **Harness:** Electron unit tests (`vitest.electron.config.ts`, `test/unit/electron/server-spawner.test.ts`)
+- **Harness:** Electron unit tests (`config/vitest/vitest.electron.config.ts`, `test/unit/electron/server-spawner.test.ts`)
 - **Preconditions:** `createServerSpawner()` instance, dev spawn mode options with `configDir: '/home/user/.freshell'`.
 - **Actions:**
   1. Call `spawner.start()` with dev spawn mode and `configDir: '/home/user/.freshell'`.
@@ -82,7 +82,7 @@ No strategy adjustments are needed. The plan's interfaces match what the strateg
 ### 6. initMainProcess does NOT register window-all-closed handler
 
 - **Type:** regression
-- **Harness:** Electron unit tests (`vitest.electron.config.ts`, `test/unit/electron/main.test.ts`)
+- **Harness:** Electron unit tests (`config/vitest/vitest.electron.config.ts`, `test/unit/electron/main.test.ts`)
 - **Preconditions:** `createMockApp()`, standard `MainProcessDeps`.
 - **Actions:**
   1. Call `initMainProcess(deps)`.
@@ -94,7 +94,7 @@ No strategy adjustments are needed. The plan's interfaces match what the strateg
 ### 7. Auth token appended to URL for app-bound mode
 
 - **Type:** scenario
-- **Harness:** Electron unit tests (`vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
+- **Harness:** Electron unit tests (`config/vitest/vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
 - **Preconditions:** Server mode `app-bound`, production, `readEnvToken` returns `'test-auth-token-abc'`.
 - **Actions:**
   1. Create context with `readEnvToken: vi.fn().mockResolvedValue('test-auth-token-abc')`.
@@ -107,7 +107,7 @@ No strategy adjustments are needed. The plan's interfaces match what the strateg
 ### 8. Auth token appended to URL for daemon mode
 
 - **Type:** scenario
-- **Harness:** Electron unit tests (`vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
+- **Harness:** Electron unit tests (`config/vitest/vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
 - **Preconditions:** Server mode `daemon`, `readEnvToken` returns `'daemon-token-xyz'`, daemon status is installed and running.
 - **Actions:**
   1. Create context with daemon mode config and `readEnvToken: vi.fn().mockResolvedValue('daemon-token-xyz')`.
@@ -120,7 +120,7 @@ No strategy adjustments are needed. The plan's interfaces match what the strateg
 ### 9. Auth token appended to URL for remote mode using remoteToken
 
 - **Type:** scenario
-- **Harness:** Electron unit tests (`vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
+- **Harness:** Electron unit tests (`config/vitest/vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
 - **Preconditions:** Server mode `remote`, `remoteUrl: 'http://10.0.0.5:3001'`, `remoteToken: 'remote-secret-123'`, health check passes.
 - **Actions:**
   1. Create context with remote mode config including `remoteToken`.
@@ -133,7 +133,7 @@ No strategy adjustments are needed. The plan's interfaces match what the strateg
 ### 10. URL loaded without token when readEnvToken returns undefined
 
 - **Type:** boundary
-- **Harness:** Electron unit tests (`vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
+- **Harness:** Electron unit tests (`config/vitest/vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
 - **Preconditions:** App-bound mode, `readEnvToken` returns `undefined`.
 - **Actions:**
   1. Create context with `readEnvToken: vi.fn().mockResolvedValue(undefined)`.
@@ -146,7 +146,7 @@ No strategy adjustments are needed. The plan's interfaces match what the strateg
 ### 11. URL loaded without token when readEnvToken is not provided (backward compat)
 
 - **Type:** regression
-- **Harness:** Electron unit tests (`vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
+- **Harness:** Electron unit tests (`config/vitest/vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
 - **Preconditions:** App-bound mode, `readEnvToken` not in context (existing tests do not provide it).
 - **Actions:**
   1. Create context via `createDefaultContext()` without `readEnvToken` override.
@@ -159,7 +159,7 @@ No strategy adjustments are needed. The plan's interfaces match what the strateg
 ### 12. Window state saved on resize with debounce
 
 - **Type:** integration
-- **Harness:** Electron unit tests (`vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
+- **Harness:** Electron unit tests (`config/vitest/vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
 - **Preconditions:** `BrowserWindowLike` mock with `getBounds` and `isMaximized` methods, fake timers enabled.
 - **Actions:**
   1. Create context with a mock window that has `getBounds` returning `{ x: 100, y: 200, width: 800, height: 600 }` and `isMaximized` returning `false`.
@@ -174,7 +174,7 @@ No strategy adjustments are needed. The plan's interfaces match what the strateg
 ### 13. Window state saved on move with debounce
 
 - **Type:** integration
-- **Harness:** Electron unit tests (`vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
+- **Harness:** Electron unit tests (`config/vitest/vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
 - **Preconditions:** Same as test 12.
 - **Actions:**
   1. Same setup as test 12.
@@ -188,7 +188,7 @@ No strategy adjustments are needed. The plan's interfaces match what the strateg
 ### 14. Window state save is debounced (rapid events coalesce)
 
 - **Type:** boundary
-- **Harness:** Electron unit tests (`vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
+- **Harness:** Electron unit tests (`config/vitest/vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
 - **Preconditions:** Same setup as test 12, fake timers.
 - **Actions:**
   1. Find the `'resize'` handler.
@@ -201,7 +201,7 @@ No strategy adjustments are needed. The plan's interfaces match what the strateg
 ### 15. Window state not saved before debounce period expires
 
 - **Type:** boundary
-- **Harness:** Electron unit tests (`vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
+- **Harness:** Electron unit tests (`config/vitest/vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
 - **Preconditions:** Same setup as test 12, fake timers.
 - **Actions:**
   1. Find the `'resize'` handler.
@@ -214,7 +214,7 @@ No strategy adjustments are needed. The plan's interfaces match what the strateg
 ### 16. Existing remote mode test still passes after auth changes
 
 - **Type:** regression
-- **Harness:** Electron unit tests (`vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
+- **Harness:** Electron unit tests (`config/vitest/vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
 - **Preconditions:** Remote mode with `remoteUrl: 'http://10.0.0.5:3001'`, no `remoteToken` in config, `fetchHealthCheck` passes.
 - **Actions:**
   1. Create context with remote mode config that has no `remoteToken`.
@@ -227,7 +227,7 @@ No strategy adjustments are needed. The plan's interfaces match what the strateg
 ### 17. All existing electron tests pass (full regression)
 
 - **Type:** regression
-- **Harness:** Full electron test suite (`npx vitest run --config vitest.electron.config.ts`)
+- **Harness:** Full electron test suite (`npx vitest run --config config/vitest/vitest.electron.config.ts`)
 - **Preconditions:** All 5 tasks implemented.
 - **Actions:** Run `npm run test:electron` (or equivalent vitest command).
 - **Expected outcome:** All tests pass (192+ existing tests, plus new tests from this plan).
@@ -260,7 +260,7 @@ No strategy adjustments are needed. The plan's interfaces match what the strateg
 ### 20. readEnvToken not called for remote mode
 
 - **Type:** boundary
-- **Harness:** Electron unit tests (`vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
+- **Harness:** Electron unit tests (`config/vitest/vitest.electron.config.ts`, `test/unit/electron/startup.test.ts`)
 - **Preconditions:** Remote mode with `remoteToken`, `readEnvToken` mock provided.
 - **Actions:**
   1. Create context with remote mode config including `remoteToken: 'remote-token'`, and `readEnvToken: vi.fn()`.

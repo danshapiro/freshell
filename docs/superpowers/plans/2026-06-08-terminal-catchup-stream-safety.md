@@ -1642,7 +1642,7 @@ describe('terminal stream identity', () => {
 Run:
 
 ```bash
-timeout 120s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/terminal-stream/stream-identity.test.ts test/unit/server/terminal-stream/serialized-budget.test.ts test/unit/server/terminal-stream/output-fragments.test.ts
+timeout 120s npm run test:vitest -- --config config/vitest/vitest.server.config.ts --run test/unit/server/terminal-stream/stream-identity.test.ts test/unit/server/terminal-stream/serialized-budget.test.ts test/unit/server/terminal-stream/output-fragments.test.ts
 ```
 
 Expected: fail because the helpers and pre-sequence fragmentation path do not exist.
@@ -1747,7 +1747,7 @@ Replace raw `Buffer.byteLength(data, 'utf8')` batch limit checks for outgoing We
 Run:
 
 ```bash
-timeout 300s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/terminal-stream/stream-identity.test.ts test/unit/server/terminal-stream/serialized-budget.test.ts test/unit/server/terminal-stream/output-fragments.test.ts test/unit/server/terminal-stream/replay-ring.test.ts test/unit/server/terminal-stream/client-output-queue.test.ts test/unit/server/ws-handler-backpressure.test.ts test/server/ws-terminal-stream-v2-replay.test.ts
+timeout 300s npm run test:vitest -- --config config/vitest/vitest.server.config.ts --run test/unit/server/terminal-stream/stream-identity.test.ts test/unit/server/terminal-stream/serialized-budget.test.ts test/unit/server/terminal-stream/output-fragments.test.ts test/unit/server/terminal-stream/replay-ring.test.ts test/unit/server/terminal-stream/client-output-queue.test.ts test/unit/server/ws-handler-backpressure.test.ts test/server/ws-terminal-stream-v2-replay.test.ts
 ```
 
 Expected: pass.
@@ -1966,7 +1966,7 @@ Also update `test/unit/server/terminal-stream/replay-ring.test.ts` in this task 
 Run:
 
 ```bash
-timeout 120s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/terminal-stream/output-barrier-scanner.test.ts test/unit/server/terminal-stream/output-batch.test.ts
+timeout 120s npm run test:vitest -- --config config/vitest/vitest.server.config.ts --run test/unit/server/terminal-stream/output-barrier-scanner.test.ts test/unit/server/terminal-stream/output-batch.test.ts
 ```
 
 Expected: fail because the helpers do not exist.
@@ -2051,7 +2051,7 @@ Use `buildTerminalOutputBatches` in:
 Run:
 
 ```bash
-timeout 300s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/terminal-stream/output-barrier-scanner.test.ts test/unit/server/terminal-stream/output-batch.test.ts test/unit/server/terminal-stream/replay-ring.test.ts test/unit/server/terminal-stream/client-output-queue.test.ts test/unit/server/ws-handler-backpressure.test.ts test/server/ws-terminal-stream-v2-replay.test.ts test/server/ws-edge-cases.test.ts
+timeout 300s npm run test:vitest -- --config config/vitest/vitest.server.config.ts --run test/unit/server/terminal-stream/output-barrier-scanner.test.ts test/unit/server/terminal-stream/output-batch.test.ts test/unit/server/terminal-stream/replay-ring.test.ts test/unit/server/terminal-stream/client-output-queue.test.ts test/unit/server/ws-handler-backpressure.test.ts test/server/ws-terminal-stream-v2-replay.test.ts test/server/ws-edge-cases.test.ts
 ```
 
 Expected: pass.
@@ -2140,7 +2140,7 @@ describe('ReplayDeque', () => {
 Run:
 
 ```bash
-timeout 120s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/terminal-stream/replay-deque.test.ts
+timeout 120s npm run test:vitest -- --config config/vitest/vitest.server.config.ts --run test/unit/server/terminal-stream/replay-deque.test.ts
 ```
 
 Expected: fail because `ReplayDeque` does not exist.
@@ -2261,7 +2261,7 @@ Make `ReplayRing` delegate to `ReplayDeque` so existing imports remain stable wh
 Run:
 
 ```bash
-timeout 240s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/terminal-stream/replay-deque.test.ts test/unit/server/terminal-stream/replay-ring.test.ts test/unit/server/ws-handler-backpressure.test.ts test/server/ws-terminal-stream-v2-replay.test.ts
+timeout 240s npm run test:vitest -- --config config/vitest/vitest.server.config.ts --run test/unit/server/terminal-stream/replay-deque.test.ts test/unit/server/terminal-stream/replay-ring.test.ts test/unit/server/ws-handler-backpressure.test.ts test/server/ws-terminal-stream-v2-replay.test.ts
 ```
 
 Expected: pass.
@@ -2334,7 +2334,7 @@ it('pauses foreground replay before avoidable buffered growth exceeds the pacing
 Run:
 
 ```bash
-timeout 180s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/ws-handler-backpressure.test.ts -t "foreground replay"
+timeout 180s npm run test:vitest -- --config config/vitest/vitest.server.config.ts --run test/unit/server/ws-handler-backpressure.test.ts -t "foreground replay"
 ```
 
 Expected before implementation: fail. The seeded backlog is intentionally larger than 2 MiB and the mock socket never drains, so unpaced replay sends the full backlog and exceeds `pacingThresholdBytes + allowedBatchOvershootBytes`.
@@ -2364,7 +2364,7 @@ Then in `server/terminal-stream/broker.ts`:
 Run:
 
 ```bash
-timeout 240s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/ws-send.test.ts test/unit/server/ws-handler-backpressure.test.ts test/server/ws-edge-cases.test.ts
+timeout 240s npm run test:vitest -- --config config/vitest/vitest.server.config.ts --run test/unit/server/ws-send.test.ts test/unit/server/ws-handler-backpressure.test.ts test/server/ws-edge-cases.test.ts
 ```
 
 Expected: pass.
@@ -2434,7 +2434,7 @@ Run:
 
 ```bash
 timeout 240s npm run test:vitest -- --run test/unit/client/lib/ws-client.test.ts
-timeout 240s npm run test:vitest -- --config vitest.server.config.ts --run test/server/ws-protocol.test.ts test/server/ws-terminal-stream-v2-replay.test.ts -t "terminal.output.batch|terminalOutputBatchV1|legacy"
+timeout 240s npm run test:vitest -- --config config/vitest/vitest.server.config.ts --run test/server/ws-protocol.test.ts test/server/ws-terminal-stream-v2-replay.test.ts -t "terminal.output.batch|terminalOutputBatchV1|legacy"
 ```
 
 Expected: fail because the capability and batch behavior do not exist.
@@ -2480,7 +2480,7 @@ Run:
 
 ```bash
 timeout 300s npm run test:vitest -- --run test/unit/client/lib/ws-client.test.ts test/unit/client/lib/terminal-attach-seq-state.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx
-timeout 300s npm run test:vitest -- --config vitest.server.config.ts --run test/server/ws-protocol.test.ts test/server/ws-terminal-stream-v2-replay.test.ts test/unit/server/ws-handler-backpressure.test.ts
+timeout 300s npm run test:vitest -- --config config/vitest/vitest.server.config.ts --run test/server/ws-protocol.test.ts test/server/ws-terminal-stream-v2-replay.test.ts test/unit/server/ws-handler-backpressure.test.ts
 ```
 
 Expected: pass.
@@ -2528,7 +2528,7 @@ Add similar assertions for:
 Run:
 
 ```bash
-timeout 180s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/ws-handler-backpressure.test.ts -t "terminal.replay"
+timeout 180s npm run test:vitest -- --config config/vitest/vitest.server.config.ts --run test/unit/server/ws-handler-backpressure.test.ts -t "terminal.replay"
 ```
 
 Expected before implementation: fail because structured event names or fields are missing.
@@ -2585,7 +2585,7 @@ These marks must be promoted into the visible-first audit artifact in Task 11. D
 Run:
 
 ```bash
-timeout 240s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/ws-handler-backpressure.test.ts
+timeout 240s npm run test:vitest -- --config config/vitest/vitest.server.config.ts --run test/unit/server/ws-handler-backpressure.test.ts
 timeout 240s npm run test:vitest -- --run test/unit/client/components/TerminalView.lifecycle.test.tsx
 ```
 
@@ -2743,7 +2743,7 @@ Expected: pass.
 - [ ] **Step 2: Run focused server suite**
 
 ```bash
-timeout 600s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/terminal-stream/stream-identity.test.ts test/unit/server/terminal-stream/output-barrier-scanner.test.ts test/unit/server/terminal-stream/output-batch.test.ts test/unit/server/terminal-stream/serialized-budget.test.ts test/unit/server/terminal-stream/output-fragments.test.ts test/unit/server/terminal-stream/replay-deque.test.ts test/unit/server/terminal-stream/replay-ring.test.ts test/unit/server/terminal-stream/client-output-queue.test.ts test/unit/server/ws-send.test.ts test/unit/server/ws-handler-backpressure.test.ts test/server/ws-terminal-stream-v2-replay.test.ts test/server/ws-edge-cases.test.ts test/server/ws-protocol.test.ts
+timeout 600s npm run test:vitest -- --config config/vitest/vitest.server.config.ts --run test/unit/server/terminal-stream/stream-identity.test.ts test/unit/server/terminal-stream/output-barrier-scanner.test.ts test/unit/server/terminal-stream/output-batch.test.ts test/unit/server/terminal-stream/serialized-budget.test.ts test/unit/server/terminal-stream/output-fragments.test.ts test/unit/server/terminal-stream/replay-deque.test.ts test/unit/server/terminal-stream/replay-ring.test.ts test/unit/server/terminal-stream/client-output-queue.test.ts test/unit/server/ws-send.test.ts test/unit/server/ws-handler-backpressure.test.ts test/server/ws-terminal-stream-v2-replay.test.ts test/server/ws-edge-cases.test.ts test/server/ws-protocol.test.ts
 ```
 
 Expected: pass.

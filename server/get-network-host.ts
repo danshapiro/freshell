@@ -17,7 +17,7 @@ import { isWSL } from './platform.js'
  * - Otherwise use config.json's network.host.
  * - Falls back to '127.0.0.1' if config is missing or invalid.
  *
- * Used by vite.config.ts and server/index.ts for bind address.
+ * Used by config/vite/vite.config.ts and server/index.ts for bind address.
  *
  * IMPORTANT: Calls dotenv.config() INSIDE the function (not at module top level)
  * to avoid loading .env as a side effect of importing this module. This matters
@@ -26,7 +26,7 @@ import { isWSL } from './platform.js'
  */
 export function getNetworkHost(): string {
   // Load .env if not already loaded. Idempotent — dotenv won't overwrite
-  // vars already in process.env. This ensures vite.config.ts (which doesn't
+  // vars already in process.env. This ensures config/vite/vite.config.ts (which doesn't
   // import 'dotenv/config') can still see HOST from .env.
   dotenv.config()
 

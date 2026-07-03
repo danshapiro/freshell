@@ -116,7 +116,7 @@ it('returns 400 for non-numeric or out-of-range x/y/sizes values', async () => {
 
 - [ ] **Step 2: Run test to verify failure**
 
-Run: `npx vitest run test/server/agent-resize-pane.test.ts --config vitest.server.config.ts`
+Run: `npx vitest run test/server/agent-resize-pane.test.ts --config config/vitest/vitest.server.config.ts`
 Expected: FAIL (current behavior injects default `50`).
 
 ### Task 3: Implement safe single-axis normalization
@@ -261,7 +261,7 @@ it('resize-pane normalizes single-axis updates to a 100-sum split', async () => 
 - [ ] **Step 6: Re-run tests**
 
 Run:
-- `npx vitest run test/server/agent-resize-pane.test.ts --config vitest.server.config.ts`
+- `npx vitest run test/server/agent-resize-pane.test.ts --config config/vitest/vitest.server.config.ts`
 - `npx vitest run test/e2e/agent-cli-flow.test.ts`
 Expected: PASS.
 
@@ -317,8 +317,8 @@ expect(hello.capabilities).toEqual({ sessionsPatchV1: true, uiScreenshotV1: true
 - [ ] **Step 4: Run tests to verify failure**
 
 Run:
-- `npx vitest run test/server/ws-protocol.test.ts --config vitest.server.config.ts`
-- `npx vitest run test/server/agent-screenshot-api.test.ts --config vitest.server.config.ts`
+- `npx vitest run test/server/ws-protocol.test.ts --config config/vitest/vitest.server.config.ts`
+- `npx vitest run test/server/agent-screenshot-api.test.ts --config config/vitest/vitest.server.config.ts`
 - `npx vitest run test/unit/client/lib/ws-client.test.ts`
 Expected: FAIL before implementation.
 
@@ -413,8 +413,8 @@ if (code === 'SCREENSHOT_CONNECTION_CLOSED') {
 - [ ] **Step 9: Re-run targeted tests**
 
 Run:
-- `npx vitest run test/server/ws-protocol.test.ts --config vitest.server.config.ts`
-- `npx vitest run test/server/agent-screenshot-api.test.ts --config vitest.server.config.ts`
+- `npx vitest run test/server/ws-protocol.test.ts --config config/vitest/vitest.server.config.ts`
+- `npx vitest run test/server/agent-screenshot-api.test.ts --config config/vitest/vitest.server.config.ts`
 - `npx vitest run test/unit/client/lib/ws-client.test.ts`
 Expected: PASS.
 

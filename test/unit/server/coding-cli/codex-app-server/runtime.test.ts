@@ -18,7 +18,7 @@ const __dirname = path.dirname(__filename)
 const FAKE_SERVER_PATH = path.resolve(__dirname, '../../../../fixtures/coding-cli/codex-app-server/fake-app-server.mjs')
 
 // These tests spawn a REAL `node` sidecar (the fake-app-server fixture) and require it to
-// reach `initialize`. The suite runs with fileParallelism + maxConcurrency (vitest.server.config.ts),
+// reach `initialize`. The suite runs with fileParallelism + maxConcurrency (config/vitest/vitest.server.config.ts),
 // so freshly-spawned sidecars are CPU-starved; a tight per-attempt budget makes a real spawn+bind+
 // initialize miss its deadline and the runtime reject (`did not finish initialize within Nms` /
 // `ECONNREFUSED`) — the dominant flake under load. These tests assert lifecycle *behavior*, not

@@ -14,6 +14,8 @@ import {
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const REPO_ROOT = path.resolve(__dirname, '../../../..')
+const DEFAULT_VITEST_CONFIG = 'config/vitest/vitest.config.ts'
+const SERVER_VITEST_CONFIG = 'config/vitest/vitest.server.config.ts'
 
 function expectVitestPhase(
   phase: UpstreamPhase,
@@ -111,7 +113,7 @@ describe('classifyCommand()', () => {
         kind: 'coordinated',
         suiteKey: 'default:coverage',
         phases: [
-          { config: 'default', args: ['run', '--coverage'] },
+          { config: 'default', args: ['run', '--config', DEFAULT_VITEST_CONFIG, '--coverage'] },
         ],
       },
     },
@@ -121,7 +123,7 @@ describe('classifyCommand()', () => {
         kind: 'coordinated',
         suiteKey: 'default:test/unit',
         phases: [
-          { config: 'default', args: ['run', 'test/unit'] },
+          { config: 'default', args: ['run', '--config', DEFAULT_VITEST_CONFIG, 'test/unit'] },
         ],
       },
     },
@@ -131,7 +133,7 @@ describe('classifyCommand()', () => {
         kind: 'coordinated',
         suiteKey: 'default:test/unit/client',
         phases: [
-          { config: 'default', args: ['run', 'test/unit/client'] },
+          { config: 'default', args: ['run', '--config', DEFAULT_VITEST_CONFIG, 'test/unit/client'] },
         ],
       },
     },
@@ -141,7 +143,7 @@ describe('classifyCommand()', () => {
         kind: 'coordinated',
         suiteKey: 'server:test/server',
         phases: [
-          { config: 'server', args: ['run', '--config', 'vitest.server.config.ts', 'test/server'] },
+          { config: 'server', args: ['run', '--config', SERVER_VITEST_CONFIG, 'test/server'] },
         ],
       },
     },
@@ -150,7 +152,7 @@ describe('classifyCommand()', () => {
       expected: {
         kind: 'delegated',
         phases: [
-          { config: 'server', args: ['--config', 'vitest.server.config.ts'] },
+          { config: 'server', args: ['--config', SERVER_VITEST_CONFIG] },
         ],
       },
     },
@@ -159,7 +161,7 @@ describe('classifyCommand()', () => {
       expected: {
         kind: 'passthrough',
         phases: [
-          { config: 'default', args: [] },
+          { config: 'default', args: ['--config', DEFAULT_VITEST_CONFIG] },
         ],
       },
     },
@@ -168,7 +170,7 @@ describe('classifyCommand()', () => {
       expected: {
         kind: 'passthrough',
         phases: [
-          { config: 'default', args: ['--ui'] },
+          { config: 'default', args: ['--config', DEFAULT_VITEST_CONFIG, '--ui'] },
         ],
       },
     },
@@ -177,7 +179,7 @@ describe('classifyCommand()', () => {
       expected: {
         kind: 'passthrough',
         phases: [
-          { config: 'default', args: [] },
+          { config: 'default', args: ['--config', DEFAULT_VITEST_CONFIG] },
         ],
       },
     },
@@ -223,7 +225,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'delegated',
       config: 'server',
-      args: ['--config', 'vitest.server.config.ts'],
+      args: ['--config', SERVER_VITEST_CONFIG],
     })
 
     expectSinglePhase(classifyCommand({
@@ -233,7 +235,7 @@ describe('classifyCommand()', () => {
       kind: 'coordinated',
       suiteKey: 'server:all:run',
       config: 'server',
-      args: ['--config', 'vitest.server.config.ts', '--run'],
+      args: ['--config', SERVER_VITEST_CONFIG, '--run'],
     })
   })
 
@@ -244,7 +246,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'delegated',
       config: 'server',
-      args: ['run', '--config', 'vitest.server.config.ts', 'test/unit/server/coding-cli/utils.test.ts'],
+      args: ['run', '--config', SERVER_VITEST_CONFIG, 'test/unit/server/coding-cli/utils.test.ts'],
     })
 
     expectSinglePhase(classifyCommand({
@@ -253,7 +255,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'delegated',
       config: 'server',
-      args: ['run', '--config', 'vitest.server.config.ts', 'test/unit/server/terminal-registry.test.ts', '-t', 'reaping exited terminals'],
+      args: ['run', '--config', SERVER_VITEST_CONFIG, 'test/unit/server/terminal-registry.test.ts', '-t', 'reaping exited terminals'],
     })
   })
 
@@ -264,7 +266,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'delegated',
       config: 'default',
-      args: ['run', 'test/unit', '--watch'],
+      args: ['run', '--config', DEFAULT_VITEST_CONFIG, 'test/unit', '--watch'],
     })
 
     expectSinglePhase(classifyCommand({
@@ -273,7 +275,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'delegated',
       config: 'default',
-      args: ['run', '--coverage', '--ui'],
+      args: ['run', '--config', DEFAULT_VITEST_CONFIG, '--coverage', '--ui'],
     })
 
     expectSinglePhase(classifyCommand({
@@ -282,7 +284,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'delegated',
       config: 'default',
-      args: ['run', '--watch'],
+      args: ['run', '--config', DEFAULT_VITEST_CONFIG, '--watch'],
     })
 
     expectSinglePhase(classifyCommand({
@@ -291,7 +293,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'delegated',
       config: 'default',
-      args: ['run', '--ui'],
+      args: ['run', '--config', DEFAULT_VITEST_CONFIG, '--ui'],
     })
 
     expectSinglePhase(classifyCommand({
@@ -300,7 +302,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'passthrough',
       config: 'server',
-      args: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
+      args: ['--config', SERVER_VITEST_CONFIG, 'test/server/ws-protocol.test.ts'],
     })
 
     expectSinglePhase(classifyCommand({
@@ -309,7 +311,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'passthrough',
       config: 'server',
-      args: ['--config', 'vitest.server.config.ts', '--ui', 'test/server/ws-protocol.test.ts'],
+      args: ['--config', SERVER_VITEST_CONFIG, '--ui', 'test/server/ws-protocol.test.ts'],
     })
   })
 
@@ -429,7 +431,7 @@ describe('classifyCommand()', () => {
       kind: 'coordinated',
       suiteKey: 'default:coverage',
       config: 'default',
-      args: ['run', '--coverage', '--bail', '1'],
+      args: ['run', '--config', DEFAULT_VITEST_CONFIG, '--coverage', '--bail', '1'],
     })
   })
 
@@ -441,7 +443,7 @@ describe('classifyCommand()', () => {
       kind: 'coordinated',
       suiteKey: 'default:test/unit',
       config: 'default',
-      args: ['run', 'test/unit', '--reporter', 'dot'],
+      args: ['run', '--config', DEFAULT_VITEST_CONFIG, 'test/unit', '--reporter', 'dot'],
     })
 
     expectSinglePhase(classifyCommand({
@@ -451,7 +453,7 @@ describe('classifyCommand()', () => {
       kind: 'coordinated',
       suiteKey: 'default:coverage',
       config: 'default',
-      args: ['run', '--coverage', '--bail', '1'],
+      args: ['run', '--config', DEFAULT_VITEST_CONFIG, '--coverage', '--bail', '1'],
     })
 
     expectSinglePhase(classifyCommand({
@@ -461,7 +463,7 @@ describe('classifyCommand()', () => {
       kind: 'coordinated',
       suiteKey: 'server:all:run',
       config: 'server',
-      args: ['--config', 'vitest.server.config.ts', '--run', '--reporter', 'dot'],
+      args: ['--config', SERVER_VITEST_CONFIG, '--run', '--reporter', 'dot'],
     })
   })
 
@@ -472,7 +474,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'passthrough',
       config: 'default',
-      args: ['run', '--help'],
+      args: ['run', '--config', DEFAULT_VITEST_CONFIG, '--help'],
     })
 
     expectSinglePhase(classifyCommand({
@@ -481,7 +483,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'passthrough',
       config: 'server',
-      args: ['--config', 'vitest.server.config.ts', '-v'],
+      args: ['--config', SERVER_VITEST_CONFIG, '-v'],
     })
 
     expectSinglePhase(classifyCommand({
@@ -490,7 +492,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'passthrough',
       config: 'server',
-      args: ['run', '--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts', '--help'],
+      args: ['run', '--config', SERVER_VITEST_CONFIG, 'test/server/ws-protocol.test.ts', '--help'],
     })
 
     expectSinglePhase(classifyCommand({
@@ -499,7 +501,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'passthrough',
       config: 'server',
-      args: ['run', '--config', 'vitest.server.config.ts', 'test/unit/server/coding-cli/utils.test.ts', '--help'],
+      args: ['run', '--config', SERVER_VITEST_CONFIG, 'test/unit/server/coding-cli/utils.test.ts', '--help'],
     })
   })
 
@@ -522,14 +524,14 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'delegated',
       config: 'default',
-      args: ['run', '--reporter', 'dot', 'test/unit/client/components/Sidebar.test.tsx'],
+      args: ['run', '--config', DEFAULT_VITEST_CONFIG, '--reporter', 'dot', 'test/unit/client/components/Sidebar.test.tsx'],
     })
   })
 
   it('rejects explicit --config overrides on public commands and directs callers to test:vitest', () => {
     const composite = classifyCommand({
       commandKey: 'test',
-      forwardedArgs: ['--config', 'vitest.server.config.ts'],
+      forwardedArgs: ['--config', 'config/vitest/vitest.server.config.ts'],
     })
 
     expect(composite).toMatchObject({
@@ -542,7 +544,7 @@ describe('classifyCommand()', () => {
 
     const compositeWithTarget = classifyCommand({
       commandKey: 'test',
-      forwardedArgs: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
+      forwardedArgs: ['--config', 'config/vitest/vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
     })
     expect(compositeWithTarget).toMatchObject({
       kind: 'rejected',
@@ -550,7 +552,7 @@ describe('classifyCommand()', () => {
 
     const singlePhase = classifyCommand({
       commandKey: 'test:unit',
-      forwardedArgs: ['--config=vitest.server.config.ts'],
+      forwardedArgs: ['--config=config/vitest/vitest.server.config.ts'],
     })
     expect(singlePhase).toMatchObject({
       kind: 'rejected',
@@ -561,7 +563,7 @@ describe('classifyCommand()', () => {
 
     const shortForm = classifyCommand({
       commandKey: 'test',
-      forwardedArgs: ['-c', 'vitest.server.config.ts'],
+      forwardedArgs: ['-c', 'config/vitest/vitest.server.config.ts'],
     })
     expect(shortForm).toMatchObject({
       kind: 'rejected',
@@ -573,7 +575,7 @@ describe('classifyCommand()', () => {
 
     const shortFormEquals = classifyCommand({
       commandKey: 'test:unit',
-      forwardedArgs: ['-c=vitest.server.config.ts'],
+      forwardedArgs: ['-c=config/vitest/vitest.server.config.ts'],
     })
     expect(shortFormEquals).toMatchObject({
       kind: 'rejected',
@@ -581,20 +583,20 @@ describe('classifyCommand()', () => {
 
     expectSinglePhase(classifyCommand({
       commandKey: 'test:vitest',
-      forwardedArgs: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
+      forwardedArgs: ['--config', 'config/vitest/vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
     }), {
       kind: 'passthrough',
       config: 'server',
-      args: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
+      args: ['--config', SERVER_VITEST_CONFIG, 'test/server/ws-protocol.test.ts'],
     })
 
     expectSinglePhase(classifyCommand({
       commandKey: 'test:vitest',
-      forwardedArgs: ['-c', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
+      forwardedArgs: ['-c', 'config/vitest/vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
     }), {
       kind: 'passthrough',
       config: 'server',
-      args: ['-c', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
+      args: ['-c', SERVER_VITEST_CONFIG, 'test/server/ws-protocol.test.ts'],
     })
   })
 
@@ -613,7 +615,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'delegated',
       config: 'default',
-      args: ['run', 'test/unit/client/store/panesSlice.test.ts'],
+      args: ['run', '--config', DEFAULT_VITEST_CONFIG, 'test/unit/client/store/panesSlice.test.ts'],
     })
   })
 
@@ -624,7 +626,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'delegated',
       config: 'server',
-      args: ['run', '--config', 'vitest.server.config.ts', './test/server/ws-protocol.test.ts'],
+      args: ['run', '--config', SERVER_VITEST_CONFIG, './test/server/ws-protocol.test.ts'],
     })
 
     expectSinglePhase(classifyCommand({
@@ -633,7 +635,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'delegated',
       config: 'server',
-      args: ['run', '--config', 'vitest.server.config.ts', 'test\\server\\ws-protocol.test.ts'],
+      args: ['run', '--config', SERVER_VITEST_CONFIG, 'test\\server\\ws-protocol.test.ts'],
     })
 
     expectSinglePhase(classifyCommand({
@@ -642,7 +644,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'delegated',
       config: 'server',
-      args: ['run', '--config', 'vitest.server.config.ts', './test/unit/server/coding-cli/utils.test.ts'],
+      args: ['run', '--config', SERVER_VITEST_CONFIG, './test/unit/server/coding-cli/utils.test.ts'],
     })
   })
 
@@ -670,7 +672,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'delegated',
       config: 'server',
-      args: ['run', '--config', 'vitest.server.config.ts', 'test/unit/server/terminal-registry.test.ts', '-t', 'reaping exited terminals'],
+      args: ['run', '--config', SERVER_VITEST_CONFIG, 'test/unit/server/terminal-registry.test.ts', '-t', 'reaping exited terminals'],
     })
 
     expectSinglePhase(classifyCommand({
@@ -679,7 +681,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'delegated',
       config: 'default',
-      args: ['run', 'test/unit/client/store/panesSlice.test.ts'],
+      args: ['run', '--config', DEFAULT_VITEST_CONFIG, 'test/unit/client/store/panesSlice.test.ts'],
     })
 
     expectSinglePhase(classifyCommand({
@@ -688,7 +690,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'delegated',
       config: 'server',
-      args: ['--config', 'vitest.server.config.ts', 'test/unit/server/sessions-sync/diff.test.ts'],
+      args: ['--config', SERVER_VITEST_CONFIG, 'test/unit/server/sessions-sync/diff.test.ts'],
     })
 
     expectSinglePhase(classifyCommand({
@@ -697,7 +699,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'delegated',
       config: 'default',
-      args: ['run', '--run', 'test/unit/client/components/Sidebar.test.tsx'],
+      args: ['run', '--config', DEFAULT_VITEST_CONFIG, '--run', 'test/unit/client/components/Sidebar.test.tsx'],
     })
 
     expectSinglePhase(classifyCommand({
@@ -706,7 +708,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'delegated',
       config: 'server',
-      args: ['run', '--config', 'vitest.server.config.ts', 'test/integration/server/port-forward-api.test.ts'],
+      args: ['run', '--config', SERVER_VITEST_CONFIG, 'test/integration/server/port-forward-api.test.ts'],
     })
 
     expectSinglePhase(classifyCommand({
@@ -715,16 +717,16 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'delegated',
       config: 'server',
-      args: ['run', '--config', 'vitest.server.config.ts', 'test/unit/server/coding-cli/utils.test.ts'],
+      args: ['run', '--config', SERVER_VITEST_CONFIG, 'test/unit/server/coding-cli/utils.test.ts'],
     })
 
     expectSinglePhase(classifyCommand({
       commandKey: 'test:vitest',
-      forwardedArgs: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
+      forwardedArgs: ['--config', 'config/vitest/vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
     }), {
       kind: 'passthrough',
       config: 'server',
-      args: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
+      args: ['--config', SERVER_VITEST_CONFIG, 'test/server/ws-protocol.test.ts'],
     })
 
     expectSinglePhase(classifyCommand({
@@ -740,7 +742,7 @@ describe('classifyCommand()', () => {
       args: [
         'run',
         '--config',
-        'vitest.server.config.ts',
+        SERVER_VITEST_CONFIG,
         'test/unit/server/coding-cli/codex-app-server',
         'test/unit/server/terminal-registry.test.ts',
         'test/unit/server/terminal-registry.codex-recovery.test.ts',
@@ -767,7 +769,7 @@ describe('classifyCommand()', () => {
     expect(scripts['test:vitest']).toBe('tsx scripts/testing/test-coordinator.ts run test:vitest')
     expect(scripts['test:balanced']).toBe('tsx scripts/run-standard-tests.ts')
     expect(scripts['test:aggressive']).toBe('tsx scripts/run-standard-tests.ts --mode aggressive')
-    expect(scripts['test:sequential']).toBe('vitest run && vitest run --config vitest.server.config.ts && vitest run --config vitest.electron.config.ts')
-    expect(scripts['test:electron']).toBe('vitest run --config vitest.electron.config.ts')
+    expect(scripts['test:sequential']).toBe('vitest run --config config/vitest/vitest.config.ts && vitest run --config config/vitest/vitest.server.config.ts && vitest run --config config/vitest/vitest.electron.config.ts')
+    expect(scripts['test:electron']).toBe('vitest run --config config/vitest/vitest.electron.config.ts')
   })
 })

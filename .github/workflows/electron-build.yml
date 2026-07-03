@@ -6,7 +6,7 @@ on:
   pull_request:
     paths:
       - 'electron/**'
-      - 'electron-builder.yml'
+      - 'config/electron-builder.yml'
       - 'scripts/prepare-bundled-node.ts'
       - 'scripts/bundled-node-version.json'
 

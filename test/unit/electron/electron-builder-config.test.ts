@@ -11,7 +11,7 @@ const readText = (filePath: string): string =>
 
 describe('electron-builder Windows config', () => {
   it('builds the Windows installer without the portable self-extracting target', () => {
-    const config = readText(path.join(PROJECT_ROOT, 'electron-builder.yml'))
+    const config = readText(path.join(PROJECT_ROOT, 'config/electron-builder.yml'))
 
     expect(config).toMatch(/win:\n(?:.*\n)*?  target:\n(?:.*\n)*?    - nsis/)
     expect(config).not.toMatch(/win:\n(?:.*\n)*?  target:\n(?:.*\n)*?    - portable/)
@@ -28,13 +28,13 @@ describe('electron-builder Windows config', () => {
   })
 
   it('does not require publish metadata for local package builds', () => {
-    const config = readText(path.join(PROJECT_ROOT, 'electron-builder.yml'))
+    const config = readText(path.join(PROJECT_ROOT, 'config/electron-builder.yml'))
 
     expect(config).toMatch(/^publish: null$/m)
   })
 
   it('packages launch chooser assets as extra resources', () => {
-    const config = readText(path.join(PROJECT_ROOT, 'electron-builder.yml'))
+    const config = readText(path.join(PROJECT_ROOT, 'config/electron-builder.yml'))
 
     expect(config).toMatch(
       /extraResources:\n(?:.*\n)*?  - from: dist\/launch-chooser\n    to: launch-chooser/,
@@ -42,13 +42,13 @@ describe('electron-builder Windows config', () => {
   })
 
   it('sets Linux maintainer metadata required by Debian packaging', () => {
-    const config = readText(path.join(PROJECT_ROOT, 'electron-builder.yml'))
+    const config = readText(path.join(PROJECT_ROOT, 'config/electron-builder.yml'))
 
     expect(config).toMatch(/^linux:\n(?:.*\n)*?  maintainer: Freshell Maintainers <maintainers@freshell\.dev>$/m)
   })
 
   it('uses a silent-install friendly NSIS flow', () => {
-    const config = readText(path.join(PROJECT_ROOT, 'electron-builder.yml'))
+    const config = readText(path.join(PROJECT_ROOT, 'config/electron-builder.yml'))
 
     expect(config).toMatch(
       /^nsis:\n  oneClick: true\n  runAfterFinish: true\n  include: assets\/electron\/installer\.nsh$/m,

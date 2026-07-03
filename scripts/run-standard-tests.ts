@@ -10,6 +10,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const repoRoot = resolve(__dirname, '..')
 const require = createRequire(import.meta.url)
 const vitestEntrypoint = require.resolve('vitest/vitest.mjs')
+const defaultVitestConfig = 'config/vitest/vitest.config.ts'
+const serverVitestConfig = 'config/vitest/vitest.server.config.ts'
+const electronVitestConfig = 'config/vitest/vitest.electron.config.ts'
 
 export type StandardTestMode = 'desktop' | 'aggressive'
 export type SuiteName = 'client' | 'server' | 'electron'
@@ -153,9 +156,9 @@ export function createStandardTestPlan({
 
   if (resolvedMode === 'aggressive') {
     const aggressiveRuns: StandardTestRun[] = [
-      { name: 'client', maxWorkers: '50%', priority: 'normal' },
-      { name: 'server', configPath: 'vitest.server.config.ts', maxWorkers: '50%', priority: 'normal' },
-      { name: 'electron', configPath: 'vitest.electron.config.ts', priority: 'normal' },
+      { name: 'client', configPath: defaultVitestConfig, maxWorkers: '50%', priority: 'normal' },
+      { name: 'server', configPath: serverVitestConfig, maxWorkers: '50%', priority: 'normal' },
+      { name: 'electron', configPath: electronVitestConfig, priority: 'normal' },
     ]
     return {
       mode: resolvedMode,
@@ -165,11 +168,11 @@ export function createStandardTestPlan({
 
   const workers = resolveDesktopWorkerPlan(cpuCount)
   const initialStage = filterRuns([
-    { name: 'client', maxWorkers: workers.clientWorkers, priority: 'background' },
-    { name: 'server', configPath: 'vitest.server.config.ts', maxWorkers: workers.serverWorkers, priority: 'background' },
+    { name: 'client', configPath: defaultVitestConfig, maxWorkers: workers.clientWorkers, priority: 'background' },
+    { name: 'server', configPath: serverVitestConfig, maxWorkers: workers.serverWorkers, priority: 'background' },
   ], requestedSuites)
   const electronStage = filterRuns([
-    { name: 'electron', configPath: 'vitest.electron.config.ts', priority: 'background' },
+    { name: 'electron', configPath: electronVitestConfig, priority: 'background' },
   ], requestedSuites)
 
   const stages = [initialStage, electronStage].filter((stage) => stage.length > 0)

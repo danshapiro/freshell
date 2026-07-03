@@ -135,7 +135,7 @@ No second harness is required. The existing server-unit harness already covers t
 
 7. **Name:** `resolveProjectRoot()` remains pinned to `process.cwd()` so bootstrap and `dotenv/config` agree on `.env` location
    - **Type:** unit
-   - **Harness:** Server Vitest suite via `npm run test:vitest -- --config vitest.server.config.ts test/unit/server/bootstrap.test.ts`
+   - **Harness:** Server Vitest suite via `npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/bootstrap.test.ts`
    - **Preconditions:** None beyond the existing bootstrap unit-test environment.
    - **Actions:**
      1. Call `resolveProjectRoot()` from `server/bootstrap.ts`.

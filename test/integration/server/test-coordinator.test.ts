@@ -653,13 +653,13 @@ describe('test coordinator CLI', () => {
       commandKey: 'check',
       forwardedArgs: ['test/server/ws-protocol.test.ts'],
       prePhaseSelector: 'npm:typecheck',
-      delegatedSelector: 'vitest:server:run --config vitest.server.config.ts test/server/ws-protocol.test.ts',
+      delegatedSelector: 'vitest:server:run --config config/vitest/vitest.server.config.ts test/server/ws-protocol.test.ts',
     },
     {
       commandKey: 'verify',
       forwardedArgs: ['test/unit/client/components/Sidebar.test.tsx'],
       prePhaseSelector: 'npm:build',
-      delegatedSelector: 'vitest:default:run test/unit/client/components/Sidebar.test.tsx',
+      delegatedSelector: 'vitest:default:run --config config/vitest/vitest.config.ts test/unit/client/components/Sidebar.test.tsx',
     },
   ])(
     'records focused successful $commandKey runs after pre-phases succeed',
@@ -706,14 +706,14 @@ describe('test coordinator CLI', () => {
       commandKey: 'check',
       forwardedArgs: ['test/server/ws-protocol.test.ts'],
       prePhaseSelector: 'npm:typecheck',
-      failingSelector: 'vitest:server:run --config vitest.server.config.ts test/server/ws-protocol.test.ts',
+      failingSelector: 'vitest:server:run --config config/vitest/vitest.server.config.ts test/server/ws-protocol.test.ts',
       exitCode: 41,
     },
     {
       commandKey: 'verify',
       forwardedArgs: ['test/unit/client/components/Sidebar.test.tsx'],
       prePhaseSelector: 'npm:build',
-      failingSelector: 'vitest:default:run test/unit/client/components/Sidebar.test.tsx',
+      failingSelector: 'vitest:default:run --config config/vitest/vitest.config.ts test/unit/client/components/Sidebar.test.tsx',
       exitCode: 42,
     },
   ])(
@@ -814,8 +814,8 @@ describe('test coordinator CLI', () => {
 
     const captures = await readCaptureLines(captureFile)
     expect(captures.map((entry) => entry.selector)).toEqual([
-      'vitest:server:--config vitest.server.config.ts --help',
-      'vitest:server:--config vitest.server.config.ts --run',
+      'vitest:server:--config config/vitest/vitest.server.config.ts --help',
+      'vitest:server:--config config/vitest/vitest.server.config.ts --run',
     ])
     const suiteRuns = await readSuiteRuns(fixture.storeDir)
     expect(suiteRuns.byKey['server:all:run']).toMatchObject({
@@ -849,7 +849,7 @@ describe('test coordinator CLI', () => {
 
     const captures = await readCaptureLines(captureFile)
     expect(captures.map((entry) => entry.selector)).toEqual([
-      'vitest:default:run --help',
+      'vitest:default:run --config config/vitest/vitest.config.ts --help',
     ])
   })
 
@@ -863,7 +863,7 @@ describe('test coordinator CLI', () => {
       {
         FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
         FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
-          'vitest:server:--config vitest.server.config.ts --run': { holdMs: 5_000 },
+          'vitest:server:--config config/vitest/vitest.server.config.ts --run': { holdMs: 5_000 },
         }),
       },
     )
@@ -923,7 +923,7 @@ describe('test coordinator CLI', () => {
       { key: 'test', args: ['--ui'] },
       { key: 'test:watch', args: ['--help'] },
       { key: 'test:ui', args: ['--help'] },
-      { key: 'test:vitest', args: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'] },
+      { key: 'test:vitest', args: ['--config', 'config/vitest/vitest.server.config.ts', 'test/server/ws-protocol.test.ts'] },
     ]
 
     for (const command of commands) {
@@ -940,10 +940,10 @@ describe('test coordinator CLI', () => {
     }
 
     const captures = await readCaptureLines(captureFile)
-    expect(captures.map((entry) => entry.selector)).toContain('vitest:default:run --watch')
-    expect(captures.map((entry) => entry.selector)).toContain('vitest:default:run --ui')
-    expect(captures.map((entry) => entry.selector)).not.toContain('vitest:server:run --config vitest.server.config.ts --watch')
-    expect(captures.map((entry) => entry.selector)).not.toContain('vitest:server:run --config vitest.server.config.ts --ui')
+    expect(captures.map((entry) => entry.selector)).toContain('vitest:default:run --config config/vitest/vitest.config.ts --watch')
+    expect(captures.map((entry) => entry.selector)).toContain('vitest:default:run --config config/vitest/vitest.config.ts --ui')
+    expect(captures.map((entry) => entry.selector)).not.toContain('vitest:server:run --config config/vitest/vitest.server.config.ts --watch')
+    expect(captures.map((entry) => entry.selector)).not.toContain('vitest:server:run --config config/vitest/vitest.server.config.ts --ui')
 
     await stopChild(holder)
   }, 60_000)
@@ -1031,19 +1031,19 @@ describe('test coordinator CLI', () => {
       commandKey: 'test:unit',
       forwardedArgs: ['--reporter', 'dot'],
       suiteKey: 'default:test/unit',
-      selectors: ['vitest:default:run test/unit --reporter dot'],
+      selectors: ['vitest:default:run --config config/vitest/vitest.config.ts test/unit --reporter dot'],
     },
     {
       commandKey: 'test:coverage',
       forwardedArgs: ['--bail', '1'],
       suiteKey: 'default:coverage',
-      selectors: ['vitest:default:run --coverage --bail 1'],
+      selectors: ['vitest:default:run --config config/vitest/vitest.config.ts --coverage --bail 1'],
     },
     {
       commandKey: 'test:server',
       forwardedArgs: ['--run', '--reporter', 'dot'],
       suiteKey: 'server:all:run',
-      selectors: ['vitest:server:--config vitest.server.config.ts --run --reporter dot'],
+      selectors: ['vitest:server:--config config/vitest/vitest.server.config.ts --run --reporter dot'],
     },
   ])('keeps broad single-phase $commandKey workloads coordinated when benign flags are forwarded', async ({
     commandKey,

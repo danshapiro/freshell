@@ -66,12 +66,12 @@ No approval required. The approved strategy still fits the implementation plan a
 
 ## Test plan
 
-1. Name: `tsx watch` ignores `.worktrees`, `dist`, and `demo-projects` changes while still restarting on a real server-source change
+1. Name: `tsx watch` ignores `.worktrees`, `dist`, and `examples/demo-projects` changes while still restarting on a real server-source change
    Type: differential
    Disposition: new command probe driven from the implementation task, not an existing test file
    Harness: H1
-   Preconditions: an isolated port is available; timestamped probe files can be created under `.worktrees/`, `dist/`, and `demo-projects/`; the command under test is the current `tsx watch server/index.ts` surface from `Repo-scripts`.
-   Actions: start `PORT=<isolated> npx tsx watch server/index.ts`; wait for the initial ready/startup output; touch one probe file under `.worktrees/`, one under `dist/`, and one under `demo-projects/`; observe rerun output after each touch; then touch `server/index.ts` or another imported server source file and observe the next rerun.
+   Preconditions: an isolated port is available; timestamped probe files can be created under `.worktrees/`, `dist/`, and `examples/demo-projects/`; the command under test is the current `tsx watch server/index.ts` surface from `Repo-scripts`.
+   Actions: start `PORT=<isolated> npx tsx watch server/index.ts`; wait for the initial ready/startup output; touch one probe file under `.worktrees/`, one under `dist/`, and one under `examples/demo-projects/`; observe rerun output after each touch; then touch `server/index.ts` or another imported server source file and observe the next rerun.
    Expected outcome: the command starts successfully, the three non-runtime touches do not trigger a rerun, and the server-source touch does trigger exactly one rerun. If any excluded-path touch restarts the watcher, the implementation can no longer satisfy `Plan-SG` or `Plan-AC` without changing scope. Sources: `Transcript`, `Plan-SG`, `Plan-AC`, `Repo-scripts`, `Docs-tsx`.
    Interactions: `tsx` watch mode, Node process startup, repo filesystem layout, isolated port binding.
 
@@ -260,7 +260,7 @@ No approval required. The approved strategy still fits the implementation plan a
     Disposition: existing/extended suites run together
     Harness: H1 and H2
     Preconditions: the implementation for tasks 1 through 3 is landed in the worktree.
-    Actions: run `npm run test:vitest -- --config vitest.server.config.ts run test/unit/server/bootstrap.test.ts test/unit/server/network-manager.test.ts test/unit/server/wsl-port-forward.test.ts test/integration/server/lan-info-api.test.ts test/integration/server/local-file-router.test.ts test/integration/server/network-api.test.ts`.
+    Actions: run `npm run test:vitest -- --config config/vitest/vitest.server.config.ts run test/unit/server/bootstrap.test.ts test/unit/server/network-manager.test.ts test/unit/server/wsl-port-forward.test.ts test/integration/server/lan-info-api.test.ts test/integration/server/local-file-router.test.ts test/integration/server/network-api.test.ts`.
     Expected outcome: the focused server suite passes as the main red-to-green server acceptance gate. Sources: `Plan-T7`, `Plan-AC`, `Repo-scripts`.
     Interactions: Vitest coordinator path, server runtime modules, router integration tests, WSL planner mocks.
 

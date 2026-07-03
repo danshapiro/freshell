@@ -86,7 +86,7 @@ Tests must prove:
 Run:
 
 ```bash
-npx vitest run --config vitest.server.config.ts test/unit/server/coding-cli/codex-provider.test.ts test/unit/server/coding-cli/session-indexer.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/codex-provider.test.ts test/unit/server/coding-cli/session-indexer.test.ts
 ```
 
 Expected: FAIL because `ParsedSessionMeta` / `CodingCliSession` do not yet expose Codex task-event snapshots.
@@ -118,7 +118,7 @@ Implementation rules:
 Run:
 
 ```bash
-npx vitest run --config vitest.server.config.ts test/unit/server/coding-cli/codex-provider.test.ts test/unit/server/coding-cli/session-indexer.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/codex-provider.test.ts test/unit/server/coding-cli/session-indexer.test.ts
 ```
 
 Expected: PASS.
@@ -170,7 +170,7 @@ expect(unbound.reason).toBe('repair_duplicate')
 Run:
 
 ```bash
-npx vitest run --config vitest.server.config.ts test/unit/server/terminal-lifecycle.test.ts test/unit/server/session-association-coordinator.test.ts test/unit/server/terminal-registry.test.ts test/server/session-association.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/terminal-lifecycle.test.ts test/unit/server/session-association-coordinator.test.ts test/unit/server/terminal-registry.test.ts test/server/session-association.test.ts
 ```
 
 Expected: FAIL because these event types and reasons do not exist yet.
@@ -215,7 +215,7 @@ Implementation rules:
 Run:
 
 ```bash
-npx vitest run --config vitest.server.config.ts test/unit/server/terminal-lifecycle.test.ts test/unit/server/session-association-coordinator.test.ts test/unit/server/terminal-registry.test.ts test/server/session-association.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/terminal-lifecycle.test.ts test/unit/server/session-association-coordinator.test.ts test/unit/server/terminal-registry.test.ts test/server/session-association.test.ts
 ```
 
 Expected: PASS.
@@ -335,7 +335,7 @@ type CodexTerminalActivity = {
 Run:
 
 ```bash
-npx vitest run --config vitest.server.config.ts test/unit/server/coding-cli/codex-activity-tracker.test.ts test/server/codex-activity-exact-subset.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/codex-activity-tracker.test.ts test/server/codex-activity-exact-subset.test.ts
 ```
 
 Expected: FAIL because the tracker and exact-subset semantics do not exist.
@@ -384,7 +384,7 @@ Implementation rules:
 Run:
 
 ```bash
-npx vitest run --config vitest.server.config.ts test/unit/server/coding-cli/codex-activity-tracker.test.ts test/server/codex-activity-exact-subset.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/codex-activity-tracker.test.ts test/server/codex-activity-exact-subset.test.ts
 ```
 
 Expected: PASS.
@@ -442,7 +442,7 @@ Tests must prove:
 Run:
 
 ```bash
-npx vitest run --config vitest.server.config.ts test/server/ws-codex-activity.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/server/ws-codex-activity.test.ts
 npx vitest run test/unit/client/store/codexActivitySlice.test.ts test/unit/client/components/App.ws-bootstrap.test.tsx
 ```
 
@@ -466,7 +466,7 @@ Do not touch `server/terminal-metadata-service.ts`.
 Run:
 
 ```bash
-npx vitest run --config vitest.server.config.ts test/server/ws-codex-activity.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/server/ws-codex-activity.test.ts
 npx vitest run test/unit/client/store/codexActivitySlice.test.ts test/unit/client/components/App.ws-bootstrap.test.tsx
 ```
 
@@ -585,7 +585,7 @@ Add one CLI e2e test showing `wait-for --prompt` stays blocked across multiple p
 Run:
 
 ```bash
-npx vitest run --config vitest.server.config.ts test/server/agent-wait-for-api.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/server/agent-wait-for-api.test.ts
 npx vitest run test/e2e/agent-cli-flow.test.ts
 ```
 
@@ -615,7 +615,7 @@ Implementation rules:
 Run:
 
 ```bash
-npx vitest run --config vitest.server.config.ts test/server/agent-wait-for-api.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/server/agent-wait-for-api.test.ts
 npx vitest run test/e2e/agent-cli-flow.test.ts
 ```
 
@@ -633,7 +633,7 @@ git commit -m "feat(agent-api): block codex prompt waits on busy state"
 Run the focused suites first:
 
 ```bash
-npx vitest run --config vitest.server.config.ts test/unit/server/coding-cli/codex-provider.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/terminal-lifecycle.test.ts test/unit/server/session-association-coordinator.test.ts test/unit/server/terminal-registry.test.ts test/server/session-association.test.ts test/unit/server/coding-cli/codex-activity-tracker.test.ts test/server/codex-activity-exact-subset.test.ts test/server/ws-codex-activity.test.ts test/server/agent-wait-for-api.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/codex-provider.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/terminal-lifecycle.test.ts test/unit/server/session-association-coordinator.test.ts test/unit/server/terminal-registry.test.ts test/server/session-association.test.ts test/unit/server/coding-cli/codex-activity-tracker.test.ts test/server/codex-activity-exact-subset.test.ts test/server/ws-codex-activity.test.ts test/server/agent-wait-for-api.test.ts
 npx vitest run test/unit/shared/turn-complete-signal.test.ts test/unit/client/lib/turn-complete-signal.test.ts test/unit/client/store/codexActivitySlice.test.ts test/unit/client/components/App.ws-bootstrap.test.tsx test/unit/client/lib/codex-activity-resolver.test.ts test/unit/client/components/panes/PaneHeader.test.tsx test/unit/client/components/TabBar.test.tsx test/e2e/codex-activity-indicator-flow.test.tsx test/e2e/agent-cli-flow.test.ts
 ```
 

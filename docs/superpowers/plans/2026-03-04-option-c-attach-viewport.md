@@ -8,7 +8,7 @@
 
 **Architecture:** Ship a hard protocol cut. `terminal.create` only creates or resolves the terminal identity. `terminal.attach` is the only replay ingress and must carry `cols` and `rows` every time. Hidden panes defer their first attach until visible geometry is available. Reconnect follows the same explicit lifecycle: reconnect to the socket, wait for `ready`, then either resend the unresolved `terminal.create` or send a new `terminal.attach` for the known `terminalId`.
 
-**Tech Stack:** TypeScript, React 18, xterm.js, Node/Express, WebSocket (`ws`), Zod protocol validation, Vitest (`vitest.server.config.ts` for server/node and `vitest.config.ts` for client/jsdom).
+**Tech Stack:** TypeScript, React 18, xterm.js, Node/Express, WebSocket (`ws`), Zod protocol validation, Vitest (`config/vitest/vitest.server.config.ts` for server/node and `config/vitest/vitest.config.ts` for client/jsdom).
 
 ---
 
@@ -169,7 +169,7 @@ npx vitest run \
   test/server/ws-terminal-create-reuse-running-claude.test.ts \
   test/server/ws-terminal-create-reuse-running-codex.test.ts \
   test/server/ws-terminal-create-session-repair.test.ts \
-  --config vitest.server.config.ts
+  --config config/vitest/vitest.server.config.ts
 ```
 
 Run client/jsdom suites:
@@ -181,7 +181,7 @@ npx vitest run \
   test/e2e/terminal-flaky-network-responsiveness.test.tsx \
   test/e2e/terminal-settings-remount-scrollback.test.tsx \
   test/e2e/terminal-create-attach-ordering.test.tsx \
-  --config vitest.config.ts
+  --config config/vitest/vitest.config.ts
 ```
 
 Run full regression suite:

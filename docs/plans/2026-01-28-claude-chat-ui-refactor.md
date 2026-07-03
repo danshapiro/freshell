@@ -758,7 +758,7 @@ describe('WebSocket Claude Events', () => {
 
 **Step 2: Run test to verify it fails**
 
-Run: `npx vitest run --config vitest.server.config.ts test/server/ws-claude-events.test.ts`
+Run: `npx vitest run --config config/vitest/vitest.server.config.ts test/server/ws-claude-events.test.ts`
 Expected: FAIL (WsHandler doesn't accept claudeManager parameter yet)
 
 **Step 3: Write minimal implementation**
@@ -892,7 +892,7 @@ if (data.type === 'claude.kill') {
 
 **Step 4: Run test to verify it passes**
 
-Run: `npx vitest run --config vitest.server.config.ts test/server/ws-claude-events.test.ts`
+Run: `npx vitest run --config config/vitest/vitest.server.config.ts test/server/ws-claude-events.test.ts`
 Expected: PASS
 
 **Step 5: Commit**
@@ -2191,7 +2191,7 @@ describe('Claude Session Flow Integration', () => {
 
 **Step 2: Run test**
 
-Run: `npx vitest run --config vitest.server.config.ts test/integration/server/claude-session-flow.test.ts`
+Run: `npx vitest run --config config/vitest/vitest.server.config.ts test/integration/server/claude-session-flow.test.ts`
 Expected: PASS (may take time due to Claude API call)
 
 **Step 3: Commit**

@@ -7,7 +7,7 @@
 | Command | Purpose |
 |---------|---------|
 | `npm run typecheck:client` | Cheap client-only compile gate; safe while prod is live |
-| `npm test` | Coordinated full suite (`vitest run` plus `vitest run --config vitest.server.config.ts`) |
+| `npm test` | Coordinated full suite (`vitest run` plus `vitest run --config config/vitest/vitest.server.config.ts`) |
 | `npm run test:all` | Alias for the same coordinated full suite |
 | `npm run check` | Run `typecheck`, then the coordinated full suite |
 | `npm run verify` | Run `build`, then the coordinated full suite |
@@ -44,5 +44,5 @@ FRESHELL_TEST_SUMMARY="Verify coordinated full suite" npm test
 npm run test:server -- --help
 npm run test:server -- --run
 npm run test:unit -- test/unit/server/coding-cli/utils.test.ts
-npm run test:vitest -- --config vitest.server.config.ts test/server/ws-protocol.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/server/ws-protocol.test.ts
 ```

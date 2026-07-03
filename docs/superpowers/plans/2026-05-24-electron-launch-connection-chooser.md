@@ -24,7 +24,7 @@
 - Modify `electron/startup.ts`: Use launch policy before server-mode switching; add a `chooser` startup result; centralize `loadMainWindow`.
 - Modify `electron/entry.ts`: Register chooser IPC handlers, show chooser when `runStartup()` requests it, and restart startup after chooser selection.
 - Modify `electron/preload.ts`: Expose chooser APIs to the renderer.
-- Modify `electron-builder.yml`: Include the built launch chooser assets beside existing setup wizard assets.
+- Modify `config/electron-builder.yml`: Include the built launch chooser assets beside existing setup wizard assets.
 - Modify `package.json`: Add `build:launch-chooser` and include it in `electron:build` and `electron:build:win`.
 - Modify `server/index.ts`: Extend `/api/health` with `instanceId`, `startedAt`, and `requiresAuth` without requiring auth.
 - Test `test/unit/electron/launch-discovery.test.ts`.
@@ -144,7 +144,7 @@ Add these tests to `test/unit/electron/desktop-config.test.ts`:
 Run:
 
 ```bash
-CI=true npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/desktop-config.test.ts --run
+CI=true npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/desktop-config.test.ts --run
 ```
 
 Expected: FAIL because `alwaysAskOnLaunch` and `knownServers` are not in `DesktopConfigSchema`.
@@ -235,7 +235,7 @@ export function getDefaultDesktopConfig(): DesktopConfig {
 Run:
 
 ```bash
-CI=true npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/desktop-config.test.ts --run
+CI=true npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/desktop-config.test.ts --run
 ```
 
 Expected: PASS.
@@ -363,7 +363,7 @@ describe('launch discovery', () => {
 Run:
 
 ```bash
-CI=true npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/launch-discovery.test.ts --run
+CI=true npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/launch-discovery.test.ts --run
 ```
 
 Expected: FAIL because `electron/launch-discovery.ts` does not exist.
@@ -475,7 +475,7 @@ export async function discoverLocalServers(options: DiscoverLocalServersOptions)
 Run:
 
 ```bash
-CI=true npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/launch-discovery.test.ts --run
+CI=true npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/launch-discovery.test.ts --run
 ```
 
 Expected: PASS.
@@ -621,7 +621,7 @@ describe('token resolver', () => {
 Run:
 
 ```bash
-CI=true npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/token-resolver.test.ts --run
+CI=true npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/token-resolver.test.ts --run
 ```
 
 Expected: FAIL because `electron/token-resolver.ts` does not exist.
@@ -703,7 +703,7 @@ export async function resolveCandidateToken(options: ResolveCandidateTokenOption
 Run:
 
 ```bash
-CI=true npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/token-resolver.test.ts --run
+CI=true npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/token-resolver.test.ts --run
 ```
 
 Expected: PASS.
@@ -864,7 +864,7 @@ describe('launch policy', () => {
 Run:
 
 ```bash
-CI=true npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/launch-policy.test.ts --run
+CI=true npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/launch-policy.test.ts --run
 ```
 
 Expected: FAIL because `electron/launch-policy.ts` does not exist.
@@ -943,7 +943,7 @@ export function chooseLaunchAction(options: ChooseLaunchActionOptions): LaunchAc
 Run:
 
 ```bash
-CI=true npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/launch-policy.test.ts --run
+CI=true npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/launch-policy.test.ts --run
 ```
 
 Expected: PASS.
@@ -1050,7 +1050,7 @@ Add these tests to `test/unit/electron/startup.test.ts`:
 Run:
 
 ```bash
-CI=true npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/startup.test.ts --run
+CI=true npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/startup.test.ts --run
 ```
 
 Expected: FAIL because `StartupContext` has no `discoverLaunchCandidates`, and `StartupResult` has no `chooser` result.
@@ -1255,7 +1255,7 @@ Then replace the old final window-loading block with:
 Run:
 
 ```bash
-CI=true npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/startup.test.ts --run
+CI=true npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/startup.test.ts --run
 ```
 
 Expected: PASS.
@@ -1353,7 +1353,7 @@ describe('launch chooser logic', () => {
 Run:
 
 ```bash
-CI=true npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/launch-chooser/chooser-logic.test.ts --run
+CI=true npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/launch-chooser/chooser-logic.test.ts --run
 ```
 
 Expected: FAIL because chooser logic does not exist.
@@ -1706,7 +1706,7 @@ Add assertions to `test/unit/electron/preload.test.ts` that the exposed API has 
 Run:
 
 ```bash
-CI=true npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/launch-chooser/chooser-logic.test.ts test/unit/electron/preload.test.ts --run
+CI=true npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/launch-chooser/chooser-logic.test.ts test/unit/electron/preload.test.ts --run
 ```
 
 Expected: PASS.
@@ -1779,7 +1779,7 @@ If the current `main.test.ts` does not expose helpers like `mainWithMocks`, firs
 Run:
 
 ```bash
-CI=true npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/main.test.ts --run
+CI=true npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/main.test.ts --run
 ```
 
 Expected: FAIL because chooser IPC is not registered.
@@ -1874,7 +1874,7 @@ When startup returns chooser:
 Run:
 
 ```bash
-CI=true npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/main.test.ts --run
+CI=true npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/main.test.ts --run
 ```
 
 Expected: PASS.
@@ -1986,7 +1986,7 @@ git commit -m "feat(server): expose launch metadata in health check"
 
 **Files:**
 - Modify: `package.json`
-- Modify: `electron-builder.yml`
+- Modify: `config/electron-builder.yml`
 - Modify: `test/unit/electron/electron-builder-config.test.ts`
 
 - [ ] **Step 1: Write failing build config tests**
@@ -2012,7 +2012,7 @@ Add to `test/unit/electron/electron-builder-config.test.ts`:
 Run:
 
 ```bash
-CI=true npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/electron-builder-config.test.ts --run
+CI=true npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/electron-builder-config.test.ts --run
 ```
 
 Expected: FAIL because launch chooser assets are not packaged.
@@ -2022,12 +2022,12 @@ Expected: FAIL because launch chooser assets are not packaged.
 Modify `package.json` scripts:
 
 ```json
-"build:launch-chooser": "vite build --config vite.launch-chooser.config.ts",
+"build:launch-chooser": "vite build --config config/vite/vite.launch-chooser.config.ts",
 "electron:build": "npm run build && npm run build:electron && npm run build:wizard && npm run build:launch-chooser && npm run prepare:bundled-node && electron-builder",
 "electron:build:win": "tsx scripts/assert-native-windows-build.ts && npm run build && npm run build:electron && npm run build:wizard && npm run build:launch-chooser && npm run prepare:bundled-node && electron-builder --win nsis portable --publish never"
 ```
 
-Create `vite.launch-chooser.config.ts` if the existing wizard Vite config cannot be parameterized:
+Create `config/vite/vite.launch-chooser.config.ts` if the existing wizard Vite config cannot be parameterized:
 
 ```ts
 import { defineConfig } from 'vite'
@@ -2046,7 +2046,7 @@ export default defineConfig({
 
 - [ ] **Step 4: Package launch chooser assets**
 
-Modify `electron-builder.yml` `extraResources`:
+Modify `config/electron-builder.yml` `extraResources`:
 
 ```yaml
   - from: dist/launch-chooser
@@ -2058,7 +2058,7 @@ Modify `electron-builder.yml` `extraResources`:
 Run:
 
 ```bash
-CI=true npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/electron-builder-config.test.ts --run
+CI=true npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/electron-builder-config.test.ts --run
 ```
 
 Expected: PASS.
@@ -2068,7 +2068,7 @@ Expected: PASS.
 Run:
 
 ```bash
-git add package.json package-lock.json electron-builder.yml vite.launch-chooser.config.ts test/unit/electron/electron-builder-config.test.ts
+git add package.json package-lock.json config/electron-builder.yml config/vite/vite.launch-chooser.config.ts test/unit/electron/electron-builder-config.test.ts
 git commit -m "build(electron): package launch chooser"
 ```
 
@@ -2170,7 +2170,7 @@ git commit -m "test(electron): cover launch chooser startup"
 Run:
 
 ```bash
-CI=true npm run test:vitest -- --config vitest.electron.config.ts \
+CI=true npm run test:vitest -- --config config/vitest/vitest.electron.config.ts \
   test/unit/electron/desktop-config.test.ts \
   test/unit/electron/launch-discovery.test.ts \
   test/unit/electron/token-resolver.test.ts \

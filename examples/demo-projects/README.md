@@ -9,7 +9,7 @@ pane via an iframe.
 Pick a project, build it, symlink it, and restart freshell:
 
 ```bash
-cd demo-projects/synth
+cd examples/demo-projects/synth
 npm install
 npx vite build
 ln -sf "$(pwd)" ~/.freshell/extensions/synth
@@ -32,7 +32,7 @@ analyser, and a 16-step sequencer with adjustable BPM.
 - **Extension name:** `synth`
 
 ```bash
-cd demo-projects/synth
+cd examples/demo-projects/synth
 npm install && npx vite build
 ln -sf "$(pwd)" ~/.freshell/extensions/synth
 ```
@@ -49,7 +49,7 @@ animation, and hover for per-planet detail tooltips.
 - **Data:** `public/exoplanets.csv` (bundled)
 
 ```bash
-cd demo-projects/dataviz/viz-a
+cd examples/demo-projects/dataviz/viz-a
 npm install && npx vite build
 ln -sf "$(pwd)" ~/.freshell/extensions/exoplanet-nightsky
 ```
@@ -67,7 +67,7 @@ a detail panel with size comparison to Earth.
 - **Data:** `public/data/exoplanets-clean.csv` (bundled)
 
 ```bash
-cd demo-projects/dataviz/viz-b
+cd examples/demo-projects/dataviz/viz-b
 npm install && npx vite build
 ln -sf "$(pwd)" ~/.freshell/extensions/exoplanet-clusters
 ```
@@ -88,7 +88,7 @@ If you're an AI agent setting up these demos, here's the full sequence:
 
 ```bash
 # From the freshell repo root
-for project in demo-projects/synth demo-projects/dataviz/viz-a demo-projects/dataviz/viz-b; do
+for project in examples/demo-projects/synth examples/demo-projects/dataviz/viz-a examples/demo-projects/dataviz/viz-b; do
   cd "$project"
   npm install
   npx vite build
@@ -96,9 +96,9 @@ for project in demo-projects/synth demo-projects/dataviz/viz-a demo-projects/dat
 done
 
 # Symlink all three
-ln -sf "$(pwd)/demo-projects/synth" ~/.freshell/extensions/synth
-ln -sf "$(pwd)/demo-projects/dataviz/viz-a" ~/.freshell/extensions/exoplanet-nightsky
-ln -sf "$(pwd)/demo-projects/dataviz/viz-b" ~/.freshell/extensions/exoplanet-clusters
+ln -sf "$(pwd)/examples/demo-projects/synth" ~/.freshell/extensions/synth
+ln -sf "$(pwd)/examples/demo-projects/dataviz/viz-a" ~/.freshell/extensions/exoplanet-nightsky
+ln -sf "$(pwd)/examples/demo-projects/dataviz/viz-b" ~/.freshell/extensions/exoplanet-clusters
 ```
 
 Then restart freshell. The three extensions appear in the pane picker alongside
@@ -109,7 +109,7 @@ the built-in pane types.
 To work on a demo with hot reload, run the Vite dev server directly:
 
 ```bash
-cd demo-projects/synth
+cd examples/demo-projects/synth
 npm install
 npx vite          # opens on the port configured in vite.config
 ```

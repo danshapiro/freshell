@@ -4,29 +4,30 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const projectRoot = path.resolve(__dirname, '../..')
 
 export default defineConfig({
   plugins: [react()],
-  root: path.resolve(__dirname, 'electron/launch-chooser'),
-  base: './',
+  root: path.resolve(projectRoot, 'electron/setup-wizard'),
+  base: './',  // relative paths for file:// protocol in production
   build: {
-    outDir: path.resolve(__dirname, 'dist/launch-chooser'),
+    outDir: path.resolve(projectRoot, 'dist/wizard'),
     emptyOutDir: true,
     sourcemap: true,
   },
   server: {
-    port: 5175,
+    port: 5174,  // separate from main app's 5173
   },
   resolve: {
     alias: {
-      '@electron': path.resolve(__dirname, './electron'),
+      '@electron': path.resolve(projectRoot, './electron'),
     },
   },
   css: {
     postcss: {
       plugins: [
         (await import('tailwindcss')).default({
-          config: path.resolve(__dirname, 'tailwind.config.wizard.js'),
+          config: path.resolve(projectRoot, 'config/tailwind/tailwind.config.wizard.js'),
         }),
         (await import('autoprefixer')).default,
       ],

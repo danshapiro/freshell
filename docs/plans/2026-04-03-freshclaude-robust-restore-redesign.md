@@ -356,8 +356,8 @@ it('evicts live aliases on unrecoverable teardown so later durable-only reads re
 Run:
 
 ```bash
-FRESHELL_TEST_SUMMARY="robust restore ledger red" npm run test:vitest -- --config vitest.server.config.ts test/unit/server/agent-timeline-ledger.test.ts test/unit/server/agent-timeline-history-source.test.ts
-FRESHELL_TEST_SUMMARY="robust restore loader red" npm run test:vitest -- --config vitest.server.config.ts test/unit/server/session-history-loader.test.ts
+FRESHELL_TEST_SUMMARY="robust restore ledger red" npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/agent-timeline-ledger.test.ts test/unit/server/agent-timeline-history-source.test.ts
+FRESHELL_TEST_SUMMARY="robust restore loader red" npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/session-history-loader.test.ts
 ```
 
 Expected: FAIL because the ledger, deterministic identity rules, typed outcomes, and shared runtime wiring do not exist yet.
@@ -400,8 +400,8 @@ Tighten naming and narrow compatibility seams so only the history source owns le
 Run:
 
 ```bash
-FRESHELL_TEST_SUMMARY="robust restore ledger verify" npm run test:vitest -- --config vitest.server.config.ts test/unit/server/agent-timeline-ledger.test.ts test/unit/server/agent-timeline-history-source.test.ts
-FRESHELL_TEST_SUMMARY="robust restore loader verify" npm run test:vitest -- --config vitest.server.config.ts test/unit/server/session-history-loader.test.ts
+FRESHELL_TEST_SUMMARY="robust restore ledger verify" npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/agent-timeline-ledger.test.ts test/unit/server/agent-timeline-history-source.test.ts
+FRESHELL_TEST_SUMMARY="robust restore loader verify" npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/session-history-loader.test.ts
 ```
 
 Expected: PASS with no test weakening.
@@ -542,7 +542,7 @@ it('dispatches sdk.create.failed through the ws client without regressing existi
 Run:
 
 ```bash
-FRESHELL_TEST_SUMMARY="robust restore create red server" npm run test:vitest -- --config vitest.server.config.ts test/unit/server/sdk-bridge-types.test.ts test/unit/server/ws-handler-sdk.test.ts
+FRESHELL_TEST_SUMMARY="robust restore create red server" npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/sdk-bridge-types.test.ts test/unit/server/ws-handler-sdk.test.ts
 FRESHELL_TEST_SUMMARY="robust restore create red client" npm run test:vitest -- test/unit/client/sdk-message-handler.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/ws-client-sdk.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
 ```
 
@@ -597,7 +597,7 @@ Remove redundant old assumptions that `sdk.created` must arrive merely to guard 
 Run:
 
 ```bash
-FRESHELL_TEST_SUMMARY="robust restore create verify server" npm run test:vitest -- --config vitest.server.config.ts test/unit/server/sdk-bridge-types.test.ts test/unit/server/ws-handler-sdk.test.ts
+FRESHELL_TEST_SUMMARY="robust restore create verify server" npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/sdk-bridge-types.test.ts test/unit/server/ws-handler-sdk.test.ts
 FRESHELL_TEST_SUMMARY="robust restore create verify client" npm run test:vitest -- test/unit/client/sdk-message-handler.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/ws-client-sdk.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
 ```
 
@@ -684,8 +684,8 @@ it('sends the snapshot revision on both timeline-page and turn-body restore read
 Run:
 
 ```bash
-FRESHELL_TEST_SUMMARY="robust restore revision red server" npm run test:vitest -- --config vitest.server.config.ts test/integration/server/agent-timeline-router.test.ts
-FRESHELL_TEST_SUMMARY="robust restore revision red service" npm run test:vitest -- --config vitest.server.config.ts test/unit/server/agent-timeline/service.test.ts
+FRESHELL_TEST_SUMMARY="robust restore revision red server" npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/integration/server/agent-timeline-router.test.ts
+FRESHELL_TEST_SUMMARY="robust restore revision red service" npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/agent-timeline/service.test.ts
 FRESHELL_TEST_SUMMARY="robust restore revision red client" npm run test:vitest -- test/unit/client/lib/api.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/e2e/agent-chat-restore-flow.test.tsx
 ```
 
@@ -726,8 +726,8 @@ Tighten error translation so stale-revision HTTP errors stay distinct from gener
 Run:
 
 ```bash
-FRESHELL_TEST_SUMMARY="robust restore revision verify server" npm run test:vitest -- --config vitest.server.config.ts test/integration/server/agent-timeline-router.test.ts
-FRESHELL_TEST_SUMMARY="robust restore revision verify service" npm run test:vitest -- --config vitest.server.config.ts test/unit/server/agent-timeline/service.test.ts
+FRESHELL_TEST_SUMMARY="robust restore revision verify server" npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/integration/server/agent-timeline-router.test.ts
+FRESHELL_TEST_SUMMARY="robust restore revision verify service" npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/agent-timeline/service.test.ts
 FRESHELL_TEST_SUMMARY="robust restore revision verify client" npm run test:vitest -- test/unit/client/lib/api.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/e2e/agent-chat-restore-flow.test.tsx
 ```
 
@@ -892,7 +892,7 @@ Add or extend tests for:
 Run:
 
 ```bash
-FRESHELL_TEST_SUMMARY="robust restore adversarial" npm run test:vitest -- --config vitest.server.config.ts test/unit/server/agent-timeline-history-source.test.ts test/unit/server/session-history-loader.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/ws-sdk-session-history-cache.test.ts
+FRESHELL_TEST_SUMMARY="robust restore adversarial" npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/agent-timeline-history-source.test.ts test/unit/server/session-history-loader.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/ws-sdk-session-history-cache.test.ts
 FRESHELL_TEST_SUMMARY="robust restore adversarial client" npm run test:vitest -- test/unit/client/agentChatSlice.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/store/tabsSlice.merge.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/ws-client-sdk.test.ts test/e2e/agent-chat-restore-flow.test.tsx test/e2e/agent-chat-resume-history-flow.test.tsx
 ```
 

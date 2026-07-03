@@ -39,7 +39,7 @@ it('uses node.exe on Windows platform', async () => {
 })
 ```
 
-Run: `cd /home/user/code/freshell/.worktrees/electron-distribution && npx vitest run test/unit/electron/startup.test.ts --config vitest.electron.config.ts`
+Run: `cd /home/user/code/freshell/.worktrees/electron-distribution && npx vitest run test/unit/electron/startup.test.ts --config config/vitest/vitest.electron.config.ts`
 Expected: FAIL (property `platform` does not exist on `StartupContext`)
 
 **Step 2: Add platform to StartupContext and fix binary path**
@@ -64,7 +64,7 @@ In `test/unit/electron/startup.test.ts`:
 
 **Step 3: Run tests**
 
-Run: `cd /home/user/code/freshell/.worktrees/electron-distribution && npx vitest run test/unit/electron/startup.test.ts --config vitest.electron.config.ts`
+Run: `cd /home/user/code/freshell/.worktrees/electron-distribution && npx vitest run test/unit/electron/startup.test.ts --config config/vitest/vitest.electron.config.ts`
 Expected: PASS
 
 **Step 4: Commit**
@@ -104,7 +104,7 @@ it('sets cwd to configDir when spawning server', async () => {
 })
 ```
 
-Run: `cd /home/user/code/freshell/.worktrees/electron-distribution && npx vitest run test/unit/electron/server-spawner.test.ts --config vitest.electron.config.ts`
+Run: `cd /home/user/code/freshell/.worktrees/electron-distribution && npx vitest run test/unit/electron/server-spawner.test.ts --config config/vitest/vitest.electron.config.ts`
 Expected: FAIL
 
 **Step 3: Fix server-spawner.ts**
@@ -124,7 +124,7 @@ The `configDir` variable is already destructured from `options` at line 91: `con
 
 **Step 4: Run tests**
 
-Run: `cd /home/user/code/freshell/.worktrees/electron-distribution && npx vitest run test/unit/electron/server-spawner.test.ts --config vitest.electron.config.ts`
+Run: `cd /home/user/code/freshell/.worktrees/electron-distribution && npx vitest run test/unit/electron/server-spawner.test.ts --config config/vitest/vitest.electron.config.ts`
 Expected: PASS
 
 **Step 5: Commit**
@@ -173,7 +173,7 @@ it('does not register window-all-closed handler', async () => {
 })
 ```
 
-Run: `cd /home/user/code/freshell/.worktrees/electron-distribution && npx vitest run test/unit/electron/main.test.ts --config vitest.electron.config.ts`
+Run: `cd /home/user/code/freshell/.worktrees/electron-distribution && npx vitest run test/unit/electron/main.test.ts --config config/vitest/vitest.electron.config.ts`
 Expected: FAIL
 
 **Step 3: Fix main.ts and entry.ts**
@@ -211,7 +211,7 @@ After `runStartup` returns a `'main'` result (right before calling `initMainProc
 
 **Step 4: Run tests**
 
-Run: `cd /home/user/code/freshell/.worktrees/electron-distribution && npx vitest run test/unit/electron/main.test.ts --config vitest.electron.config.ts`
+Run: `cd /home/user/code/freshell/.worktrees/electron-distribution && npx vitest run test/unit/electron/main.test.ts --config config/vitest/vitest.electron.config.ts`
 Expected: PASS
 
 **Step 5: Commit**
@@ -265,7 +265,7 @@ it('saves window state on resize (debounced)', async () => {
 })
 ```
 
-Run: `cd /home/user/code/freshell/.worktrees/electron-distribution && npx vitest run test/unit/electron/startup.test.ts --config vitest.electron.config.ts`
+Run: `cd /home/user/code/freshell/.worktrees/electron-distribution && npx vitest run test/unit/electron/startup.test.ts --config config/vitest/vitest.electron.config.ts`
 Expected: FAIL
 
 **Step 2: Implement window state save handlers**
@@ -304,7 +304,7 @@ window.on('move', saveState)
 
 **Step 3: Run tests**
 
-Run: `cd /home/user/code/freshell/.worktrees/electron-distribution && npx vitest run test/unit/electron/startup.test.ts --config vitest.electron.config.ts`
+Run: `cd /home/user/code/freshell/.worktrees/electron-distribution && npx vitest run test/unit/electron/startup.test.ts --config config/vitest/vitest.electron.config.ts`
 Expected: PASS
 
 **Step 4: Commit**
@@ -399,7 +399,7 @@ describe('auth token in URL', () => {
 })
 ```
 
-Run: `cd /home/user/code/freshell/.worktrees/electron-distribution && npx vitest run test/unit/electron/startup.test.ts --config vitest.electron.config.ts`
+Run: `cd /home/user/code/freshell/.worktrees/electron-distribution && npx vitest run test/unit/electron/startup.test.ts --config config/vitest/vitest.electron.config.ts`
 Expected: FAIL
 
 **Step 2: Add readEnvToken to StartupContext**
@@ -474,7 +474,7 @@ However, `createDefaultContext` needs a `platform` field (from Task 1). Also, ve
 
 **Step 6: Run tests**
 
-Run: `cd /home/user/code/freshell/.worktrees/electron-distribution && npx vitest run test/unit/electron/startup.test.ts --config vitest.electron.config.ts`
+Run: `cd /home/user/code/freshell/.worktrees/electron-distribution && npx vitest run test/unit/electron/startup.test.ts --config config/vitest/vitest.electron.config.ts`
 Expected: PASS
 
 **Step 7: Commit**

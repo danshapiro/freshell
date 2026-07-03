@@ -12,7 +12,7 @@
 
 - Relative server/client imports use explicit `.js` extensions (NodeNext/ESM). Copy verbatim from neighboring imports.
 - TDD red→green→refactor for every code task; never skip the refactor; never weaken/skip a test to pass.
-- Focused test command + CONFIG (critical — wrong config silently runs ZERO tests = false green): default config (jsdom) covers `test/unit/client/**` and `test/e2e/**` → `npm run test:vitest -- run <path>`. The server config (node) covers BOTH `test/server/**` AND `test/unit/server/**` (the latter is EXCLUDED from the default config) → `npm run test:vitest -- run <path> --config vitest.server.config.ts`. So: `codex-adapter.test.ts`, `sdk-events.test.ts`, `sdk-bridge.test.ts` (all under `test/unit/server/`) MUST use `--config vitest.server.config.ts`; `fresh-agent-turn-complete.test.ts` and the e2e use the default config.
+- Focused test command + CONFIG (critical — wrong config silently runs ZERO tests = false green): default config (jsdom) covers `test/unit/client/**` and `test/e2e/**` → `npm run test:vitest -- run <path>`. The server config (node) covers BOTH `test/server/**` AND `test/unit/server/**` (the latter is EXCLUDED from the default config) → `npm run test:vitest -- run <path> --config config/vitest/vitest.server.config.ts`. So: `codex-adapter.test.ts`, `sdk-events.test.ts`, `sdk-bridge.test.ts` (all under `test/unit/server/`) MUST use `--config config/vitest/vitest.server.config.ts`; `fresh-agent-turn-complete.test.ts` and the e2e use the default config.
 - Avoid tautological tests (no "string is present" assertions); test behavior/contracts.
 - A "completion" (GREEN + chime) fires ONLY on a discrete turn-complete/waiting edge. A self-heal/recovery emits a terminal STATUS (`exited`/`idle`) and MUST NOT emit any `*.turn.complete`/`*.turn.waiting` — recovery clears BLUE without chiming.
 - The discrete edge stamps a per-session strictly-monotonic wall-clock `at` via `nextMonotonicTurnCompleteAt(...)` (`server/fresh-agent/turn-complete-clock.ts`). Each new edge type keeps its OWN per-session `last*At` field.
@@ -141,7 +141,7 @@ it('preserves the runtime on sidecar exit so recovery reuses the SAME subscribed
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `npm run test:vitest -- run test/unit/server/fresh-agent/codex-adapter.test.ts -t "self-heals to exited" --config vitest.server.config.ts`
+Run: `npm run test:vitest -- run test/unit/server/fresh-agent/codex-adapter.test.ts -t "self-heals to exited" --config config/vitest/vitest.server.config.ts`
 Expected: FAIL — `runtime.onExit` is never called (the adapter doesn't subscribe to it), so `exitHandler` is undefined and the `sdk.status exited` assertion fails.
 
 - [ ] **Step 3: Add `onExit?` to `CodexRuntimePort`**
@@ -187,12 +187,12 @@ Then extend the teardown closure (currently lines ~921-924) to also detach it:
 
 - [ ] **Step 5: Run the test to verify it passes**
 
-Run: `npm run test:vitest -- run test/unit/server/fresh-agent/codex-adapter.test.ts -t "self-heals to exited" --config vitest.server.config.ts`
+Run: `npm run test:vitest -- run test/unit/server/fresh-agent/codex-adapter.test.ts -t "self-heals to exited" --config config/vitest/vitest.server.config.ts`
 Expected: PASS.
 
 - [ ] **Step 6: Run the full codex-adapter suite (regression)**
 
-Run: `npm run test:vitest -- run test/unit/server/fresh-agent/codex-adapter.test.ts --config vitest.server.config.ts`
+Run: `npm run test:vitest -- run test/unit/server/fresh-agent/codex-adapter.test.ts --config config/vitest/vitest.server.config.ts`
 Expected: PASS (all existing tests still green; existing fakes that omit `onExit` are unaffected because the call is `runtime.onExit?.(...)`).
 
 - [ ] **Step 7: Refactor**
@@ -233,7 +233,7 @@ it('normalizes sdk.turn.waiting to freshAgent.turn.waiting preserving at', () =>
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `npm run test:vitest -- run test/unit/server/fresh-agent/sdk-events.test.ts -t "freshAgent.turn.waiting" --config vitest.server.config.ts`
+Run: `npm run test:vitest -- run test/unit/server/fresh-agent/sdk-events.test.ts -t "freshAgent.turn.waiting" --config config/vitest/vitest.server.config.ts`
 Expected: FAIL — `sdk.turn.waiting` falls through `default` and is returned unchanged (type stays `sdk.turn.waiting`).
 
 - [ ] **Step 3: Add the union members**
@@ -268,7 +268,7 @@ In `server/fresh-agent/sdk-events.ts`, after the `sdk.turn.complete` case (line 
 
 - [ ] **Step 5: Run to verify it passes**
 
-Run: `npm run test:vitest -- run test/unit/server/fresh-agent/sdk-events.test.ts --config vitest.server.config.ts`
+Run: `npm run test:vitest -- run test/unit/server/fresh-agent/sdk-events.test.ts --config config/vitest/vitest.server.config.ts`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -427,7 +427,7 @@ it('combined waiting set — the REVERSE direction (question first, then permiss
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `npm run test:vitest -- run test/unit/server/sdk-bridge.test.ts -t "sdk.turn.waiting" --config vitest.server.config.ts`
+Run: `npm run test:vitest -- run test/unit/server/sdk-bridge.test.ts -t "sdk.turn.waiting" --config config/vitest/vitest.server.config.ts`
 Expected: FAIL — no `sdk.turn.waiting` is ever broadcast.
 
 - [ ] **Step 3: Add the emit helper**
@@ -493,7 +493,7 @@ In `handleAskUserQuestion` (`sdk-bridge.ts:551-607`), capture emptiness before t
 
 - [ ] **Step 6: Run to verify it passes**
 
-Run: `npm run test:vitest -- run test/unit/server/sdk-bridge.test.ts --config vitest.server.config.ts`
+Run: `npm run test:vitest -- run test/unit/server/sdk-bridge.test.ts --config config/vitest/vitest.server.config.ts`
 Expected: PASS (new waiting tests green; existing permission/question/turn-complete tests still green).
 
 - [ ] **Step 7: Refactor**

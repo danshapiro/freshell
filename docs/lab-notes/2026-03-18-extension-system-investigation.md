@@ -70,7 +70,7 @@ terminal pane integration. These don't use iframes and don't hit the auth issue.
 1. **Client extension auth** — the main bug. Easy fix.
 2. **Docker/remote server extensions** — `isRemote` detection doesn't account
    for Docker port forwarding. The proxy path exists but never activates.
-3. **No example extensions ship** — synth and dataviz are in `demo-projects/`
+3. **No example extensions ship** — synth and dataviz are in `examples/demo-projects/`
    but aren't wired as extensions. No non-CLI extension works out of the box.
 4. **Extension-installer skill** has good docs but can't help users past the
    auth bug.
@@ -102,7 +102,7 @@ Log discovered extensions at INFO level in production. Add a list of
 registered extensions somewhere in the UI (settings page?).
 
 ### P3: Ship a working example
-Convert `demo-projects/synth` to a client extension with a freshell.json.
+Convert `examples/demo-projects/synth` to a client extension with a freshell.json.
 This gives users a real reference implementation.
 
 ### P4: Docker server extension support — DONE

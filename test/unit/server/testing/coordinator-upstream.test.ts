@@ -80,7 +80,7 @@ describe('coordinator-upstream', () => {
     const serverHelpPhase: UpstreamPhase = {
       runner: 'vitest',
       config: 'server',
-      args: ['--config', 'vitest.server.config.ts', '--help'],
+      args: ['--config', 'config/vitest/vitest.server.config.ts', '--help'],
     }
     const watchPhase: UpstreamPhase = {
       runner: 'vitest',
@@ -94,9 +94,9 @@ describe('coordinator-upstream', () => {
     const captures = await readCaptureLines()
     expect(captures).toHaveLength(2)
     expect(captures[0]).toMatchObject({
-      selector: 'vitest:server:--config vitest.server.config.ts --help',
+      selector: 'vitest:server:--config config/vitest/vitest.server.config.ts --help',
       command: process.execPath,
-      args: [expectedVitest, '--config', 'vitest.server.config.ts', '--help'],
+      args: [expectedVitest, '--config', 'config/vitest/vitest.server.config.ts', '--help'],
       active: '1',
     })
     expect(captures[1]).toMatchObject({

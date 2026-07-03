@@ -12,7 +12,7 @@ The accepted strategy still holds after reading the implementation plan and curr
 
 Adjustments that do not change user-approved scope:
 
-1. Most audit verification should live in `test/unit/**` as pure Node or jsdom tests because the root `vitest.config.ts` excludes `test/e2e-browser/**`, while only reduced-run smoke coverage belongs under `test/e2e-browser/perf/**`. This matches the implementation plan and keeps the audit logic TDD-friendly.
+1. Most audit verification should live in `test/unit/**` as pure Node or jsdom tests because the default `config/vitest/vitest.config.ts` excludes `test/e2e-browser/**`, while only reduced-run smoke coverage belongs under `test/e2e-browser/perf/**`. This matches the implementation plan and keeps the audit logic TDD-friendly.
 2. The interaction and output-capture harnesses must treat Chromium CDP as the transport authority and the server debug JSONL file from `TestServerInfo.debugLogPath` as the server authority. Browser console forwarding to `/api/logs/client` is explicitly not a valid audit path.
 3. Browser-persisted layout seeds and HOME fixture seeds must be tested separately because the plan and current codebase split them across `localStorage` (`freshell.tabs.v2`, `freshell.panes.v2`) and the temp HOME directory created by `TestServer`.
 

@@ -10,27 +10,29 @@ import { fileURLToPath } from 'url'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
+const projectRoot = path.resolve(__dirname, '../..')
 
 export default defineConfig({
+  root: projectRoot,
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, './src'),
-      '@test': path.resolve(__dirname, './test'),
-      '@shared': path.resolve(__dirname, './shared'),
+      '@': path.resolve(projectRoot, './src'),
+      '@test': path.resolve(projectRoot, './test'),
+      '@shared': path.resolve(projectRoot, './shared'),
     },
   },
   test: {
     environment: 'node',
     globalSetup: ['./test/setup/server-global-setup.ts'],
     include: [
-      'test/integration/server/codex-real-provider-smoke.test.ts',
+      'test/integration/server/opencode-serve-real-provider-smoke.test.ts',
     ],
-    testTimeout: 60000,
+    testTimeout: 120000,
     hookTimeout: 30000,
     pool: 'threads',
     poolOptions: {
       threads: {
-        singleThread: false,
+        singleThread: true,
         isolate: true,
       },
     },

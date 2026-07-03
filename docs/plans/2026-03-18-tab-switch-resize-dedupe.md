@@ -263,7 +263,7 @@ describe('Idempotent resize', () => {
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/terminal-lifecycle.test.ts -t "Idempotent resize"
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/terminal-lifecycle.test.ts -t "Idempotent resize"
 ```
 
 Expected: FAIL because same-size `registry.resize()` currently calls `pty.resize()`.
@@ -296,7 +296,7 @@ This is deliberately the narrowest possible server choke point. It preserves the
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/terminal-lifecycle.test.ts -t "Idempotent resize"
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/terminal-lifecycle.test.ts -t "Idempotent resize"
 ```
 
 Expected: PASS.
@@ -480,7 +480,7 @@ git commit -m "fix: dedupe same-geometry terminal resizes on tab reveal"
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/terminal-lifecycle.test.ts -t "Idempotent resize"
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/terminal-lifecycle.test.ts -t "Idempotent resize"
 npm run test:vitest -- test/unit/client/components/TerminalView.lifecycle.test.tsx -t "already-live terminal"
 npm run test:e2e:chromium -- test/e2e-browser/specs/terminal-lifecycle.spec.ts -g "already-live top-tab switches do not emit terminal.attach or terminal.resize when geometry is unchanged"
 ```

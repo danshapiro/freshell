@@ -68,9 +68,9 @@ it('terminal.create reuses only canonical owner when duplicate resumeSessionId r
 
 Run:
 ```bash
-npx vitest run --config vitest.server.config.ts test/unit/server/session-binding-authority.test.ts
-npx vitest run --config vitest.server.config.ts test/server/session-association.test.ts
-npx vitest run --config vitest.server.config.ts test/server/ws-terminal-create-reuse-running-codex.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/session-binding-authority.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/server/session-association.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/server/ws-terminal-create-reuse-running-codex.test.ts
 ```
 Expected: FAIL with missing authority class and failing duplicate-association assertions.
 
@@ -170,9 +170,9 @@ private releaseBinding(terminalId: string) {
 
 Run:
 ```bash
-npx vitest run --config vitest.server.config.ts test/unit/server/session-binding-authority.test.ts
-npx vitest run --config vitest.server.config.ts test/unit/server/terminal-registry.test.ts
-npx vitest run --config vitest.server.config.ts test/unit/server/terminal-registry.findRunningTerminal.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/session-binding-authority.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/terminal-registry.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/terminal-registry.findRunningTerminal.test.ts
 ```
 Expected: PASS.
 
@@ -256,8 +256,8 @@ claudeIndexer.onNewSession((session) => {
 
 Run:
 ```bash
-npx vitest run --config vitest.server.config.ts test/server/session-association.test.ts
-npx vitest run --config vitest.server.config.ts test/integration/server/claude-session-flow.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/server/session-association.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/integration/server/claude-session-flow.test.ts
 ```
 Expected: PASS with no multi-terminal duplicate associations under repeated updates.
 
@@ -324,8 +324,8 @@ if (modeSupportsResume(mode) && effectiveResumeSessionId) {
 
 Run:
 ```bash
-npx vitest run --config vitest.server.config.ts test/server/ws-terminal-create-reuse-running-codex.test.ts
-npx vitest run --config vitest.server.config.ts test/server/ws-edge-cases.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/server/ws-terminal-create-reuse-running-codex.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/server/ws-edge-cases.test.ts
 ```
 Expected: PASS.
 
@@ -432,8 +432,8 @@ await this.tabsRegistryStore.upsert({
 
 Run:
 ```bash
-npx vitest run --config vitest.server.config.ts test/unit/server/tabs-registry/types.test.ts
-npx vitest run --config vitest.server.config.ts test/server/ws-tabs-registry.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/tabs-registry/types.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/server/ws-tabs-registry.test.ts
 npx vitest run test/unit/client/components/App.ws-bootstrap.test.tsx
 ```
 Expected: PASS.
@@ -590,7 +590,7 @@ log.info({ provider, sessionId, repairedTerminalId }, 'session_bind_repair_appli
 
 Run:
 ```bash
-npx vitest run --config vitest.server.config.ts test/integration/server/codex-session-rebind-regression.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/integration/server/codex-session-rebind-regression.test.ts
 npx vitest run test/e2e/tabs-view-flow.test.tsx
 ```
 Expected: PASS.
@@ -632,7 +632,7 @@ Expected: PASS (or documented pre-existing failures).
 
 Run:
 ```bash
-npx vitest run --config vitest.server.config.ts test/server/session-association.test.ts test/server/ws-terminal-create-reuse-running-codex.test.ts test/server/ws-tabs-registry.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/server/session-association.test.ts test/server/ws-terminal-create-reuse-running-codex.test.ts test/server/ws-tabs-registry.test.ts
 ```
 Expected: PASS.
 

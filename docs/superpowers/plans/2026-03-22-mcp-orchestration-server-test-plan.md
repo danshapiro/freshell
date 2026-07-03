@@ -6,7 +6,7 @@
 
 ## Test Infrastructure Notes
 
-- **Vitest configs:** Unit server tests run under `vitest.server.config.ts` (node environment). The include pattern is `test/unit/server/**/*.test.ts` plus `test/server/**/*.test.ts`.
+- **Vitest configs:** Unit server tests run under `config/vitest/vitest.server.config.ts` (node environment). The include pattern is `test/unit/server/**/*.test.ts` plus `test/server/**/*.test.ts`.
 - **Mocking patterns:** The codebase uses `vi.mock(...)` with factory functions and `vi.hoisted(...)` for mock objects needed before module loading. `vi.stubGlobal('fetch', ...)` is used for HTTP mocking. `vi.resetModules()` + dynamic import isolates env var reads.
 - **Existing helpers:** `test/unit/server/terminal-registry.test.ts` mocks `fs`, `node-pty`, and `server/logger`. New MCP tests should follow the same mock-first pattern.
 - **API response envelopes:** The agent API (`server/agent-api/router.ts`) wraps responses in `{ status, data?, message? }` envelopes (see `server/agent-api/response.ts`). The MCP HTTP client (`http-client.ts`) must handle envelope unwrapping — either by returning `response.data` when the envelope has a `data` field, or by returning the full response and letting the tool layer unwrap. The freshell-tool tests should mock return values matching what the HTTP client actually delivers after unwrapping. If the HTTP client unwraps envelopes, tool tests mock unwrapped payloads; if not, tool tests must mock full envelopes and the tool code must unwrap.

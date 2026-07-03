@@ -12,13 +12,13 @@ The agreed testing strategy was **medium fidelity**:
 - Unit tests for all new modules using vitest with mocked OS/Electron APIs
 - Integration tests for the server-info endpoint using supertest (same pattern as existing API tests)
 - No E2E Playwright tests for v1 (deferred -- would require building the full Electron app)
-- Separate `vitest.electron.config.ts` for electron tests
+- Separate `config/vitest/vitest.electron.config.ts` for electron tests
 - Tests written TDD-style (red-green-refactor)
 - Three vitest configs: client (jsdom), server (node), electron (node)
 
 After reviewing the implementation plan, the strategy holds with one clarification:
 
-**Wizard component tests require jsdom.** The implementation plan specifies that `test/unit/electron/setup-wizard/wizard.test.tsx` uses `// @vitest-environment jsdom` to override the electron config's default `node` environment. The `vitest.electron.config.ts` includes the `react()` plugin for JSX transform. This is consistent with the strategy -- no change in cost or scope.
+**Wizard component tests require jsdom.** The implementation plan specifies that `test/unit/electron/setup-wizard/wizard.test.tsx` uses `// @vitest-environment jsdom` to override the electron config's default `node` environment. The `config/vitest/vitest.electron.config.ts` includes the `react()` plugin for JSX transform. This is consistent with the strategy -- no change in cost or scope.
 
 ---
 
@@ -690,7 +690,7 @@ After reviewing the implementation plan, the strategy holds with one clarificati
 | **E2E Playwright tests** | Deferred for v1 -- requires building the full Electron app, which depends on having electron/electron-builder installed and full packaging pipeline working. The agreed strategy explicitly deferred this. | **Medium.** Multi-process integration bugs (Electron main process + spawned server + BrowserWindow renderer) cannot be caught by unit/integration tests alone. The scenario tests with mocked dependencies mitigate this partially. |
 | **Setup wizard React component rendering** | The wizard test (`wizard.test.tsx`) is described in the impl plan but is covered by the implementation subagent, not enumerated here as a separate test plan entry. The wizard's behavior is exercised through the scenario tests (Test 1) at the orchestrator level. | **Low.** UI rendering bugs in the wizard are cosmetic and will be caught during manual testing. |
 | **Real OS daemon operations** | All daemon tests use mocked `child_process`/`fs`. No real `launchctl`/`systemctl`/`schtasks` commands are executed. | **Medium.** Platform-specific daemon edge cases (permissions, systemd user session availability, Windows UAC) require real-OS testing. CI matrix build partially mitigates this for compilation, but runtime behavior is not covered. |
-| **electron-builder packaging** | Build configuration (`electron-builder.yml`) is validated only by CI builds, not by test assertions. | **Low.** Packaging issues are caught by the CI build matrix. |
+| **electron-builder packaging** | Build configuration (`config/electron-builder.yml`) is validated only by CI builds, not by test assertions. | **Low.** Packaging issues are caught by the CI build matrix. |
 | **Auto-update full flow** | Only the delegation layer is tested. Actual update download/install requires a published GitHub Release. | **Low for v1.** Code signing is deferred, so auto-update may not work reliably on macOS anyway. |
 | **Icon/asset correctness** | Placeholder icons are out of scope. | **None.** Icons are cosmetic. |
 | **GitHub Actions workflows** | YAML syntax validated by GitHub on push, not by vitest. | **Low.** CI workflow bugs are self-correcting (the build fails visibly). |

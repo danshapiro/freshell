@@ -43,7 +43,7 @@ This plan lands the requested end state directly:
 6. [main.tsx](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/src/main.tsx) registers the service worker in production mode. The audit should block service workers from the browser context instead of adding app-only disable logic.
 7. Tabs and panes persist in browser `localStorage`, not in HOME. The relevant keys are in [storage-keys.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/src/store/storage-keys.ts), and the payload parsers/version constants are in [persistedState.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/src/store/persistedState.ts).
 8. Existing session fixture files in [test/fixtures/sessions](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/test/fixtures/sessions) are the best reference for writing deterministic JSONL session data in the real app format.
-9. The root [vitest.config.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/vitest.config.ts) excludes `test/e2e-browser/**`, so pure Node-side audit tests should live under `test/unit/**` with `// @vitest-environment node`. The dedicated E2E helper config should be expanded later only for smoke coverage that really belongs beside the audit runner.
+9. The default [config/vitest/vitest.config.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/config/vitest/vitest.config.ts) excludes `test/e2e-browser/**`, so pure Node-side audit tests should live under `test/unit/**` with `// @vitest-environment node`. The dedicated E2E helper config should be expanded later only for smoke coverage that really belongs beside the audit runner.
 
 ## Fixed Audit Matrix
 

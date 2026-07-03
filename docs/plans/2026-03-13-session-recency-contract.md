@@ -104,7 +104,7 @@ it('ignores Claude housekeeping-only records when deriving lastActivityAt', () =
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/claude-provider.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/claude-provider.test.ts
 ```
 
 Expected: FAIL because `parseSessionContent()` and its return type do not yet expose semantic clocks.
@@ -150,7 +150,7 @@ Implementation rules:
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/claude-provider.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/claude-provider.test.ts
 ```
 
 Expected: PASS
@@ -237,7 +237,7 @@ it('ignores token_count and turn_context when deriving Codex lastActivityAt', ()
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/codex-provider.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/codex-provider.test.ts
 ```
 
 Expected: FAIL because `parseCodexSessionContent()` does not yet derive semantic clocks.
@@ -264,7 +264,7 @@ Implementation rules:
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/codex-provider.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/codex-provider.test.ts
 ```
 
 Expected: PASS
@@ -362,7 +362,7 @@ Update `test/unit/server/coding-cli/opencode-provider.test.ts` so the provider e
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/coding-cli/opencode-provider.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/coding-cli/opencode-provider.test.ts
 ```
 
 Expected: FAIL because `CodingCliSession` still uses `updatedAt` and the indexer still copies file `mtime` into session recency.
@@ -409,7 +409,7 @@ Implementation rules:
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/coding-cli/opencode-provider.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/coding-cli/opencode-provider.test.ts
 ```
 
 Expected: PASS
@@ -460,7 +460,7 @@ expect(coordinator.noteSession({ ...session, lastActivityAt: session.lastActivit
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/session-association-coordinator.test.ts test/unit/server/coding-cli/codex-activity-tracker.test.ts test/unit/server/sessions-sync/diff.test.ts test/server/session-association.test.ts test/server/ws-codex-activity.test.ts test/server/codex-activity-exact-subset.test.ts test/server/ws-terminal-create-session-repair.test.ts test/server/ws-session-repair-activity.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/session-association-coordinator.test.ts test/unit/server/coding-cli/codex-activity-tracker.test.ts test/unit/server/sessions-sync/diff.test.ts test/server/session-association.test.ts test/server/ws-codex-activity.test.ts test/server/codex-activity-exact-subset.test.ts test/server/ws-terminal-create-session-repair.test.ts test/server/ws-session-repair-activity.test.ts
 ```
 
 Expected: FAIL because these server consumers still expect session `updatedAt`.
@@ -479,7 +479,7 @@ Implementation rules:
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/session-association-coordinator.test.ts test/unit/server/coding-cli/codex-activity-tracker.test.ts test/unit/server/sessions-sync/diff.test.ts test/server/session-association.test.ts test/server/ws-codex-activity.test.ts test/server/codex-activity-exact-subset.test.ts test/server/ws-terminal-create-session-repair.test.ts test/server/ws-session-repair-activity.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/session-association-coordinator.test.ts test/unit/server/coding-cli/codex-activity-tracker.test.ts test/unit/server/sessions-sync/diff.test.ts test/server/session-association.test.ts test/server/ws-codex-activity.test.ts test/server/codex-activity-exact-subset.test.ts test/server/ws-terminal-create-session-repair.test.ts test/server/ws-session-repair-activity.test.ts
 ```
 
 Expected: PASS
@@ -522,7 +522,7 @@ expect(toSessionDirectoryComparableItem(session)).toMatchObject({
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/session-directory/projection.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/session-directory/projection.test.ts
 ```
 
 Expected: FAIL because the projection contract still uses `updatedAt` and there is no shared session-directory schema yet.
@@ -570,7 +570,7 @@ Implementation rules:
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/session-directory/projection.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/session-directory/projection.test.ts
 ```
 
 Expected: PASS
@@ -629,7 +629,7 @@ expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(1)
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/session-directory/service.test.ts test/unit/server/sessions-sync/service.test.ts test/server/ws-sidebar-snapshot-refresh.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/session-directory/service.test.ts test/unit/server/sessions-sync/service.test.ts test/server/ws-sidebar-snapshot-refresh.test.ts
 ```
 
 Expected: FAIL because the cursor payload, filters, and fixtures still use `updatedAt`.
@@ -658,7 +658,7 @@ Implementation rules:
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/session-directory/service.test.ts test/unit/server/sessions-sync/service.test.ts test/server/ws-sidebar-snapshot-refresh.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/session-directory/service.test.ts test/unit/server/sessions-sync/service.test.ts test/server/ws-sidebar-snapshot-refresh.test.ts
 ```
 
 Expected: PASS
@@ -704,7 +704,7 @@ expect(results[0].lastActivityAt).toBeGreaterThanOrEqual(results[results.length 
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/session-search.test.ts test/unit/server/session-pagination.test.ts test/integration/server/session-directory-router.test.ts test/integration/server/codex-session-rebind-regression.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/session-search.test.ts test/unit/server/session-pagination.test.ts test/integration/server/session-directory-router.test.ts test/integration/server/codex-session-rebind-regression.test.ts
 npm run test:vitest -- test/unit/cli/commands.test.ts
 ```
 
@@ -742,7 +742,7 @@ Implementation rules:
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/session-search.test.ts test/unit/server/session-pagination.test.ts test/integration/server/session-directory-router.test.ts test/integration/server/codex-session-rebind-regression.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/session-search.test.ts test/unit/server/session-pagination.test.ts test/integration/server/session-directory-router.test.ts test/integration/server/codex-session-rebind-regression.test.ts
 npm run test:vitest -- test/unit/cli/commands.test.ts
 ```
 
@@ -1069,7 +1069,7 @@ Expected: PASS
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/claude-provider.test.ts test/unit/server/coding-cli/codex-provider.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/coding-cli/opencode-provider.test.ts test/unit/server/session-association-coordinator.test.ts test/unit/server/coding-cli/codex-activity-tracker.test.ts test/unit/server/sessions-sync/diff.test.ts test/unit/server/session-directory/projection.test.ts test/unit/server/session-directory/service.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/session-search.test.ts test/unit/server/session-pagination.test.ts test/integration/server/session-directory-router.test.ts test/integration/server/codex-session-rebind-regression.test.ts test/server/session-association.test.ts test/server/ws-codex-activity.test.ts test/server/codex-activity-exact-subset.test.ts test/server/ws-terminal-create-session-repair.test.ts test/server/ws-session-repair-activity.test.ts test/server/ws-sidebar-snapshot-refresh.test.ts test/server/ws-handshake-snapshot.test.ts test/unit/server/unified-rename.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/claude-provider.test.ts test/unit/server/coding-cli/codex-provider.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/coding-cli/opencode-provider.test.ts test/unit/server/session-association-coordinator.test.ts test/unit/server/coding-cli/codex-activity-tracker.test.ts test/unit/server/sessions-sync/diff.test.ts test/unit/server/session-directory/projection.test.ts test/unit/server/session-directory/service.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/session-search.test.ts test/unit/server/session-pagination.test.ts test/integration/server/session-directory-router.test.ts test/integration/server/codex-session-rebind-regression.test.ts test/server/session-association.test.ts test/server/ws-codex-activity.test.ts test/server/codex-activity-exact-subset.test.ts test/server/ws-terminal-create-session-repair.test.ts test/server/ws-session-repair-activity.test.ts test/server/ws-sidebar-snapshot-refresh.test.ts test/server/ws-handshake-snapshot.test.ts test/unit/server/unified-rename.test.ts
 npm run test:vitest -- test/unit/cli/commands.test.ts test/unit/client/lib/api.test.ts test/unit/client/store/sessionsSlice.test.ts test/unit/client/store/sessionsThunks.test.ts test/unit/client/sessionsSlice.pagination.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/store/selectors/sidebarSelectors.knownKeys.test.ts test/unit/client/store/selectors/sidebarSelectors.runningTerminal.test.ts test/unit/client/components/App.test.tsx test/unit/client/components/App.ws-bootstrap.test.tsx test/unit/client/components/Sidebar.test.tsx test/unit/client/components/Sidebar.mobile.test.tsx test/unit/client/components/Sidebar.perf-audit.test.tsx test/unit/client/components/ContextMenuProvider.test.tsx test/unit/client/components/HistoryView.mobile.test.tsx test/unit/client/components/HistoryView.a11y.test.tsx test/unit/client/components/MobileTabStrip.test.tsx test/unit/client/components/TabBar.test.tsx test/unit/client/components/TabSwitcher.test.tsx test/unit/client/components/component-edge-cases.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/store/state-edge-cases.test.ts test/e2e/open-tab-session-sidebar-visibility.test.tsx test/e2e/sidebar-click-opens-pane.test.tsx test/e2e/sidebar-busy-icon-flow.test.tsx
 ```
 

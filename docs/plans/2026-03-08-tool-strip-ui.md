@@ -1235,7 +1235,7 @@ git commit -m "style: add slot-reel-in keyframe animation to Tailwind config"
 
 **Step 1: Run the full client test suite**
 
-Run: `npx vitest run --config vitest.config.ts`
+Run: `npx vitest run --config config/vitest/vitest.config.ts`
 Expected: All PASS
 
 **Step 2: Run the lint check**

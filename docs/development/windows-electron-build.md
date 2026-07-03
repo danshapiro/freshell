@@ -75,7 +75,7 @@ Windows-local path and run Windows' own npm against it via interop.
 
 ## What you get
 
-`electron-builder.yml` targets **`nsis`** for Windows: a one-click, per-user
+`config/electron-builder.yml` targets **`nsis`** for Windows: a one-click, per-user
 installer (`oneClick: true`, `perMachine: false`).
 
 - `release/Freshell Setup <version>.exe` — the installer. Running it installs to

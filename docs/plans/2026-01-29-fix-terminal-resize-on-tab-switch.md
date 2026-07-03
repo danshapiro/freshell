@@ -531,7 +531,7 @@ Expected: See commits for Tasks 1-3
 
 **Step 2: Run final verification**
 
-Run: `npx vitest run && npx vitest run --config vitest.server.config.ts`
+Run: `npx vitest run && npx vitest run --config config/vitest/vitest.server.config.ts`
 
 Expected: All tests pass
 

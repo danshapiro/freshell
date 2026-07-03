@@ -10,13 +10,15 @@ import { fileURLToPath } from 'url'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
+const projectRoot = path.resolve(__dirname, '../..')
 
 export default defineConfig({
+  root: projectRoot,
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, './src'),
-      '@test': path.resolve(__dirname, './test'),
-      '@shared': path.resolve(__dirname, './shared'),
+      '@': path.resolve(projectRoot, './src'),
+      '@test': path.resolve(projectRoot, './test'),
+      '@shared': path.resolve(projectRoot, './shared'),
     },
   },
   test: {

@@ -1487,7 +1487,7 @@ Update imports in every moved test to the new paths and symbol names from Step 4
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/fresh-agent/claude-history-source.test.ts test/unit/server/fresh-agent/claude-history-include-bodies.test.ts test/unit/server/fresh-agent/claude-history-ledger.test.ts test/unit/server/fresh-agent/claude-history-service.test.ts test/unit/server/fresh-agent/claude-restore-contract.test.ts test/integration/server/fresh-agent-claude-history-route-parity.test.ts test/integration/server/fresh-agent-removes-legacy-routes.test.ts --run
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/fresh-agent/claude-history-source.test.ts test/unit/server/fresh-agent/claude-history-include-bodies.test.ts test/unit/server/fresh-agent/claude-history-ledger.test.ts test/unit/server/fresh-agent/claude-history-service.test.ts test/unit/server/fresh-agent/claude-restore-contract.test.ts test/integration/server/fresh-agent-claude-history-route-parity.test.ts test/integration/server/fresh-agent-removes-legacy-routes.test.ts --run
 ```
 
 Expected: PASS.
@@ -2229,7 +2229,7 @@ Expected: PASS.
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/fresh-agent/claude-history-source.test.ts test/unit/server/fresh-agent/claude-history-include-bodies.test.ts test/unit/server/fresh-agent/claude-restore-contract.test.ts test/unit/server/fresh-agent/claude-adapter.test.ts test/unit/server/fresh-agent/codex-adapter.test.ts test/unit/server/fresh-agent/opencode-adapter.test.ts test/unit/server/ws-handler-fresh-agent-lifecycle-parity.test.ts test/unit/server/ws-handler-fresh-agent-ownership.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/server/tabs-registry/fresh-agent-migration.test.ts test/integration/server/fresh-agent-model-capabilities-router.test.ts test/integration/server/fresh-agent-claude-history-route-parity.test.ts test/integration/server/fresh-agent-removes-legacy-routes.test.ts test/integration/server/settings-api.test.ts --run
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/fresh-agent/claude-history-source.test.ts test/unit/server/fresh-agent/claude-history-include-bodies.test.ts test/unit/server/fresh-agent/claude-restore-contract.test.ts test/unit/server/fresh-agent/claude-adapter.test.ts test/unit/server/fresh-agent/codex-adapter.test.ts test/unit/server/fresh-agent/opencode-adapter.test.ts test/unit/server/ws-handler-fresh-agent-lifecycle-parity.test.ts test/unit/server/ws-handler-fresh-agent-ownership.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/server/tabs-registry/fresh-agent-migration.test.ts test/integration/server/fresh-agent-model-capabilities-router.test.ts test/integration/server/fresh-agent-claude-history-route-parity.test.ts test/integration/server/fresh-agent-removes-legacy-routes.test.ts test/integration/server/settings-api.test.ts --run
 ```
 
 Expected: PASS.

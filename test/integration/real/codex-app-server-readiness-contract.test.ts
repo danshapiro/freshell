@@ -9,7 +9,7 @@
 //
 // To run it: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- \
 //   run test/integration/real/codex-app-server-readiness-contract.test.ts \
-//   --config vitest.server.config.ts
+//   --config config/vitest/vitest.server.config.ts
 //
 import fsp from 'node:fs/promises'
 import { execFile } from 'node:child_process'

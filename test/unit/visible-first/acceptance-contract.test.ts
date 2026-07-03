@@ -45,7 +45,7 @@ describe('visible-first acceptance contract', () => {
     }
 
     expect(packageJson.scripts?.['test:visible-first:contract']).toBe(
-      'vitest run test/unit/visible-first/acceptance-contract.test.ts test/unit/visible-first/protocol-harness.test.ts test/unit/lib/visible-first-acceptance-report.test.ts',
+      'vitest run --config config/vitest/vitest.config.ts test/unit/visible-first/acceptance-contract.test.ts test/unit/visible-first/protocol-harness.test.ts test/unit/lib/visible-first-acceptance-report.test.ts',
     )
     expect(packageJson.scripts?.['visible-first:contract:check']).toBe(
       'tsx scripts/assert-visible-first-acceptance.ts',

@@ -32,15 +32,15 @@ The coordinator must preserve the exact current no-arg behavior of each public c
 
 | Command key | Current no-arg upstream behavior | Coordinator behavior |
 | --- | --- | --- |
-| `test` | `vitest run` then `vitest run --config vitest.server.config.ts` | Coordinated suite `full-suite` |
-| `test:all` | `vitest run` then `vitest run --config vitest.server.config.ts` | Coordinated suite `full-suite` |
+| `test` | `vitest run` then `vitest run --config config/vitest/vitest.server.config.ts` | Coordinated suite `full-suite` |
+| `test:all` | `vitest run` then `vitest run --config config/vitest/vitest.server.config.ts` | Coordinated suite `full-suite` |
 | `check` | `npm run typecheck` then `npm test` | Run `typecheck` first, then coordinated suite `full-suite` |
 | `verify` | `npm run build` then `npm test` | Run `build` first, then coordinated suite `full-suite` |
 | `test:coverage` | `vitest run --coverage` | Coordinated suite `default:coverage` |
 | `test:unit` | `vitest run test/unit` under the default config, which excludes `test/unit/server/**` | Coordinated suite `default:test/unit` |
 | `test:client` | `vitest run test/unit/client` | Coordinated suite `default:test/unit/client` |
-| `test:integration` | `vitest run --config vitest.server.config.ts test/server` | Coordinated suite `server:test/server` |
-| `test:server` | `vitest --config vitest.server.config.ts` | Delegated by default; coordinated only for explicit broad one-shot `--run` with no narrowing target as suite `server:all:run` |
+| `test:integration` | `vitest run --config config/vitest/vitest.server.config.ts test/server` | Coordinated suite `server:test/server` |
+| `test:server` | `vitest --config config/vitest/vitest.server.config.ts` | Delegated by default; coordinated only for explicit broad one-shot `--run` with no narrowing target as suite `server:all:run` |
 | `test:watch` | `vitest` | Always delegated |
 | `test:ui` | `vitest --ui` | Always delegated |
 | `test:status` | New status command | Always delegated to coordinator status output |
@@ -100,7 +100,7 @@ npm test -- --run test/unit/client/store/panesSlice.test.ts
 npm run test:server -- test/unit/server/sessions-sync/diff.test.ts
 npm run test:client -- --run test/unit/client/components/Sidebar.test.tsx
 npm run test:unit -- test/unit/server/coding-cli/utils.test.ts
-npm run test:vitest -- --config vitest.server.config.ts test/server/ws-protocol.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/server/ws-protocol.test.ts
 ```
 
 Each form must resolve to exactly one of:
@@ -291,7 +291,7 @@ Cover:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run --config vitest.server.config.ts test/unit/server/testing/coordinator-command-matrix.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/testing/coordinator-command-matrix.test.ts
 ```
 
 Expected: FAIL because the classifier module does not exist yet.
@@ -324,7 +324,7 @@ Make the suite definitions encode exact upstream invocations. Do not infer broad
 
 ```bash
 cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run --config vitest.server.config.ts test/unit/server/testing/coordinator-command-matrix.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/testing/coordinator-command-matrix.test.ts
 ```
 
 Expected: PASS.
@@ -362,7 +362,7 @@ Add tests for:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run --config vitest.server.config.ts test/unit/server/coding-cli/resolve-git-root.test.ts test/unit/server/coding-cli/git-metadata.test.ts test/unit/server/testing/coordinator-store.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/resolve-git-root.test.ts test/unit/server/coding-cli/git-metadata.test.ts test/unit/server/testing/coordinator-store.test.ts
 ```
 
 Expected: FAIL because the new helper and store modules do not exist yet.
@@ -393,7 +393,7 @@ Use temp-file-plus-rename atomic writes for every JSON file.
 
 ```bash
 cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run --config vitest.server.config.ts test/unit/server/coding-cli/resolve-git-root.test.ts test/unit/server/coding-cli/git-metadata.test.ts test/unit/server/testing/coordinator-store.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/resolve-git-root.test.ts test/unit/server/coding-cli/git-metadata.test.ts test/unit/server/testing/coordinator-store.test.ts
 ```
 
 Expected: PASS.
@@ -430,7 +430,7 @@ Cover:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run --config vitest.server.config.ts test/unit/server/testing/coordinator-endpoint.test.ts test/unit/server/testing/coordinator-status.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/testing/coordinator-endpoint.test.ts test/unit/server/testing/coordinator-status.test.ts
 ```
 
 Expected: FAIL because the endpoint and status modules do not exist yet.
@@ -452,7 +452,7 @@ Status must remain truthful even when `holder.json` is missing or corrupt.
 
 ```bash
 cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run --config vitest.server.config.ts test/unit/server/testing/coordinator-endpoint.test.ts test/unit/server/testing/coordinator-status.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/testing/coordinator-endpoint.test.ts test/unit/server/testing/coordinator-status.test.ts
 ```
 
 Expected: PASS.
@@ -487,7 +487,7 @@ Cover:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run --config vitest.server.config.ts test/unit/server/testing/coordinator-upstream.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/testing/coordinator-upstream.test.ts
 ```
 
 Expected: FAIL because the upstream module and fixture do not exist yet.
@@ -508,7 +508,7 @@ Use the `.mjs` fixture in subprocess tests because it runs under plain `node` wi
 
 ```bash
 cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run --config vitest.server.config.ts test/unit/server/testing/coordinator-upstream.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/testing/coordinator-upstream.test.ts
 ```
 
 Expected: PASS.
@@ -546,7 +546,7 @@ Cover:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run --config vitest.server.config.ts test/integration/server/test-coordinator.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/integration/server/test-coordinator.test.ts
 ```
 
 Expected: FAIL because the coordinator CLI does not exist yet.
@@ -577,7 +577,7 @@ Do not promise FIFO ordering. The behavior is serialized waiting with crash-safe
 
 ```bash
 cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run --config vitest.server.config.ts test/integration/server/test-coordinator.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/integration/server/test-coordinator.test.ts
 ```
 
 Expected: PASS.
@@ -614,7 +614,7 @@ Extend the existing tests to assert:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run --config vitest.server.config.ts test/unit/server/testing/coordinator-command-matrix.test.ts test/integration/server/test-coordinator.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/testing/coordinator-command-matrix.test.ts test/integration/server/test-coordinator.test.ts
 ```
 
 Expected: FAIL because the public script wiring and docs are still old.
@@ -654,7 +654,7 @@ Documentation must say plainly:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run --config vitest.server.config.ts test/unit/server/testing/coordinator-command-matrix.test.ts test/integration/server/test-coordinator.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/testing/coordinator-command-matrix.test.ts test/integration/server/test-coordinator.test.ts
 ```
 
 Expected: PASS.
@@ -676,7 +676,7 @@ git commit -m "docs: publish coordinated test workflow"
 
 ```bash
 cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run --config vitest.server.config.ts test/unit/server/testing/coordinator-command-matrix.test.ts test/unit/server/testing/coordinator-store.test.ts test/unit/server/testing/coordinator-endpoint.test.ts test/unit/server/testing/coordinator-status.test.ts test/unit/server/testing/coordinator-upstream.test.ts test/integration/server/test-coordinator.test.ts test/unit/server/coding-cli/resolve-git-root.test.ts test/unit/server/coding-cli/git-metadata.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/testing/coordinator-command-matrix.test.ts test/unit/server/testing/coordinator-store.test.ts test/unit/server/testing/coordinator-endpoint.test.ts test/unit/server/testing/coordinator-status.test.ts test/unit/server/testing/coordinator-upstream.test.ts test/integration/server/test-coordinator.test.ts test/unit/server/coding-cli/resolve-git-root.test.ts test/unit/server/coding-cli/git-metadata.test.ts
 ```
 
 Expected: PASS.

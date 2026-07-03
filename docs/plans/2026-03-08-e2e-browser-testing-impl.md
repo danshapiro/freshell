@@ -129,7 +129,7 @@ This is implemented in the fixture's `freshellPage` teardown and also available 
 ```
 test/e2e-browser/
   playwright.config.ts          # Playwright configuration
-  vitest.config.ts              # Vitest config for helper unit tests (test-server.test.ts etc.)
+  config/vitest/vitest.config.ts              # Vitest config for helper unit tests (test-server.test.ts etc.)
   global-setup.ts               # Build client+server if needed, install browsers
   global-teardown.ts            # Clean up temp dirs
   helpers/
@@ -163,7 +163,7 @@ test/e2e-browser/
 - Modify: `package.json`
 - Create: `test/e2e-browser/playwright.config.ts`
 - Create: `test/e2e-browser/vitest.config.ts` (dedicated vitest config for helper unit tests)
-- Modify: `vitest.config.ts` (exclude `test/e2e-browser/**`)
+- Modify: `config/vitest/vitest.config.ts` (exclude `test/e2e-browser/**`)
 - Create: `.gitignore` entry for Playwright artifacts
 
 **Step 1: Write the test that verifies Playwright is configured**
@@ -256,7 +256,7 @@ blob-report/
 
 This must be done immediately so that `npm test` continues to pass throughout development. Later tasks add vitest-format tests (e.g., `test-server.test.ts`) inside `test/e2e-browser/helpers/`, but these are run via explicit vitest invocations, not via `npm test`. Without this exclusion, vitest would try to collect Playwright spec files and fail.
 
-Add `'test/e2e-browser/**'` to the `exclude` array in `vitest.config.ts`:
+Add `'test/e2e-browser/**'` to the `exclude` array in `config/vitest/vitest.config.ts`:
 
 ```ts
 exclude: [
@@ -273,13 +273,13 @@ exclude: [
 ],
 ```
 
-Also add the same exclusion to `vitest.server.config.ts` if it uses an explicit include list (read the file and add the exclusion if needed).
+Also add the same exclusion to `config/vitest/vitest.server.config.ts` if it uses an explicit include list (read the file and add the exclusion if needed).
 
 **Step 7: Create a dedicated vitest config for E2E helper unit tests**
 
 The e2e-browser helper tests (e.g., `test-server.test.ts`) need their own vitest config because:
-- `vitest.config.ts` excludes `test/e2e-browser/**` (added in Step 6 above)
-- `vitest.server.config.ts` uses an explicit `include` list that only covers `test/server/**`, `test/unit/server/**`, `test/integration/server/**`, and three named files -- it does not match `test/e2e-browser/**`
+- `config/vitest/vitest.config.ts` excludes `test/e2e-browser/**` (added in Step 6 above)
+- `config/vitest/vitest.server.config.ts` uses an explicit `include` list that only covers `test/server/**`, `test/unit/server/**`, `test/integration/server/**`, and three named files -- it does not match `test/e2e-browser/**`
 - Neither config will collect e2e-browser helper tests
 
 Create `test/e2e-browser/vitest.config.ts`:
@@ -327,7 +327,7 @@ Expected: PASS
 **Step 9: Commit**
 
 ```bash
-git add test/e2e-browser/playwright.config.ts test/e2e-browser/vitest.config.ts test/e2e-browser/specs/smoke.spec.ts package.json package-lock.json .gitignore vitest.config.ts vitest.server.config.ts
+git add test/e2e-browser/playwright.config.ts test/e2e-browser/vitest.config.ts test/e2e-browser/specs/smoke.spec.ts package.json package-lock.json .gitignore config/vitest/vitest.config.ts config/vitest/vitest.server.config.ts
 git commit -m "feat: install Playwright, add E2E test configuration, exclude from vitest"
 ```
 
@@ -415,7 +415,7 @@ describe('TestServer', () => {
 npx vitest run --config test/e2e-browser/vitest.config.ts
 ```
 
-This uses the dedicated `test/e2e-browser/vitest.config.ts` created in Task 1 Step 7, which includes `helpers/**/*.test.ts`. Using `vitest.server.config.ts` would not work because its explicit `include` list does not cover `test/e2e-browser/**`, and `vitest.config.ts` explicitly excludes `test/e2e-browser/**`.
+This uses the dedicated `test/e2e-browser/vitest.config.ts` created in Task 1 Step 7, which includes `helpers/**/*.test.ts`. Using `config/vitest/vitest.server.config.ts` would not work because its explicit `include` list does not cover `test/e2e-browser/**`, and `config/vitest/vitest.config.ts` explicitly excludes `test/e2e-browser/**`.
 
 Expected: FAIL (module not found)
 

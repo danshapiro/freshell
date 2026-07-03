@@ -1,4 +1,4 @@
-import baseConfig from './tailwind.config.js'
+import baseConfig from '../../tailwind.config.js'
 
 /** @type {import('tailwindcss').Config} */
 export default {

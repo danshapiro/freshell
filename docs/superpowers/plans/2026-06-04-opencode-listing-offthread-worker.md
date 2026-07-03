@@ -23,7 +23,7 @@ The following were **empirically validated by spike** on this machine (Node v22.
 5. **NodeNext `.js`→`.ts` remap FAILS inside a worker** under both plain node and tsx (`Cannot find module './x.js'`). Therefore the worker entry must NOT statically import a relative sibling. Instead the main thread resolves the *exact* sibling URL (`.ts` in dev/test, `.js` in prod — the file that actually exists) and passes it via `workerData`; the worker `await import()`s that exact URL (no remap). This works in all three runtimes. ✓
 6. **`import.meta.url.endsWith('.ts')`** reliably distinguishes dev/test (source `.ts`) from prod (compiled `.js`), enabling extension-swap path resolution. ✓
 7. **`tsc -p tsconfig.server.json`** has `include: ["server/**/*", ...]`, so new `server/coding-cli/providers/*.ts` files (including the worker) compile to `dist/server/...` automatically — **no build-step change required.** ✓
-8. **Electron is a fourth+fifth runtime, and it works (validator-confirmed).** The desktop app reaches this exact code path (`server/index.ts` instantiates `opencodeProvider` + `CodingCliSessionIndexer` identically). Electron **prod** spawns the **compiled** `dist/server/index.js` under a **bundled standalone Node v22.12.0** (`electron/server-spawner.ts`, `scripts/bundled-node-version.json`) — `import.meta.url` ends in `.js`, so the ext-swap picks `.js`; 22.12.0 ≥ 22.5 so `node:sqlite`/`worker_threads` are present; and `electron-builder.yml` `extraResources` copies `dist/server/**/*` (including the new `opencode-listing*.js`) onto the real filesystem (not ASAR), so the worker file is loadable. Electron **dev** runs `tsx server/index.ts` (`.ts`, same as constraint §1). The throw-on-failure contract means even a worst-case Electron worker failure degrades to a preserved/empty listing, never a crash. ⚠️ The plan's tests run on the host Node (22.21), not the bundled 22.12.0 binary; Task 6 includes an optional step to run the prod one-off under the bundled binary when present. ✓
+8. **Electron is a fourth+fifth runtime, and it works (validator-confirmed).** The desktop app reaches this exact code path (`server/index.ts` instantiates `opencodeProvider` + `CodingCliSessionIndexer` identically). Electron **prod** spawns the **compiled** `dist/server/index.js` under a **bundled standalone Node v22.12.0** (`electron/server-spawner.ts`, `scripts/bundled-node-version.json`) — `import.meta.url` ends in `.js`, so the ext-swap picks `.js`; 22.12.0 ≥ 22.5 so `node:sqlite`/`worker_threads` are present; and `config/electron-builder.yml` `extraResources` copies `dist/server/**/*` (including the new `opencode-listing*.js`) onto the real filesystem (not ASAR), so the worker file is loadable. Electron **dev** runs `tsx server/index.ts` (`.ts`, same as constraint §1). The throw-on-failure contract means even a worst-case Electron worker failure degrades to a preserved/empty listing, never a crash. ⚠️ The plan's tests run on the host Node (22.21), not the bundled 22.12.0 binary; Task 6 includes an optional step to run the prod one-off under the bundled binary when present. ✓
 9. **Cross-platform path safety.** All worker/query URLs are resolved with `new URL('./sibling.<ext>', import.meta.url).href` and consumed via `await import(url)` / `new Worker(url)` — no raw path-string concatenation — so Windows drive/backslash paths, spaces, and the mandated `.worktrees/...` layout are handled by the URL layer. Windows Electron remains a manual-verify residual (the automated suite runs on Linux). ✓
 
 **Non-goals (keep scope tight):**
@@ -275,7 +275,7 @@ describe('runOpencodeListingQuery', () => {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/opencode-listing-query.test.ts --run`
+Run: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/opencode-listing-query.test.ts --run`
 Expected: FAIL — cannot resolve `opencode-listing-query` / `runOpencodeListingQuery is not a function`.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -365,7 +365,7 @@ export async function runOpencodeListingQuery(
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/opencode-listing-query.test.ts --run`
+Run: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/opencode-listing-query.test.ts --run`
 Expected: PASS (4 tests: part-marker/message-marker/normal ordering, archived+child exclusion, parent_id-absent flat roots, missing part/message degrades to unmarked).
 
 - [ ] **Step 5: Commit**
@@ -442,7 +442,7 @@ describe('opencode listing worker executeListing', () => {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/opencode-listing-worker.test.ts --run`
+Run: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/opencode-listing-worker.test.ts --run`
 Expected: FAIL — cannot resolve `opencode-listing.worker` / `executeListing` not exported.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -497,7 +497,7 @@ if (parentPort && (workerData as Partial<WorkerListingInput> | undefined)?.kind 
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/opencode-listing-worker.test.ts --run`
+Run: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/opencode-listing-worker.test.ts --run`
 Expected: PASS (2 tests).
 
 - [ ] **Step 5: Commit**
@@ -654,7 +654,7 @@ describe('createWorkerListingRunner', () => {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/opencode-listing-runner.test.ts --run`
+Run: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/opencode-listing-runner.test.ts --run`
 Expected: FAIL — `createWorkerListingRunner` not found.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -779,7 +779,7 @@ export function createWorkerListingRunner(
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/opencode-listing-runner.test.ts --run`
+Run: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/opencode-listing-runner.test.ts --run`
 Expected: PASS (all runner orchestration cases: ok→resolve+terminate, workerData+execArgv, late-exit-after-success, error message, malformed messages, error event, early exit, timeout).
 
 - [ ] **Step 5: Commit**
@@ -877,7 +877,7 @@ it('still returns [] (not throw) for a genuinely empty database', async () => {
 
 - [ ] **Step 2 (Red): Run the existing + new provider tests — expect failures**
 
-Run: `npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/opencode-provider.test.ts test/unit/server/coding-cli/opencode-provider.sqlite.test.ts --run`
+Run: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/opencode-provider.test.ts test/unit/server/coding-cli/opencode-provider.sqlite.test.ts --run`
 Expected: FAIL — `OpencodeProvider` constructor does not accept a second `{ queryRunner }` argument; `listSessionsDirect` ignores it.
 
 - [ ] **Step 3 (Green): Implement the provider wiring**
@@ -978,7 +978,7 @@ export class OpencodeProvider implements CodingCliProvider {
 
 - [ ] **Step 4 (Green): Run the provider tests**
 
-Run: `npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/opencode-provider.test.ts test/unit/server/coding-cli/opencode-provider.sqlite.test.ts --run`
+Run: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/opencode-provider.test.ts test/unit/server/coding-cli/opencode-provider.sqlite.test.ts --run`
 Expected: PASS (existing assertions + new throw-on-failure and empty-db tests).
 
 - [ ] **Step 5: Typecheck**
@@ -1062,7 +1062,7 @@ it('preserves cached direct-provider sessions (and does not warn-log the raw err
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/session-indexer-provider-refresh.test.ts --run`
+Run: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/session-indexer-provider-refresh.test.ts --run`
 Expected: FAIL — after the second (full-scan) refresh, `getProjects()` is empty (the global prune deleted `s1`), and/or `loggerMock.warn` was called with the raw error.
 
 - [ ] **Step 3: Implement the indexer fix**
@@ -1091,7 +1091,7 @@ In `server/coding-cli/session-indexer.ts`, change the `refreshDirectProvider` ca
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/session-indexer-provider-refresh.test.ts --run`
+Run: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/session-indexer-provider-refresh.test.ts --run`
 Expected: PASS (existing coalescing test + new preservation test).
 
 - [ ] **Step 5: Commit**
@@ -1203,7 +1203,7 @@ describe('OpenCode listing off-thread (real worker)', () => {
 
 - [ ] **Step 3: Run to verify it fails, then passes**
 
-Run: `npm run test:vitest -- --config vitest.server.config.ts test/integration/server/opencode-listing-offthread.test.ts --run`
+Run: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/integration/server/opencode-listing-offthread.test.ts --run`
 Expected before Tasks 1–3 exist: FAIL (imports unresolved). After Tasks 1–4: PASS (2 tests). The non-blocking test confirms the main loop ticked ≥ 10 times during a 250 ms worker query.
 
 > If this test reveals the real worker cannot load in the vitest runtime on some machine (e.g. Node < 22.18 without native strip-types), that is a genuine failure of the production path on that runtime — do not paper over it. The spike validated Node 22.21; if CI uses an older Node, gate the real-worker test behind a `node:sqlite`-availability + Node-version check and add a `tsx`-run smoke (`scripts/`) instead. Record the decision in the PR.
@@ -1292,7 +1292,7 @@ describe('OpenCode discovery via the off-thread worker (provider + indexer)', ()
 
 - [ ] **Step 2: Run it**
 
-Run: `npm run test:vitest -- --config vitest.server.config.ts test/integration/server/opencode-listing-discovery.test.ts --run`
+Run: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/integration/server/opencode-listing-discovery.test.ts --run`
 Expected before Tasks 1–4: FAIL (imports/behavior). After Tasks 1–4: PASS — the real worker spawned by the default runner discovered both sessions and classified the marker one as subagent, end-to-end through the indexer.
 
 - [ ] **Step 3: Commit**

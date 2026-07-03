@@ -221,7 +221,7 @@ Delete or rewrite the old tests that still treat bare `confirmElevation: true` a
 Run:
 
 ```bash
-npx vitest run --config vitest.server.config.ts \
+npx vitest run --config config/vitest/vitest.server.config.ts \
   test/integration/server/network-api.test.ts
 ```
 
@@ -441,7 +441,7 @@ Important constraints:
 Run:
 
 ```bash
-npx vitest run --config vitest.server.config.ts \
+npx vitest run --config config/vitest/vitest.server.config.ts \
   test/integration/server/network-api.test.ts
 ```
 
@@ -528,7 +528,7 @@ it('allows only one confirmed repair through the single-flight lock at a time', 
 Run:
 
 ```bash
-npx vitest run --config vitest.server.config.ts \
+npx vitest run --config config/vitest/vitest.server.config.ts \
   test/unit/server/firewall-repair-coordinator.test.ts
 ```
 
@@ -597,7 +597,7 @@ Update `server/network-router.ts` to import and use `createFirewallRepairCoordin
 Run:
 
 ```bash
-npx vitest run --config vitest.server.config.ts \
+npx vitest run --config config/vitest/vitest.server.config.ts \
   test/unit/server/firewall-repair-coordinator.test.ts \
   test/integration/server/network-api.test.ts
 ```
@@ -906,7 +906,7 @@ git commit -m "fix(ui): confirm elevated repair with server tokens"
 Run:
 
 ```bash
-npx vitest run --config vitest.server.config.ts \
+npx vitest run --config config/vitest/vitest.server.config.ts \
   test/unit/server/wsl-port-forward.test.ts \
   test/integration/server/wsl-port-forward.test.ts \
   test/integration/server/logger.separation.harness.test.ts \
@@ -929,7 +929,7 @@ Expected:
 Run:
 
 ```bash
-npx vitest run --config vitest.electron.config.ts \
+npx vitest run --config config/vitest/vitest.electron.config.ts \
   test/unit/electron/daemon/windows-service.test.ts \
   test/unit/electron/startup.test.ts
 ```
@@ -953,7 +953,7 @@ If all Step 1 tests pass, make no file changes in this task.
 Run:
 
 ```bash
-npx vitest run --config vitest.server.config.ts \
+npx vitest run --config config/vitest/vitest.server.config.ts \
   test/integration/server/network-api.test.ts \
   test/unit/server/firewall-repair-coordinator.test.ts \
   test/unit/server/wsl-port-forward.test.ts \
@@ -982,7 +982,7 @@ Expected:
 Run:
 
 ```bash
-npx vitest run --config vitest.electron.config.ts \
+npx vitest run --config config/vitest/vitest.electron.config.ts \
   test/unit/electron/daemon/windows-service.test.ts \
   test/unit/electron/startup.test.ts
 ```

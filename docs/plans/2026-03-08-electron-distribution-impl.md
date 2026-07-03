@@ -142,7 +142,7 @@ Note: `.tsx` files in `electron/setup-wizard/` are excluded because they are Rea
 
 ### 1.5 Vitest configuration for Electron tests
 
-**File:** `vitest.electron.config.ts` (new)
+**File:** `config/vitest/vitest.electron.config.ts` (new)
 
 ```typescript
 import { defineConfig } from 'vitest/config'
@@ -172,7 +172,7 @@ export default defineConfig({
 
 Note: The `react()` plugin and `.test.tsx` pattern are included because the setup wizard tests (`wizard.test.tsx`) use JSX and need React transform support.
 
-**File:** `vitest.config.ts` (edit -- critical)
+**File:** `config/vitest/vitest.config.ts` (edit -- critical)
 
 Add `'test/unit/electron/**'` to the `exclude` array. Without this, the main vitest config (which uses `environment: 'jsdom'`) would also pick up the electron tests, causing either duplicate runs or failures from the wrong test environment:
 
@@ -182,22 +182,22 @@ exclude: [
   '**/.worktrees/**',
   '**/.claude/worktrees/**',
   'docs/plans/**',
-  // Server tests run under vitest.server.config.ts (node environment)
+  // Server tests run under config/vitest/vitest.server.config.ts (node environment)
   'test/server/**',
   'test/unit/server/**',
   'test/integration/server/**',
   'test/integration/session-repair.test.ts',
   'test/integration/session-search-e2e.test.ts',
-  // Electron tests run under vitest.electron.config.ts (node environment)
+  // Electron tests run under config/vitest/vitest.electron.config.ts (node environment)
   'test/unit/electron/**',
 ],
 ```
 
 **File:** `package.json` (edit)
 
-Add script: `"test:electron": "vitest run --config vitest.electron.config.ts"`
+Add script: `"test:electron": "vitest run --config config/vitest/vitest.electron.config.ts"`
 
-Update `"test"` to also run electron tests: `"test": "vitest run && vitest run --config vitest.server.config.ts && vitest run --config vitest.electron.config.ts"`
+Update `"test"` to also run electron tests: `"test": "vitest run && vitest run --config config/vitest/vitest.server.config.ts && vitest run --config config/vitest/vitest.electron.config.ts"`
 
 ---
 
@@ -558,7 +558,7 @@ export interface UpdateManager {
 
 Implementation:
 - Wraps `autoUpdater` from `electron-updater`
-- Points at GitHub Releases (configured via `electron-builder.yml` `publish` config)
+- Points at GitHub Releases (configured via `config/electron-builder.yml` `publish` config)
 - Checks on app launch (after a 10-second delay to avoid slowing startup)
 - Notifies user via dialog when update is available
 - Does NOT auto-install -- always asks user first
@@ -800,7 +800,7 @@ React multi-step form component. Uses the same stack as the main Freshell UI (Re
 
 ### 4.4 Wizard Vite build configuration
 
-**File:** `vite.wizard.config.ts` (new, at repo root)
+**File:** `config/vite/vite.wizard.config.ts` (new)
 
 The wizard is a separate Vite application. It must be bundled by Vite (not `tsc`) because:
 1. React JSX requires a transform (`tsc` with `NodeNext` module resolution does not bundle)
@@ -836,7 +836,7 @@ export default defineConfig({
     postcss: {
       plugins: [
         (await import('tailwindcss')).default({
-          config: path.resolve(__dirname, 'tailwind.config.wizard.js'),
+          config: path.resolve(__dirname, 'config/tailwind/tailwind.config.wizard.js'),
         }),
         (await import('autoprefixer')).default,
       ],
@@ -847,7 +847,7 @@ export default defineConfig({
 
 **Critical: Wizard-specific Tailwind config.** The project's existing `tailwind.config.js` has `content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}']`, which does not include the wizard's files in `electron/setup-wizard/`. If the wizard reused that config, Tailwind's JIT compiler would scan zero wizard files and produce zero utility classes, resulting in a completely unstyled wizard.
 
-**File:** `tailwind.config.wizard.js` (new, at repo root)
+**File:** `config/tailwind/tailwind.config.wizard.js` (new)
 
 ```javascript
 import baseConfig from './tailwind.config.js'
@@ -865,8 +865,8 @@ This inherits the project's theme (colors, fonts, spacing, plugins) so the wizar
 
 ```json
 {
-  "build:wizard": "vite build --config vite.wizard.config.ts",
-  "dev:wizard": "vite --config vite.wizard.config.ts"
+  "build:wizard": "vite build --config config/vite/vite.wizard.config.ts",
+  "dev:wizard": "vite --config config/vite/vite.wizard.config.ts"
 }
 ```
 
@@ -880,7 +880,7 @@ The `electron:build` script is updated to include the wizard build:
 The `electron:dev` script starts the wizard dev server alongside:
 ```json
 {
-  "electron:dev": "npm run build:electron && concurrently -n wizard,electron \"vite --config vite.wizard.config.ts\" \"electron .\""
+  "electron:dev": "npm run build:electron && concurrently -n wizard,electron \"vite --config config/vite/vite.wizard.config.ts\" \"electron .\""
 }
 ```
 
@@ -888,7 +888,7 @@ The `electron:dev` script starts the wizard dev server alongside:
 
 **Tests:** `test/unit/electron/setup-wizard/wizard.test.tsx`
 
-These tests run under `vitest.electron.config.ts` which includes the `react()` plugin for JSX transform. The test environment is `jsdom` (overridden per-file with `// @vitest-environment jsdom` directive) since the wizard component renders DOM elements.
+These tests run under `config/vitest/vitest.electron.config.ts` which includes the `react()` plugin for JSX transform. The test environment is `jsdom` (overridden per-file with `// @vitest-environment jsdom` directive) since the wizard component renders DOM elements.
 
 - Renders each step
 - Step navigation (next/back)
@@ -905,7 +905,7 @@ These tests run under `vitest.electron.config.ts` which includes the `react()` p
 
 ### 5.1 electron-builder configuration
 
-**File:** `electron-builder.yml` (new, at repo root)
+**File:** `config/electron-builder.yml` (new)
 
 ```yaml
 appId: com.freshell.desktop
@@ -1009,13 +1009,13 @@ Note: `@electron/rebuild` is explicitly NOT used. See Section 5.3 and Key Design
 Add scripts:
 ```json
 {
-  "electron:dev": "npm run build:electron && cross-env ELECTRON_DEV=1 concurrently -n client,wizard,electron \"vite\" \"vite --config vite.wizard.config.ts\" \"electron .\"",
+  "electron:dev": "npm run build:electron && cross-env ELECTRON_DEV=1 concurrently -n client,wizard,electron \"vite\" \"vite --config config/vite/vite.wizard.config.ts\" \"electron .\"",
   "electron:build": "npm run build && npm run build:electron && npm run build:wizard && npm run prepare:bundled-node && electron-builder",
   "prepare:bundled-node": "tsx scripts/prepare-bundled-node.ts",
   "build:electron": "tsc -p tsconfig.electron.json",
-  "build:wizard": "vite build --config vite.wizard.config.ts",
-  "dev:wizard": "vite --config vite.wizard.config.ts",
-  "test:electron": "vitest run --config vitest.electron.config.ts"
+  "build:wizard": "vite build --config config/vite/vite.wizard.config.ts",
+  "dev:wizard": "vite --config config/vite/vite.wizard.config.ts",
+  "test:electron": "vitest run --config config/vitest/vitest.electron.config.ts"
 }
 ```
 
@@ -1231,7 +1231,7 @@ on:
   push:
     tags: ['v*']
   pull_request:
-    paths: ['electron/**', 'electron-builder.yml']
+    paths: ['electron/**', 'config/electron-builder.yml']
 
 jobs:
   build:
@@ -1363,15 +1363,15 @@ These tests require `electron` to be installed and may be slow. They are marked 
 | `electron/setup-wizard/wizard.tsx` | Wizard React multi-step form |
 | `electron/setup-wizard/wizard.css` | Wizard Tailwind CSS entry (imports shared theme-variables.css) |
 | `src/theme-variables.css` | Shared CSS custom property definitions (extracted from src/index.css) |
-| `vite.wizard.config.ts` | Vite config for wizard build (JSX + Tailwind + bundling) |
-| `tailwind.config.wizard.js` | Wizard-specific Tailwind config (scans electron/setup-wizard/ for classes) |
+| `config/vite/vite.wizard.config.ts` | Vite config for wizard build (JSX + Tailwind + bundling) |
+| `config/tailwind/tailwind.config.wizard.js` | Wizard-specific Tailwind config (scans electron/setup-wizard/ for classes) |
 | `server/server-info-router.ts` | /api/server-info endpoint |
 | `installers/launchd/com.freshell.server.plist.template` | macOS plist template |
 | `installers/systemd/freshell.service.template` | Linux unit file template |
 | `installers/windows/freshell-task.xml.template` | Windows task template |
 | `tsconfig.electron.json` | TypeScript config for electron main process (excludes .tsx) |
-| `vitest.electron.config.ts` | Vitest config for electron tests |
-| `electron-builder.yml` | electron-builder packaging config |
+| `config/vitest/vitest.electron.config.ts` | Vitest config for electron tests |
+| `config/electron-builder.yml` | electron-builder packaging config |
 | `scripts/prepare-bundled-node.ts` | Download Node binary + headers, recompile node-pty, stage native modules |
 | `scripts/bundled-node-version.json` | Pinned bundled Node.js version (single source of truth) |
 | `.github/workflows/electron-build.yml` | CI build workflow |
@@ -1406,7 +1406,7 @@ These tests require `electron` to be installed and may be slow. They are marked 
 |------|--------|
 | `server/index.ts` | Mount `/api/server-info` router, capture `startedAt` timestamp |
 | `package.json` | Add electron/electron-builder/electron-updater deps, add scripts, add `main` field |
-| `vitest.config.ts` | Add `test/unit/electron/**` to exclude array (prevent jsdom runner picking up electron tests) |
+| `config/vitest/vitest.config.ts` | Add `test/unit/electron/**` to exclude array (prevent jsdom runner picking up electron tests) |
 | `src/index.css` | Extract `:root`/`.dark` CSS variable blocks into `src/theme-variables.css`, replace with `@import` |
 | `.gitignore` | Add `bundled-node/`, `server-node-modules/`, `release/`, `dist/wizard/` |
 
@@ -1442,11 +1442,11 @@ Within each phase, the order is file-by-file as listed.
    - The Electron Node.js is completely separate from the server Node.js
    - The compilation target is explicit and reproducible across platforms
 
-5. **Setup wizard as a separate BrowserWindow with its own Vite build**: The wizard is not a route in the main app -- it works without any server running, which is essential for the first-run experience. It has a dedicated Vite config (`vite.wizard.config.ts`) that produces a self-contained bundle (`dist/wizard/`) with React JSX transform and Tailwind CSS processing. CSS theme variables (`:root`/`.dark` custom properties) are extracted into `src/theme-variables.css` and imported by both the main app's CSS and the wizard's CSS, ensuring semantic Tailwind colors (e.g., `bg-background`, `text-foreground`) render correctly in both contexts. The `tsconfig.electron.json` excludes `.tsx` files; they are handled exclusively by Vite.
+5. **Setup wizard as a separate BrowserWindow with its own Vite build**: The wizard is not a route in the main app -- it works without any server running, which is essential for the first-run experience. It has a dedicated Vite config (`config/vite/vite.wizard.config.ts`) that produces a self-contained bundle (`dist/wizard/`) with React JSX transform and Tailwind CSS processing. CSS theme variables (`:root`/`.dark` custom properties) are extracted into `src/theme-variables.css` and imported by both the main app's CSS and the wizard's CSS, ensuring semantic Tailwind colors (e.g., `bg-background`, `text-foreground`) render correctly in both contexts. The `tsconfig.electron.json` excludes `.tsx` files; they are handled exclusively by Vite.
 
 6. **Dynamic `import()` in platform factory**: The project uses `"type": "module"` (ESM) throughout. The daemon manager factory uses `await import()` instead of `require()` (which is unavailable in ESM). The factory function is `async`, which fits naturally since all callers are already async.
 
-7. **Three separate vitest configs**: Client tests (`vitest.config.ts`, jsdom), server tests (`vitest.server.config.ts`, node), and electron tests (`vitest.electron.config.ts`, node). Each config's `exclude` array prevents other configs from picking up its tests, avoiding duplicate runs or wrong-environment failures.
+7. **Three separate vitest configs**: Client tests (`config/vitest/vitest.config.ts`, jsdom), server tests (`config/vitest/vitest.server.config.ts`, node), and electron tests (`config/vitest/vitest.electron.config.ts`, node). Each config's `exclude` array prevents other configs from picking up its tests, avoiding duplicate runs or wrong-environment failures.
 
 8. **Quake-style toggle**: The global hotkey toggles window visibility. Implementation is in the hotkey callback, not in a separate module, because the logic is simple (show+focus if hidden, hide if focused).
 
@@ -1464,4 +1464,4 @@ Within each phase, the order is file-by-file as listed.
 
 3. **Auto-update without code signing**: Without code signing, macOS will show "unidentified developer" warnings and Gatekeeper may block the app. Windows will show SmartScreen warnings. This is explicitly deferred to post-v1 per the design doc.
 
-4. **Wizard build complexity**: The wizard requires a separate Vite build (`vite.wizard.config.ts`) in addition to the main client build and the `tsc` electron build. This adds a third build step but is unavoidable -- React JSX + Tailwind CSS cannot be processed by `tsc` alone, and the wizard must work without a running server (so it cannot be served by the existing Vite dev server).
+4. **Wizard build complexity**: The wizard requires a separate Vite build (`config/vite/vite.wizard.config.ts`) in addition to the main client build and the `tsc` electron build. This adds a third build step but is unavoidable -- React JSX + Tailwind CSS cannot be processed by `tsc` alone, and the wizard must work without a running server (so it cannot be served by the existing Vite dev server).

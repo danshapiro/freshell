@@ -107,7 +107,7 @@ The command-classifier tests do not need a bespoke harness. A table-driven unit 
    1. Run `tsx scripts/testing/test-coordinator.ts run test:server -- --help`.
    2. Run `tsx scripts/testing/test-coordinator.ts run test:server -- --run`.
    **Expected outcome:**
-   - Step 1 delegates directly to upstream `vitest --config vitest.server.config.ts --help`, exits `0`, and creates no holder/store side effects. Source: implementation plan `§1 Public Commands Keep Their Current Meaning` and `§2 Forwarded-Arg Rules Are Explicit`.
+   - Step 1 delegates directly to upstream `vitest --config config/vitest/vitest.server.config.ts --help`, exits `0`, and creates no holder/store side effects. Source: implementation plan `§1 Public Commands Keep Their Current Meaning` and `§2 Forwarded-Arg Rules Are Explicit`.
    - Step 2 coordinates the `server:all:run` suite, acquires the endpoint, and records the latest suite result for that key. Source: implementation plan `§1 Public Commands Keep Their Current Meaning` and `§2 Forwarded-Arg Rules Are Explicit`.
    **Interactions:** Command classifier, upstream argv generation, endpoint/store.
 
@@ -120,10 +120,10 @@ The command-classifier tests do not need a bespoke harness. A table-driven unit 
    2. Run `tsx scripts/testing/test-coordinator.ts run test:client -- --run test/unit/client/components/Sidebar.test.tsx`.
    3. Run `tsx scripts/testing/test-coordinator.ts run test:watch -- --help`.
    4. Run `tsx scripts/testing/test-coordinator.ts run test:ui -- --help`.
-   5. Run `tsx scripts/testing/test-coordinator.ts run test:vitest -- --config vitest.server.config.ts test/server/ws-protocol.test.ts`.
+   5. Run `tsx scripts/testing/test-coordinator.ts run test:vitest -- --config config/vitest/vitest.server.config.ts test/server/ws-protocol.test.ts`.
    **Expected outcome:**
    - None of these commands wait on the active holder; each delegates or passthroughs immediately. Source: implementation plan `§2 Forwarded-Arg Rules Are Explicit`.
-   - `test:unit -- test/unit/server/...` delegates to the truthful server-config owner instead of pretending the default config can run it. Source: implementation plan `§2 Forwarded-Arg Rules Are Explicit` plus current `vitest.config.ts` and `vitest.server.config.ts`.
+   - `test:unit -- test/unit/server/...` delegates to the truthful server-config owner instead of pretending the default config can run it. Source: implementation plan `§2 Forwarded-Arg Rules Are Explicit` plus current `config/vitest/vitest.config.ts` and `config/vitest/vitest.server.config.ts`.
    - `test:watch`, `test:ui`, and help/direct-Vitest flows surface upstream behavior and create no coordinator holder/store mutations. Source: implementation plan `§1 Public Commands Keep Their Current Meaning` and `§2 Forwarded-Arg Rules Are Explicit`.
    **Interactions:** Classifier fast-paths, upstream Vitest resolver, busy-holder bypass logic.
 
@@ -251,7 +251,7 @@ The command-classifier tests do not need a bespoke harness. A table-driven unit 
    4. Classify `--reporter` on composite commands and on delegated single-phase commands.
    5. Classify `--run` on `test` and `test:all`.
    **Expected outcome:**
-   - Server-only selectors delegate to one truthful server-config invocation; client-only selectors delegate to one truthful default-config invocation. Source: implementation plan `§2 Forwarded-Arg Rules Are Explicit` plus current `vitest.config.ts` and `vitest.server.config.ts`.
+   - Server-only selectors delegate to one truthful server-config invocation; client-only selectors delegate to one truthful default-config invocation. Source: implementation plan `§2 Forwarded-Arg Rules Are Explicit` plus current `config/vitest/vitest.config.ts` and `config/vitest/vitest.server.config.ts`.
    - Mixed selectors are rejected with guidance to split the command. Source: implementation plan `§2 Forwarded-Arg Rules Are Explicit`.
    - `--reporter` is rejected on composite coordinated commands and accepted on delegated single-phase invocations. Source: implementation plan `§2 Forwarded-Arg Rules Are Explicit`.
    - `--run` on `test` and `test:all` is treated as a compatibility no-op. Source: implementation plan `§2 Forwarded-Arg Rules Are Explicit`.

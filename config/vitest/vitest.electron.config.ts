@@ -4,8 +4,10 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const projectRoot = path.resolve(__dirname, '../..')
 
 export default defineConfig({
+  root: projectRoot,
   plugins: [react()],
   define: {
     // Override NODE_ENV for tests so React loads its development build
@@ -23,7 +25,7 @@ export default defineConfig({
     testTimeout: 30000,
     hookTimeout: 30000,
     alias: {
-      '@electron': path.resolve(__dirname, './electron'),
+      '@electron': path.resolve(projectRoot, './electron'),
     },
   },
 })

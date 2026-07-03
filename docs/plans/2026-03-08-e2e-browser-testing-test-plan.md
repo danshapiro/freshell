@@ -631,7 +631,7 @@ These are checked as postconditions after scenario tests.
 - **Name:** `npm test` passes with the E2E browser directory excluded from vitest
 - **Type:** regression
 - **Harness:** Vitest (command line)
-- **Preconditions:** `test/e2e-browser/**` added to vitest.config.ts exclude list.
+- **Preconditions:** `test/e2e-browser/**` added to config/vitest/vitest.config.ts exclude list.
 - **Actions:**
   1. Run `npm test`.
 - **Expected outcome:** All existing tests pass. No regressions from the E2E infrastructure addition. (ST-2: Task 1 Step 6 adds exclusion.)

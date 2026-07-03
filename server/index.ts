@@ -906,7 +906,7 @@ async function main() {
       })
   }
 
-  // Determine bind host from config (shared logic with vite.config.ts)
+  // Determine bind host from config (shared logic with config/vite/vite.config.ts)
   const currentSettings = await configStore.getSettings()
   const bindHost = getNetworkHost()
 

@@ -28,7 +28,7 @@ No new standalone harness is required. The plan reuses existing repo harnesses p
 
 | Harness | What it exercises | Notes |
 | --- | --- | --- |
-| `H1 Server semantic-file scenario harness` | Real provider parse helpers, temp JSONL files, `fsp.utimes`/append/shrink flows, `CodingCliSessionIndexer`, and `SessionsSyncService` with a websocket spy. | Runs under `vitest.server.config.ts`; no live CLI or external services. |
+| `H1 Server semantic-file scenario harness` | Real provider parse helpers, temp JSONL files, `fsp.utimes`/append/shrink flows, `CodingCliSessionIndexer`, and `SessionsSyncService` with a websocket spy. | Runs under `config/vitest/vitest.server.config.ts`; no live CLI or external services. |
 | `H2 Session-directory read-model harness` | Pure server fixtures plus `querySessionDirectory()` and `GET /api/session-directory` integration coverage. | Reuses existing service and router tests. |
 | `H3 Websocket invalidation harness` | Real `WsHandler` plus authenticated websocket client for `sessions.changed` and handshake assertions. | Reuses existing ws integration tests; no browser needed. |
 | `H4 Public contract harness` | Search, pagination, CLI mappers, and shared schema parsing. | Mix of server Vitest and default-config CLI tests. |

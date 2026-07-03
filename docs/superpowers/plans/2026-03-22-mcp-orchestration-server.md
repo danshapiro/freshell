@@ -646,7 +646,7 @@ Ensure the tool description, instructions, and `help` output cover:
 - [ ] **Step 2: Verify the canonical MCP help/instruction test still passes**
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/mcp/freshell-tool.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts --run test/unit/server/mcp/freshell-tool.test.ts
 ```
 Expected: PASS
 

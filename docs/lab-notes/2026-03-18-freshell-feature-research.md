@@ -76,7 +76,7 @@ surprises, and next steps.
 
 Commands: `new-tab`, `list-tabs`, `select-tab`, `kill-tab`, `rename-tab`, `split-pane`, `send-keys`, `capture-pane`, `wait-for`, etc. Has tmux aliases (`new-window` → `new-tab`, etc.).
 
-**Design spec:** `TMUX-SEMANTICS-PROPOSAL.md` (775 lines). Transport is HTTP+token, not Unix sockets.
+**Design spec:** `docs/plans/tmux-semantics-proposal.md` (775 lines). Transport is HTTP+token, not Unix sockets.
 
 **Orchestration surface:** the `freshell` MCP tool in `server/mcp/freshell-tool.ts` provides the canonical automation guidance and action reference.
 

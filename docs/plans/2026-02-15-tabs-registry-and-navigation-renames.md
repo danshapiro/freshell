@@ -115,7 +115,7 @@ it('accepts open/closed tab records with device metadata and revision', () => {
 Run:
 ```bash
 npx vitest run test/unit/client/store/tabRegistryTypes.test.ts
-npx vitest run --config vitest.server.config.ts test/unit/server/tabs-registry/types.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/tabs-registry/types.test.ts
 ```
 Expected: FAIL because schemas/types do not exist yet.
 
@@ -153,7 +153,7 @@ export type RegistryTabRecord = {
 Run:
 ```bash
 npx vitest run test/unit/client/store/tabRegistryTypes.test.ts
-npx vitest run --config vitest.server.config.ts test/unit/server/tabs-registry/types.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/tabs-registry/types.test.ts
 ```
 Expected: PASS.
 
@@ -194,7 +194,7 @@ it('returns only live + closed within 24h for default snapshot', async () => {
 
 Run:
 ```bash
-npx vitest run --config vitest.server.config.ts test/unit/server/tabs-registry/store.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/tabs-registry/store.test.ts
 ```
 Expected: FAIL.
 
@@ -219,8 +219,8 @@ export class TabsRegistryStore {
 
 Run:
 ```bash
-npx vitest run --config vitest.server.config.ts test/unit/server/tabs-registry/store.test.ts
-npx vitest run --config vitest.server.config.ts test/integration/server/tabs-registry-store.persistence.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/tabs-registry/store.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/integration/server/tabs-registry-store.persistence.test.ts
 ```
 Expected: PASS.
 
@@ -254,7 +254,7 @@ it('accepts tabs.sync.push and emits tabs.sync.snapshot on query', async () => {
 
 Run:
 ```bash
-npx vitest run --config vitest.server.config.ts test/server/ws-tabs-registry.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/server/ws-tabs-registry.test.ts
 ```
 Expected: FAIL (message types missing).
 
@@ -284,7 +284,7 @@ Emit response:
 
 Run:
 ```bash
-npx vitest run --config vitest.server.config.ts test/server/ws-tabs-registry.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/server/ws-tabs-registry.test.ts
 npx vitest run test/unit/client/ws-client.tabs-sync.test.ts
 ```
 Expected: PASS.
@@ -627,7 +627,7 @@ it('requests older history only when user expands search range', async () => {
 
 Run:
 ```bash
-npx vitest run --config vitest.server.config.ts test/server/ws-tabs-registry.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/server/ws-tabs-registry.test.ts
 npx vitest run test/e2e/tabs-view-search-range.test.tsx
 ```
 Expected: FAIL.
@@ -642,7 +642,7 @@ Expected: FAIL.
 
 Run:
 ```bash
-npx vitest run --config vitest.server.config.ts test/server/ws-tabs-registry.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/server/ws-tabs-registry.test.ts
 npx vitest run test/unit/client/store/tabRegistrySync.test.ts test/e2e/tabs-view-search-range.test.tsx
 ```
 Expected: PASS.

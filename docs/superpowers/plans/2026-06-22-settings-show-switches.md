@@ -1085,7 +1085,7 @@ npm run test:vitest -- run \
   test/unit/client/store/selectors/sidebarSelectors.test.ts \
   test/unit/client/lib/browser-preferences.test.ts
 
-npm run test:vitest -- run test/integration/server/settings-api.test.ts --config vitest.server.config.ts
+npm run test:vitest -- run test/integration/server/settings-api.test.ts --config config/vitest/vitest.server.config.ts
 ```
 
 Expected: PASS.

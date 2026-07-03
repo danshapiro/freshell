@@ -225,7 +225,7 @@ describe('auth module', () => {
 
 **Step 2: Run test to verify it fails**
 
-Run: `npx vitest run test/unit/server/auth.test.ts --config vitest.server.config.ts`
+Run: `npx vitest run test/unit/server/auth.test.ts --config config/vitest/vitest.server.config.ts`
 Expected: Tests should pass (these test existing functionality)
 
 **Step 3: Commit**
@@ -337,7 +337,7 @@ describe('ChunkRingBuffer', () => {
 
 **Step 2: Run test to verify it passes**
 
-Run: `npx vitest run test/unit/server/chunk-ring-buffer.test.ts --config vitest.server.config.ts`
+Run: `npx vitest run test/unit/server/chunk-ring-buffer.test.ts --config config/vitest/vitest.server.config.ts`
 Expected: PASS
 
 **Step 3: Commit**
@@ -526,7 +526,7 @@ describe('ConfigStore', () => {
 
 **Step 2: Run test to verify status**
 
-Run: `npx vitest run test/unit/server/config-store.test.ts --config vitest.server.config.ts`
+Run: `npx vitest run test/unit/server/config-store.test.ts --config config/vitest/vitest.server.config.ts`
 Expected: PASS (after fixing any import issues)
 
 **Step 3: Commit**
@@ -1361,7 +1361,7 @@ describe('Settings API', () => {
 
 **Step 3: Run test to verify status**
 
-Run: `npx vitest run test/integration/api/settings.test.ts --config vitest.server.config.ts`
+Run: `npx vitest run test/integration/api/settings.test.ts --config config/vitest/vitest.server.config.ts`
 Expected: PASS
 
 **Step 4: Commit**
@@ -1553,7 +1553,7 @@ describe('Terminals API', () => {
 
 **Step 2: Run test to verify status**
 
-Run: `npx vitest run test/integration/api/terminals.test.ts --config vitest.server.config.ts`
+Run: `npx vitest run test/integration/api/terminals.test.ts --config config/vitest/vitest.server.config.ts`
 Expected: PASS
 
 **Step 3: Commit**
@@ -1773,7 +1773,7 @@ Add these additional tests to the existing file:
 
 **Step 2: Run tests to verify**
 
-Run: `npx vitest run test/server/ws-protocol.test.ts --config vitest.server.config.ts`
+Run: `npx vitest run test/server/ws-protocol.test.ts --config config/vitest/vitest.server.config.ts`
 Expected: PASS
 
 **Step 3: Commit**
@@ -2084,13 +2084,13 @@ git commit -m "test: add SettingsView component tests"
 ### Task 14: Update Vitest Configuration
 
 **Files:**
-- Modify: `vitest.config.ts`
-- Modify: `vitest.server.config.ts`
+- Modify: `config/vitest/vitest.config.ts`
+- Modify: `config/vitest/vitest.server.config.ts`
 
 **Step 1: Update client config**
 
 ```typescript
-// vitest.config.ts
+// config/vitest/vitest.config.ts
 import { defineConfig } from 'vitest/config'
 import react from '@vitejs/plugin-react'
 import path from 'path'
@@ -2129,7 +2129,7 @@ export default defineConfig({
 **Step 2: Update server config**
 
 ```typescript
-// vitest.server.config.ts
+// config/vitest/vitest.server.config.ts
 import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
@@ -2153,7 +2153,7 @@ export default defineConfig({
 **Step 3: Commit**
 
 ```bash
-git add vitest.config.ts vitest.server.config.ts
+git add config/vitest/vitest.config.ts config/vitest/vitest.server.config.ts
 git commit -m "chore: update vitest configs for comprehensive test coverage"
 ```
 
@@ -2175,8 +2175,8 @@ Add to scripts section:
   "scripts": {
     "test": "vitest",
     "test:ui": "vitest --ui",
-    "test:server": "vitest --config vitest.server.config.ts",
-    "test:client": "vitest --config vitest.config.ts",
+    "test:server": "vitest --config config/vitest/vitest.server.config.ts",
+    "test:client": "vitest --config config/vitest/vitest.config.ts",
     "test:all": "npm run test:client -- --run && npm run test:server -- --run",
     "test:coverage": "npm run test:client -- --run --coverage && npm run test:server -- --run --coverage",
     "test:watch": "vitest --watch"
@@ -2242,5 +2242,5 @@ npm run test:coverage
 
 Run specific test file:
 ```bash
-npx vitest run test/unit/server/auth.test.ts --config vitest.server.config.ts
+npx vitest run test/unit/server/auth.test.ts --config config/vitest/vitest.server.config.ts
 ```

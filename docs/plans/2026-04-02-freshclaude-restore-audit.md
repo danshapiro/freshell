@@ -332,7 +332,7 @@ it('passes includeBodies through the route family', async () => {
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/agent-timeline-history-source.test.ts test/unit/server/agent-timeline/service.test.ts test/unit/server/agent-timeline-include-bodies.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/agent-timeline-history-source.test.ts test/unit/server/agent-timeline/service.test.ts test/unit/server/agent-timeline-include-bodies.test.ts
 npm run test:integration -- --run test/integration/server/agent-timeline-router.test.ts
 ```
 
@@ -411,7 +411,7 @@ Wire the shared source once in `server/index.ts` and pass it into `createAgentTi
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/agent-timeline-history-source.test.ts test/unit/server/agent-timeline/service.test.ts test/unit/server/agent-timeline-include-bodies.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/agent-timeline-history-source.test.ts test/unit/server/agent-timeline/service.test.ts test/unit/server/agent-timeline-include-bodies.test.ts
 npm run test:integration -- --run test/integration/server/agent-timeline-router.test.ts
 ```
 
@@ -424,7 +424,7 @@ Refactor the merge helper so the resumed-delta path and the fresh-live path are 
 Re-run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/agent-timeline-history-source.test.ts test/unit/server/agent-timeline/service.test.ts test/unit/server/agent-timeline-include-bodies.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/agent-timeline-history-source.test.ts test/unit/server/agent-timeline/service.test.ts test/unit/server/agent-timeline-include-bodies.test.ts
 npm run test:integration -- --run test/integration/server/agent-timeline-router.test.ts
 ```
 
@@ -562,7 +562,7 @@ expect(moduleLoadSessionHistoryMock).not.toHaveBeenCalled()
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/sdk-bridge.test.ts test/unit/server/sdk-bridge-types.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/ws-sdk-session-history-cache.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/sdk-bridge.test.ts test/unit/server/sdk-bridge-types.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/ws-sdk-session-history-cache.test.ts
 ```
 
 Expected:
@@ -669,7 +669,7 @@ Keep the existing ordering invariant:
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/sdk-bridge.test.ts test/unit/server/sdk-bridge-types.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/ws-sdk-session-history-cache.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/sdk-bridge.test.ts test/unit/server/sdk-bridge-types.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/ws-sdk-session-history-cache.test.ts
 ```
 
 Expected: PASS.
@@ -681,7 +681,7 @@ Remove the legacy raw `loadSessionHistory` branching from `server/ws-handler.ts`
 Re-run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/sdk-bridge.test.ts test/unit/server/sdk-bridge-types.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/ws-sdk-session-history-cache.test.ts test/unit/server/agent-timeline-history-source.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/sdk-bridge.test.ts test/unit/server/sdk-bridge-types.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/ws-sdk-session-history-cache.test.ts test/unit/server/agent-timeline-history-source.test.ts
 ```
 
 Expected: all PASS.
@@ -1341,7 +1341,7 @@ Expected: PASS.
 Run the restore regressions that now share canonical identity, then the coordinated broad suite:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/agent-timeline-history-source.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/sdk-bridge.test.ts test/unit/server/sdk-bridge-types.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/agent-timeline-history-source.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/sdk-bridge.test.ts test/unit/server/sdk-bridge-types.test.ts
 npm run test:integration -- --run test/integration/server/agent-timeline-router.test.ts
 npm run test:vitest -- test/unit/client/lib/api.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/sdk-message-handler.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx test/unit/client/components/agent-chat/AgentChatView.session-lost.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/lib/pane-activity.test.ts test/e2e/agent-chat-resume-history-flow.test.tsx test/e2e/agent-chat-restore-flow.test.tsx test/e2e/pane-activity-indicator-flow.test.tsx test/e2e/pane-header-runtime-meta-flow.test.tsx
 npm run lint

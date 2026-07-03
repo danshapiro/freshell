@@ -338,7 +338,7 @@ git commit -m "test(harness): cover compiled first-run bootstrap"
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/bootstrap.test.ts -t "returns process.cwd() so .env lands where dotenv looks"
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/bootstrap.test.ts -t "returns process.cwd() so .env lands where dotenv looks"
 ```
 
 Expected:
@@ -367,7 +367,7 @@ Rules:
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/bootstrap.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/bootstrap.test.ts
 npm run build
 npm run test:e2e:helpers -- helpers/test-server.test.ts
 ```
@@ -394,7 +394,7 @@ Run:
 ```bash
 npm run build
 npm run test:e2e:helpers -- helpers/test-server.test.ts
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/bootstrap.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/bootstrap.test.ts
 ```
 
 Expected:

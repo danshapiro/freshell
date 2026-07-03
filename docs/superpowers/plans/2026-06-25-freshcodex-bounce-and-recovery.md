@@ -527,7 +527,7 @@ Do not add a test that resets the counter merely because `runCodexRecoveryAttemp
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts --config vitest.server.config.ts
+npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts --config config/vitest/vitest.server.config.ts
 ```
 
 Expected: FAIL because `CodexRecoveryOptions` has no `maxConsecutiveFailures` and the recovery loop retries forever.
@@ -615,7 +615,7 @@ Update the stale blocked-recovery log text in `startCodexDurableRecovery(...)` f
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts --config vitest.server.config.ts
+npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts --config config/vitest/vitest.server.config.ts
 ```
 
 Expected: PASS.
@@ -625,7 +625,7 @@ Expected: PASS.
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts test/unit/server/terminal-registry.codex-recovery.test.ts --config vitest.server.config.ts
+npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts test/unit/server/terminal-registry.codex-recovery.test.ts --config config/vitest/vitest.server.config.ts
 ```
 
 Expected: PASS.
@@ -654,7 +654,7 @@ Run:
 
 ```bash
 npm run test:vitest -- run test/unit/client/lib/fresh-agent-ws.test.ts test/unit/client/store/freshAgentSlice.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
-npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts test/unit/server/terminal-registry.codex-recovery.test.ts --config vitest.server.config.ts
+npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts test/unit/server/terminal-registry.codex-recovery.test.ts --config config/vitest/vitest.server.config.ts
 ```
 
 Expected: PASS for both commands.

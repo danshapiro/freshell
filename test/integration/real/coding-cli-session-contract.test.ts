@@ -16,7 +16,7 @@
 //
 //    To run them: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- \
 //      run test/integration/real/coding-cli-session-contract.test.ts \
-//      --config vitest.server.config.ts
+//      --config config/vitest/vitest.server.config.ts
 //
 import fsp from 'node:fs/promises'
 import os from 'node:os'

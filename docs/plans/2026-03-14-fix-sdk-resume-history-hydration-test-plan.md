@@ -549,7 +549,7 @@ Reuse the existing `on('message', ...)` collection style already present in this
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/ws-handler-sdk.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts --run test/unit/server/ws-handler-sdk.test.ts
 ```
 
 Expected: PASS immediately. If it fails, stop and re-plan the lane, because the chosen client-only fix would no longer rest on a true server contract.
@@ -567,7 +567,7 @@ git commit -m "test: characterize sdk resume snapshot ordering"
 
 ```bash
 npm run test:vitest -- --run test/unit/client/agentChatSlice.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/e2e/agent-chat-resume-history-flow.test.tsx
-npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/ws-handler-sdk.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts --run test/unit/server/ws-handler-sdk.test.ts
 ```
 
 Expected: all targeted unit, client integration, e2e, and server characterization tests PASS.

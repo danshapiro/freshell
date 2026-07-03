@@ -46,14 +46,14 @@ describe('run-standard-tests', () => {
 
     it('includes config when present', () => {
       expect(buildVitestArgs({
-        configPath: 'vitest.server.config.ts',
+        configPath: 'config/vitest/vitest.server.config.ts',
         maxWorkers: '3',
         forwardedArgs: ['-t', 'prebuild'],
       })).toEqual([
         'run',
         '--passWithNoTests',
         '--config',
-        'vitest.server.config.ts',
+        'config/vitest/vitest.server.config.ts',
         '--maxWorkers',
         '3',
         '-t',
@@ -72,11 +72,11 @@ describe('run-standard-tests', () => {
         mode: 'desktop',
         stages: [
           [
-            { name: 'client', maxWorkers: '5', priority: 'background' },
-            { name: 'server', configPath: 'vitest.server.config.ts', maxWorkers: '3', priority: 'background' },
+            { name: 'client', configPath: 'config/vitest/vitest.config.ts', maxWorkers: '5', priority: 'background' },
+            { name: 'server', configPath: 'config/vitest/vitest.server.config.ts', maxWorkers: '3', priority: 'background' },
           ],
           [
-            { name: 'electron', configPath: 'vitest.electron.config.ts', priority: 'background' },
+            { name: 'electron', configPath: 'config/vitest/vitest.electron.config.ts', priority: 'background' },
           ],
         ],
       })
@@ -91,9 +91,9 @@ describe('run-standard-tests', () => {
         mode: 'aggressive',
         stages: [
           [
-            { name: 'client', maxWorkers: '50%', priority: 'normal' },
-            { name: 'server', configPath: 'vitest.server.config.ts', maxWorkers: '50%', priority: 'normal' },
-            { name: 'electron', configPath: 'vitest.electron.config.ts', priority: 'normal' },
+            { name: 'client', configPath: 'config/vitest/vitest.config.ts', maxWorkers: '50%', priority: 'normal' },
+            { name: 'server', configPath: 'config/vitest/vitest.server.config.ts', maxWorkers: '50%', priority: 'normal' },
+            { name: 'electron', configPath: 'config/vitest/vitest.electron.config.ts', priority: 'normal' },
           ],
         ],
       })
@@ -117,7 +117,7 @@ describe('run-standard-tests', () => {
         mode: 'desktop',
         stages: [
           [
-            { name: 'server', configPath: 'vitest.server.config.ts', maxWorkers: '3', priority: 'background' },
+            { name: 'server', configPath: 'config/vitest/vitest.server.config.ts', maxWorkers: '3', priority: 'background' },
           ],
         ],
       })
@@ -132,7 +132,7 @@ describe('run-standard-tests', () => {
         mode: 'desktop',
         stages: [
           [
-            { name: 'server', configPath: 'vitest.server.config.ts', maxWorkers: '3', priority: 'background' },
+            { name: 'server', configPath: 'config/vitest/vitest.server.config.ts', maxWorkers: '3', priority: 'background' },
           ],
         ],
       })
@@ -147,7 +147,7 @@ describe('run-standard-tests', () => {
         mode: 'desktop',
         stages: [
           [
-            { name: 'electron', configPath: 'vitest.electron.config.ts', priority: 'background' },
+            { name: 'electron', configPath: 'config/vitest/vitest.electron.config.ts', priority: 'background' },
           ],
         ],
       })
@@ -162,7 +162,7 @@ describe('run-standard-tests', () => {
         mode: 'desktop',
         stages: [
           [
-            { name: 'server', configPath: 'vitest.server.config.ts', maxWorkers: '3', priority: 'background' },
+            { name: 'server', configPath: 'config/vitest/vitest.server.config.ts', maxWorkers: '3', priority: 'background' },
           ],
         ],
       })

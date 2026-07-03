@@ -23,7 +23,7 @@ Add unit coverage for the startup gating helper so automatic WSL port forwarding
 
 **Step 2: Run targeted tests to verify the missing startup gate fails**
 
-Run: `npx vitest run --config vitest.server.config.ts test/unit/server/wsl-port-forward-startup.test.ts test/integration/server/wsl-port-forward.test.ts test/integration/server/logger.separation.harness.test.ts`
+Run: `npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/wsl-port-forward-startup.test.ts test/integration/server/wsl-port-forward.test.ts test/integration/server/logger.separation.harness.test.ts`
 
 Expected: FAIL because the startup helper does not exist yet and `server/index.ts` still calls `setupWslPortForwarding()` directly when bound to `0.0.0.0`.
 
@@ -39,7 +39,7 @@ Create a dedicated helper that interprets `FRESHELL_DISABLE_WSL_PORT_FORWARD` as
 
 **Step 2: Run targeted tests**
 
-Run: `npx vitest run --config vitest.server.config.ts test/unit/server/wsl-port-forward-startup.test.ts test/integration/server/wsl-port-forward.test.ts test/integration/server/logger.separation.harness.test.ts`
+Run: `npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/wsl-port-forward-startup.test.ts test/integration/server/wsl-port-forward.test.ts test/integration/server/logger.separation.harness.test.ts`
 
 Expected: PASS
 
@@ -54,7 +54,7 @@ Refactor only as needed so the startup env parsing lives in the new helper inste
 
 **Step 2: Run broader verification**
 
-Run: `npx vitest run --config vitest.server.config.ts test/unit/server/wsl-port-forward-startup.test.ts test/unit/server/wsl-port-forward.test.ts test/integration/server/wsl-port-forward.test.ts test/integration/server/logger.separation.harness.test.ts test/integration/server/logger.separation.test.ts`
+Run: `npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/wsl-port-forward-startup.test.ts test/unit/server/wsl-port-forward.test.ts test/integration/server/wsl-port-forward.test.ts test/integration/server/logger.separation.harness.test.ts test/integration/server/logger.separation.test.ts`
 
 Expected: PASS
 

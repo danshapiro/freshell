@@ -930,8 +930,8 @@ Focused commands:
 
 ```bash
 npm run test:vitest -- test/unit/server/tabs-registry/store.test.ts --run
-npm run test:vitest -- --config vitest.server.config.ts test/integration/server/tabs-registry-store.persistence.test.ts --run
-npm run test:vitest -- --config vitest.server.config.ts test/server/ws-tabs-registry.test.ts --run
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/integration/server/tabs-registry-store.persistence.test.ts --run
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/server/ws-tabs-registry.test.ts --run
 npm run test:vitest -- test/unit/client/store/tabRegistrySync.test.ts test/unit/client/lib/browser-preferences.test.ts test/unit/client/store/browserPreferencesPersistence.test.ts test/unit/client/store/crossTabSync.test.ts --run
 npm run test:vitest -- test/unit/client/components/TabsView.test.tsx test/unit/client/components/SettingsView.behavior.test.tsx --run
 ```

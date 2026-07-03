@@ -125,7 +125,7 @@ it('redacts token-bearing keys, URL token parameters, and token-like string frag
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/main-process-logger.test.ts --run`
+Run: `npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/main-process-logger.test.ts --run`
 
 Expected: FAIL because `electron/main-process-logger.ts` does not exist.
 
@@ -165,7 +165,7 @@ Token-bearing keys are any case-insensitive key that contains `token`, `authoriz
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/main-process-logger.test.ts --run`
+Run: `npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/main-process-logger.test.ts --run`
 
 Expected: PASS.
 
@@ -301,7 +301,7 @@ it('does not log success until the recovery verifier resolves', async () => {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/renderer-recovery.test.ts --run`
+Run: `npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/renderer-recovery.test.ts --run`
 
 Expected: FAIL because `electron/renderer-recovery.ts` does not exist.
 
@@ -322,7 +322,7 @@ Implement `registerRendererRecovery()` so it:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/renderer-recovery.test.ts --run`
+Run: `npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/renderer-recovery.test.ts --run`
 
 Expected: PASS.
 
@@ -406,7 +406,7 @@ it('logs an explicit warning when recovery cannot attach because webContents is 
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/startup.test.ts --run`
+Run: `npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/startup.test.ts --run`
 
 Expected: FAIL because `StartupContext.mainProcessLogger` and recovery wiring do not exist.
 
@@ -423,7 +423,7 @@ In `electron/startup.ts`:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `npm run test:vitest -- --config vitest.electron.config.ts test/unit/electron/startup.test.ts --run`
+Run: `npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/startup.test.ts --run`
 
 Expected: PASS.
 
@@ -560,7 +560,7 @@ In `electron/entry.ts`:
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.electron.config.ts \
+npm run test:vitest -- --config config/vitest/vitest.electron.config.ts \
   test/unit/electron/main-process-logger.test.ts \
   test/unit/electron/renderer-recovery.test.ts \
   test/unit/electron/startup.test.ts --run

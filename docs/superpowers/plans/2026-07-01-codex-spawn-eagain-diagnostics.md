@@ -129,7 +129,7 @@ Add this test near the existing missing-command startup test:
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/runtime.test.ts --config vitest.server.config.ts -t "classifies spawn EAGAIN"
+npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/runtime.test.ts --config config/vitest/vitest.server.config.ts -t "classifies spawn EAGAIN"
 ```
 
 Expected: FAIL because `spawnProcess` is not a `RuntimeOptions` field and runtime errors do not yet expose retryable diagnostics.
@@ -510,7 +510,7 @@ At the final throw in `startRuntime`, collect diagnostics and throw `CodexAppSer
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/runtime.test.ts --config vitest.server.config.ts -t "classifies spawn EAGAIN"
+npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/runtime.test.ts --config config/vitest/vitest.server.config.ts -t "classifies spawn EAGAIN"
 ```
 
 Expected: PASS.
@@ -721,7 +721,7 @@ Add this test near existing terminal-create failure tests:
 Run:
 
 ```bash
-npm run test:vitest -- run test/server/ws-protocol.test.ts --config vitest.server.config.ts -t "logs terminal and resource diagnostics"
+npm run test:vitest -- run test/server/ws-protocol.test.ts --config config/vitest/vitest.server.config.ts -t "logs terminal and resource diagnostics"
 ```
 
 Expected: FAIL because registry counts, process diagnostics, and launch details are not yet added to the warning log.
@@ -865,7 +865,7 @@ In the terminal.create catch block, compute diagnostics before the warning:
 Run:
 
 ```bash
-npm run test:vitest -- run test/server/ws-protocol.test.ts --config vitest.server.config.ts -t "logs terminal and resource diagnostics"
+npm run test:vitest -- run test/server/ws-protocol.test.ts --config config/vitest/vitest.server.config.ts -t "logs terminal and resource diagnostics"
 ```
 
 Expected: PASS.
@@ -875,7 +875,7 @@ Expected: PASS.
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/runtime.test.ts test/server/ws-protocol.test.ts --config vitest.server.config.ts
+npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/runtime.test.ts test/server/ws-protocol.test.ts --config config/vitest/vitest.server.config.ts
 ```
 
 Expected: PASS.

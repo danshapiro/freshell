@@ -280,7 +280,7 @@ If a 5ms timer does not flush the replay cursor, use the delay pattern already p
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/ws-handler-backpressure.test.ts --config vitest.server.config.ts
+npm run test:vitest -- run test/unit/server/ws-handler-backpressure.test.ts --config config/vitest/vitest.server.config.ts
 ```
 
 Expected: FAIL because retention still emits `terminal.stream.changed` with `reason: 'retention_lost'`, changes stream IDs, and converts paced replay cursors through stream replacement.
@@ -493,7 +493,7 @@ In `test/unit/server/terminal-stream/client-output-queue.test.ts`, delete the `r
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/ws-handler-backpressure.test.ts test/unit/server/terminal-stream/stream-identity.test.ts test/unit/server/terminal-stream/client-output-queue.test.ts --config vitest.server.config.ts
+npm run test:vitest -- run test/unit/server/ws-handler-backpressure.test.ts test/unit/server/terminal-stream/stream-identity.test.ts test/unit/server/terminal-stream/client-output-queue.test.ts --config config/vitest/vitest.server.config.ts
 ```
 
 Expected: PASS.
@@ -612,7 +612,7 @@ it('treats same-stream replay gaps as lost history without making later output u
 Run:
 
 ```bash
-npm run test:vitest -- run test/server/ws-terminal-stream-v2-replay.test.ts --config vitest.server.config.ts
+npm run test:vitest -- run test/server/ws-terminal-stream-v2-replay.test.ts --config config/vitest/vitest.server.config.ts
 npm run test:vitest -- run test/unit/client/lib/terminal-attach-seq-state.test.ts
 ```
 
@@ -645,8 +645,8 @@ Expected: both commands exit `0`.
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/ws-handler-backpressure.test.ts test/unit/server/terminal-stream/stream-identity.test.ts test/unit/server/terminal-stream/client-output-queue.test.ts --config vitest.server.config.ts
-npm run test:vitest -- run test/server/ws-terminal-stream-v2-replay.test.ts --config vitest.server.config.ts
+npm run test:vitest -- run test/unit/server/ws-handler-backpressure.test.ts test/unit/server/terminal-stream/stream-identity.test.ts test/unit/server/terminal-stream/client-output-queue.test.ts --config config/vitest/vitest.server.config.ts
+npm run test:vitest -- run test/server/ws-terminal-stream-v2-replay.test.ts --config config/vitest/vitest.server.config.ts
 npm run test:vitest -- run test/unit/client/lib/terminal-attach-seq-state.test.ts
 npm run test:vitest -- run test/unit/client/components/TerminalView.lifecycle.test.tsx
 ```

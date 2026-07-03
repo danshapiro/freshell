@@ -12,7 +12,7 @@
 
 ## Acceptance Criteria
 
-- `package.json` remains unchanged unless an execution-time `tsx watch` probe proves that `.worktrees`, `demo-projects`, or `dist` actually trigger restarts from the current repo setup.
+- `package.json` remains unchanged unless an execution-time `tsx watch` probe proves that `.worktrees`, `examples/demo-projects`, or `dist` actually trigger restarts from the current repo setup.
 - The runtime LAN-detection path is async everywhere except the required sync bootstrap/import path and the constructor-only lazy initialization path.
 - `server/wsl-port-forward.ts` no longer exports dead sync wrappers that shell out through `execSync`; runtime callers keep using async plan helpers only.
 - `/api/lan-info` and `/local-file` preserve their success payloads and now return deterministic async 400/404/500 responses without sync filesystem or sync process execution in steady-state request handling.
@@ -123,7 +123,7 @@ Run:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/trycycle-performance-fixes-20260404
-npm run test:vitest -- --config vitest.server.config.ts run test/unit/server/bootstrap.test.ts test/unit/server/network-manager.test.ts test/integration/server/lan-info-api.test.ts test/integration/server/network-api.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts run test/unit/server/bootstrap.test.ts test/unit/server/network-manager.test.ts test/integration/server/lan-info-api.test.ts test/integration/server/network-api.test.ts
 ```
 
 Expected: FAIL because `detectLanIpsAsync()` does not exist yet and `/api/lan-info` still expects a sync dependency.
@@ -153,7 +153,7 @@ Run:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/trycycle-performance-fixes-20260404
-npm run test:vitest -- --config vitest.server.config.ts run test/unit/server/bootstrap.test.ts test/unit/server/network-manager.test.ts test/integration/server/lan-info-api.test.ts test/integration/server/network-api.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts run test/unit/server/bootstrap.test.ts test/unit/server/network-manager.test.ts test/integration/server/lan-info-api.test.ts test/integration/server/network-api.test.ts
 ```
 
 Expected: PASS.
@@ -205,7 +205,7 @@ Run:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/trycycle-performance-fixes-20260404
-npm run test:vitest -- --config vitest.server.config.ts run test/unit/server/wsl-port-forward.test.ts test/integration/server/wsl-port-forward.test.ts test/integration/server/network-api.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts run test/unit/server/wsl-port-forward.test.ts test/integration/server/wsl-port-forward.test.ts test/integration/server/network-api.test.ts
 ```
 
 Expected: FAIL because the integration test now asserts that the dead sync exports are gone, but the code still exports them.
@@ -229,7 +229,7 @@ Run:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/trycycle-performance-fixes-20260404
-npm run test:vitest -- --config vitest.server.config.ts run test/unit/server/wsl-port-forward.test.ts test/integration/server/wsl-port-forward.test.ts test/integration/server/network-api.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts run test/unit/server/wsl-port-forward.test.ts test/integration/server/wsl-port-forward.test.ts test/integration/server/network-api.test.ts
 ```
 
 Expected: PASS.
@@ -549,7 +549,7 @@ Run:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/trycycle-performance-fixes-20260404
-npm run test:vitest -- --config vitest.server.config.ts run test/unit/server/bootstrap.test.ts test/unit/server/network-manager.test.ts test/unit/server/wsl-port-forward.test.ts test/integration/server/lan-info-api.test.ts test/integration/server/local-file-router.test.ts test/integration/server/network-api.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts run test/unit/server/bootstrap.test.ts test/unit/server/network-manager.test.ts test/unit/server/wsl-port-forward.test.ts test/integration/server/lan-info-api.test.ts test/integration/server/local-file-router.test.ts test/integration/server/network-api.test.ts
 ```
 
 Expected: PASS.

@@ -138,7 +138,7 @@ it('does not flag resume issue for files without stop-hook progress', async () =
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.config.ts test/unit/server/session-scanner.test.ts
+npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/server/session-scanner.test.ts
 ```
 
 Expected: FAIL because `SessionScanResult` does not yet have a `resumeIssue` property and the scanner does not classify the inline-progress leaf shape.
@@ -335,7 +335,7 @@ return {
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.config.ts test/unit/server/session-scanner.test.ts
+npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/server/session-scanner.test.ts
 ```
 
 Expected: All tests PASS, including the three new classification tests and all existing tests. Existing tests should continue to pass unchanged because `resumeIssue` defaults to `undefined` for healthy files without the inline-progress shape, and `resumeIssuesFixed` is always 0 (repair not yet implemented).
@@ -351,7 +351,7 @@ Review the code for clarity. Ensure:
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.config.ts test/unit/server/session-scanner.test.ts
+npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/server/session-scanner.test.ts
 ```
 
 Expected: All PASS.
@@ -498,7 +498,7 @@ it('leaves progress record in file as side leaf after repair', async () => {
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.config.ts test/unit/server/session-scanner.test.ts
+npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/server/session-scanner.test.ts
 ```
 
 Expected: FAIL because `repair()` does not yet accept options or fix resume issues.
@@ -581,7 +581,7 @@ Important implementation note: the existing backup code is already positioned be
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.config.ts test/unit/server/session-scanner.test.ts
+npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/server/session-scanner.test.ts
 ```
 
 Expected: All PASS, including all new repair tests and all existing orphan repair tests.
@@ -597,7 +597,7 @@ Check that:
 Run the full scanner suite:
 
 ```bash
-npm run test:vitest -- --config vitest.config.ts test/unit/server/session-scanner.test.ts
+npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/server/session-scanner.test.ts
 ```
 
 Expected: All PASS.
@@ -808,7 +808,7 @@ it('uses cached resume-issue result for disk priority without repair', async () 
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.config.ts test/unit/server/session-queue.test.ts
+npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/server/session-queue.test.ts
 ```
 
 Expected: FAIL because the queue does not distinguish resume issues from healthy results and does not pass `includeResumeIssues` to `repair()`.
@@ -898,7 +898,7 @@ This is a one-line method but it solves a critical race: `waitFor()` checks `thi
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.config.ts test/unit/server/session-queue.test.ts
+npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/server/session-queue.test.ts
 ```
 
 Expected: All PASS, including all new resume-issue tests and all existing queue tests.
@@ -913,7 +913,7 @@ Ensure:
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.config.ts test/unit/server/session-queue.test.ts
+npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/server/session-queue.test.ts
 ```
 
 Expected: All PASS.
@@ -1007,7 +1007,7 @@ But there is a subtlety: `waitForSession()` currently returns immediately if `qu
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/server/ws-terminal-create-session-repair.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/server/ws-terminal-create-session-repair.test.ts
 ```
 
 Expected: This test should actually pass with the existing code because the integration test uses a `FakeSessionRepairService` -- we need to verify the real service behavior. However, the fake service's `getResult()` returns the cached result with `resumeIssue`, and the ws-handler sees `status: 'healthy'` (not missing), so it calls `waitForSession()`. The fake's `waitForSession()` always returns the `waitForSessionResult` which has no `resumeIssue`. So this test may pass even without changes.
@@ -1155,7 +1155,7 @@ if (cached) {
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/server/ws-terminal-create-session-repair.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/server/ws-terminal-create-session-repair.test.ts
 ```
 
 Expected: All PASS, including the new resume-issue integration test and all existing tests.
@@ -1170,8 +1170,8 @@ Ensure:
 Run both test suites:
 
 ```bash
-npm run test:vitest -- --config vitest.config.ts test/unit/server/session-scanner.test.ts test/unit/server/session-queue.test.ts
-npm run test:vitest -- --config vitest.server.config.ts test/server/ws-terminal-create-session-repair.test.ts
+npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/server/session-scanner.test.ts test/unit/server/session-queue.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/server/ws-terminal-create-session-repair.test.ts
 ```
 
 Expected: All PASS.
@@ -1200,19 +1200,19 @@ Expected: No errors. The type changes (`resumeIssue` on `SessionScanResult`, `re
 - [ ] Run the focused scanner suite:
 
 ```bash
-npm run test:vitest -- --config vitest.config.ts test/unit/server/session-scanner.test.ts
+npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/server/session-scanner.test.ts
 ```
 
 - [ ] Run the focused queue suite:
 
 ```bash
-npm run test:vitest -- --config vitest.config.ts test/unit/server/session-queue.test.ts
+npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/server/session-queue.test.ts
 ```
 
 - [ ] Run the server integration suite:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/server/ws-terminal-create-session-repair.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/server/ws-terminal-create-session-repair.test.ts
 ```
 
 - [ ] Check coordinator state, then run the full regression suite:

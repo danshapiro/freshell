@@ -122,7 +122,7 @@ it('URL-encodes routed cwd values without putting cwd in the body', async () => 
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/fresh-agent/opencode-serve-manager.test.ts --run
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/fresh-agent/opencode-serve-manager.test.ts --run
 ```
 
 Expected: FAIL because `createSession` still posts `/session` with body `directory`.
@@ -259,7 +259,7 @@ it('routes onceIdle status polling through the session cwd', async () => {
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/fresh-agent/opencode-serve-manager.test.ts --run
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/fresh-agent/opencode-serve-manager.test.ts --run
 ```
 
 Expected: PASS.
@@ -363,7 +363,7 @@ In `serve-manager.ts`, change both injected and default event URLs from `/event`
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/fresh-agent/opencode-serve-manager.test.ts test/unit/server/fresh-agent/opencode-serve-events.test.ts --run
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/fresh-agent/opencode-serve-manager.test.ts test/unit/server/fresh-agent/opencode-serve-events.test.ts --run
 ```
 
 Expected: PASS.
@@ -442,7 +442,7 @@ Keep no-cwd tests expecting the two-argument form or accepting the third argumen
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/fresh-agent/opencode-serve-adapter.test.ts --run
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/fresh-agent/opencode-serve-adapter.test.ts --run
 ```
 
 Expected: FAIL because `validateCwd` is not an adapter option.
@@ -573,7 +573,7 @@ This turn smoke is opt-in, but it protects the exact regression where unrouted `
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/fresh-agent/opencode-serve-manager.test.ts test/unit/server/fresh-agent/opencode-serve-events.test.ts test/unit/server/fresh-agent/opencode-serve-adapter.test.ts --run
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/fresh-agent/opencode-serve-manager.test.ts test/unit/server/fresh-agent/opencode-serve-events.test.ts test/unit/server/fresh-agent/opencode-serve-adapter.test.ts --run
 ```
 
 Expected: PASS.
@@ -608,7 +608,7 @@ git commit -m "test: cover opencode routed cwd smoke"
 - [ ] **Step 1: Run focused OpenCode tests**
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/fresh-agent/opencode-serve-manager.test.ts test/unit/server/fresh-agent/opencode-serve-adapter.test.ts --run
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/fresh-agent/opencode-serve-manager.test.ts test/unit/server/fresh-agent/opencode-serve-adapter.test.ts --run
 ```
 
 Expected: PASS.
@@ -619,7 +619,7 @@ Expected: PASS.
 npm run test:opencode-serve-smoke
 ```
 
-Expected: PASS or SKIP when `opencode` is unavailable. This file is excluded from `vitest.server.config.ts`, so it must run through the dedicated smoke config.
+Expected: PASS or SKIP when `opencode` is unavailable. This file is excluded from `config/vitest/vitest.server.config.ts`, so it must run through the dedicated smoke config.
 
 - [ ] **Step 2: Run broad verification through the coordinator**
 

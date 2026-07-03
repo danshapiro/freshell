@@ -67,42 +67,44 @@ type SinglePhaseSpec = {
 }
 
 const COMPOSITE_COMMANDS = new Set<CommandKey>(['test', 'test:all', 'check', 'verify'])
+const DEFAULT_VITEST_CONFIG = 'config/vitest/vitest.config.ts'
+const SERVER_VITEST_CONFIG = 'config/vitest/vitest.server.config.ts'
 const SINGLE_PHASE_SPECS: Record<Exclude<CommandKey, 'test' | 'test:all' | 'check' | 'verify'>, SinglePhaseSpec> = {
   'test:watch': {
     owner: 'default',
-    broadArgs: [],
+    broadArgs: ['--config', DEFAULT_VITEST_CONFIG],
     passthroughKind: 'passthrough',
   },
   'test:ui': {
     owner: 'default',
-    broadArgs: ['--ui'],
+    broadArgs: ['--config', DEFAULT_VITEST_CONFIG, '--ui'],
     passthroughKind: 'passthrough',
   },
   'test:server': {
     owner: 'server',
     broadSuiteKey: 'server:all:run',
-    broadArgs: ['--config', 'vitest.server.config.ts', '--run'],
-    delegatedArgs: ['--config', 'vitest.server.config.ts'],
+    broadArgs: ['--config', SERVER_VITEST_CONFIG, '--run'],
+    delegatedArgs: ['--config', SERVER_VITEST_CONFIG],
   },
   'test:coverage': {
     owner: 'default',
     broadSuiteKey: 'default:coverage',
-    broadArgs: ['run', '--coverage'],
+    broadArgs: ['run', '--config', DEFAULT_VITEST_CONFIG, '--coverage'],
   },
   'test:unit': {
     owner: 'default',
     broadSuiteKey: 'default:test/unit',
-    broadArgs: ['run', 'test/unit'],
+    broadArgs: ['run', '--config', DEFAULT_VITEST_CONFIG, 'test/unit'],
   },
   'test:integration': {
     owner: 'server',
     broadSuiteKey: 'server:test/server',
-    broadArgs: ['run', '--config', 'vitest.server.config.ts', 'test/server'],
+    broadArgs: ['run', '--config', SERVER_VITEST_CONFIG, 'test/server'],
   },
   'test:client': {
     owner: 'default',
     broadSuiteKey: 'default:test/unit/client',
-    broadArgs: ['run', 'test/unit/client'],
+    broadArgs: ['run', '--config', DEFAULT_VITEST_CONFIG, 'test/unit/client'],
   },
   'test:vitest': {
     owner: 'default',
@@ -193,13 +195,13 @@ function classifyCompositeCommand(commandKey: CommandKey, args: string[]): Comma
 
   if (targetAnalysis.kind === 'server') {
     return delegated([
-      vitestPhase('server', ['run', '--config', 'vitest.server.config.ts', ...filteredArgs]),
+      vitestPhase('server', ['run', '--config', SERVER_VITEST_CONFIG, ...filteredArgs]),
     ])
   }
 
   if (targetAnalysis.kind === 'default') {
     return delegated([
-      vitestPhase('default', ['run', ...filteredArgs]),
+      vitestPhase('default', ['run', '--config', DEFAULT_VITEST_CONFIG, ...filteredArgs]),
     ])
   }
 
@@ -210,7 +212,7 @@ function classifyCompositeCommand(commandKey: CommandKey, args: string[]): Comma
   }
 
   return delegated([
-    vitestPhase('default', ['run', ...filteredArgs]),
+    vitestPhase('default', ['run', '--config', DEFAULT_VITEST_CONFIG, ...filteredArgs]),
   ])
 }
 
@@ -493,9 +495,9 @@ function normalizeTargetForOwnership(target: string): string {
 
 function ownerRunPrefix(owner: 'default' | 'server'): string[] {
   if (owner === 'server') {
-    return ['run', '--config', 'vitest.server.config.ts']
+    return ['run', '--config', SERVER_VITEST_CONFIG]
   }
-  return ['run']
+  return ['run', '--config', DEFAULT_VITEST_CONFIG]
 }
 
 function singlePhaseDelegatedBaseArgs(spec: SinglePhaseSpec): string[] {
@@ -508,9 +510,25 @@ function singlePhaseTargetBaseArgs(spec: SinglePhaseSpec): string[] {
 
 function singlePhasePassthroughTargetBaseArgs(spec: SinglePhaseSpec, owner: 'default' | 'server'): string[] {
   if (owner === 'server') {
-    return ['--config', 'vitest.server.config.ts', ...spec.broadArgs]
+    return ['--config', SERVER_VITEST_CONFIG, ...withoutDefaultConfigArgs(spec.broadArgs)]
   }
-  return [...spec.broadArgs]
+  return ['--config', DEFAULT_VITEST_CONFIG]
+}
+
+function withoutDefaultConfigArgs(args: string[]): string[] {
+  const filtered: string[] = []
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]
+    if ((arg === '--config' || arg === '-c') && args[index + 1] === DEFAULT_VITEST_CONFIG) {
+      index += 1
+      continue
+    }
+    if (arg === `--config=${DEFAULT_VITEST_CONFIG}` || arg === `-c=${DEFAULT_VITEST_CONFIG}`) {
+      continue
+    }
+    filtered.push(arg)
+  }
+  return filtered
 }
 
 function coordinated(suiteKey: SuiteKey | undefined, phases: UpstreamPhase[]): CommandDisposition {
@@ -532,10 +550,10 @@ function buildVitestPassthroughPhase(args: string[]): UpstreamPhase {
 
   const owner = classifyTargetOwnership(args)
   if (owner === 'server') {
-    return vitestPhase('server', ['run', '--config', 'vitest.server.config.ts', ...args])
+    return vitestPhase('server', ['run', '--config', SERVER_VITEST_CONFIG, ...args])
   }
 
-  return vitestPhase('default', args)
+  return vitestPhase('default', ['--config', DEFAULT_VITEST_CONFIG, ...args])
 }
 
 function vitestPhase(config: 'default' | 'server', args: string[]): UpstreamPhase {
@@ -579,5 +597,5 @@ function isServerConfigArg(value: string | undefined): boolean {
   }
 
   const normalized = value.replaceAll('\\', '/')
-  return normalized === 'vitest.server.config.ts' || normalized.endsWith('/vitest.server.config.ts')
+  return normalized === SERVER_VITEST_CONFIG || normalized.endsWith(`/${SERVER_VITEST_CONFIG}`)
 }

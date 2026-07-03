@@ -12,8 +12,10 @@ import { fileURLToPath } from 'url'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
+const projectRoot = path.resolve(__dirname, '../..')
 
 export default defineConfig({
+  root: projectRoot,
   plugins: [react()],
   resolve: {
     // Prevent duplicate React instances in git worktrees (where node_modules
@@ -31,7 +33,7 @@ export default defineConfig({
       '**/.worktrees/**',
       '**/.claude/worktrees/**',
       'docs/plans/**',
-      // Server tests run under vitest.server.config.ts (node environment)
+      // Server tests run under config/vitest/vitest.server.config.ts (node environment)
       'test/server/**',
       'test/unit/server/**',
       'test/integration/server/**',
@@ -42,7 +44,7 @@ export default defineConfig({
       'test/integration/session-search-e2e.test.ts',
       'test/e2e-browser/**',
       'test/integration/real/**',
-      // Electron tests run under vitest.electron.config.ts (node environment)
+      // Electron tests run under config/vitest/vitest.electron.config.ts (node environment)
       'test/unit/electron/**',
       // Electron E2E tests run under Playwright, not Vitest
       'test/e2e-electron/**',
@@ -50,9 +52,9 @@ export default defineConfig({
     testTimeout: 30000,
     hookTimeout: 30000,
     alias: {
-      '@': path.resolve(__dirname, './src'),
-      '@test': path.resolve(__dirname, './test'),
-      '@shared': path.resolve(__dirname, './shared'),
+      '@': path.resolve(projectRoot, './src'),
+      '@test': path.resolve(projectRoot, './test'),
+      '@shared': path.resolve(projectRoot, './shared'),
     },
     // Maximum parallelization settings
     pool: 'threads',

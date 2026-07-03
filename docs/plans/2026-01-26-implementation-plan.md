@@ -964,7 +964,7 @@ UNAUTHENTICATED → (hello with valid token) → READY → (messages)
 ### Task 1.1: Initialize Project
 
 **Files:**
-- Create: `package.json`, `vite.config.ts`, `tsconfig.json`, `index.html`
+- Create: `package.json`, `config/vite/vite.config.ts`, `tsconfig.json`, `index.html`
 - Create: `src/main.tsx`, `src/App.tsx`
 
 **Step 1: Initialize Vite project**
@@ -1034,7 +1034,7 @@ git add -A && git commit -m "chore: add Tailwind CSS + shadcn/ui"
 ### Task 1.3: Add Testing Infrastructure
 
 **Files:**
-- Create: `vitest.config.ts`, `vitest.server.config.ts`
+- Create: `config/vitest/vitest.config.ts`, `config/vitest/vitest.server.config.ts`
 - Create: `test/setup/dom.ts`, `test/setup/server.ts`
 - Create: `test/helpers/server.ts`, `test/helpers/ws.ts`, `test/helpers/pty-mock.ts`
 
@@ -1043,7 +1043,7 @@ git add -A && git commit -m "chore: add Tailwind CSS + shadcn/ui"
 npm install -D vitest @testing-library/react @testing-library/jest-dom jsdom supertest superwstest @types/supertest
 ```
 
-**Step 2: Create frontend Vitest config (`vitest.config.ts`)**
+**Step 2: Create frontend Vitest config (`config/vitest/vitest.config.ts`)**
 ```typescript
 import { defineConfig } from 'vitest/config'
 import react from '@vitejs/plugin-react'
@@ -1066,7 +1066,7 @@ export default defineConfig({
 })
 ```
 
-**Step 3: Create server Vitest config (`vitest.server.config.ts`)**
+**Step 3: Create server Vitest config (`config/vitest/vitest.server.config.ts`)**
 ```typescript
 import { defineConfig } from 'vitest/config'
 import path from 'path'
@@ -1362,7 +1362,7 @@ export const shouldMockPty = process.env.MOCK_PTY === 'true' || process.env.CI =
 {
   "scripts": {
     "test": "vitest",
-    "test:server": "vitest --config vitest.server.config.ts",
+    "test:server": "vitest --config config/vitest/vitest.server.config.ts",
     "test:ui": "vitest --ui",
     "test:coverage": "vitest run --coverage"
   }
@@ -3433,7 +3433,7 @@ export default App
 
 **Step 5: Configure Vite proxy for dev**
 
-Update `vite.config.ts`:
+Update `config/vite/vite.config.ts`:
 ```typescript
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
@@ -4706,14 +4706,14 @@ git add -A && git commit -m "feat: add tab persistence via localStorage middlewa
 ### Task 2.6: Production Build Configuration
 
 **Files:**
-- Modify: `vite.config.ts`
+- Modify: `config/vite/vite.config.ts`
 - Modify: `server/index.ts`
 - Create: `.env.example`
 - Modify: `package.json`
 
 **Step 1: Update Vite config for production**
 
-Update `vite.config.ts`:
+Update `config/vite/vite.config.ts`:
 ```typescript
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
@@ -4805,7 +4805,7 @@ npm install -D cross-env
     "start": "node dist/server/index.js",
     "preview": "npm run build && cross-env NODE_ENV=production npm run start",
     "test": "vitest",
-    "test:server": "vitest --config vitest.server.config.ts",
+    "test:server": "vitest --config config/vitest/vitest.server.config.ts",
     "test:coverage": "vitest run --coverage",
     "lint": "eslint . --ext ts,tsx",
     "format": "prettier --write \"src/**/*.{ts,tsx}\" \"server/**/*.ts\""

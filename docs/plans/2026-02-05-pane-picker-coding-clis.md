@@ -413,7 +413,7 @@ export const CODING_CLI_PROVIDER_CONFIGS: CodingCliProviderConfig[] = [
 ]
 ```
 
-Note: The SVGs are in `assets/icons/` which Vite serves. Check the actual public path — it may be `/assets/icons/` or just `/icons/` depending on Vite config. Verify by checking `vite.config.ts` for `publicDir` or an alias.
+Note: The SVGs are in `assets/icons/` which Vite serves. Check the actual public path — it may be `/assets/icons/` or just `/icons/` depending on Vite config. Verify by checking `config/vite/vite.config.ts` for `publicDir` or an alias.
 
 **Step 2: Verify it builds**
 
@@ -720,12 +720,12 @@ git commit -m "test: verify provider cwd flows through terminal creation"
 Make sure the SVG files at `assets/icons/claude-code.svg` and `assets/icons/codex_openai.svg` are accessible from the browser at the paths used in Task 5's `iconPath`.
 
 **Files:**
-- Check: `vite.config.ts` for `publicDir` setting
+- Check: `config/vite/vite.config.ts` for `publicDir` setting
 - Check: `server/index.ts` for static file serving in production
 
 **Step 1: Investigate**
 
-Read `vite.config.ts` and check if `assets/` or `assets/icons/` is included in the public dir or served statically. In dev mode Vite serves `public/` by default. The icons are in `assets/icons/` — if that's not the public dir, they won't be served.
+Read `config/vite/vite.config.ts` and check if `assets/` or `assets/icons/` is included in the public dir or served statically. In dev mode Vite serves `public/` by default. The icons are in `assets/icons/` — if that's not the public dir, they won't be served.
 
 Options:
 - Move the SVGs to `public/icons/`

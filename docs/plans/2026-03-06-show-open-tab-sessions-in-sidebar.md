@@ -287,7 +287,7 @@ Run:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/show-open-tab-sessions-in-sidebar
-npx vitest run --config vitest.server.config.ts test/unit/server/sidebar-session-selection.test.ts test/unit/server/session-pagination.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/sidebar-session-selection.test.ts test/unit/server/session-pagination.test.ts
 ```
 
 Expected: FAIL because the helper and pagination option do not exist yet.
@@ -340,7 +340,7 @@ Run:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/show-open-tab-sessions-in-sidebar
-npx vitest run --config vitest.server.config.ts test/unit/server/sidebar-session-selection.test.ts test/unit/server/session-pagination.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/sidebar-session-selection.test.ts test/unit/server/session-pagination.test.ts
 ```
 
 Expected: PASS.
@@ -390,7 +390,7 @@ Run:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/show-open-tab-sessions-in-sidebar
-npx vitest run --config vitest.server.config.ts test/unit/server/sessions-router-pagination.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/sessions-router-pagination.test.ts
 npx vitest run test/unit/client/lib/api.test.ts test/unit/client/components/App.ws-bootstrap.test.tsx
 ```
 
@@ -442,7 +442,7 @@ Run:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/show-open-tab-sessions-in-sidebar
-npx vitest run --config vitest.server.config.ts test/unit/server/sessions-router-pagination.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/sessions-router-pagination.test.ts
 npx vitest run test/unit/client/lib/api.test.ts test/unit/client/components/App.ws-bootstrap.test.tsx
 ```
 
@@ -514,8 +514,8 @@ Run:
 ```bash
 cd /home/user/code/freshell/.worktrees/show-open-tab-sessions-in-sidebar
 npx vitest run test/unit/client/layout-mirror-middleware.test.ts
-npx vitest run --config vitest.server.config.ts test/unit/server/agent-layout-schema.test.ts
-npx vitest run --config vitest.server.config.ts test/server/ws-handshake-snapshot.test.ts test/server/ws-sidebar-snapshot-refresh.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/agent-layout-schema.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/server/ws-handshake-snapshot.test.ts test/server/ws-sidebar-snapshot-refresh.test.ts
 ```
 
 Expected: FAIL because hello does not carry sidebar locators yet, `ui.layout.sync` does not mirror tab-level fallback session refs, and the websocket refresh/broadcast paths cannot currently see no-layout tabs.
@@ -597,8 +597,8 @@ Run:
 ```bash
 cd /home/user/code/freshell/.worktrees/show-open-tab-sessions-in-sidebar
 npx vitest run test/unit/client/layout-mirror-middleware.test.ts
-npx vitest run --config vitest.server.config.ts test/unit/server/agent-layout-schema.test.ts
-npx vitest run --config vitest.server.config.ts test/server/ws-handshake-snapshot.test.ts test/server/ws-sidebar-snapshot-refresh.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/unit/server/agent-layout-schema.test.ts
+npx vitest run --config config/vitest/vitest.server.config.ts test/server/ws-handshake-snapshot.test.ts test/server/ws-sidebar-snapshot-refresh.test.ts
 ```
 
 Expected: PASS.

@@ -102,7 +102,7 @@ describe('vite config', () => {
       const expectedPort = env.PORT || '3001'
       const expectedUrl = `http://${expectedHost}:${expectedPort}`
 
-      const configModule = await import('../../vite.config.ts')
+      const configModule = await import('../../config/vite/vite.config.ts')
       const configFn = configModule.default
       const config = configFn({ mode: 'development', command: 'serve' })
       const proxy = config.server?.proxy as Record<string, string | { target?: string }>
@@ -151,7 +151,7 @@ describe('vitest config', () => {
   })
 
   it('excludes real-provider integration contracts from the default jsdom suite', async () => {
-    const configModule = await import('../../vitest.config.ts')
+    const configModule = await import('../../config/vitest/vitest.config.ts')
     const config = configModule.default
     const excluded = config.test?.exclude ?? []
 
@@ -159,7 +159,7 @@ describe('vitest config', () => {
   })
 
   it('runs real-provider integration contracts in the node server suite', async () => {
-    const configModule = await import('../../vitest.server.config.ts')
+    const configModule = await import('../../config/vitest/vitest.server.config.ts')
     const config = configModule.default
     const included = config.test?.include ?? []
 

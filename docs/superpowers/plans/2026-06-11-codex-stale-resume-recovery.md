@@ -864,7 +864,7 @@ it('records durable Codex terminal exits at warn with exit diagnostics', () => {
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/session-observability.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/session-observability.test.ts
 ```
 
 Expected: FAIL because `codex_durable_terminal_exit` is not part of `SessionLifecycleEvent`.
@@ -921,7 +921,7 @@ Add this `buildPayload` case immediately after `terminal_exit_without_durable_se
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/session-observability.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/session-observability.test.ts
 ```
 
 Expected: PASS.
@@ -958,7 +958,7 @@ Then append this assertion to the end of that same test:
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/terminal-registry.codex-recovery.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/terminal-registry.codex-recovery.test.ts
 ```
 
 Expected: FAIL because the registry does not emit `codex_durable_terminal_exit` yet.
@@ -1018,7 +1018,7 @@ Do not alter recovery decisions, terminal status transitions, or sidecar release
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/session-observability.test.ts test/unit/server/terminal-registry.codex-recovery.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/session-observability.test.ts test/unit/server/terminal-registry.codex-recovery.test.ts
 ```
 
 Expected: PASS.
@@ -1054,7 +1054,7 @@ Expected: PASS. This proves stale matching, tab creation, left-bar click behavio
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/session-observability.test.ts test/unit/server/terminal-registry.codex-recovery.test.ts test/integration/server/codex-session-flow.test.ts test/server/ws-session-observability.test.ts
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/session-observability.test.ts test/unit/server/terminal-registry.codex-recovery.test.ts test/integration/server/codex-session-flow.test.ts test/server/ws-session-observability.test.ts
 ```
 
 Expected: PASS. This proves the new lifecycle event does not regress Codex recovery, clean-exit finalization, or stale-terminal websocket diagnostics.
@@ -1139,7 +1139,7 @@ gh pr create --base main --head plan/codex-stale-resume-recovery --title "Fix st
 
 ## Tests
 - npm run test:vitest -- test/unit/client/lib/session-utils.test.ts test/unit/client/store/tabsSlice.test.ts test/e2e/sidebar-click-opens-pane.test.tsx test/unit/client/components/Sidebar.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.resumeSession.test.tsx
-- npm run test:vitest -- --config vitest.server.config.ts test/unit/server/session-observability.test.ts test/unit/server/terminal-registry.codex-recovery.test.ts test/integration/server/codex-session-flow.test.ts test/server/ws-session-observability.test.ts
+- npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/session-observability.test.ts test/unit/server/terminal-registry.codex-recovery.test.ts test/integration/server/codex-session-flow.test.ts test/server/ws-session-observability.test.ts
 - npm run typecheck
 - FRESHELL_TEST_SUMMARY=\"Codex stale resume recovery\" npm run check"
 ```
