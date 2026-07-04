@@ -1,0 +1,43 @@
+# Autonomous port machine — state tracker.
+# The self-driving / dev-machine loop reads and updates this to resume safely.
+
+campaign: freshell-rust-tauri-port
+base_commit: 98ed121c            # origin/main, verified green (npm run test:status)
+worktree: .worktrees/rust-tauri-port
+branch: feat/rust-tauri-port
+updated: 2026-07-04
+
+current_phase: 0                 # 0=oracle bootstrap, 1=understand, 2=architect, 3=port, 4=self-qa, 5=converge
+
+phases:
+  0_oracle_bootstrap:
+    status: in_progress
+    done:
+      - laid down plan-of-record (port/README, bundle.yaml, AGENTS.md, oracle/DESIGN, architecture-spec)
+      - confirmed base green + node-pty loads from shared node_modules
+      - FIXED prerequisite defect: test:real:coding-cli-contracts env var (regression test added)
+    next:
+      - extract shared/ws-protocol.ts to a language-neutral schema + codegen Rust types
+      - build external-process server harness variant (spawn + connect over ws://)
+      - build PTY byte-stream golden-capture harness (node-pty is mocked today — real gap)
+      - capture T0/T1 golden transcripts + T2 live-invariant baselines FROM ORIGINAL
+      - enumerate nondeterministic boundary fields; build normalization layer
+      - validate oracle by mutation testing against ORIGINAL (must catch injected divergence)
+      - make ORIGINAL's live provider suite actually pass (now that the env gate is fixed)
+    exit_criteria:
+      - oracle detects every injected mutation in the original
+      - original passes T0–T3 (T2 with cheapest-model matrix)
+  1_understand:  { status: pending, bundle: parallax-discovery, targets: [terminal-registry, coding-cli parsers, platform glue, electron->tauri] }
+  2_architect:   { status: pending, bundle: systems-design, output: port/machine/architecture-spec.md (freeze) }
+  3_port:        { status: pending, bundle: dev-machine, order: [protocol, terminal, api+ws, harness, llm+platform+tauri] }
+  4_self_qa:     { status: pending, bundle: self-driving }
+  5_converge:    { status: pending }
+
+blockers: []                     # write here and STOP rather than guess on unrecoverable ambiguity
+
+guardrails:
+  equivalence: differential (T0 protocol, T1 deterministic, T2 live-invariant, T3 e2e/visual) — never byte-identical LLM output
+  architecture: rust-first single cargo workspace; frontend unchanged; ws contract frozen
+  autonomy: recipes non-staged/auto-approve; antagonist review replaces human; self-driving owns crash/token
+  process_safety: never restart the self-hosted freshell server without user "APPROVED"; no PR without explicit approval
+  single_host: WSL2 Linux — WSL/PowerShell/native mac+Windows paths are golden-fixture only, not live-QA
