@@ -15,13 +15,22 @@ import {
   MAX_RAW_FORWARD_BYTES,
   scanJsonRpcEnvelope,
 } from './json-rpc-envelope.js'
-import { rewriteThreadForkRequestExcludeTurns } from './json-rpc-side-effects.js'
+import {
+  extractForkResponseCandidate,
+  extractFsChangedRepairTrigger,
+  extractThreadLifecycleEvent,
+  extractThreadStartResponseCandidate,
+  extractThreadStartedNotificationSideEffects,
+  extractTurnNotificationEvent,
+  normalizeThreadForkResponseForTui,
+  rewriteThreadForkRequestExcludeTurns,
+} from './json-rpc-side-effects.js'
 
 const log = logger.child({ component: 'codex-remote-proxy' })
 
 export type CodexRemoteProxyCandidate = {
   thread: CodexThreadHandle
-  source: 'thread_start_response' | 'thread_started_notification'
+  source: 'thread_start_response' | 'thread_started_notification' | 'thread_fork_response'
 }
 
 export type CodexRemoteProxyRepairTrigger =
@@ -36,11 +45,23 @@ type ProxyFrame = {
   byteLength: number
 }
 
+type UpstreamSideEffects = {
+  candidates?: CodexRemoteProxyCandidate[]
+  lifecycleEvents?: CodexThreadLifecycleEvent[]
+  lifecycleLossEvents?: CodexThreadLifecycleLossEvent[]
+  repairTriggers?: CodexRemoteProxyRepairTrigger[]
+  threadId?: string
+  turnCompletedParams?: Array<{ threadId: string; turnId?: string } & Record<string, unknown>>
+  turnStartedParams?: Array<{ threadId: string; turnId?: string } & Record<string, unknown>>
+}
+
 type HeldProxyFrame = {
   connection: ProxyConnection
+  direction: 'client' | 'upstream'
   frame: ProxyFrame
   id?: JsonRpcId
   method?: string
+  upstreamEffects?: UpstreamSideEffects
 }
 
 type IdentityGateReason = 'initial_capture' | 'fork_handoff'
@@ -49,6 +70,7 @@ type IdentityGate = {
   reason: IdentityGateReason
   heldFrames: HeldProxyFrame[]
   heldBytes: number
+  forkThreadId?: string
   requestTimer?: NodeJS.Timeout
 }
 
@@ -74,7 +96,17 @@ const MAX_COMPLETED_TURN_KEYS = 256
 const MAX_HELD_IDENTITY_GATE_FRAMES = 32
 const FORK_HANDOFF_STATEFUL_CLIENT_METHODS = new Set([
   'turn/start',
+  'turn/steer',
   'turn/interrupt',
+])
+const STATEFUL_RESPONSE_METHODS = new Set(['thread/start', 'thread/fork'])
+const STATEFUL_NOTIFICATION_METHODS = new Set([
+  'thread/started',
+  'turn/started',
+  'turn/completed',
+  'fs/changed',
+  'thread/closed',
+  'thread/status/changed',
 ])
 
 export class CodexRemoteProxy {
@@ -121,7 +153,11 @@ export class CodexRemoteProxy {
     if (this.server) return { wsUrl: this.wsUrl }
     const endpoint = await this.portAllocator()
     await new Promise<void>((resolve, reject) => {
-      const server = new WebSocketServer({ host: endpoint.hostname, port: endpoint.port }, () => resolve())
+      const server = new WebSocketServer({
+        host: endpoint.hostname,
+        maxPayload: this.maxRawForwardBytes,
+        port: endpoint.port,
+      }, () => resolve())
       server.once('error', reject)
       server.on('connection', (client) => this.handleClientConnection(client))
       this.server = server
@@ -146,11 +182,13 @@ export class CodexRemoteProxy {
       this.identityGate = undefined
       this.clearIdentityGateRequestTimer(gate)
       for (const held of gate.heldFrames) {
-        this.sendJsonRpcError(
-          held.connection.client,
-          held.id,
-          'Codex remote proxy is closing before restore identity persistence completed.',
-        )
+        if (held.direction === 'client') {
+          this.sendJsonRpcError(
+            held.connection.client,
+            held.id,
+            'Codex remote proxy is closing before restore identity persistence completed.',
+          )
+        }
       }
     }
     for (const connection of [...this.connections]) {
@@ -175,10 +213,17 @@ export class CodexRemoteProxy {
       this.clearCandidateCaptureTimer()
     }
     for (const held of gate.heldFrames) {
-      this.forwardClientFrame(held.connection, held.frame, {
-        id: held.id,
-        method: held.method,
-      })
+      if (held.direction === 'client') {
+        this.forwardClientFrame(held.connection, held.frame, {
+          id: held.id,
+          method: held.method,
+        })
+      } else {
+        if (held.upstreamEffects) {
+          this.applyUpstreamSideEffects(held.upstreamEffects)
+        }
+        sendFrameIfOpen(held.connection.client, held.frame)
+      }
     }
   }
 
@@ -242,7 +287,10 @@ export class CodexRemoteProxy {
       client.close()
       return
     }
-    const upstream = new WebSocket(this.upstreamWsUrl)
+    const upstream = new WebSocket(this.upstreamWsUrl, {
+      maxPayload: this.maxRawForwardBytes,
+      perMessageDeflate: false,
+    })
     const connection: ProxyConnection = {
       client,
       upstream,
@@ -404,14 +452,23 @@ export class CodexRemoteProxy {
 
   private handleUpstreamMessage(connection: ProxyConnection, raw: WebSocket.RawData, isBinary: boolean): void {
     const frame = createProxyFrame(raw, isBinary)
+    if (frame.byteLength > this.maxRawForwardBytes) {
+      this.failUnsafeUpstreamFrame(connection, undefined, 'raw_forward_cap_exceeded')
+      return
+    }
+
     const envelope = scanJsonRpcEnvelope(frame.data)
-    const parsed = frame.byteLength <= MAX_FULL_PARSE_BYTES ? parseJsonFrame(frame) : undefined
-    const id = envelope.ok ? envelope.id : jsonRpcId(parsed)
+    if (!envelope.ok) {
+      this.failUnsafeUpstreamFrame(connection, undefined, envelope.reason)
+      return
+    }
+
+    const id = envelope.id
     if (id !== undefined) {
       const method = connection.pendingMethods.get(id)
-      connection.pendingMethods.delete(id)
-      if (method === 'thread/fork') {
-        connection.pendingForkRequests.delete(id)
+      const forkRequest = connection.pendingForkRequests.get(id)
+      if (method !== undefined) {
+        connection.pendingMethods.delete(id)
       }
       log.debug({
         proxyWsUrl: this.endpoint ? this.wsUrl : undefined,
@@ -419,24 +476,33 @@ export class CodexRemoteProxy {
         method,
         id,
       }, 'Codex remote proxy forwarding upstream response')
+
       if (method === 'thread/start') {
-        this.maybeEmitThreadStartResponseCandidate(parsed)
+        this.handleThreadStartResponse(connection, frame, id)
+        return
       }
-    } else {
-      const method = envelope.ok
-        ? envelope.method
-        : parsed && typeof parsed === 'object'
-        ? (parsed as Record<string, unknown>).method
-        : undefined
-      if (typeof method === 'string') {
-        log.debug({
-          proxyWsUrl: this.endpoint ? this.wsUrl : undefined,
-          upstreamWsUrl: this.upstreamWsUrl,
-          method,
-        }, 'Codex remote proxy forwarding upstream notification')
+      if (method === 'thread/fork' || forkRequest) {
+        this.handleThreadForkResponse(connection, frame, id, forkRequest)
+        return
       }
-      this.handleUpstreamNotification(parsed)
+      sendFrameIfOpen(connection.client, frame)
+      return
     }
+
+    const method = envelope.method
+    if (typeof method === 'string') {
+      log.debug({
+        proxyWsUrl: this.endpoint ? this.wsUrl : undefined,
+        upstreamWsUrl: this.upstreamWsUrl,
+        method,
+      }, 'Codex remote proxy forwarding upstream notification')
+    }
+
+    if (typeof method === 'string' && STATEFUL_NOTIFICATION_METHODS.has(method)) {
+      this.handleStatefulUpstreamNotification(connection, frame, method)
+      return
+    }
+
     sendFrameIfOpen(connection.client, frame)
   }
 
@@ -453,7 +519,95 @@ export class CodexRemoteProxy {
     })
   }
 
-  private handleUpstreamNotification(parsed: unknown): void {
+  private handleThreadStartResponse(connection: ProxyConnection, frame: ProxyFrame, id: JsonRpcId): void {
+    if (frame.byteLength <= MAX_FULL_PARSE_BYTES) {
+      this.maybeEmitThreadStartResponseCandidate(parseJsonFrame(frame))
+      sendFrameIfOpen(connection.client, frame)
+      return
+    }
+
+    const extracted = extractThreadStartResponseCandidate(frame.data, {
+      pendingThreadStartRequestIds: new Set([id]),
+    })
+    if (!extracted.ok) {
+      this.failUnsafeUpstreamFrame(connection, 'thread/start', extracted.reason)
+      return
+    }
+
+    this.emitCandidate(extracted.candidate)
+    sendFrameIfOpen(connection.client, frame)
+  }
+
+  private handleThreadForkResponse(
+    connection: ProxyConnection,
+    frame: ProxyFrame,
+    id: JsonRpcId,
+    forkRequest: { parentThreadId?: string } | undefined,
+  ): void {
+    if (this.identityGate?.reason === 'fork_handoff') {
+      this.failUnsafeUpstreamFrame(connection, 'thread/fork', 'fork_handoff_active')
+      return
+    }
+
+    const extracted = extractForkResponseCandidate(frame.data, {
+      parentThreadId: forkRequest?.parentThreadId,
+      pendingForkRequestIds: forkRequest ? new Set([id]) : new Set(),
+      provenForkPathField: 'path',
+    })
+    connection.pendingForkRequests.delete(id)
+    if (!extracted.ok) {
+      this.failUnsafeUpstreamFrame(connection, 'thread/fork', extracted.reason)
+      return
+    }
+
+    const normalized = normalizeThreadForkResponseForTui(frame.data)
+    if (!normalized.ok) {
+      this.failUnsafeUpstreamFrame(connection, 'thread/fork', normalized.reason)
+      return
+    }
+
+    const candidate = extracted.candidate
+    this.identityGate = this.createIdentityGate('fork_handoff', candidate.thread.id)
+    this.emitCandidate(candidate)
+
+    const forwardedFrame = createProxyFrame(normalized.raw, frame.binary)
+    if (forwardedFrame.byteLength > this.maxRawForwardBytes) {
+      this.failUnsafeUpstreamFrame(connection, 'thread/fork', 'raw_forward_cap_exceeded')
+      return
+    }
+    sendFrameIfOpen(connection.client, forwardedFrame)
+  }
+
+  private handleStatefulUpstreamNotification(
+    connection: ProxyConnection,
+    frame: ProxyFrame,
+    method: string,
+  ): void {
+    const parsed = frame.byteLength <= MAX_FULL_PARSE_BYTES ? parseJsonFrame(frame) : undefined
+    const effects = parsed !== undefined
+      ? this.collectParsedUpstreamNotificationSideEffects(parsed)
+      : this.extractLargeUpstreamNotificationSideEffects(frame, method)
+
+    if (!effects) {
+      if (frame.byteLength > MAX_FULL_PARSE_BYTES || this.identityGate?.reason === 'fork_handoff') {
+        this.failUnsafeUpstreamFrame(connection, method, 'unrecoverable_stateful_frame')
+        return
+      }
+      sendFrameIfOpen(connection.client, frame)
+      return
+    }
+
+    const gate = this.identityGate
+    if (gate?.reason === 'fork_handoff' && effects.threadId === gate.forkThreadId) {
+      this.holdIdentityGateUpstreamFrame(connection, frame, method, effects)
+      return
+    }
+
+    this.applyUpstreamSideEffects(effects)
+    sendFrameIfOpen(connection.client, frame)
+  }
+
+  private collectParsedUpstreamNotificationSideEffects(parsed: unknown): UpstreamSideEffects | undefined {
     const method = parsed && typeof parsed === 'object'
       ? (parsed as Record<string, unknown>).method
       : undefined
@@ -463,57 +617,166 @@ export class CodexRemoteProxy {
         ? normalizeCandidateThread((params as Record<string, unknown>).thread)
         : undefined
       if (!thread) return
-      this.emitCandidate({
-        thread,
-        source: 'thread_started_notification',
-      })
-      this.emitThreadLifecycle({
-        kind: 'thread_started',
-        thread,
-      })
-      return
+      return {
+        candidates: [{
+          thread,
+          source: 'thread_started_notification',
+        }],
+        lifecycleEvents: [{
+          kind: 'thread_started',
+          thread,
+        }],
+        threadId: thread.id,
+      }
     }
 
     const turnStarted = CodexTurnStartedNotificationSchema.safeParse(parsed)
     if (turnStarted.success) {
-      this.recordTurnStarted(turnStarted.data.params)
-      this.emitTurnEvent(this.turnStartedHandlers, turnStarted.data.params)
-      return
+      return {
+        threadId: turnStarted.data.params.threadId,
+        turnStartedParams: [turnStarted.data.params],
+      }
     }
 
     const turnCompleted = CodexTurnCompletedNotificationSchema.safeParse(parsed)
     if (turnCompleted.success) {
-      this.recordTurnCompleted(turnCompleted.data.params)
-      this.emitTurnEvent(this.turnCompletedHandlers, turnCompleted.data.params)
-      return
+      return {
+        threadId: turnCompleted.data.params.threadId,
+        turnCompletedParams: [turnCompleted.data.params],
+      }
     }
 
     const fsChanged = CodexFsChangedNotificationSchema.safeParse(parsed)
     if (fsChanged.success) {
-      this.emitRepairTrigger({ kind: 'fs_changed', ...fsChanged.data.params })
-      return
+      return {
+        repairTriggers: [{ kind: 'fs_changed', ...fsChanged.data.params }],
+      }
     }
 
     const lifecycle = CodexThreadLifecycleNotificationSchema.safeParse(parsed)
     if (lifecycle.success) {
       if (lifecycle.data.method === 'thread/closed') {
-        this.emitThreadLifecycle({ kind: 'thread_closed', threadId: lifecycle.data.params.threadId })
-        this.emitLifecycleLoss({ method: 'thread/closed', threadId: lifecycle.data.params.threadId })
-      } else if (lifecycle.data.method === 'thread/status/changed') {
-        this.emitThreadLifecycle({
-          kind: 'thread_status_changed',
+        return {
+          lifecycleEvents: [{ kind: 'thread_closed', threadId: lifecycle.data.params.threadId }],
+          lifecycleLossEvents: [{ method: 'thread/closed', threadId: lifecycle.data.params.threadId }],
           threadId: lifecycle.data.params.threadId,
-          status: lifecycle.data.params.status,
-        })
+        }
+      }
+      if (lifecycle.data.method === 'thread/status/changed') {
+        const lossEvents: CodexThreadLifecycleLossEvent[] = []
         const status = lifecycle.data.params.status.type
         if (status === 'notLoaded' || status === 'systemError') {
-          this.emitLifecycleLoss({
+          lossEvents.push({
             method: 'thread/status/changed',
             threadId: lifecycle.data.params.threadId,
             status,
           })
         }
+        return {
+          lifecycleEvents: [{
+            kind: 'thread_status_changed',
+            threadId: lifecycle.data.params.threadId,
+            status: lifecycle.data.params.status,
+          }],
+          ...(lossEvents.length > 0 ? { lifecycleLossEvents: lossEvents } : {}),
+          threadId: lifecycle.data.params.threadId,
+        }
       }
+    }
+
+    return undefined
+  }
+
+  private extractLargeUpstreamNotificationSideEffects(frame: ProxyFrame, method: string): UpstreamSideEffects | undefined {
+    if (method === 'thread/started') {
+      const extracted = extractThreadStartedNotificationSideEffects(frame.data)
+      if (!extracted.ok) return undefined
+      return {
+        candidates: [extracted.candidate],
+        lifecycleEvents: [extracted.lifecycle],
+        threadId: extracted.candidate.thread.id,
+      }
+    }
+
+    if (method === 'turn/started' || method === 'turn/completed') {
+      const extracted = extractTurnNotificationEvent(frame.data)
+      if (!extracted.ok) return undefined
+      const params = {
+        threadId: extracted.event.threadId,
+        ...(typeof extracted.event.turnId === 'string' ? { turnId: extracted.event.turnId } : {}),
+        ...('status' in extracted.event && typeof extracted.event.status === 'string'
+          ? { status: extracted.event.status }
+          : {}),
+      }
+      if (extracted.event.kind === 'turn_started') {
+        return {
+          threadId: extracted.event.threadId,
+          turnStartedParams: [params],
+        }
+      }
+      return {
+        threadId: extracted.event.threadId,
+        turnCompletedParams: [params],
+      }
+    }
+
+    if (method === 'fs/changed') {
+      const extracted = extractFsChangedRepairTrigger(frame.data)
+      if (!extracted.ok) return undefined
+      return {
+        repairTriggers: [extracted.trigger],
+      }
+    }
+
+    if (method === 'thread/closed' || method === 'thread/status/changed') {
+      const extracted = extractThreadLifecycleEvent(frame.data)
+      if (!extracted.ok) return undefined
+      if (extracted.event.kind === 'thread_closed') {
+        return {
+          lifecycleEvents: [extracted.event],
+          lifecycleLossEvents: [{ method: 'thread/closed', threadId: extracted.event.threadId }],
+          threadId: extracted.event.threadId,
+        }
+      }
+      const lossEvents: CodexThreadLifecycleLossEvent[] = []
+      const status = extracted.event.status.type
+      if (status === 'notLoaded' || status === 'systemError') {
+        lossEvents.push({
+          method: 'thread/status/changed',
+          threadId: extracted.event.threadId,
+          status,
+        })
+      }
+      return {
+        lifecycleEvents: [extracted.event],
+        ...(lossEvents.length > 0 ? { lifecycleLossEvents: lossEvents } : {}),
+        threadId: extracted.event.threadId,
+      }
+    }
+
+    return undefined
+  }
+
+  private applyUpstreamSideEffects(effects: UpstreamSideEffects): void {
+    for (const candidate of effects.candidates ?? []) {
+      this.emitCandidate(candidate)
+    }
+    for (const params of effects.turnStartedParams ?? []) {
+      this.recordTurnStarted(params)
+      this.emitTurnEvent(this.turnStartedHandlers, params)
+    }
+    for (const params of effects.turnCompletedParams ?? []) {
+      this.recordTurnCompleted(params)
+      this.emitTurnEvent(this.turnCompletedHandlers, params)
+    }
+    for (const trigger of effects.repairTriggers ?? []) {
+      this.emitRepairTrigger(trigger)
+    }
+    for (const event of effects.lifecycleEvents ?? []) {
+      this.emitThreadLifecycle(event)
+    }
+    for (const event of effects.lifecycleLossEvents ?? []) {
+      this.emitLifecycleLoss(event)
     }
   }
 
@@ -586,6 +849,7 @@ export class CodexRemoteProxy {
     ) {
       gate.heldFrames.push({
         connection,
+        direction: 'client',
         frame,
         id: request.id,
         method: request.method,
@@ -601,6 +865,7 @@ export class CodexRemoteProxy {
 
     gate.heldFrames.push({
       connection,
+      direction: 'client',
       frame,
       id: request.id,
       method: request.method,
@@ -612,6 +877,60 @@ export class CodexRemoteProxy {
           gate,
           identityGateTimeoutMessage(gate.reason),
           { closeAllConnections: gate.reason === 'initial_capture' },
+        )
+      }, this.requestHoldTimeoutMs)
+      gate.requestTimer.unref?.()
+    }
+  }
+
+  private holdIdentityGateUpstreamFrame(
+    connection: ProxyConnection,
+    frame: ProxyFrame,
+    method: string,
+    upstreamEffects: UpstreamSideEffects,
+  ): void {
+    const gate = this.identityGate
+    if (gate?.reason !== 'fork_handoff') {
+      this.applyUpstreamSideEffects(upstreamEffects)
+      sendFrameIfOpen(connection.client, frame)
+      return
+    }
+
+    const nextHeldBytes = gate.heldBytes + frame.byteLength
+    if (
+      gate.heldFrames.length >= MAX_HELD_IDENTITY_GATE_FRAMES ||
+      nextHeldBytes > this.maxRawForwardBytes
+    ) {
+      gate.heldFrames.push({
+        connection,
+        direction: 'upstream',
+        frame,
+        method,
+        upstreamEffects,
+      })
+      gate.heldBytes = nextHeldBytes
+      this.failIdentityGate(
+        gate,
+        identityGateOverflowMessage(gate.reason),
+        { closeAllConnections: false },
+      )
+      return
+    }
+
+    gate.heldFrames.push({
+      connection,
+      direction: 'upstream',
+      frame,
+      method,
+      upstreamEffects,
+    })
+    gate.heldBytes = nextHeldBytes
+    if (!gate.requestTimer) {
+      gate.requestTimer = setTimeout(() => {
+        this.failIdentityGate(
+          gate,
+          identityGateTimeoutMessage(gate.reason),
+          { closeAllConnections: false },
         )
       }, this.requestHoldTimeoutMs)
       gate.requestTimer.unref?.()
@@ -639,6 +958,7 @@ export class CodexRemoteProxy {
       : new Set(gate.heldFrames.map((held) => held.connection))
     const sentConnectionErrors = new Set<ProxyConnection>()
     for (const held of gate.heldFrames) {
+      if (held.direction !== 'client') continue
       this.sendJsonRpcError(held.connection.client, held.id, message)
       sentConnectionErrors.add(held.connection)
     }
@@ -667,11 +987,43 @@ export class CodexRemoteProxy {
     }
   }
 
-  private createIdentityGate(reason: IdentityGateReason): IdentityGate {
+  private failUnsafeUpstreamFrame(
+    connection: ProxyConnection,
+    method: string | undefined,
+    reason: string,
+  ): void {
+    const message = method
+      ? `Codex remote proxy rejected an unsafe upstream ${method} frame: ${reason}.`
+      : `Codex remote proxy rejected an unsafe upstream frame: ${reason}.`
+    log.warn({
+      proxyWsUrl: this.endpoint ? this.wsUrl : undefined,
+      upstreamWsUrl: this.upstreamWsUrl,
+      method,
+      reason,
+    }, 'Codex remote proxy failed closed on unsafe upstream frame')
+
+    if (
+      this.identityGate?.reason === 'initial_capture' &&
+      typeof method === 'string' &&
+      STATEFUL_RESPONSE_METHODS.has(method)
+    ) {
+      this.failCandidateCapture(
+        'Freshell could not safely capture Codex restore identity from an oversized app-server frame.',
+      )
+      return
+    }
+
+    this.emitRepairTrigger({ kind: 'proxy_error', error: new Error(message) })
+    connection.client.close()
+    connection.upstream.close()
+  }
+
+  private createIdentityGate(reason: IdentityGateReason, forkThreadId?: string): IdentityGate {
     return {
       reason,
       heldFrames: [],
       heldBytes: 0,
+      ...(forkThreadId !== undefined ? { forkThreadId } : {}),
     }
   }
 

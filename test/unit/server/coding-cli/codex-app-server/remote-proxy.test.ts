@@ -173,6 +173,13 @@ function socketClosed(socket: WebSocket): Promise<void> {
   })
 }
 
+async function expectSocketClosedWithin(socket: WebSocket, ms: number): Promise<void> {
+  await expect(Promise.race([
+    socketClosed(socket).then(() => 'closed'),
+    delay(ms).then(() => 'timeout'),
+  ])).resolves.toBe('closed')
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
@@ -181,6 +188,21 @@ function rawDataToBuffer(raw: WebSocket.RawData): Buffer {
   if (Buffer.isBuffer(raw)) return raw
   if (Array.isArray(raw)) return Buffer.concat(raw.map((part) => Buffer.from(part)))
   return Buffer.from(raw)
+}
+
+async function expectNoMessage(socket: WebSocket, ms: number): Promise<void> {
+  let received = false
+  const onMessage = () => {
+    received = true
+  }
+  socket.once('message', onMessage)
+  await delay(ms)
+  socket.off('message', onMessage)
+  expect(received).toBe(false)
+}
+
+function largePadding(extraBytes = 1_024): string {
+  return 'x'.repeat(MAX_FULL_PARSE_BYTES + extraBytes)
 }
 
 describe('CodexRemoteProxy', () => {
@@ -429,10 +451,16 @@ describe('CodexRemoteProxy', () => {
       params: { payload: 'x'.repeat(512) },
     }))
 
-    await expect(nextMessageWithin(tui, 100)).resolves.toMatchObject({
-      id: 72,
-      error: { message: expect.stringContaining('too large') },
-    })
+    const outcome = await Promise.race([
+      nextMessageWithin(tui, 100).then((message) => ({ kind: 'message' as const, message })),
+      socketClosed(tui).then(() => ({ kind: 'closed' as const })),
+    ])
+    if (outcome.kind === 'message') {
+      expect(outcome.message).toMatchObject({
+        id: 72,
+        error: { message: expect.stringContaining('too large') },
+      })
+    }
     await socketClosed(tui)
     expect(upstream.messages).toEqual([])
     expect(repairTriggers).toContainEqual(expect.objectContaining({ kind: 'proxy_error' }))
@@ -1033,6 +1061,620 @@ describe('CodexRemoteProxy', () => {
     })
     await socketClosed(tui)
     expect(upstream.messages).toEqual([])
+  })
+
+  it('recovers large thread/start response candidates before forwarding', async () => {
+    const upstream = await startUpstream((socket, message) => {
+      if (message.method !== 'thread/start') return
+      socket.send(JSON.stringify({
+        id: message.id,
+        result: {
+          thread: {
+            id: 'thread-large-start',
+            path: '/tmp/codex/large-start.jsonl',
+            ephemeral: false,
+          },
+        },
+        padding: largePadding(),
+      }))
+    })
+    const proxy = await startProxy(upstream.wsUrl)
+    const candidates: unknown[] = []
+    proxy.onCandidate((candidate) => {
+      candidates.push(candidate)
+      proxy.markCandidatePersisted()
+    })
+    const tui = await connect(proxy.wsUrl)
+    const response = nextMessageFrame(tui)
+
+    tui.send(JSON.stringify({ id: 101, method: 'thread/start', params: {} }))
+
+    await expect(response).resolves.toMatchObject({
+      message: {
+        id: 101,
+        result: {
+          thread: {
+            id: 'thread-large-start',
+            path: '/tmp/codex/large-start.jsonl',
+          },
+        },
+      },
+    })
+    expect(candidates).toEqual([
+      {
+        source: 'thread_start_response',
+        thread: {
+          id: 'thread-large-start',
+          path: '/tmp/codex/large-start.jsonl',
+          ephemeral: false,
+        },
+      },
+    ])
+  })
+
+  it('recovers large thread/started notification candidate and lifecycle side effects before forwarding', async () => {
+    const upstream = await startUpstream((socket, message) => {
+      if (message.method !== 'initialize') return
+      socket.send(JSON.stringify({ id: message.id, result: {} }))
+      socket.send(JSON.stringify({
+        method: 'thread/started',
+        params: {
+          thread: {
+            id: 'thread-large-notified',
+            path: '/tmp/codex/large-notified.jsonl',
+            ephemeral: false,
+          },
+        },
+        padding: largePadding(),
+      }))
+    })
+    const proxy = await startProxy(upstream.wsUrl)
+    const candidates: unknown[] = []
+    const lifecycleEvents: unknown[] = []
+    proxy.onCandidate((candidate) => {
+      candidates.push(candidate)
+      proxy.markCandidatePersisted()
+    })
+    proxy.onThreadLifecycle((event) => lifecycleEvents.push(event))
+    const tui = await connect(proxy.wsUrl)
+
+    tui.send(JSON.stringify({ id: 102, method: 'initialize', params: {} }))
+
+    await vi.waitFor(() => expect(candidates).toHaveLength(1))
+    expect(candidates[0]).toEqual({
+      source: 'thread_started_notification',
+      thread: {
+        id: 'thread-large-notified',
+        path: '/tmp/codex/large-notified.jsonl',
+        ephemeral: false,
+      },
+    })
+    expect(lifecycleEvents).toEqual([
+      {
+        kind: 'thread_started',
+        thread: {
+          id: 'thread-large-notified',
+          path: '/tmp/codex/large-notified.jsonl',
+          ephemeral: false,
+        },
+      },
+    ])
+  })
+
+  it('recovers large turn started and completed side effects before forwarding', async () => {
+    const upstream = await startUpstream((socket, message) => {
+      if (message.method !== 'initialize') return
+      socket.send(JSON.stringify({ id: message.id, result: {} }))
+      socket.send(JSON.stringify({
+        method: 'turn/started',
+        params: { threadId: 'thread-large-turn', turnId: 'turn-1' },
+        padding: largePadding(),
+      }))
+      socket.send(JSON.stringify({
+        method: 'turn/completed',
+        params: {
+          threadId: 'thread-large-turn',
+          turnId: 'turn-1',
+          turn: { id: 'turn-1', status: 'completed' },
+        },
+        padding: largePadding(),
+      }))
+    })
+    const proxy = await startProxy(upstream.wsUrl, {
+      requireCandidatePersistence: false,
+    })
+    const started: unknown[] = []
+    const completed: unknown[] = []
+    proxy.onTurnStarted((event) => started.push(event))
+    proxy.onTurnCompleted((event) => completed.push(event))
+    const tui = await connect(proxy.wsUrl)
+
+    tui.send(JSON.stringify({ id: 103, method: 'initialize', params: {} }))
+
+    await vi.waitFor(() => expect(started).toHaveLength(1))
+    await vi.waitFor(() => expect(completed).toHaveLength(1))
+    expect(started[0]).toMatchObject({ threadId: 'thread-large-turn', turnId: 'turn-1' })
+    expect(completed[0]).toMatchObject({ threadId: 'thread-large-turn', turnId: 'turn-1' })
+  })
+
+  it('recovers large fs changed side effects with empty paths when the path list is too large', async () => {
+    const upstream = await startUpstream((socket, message) => {
+      if (message.method !== 'initialize') return
+      socket.send(JSON.stringify({ id: message.id, result: {} }))
+      socket.send(JSON.stringify({
+        method: 'fs/changed',
+        params: {
+          watchId: 'watch-large',
+          changedPaths: [`/tmp/${largePadding()}`],
+        },
+      }))
+    })
+    const proxy = await startProxy(upstream.wsUrl, {
+      requireCandidatePersistence: false,
+    })
+    const repairTriggers: unknown[] = []
+    proxy.onRepairTrigger((event) => repairTriggers.push(event))
+    const tui = await connect(proxy.wsUrl)
+
+    tui.send(JSON.stringify({ id: 104, method: 'initialize', params: {} }))
+
+    await vi.waitFor(() => {
+      expect(repairTriggers).toContainEqual({
+        kind: 'fs_changed',
+        watchId: 'watch-large',
+        changedPaths: [],
+      })
+    })
+  })
+
+  it('recovers large thread/status and thread/closed lifecycle side effects before forwarding', async () => {
+    const upstream = await startUpstream((socket, message) => {
+      if (message.method !== 'initialize') return
+      socket.send(JSON.stringify({ id: message.id, result: {} }))
+      socket.send(JSON.stringify({
+        method: 'thread/closed',
+        params: { threadId: 'thread-large-lifecycle' },
+        padding: largePadding(),
+      }))
+      socket.send(JSON.stringify({
+        method: 'thread/status/changed',
+        params: {
+          threadId: 'thread-large-lifecycle',
+          status: { type: 'systemError', details: largePadding() },
+        },
+      }))
+    })
+    const proxy = await startProxy(upstream.wsUrl, {
+      requireCandidatePersistence: false,
+    })
+    const lifecycleEvents: unknown[] = []
+    const lifecycleLosses: unknown[] = []
+    proxy.onThreadLifecycle((event) => lifecycleEvents.push(event))
+    proxy.onLifecycleLoss((event) => lifecycleLosses.push(event))
+    const tui = await connect(proxy.wsUrl)
+
+    tui.send(JSON.stringify({ id: 105, method: 'initialize', params: {} }))
+
+    await vi.waitFor(() => expect(lifecycleEvents).toHaveLength(2))
+    expect(lifecycleEvents).toEqual([
+      { kind: 'thread_closed', threadId: 'thread-large-lifecycle' },
+      {
+        kind: 'thread_status_changed',
+        threadId: 'thread-large-lifecycle',
+        status: { type: 'systemError' },
+      },
+    ])
+    expect(lifecycleLosses).toEqual([
+      { method: 'thread/closed', threadId: 'thread-large-lifecycle' },
+      {
+        method: 'thread/status/changed',
+        threadId: 'thread-large-lifecycle',
+        status: 'systemError',
+      },
+    ])
+  })
+
+  it('recovers large thread/fork responses with id after result, forwards the raw response, and clears pending state', async () => {
+    let duplicateForkResponse = ''
+    const upstream = await startUpstream((socket, message) => {
+      if (message.method !== 'thread/fork') return
+      const forkResponse = `{"result":{"thread":{"id":"thread-large-child","path":"/tmp/codex/large-fork.jsonl","ephemeral":false,"turns":[]}},"id":${message.id},"padding":"${largePadding()}"}`
+      duplicateForkResponse = `{"result":{"thread":{"id":"thread-large-child-duplicate","path":"/tmp/codex/large-fork-duplicate.jsonl","ephemeral":false,"turns":[]}},"id":${message.id}}`
+      socket.send(forkResponse)
+      socket.send(duplicateForkResponse)
+    })
+    const proxy = await startProxy(upstream.wsUrl, {
+      requireCandidatePersistence: false,
+    })
+    const candidates: unknown[] = []
+    proxy.onCandidate((candidate) => candidates.push(candidate))
+    const tui = await connect(proxy.wsUrl)
+    const frames = collectRawFrames(tui, 2)
+
+    tui.send(JSON.stringify({
+      id: 106,
+      method: 'thread/fork',
+      params: { threadId: 'thread-parent', excludeTurns: false },
+    }))
+
+    const [firstFrame, secondFrame] = await frames
+    expect(firstFrame.raw.toString()).toContain('"result":{"thread":{"id":"thread-large-child"')
+    expect(firstFrame.raw.toString()).toContain('"id":106')
+    expect(secondFrame.raw.toString()).toBe(duplicateForkResponse)
+    expect(candidates).toEqual([
+      {
+        source: 'thread_fork_response',
+        thread: {
+          id: 'thread-large-child',
+          path: '/tmp/codex/large-fork.jsonl',
+          ephemeral: false,
+        },
+      },
+    ])
+  })
+
+  it('normalizes large thread/fork responses and holds post-fork stateful client requests until persistence', async () => {
+    const upstream = await startUpstream((socket, message) => {
+      if (message.method !== 'thread/fork') return
+      socket.send(JSON.stringify({
+        id: message.id,
+        result: {
+          thread: {
+            id: 'thread-large-child',
+            path: '/tmp/codex/large-fork-normalized.jsonl',
+            ephemeral: false,
+          },
+        },
+        padding: largePadding(),
+      }))
+    })
+    const proxy = await startProxy(upstream.wsUrl, {
+      requireCandidatePersistence: false,
+    })
+    const tui = await connect(proxy.wsUrl)
+    const forkResponse = nextMessageFrame(tui)
+
+    tui.send(JSON.stringify({
+      id: 107,
+      method: 'thread/fork',
+      params: { threadId: 'thread-parent', excludeTurns: false },
+    }))
+
+    await expect(forkResponse).resolves.toMatchObject({
+      message: {
+        id: 107,
+        result: {
+          thread: {
+            id: 'thread-large-child',
+            turns: [],
+          },
+        },
+      },
+    })
+
+    tui.send(JSON.stringify({ id: 108, method: 'turn/start', params: { threadId: 'thread-large-child' } }))
+    tui.send(JSON.stringify({ id: 109, method: 'turn/steer', params: { threadId: 'thread-large-child' } }))
+    tui.send(JSON.stringify({ id: 110, method: 'turn/interrupt', params: { threadId: 'thread-large-child', turnId: 'turn-1' } }))
+
+    await delay(50)
+    expect(upstream.messages).toHaveLength(1)
+
+    proxy.markCandidatePersisted()
+
+    await vi.waitFor(() => expect(upstream.messages).toHaveLength(4))
+    expect(upstream.messages.slice(1).map((message) => (message as { method: string }).method)).toEqual([
+      'turn/start',
+      'turn/steer',
+      'turn/interrupt',
+    ])
+  })
+
+  it('queues large thread/fork handoff upstream stateful notifications until persistence', async () => {
+    const upstream = await startUpstream((socket, message) => {
+      if (message.method !== 'thread/fork') return
+      socket.send(JSON.stringify({
+        id: message.id,
+        result: {
+          thread: {
+            id: 'thread-large-child',
+            path: '/tmp/codex/large-fork-queued.jsonl',
+            ephemeral: false,
+          },
+        },
+        padding: largePadding(),
+      }))
+      socket.send(JSON.stringify({
+        method: 'turn/started',
+        params: { threadId: 'thread-large-child', turnId: 'turn-queued' },
+        padding: largePadding(),
+      }))
+    })
+    const proxy = await startProxy(upstream.wsUrl, {
+      requireCandidatePersistence: false,
+    })
+    const started: unknown[] = []
+    proxy.onTurnStarted((event) => started.push(event))
+    const tui = await connect(proxy.wsUrl)
+    const forkResponse = nextMessageFrame(tui)
+
+    tui.send(JSON.stringify({
+      id: 111,
+      method: 'thread/fork',
+      params: { threadId: 'thread-parent', excludeTurns: false },
+    }))
+
+    await expect(forkResponse).resolves.toMatchObject({
+      message: {
+        id: 111,
+        result: { thread: { id: 'thread-large-child', turns: [] } },
+      },
+    })
+    await expectNoMessage(tui, 50)
+    expect(started).toEqual([])
+
+    proxy.markCandidatePersisted()
+
+    await expect(nextMessageFrame(tui)).resolves.toMatchObject({
+      message: {
+        method: 'turn/started',
+        params: { threadId: 'thread-large-child', turnId: 'turn-queued' },
+      },
+    })
+    expect(started).toHaveLength(1)
+  })
+
+  it('fails large thread/fork handoff timeout with proxy_error and no candidate_capture_timeout', async () => {
+    const upstream = await startUpstream((socket, message) => {
+      if (message.method !== 'thread/fork') return
+      socket.send(JSON.stringify({
+        id: message.id,
+        result: {
+          thread: {
+            id: 'thread-large-child',
+            path: '/tmp/codex/large-fork-timeout.jsonl',
+            ephemeral: false,
+          },
+        },
+        padding: largePadding(),
+      }))
+    })
+    const proxy = await startProxy(upstream.wsUrl, {
+      requestHoldTimeoutMs: 20,
+      requireCandidatePersistence: false,
+    })
+    const repairTriggers: unknown[] = []
+    proxy.onRepairTrigger((event) => repairTriggers.push(event))
+    const tui = await connect(proxy.wsUrl)
+
+    tui.send(JSON.stringify({
+      id: 112,
+      method: 'thread/fork',
+      params: { threadId: 'thread-parent', excludeTurns: false },
+    }))
+    await expect(nextMessageFrame(tui)).resolves.toMatchObject({
+      message: {
+        id: 112,
+        result: { thread: { id: 'thread-large-child', turns: [] } },
+      },
+    })
+
+    tui.send(JSON.stringify({ id: 113, method: 'turn/start', params: { threadId: 'thread-large-child' } }))
+
+    await expect(nextMessageWithin(tui, 100)).resolves.toMatchObject({
+      id: 113,
+      error: { message: expect.stringContaining('fork handoff identity') },
+    })
+    await socketClosed(tui)
+    expect(upstream.messages).toHaveLength(1)
+    expect(repairTriggers).toContainEqual(expect.objectContaining({ kind: 'proxy_error' }))
+    expect(repairTriggers).not.toContainEqual({ kind: 'candidate_capture_timeout' })
+  })
+
+  it('rejects large thread/fork responses with missing parent attribution, same-as-parent child ids, or ids matching only pending methods', async () => {
+    async function expectRejectedForkResponse(params: {
+      requestId: number
+      requestParams: Record<string, unknown>
+      responseThreadId: string
+      mutateProxy?: (proxy: CodexRemoteProxy) => void
+    }): Promise<void> {
+      const upstream = await startUpstream()
+      const proxy = await startProxy(upstream.wsUrl, {
+        requireCandidatePersistence: false,
+      })
+      const repairTriggers: unknown[] = []
+      const candidates: unknown[] = []
+      proxy.onRepairTrigger((event) => repairTriggers.push(event))
+      proxy.onCandidate((candidate) => candidates.push(candidate))
+      const tui = await connect(proxy.wsUrl)
+
+      tui.send(JSON.stringify({
+        id: params.requestId,
+        method: 'thread/fork',
+        params: params.requestParams,
+      }))
+      await vi.waitFor(() => expect(upstream.messages).toHaveLength(1))
+      params.mutateProxy?.(proxy)
+      const upstreamSocket = [...upstream.sockets][0]
+      expect(upstreamSocket).toBeDefined()
+      upstreamSocket?.send(JSON.stringify({
+        id: params.requestId,
+        result: {
+          thread: {
+            id: params.responseThreadId,
+            path: `/tmp/codex/rejected-${params.requestId}.jsonl`,
+            ephemeral: false,
+          },
+        },
+        padding: largePadding(),
+      }))
+
+      await expectSocketClosedWithin(tui, 100)
+      expect(candidates).toEqual([])
+      expect(repairTriggers).toContainEqual(expect.objectContaining({ kind: 'proxy_error' }))
+    }
+
+    await expectRejectedForkResponse({
+      requestId: 114,
+      requestParams: { cwd: '/repo' },
+      responseThreadId: 'thread-child',
+    })
+    await expectRejectedForkResponse({
+      requestId: 115,
+      requestParams: { threadId: 'thread-parent' },
+      responseThreadId: 'thread-parent',
+    })
+    await expectRejectedForkResponse({
+      requestId: 116,
+      requestParams: { threadId: 'thread-parent' },
+      responseThreadId: 'thread-child',
+      mutateProxy: (proxy) => {
+        for (const connection of (proxy as any).connections as Set<{ pendingForkRequests: Map<unknown, unknown> }>) {
+          connection.pendingForkRequests.clear()
+        }
+      },
+    })
+  })
+
+  it('keeps large thread/start pending when only nested result.id matches the request id', async () => {
+    const upstream = await startUpstream((socket, message) => {
+      if (message.method !== 'thread/start') return
+      socket.send(JSON.stringify({
+        result: { id: message.id },
+        padding: largePadding(),
+      }))
+      socket.send(JSON.stringify({
+        id: message.id,
+        result: {
+          thread: {
+            id: 'thread-nested-id-survivor',
+            path: '/tmp/codex/nested-id-survivor.jsonl',
+            ephemeral: false,
+          },
+        },
+      }))
+    })
+    const proxy = await startProxy(upstream.wsUrl)
+    const candidates: unknown[] = []
+    proxy.onCandidate((candidate) => {
+      candidates.push(candidate)
+      proxy.markCandidatePersisted()
+    })
+    const tui = await connect(proxy.wsUrl)
+    const frames = collectRawFrames(tui, 2)
+
+    tui.send(JSON.stringify({ id: 117, method: 'thread/start', params: {} }))
+
+    await frames
+    expect(candidates).toEqual([
+      {
+        source: 'thread_start_response',
+        thread: {
+          id: 'thread-nested-id-survivor',
+          path: '/tmp/codex/nested-id-survivor.jsonl',
+          ephemeral: false,
+        },
+      },
+    ])
+  })
+
+  it('fails closed for large thread/start root-array upstream batches before forwarding', async () => {
+    const upstream = await startUpstream((socket, message) => {
+      if (message.method !== 'thread/start') return
+      socket.send(JSON.stringify([
+        {
+          id: message.id,
+          result: {
+            thread: {
+              id: 'thread-batch',
+              path: '/tmp/codex/batch.jsonl',
+              ephemeral: false,
+            },
+          },
+          padding: largePadding(),
+        },
+      ]))
+    })
+    const proxy = await startProxy(upstream.wsUrl, {
+      requireCandidatePersistence: false,
+    })
+    const repairTriggers: unknown[] = []
+    const candidates: unknown[] = []
+    proxy.onRepairTrigger((event) => repairTriggers.push(event))
+    proxy.onCandidate((candidate) => candidates.push(candidate))
+    const tui = await connect(proxy.wsUrl)
+
+    tui.send(JSON.stringify({ id: 118, method: 'thread/start', params: {} }))
+
+    await expectSocketClosedWithin(tui, 100)
+    expect(candidates).toEqual([])
+    expect(repairTriggers).toContainEqual(expect.objectContaining({ kind: 'proxy_error' }))
+  })
+
+  it('enforces raw forward cap for above-cap upstream non-state frames', async () => {
+    const upstream = await startUpstream((socket, message) => {
+      if (message.method !== 'initialize') return
+      socket.send(JSON.stringify({
+        id: message.id,
+        result: { ok: true, payload: 'x'.repeat(512) },
+      }))
+    })
+    const proxy = await startProxy(upstream.wsUrl, {
+      maxRawForwardBytes: 256,
+      requireCandidatePersistence: false,
+    })
+    const repairTriggers: unknown[] = []
+    proxy.onRepairTrigger((event) => repairTriggers.push(event))
+    const tui = await connect(proxy.wsUrl)
+
+    tui.send(JSON.stringify({ id: 119, method: 'initialize', params: {} }))
+
+    await expectSocketClosedWithin(tui, 100)
+    expect(repairTriggers).toContainEqual(expect.objectContaining({ kind: 'proxy_error' }))
+  })
+
+  it('closes on unrecoverable large turn notifications with proxy_error', async () => {
+    const upstream = await startUpstream((socket, message) => {
+      if (message.method !== 'initialize') return
+      socket.send(JSON.stringify({ id: message.id, result: {} }))
+      socket.send(JSON.stringify({
+        method: 'turn/started',
+        params: { turnId: 'turn-missing-thread' },
+        padding: largePadding(),
+      }))
+    })
+    const proxy = await startProxy(upstream.wsUrl, {
+      requireCandidatePersistence: false,
+    })
+    const repairTriggers: unknown[] = []
+    proxy.onRepairTrigger((event) => repairTriggers.push(event))
+    const tui = await connect(proxy.wsUrl)
+
+    tui.send(JSON.stringify({ id: 120, method: 'initialize', params: {} }))
+
+    await expectSocketClosedWithin(tui, 100)
+    expect(repairTriggers).toContainEqual(expect.objectContaining({ kind: 'proxy_error' }))
+  })
+
+  it('fails candidate capture for unrecoverable large thread/start responses before identity persistence', async () => {
+    const upstream = await startUpstream((socket, message) => {
+      if (message.method !== 'thread/start') return
+      socket.send(JSON.stringify({
+        id: message.id,
+        result: {},
+        padding: largePadding(),
+      }))
+    })
+    const proxy = await startProxy(upstream.wsUrl, {
+      candidateCaptureTimeoutMs: 1_000,
+    })
+    const repairTriggers: unknown[] = []
+    proxy.onRepairTrigger((event) => repairTriggers.push(event))
+    const tui = await connect(proxy.wsUrl)
+
+    tui.send(JSON.stringify({ id: 121, method: 'thread/start', params: {} }))
+
+    await expectSocketClosedWithin(tui, 100)
+    expect(repairTriggers).toContainEqual({ kind: 'candidate_capture_timeout' })
   })
 
   it('stages fork response candidates and holds post-fork stateful traffic until persistence is acknowledged', async () => {
