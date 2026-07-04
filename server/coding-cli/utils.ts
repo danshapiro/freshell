@@ -13,7 +13,7 @@ export { looksLikePath } from '../../shared/path-utils.js'
  * Algorithm:
  * 1. Normalize input (expand ~, resolve relative paths)
  * 2. Walk up from cwd looking for .git entry
- * 3. If .git is a directory → regular repo root
+ * 3. If .git is a valid directory → regular repo root
  * 4. If .git is a file → parse gitdir: line
  *    - /worktrees/ in gitdir → read commondir to find shared .git dir
  *    - /modules/ in gitdir → submodule, keep as independent repo
@@ -167,6 +167,9 @@ async function walkForGitRoot(startDir: string, mode: 'repo' | 'checkout'): Prom
       const stat = await fsp.lstat(gitPath)
 
       if (stat.isDirectory()) {
+        if (!await isGitDirectory(gitPath)) {
+          return startDir
+        }
         // Regular repo root
         return current
       }
@@ -254,6 +257,9 @@ async function walkForGitCommonDir(startDir: string): Promise<string | undefined
       const stat = await fsp.lstat(gitPath)
 
       if (stat.isDirectory()) {
+        if (!await isGitDirectory(gitPath)) {
+          return undefined
+        }
         return gitPath
       }
 
@@ -275,6 +281,15 @@ async function walkForGitCommonDir(startDir: string): Promise<string | undefined
   }
 
   return undefined
+}
+
+async function isGitDirectory(gitPath: string): Promise<boolean> {
+  try {
+    const headStat = await fsp.stat(path.join(gitPath, 'HEAD'))
+    return headStat.isFile()
+  } catch {
+    return false
+  }
 }
 
 async function resolveCommonDirFromGitFile(gitdir: string): Promise<string> {
