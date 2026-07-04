@@ -74,6 +74,18 @@ describe('scanJsonRpcEnvelope', () => {
     })
   })
 
+  it('skips adversarially deep nested values without overflowing the call stack', () => {
+    const depth = 20_000
+    const nestedResult = `${'['.repeat(depth)}0${']'.repeat(depth)}`
+    expect(scanJsonRpcEnvelope(Buffer.from(`{"result":${nestedResult},"id":"deep","method":"turn/start"}`))).toEqual({
+      ok: true,
+      root: 'object',
+      id: 'deep',
+      method: 'turn/start',
+      duplicateTopLevelKeys: [],
+    })
+  })
+
   it('decodes escaped top-level property names and escaped string values', () => {
     expect(scanJsonRpcEnvelope(Buffer.from('{"meth\\u006fd":"turn\\/start","\\u0069d":"request-1"}'))).toEqual({
       ok: true,
@@ -106,6 +118,19 @@ describe('scanJsonRpcEnvelope', () => {
       expect(scanJsonRpcEnvelope(Buffer.from(`{"id":${id},"method":"initialize"}`))).toEqual({
         ok: true,
         root: 'object',
+        method: 'initialize',
+        duplicateTopLevelKeys: [],
+      })
+    }
+  })
+
+  it('matches JS number parsing for bounded large integer ids', () => {
+    for (const id of ['999999999999999999999', '9223372036854775807']) {
+      const expectedId = Number(id)
+      expect(scanJsonRpcEnvelope(Buffer.from(`{"id":${id},"method":"initialize"}`))).toEqual({
+        ok: true,
+        root: 'object',
+        id: expectedId,
         method: 'initialize',
         duplicateTopLevelKeys: [],
       })

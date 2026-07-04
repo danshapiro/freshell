@@ -57,6 +57,15 @@ type NumberScanResult = { ok: true; start: number; end: number; next: number } |
 type StringBoundsScanResult =
   | { ok: true; contentStart: number; contentEnd: number; next: number }
   | JsonRpcEnvelopeScanFailure
+type ContainerFrame =
+  | {
+      type: 'array'
+      state: 'expectValueOrEnd' | 'expectValue' | 'expectCommaOrEnd'
+    }
+  | {
+      type: 'object'
+      state: 'expectKeyOrEnd' | 'expectKey' | 'expectColon' | 'expectValue' | 'expectCommaOrEnd'
+    }
 
 class StringByteReader implements ByteReader {
   readonly length: number
@@ -267,7 +276,7 @@ function scanTopLevelId(reader: ByteReader, index: number): IdScanResult {
     if (numberTokenHasFractionOrExponent(reader, parsed.start, parsed.end)) {
       return { ok: true, value: undefined, next: parsed.next }
     }
-    const value = numberTokenToNumber(reader, parsed.start, parsed.end)
+    const value = Number(reader.sliceToUtf8String(parsed.start, parsed.end))
     return {
       ok: true,
       value: Number.isFinite(value) && Number.isInteger(value) ? value : undefined,
@@ -295,11 +304,119 @@ function scanTopLevelMethod(reader: ByteReader, index: number): StringScanResult
 function skipValue(reader: ByteReader, index: number): IndexScanResult {
   const valueStart = skipWhitespace(reader, index)
   if (valueStart >= reader.length) return failure('malformed_json')
+
+  const stack: ContainerFrame[] = []
+  let value = beginSkippedValue(reader, valueStart, stack)
+  if (!value.ok) return value
+  let next = value.next
+  if (stack.length === 0) return { ok: true, next }
+
+  while (stack.length > 0) {
+    next = skipWhitespace(reader, next)
+    if (next >= reader.length) return failure('malformed_json')
+
+    const frame = stack[stack.length - 1]!
+    if (frame.type === 'array') {
+      if (frame.state === 'expectValueOrEnd') {
+        if (reader.byteAt(next) === BYTE_CLOSE_BRACKET) {
+          stack.pop()
+          next += 1
+          continue
+        }
+        frame.state = 'expectCommaOrEnd'
+        value = beginSkippedValue(reader, next, stack)
+        if (!value.ok) return value
+        next = value.next
+        continue
+      }
+
+      if (frame.state === 'expectValue') {
+        frame.state = 'expectCommaOrEnd'
+        value = beginSkippedValue(reader, next, stack)
+        if (!value.ok) return value
+        next = value.next
+        continue
+      }
+
+      const delimiter = reader.byteAt(next)
+      if (delimiter === BYTE_COMMA) {
+        frame.state = 'expectValue'
+        next += 1
+        continue
+      }
+      if (delimiter === BYTE_CLOSE_BRACKET) {
+        stack.pop()
+        next += 1
+        continue
+      }
+      return failure('malformed_json')
+    }
+
+    if (frame.state === 'expectKeyOrEnd') {
+      if (reader.byteAt(next) === BYTE_CLOSE_BRACE) {
+        stack.pop()
+        next += 1
+        continue
+      }
+      const key = skipString(reader, next)
+      if (!key.ok) return key
+      frame.state = 'expectColon'
+      next = key.next
+      continue
+    }
+
+    if (frame.state === 'expectKey') {
+      const key = skipString(reader, next)
+      if (!key.ok) return key
+      frame.state = 'expectColon'
+      next = key.next
+      continue
+    }
+
+    if (frame.state === 'expectColon') {
+      if (reader.byteAt(next) !== BYTE_COLON) return failure('malformed_json')
+      frame.state = 'expectValue'
+      next += 1
+      continue
+    }
+
+    if (frame.state === 'expectValue') {
+      frame.state = 'expectCommaOrEnd'
+      value = beginSkippedValue(reader, next, stack)
+      if (!value.ok) return value
+      next = value.next
+      continue
+    }
+
+    const delimiter = reader.byteAt(next)
+    if (delimiter === BYTE_COMMA) {
+      frame.state = 'expectKey'
+      next += 1
+      continue
+    }
+    if (delimiter === BYTE_CLOSE_BRACE) {
+      stack.pop()
+      next += 1
+      continue
+    }
+    return failure('malformed_json')
+  }
+
+  return { ok: true, next }
+}
+
+function beginSkippedValue(reader: ByteReader, valueStart: number, stack: ContainerFrame[]): IndexScanResult {
   const first = reader.byteAt(valueStart)
 
   if (first === BYTE_QUOTE) return skipString(reader, valueStart)
-  if (first === BYTE_OPEN_BRACE) return skipObject(reader, valueStart)
-  if (first === BYTE_OPEN_BRACKET) return skipArray(reader, valueStart)
+  if (first === BYTE_OPEN_BRACE) {
+    stack.push({ type: 'object', state: 'expectKeyOrEnd' })
+    return { ok: true, next: valueStart + 1 }
+  }
+  if (first === BYTE_OPEN_BRACKET) {
+    stack.push({ type: 'array', state: 'expectValueOrEnd' })
+    return { ok: true, next: valueStart + 1 }
+  }
   if (first === BYTE_MINUS || isDigit(first)) {
     const parsed = parseNumberToken(reader, valueStart)
     if (!parsed.ok) return parsed
@@ -308,56 +425,6 @@ function skipValue(reader: ByteReader, index: number): IndexScanResult {
   if (matchesLiteral(reader, valueStart, 'true')) return { ok: true, next: valueStart + 4 }
   if (matchesLiteral(reader, valueStart, 'false')) return { ok: true, next: valueStart + 5 }
   if (matchesLiteral(reader, valueStart, 'null')) return { ok: true, next: valueStart + 4 }
-
-  return failure('malformed_json')
-}
-
-function skipObject(reader: ByteReader, start: number): IndexScanResult {
-  let index = skipWhitespace(reader, start + 1)
-  if (index >= reader.length) return failure('malformed_json')
-  if (reader.byteAt(index) === BYTE_CLOSE_BRACE) return { ok: true, next: index + 1 }
-
-  while (index < reader.length) {
-    const key = skipString(reader, index)
-    if (!key.ok) return key
-    index = skipWhitespace(reader, key.next)
-    if (index >= reader.length || reader.byteAt(index) !== BYTE_COLON) {
-      return failure('malformed_json')
-    }
-    const value = skipValue(reader, index + 1)
-    if (!value.ok) return value
-    index = skipWhitespace(reader, value.next)
-    if (index >= reader.length) return failure('malformed_json')
-    const delimiter = reader.byteAt(index)
-    if (delimiter === BYTE_COMMA) {
-      index = skipWhitespace(reader, index + 1)
-      continue
-    }
-    if (delimiter === BYTE_CLOSE_BRACE) return { ok: true, next: index + 1 }
-    return failure('malformed_json')
-  }
-
-  return failure('malformed_json')
-}
-
-function skipArray(reader: ByteReader, start: number): IndexScanResult {
-  let index = skipWhitespace(reader, start + 1)
-  if (index >= reader.length) return failure('malformed_json')
-  if (reader.byteAt(index) === BYTE_CLOSE_BRACKET) return { ok: true, next: index + 1 }
-
-  while (index < reader.length) {
-    const value = skipValue(reader, index)
-    if (!value.ok) return value
-    index = skipWhitespace(reader, value.next)
-    if (index >= reader.length) return failure('malformed_json')
-    const delimiter = reader.byteAt(index)
-    if (delimiter === BYTE_COMMA) {
-      index = skipWhitespace(reader, index + 1)
-      continue
-    }
-    if (delimiter === BYTE_CLOSE_BRACKET) return { ok: true, next: index + 1 }
-    return failure('malformed_json')
-  }
 
   return failure('malformed_json')
 }
@@ -508,21 +575,6 @@ function numberTokenHasFractionOrExponent(reader: ByteReader, start: number, end
     if (byte === BYTE_DOT || isExponentMarker(byte)) return true
   }
   return false
-}
-
-function numberTokenToNumber(reader: ByteReader, start: number, end: number): number {
-  let sign = 1
-  let index = start
-  if (reader.byteAt(index) === BYTE_MINUS) {
-    sign = -1
-    index += 1
-  }
-
-  let value = 0
-  for (; index < end; index += 1) {
-    value = value * 10 + (reader.byteAt(index) - 0x30)
-  }
-  return sign * value
 }
 
 function recordDuplicateKey(
