@@ -12,6 +12,11 @@ import {
 
 let tempDir: string
 
+async function createMinimalGitDir(gitDir: string): Promise<void> {
+  await fsp.mkdir(gitDir, { recursive: true })
+  await fsp.writeFile(path.join(gitDir, 'HEAD'), 'ref: refs/heads/main\n')
+}
+
 beforeEach(async () => {
   tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-git-root-'))
   clearRepoRootCache()
@@ -24,7 +29,7 @@ afterEach(async () => {
 describe('resolveGitRepoRoot()', () => {
   it('returns the repo root for a regular git repo', async () => {
     const repoDir = path.join(tempDir, 'repo')
-    await fsp.mkdir(path.join(repoDir, '.git'), { recursive: true })
+    await createMinimalGitDir(path.join(repoDir, '.git'))
 
     expect(await resolveGitRepoRoot(repoDir)).toBe(repoDir)
   })
@@ -33,7 +38,7 @@ describe('resolveGitRepoRoot()', () => {
     // Set up parent repo with .git directory
     const repoDir = path.join(tempDir, 'repo')
     const gitDir = path.join(repoDir, '.git')
-    await fsp.mkdir(gitDir, { recursive: true })
+    await createMinimalGitDir(gitDir)
 
     // Set up worktree's gitdir inside the parent repo
     const worktreeGitDir = path.join(gitDir, 'worktrees', 'my-worktree')
@@ -56,7 +61,7 @@ describe('resolveGitRepoRoot()', () => {
     // Set up superproject
     const superDir = path.join(tempDir, 'super')
     const superGitDir = path.join(superDir, '.git')
-    await fsp.mkdir(superGitDir, { recursive: true })
+    await createMinimalGitDir(superGitDir)
 
     // Set up submodule gitdir inside superproject
     const submoduleGitDir = path.join(superGitDir, 'modules', 'sub')
@@ -89,11 +94,21 @@ describe('resolveGitRepoRoot()', () => {
 
   it('finds the repo root from a nested path within a repo', async () => {
     const repoDir = path.join(tempDir, 'repo')
-    await fsp.mkdir(path.join(repoDir, '.git'), { recursive: true })
+    await createMinimalGitDir(path.join(repoDir, '.git'))
     const nestedDir = path.join(repoDir, 'src', 'deep', 'nested')
     await fsp.mkdir(nestedDir, { recursive: true })
 
     expect(await resolveGitRepoRoot(nestedDir)).toBe(repoDir)
+  })
+
+  it('ignores an invalid ancestor .git directory', async () => {
+    const outerDir = path.join(tempDir, 'outer')
+    const gitDir = path.join(outerDir, '.git')
+    const plainDir = path.join(outerDir, 'plain', 'child')
+    await fsp.mkdir(gitDir, { recursive: true })
+    await fsp.mkdir(plainDir, { recursive: true })
+
+    expect(await resolveGitRepoRoot(plainDir)).toBe(plainDir)
   })
 
   it('expands tilde paths', async () => {
@@ -107,7 +122,7 @@ describe('resolveGitRepoRoot()', () => {
 
   it('caches results and avoids re-walking the filesystem', async () => {
     const repoDir = path.join(tempDir, 'repo')
-    await fsp.mkdir(path.join(repoDir, '.git'), { recursive: true })
+    await createMinimalGitDir(path.join(repoDir, '.git'))
 
     const statSpy = vi.spyOn(fsp, 'stat')
     const lstatSpy = vi.spyOn(fsp, 'lstat')
@@ -130,7 +145,7 @@ describe('resolveGitRepoRoot()', () => {
     // Set up parent repo
     const repoDir = path.join(tempDir, 'project')
     const gitDir = path.join(repoDir, '.git')
-    await fsp.mkdir(gitDir, { recursive: true })
+    await createMinimalGitDir(gitDir)
 
     // Worktree gitdir with relative commondir
     const worktreeGitDir = path.join(gitDir, 'worktrees', 'feature-branch')
@@ -152,7 +167,7 @@ describe('resolveGitRepoRoot()', () => {
     // Set up parent repo
     const repoDir = path.join(tempDir, 'project')
     const gitDir = path.join(repoDir, '.git')
-    await fsp.mkdir(gitDir, { recursive: true })
+    await createMinimalGitDir(gitDir)
 
     // Worktree gitdir WITHOUT commondir file
     const worktreeGitDir = path.join(gitDir, 'worktrees', 'feature-branch')
@@ -186,7 +201,7 @@ describe('resolveGitRepoRoot()', () => {
     // will contain /modules/ in the full path, but NOT as /.git/modules/
     const repoDir = path.join(tempDir, 'modules', 'my-repo')
     const gitDir = path.join(repoDir, '.git')
-    await fsp.mkdir(gitDir, { recursive: true })
+    await createMinimalGitDir(gitDir)
 
     const worktreeGitDir = path.join(gitDir, 'worktrees', 'my-wt')
     await fsp.mkdir(worktreeGitDir, { recursive: true })
@@ -207,15 +222,25 @@ describe('resolveGitRepoRoot()', () => {
 describe('resolveGitCheckoutRoot()', () => {
   it('returns the directory containing .git for a regular repo', async () => {
     const repoDir = path.join(tempDir, 'repo')
-    await fsp.mkdir(path.join(repoDir, '.git'), { recursive: true })
+    await createMinimalGitDir(path.join(repoDir, '.git'))
 
     expect(await resolveGitCheckoutRoot(repoDir)).toBe(repoDir)
+  })
+
+  it('ignores an invalid ancestor .git directory', async () => {
+    const outerDir = path.join(tempDir, 'outer')
+    const gitDir = path.join(outerDir, '.git')
+    const plainDir = path.join(outerDir, 'plain', 'child')
+    await fsp.mkdir(gitDir, { recursive: true })
+    await fsp.mkdir(plainDir, { recursive: true })
+
+    expect(await resolveGitCheckoutRoot(plainDir)).toBe(plainDir)
   })
 
   it('returns worktree checkout root while resolveGitRepoRoot returns canonical parent repo', async () => {
     const repoDir = path.join(tempDir, 'repo')
     const gitDir = path.join(repoDir, '.git')
-    await fsp.mkdir(gitDir, { recursive: true })
+    await createMinimalGitDir(gitDir)
 
     const worktreeGitDir = path.join(gitDir, 'worktrees', 'feature')
     await fsp.mkdir(worktreeGitDir, { recursive: true })
@@ -236,7 +261,7 @@ describe('resolveGitCheckoutRoot()', () => {
   it('keeps submodule checkout root as submodule directory', async () => {
     const superDir = path.join(tempDir, 'super')
     const superGitDir = path.join(superDir, '.git')
-    await fsp.mkdir(superGitDir, { recursive: true })
+    await createMinimalGitDir(superGitDir)
 
     const submoduleGitDir = path.join(superGitDir, 'modules', 'sub')
     await fsp.mkdir(submoduleGitDir, { recursive: true })
@@ -257,7 +282,7 @@ describe('resolveGitCommonDir()', () => {
   it('returns the .git directory for a regular repo', async () => {
     const repoDir = path.join(tempDir, 'repo')
     const gitDir = path.join(repoDir, '.git')
-    await fsp.mkdir(gitDir, { recursive: true })
+    await createMinimalGitDir(gitDir)
 
     expect(await resolveGitCommonDir(repoDir)).toBe(gitDir)
   })
@@ -265,7 +290,7 @@ describe('resolveGitCommonDir()', () => {
   it('returns the shared common-dir for a linked worktree', async () => {
     const repoDir = path.join(tempDir, 'repo')
     const gitDir = path.join(repoDir, '.git')
-    await fsp.mkdir(gitDir, { recursive: true })
+    await createMinimalGitDir(gitDir)
 
     const worktreeGitDir = path.join(gitDir, 'worktrees', 'feature')
     await fsp.mkdir(worktreeGitDir, { recursive: true })
@@ -283,6 +308,16 @@ describe('resolveGitCommonDir()', () => {
 
   it('returns undefined when no git directory exists', async () => {
     const plainDir = path.join(tempDir, 'plain')
+    await fsp.mkdir(plainDir, { recursive: true })
+
+    expect(await resolveGitCommonDir(plainDir)).toBeUndefined()
+  })
+
+  it('ignores an invalid ancestor .git directory', async () => {
+    const outerDir = path.join(tempDir, 'outer')
+    const gitDir = path.join(outerDir, '.git')
+    const plainDir = path.join(outerDir, 'plain', 'child')
+    await fsp.mkdir(gitDir, { recursive: true })
     await fsp.mkdir(plainDir, { recursive: true })
 
     expect(await resolveGitCommonDir(plainDir)).toBeUndefined()
