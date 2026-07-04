@@ -350,6 +350,102 @@ describe('CodexRemoteProxy', () => {
     ])
   })
 
+  it('holds thread/fork behind initial_capture without orphaning already-held initial frames', async () => {
+    const upstream = await startUpstream((socket, message) => {
+      if (message.method === 'turn/start') {
+        socket.send(JSON.stringify({ id: message.id, result: { ok: true } }))
+      } else if (message.method === 'thread/fork') {
+        socket.send(JSON.stringify({
+          id: message.id,
+          result: {
+            thread: {
+              id: 'thread-child-after-initial',
+              path: '/tmp/codex/thread-child-after-initial.jsonl',
+              ephemeral: false,
+            },
+          },
+        }))
+      }
+    })
+    const proxy = await startProxy(upstream.wsUrl, {
+      candidateCaptureTimeoutMs: 1_000,
+    })
+    const candidates: unknown[] = []
+    proxy.onCandidate((candidate) => candidates.push(candidate))
+    const tui = await connect(proxy.wsUrl)
+    const initialResponses = collectRawFrames(tui, 2)
+
+    tui.send(JSON.stringify({
+      id: 701,
+      method: 'turn/start',
+      params: { threadId: 'thread-original', input: [{ type: 'text', text: 'held first' }] },
+    }))
+    tui.send(JSON.stringify({
+      id: 702,
+      method: 'thread/fork',
+      params: { threadId: 'thread-original', excludeTurns: false },
+    }))
+
+    await delay(50)
+    expect(upstream.messages).toEqual([])
+    expect(candidates).toEqual([])
+
+    proxy.markCandidatePersisted()
+
+    await vi.waitFor(() => expect(upstream.messages).toHaveLength(2))
+    expect(upstream.messages[0]).toMatchObject({
+      id: 701,
+      method: 'turn/start',
+      params: { threadId: 'thread-original' },
+    })
+    expect(upstream.messages[1]).toMatchObject({
+      id: 702,
+      method: 'thread/fork',
+      params: { threadId: 'thread-original', excludeTurns: true },
+    })
+
+    const responseMessages = (await initialResponses).map((frame) => JSON.parse(frame.raw.toString()))
+    expect(responseMessages).toEqual(expect.arrayContaining([
+      { id: 701, result: { ok: true } },
+      expect.objectContaining({
+        id: 702,
+        result: {
+          thread: expect.objectContaining({
+            id: 'thread-child-after-initial',
+            turns: [],
+          }),
+        },
+      }),
+    ]))
+    expect(candidates).toEqual([
+      {
+        source: 'thread_fork_response',
+        thread: {
+          id: 'thread-child-after-initial',
+          path: '/tmp/codex/thread-child-after-initial.jsonl',
+          ephemeral: false,
+        },
+      },
+    ])
+
+    tui.send(JSON.stringify({
+      id: 703,
+      method: 'turn/start',
+      params: { threadId: 'thread-child-after-initial' },
+    }))
+    await delay(50)
+    expect(upstream.messages).toHaveLength(2)
+
+    proxy.markCandidatePersisted()
+
+    await vi.waitFor(() => expect(upstream.messages).toHaveLength(3))
+    expect(upstream.messages[2]).toMatchObject({
+      id: 703,
+      method: 'turn/start',
+      params: { threadId: 'thread-child-after-initial' },
+    })
+  })
+
   it('holds turn/start text frames and releases them with text framing intact', async () => {
     const upstream = await startUpstream((socket, message) => {
       if (message.method === 'turn/start') {

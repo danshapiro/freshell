@@ -214,10 +214,14 @@ export class CodexRemoteProxy {
     }
     for (const held of gate.heldFrames) {
       if (held.direction === 'client') {
-        this.forwardClientFrame(held.connection, held.frame, {
-          id: held.id,
-          method: held.method,
-        })
+        if (held.method === 'thread/fork') {
+          this.handleThreadForkRequest(held.connection, held.frame, held.id)
+        } else {
+          this.forwardClientFrame(held.connection, held.frame, {
+            id: held.id,
+            method: held.method,
+          })
+        }
       } else {
         if (held.upstreamEffects) {
           this.applyUpstreamSideEffects(held.upstreamEffects)
@@ -415,13 +419,13 @@ export class CodexRemoteProxy {
       }, 'Codex remote proxy received client request')
     }
 
-    if (method === 'thread/fork') {
-      this.handleThreadForkRequest(connection, frame, id)
+    if (this.identityGate?.reason === 'initial_capture' && (method === 'turn/start' || method === 'thread/fork')) {
+      this.holdIdentityGateFrame(connection, frame, { id, method })
       return
     }
 
-    if (this.identityGate?.reason === 'initial_capture' && method === 'turn/start') {
-      this.holdIdentityGateFrame(connection, frame, { id, method })
+    if (method === 'thread/fork') {
+      this.handleThreadForkRequest(connection, frame, id)
       return
     }
 
@@ -544,6 +548,10 @@ export class CodexRemoteProxy {
     id: JsonRpcId,
     forkRequest: { parentThreadId?: string } | undefined,
   ): void {
+    if (this.identityGate?.reason === 'initial_capture') {
+      this.failUnsafeUpstreamFrame(connection, 'thread/fork', 'initial_capture_active')
+      return
+    }
     if (this.identityGate?.reason === 'fork_handoff') {
       this.failUnsafeUpstreamFrame(connection, 'thread/fork', 'fork_handoff_active')
       return
@@ -1152,12 +1160,6 @@ function parseJsonFrame(frame: ProxyFrame): unknown {
   } catch {
     return undefined
   }
-}
-
-function jsonRpcId(parsed: unknown): JsonRpcId | undefined {
-  if (!parsed || typeof parsed !== 'object') return undefined
-  const id = (parsed as Record<string, unknown>).id
-  return typeof id === 'string' || typeof id === 'number' ? id : undefined
 }
 
 function sendFrameIfOpen(socket: WebSocket, frame: ProxyFrame): void {
