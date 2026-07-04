@@ -43,7 +43,15 @@ phases:
       - FIXED prerequisite defect: test:real:coding-cli-contracts env var (regression test added)
       - re-verified env post-reboot; baked in the 4 user constraints + deviation-ledger model
     next:
-      - freeze shared/ws-protocol.ts → language-neutral JSON Schema + drift-guard test (IN PROGRESS)
+      - "DONE: froze ws-protocol → port/contract/ws-protocol.schema.json (v7, 55 schemas) + drift-guard (7/7, mutation-validated)"
+      - "FOLLOW-UP (oracle gap): server→client is TS-types-only for ~44 of 52 outbound message types;
+         only 8 have runtime zod schemas. Generate outbound shape schemas from the TS unions
+         (ts-json-schema-generator) so the server's EMITTED wire can be schema-validated by T0.
+         Until then T0 covers 27 inbound + 8 outbound fully, 44 outbound at discriminant-level only."
+      - "note: zod4 emits additionalProperties:false but runtime strips (accept-and-strip);
+         treat zod parse as inbound authority, JSON Schema as shape contract."
+      - "opaque blobs (model as serde_json::Value, exclude from byte-diff): Usage.passthrough,
+         record(string,unknown) layouts/tool_use.input/decision/fork.input, tool_result.content, codingcli/freshAgent event"
       - scaffold Cargo workspace + freshell-protocol crate (Rust types generated from the schema)
       - build external-process server harness variant (spawn + connect over ws://)
       - build PTY byte-stream golden-capture harness (node-pty is mocked today — real gap)

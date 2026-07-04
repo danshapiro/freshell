@@ -33,6 +33,8 @@ export default defineConfig({
       '**/.worktrees/**',
       '**/.claude/worktrees/**',
       'docs/plans/**',
+      // Port contract-freeze tests run under config/vitest/vitest.port.config.ts (node environment)
+      'test/unit/port/**',
       // Server tests run under config/vitest/vitest.server.config.ts (node environment)
       'test/server/**',
       'test/unit/server/**',

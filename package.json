@@ -73,7 +73,8 @@
     "perf:audit:visible-first": "PORT=3311 npm run build && tsx scripts/visible-first-audit.ts",
     "visible-first:contract:check": "tsx scripts/assert-visible-first-acceptance.ts",
     "perf:audit:compare": "tsx scripts/compare-visible-first-audit.ts",
-    "perf:audit:gate": "tsx scripts/assert-visible-first-audit-gate.ts"
+    "perf:audit:gate": "tsx scripts/assert-visible-first-audit-gate.ts",
+    "contract:generate": "tsx port/contract/generate-ws-contract.ts"
   },
   "dependencies": {
     "@ai-sdk/google": "^3.0.29",
