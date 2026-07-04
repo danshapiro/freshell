@@ -1,6 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/node-%3E%3D18-brightgreen" alt="Node.js Version">
   <img src="https://img.shields.io/badge/platform-windows%20%7C%20macos%20%7C%20linux-blue" alt="Platform Support">
+  <img src="https://img.shields.io/badge/release-v0.7.0--rc.1-orange" alt="Release candidate v0.7.0-rc.1">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
@@ -12,6 +13,10 @@
 
 <p align="center">
   <strong>CLIs in tabs and panes | Forever coding agent history | What if tmux and Claude fell in love?</strong>
+</p>
+
+<p align="center">
+  <strong>Release candidate: v0.7.0-rc.1</strong>
 </p>
 
 ---
@@ -36,8 +41,8 @@
 ## Quick Start
 
 ```bash
-# Clone the repository at the latest stable release
-git clone --branch v0.7.0 https://github.com/danshapiro/freshell.git
+# Clone the release candidate
+git clone --branch v0.7.0-rc.1 https://github.com/danshapiro/freshell.git
 cd freshell
 
 # Install dependencies
