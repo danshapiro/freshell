@@ -1,7 +1,19 @@
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+
 import WebSocket, { WebSocketServer } from 'ws'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { CodexRemoteProxy } from '../../../../../server/coding-cli/codex-app-server/remote-proxy.js'
-import { MAX_FULL_PARSE_BYTES } from '../../../../../server/coding-cli/codex-app-server/json-rpc-envelope.js'
+import {
+  MAX_FULL_PARSE_BYTES,
+  MAX_RAW_FORWARD_BYTES,
+} from '../../../../../server/coding-cli/codex-app-server/json-rpc-envelope.js'
+
+const execFileAsync = promisify(execFile)
+const largeForwardChildPath = new URL('./remote-proxy-large-forward-child.ts', import.meta.url)
+const SMALL_CONSTRAINED_HEAP_CAP_BYTES = 2 * 1024 * 1024
+
+type LargeForwardStressMode = 'stateful-fork' | 'non-state' | 'above-cap'
 
 type UpstreamHandle = {
   server: WebSocketServer
@@ -204,6 +216,103 @@ async function expectNoMessage(socket: WebSocket, ms: number): Promise<void> {
 function largePadding(extraBytes = 1_024): string {
   return 'x'.repeat(MAX_FULL_PARSE_BYTES + extraBytes)
 }
+
+async function runLargeForwardStressChild(options: {
+  capBytes: number
+  heapMb: number
+  mode: LargeForwardStressMode
+  timeoutMs: number
+}): Promise<void> {
+  try {
+    const result = await execFileAsync(process.execPath, [
+      `--max-old-space-size=${options.heapMb}`,
+      '--import',
+      'tsx',
+      largeForwardChildPath.pathname,
+      '--cap-bytes',
+      String(options.capBytes),
+      '--mode',
+      options.mode,
+    ], {
+      timeout: options.timeoutMs,
+      maxBuffer: 1024 * 1024,
+    })
+    const stdout = result.stdout.trim()
+    if (stdout.length > 0) {
+      console.info(stdout)
+    }
+  } catch (error) {
+    const failure = error as Error & { stdout?: string; stderr?: string }
+    throw new Error([
+      `constrained heap large-forward child failed in ${options.mode} mode`,
+      failure.message,
+      failure.stdout ? `stdout:\n${failure.stdout}` : undefined,
+      failure.stderr ? `stderr:\n${failure.stderr}` : undefined,
+    ].filter(Boolean).join('\n'))
+  }
+}
+
+describe('CodexRemoteProxy constrained heap large response forwarding', () => {
+  it('constrained heap forwards a large stateful thread/fork response below a small active cap', async () => {
+    await runLargeForwardStressChild({
+      capBytes: SMALL_CONSTRAINED_HEAP_CAP_BYTES,
+      heapMb: 96,
+      mode: 'stateful-fork',
+      timeoutMs: 30_000,
+    })
+  }, 35_000)
+
+  it('constrained heap raw-forwards a large non-state response below a small active cap', async () => {
+    await runLargeForwardStressChild({
+      capBytes: SMALL_CONSTRAINED_HEAP_CAP_BYTES,
+      heapMb: 96,
+      mode: 'non-state',
+      timeoutMs: 30_000,
+    })
+  }, 35_000)
+
+  it('constrained heap rejects an above-cap upstream response at a small active cap', async () => {
+    await runLargeForwardStressChild({
+      capBytes: SMALL_CONSTRAINED_HEAP_CAP_BYTES,
+      heapMb: 96,
+      mode: 'above-cap',
+      timeoutMs: 30_000,
+    })
+  }, 35_000)
+})
+
+const describeFullBoundaryStress = process.env.FRESHELL_RUN_LARGE_PROXY_STRESS === '1'
+  ? describe
+  : describe.skip
+
+describeFullBoundaryStress('CodexRemoteProxy constrained heap full-boundary large response forwarding', () => {
+  it('constrained heap forwards a large stateful thread/fork response at the raw-forward cap', async () => {
+    await runLargeForwardStressChild({
+      capBytes: MAX_RAW_FORWARD_BYTES,
+      heapMb: 128,
+      mode: 'stateful-fork',
+      timeoutMs: 60_000,
+    })
+  }, 65_000)
+
+  it('constrained heap raw-forwards a large non-state response at the raw-forward cap', async () => {
+    await runLargeForwardStressChild({
+      capBytes: MAX_RAW_FORWARD_BYTES,
+      heapMb: 128,
+      mode: 'non-state',
+      timeoutMs: 60_000,
+    })
+  }, 65_000)
+
+  it('constrained heap rejects an above-cap upstream response at the raw-forward cap', async () => {
+    await runLargeForwardStressChild({
+      capBytes: MAX_RAW_FORWARD_BYTES,
+      heapMb: 128,
+      mode: 'above-cap',
+      timeoutMs: 60_000,
+    })
+  }, 65_000)
+})
 
 describe('CodexRemoteProxy', () => {
   it('preserves text and binary frames across client and upstream forwarding', async () => {
