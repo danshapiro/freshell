@@ -13,6 +13,27 @@ BOTH implementations and compares at the level where equivalence is actually
 defined: the wire contract, deterministic byte streams, and behavioral
 invariants.
 
+## Divergence adjudication (bug-fix posture — user directive)
+
+The user directed: **fix bugs as found; do not replicate bug-for-bug.** So
+differential equivalence is the *default* expectation, not an absolute one.
+Every diff the oracle detects MUST resolve to exactly one of three verdicts:
+
+- **PORT_DEFECT** — the port is wrong. Fix the port. This is the default; the
+  machine may never rule its own divergence "correct" without an objective basis.
+- **DELIBERATE_FIX** — the ORIGINAL is objectively defective and the port
+  corrects it. Allowed only with a `port/oracle/DEVIATIONS.md` entry (objective
+  defect criterion + a new positive test pinning the fixed behavior),
+  adjudicated by the **antagonist reviewer**, not the implementer. The oracle
+  then whitelists that specific diff via the entry's fingerprint.
+- **EQUIVALENT** — no material diff (after normalization).
+
+Objective-defect bar (any one): panics/crashes/errors, resource leak, violates
+the WS schema, contradicts documented behavior, corrupts data, or breaks an
+invariant the code itself asserts. Aesthetic preference is NOT a defect. The
+differ consults the ledger: a diff matching a ledger fingerprint is expected;
+any *unexplained* diff is always a failure.
+
 ## Four tiers
 
 | Tier | Asserts | Determinism | Reuse (exists in repo) | Build (Phase 0 gap) |
@@ -29,7 +50,8 @@ invariants.
 | OpenCode | Kimi k2.7 (`umans-ai-coding-plan/umans-kimi-k2.7`) | already wired in `opencode-serve-real-provider-smoke.test.ts` |
 | Claude Code | Claude Haiku | to wire |
 | Codex | GPT mini/nano | to wire |
-| Gemini | Gemini Flash-Lite | to wire |
+
+(Gemini is OUT of scope per user directive — not ported, not QA'd.)
 
 Determinism trick (already used in repo): pin exact outputs — prompt "Reply with
 exactly: <token>" then assert equality. Reuse it for every live probe.
@@ -38,7 +60,7 @@ exactly: <token>" then assert equality. Reuse it for every live probe.
 
 Today WS/server tests construct the server **in-process** (`new WsHandler(...)`).
 The oracle must connect to an **externally spawned** server over `ws://`/`http://`
-so a Go/Rust binary can be diffed. The client side already speaks raw `ws`; only
+so the Rust binary can be diffed. The client side already speaks raw `ws`; only
 server construction changes. Deliverable: a harness variant that boots either
 (a) the original Node server or (b) the Rust `freshell-server`, and drives both
 through the identical client transcript.

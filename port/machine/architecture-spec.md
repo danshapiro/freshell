@@ -17,6 +17,15 @@ Tauri shell (Rust)  ──spawns/embeds──►  freshell-server (Rust binary)
 - One Cargo workspace. The server is a standalone binary so the
   headless/daemon/phone-reachable mode is preserved exactly.
 - Frontend retained verbatim; only `electron/preload.ts` IPC → Tauri commands.
+- **No Go** (user directive). **Pure Rust by default**; a spawned **JS/Node
+  sidecar** is permitted ONLY where it is a massive net savings — a dependency
+  with no Rust equivalent/near-equivalent (e.g. a vendor SDK that exists solely
+  in JS). Each such sidecar must name the missing crate in this ADR, sit behind
+  a process boundary, and be covered by the oracle. Convenience ≠ justification.
+- **Windows integration is partially live-verifiable from this WSL2 host**
+  (`powershell.exe` 5.1 + `cmd.exe` reachable): exercise `netsh` firewall, WSL
+  port-forward, WSL↔Windows path conversion, elevated PowerShell against the
+  real Windows shell. macOS remains spec/fixture-only (no mac host).
 
 ## Crate decomposition (maps freshell `server/` → Rust)
 

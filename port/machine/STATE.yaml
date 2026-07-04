@@ -2,32 +2,60 @@
 # The self-driving / dev-machine loop reads and updates this to resume safely.
 
 campaign: freshell-rust-tauri-port
-base_commit: 98ed121c            # origin/main, verified green (npm run test:status)
+base_commit: 98ed121c            # frozen. origin/main has since advanced to 6e8b16d6;
+                                 # do NOT rebase unless the user asks.
 worktree: .worktrees/rust-tauri-port
 branch: feat/rust-tauri-port
 updated: 2026-07-04
 
 current_phase: 0                 # 0=oracle bootstrap, 1=understand, 2=architect, 3=port, 4=self-qa, 5=converge
 
+# --- Confirmed user constraints (this run) ---------------------------------
+constraints:
+  gemini: OUT of scope — not ported, not QA'd
+  languages: Rust only (Go dropped). JS/Node allowed ONLY as a spawned sidecar
+             when it is a massive net savings (no Rust equivalent); justify in ADR.
+  bug_posture: FIX bugs as found; do NOT replicate bug-for-bug. Every diff →
+               PORT_DEFECT | DELIBERATE_FIX (ledgered, antagonist-adjudicated) | EQUIVALENT
+  autonomy: left running unattended for ~1 week; no spend cap; no human gates
+  delivery: push branch periodically; NO PR (leave pushed branch for review)
+  windows: powershell.exe 5.1 + cmd.exe reachable → Windows integration is
+           partially LIVE-verifiable. macOS = spec/fixture only.
+  host: WSL2 Linux, 32 CPU / 62G RAM / 232G free, Docker up, Playwright browsers
+        installed, Tauri libs installed (webkit2gtk-4.1 2.52.3), Rust 1.96.
+
+# --- DO NOT TOUCH (user's live environment) --------------------------------
+do_not_touch:
+  freshell_server: { pid: 1262455, port: 3001, note: "user's live freshell + child ports; never bind 3001" }
+  freshell_mcp: { pid: 519533 }
+  live_codex_pids: [1131271, 1113784, 1263603, 2979002, 3145360]
+  live_opencode_pids: [2715495]
+  rule: my own server binds a unique high port; live-QA spawns its OWN codex/opencode
+        on unique ports and cleans up only what it spawned (ownership-safe cleanup).
+my_server_port: 3456             # my isolated server for browser-based validation
+
 phases:
   0_oracle_bootstrap:
     status: in_progress
     done:
-      - laid down plan-of-record (port/README, bundle.yaml, AGENTS.md, oracle/DESIGN, architecture-spec)
+      - laid down plan-of-record (README, bundle.yaml, AGENTS.md, oracle/DESIGN, DEVIATIONS, architecture-spec)
       - confirmed base green + node-pty loads from shared node_modules
       - FIXED prerequisite defect: test:real:coding-cli-contracts env var (regression test added)
+      - re-verified env post-reboot; baked in the 4 user constraints + deviation-ledger model
     next:
-      - extract shared/ws-protocol.ts to a language-neutral schema + codegen Rust types
+      - freeze shared/ws-protocol.ts → language-neutral JSON Schema + drift-guard test (IN PROGRESS)
+      - scaffold Cargo workspace + freshell-protocol crate (Rust types generated from the schema)
       - build external-process server harness variant (spawn + connect over ws://)
       - build PTY byte-stream golden-capture harness (node-pty is mocked today — real gap)
       - capture T0/T1 golden transcripts + T2 live-invariant baselines FROM ORIGINAL
       - enumerate nondeterministic boundary fields; build normalization layer
       - validate oracle by mutation testing against ORIGINAL (must catch injected divergence)
-      - make ORIGINAL's live provider suite actually pass (now that the env gate is fixed)
+      - make ORIGINAL's live provider suite actually pass (env gate now fixed)
     exit_criteria:
       - oracle detects every injected mutation in the original
-      - original passes T0–T3 (T2 with cheapest-model matrix)
-  1_understand:  { status: pending, bundle: parallax-discovery, targets: [terminal-registry, coding-cli parsers, platform glue, electron->tauri] }
+      - original passes T0–T3 (T2 with cheapest-model matrix: Kimi/Haiku/GPT-mini)
+      - every old-vs-new diff resolves to EQUIVALENT or a ledgered DELIBERATE_FIX
+  1_understand:  { status: pending, bundle: parallax-discovery, targets: [terminal-registry, coding-cli parsers, platform/windows glue, electron->tauri] }
   2_architect:   { status: pending, bundle: systems-design, output: port/machine/architecture-spec.md (freeze) }
   3_port:        { status: pending, bundle: dev-machine, order: [protocol, terminal, api+ws, harness, llm+platform+tauri] }
   4_self_qa:     { status: pending, bundle: self-driving }
@@ -36,8 +64,8 @@ phases:
 blockers: []                     # write here and STOP rather than guess on unrecoverable ambiguity
 
 guardrails:
-  equivalence: differential (T0 protocol, T1 deterministic, T2 live-invariant, T3 e2e/visual) — never byte-identical LLM output
-  architecture: rust-first single cargo workspace; frontend unchanged; ws contract frozen
-  autonomy: recipes non-staged/auto-approve; antagonist review replaces human; self-driving owns crash/token
-  process_safety: never restart the self-hosted freshell server without user "APPROVED"; no PR without explicit approval
-  single_host: WSL2 Linux — WSL/PowerShell/native mac+Windows paths are golden-fixture only, not live-QA
+  equivalence: differential (T0 protocol, T1 deterministic, T2 live-invariant, T3 e2e/visual) + deviation ledger; never byte-identical LLM output
+  architecture: rust-only (JS sidecar only if massive savings); single cargo workspace; frontend unchanged; ws contract frozen
+  autonomy: recipes non-staged/auto-approve; antagonist review replaces human AND adjudicates ledger; self-driving owns crash/token; no cap
+  process_safety: never touch pid 1262455 / :3001; run own server on 3456; own-process-only cleanup; no PR
+  platform: Windows partially live-verifiable via powershell.exe/cmd.exe; macOS spec/fixture-only
