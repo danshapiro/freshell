@@ -2001,6 +2001,127 @@ describe('CodingCliSessionIndexer', () => {
       expect(olderSession?.title).toBe('Sticky old title')
     })
 
+    it('lets a provider-generated parsed title beat a first-message automatic override', async () => {
+      const fileA = path.join(tempDir, 'session-provider-title.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
+
+      vi.mocked(configStore.snapshot).mockResolvedValue({
+        sessionOverrides: {
+          [makeSessionKey('claude', 'session-provider-title')]: {
+            titleOverride: 'Prompt fallback title',
+            titleSource: 'first-message',
+          },
+        },
+        settings: { codingCli: { enabledProviders: ['claude'], providers: {} } },
+      })
+
+      const provider = makeProvider([fileA], {
+        parseSessionFile: async () => ({
+          cwd: '/project/a',
+          title: 'Auth Redirect Fix',
+          titleSource: 'provider-generated',
+        }),
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+
+      expect(indexer.getProjects()[0]?.sessions[0]?.title).toBe('Auth Redirect Fix')
+    })
+
+    it('keeps a finalized ai override ahead of a provider-generated parsed title', async () => {
+      const fileA = path.join(tempDir, 'session-ai-title.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
+
+      vi.mocked(configStore.snapshot).mockResolvedValue({
+        sessionOverrides: {
+          [makeSessionKey('claude', 'session-ai-title')]: {
+            titleOverride: 'Gemini Generated Title',
+            titleSource: 'ai',
+          },
+        },
+        settings: { codingCli: { enabledProviders: ['claude'], providers: {} } },
+      })
+
+      const provider = makeProvider([fileA], {
+        parseSessionFile: async () => ({
+          cwd: '/project/a',
+          title: 'Auth Redirect Fix',
+          titleSource: 'provider-generated',
+        }),
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+
+      expect(indexer.getProjects()[0]?.sessions[0]?.title).toBe('Gemini Generated Title')
+    })
+
+    it('keeps an explicit user override ahead of a provider-generated parsed title', async () => {
+      const fileA = path.join(tempDir, 'session-user-title.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
+
+      vi.mocked(configStore.snapshot).mockResolvedValue({
+        sessionOverrides: {
+          [makeSessionKey('claude', 'session-user-title')]: {
+            titleOverride: 'My Rename',
+            titleSource: 'user',
+          },
+        },
+        settings: { codingCli: { enabledProviders: ['claude'], providers: {} } },
+      })
+
+      const provider = makeProvider([fileA], {
+        parseSessionFile: async () => ({
+          cwd: '/project/a',
+          title: 'Auth Redirect Fix',
+          titleSource: 'provider-generated',
+        }),
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+
+      expect(indexer.getProjects()[0]?.sessions[0]?.title).toBe('My Rename')
+    })
+
+    it('finds a Claude generated title in the middle of a truncated full-enrichment file', async () => {
+      const fileA = path.join(tempDir, 'large-claude-summary.jsonl')
+      const beforeSummary = Array.from({ length: 150 }, (_, i) =>
+        JSON.stringify({ type: 'noise', payload: `${i}:${'x'.repeat(1024)}` }),
+      )
+      const afterSummary = Array.from({ length: 180 }, (_, i) =>
+        JSON.stringify({ type: 'noise', payload: `${i}:${'y'.repeat(1024)}` }),
+      )
+      await fsp.writeFile(fileA, [
+        JSON.stringify({
+          type: 'system',
+          subtype: 'init',
+          session_id: 'large-claude-summary',
+          cwd: '/project/a',
+          timestamp: '2026-01-01T09:00:00.000Z',
+        }),
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: 'Prompt fallback title' },
+          timestamp: '2026-01-01T09:01:00.000Z',
+        }),
+        ...beforeSummary,
+        JSON.stringify({ type: 'summary', summary: 'Auth Redirect Fix' }),
+        ...afterSummary,
+      ].join('\n'))
+
+      const { parseSessionContent } = await import('../../../../server/coding-cli/providers/claude')
+      const provider = makeProvider([fileA], {
+        parseSessionFile: async (content) => parseSessionContent(content),
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+
+      expect(indexer.getProjects()[0]?.sessions[0]?.title).toBe('Auth Redirect Fix')
+    })
+
     it('persists a newly parsed non-empty title to the metadata store', async () => {
       const fileA = path.join(tempDir, 'session-b.jsonl')
       await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Fresh title' }) + '\n')
@@ -2104,6 +2225,185 @@ describe('CodingCliSessionIndexer', () => {
       .find((session) => session.sessionId === olderSessionId)
 
     expect(olderSession?.title).toBe('Investigate sidebar visibility')
+  })
+
+  it('extracts a lightweight Claude generated summary title from the tail even when a later timestamp follows it', async () => {
+    const files: string[] = []
+    for (let i = 0; i < 151; i += 1) {
+      const file = path.join(tempDir, `recent-claude-${i}.jsonl`)
+      await fsp.writeFile(file, [
+        JSON.stringify({
+          type: 'system',
+          subtype: 'init',
+          session_id: `recent-claude-${i}`,
+          cwd: `/project/${i}`,
+          timestamp: new Date(2026, 3, 5, 12, i).toISOString(),
+        }),
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: `Recent Claude task ${i}` },
+          timestamp: new Date(2026, 3, 5, 12, i, 1).toISOString(),
+        }),
+      ].join('\n'))
+      files.push(file)
+    }
+
+    const olderSessionId = 'older-claude-summary'
+    const olderFile = path.join(tempDir, `${olderSessionId}.jsonl`)
+    await fsp.writeFile(olderFile, [
+      JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        session_id: olderSessionId,
+        cwd: '/project/older-claude',
+        timestamp: new Date(2026, 0, 1, 9).toISOString(),
+      }),
+      ...Array.from({ length: 6 }, (_, i) =>
+        JSON.stringify({ type: 'noise', payload: `${i}:${'x'.repeat(1024)}` }),
+      ),
+      JSON.stringify({
+        type: 'summary',
+        summary: 'Auth Redirect Fix',
+        timestamp: new Date(2026, 0, 1, 9, 1).toISOString(),
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { role: 'assistant', content: 'Working' },
+        timestamp: new Date(2026, 0, 1, 9, 2).toISOString(),
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { role: 'assistant', content: 'Done' },
+        timestamp: new Date(2026, 0, 1, 9, 3).toISOString(),
+      }),
+    ].join('\n'))
+    files.push(olderFile)
+
+    const indexer = new CodingCliSessionIndexer([makeProvider(files)], { fullScanIntervalMs: 0 })
+    await indexer.refresh()
+
+    const olderSession = indexer.getProjects()
+      .flatMap((group) => group.sessions)
+      .find((session) => session.sessionId === olderSessionId)
+
+    expect(olderSession?.title).toBe('Auth Redirect Fix')
+    expect(olderSession?.lastActivityAt).toBe(Date.parse(new Date(2026, 0, 1, 9, 3).toISOString()))
+  })
+
+  it('keeps the newest lightweight Claude tail timestamp when no generated summary is present', async () => {
+    const files: string[] = []
+    for (let i = 0; i < 151; i += 1) {
+      const file = path.join(tempDir, `recent-claude-nosummary-${i}.jsonl`)
+      await fsp.writeFile(file, [
+        JSON.stringify({
+          type: 'system',
+          subtype: 'init',
+          session_id: `recent-claude-nosummary-${i}`,
+          cwd: `/project/${i}`,
+          timestamp: new Date(2026, 3, 5, 12, i).toISOString(),
+        }),
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: `Recent Claude task ${i}` },
+          timestamp: new Date(2026, 3, 5, 12, i, 1).toISOString(),
+        }),
+      ].join('\n'))
+      files.push(file)
+    }
+
+    const olderSessionId = 'older-claude-nosummary'
+    const newestTimestamp = new Date(2026, 0, 1, 9, 3).toISOString()
+    const olderFile = path.join(tempDir, `${olderSessionId}.jsonl`)
+    await fsp.writeFile(olderFile, [
+      JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        session_id: olderSessionId,
+        cwd: '/project/older-claude-nosummary',
+        timestamp: new Date(2026, 0, 1, 9).toISOString(),
+      }),
+      ...Array.from({ length: 6 }, (_, i) =>
+        JSON.stringify({ type: 'noise', payload: `${i}:${'x'.repeat(1024)}` }),
+      ),
+      JSON.stringify({
+        type: 'assistant',
+        message: { role: 'assistant', content: 'Working' },
+        timestamp: new Date(2026, 0, 1, 9, 1).toISOString(),
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { role: 'assistant', content: 'Still working' },
+        timestamp: new Date(2026, 0, 1, 9, 2).toISOString(),
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { role: 'assistant', content: 'Done' },
+        timestamp: newestTimestamp,
+      }),
+    ].join('\n'))
+    files.push(olderFile)
+
+    const indexer = new CodingCliSessionIndexer([makeProvider(files)], { fullScanIntervalMs: 0 })
+    await indexer.refresh()
+
+    const olderSession = indexer.getProjects()
+      .flatMap((group) => group.sessions)
+      .find((session) => session.sessionId === olderSessionId)
+
+    expect(olderSession?.title).toBeUndefined()
+    expect(olderSession?.lastActivityAt).toBe(Date.parse(newestTimestamp))
+  })
+
+  it('does not use Claude summary records as lightweight generated titles for non-Claude providers', async () => {
+    const files: string[] = []
+    const codexSessionId = 'codex-summary-record'
+    const codexFile = path.join(tempDir, `${codexSessionId}.jsonl`)
+    await fsp.writeFile(codexFile, [
+      JSON.stringify({ type: 'session_meta', payload: { id: codexSessionId, cwd: '/project/codex' } }),
+      ...Array.from({ length: 6 }, (_, i) =>
+        JSON.stringify({ type: 'noise', payload: `${i}:${'x'.repeat(1024)}` }),
+      ),
+      JSON.stringify({ type: 'summary', summary: 'Should Stay Provider Scoped' }),
+      JSON.stringify({ timestamp: new Date(2026, 0, 1, 9, 1).toISOString(), type: 'turn_context' }),
+    ].join('\n'))
+    await fsp.utimes(codexFile, new Date(2026, 0, 1), new Date(2026, 0, 1))
+    files.push(codexFile)
+
+    for (let i = 0; i < 151; i += 1) {
+      const file = path.join(tempDir, `recent-codex-scoped-${i}.jsonl`)
+      await fsp.writeFile(file, [
+        JSON.stringify({ type: 'session_meta', payload: { id: `recent-codex-scoped-${i}`, cwd: `/project/${i}` } }),
+        JSON.stringify({
+          timestamp: new Date(2026, 3, 5, 12, i).toISOString(),
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: `Recent task ${i}` }],
+          },
+        }),
+      ].join('\n'))
+      files.push(file)
+    }
+
+    vi.mocked(configStore.snapshot).mockResolvedValue({
+      sessionOverrides: {},
+      settings: { codingCli: { enabledProviders: ['codex'], providers: {} } },
+    })
+
+    const provider = makeProvider(files, {
+      name: 'codex',
+      parseSessionFile: codexProvider.parseSessionFile,
+    })
+
+    const indexer = new CodingCliSessionIndexer([provider], { fullScanIntervalMs: 0 })
+    await indexer.refresh()
+
+    const codexSession = indexer.getProjects()
+      .flatMap((group) => group.sessions)
+      .find((session) => session.sessionId === codexSessionId)
+
+    expect(codexSession?.title).toBeUndefined()
   })
 
   it('does not synthesize a lightweight title from older system-context user records', async () => {
