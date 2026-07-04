@@ -1,10 +1,37 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
-import { scanJsonRpcEnvelope } from '../../../../../server/coding-cli/codex-app-server/json-rpc-envelope.js'
+import {
+  MAX_SCANNED_TOKEN_BYTES,
+  scanJsonRpcEnvelope,
+} from '../../../../../server/coding-cli/codex-app-server/json-rpc-envelope.js'
 
 function slicedArrayBuffer(value: string): ArrayBuffer {
   const buffer = Buffer.from(value)
   return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
+}
+
+function seededRandom(seed: number): () => number {
+  let state = seed >>> 0
+  return () => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0
+    return state / 0x100000000
+  }
+}
+
+function pick<T>(random: () => number, values: readonly T[]): T {
+  return values[Math.floor(random() * values.length)]!
+}
+
+function expectedJsonRpcEnvelope(json: string): { id?: string | number; method?: string } {
+  const parsed = JSON.parse(json) as { id?: unknown; method?: unknown }
+  const expected: { id?: string | number; method?: string } = {}
+  if (typeof parsed.id === 'string' || (typeof parsed.id === 'number' && Number.isInteger(parsed.id))) {
+    expected.id = parsed.id
+  }
+  if (typeof parsed.method === 'string') {
+    expected.method = parsed.method
+  }
+  return expected
 }
 
 describe('scanJsonRpcEnvelope', () => {
@@ -22,6 +49,14 @@ describe('scanJsonRpcEnvelope', () => {
       root: 'object',
       id: 7,
       method: 'thread/fork',
+      duplicateTopLevelKeys: [],
+    })
+
+    expect(scanJsonRpcEnvelope('{"method":"initialize","params":{},"id":-12}')).toEqual({
+      ok: true,
+      root: 'object',
+      id: -12,
+      method: 'initialize',
       duplicateTopLevelKeys: [],
     })
   })
@@ -54,6 +89,13 @@ describe('scanJsonRpcEnvelope', () => {
       ok: true,
       root: 'object',
       id: 2,
+      method: 'turn/start',
+      duplicateTopLevelKeys: ['id', 'method'],
+    })
+
+    expect(scanJsonRpcEnvelope(Buffer.from('{"\\u0069d":1,"id":null,"meth\\u006fd":false,"method":"turn/start"}'))).toEqual({
+      ok: true,
+      root: 'object',
       method: 'turn/start',
       duplicateTopLevelKeys: ['id', 'method'],
     })
@@ -91,6 +133,86 @@ describe('scanJsonRpcEnvelope', () => {
 
   it('classifies malformed JSON and scalar roots as unsafe', () => {
     expect(scanJsonRpcEnvelope(Buffer.from('{"id":1'))).toEqual({ ok: false, reason: 'malformed_json' })
+    expect(scanJsonRpcEnvelope(Buffer.from('{"method":"bad\\q"}'))).toEqual({ ok: false, reason: 'malformed_json' })
     expect(scanJsonRpcEnvelope(Buffer.from('"not-an-object"'))).toEqual({ ok: false, reason: 'non_object_root' })
+  })
+
+  it('rejects overlarge top-level tokens that would need to be decoded', () => {
+    const tooLargeMethod = 'x'.repeat(MAX_SCANNED_TOKEN_BYTES + 1)
+    expect(scanJsonRpcEnvelope(Buffer.from(`{"id":1,"method":"${tooLargeMethod}"}`))).toEqual({
+      ok: false,
+      reason: 'token_too_large',
+    })
+  })
+
+  it('does not use JSON.parse or Buffer.toString when scanning a large frame', () => {
+    const largeResult = 'x'.repeat(256 * 1024)
+    const raw = Buffer.from(`{"result":{"payload":"${largeResult}"},"id":42,"method":"turn/start"}`)
+    const parseSpy = vi.spyOn(JSON, 'parse')
+    const toStringSpy = vi.spyOn(Buffer.prototype, 'toString')
+
+    const result = scanJsonRpcEnvelope(raw)
+    const parseCalls = parseSpy.mock.calls.length
+    const toStringCalls = toStringSpy.mock.calls.length
+    parseSpy.mockRestore()
+    toStringSpy.mockRestore()
+
+    expect(result).toEqual({
+      ok: true,
+      root: 'object',
+      id: 42,
+      method: 'turn/start',
+      duplicateTopLevelKeys: [],
+    })
+    expect(parseCalls).toBe(0)
+    expect(toStringCalls).toBe(0)
+  })
+
+  it('matches bounded JSON.parse semantics for a deterministic corpus of top-level envelopes', () => {
+    const random = seededRandom(0xc0de)
+    const keySources = {
+      id: ['"id"', '"\\u0069d"'],
+      method: ['"method"', '"meth\\u006fd"'],
+      params: ['"params"'],
+      result: ['"result"'],
+      other: ['"jsonrpc"', '"meta"', '"nested"'],
+    } as const
+    const idValues = ['0', '1', '-2', '"request-1"', '"escaped\\\\id"', 'null', 'false', '1.25', '{"id":"nested"}', '[1]']
+    const methodValues = ['"initialize"', '"turn\\/start"', '"thread/fork"', 'null', 'true', '7', '{"name":"nested"}']
+    const nestedValues = [
+      '{"id":"nested","method":"nested/method"}',
+      '{"items":[{"id":1},{"method":"ignored"}]}',
+      '["id","method",{"id":"array-nested"}]',
+    ]
+
+    for (let index = 0; index < 96; index += 1) {
+      const entries: string[] = []
+      const entryCount = 5 + Math.floor(random() * 5)
+      for (let entryIndex = 0; entryIndex < entryCount; entryIndex += 1) {
+        const slot = pick(random, ['id', 'method', 'params', 'result', 'other'] as const)
+        if (slot === 'id') {
+          entries.push(`${pick(random, keySources.id)}:${pick(random, idValues)}`)
+        } else if (slot === 'method') {
+          entries.push(`${pick(random, keySources.method)}:${pick(random, methodValues)}`)
+        } else if (slot === 'params') {
+          entries.push(`${pick(random, keySources.params)}:${pick(random, nestedValues)}`)
+        } else if (slot === 'result') {
+          entries.push(`${pick(random, keySources.result)}:${pick(random, nestedValues)}`)
+        } else {
+          entries.push(`${pick(random, keySources.other)}:${pick(random, ['"2.0"', '{"id":"not-top"}', '3'])}`)
+        }
+      }
+
+      const json = `{${entries.join(',')}}`
+      const expected = expectedJsonRpcEnvelope(json)
+      const result = scanJsonRpcEnvelope(Buffer.from(json))
+
+      expect(result).toMatchObject({ ok: true, root: 'object' })
+      if (!result.ok) return
+      expect({ id: result.id, method: result.method }).toEqual({
+        id: expected.id,
+        method: expected.method,
+      })
+    }
   })
 })
