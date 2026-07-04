@@ -188,10 +188,14 @@ async function runAboveCapMode(activeCap: number): Promise<void> {
     proxy = await startProxy(upstream.wsUrl, activeCap)
     const proxyError = waitForProxyError(proxy)
     tui = await connect(proxy.wsUrl)
+    const noTuiForward = expectNoFrameUntilClose(tui, CLOSE_TIMEOUT_MS, 'above-cap TUI forwarding')
+
     tui.send(JSON.stringify({ id: ABOVE_CAP_REQUEST_ID, method: 'model/list', params: {} }), { binary: false })
 
-    await withTimeout(proxyError, CLOSE_TIMEOUT_MS, 'proxy_error repair trigger')
-    await expectNoFrameBeforeClose(tui, CLOSE_TIMEOUT_MS, 'above-cap TUI forwarding')
+    await Promise.all([
+      withTimeout(proxyError, CLOSE_TIMEOUT_MS, 'proxy_error repair trigger'),
+      noTuiForward,
+    ])
 
     logResult({
       mode: 'above-cap',
@@ -336,12 +340,8 @@ function waitForProxyError(proxy: CodexRemoteProxy): Promise<CodexRemoteProxyRep
   })
 }
 
-function expectNoFrameBeforeClose(socket: WebSocket, timeoutMs: number, label: string): Promise<void> {
+function expectNoFrameUntilClose(socket: WebSocket, timeoutMs: number, label: string): Promise<void> {
   return withTimeout(new Promise<void>((resolve, reject) => {
-    if (socket.readyState === WebSocket.CLOSED) {
-      resolve()
-      return
-    }
     const onMessage = () => {
       cleanupListeners()
       reject(new Error(`${label} unexpectedly forwarded a TUI frame.`))
