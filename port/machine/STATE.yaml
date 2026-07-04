@@ -44,21 +44,26 @@ phases:
       - re-verified env post-reboot; baked in the 4 user constraints + deviation-ledger model
     next:
       - "DONE: froze ws-protocol → port/contract/ws-protocol.schema.json (v7, 55 schemas) + drift-guard (7/7, mutation-validated)"
-      - "FOLLOW-UP (oracle gap): server→client is TS-types-only for ~44 of 52 outbound message types;
-         only 8 have runtime zod schemas. Generate outbound shape schemas from the TS unions
-         (ts-json-schema-generator) so the server's EMITTED wire can be schema-validated by T0.
-         Until then T0 covers 27 inbound + 8 outbound fully, 44 outbound at discriminant-level only."
+      - "DONE: closed T0 outbound gap — all 52 server→client messages schematized from the TS
+         unions via the TS compiler API (port/contract/ws-server-messages.schema.json); drift-guard
+         13/13, mutation-validated; zod-vs-TS cross-check clean on the 8 overlapping messages."
+      - "DONE: external-process capture harness + first LIVE T0 test — boots the ORIGINAL server
+         isolated (ephemeral loopback port, isolated HOME, ownership sentinels), captures the real
+         WS handshake, validates every server→client message against the frozen contract (5/5,
+         4/4 conformant), clean ownership-safe teardown, live :3001 never touched.
+         (port/oracle/harness/*, test:oracle)"
       - "note: zod4 emits additionalProperties:false but runtime strips (accept-and-strip);
          treat zod parse as inbound authority, JSON Schema as shape contract."
       - "opaque blobs (model as serde_json::Value, exclude from byte-diff): Usage.passthrough,
          record(string,unknown) layouts/tool_use.input/decision/fork.input, tool_result.content, codingcli/freshAgent event"
-      - scaffold Cargo workspace + freshell-protocol crate (Rust types generated from the schema)
-      - build external-process server harness variant (spawn + connect over ws://)
-      - build PTY byte-stream golden-capture harness (node-pty is mocked today — real gap)
-      - capture T0/T1 golden transcripts + T2 live-invariant baselines FROM ORIGINAL
-      - enumerate nondeterministic boundary fields; build normalization layer
-      - validate oracle by mutation testing against ORIGINAL (must catch injected divergence)
-      - make ORIGINAL's live provider suite actually pass (env gate now fixed)
+      - "NEXT: build normalization layer for nondeterministic boundary fields (ids/timestamps/ports/
+         session-ids/paths/bootId per port/contract/nondeterministic-fields.md) — shared by T0/T1;
+         prerequisite for persisting stable golden transcripts for old-vs-new diffing"
+      - build PTY byte-stream golden-capture harness against ORIGINAL (node-pty real; drive fixed shell cmds)
+      - capture + persist T0/T1 golden baselines FROM ORIGINAL (transcripts normalized)
+      - wire T2 live-invariant harness (Kimi/Haiku/GPT-mini) + make ORIGINAL's live provider suite pass
+      - validate whole oracle by mutation testing against ORIGINAL (must catch injected divergence)
+      - THEN (Phase 3 start): scaffold Cargo workspace + freshell-protocol crate (Rust types from frozen schema)
     exit_criteria:
       - oracle detects every injected mutation in the original
       - original passes T0–T3 (T2 with cheapest-model matrix: Kimi/Haiku/GPT-mini)
