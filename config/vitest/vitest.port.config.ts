@@ -30,6 +30,10 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['test/unit/port/**/*.test.ts'],
+    // The oracle's live conformance tests boot a REAL external server and must
+    // NOT run under this fast, no-server drift-guard config. They have their own
+    // config (config/vitest/vitest.oracle.config.ts) — run via `npm run test:oracle`.
+    exclude: ['test/unit/port/oracle/**'],
     testTimeout: 30000,
     hookTimeout: 30000,
   },
