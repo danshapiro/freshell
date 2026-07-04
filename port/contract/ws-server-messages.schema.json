@@ -1,0 +1,2879 @@
+{
+  "authority": "Server→client messages are TypeScript types only; this file is their shape authority for the oracle. Inbound (client→server) runtime authority remains the Zod schemas frozen in ws-protocol.schema.json.",
+  "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. Each entry is a JSON Schema for one server→client message shape, keyed by its `type` discriminant and synthesized from the ServerMessage union via the TypeScript type checker. Opaque values (unknown / index signatures / any) are intentionally permissive — see nondeterministic-fields.md. The wire contract is frozen for the Rust port.",
+  "generator": "port/contract/generate-ws-contract.ts",
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "messageCount": 52,
+  "messages": {
+    "claude.activity.list.response": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "latestTurnCompletions": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "at": {
+                "type": "number"
+              },
+              "completionSeq": {
+                "type": "number"
+              },
+              "terminalId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "at",
+              "completionSeq",
+              "terminalId"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "terminals": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "phase": {
+                "enum": [
+                  "idle",
+                  "busy"
+                ],
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "terminalId": {
+                "type": "string"
+              },
+              "updatedAt": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "phase",
+              "terminalId",
+              "updatedAt"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "claude.activity.list.response",
+          "type": "string"
+        }
+      },
+      "required": [
+        "requestId",
+        "terminals",
+        "type"
+      ],
+      "type": "object"
+    },
+    "claude.activity.updated": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "remove": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "claude.activity.updated",
+          "type": "string"
+        },
+        "upsert": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "phase": {
+                "enum": [
+                  "idle",
+                  "busy"
+                ],
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "terminalId": {
+                "type": "string"
+              },
+              "updatedAt": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "phase",
+              "terminalId",
+              "updatedAt"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "remove",
+        "type",
+        "upsert"
+      ],
+      "type": "object"
+    },
+    "codex.activity.list.response": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "latestTurnCompletions": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "at": {
+                "type": "number"
+              },
+              "completionSeq": {
+                "type": "number"
+              },
+              "terminalId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "at",
+              "completionSeq",
+              "terminalId"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "terminals": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "phase": {
+                "enum": [
+                  "unknown",
+                  "idle",
+                  "pending",
+                  "busy"
+                ],
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "terminalId": {
+                "type": "string"
+              },
+              "updatedAt": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "phase",
+              "terminalId",
+              "updatedAt"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "codex.activity.list.response",
+          "type": "string"
+        }
+      },
+      "required": [
+        "requestId",
+        "terminals",
+        "type"
+      ],
+      "type": "object"
+    },
+    "codex.activity.updated": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "remove": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "codex.activity.updated",
+          "type": "string"
+        },
+        "upsert": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "phase": {
+                "enum": [
+                  "unknown",
+                  "idle",
+                  "pending",
+                  "busy"
+                ],
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "terminalId": {
+                "type": "string"
+              },
+              "updatedAt": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "phase",
+              "terminalId",
+              "updatedAt"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "remove",
+        "type",
+        "upsert"
+      ],
+      "type": "object"
+    },
+    "codingcli.created": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "codingcli.created",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "requestId",
+        "sessionId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "codingcli.event": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "event": true,
+        "provider": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "codingcli.event",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event",
+        "provider",
+        "sessionId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "codingcli.exit": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "exitCode": {
+          "type": "number"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "codingcli.exit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "exitCode",
+        "provider",
+        "sessionId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "codingcli.killed": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "type": {
+          "const": "codingcli.killed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId",
+        "success",
+        "type"
+      ],
+      "type": "object"
+    },
+    "codingcli.stderr": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "type": {
+          "const": "codingcli.stderr",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "sessionId",
+        "text",
+        "type"
+      ],
+      "type": "object"
+    },
+    "config.fallback": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "backupExists": {
+          "type": "boolean"
+        },
+        "reason": {
+          "enum": [
+            "PARSE_ERROR",
+            "VERSION_MISMATCH",
+            "READ_ERROR",
+            "ENOENT"
+          ],
+          "type": "string"
+        },
+        "type": {
+          "const": "config.fallback",
+          "type": "string"
+        }
+      },
+      "required": [
+        "backupExists",
+        "reason",
+        "type"
+      ],
+      "type": "object"
+    },
+    "error": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "actualSessionRef": {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "type": "string"
+            },
+            "sessionId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "sessionId"
+          ],
+          "type": "object"
+        },
+        "code": {
+          "enum": [
+            "NOT_AUTHENTICATED",
+            "INVALID_MESSAGE",
+            "UNKNOWN_MESSAGE",
+            "INVALID_TERMINAL_ID",
+            "SESSION_IDENTITY_MISMATCH",
+            "INVALID_SESSION_ID",
+            "RESTORE_UNAVAILABLE",
+            "INVALID_CREATE_REQUEST",
+            "PTY_SPAWN_FAILED",
+            "FILE_WATCHER_ERROR",
+            "INTERNAL_ERROR",
+            "RATE_LIMITED",
+            "UNAUTHORIZED",
+            "PROTOCOL_MISMATCH"
+          ],
+          "type": "string"
+        },
+        "expectedSessionRef": {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "type": "string"
+            },
+            "sessionId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "sessionId"
+          ],
+          "type": "object"
+        },
+        "message": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "terminalExitCode": {
+          "type": "number"
+        },
+        "terminalId": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "string"
+        },
+        "type": {
+          "const": "error",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "timestamp",
+        "type"
+      ],
+      "type": "object"
+    },
+    "extension.server.error": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "const": "extension.server.error",
+          "type": "string"
+        }
+      },
+      "required": [
+        "error",
+        "name",
+        "type"
+      ],
+      "type": "object"
+    },
+    "extension.server.ready": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "port": {
+          "type": "number"
+        },
+        "type": {
+          "const": "extension.server.ready",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "port",
+        "type"
+      ],
+      "type": "object"
+    },
+    "extension.server.starting": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "const": "extension.server.starting",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "type"
+      ],
+      "type": "object"
+    },
+    "extension.server.stopped": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "const": "extension.server.stopped",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "type"
+      ],
+      "type": "object"
+    },
+    "extensions.registry": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "extensions": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "category": {
+                "enum": [
+                  "client",
+                  "server",
+                  "cli"
+                ],
+                "type": "string"
+              },
+              "cli": {
+                "additionalProperties": false,
+                "properties": {
+                  "resumeCommandTemplate": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "supportsModel": {
+                    "type": "boolean"
+                  },
+                  "supportsPermissionMode": {
+                    "type": "boolean"
+                  },
+                  "supportsResume": {
+                    "type": "boolean"
+                  },
+                  "supportsSandbox": {
+                    "type": "boolean"
+                  },
+                  "terminalBehavior": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "preferredRenderer": {
+                        "const": "canvas",
+                        "type": "string"
+                      },
+                      "scrollInputPolicy": {
+                        "enum": [
+                          "native",
+                          "fallbackToCursorKeysWhenAltScreenMouseCapture"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  }
+                },
+                "type": "object"
+              },
+              "contentSchema": {
+                "additionalProperties": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "default": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "const": false,
+                          "type": "boolean"
+                        },
+                        {
+                          "const": true,
+                          "type": "boolean"
+                        }
+                      ]
+                    },
+                    "label": {
+                      "type": "string"
+                    },
+                    "required": {
+                      "type": "boolean"
+                    },
+                    "type": {
+                      "enum": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "label",
+                    "type"
+                  ],
+                  "type": "object"
+                },
+                "type": "object"
+              },
+              "description": {
+                "type": "string"
+              },
+              "iconUrl": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "picker": {
+                "additionalProperties": false,
+                "properties": {
+                  "group": {
+                    "type": "string"
+                  },
+                  "shortcut": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "serverPort": {
+                "type": "number"
+              },
+              "serverRunning": {
+                "type": "boolean"
+              },
+              "url": {
+                "type": "string"
+              },
+              "version": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "category",
+              "description",
+              "label",
+              "name",
+              "version"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "extensions.registry",
+          "type": "string"
+        }
+      },
+      "required": [
+        "extensions",
+        "type"
+      ],
+      "type": "object"
+    },
+    "freshAgent.create.failed": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "type": {
+          "const": "freshAgent.create.failed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "requestId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "freshAgent.created": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "runtimeProvider": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "sessionRef": {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "type": "string"
+            },
+            "sessionId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "sessionId"
+          ],
+          "type": "object"
+        },
+        "sessionType": {
+          "type": "string"
+        },
+        "type": {
+          "const": "freshAgent.created",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "requestId",
+        "runtimeProvider",
+        "sessionId",
+        "sessionType",
+        "type"
+      ],
+      "type": "object"
+    },
+    "freshAgent.event": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "event": true,
+        "provider": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "sessionType": {
+          "type": "string"
+        },
+        "type": {
+          "const": "freshAgent.event",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event",
+        "provider",
+        "sessionId",
+        "sessionType",
+        "type"
+      ],
+      "type": "object"
+    },
+    "freshAgent.forked": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "parentSessionId": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "runtimeProvider": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "sessionRef": {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "type": "string"
+            },
+            "sessionId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "sessionId"
+          ],
+          "type": "object"
+        },
+        "sessionType": {
+          "type": "string"
+        },
+        "type": {
+          "const": "freshAgent.forked",
+          "type": "string"
+        }
+      },
+      "required": [
+        "parentSessionId",
+        "provider",
+        "runtimeProvider",
+        "sessionId",
+        "sessionType",
+        "type"
+      ],
+      "type": "object"
+    },
+    "freshAgent.killed": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "sessionType": {
+          "type": "string"
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "type": {
+          "const": "freshAgent.killed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "sessionId",
+        "sessionType",
+        "success",
+        "type"
+      ],
+      "type": "object"
+    },
+    "freshAgent.send.accepted": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "cwd": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "sessionType": {
+          "type": "string"
+        },
+        "submittedTurnId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "freshAgent.send.accepted",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "requestId",
+        "sessionId",
+        "sessionType",
+        "type"
+      ],
+      "type": "object"
+    },
+    "freshAgent.session.materialized": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "previousSessionId": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "sessionRef": {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "type": "string"
+            },
+            "sessionId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "sessionId"
+          ],
+          "type": "object"
+        },
+        "sessionType": {
+          "type": "string"
+        },
+        "type": {
+          "const": "freshAgent.session.materialized",
+          "type": "string"
+        }
+      },
+      "required": [
+        "previousSessionId",
+        "provider",
+        "sessionId",
+        "sessionType",
+        "type"
+      ],
+      "type": "object"
+    },
+    "opencode.activity.list.response": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "latestTurnCompletions": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "at": {
+                "type": "number"
+              },
+              "completionSeq": {
+                "type": "number"
+              },
+              "terminalId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "at",
+              "completionSeq",
+              "terminalId"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "terminals": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "phase": {
+                "const": "busy",
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "terminalId": {
+                "type": "string"
+              },
+              "updatedAt": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "phase",
+              "terminalId",
+              "updatedAt"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "opencode.activity.list.response",
+          "type": "string"
+        }
+      },
+      "required": [
+        "requestId",
+        "terminals",
+        "type"
+      ],
+      "type": "object"
+    },
+    "opencode.activity.updated": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "remove": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "opencode.activity.updated",
+          "type": "string"
+        },
+        "upsert": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "phase": {
+                "const": "busy",
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "terminalId": {
+                "type": "string"
+              },
+              "updatedAt": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "phase",
+              "terminalId",
+              "updatedAt"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "remove",
+        "type",
+        "upsert"
+      ],
+      "type": "object"
+    },
+    "perf.logging": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "type": {
+          "const": "perf.logging",
+          "type": "string"
+        }
+      },
+      "required": [
+        "enabled",
+        "type"
+      ],
+      "type": "object"
+    },
+    "pong": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "timestamp": {
+          "type": "string"
+        },
+        "type": {
+          "const": "pong",
+          "type": "string"
+        }
+      },
+      "required": [
+        "timestamp",
+        "type"
+      ],
+      "type": "object"
+    },
+    "ready": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "bootId": {
+          "type": "string"
+        },
+        "serverInstanceId": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "string"
+        },
+        "type": {
+          "const": "ready",
+          "type": "string"
+        }
+      },
+      "required": [
+        "timestamp",
+        "type"
+      ],
+      "type": "object"
+    },
+    "session.repair.activity": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "chainDepth": {
+          "type": "number"
+        },
+        "event": {
+          "enum": [
+            "error",
+            "scanned",
+            "repaired"
+          ],
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "orphanCount": {
+          "type": "number"
+        },
+        "orphansFixed": {
+          "type": "number"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.repair.activity",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event",
+        "sessionId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "session.status": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "chainDepth": {
+          "type": "number"
+        },
+        "orphansFixed": {
+          "type": "number"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId",
+        "status",
+        "type"
+      ],
+      "type": "object"
+    },
+    "sessions.changed": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "revision": {
+          "type": "number"
+        },
+        "type": {
+          "const": "sessions.changed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "revision",
+        "type"
+      ],
+      "type": "object"
+    },
+    "settings.updated": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "settings": {
+          "additionalProperties": false,
+          "properties": {
+            "ai": {
+              "additionalProperties": false,
+              "properties": {
+                "geminiApiKey": {
+                  "type": "string"
+                },
+                "titlePrompt": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "allowedFilePaths": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "codingCli": {
+              "additionalProperties": false,
+              "properties": {
+                "enabledProviders": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "knownProviders": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "mcpServer": {
+                  "type": "boolean"
+                },
+                "providers": {
+                  "additionalProperties": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "cwd": {
+                        "type": "string"
+                      },
+                      "maxTurns": {
+                        "type": "number"
+                      },
+                      "model": {
+                        "type": "string"
+                      },
+                      "permissionMode": {
+                        "enum": [
+                          "default",
+                          "plan",
+                          "acceptEdits",
+                          "bypassPermissions"
+                        ],
+                        "type": "string"
+                      },
+                      "sandbox": {
+                        "enum": [
+                          "read-only",
+                          "workspace-write",
+                          "danger-full-access"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "type": "object"
+                }
+              },
+              "required": [
+                "enabledProviders",
+                "mcpServer",
+                "providers"
+              ],
+              "type": "object"
+            },
+            "defaultCwd": {
+              "type": "string"
+            },
+            "editor": {
+              "additionalProperties": false,
+              "properties": {
+                "customEditorCommand": {
+                  "type": "string"
+                },
+                "externalEditor": {
+                  "enum": [
+                    "custom",
+                    "code",
+                    "auto",
+                    "cursor"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "externalEditor"
+              ],
+              "type": "object"
+            },
+            "extensions": {
+              "additionalProperties": false,
+              "properties": {
+                "disabled": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "disabled"
+              ],
+              "type": "object"
+            },
+            "freshAgent": {
+              "additionalProperties": false,
+              "properties": {
+                "defaultPlugins": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "enabled": {
+                  "type": "boolean"
+                },
+                "initialSetupDone": {
+                  "type": "boolean"
+                },
+                "providers": {
+                  "additionalProperties": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "defaultPermissionMode": {
+                        "type": "string"
+                      },
+                      "effort": {
+                        "type": "string"
+                      },
+                      "modelSelection": {
+                        "anyOf": [
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "kind": {
+                                "const": "tracked",
+                                "type": "string"
+                              },
+                              "modelId": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "kind",
+                              "modelId"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "kind": {
+                                "const": "exact",
+                                "type": "string"
+                              },
+                              "modelId": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "kind",
+                              "modelId"
+                            ],
+                            "type": "object"
+                          }
+                        ]
+                      },
+                      "style": {
+                        "enum": [
+                          "sans",
+                          "serif",
+                          "mono"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "type": "object"
+                }
+              },
+              "required": [
+                "defaultPlugins",
+                "enabled",
+                "providers"
+              ],
+              "type": "object"
+            },
+            "logging": {
+              "additionalProperties": false,
+              "properties": {
+                "debug": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "debug"
+              ],
+              "type": "object"
+            },
+            "network": {
+              "additionalProperties": false,
+              "properties": {
+                "configured": {
+                  "type": "boolean"
+                },
+                "host": {
+                  "enum": [
+                    "127.0.0.1",
+                    "0.0.0.0"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "configured",
+                "host"
+              ],
+              "type": "object"
+            },
+            "panes": {
+              "additionalProperties": false,
+              "properties": {
+                "defaultNewPane": {
+                  "enum": [
+                    "shell",
+                    "ask",
+                    "browser",
+                    "editor"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "defaultNewPane"
+              ],
+              "type": "object"
+            },
+            "safety": {
+              "additionalProperties": false,
+              "properties": {
+                "autoKillIdleMinutes": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "autoKillIdleMinutes"
+              ],
+              "type": "object"
+            },
+            "sidebar": {
+              "additionalProperties": false,
+              "properties": {
+                "autoGenerateTitles": {
+                  "type": "boolean"
+                },
+                "excludeFirstChatMustStart": {
+                  "type": "boolean"
+                },
+                "excludeFirstChatSubstrings": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "autoGenerateTitles",
+                "excludeFirstChatMustStart",
+                "excludeFirstChatSubstrings"
+              ],
+              "type": "object"
+            },
+            "terminal": {
+              "additionalProperties": false,
+              "properties": {
+                "scrollback": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "scrollback"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "ai",
+            "codingCli",
+            "editor",
+            "extensions",
+            "freshAgent",
+            "logging",
+            "network",
+            "panes",
+            "safety",
+            "sidebar",
+            "terminal"
+          ],
+          "type": "object"
+        },
+        "type": {
+          "const": "settings.updated",
+          "type": "string"
+        }
+      },
+      "required": [
+        "settings",
+        "type"
+      ],
+      "type": "object"
+    },
+    "tabs.sync.ack": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        },
+        "closedRecords": {
+          "type": "number"
+        },
+        "openRecords": {
+          "type": "number"
+        },
+        "type": {
+          "const": "tabs.sync.ack",
+          "type": "string"
+        }
+      },
+      "required": [
+        "accepted",
+        "closedRecords",
+        "openRecords",
+        "type"
+      ],
+      "type": "object"
+    },
+    "tabs.sync.snapshot": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "additionalProperties": false,
+          "properties": {
+            "closed": {
+              "items": {
+                "additionalProperties": true,
+                "properties": {
+                  "deviceId": {
+                    "type": "string"
+                  },
+                  "deviceLabel": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "deviceId",
+                  "deviceLabel"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "devices": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "deviceId": {
+                    "type": "string"
+                  },
+                  "deviceLabel": {
+                    "type": "string"
+                  },
+                  "lastSeenAt": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "deviceId",
+                  "deviceLabel",
+                  "lastSeenAt"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "localOpen": {
+              "items": {
+                "additionalProperties": true,
+                "properties": {
+                  "clientInstanceId": {
+                    "type": "string"
+                  },
+                  "deviceId": {
+                    "type": "string"
+                  },
+                  "deviceLabel": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "clientInstanceId",
+                  "deviceId",
+                  "deviceLabel"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "remoteOpen": {
+              "items": {
+                "additionalProperties": true,
+                "properties": {
+                  "clientInstanceId": {
+                    "type": "string"
+                  },
+                  "deviceId": {
+                    "type": "string"
+                  },
+                  "deviceLabel": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "clientInstanceId",
+                  "deviceId",
+                  "deviceLabel"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "sameDeviceOpen": {
+              "items": {
+                "additionalProperties": true,
+                "properties": {
+                  "clientInstanceId": {
+                    "type": "string"
+                  },
+                  "deviceId": {
+                    "type": "string"
+                  },
+                  "deviceLabel": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "clientInstanceId",
+                  "deviceId",
+                  "deviceLabel"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "closed",
+            "devices",
+            "localOpen",
+            "remoteOpen",
+            "sameDeviceOpen"
+          ],
+          "type": "object"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "tabs.sync.snapshot",
+          "type": "string"
+        }
+      },
+      "required": [
+        "data",
+        "requestId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "terminal.attach.ready": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "attachRequestId": {
+          "type": "string"
+        },
+        "effectiveSinceSeq": {
+          "type": "number"
+        },
+        "geometryAuthority": {
+          "enum": [
+            "single_client",
+            "server_stream",
+            "multi_client_unknown"
+          ],
+          "type": "string"
+        },
+        "geometryEpoch": {
+          "type": "number"
+        },
+        "headSeq": {
+          "type": "number"
+        },
+        "replayFromSeq": {
+          "type": "number"
+        },
+        "replayResetReason": {
+          "const": "geometry_authority_unknown",
+          "type": "string"
+        },
+        "replayToSeq": {
+          "type": "number"
+        },
+        "requestedSinceSeq": {
+          "type": "number"
+        },
+        "sessionRef": {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "type": "string"
+            },
+            "sessionId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "sessionId"
+          ],
+          "type": "object"
+        },
+        "streamId": {
+          "type": "string"
+        },
+        "terminalId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.attach.ready",
+          "type": "string"
+        }
+      },
+      "required": [
+        "headSeq",
+        "replayFromSeq",
+        "replayToSeq",
+        "streamId",
+        "terminalId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "terminal.codex.durability.updated": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "durability": {
+          "additionalProperties": false,
+          "properties": {
+            "candidate": {
+              "additionalProperties": false,
+              "properties": {
+                "candidateThreadId": {
+                  "type": "string"
+                },
+                "capturedAt": {
+                  "type": "number"
+                },
+                "cliVersion": {
+                  "type": "string"
+                },
+                "provider": {
+                  "const": "codex",
+                  "type": "string"
+                },
+                "rolloutPath": {
+                  "type": "string"
+                },
+                "source": {
+                  "enum": [
+                    "thread_start_response",
+                    "thread_started_notification",
+                    "thread_fork_response",
+                    "restored_client_state",
+                    "durable_resume"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "candidateThreadId",
+                "capturedAt",
+                "provider",
+                "rolloutPath",
+                "source"
+              ],
+              "type": "object"
+            },
+            "durableThreadId": {
+              "type": "string"
+            },
+            "lastProofFailure": {
+              "additionalProperties": false,
+              "properties": {
+                "checkedAt": {
+                  "type": "number"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "reason": {
+                  "enum": [
+                    "invalid_path",
+                    "missing",
+                    "not_regular_file",
+                    "empty",
+                    "malformed_json",
+                    "wrong_record_type",
+                    "missing_payload_id",
+                    "mismatched_thread_id",
+                    "read_error"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "checkedAt",
+                "message",
+                "reason"
+              ],
+              "type": "object"
+            },
+            "nonRestorableReason": {
+              "type": "string"
+            },
+            "schemaVersion": {
+              "const": 1,
+              "type": "number"
+            },
+            "state": {
+              "enum": [
+                "identity_pending",
+                "captured_pre_turn",
+                "turn_in_progress_unproven",
+                "proof_checking",
+                "durable",
+                "durable_resuming",
+                "durability_unproven_after_completion",
+                "non_restorable"
+              ],
+              "type": "string"
+            },
+            "turnCompletedAt": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "state"
+          ],
+          "type": "object"
+        },
+        "terminalId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.codex.durability.updated",
+          "type": "string"
+        }
+      },
+      "required": [
+        "durability",
+        "terminalId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "terminal.created": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "clearCodexDurability": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "number"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "restoreError": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "RESTORE_UNAVAILABLE",
+              "type": "string"
+            },
+            "reason": {
+              "enum": [
+                "dead_live_handle",
+                "missing_canonical_identity",
+                "invalid_legacy_restore_target",
+                "provider_runtime_failed",
+                "durable_artifact_missing"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "reason"
+          ],
+          "type": "object"
+        },
+        "sessionRef": {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "type": "string"
+            },
+            "sessionId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "sessionId"
+          ],
+          "type": "object"
+        },
+        "terminalId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.created",
+          "type": "string"
+        }
+      },
+      "required": [
+        "createdAt",
+        "requestId",
+        "terminalId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "terminal.detached": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "terminalId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.detached",
+          "type": "string"
+        }
+      },
+      "required": [
+        "terminalId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "terminal.exit": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "exitCode": {
+          "type": "number"
+        },
+        "terminalId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.exit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "exitCode",
+        "terminalId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "terminal.input.blocked": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "enum": [
+            "codex_identity_pending",
+            "codex_identity_capture_timeout",
+            "codex_identity_unavailable",
+            "codex_recovery_pending",
+            "codex_clean_exit_decision_pending",
+            "codex_lifecycle_loss_pending"
+          ],
+          "type": "string"
+        },
+        "terminalId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.input.blocked",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "terminalId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "terminal.inventory": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "bootId": {
+          "type": "string"
+        },
+        "terminalMeta": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "branch": {
+                "type": "string"
+              },
+              "checkoutRoot": {
+                "type": "string"
+              },
+              "cwd": {
+                "type": "string"
+              },
+              "displaySubdir": {
+                "type": "string"
+              },
+              "isDirty": {
+                "type": "boolean"
+              },
+              "provider": {
+                "type": "string"
+              },
+              "repoRoot": {
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "terminalId": {
+                "type": "string"
+              },
+              "tokenUsage": {
+                "additionalProperties": false,
+                "properties": {
+                  "cachedTokens": {
+                    "type": "number"
+                  },
+                  "compactPercent": {
+                    "type": "number"
+                  },
+                  "compactThresholdTokens": {
+                    "type": "number"
+                  },
+                  "contextTokens": {
+                    "type": "number"
+                  },
+                  "inputTokens": {
+                    "type": "number"
+                  },
+                  "modelContextWindow": {
+                    "type": "number"
+                  },
+                  "outputTokens": {
+                    "type": "number"
+                  },
+                  "totalTokens": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "cachedTokens",
+                  "inputTokens",
+                  "outputTokens",
+                  "totalTokens"
+                ],
+                "type": "object"
+              },
+              "updatedAt": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "terminalId",
+              "updatedAt"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "terminals": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "codexDurability": {
+                "additionalProperties": false,
+                "properties": {
+                  "candidate": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "candidateThreadId": {
+                        "type": "string"
+                      },
+                      "capturedAt": {
+                        "type": "number"
+                      },
+                      "cliVersion": {
+                        "type": "string"
+                      },
+                      "provider": {
+                        "const": "codex",
+                        "type": "string"
+                      },
+                      "rolloutPath": {
+                        "type": "string"
+                      },
+                      "source": {
+                        "enum": [
+                          "thread_start_response",
+                          "thread_started_notification",
+                          "thread_fork_response",
+                          "restored_client_state",
+                          "durable_resume"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "candidateThreadId",
+                      "capturedAt",
+                      "provider",
+                      "rolloutPath",
+                      "source"
+                    ],
+                    "type": "object"
+                  },
+                  "durableThreadId": {
+                    "type": "string"
+                  },
+                  "lastProofFailure": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "checkedAt": {
+                        "type": "number"
+                      },
+                      "message": {
+                        "type": "string"
+                      },
+                      "reason": {
+                        "enum": [
+                          "invalid_path",
+                          "missing",
+                          "not_regular_file",
+                          "empty",
+                          "malformed_json",
+                          "wrong_record_type",
+                          "missing_payload_id",
+                          "mismatched_thread_id",
+                          "read_error"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "checkedAt",
+                      "message",
+                      "reason"
+                    ],
+                    "type": "object"
+                  },
+                  "nonRestorableReason": {
+                    "type": "string"
+                  },
+                  "schemaVersion": {
+                    "const": 1,
+                    "type": "number"
+                  },
+                  "state": {
+                    "enum": [
+                      "identity_pending",
+                      "captured_pre_turn",
+                      "turn_in_progress_unproven",
+                      "proof_checking",
+                      "durable",
+                      "durable_resuming",
+                      "durability_unproven_after_completion",
+                      "non_restorable"
+                    ],
+                    "type": "string"
+                  },
+                  "turnCompletedAt": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "schemaVersion",
+                  "state"
+                ],
+                "type": "object"
+              },
+              "createdAt": {
+                "type": "number"
+              },
+              "cwd": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "lastActivityAt": {
+                "type": "number"
+              },
+              "mode": {
+                "type": "string"
+              },
+              "runtimeStatus": {
+                "enum": [
+                  "running",
+                  "recovering"
+                ],
+                "type": "string"
+              },
+              "sessionRef": {
+                "additionalProperties": false,
+                "properties": {
+                  "provider": {
+                    "type": "string"
+                  },
+                  "sessionId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "provider",
+                  "sessionId"
+                ],
+                "type": "object"
+              },
+              "status": {
+                "enum": [
+                  "running",
+                  "exited"
+                ],
+                "type": "string"
+              },
+              "terminalId": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "createdAt",
+              "lastActivityAt",
+              "mode",
+              "status",
+              "terminalId",
+              "title"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "terminal.inventory",
+          "type": "string"
+        }
+      },
+      "required": [
+        "bootId",
+        "terminalMeta",
+        "terminals",
+        "type"
+      ],
+      "type": "object"
+    },
+    "terminal.meta.updated": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "remove": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "terminal.meta.updated",
+          "type": "string"
+        },
+        "upsert": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "branch": {
+                "type": "string"
+              },
+              "checkoutRoot": {
+                "type": "string"
+              },
+              "cwd": {
+                "type": "string"
+              },
+              "displaySubdir": {
+                "type": "string"
+              },
+              "isDirty": {
+                "type": "boolean"
+              },
+              "provider": {
+                "type": "string"
+              },
+              "repoRoot": {
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "terminalId": {
+                "type": "string"
+              },
+              "tokenUsage": {
+                "additionalProperties": false,
+                "properties": {
+                  "cachedTokens": {
+                    "type": "number"
+                  },
+                  "compactPercent": {
+                    "type": "number"
+                  },
+                  "compactThresholdTokens": {
+                    "type": "number"
+                  },
+                  "contextTokens": {
+                    "type": "number"
+                  },
+                  "inputTokens": {
+                    "type": "number"
+                  },
+                  "modelContextWindow": {
+                    "type": "number"
+                  },
+                  "outputTokens": {
+                    "type": "number"
+                  },
+                  "totalTokens": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "cachedTokens",
+                  "inputTokens",
+                  "outputTokens",
+                  "totalTokens"
+                ],
+                "type": "object"
+              },
+              "updatedAt": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "terminalId",
+              "updatedAt"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "remove",
+        "type",
+        "upsert"
+      ],
+      "type": "object"
+    },
+    "terminal.output": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "attachRequestId": {
+          "type": "string"
+        },
+        "data": {
+          "type": "string"
+        },
+        "seqEnd": {
+          "type": "number"
+        },
+        "seqStart": {
+          "type": "number"
+        },
+        "source": {
+          "enum": [
+            "live",
+            "replay"
+          ],
+          "type": "string"
+        },
+        "streamId": {
+          "type": "string"
+        },
+        "terminalId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.output",
+          "type": "string"
+        }
+      },
+      "required": [
+        "data",
+        "seqEnd",
+        "seqStart",
+        "streamId",
+        "terminalId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "terminal.output.batch": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "attachRequestId": {
+          "type": "string"
+        },
+        "data": {
+          "type": "string"
+        },
+        "segments": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "barrier": {
+                "enum": [
+                  "control",
+                  "startup_probe",
+                  "osc52",
+                  "request_mode",
+                  "turn_complete",
+                  "gap",
+                  "geometry"
+                ],
+                "type": "string"
+              },
+              "data": {
+                "type": "string"
+              },
+              "endOffset": {
+                "type": "number"
+              },
+              "rawFrameCount": {
+                "type": "number"
+              },
+              "seqEnd": {
+                "type": "number"
+              },
+              "seqStart": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "endOffset",
+              "rawFrameCount",
+              "seqEnd",
+              "seqStart"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "seqEnd": {
+          "type": "number"
+        },
+        "seqStart": {
+          "type": "number"
+        },
+        "serializedBytes": {
+          "type": "number"
+        },
+        "source": {
+          "enum": [
+            "live",
+            "replay"
+          ],
+          "type": "string"
+        },
+        "streamId": {
+          "type": "string"
+        },
+        "terminalId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.output.batch",
+          "type": "string"
+        }
+      },
+      "required": [
+        "attachRequestId",
+        "data",
+        "segments",
+        "seqEnd",
+        "seqStart",
+        "serializedBytes",
+        "source",
+        "streamId",
+        "terminalId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "terminal.output.gap": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "attachRequestId": {
+          "type": "string"
+        },
+        "fromSeq": {
+          "type": "number"
+        },
+        "reason": {
+          "enum": [
+            "queue_overflow",
+            "replay_window_exceeded",
+            "replay_budget_exceeded"
+          ],
+          "type": "string"
+        },
+        "streamId": {
+          "type": "string"
+        },
+        "terminalId": {
+          "type": "string"
+        },
+        "toSeq": {
+          "type": "number"
+        },
+        "type": {
+          "const": "terminal.output.gap",
+          "type": "string"
+        }
+      },
+      "required": [
+        "fromSeq",
+        "reason",
+        "streamId",
+        "terminalId",
+        "toSeq",
+        "type"
+      ],
+      "type": "object"
+    },
+    "terminal.session.associated": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "sessionRef": {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "type": "string"
+            },
+            "sessionId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "sessionId"
+          ],
+          "type": "object"
+        },
+        "terminalId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.session.associated",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionRef",
+        "terminalId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "terminal.status": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "attempt": {
+          "type": "number"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "running",
+            "recovering"
+          ],
+          "type": "string"
+        },
+        "terminalId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "terminalId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "terminal.stream.changed": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "attachRequestId": {
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "new_pty_session",
+            "codex_pty_recovery",
+            "retention_lost",
+            "server_restart_incompatible_retention"
+          ],
+          "type": "string"
+        },
+        "streamId": {
+          "type": "string"
+        },
+        "terminalId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.stream.changed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "streamId",
+        "terminalId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "terminal.title.updated": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "terminalId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.title.updated",
+          "type": "string"
+        }
+      },
+      "required": [
+        "terminalId",
+        "title",
+        "type"
+      ],
+      "type": "object"
+    },
+    "terminal.turn.complete": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "type": "number"
+        },
+        "completionSeq": {
+          "type": "number"
+        },
+        "provider": {
+          "enum": [
+            "codex",
+            "claude",
+            "opencode"
+          ],
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "terminalId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.turn.complete",
+          "type": "string"
+        }
+      },
+      "required": [
+        "at",
+        "completionSeq",
+        "provider",
+        "terminalId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "terminals.changed": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "recoverableTerminalIds": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "revision": {
+          "type": "number"
+        },
+        "type": {
+          "const": "terminals.changed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "revision",
+        "type"
+      ],
+      "type": "object"
+    },
+    "ui.command": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "payload": true,
+        "type": {
+          "const": "ui.command",
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "type"
+      ],
+      "type": "object"
+    }
+  },
+  "source": "shared/ws-protocol.ts",
+  "title": "freshell server→client message shapes — frozen contract",
+  "wsProtocolVersion": 7
+}
