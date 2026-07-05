@@ -1,0 +1,52 @@
+# freshell-opencode — the opencode `serve` HTTP/SSE client CORE (fresh-agent layer B).
+#
+# Additive, faithful port of the opencode serve runtime:
+#   server/fresh-agent/adapters/opencode/{serve-manager,serve-events}.ts
+# plus the opencode slice of shared/fresh-agent-models.ts (model/effort normalize).
+#
+# Carries the DEV-0001 fix (port/oracle/DEVIATIONS.md): the cold-serve health probe
+# is bounded PER PROBE (the reqwest `.timeout()` analog of the reference 2 s
+# AbortController) and retried to the unchanged outer deadline — so a wedged serve
+# fails as the bounded "did not become healthy" error instead of hanging past the
+# deadline (serve-manager.ts:276-297, the un-timed GET at :286 was the bug).
+#
+# All IO is injected behind traits (ProcessSpawner / ServeHttp / EventSource /
+# PortAllocator) so the CORE logic is unit-testable with fakes and NO real serve /
+# NO live API calls. The real reqwest + tokio::process backends live in `transport`
+# behind the (default-off) `real-transport` feature; wiring them live is the next
+# step (T2-over-rust).
+[package]
+name = "freshell-opencode"
+version = "0.1.0"
+description = "opencode `serve` HTTP/SSE client CORE for the freshell Rust port (fresh-agent layer B). Faithful port of server/fresh-agent/adapters/opencode/{serve-manager,serve-events}.ts + the opencode model/effort normalization from shared/fresh-agent-models.ts. Carries the DEV-0001 bounded cold-serve health-probe fix (per-probe timeout + retry-to-deadline, outer deadline unchanged) and its mandatory pinning test. All IO injected behind traits (ProcessSpawner/ServeHttp/EventSource/PortAllocator) for fake-driven, network-free unit tests; the real reqwest/tokio::process backends sit behind the default-off `real-transport` feature."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# The CORE + DEV-0001 fix + parsers are pure/fake-injected and need NO heavy deps.
+# The real reqwest HTTP client, reqwest SSE stream, and tokio::process serve spawn
+# are additive production backends behind this feature (verified to compile; wired
+# live in the next step). Default-off keeps the shared workspace build lean.
+default = []
+real-transport = ["dep:reqwest", "dep:libc", "tokio/process", "tokio/io-util"]
+
+[dependencies]
+# Dynamic JSON parsing that mirrors the TS `Record<string, unknown>` event/property
+# model (JSON.parse parity, corruption-tolerant). preserve_order matches the object model.
+serde_json = { workspace = true }
+# Async runtime for the bounded health wait, the once-idle select loop, and the
+# broadcast fan-out. `time` = the per-probe timeout + retry sleep (DEV-0001);
+# `sync` = the per-session broadcast emitter + single-flight start mutex.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+# Ownership id minting for the sidecar env tag (randomUUID() in serve-manager.ts:204).
+uuid = { version = "1", features = ["v4"] }
+# Real HTTP client (fetchFn) + SSE byte stream, gated behind `real-transport`. The
+# serve sidecar is always loopback plain-HTTP, so TLS/proxy/http3 default features are
+# disabled to keep the dependency tree (and Cargo.lock) lean — only `stream` (for the
+# SSE `bytes_stream()`) is needed; JSON is parsed via serde_json directly.
+reqwest = { version = "0.13", default-features = false, features = ["stream"], optional = true }
+# Linux /proc ownership reaper: SIGTERM the detached serve listener carrying our
+# FRESHELL_OPENCODE_SIDECAR_ID tag (killOwnedProcesses, serve-manager.ts:599-623). Only
+# needed by the real transport; libc is already in the workspace lock (transitive).
+libc = { version = "0.2", optional = true }

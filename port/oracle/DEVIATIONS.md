@@ -64,8 +64,10 @@ Every entry requires:
   {blocks past deadline | throws "did not become healthy"} vs port {healthy within `healthTimeoutMs`}.
   The port is NOT required to reproduce the original's cold-start block; every other opencode T2
   invariant must still match.
-- **pinning_test (REQUIRED — does not exist yet):** port-side test that injects a `fetchFn` whose
-  `/global/health` never resolves, drives `ensureStarted()`, and asserts it settles within the deadline
+- **pinning_test (SATISFIED — Phase 3.6, `crates/freshell-opencode/tests/serve_health_bounded.rs`, 3 tests
+  RED→GREEN: never-resolving health settles-not-hangs + stall-then-succeed resolves + healthy stays fast):**
+  port-side test that injects a health source whose
+  `/global/health` never resolves, drives the readiness wait, and asserts it settles within the deadline
   (rejects with the bounded "did not become healthy" message, i.e. the loop advanced) rather than
   hanging; plus a companion where the probe stalls on the first N attempts then succeeds, asserting
   `ensureStarted()` resolves. Target: the port's opencode serve-manager suite
