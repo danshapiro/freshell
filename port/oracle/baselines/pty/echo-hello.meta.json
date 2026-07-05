@@ -1,0 +1,18 @@
+{
+  "scenario": "echo-hello",
+  "description": "single fixed-string line via printf",
+  "shell": "system",
+  "mode": "shell",
+  "resolvedShellArgv": [
+    "/bin/bash",
+    "-l"
+  ],
+  "inputLines": [
+    "printf 'hello\\n'"
+  ],
+  "cols": 120,
+  "rows": 30,
+  "reassembledLength": 1458,
+  "byteLength": 7,
+  "sha256": "cd2eca3535741f27a8ae40c31b0c41d4057a7a7b912b33b9aed86485d1c84676"
+}

@@ -56,10 +56,12 @@ phases:
          treat zod parse as inbound authority, JSON Schema as shape contract."
       - "opaque blobs (model as serde_json::Value, exclude from byte-diff): Usage.passthrough,
          record(string,unknown) layouts/tool_use.input/decision/fork.input, tool_result.content, codingcli/freshAgent event"
-      - "NEXT: build normalization layer for nondeterministic boundary fields (ids/timestamps/ports/
-         session-ids/paths/bootId per port/contract/nondeterministic-fields.md) — shared by T0/T1;
-         prerequisite for persisting stable golden transcripts for old-vs-new diffing"
-      - build PTY byte-stream golden-capture harness against ORIGINAL (node-pty real; drive fixed shell cmds)
+      - "DONE: normalization layer (port/oracle/harness/normalize.ts) — stable per-family placeholders,
+         cross-ref-preserving, idempotent; 25 unit + LIVE two-boot determinism (handshake normalizes
+         deep-equal across fresh boots). Findings: added `token` opaque; bootId identical across
+         ready+terminal.inventory (port MUST preserve); ready.timestamp ISO; ready always emits srv+boot ids."
+      - "NEXT (in progress): PTY byte-stream golden-capture harness against ORIGINAL (node-pty real;
+         drive fixed shell cmds via terminal.create/input; reassemble stream by seq; two-boot determinism)"
       - capture + persist T0/T1 golden baselines FROM ORIGINAL (transcripts normalized)
       - wire T2 live-invariant harness (Kimi/Haiku/GPT-mini) + make ORIGINAL's live provider suite pass
       - validate whole oracle by mutation testing against ORIGINAL (must catch injected divergence)
