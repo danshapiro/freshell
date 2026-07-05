@@ -9,6 +9,7 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import cookieParser from 'cookie-parser'
 import rateLimit from 'express-rate-limit'
+import chokidar from 'chokidar'
 import { logger, resolveRuntimeLogLevel, setLogLevel } from './logger.js'
 import { requestLogger } from './request-logger.js'
 import { validateStartupSecurity, httpAuthMiddleware } from './auth.js'
@@ -100,6 +101,37 @@ function compileArgTemplate(
 ): ((value: string) => string[]) | undefined {
   if (!template) return undefined
   return (value: string) => template.map((arg) => arg.replaceAll(placeholder, value))
+}
+
+// Build the CLI spawn table from CLI-category extension manifests.
+// Pure over the manager's current registry; used at startup and by the dev
+// hot-reload watcher to hot-swap the spawn table without a restart.
+function buildCliCommandsMap(extensionManager: ExtensionManager): Map<string, CodingCliCommandSpec> {
+  const cliCommandsMap = new Map<string, CodingCliCommandSpec>()
+  for (const ext of extensionManager.getAll()) {
+    if (ext.manifest.category !== 'cli' || !ext.manifest.cli) continue
+    const cli = ext.manifest.cli
+    const spec: CodingCliCommandSpec = {
+      label: ext.manifest.label,
+      envVar: cli.envVar || '',
+      defaultCommand: cli.command,
+      args: cli.args,
+      env: cli.env,
+      modelArgs: compileArgTemplate(cli.modelArgs, '{{model}}'),
+      sandboxArgs: compileArgTemplate(cli.sandboxArgs, '{{sandbox}}'),
+      permissionModeArgs: compileArgTemplate(cli.permissionModeArgs, '{{permissionMode}}'),
+      createSessionArgs: compileArgTemplate(cli.createSessionArgs, '{{sessionId}}'),
+      permissionModeEnvVar: cli.permissionModeEnvVar,
+      permissionModeEnvValues: cli.permissionModeValues,
+    }
+    if (cli.resumeArgs) {
+      const template = cli.resumeArgs
+      spec.resumeArgs = (sessionId: string) =>
+        template.map(arg => arg.replace('{{sessionId}}', sessionId))
+    }
+    cliCommandsMap.set(ext.manifest.name, spec)
+  }
+  return cliCommandsMap
 }
 
 const __filename = fileURLToPath(import.meta.url)
@@ -231,31 +263,7 @@ async function main() {
   extensionManager.scan([userExtDir, localExtDir, builtinExtDir])
 
   // Build CLI commands from extension manifests
-  const cliCommandsMap = new Map<string, CodingCliCommandSpec>()
-  for (const ext of extensionManager.getAll()) {
-    if (ext.manifest.category !== 'cli' || !ext.manifest.cli) continue
-    const cli = ext.manifest.cli
-    const spec: CodingCliCommandSpec = {
-      label: ext.manifest.label,
-      envVar: cli.envVar || '',
-      defaultCommand: cli.command,
-      args: cli.args,
-      env: cli.env,
-      modelArgs: compileArgTemplate(cli.modelArgs, '{{model}}'),
-      sandboxArgs: compileArgTemplate(cli.sandboxArgs, '{{sandbox}}'),
-      permissionModeArgs: compileArgTemplate(cli.permissionModeArgs, '{{permissionMode}}'),
-      createSessionArgs: compileArgTemplate(cli.createSessionArgs, '{{sessionId}}'),
-      permissionModeEnvVar: cli.permissionModeEnvVar,
-      permissionModeEnvValues: cli.permissionModeValues,
-    }
-    if (cli.resumeArgs) {
-      const template = cli.resumeArgs
-      spec.resumeArgs = (sessionId: string) =>
-        template.map(arg => arg.replace('{{sessionId}}', sessionId))
-    }
-    cliCommandsMap.set(ext.manifest.name, spec)
-  }
-  registerCodingCliCommands(cliCommandsMap)
+  registerCodingCliCommands(buildCliCommandsMap(extensionManager))
 
   // Build CLI detection specs from extension manifests
   const cliDetectionSpecs: CliDetectionSpec[] = extensionManager.getAll()
@@ -440,6 +448,56 @@ async function main() {
   extensionManager.on('server.error', ({ name, error }: { name: string; error: string }) => {
     wsHandler.broadcast({ type: 'extension.server.error', name, error })
   })
+
+  // DEV ONLY: hot-reload extension manifests. Watches the three extension dirs
+  // for freshell.json changes and live re-scans — refreshing the CLI spawn
+  // table, the WS mode validator, and the client registry — WITHOUT dropping
+  // panes or requiring a page reload. Gated by isDev so prod never builds it.
+  let extWatcher: chokidar.FSWatcher | undefined
+  if (isDev) {
+    const reloadExtensions = () => {
+      try {
+        // scan() clears the registry first, so this is a full re-scan.
+        extensionManager.scan([userExtDir, localExtDir, builtinExtDir])
+        const cliCommandsMap = buildCliCommandsMap(extensionManager)
+        registerCodingCliCommands(cliCommandsMap)
+        wsHandler.refreshExtensionModes()
+        wsHandler.broadcast({
+          type: 'extensions.registry',
+          extensions: extensionManager.toClientRegistry(),
+        })
+        console.log(`[dev] reloaded extensions (${cliCommandsMap.size} cli)`)
+      } catch (err) {
+        // A malformed manifest must not crash the dev server.
+        logger.warn({ err }, '[dev] extension reload failed')
+      }
+    }
+
+    let reloadTimer: ReturnType<typeof setTimeout> | undefined
+    const scheduleReload = () => {
+      if (reloadTimer) clearTimeout(reloadTimer)
+      reloadTimer = setTimeout(reloadExtensions, 300)
+    }
+
+    // Watch the extension DIRS (not a file glob) so both manifest edits and
+    // whole-dir add/remove (e.g. `rm -rf extensions/foo`) reliably re-scan.
+    const extDirs = [userExtDir, localExtDir, builtinExtDir]
+    const onFileEvent = (changed: string) => {
+      if (changed.endsWith('freshell.json')) scheduleReload()
+    }
+    extWatcher = chokidar.watch(extDirs, {
+      ignoreInitial: true,
+      depth: 3,
+      ignored: /(^|[/\\])node_modules([/\\]|$)/,
+    })
+    extWatcher.on('add', onFileEvent)
+    extWatcher.on('change', onFileEvent)
+    extWatcher.on('unlink', onFileEvent)
+    extWatcher.on('unlinkDir', scheduleReload)
+    extWatcher.on('error', (err) => logger.warn({ err }, '[dev] extension watcher error'))
+    // console.log (not pino) so the notice is visible in the dev terminal.
+    console.log(`[dev] hot-reloading extension manifests under: ${extDirs.join(', ')}`)
+  }
 
   const sessionsSync = new SessionsSyncService(wsHandler)
   const associationCoordinator = new SessionAssociationCoordinator(registry, ASSOCIATION_MAX_AGE_MS)
@@ -1048,6 +1106,9 @@ async function main() {
 
     // 9. Stop session indexer
     await codingCliIndexer.stop()
+
+    // 9a. Stop the DEV extension-manifest watcher (undefined in production)
+    await extWatcher?.close()
 
     // 9b. Stop Codex activity tracker listeners and sweep timer
     codexActivity.dispose()
