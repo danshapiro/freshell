@@ -58,6 +58,14 @@ export interface StartExternalServerOptions {
   verbose?: boolean
   /** Extra env vars to inject into the spawned server. */
   env?: Record<string, string>
+  /**
+   * Hook to populate the server's ISOLATED HOME before it boots (and before it
+   * lazily spawns any coding-CLI sidecars). Used by T2 to seed provider auth
+   * (e.g. copy the user's opencode auth.json into `<HOME>/.local/share/opencode`)
+   * so the isolated server can make a real provider call while writing all
+   * session data into the temp HOME — never the user's real store.
+   */
+  setupHome?: (homeDir: string) => Promise<void>
 }
 
 export function serverEntryPath(root: string = PROJECT_ROOT): string {
@@ -130,6 +138,7 @@ export async function startExternalServer(
     runtimeRootMode: 'isolated',
     startTimeoutMs: options.startTimeoutMs ?? 60_000,
     verbose: options.verbose ?? false,
+    ...(options.setupHome ? { setupHome: options.setupHome } : {}),
     env: {
       // Force loopback: WSL servers default to 0.0.0.0. TestServer already sets
       // this, but we assert it here too so the harness is self-documenting.

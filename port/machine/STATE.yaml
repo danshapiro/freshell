@@ -60,8 +60,26 @@ phases:
          cross-ref-preserving, idempotent; 25 unit + LIVE two-boot determinism (handshake normalizes
          deep-equal across fresh boots). Findings: added `token` opaque; bootId identical across
          ready+terminal.inventory (port MUST preserve); ready.timestamp ISO; ready always emits srv+boot ids."
-      - "NEXT (in progress): PTY byte-stream golden-capture harness against ORIGINAL (node-pty real;
-         drive fixed shell cmds via terminal.create/input; reassemble stream by seq; two-boot determinism)"
+      - "DONE: PTY byte-stream golden capture (T1) — real node-pty over WS, sentinel-bounded,
+         seq-reassembled; two-boot byte-identical for 4 scenarios; committed baselines under
+         port/oracle/baselines/pty/*.golden (sha256-pinned, host-specific /bin/bash -l). Oracle 21/21.
+         Safety check MUST be ownership-based (probe sentinel / isolated cwd) — naive pgrep self-matches."
+      - "PARTIAL: T2 scaffolding landed — invariants grader (port/oracle/harness/invariants.ts, 20/20 unit),
+         t2-live opencode/Kimi harness + auth-seeding (external-server setupHome passthrough), gated live test.
+         Live opencode/Kimi turn reached Kimi with SEEDED auth writing to an ISOLATED opencode.db (user store
+         untouched) — proving the cred-seed + isolation path works."
+      - "ANTAGONIST VERDICT (DEV-0001, session ...670a1870): the builder had patched the ORIGINAL
+         serve-manager.ts (un-timed cold-serve health probe) to get T2 green. REJECTED as a governance breach
+         (never mutate the reference baseline to pass a new harness) — REVERTED to pristine; original 49/49 green.
+         Defect classification ACCEPTED: the PORT will bound the health probe; ledgered as DEV-0001."
+      - "T2-opencode is BLOCKED, not done. Conditions (from DEV-0001): (1) original stays pristine [done];
+         (2) capture the T2 baseline via a WARM opencode-serve sidecar, not by mutating the original;
+         (3) PIN the real stall first (turnAccepted=false persisted even with the patch — the deeper
+         never-flips-to-idle / createSession stall must be proven, not masked by the health fix);
+         (4) implement the bounded probe in the PORT with a red→green pinning test.
+         Harden the live test to FAIL (not skip) on turnAccepted=false so it can never false-green."
+      - "NEXT: T2 warm-sidecar rework per DEV-0001 conditions; THEN extend to claude/Haiku + codex/GPT-mini.
+         Creds for claude/codex/opencode present; Gemini OUT."
       - capture + persist T0/T1 golden baselines FROM ORIGINAL (transcripts normalized)
       - wire T2 live-invariant harness (Kimi/Haiku/GPT-mini) + make ORIGINAL's live provider suite pass
       - validate whole oracle by mutation testing against ORIGINAL (must catch injected divergence)
