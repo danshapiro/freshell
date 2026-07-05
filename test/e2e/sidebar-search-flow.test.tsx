@@ -695,4 +695,94 @@ describe('sidebar search flow (e2e)', () => {
     // Browse session visible
     expect(screen.getByText('Browse Session')).toBeInTheDocument()
   })
+
+  it('scrolling an active search appends the next page of SEARCH results via the stored cursor', async () => {
+    const page1Projects: ProjectGroup[] = [{
+      projectPath: '/repo',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-page1',
+        projectPath: '/repo',
+        lastActivityAt: 2_000,
+        title: 'Widget One',
+      }],
+    }]
+
+    // Page 2 of the SEARCH results (returned when the sidebar paginates the query).
+    vi.mocked(mockSearchSessions).mockResolvedValue({
+      results: [{
+        sessionId: 'session-page2',
+        provider: 'claude',
+        projectPath: '/repo',
+        title: 'Widget Fifty One',
+        matchedIn: 'title',
+        lastActivityAt: 1_000,
+        archived: false,
+      }],
+      tier: 'title',
+      query: 'widget',
+      totalScanned: 1,
+      nextCursor: null,
+      hasMore: false,
+    } as any)
+
+    const store = createStore({
+      projects: page1Projects,
+      sessions: {
+        activeSurface: 'sidebar',
+        projects: page1Projects,
+        lastLoadedAt: 1_700_000_000_000,
+        windows: {
+          sidebar: {
+            projects: page1Projects,
+            lastLoadedAt: 1_700_000_000_000,
+            loading: false,
+            hasMore: true,
+            searchCursor: 'cursor-page-2',
+            query: 'widget',
+            searchTier: 'title',
+            appliedQuery: 'widget',
+            appliedSearchTier: 'title',
+            oldestLoadedTimestamp: 2_000,
+            oldestLoadedSessionId: 'claude:session-page1',
+          },
+        },
+      },
+    })
+
+    renderSidebar(store)
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+      await Promise.resolve()
+    })
+
+    // Page 1 search result visible; no initial network calls (already applied).
+    expect(screen.getByText('Widget One')).toBeInTheDocument()
+    expect(mockSearchSessions).not.toHaveBeenCalled()
+
+    // Simulate the sidebar list being scrolled near the bottom.
+    const list = screen.getByTestId('sidebar-session-list')
+    Object.defineProperty(list, 'clientHeight', { configurable: true, value: 500 })
+    Object.defineProperty(list, 'scrollHeight', { configurable: true, value: 3_000 })
+    list.scrollTop = 2_600
+
+    await act(async () => {
+      fireEvent.scroll(list)
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    // The sidebar paginated the SEARCH (not the unfiltered browse list) using the stored cursor.
+    expect(mockFetchSnapshot).not.toHaveBeenCalled()
+    expect(mockSearchSessions).toHaveBeenCalledWith(expect.objectContaining({
+      query: 'widget',
+      tier: 'title',
+      cursor: 'cursor-page-2',
+    }))
+
+    // Page 2 results appended while page 1 remains.
+    expect(screen.getByText('Widget Fifty One')).toBeInTheDocument()
+    expect(screen.getByText('Widget One')).toBeInTheDocument()
+  })
 })

@@ -464,6 +464,10 @@ export type SearchResponse = {
   tier: 'title' | 'userMessages' | 'fullText'
   query: string
   totalScanned: number
+  /** Opaque cursor for the next page of matches, or null when the last page was returned. */
+  nextCursor: string | null
+  /** True when the server has additional matches beyond this page (nextCursor is non-null). */
+  hasMore: boolean
   partial?: boolean
   partialReason?: 'budget' | 'io_error'
 }
@@ -473,6 +477,8 @@ export type SearchOptions = {
   tier?: 'title' | 'userMessages' | 'fullText'
   limit?: number
   maxFiles?: number
+  /** Opaque cursor from a previous SearchResponse.nextCursor, used to fetch the next page. */
+  cursor?: string
   signal?: AbortSignal
   includeSubagents?: boolean
   includeNonInteractive?: boolean
@@ -578,12 +584,13 @@ export async function fetchSidebarSessionsSnapshot(options: {
 }
 
 export async function searchSessions(options: SearchOptions): Promise<SearchResponse> {
-  const { query, tier = 'title', limit, signal, includeSubagents, includeNonInteractive, includeEmpty } = options
+  const { query, tier = 'title', limit, cursor, signal, includeSubagents, includeNonInteractive, includeEmpty } = options
   const page = SessionDirectoryPageSchema.parse(await getSessionDirectoryPage({
     priority: 'visible',
     query,
     tier,
     ...(limit ? { limit } : {}),
+    ...(cursor ? { cursor } : {}),
     includeSubagents,
     includeNonInteractive,
     includeEmpty,
@@ -615,6 +622,8 @@ export async function searchSessions(options: SearchOptions): Promise<SearchResp
     tier,
     query,
     totalScanned: page.items.length,
+    nextCursor: page.nextCursor,
+    hasMore: page.nextCursor !== null,
   }
 
   if (page.partial) {

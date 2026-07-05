@@ -97,6 +97,10 @@ function sessionKey(session: { provider?: string; sessionId: string }) {
   return `${session.provider || 'claude'}:${session.sessionId}`
 }
 
+function countSessions(projects: ProjectGroup[]): number {
+  return projects.reduce((total, project) => total + (project.sessions?.length ?? 0), 0)
+}
+
 /**
  * Merge Phase 1 (title) and Phase 2 (deep) search results.
  * Deep results overwrite title results for the same session key (provider:sessionId).
@@ -274,7 +278,12 @@ function buildSearchPayload(
   query: string,
   searchTier: SearchOptions['tier'],
   deepSearchPending: boolean,
-  opts?: { partial?: boolean; partialReason?: 'budget' | 'io_error' },
+  opts?: {
+    partial?: boolean
+    partialReason?: 'budget' | 'io_error'
+    hasMore?: boolean
+    searchCursor?: string | null
+  },
 ) {
   const last = results.at(-1)
   return {
@@ -283,7 +292,8 @@ function buildSearchPayload(
     totalSessions: results.length,
     oldestLoadedTimestamp: last?.lastActivityAt ?? 0,
     oldestLoadedSessionId: last ? `${last.provider}:${last.sessionId}` : '',
-    hasMore: false,
+    hasMore: opts?.hasMore ?? false,
+    searchCursor: opts?.searchCursor ?? undefined,
     query,
     searchTier,
     deepSearchPending,
@@ -486,6 +496,46 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
 
       try {
         if (trimmedQuery) {
+          if (append) {
+            // Search pagination: continue the active query from the stored
+            // cursor and append the next page, mirroring the plain-list append.
+            const searchCursor = windowState?.searchCursor
+            if (!searchCursor) {
+              // No further pages to load; drop the pagination loading state
+              // and keep the currently committed results untouched.
+              dispatch(setSessionWindowLoading({
+                surface,
+                loading: false,
+                query: trimmedQuery,
+                searchTier,
+              }))
+              return
+            }
+
+            const response = await searchSessions({
+              query: trimmedQuery,
+              tier: searchTier,
+              cursor: searchCursor,
+              signal: controller.signal,
+              ...visibilityOpts,
+            })
+            if (controller.signal.aborted) return
+
+            const pagePayload = buildSearchPayload(surface, response.results, trimmedQuery, searchTier, false, {
+              partial: response.partial,
+              partialReason: response.partialReason,
+              hasMore: response.hasMore,
+              searchCursor: response.nextCursor,
+            })
+            const mergedProjects = mergeProjects(windowState?.projects ?? [], pagePayload.projects)
+            dispatch(commitSessionWindowReplacement({
+              ...pagePayload,
+              projects: mergedProjects,
+              totalSessions: countSessions(mergedProjects),
+            }))
+            return
+          }
+
           if (searchTier !== 'title') {
             // Two-phase search: Phase 1 (title) then Phase 2 (deep)
             const titleResponse = await searchSessions({
@@ -536,6 +586,8 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
             dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, response.results, trimmedQuery, searchTier, false, {
               partial: response.partial,
               partialReason: response.partialReason,
+              hasMore: response.hasMore,
+              searchCursor: response.nextCursor,
             })))
           }
           return
