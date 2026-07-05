@@ -215,6 +215,7 @@ function applyOverride(
     summary: ov?.summaryOverride || session.summary,
     createdAt: ov?.createdAtOverride ?? session.createdAt,
     archived: ov?.archived ?? session.archived ?? false,
+    titleSource,
   }
 }
 

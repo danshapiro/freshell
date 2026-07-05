@@ -2029,6 +2029,24 @@ describe('CodingCliSessionIndexer', () => {
       expect(indexer.getProjects()[0]?.sessions[0]?.title).toBe('Auth Redirect Fix')
     })
 
+    it('projects the parsed provider-generated title source onto the session', async () => {
+      const fileA = path.join(tempDir, 'session-title-source-projection.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
+
+      const provider = makeProvider([fileA], {
+        parseSessionFile: async () => ({
+          cwd: '/project/a',
+          title: 'Auth Redirect Fix',
+          titleSource: 'provider-generated',
+        }),
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+
+      expect(indexer.getProjects()[0]?.sessions[0]?.titleSource).toBe('provider-generated')
+    })
+
     it('keeps a finalized ai override ahead of a provider-generated parsed title', async () => {
       const fileA = path.join(tempDir, 'session-ai-title.jsonl')
       await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')

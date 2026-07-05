@@ -175,6 +175,7 @@ export interface CodingCliSession {
   archived?: boolean
   messageCount?: number
   title?: string
+  titleSource?: ParsedSessionTitleSource
   summary?: string
   firstUserMessage?: string
   cwd?: string
