@@ -1,0 +1,55 @@
+# freshell-codex — the codex `app-server` JSON-RPC/WS client CORE (fresh-agent layer B).
+#
+# Additive, faithful port of the codex app-server runtime + the codex fresh-agent adapter:
+#   server/coding-cli/codex-app-server/{protocol,client}.ts   (JSON-RPC 2.0 over WS)
+#   server/fresh-agent/adapters/codex/adapter.ts              (status-guarded completion)
+#   the codex slice of shared/fresh-agent-models.ts           (model/effort normalize)
+#
+# Carries the DEV-0003 REJECTION (port/oracle/DEVIATIONS.md) with ZERO tolerance: codex
+# reasoning-effort `none`/`minimal` are FORWARDED VERBATIM on `turn/start` (protocol.ts:26,
+# adapter.ts:130-131) — the port must NOT clamp or map them. Any old-vs-new divergence in
+# codex effort handling is a port defect.
+#
+# All IO is injected behind a trait (`WsTransport`) so the CORE — the JSON-RPC framing,
+# the initialize→initialized handshake, thread/turn drive, the notification consumer, and
+# the STATUS-GUARDED completion edge — is unit-testable with fakes driven by the committed
+# fake-app-server's message shapes and NO real app-server / NO live API calls. The real
+# tokio-tungstenite backend lives in `transport` behind the (default-off) `real-transport`
+# feature; wiring it live is the next step (T2-over-rust, 3.8b).
+[package]
+name = "freshell-codex"
+version = "0.1.0"
+description = "codex `app-server` JSON-RPC/WS client CORE for the freshell Rust port (fresh-agent layer B). Faithful port of server/coding-cli/codex-app-server/{protocol,client}.ts + the status-guarded turn completion from server/fresh-agent/adapters/codex/adapter.ts + the codex model/effort normalization from shared/fresh-agent-models.ts. Honors the DEV-0003 rejection: codex effort none/minimal are forwarded VERBATIM (no clamp). All IO injected behind the WsTransport trait for fake-driven, network-free unit tests; the real tokio-tungstenite backend sits behind the default-off `real-transport` feature."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# The CORE (framing, handshake, completion gating, model/effort normalization, durability
+# id-shapes) is pure/fake-injected and needs NO heavy deps. The real tokio-tungstenite WS
+# client and the Linux /proc ownership reaper are additive production backends behind this
+# feature (verified to compile; wired live in the next step). Default-off keeps the shared
+# workspace build lean.
+default = []
+real-transport = ["dep:tokio-tungstenite", "dep:futures-util", "dep:libc", "tokio/net", "tokio/io-util"]
+
+[dependencies]
+# Dynamic JSON parsing that mirrors the TS `Record<string, unknown>` params/result model
+# (JSON.parse parity, corruption-tolerant). preserve_order matches the wire object model.
+serde_json = { workspace = true }
+# Async runtime for the request/response correlation (oneshot pending map), the background
+# notification consumer (mpsc), the bounded request timeout (`time`), and the single-flight
+# initialize guard (`sync`). No live IO in the CORE — the transport is injected.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+# Codex thread/ownership id minting (UUID) — the app-server thread id is a UUID and the
+# sidecar ownership tag is `codex-sidecar-<uuid>` (runtime.ts:924).
+uuid = { version = "1", features = ["v4"] }
+# Real WS client (the `ws` transport, client.ts:1) + its stream combinators, gated behind
+# `real-transport`. The app-server listener is always loopback plain-WS, so no TLS features
+# are pulled — keeps the dependency tree (and Cargo.lock) lean.
+tokio-tungstenite = { version = "0.24", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
+# Linux /proc ownership reaper: SIGTERM the detached app-server carrying our
+# FRESHELL_CODEX_SIDECAR_ID tag (runtime.ts:494) so no orphan survives (the oracle
+# `ownership.cleanup` invariant). Only needed by the real transport.
+libc = { version = "0.2", optional = true }
