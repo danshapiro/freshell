@@ -78,8 +78,17 @@ phases:
          never-flips-to-idle / createSession stall must be proven, not masked by the health fix);
          (4) implement the bounded probe in the PORT with a red→green pinning test.
          Harden the live test to FAIL (not skip) on turnAccepted=false so it can never false-green."
-      - "NEXT: T2 warm-sidecar rework per DEV-0001 conditions; THEN extend to claude/Haiku + codex/GPT-mini.
-         Creds for claude/codex/opencode present; Gemini OUT."
+      - "DIAGNOSIS (debugger session ...45c78005, 2 live calls, notes: port/oracle/notes/t2-opencode-stall.md):
+         real stall PINNED = DEV-0001 alone (un-timed health probe, serve-manager.ts:286) → turnAccepted=false.
+         Antagonist's 'deeper stall' REFUTED: createSession+persist fine (532ms/2ms); 'never emits idle' is
+         FALSE — opencode 1.17.13 emits session.idle + session.status{idle} ~5s; adapter onceIdle handles it.
+         Exp5b GOLD: warming the serve via OPENCODE_CMD warm-proxy (ZERO source mutation) → full turn completes
+         through PRISTINE freshell (send-keys 200 {idle}, durable ses_, reply persisted). No 2nd deviation needed."
+      - "NEXT (rework, now de-risked): (1) t2-live.ts warms serve via OPENCODE_CMD warm-proxy (ownership-tagged,
+         reaped) so pristine freshell drives end-to-end; (2) detect completion via the idle edge — INVERT the
+         serverReportedIdle-expected-false assertions in invariants.ts; (3) harden the live test to FAIL (not
+         skip) on turnAccepted=false; (4) capture the opencode T2 baseline observation. THEN claude/Haiku +
+         codex/GPT-mini. Creds for claude/codex/opencode present; Gemini OUT."
       - capture + persist T0/T1 golden baselines FROM ORIGINAL (transcripts normalized)
       - wire T2 live-invariant harness (Kimi/Haiku/GPT-mini) + make ORIGINAL's live provider suite pass
       - validate whole oracle by mutation testing against ORIGINAL (must catch injected divergence)
