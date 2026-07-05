@@ -1,0 +1,112 @@
+{
+  "note": "Representative handshake snapshot for the oracle DATA-LEVEL mutation suite. Captured once from the ORIGINAL node server via port/oracle/harness. Regenerate with: npx tsx port/oracle/fixtures/generate-handshake-fixture.ts",
+  "capturedAt": "2026-07-05T04:20:52.619Z",
+  "wsProtocolVersion": 7,
+  "serverMessageTypes": [
+    "ready",
+    "settings.updated",
+    "perf.logging",
+    "terminal.inventory"
+  ],
+  "transcript": [
+    {
+      "dir": "out",
+      "type": "hello",
+      "raw": "{\"type\":\"hello\",\"token\":\"ad6493f2-bafc-4501-9da8-1be352164d82\",\"protocolVersion\":7}",
+      "parsed": {
+        "type": "hello",
+        "token": "ad6493f2-bafc-4501-9da8-1be352164d82",
+        "protocolVersion": 7
+      }
+    },
+    {
+      "dir": "in",
+      "type": "ready",
+      "raw": "{\"type\":\"ready\",\"timestamp\":\"2026-07-05T04:20:52.546Z\",\"serverInstanceId\":\"srv-c0f517cc-87ca-42dd-8ed8-c6a19c64a6a7\",\"bootId\":\"boot-e5b76607-9e87-4895-91c3-725e38e914b6\"}",
+      "parsed": {
+        "type": "ready",
+        "timestamp": "2026-07-05T04:20:52.546Z",
+        "serverInstanceId": "srv-c0f517cc-87ca-42dd-8ed8-c6a19c64a6a7",
+        "bootId": "boot-e5b76607-9e87-4895-91c3-725e38e914b6"
+      }
+    },
+    {
+      "dir": "in",
+      "type": "settings.updated",
+      "raw": "{\"type\":\"settings.updated\",\"settings\":{\"logging\":{\"debug\":false},\"safety\":{\"autoKillIdleMinutes\":15},\"terminal\":{\"scrollback\":10000},\"panes\":{\"defaultNewPane\":\"ask\"},\"sidebar\":{\"excludeFirstChatSubstrings\":[],\"excludeFirstChatMustStart\":false,\"autoGenerateTitles\":true},\"ai\":{},\"codingCli\":{\"enabledProviders\":[\"claude\",\"codex\",\"opencode\"],\"providers\":{\"claude\":{\"permissionMode\":\"default\"},\"codex\":{}},\"mcpServer\":true,\"knownProviders\":[]},\"editor\":{\"externalEditor\":\"auto\"},\"freshAgent\":{\"enabled\":false,\"defaultPlugins\":[],\"providers\":{}},\"extensions\":{\"disabled\":[]},\"network\":{\"host\":\"127.0.0.1\",\"configured\":true}}}",
+      "parsed": {
+        "type": "settings.updated",
+        "settings": {
+          "logging": {
+            "debug": false
+          },
+          "safety": {
+            "autoKillIdleMinutes": 15
+          },
+          "terminal": {
+            "scrollback": 10000
+          },
+          "panes": {
+            "defaultNewPane": "ask"
+          },
+          "sidebar": {
+            "excludeFirstChatSubstrings": [],
+            "excludeFirstChatMustStart": false,
+            "autoGenerateTitles": true
+          },
+          "ai": {},
+          "codingCli": {
+            "enabledProviders": [
+              "claude",
+              "codex",
+              "opencode"
+            ],
+            "providers": {
+              "claude": {
+                "permissionMode": "default"
+              },
+              "codex": {}
+            },
+            "mcpServer": true,
+            "knownProviders": []
+          },
+          "editor": {
+            "externalEditor": "auto"
+          },
+          "freshAgent": {
+            "enabled": false,
+            "defaultPlugins": [],
+            "providers": {}
+          },
+          "extensions": {
+            "disabled": []
+          },
+          "network": {
+            "host": "127.0.0.1",
+            "configured": true
+          }
+        }
+      }
+    },
+    {
+      "dir": "in",
+      "type": "perf.logging",
+      "raw": "{\"type\":\"perf.logging\",\"enabled\":false}",
+      "parsed": {
+        "type": "perf.logging",
+        "enabled": false
+      }
+    },
+    {
+      "dir": "in",
+      "type": "terminal.inventory",
+      "raw": "{\"type\":\"terminal.inventory\",\"bootId\":\"boot-e5b76607-9e87-4895-91c3-725e38e914b6\",\"terminals\":[],\"terminalMeta\":[]}",
+      "parsed": {
+        "type": "terminal.inventory",
+        "bootId": "boot-e5b76607-9e87-4895-91c3-725e38e914b6",
+        "terminals": [],
+        "terminalMeta": []
+      }
+    }
+  ]
+}
