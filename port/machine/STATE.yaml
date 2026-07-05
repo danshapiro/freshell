@@ -8,7 +8,13 @@ worktree: .worktrees/rust-tauri-port
 branch: feat/rust-tauri-port
 updated: 2026-07-04
 
-current_phase: 0                 # 0=oracle bootstrap, 1=understand, 2=architect, 3=port, 4=self-qa, 5=converge
+current_phase: 1                 # 0=oracle bootstrap, 1=understand, 2=architect, 3=port, 4=self-qa, 5=converge
+# PHASE 0 COMPLETE (2026-07-05): oracle T0 (protocol conformance), T1 (PTY byte goldens),
+# T2 (opencode/Kimi + claude/Haiku + codex/GPT all green), T3 (e2e/visual baseline 122/138,
+# 6/7 visual, red==red honest) — all vs PRISTINE original; mutation-validated (28/28 caught,
+# e2e RED->GREEN). Deviations: DEV-0001 (opencode cold-serve probe, accepted, port-side),
+# DEV-0002 (freshclaude chokidar process-crash, accepted, port-side liveness test),
+# DEV-0003 (codex effort, REJECTED). Original source never mutated across the whole phase.
 
 # --- Confirmed user constraints (this run) ---------------------------------
 constraints:
@@ -123,7 +129,7 @@ phases:
       - oracle detects every injected mutation in the original
       - original passes T0–T3 (T2 with cheapest-model matrix: Kimi/Haiku/GPT-mini)
       - every old-vs-new diff resolves to EQUIVALENT or a ledgered DELIBERATE_FIX
-  1_understand:  { status: pending, bundle: parallax-discovery, targets: [terminal-registry, coding-cli parsers, platform/windows glue, electron->tauri] }
+  1_understand:  { status: in_progress, bundle: parallax-discovery, targets: [terminal-registry(IN PROGRESS), coding-cli parsers, platform/windows glue, electron->tauri], output: port/machine/specs/*.md }
   2_architect:   { status: pending, bundle: systems-design, output: port/machine/architecture-spec.md (freeze) }
   3_port:        { status: pending, bundle: dev-machine, order: [protocol, terminal, api+ws, harness, llm+platform+tauri] }
   4_self_qa:     { status: pending, bundle: self-driving }
