@@ -29,6 +29,8 @@ import { claudeProvider } from './coding-cli/providers/claude.js'
 import { codexProvider } from './coding-cli/providers/codex.js'
 import { opencodeProvider } from './coding-cli/providers/opencode.js'
 import { amplifierProvider } from './coding-cli/providers/amplifier.js'
+import { overrideKeysToClear } from './coding-cli/provider-title-cleanup.js'
+import type { CodingCliProvider } from './coding-cli/provider.js'
 import { makeSessionKey, type CodingCliProviderName, type CodingCliSession } from './coding-cli/types.js'
 import { computeSessionTitleSync } from './auto-title.js'
 import { generateAiSessionTitle } from './ai-title.js'
@@ -232,7 +234,7 @@ async function main() {
   }))
   app.use('/api', createClientLogsRouter())
 
-  const codingCliProviders = [claudeProvider, codexProvider, opencodeProvider, amplifierProvider]
+  const codingCliProviders: CodingCliProvider[] = [claudeProvider, codexProvider, opencodeProvider, amplifierProvider]
   const freshellConfigDir = getFreshellConfigDir()
   const sessionMetadataStore = new SessionMetadataStore(freshellConfigDir)
   const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders, {}, sessionMetadataStore)
@@ -972,10 +974,27 @@ async function main() {
       {},
       { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
     )
-      .then(() => {
+      .then(async () => {
         sessionRepairService.setFilePathResolver((id) => codingCliIndexer.getFilePathForSession(id, 'claude'))
         startupState.markReady('codingCliIndexer')
         logger.info({ task: 'codingCliIndexer' }, 'Startup task ready')
+
+        // One-time cleanup: drop auto-written (non-user) title overrides that
+        // shadow an authoritative provider-generated title (e.g. Amplifier's own
+        // AI name). Keyed on provider capability so it never depends on live
+        // enrichment; runs once after the first full index, not on every refresh.
+        if (!(await configStore.isMigrationDone('ai-title-shadow-cleanup'))) {
+          const authoritative = new Set<string>(
+            codingCliProviders.filter((p) => p.providesAuthoritativeTitle?.()).map((p) => p.name),
+          )
+          const snap = await configStore.snapshot()
+          const keys = overrideKeysToClear(snap.sessionOverrides ?? {}, authoritative)
+          for (const key of keys) {
+            await configStore.patchSessionOverride(key, { titleOverride: undefined, titleSource: undefined })
+          }
+          await configStore.markMigrationDone('ai-title-shadow-cleanup')
+          if (keys.length) await codingCliIndexer.refresh()
+        }
       })
       .catch((err) => {
         logger.error({ err }, 'Coding CLI indexer failed to start')

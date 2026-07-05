@@ -33,4 +33,11 @@ export interface CodingCliProvider {
 
   supportsLiveStreaming(): boolean
   supportsSessionResume(): boolean
+
+  /**
+   * Whether this provider always generates its own authoritative session title
+   * (e.g. Amplifier AI-names every session). Used by the one-time title-shadow
+   * cleanup to identify overrides that should yield to the provider title.
+   */
+  providesAuthoritativeTitle?(): boolean
 }

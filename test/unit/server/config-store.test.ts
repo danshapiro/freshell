@@ -934,6 +934,33 @@ describe('ConfigStore', () => {
       expect(result.titleOverride).toBe('Updated')
     })
 
+    it('clears title fields while preserving archived when patched with undefined title/source', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      await store.patchSessionOverride('session-1', {
+        titleOverride: 'Shadowing AI Title',
+        titleSource: 'ai',
+        archived: true,
+      })
+
+      const cleared = await store.patchSessionOverride('session-1', {
+        titleOverride: undefined,
+        titleSource: undefined,
+      })
+
+      expect(cleared.titleOverride).toBeUndefined()
+      expect(cleared.titleSource).toBeUndefined()
+      expect(cleared.archived).toBe(true)
+
+      // Survives a reload from disk (undefined fields are dropped on serialize).
+      const reloaded = new ConfigStore()
+      const override = await reloaded.getSessionOverride('session-1')
+      expect(override?.titleOverride).toBeUndefined()
+      expect(override?.titleSource).toBeUndefined()
+      expect(override?.archived).toBe(true)
+    })
+
     it('deleteSession marks session as deleted', async () => {
       const store = new ConfigStore()
       await store.load()
@@ -942,6 +969,31 @@ describe('ConfigStore', () => {
 
       const override = await store.getSessionOverride('session-1')
       expect(override?.deleted).toBe(true)
+    })
+  })
+
+  describe('migration flags', () => {
+    it('isMigrationDone is false until markMigrationDone records the id', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      expect(await store.isMigrationDone('ai-title-shadow-cleanup')).toBe(false)
+
+      await store.markMigrationDone('ai-title-shadow-cleanup')
+
+      expect(await store.isMigrationDone('ai-title-shadow-cleanup')).toBe(true)
+      expect(await store.isMigrationDone('some-other-migration')).toBe(false)
+    })
+
+    it('persists completedMigrations across reloads without duplicating ids', async () => {
+      const store = new ConfigStore()
+      await store.markMigrationDone('ai-title-shadow-cleanup')
+      await store.markMigrationDone('ai-title-shadow-cleanup')
+
+      const reloaded = new ConfigStore()
+      expect(await reloaded.isMigrationDone('ai-title-shadow-cleanup')).toBe(true)
+      const snap = await reloaded.snapshot()
+      expect(snap.completedMigrations).toEqual(['ai-title-shadow-cleanup'])
     })
   })
 

@@ -280,4 +280,10 @@ export const amplifierProvider: CodingCliProvider = {
   supportsSessionResume() {
     return true
   },
+
+  providesAuthoritativeTitle() {
+    // Amplifier AI-names every session (metadata `name`), so its title is the
+    // authoritative one; freshell's own auto-title overrides must yield to it.
+    return true
+  },
 }

@@ -65,6 +65,7 @@ export type UserConfig = {
   terminalOverrides: Record<string, TerminalOverride>
   projectColors: Record<string, string>
   recentDirectories?: string[]
+  completedMigrations?: string[]
 }
 
 export function resolveDefaultLoggingDebug(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -559,6 +560,23 @@ export class ConfigStore {
   async getProjectColors(): Promise<Record<string, string>> {
     const cfg = await this.load()
     return cfg.projectColors || {}
+  }
+
+  async isMigrationDone(id: string): Promise<boolean> {
+    const cfg = await this.load()
+    return (cfg.completedMigrations ?? []).includes(id)
+  }
+
+  async markMigrationDone(id: string): Promise<void> {
+    return this.writeMutex.acquire(async () => {
+      const cfg = await this.loadForWrite()
+      if ((cfg.completedMigrations ?? []).includes(id)) return
+      const updated: UserConfig = {
+        ...cfg,
+        completedMigrations: [...(cfg.completedMigrations ?? []), id],
+      }
+      await this.saveInternal(updated)
+    })
   }
 
   async pushRecentDirectory(dir: string): Promise<string[]> {
