@@ -163,6 +163,20 @@ export class WsCaptureClient {
     return this.waitFor((m) => m.dir === 'in' && m.type === type, timeoutMs, `server→client "${type}"`)
   }
 
+  /**
+   * Resolve with the first server→client message matching an arbitrary predicate.
+   * Needed for wrapped envelopes like `freshAgent.event`, where the meaningful
+   * discriminant is the INNER `event.type` (e.g. `freshAgent.turn.complete`) rather
+   * than the outer message `type`. Additive — existing helpers are unchanged.
+   */
+  waitForServerMessage(
+    predicate: (m: CapturedMessage) => boolean,
+    timeoutMs = DEFAULT_WAIT_MS,
+    label = 'server→client message',
+  ): Promise<CapturedMessage> {
+    return this.waitFor((m) => m.dir === 'in' && predicate(m), timeoutMs, label)
+  }
+
   /** Resolve when the server sends `ready` (the first post-hello message). */
   waitForReady(timeoutMs = DEFAULT_WAIT_MS): Promise<CapturedMessage> {
     return this.waitForType('ready', timeoutMs)

@@ -41,6 +41,10 @@ export interface ExternalServerHandle {
   pid: number
   /** Isolated HOME the server ran under (owned + cleaned up by TestServer). */
   homeDir: string
+  /** Directory the isolated server writes its debug logs to. */
+  logsDir: string
+  /** Absolute path of the isolated server's debug log file (readable pre-teardown). */
+  debugLogPath: string
   /** Root of the ownership-sentinel probe workspace this harness owns. */
   probeHome: string
   /** Path to the ownership sentinel file inside `probeHome`. */
@@ -180,6 +184,8 @@ export async function startExternalServer(
     port: info.port,
     pid: info.pid,
     homeDir: info.homeDir,
+    logsDir: info.logsDir,
+    debugLogPath: info.debugLogPath,
     probeHome,
     sentinelPath,
     stop,

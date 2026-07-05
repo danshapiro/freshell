@@ -83,6 +83,17 @@ export interface T2Observation {
    * The Rust port is graded on reproducing this SAME idle-edge completion.
    */
   serverReportedIdle: boolean
+  /**
+   * PRIMARY completion edge for SDK-driven providers (claude/kilroy): whether the
+   * discrete `freshAgent.turn.complete` wire event fired. That event is emitted
+   * ONLY when the Claude SDK `result` message carries `subtype === 'success'`
+   * (server/sdk-bridge.ts → `sdk.turn.complete` → server/fresh-agent/sdk-events.ts
+   * → `freshAgent.turn.complete`), so an interrupted/errored turn never sets it.
+   * This is the claude analogue of opencode's `serverReportedIdle`; the grader
+   * picks the right one per provider. Optional so opencode observations (which use
+   * the idle edge) need not set it.
+   */
+  turnCompleteEventObserved?: boolean
   /** ms from firing the turn to the assistant reply first being observed. */
   assistantReplyLatencyMs: number
   /** Reported send status if the blocking send happened to return ('idle'|'approx'|null). */
@@ -157,7 +168,16 @@ export const PROVIDER_ID_SHAPES: Record<string, { placeholder: RegExp; durable: 
     durable: /^ses_[A-Za-z0-9]+$/,
   },
   claude: {
-    placeholder: /^freshclaude-/,
+    // CORRECTED against real freshclaude behavior (this is the first live claude
+    // T2 run). Unlike opencode's `freshopencode-<requestId>` placeholder, the
+    // freshclaude create returns the SDK bridge's BARE nanoid
+    // (server/sdk-bridge.ts createSession → `const sessionId = nanoid()`, surfaced
+    // verbatim by the claude adapter + runtime-manager). nanoid()'s default is 21
+    // url-safe chars ([A-Za-z0-9_-]); the {16,32} bound tolerates length drift
+    // while still excluding the 36-char durable UUID below (so placeholder≠durable).
+    // The pre-existing `^freshclaude-` here was aspirational and never validated
+    // against a live claude run — see notes/t2-claude-haiku.md.
+    placeholder: /^[A-Za-z0-9_-]{16,32}$/,
     durable: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
   },
   codex: {
@@ -283,20 +303,38 @@ export function assertT2Invariants(obs: T2Observation): T2InvariantReport {
     `ownedCleanupOk=${obs.ownedCleanupOk}, strayOwnedPidsAfter=[${obs.strayOwnedPidsAfter.join(', ')}]`,
   )
 
-  // PRIMARY completion invariant (FATAL): the provider serve emitted a turn-idle
-  // signal (session.idle / session.status{type:idle}) that freshell surfaced as a
-  // completed turn (send-keys returned status=idle). The debugger PROVED opencode
-  // 1.17.13 emits the idle edge ~5s post-turn once the serve is health-ready, so a
-  // correctly-driven turn MUST complete on this edge — the persisted reply
-  // (turn.completed above) only corroborates it. The Rust port is graded on
-  // reproducing this same idle-edge completion.
-  add(
-    'provider.emits-idle-signal',
-    obs.serverReportedIdle,
-    `serverReportedIdle=${obs.serverReportedIdle} ` +
-      `(turn completion observed via session.idle/session.status{idle}, surfaced through ` +
-      `freshell's blocking send returning status=idle; persisted reply corroborates it)`,
-  )
+  // PRIMARY completion invariant (FATAL) — the mechanism is PROVIDER-SPECIFIC, so
+  // the grader picks the right edge per provider while keeping opencode's output
+  // byte-identical (same name/position/detail) so its baseline never drifts:
+  //
+  //   • claude/kilroy (SDK-driven): the DISCRETE `freshAgent.turn.complete` wire
+  //     event, emitted ONLY on the Claude SDK `result` with subtype==='success'
+  //     (server/sdk-bridge.ts:~469 → sdk.turn.complete → sdk-events.ts:~71 →
+  //     freshAgent.turn.complete). An interrupt/error never fires it, so it is a
+  //     clean, positive completion edge — cleaner than opencode's idle poll.
+  //   • opencode: the idle edge (session.idle / session.status{type:idle}) that
+  //     freshell surfaces as send-keys → status=idle. The debugger PROVED opencode
+  //     1.17.13 emits it ~5s post-turn once the serve is health-ready.
+  //
+  // The persisted reply (turn.completed above) only CORROBORATES the primary edge.
+  // The Rust port is graded on reproducing the SAME per-provider completion edge.
+  if (obs.provider === 'claude' || obs.provider === 'kilroy') {
+    add(
+      'provider.emits-completion-signal',
+      obs.turnCompleteEventObserved === true,
+      `turnCompleteEventObserved=${obs.turnCompleteEventObserved === true} ` +
+        `(turn completion observed via the discrete freshAgent.turn.complete wire event, ` +
+        `emitted on the Claude SDK result subtype=success; persisted .jsonl reply corroborates it)`,
+    )
+  } else {
+    add(
+      'provider.emits-idle-signal',
+      obs.serverReportedIdle,
+      `serverReportedIdle=${obs.serverReportedIdle} ` +
+        `(turn completion observed via session.idle/session.status{idle}, surfaced through ` +
+        `freshell's blocking send returning status=idle; persisted reply corroborates it)`,
+    )
+  }
 
   // Informational: cost discipline. Not fatal, but surfaced so a runaway
   // live-call count is visible in the report.
@@ -359,8 +397,10 @@ export interface T2Baseline {
     durableIdMatches: boolean
     sessionCreated: boolean
     turnAccepted: boolean
-    /** PRIMARY completion edge: provider signalled idle (session.idle/status{idle}). */
+    /** PRIMARY completion edge (opencode): provider signalled idle (session.idle/status{idle}). */
     serverReportedIdle: boolean
+    /** PRIMARY completion edge (claude/kilroy): discrete freshAgent.turn.complete (SDK result subtype=success). */
+    turnCompleteEventObserved: boolean
     /** SECONDARY corroboration: assistant reply persisted with the sentinel. */
     turnCompleted: boolean
     dbSessionRowPresent: boolean
@@ -404,6 +444,7 @@ export function summarizeT2ForBaseline(obs: T2Observation, report: T2InvariantRe
       sessionCreated: obs.sessionCreated,
       turnAccepted: obs.turnAccepted,
       serverReportedIdle: obs.serverReportedIdle,
+      turnCompleteEventObserved: obs.turnCompleteEventObserved === true,
       turnCompleted: obs.turnCompleted,
       dbSessionRowPresent: obs.dbSessionRowPresent,
       dbMessageCount: obs.dbMessageCount,

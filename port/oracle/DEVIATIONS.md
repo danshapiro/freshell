@@ -88,6 +88,104 @@ Every entry requires:
    (`t2-live.ts:50-51` notes a directly-spawned serve with bounded polling already works; the user's
    warm server is unaffected).
 
+### DEV-0002 — coding-CLI session-indexer crashes the whole process on a late provider session-root
+
+**Antagonist adjudication (two decisions):**
+1. **Defect classification: ACCEPTED as OBJECTIVE (crash / uncaught exception).** The PORT's Rust
+   session-indexer must guard the late-root watcher: a provider home that exists while its
+   session-root subdir is absent at boot, then gains that subdir at runtime, must **log + degrade and
+   keep the process alive**, never abort.
+2. **Harness env workaround (`seedClaudeCredsIntoHome()` `mkdir -p <HOME>/.claude/projects`,
+   `port/oracle/harness/t2-live-claude.ts:221-238`): ACCEPTED for T2 baseline capture.** It is
+   legitimate environment parity (make the isolated HOME match a real user's steady state), exactly
+   the DEV-0001 warm-sidecar pattern — NOT a source mutation. Verified: `server/**` is pristine
+   (`git status`: only `port/oracle/**` + `test/**` touched; `server/coding-cli/session-indexer.ts`
+   unmodified). This does NOT self-approve the port fix; the pinning test below is mandatory and the
+   port is held to the higher "no crash" bar the harness deliberately sidesteps for the original.
+
+- **objective_defect:** *crashes / uncaught error* — a process-fatal, unhandled `'error'` on a
+  chokidar `FSWatcher`. Independently reproduced (throwaway repro, zero model cost, repo chokidar
+  3.6.0) with the byte-identical stack the implementer reported:
+  ```
+  TypeError: Cannot read properties of undefined (reading 'on')
+      at NodeFsHandler._handleRead  (chokidar/lib/nodefs-handler.js:472:5)
+      at NodeFsHandler._handleDir   (…/nodefs-handler.js:563:18)
+      at NodeFsHandler._addToNodeFs (…/nodefs-handler.js:617:27)
+  Emitted 'error' event on FSWatcher instance at:
+      at FSWatcher._handleError     (chokidar/index.js:647:10)
+      at NodeFsHandler._addToNodeFs (…/nodefs-handler.js:645:18)
+  Node.js v22.21.1   → process.exit(1)
+  ```
+  Root cause is a **self-inflicted close-during-add race**, confirmed line-by-line:
+  - claude root = `<HOME>/.claude/projects` (`providers/claude.ts:521-522`), watch-base = `<HOME>/.claude`
+    (`providers/claude.ts:525-526`). Seeding only `.credentials.json` makes `<HOME>/.claude` exist but
+    `…/projects` absent, so `startRootWatcher` walks to the nearest existing ancestor `<HOME>/.claude`
+    (`session-indexer.ts:516-528`) and arms `chokidar.watch([ancestor], { depth: 1 })`
+    (`session-indexer.ts:538-541`).
+  - When the first turn creates `…/projects`, the rootWatcher's own `'addDir'` handler fires
+    `void this.reconfigureWatchers()` (`session-indexer.ts:553-556`). The watcher-key now changes
+    (root exists), so reconfigure closes the *old* rootWatcher (`session-indexer.ts:479-482`).
+  - chokidar `close()` synchronously sets `closed = true` **and `this.removeAllListeners()`**
+    (`chokidar/index.js:502-507`) — destroying the `'error'` guard installed at
+    `session-indexer.ts:597`.
+  - The in-flight `_addToNodeFs` for the new dir resumes on a later microtask; `_readdirp` now returns
+    `undefined` because the watcher is closed (`chokidar/index.js:939-940`), so
+    `undefined.on(STR_DATA, …)` throws (`nodefs-handler.js:468-472`). The `catch` re-routes it to
+    `_handleError` (`nodefs-handler.js:644-645`), which `emit('error', …)` for a code-less TypeError
+    (`chokidar/index.js:642-647`) — now on a **listener-less** FSWatcher → Node aborts the process.
+  - Repro proof: root **absent** at boot → `CRASHED=true`, exit 1, the `'error'` handler never fires
+    (removeAllListeners stripped it first); root **pre-created** → clean exit 0. Matches the
+    implementer's table (`notes/t2-claude-haiku.md:51-57`).
+  - Not merely an isolated-home artifact: the late-root watcher exists *specifically* to handle
+    "root absent at startup, appears later" (`session-indexer.ts:432-435`), and it handles that
+    designed-for case by crashing. Reachable by real users on a fresh Claude-Code install / after
+    deleting `~/.claude/projects` while keeping creds; and structurally provider-agnostic (opencode's
+    watch-base `path.dirname(homeDir)` = `~/.local/share` commonly exists on real Linux hosts —
+    `providers/opencode.ts:334-335` — so it can hit the same race; it is spared only in the empty
+    isolated HOME). claude is the sole crasher *in the oracle's isolated HOME* because it is the only
+    provider whose ancestor exists there (creds seeding), per `notes/t2-claude-haiku.md:41-44` — verified.
+- **original_behavior:** With `<provider-home>` present but its session-root subdir absent at server
+  boot, freshell arms a depth-limited late-root watcher on the ancestor; the instant the subdir is
+  created at runtime (e.g. the first freshclaude turn writing `…/projects/<hash>/<uuid>.jsonl`),
+  chokidar throws an uncaught `TypeError` on the FSWatcher `'error'` path and **the entire freshell
+  process exits mid-turn** (captured transcript stops at `system/init`, `msgs=0`; no assistant reply).
+- **port_behavior:** The Rust session-indexer's late-root watcher tolerates the subdir appearing:
+  on the reconfigure-triggered teardown it must not deref a closed watcher; a watcher error is
+  **logged and the indexer degrades** (schedules a full rescan) while the **process stays up**; once
+  the subdir exists, precise-root watching + indexing **resume** and the new session becomes visible.
+- **fingerprint:** **Not a wire-message diff — a process-liveness / lifecycle invariant.** The T2
+  live differ will *never* observe this diff: the harness pre-creates `…/projects` for BOTH original
+  and port (env parity), so neither side crashes during baseline capture and there is nothing for the
+  message-differ to whitelist. Therefore this deviation is **pinned by a dedicated liveness test, not
+  whitelisted in the differ.** If any future harness/chaos run *omits* the pre-create, the expected
+  (whitelisted) divergence is: original → abnormal WS close + `process.exit` (turn aborts, no further
+  messages) vs port → process stays alive, WS open, `sessions.changed`/rescan proceeds once the subdir
+  appears. Keyed on the env precondition {provider-home exists ∧ session-root subdir absent at boot ∧
+  subdir created at runtime}, never on a message payload.
+- **pinning_test (REQUIRED — does not exist yet):** port-side liveness test —
+  `crates/freshell-server/tests/coding_cli_late_root_watcher.rs`. Arrange a watched provider home whose
+  session-root subdir is absent at boot (indexer arms the late-root watcher on the existing ancestor);
+  create the subdir + a session file at runtime; assert (a) the process/task does **not** panic or
+  abort, (b) the watcher error is logged and a rescan is scheduled (degrade, not die), and (c) the new
+  session under the subdir becomes visible (indexing resumed). Companion: reconfigure-on-appearance must
+  not tear down liveness or double-fault. Interim TS red-documenting-original mirror (optional, proves
+  the ledger's claim about the reference): `test/unit/port/oracle/session-indexer-late-root-liveness.test.ts`
+  asserting the *current* TS original crashes/emits-uncaught under the precondition. The authoritative
+  green assertion lives in the Rust port test.
+- **adjudicated_by:** antagonist-reviewer session `0000000000000000-07e6276da5bd45cc_anchors-architect`
+  (parent `1d2dea08-9a63-4ecf-bc4b-ee25a852a4d8`), 2026-07-04.
+- **status:** accepted (deviation) — **no source mutation this time (harness/env fix only); harness
+  workaround APPROVED for baseline capture; port owes the guarded watcher + pinning test above.**
+
+**Conditions before this deviation is satisfied / committable:**
+1. Keep `server/coding-cli/session-indexer.ts` pristine (confirmed unmodified). The fix lands only in
+   the PORT.
+2. Land the port-side liveness pinning test above (red on a naive port that mirrors the crash → green
+   once the watcher is guarded).
+3. The T2 claude/Haiku baseline may rely on the pre-created `…/projects` env parity, but the port must
+   NOT be exempted from the projects-absent path — the pinning test is the sole mechanism that verifies
+   the fix, since the T2 differ is blind to this lifecycle defect by construction.
+
 <!--
 Template:
 
