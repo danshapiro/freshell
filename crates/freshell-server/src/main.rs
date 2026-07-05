@@ -58,12 +58,22 @@ async fn main() -> ExitCode {
     // fresh-agent turn's handful of broadcasts never laps a briefly-busy consumer.
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(1024).0);
 
+    // The freshcodex WS fresh-agent slice: shares the auth token + the broadcast bus so its
+    // freshAgent.created/send.accepted/event frames reach every WS client (incl. the oracle's
+    // capture socket). Seeded with the settings tree so `PATCH /api/settings` returns/merges it.
+    let fresh_codex_state = freshell_freshagent::FreshCodexState::new(
+        Arc::clone(&auth_token),
+        Arc::clone(&broadcast_tx),
+        serde_json::to_value(settings.as_ref()).unwrap_or_else(|_| serde_json::json!({})),
+    );
+
     let ws_state = WsState {
         auth_token: Arc::clone(&auth_token),
         server_instance_id,
         boot_id,
         settings,
         broadcast_tx: Arc::clone(&broadcast_tx),
+        fresh_codex: fresh_codex_state.clone(),
     };
     let api_state = ApiState {
         auth_token: Arc::clone(&auth_token),
@@ -73,10 +83,12 @@ async fn main() -> ExitCode {
     // broadcast bus so its create/send broadcasts reach every WS client.
     let fresh_agent_state = FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx));
 
-    // One axum app serving REST (`/api/health` + fresh-agent) + the WS upgrade (`/ws`).
+    // One axum app serving REST (`/api/health` + fresh-agent + `PATCH /api/settings`) + the
+    // WS upgrade (`/ws`).
     let app = freshell_api::router(api_state)
         .merge(freshell_ws::router(ws_state))
-        .merge(freshell_freshagent::router(fresh_agent_state.clone()));
+        .merge(freshell_freshagent::router(fresh_agent_state.clone()))
+        .merge(fresh_codex_state.settings_router());
 
     let ip: IpAddr = bind_host.parse().unwrap_or(IpAddr::from([127, 0, 0, 1]));
     let addr = SocketAddr::new(ip, port);
@@ -97,6 +109,9 @@ async fn main() -> ExitCode {
         .with_graceful_shutdown(shutdown_signal())
         .await;
     fresh_agent_state.shutdown().await;
+    // Reap every owned codex app-server sidecar (SIGKILL + `/proc` ownership sweep) so a
+    // freshcodex T2 run leaves no orphaned app-server.
+    fresh_codex_state.shutdown().await;
     if let Err(err) = serve_result {
         eprintln!("freshell-server: serve error: {err}");
         return ExitCode::FAILURE;

@@ -27,6 +27,10 @@ freshell-protocol = { path = "../freshell-protocol" }
 # handlers drive, and the SpawnSpec builder that resolves the shell.
 freshell-terminal = { path = "../freshell-terminal" }
 freshell-platform = { path = "../freshell-platform" }
+# The freshcodex WS fresh-agent slice (freshAgent.create/send → codex app-server). The
+# post-handshake loop dispatches the codex client→server messages to this shared state,
+# which spawns the app-server sidecar and broadcasts freshAgent.created/send.accepted/event.
+freshell-freshagent = { path = "../freshell-freshagent" }
 # Transport: axum's WebSocket upgrade is tokio-tungstenite-backed (ADR Decision 3).
 axum = { version = "0.8", features = ["ws"] }
 serde_json = { workspace = true }

@@ -110,9 +110,10 @@ fn map_shell(shell: Shell) -> ShellType {
 /// `freshAgent.session.materialized` / `sessions.changed`, pushed by REST handlers).
 pub async fn run(
     socket: WebSocket,
-    _state: &WsState,
+    state: &WsState,
     mut bcast_rx: tokio::sync::broadcast::Receiver<String>,
 ) {
+    let fresh_codex = &state.fresh_codex;
     let (mut ws_tx, mut ws_rx) = socket.split();
     // Single per-connection output channel. Every terminal's reader-thread sink
     // sends here; the select loop routes by `terminalId`. Held open for the whole
@@ -128,8 +129,14 @@ pub async fn run(
             inbound = ws_rx.next() => {
                 match inbound {
                     Some(Ok(Message::Text(text))) => {
-                        if !handle_client_text(text.as_str(), &mut ws_tx, &mut terminals, &out_tx)
-                            .await
+                        if !handle_client_text(
+                            text.as_str(),
+                            &mut ws_tx,
+                            &mut terminals,
+                            &out_tx,
+                            fresh_codex,
+                        )
+                        .await
                         {
                             break;
                         }
@@ -202,6 +209,7 @@ async fn handle_client_text(
     ws_tx: &mut WsSink,
     terminals: &mut HashMap<String, TerminalEntry>,
     out_tx: &mpsc::UnboundedSender<ServerMessage>,
+    fresh_codex: &freshell_freshagent::FreshCodexState,
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
     // runtime's tolerance; the handshake already gated auth).
@@ -225,8 +233,29 @@ async fn handle_client_text(
             handle_detach(&detach.terminal_id, ws_tx, terminals).await
         }
         ClientMessage::TerminalKill(kill) => handle_kill(kill, ws_tx, terminals).await,
-        // Everything else (coding-cli, fresh-agent, activity lists, ui.*, ping) is
-        // out of scope for the shell terminal path; ignore.
+        // freshAgent.create / freshAgent.send (codex slice): dispatch to the shared
+        // FreshCodexState as a DETACHED task so the cold app-server spawn + the live turn
+        // never block this connection's select loop (which must keep fanning out the
+        // broadcast bus so the codex `freshAgent.*` frames the task emits reach the client).
+        // Non-codex providers are deferred (the task no-ops on a missing/unsupported gate).
+        ClientMessage::FreshAgentCreate(create) => {
+            if matches!(create.provider, Some(freshell_protocol::AgentProvider::Codex))
+                && fresh_codex.is_enabled()
+            {
+                let fresh_codex = fresh_codex.clone();
+                tokio::spawn(async move { fresh_codex.handle_create(create).await });
+            }
+            true
+        }
+        ClientMessage::FreshAgentSend(send) => {
+            if matches!(send.provider, freshell_protocol::AgentProvider::Codex) {
+                let fresh_codex = fresh_codex.clone();
+                tokio::spawn(async move { fresh_codex.handle_send(send).await });
+            }
+            true
+        }
+        // Everything else (opencode/claude fresh-agent, activity lists, ui.*, ping) is
+        // out of scope for this path; ignore.
         _ => true,
     }
 }

@@ -58,6 +58,11 @@ pub struct WsState {
     /// Carries `ui.command` / `freshAgent.session.materialized` / `sessions.changed`
     /// during a fresh-agent turn, which the oracle's capture socket records.
     pub broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    /// The freshcodex WS fresh-agent slice: the post-handshake loop dispatches
+    /// `freshAgent.create` / `freshAgent.send` (codex) here, which spawns the codex
+    /// app-server sidecar and broadcasts `freshAgent.created` / `freshAgent.send.accepted`
+    /// / `freshAgent.event` (session.snapshot + the status-guarded turn.complete edge).
+    pub fresh_codex: freshell_freshagent::FreshCodexState,
 }
 
 /// The `/ws` sub-router, pre-bound to its state (mergeable into the server app).
@@ -254,12 +259,19 @@ mod tests {
     }
 
     fn state() -> WsState {
+        let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
+        let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         WsState {
-            auth_token: Arc::new("s3cr3t-token-abcdef".to_string()),
+            auth_token: Arc::clone(&auth_token),
             server_instance_id: Arc::new("srv-1111".to_string()),
             boot_id: Arc::new("boot-2222".to_string()),
             settings: Arc::new(test_settings()),
-            broadcast_tx: Arc::new(tokio::sync::broadcast::channel::<String>(16).0),
+            broadcast_tx: Arc::clone(&broadcast_tx),
+            fresh_codex: freshell_freshagent::FreshCodexState::new(
+                auth_token,
+                broadcast_tx,
+                serde_json::json!({ "freshAgent": { "enabled": false } }),
+            ),
         }
     }
 

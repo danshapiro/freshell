@@ -421,6 +421,7 @@ name = "freshell-freshagent"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "freshell-codex",
  "freshell-opencode",
  "freshell-protocol",
  "serde_json",
@@ -492,6 +493,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
+ "freshell-freshagent",
  "freshell-platform",
  "freshell-protocol",
  "freshell-terminal",

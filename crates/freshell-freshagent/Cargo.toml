@@ -32,11 +32,17 @@ freshell-protocol = { path = "../freshell-protocol" }
 # spawn+bounded-health cold-start (DEV-0001), create_session, run_turn (idle edge),
 # list_messages (transcript capture), and the ownership-safe reaper.
 freshell-opencode = { path = "../freshell-opencode", features = ["real-transport"] }
+# The codex app-server JSON-RPC/WS client CORE + its real tokio-tungstenite backend +
+# the /proc ownership reaper (real-transport): initialize→thread/turn drive (effort VERBATIM,
+# DEV-0003), the status-guarded completion edge, model/effort normalization. The codex slice
+# drives a live freshcodex T2 turn through the Rust server (Phase 3.8b).
+freshell-codex = { path = "../freshell-codex", features = ["real-transport"] }
 # The REST router + JSON extraction.
 axum = "0.8"
 serde_json = { workspace = true }
-# The shared broadcast bus (String frames) + the create/turn async orchestration.
-tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+# The shared broadcast bus (String frames), the create/turn async orchestration, the codex
+# app-server sidecar spawn (`process`), and its stdio drain (`io-util`).
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "process", "io-util"] }
 # paneId / tabId / placeholder-suffix / submittedTurnId minting.
 uuid = { version = "1", features = ["v4"] }
 

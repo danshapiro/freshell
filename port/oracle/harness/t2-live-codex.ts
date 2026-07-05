@@ -76,7 +76,7 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { startExternalServer, type ExternalServerHandle } from './external-server.js'
+import { startExternalServer, type ExternalServerHandle, type OracleTarget } from './external-server.js'
 import { WsCaptureClient, type CapturedMessage } from './ws-capture-client.js'
 import { collectSentinelOwnedPids, reapSentinelOwned } from './t2-live.js'
 import { enableFreshClients } from './t2-live-claude.js'
@@ -485,6 +485,14 @@ export interface RunCodexT2Options {
   turnTimeoutMs?: number
   /** Pipe the spawned server's stdout/stderr. */
   verbose?: boolean
+  /**
+   * Which server to drive: the node original (`'node'`, default) or the Rust port
+   * (`'rust'`). The SAME driver produces the T2Observation for both, so the oracle's
+   * original-vs-rust comparison is a true same-driver / different-SUT differential
+   * (mirrors the opencode T2-rust equivalence path). Both spawn the REAL `codex app-server`
+   * under the isolated CODEX_HOME and drive the identical WS `freshAgent.*` surface.
+   */
+  target?: OracleTarget
 }
 
 export interface T2TeardownFacts {
@@ -495,6 +503,8 @@ export interface T2TeardownFacts {
 
 export interface CodexT2Run {
   handle: ExternalServerHandle
+  /** Which server was driven ('node' original or 'rust' port). */
+  target: OracleTarget
   /** Isolated project cwd created for this run (removed on teardown). */
   cwd: string
   /** Absolute isolated sessions dir observed for rollout transcripts. */
@@ -516,6 +526,7 @@ export async function runCodexGptMiniT2(options: RunCodexT2Options = {}): Promis
   const turnTimeoutMs = options.turnTimeoutMs ?? 180_000
   const traceOn = options.verbose === true || !!process.env.FRESHELL_T2_TRACE
   const startedAt = Date.now()
+  const target: OracleTarget = options.target ?? 'node'
 
   if (resolveCodexBinary() === null) {
     throw new Error('codex binary not resolvable on PATH (required for the codex T2 harness)')
@@ -533,6 +544,7 @@ export async function runCodexGptMiniT2(options: RunCodexT2Options = {}): Promis
   let handle: ExternalServerHandle
   try {
     handle = await startExternalServer({
+      target,
       provider: 'oracle-t2-codex',
       startTimeoutMs: 90_000,
       verbose: options.verbose ?? false,
@@ -798,7 +810,7 @@ export async function runCodexGptMiniT2(options: RunCodexT2Options = {}): Promis
     return facts
   }
 
-  return { handle, cwd, sessionsDir, observation, teardown }
+  return { handle, target, cwd, sessionsDir, observation, teardown }
 }
 
 /** Re-exported so tests can assert ownership without importing t2-live directly. */
