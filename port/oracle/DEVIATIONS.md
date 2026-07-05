@@ -186,6 +186,111 @@ Every entry requires:
    NOT be exempted from the projects-absent path — the pinning test is the sole mechanism that verifies
    the fix, since the T2 differ is blind to this lifecycle defect by construction.
 
+### DEV-0003 — freshcodex reasoning-effort `none`/`minimal` "silent stall" (proposed as DEV-CODEX-EFFORT) — **REJECTED / NOT PROVEN**
+
+**Antagonist adjudication: REJECTED — the objective-defect bar is NOT met, and the stated root cause is
+contradicted by freshell's own committed codex contract.** This entry is recorded for traceability only.
+It grants the differ **NO tolerance** (see fingerprint) — an unlisted original-vs-port divergence in codex
+effort handling remains a port defect to fix, exactly as if this entry did not exist. Source stays pristine
+(it already is; `git status` shows only `port/oracle/**` touched). The T2 codex slice is NOT blocked by this
+rejection: it captured its baseline with `effort='low'` and stands on its own.
+
+**What the implementer proposed:** freshcodex offers efforts `none`/`minimal`/`max`
+(`shared/fresh-agent-models.ts:34,40,46`) and forwards `none`/`minimal` to the codex app-server verbatim
+(`server/fresh-agent/adapters/codex/adapter.ts:130-131`, sent on `turn/start` at `:978`); a live run #1 with
+`effort='minimal'` stalled ~180s with no reply and no error; therefore the PORT should map/clamp `none`/`minimal`
+to a codex-valid effort. Proposed as an objective *hang*.
+
+**Why REJECTED (independently verified, `file:line`):**
+1. **The premise "codex accepts efforts ONLY `{low,medium,high,xhigh}`; `none`/`minimal` are rejected" is
+   directly contradicted by freshell's own codex app-server protocol model.**
+   - `CodexReasoningEffortSchema = z.enum(['none','minimal','low','medium','high','xhigh'])`
+     (`server/coding-cli/codex-app-server/protocol.ts:26`) — `none`/`minimal` are modeled as VALID codex
+     efforts. Set deliberately in commit `d4c7f5b5` ("Bring main to tested dev stack"), not incidental.
+   - That schema governs BOTH the outbound `turn/start` params (`protocol.ts:312`, `effort:
+     CodexReasoningEffortSchema…`) AND the inbound `thread` operation RESULT the app-server RETURNS
+     (`protocol.ts:233`, `reasoningEffort: CodexReasoningEffortSchema…`). freshell modeling the server as
+     *returning* `reasoningEffort ∈ {none,minimal,…}` means its authors observed/expected the server to
+     accept and echo those values.
+   - freshell's real-codex **contract-harness `model/list` fixture advertises `minimal` as a
+     `supportedReasoningEffort`** (`test/helpers/coding-cli/real-session-contract-harness.ts:1121-1130`,
+     `defaultReasoningEffort:'high'` at `:1120`). So `minimal` is a first-class codex effort in freshell's own
+     model of the wire — the opposite of "not accepted by the codex models."
+2. **The claimed failure mode (silent stall, NO error) is inconsistent with "the server rejected the value."**
+   A schema-invalid/unsupported param yields a JSON-RPC error, which `startTurn`
+   (`server/coding-cli/codex-app-server/runtime.ts:1017-1020`) would REJECT on and surface — not a silent hang.
+   A silent 180s stall is evidence *against* "server rejected the effort" and *for* an unrelated stall
+   (mirroring this campaign's earlier opencode "never emits idle" misdiagnosis, which was actually the
+   DEV-0001 health wedge, and the false-green the antagonist previously caught).
+3. **The stall is un-pinned and unreproducible from any deterministic artifact.** The fake app-server ignores
+   `effort` entirely and always completes the turn (`test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs:228-232`;
+   `turn/completed` only fires if the harness scripts it, `:333-345,547`). Nothing in the suite substantiates
+   an effort-dependent hang; the sole evidence is one live observation whose interpretation conflicts with the
+   committed contract. Burden of proof is on the party asserting the original is objectively defective; it is
+   not discharged.
+4. **`max` is NOT a defect — it is correctly handled.** `max`/`xhigh`→`xhigh` on the wire
+   (`adapter.ts:129`), tested at `test/unit/server/fresh-agent/codex-adapter.test.ts:1418→1438`; and
+   `normalizeFreshAgentEffort` already clamps any effort NOT in a model's declared list back to the model's
+   `defaultEffort` (`shared/fresh-agent-models.ts:142-151`), tested at `codex-adapter.test.ts:1477-1509`
+   (`gpt-5.4-flash` + `xhigh` → wire `high`). `none`/`minimal` survive only because freshell *declares them in
+   the model's `thinkingEfforts`* — consistent with the protocol treating them as valid.
+5. **Accepting would prescribe a silent behavior regression on contested evidence.** Clamping/mapping
+   `none`/`minimal` would change a user's selected effort and diverge from the original with no *proven*
+   objective defect — precisely the "scope creep / grading your own homework" failure the ledger's Entry rules
+   (this file, "Entry rules", lines 8-14) and the DEV-0001 adjudication exist to prevent.
+
+**One or two defects? Neither is adjudicable as objective right now:**
+- *(A) Menu vs. reality:* `shared/fresh-agent-models.ts` HARDCODES per-model effort menus instead of deriving
+  them from the app-server's live `model/list.supportedReasoningEfforts`, which is the DOCUMENTED design intent
+  (`docs/plans/2026-04-30-freshcodex-contract-foundation.md:980-981,2625-2629`;
+  `docs/plans/2026-05-03-freshcodex-contract-foundation-test-plan.md:406`, "efforts come from app-server
+  model/list … not stale defaults"). A hardcoded-vs-dynamic gap is a completeness/design item (plausibly
+  intended-future work), NOT a proven hang, and not what was proposed. If a real menu/reality mismatch is ever
+  pinned, the fix belongs in the port's model-catalog layer (derive efforts from `model/list`), not a blind
+  effort clamp.
+- *(B) No turn-completion timeout:* `runtime.startTurn` returns after the JSON-RPC ack
+  (`runtime.ts:1017-1020`); completion arrives only via the async `onTurnCompleted` notification
+  (`adapter.ts:911-928`) with NO deadline — so a turn that never completes (for ANY reason) hangs unbounded
+  with no user-visible error. This robustness gap is code-real and verifiable, but (i) it is orthogonal to the
+  effort vocabulary, (ii) unbounded turns are a general/legitimate agentic property, (iii) freshell asserts no
+  bounded-turn invariant anywhere (unlike DEV-0001's explicit `while (Date.now() < deadline)`), and adding a
+  turn timeout could break legitimate long turns. Not an objective defect as-is, and not what was proposed.
+
+- **objective_defect:** NONE ESTABLISHED. Fails every bar: no crash/error (a rejected effort would error, not
+  hang), no leak, no WS-schema violation, no contradiction of documented behavior (the protocol schema +
+  contract fixture document `none`/`minimal` as VALID), no data corruption, no code-asserted invariant broken.
+  The only bar invoked — *hang* — is asserted from a single un-pinned live run and is refuted as to cause by
+  `protocol.ts:26,233,312` and `real-session-contract-harness.ts:1121-1130`.
+- **original_behavior:** freshcodex offers `none`/`minimal`/`max`, maps `max→xhigh`, and forwards
+  `none`/`minimal` verbatim on `turn/start` (`adapter.ts:129-131,978`) as values its own protocol schema deems
+  valid (`protocol.ts:26,312`). Claimed 180s silent stall on `minimal` is NOT reproduced/root-caused.
+- **port_behavior:** UNCHANGED from the original until/unless the defect is proven. The port must reproduce the
+  original's effort handling; it MUST NOT silently clamp `none`/`minimal` on the strength of this rejected claim.
+- **fingerprint:** **NONE — this is not a whitelisted deviation.** The T2 codex differ must treat ANY
+  original-vs-port divergence in effort handling (including `none`/`minimal` forwarding) as a **failure**, not a
+  tolerated diff. No matcher is registered.
+- **pinning_test:** N/A (rejected). See reconciliation conditions below for what a future *accepted* version
+  would require.
+- **adjudicated_by:** antagonist-reviewer session `0000000000000000-6ff6320fb70d4149_anchors-architect`
+  (parent `1d2dea08-9a63-4ecf-bc4b-ee25a852a4d8`), 2026-07-04.
+- **status:** rejected
+
+**Reconciliation conditions to RE-OPEN (the burden is on the implementer):**
+1. Resolve the contradiction with the committed contract: either (a) produce a captured, non-inference artifact
+   (raw `turn/start` request + the app-server's response/behavior + that specific model's live
+   `supportedReasoningEfforts`) showing the server does NOT accept `none`/`minimal` for the model in use — in
+   which case the objective defect is a **schema/data mismatch** and the fix updates `CodexReasoningEffortSchema`
+   / the model catalog (pinned by the real-codex **contract** test), NOT a blind effort clamp; OR (b) accept
+   that the server DOES accept `none`/`minimal` (as `protocol.ts:26,233` and
+   `real-session-contract-harness.ts:1121-1130` assert) — in which case there is no effort defect and the
+   observed stall must be **re-pinned to its true cause** before any deviation is proposed (do not repeat the
+   opencode-idle misdiagnosis).
+2. Prove the failure mode: demonstrate the hang is caused by the effort value specifically (not setup/health
+   races, not a slow/looping turn, not a dropped completion notification), with an artifact a deterministic test
+   could assert against — otherwise it is not an objective *hang* attributable to effort.
+3. Only after 1–2, a fresh candidate may be filed; harness pinning `effort='low'` for baseline capture remains
+   acceptable test hygiene either way and needs no deviation.
+
 <!--
 Template:
 

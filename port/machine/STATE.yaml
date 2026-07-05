@@ -84,11 +84,18 @@ phases:
          FALSE — opencode 1.17.13 emits session.idle + session.status{idle} ~5s; adapter onceIdle handles it.
          Exp5b GOLD: warming the serve via OPENCODE_CMD warm-proxy (ZERO source mutation) → full turn completes
          through PRISTINE freshell (send-keys 200 {idle}, durable ses_, reply persisted). No 2nd deviation needed."
-      - "NEXT (rework, now de-risked): (1) t2-live.ts warms serve via OPENCODE_CMD warm-proxy (ownership-tagged,
-         reaped) so pristine freshell drives end-to-end; (2) detect completion via the idle edge — INVERT the
-         serverReportedIdle-expected-false assertions in invariants.ts; (3) harden the live test to FAIL (not
-         skip) on turnAccepted=false; (4) capture the opencode T2 baseline observation. THEN claude/Haiku +
-         codex/GPT-mini. Creds for claude/codex/opencode present; Gemini OUT."
+      - "DONE: T2 opencode/Kimi GREEN (warm-proxy, idle-edge, baseline). Mutation-validation capstone DONE —
+         oracle PROVEN: 28/28 planted divergences caught, e2e RED→GREEN (dist-patched, restored), full 81/81.
+         T2 claude/Haiku GREEN (9/9, freshAgent.turn.complete edge, baseline)."
+      - "DEV-0002 ledgered (antagonist ...07e6276d): first freshclaude turn crashes the whole process via an
+         uncaught chokidar close-during-add race when ~/.claude exists but ~/.claude/projects doesn't. Real
+         latent robustness bug (fresh Claude-Code install trips it). Source PRISTINE; harness pre-creates
+         projects/ (env parity). NOT differ-whitelistable (both sides pre-create) → carried SOLELY by a
+         mandatory port-side liveness pinning test (guard the watcher: stay up, degrade, resume)."
+      - "NEXT (in progress): T2 codex/GPT-mini (codex app-server JSON-RPC/WS; completion = turn/completed with
+         params.turn.status==='completed'; seed ~/.codex/auth.json + config.toml; reuse fake-app-server.mjs +
+         real-session-contract-harness codex paths; watch for isolated-home crashes like DEV-0002). THEN T3
+         (e2e-browser Playwright + 7 visual baselines against the isolated server). THEN exit Phase 0 → Phase 1."
       - capture + persist T0/T1 golden baselines FROM ORIGINAL (transcripts normalized)
       - wire T2 live-invariant harness (Kimi/Haiku/GPT-mini) + make ORIGINAL's live provider suite pass
       - validate whole oracle by mutation testing against ORIGINAL (must catch injected divergence)

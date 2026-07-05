@@ -1,0 +1,125 @@
+{
+  "tier": "T2",
+  "provider": "codex",
+  "model": "gpt-5.3-codex-spark",
+  "sentinelToken": "freshell-t2-ok",
+  "assertedInvariants": [
+    "session.created",
+    "session.durable-id-shape",
+    "turn.accepted",
+    "turn.completed",
+    "assistant.replied-sentinel",
+    "transcript.persisted",
+    "transcript.parseable",
+    "ownership.cleanup",
+    "provider.emits-completion-signal"
+  ],
+  "informationalInvariants": [
+    "wire.session-materialized",
+    "cost.live-calls-bounded"
+  ],
+  "ok": true,
+  "passed": 9,
+  "failed": 0,
+  "invariantMatrix": [
+    {
+      "name": "session.created",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "session.durable-id-shape",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "turn.accepted",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "turn.completed",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "assistant.replied-sentinel",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "transcript.persisted",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "transcript.parseable",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "wire.session-materialized",
+      "ok": false,
+      "fatal": false
+    },
+    {
+      "name": "ownership.cleanup",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "provider.emits-completion-signal",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "cost.live-calls-bounded",
+      "ok": true,
+      "fatal": false
+    }
+  ],
+  "shapes": {
+    "placeholderIdPattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    "durableIdPattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    "placeholderIdMatches": true,
+    "durableIdMatches": true,
+    "sessionCreated": true,
+    "turnAccepted": true,
+    "serverReportedIdle": false,
+    "turnCompleteEventObserved": true,
+    "turnCompleted": true,
+    "dbSessionRowPresent": true,
+    "dbMessageCount": 4,
+    "dbPartCount": 2,
+    "dbHasAssistantMessage": true,
+    "transcriptParseable": true,
+    "captureNonEmpty": true,
+    "captureContainsSentinel": true,
+    "wsServerMessageTypes": [
+      "freshAgent.created",
+      "freshAgent.event",
+      "freshAgent.send.accepted",
+      "freshAgent.session.snapshot",
+      "freshAgent.turn.complete",
+      "perf.logging",
+      "ready",
+      "settings.updated",
+      "terminal.inventory"
+    ],
+    "sessionMaterializedObserved": false,
+    "liveModelCalls": 1,
+    "ownedCleanupOk": true
+  },
+  "provenance": {
+    "capturedAt": "2026-07-05T06:25:37.434Z",
+    "capturedBy": "test/integration/port/oracle/t2-codex-gptmini.test.ts",
+    "model": "gpt-5.3-codex-spark",
+    "effort": "low",
+    "codexVersion": "codex-cli 0.142.5",
+    "completionSignal": "freshAgent.turn.complete (status-guarded: params.turn.status ?? params.status === \"completed\")",
+    "drivePath": "ws freshAgent.create + freshAgent.send (codex app-server JSON-RPC 2.0)",
+    "transcript": "isolated <CODEX_HOME>/.codex/sessions/<date-dirs>/rollout-<ts>-<threadId>.jsonl",
+    "modelReachabilityNote": "codex-spark is the cheapest GPT model REACHABLE through freshell's freshcodex surface: normalizeFreshcodexModel clamps the model to {gpt-5.5, gpt-5.4-flash, gpt-5.3-codex-spark} (fallback gpt-5.5), so gpt-5.4-mini (present in the codex catalog) is silently rewritten to gpt-5.5 and is unreachable; gpt-5.4-flash is absent from the real codex catalog. codex-spark is the only non-flagship model in BOTH the freshcodex allowlist and the codex catalog.",
+    "note": "Structural, LLM-text-free baseline. The Rust port drives the identical WS fresh-agent surface and its T2 observation is projected via summarizeT2ForBaseline() and diffed against this file. Codex is app-server-driven (JSON-RPC 2.0 over WS): completion is the discrete, STATUS-GUARDED freshAgent.turn.complete edge (NOT opencode's idle poll); the session id is the codex app-server thread id (UUID), STABLE from create — placeholder == durable and NO freshAgent.session.materialized event fires."
+  }
+}

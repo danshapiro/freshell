@@ -181,7 +181,18 @@ export const PROVIDER_ID_SHAPES: Record<string, { placeholder: RegExp; durable: 
     durable: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
   },
   codex: {
-    placeholder: /^freshcodex-/,
+    // CORRECTED against real freshcodex behavior (this is the first live codex T2
+    // run). Unlike opencode's `freshopencode-<requestId>` placeholder, the freshcodex
+    // create returns the codex app-server THREAD ID verbatim as the session id
+    // (server/fresh-agent/adapters/codex/adapter.ts create() -> runtime.startThread()
+    // -> { sessionId: started.threadId }; surfaced as freshAgent.created.sessionId in
+    // server/ws-handler.ts). That thread id is a UUID (UUIDv7 in codex-cli 0.142.x,
+    // e.g. `019e4983-201c-7451-ad52-c8505e08c699`), and it is STABLE from create -
+    // there is NO placeholder->durable materialization for codex, so placeholder and
+    // durable share the same UUID shape. The pre-existing `^freshcodex-` here was
+    // aspirational and never validated against a live codex run - see
+    // notes/t2-codex-gptmini.md.
+    placeholder: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
     durable: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
   },
 }
@@ -307,24 +318,34 @@ export function assertT2Invariants(obs: T2Observation): T2InvariantReport {
   // the grader picks the right edge per provider while keeping opencode's output
   // byte-identical (same name/position/detail) so its baseline never drifts:
   //
-  //   • claude/kilroy (SDK-driven): the DISCRETE `freshAgent.turn.complete` wire
-  //     event, emitted ONLY on the Claude SDK `result` with subtype==='success'
-  //     (server/sdk-bridge.ts:~469 → sdk.turn.complete → sdk-events.ts:~71 →
-  //     freshAgent.turn.complete). An interrupt/error never fires it, so it is a
-  //     clean, positive completion edge — cleaner than opencode's idle poll.
+  //   • claude/kilroy (SDK-driven) AND codex (app-server-driven): the DISCRETE
+  //     `freshAgent.turn.complete` wire event.
+  //       - claude: emitted ONLY on the Claude SDK `result` with subtype==='success'
+  //         (server/sdk-bridge.ts:~469 → sdk.turn.complete → sdk-events.ts:~71 →
+  //         freshAgent.turn.complete).
+  //       - codex: emitted ONLY when the codex app-server `turn/completed` notification
+  //         carries `params.turn.status ?? params.status === 'completed'`
+  //         (server/fresh-agent/adapters/codex/adapter.ts:~922 → sdk.turn.complete →
+  //         sdk-events.ts:~71 → freshAgent.turn.complete). `turn/completed` ALSO fires
+  //         for interrupts/failures (CodexTurnStatusSchema =
+  //         completed|interrupted|failed|inProgress), so the server STATUS-GUARDS the
+  //         edge; observing it on the wire is therefore a positive completion signal.
+  //     An interrupt/error never fires it, so it is a clean, positive completion edge —
+  //     cleaner than opencode's idle poll.
   //   • opencode: the idle edge (session.idle / session.status{type:idle}) that
   //     freshell surfaces as send-keys → status=idle. The debugger PROVED opencode
   //     1.17.13 emits it ~5s post-turn once the serve is health-ready.
   //
   // The persisted reply (turn.completed above) only CORROBORATES the primary edge.
   // The Rust port is graded on reproducing the SAME per-provider completion edge.
-  if (obs.provider === 'claude' || obs.provider === 'kilroy') {
+  if (obs.provider === 'claude' || obs.provider === 'kilroy' || obs.provider === 'codex') {
     add(
       'provider.emits-completion-signal',
       obs.turnCompleteEventObserved === true,
       `turnCompleteEventObserved=${obs.turnCompleteEventObserved === true} ` +
         `(turn completion observed via the discrete freshAgent.turn.complete wire event, ` +
-        `emitted on the Claude SDK result subtype=success; persisted .jsonl reply corroborates it)`,
+        `status-guarded server-side to fire only on a positive completion; ` +
+        `persisted transcript reply corroborates it)`,
     )
   } else {
     add(

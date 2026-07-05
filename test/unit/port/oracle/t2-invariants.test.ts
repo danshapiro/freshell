@@ -265,6 +265,138 @@ describe('assertT2Invariants — claude/Haiku (SDK completion edge)', () => {
   })
 })
 
+/**
+ * A known-good CODEX/GPT observation. Codex is app-server-driven (JSON-RPC 2.0 over
+ * WS), and — like claude — its PRIMARY completion edge is the discrete
+ * `freshAgent.turn.complete` wire event, but the guard differs: the codex
+ * `turn/completed` notification ALSO fires on interrupt/failure, so the adapter
+ * emits `sdk.turn.complete` ONLY when `params.turn.status ?? params.status ===
+ * 'completed'` (server/fresh-agent/adapters/codex/adapter.ts:~922). The freshcodex
+ * `create` returns the codex app-server THREAD ID verbatim (a UUIDv7 in codex-cli
+ * 0.142.x), and that id is STABLE from create — there is NO placeholder->durable
+ * materialization — so placeholder and durable are the SAME UUID and no
+ * `freshAgent.session.materialized` event is emitted (non-fatal). The rollout
+ * transcript persists as a `.jsonl` under the isolated CODEX_HOME
+ * (<HOME>/.codex/sessions/<date-dirs>/rollout-<ts>-<threadId>.jsonl), projected into
+ * the db-star fields.
+ */
+function goodCodexObservation(overrides: Partial<T2Observation> = {}): T2Observation {
+  const threadId = '019e4983-201c-7451-ad52-c8505e08c699' // UUIDv7 codex thread id
+  return {
+    provider: 'codex',
+    model: 'gpt-5.3-codex-spark',
+    prompt: 'Reply with exactly this token and nothing else: freshell-t2-ok',
+    sentinelToken: 'freshell-t2-ok',
+
+    sessionCreated: true,
+    initialSessionId: threadId, // codex create returns the thread id verbatim
+    durableSessionId: threadId, // stable from create — no materialization
+    sessionRef: { provider: 'codex', sessionId: threadId },
+
+    turnAccepted: true,
+    turnCompleted: true, // secondary: assistant reply (sentinel) persisted to the rollout .jsonl
+    serverReportedIdle: false, // N/A for codex — it uses the turn.complete edge, not the idle poll
+    turnCompleteEventObserved: true, // PRIMARY edge: status-guarded freshAgent.turn.complete
+    assistantReplyLatencyMs: 5200,
+    sendStatus: null,
+    submittedTurnId: 'codex-display:abc',
+
+    captureText: 'freshell-t2-ok\n',
+    captureLength: 15,
+    captureNonEmpty: true,
+    captureContainsSentinel: true,
+
+    dbPath: '/tmp/freshell-e2e-x/.codex/sessions/2026/07/04/rollout-2026-07-04T23-00-00-' + threadId + '.jsonl',
+    dbSessionRowPresent: true,
+    dbSessionRow: { id: threadId, title: null, directory: '/tmp/work' },
+    dbMessageCount: 2, // user + assistant message lines in the rollout
+    dbPartCount: 1, // one assistant text block
+    dbHasAssistantMessage: true,
+    transcriptParseable: true,
+
+    // Codex does NOT emit freshAgent.session.materialized (no placeholder->durable
+    // transition; the thread id is stable from create), so the materialized event is
+    // legitimately absent (non-fatal invariant).
+    wsServerMessageTypes: ['ready', 'settings.updated', 'terminal.inventory', 'freshAgent.created', 'freshAgent.event'],
+    sessionMaterializedEvent: null,
+
+    ownedCleanupOk: true,
+    strayOwnedPidsAfter: [],
+    liveModelCalls: 1,
+
+    timings: { createMs: 900, turnMs: 5200, totalMs: 8000 },
+    ...overrides,
+  }
+}
+
+describe('assertT2Invariants — codex/GPT (status-guarded SDK-style completion edge)', () => {
+  it('passes a known-good codex observation (status-guarded turn.complete edge)', () => {
+    const report = assertT2Invariants(goodCodexObservation())
+    expect(report.ok, report.summary + '\n' + JSON.stringify(report.results, null, 2)).toBe(true)
+    expect(report.failed).toBe(0)
+    expect(report.provider).toBe('codex')
+  })
+
+  it('grades codex on provider.emits-completion-signal, NOT the opencode idle edge', () => {
+    const report = assertT2Invariants(goodCodexObservation())
+    const completion = report.results.find((r) => r.name === 'provider.emits-completion-signal')
+    expect(completion, 'codex must be graded on the discrete status-guarded turn.complete edge').toBeTruthy()
+    expect(completion!.fatal).toBe(true)
+    expect(completion!.ok).toBe(true)
+    // The opencode-only idle invariant must NOT appear for codex.
+    expect(report.results.find((r) => r.name === 'provider.emits-idle-signal')).toBeUndefined()
+  })
+
+  it('FAILS (fatal) when the discrete turn.complete edge is never observed', () => {
+    const report = assertT2Invariants(goodCodexObservation({ turnCompleteEventObserved: false }))
+    expect(report.ok).toBe(false)
+    const completion = report.results.find((r) => r.name === 'provider.emits-completion-signal')
+    expect(completion!.ok).toBe(false)
+    expect(completion!.fatal).toBe(true)
+    expect(completion!.detail).toMatch(/turnCompleteEventObserved=false/)
+  })
+
+  it('FAILS (fatal) when turnCompleteEventObserved is missing (undefined ≠ observed)', () => {
+    const obs = goodCodexObservation()
+    delete (obs as { turnCompleteEventObserved?: boolean }).turnCompleteEventObserved
+    const report = assertT2Invariants(obs)
+    expect(report.ok).toBe(false)
+    expect(report.results.find((r) => r.name === 'provider.emits-completion-signal')!.ok).toBe(false)
+  })
+
+  // The codex placeholder is the codex app-server thread id (a UUID) — NOT `freshcodex-...`.
+  const codexShapeMutations: Array<{ name: string; invariant: string; patch: Partial<T2Observation> }> = [
+    { name: 'placeholder is the retired freshcodex- prefix (not a UUID)', invariant: 'session.created', patch: { initialSessionId: 'freshcodex-abc123' } },
+    { name: 'placeholder not a UUID', invariant: 'session.created', patch: { initialSessionId: 'bogus-id' } },
+    { name: 'durable id not a UUID', invariant: 'session.durable-id-shape', patch: { durableSessionId: 'not-a-uuid' } },
+    { name: 'null durable id', invariant: 'session.durable-id-shape', patch: { durableSessionId: null } },
+    { name: 'turn not accepted', invariant: 'turn.accepted', patch: { turnAccepted: false } },
+    { name: 'reply not persisted', invariant: 'turn.completed', patch: { turnCompleted: false } },
+    { name: 'sentinel missing from reply', invariant: 'assistant.replied-sentinel', patch: { captureContainsSentinel: false } },
+    { name: 'rollout .jsonl absent', invariant: 'transcript.persisted', patch: { dbSessionRowPresent: false } },
+    { name: 'zero messages persisted', invariant: 'transcript.persisted', patch: { dbMessageCount: 0 } },
+    { name: 'transcript not parseable', invariant: 'transcript.parseable', patch: { transcriptParseable: false } },
+    { name: 'stray owned pid left behind', invariant: 'ownership.cleanup', patch: { ownedCleanupOk: false, strayOwnedPidsAfter: [4242] } },
+  ]
+
+  for (const m of codexShapeMutations) {
+    it(`flips "${m.invariant}" when: ${m.name}`, () => {
+      const report = assertT2Invariants(goodCodexObservation(m.patch))
+      const inv = report.results.find((r) => r.name === m.invariant)
+      expect(inv, `invariant ${m.invariant} should exist`).toBeTruthy()
+      expect(inv!.ok, `invariant ${m.invariant} should be false for "${m.name}"`).toBe(false)
+      expect(report.ok, `expected overall FAIL for mutation "${m.name}"`).toBe(false)
+    })
+  }
+
+  it('uses the corrected UUID placeholder shape (thread id) and rejects the aspirational freshcodex- prefix', () => {
+    // Codex's placeholder IS its durable id: a stable UUID thread id from create.
+    expect(PROVIDER_ID_SHAPES.codex.placeholder.test('019e4983-201c-7451-ad52-c8505e08c699')).toBe(true)
+    expect(PROVIDER_ID_SHAPES.codex.placeholder.test('freshcodex-abc123')).toBe(false)
+    expect(PROVIDER_ID_SHAPES.codex.durable.test('019e4983-201c-7451-ad52-c8505e08c699')).toBe(true)
+  })
+})
+
 describe('containsSentinel (LLM text tolerance)', () => {
   it('matches the token amid provider preamble, case-insensitively', () => {
     expect(containsSentinel('Sure! Here you go: FRESHELL-T2-OK', 'freshell-t2-ok')).toBe(true)
