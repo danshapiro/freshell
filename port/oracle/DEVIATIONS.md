@@ -162,8 +162,10 @@ Every entry requires:
   messages) vs port → process stays alive, WS open, `sessions.changed`/rescan proceeds once the subdir
   appears. Keyed on the env precondition {provider-home exists ∧ session-root subdir absent at boot ∧
   subdir created at runtime}, never on a message payload.
-- **pinning_test (REQUIRED — does not exist yet):** port-side liveness test —
-  `crates/freshell-server/tests/coding_cli_late_root_watcher.rs`. Arrange a watched provider home whose
+- **pinning_test (SATISFIED — Phase 3.5):** port-side liveness test —
+  `crates/freshell-sessions/tests/late_root_watcher_liveness.rs` (4 tests green: a deterministic-fake
+  drive of the exact close-during-add race + a real-`notify` end-to-end; co-located with the indexer it
+  pins rather than the pre-crate-split path below). Arrange a watched provider home whose
   session-root subdir is absent at boot (indexer arms the late-root watcher on the existing ancestor);
   create the subdir + a session file at runtime; assert (a) the process/task does **not** panic or
   abort, (b) the watcher error is logged and a rescan is scheduled (degrade, not die), and (c) the new
