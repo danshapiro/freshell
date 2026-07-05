@@ -70,7 +70,7 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { startExternalServer, type ExternalServerHandle } from './external-server.js'
+import { startExternalServer, type ExternalServerHandle, type OracleTarget } from './external-server.js'
 import { writeWarmProxyShim } from './opencode-warm-proxy.js'
 import { WsCaptureClient } from './ws-capture-client.js'
 import {
@@ -440,6 +440,20 @@ export interface RunT2Options {
   turnTimeoutMs?: number
   /** Pipe the spawned server's stdout/stderr. */
   verbose?: boolean
+  /**
+   * Which server to drive: the node original (`'node'`, default) or the Rust port
+   * (`'rust'`). The SAME driver produces the T2Observation for both, so the oracle's
+   * original-vs-rust comparison is a true same-driver / different-SUT differential.
+   */
+  target?: OracleTarget
+  /**
+   * Whether to front the `opencode serve` with the DEV-0001 warm-proxy. Defaults to
+   * TRUE for the node original (which needs it to step around the cold-serve
+   * health-probe wedge) and FALSE for the Rust port, which carries the DEV-0001 fix
+   * natively and COLD-STARTS the serve clean — the fingerprint the T2-rust equivalence
+   * test asserts (`usedWarmProxy === false`).
+   */
+  warmProxy?: boolean
 }
 
 export interface T2TeardownFacts {
@@ -450,6 +464,13 @@ export interface T2TeardownFacts {
 
 export interface T2Run {
   handle: ExternalServerHandle
+  /** Which server was driven ('node' original or 'rust' port). */
+  target: OracleTarget
+  /**
+   * Whether the DEV-0001 warm-proxy fronted the serve. FALSE for the Rust port —
+   * the cold-start-clean fingerprint the T2-rust equivalence test asserts.
+   */
+  usedWarmProxy: boolean
   /** Isolated project cwd created for this run (removed on teardown). */
   cwd: string
   /** Empty temp XDG_CONFIG_HOME pinned for opencode config isolation (removed on teardown). */
@@ -493,42 +514,65 @@ export async function runOpencodeKimiT2(options: RunT2Options = {}): Promise<T2R
   const ownsCwd = !options.cwd
   const cwd = options.cwd ?? (await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-t2-project-')))
 
-  // Warm-proxy: freshell honors OPENCODE_CMD as its serve command and invokes it
-  // as `<cmd> serve --hostname H --port P`. We point it at a shim that warms the
-  // real serve past DEV-0001's cold-accept race with ZERO source mutation (see
-  // opencode-warm-proxy.ts). The shim + its inner serve inherit the run's
-  // FRESHELL_PROBE_SENTINEL (via freshell's server env) and are reaped normally.
+  const target: OracleTarget = options.target ?? 'node'
+  // The node original needs the DEV-0001 warm-proxy; the Rust port cold-starts clean.
+  const useWarmProxy = options.warmProxy ?? target === 'node'
+
+  // Both targets spawn the REAL `opencode serve` (the node original via the warm-proxy
+  // passthrough; the Rust port directly, `OPENCODE_CMD` unset). Resolve it up front.
   const realOpencode = resolveOpencodeBinary()
   if (!realOpencode) {
     if (ownsCwd) await fsp.rm(cwd, { recursive: true, force: true }).catch(() => {})
     await fsp.rm(xdgConfigHome, { recursive: true, force: true }).catch(() => {})
-    throw new Error('opencode binary not resolvable on PATH (required for the T2 warm-proxy)')
+    throw new Error('opencode binary not resolvable on PATH (required for the T2 serve)')
   }
-  const proxyDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-t2-proxy-'))
-  const proxyLogPath = path.join(proxyDir, 'warm-proxy.log')
-  const warmProxyCmd = await writeWarmProxyShim(proxyDir)
+
+  // Warm-proxy (NODE ONLY): freshell honors OPENCODE_CMD as its serve command and invokes
+  // it as `<cmd> serve --hostname H --port P`. We point it at a shim that warms the real
+  // serve past DEV-0001's cold-accept race with ZERO source mutation (opencode-warm-proxy.ts).
+  // The Rust port carries the DEV-0001 fix natively, so it gets NO OPENCODE_CMD and
+  // cold-starts the serve directly — the observable fingerprint the T2-rust test asserts.
+  let proxyDir: string | null = null
+  let proxyLogPath = ''
+  let warmProxyCmd: string | null = null
+  if (useWarmProxy) {
+    proxyDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-t2-proxy-'))
+    proxyLogPath = path.join(proxyDir, 'warm-proxy.log')
+    warmProxyCmd = await writeWarmProxyShim(proxyDir)
+  }
 
   const rmOwnedTemps = async () => {
     await fsp.rm(xdgConfigHome, { recursive: true, force: true }).catch(() => {})
-    await fsp.rm(proxyDir, { recursive: true, force: true }).catch(() => {})
+    if (proxyDir) await fsp.rm(proxyDir, { recursive: true, force: true }).catch(() => {})
     if (ownsCwd) await fsp.rm(cwd, { recursive: true, force: true }).catch(() => {})
   }
 
-  trace(traceOn, startedAt, `booting isolated server + seeding opencode auth (warm-proxy: ${warmProxyCmd})…`)
+  trace(
+    traceOn,
+    startedAt,
+    `booting isolated ${target} server + seeding opencode auth ` +
+      `(warm-proxy: ${warmProxyCmd ?? 'none — cold-start'})…`,
+  )
   let seededDbPath = ''
   let handle: ExternalServerHandle
   try {
     handle = await startExternalServer({
+      target,
       provider: 'oracle-t2-opencode',
       startTimeoutMs: 90_000,
       verbose: options.verbose ?? false,
       env: {
         XDG_CONFIG_HOME: xdgConfigHome,
         XDG_CACHE_HOME: xdgCacheHome,
-        // Warm-proxy wiring (freshell → `<OPENCODE_CMD> serve --hostname H --port P`).
-        OPENCODE_CMD: warmProxyCmd,
-        FRESHELL_T2_REAL_OPENCODE: realOpencode,
-        FRESHELL_T2_PROXY_LOG: proxyLogPath,
+        // Warm-proxy wiring (node original only). Omitted for the Rust cold-start so its
+        // ServeConfig command defaults to the real `opencode` binary.
+        ...(useWarmProxy && warmProxyCmd
+          ? {
+              OPENCODE_CMD: warmProxyCmd,
+              FRESHELL_T2_REAL_OPENCODE: realOpencode,
+              FRESHELL_T2_PROXY_LOG: proxyLogPath,
+            }
+          : {}),
       },
       setupHome: async (homeDir) => {
         const { dbPath } = await seedOpencodeAuthIntoHome(homeDir)
@@ -756,5 +800,5 @@ export async function runOpencodeKimiT2(options: RunT2Options = {}): Promise<T2R
     return facts
   }
 
-  return { handle, cwd, xdgConfigHome, xdgCacheHome, observation, teardown }
+  return { handle, target, usedWarmProxy: useWarmProxy, cwd, xdgConfigHome, xdgCacheHome, observation, teardown }
 }

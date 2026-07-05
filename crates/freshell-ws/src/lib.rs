@@ -52,6 +52,12 @@ pub struct WsState {
     pub boot_id: Arc<String>,
     /// The default server settings tree emitted in `settings.updated`.
     pub settings: Arc<ServerSettings>,
+    /// The shared server→client broadcast bus (pre-serialized JSON frames). REST
+    /// handlers (e.g. fresh-agent create/send) push here; every authenticated `/ws`
+    /// connection fans the frames out to its socket (the original `WsHandler.broadcast`).
+    /// Carries `ui.command` / `freshAgent.session.materialized` / `sessions.changed`
+    /// during a fresh-agent turn, which the oracle's capture socket records.
+    pub broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
 }
 
 /// The `/ws` sub-router, pre-bound to its state (mergeable into the server app).
@@ -156,6 +162,11 @@ async fn handle_socket(mut socket: WebSocket, state: WsState) {
         }
     };
 
+    // Subscribe to the broadcast bus BEFORE the handshake so a REST-driven broadcast
+    // can never slip through the window between "authenticated" and "streaming" (the
+    // oracle's capture socket must observe every fresh-agent broadcast).
+    let bcast_rx = state.broadcast_tx.subscribe();
+
     match evaluate_hello(&value, &state.auth_token) {
         HelloOutcome::Accept => {}
         HelloOutcome::NotHello => {
@@ -186,8 +197,9 @@ async fn handle_socket(mut socket: WebSocket, state: WsState) {
         }
     }
 
-    // Handshake done: serve the terminal.* shell path until the client closes.
-    terminal::run(socket, &state).await;
+    // Handshake done: serve the terminal.* shell path (and fan out broadcast-bus
+    // frames) until the client closes.
+    terminal::run(socket, &state, bcast_rx).await;
 }
 
 /// Best-effort structured error (used only on the non-graded reject paths). The
@@ -247,6 +259,7 @@ mod tests {
             server_instance_id: Arc::new("srv-1111".to_string()),
             boot_id: Arc::new("boot-2222".to_string()),
             settings: Arc::new(test_settings()),
+            broadcast_tx: Arc::new(tokio::sync::broadcast::channel::<String>(16).0),
         }
     }
 

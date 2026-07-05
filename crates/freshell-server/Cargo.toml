@@ -22,7 +22,10 @@ path = "src/main.rs"
 freshell-protocol = { path = "../freshell-protocol" }
 freshell-ws = { path = "../freshell-ws" }
 freshell-api = { path = "../freshell-api" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+# The fresh-agent REST surface (opencode slice) wired for the oracle T2 rung.
+freshell-freshagent = { path = "../freshell-freshagent" }
+# `sync` = the shared broadcast bus; `signal` = graceful SIGTERM shutdown (serve reaping).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 axum = "0.8"
 serde_json = { workspace = true }
 # Boot-scoped identifiers: `srv-<uuidv4>` / `boot-<uuidv4>`.

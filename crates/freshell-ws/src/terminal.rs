@@ -103,15 +103,25 @@ fn map_shell(shell: Shell) -> ShellType {
     }
 }
 
-/// Serve one authenticated connection's `terminal.*` traffic until the socket
-/// closes. `socket` has already had the connect handshake written by the caller.
-pub async fn run(socket: WebSocket, _state: &WsState) {
+/// Serve one authenticated connection's `terminal.*` traffic (and fan out the
+/// shared broadcast bus) until the socket closes. `socket` has already had the
+/// connect handshake written by the caller; `bcast_rx` is this connection's
+/// subscription to the server→client broadcast bus (`ui.command` /
+/// `freshAgent.session.materialized` / `sessions.changed`, pushed by REST handlers).
+pub async fn run(
+    socket: WebSocket,
+    _state: &WsState,
+    mut bcast_rx: tokio::sync::broadcast::Receiver<String>,
+) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     // Single per-connection output channel. Every terminal's reader-thread sink
     // sends here; the select loop routes by `terminalId`. Held open for the whole
     // connection so `recv()` never yields `None` while a terminal could still emit.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMessage>();
     let mut terminals: HashMap<String, TerminalEntry> = HashMap::new();
+    // Whether the broadcast bus is still open (guards the select branch so a closed
+    // bus can never busy-loop). The bus outlives every connection in practice.
+    let mut bus_open = true;
 
     loop {
         tokio::select! {
@@ -134,6 +144,23 @@ pub async fn run(socket: WebSocket, _state: &WsState) {
                 if let Some(out) = maybe_out {
                     if !route_output(out, &mut ws_tx, &mut terminals).await {
                         break;
+                    }
+                }
+            }
+            frame = bcast_rx.recv(), if bus_open => {
+                match frame {
+                    // A pre-serialized server→client frame — forward it verbatim.
+                    Ok(json) => {
+                        if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Slow consumer dropped some frames: the T2 broadcast set is tiny and
+                    // paced, so this is not expected; skip the gap and keep serving.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    // Sender gone (server shutting down): stop polling the bus.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        bus_open = false;
                     }
                 }
             }

@@ -548,6 +548,16 @@ impl OpencodeServeManager {
         self.json_request(HttpMethod::Get, &path, None, None).await
     }
 
+    /// `listMessages(id, {}, route)` (`serve-manager.ts:367-393`) — the current session
+    /// message page (`GET /session/:id/message`). Simplified for the transcript-capture
+    /// use: returns the raw JSON body the serve responds with (an array of message/part
+    /// objects) so the caller renders text parts; the pagination cursor is not threaded
+    /// here (a single page carries the whole short T2 turn). A 404 yields an empty array.
+    pub async fn list_messages(&self, id: &str, route: &Route) -> Result<Value, ServeError> {
+        let path = with_route(&format!("/session/{}/message", encode_path_segment(id)), route);
+        self.json_request(HttpMethod::Get, &path, None, Some(Value::Array(Vec::new()))).await
+    }
+
     /// `promptAsync(id, {parts, model?, variant?, agent?}, route)` — the send-turn call
     /// (`serve-manager.ts:355-365`). Returns once the serve accepts the prompt.
     pub async fn prompt_async(&self, id: &str, body: Value, route: &Route) -> Result<(), ServeError> {

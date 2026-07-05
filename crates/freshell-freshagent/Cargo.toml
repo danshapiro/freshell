@@ -1,0 +1,44 @@
+# freshell-freshagent — the fresh-agent REST surface for the opencode provider.
+#
+# Additive Phase 3.7 wiring: the slice of server/agent-api/router.ts the oracle's
+# T2 opencode rung drives —
+#   POST /api/tabs {agent:'opencode',…}   -> placeholder `freshopencode-*` pane + ui.command(tab.create)
+#   POST /api/panes/:id/send-keys         -> COLD-START the opencode serve (via freshell-opencode
+#                                            real-transport; DEV-0001 fix means NO warm-proxy),
+#                                            create the durable `ses_*`, broadcast
+#                                            freshAgent.session.materialized + sessions.changed,
+#                                            drive one turn, complete on the IDLE edge
+#   GET  /api/panes/:id/capture           -> render the transcript (listMessages) as text
+#
+# Only enough of the surface to satisfy the opencode T2 invariant set + the structural
+# baseline (port/oracle/baselines/t2/opencode-kimi.json). Claude/codex adapters, the
+# full pane/tab lifecycle, and non-opencode REST are deferred. The isolated opencode.db
+# is written by the real `opencode serve` under the server's isolated HOME (never the
+# user's store). Broadcasts are pushed as pre-serialized frames onto a shared bus the
+# freshell-ws connections fan out (see freshell-server main).
+[package]
+name = "freshell-freshagent"
+version = "0.1.0"
+description = "Fresh-agent REST surface (opencode slice) for the freshell Rust port: POST /api/tabs, /panes/:id/send-keys, /panes/:id/capture wired to freshell-opencode (real-transport, cold-start via the DEV-0001 fix). Emits ui.command / freshAgent.session.materialized / sessions.changed over the shared WS broadcast bus. Phase 3.7 — the surface the oracle T2 opencode rung grades (original≡rust)."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The frozen wire types the broadcasts emit (ui.command / freshAgent.session.materialized
+# / sessions.changed) — contract-locked shapes.
+freshell-protocol = { path = "../freshell-protocol" }
+# The opencode serve client CORE + its real reqwest/process backends (real-transport):
+# spawn+bounded-health cold-start (DEV-0001), create_session, run_turn (idle edge),
+# list_messages (transcript capture), and the ownership-safe reaper.
+freshell-opencode = { path = "../freshell-opencode", features = ["real-transport"] }
+# The REST router + JSON extraction.
+axum = "0.8"
+serde_json = { workspace = true }
+# The shared broadcast bus (String frames) + the create/turn async orchestration.
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+# paneId / tabId / placeholder-suffix / submittedTurnId minting.
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

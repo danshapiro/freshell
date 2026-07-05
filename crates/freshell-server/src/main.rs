@@ -24,6 +24,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use freshell_api::ApiState;
+use freshell_freshagent::FreshAgentState;
 use freshell_ws::WsState;
 use uuid::Uuid;
 
@@ -51,19 +52,31 @@ async fn main() -> ExitCode {
 
     let settings = Arc::new(load_server_settings(home.as_deref()));
 
+    // The shared server→client broadcast bus (pre-serialized frames). REST handlers
+    // (fresh-agent create/send) push here; every `/ws` connection fans it out to its
+    // socket — the original `WsHandler.broadcast`. Capacity is generous so a paced
+    // fresh-agent turn's handful of broadcasts never laps a briefly-busy consumer.
+    let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(1024).0);
+
     let ws_state = WsState {
         auth_token: Arc::clone(&auth_token),
         server_instance_id,
         boot_id,
         settings,
+        broadcast_tx: Arc::clone(&broadcast_tx),
     };
     let api_state = ApiState {
         auth_token: Arc::clone(&auth_token),
         ready: true,
     };
+    // The fresh-agent REST surface (opencode slice): shares the auth token + the
+    // broadcast bus so its create/send broadcasts reach every WS client.
+    let fresh_agent_state = FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx));
 
-    // One axum app serving REST (`/api/health`) + the WS upgrade (`/ws`).
-    let app = freshell_api::router(api_state).merge(freshell_ws::router(ws_state));
+    // One axum app serving REST (`/api/health` + fresh-agent) + the WS upgrade (`/ws`).
+    let app = freshell_api::router(api_state)
+        .merge(freshell_ws::router(ws_state))
+        .merge(freshell_freshagent::router(fresh_agent_state.clone()));
 
     let ip: IpAddr = bind_host.parse().unwrap_or(IpAddr::from([127, 0, 0, 1]));
     let addr = SocketAddr::new(ip, port);
@@ -78,11 +91,45 @@ async fn main() -> ExitCode {
     // Single startup line (stderr, so it never pollutes any stdout protocol).
     eprintln!("freshell-server listening on http://{addr} (ws://{addr}/ws)");
 
-    if let Err(err) = axum::serve(listener, app).await {
+    // Serve with graceful shutdown on SIGTERM/SIGINT so the fresh-agent opencode
+    // serve sidecar is reaped (SIGTERM + `/proc` ownership sweep) — no orphans.
+    let serve_result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await;
+    fresh_agent_state.shutdown().await;
+    if let Err(err) = serve_result {
         eprintln!("freshell-server: serve error: {err}");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+/// Resolve once a shutdown signal arrives (SIGTERM from the oracle harness's
+/// `stop()`, or Ctrl-C). Drives `axum`'s graceful shutdown so the opencode serve
+/// sidecar is reaped before exit.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            // If the SIGTERM handler cannot be installed, fall back to never-resolving
+            // so Ctrl-C still drives shutdown.
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 /// Resolve the port to bind. Mirrors `server/index.ts`: `PORT` env or 3001.

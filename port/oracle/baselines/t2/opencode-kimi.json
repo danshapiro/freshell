@@ -86,6 +86,7 @@
     "sessionCreated": true,
     "turnAccepted": true,
     "serverReportedIdle": true,
+    "turnCompleteEventObserved": false,
     "turnCompleted": true,
     "dbSessionRowPresent": true,
     "dbMessageCount": 2,
