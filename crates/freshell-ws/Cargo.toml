@@ -20,10 +20,26 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-# The frozen wire types this crate emits (ready/settings.updated/etc.).
+# The frozen wire types this crate emits (ready/settings.updated/etc.) + the
+# client-message types it parses (terminal.create/attach/input/kill/…).
 freshell-protocol = { path = "../freshell-protocol" }
+# The PTY core (real pseudo-terminal spawn + seq'd output framing) the terminal
+# handlers drive, and the SpawnSpec builder that resolves the shell.
+freshell-terminal = { path = "../freshell-terminal" }
+freshell-platform = { path = "../freshell-platform" }
 # Transport: axum's WebSocket upgrade is tokio-tungstenite-backed (ADR Decision 3).
 axum = { version = "0.8", features = ["ws"] }
 serde_json = { workspace = true }
 # ISO-8601 timestamp for `ready.timestamp` (matches Date#toISOString()).
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Async select loop + the mpsc channel that bridges the PTY reader thread (sync)
+# to the WS send path (async). `time` is used only for the terminal.output flush.
+tokio = { version = "1", features = ["sync", "macros", "time", "rt"] }
+# Split the WS socket into an independent sink + stream for the select loop
+# (StreamExt::split needs the `sink` feature; default features carry std+alloc).
+futures-util = "0.3"
+# terminalId + streamId minting. The reference mints `terminalId` via nanoid()
+# (terminal-registry.ts:1560) and `streamId` via randomUUID() (stream-identity.ts:24).
+# A UUIDv4's [0-9a-f-] is a subset of the oracle's url-safe id alphabet, so it
+# satisfies BOTH the `nanoid` and `streamId` shape validators (normalize.ts:176).
+uuid = { version = "1", features = ["v4"] }

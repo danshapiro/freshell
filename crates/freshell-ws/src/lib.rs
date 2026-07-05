@@ -13,10 +13,14 @@
 //!   **byte-identical** to the `ready.bootId` (the cross-message invariant the
 //!   oracle normalizer + determinism test pin).
 //!
-//! Everything else the real `ws-handler.ts` does (terminal.*, coding-cli,
-//! fresh-agent, backpressure, keepalive ping) is out of scope for Phase 3.4a and
-//! is added in later steps. The crate emits the frozen [`freshell_protocol`]
-//! server-message types so its wire bytes are contract-locked.
+//! After the handshake, the connection is handed to [`terminal`], which serves the
+//! `terminal.*` shell path (create/attach/input/output/kill) over the same socket —
+//! the transport the oracle's T1 rung grades (`port/machine/specs/terminal-core.md`).
+//! Coding-cli, fresh-agent, backpressure, and keepalive ping remain out of scope.
+//! The crate emits the frozen [`freshell_protocol`] server-message types so its
+//! wire bytes are contract-locked.
+
+pub mod terminal;
 
 use std::sync::Arc;
 
@@ -182,14 +186,8 @@ async fn handle_socket(mut socket: WebSocket, state: WsState) {
         }
     }
 
-    // Keep the connection open until the client closes it (a live server would
-    // stay attached). Handshake-only: ignore any further inbound frames.
-    loop {
-        match socket.recv().await {
-            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
-            _ => {}
-        }
-    }
+    // Handshake done: serve the terminal.* shell path until the client closes.
+    terminal::run(socket, &state).await;
 }
 
 /// Best-effort structured error (used only on the non-graded reject paths). The

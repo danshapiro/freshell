@@ -34,6 +34,16 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use crate::decode::Utf8StreamDecoder;
 use crate::framing::{reassemble_stream, OutputFramer};
 
+/// A live output sink invoked by the reader thread for **every** framed
+/// `terminal.output` message as it is produced (seq-ordered, single producer).
+///
+/// This is the streaming seam the WS transport layer (`freshell-ws`) uses to
+/// forward output frames to an attached client the moment they arrive, in
+/// addition to the crate's own in-memory capture (`captured_messages`). Kept as a
+/// bare `FnMut` callback so `freshell-terminal` stays transport-agnostic (no tokio
+/// dependency): the caller decides where each message goes (a channel, a buffer…).
+pub type MessageSink = Box<dyn FnMut(ServerMessage) + Send>;
+
 fn to_io<E: std::fmt::Display>(err: E) -> io::Error {
     io::Error::other(err.to_string())
 }
@@ -85,12 +95,31 @@ pub struct PtyTerminal {
 impl PtyTerminal {
     /// Spawn `spec` with the given fully-resolved child `env`, at `spec.cols` x
     /// `spec.rows`. `terminal_id`/`stream_id` label the framed output.
+    ///
+    /// The output is captured in-memory only (query via [`captured_messages`] /
+    /// [`reassemble`]). For live streaming to a WS client, use
+    /// [`spawn_with_sink`](Self::spawn_with_sink).
     pub fn spawn(
         spec: &SpawnSpec,
         env: &BTreeMap<String, String>,
         terminal_id: impl Into<String>,
         stream_id: impl Into<String>,
         ring_max_bytes: Option<i64>,
+    ) -> io::Result<Self> {
+        Self::spawn_with_sink(spec, env, terminal_id, stream_id, ring_max_bytes, None)
+    }
+
+    /// As [`spawn`](Self::spawn), but the reader thread also forwards every framed
+    /// `terminal.output` message to `sink` the moment it is produced (in seq order,
+    /// single producer), in addition to the in-memory capture. This is the seam the
+    /// WS transport uses to stream output to an attached client.
+    pub fn spawn_with_sink(
+        spec: &SpawnSpec,
+        env: &BTreeMap<String, String>,
+        terminal_id: impl Into<String>,
+        stream_id: impl Into<String>,
+        ring_max_bytes: Option<i64>,
+        sink: Option<MessageSink>,
     ) -> io::Result<Self> {
         let terminal_id = terminal_id.into();
         let stream_id = stream_id.into();
@@ -125,7 +154,7 @@ impl PtyTerminal {
 
         let captured = Arc::new(Mutex::new(Captured::default()));
         let framer = OutputFramer::new(terminal_id.clone(), stream_id.clone(), ring_max_bytes);
-        let reader_thread = spawn_reader(reader, framer, Arc::clone(&captured));
+        let reader_thread = spawn_reader(reader, framer, Arc::clone(&captured), sink);
 
         Ok(Self {
             child,
@@ -137,6 +166,18 @@ impl PtyTerminal {
             stream_id,
             reaped: false,
         })
+    }
+
+    /// Resize the PTY window (`terminal.resize` write path,
+    /// `terminal-registry.ts:3989` `pty.resize(cols,rows)`). Errors are swallowed
+    /// exactly as the reference swallows node-pty resize errors.
+    pub fn resize(&self, cols: u16, rows: u16) {
+        let _ = self._master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
     }
 
     pub fn terminal_id(&self) -> &str {
@@ -189,12 +230,28 @@ impl Drop for PtyTerminal {
 }
 
 /// The `onData` loop: read raw bytes -> decode UTF-8 (holding partial scalars) ->
-/// frame into `terminal.output` messages -> append to the shared sink.
+/// frame into `terminal.output` messages -> append to the in-memory capture AND
+/// (when present) forward each message to the live streaming `sink`.
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     mut framer: OutputFramer,
     captured: Arc<Mutex<Captured>>,
+    mut sink: Option<MessageSink>,
 ) -> JoinHandle<()> {
+    // Capture in-memory and (if wired) forward each framed message to the live sink.
+    // The sink sees frames in the SAME seq order they are appended (single producer).
+    let mut emit = move |messages: Vec<ServerMessage>| {
+        if messages.is_empty() {
+            return;
+        }
+        if let Some(sink) = sink.as_mut() {
+            for message in &messages {
+                sink(message.clone());
+            }
+        }
+        captured.lock().expect("captured mutex").messages.extend(messages);
+    };
+
     std::thread::spawn(move || {
         let mut decoder = Utf8StreamDecoder::new();
         let mut buf = [0u8; 8192];
@@ -204,10 +261,7 @@ fn spawn_reader(
                 Ok(n) => {
                     let text = decoder.push(&buf[..n]);
                     if !text.is_empty() {
-                        let messages = framer.append_output(&text);
-                        if !messages.is_empty() {
-                            captured.lock().expect("captured mutex").messages.extend(messages);
-                        }
+                        emit(framer.append_output(&text));
                     }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -218,10 +272,7 @@ fn spawn_reader(
         // Flush any trailing partial bytes at stream end (lossy).
         let tail = decoder.finish();
         if !tail.is_empty() {
-            let messages = framer.append_output(&tail);
-            if !messages.is_empty() {
-                captured.lock().expect("captured mutex").messages.extend(messages);
-            }
+            emit(framer.append_output(&tail));
         }
     })
 }
