@@ -1,0 +1,16 @@
+[package]
+name = "freshell-protocol"
+version = "0.1.0"
+description = "Generated Rust wire types for the frozen freshell WebSocket protocol (WS_PROTOCOL_VERSION = 7). Serialization only, no logic. Shared by the Rust server and the equivalence oracle."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Dev-only: used by the fidelity tests to validate serialized messages against
+# the frozen JSON Schema contract. Not part of the shipped crate surface.
+[dev-dependencies]
+jsonschema = "0.46"

@@ -1,0 +1,18 @@
+# freshell → Rust/Tauri port: Cargo workspace root.
+#
+# Additive to the existing Node repo (never modifies server/ or shared/ source).
+# Crates live under crates/; this file and `target/` sit at the worktree root.
+# The frozen WS contract (port/contract/*.schema.json, WS_PROTOCOL_VERSION=7) is
+# the shared seam consumed by freshell-protocol.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.96"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }

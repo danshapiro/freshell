@@ -38,3 +38,9 @@ artifacts/perf/
 .opencode/
 sdk.session.snapshot
 .kata.local.toml
+
+# --- Rust/Tauri port (additive; port-scoped so the Node repo is undisturbed) ---
+# Cargo build output for the workspace at this worktree root.
+/target
+**/*.rs.bk
+# Note: Cargo.lock IS committed for the workspace (it will host binaries).
