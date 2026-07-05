@@ -268,6 +268,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "freshell-platform"
+version = "0.1.0"
+
+[[package]]
 name = "freshell-protocol"
 version = "0.1.0"
 dependencies = [
