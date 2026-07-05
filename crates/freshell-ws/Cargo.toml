@@ -1,0 +1,29 @@
+# freshell-ws — WebSocket transport + connect-handshake dispatch (port of the
+# handshake path of server/ws-handler.ts).
+#
+# Phase 3.4a scope: the `/ws` endpoint, `hello` auth negotiation (protocolVersion
+# THEN constant-time token compare), and the exact ordered connect handshake the
+# original emits on a clean isolated boot: ready → settings.updated →
+# perf.logging → terminal.inventory (bootId byte-identical across ready and
+# inventory). Everything else (terminal.*, coding-cli, fresh-agent, backpressure,
+# ping/keepalive) is deferred to later steps.
+#
+# Uses axum's WebSocket upgrade (tokio-tungstenite-backed) per ADR Decision 3
+# (one axum app serves HTTP + the WS upgrade). Emits the frozen freshell-protocol
+# server message types.
+[package]
+name = "freshell-ws"
+version = "0.1.0"
+description = "WebSocket transport + connect-handshake dispatch for the freshell Rust port: /ws endpoint, hello auth (protocolVersion then constant-time token), and the exact ordered ready/settings.updated/perf.logging/terminal.inventory handshake. Emits frozen freshell-protocol types. Phase 3.4a (handshake only)."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The frozen wire types this crate emits (ready/settings.updated/etc.).
+freshell-protocol = { path = "../freshell-protocol" }
+# Transport: axum's WebSocket upgrade is tokio-tungstenite-backed (ADR Decision 3).
+axum = { version = "0.8", features = ["ws"] }
+serde_json = { workspace = true }
+# ISO-8601 timestamp for `ready.timestamp` (matches Date#toISOString()).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

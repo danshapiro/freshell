@@ -1,0 +1,29 @@
+# freshell-server — the standalone headless/daemon binary (the SYSTEM-UNDER-TEST).
+#
+# Phase 3.4a scope: boot fast + clean on an ephemeral loopback port, read the
+# env contract the oracle harness sets (PORT, AUTH_TOKEN, FRESHELL_BIND_HOST,
+# isolated HOME), wire ONE axum app serving `/api/health` (freshell-api) + `/ws`
+# (freshell-ws), and prove the connect handshake normalize-equals the original's
+# (oracle T0). Terminal-over-wire, the rest of REST, sessions, and the harness
+# providers are later steps.
+[package]
+name = "freshell-server"
+version = "0.1.0"
+description = "The standalone headless/daemon freshell server binary (the oracle system-under-test). Phase 3.4a: boots on an ephemeral loopback port under the harness env contract and serves /api/health + the connect-handshake /ws, normalize-equal to the original (oracle T0)."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "freshell-server"
+path = "src/main.rs"
+
+[dependencies]
+freshell-protocol = { path = "../freshell-protocol" }
+freshell-ws = { path = "../freshell-ws" }
+freshell-api = { path = "../freshell-api" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+axum = "0.8"
+serde_json = { workspace = true }
+# Boot-scoped identifiers: `srv-<uuidv4>` / `boot-<uuidv4>`.
+uuid = { version = "1", features = ["v4"] }
