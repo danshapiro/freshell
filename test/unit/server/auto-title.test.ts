@@ -133,4 +133,15 @@ describe('computeSessionTitleSync', () => {
     expect(r.shouldGenerateAi).toBe(false)
     expect(r.terminalIdsToUpdate).toEqual([])
   })
+
+  it('does not flag AI generation when the parsed title is provider-generated', () => {
+    const r = computeSessionTitleSync({
+      sessionTitle: 'Auth Redirect Fix',
+      override: { titleOverride: 'freshell', titleSource: 'dir' },
+      cwd: '/x', firstUserMessage: 'hi', aiWillAutoName: true,
+      parsedTitleSource: 'provider-generated',
+      terminals: [term('t1', 'Auth Redirect Fix')],
+    })
+    expect(r.shouldGenerateAi).toBe(false)
+  })
 })

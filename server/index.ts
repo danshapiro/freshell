@@ -835,6 +835,7 @@ async function main() {
             cwd: session.cwd,
             firstUserMessage: session.firstUserMessage,
             aiWillAutoName,
+            parsedTitleSource: session.titleSource,
             terminals: matching.map((t) => ({ terminalId: t.terminalId, title: t.title })),
           })
 
