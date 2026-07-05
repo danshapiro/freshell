@@ -1,0 +1,474 @@
+{
+  "tier": "T3",
+  "title": "E2E UI + visual parity (Playwright e2e-browser)",
+  "generated": "2026-07-05T17:35:29.239Z",
+  "against": "ORIGINAL (pristine TS/Electron freshell); the frontend is retained UNCHANGED in the Rust port, so these specs + visual baselines are the T3 contract",
+  "worktree_commit": "700dcacd",
+  "base_commit": "98ed121c",
+  "host": {
+    "os": "Linux 6.6.87.2-microsoft-standard-WSL2 (WSL2)",
+    "node": "v22.21.1",
+    "playwright": "1.58.2",
+    "chromium_rev": "145.0.7632.6",
+    "chromium_build": "chromium-1200",
+    "snapshot_platform": "chromium-linux"
+  },
+  "how_produced": {
+    "config": "test/e2e-browser/playwright.config.ts (the shared, unmodified spec suite)",
+    "command": "PLAYWRIGHT_JSON_OUTPUT_NAME=t3_full.json npx playwright test --config test/e2e-browser/playwright.config.ts --project=chromium --workers=4 --reporter=list,json",
+    "workers": 4,
+    "retries": 0,
+    "isolation": "Each Playwright worker booted its OWN isolated server on an ephemeral loopback port via TestServer (isolated $HOME). The user live server on :3001 was never touched.",
+    "flake_classification": "Every failure was re-run in isolation at --workers=1 --retries=1 to separate flaky-under-contention from hard-against-original.",
+    "raw_report": "port/oracle/baselines/t3/playwright-report.json"
+  },
+  "totals": {
+    "files": 31,
+    "tests": 138,
+    "passed": 122,
+    "failed": 16,
+    "flaky": 0,
+    "skipped": 0,
+    "duration_ms": 429544
+  },
+  "visual_baselines": {
+    "count": 7,
+    "matched": 6,
+    "mismatched": 1,
+    "results": [
+      {
+        "baseline": "screenshot-baselines.spec.ts-snapshots/default-layout-chromium-linux.png",
+        "spec": "screenshot-baselines.spec.ts:4",
+        "status": "MATCH"
+      },
+      {
+        "baseline": "screenshot-baselines.spec.ts-snapshots/settings-view-chromium-linux.png",
+        "spec": "screenshot-baselines.spec.ts:16",
+        "status": "MATCH"
+      },
+      {
+        "baseline": "screenshot-baselines.spec.ts-snapshots/multiple-tabs-chromium-linux.png",
+        "spec": "screenshot-baselines.spec.ts:29",
+        "status": "MATCH"
+      },
+      {
+        "baseline": "screenshot-baselines.spec.ts-snapshots/auth-modal-chromium-linux.png",
+        "spec": "screenshot-baselines.spec.ts:41",
+        "status": "MATCH"
+      },
+      {
+        "baseline": "screenshot-baselines.spec.ts-snapshots/sidebar-collapsed-chromium-linux.png",
+        "spec": "screenshot-baselines.spec.ts:52",
+        "status": "MATCH"
+      },
+      {
+        "baseline": "screenshot-baselines.spec.ts-snapshots/mobile-layout-chromium-linux.png",
+        "spec": "screenshot-baselines.spec.ts:64",
+        "status": "MATCH"
+      },
+      {
+        "baseline": "editor-pane.spec.ts-snapshots/editor-pane-loaded-chromium-linux.png",
+        "spec": "editor-pane.spec.ts:83",
+        "status": "MISMATCH"
+      }
+    ],
+    "note": "The 6 screenshot-baselines assertions use maxDiffPixelRatio:0.05 and all MATCH on this host. editor-pane-loaded uses NO tolerance and mismatches by 118px (ratio 0.0100) — a baseline-strictness finding, not a functional regression."
+  },
+  "baseline_semantics": {
+    "reference": "This exact 122-pass / 16-fail set is the T3 equivalence reference.",
+    "port_must": "Keep all 122 currently-GREEN tests green (a newly-RED test is a PORT_DEFECT) and keep the 6 matching visual baselines matching.",
+    "port_need_not": "Pass the 16 tests already RED against the original on this host (red==red is EQUIVALENT). Making any of them green is a candidate DELIBERATE_FIX (antagonist-adjudicated, ledgered).",
+    "why_red": "All 16 reproduce against the PRISTINE original — pre-existing red, consistent with DESIGN.md: CI runs NONE of these suites, so they have rotted unnoticed. They are FINDINGS, not port failures."
+  },
+  "core_in_baseline": {
+    "description": "Fully-green spec files against the original (the stable T3 CORE the port must reproduce).",
+    "files_green": [
+      "auth.spec.ts",
+      "browser-pane-screenshot.spec.ts",
+      "browser-pane.spec.ts",
+      "fresh-agent-mobile.spec.ts",
+      "fresh-agent.spec.ts",
+      "freshopencode-first-send-reload-repro.spec.ts",
+      "freshopencode-restart-recovery.spec.ts",
+      "opencode-replay-write-progression.spec.ts",
+      "pane-picker.spec.ts",
+      "pane-system.spec.ts",
+      "reconnection.spec.ts",
+      "screenshot-baselines.spec.ts",
+      "settings-persistence-split.spec.ts",
+      "settings.spec.ts",
+      "sidebar.spec.ts",
+      "stress.spec.ts",
+      "tab-management.spec.ts",
+      "tab-recency-sync.spec.ts",
+      "tabs-client-retire.spec.ts",
+      "terminal-background-freeze-catchup.spec.ts",
+      "terminal-lifecycle.spec.ts"
+    ],
+    "files_green_count": 21,
+    "covers_required_core": {
+      "auth": "auth.spec.ts (6/6)",
+      "terminal_create_lifecycle": "terminal-lifecycle.spec.ts (13/13)",
+      "reconnection": "reconnection.spec.ts (6/6)",
+      "tab_system": "tab-management.spec.ts (11/11), tab-recency-sync, tabs-client-retire, multirow-tabs (2/3)",
+      "pane_system": "pane-system.spec.ts (10/10), pane-picker (2/2), pane-activity-indicator (2/3)",
+      "visual_baselines": "6 of 7 MATCH",
+      "restart_recovery_note": "server-restart-recovery + the *-restart-recovery provider specs are RED against the original — quarantined below (not a stable-CORE gate)."
+    }
+  },
+  "quarantined": {
+    "description": "Tests that FAIL against the pristine ORIGINAL on this host (findings, not port gates). Not force-greened; baselines were not retaken.",
+    "count": 16,
+    "items": [
+      {
+        "id": "editor-pane.spec.ts:83",
+        "title": "loads the editor lazily and requests a new JS asset after the click",
+        "category": "visual_strictness",
+        "flaky_vs_hard": "hard",
+        "externally_targetable": true,
+        "evidence": "toHaveScreenshot(editor-pane-loaded.png): 118px differ (ratio 0.0100). This assertion has NO maxDiffPixelRatio tolerance, unlike the 6 screenshot-baselines (0.05) which all MATCH. Reproduced isolated@1w + retry."
+      },
+      {
+        "id": "fresh-agent-centralization-smoke.spec.ts:402",
+        "title": "normalizes remote legacy layout sync before exposing server pane snapshots",
+        "category": "fresh_agent_centralization",
+        "flaky_vs_hard": "hard(full-run)",
+        "externally_targetable": true,
+        "evidence": "normalizes remote legacy layout sync before exposing server pane snapshots; failed in 4-worker full run."
+      },
+      {
+        "id": "fresh-agent-centralization-smoke.spec.ts:448",
+        "title": "keeps fresh-agent settings and routes while legacy settings and routes are removed",
+        "category": "fresh_agent_centralization",
+        "flaky_vs_hard": "hard(full-run)",
+        "externally_targetable": true,
+        "evidence": "keeps fresh-agent settings/routes while legacy settings/routes are removed; failed in 4-worker full run (19s)."
+      },
+      {
+        "id": "freshopencode-db-history.spec.ts:245",
+        "title": "restores Freshopencode turns from DB history when export is truncated",
+        "category": "provider_opencode",
+        "flaky_vs_hard": "hard(full-run)",
+        "externally_targetable": false,
+        "evidence": "restores Freshopencode turns from truncated DB export; own TestServer + opencode DB fixtures."
+      },
+      {
+        "id": "freshopencode-db-history.spec.ts:324",
+        "title": "does not materialize Freshopencode from DB rows without top-level run sessionID",
+        "category": "provider_opencode",
+        "flaky_vs_hard": "hard(full-run)",
+        "externally_targetable": false,
+        "evidence": "does not materialize Freshopencode from DB rows without top-level run sessionID; own TestServer + opencode DB fixtures."
+      },
+      {
+        "id": "freshopencode-model-picker.spec.ts:41",
+        "title": "shows MRU tiles, sorted modal sources, and client-side filtering",
+        "category": "provider_opencode",
+        "flaky_vs_hard": "hard(full-run)",
+        "externally_targetable": true,
+        "evidence": "MRU tiles / sorted modal sources / filtering; needs the opencode model catalog; failed in full run."
+      },
+      {
+        "id": "mobile-viewport.spec.ts:195",
+        "title": "permission banner buttons are visible and functional on mobile",
+        "category": "frontend_state_machine",
+        "flaky_vs_hard": "hard",
+        "externally_targetable": true,
+        "evidence": "toContainText on the permission-banner card failed; hard-fail isolated@1w both attempts (17-18s each)."
+      },
+      {
+        "id": "multi-client.spec.ts:217",
+        "title": "reconnecting second viewer keeps page 1 PTY size stable and both pages keep shared output",
+        "category": "server_colocated",
+        "flaky_vs_hard": "hard",
+        "externally_targetable": true,
+        "evidence": "reconnecting 2nd viewer keeps page-1 PTY size stable + shared output; uses serverInfo.homeDir (co-located). Hard-fail isolated@1w both attempts (~25s)."
+      },
+      {
+        "id": "multirow-tabs.spec.ts:9",
+        "title": "enables multi-row tabs via settings toggle",
+        "category": "frontend_settings_ui",
+        "flaky_vs_hard": "hard",
+        "externally_targetable": true,
+        "evidence": "multi-row-tabs switch toBeVisible failed after opening Settings; hard-fail isolated@1w both attempts. Sibling tests :19/:33 (harness-dispatch) PASS."
+      },
+      {
+        "id": "opencode-restart-recovery.spec.ts:628",
+        "title": "reattaches a UI-created OpenCode pane across browser refresh",
+        "category": "provider_opencode",
+        "flaky_vs_hard": "hard(full-run)",
+        "externally_targetable": false,
+        "evidence": "reattaches a UI-created OpenCode pane across browser refresh; real opencode + own server."
+      },
+      {
+        "id": "opencode-restart-recovery.spec.ts:713",
+        "title": "recovers a hidden OpenCode sessionRef when association lands while the browser is closed",
+        "category": "provider_opencode",
+        "flaky_vs_hard": "hard(full-run)",
+        "externally_targetable": false,
+        "evidence": "recovers a hidden OpenCode sessionRef when association lands while browser closed."
+      },
+      {
+        "id": "opencode-restart-recovery.spec.ts:901",
+        "title": "preserves an associated OpenCode pane across browser refresh",
+        "category": "provider_opencode",
+        "flaky_vs_hard": "hard(full-run)",
+        "externally_targetable": false,
+        "evidence": "preserves an associated OpenCode pane across browser refresh (53s)."
+      },
+      {
+        "id": "opencode-restart-recovery.spec.ts:1042",
+        "title": "restores surviving OpenCode panes after graceful server restart and leaves a closed pane closed",
+        "category": "provider_opencode",
+        "flaky_vs_hard": "hard(full-run)",
+        "externally_targetable": false,
+        "evidence": "restores surviving OpenCode panes after graceful server restart and leaves a closed pane closed."
+      },
+      {
+        "id": "opencode-restart-recovery.spec.ts:1051",
+        "title": "restores multiple OpenCode panes after hard server kill",
+        "category": "provider_opencode",
+        "flaky_vs_hard": "hard(full-run)",
+        "externally_targetable": false,
+        "evidence": "restores multiple OpenCode panes after hard server kill (32s)."
+      },
+      {
+        "id": "pane-activity-indicator.spec.ts:79",
+        "title": "freshclaude panes transition from waiting to blue running and back to idle",
+        "category": "frontend_state_machine",
+        "flaky_vs_hard": "hard",
+        "externally_targetable": true,
+        "evidence": "freshclaude tab icon toHaveClass(/text-blue-500/) failed; hard-fail isolated@1w both attempts. Siblings :33 (browser) and :185 (claude terminals) PASS."
+      },
+      {
+        "id": "server-restart-recovery.spec.ts:21",
+        "title": "all panes recover after server restart without rate limit errors",
+        "category": "server_lifecycle",
+        "flaky_vs_hard": "hard",
+        "externally_targetable": false,
+        "evidence": "spawns then restarts its OWN TestServer on the same port; multi-pane recovery toPass timed out (30s). Hard-fail isolated@1w both attempts (~1.7m each)."
+      }
+    ]
+  },
+  "flaky_under_contention": [
+    {
+      "id": "editor-pane.spec.ts:120",
+      "title": "editor pane has path input and open button",
+      "evidence": "PASSED isolated@1w and in the 4-worker full run, but FAILED once at 6-worker contention (CORE run). Contention-sensitive, not a hard failure. In-baseline."
+    }
+  ],
+  "per_file": [
+    {
+      "file": "auth.spec.ts",
+      "pass": 6,
+      "fail": 0,
+      "externally_targetable": true
+    },
+    {
+      "file": "browser-pane-screenshot.spec.ts",
+      "pass": 2,
+      "fail": 0,
+      "externally_targetable": true
+    },
+    {
+      "file": "browser-pane.spec.ts",
+      "pass": 5,
+      "fail": 0,
+      "externally_targetable": true
+    },
+    {
+      "file": "editor-pane.spec.ts",
+      "pass": 5,
+      "fail": 1,
+      "externally_targetable": true
+    },
+    {
+      "file": "fresh-agent-centralization-smoke.spec.ts",
+      "pass": 2,
+      "fail": 2,
+      "externally_targetable": true
+    },
+    {
+      "file": "fresh-agent-mobile.spec.ts",
+      "pass": 1,
+      "fail": 0,
+      "externally_targetable": true
+    },
+    {
+      "file": "fresh-agent.spec.ts",
+      "pass": 9,
+      "fail": 0,
+      "externally_targetable": true
+    },
+    {
+      "file": "freshopencode-db-history.spec.ts",
+      "pass": 1,
+      "fail": 2,
+      "externally_targetable": false
+    },
+    {
+      "file": "freshopencode-first-send-reload-repro.spec.ts",
+      "pass": 1,
+      "fail": 0,
+      "externally_targetable": false
+    },
+    {
+      "file": "freshopencode-model-picker.spec.ts",
+      "pass": 0,
+      "fail": 1,
+      "externally_targetable": true
+    },
+    {
+      "file": "freshopencode-restart-recovery.spec.ts",
+      "pass": 1,
+      "fail": 0,
+      "externally_targetable": false
+    },
+    {
+      "file": "mobile-viewport.spec.ts",
+      "pass": 6,
+      "fail": 1,
+      "externally_targetable": true
+    },
+    {
+      "file": "multi-client.spec.ts",
+      "pass": 5,
+      "fail": 1,
+      "externally_targetable": true
+    },
+    {
+      "file": "multirow-tabs.spec.ts",
+      "pass": 2,
+      "fail": 1,
+      "externally_targetable": true
+    },
+    {
+      "file": "opencode-replay-write-progression.spec.ts",
+      "pass": 1,
+      "fail": 0,
+      "externally_targetable": true
+    },
+    {
+      "file": "opencode-restart-recovery.spec.ts",
+      "pass": 0,
+      "fail": 5,
+      "externally_targetable": false
+    },
+    {
+      "file": "pane-activity-indicator.spec.ts",
+      "pass": 2,
+      "fail": 1,
+      "externally_targetable": true
+    },
+    {
+      "file": "pane-picker.spec.ts",
+      "pass": 2,
+      "fail": 0,
+      "externally_targetable": true
+    },
+    {
+      "file": "pane-system.spec.ts",
+      "pass": 10,
+      "fail": 0,
+      "externally_targetable": true
+    },
+    {
+      "file": "reconnection.spec.ts",
+      "pass": 6,
+      "fail": 0,
+      "externally_targetable": true
+    },
+    {
+      "file": "screenshot-baselines.spec.ts",
+      "pass": 6,
+      "fail": 0,
+      "externally_targetable": true
+    },
+    {
+      "file": "server-restart-recovery.spec.ts",
+      "pass": 0,
+      "fail": 1,
+      "externally_targetable": false
+    },
+    {
+      "file": "settings-persistence-split.spec.ts",
+      "pass": 1,
+      "fail": 0,
+      "externally_targetable": false
+    },
+    {
+      "file": "settings.spec.ts",
+      "pass": 8,
+      "fail": 0,
+      "externally_targetable": true
+    },
+    {
+      "file": "sidebar.spec.ts",
+      "pass": 8,
+      "fail": 0,
+      "externally_targetable": true
+    },
+    {
+      "file": "stress.spec.ts",
+      "pass": 5,
+      "fail": 0,
+      "externally_targetable": true
+    },
+    {
+      "file": "tab-management.spec.ts",
+      "pass": 11,
+      "fail": 0,
+      "externally_targetable": true
+    },
+    {
+      "file": "tab-recency-sync.spec.ts",
+      "pass": 1,
+      "fail": 0,
+      "externally_targetable": true
+    },
+    {
+      "file": "tabs-client-retire.spec.ts",
+      "pass": 1,
+      "fail": 0,
+      "externally_targetable": true
+    },
+    {
+      "file": "terminal-background-freeze-catchup.spec.ts",
+      "pass": 1,
+      "fail": 0,
+      "externally_targetable": true
+    },
+    {
+      "file": "terminal-lifecycle.spec.ts",
+      "pass": 13,
+      "fail": 0,
+      "externally_targetable": true
+    }
+  ],
+  "targetable_seam": {
+    "purpose": "Point the identical e2e specs at an arbitrary running server (the Rust port) instead of booting a local TestServer, so the port is graded by the same suite + visual goldens.",
+    "helper": "test/e2e-browser/helpers/external-target.ts",
+    "fixture_seam": "test/e2e-browser/helpers/fixtures.ts (testServer worker fixture uses createE2eServerHandle())",
+    "oracle_config": "port/oracle/t3/playwright.target.config.ts",
+    "global_setup_wrapper": "port/oracle/t3/global-setup.target.ts (skips build when external)",
+    "env_vars": {
+      "FRESHELL_E2E_TARGET_URL": "http(s) base URL of the running server to grade (REQUIRED to enable external mode)",
+      "FRESHELL_E2E_TARGET_TOKEN": "auth token the specs navigate with (?token=...)",
+      "FRESHELL_E2E_TARGET_WS_URL": "optional ws(s) URL override (default: derived + /ws)",
+      "FRESHELL_E2E_TARGET_HOME": "optional: the target HOME dir if co-located, so serverInfo.homeDir specs work",
+      "FRESHELL_E2E_TARGET_TIMEOUT_MS": "optional health-probe timeout (default 30000)",
+      "FRESHELL_E2E_SKIP_BUILD": "optional: reuse existing dist for a local run (oracle config only)",
+      "FRESHELL_E2E_RETRIES": "optional retries override (default 0)"
+    },
+    "excluded_when_external": [
+      "server-restart-recovery.spec.ts",
+      "settings-persistence-split.spec.ts",
+      "freshopencode-restart-recovery.spec.ts",
+      "freshopencode-db-history.spec.ts",
+      "freshopencode-first-send-reload-repro.spec.ts",
+      "opencode-restart-recovery.spec.ts"
+    ],
+    "grade_the_port": "FRESHELL_E2E_TARGET_URL=http://127.0.0.1:PORT FRESHELL_E2E_TARGET_TOKEN=<token> npx playwright test --config port/oracle/t3/playwright.target.config.ts",
+    "default_unchanged": "When FRESHELL_E2E_TARGET_URL is unset, the fixture spawns a normal TestServer — behavior identical to before the seam."
+  }
+}

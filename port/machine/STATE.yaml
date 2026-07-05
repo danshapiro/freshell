@@ -92,10 +92,29 @@ phases:
          latent robustness bug (fresh Claude-Code install trips it). Source PRISTINE; harness pre-creates
          projects/ (env parity). NOT differ-whitelistable (both sides pre-create) → carried SOLELY by a
          mandatory port-side liveness pinning test (guard the watcher: stay up, degrade, resume)."
-      - "NEXT (in progress): T2 codex/GPT-mini (codex app-server JSON-RPC/WS; completion = turn/completed with
-         params.turn.status==='completed'; seed ~/.codex/auth.json + config.toml; reuse fake-app-server.mjs +
-         real-session-contract-harness codex paths; watch for isolated-home crashes like DEV-0002). THEN T3
-         (e2e-browser Playwright + 7 visual baselines against the isolated server). THEN exit Phase 0 → Phase 1."
+      - "DONE: T2 codex/GPT-mini GREEN (codex app-server JSON-RPC/WS; completion = turn/completed with
+         params.turn.status==='completed'; seed ~/.codex/auth.json + config.toml). DEV-0003 (codex effort) REJECTED
+         by antagonist. Cheapest-model matrix complete (Kimi/Haiku/GPT). Commit 700dcacd."
+      - "DONE: T3 e2e/visual baseline vs ORIGINAL on this host (WSL2 chromium-linux). Ran the shared unmodified
+         Playwright suite (test/e2e-browser, 138 tests, 4 workers, each worker its OWN isolated ephemeral-port
+         server; :3001 NEVER touched): 122 pass / 16 fail / 0 flaky; VISUAL 6/7 MATCH. Failure editor-pane-loaded
+         is a zero-tolerance 118px (0.01) Monaco-AA strictness finding; other 6 baselines match @0.05. All 16 fails
+         REPRODUCE against the pristine original (pre-existing red — CI runs none of these suites) → recorded as
+         FINDINGS, NOT force-greened, baselines NOT retaken; each classified hard-vs-flaky via isolated 1w re-runs
+         (editor-pane:120 is the only flaky-under-contention, in-baseline). Baseline semantics: port must keep the
+         122 green + 6 visual matching (else PORT_DEFECT); the 16 red==red are EQUIVALENT, fixing one = candidate
+         DELIBERATE_FIX. Source stayed PRISTINE (git diff server/ shared/ empty)."
+      - "DONE: T3 TARGETABLE SEAM (no shared spec rewritten). test/e2e-browser/helpers/external-target.ts +
+         a one-line fixtures.ts change (testServer worker fixture -> createE2eServerHandle): when
+         FRESHELL_E2E_TARGET_URL is set the specs point at an already-running EXTERNAL server (the Rust port),
+         ExternalServer.start()=health-check only, stop()=NO-OP (never kills a server it didn't spawn). Oracle
+         config port/oracle/t3/playwright.target.config.ts (workers=1, excludes the 6 server-owning specs when
+         external) + global-setup.target.ts (skips build when external). Default (unset) path is byte-identical —
+         proven: the whole 138-test baseline ran through the new code path in local mode. Artifacts:
+         port/oracle/baselines/t3/{summary.json,playwright-report.json}, port/oracle/notes/t3-e2e-visual.md,
+         port/oracle/t3/gen-summary.mjs. Grade the port later:
+         FRESHELL_E2E_TARGET_URL=http://127.0.0.1:PORT FRESHELL_E2E_TARGET_TOKEN=<tok>
+         npx playwright test --config port/oracle/t3/playwright.target.config.ts"
       - capture + persist T0/T1 golden baselines FROM ORIGINAL (transcripts normalized)
       - wire T2 live-invariant harness (Kimi/Haiku/GPT-mini) + make ORIGINAL's live provider suite pass
       - validate whole oracle by mutation testing against ORIGINAL (must catch injected divergence)

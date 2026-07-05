@@ -1,7 +1,8 @@
 import { test as base, type Page } from '@playwright/test'
-import { TestServer, type TestServerInfo } from './test-server.js'
+import { type TestServerInfo } from './test-server.js'
 import { TestHarness } from './test-harness.js'
 import { TerminalHelper } from './terminal-helpers.js'
+import { createE2eServerHandle, type E2eServerHandle } from './external-target.js'
 
 /**
  * Select a shell from the PanePicker, handling the race condition where
@@ -57,16 +58,21 @@ async function selectShellFromPicker(page: Page): Promise<void> {
  * - freshellPage: A page pre-navigated to Freshell with harness ready
  */
 export const test = base.extend<{
-  testServer: TestServer
+  testServer: E2eServerHandle
   serverInfo: TestServerInfo
   harness: TestHarness
   terminal: TerminalHelper
   freshellPage: Page
 }>({
-  // TestServer is scoped per-test by default, but we use a worker-scoped
-  // server for efficiency. Each test file shares one server.
+  // The server handle is scoped per-worker for efficiency: each test file
+  // shares one server.
+  //
+  // Seam (T3 oracle): when FRESHELL_E2E_TARGET_URL is set, createE2eServerHandle
+  // returns a handle that points at an already-running EXTERNAL server (e.g. the
+  // Rust port) instead of spawning a fresh local TestServer. When it is unset,
+  // this is a normal TestServer and the behavior is identical to before.
   testServer: [async ({}, use) => {
-    const server = new TestServer()
+    const server = await createE2eServerHandle()
     await server.start()
     await use(server)
     await server.stop()
