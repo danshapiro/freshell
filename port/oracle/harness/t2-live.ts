@@ -29,10 +29,14 @@
  *      session, and persists the assistant reply + messages + parts into the
  *      isolated opencode.db.
  *
- * Because the provider send blocks server-side until the session goes idle — and
- * opencode's headless serve replies fast yet never flips to idle — this harness
- * FIRES the turn and observes its EFFECTS (the persisted reply) rather than
- * awaiting the HTTP response. Completion is the persisted reply, never LLM text.
+ * Turn completion uses the IDLE EDGE as the PRIMARY signal: opencode's provider
+ * send blocks server-side until the session goes idle, and freshell's fresh-agent
+ * send-keys returns `data.status === 'idle'` on that edge. The debugger PROVED
+ * (notes/t2-opencode-stall.md, Exp4) that opencode 1.17.13 DOES emit session.idle /
+ * session.status{type:idle} ~5s post-turn — the earlier "never flips to idle" note
+ * was a MISdiagnosis caused by a cold-serve health-probe wedge. So this harness
+ * AWAITS the turn, treats the idle edge as primary completion, and uses the
+ * persisted assistant reply as SECONDARY corroboration. Never LLM-text equality.
  *
  * ── STATUS (original-side, captured this run) ───────────────────────────────
  * VERIFIED directly: with the seed paths above, `opencode serve` in an isolated
@@ -41,18 +45,18 @@
  * seeding, HOME/XDG isolation, warm-cache sharing, and the live model path are
  * all correct and the T2 invariants are satisfiable.
  *
- * KNOWN BLOCKER (a real finding for the Rust port, not papered over): driving
+ * DEV-0001 (the cold-serve health-probe wedge) was the SOLE blocker to driving
  * that same turn THROUGH the freshell fresh-agent adapter (POST /api/tabs +
- * send-keys) in this isolated/headless context STALLS before a durable `ses_…`
- * session is created — the freshell-spawned `opencode serve` boots and loads
- * config but no session is written, and send-keys never returns. The stall is
- * localized to freshell's `OpencodeServeManager`/serve interaction in a COLD
- * isolated home (a directly-spawned serve with per-request-timeout health polling
- * does not exhibit it, and the user's WARM production server is unaffected). The
- * exact stall point (health-probe vs createSession) is not yet pinned. Until it
- * is resolved, `t2-opencode-kimi.test.ts` verifies the T2 INFRA and skips the
- * behavioral assertions, auto-activating them the moment a durable session
- * materializes.
+ * send-keys). It is now stepped around here by an `OPENCODE_CMD` warm-proxy
+ * (`opencode-warm-proxy.ts`) that starts the real `opencode serve` on a private
+ * inner port, waits for its health, then opens an L4 passthrough on freshell's
+ * port — so freshell's own un-timed probe succeeds immediately, with ZERO source
+ * mutation (the PORT, not this baseline, fixes the probe itself). The proxy + its
+ * inner serve inherit this run's ownership sentinel and are reaped normally. With
+ * the warm-proxy the full turn completes: durable `ses_…` (turnAccepted), reply
+ * persisted (secondary corroboration), send-keys returns status=idle (primary
+ * idle edge). `t2-opencode-kimi.test.ts` now FAILS LOUDLY (never silently skips)
+ * whenever the gate is on but the turn does not accept or complete.
  *
  * SAFETY: only ever reaps processes carrying THIS run's ownership sentinel
  * (`FRESHELL_PROBE_SENTINEL=<sentinelPath>`, inherited by the server and every
@@ -67,6 +71,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { startExternalServer, type ExternalServerHandle } from './external-server.js'
+import { writeWarmProxyShim } from './opencode-warm-proxy.js'
 import { WsCaptureClient } from './ws-capture-client.js'
 import {
   type T2Observation,
@@ -92,6 +97,16 @@ function trace(enabled: boolean, startedAt: number, msg: string): void {
   console.error(`[t2-live +${Date.now() - startedAt}ms] ${msg}`)
 }
 
+/** Best-effort: last `n` lines of a text file (warm-proxy diagnostics only). */
+async function tailFile(filePath: string, n: number): Promise<string> {
+  try {
+    const txt = await fsp.readFile(filePath, 'utf8')
+    return txt.split('\n').slice(-n).join('\n')
+  } catch {
+    return '(no warm-proxy log)'
+  }
+}
+
 // ── auth path resolution + availability gate ─────────────────────────────────
 
 export interface OpencodeAuthPaths {
@@ -115,9 +130,15 @@ async function pathExists(p: string): Promise<boolean> {
   try { await fsp.access(p); return true } catch { return false }
 }
 
-function opencodeBinaryResolvable(): boolean {
+/** Absolute path of the real `opencode` binary on PATH, or null if unresolvable. */
+export function resolveOpencodeBinary(): string | null {
   const r = spawnSync('bash', ['-lc', 'command -v -- opencode'], { encoding: 'utf8', timeout: 5000 })
-  return r.status === 0 && !!r.stdout.trim()
+  const resolved = r.status === 0 ? r.stdout.trim() : ''
+  return resolved ? resolved : null
+}
+
+function opencodeBinaryResolvable(): boolean {
+  return resolveOpencodeBinary() !== null
 }
 
 /**
@@ -472,12 +493,28 @@ export async function runOpencodeKimiT2(options: RunT2Options = {}): Promise<T2R
   const ownsCwd = !options.cwd
   const cwd = options.cwd ?? (await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-t2-project-')))
 
+  // Warm-proxy: freshell honors OPENCODE_CMD as its serve command and invokes it
+  // as `<cmd> serve --hostname H --port P`. We point it at a shim that warms the
+  // real serve past DEV-0001's cold-accept race with ZERO source mutation (see
+  // opencode-warm-proxy.ts). The shim + its inner serve inherit the run's
+  // FRESHELL_PROBE_SENTINEL (via freshell's server env) and are reaped normally.
+  const realOpencode = resolveOpencodeBinary()
+  if (!realOpencode) {
+    if (ownsCwd) await fsp.rm(cwd, { recursive: true, force: true }).catch(() => {})
+    await fsp.rm(xdgConfigHome, { recursive: true, force: true }).catch(() => {})
+    throw new Error('opencode binary not resolvable on PATH (required for the T2 warm-proxy)')
+  }
+  const proxyDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-t2-proxy-'))
+  const proxyLogPath = path.join(proxyDir, 'warm-proxy.log')
+  const warmProxyCmd = await writeWarmProxyShim(proxyDir)
+
   const rmOwnedTemps = async () => {
     await fsp.rm(xdgConfigHome, { recursive: true, force: true }).catch(() => {})
+    await fsp.rm(proxyDir, { recursive: true, force: true }).catch(() => {})
     if (ownsCwd) await fsp.rm(cwd, { recursive: true, force: true }).catch(() => {})
   }
 
-  trace(traceOn, startedAt, 'booting isolated server + seeding opencode auth…')
+  trace(traceOn, startedAt, `booting isolated server + seeding opencode auth (warm-proxy: ${warmProxyCmd})…`)
   let seededDbPath = ''
   let handle: ExternalServerHandle
   try {
@@ -488,6 +525,10 @@ export async function runOpencodeKimiT2(options: RunT2Options = {}): Promise<T2R
       env: {
         XDG_CONFIG_HOME: xdgConfigHome,
         XDG_CACHE_HOME: xdgCacheHome,
+        // Warm-proxy wiring (freshell → `<OPENCODE_CMD> serve --hostname H --port P`).
+        OPENCODE_CMD: warmProxyCmd,
+        FRESHELL_T2_REAL_OPENCODE: realOpencode,
+        FRESHELL_T2_PROXY_LOG: proxyLogPath,
       },
       setupHome: async (homeDir) => {
         const { dbPath } = await seedOpencodeAuthIntoHome(homeDir)
@@ -506,8 +547,8 @@ export async function runOpencodeKimiT2(options: RunT2Options = {}): Promise<T2R
 
   const ws = new WsCaptureClient(handle.wsUrl, handle.token)
 
-  // The live turn is fired but never awaited (see below), so we hold its abort
-  // controller here for teardown to cancel the still-open request.
+  // The live turn's abort controller — held so teardown (or a blown deadline) can
+  // cancel a still-open send-keys request.
   let pendingSendAbort: AbortController | null = null
 
   // Single reaper used by BOTH the mid-run failure path and the caller's
@@ -561,6 +602,16 @@ export async function runOpencodeKimiT2(options: RunT2Options = {}): Promise<T2R
   }
 
   try {
+    // 0. Connect the capture socket + record the handshake so the materialized
+    //    broadcast and the server→client message inventory are observed on the
+    //    real wire. Best-effort: the capture client is an observer, never a driver.
+    try {
+      await ws.connect()
+      await ws.captureHandshake(20_000)
+    } catch (wsErr) {
+      trace(traceOn, startedAt, `ws capture handshake skipped: ${(wsErr as Error)?.message}`)
+    }
+
     // 1. Create the fresh-agent opencode pane (placeholder id; no serve yet).
     const tCreate = Date.now()
     const created = await httpJson(handle.baseUrl, handle.token, 'POST', '/api/tabs', {
@@ -575,14 +626,19 @@ export async function runOpencodeKimiT2(options: RunT2Options = {}): Promise<T2R
     observation.initialSessionId = created.json.data.sessionId ?? null
     trace(traceOn, startedAt, `tab created: pane=${paneId} placeholder=${observation.initialSessionId}; firing 1 live turn…`)
 
-    // 2. FIRE the live turn but DO NOT await it. The fresh-agent send blocks
-    //    server-side until the provider goes idle — and opencode's headless
-    //    serve replies fast yet never flips to idle — so awaiting the HTTP
-    //    response would hang. We observe the turn's EFFECTS instead.
+    // 2. FIRE the live turn. With the warm-proxy the serve is health-ready, so the
+    //    fresh-agent send drives the turn and BLOCKS server-side until the session
+    //    goes idle (the completion edge). We fire now so steps 3-4 can watch the
+    //    durable session + reply materialize mid-turn, then AWAIT the idle edge in
+    //    step 5. EXACTLY ONE live model call.
     const tTurn = Date.now()
     observation.liveModelCalls += 1
     const sendAc = new AbortController()
     pendingSendAbort = sendAc
+    // Belt: abort the socket if freshell's own idle deadline (turnTimeoutMs) is
+    // blown, so a network-level hang can never exceed the run budget.
+    const sendAbortTimer = setTimeout(() => { try { sendAc.abort() } catch { /* settled */ } }, turnTimeoutMs + 15_000)
+    if (typeof sendAbortTimer.unref === 'function') sendAbortTimer.unref()
     let sendOutcome = 'pending'
     const sendPromise = fetch(`${handle.baseUrl}/api/panes/${paneId}/send-keys`, {
       method: 'POST',
@@ -600,7 +656,10 @@ export async function runOpencodeKimiT2(options: RunT2Options = {}): Promise<T2R
           observation.submittedTurnId = json?.data?.submittedTurnId ?? observation.submittedTurnId
           observation.durableSessionId = observation.durableSessionId ?? json?.data?.sessionId ?? null
           observation.sessionRef = observation.sessionRef ?? json?.data?.sessionRef ?? null
-          if (res.status === 200 && json?.status !== 'approx' && json?.data?.status === 'idle') {
+          // PRIMARY completion edge: freshell surfaces the provider's idle signal
+          // (session.idle / session.status{type:idle}) as an `ok` response with
+          // data.status==='idle'. `approx` means the idle deadline was missed.
+          if (res.status === 200 && json?.status === 'ok' && json?.data?.status === 'idle') {
             observation.serverReportedIdle = true
           }
         } catch { /* non-JSON body already captured in sendOutcome */ }
@@ -609,12 +668,11 @@ export async function runOpencodeKimiT2(options: RunT2Options = {}): Promise<T2R
         sendOutcome = `rejected: ${(err as Error)?.name ?? String(err)}`
         trace(traceOn, startedAt, `send-keys ${sendOutcome}`)
       },
-    )
-    void sendPromise
+    ).finally(() => clearTimeout(sendAbortTimer))
 
     // 3. Observe the durable session materialize (created at turn start), from
     //    the DB OR the send-keys response — whichever surfaces the durable id.
-    let durableId = await waitForDurableSessionId(seededDbPath, 30_000)
+    let durableId = await waitForDurableSessionId(seededDbPath, 60_000)
     if (!durableId && observation.durableSessionId) durableId = observation.durableSessionId
     observation.durableSessionId = durableId
     observation.turnAccepted = !!durableId
@@ -623,11 +681,12 @@ export async function runOpencodeKimiT2(options: RunT2Options = {}): Promise<T2R
       trace(traceOn, startedAt, `durable session: ${durableId} (+${Date.now() - tTurn}ms)`)
     } else {
       const dbExists = await pathExists(seededDbPath)
-      trace(traceOn, startedAt, `NO durable session after 30s. dbExists=${dbExists} newest=${dbExists ? newestSessionId(seededDbPath) : 'n/a'} sendOutcome=[${sendOutcome}]`)
+      const proxyTail = await tailFile(proxyLogPath, 12)
+      trace(traceOn, startedAt, `NO durable session after 60s. dbExists=${dbExists} newest=${dbExists ? newestSessionId(seededDbPath) : 'n/a'} sendOutcome=[${sendOutcome}]\n--- warm-proxy.log tail ---\n${proxyTail}`)
     }
 
-    // 4. BEHAVIORAL completion: wait for the assistant reply (with the sentinel)
-    //    to PERSIST — the reliable completion edge, since idle is never signalled.
+    // 4. SECONDARY corroboration: wait for the assistant reply (with the sentinel)
+    //    to PERSIST into the isolated store — confirms the idle edge from step 5.
     if (durableId) {
       const { facts, latencyMs } = await waitForAssistantReply(seededDbPath, durableId, sentinel, turnTimeoutMs)
       observation.assistantReplyLatencyMs = latencyMs
@@ -638,9 +697,15 @@ export async function runOpencodeKimiT2(options: RunT2Options = {}): Promise<T2R
       observation.dbHasAssistantMessage = facts.hasAssistantMessage
       observation.transcriptParseable = facts.transcriptParseable
       observation.turnCompleted = facts.assistantContainsSentinel
-      observation.timings.turnMs = Date.now() - tTurn
       trace(traceOn, startedAt, `reply persisted=${facts.assistantContainsSentinel} in ${latencyMs}ms (msgs=${facts.messageCount} parts=${facts.partCount})`)
     }
+
+    // 5. AWAIT the PRIMARY completion edge: send-keys resolves when the turn goes
+    //    idle (data.status==='idle'), setting serverReportedIdle. Bounded by the
+    //    abort timer above, so this can never hang past the run budget.
+    await sendPromise
+    observation.timings.turnMs = Date.now() - tTurn
+    trace(traceOn, startedAt, `idle edge: serverReportedIdle=${observation.serverReportedIdle} sendStatus=${observation.sendStatus ?? 'null'} (+${observation.timings.turnMs}ms)`)
 
     // 5. Capture the rendered transcript via the real REST surface (best-effort;
     //    the persisted DB reply above is authoritative for the sentinel).

@@ -1,4 +1,7 @@
 import { spawnSync } from 'node:child_process'
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { afterAll, describe, expect, it } from 'vitest'
 import {
   runOpencodeKimiT2,
@@ -6,25 +9,30 @@ import {
   KIMI_MODEL,
   type T2Run,
 } from '../../../../port/oracle/harness/t2-live.js'
-import { assertT2Invariants } from '../../../../port/oracle/harness/invariants.js'
+import { assertT2Invariants, summarizeT2ForBaseline } from '../../../../port/oracle/harness/invariants.js'
 
 /**
  * T2 — LIVE behavioral-invariant conformance, opencode + Kimi k2.7 slice.
  *
- * Boots the ORIGINAL freshell server isolated + auth-seeded, drives ONE real
- * (cheap) Kimi turn through the real fresh-agent surface, and asserts the T2
- * BEHAVIORAL invariants (shape/presence/persistence/parseability/wire) — never
- * LLM-text equality. This captured original-side observation is the T2 baseline
- * the Rust port will later be diffed against.
+ * Boots the ORIGINAL freshell server isolated + auth-seeded, WARMS the opencode
+ * serve via the `OPENCODE_CMD` warm-proxy (steps past DEV-0001's cold-accept race
+ * with ZERO source mutation — see port/oracle/notes/t2-opencode-stall.md), drives
+ * ONE real (cheap) Kimi turn through the real fresh-agent surface, and asserts the
+ * T2 BEHAVIORAL invariants (shape/presence/persistence/parseability/idle-edge/wire)
+ * — never LLM-text equality. The captured original-side observation is projected
+ * into `port/oracle/baselines/t2/opencode-kimi.json`, the baseline the Rust port
+ * will later be diffed against.
  *
  * COST: exactly ONE live model call per run, pinned to the cheapest wired model.
  *
- * GATE: skips unless FRESHELL_RUN_REAL_PROVIDER_CONTRACTS is set AND opencode +
- * the umans-kimi-k2.7 credential are actually available in an isolated home.
- * Never wired into the shared suite — run via `npm run test:oracle:t2`.
+ * GATE: skips ONLY when the gate is off OR opencode + the umans-kimi-k2.7
+ * credential are genuinely absent. When the gate is ON and creds are present it
+ * runs for real and FAILS LOUDLY on any regression (never silently skips). Never
+ * wired into the shared suite — run via `npm run test:oracle:t2`.
  *
- * SAFETY: only reaps processes carrying this run's ownership sentinel; asserts
- * the user's live server (:3001) and its pid survive untouched.
+ * SAFETY: only reaps processes carrying this run's ownership sentinel (the server,
+ * the warm-proxy shim, and the inner opencode serve); asserts the user's live
+ * server (:3001) and its pid survive untouched.
  */
 
 const GATE_ENV = 'FRESHELL_RUN_REAL_PROVIDER_CONTRACTS'
@@ -39,6 +47,11 @@ if (!shouldRun) {
   // eslint-disable-next-line no-console
   console.warn(`[T2] SKIPPED — ${why}`)
 }
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+const PROJECT_ROOT = path.resolve(__dirname, '../../../..')
+const BASELINE_PATH = path.join(PROJECT_ROOT, 'port/oracle/baselines/t2/opencode-kimi.json')
 
 function pidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true } catch { return false }
@@ -62,6 +75,12 @@ function listenersOn3001(): number[] {
   return [...pids]
 }
 
+/** The opencode CLI version string (recorded in the baseline provenance). */
+function opencodeVersion(): string {
+  const r = spawnSync('opencode', ['--version'], { encoding: 'utf8', timeout: 10_000 })
+  return r.status === 0 ? r.stdout.trim().split('\n')[0] : 'unknown'
+}
+
 const describeLive = shouldRun ? describe.sequential : describe.skip
 
 describeLive('T2 live opencode + Kimi k2.7 behavioral invariants (original server)', () => {
@@ -74,8 +93,8 @@ describeLive('T2 live opencode + Kimi k2.7 behavioral invariants (original serve
   })
 
   it(
-    'drives one live Kimi turn through the isolated server and satisfies every T2 invariant',
-    async (ctx) => {
+    'drives one live Kimi turn through the warm-proxied server and satisfies every T2 invariant',
+    async () => {
       run = await runOpencodeKimiT2({ verbose: !!process.env.FRESHELL_T2_VERBOSE })
       const spawnedPid = run.handle.pid
 
@@ -104,38 +123,53 @@ describeLive('T2 live opencode + Kimi k2.7 behavioral invariants (original serve
         console.log(`[T2]   ${r.ok ? 'PASS' : 'FAIL'} ${r.name} — ${r.detail}`)
       }
 
-      // ── INFRA invariants — must ALWAYS hold, whether or not the turn lands ──
-      // These prove the T2 spine: isolated+seeded boot, real fresh-agent surface,
-      // ownership-safe reaping, and the user's live :3001 left untouched.
+      // ── INFRA invariants — the T2 spine (isolated+seeded boot, real fresh-agent
+      //    surface, ownership-safe reaping, live :3001 untouched) ──────────────
       expect(observation.model).toBe(KIMI_MODEL)
       expect(observation.sessionCreated, 'fresh-agent opencode pane must be created').toBe(true)
       expect(cleanup.serverPidGone, `spawned server pid ${spawnedPid} must be reaped`).toBe(true)
       expect(await waitForPidGone(spawnedPid)).toBe(true)
       expect(cleanup.strayOwnedPidsAfter, 'no sentinel-owned strays may remain').toEqual([])
 
-      if (!observation.turnAccepted) {
-        // ── KNOWN BLOCKER (documented in t2-live.ts header + the port report) ──
-        // The opencode/Kimi path works when driven DIRECTLY against `opencode
-        // serve` (session in ~0.2s, reply-with-sentinel persisted in ~10s), but
-        // driving it THROUGH the freshell fresh-agent adapter in this isolated/
-        // headless context stalls before a durable `ses_…` session is created.
-        // Infra above is verified; we DEFER (skip) the behavioral assertions so
-        // the slice stays honest — this test auto-activates them the moment the
-        // server-side stall is resolved (durableSessionId materializes).
-        // eslint-disable-next-line no-console
-        console.error(
-          '[T2] ⛔ LIVE DRIVE BLOCKED — no durable opencode session materialized through the ' +
-            'freshell fresh-agent adapter in the isolated context (opencode serve + Kimi work when ' +
-            'driven directly). Infra verified; skipping behavioral-invariant assertions. See ' +
-            'port/oracle/harness/t2-live.ts header.',
-        )
-        ctx.skip()
-        return
-      }
-
-      // ── Drive completed → the full behavioral report must be green ──────────
-      expect(observation.liveModelCalls).toBe(1)
+      // ── BEHAVIORAL invariants — FAIL LOUDLY (never skip) once the gate is on ──
+      // DEV-0001 is stepped around by the warm-proxy, so a stalled/incomplete turn
+      // is now a genuine regression, not an expected condition. The gate already
+      // guaranteed opencode + creds are present, so there is nothing left to defer.
+      expect(observation.liveModelCalls, 'exactly one live model call').toBe(1)
+      expect(
+        observation.turnAccepted,
+        'turn MUST be accepted (durable ses_ session materialized) — warm-proxy removed the DEV-0001 stall',
+      ).toBe(true)
+      expect(
+        observation.serverReportedIdle,
+        'turn MUST complete on the IDLE EDGE (send-keys → status=idle; session.idle/status{idle})',
+      ).toBe(true)
+      expect(
+        observation.turnCompleted,
+        'assistant reply MUST persist with the sentinel (secondary corroboration of the idle edge)',
+      ).toBe(true)
       expect(report.ok, report.summary).toBe(true)
+
+      // ── Persist the LLM-text-free original-side baseline (only on full green) ──
+      const baseline = {
+        ...summarizeT2ForBaseline(observation, report),
+        provenance: {
+          capturedAt: new Date().toISOString(),
+          capturedBy: 'test/integration/port/oracle/t2-opencode-kimi.test.ts',
+          opencodeVersion: opencodeVersion(),
+          warmProxy: true,
+          warmProxyReason:
+            'DEV-0001 cold-serve health-probe wedge; warmed via OPENCODE_CMD passthrough (zero source mutation). ' +
+            'The Rust port implements the probe fix natively and needs NO warm-proxy.',
+          note:
+            'Structural, LLM-text-free baseline. The Rust port drives the identical surface and its T2 ' +
+            'observation is projected via summarizeT2ForBaseline() and diffed against this file.',
+        },
+      }
+      fs.mkdirSync(path.dirname(BASELINE_PATH), { recursive: true })
+      fs.writeFileSync(BASELINE_PATH, `${JSON.stringify(baseline, null, 2)}\n`, 'utf8')
+      // eslint-disable-next-line no-console
+      console.log(`[T2] baseline persisted → ${BASELINE_PATH}`)
     },
     220_000,
   )

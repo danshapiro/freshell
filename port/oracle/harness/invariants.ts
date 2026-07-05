@@ -63,18 +63,24 @@ export interface T2Observation {
   /** The turn was dispatched and the provider began it (durable session materialized). */
   turnAccepted: boolean
   /**
-   * BEHAVIORAL completion: the assistant reply (containing the sentinel) was
-   * observed/persisted. NOTE: this is deliberately NOT the provider's idle flag —
-   * see `serverReportedIdle`. opencode's headless/isolated serve replies quickly
-   * but does not reliably emit a turn-idle signal, so the persisted reply is the
-   * authoritative behavioral completion edge for T2.
+   * SECONDARY corroboration of completion: the assistant reply (containing the
+   * sentinel) was observed/persisted into the isolated store. This CORROBORATES
+   * the primary idle edge (`serverReportedIdle`) but is deliberately not the
+   * primary completion signal — see the debugger's finding in
+   * `port/oracle/notes/t2-opencode-stall.md`: opencode 1.17.13 DOES emit
+   * `session.idle` / `session.status{type:idle}` ~5s after the turn, so the idle
+   * edge is the authoritative completion signal and the persisted reply merely
+   * confirms it.
    */
   turnCompleted: boolean
   /**
-   * FINDING (opencode session lifecycle): whether the provider serve actually
-   * emitted a turn-idle/complete signal within the observation window. Expected
-   * FALSE in the isolated/headless serve — recorded so the Rust port is graded
-   * on reproducing the SAME lifecycle (reply persists; idle not signalled).
+   * PRIMARY completion edge: whether the provider serve emitted a turn-idle
+   * signal (`session.idle` / `session.status{type:idle}`) that freshell surfaced
+   * through its blocking send (send-keys returned `data.status === 'idle'`).
+   * Expected TRUE — a correctly-driven turn completes on the idle edge. (The
+   * earlier "opencode never flips to idle" premise was a MISdiagnosis caused by a
+   * cold-serve health-probe wedge; with the serve warmed the idle edge fires.)
+   * The Rust port is graded on reproducing this SAME idle-edge completion.
    */
   serverReportedIdle: boolean
   /** ms from firing the turn to the assistant reply first being observed. */
@@ -214,12 +220,13 @@ export function assertT2Invariants(obs: T2Observation): T2InvariantReport {
   // 3. The turn was dispatched and the provider began it (durable session made).
   add('turn.accepted', obs.turnAccepted, `turnAccepted=${obs.turnAccepted}`)
 
-  // 4. BEHAVIORAL completion: the assistant reply was observed/persisted (NOT the
-  //    provider's unreliable idle flag — see provider.emits-idle-signal below).
+  // 4. SECONDARY corroboration of completion: the assistant reply (sentinel) was
+  //    observed/persisted. This confirms the PRIMARY idle edge asserted in
+  //    provider.emits-idle-signal below — never the sole completion signal.
   add(
     'turn.completed',
     obs.turnCompleted,
-    `turnCompleted(reply-observed)=${obs.turnCompleted}, ` +
+    `turnCompleted(reply-persisted, secondary)=${obs.turnCompleted}, ` +
       `assistantReplyLatencyMs=${obs.assistantReplyLatencyMs}, sendStatus=${obs.sendStatus ?? 'null'}`,
   )
 
@@ -276,18 +283,19 @@ export function assertT2Invariants(obs: T2Observation): T2InvariantReport {
     `ownedCleanupOk=${obs.ownedCleanupOk}, strayOwnedPidsAfter=[${obs.strayOwnedPidsAfter.join(', ')}]`,
   )
 
-  // Informational (non-fatal): does the provider serve emit a turn-idle signal?
-  // FINDING: opencode's headless/isolated serve replies fast but leaves the
-  // session perpetually "busy" (no idle event / status never flips). Surfaced
-  // here so the lifecycle difference is legible and the Rust port is graded on
-  // reproducing it — never text — rather than silently regressing on it.
+  // PRIMARY completion invariant (FATAL): the provider serve emitted a turn-idle
+  // signal (session.idle / session.status{type:idle}) that freshell surfaced as a
+  // completed turn (send-keys returned status=idle). The debugger PROVED opencode
+  // 1.17.13 emits the idle edge ~5s post-turn once the serve is health-ready, so a
+  // correctly-driven turn MUST complete on this edge — the persisted reply
+  // (turn.completed above) only corroborates it. The Rust port is graded on
+  // reproducing this same idle-edge completion.
   add(
     'provider.emits-idle-signal',
     obs.serverReportedIdle,
     `serverReportedIdle=${obs.serverReportedIdle} ` +
-      `(opencode-in-isolation is expected NOT to emit idle; behavioral completion ` +
-      `is asserted via the persisted reply instead)`,
-    false,
+      `(turn completion observed via session.idle/session.status{idle}, surfaced through ` +
+      `freshell's blocking send returning status=idle; persisted reply corroborates it)`,
   )
 
   // Informational: cost discipline. Not fatal, but surfaced so a runaway
@@ -315,5 +323,99 @@ export function assertT2Invariants(obs: T2Observation): T2InvariantReport {
     summary: ok
       ? `T2 invariants PASS (${passed}/${fatalResults.length}) for ${obs.provider} · ${obs.model}`
       : `T2 invariants FAIL (${failed} failed: ${failedNames.join(', ')}) for ${obs.provider} · ${obs.model}`,
+  }
+}
+
+// ── baseline projection (LLM-text-free) ─────────────────────────────────────────
+
+/**
+ * The ORIGINAL-side T2 baseline the Rust port is diffed against. Deliberately
+ * LLM-text-FREE and free of per-run nondeterminism (no captureText, no concrete
+ * random ids, no temp paths, no timings): only the structural SHAPES + the
+ * invariant PASS/FAIL matrix — the facts a correct port must reproduce.
+ */
+export interface T2Baseline {
+  tier: 'T2'
+  provider: string
+  model: string
+  sentinelToken: string
+  /** Fatal invariant names — these MUST be green for a conformant port. */
+  assertedInvariants: string[]
+  /** Non-fatal invariant names — recorded/observed but do not gate green. */
+  informationalInvariants: string[]
+  /** Overall grade of the captured original run (must be true to be a valid baseline). */
+  ok: boolean
+  passed: number
+  failed: number
+  /** The invariant matrix (name/ok/fatal only — details are dropped as they carry per-run ids/paths). */
+  invariantMatrix: Array<{ name: string; ok: boolean; fatal: boolean }>
+  /** Structural shapes the port must reproduce (booleans / counts / patterns / wire-type set). */
+  shapes: {
+    /** Regex source the placeholder id must match (provider id-shape). */
+    placeholderIdPattern: string | null
+    /** Regex source the durable id must match (provider id-shape). */
+    durableIdPattern: string | null
+    placeholderIdMatches: boolean
+    durableIdMatches: boolean
+    sessionCreated: boolean
+    turnAccepted: boolean
+    /** PRIMARY completion edge: provider signalled idle (session.idle/status{idle}). */
+    serverReportedIdle: boolean
+    /** SECONDARY corroboration: assistant reply persisted with the sentinel. */
+    turnCompleted: boolean
+    dbSessionRowPresent: boolean
+    dbMessageCount: number
+    dbPartCount: number
+    dbHasAssistantMessage: boolean
+    transcriptParseable: boolean
+    captureNonEmpty: boolean
+    captureContainsSentinel: boolean
+    /** Distinct server→client wire types seen (types only — never payloads). */
+    wsServerMessageTypes: string[]
+    sessionMaterializedObserved: boolean
+    liveModelCalls: number
+    ownedCleanupOk: boolean
+  }
+}
+
+/**
+ * Project a live observation + its graded report into the stable, LLM-text-free
+ * T2 baseline. Provenance (opencode version, capture timestamp) is added by the
+ * caller that persists the file.
+ */
+export function summarizeT2ForBaseline(obs: T2Observation, report: T2InvariantReport): T2Baseline {
+  const shape = shapeFor(obs.provider)
+  return {
+    tier: 'T2',
+    provider: obs.provider,
+    model: obs.model,
+    sentinelToken: obs.sentinelToken,
+    assertedInvariants: report.results.filter((r) => r.fatal).map((r) => r.name),
+    informationalInvariants: report.results.filter((r) => !r.fatal).map((r) => r.name),
+    ok: report.ok,
+    passed: report.passed,
+    failed: report.failed,
+    invariantMatrix: report.results.map((r) => ({ name: r.name, ok: r.ok, fatal: r.fatal })),
+    shapes: {
+      placeholderIdPattern: shape ? shape.placeholder.source : null,
+      durableIdPattern: shape ? shape.durable.source : null,
+      placeholderIdMatches: !!obs.initialSessionId && !!shape && shape.placeholder.test(obs.initialSessionId),
+      durableIdMatches: !!obs.durableSessionId && !!shape && shape.durable.test(obs.durableSessionId),
+      sessionCreated: obs.sessionCreated,
+      turnAccepted: obs.turnAccepted,
+      serverReportedIdle: obs.serverReportedIdle,
+      turnCompleted: obs.turnCompleted,
+      dbSessionRowPresent: obs.dbSessionRowPresent,
+      dbMessageCount: obs.dbMessageCount,
+      dbPartCount: obs.dbPartCount,
+      dbHasAssistantMessage: obs.dbHasAssistantMessage,
+      transcriptParseable: obs.transcriptParseable,
+      captureNonEmpty: obs.captureNonEmpty,
+      captureContainsSentinel: obs.captureContainsSentinel,
+      wsServerMessageTypes: [...obs.wsServerMessageTypes].sort(),
+      sessionMaterializedObserved: obs.sessionMaterializedEvent !== null,
+      liveModelCalls: obs.liveModelCalls,
+      ownedCleanupOk: obs.ownedCleanupOk,
+    },
   }
 }

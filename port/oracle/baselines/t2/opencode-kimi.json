@@ -1,0 +1,118 @@
+{
+  "tier": "T2",
+  "provider": "opencode",
+  "model": "umans-ai-coding-plan/umans-kimi-k2.7",
+  "sentinelToken": "freshell-t2-ok",
+  "assertedInvariants": [
+    "session.created",
+    "session.durable-id-shape",
+    "turn.accepted",
+    "turn.completed",
+    "assistant.replied-sentinel",
+    "transcript.persisted",
+    "transcript.parseable",
+    "ownership.cleanup",
+    "provider.emits-idle-signal"
+  ],
+  "informationalInvariants": [
+    "wire.session-materialized",
+    "cost.live-calls-bounded"
+  ],
+  "ok": true,
+  "passed": 9,
+  "failed": 0,
+  "invariantMatrix": [
+    {
+      "name": "session.created",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "session.durable-id-shape",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "turn.accepted",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "turn.completed",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "assistant.replied-sentinel",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "transcript.persisted",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "transcript.parseable",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "wire.session-materialized",
+      "ok": true,
+      "fatal": false
+    },
+    {
+      "name": "ownership.cleanup",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "provider.emits-idle-signal",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "cost.live-calls-bounded",
+      "ok": true,
+      "fatal": false
+    }
+  ],
+  "shapes": {
+    "placeholderIdPattern": "^freshopencode-",
+    "durableIdPattern": "^ses_[A-Za-z0-9]+$",
+    "placeholderIdMatches": true,
+    "durableIdMatches": true,
+    "sessionCreated": true,
+    "turnAccepted": true,
+    "serverReportedIdle": true,
+    "turnCompleted": true,
+    "dbSessionRowPresent": true,
+    "dbMessageCount": 2,
+    "dbPartCount": 1,
+    "dbHasAssistantMessage": true,
+    "transcriptParseable": true,
+    "captureNonEmpty": true,
+    "captureContainsSentinel": true,
+    "wsServerMessageTypes": [
+      "freshAgent.session.materialized",
+      "perf.logging",
+      "ready",
+      "sessions.changed",
+      "settings.updated",
+      "terminal.inventory",
+      "ui.command"
+    ],
+    "sessionMaterializedObserved": true,
+    "liveModelCalls": 1,
+    "ownedCleanupOk": true
+  },
+  "provenance": {
+    "capturedAt": "2026-07-05T04:10:49.086Z",
+    "capturedBy": "test/integration/port/oracle/t2-opencode-kimi.test.ts",
+    "opencodeVersion": "1.17.13",
+    "warmProxy": true,
+    "warmProxyReason": "DEV-0001 cold-serve health-probe wedge; warmed via OPENCODE_CMD passthrough (zero source mutation). The Rust port implements the probe fix natively and needs NO warm-proxy.",
+    "note": "Structural, LLM-text-free baseline. The Rust port drives the identical surface and its T2 observation is projected via summarizeT2ForBaseline() and diffed against this file."
+  }
+}

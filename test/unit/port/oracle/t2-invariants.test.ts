@@ -28,8 +28,8 @@ function goodObservation(overrides: Partial<T2Observation> = {}): T2Observation 
     sessionRef: { provider: 'opencode', sessionId: 'ses_0dedf8321ffeHD7n8QMereeYXd' },
 
     turnAccepted: true,
-    turnCompleted: true,
-    serverReportedIdle: false, // the real-world finding: reply persists, idle not signalled
+    turnCompleted: true, // secondary corroboration: reply persisted with the sentinel
+    serverReportedIdle: true, // PRIMARY edge: the turn completed on session.idle/status{idle}
     assistantReplyLatencyMs: 10500,
     sendStatus: null,
     submittedTurnId: 'turn_1',
@@ -85,7 +85,8 @@ describe('assertT2Invariants (provider-agnostic grader)', () => {
     { name: 'wrong durable shape', invariant: 'session.durable-id-shape', patch: { durableSessionId: 'not-a-ses-id' } },
     { name: 'null durable id', invariant: 'session.durable-id-shape', patch: { durableSessionId: null } },
     { name: 'turn not accepted', invariant: 'turn.accepted', patch: { turnAccepted: false } },
-    { name: 'reply not observed', invariant: 'turn.completed', patch: { turnCompleted: false } },
+    { name: 'reply not persisted (secondary corroboration)', invariant: 'turn.completed', patch: { turnCompleted: false } },
+    { name: 'provider never emits the idle edge', invariant: 'provider.emits-idle-signal', patch: { serverReportedIdle: false } },
     { name: 'sentinel missing from reply', invariant: 'assistant.replied-sentinel', patch: { captureContainsSentinel: false } },
     { name: 'no session row persisted', invariant: 'transcript.persisted', patch: { dbSessionRowPresent: false } },
     { name: 'zero messages persisted', invariant: 'transcript.persisted', patch: { dbMessageCount: 0 } },
@@ -110,12 +111,15 @@ describe('assertT2Invariants (provider-agnostic grader)', () => {
     })
   }
 
-  it('stays green when the provider never emits idle, but records the finding (non-fatal)', () => {
+  it('FAILS (fatal) when the provider never emits the idle edge — completion must be observed', () => {
+    // INVERTED (was: "stays green when provider never emits idle"). The debugger
+    // proved opencode DOES emit session.idle/session.status{idle} ~5s post-turn, so
+    // the idle edge is now the PRIMARY completion signal: its absence is a hard fail.
     const report = assertT2Invariants(goodObservation({ serverReportedIdle: false }))
-    expect(report.ok).toBe(true)
+    expect(report.ok).toBe(false)
     const idle = report.results.find((r) => r.name === 'provider.emits-idle-signal')
     expect(idle!.ok).toBe(false)
-    expect(idle!.fatal).toBe(false)
+    expect(idle!.fatal).toBe(true)
     expect(idle!.detail).toMatch(/serverReportedIdle=false/)
   })
 
