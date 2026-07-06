@@ -16,19 +16,27 @@
 //! * `FRESHELL_HOME` / `HOME` — the isolated home whose `.freshell/config.json`
 //!   supplies the persisted `network` overlay for `settings.updated`.
 
+mod boot;
+mod serve_client;
 mod settings;
 
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use freshell_api::ApiState;
 use freshell_freshagent::FreshAgentState;
+use freshell_platform::detect::{detect_platform_proc, host_os_live, read_proc_version};
 use freshell_ws::WsState;
 use uuid::Uuid;
 
+use crate::boot::BootState;
 use crate::settings::load_server_settings;
+
+/// App version reported by `GET /api/version` (mirrors `package.json` `version`).
+/// Overridable via `FRESHELL_APP_VERSION` for parity when a run needs it.
+const APP_VERSION: &str = "0.7.0";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -77,7 +85,7 @@ async fn main() -> ExitCode {
         auth_token: Arc::clone(&auth_token),
         server_instance_id,
         boot_id,
-        settings,
+        settings: Arc::clone(&settings),
         broadcast_tx: Arc::clone(&broadcast_tx),
         fresh_codex: fresh_codex_state.clone(),
         fresh_claude: fresh_claude_state.clone(),
@@ -90,12 +98,36 @@ async fn main() -> ExitCode {
     // broadcast bus so its create/send broadcasts reach every WS client.
     let fresh_agent_state = FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx));
 
-    // One axum app serving REST (`/api/health` + fresh-agent + `PATCH /api/settings`) + the
-    // WS upgrade (`/ws`).
+    // The boot REST surface the RETAINED React SPA fetches on first paint
+    // (bootstrap/platform/version/settings/session-directory/terminals/network),
+    // and the resolved `dist/client` dir the SPA is served from.
+    let boot_state = BootState {
+        auth_token: Arc::clone(&auth_token),
+        settings: Arc::clone(&settings),
+        platform: Arc::new(build_platform_payload()),
+        app_version: Arc::new(
+            std::env::var("FRESHELL_APP_VERSION").unwrap_or_else(|_| APP_VERSION.to_string()),
+        ),
+        port,
+    };
+    let client_dir = Arc::new(resolve_client_dir());
+
+    // One axum app serving REST (`/api/health` + fresh-agent + `PATCH /api/settings`
+    // + the SPA boot endpoints) + the WS upgrade (`/ws`) + static `dist/client`
+    // with SPA-fallback routing. The fallback also returns a clean 404 for any
+    // unmatched `/api/*` (never the HTML shell), mirroring the original ordering.
     let app = freshell_api::router(api_state)
         .merge(freshell_ws::router(ws_state))
         .merge(freshell_freshagent::router(fresh_agent_state.clone()))
-        .merge(fresh_codex_state.settings_router());
+        .merge(fresh_codex_state.settings_router())
+        .merge(boot::router(boot_state))
+        .fallback({
+            let client_dir = Arc::clone(&client_dir);
+            move |uri: axum::http::Uri| {
+                let client_dir = Arc::clone(&client_dir);
+                async move { serve_client::serve(uri, client_dir).await }
+            }
+        });
 
     let ip: IpAddr = bind_host.parse().unwrap_or(IpAddr::from([127, 0, 0, 1]));
     let addr = SocketAddr::new(ip, port);
@@ -184,4 +216,47 @@ fn resolve_home() -> Option<PathBuf> {
         .or_else(|| std::env::var("HOME").ok())
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+/// Build the `{ platform, availableClis, hostName, featureFlags }` payload the
+/// SPA reads on boot (mirrors `server/platform-router.ts`). `platform` is the
+/// real `/proc/version`-derived string (`detect_platform_proc`); `availableClis`
+/// is empty here (extension-driven CLI detection is a later step — the PanePicker
+/// still shows the shell/editor/browser options), and `featureFlags` defaults off.
+fn build_platform_payload() -> serde_json::Value {
+    let platform = detect_platform_proc(host_os_live(), read_proc_version().as_deref());
+    serde_json::json!({
+        "platform": platform,
+        "availableClis": {},
+        "hostName": read_host_name(),
+        "featureFlags": { "kilroy": false, "aiEnabled": false },
+    })
+}
+
+/// The OS hostname (mirrors `detectHostName`). `/proc/sys/kernel/hostname` →
+/// `$HOSTNAME` → `"localhost"`.
+fn read_host_name() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "localhost".to_string())
+}
+
+/// Resolve the built `dist/client` directory to serve the SPA from. Mirrors the
+/// original's `path.join(distRoot, 'client')`, with an explicit override for the
+/// oracle harness:
+/// * `FRESHELL_CLIENT_DIR` (explicit) →
+/// * `<worktree>/dist/client` (compile-time fallback, for a local run) →
+/// * `./dist/client` (cwd-relative last resort).
+fn resolve_client_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("FRESHELL_CLIENT_DIR") {
+        return PathBuf::from(dir);
+    }
+    let compiled = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dist/client");
+    if compiled.exists() {
+        return compiled;
+    }
+    PathBuf::from("dist/client")
 }

@@ -197,8 +197,17 @@ async fn route_output(
     };
     entry.last_seq = entry.last_seq.max(frame.seq_end);
     if entry.attached {
+        // Stamp the LIVE frame with the current attach's correlation id. The client
+        // (`TerminalView#isCurrentAttachMessage`) DROPS any stream frame whose
+        // `attachRequestId` is absent or does not match the active attach — so an
+        // unstamped frame renders nothing. The original echoes `m.attachRequestId`
+        // onto every output frame (`ws-handler.ts`); this reproduces that.
+        let mut frame = frame;
+        frame.attach_request_id = entry.attach_request_id.clone();
         send(ws_tx, &ServerMessage::TerminalOutput(frame)).await
     } else {
+        // Buffer un-stamped; the pending frames are stamped with the attach's id at
+        // flush time (an attach that arrives later owns the replay generation).
         entry.pending.push(frame);
         true
     }
@@ -396,9 +405,13 @@ async fn handle_attach(
         return false;
     }
 
-    // Flush buffered pre-attach frames (replay) in seq order, then go live.
+    // Flush buffered pre-attach frames (replay) in seq order, then go live. Stamp
+    // each replayed frame with THIS attach's correlation id so the client accepts
+    // them as replay for the active attach generation (see `route_output`).
     let pending = std::mem::take(&mut entry.pending);
-    for frame in pending {
+    let attach_request_id = entry.attach_request_id.clone();
+    for mut frame in pending {
+        frame.attach_request_id = attach_request_id.clone();
         if !send(ws_tx, &ServerMessage::TerminalOutput(frame)).await {
             return false;
         }

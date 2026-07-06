@@ -461,6 +461,7 @@ dependencies = [
  "axum",
  "freshell-api",
  "freshell-freshagent",
+ "freshell-platform",
  "freshell-protocol",
  "freshell-ws",
  "serde_json",

@@ -24,6 +24,8 @@ freshell-ws = { path = "../freshell-ws" }
 freshell-api = { path = "../freshell-api" }
 # The fresh-agent REST surface (opencode slice) wired for the oracle T2 rung.
 freshell-freshagent = { path = "../freshell-freshagent" }
+# Platform detection (`/proc/version` → platform string) for the SPA boot payload.
+freshell-platform = { path = "../freshell-platform" }
 # `sync` = the shared broadcast bus; `signal` = graceful SIGTERM shutdown (serve reaping).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 axum = "0.8"
