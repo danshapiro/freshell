@@ -24,11 +24,21 @@ current_phase: 5                 # 0=oracle bootstrap, 1=understand, 2=architect
 #   Open candidates CD-1..CD-8 + candidate-dirs (tracked in architecture-spec.md §8 / in-code notes).
 # DISCIPLINE HELD END-TO-END: original source NEVER mutated (git diff server/ shared/ empty at all
 #   ~25 commits); live :3001 / pid 1262455 never touched; 0 orphans; branch feat/rust-tauri-port pushed.
-# REMAINING (follow-up polish, honestly documented in EQUIVALENCE-REPORT §"what remains"):
-#   terminal batch framing (terminalOutputBatchV1); Tauri desktop features (tray/hotkey/updater/
-#   window-state/wizard/launch-chooser); browser-pane reverse-proxy (1 T3 spec); deeper REST breadth
-#   (sessions/history detail, files read/write, network/LAN control, extensions serving); and the
-#   off-host ceiling — macOS unverified, Windows-elevated netsh/UAC golden-string-only (not live-mutated).
+# FOLLOW-UPS LANDED (2026-07-06, see EQUIVALENCE-REPORT §0.1 addendum):
+#   [DONE] 3.16 terminal batch framing (barrier scanner + UTF-16 offsets + char ring; batch_wire_golden
+#          2/2 + t1-batch 44/44 original≡rust, multibyte UTF-16 proven).
+#   [DONE] 3.17 Tauri desktop features (tray/hotkey/window-state/wizard/chooser/updater-config/recovery;
+#          89 unit tests + xvfb hotkey; display/signing-gated items flagged).
+#   [DONE] ENV-0001 raised+RESOLVED: live-node uppercasing was a stale dist build; clean rebuild restored
+#          byte-exact (t1 10/10 + t1-batch 44/44, 0 skips); antagonist rejected a case-fold weakening;
+#          port always correct; quarantine self-extinguished.
+#   [DONE] 3.18 REST breadth (browser-pane proxy + screenshots + files r/w) => external e2e 118/126;
+#          port matches the original's EXACT pass/fail profile (remaining 8 = EQUIVALENT red-on-original).
+# REMAINING (bounded; off-host ceiling — NOT doable on this WSL2 host, documented, not defects):
+#   macOS packaging/visual (unverified); live Windows-elevated netsh/UAC mutation (golden-string-only —
+#   must not touch DANDESKTOP); the 8 EQUIVALENT specs (red on the pristine original, CI-rotted upstream);
+#   a few deep endpoints no failing spec gates (sessions/history detail, network/LAN control UI, extensions).
+#   ENV-0001 deep mechanism (stale-build fold) — moot (artifact gone), left as an optional curiosity.
 
 # --- Confirmed user constraints (this run) ---------------------------------
 constraints:

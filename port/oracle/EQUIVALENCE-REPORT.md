@@ -35,6 +35,41 @@
 
 ---
 
+## 0.1 Addendum — follow-ups landed after this capstone (2026-07-06)
+
+The capstone above was written mid-Phase-3. These follow-ups landed after it; all are committed
+and pushed, source still byte-pristine:
+
+- **3.16 Terminal batch framing** (`freshell-terminal`): the stateful VT barrier scanner + the
+  `terminal.output.batch` builder with **UTF-16** `endOffset`/`serializedBytes` (4-pass fixpoint) +
+  the char `ChunkRingBuffer` attach snapshot. Proven env-independently: `batch_wire_golden` 2/2 +
+  `t1-batch-equivalence-rust` 44/44 (incl. an emoji/CJK case proving `endOffset` is UTF-16 code
+  units, not bytes). Single-frame T1 path unchanged/byte-identical.
+- **3.17 Tauri desktop features** (`freshell-tauri`): tray, global hotkey (+ accelerator translation,
+  xvfb-live-registered), window-state persistence (+ off-screen clamp), wizard + launch-chooser
+  windows (per-window capabilities), updater config, renderer-recovery decision core. 89 new unit
+  tests. Display/signing-gated items (tray render/click, OS keypress, live update, rendered
+  wizard/chooser) are flagged fixture/manual — not faked.
+- **ENV-0001 (raised + RESOLVED):** capturing live batch goldens surfaced the live node-original
+  uppercasing PTY output. Antagonist REJECTED a proposed case-fold oracle-weakening; root-cause
+  re-check proved it was a **stale `dist/server` build** — a clean rebuild restored byte-exact
+  output (`t1` 10/10 + `t1-batch` 44/44, **0 skips**; self-extinguishing quarantine retained). The
+  Rust port was byte-for-byte correct throughout. See DEVIATIONS.md ENV-0001.
+- **3.18 REST breadth** (`freshell-server`/`freshell-ws`): browser-pane loopback reverse-proxy +
+  `POST /api/screenshots` + `ui.screenshot.result` WS round-trip + files read/write/stat/mkdir.
+  Full external e2e is now **118/126** — the sole genuine port-gap (`browser-pane-screenshot:56`)
+  closed; **the remaining 8 are EQUIVALENT (red on the pristine original too)**, so the port now
+  reproduces the original's **exact e2e pass/fail profile**. Mutating netsh/elevated NOT executed
+  live (golden-string only, per safety).
+
+**Updated tally:** 11 Rust crates + 1 Node sidecar; `cargo` workspace + oracle all green; the port
+is equivalence-proven original≡rust on **all four tiers** (T2-opencode determinism fixed;
+ENV-0001 resolved). Remaining is honestly-bounded (see §"what remains"): the off-host ceiling
+(macOS; live Windows-elevated netsh/UAC) + the 8 EQUIVALENT-red-on-original specs (pre-existing,
+CI-rotted on the original) + a few deep endpoints no failing spec gates.
+
+---
+
 ## 1. Rust crate map → which oracle tier proves each
 
 The workspace has **11 Rust crates + 1 Node sidecar** (`cargo metadata --no-deps` = 11 packages; `freshell-claude-sidecar` is the one sanctioned Node package per ADR Decision 2 and is excluded from the cargo workspace).
