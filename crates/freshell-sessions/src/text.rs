@@ -388,7 +388,12 @@ fn strip_image_tags(s: &str) -> String {
             if j < bytes.len() && bytes[j] == b'/' {
                 j += 1;
             }
-            if s[j..].len() >= 5 && s[j..j + 5].eq_ignore_ascii_case("image") {
+            // Compare on BYTES, not a `&str` slice: `j + 5` can land inside a
+            // multibyte UTF-8 char (e.g. `→`, 3 bytes), and slicing a `&str` there
+            // panics ("not a char boundary"). Byte-slicing is boundary-agnostic and
+            // "image" is pure ASCII, so this is an exact, panic-free equivalent of the
+            // original regex `/<\/?image[^>]*>/` (which handles Unicode input fine).
+            if bytes.len() >= j + 5 && bytes[j..j + 5].eq_ignore_ascii_case(b"image") {
                 // consume up to and including the next '>'
                 if let Some(gt) = s[j..].find('>') {
                     i = j + gt + 1;
@@ -507,4 +512,46 @@ pub fn is_canonical_claude_session_id(value: &str) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod char_boundary_tests {
+    use super::*;
+
+    // Regression for the panic:
+    //   "end byte index N is not a char boundary; it is inside '→'"
+    // strip_image_tags used a `&str` slice `s[j..j+5]` where `j+5` could land inside
+    // a multibyte UTF-8 char (arrows `→` are 3 bytes and extremely common in real
+    // AI transcripts), crashing the session indexer thread on real data.
+    #[test]
+    fn strip_image_tags_does_not_panic_on_multibyte_after_lt() {
+        // `<` at 0; the old `s[1..6]` slice landed inside the second `→`.
+        assert_eq!(strip_image_tags("<→→x"), "<→→x");
+        // A long run of arrows after `<` (mirrors the real 5266-byte offset case).
+        let long = format!("<{}", "→".repeat(64));
+        assert_eq!(strip_image_tags(&long), long);
+    }
+
+    #[test]
+    fn strip_image_tags_still_removes_tags_around_multibyte() {
+        // Real removal still works, and surrounding multibyte survives intact.
+        assert_eq!(strip_image_tags("a<image src=\"x\">b"), "ab");
+        assert_eq!(strip_image_tags("</IMAGE>→"), "→");
+        assert_eq!(strip_image_tags("see → <image foo> then → done"), "see →  then → done");
+    }
+
+    // Broad guard: the whole text-normalization path must never panic on multibyte,
+    // regardless of where a `<` falls relative to char boundaries.
+    #[test]
+    fn normalize_first_user_message_survives_arrows() {
+        for s in [
+            "→→→→→→→→→→ <not-a-real-tag> →→→",
+            "<image>→→→→→→",
+            "plan: a → b → c → d → e",
+            "<→<→<→<→<→<→",
+        ] {
+            let _ = normalize_first_user_message(s);
+            let _ = extract_user_authored_text(s);
+        }
+    }
 }
