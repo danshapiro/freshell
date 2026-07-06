@@ -59,13 +59,15 @@ pub struct BootState {
     pub platform: Arc<Value>,
     /// The app version string reported by `GET /api/version`.
     pub app_version: Arc<String>,
-    /// The bound loopback port, echoed in `GET /api/network/status`.
-    pub port: u16,
     /// The shared in-memory tabs registry — the `POST /api/tabs-sync/client-retire`
     /// beacon retires a client's snapshot here (the SAME registry the `/ws`
     /// `tabs.sync.*` path uses), so an unload without a live socket still drops the
     /// closing client's tabs from every other viewer.
     pub tabs: freshell_ws::tabs::TabsRegistry,
+    /// The client extensions registry (`toClientRegistry()`), returned by
+    /// `GET /api/extensions` (Follow-up 3.19) so the SPA's picker knows the real
+    /// CLI agents. Precomputed at boot (immutable for the process life).
+    pub extensions: std::sync::Arc<Vec<Value>>,
 }
 
 /// The boot REST sub-router, pre-bound to its state (mergeable into the app).
@@ -78,9 +80,7 @@ pub fn router(state: BootState) -> Router {
         .route("/api/platform", get(platform))
         .route("/api/version", get(version))
         .route("/api/settings", get(get_settings))
-        .route("/api/session-directory", get(session_directory))
         .route("/api/terminals", get(terminals))
-        .route("/api/network/status", get(network_status))
         .route("/api/extensions", get(extensions))
         .route("/api/logs/client", post(logs_client))
         .route("/api/tabs-sync/client-retire", post(tabs_sync_client_retire))
@@ -126,14 +126,6 @@ async fn get_settings(State(state): State<BootState>, headers: HeaderMap) -> Res
     Json(&*state.settings).into_response()
 }
 
-/// `GET /api/session-directory` → an empty read-model page (clean isolated boot).
-async fn session_directory(State(state): State<BootState>, headers: HeaderMap) -> Response {
-    if !is_authed(&headers, &state.auth_token) {
-        return unauthorized();
-    }
-    Json(json!({ "items": [], "nextCursor": null, "revision": 0 })).into_response()
-}
-
 /// `GET /api/terminals` → the terminal directory. Empty array on a clean boot
 /// (the no-read-model-query shape `terminalViewService.listTerminalDirectory()`
 /// returns, which `TestHarness.killAllTerminals` consumes as an array).
@@ -144,36 +136,17 @@ async fn terminals(State(state): State<BootState>, headers: HeaderMap) -> Respon
     Json(json!([])).into_response()
 }
 
-/// `GET /api/network/status` → a minimal loopback status so `fetchNetworkStatus`
-/// resolves. Remote access is off on a clean isolated boot. This is intentionally
-/// minimal — the full network surface (firewall/LAN/port-forward) is a later step.
-async fn network_status(State(state): State<BootState>, headers: HeaderMap) -> Response {
-    if !is_authed(&headers, &state.auth_token) {
-        return unauthorized();
-    }
-    Json(json!({
-        "configured": true,
-        "host": "127.0.0.1",
-        "remoteAccessEnabled": false,
-        "remoteAccessRequested": false,
-        "remoteAccessNeedsRepair": false,
-        "port": state.port,
-        "firewall": { "platform": "none", "active": false, "commands": [] },
-        "accessUrl": format!("http://localhost:{}/", state.port),
-    }))
-    .into_response()
-}
-
-/// `GET /api/extensions` → the client extensions registry. Empty on a clean boot
-/// (no `extensions/` dir in the isolated runtime root). The SPA's
-/// `useEnsureExtensionsRegistry` normalizes a non-array to `[]`; returning `[]`
-/// settles its load (a 404 makes it retry-storm), keeping the console clean and
-/// the terminal write pipeline un-starved.
+/// `GET /api/extensions` → the client extensions registry (`toClientRegistry()`,
+/// `server/extension-routes.ts:15-17`). Follow-up 3.19: this now returns the real
+/// discovered CLI extensions (claude/codex/opencode/…) so the SPA's PanePicker can
+/// surface the coding-CLI agents, instead of the earlier empty `[]`. The SPA's
+/// `useEnsureExtensionsRegistry` consumes this as the `ClientExtensionEntry[]`
+/// array.
 async fn extensions(State(state): State<BootState>, headers: HeaderMap) -> Response {
     if !is_authed(&headers, &state.auth_token) {
         return unauthorized();
     }
-    Json(json!([])).into_response()
+    Json(&*state.extensions).into_response()
 }
 
 /// `POST /api/logs/client` → the client-log sink. Accept-and-ack (the SPA ignores
@@ -258,7 +231,9 @@ pub(crate) fn is_authed(headers: &HeaderMap, token: &str) -> bool {
 }
 
 /// `401 { "error": "Unauthorized" }` — byte-shape-equal to the original's reject.
-fn unauthorized() -> Response {
+///
+/// `pub(crate)` so the additive `network` REST surface shares the identical reject.
+pub(crate) fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         Json(json!({ "error": "Unauthorized" })),

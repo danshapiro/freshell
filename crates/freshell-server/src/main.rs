@@ -17,10 +17,13 @@
 //!   supplies the persisted `network` overlay for `settings.updated`.
 
 mod boot;
+mod extensions;
 mod files;
+mod network;
 mod proxy;
 mod screenshots;
 mod serve_client;
+mod session_directory;
 mod settings;
 
 use std::net::{IpAddr, SocketAddr};
@@ -121,19 +124,49 @@ async fn main() -> ExitCode {
     // broadcast bus so its create/send broadcasts reach every WS client.
     let fresh_agent_state = FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx));
 
+    // Follow-up 3.19: discover the CLI extensions (bundled `extensions/` +
+    // user/local dirs) and detect which coding-CLI agents are on PATH, so the
+    // PanePicker surfaces the real claude/codex/opencode agents (was `{}`). The
+    // client registry feeds `GET /api/extensions`; `availableClis` feeds the
+    // platform payload (`/api/platform` + `bootstrap.platform`).
+    let extension_registry =
+        extensions::ExtensionRegistry::scan(&extensions::resolve_extension_dirs(home.as_deref()));
+    let available_clis =
+        extensions::detect_available_clis_live(&extension_registry.cli_detection_specs());
+    let extensions_registry = Arc::new(extension_registry.to_client_registry());
+
     // The boot REST surface the RETAINED React SPA fetches on first paint
     // (bootstrap/platform/version/settings/session-directory/terminals/network),
     // and the resolved `dist/client` dir the SPA is served from.
     let boot_state = BootState {
         auth_token: Arc::clone(&auth_token),
         settings: Arc::clone(&settings),
-        platform: Arc::new(build_platform_payload()),
+        platform: Arc::new(build_platform_payload(available_clis)),
         app_version: Arc::new(
             std::env::var("FRESHELL_APP_VERSION").unwrap_or_else(|_| APP_VERSION.to_string()),
         ),
-        port,
         tabs: tabs.clone(),
+        extensions: Arc::clone(&extensions_registry),
     };
+    // The read-only network status surface (`GET /api/network/status`, Follow-up
+    // 3.19): the full `NetworkStatus` shape, with firewall/LAN facts detected
+    // lazily via READ-ONLY probes and cached. `effective_host` is the actual bind.
+    let network_state = network::NetworkState {
+        auth_token: Arc::clone(&auth_token),
+        settings: Arc::clone(&settings),
+        effective_host: Arc::new(bind_host.clone()),
+        port,
+        facts: Arc::new(tokio::sync::OnceCell::new()),
+    };
+
+    // The History read model (`GET /api/session-directory`, Follow-up 3.19): list
+    // the coding-CLI sessions from the isolated home's provider transcript dirs,
+    // reusing `freshell-sessions` parsers. Replaces the earlier empty-page stub.
+    let session_directory_state = session_directory::SessionDirectoryState {
+        auth_token: Arc::clone(&auth_token),
+        home: home.clone(),
+    };
+
     let client_dir = Arc::new(resolve_client_dir());
 
     // The files REST surface the RETAINED SPA's DirectoryPicker fetches when a
@@ -167,6 +200,8 @@ async fn main() -> ExitCode {
         .merge(freshell_freshagent::router(fresh_agent_state.clone()))
         .merge(fresh_codex_state.settings_router())
         .merge(boot::router(boot_state))
+        .merge(network::router(network_state))
+        .merge(session_directory::router(session_directory_state))
         .merge(files::router(files_state))
         .merge(proxy::router(proxy_state))
         .merge(screenshots::router(screenshots_state))
@@ -270,13 +305,14 @@ fn resolve_home() -> Option<PathBuf> {
 /// Build the `{ platform, availableClis, hostName, featureFlags }` payload the
 /// SPA reads on boot (mirrors `server/platform-router.ts`). `platform` is the
 /// real `/proc/version`-derived string (`detect_platform_proc`); `availableClis`
-/// is empty here (extension-driven CLI detection is a later step — the PanePicker
-/// still shows the shell/editor/browser options), and `featureFlags` defaults off.
-fn build_platform_payload() -> serde_json::Value {
+/// is the extension-driven `which`/`where.exe` detection result (Follow-up 3.19,
+/// so the PanePicker surfaces the real coding-CLI agents), and `featureFlags`
+/// defaults off.
+fn build_platform_payload(available_clis: serde_json::Value) -> serde_json::Value {
     let platform = detect_platform_proc(host_os_live(), read_proc_version().as_deref());
     serde_json::json!({
         "platform": platform,
-        "availableClis": {},
+        "availableClis": available_clis,
         "hostName": read_host_name(),
         "featureFlags": { "kilroy": false, "aiEnabled": false },
     })

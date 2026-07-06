@@ -26,6 +26,9 @@ freshell-api = { path = "../freshell-api" }
 freshell-freshagent = { path = "../freshell-freshagent" }
 # Platform detection (`/proc/version` → platform string) for the SPA boot payload.
 freshell-platform = { path = "../freshell-platform" }
+# Read-only coding-CLI transcript parsers, reused to back `GET /api/session-directory`
+# (Follow-up 3.19): list + summarize sessions from the isolated provider homes.
+freshell-sessions = { path = "../freshell-sessions" }
 # The shared terminal registry constructed into WsState (terminals owned by
 # terminalId across connections — the multi-client / reconnection backbone).
 freshell-terminal = { path = "../freshell-terminal" }
