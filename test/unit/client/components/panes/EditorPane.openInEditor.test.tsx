@@ -6,6 +6,7 @@ import EditorPane from '@/components/panes/EditorPane'
 import { getEditorActions } from '@/lib/pane-action-registry'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
+import connectionReducer, { setStatus } from '@/store/connectionSlice'
 
 // Capture the onMount callback so we can invoke it with a mock editor
 let capturedOnMount: ((editor: any) => void) | null = null
@@ -27,13 +28,17 @@ vi.mock('@monaco-editor/react', () => {
   }
 })
 
-const createMockStore = () =>
-  configureStore({
+const createMockStore = () => {
+  const store = configureStore({
     reducer: {
       panes: panesReducer,
       settings: settingsReducer,
+      connection: connectionReducer,
     },
   })
+  store.dispatch(setStatus('ready'))
+  return store
+}
 
 function createRoutedFetch() {
   return async (input: any) => {

@@ -31,10 +31,22 @@ import {
   type TerminalSearchQuery,
 } from '@shared/read-models'
 
-export type ApiError = {
-  status: number
-  message: string
-  details?: unknown
+/**
+ * An HTTP response was received but carried an error status (4xx/5xx). This is a
+ * real `Error` subclass so it stringifies to a readable message, carries a stack,
+ * and is reliably distinguishable from transport-level failures via `instanceof`.
+ * (Previously a plain object literal, which stringified to "[object Object]".)
+ */
+export class ApiError extends Error {
+  readonly status: number
+  readonly details?: unknown
+
+  constructor(status: number, message: string, details?: unknown) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.details = details
+  }
 }
 
 export type ApiRequestOptions = {
@@ -78,6 +90,32 @@ export function isApiUnauthorizedError(error: unknown): error is ApiError {
     'status' in error &&
     (error as { status?: unknown }).status === 401
   )
+}
+
+/**
+ * True when a `fetch()` call failed at the transport layer — the request never
+ * received an HTTP response. This happens when the server is unreachable (down,
+ * restarting, network dropped) or the request was aborted.
+ *
+ * These are EXPECTED, transient conditions — not application errors — so callers
+ * should treat them quietly (retry/skip) rather than logging error/warn noise;
+ * otherwise every server restart floods the logs.
+ *
+ * Note: an HTTP response with an error status (4xx/5xx) is NOT a transport
+ * failure — it surfaces as {@link ApiError} and should be handled explicitly.
+ */
+export function isTransientNetworkError(error: unknown): boolean {
+  // Aborted requests (AbortController / navigation) reject with an AbortError,
+  // which is a DOMException in browsers (not an Error subclass everywhere).
+  if (typeof DOMException !== 'undefined' && error instanceof DOMException) {
+    return error.name === 'AbortError'
+  }
+  if (error instanceof Error && error.name === 'AbortError') return true
+  // fetch() rejects with a TypeError on any network-level failure. The message
+  // is engine-specific ("Failed to fetch" in Chromium, "NetworkError…" in
+  // Firefox, "Load failed" in WebKit), so classify by type, not by text.
+  if (error instanceof TypeError) return true
+  return false
 }
 
 async function request<T = any>(path: string, options: RequestInit = {}): Promise<T> {
@@ -157,12 +195,7 @@ async function request<T = any>(path: string, options: RequestInit = {}): Promis
   }
 
   if (!res.ok) {
-    const err: ApiError = {
-      status: res.status,
-      message: getApiErrorMessage(data, res.statusText),
-      details: data,
-    }
-    throw err
+    throw new ApiError(res.status, getApiErrorMessage(data, res.statusText), data)
   }
 
   return data as T

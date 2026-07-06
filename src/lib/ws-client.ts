@@ -460,7 +460,9 @@ export class WsClient {
 
   private scheduleReconnect(opts?: { minDelayMs?: number }) {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      log.error('max reconnect attempts reached')
+      // Giving up is a genuine degraded state worth surfacing once — but it is
+      // not an error/crash (the server may simply be intentionally down), so warn.
+      log.warn('max reconnect attempts reached')
       return
     }
 
@@ -475,7 +477,10 @@ export class WsClient {
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null
       if (!this.intentionalClose) {
-        this.connect().catch((err) => log.error('reconnect failed', err))
+        // A failed reconnect attempt is expected while the server is restarting;
+        // the backoff loop keeps trying and 'max reconnect attempts reached'
+        // warns if we ultimately give up. Log at debug so restarts stay quiet.
+        this.connect().catch((err) => log.debug('reconnect failed', err))
       }
     }, delay)
 

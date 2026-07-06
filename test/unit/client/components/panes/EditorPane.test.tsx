@@ -6,6 +6,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import EditorPane from '@/components/panes/EditorPane'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
+import connectionReducer, { setStatus } from '@/store/connectionSlice'
 
 // Render MarkdownRenderer synchronously to avoid React.lazy timing issues
 // when running in the full test suite (dynamic import may not resolve in time)
@@ -78,11 +79,12 @@ function createRoutedFetch(opts?: {
   }
 }
 
-const createMockStore = (overrides?: { theme?: string }) =>
-  configureStore({
+const createMockStore = (overrides?: { theme?: string }) => {
+  const store = configureStore({
     reducer: {
       panes: panesReducer,
       settings: settingsReducer,
+      connection: connectionReducer,
     },
     preloadedState: overrides
       ? {
@@ -102,6 +104,9 @@ const createMockStore = (overrides?: { theme?: string }) =>
         }
       : undefined,
   })
+  store.dispatch(setStatus('ready'))
+  return store
+}
 
 describe('EditorPane', () => {
   let store: ReturnType<typeof createMockStore>

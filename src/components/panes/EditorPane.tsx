@@ -7,7 +7,7 @@ import { updatePaneContent } from '@/store/panesSlice'
 import type { EditorPaneContent } from '@/store/paneTypes'
 import EditorToolbar from './EditorToolbar'
 import MarkdownPreview from './MarkdownPreview'
-import { api } from '@/lib/api'
+import { api, isTransientNetworkError } from '@/lib/api'
 import { getFirstTerminalCwd } from '@/lib/pane-utils'
 import { isAbsolutePath, joinPath } from '@/lib/path-utils'
 import { copyText } from '@/lib/clipboard'
@@ -151,6 +151,10 @@ export default function EditorPane({
   const monacoTheme = useMonacoTheme()
   const layout = useAppSelector((s) => s.panes.layouts[tabId])
   const defaultCwd = useAppSelector((s) => s.settings.settings.defaultCwd)
+  // The disk-sync poll (below) only makes sense while the server is reachable.
+  // Gating on the WS-derived connection status means an expected server restart
+  // pauses polling instead of hammering a dead endpoint and flooding the logs.
+  const connectionStatus = useAppSelector((s) => s.connection.status)
   const mountedRef = useRef(true)
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -400,6 +404,10 @@ export default function EditorPane({
         setSuggestions([])
       } catch (err) {
         if (!mountedRef.current) return
+        // A transport failure (server unreachable / restarting) is expected and
+        // transient — don't surface it as an error. The user can retry once the
+        // server is back; only genuinely unexpected failures are logged.
+        if (isTransientNetworkError(err)) return
         const message = err instanceof Error ? err.message : String(err)
         log.error(
           JSON.stringify({
@@ -729,6 +737,11 @@ export default function EditorPane({
   useEffect(() => {
     if (!filePath) return
     if (fileHandleRef.current) return
+    // Pause disk-sync polling while the server is known-unreachable (e.g. a
+    // restart). There is nothing to sync from a server that is down, and polling
+    // it only produces transport failures. Polling resumes automatically when
+    // the connection returns to 'ready' (this effect re-runs on that change).
+    if (connectionStatus !== 'ready') return
 
     const poll = async () => {
       if (!mountedRef.current) return
@@ -780,6 +793,11 @@ export default function EditorPane({
           })
         }
       } catch (err) {
+        // A transport failure here means the server became unreachable between
+        // ticks (restart / dropped connection) — an expected, transient event,
+        // not a surprising one. Stay silent; the connectivity gate above will
+        // pause polling on the next render. Only log genuinely unexpected errors.
+        if (isTransientNetworkError(err)) return
         const message = err instanceof Error ? err.message : String(err)
         log.error(
           JSON.stringify({
@@ -799,7 +817,7 @@ export default function EditorPane({
         pollIntervalRef.current = null
       }
     }
-  }, [filePath, resolvePath, conflictState, updateContent])
+  }, [filePath, resolvePath, conflictState, updateContent, connectionStatus])
 
   useEffect(() => {
     return registerEditorActions(paneId, {
