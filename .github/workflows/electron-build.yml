@@ -36,11 +36,9 @@ jobs:
         run: npm run test:electron
 
       - name: Build Electron app
-        if: runner.os != 'Windows'
         run: npm run electron:build
 
       - name: Upload artifacts
-        if: runner.os != 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: electron-${{ matrix.os }}

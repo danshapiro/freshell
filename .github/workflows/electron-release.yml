@@ -28,7 +28,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build and publish Electron app
+      - name: Build Electron app
         run: npm run electron:build
+
+      - name: Upload installers to GitHub Release
+        shell: bash
+        run: npx tsx scripts/upload-electron-release-assets.ts "$GITHUB_REF_NAME" release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
