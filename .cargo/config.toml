@@ -1,0 +1,14 @@
+# Additive cross-compile config for the freshell Rust port (worktree-local).
+#
+# This file ONLY configures the Windows GNU cross target so a Windows
+# `freshell-server.exe` can be produced from this WSL2 host for the test matrix
+# ("Windows server" leg). It does NOT touch the default (host Linux) build: the
+# `[target.x86_64-pc-windows-gnu]` table applies solely when that target is
+# selected via `--target x86_64-pc-windows-gnu`.
+#
+# Toolchain: `rustup target add x86_64-pc-windows-gnu` + Debian/Ubuntu
+# `mingw-w64` (provides `x86_64-w64-mingw32-gcc`, used both as the linker and as
+# the C compiler the `cc` crate picks up for rusqlite's bundled SQLite).
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"
