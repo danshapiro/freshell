@@ -8,23 +8,27 @@ worktree: .worktrees/rust-tauri-port
 branch: feat/rust-tauri-port
 updated: 2026-07-04
 
-current_phase: 3                 # 0=oracle bootstrap, 1=understand, 2=architect, 3=port, 4=self-qa, 5=converge
-# PHASE 0 COMPLETE: oracle T0/T1/T2/T3 vs PRISTINE original; mutation-validated (28/28 caught).
-# PHASE 1 COMPLETE: 4 ground-truth specs (port/machine/specs/*.md). PHASE 2 COMPLETE: frozen ADR.
-# PHASE 3 IN PROGRESS — the Rust port now passes the oracle at ALL FOUR tiers, original≡rust:
-#   T0 handshake deep-equal; T1 terminal bytes byte-identical over the wire; T2 live matrix
-#   (opencode/Kimi + codex/GPT + claude/Haiku-via-Node-sidecar) 9/9 invariants each; T3 CORE
-#   25/25 + 6/7 visual with the RETAINED SPA running on the Rust backend. 12 Rust crates
-#   (protocol, platform, terminal[+registry], sessions, opencode, codex, freshagent, ws, api,
-#   server bin) + 1 Node sidecar (claude). Server-side terminal registry (multi-client/detach/
-#   attach) done. cargo workspace 273 green. Deviations: DEV-0001 fixed+pinned (freshell-opencode),
-#   DEV-0002 fixed+pinned (freshell-sessions), DEV-0003 REJECTED. One PORT_DEFECT found+fixed
-#   (missing attachRequestId, invisible to T1, caught by T3). Original source NEVER mutated
-#   (git diff server/ shared/ empty at every commit); live :3001 never touched; 0 orphans.
-# REMAINING (Phase 3): Tauri desktop shell (spawn server + SPA + 2-property window.freshellDesktop
-#   shim + single-instance/tray/hotkey/updater); platform live-process (netsh/firewall/elevated/
-#   wsl-port-forward); terminal batch framing (3.3b); remaining REST breadth (sessions/history,
-#   files/editor, network/LAN, extensions, tabs-registry sync). THEN Phase 4 self-QA + Phase 5 converge.
+current_phase: 5                 # 0=oracle bootstrap, 1=understand, 2=architect, 3=port, 4=self-qa, 5=converge
+# PHASES 0-2 COMPLETE: oracle (T0/T1/T2/T3 + mutation 28/28), 4 ground-truth specs, frozen ADR.
+# PHASE 3 (port) — functionally COMPLETE for the equivalence thesis. 11 Rust crates + 1 Node sidecar
+#   (protocol, platform[+live-process], terminal[+registry], sessions, opencode, codex, freshagent,
+#   ws, api, server bin, tauri app; claude-sidecar=Node). The RETAINED React SPA runs unchanged on
+#   the Rust backend; the Tauri v2 desktop shell spawns the server + loads the SPA (xvfb-smoked).
+# PHASE 4 (self-QA) COMPLETE — port/oracle/EQUIVALENCE-REPORT.md. ALL FOUR TIERS deterministically
+#   original≡rust: T0 5/5 (handshake deep-equal), T1 10/10 (bytes sha256-identical), T2 matrix
+#   (opencode+codex+claude) structural deep-equal + 9/9 invariants each, T3 117/126 (+6/6 visual;
+#   8 EQUIVALENT red-on-original, 1 deferred PORT-GAP). Mutation 28/28. cargo workspace 400.
+#   T2-opencode flake fixed (093c1050, harness determinism). One PORT_DEFECT found+fixed
+#   (attachRequestId, invisible to T1, caught by T3).
+# DEVIATIONS: DEV-0001 fixed+pinned (3/3), DEV-0002 fixed+pinned (4/4), DEV-0003 REJECTED (zero-tol).
+#   Open candidates CD-1..CD-8 + candidate-dirs (tracked in architecture-spec.md §8 / in-code notes).
+# DISCIPLINE HELD END-TO-END: original source NEVER mutated (git diff server/ shared/ empty at all
+#   ~25 commits); live :3001 / pid 1262455 never touched; 0 orphans; branch feat/rust-tauri-port pushed.
+# REMAINING (follow-up polish, honestly documented in EQUIVALENCE-REPORT §"what remains"):
+#   terminal batch framing (terminalOutputBatchV1); Tauri desktop features (tray/hotkey/updater/
+#   window-state/wizard/launch-chooser); browser-pane reverse-proxy (1 T3 spec); deeper REST breadth
+#   (sessions/history detail, files read/write, network/LAN control, extensions serving); and the
+#   off-host ceiling — macOS unverified, Windows-elevated netsh/UAC golden-string-only (not live-mutated).
 
 # --- Confirmed user constraints (this run) ---------------------------------
 constraints:
