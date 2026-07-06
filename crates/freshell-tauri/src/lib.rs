@@ -23,21 +23,31 @@
 //! `pub` so the headless integration test (`tests/server_spawn_smoke.rs`) can drive
 //! the real spawn→health→reap path against the built server without a display.
 
+pub mod commands;
+pub mod config;
 pub mod external_url;
 pub mod health;
+pub mod hotkey;
+pub mod renderer_recovery;
 pub mod server;
 pub mod shim;
 pub mod state_machine;
+pub mod tray;
+pub mod updater;
+pub mod window_state;
+pub mod windows;
 
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Listener, Manager, RunEvent, Runtime, WebviewUrl, WebviewWindowBuilder};
 
 use crate::server::{ReapOutcome, SpawnConfig};
-use crate::state_machine::{decide_initial_phase, runnable_phase, BootInputs, ServerMode, ShellPhase};
+use crate::state_machine::{
+    decide_initial_phase, runnable_phase, BootInputs, ServerMode, ShellPhase,
+};
 
 /// Grace before escalating SIGTERM→SIGKILL when reaping the server
 /// (`server-spawner.ts:178`, 5 s).
@@ -68,7 +78,17 @@ pub fn run() {
     let build_result = tauri::Builder::default()
         .plugin(single_instance)
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![external_url::open_external_url])
+        // Global hotkey plugin (electron/hotkey.ts). The single global handler
+        // toggles the main window on the registered show/hide accelerator
+        // (startup.ts:204-211); registration happens in setup (best-effort).
+        .plugin(global_shortcut_plugin())
+        .invoke_handler(tauri::generate_handler![
+            external_url::open_external_url,
+            // Per-window-gated wizard/chooser commands (electron/preload.ts §2).
+            commands::complete_setup,
+            commands::get_launch_options,
+            commands::choose_launch_option,
+        ])
         .setup({
             let server_slot = server_slot.clone();
             move |app| {
@@ -112,7 +132,11 @@ fn setup_app_bound(
         setup_completed: true,
         server_mode: ServerMode::AppBound,
     }));
-    debug_assert_eq!(phase, ShellPhase::Main, "3.13 constructs only the Main phase");
+    debug_assert_eq!(
+        phase,
+        ShellPhase::Main,
+        "3.13 constructs only the Main phase"
+    );
 
     // 1. Resolve inputs for the app-bound spawn.
     let server_binary = server::resolve_server_binary()?;
@@ -161,7 +185,16 @@ fn setup_app_bound(
         .inner_size(1200.0, 800.0)
         .initialization_script(shim::desktop_shim_script())
         .build()?;
-    eprintln!("freshell-tauri: main window loading {}", redact_token(&load_url));
+    eprintln!(
+        "freshell-tauri: main window loading {}",
+        redact_token(&load_url)
+    );
+
+    // 4. Desktop features (Phase 3.17): tray, global hotkey, updater surface. ALL
+    //    best-effort — a session-gated failure (headless / no tray / no key session)
+    //    must never abort boot (`startup.ts:213-217` makes tray creation non-fatal;
+    //    the port extends that to the hotkey + updater wiring too).
+    wire_desktop_features(app, ServerMode::AppBound);
 
     // Headless-smoke hook: auto-quit after N ms so an xvfb smoke can prove the full
     // spawn→health→window→reap path and exit cleanly. No-op in normal use.
@@ -211,6 +244,135 @@ fn redact_token(url: &str) -> String {
     match url.split_once("?token=") {
         Some((base, _)) => format!("{base}?token=<redacted>"),
         None => url.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Desktop-features wiring (Phase 3.17). All seams are best-effort + session-gated:
+// they only do real work under a display session (tray/hotkey need one), and never
+// abort boot on failure. Live behavior is not headlessly verifiable (electron-
+// tauri.md §8 items 7/8/12).
+// ---------------------------------------------------------------------------
+
+/// The global-shortcut plugin (electron/hotkey.ts). One global handler toggles the
+/// main window's visibility on the registered accelerator (`startup.ts:204-211`);
+/// the accelerator itself is registered in [`wire_desktop_features`].
+fn global_shortcut_plugin<R: Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    use tauri_plugin_global_shortcut::ShortcutState;
+    tauri_plugin_global_shortcut::Builder::new()
+        .with_handler(|app, _shortcut, event| {
+            if event.state == ShortcutState::Pressed {
+                toggle_main_window(app);
+            }
+        })
+        .build()
+}
+
+/// Toggle the main window: hide if visible+focused, else show+focus
+/// (`startup.ts:206-210`).
+fn toggle_main_window<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(win) = app.get_webview_window("main") {
+        let visible = win.is_visible().unwrap_or(false);
+        let focused = win.is_focused().unwrap_or(false);
+        if visible && focused {
+            let _ = win.hide();
+        } else {
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+    }
+}
+
+/// Register the show/hide global hotkey, translating the Electron accelerator to
+/// the plugin grammar first ([`hotkey::translate_accelerator`]). Best-effort: a
+/// translate/parse/register failure is logged, not fatal (headless has no session
+/// to grab a hotkey on).
+fn register_global_hotkey<R: Runtime>(app: &AppHandle<R>, electron_accel: &str) {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+    let translated = match hotkey::translate_accelerator(electron_accel) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("freshell-tauri: hotkey translate failed for {electron_accel:?}: {e}");
+            return;
+        }
+    };
+    let shortcut: tauri_plugin_global_shortcut::Shortcut = match translated.parse() {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("freshell-tauri: hotkey parse failed for {translated:?}");
+            return;
+        }
+    };
+    match app.global_shortcut().register(shortcut) {
+        Ok(()) => eprintln!("freshell-tauri: global hotkey {translated:?} registered"),
+        Err(e) => {
+            eprintln!("freshell-tauri: global hotkey register failed (session-gated): {e}")
+        }
+    }
+}
+
+/// Wire the desktop features onto the running app: global hotkey + system tray +
+/// the tray "Check for Updates" → updater-state surface. Best-effort throughout.
+fn wire_desktop_features(app: &tauri::App, mode: ServerMode) {
+    let handle = app.handle();
+
+    // Global hotkey (best-effort; session-gated).
+    register_global_hotkey(handle, hotkey::DEFAULT_HOTKEY);
+
+    // System tray (best-effort; session-gated — non-fatal per startup.ts:213-217).
+    #[cfg(feature = "tray")]
+    {
+        let status = tray::TrayStatus {
+            running: true,
+            mode: mode_str(mode).to_string(),
+        };
+        if let Err(e) = tray::build_tray(handle, &status) {
+            eprintln!("freshell-tauri: tray creation failed (session-gated): {e}");
+        }
+        // Tray "Check for Updates" → surface the (signing-gated) updater state
+        // instead of a silent no-op (CD-7). The live check/apply needs a signed
+        // release + a real Ed25519 key + a feed — Phase-4 manual QA.
+        let updater_handle = handle.clone();
+        handle.listen(tray::TRAY_CHECK_UPDATES_EVENT, move |_event| {
+            report_updater_state(&updater_handle);
+        });
+    }
+    let _ = mode; // consumed only under the `tray` feature
+}
+
+/// The server-mode string shown in the tray + written to desktop.json.
+#[cfg(feature = "tray")]
+fn mode_str(mode: ServerMode) -> &'static str {
+    match mode {
+        ServerMode::AppBound => "app-bound",
+        ServerMode::Daemon => "daemon",
+        ServerMode::Remote => "remote",
+    }
+}
+
+/// Report the auto-updater state (CD-7's explicit disabled surface). The runtime
+/// updater config (endpoints + Ed25519 pubkey) comes from `tauri.conf.json`
+/// `plugins.updater`; until a real key is provisioned the updater is DISARMED and
+/// this says so out loud rather than silently doing nothing.
+#[cfg(feature = "tray")]
+fn report_updater_state<R: Runtime>(app: &AppHandle<R>) {
+    // Read the REAL updater config from tauri.conf.json `plugins.updater` (endpoints
+    // + Ed25519 pubkey). The shipped placeholder key → DisarmedNoPubkey, so the
+    // config block is genuinely consumed (not inert). The live plugin is registered
+    // only when armed (a real key exists) — deferred until a signed release.
+    let plugins = serde_json::to_value(app.config().plugins.clone())
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let cfg = updater::parse_updater_config(&plugins);
+    match updater::updater_state(&cfg) {
+        updater::UpdaterState::Armed => {
+            eprintln!("freshell-tauri: checking for updates…")
+        }
+        updater::UpdaterState::DisarmedNoPubkey => eprintln!(
+            "freshell-tauri: updater disarmed — no signing key configured (signing-gated; CD-7)"
+        ),
+        updater::UpdaterState::DisarmedNoEndpoint => {
+            eprintln!("freshell-tauri: updater disarmed — no update endpoint configured")
+        }
     }
 }
 

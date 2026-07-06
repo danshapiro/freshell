@@ -12,6 +12,15 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "endpoints": ["https://releases.freshell.app/latest.json"],
+      "pubkey": "REPLACE_WITH_REAL_ED25519_PUBKEY",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
   "bundle": {
     "active": false,
     "targets": "all",

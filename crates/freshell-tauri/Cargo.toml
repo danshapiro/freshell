@@ -32,6 +32,15 @@ publish.workspace = true
 name = "freshell-tauri"
 path = "src/main.rs"
 
+[features]
+# The system-tray seam needs the tauri `tray-icon` feature; it is on by default so
+# the whole crate builds + the smoke exercises it. The PURE logic (accelerator
+# translator, window-state serde + clamp, updater decision, renderer-recovery state
+# machine, tray menu model, wizard/chooser validators/commands) compiles +
+# unit-tests regardless of this flag.
+default = ["tray"]
+tray = ["tauri/tray-icon"]
+
 [build-dependencies]
 # Reads tauri.conf.json + capabilities/ at compile time and generates the app
 # context (`tauri::generate_context!`). Required for a Tauri v2 crate to build.
@@ -45,6 +54,10 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 # Single-instance lock + focus-first (electron/main.ts:24-28,63-70). Registered FIRST.
 tauri-plugin-single-instance = "2"
+# Global hotkey registration (electron/hotkey.ts + startup.ts:204-211). The
+# Electron→Tauri accelerator translation lives in src/hotkey.rs; live OS-keypress
+# capture is display/session-gated (electron-tauri.md §8 item 7).
+tauri-plugin-global-shortcut = "2"
 # Command args (open_external_url) + the shim/URL JSON-free plumbing.
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -53,9 +66,16 @@ serde_json = { workspace = true }
 url = "2"
 # Generated AUTH_TOKEN (srv-scoped random) minting for the app-bound spawn.
 uuid = { version = "1", features = ["v4"] }
+# Semver comparison for the auto-updater check-decision (src/updater.rs). Already in
+# the workspace lock (transitive via tauri); pinned here for the direct use.
+semver = "1"
 
 # SIGTERM→SIGKILL server reap on app exit (electron/server-spawner.ts:154-189).
 # Unix-only; on Windows the owned Child.kill() terminates. Matches the reference's
 # platform-guarded signal handling.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# Isolated tmp dirs for the desktop.json config read/patch tests (src/config.rs).
+tempfile = "3"
