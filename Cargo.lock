@@ -1254,12 +1254,16 @@ name = "freshell-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
+ "chrono",
  "freshell-api",
  "freshell-freshagent",
  "freshell-platform",
  "freshell-protocol",
  "freshell-terminal",
  "freshell-ws",
+ "reqwest",
+ "serde",
  "serde_json",
  "tokio",
  "uuid",

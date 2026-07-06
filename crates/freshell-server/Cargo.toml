@@ -29,9 +29,23 @@ freshell-platform = { path = "../freshell-platform" }
 # The shared terminal registry constructed into WsState (terminals owned by
 # terminalId across connections — the multi-client / reconnection backbone).
 freshell-terminal = { path = "../freshell-terminal" }
-# `sync` = the shared broadcast bus; `signal` = graceful SIGTERM shutdown (serve reaping).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
+# `sync` = the shared broadcast bus; `signal` = graceful SIGTERM shutdown (serve
+# reaping); `time` = the bounded wait for the `ui.screenshot.result` round-trip.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 axum = "0.8"
 serde_json = { workspace = true }
 # Boot-scoped identifiers: `srv-<uuidv4>` / `boot-<uuidv4>`.
 uuid = { version = "1", features = ["v4"] }
+# The browser-pane HTTP reverse proxy (`/api/proxy/http/{port}/*`) forwards to a
+# loopback target and streams the response back. `default-features = false`
+# (no TLS \u2014 loopback http only) + `stream` for the response byte stream. Same
+# config already vendored by freshell-opencode, so no new transitive download.
+reqwest = { version = "0.13", default-features = false, features = ["stream"] }
+# Decode the base64 PNG the UI returns in `ui.screenshot.result` before writing it
+# (POST /api/screenshots). Already resolved in the workspace lock (no new download).
+base64 = "0.22"
+# `modifiedAt` ISO-8601 timestamps for the files read/stat/write responses
+# (`stat.mtime.toISOString()` shape). Same config freshell-ws already uses.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Query-param structs for the files read/stat/complete endpoints.
+serde = { version = "1", features = ["derive"] }

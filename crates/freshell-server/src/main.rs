@@ -18,6 +18,8 @@
 
 mod boot;
 mod files;
+mod proxy;
+mod screenshots;
 mod serve_client;
 mod settings;
 
@@ -67,6 +69,12 @@ async fn main() -> ExitCode {
     // fresh-agent turn's handful of broadcasts never laps a briefly-busy consumer.
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(1024).0);
 
+    // The shared UI-screenshot broker over that same bus: `POST /api/screenshots`
+    // registers a request + broadcasts `screenshot.capture`; the `/ws` loop routes
+    // the capable client's `ui.screenshot.result` back. Shared by value into WsState
+    // (capability tracking + result routing) and the screenshots REST state.
+    let screenshots = freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx));
+
     // The freshcodex WS fresh-agent slice: shares the auth token + the broadcast bus so its
     // freshAgent.created/send.accepted/event frames reach every WS client (incl. the oracle's
     // capture socket). Seeded with the settings tree so `PATCH /api/settings` returns/merges it.
@@ -103,6 +111,7 @@ async fn main() -> ExitCode {
         fresh_claude: fresh_claude_state.clone(),
         registry: registry.clone(),
         tabs: tabs.clone(),
+        screenshots: screenshots.clone(),
     };
     let api_state = ApiState {
         auth_token: Arc::clone(&auth_token),
@@ -137,6 +146,18 @@ async fn main() -> ExitCode {
         registry: registry.clone(),
     };
 
+    // The browser-pane HTTP reverse proxy (`/api/proxy/http/{port}/*`): the SPA's
+    // BrowserPane rewrites loopback URLs to this same-origin path so its iframe can
+    // render dev-server content with the iframe-blocking headers stripped.
+    let proxy_state = proxy::ProxyState::new(Arc::clone(&auth_token));
+
+    // The agent screenshot endpoint (`POST /api/screenshots`): drives the WS
+    // `screenshot.capture` round-trip through the shared broker and writes the PNG.
+    let screenshots_state = screenshots::ScreenshotsState {
+        auth_token: Arc::clone(&auth_token),
+        broker: screenshots.clone(),
+    };
+
     // One axum app serving REST (`/api/health` + fresh-agent + `PATCH /api/settings`
     // + the SPA boot endpoints + files) + the WS upgrade (`/ws`) + static
     // `dist/client` with SPA-fallback routing. The fallback also returns a clean 404
@@ -147,6 +168,8 @@ async fn main() -> ExitCode {
         .merge(fresh_codex_state.settings_router())
         .merge(boot::router(boot_state))
         .merge(files::router(files_state))
+        .merge(proxy::router(proxy_state))
+        .merge(screenshots::router(screenshots_state))
         .fallback({
             let client_dir = Arc::clone(&client_dir);
             move |uri: axum::http::Uri| {

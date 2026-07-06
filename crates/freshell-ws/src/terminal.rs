@@ -268,8 +268,28 @@ async fn handle_client_text(
             }
             true
         }
-        // Everything else (opencode fresh-agent, activity lists, ui.*, ping) is out of
-        // scope for this path; ignore.
+        // `ui.screenshot.result` (`ui-commands.ts:51`): the capable UI's reply to a
+        // `screenshot.capture` command. Route it to the broker, waking the awaiting
+        // `POST /api/screenshots` handler (`ws-handler.ts:1916`). Late duplicates for
+        // an already-resolved requestId are dropped inside `resolve`.
+        ClientMessage::UiScreenshotResult(result) => {
+            state.screenshots.resolve(
+                &result.request_id,
+                crate::screenshot::ScreenshotResult {
+                    ok: result.ok,
+                    image_base64: result.image_base64,
+                    mime_type: result.mime_type,
+                    width: result.width,
+                    height: result.height,
+                    changed_focus: result.changed_focus,
+                    restored_focus: result.restored_focus,
+                    error: result.error,
+                },
+            );
+            true
+        }
+        // Everything else (opencode fresh-agent, activity lists, other ui.*, ping) is
+        // out of scope for this path; ignore.
         _ => true,
     }
 }

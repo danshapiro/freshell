@@ -20,6 +20,7 @@
 //! The crate emits the frozen [`freshell_protocol`] server-message types so its
 //! wire bytes are contract-locked.
 
+pub mod screenshot;
 pub mod tabs;
 pub mod terminal;
 
@@ -84,6 +85,11 @@ pub struct WsState {
     /// `client-retire` beacon — shares one cross-device tab view. This is what makes
     /// a closed device's tab disappear from other clients' Tabs UI.
     pub tabs: crate::tabs::TabsRegistry,
+    /// The shared UI-screenshot broker (`ws-handler.ts#requestUiScreenshot`). A
+    /// connection that advertised `capabilities.uiScreenshotV1` is counted here so
+    /// `POST /api/screenshots` knows a capable UI exists, and its inbound
+    /// `ui.screenshot.result` is routed back to the waiting REST handler.
+    pub screenshots: crate::screenshot::ScreenshotBroker,
 }
 
 /// The `/ws` sub-router, pre-bound to its state (mergeable into the server app).
@@ -239,9 +245,27 @@ async fn handle_socket(mut socket: WebSocket, state: WsState) {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // `capabilities.uiScreenshotV1` (`ws-handler.ts:1846`) marks this socket as able
+    // to answer a `screenshot.capture` command. Count it for the life of the
+    // connection so `POST /api/screenshots` knows a capable UI exists; decrement on
+    // disconnect. The oracle's T0/T1 capture clients send no such capability, so this
+    // stays a no-op on the graded paths.
+    let ui_screenshot_v1 = value
+        .get("capabilities")
+        .and_then(|c| c.get("uiScreenshotV1"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if ui_screenshot_v1 {
+        state.screenshots.add_capable_client();
+    }
+
     // Handshake done: serve the terminal.* shell path (and fan out broadcast-bus
     // frames) until the client closes.
     terminal::run(socket, &state, bcast_rx, terminal_output_batch_v1).await;
+
+    if ui_screenshot_v1 {
+        state.screenshots.remove_capable_client();
+    }
 }
 
 /// Best-effort structured error (used only on the non-graded reject paths). The
@@ -309,9 +333,10 @@ mod tests {
                 Arc::clone(&broadcast_tx),
                 serde_json::json!({ "freshAgent": { "enabled": false } }),
             ),
-            fresh_claude: freshell_freshagent::FreshClaudeState::new(broadcast_tx),
+            fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
             registry: freshell_terminal::TerminalRegistry::new(),
             tabs: crate::tabs::TabsRegistry::new(),
+            screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
         }
     }
 
