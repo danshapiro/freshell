@@ -10,8 +10,9 @@
 > **Reading this report honestly.** This is a QA capstone, not a victory lap. The oracle
 > is a *differential* one: the port is graded equivalent to the original **except** for the
 > adjudicated deviations in the ledger. Where a tier is not a clean pass, it is written up as
-> a **finding**, not smoothed over. One live tier (**T2 opencode**) did **not** cleanly match
-> its structural baseline this run — see §T2. Nothing here was force-passed.
+> a **finding**, not smoothed over. Nothing here was force-passed. (Update, commit `093c1050`:
+> the one live tier that flaked this sweep — **T2 opencode** — has since been made deterministic
+> and re-confirmed `original≡rust` stable across two live runs; see §T2.)
 
 ---
 
@@ -22,7 +23,7 @@
 | **Rust build** | 11 crates compile + unit/integration green | **400 passed / 0 failed / 0 ignored** (`--exclude freshell-tauri`: 358; `freshell-tauri`: 42) | — |
 | **T0 protocol** | WS handshake conforms to frozen contract + matches original | **5 / 5** · 4 server→client msgs schema-conformant · two-boot determinism | ✅ **deep-equal = true** |
 | **T1 terminal** | Real PTY bytes reproduce over the wire | **10 / 10** · all 4 goldens sha256-identical | ✅ **byte-identical** (framing differs, bytes identical) |
-| **T2 opencode/Kimi** | Live cheap-model turn holds invariants + matches baseline | invariants **9/9 asserted** (+2 info) PASS · liveModelCalls=1 · cold-start clean | ⚠️ **structural match FAILED** (DB flush-timing fields; see §T2) |
+| **T2 opencode/Kimi** | Live cheap-model turn holds invariants + matches baseline | invariants **9/9** PASS · liveModelCalls=1 · cold-start clean | ✅ **structural deep-equal** (after the §T2 determinism fix `093c1050`; re-run twice, stable msgs=2) |
 | **T2 codex/gpt-5.3-codex-spark** | ″ | **2 / 2** · liveModelCalls=1 | ✅ **structural deep-equal** |
 | **T2 claude/Haiku** | ″ (Node sidecar) | **2 / 2** · liveModelCalls=1 | ✅ **structural deep-equal** |
 | **Mutation-validation** | The oracle actually *catches* divergence | **28/28 planted caught · 5/5 no-false-positive · GAPS: 0** (36 tests) + e2e **RED→GREEN** (3 tests) | ✅ oracle proven to detect |
@@ -30,7 +31,7 @@
 
 **Live model calls this sweep: 3 total** (one per provider; each harness reported `liveModelCalls=1`). **0 orphan processes; user’s live `:3001` (pid 1262455) untouched; source byte-pristine; nothing committed.**
 
-**Headline (honest):** the Rust port is **equivalence-proven on T0, T1, mutation-validation, two of three T2 providers, and T3 (minus one deferred surface)**. The **T2 opencode** structural baseline did not match on two async-SQLite-flush-timing-sensitive fields — most-likely a harness determinism gap (the opencode `serve` binary, not the port, writes that DB), **flagged, not fixed, not re-confirmed by a second live run** to respect the ≤3-call budget.
+**Headline (honest):** the Rust port is **equivalence-proven on T0, T1, mutation-validation, all three T2 providers, and T3 (minus one deferred surface)**. The **T2 opencode** structural baseline flaked *this* sweep on two async-SQLite-flush-timing fields (the opencode `serve` binary, not the port, authors that DB); the follow-up commit `093c1050` made the harness wait for the durable assistant message row and re-confirmed `original≡rust` **stable across two live runs** (msgs=2 both). See §T2 for the full write-up of the original finding and its resolution.
 
 ---
 
@@ -119,7 +120,13 @@ liveModelCalls=1 · user ~/.claude/.credentials.json mtime unchanged · :3001 un
 ```
 Structural projection deep-equals `claude-haiku.json`. The DEV-0002 late-root crash path is *not* exercised here (harness pre-creates `~/.claude/projects` for env parity); it is carried solely by the port liveness pinning test (green — see §Ledger).
 
-### 4.3 opencode/Kimi-k2.7 — ⚠️ MIXED: invariants PASS, **structural baseline match FAILED**
+### 4.3 opencode/Kimi-k2.7 — ✅ RESOLVED (commit `093c1050`): invariants PASS + structural deep-equal after the harness determinism fix
+
+> **Resolution:** the finding below was a harness read-timing race, now fixed — the driver
+> waits for the durable assistant message row (`dbMessageCount>=2 && dbHasAssistantMessage`)
+> before snapshotting, identically for node-original and rust-port. Re-run twice live: `msgs=2`
+> both, `original≡rust` structural deep-equal GREEN both. The diagnosis below is retained as the
+> record of the finding.
 
 ```
 [T2-rust] T2 invariants PASS (9/9) for opencode · umans-ai-coding-plan/umans-kimi-k2.7
@@ -254,7 +261,7 @@ Tracked in `port/machine/architecture-spec.md` (Decision 8.1 table, and §6.5 fo
 - Tabs (management, recency-sync, client-retire, drag-reorder, keyboard nav), panes (splits/resize/focus/zoom/nested, picker), sidebar, settings (incl. `PATCH` fan-out), stress (6+ panes, concurrent + large output).
 - Auth gate (WS + REST, constant-time), static SPA serving + cache policy, boot REST surface (`/api/bootstrap|platform|version|settings|terminals|network/status|extensions|session-directory`, `logs/client`, `tabs-sync/client-retire`, `files/candidate-dirs|validate-dir`).
 - Browser-pane basics (URL input, load, URL-bar update).
-- Live provider turns: codex (app-server) ✅, claude (Node sidecar) ✅, opencode (invariants ✅; DB-flush structural field ⚠️).
+- Live provider turns: codex (app-server) ✅, claude (Node sidecar) ✅, opencode (invariants ✅ + structural deep-equal ✅ after the `093c1050` determinism fix).
 - Visual parity: **6/6** committed screenshot baselines MATCH.
 
 **EQUIVALENT-but-red (red on the pristine original on this host too — findings, not port gaps):** editor-pane lazy-load visual strictness; fresh-agent-centralization legacy-layout normalization; freshopencode model-picker MRU; mobile permission-banner; multi-client reconnecting-2nd-viewer PTY-size; multi-row-tabs toggle; pane-activity-indicator freshclaude color transition. (All reproduce against the original — CI runs none of these suites, so they have rotted unnoticed.)
@@ -272,7 +279,7 @@ Tracked in `port/machine/architecture-spec.md` (Decision 8.1 table, and §6.5 fo
 
 These are real ceilings of the campaign on a single WSL2 host; they bound how strong “equivalent” can be claimed:
 
-1. **T2 opencode structural match is currently RED** on two async-SQLite DB-flush-timing fields (§4.3). Most-likely a harness determinism gap (the opencode `serve` binary writes that DB, not the port), **flagged and unresolved**, not re-confirmed by a second live run (budget). Do not read T2-opencode as a clean structural pass.
+1. **T2 opencode structural match — RESOLVED** (commit `093c1050`): was a harness read-timing race on two async-SQLite DB-flush fields (§4.3), now deterministic (the driver waits for the durable assistant message row) and re-confirmed `original≡rust` stable across two live runs (`msgs=2` both). Not a port defect — the opencode `serve` binary authors that DB identically for node and rust.
 2. **Elevated / mutating Windows paths are golden-string-only, not live-mutated.** WSL2 can reach `powershell.exe`/`cmd.exe`, but network/LAN control that needs `netsh` + a UAC elevation prompt (firewall/port-proxy mutation) is verified against captured golden command strings, **never actually executed** against a live elevated Windows session.
 3. **macOS is entirely unverified.** No macOS host was available; all macOS-specific platform/spawn/path/signing behavior is unexercised.
 4. **Tauri live desktop launch is xvfb-smoked only.** `freshell-tauri` compiles and its server-spawn smoke passes under a virtual framebuffer; there is **no real display, no code-signing, no packaged bundle, no per-OS installer/updater install** exercised. Renderer-crash-recovery in particular **has no WRY equivalent tested** (Electron’s `render-process-gone` path is not reproduced on WRY).
@@ -285,7 +292,7 @@ These are real ceilings of the campaign on a single WSL2 host; they bound how st
 
 ## 10. What remains to reach “100% identical”
 
-1. **Resolve T2 opencode** — apply the harness settle-fix (wait for the assistant message row, or demote the two DB counts to informational), then re-baseline; confirm deterministic original≡rust across cold + warm.
+1. ~~**Resolve T2 opencode**~~ — **DONE** (commit `093c1050`): the harness now waits for the durable assistant message row; deterministic `original≡rust` re-confirmed stable across two live runs.
 2. **Close the 1 PORT-GAP** — implement browser-pane proxy content rendering so `browser-pane-screenshot:56` goes green (route through the antagonist if it changes observable behavior).
 3. **Build the deferred server surface** and extend the oracle to it: sessions/history detail, files read/write + editor pane, network/LAN control (incl. live-elevated Windows), extensions serving.
 4. **Build the batch-framing tier** and add a golden for the coalesced frame protocol.
