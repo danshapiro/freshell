@@ -76,7 +76,10 @@ pub use path::{
 pub use port_forward::{
     build_port_forwarding_script, build_wsl_port_forwarding_plan, WslPortForwardingPlan,
 };
-pub use spawn::{build_spawn_spec, ShellType, SpawnSpec};
+pub use spawn::{
+    build_cli_spawn_spec, build_spawn_spec, resolve_cli_launch, CliCommandSpec, CliLaunch,
+    ShellType, SpawnSpec,
+};
 
 // ---------------------------------------------------------------------------
 // Injection infrastructure

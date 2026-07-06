@@ -90,6 +90,11 @@ pub struct WsState {
     /// `POST /api/screenshots` knows a capable UI exists, and its inbound
     /// `ui.screenshot.result` is routed back to the waiting REST handler.
     pub screenshots: crate::screenshot::ScreenshotBroker,
+    /// The registered coding-CLI command specs (`claude`/`codex`/`opencode`/...),
+    /// used to resolve `terminal.create { mode: <cli> }` into a real CLI launch
+    /// (`resolveCodingCliCommand`). Populated from the extension registry at boot;
+    /// empty in unit tests (shell-only).
+    pub cli_commands: Arc<Vec<freshell_platform::CliCommandSpec>>,
 }
 
 /// The `/ws` sub-router, pre-bound to its state (mergeable into the server app).
@@ -337,6 +342,7 @@ mod tests {
             registry: freshell_terminal::TerminalRegistry::new(),
             tabs: crate::tabs::TabsRegistry::new(),
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
+            cli_commands: Arc::new(Vec::new()),
         }
     }
 

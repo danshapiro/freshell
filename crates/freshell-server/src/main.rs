@@ -121,6 +121,27 @@ async fn main() -> ExitCode {
     // (`tabs.sync.*`) and the boot REST surface (`/api/tabs-sync/client-retire`),
     // so the unload beacon and the socket path retire against ONE cross-device view.
     let tabs = freshell_ws::tabs::TabsRegistry::new();
+
+    // Follow-up 3.19: discover the CLI extensions (bundled `extensions/` + user/local
+    // dirs) once. Feeds THREE consumers: the WS terminal spawner's coding-CLI command
+    // resolution (`cli_commands`, below), `availableClis` (platform payload), and the
+    // client registry (`GET /api/extensions`).
+    let extension_registry =
+        extensions::ExtensionRegistry::scan(&extensions::resolve_extension_dirs(home.as_deref()));
+    // The coding-CLI command specs the WS terminal handler resolves `terminal.create
+    // { mode: <cli> }` against (claude/codex/opencode → the real CLI launch).
+    let cli_commands = Arc::new(
+        extension_registry
+            .cli_detection_specs()
+            .into_iter()
+            .map(|s| freshell_platform::CliCommandSpec {
+                name: s.name,
+                env_var: s.env_var,
+                default_cmd: s.default_cmd,
+            })
+            .collect::<Vec<_>>(),
+    );
+
     let ws_state = WsState {
         auth_token: Arc::clone(&auth_token),
         // Shared (not moved) so `GET /api/health` reports the SAME `instanceId`.
@@ -133,6 +154,7 @@ async fn main() -> ExitCode {
         registry: registry.clone(),
         tabs: tabs.clone(),
         screenshots: screenshots.clone(),
+        cli_commands: Arc::clone(&cli_commands),
     };
     let api_state = ApiState {
         auth_token: Arc::clone(&auth_token),
@@ -148,13 +170,9 @@ async fn main() -> ExitCode {
     // broadcast bus so its create/send broadcasts reach every WS client.
     let fresh_agent_state = FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx));
 
-    // Follow-up 3.19: discover the CLI extensions (bundled `extensions/` +
-    // user/local dirs) and detect which coding-CLI agents are on PATH, so the
-    // PanePicker surfaces the real claude/codex/opencode agents (was `{}`). The
-    // client registry feeds `GET /api/extensions`; `availableClis` feeds the
-    // platform payload (`/api/platform` + `bootstrap.platform`).
-    let extension_registry =
-        extensions::ExtensionRegistry::scan(&extensions::resolve_extension_dirs(home.as_deref()));
+    // Detect which coding-CLI agents are on PATH (so the PanePicker surfaces the real
+    // claude/codex/opencode agents, was `{}`) and serialize the client registry for
+    // `GET /api/extensions`, reusing the `extension_registry` scanned above.
     let available_clis =
         extensions::detect_available_clis_live(&extension_registry.cli_detection_specs());
     let extensions_registry = Arc::new(extension_registry.to_client_registry());

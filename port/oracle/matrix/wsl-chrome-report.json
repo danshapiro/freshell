@@ -1,0 +1,90 @@
+[
+  {
+    "kind": "cmd",
+    "label": "CMD",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/.worktrees/rust-tauri-port/port/oracle/matrix/wsl-chrome-cmd.png",
+    "status": "PASS",
+    "detail": "marker x>=2",
+    "bufferExcerpt": "CMD.EXE was started with the above path as the current directory. | UNC paths are not supported.  Defaulting to Windows directory. | The filename, directory name, or volume label syntax is incorrect. | C:\\Windows>echo freshell-matrix-OK | freshell-matrix-OK | C:\\Windows>",
+    "terminalId": "9d7fad19e4834c9baaf71393c5c6ac7b"
+  },
+  {
+    "kind": "powershell",
+    "label": "PowerShell",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/.worktrees/rust-tauri-port/port/oracle/matrix/wsl-chrome-powershell.png",
+    "status": "PASS",
+    "detail": "marker x>=2",
+    "bufferExcerpt": "PS C:\\> echo freshell-matrix-OK | freshell-matrix-OK | PS C:\\> ",
+    "terminalId": "adad6c42affb4f0488f78349ac116b5e"
+  },
+  {
+    "kind": "wsl",
+    "label": "WSL",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/.worktrees/rust-tauri-port/port/oracle/matrix/wsl-chrome-wsl.png",
+    "status": "PASS",
+    "detail": "marker x>=2 + Linux",
+    "bufferExcerpt": "/tmp/freshell-matrix-vWMo8n/.hushlogin file. | dan@DANDESKTOP:~$ echo freshell-matrix-OK && uname -a | freshell-matrix-OK | Linux DANDESKTOP 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64 x86_64  | x86_64 GNU/Linux | dan@DANDESKTOP:~$ ",
+    "terminalId": "e153c345bc60470e844ebedc2b9a8c22"
+  },
+  {
+    "kind": "claude",
+    "label": "Claude CLI",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/.worktrees/rust-tauri-port/port/oracle/matrix/wsl-chrome-claude.png",
+    "status": "PASS",
+    "detail": "banner matched /welcome to claude|claude code|for shortcuts|bypass permissions|choose the text style|\\/help|anthropic|claude/i",
+    "bufferExcerpt": "                                 ░░░░░░░░ |                                ░░░░░░░░░░░░░░░░ |        █████████                                        * |       ██▄█████▄██                        * |        █████████      * | .......█ █   █ █..........................................",
+    "terminalId": "9ca171b5632442eea5b8bd0b3a4f8996"
+  },
+  {
+    "kind": "codex",
+    "label": "Codex CLI",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/.worktrees/rust-tauri-port/port/oracle/matrix/wsl-chrome-codex.png",
+    "status": "PASS",
+    "detail": "banner matched /openai codex|to get started|\\/status|model:|approval|proceeding, even though|codex/i",
+    "bufferExcerpt": "WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporar | y dir \"/tmp\" (codex_home: AbsolutePathBuf(\"/tmp/freshell-matrix-vWMo8n/.codex\"))",
+    "terminalId": "504c7959c44145fb9244fac7e1158150"
+  },
+  {
+    "kind": "opencode",
+    "label": "OpenCode",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/.worktrees/rust-tauri-port/port/oracle/matrix/wsl-chrome-opencode.png",
+    "status": "PASS",
+    "detail": "banner matched /ask anything|ctrl\\+p|tab\\s+agents|build\\s+·|share|opencode/i",
+    "bufferExcerpt": "                       ┃                                                                                     |                        ┃  Build · Claude Sonnet 4.6 Anthropic                                                |                        ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀           |                                                                    ",
+    "terminalId": "bdbfae99297b4d5d982541cd0768fd6c"
+  },
+  {
+    "kind": "editor",
+    "label": "Editor",
+    "created": false,
+    "asserted": false,
+    "screenshot": "/home/dan/code/freshell/.worktrees/rust-tauri-port/port/oracle/matrix/wsl-chrome-editor.png",
+    "status": "ENV-LIMITED",
+    "detail": "locator.waitFor: Timeout 30000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('.monaco-editor').first() to be visible\u001b[22m\n",
+    "bufferExcerpt": "",
+    "envReason": "Monaco loads from jsdelivr CDN via the unchanged frontend; server serves the editor chunk correctly (200, text/javascript). Not port-differentiating.",
+    "layoutExcerpt": "{\"type\":\"leaf\",\"id\":\"PU_O9GF71BPs9NRmZpURX\",\"content\":{\"kind\":\"editor\",\"filePath\":null,\"language\":null,\"readOnly\":false,\"content\":\"\",\"viewMode\":\"source\",\"wordWrap\":true}}"
+  },
+  {
+    "kind": "browser",
+    "label": "Browser",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/.worktrees/rust-tauri-port/port/oracle/matrix/wsl-chrome-browser.png",
+    "status": "PASS",
+    "detail": "browser pane rendered",
+    "bufferExcerpt": ""
+  }
+]

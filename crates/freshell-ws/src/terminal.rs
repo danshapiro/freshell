@@ -48,8 +48,10 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use freshell_platform::detect::{host_os_live, is_wsl_env_live};
-use freshell_platform::{build_spawn_spec, RealEnv, RealFileProbe, ShellType};
+use freshell_platform::detect::{host_os_live, is_wsl_env_live, is_windows};
+use freshell_platform::{
+    build_cli_spawn_spec, build_spawn_spec, resolve_cli_launch, RealEnv, RealFileProbe, ShellType,
+};
 use freshell_protocol::{
     ClientMessage, ServerMessage, Shell, TerminalAttach, TerminalCreate, TerminalCreated,
     TerminalIdOnly, TerminalKill, TerminalResize,
@@ -303,25 +305,51 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
     let terminal_id = Uuid::new_v4().simple().to_string();
     let stream_id = Uuid::new_v4().to_string();
 
+    let host_os = host_os_live();
+    let is_wsl = is_wsl_env_live();
     let shell = map_shell(create.shell);
     // buildTerminalBaseEnv carries FRESHELL_TERMINAL_ID (FRESHELL_URL/TOKEN are not
     // part of the PTY byte stream — the T1 goldens exclude them). Present for faith.
     let mut overrides = BTreeMap::new();
     overrides.insert("FRESHELL_TERMINAL_ID".to_string(), terminal_id.clone());
 
+    // `terminal.create` carries `mode`: 'shell' or a registered coding-CLI provider
+    // (claude/codex/opencode). For a CLI mode on the non-Windows / WSL-Linux-shell
+    // path (CLI panes are always shell:'system'), launch the real CLI via the
+    // `resolveCodingCliCommand` base slice; otherwise spawn the shell. Native-Windows
+    // CLI launch is deferred (falls back to the shell path); an unknown mode also
+    // falls back to shell (the reference throws UnknownTerminalModeError — kept
+    // lenient here so a bad mode never tears down the connection).
+    let cli = if is_windows(host_os) {
+        None
+    } else {
+        resolve_cli_launch(&state.cli_commands, &create.mode, &RealEnv)
+    };
+
     // Spawn at the default geometry (`opts.cols||120`, `opts.rows||30`); the client
     // attaches then resizes to its viewport.
-    let spec = build_spawn_spec(
-        shell,
-        host_os_live(),
-        is_wsl_env_live(),
-        create.cwd.as_deref(),
-        &RealEnv,
-        &RealFileProbe,
-        &overrides,
-        None,
-        None,
-    );
+    let spec = match &cli {
+        Some(launch) => build_cli_spawn_spec(
+            launch,
+            is_wsl,
+            create.cwd.as_deref(),
+            &RealEnv,
+            &overrides,
+            None,
+            None,
+        ),
+        None => build_spawn_spec(
+            shell,
+            host_os,
+            is_wsl,
+            create.cwd.as_deref(),
+            &RealEnv,
+            &RealFileProbe,
+            &overrides,
+            None,
+            None,
+        ),
+    };
     let child_env = build_child_env_from_process(&spec);
 
     if let Err(err) =

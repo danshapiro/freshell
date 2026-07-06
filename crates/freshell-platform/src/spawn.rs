@@ -62,6 +62,75 @@ pub enum WindowsExe {
     Powershell,
 }
 
+// ===========================================================================
+// Coding-CLI launch (mode != 'shell') — the deterministic base-command slice of
+// `resolveCodingCliCommand`/`buildSpawnSpec` (`terminal-registry.ts:274-320,
+// 1256-1266`).
+// ===========================================================================
+
+/// A registered coding-CLI's command resolution inputs (the subset of
+/// `CodingCliCommandSpec` this port consumes: `terminal-registry.ts:77-90`).
+/// Populated from the extension registry's `cli` block (`freshell.json`) or the
+/// `FALLBACK_CODING_CLI_COMMAND_SPECS` seed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliCommandSpec {
+    /// The terminal mode / provider name (`claude` | `codex` | `opencode` | ...).
+    pub name: String,
+    /// The env var that overrides the command (`spec.envVar`); `None` = no override.
+    pub env_var: Option<String>,
+    /// `spec.defaultCommand` — the executable to run when no override is set.
+    pub default_cmd: String,
+}
+
+/// A resolved coding-CLI launch (`resolveCodingCliCommand` return, reduced).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliLaunch {
+    /// `cli.command` — `(env[spec.envVar] || spec.defaultCommand)`.
+    pub command: String,
+    /// `cli.args` — the base launch args (empty for a fresh, non-resume launch).
+    pub args: Vec<String>,
+    /// `cli.env` — CLI-specific env overrides (empty in the reduced port).
+    pub env: BTreeMap<String, String>,
+}
+
+/// `resolveCodingCliCommand(mode, ...)` base-command slice
+/// (`terminal-registry.ts:283-286`): look up the spec for `mode`, then resolve
+/// `command = (env[spec.envVar] || spec.defaultCommand)`. Returns `None` for
+/// `mode == 'shell'` or an unregistered mode (the caller then uses the shell path,
+/// mirroring `buildSpawnSpec`'s `mode === 'shell'` branch; the reference *throws*
+/// `UnknownTerminalModeError` for a truly-unknown mode — see the caller).
+///
+/// **REDUCED FIDELITY (deferred, tracked as a candidate deviation):** this resolves
+/// only the base `command` + (empty) base `args` + (empty) `env`. The reference also
+/// injects, per provider: MCP config (`generateMcpInjection` — writes a config file
+/// / `-c mcp_servers.*`), turn-complete notification args
+/// (`providerNotificationArgs` — codex `-c tui.*`, claude `--settings <hook json>`),
+/// the OpenCode loopback control endpoint (`--hostname/--port`, server-allocated),
+/// and resume/model/sandbox/permission args from provider settings. Those layers are
+/// NOT ported here; a fresh CLI still launches and renders its interactive UI, which
+/// is what this matrix validates (it does not drive a live model turn).
+pub fn resolve_cli_launch(
+    specs: &[CliCommandSpec],
+    mode: &str,
+    env: &dyn Env,
+) -> Option<CliLaunch> {
+    if mode == "shell" {
+        return None;
+    }
+    let spec = specs.iter().find(|s| s.name == mode)?;
+    let command = spec
+        .env_var
+        .as_deref()
+        .and_then(|var| env.get(var))
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| spec.default_cmd.clone());
+    Some(CliLaunch {
+        command,
+        args: Vec::new(),
+        env: BTreeMap::new(),
+    })
+}
+
 /// The resolved shell spawn specification (shell mode).
 ///
 /// `env_overrides` is the **deterministic override layer** the reference applies
@@ -392,6 +461,51 @@ pub fn build_spawn_spec(
     let unix_cwd = resolve_unix_shell_cwd(cwd, env, is_wsl_env);
     // mode === 'shell'
     spec(system_shell, vec!["-l".to_string()], unix_cwd)
+}
+
+/// Build the **coding-CLI** launch [`SpawnSpec`] (mode != 'shell') on the
+/// non-Windows / WSL-Linux-shell path — the tail of `buildSpawnSpec`
+/// (`terminal-registry.ts:1256-1266`):
+///
+/// ```js
+/// const cli = resolveCodingCliCommand(mode, ...)
+/// return { file: cli.command, args: cli.args, cwd: unixCwd, env: { ...env, ...cli.env } }
+/// ```
+///
+/// The env layer matches shell mode (parent − STRIP_ENV + TERM/COLORTERM/LANG/LC_ALL
+/// + user overrides, then `...cli.env` on top) and the cwd is resolved through the
+/// same `resolveUnixShellCwd`, so a claude/codex/opencode terminal lands in the
+/// requested directory with `CLAUDECODE` stripped (which the reference notes is
+/// required or child Claude refuses to start).
+///
+/// Scope: CLI panes are always created with `shell:'system'` (`PaneContainer`
+/// `createContentForType`), which resolves to the Linux system shell on WSL/Linux/
+/// macOS — i.e. this tail. Native-Windows CLI launch (the `cmd`/`powershell`
+/// windows-shell CLI branches, `terminal-registry.ts:1204/1237`) is **deferred**;
+/// the caller falls back to the shell path there.
+#[allow(clippy::too_many_arguments)]
+pub fn build_cli_spawn_spec(
+    launch: &CliLaunch,
+    is_wsl_env: bool,
+    cwd: Option<&str>,
+    env: &dyn Env,
+    user_env_overrides: &BTreeMap<String, String>,
+    cols: Option<u16>,
+    rows: Option<u16>,
+) -> SpawnSpec {
+    let mut env_overrides = build_env_overrides(env, user_env_overrides);
+    for (k, v) in &launch.env {
+        env_overrides.insert(k.clone(), v.clone()); // ...cli.env wins
+    }
+    let unix_cwd = resolve_unix_shell_cwd(cwd, env, is_wsl_env);
+    SpawnSpec {
+        program: launch.command.clone(),
+        args: launch.args.clone(),
+        env_overrides,
+        cwd: unix_cwd,
+        cols: cols.unwrap_or(DEFAULT_COLS),
+        rows: rows.unwrap_or(DEFAULT_ROWS),
+    }
 }
 
 /// `winCwd = inWsl ? (resolveWindowsShellCwd(cwd) || getWindowsDefaultCwd()) :
