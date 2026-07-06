@@ -297,6 +297,17 @@ to a codex-valid effort. Proposed as an objective *hang*.
 
 ### DEV-BATCH-0001 — live node-ORIGINAL uppercases PTY output in THIS session — **RECLASSIFIED: ENVIRONMENT/RUNTIME ARTIFACT (→ ENV-0001), NOT A DEVIATION; case-fold oracle-weakening REJECTED**
 
+> **✅ RESOLVED (2026-07-06, commit follows).** Root cause CONFIRMED = a stale/corrupt `dist/server`
+> build (the one bundled at 21:40 during this session). A **clean rebuild** (`rm -rf dist/server && npm
+> run build:server` from the still-pristine source) restored the live node-original to correct lowercase
+> output. Re-running both live legs afterward: `t1-equivalence-rust` **10/10 byte-exact, 0 skips** and
+> `t1-batch-equivalence-rust` **44/44 byte-exact, 0 skips** — the node original is now byte-identical to
+> rust and to the committed goldens (`echo-hello` sha `cd2eca35…` on both sides). The detect-and-quarantine
+> posture **self-extinguished exactly as designed** (full byte-exact strictness auto-returned the instant
+> `original == golden`). Confirms the port was byte-for-byte correct throughout; the quarantine is retained
+> as a self-arming safety net for any future env drift. Precise mechanism of the stale build's fold remains
+> unknown but is moot (the artifact is gone; source pristine; :3001 untouched throughout).
+
 **Antagonist adjudication (session `0000000000000000-cb72533e1e304bd5_anchors-architect`, parent
 `1d2dea08-9a63-4ecf-bc4b-ee25a852a4d8`, 2026-07-05). Two rulings:**
 1. **This is NOT a ledger deviation.** The ledger records objective defects in the ORIGINAL that the PORT
