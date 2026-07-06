@@ -1,0 +1,20 @@
+{
+  "productName": "Freshell",
+  "version": "0.7.0",
+  "identifier": "com.freshell.desktop",
+  "build": {
+    "frontendDist": "frontend"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all",
+    "icon": ["icons/icon.png"]
+  }
+}
