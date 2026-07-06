@@ -17,6 +17,7 @@
 //!   supplies the persisted `network` overlay for `settings.updated`.
 
 mod boot;
+mod files;
 mod serve_client;
 mod settings;
 
@@ -85,6 +86,13 @@ async fn main() -> ExitCode {
     // `terminalId` here (not by the socket that created them), so a second/reconnected
     // socket re-attaches to a running PTY and replays its scrollback. This is what
     // makes the multi-client / reconnection / hot-across-reload flows work.
+    // Cloned (cheap Arc) into the files REST surface too, whose `candidate-dirs`
+    // sources the running terminals' cwds for the DirectoryPicker.
+    let registry = freshell_terminal::TerminalRegistry::new();
+    // The shared in-memory tabs registry — cloned into both the WS handler
+    // (`tabs.sync.*`) and the boot REST surface (`/api/tabs-sync/client-retire`),
+    // so the unload beacon and the socket path retire against ONE cross-device view.
+    let tabs = freshell_ws::tabs::TabsRegistry::new();
     let ws_state = WsState {
         auth_token: Arc::clone(&auth_token),
         server_instance_id,
@@ -93,7 +101,8 @@ async fn main() -> ExitCode {
         broadcast_tx: Arc::clone(&broadcast_tx),
         fresh_codex: fresh_codex_state.clone(),
         fresh_claude: fresh_claude_state.clone(),
-        registry: freshell_terminal::TerminalRegistry::new(),
+        registry: registry.clone(),
+        tabs: tabs.clone(),
     };
     let api_state = ApiState {
         auth_token: Arc::clone(&auth_token),
@@ -114,18 +123,30 @@ async fn main() -> ExitCode {
             std::env::var("FRESHELL_APP_VERSION").unwrap_or_else(|_| APP_VERSION.to_string()),
         ),
         port,
+        tabs: tabs.clone(),
     };
     let client_dir = Arc::new(resolve_client_dir());
 
+    // The files REST surface the RETAINED SPA's DirectoryPicker fetches when a
+    // browser user opens a Fresh Agent pane (candidate dirs + validate-dir). Shares
+    // the auth token, the settings tree (for `defaultCwd`), and the terminal
+    // registry (for the running terminals' cwds).
+    let files_state = files::FilesState {
+        auth_token: Arc::clone(&auth_token),
+        settings: Arc::clone(&settings),
+        registry: registry.clone(),
+    };
+
     // One axum app serving REST (`/api/health` + fresh-agent + `PATCH /api/settings`
-    // + the SPA boot endpoints) + the WS upgrade (`/ws`) + static `dist/client`
-    // with SPA-fallback routing. The fallback also returns a clean 404 for any
-    // unmatched `/api/*` (never the HTML shell), mirroring the original ordering.
+    // + the SPA boot endpoints + files) + the WS upgrade (`/ws`) + static
+    // `dist/client` with SPA-fallback routing. The fallback also returns a clean 404
+    // for any unmatched `/api/*` (never the HTML shell), mirroring the original ordering.
     let app = freshell_api::router(api_state)
         .merge(freshell_ws::router(ws_state))
         .merge(freshell_freshagent::router(fresh_agent_state.clone()))
         .merge(fresh_codex_state.settings_router())
         .merge(boot::router(boot_state))
+        .merge(files::router(files_state))
         .fallback({
             let client_dir = Arc::clone(&client_dir);
             move |uri: axum::http::Uri| {

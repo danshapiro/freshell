@@ -186,7 +186,27 @@ async fn handle_client_text(
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
     // runtime's tolerance; the handshake already gated auth).
-    let Ok(message) = serde_json::from_str::<ClientMessage>(text) else {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return true;
+    };
+
+    // The `tabs.sync.*` family is carried as opaque envelopes (its records aren't
+    // in the typed `ClientMessage` enum), so dispatch it from the raw JSON before
+    // the typed parse — mirrors the dedicated `case 'tabs.sync.*'` arms in
+    // `server/ws-handler.ts:3058-3145`.
+    if let Some(msg_type) = value.get("type").and_then(|v| v.as_str()) {
+        match msg_type {
+            "tabs.sync.push" => return handle_tabs_push(&value, ws_tx, state).await,
+            "tabs.sync.query" => return handle_tabs_query(&value, ws_tx, state).await,
+            "tabs.sync.client.retire" => {
+                handle_tabs_retire(&value, state);
+                return true;
+            }
+            _ => {}
+        }
+    }
+
+    let Ok(message) = serde_json::from_value::<ClientMessage>(value) else {
         return true;
     };
     match message {
@@ -347,4 +367,100 @@ async fn handle_detach(
 /// via `conn_sink`), so no direct reply is needed here.
 fn handle_kill(kill: TerminalKill, state: &WsState) {
     state.registry.kill(&kill.terminal_id);
+}
+
+// ── tabs.sync.* (ws-handler.ts:3058-3145) ────────────────────────────────────
+
+/// `tabs.sync.push` — replace this client's open snapshot in the shared tabs
+/// registry, then reply `tabs.sync.ack`. On a stale/invalid revision the registry
+/// returns `Err`, which we surface as an `error{code:INVALID_MESSAGE}` frame (the
+/// original's `catch` arm; the SPA maps a `/tabs/i` error to its sync-error state).
+async fn handle_tabs_push(value: &serde_json::Value, ws_tx: &mut WsSink, state: &WsState) -> bool {
+    let device_id = value.get("deviceId").and_then(|v| v.as_str()).unwrap_or("");
+    let device_label = value.get("deviceLabel").and_then(|v| v.as_str()).unwrap_or("");
+    let client_instance_id = value
+        .get("clientInstanceId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let snapshot_revision = value
+        .get("snapshotRevision")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let records = crate::tabs::envelope_records(value);
+
+    match state.tabs.replace_client_snapshot(
+        state.server_instance_id.as_str(),
+        device_id,
+        device_label,
+        client_instance_id,
+        snapshot_revision,
+        records,
+    ) {
+        Ok(ack) => {
+            let msg = ServerMessage::TabsSyncAck(freshell_protocol::TabsSyncAck {
+                accepted: ack.accepted,
+                open_records: ack.open_records,
+                closed_records: ack.closed_records,
+            });
+            send(ws_tx, &msg).await
+        }
+        Err(message) => send_tabs_error(ws_tx, &message).await,
+    }
+}
+
+/// `tabs.sync.query` — reply `tabs.sync.snapshot` with the merged cross-device view
+/// for the asking `(deviceId, clientInstanceId)`, echoing the query's `requestId`
+/// (the SPA drops a snapshot whose `requestId` isn't the latest in-flight one).
+async fn handle_tabs_query(value: &serde_json::Value, ws_tx: &mut WsSink, state: &WsState) -> bool {
+    let device_id = value.get("deviceId").and_then(|v| v.as_str()).unwrap_or("");
+    let client_instance_id = value
+        .get("clientInstanceId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let request_id = value.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
+
+    let data = state.tabs.query(device_id, client_instance_id);
+    let frame = serde_json::json!({
+        "type": "tabs.sync.snapshot",
+        "requestId": request_id,
+        "data": data,
+    });
+    send_raw(ws_tx, &frame).await
+}
+
+/// `tabs.sync.client.retire` — drop this client's open snapshot (background retire;
+/// no reply). The unload beacon also hits `POST /api/tabs-sync/client-retire`, which
+/// routes to the same [`crate::tabs::TabsRegistry`], so the retire is idempotent.
+fn handle_tabs_retire(value: &serde_json::Value, state: &WsState) {
+    let device_id = value.get("deviceId").and_then(|v| v.as_str()).unwrap_or("");
+    let client_instance_id = value
+        .get("clientInstanceId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let snapshot_revision = value
+        .get("snapshotRevision")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    state
+        .tabs
+        .retire_client_snapshot(device_id, client_instance_id, snapshot_revision);
+}
+
+/// Send a raw JSON value as a text frame. Returns `false` if the socket is closed.
+async fn send_raw(ws_tx: &mut WsSink, value: &serde_json::Value) -> bool {
+    match serde_json::to_string(value) {
+        Ok(json) => ws_tx.send(Message::Text(json.into())).await.is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Emit a minimal `error{code:INVALID_MESSAGE}` frame for a rejected tabs push.
+async fn send_tabs_error(ws_tx: &mut WsSink, message: &str) -> bool {
+    let frame = serde_json::json!({
+        "type": "error",
+        "code": "INVALID_MESSAGE",
+        "message": message,
+        "timestamp": crate::now_iso(),
+    });
+    send_raw(ws_tx, &frame).await
 }

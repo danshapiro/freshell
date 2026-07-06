@@ -61,6 +61,11 @@ pub struct BootState {
     pub app_version: Arc<String>,
     /// The bound loopback port, echoed in `GET /api/network/status`.
     pub port: u16,
+    /// The shared in-memory tabs registry — the `POST /api/tabs-sync/client-retire`
+    /// beacon retires a client's snapshot here (the SAME registry the `/ws`
+    /// `tabs.sync.*` path uses), so an unload without a live socket still drops the
+    /// closing client's tabs from every other viewer.
+    pub tabs: freshell_ws::tabs::TabsRegistry,
 }
 
 /// The boot REST sub-router, pre-bound to its state (mergeable into the app).
@@ -180,13 +185,48 @@ async fn logs_client(State(state): State<BootState>, headers: HeaderMap) -> Resp
     Json(json!({ "ok": true })).into_response()
 }
 
-/// `POST /api/tabs-sync/client-retire` → acknowledge a client-retire push. A
-/// minimal ack keeps `startTabRegistrySync` from erroring on a clean boot.
-async fn tabs_sync_client_retire(State(state): State<BootState>, headers: HeaderMap) -> Response {
+/// `POST /api/tabs-sync/client-retire` → retire a client's tab snapshot from the
+/// shared registry (`server/tabs-registry/client-retire-router.ts`). This is the
+/// unload path: the SPA `sendBeacon`s `{ deviceId, clientInstanceId, snapshotRevision }`
+/// when the socket is already gone, so a closed device's tabs still disappear from
+/// every other viewer. Returns `{ ok, accepted }` (the beacon body is authed by the
+/// `freshell-auth` cookie, since `sendBeacon` cannot set the `x-auth-token` header).
+async fn tabs_sync_client_retire(
+    State(state): State<BootState>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
     if !is_authed(&headers, &state.auth_token) {
         return unauthorized();
     }
-    Json(json!({ "ok": true })).into_response()
+    let Some(Json(body)) = body else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Invalid tabs registry retire payload" })),
+        )
+            .into_response();
+    };
+    let device_id = body.get("deviceId").and_then(Value::as_str).unwrap_or("");
+    let client_instance_id = body
+        .get("clientInstanceId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let snapshot_revision = body
+        .get("snapshotRevision")
+        .and_then(Value::as_i64)
+        .unwrap_or(-1);
+    if device_id.is_empty() || client_instance_id.is_empty() || snapshot_revision < 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Invalid tabs registry retire payload" })),
+        )
+            .into_response();
+    }
+    let accepted =
+        state
+            .tabs
+            .retire_client_snapshot(device_id, client_instance_id, snapshot_revision);
+    Json(json!({ "ok": true, "accepted": accepted })).into_response()
 }
 
 // ── Auth gate (ports server/auth.ts#httpAuthMiddleware) ──────────────────────
@@ -194,7 +234,10 @@ async fn tabs_sync_client_retire(State(state): State<BootState>, headers: Header
 /// A request is authorized iff it presents the exact `AUTH_TOKEN` via the
 /// `x-auth-token` header or the `freshell-auth` cookie (url-decoded), under a
 /// constant-time compare. Absent/wrong credentials are rejected.
-fn is_authed(headers: &HeaderMap, token: &str) -> bool {
+///
+/// `pub(crate)` so the additive `files` REST surface shares the identical gate
+/// (mirrors the single `server/auth.ts#httpAuthMiddleware` in the original).
+pub(crate) fn is_authed(headers: &HeaderMap, token: &str) -> bool {
     if let Some(header_token) = headers
         .get("x-auth-token")
         .and_then(|value| value.to_str().ok())

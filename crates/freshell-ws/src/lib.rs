@@ -20,6 +20,7 @@
 //! The crate emits the frozen [`freshell_protocol`] server-message types so its
 //! wire bytes are contract-locked.
 
+pub mod tabs;
 pub mod terminal;
 
 use std::sync::Arc;
@@ -77,6 +78,12 @@ pub struct WsState {
     /// the multi-client / reconnection / hot-across-reload flows work
     /// (`port/machine/specs/terminal-core.md` §1).
     pub registry: freshell_terminal::TerminalRegistry,
+    /// The shared, in-memory tabs registry (the `tabs.sync.*` slice of
+    /// `server/ws-handler.ts` + `server/tabs-registry/store.ts`). Owned here by
+    /// `(deviceId, clientInstanceId)` so every `/ws` connection — and the REST
+    /// `client-retire` beacon — shares one cross-device tab view. This is what makes
+    /// a closed device's tab disappear from other clients' Tabs UI.
+    pub tabs: crate::tabs::TabsRegistry,
 }
 
 /// The `/ws` sub-router, pre-bound to its state (mergeable into the server app).
@@ -295,6 +302,7 @@ mod tests {
             ),
             fresh_claude: freshell_freshagent::FreshClaudeState::new(broadcast_tx),
             registry: freshell_terminal::TerminalRegistry::new(),
+            tabs: crate::tabs::TabsRegistry::new(),
         }
     }
 
