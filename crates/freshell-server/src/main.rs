@@ -61,8 +61,25 @@ async fn main() -> ExitCode {
 
     // Boot-scoped identifiers, stable for the life of the process (as in the
     // original's single `WsHandler`). Normalized away by the oracle.
+    // `server_instance_id` is shared (Arc::clone) into BOTH the WS handshake
+    // (`ready.serverInstanceId`) AND `GET /api/health` (`instanceId`), so the id an
+    // Electron discovery candidate records matches the handshake it later opens.
     let server_instance_id = Arc::new(format!("srv-{}", Uuid::new_v4()));
     let boot_id = Arc::new(format!("boot-{}", Uuid::new_v4()));
+
+    // The app version string, resolved ONCE and shared (Arc::clone) into BOTH
+    // `GET /api/version` (`currentVersion`) and `GET /api/health` (`version`), so
+    // the two endpoints can never disagree. Overridable via `FRESHELL_APP_VERSION`.
+    let app_version = Arc::new(
+        std::env::var("FRESHELL_APP_VERSION").unwrap_or_else(|_| APP_VERSION.to_string()),
+    );
+
+    // The server-start timestamp, captured once here as an ISO-8601 string
+    // (millisecond precision + `Z`, matching JS `Date.toISOString()` in
+    // `server/health-router.ts`). Surfaced as health `startedAt`.
+    let started_at = Arc::new(
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    );
 
     let settings = Arc::new(load_server_settings(home.as_deref()));
 
@@ -106,7 +123,8 @@ async fn main() -> ExitCode {
     let tabs = freshell_ws::tabs::TabsRegistry::new();
     let ws_state = WsState {
         auth_token: Arc::clone(&auth_token),
-        server_instance_id,
+        // Shared (not moved) so `GET /api/health` reports the SAME `instanceId`.
+        server_instance_id: Arc::clone(&server_instance_id),
         boot_id,
         settings: Arc::clone(&settings),
         broadcast_tx: Arc::clone(&broadcast_tx),
@@ -119,6 +137,12 @@ async fn main() -> ExitCode {
     let api_state = ApiState {
         auth_token: Arc::clone(&auth_token),
         ready: true,
+        // Same version as `GET /api/version` and same instance id as the WS
+        // `ready` handshake, so `GET /api/health` (which the legacy Electron
+        // launcher's discovery probe consumes) is consistent with both.
+        version: Arc::clone(&app_version),
+        instance_id: Arc::clone(&server_instance_id),
+        started_at: Arc::clone(&started_at),
     };
     // The fresh-agent REST surface (opencode slice): shares the auth token + the
     // broadcast bus so its create/send broadcasts reach every WS client.
@@ -142,9 +166,9 @@ async fn main() -> ExitCode {
         auth_token: Arc::clone(&auth_token),
         settings: Arc::clone(&settings),
         platform: Arc::new(build_platform_payload(available_clis)),
-        app_version: Arc::new(
-            std::env::var("FRESHELL_APP_VERSION").unwrap_or_else(|_| APP_VERSION.to_string()),
-        ),
+        // The SAME resolved version `GET /api/health` reports (shared above), so
+        // `/api/version` `currentVersion` and health `version` never diverge.
+        app_version: Arc::clone(&app_version),
         tabs: tabs.clone(),
         extensions: Arc::clone(&extensions_registry),
     };
