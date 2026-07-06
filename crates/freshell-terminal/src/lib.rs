@@ -15,27 +15,41 @@
 //! | [`decode`] | node-pty's `StringDecoder` role | streaming UTF-8 decode of raw PTY bytes |
 //! | [`framing`] | `broker.ts` `appendOutputFrames` / `buildTerminalOutputPayload` | raw output -> `terminal.output` messages |
 //! | [`pty`] | `terminal-registry.ts` spawn + `onData` path | real portable-pty spawn/read/write/reap |
-//! | [`stub_3b`] | (deferred) | 3.3b surface stubs (batch, barrier scanner, gaps, resize, snapshot) |
+//! | [`barrier_scanner`] | `output-barrier-scanner.ts` | stateful VT parser (batch merge boundaries) |
+//! | [`batch`] | `output-batch.ts` + broker wire projection | `terminal.output.batch` framing (UTF-16 offsets, `serializedBytes`) |
+//! | [`chunk_ring`] | `ChunkRingBuffer` (`terminal-registry.ts:810-853`) | char-measured scrollback + snapshot seed |
 //!
-//! ## In scope (3.3a) vs deferred (3.3b, see [`stub_3b`])
+//! ## Two framing variants (capability-gated, `§4.1`/`§4.2`)
+//!
+//! - **`terminal.output`** (batchV1 OFF, the default) — one frame per message, raw
+//!   UTF-8 `data`. This is what a client advertising no capability receives, and it is
+//!   the byte-exact path the oracle's **T1** rung grades. [`framing`].
+//! - **`terminal.output.batch`** (batchV1 ON) — contiguous transparent-ground frames
+//!   merged, each carrying a UTF-16 `endOffset` + `rawFrameCount`, the batch a
+//!   self-referential `serializedBytes`. The stateful [`barrier_scanner`] decides merge
+//!   boundaries. [`batch`]. Gated by `hello.capabilities.terminalOutputBatchV1`.
 //!
 //! **In:** PTY spawn via [`freshell_platform`]'s `SpawnSpec`; reading PTY bytes;
 //! the byte-measured, seq-numbered [`ReplayRing`](replay_ring::ReplayRing); fragmenting
-//! output into `terminal.output`-shaped frames with the code-point-budget splitter;
-//! UTF-8 decoding.
-//!
-//! **Out (3.3b):** `terminal.output.batch` + the stateful VT barrier scanner + UTF-16
-//! `endOffset`/`serializedBytes`; the char-measured ChunkRingBuffer attach snapshot;
-//! gap emission; resize/geometry-epoch; coding-CLI `turn.complete`.
+//! output into frames with the code-point-budget splitter; UTF-8 decoding; both output
+//! framing variants; the char-measured [`ChunkRingBuffer`](chunk_ring::ChunkRingBuffer).
 
+pub mod barrier_scanner;
+pub mod batch;
+pub mod chunk_ring;
 pub mod decode;
 pub mod fragment;
 pub mod framing;
 pub mod pty;
 pub mod registry;
 pub mod replay_ring;
-pub mod stub_3b;
 
+pub use barrier_scanner::{BarrierClassification, BarrierReason, BarrierScanner, ScannerMode, ScannerState};
+pub use batch::{
+    build_terminal_output_batches, frames_to_wire_payloads, slice_utf16, utf16_len, BatchBuildInput,
+    BatchInputFrame, OutputBatch,
+};
+pub use chunk_ring::{snapshot_seed_if_ring_empty, ChunkRingBuffer};
 pub use decode::Utf8StreamDecoder;
 pub use framing::{reassemble_stream, OutputFramer};
 pub use pty::{build_child_env, build_child_env_from_process, MessageSink, PtyTerminal};

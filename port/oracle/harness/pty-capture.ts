@@ -84,6 +84,13 @@ export interface PtyCaptureOptions {
   setupTemplate?: string
   /** Per-wait budget in ms for the handshake / sentinels (default 20000). */
   timeoutMs?: number
+  /**
+   * Client capabilities to advertise in `hello.capabilities` (e.g.
+   * `{ terminalOutputBatchV1: true }`). Default: none — so output arrives as legacy
+   * `terminal.output` frames (the T1 default). When `terminalOutputBatchV1` is set the
+   * server emits `terminal.output.batch` instead (`ws-handler.ts:1846-1848`).
+   */
+  capabilities?: Record<string, boolean>
   /** Optional sink for human-readable progress (test diagnostics). */
   log?: (msg: string) => void
 }
@@ -115,6 +122,24 @@ export interface PtyCaptureResult {
   normalizedEnvelope: { created: string; attachReady: string }
   /** `terminal.output.gap` occurrences (should be empty; non-empty = lost bytes). */
   gaps: Array<{ fromSeq: number; toSeq: number; reason: string }>
+  /**
+   * Raw `terminal.output.batch` wire payloads for this stream, in capture order
+   * (empty unless `terminalOutputBatchV1` was negotiated). Exposed so the batch tier
+   * can assert per-batch structural invariants (UTF-16 `endOffset`, `rawFrameCount`,
+   * `serializedBytes` fixpoint, `barrier` reason) on the live wire.
+   */
+  outputBatches: CapturedBatch[]
+}
+
+/** A `terminal.output.batch` wire payload (the fields the batch tier asserts on). */
+export interface CapturedBatch {
+  seqStart: number
+  seqEnd: number
+  data: string
+  serializedBytes: number
+  segments: Array<{ seqStart: number; seqEnd: number; endOffset: number; rawFrameCount: number; barrier?: string }>
+  /** UTF-8 byte length of the EXACT wire frame — must equal `serializedBytes` (the fixpoint). */
+  rawByteLength: number
 }
 
 interface OutputFrame {
@@ -147,6 +172,7 @@ interface CollectResult {
   frames: OutputFrame[]
   gaps: Array<{ fromSeq: number; toSeq: number; reason: string }>
   typeCounts: Record<string, number>
+  batches: CapturedBatch[]
 }
 
 /** Pull the output frames for a given stream out of the capture transcript. */
@@ -154,6 +180,7 @@ function collectOutput(client: WsCaptureClient, streamId: string): CollectResult
   const frames: OutputFrame[] = []
   const gaps: Array<{ fromSeq: number; toSeq: number; reason: string }> = []
   const typeCounts: Record<string, number> = {}
+  const batches: CapturedBatch[] = []
   for (const m of client.getServerMessages()) {
     const p = m.parsed as Record<string, unknown> | null
     if (!p || typeof p !== 'object') continue
@@ -164,6 +191,22 @@ function collectOutput(client: WsCaptureClient, streamId: string): CollectResult
       if (typeof p.data === 'string') {
         frames.push({ seqStart: Number(p.seqStart), seqEnd: Number(p.seqEnd), data: p.data })
       }
+      if (type === 'terminal.output.batch' && Array.isArray(p.segments)) {
+        batches.push({
+          seqStart: Number(p.seqStart),
+          seqEnd: Number(p.seqEnd),
+          data: String(p.data),
+          serializedBytes: Number(p.serializedBytes),
+          segments: (p.segments as Array<Record<string, unknown>>).map((s) => ({
+            seqStart: Number(s.seqStart),
+            seqEnd: Number(s.seqEnd),
+            endOffset: Number(s.endOffset),
+            rawFrameCount: Number(s.rawFrameCount),
+            ...(typeof s.barrier === 'string' ? { barrier: s.barrier } : {}),
+          })),
+          rawByteLength: Buffer.byteLength(m.raw, 'utf8'),
+        })
+      }
     } else if (type === 'terminal.output.gap') {
       typeCounts[type] = (typeCounts[type] ?? 0) + 1
       gaps.push({
@@ -173,7 +216,7 @@ function collectOutput(client: WsCaptureClient, streamId: string): CollectResult
       })
     }
   }
-  return { frames, gaps, typeCounts }
+  return { frames, gaps, typeCounts, batches }
 }
 
 /** True once the marker appears in its terminal-OUTPUT form (CR-LF or LF). */
@@ -311,8 +354,14 @@ export async function capturePtyScenario(
   let terminalId = ''
   try {
     await client.connect()
-    // Drive the full connect handshake (hello → … → terminal.inventory). No
-    // capabilities advertised, so output arrives as `terminal.output` frames.
+    // Advertise capabilities BEFORE captureHandshake drives the default hello, so the
+    // server negotiates them (`ws-handler.ts:1846-1848`). With no capabilities, output
+    // arrives as legacy `terminal.output`; with `terminalOutputBatchV1`, as
+    // `terminal.output.batch`.
+    if (options.capabilities) {
+      client.sendHello({ capabilities: options.capabilities })
+    }
+    // Drive the full connect handshake (hello → … → terminal.inventory).
     await client.captureHandshake(timeoutMs)
 
     // 1) create the terminal (pinned shell enum; argv/env pinned via setup line)
@@ -361,7 +410,7 @@ export async function capturePtyScenario(
     // 5) wait until the END sentinel lands (guarantees all payload bytes arrived,
     //    since the wire preserves byte order by seq), then reassemble + extract.
     const stream = await waitForOutputMarker(client, streamId, sentinels.end, timeoutMs, 'end-sentinel')
-    const { frames, gaps, typeCounts } = collectOutput(client, streamId)
+    const { frames, gaps, typeCounts, batches } = collectOutput(client, streamId)
     const reassembled = reassemble(frames)
     const { golden, reason } = extractGolden(reassembled, sentinels.start, sentinels.end)
     if (reason) {
@@ -390,6 +439,7 @@ export async function capturePtyScenario(
         attachReady: normalizeEnvelope(attachReady.parsed),
       },
       gaps,
+      outputBatches: batches,
     }
   } finally {
     // Clean terminal teardown before the caller stops the server.

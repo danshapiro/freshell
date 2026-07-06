@@ -1,0 +1,20 @@
+{
+  "scenario": "echo-hello",
+  "description": "single fixed-string line via printf",
+  "shell": "system",
+  "mode": "shell",
+  "inputLines": [
+    "printf 'hello\\n'"
+  ],
+  "capabilities": {
+    "terminalOutputBatchV1": true
+  },
+  "cols": 120,
+  "rows": 30,
+  "reassembledLength": 1467,
+  "byteLength": 7,
+  "sha256": "cd2eca3535741f27a8ae40c31b0c41d4057a7a7b912b33b9aed86485d1c84676",
+  "outputTypeCounts": {
+    "terminal.output.batch": 17
+  }
+}

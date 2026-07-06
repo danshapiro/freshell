@@ -96,6 +96,7 @@ pub async fn run(
     socket: WebSocket,
     state: &WsState,
     mut bcast_rx: tokio::sync::broadcast::Receiver<String>,
+    terminal_output_batch_v1: bool,
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
@@ -129,6 +130,7 @@ pub async fn run(
                             state,
                             conn_id,
                             &conn_sink,
+                            terminal_output_batch_v1,
                         )
                         .await
                         {
@@ -183,6 +185,7 @@ async fn handle_client_text(
     state: &WsState,
     conn_id: u64,
     conn_sink: &FrameSink,
+    terminal_output_batch_v1: bool,
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
     // runtime's tolerance; the handshake already gated auth).
@@ -212,7 +215,7 @@ async fn handle_client_text(
     match message {
         ClientMessage::TerminalCreate(create) => handle_create(create, ws_tx, state).await,
         ClientMessage::TerminalAttach(attach) => {
-            handle_attach(attach, state, conn_id, conn_sink);
+            handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1);
             true
         }
         ClientMessage::TerminalInput(input) => {
@@ -329,13 +332,20 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
 /// registers the connection so live output fans out — all onto `conn_sink`, which
 /// the select loop drains to the socket. Attaching to an unknown terminal is a no-op
 /// (the reference surfaces `INVALID_TERMINAL_ID`; the SPA recreates on its own).
-fn handle_attach(attach: TerminalAttach, state: &WsState, conn_id: u64, conn_sink: &FrameSink) {
+fn handle_attach(
+    attach: TerminalAttach,
+    state: &WsState,
+    conn_id: u64,
+    conn_sink: &FrameSink,
+    terminal_output_batch_v1: bool,
+) {
     state.registry.attach(
         &attach.terminal_id,
         conn_id,
         Arc::clone(conn_sink),
         attach.attach_request_id.clone(),
         attach.since_seq.unwrap_or(0),
+        terminal_output_batch_v1,
     );
 }
 

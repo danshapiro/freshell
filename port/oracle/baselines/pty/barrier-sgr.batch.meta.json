@@ -1,0 +1,20 @@
+{
+  "scenario": "barrier-sgr",
+  "description": "ANSI SGR color escapes (ESC[..m) = control barriers — the stateful scanner splits the stream",
+  "shell": "system",
+  "mode": "shell",
+  "inputLines": [
+    "printf '\\033[31mRED\\033[0m\\n'"
+  ],
+  "capabilities": {
+    "terminalOutputBatchV1": true
+  },
+  "cols": 120,
+  "rows": 30,
+  "reassembledLength": 588,
+  "byteLength": 14,
+  "sha256": "a0c9c0a35353f8f4336a848f18a8195006de5c66e88d2f7b112cae51acbe86b2",
+  "outputTypeCounts": {
+    "terminal.output.batch": 7
+  }
+}

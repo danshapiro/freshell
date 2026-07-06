@@ -230,9 +230,18 @@ async fn handle_socket(mut socket: WebSocket, state: WsState) {
         }
     }
 
+    // Capability negotiation (`ws-handler.ts:1846-1848`): the connection's
+    // `hello.capabilities.terminalOutputBatchV1` gates whether its terminal output is
+    // framed as `terminal.output.batch` (on) or legacy `terminal.output` (off, default).
+    let terminal_output_batch_v1 = value
+        .get("capabilities")
+        .and_then(|c| c.get("terminalOutputBatchV1"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     // Handshake done: serve the terminal.* shell path (and fan out broadcast-bus
     // frames) until the client closes.
-    terminal::run(socket, &state, bcast_rx).await;
+    terminal::run(socket, &state, bcast_rx, terminal_output_batch_v1).await;
 }
 
 /// Best-effort structured error (used only on the non-graded reject paths). The

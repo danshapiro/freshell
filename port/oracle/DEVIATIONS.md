@@ -295,6 +295,121 @@ to a codex-valid effort. Proposed as an objective *hang*.
 3. Only after 1–2, a fresh candidate may be filed; harness pinning `effort='low'` for baseline capture remains
    acceptable test hygiene either way and needs no deviation.
 
+### DEV-BATCH-0001 — live node-ORIGINAL uppercases PTY output in THIS session — **RECLASSIFIED: ENVIRONMENT/RUNTIME ARTIFACT (→ ENV-0001), NOT A DEVIATION; case-fold oracle-weakening REJECTED**
+
+**Antagonist adjudication (session `0000000000000000-cb72533e1e304bd5_anchors-architect`, parent
+`1d2dea08-9a63-4ecf-bc4b-ee25a852a4d8`, 2026-07-05). Two rulings:**
+1. **This is NOT a ledger deviation.** The ledger records objective defects in the ORIGINAL that the PORT
+   faithfully-or-deliberately handles (see Entry rules, lines 8-14). This is neither: the **port is
+   byte-for-byte CORRECT**, and the pristine source is NOT objectively defective — its own earlier goldens
+   AND a direct node-pty spawn of the exact shell it uses are both lowercase. The fold is an artifact of the
+   **live node-original process's runtime in this session only**. Kept here for traceability, reclassified as
+   **ENV-0001** (environment / oracle-infra note, below). No source change, no port change, and — critically —
+   **NO differ whitelist and NO tolerance**: the T1/batch differ must NEVER case-fold; any real port
+   case/letter corruption must still fail.
+2. **The implementer's `original.toUpperCase() === rust.toUpperCase()` oracle weakening is REJECTED.** A
+   case-insensitive equivalence assertion masks real divergence — it would pass a port that mangled case,
+   dropped an SGR `m`→`M`, or corrupted any letter — and violates this campaign's byte-exact oracle
+   principle (the same "weaken the oracle so it passes" move rejected in DEV-0001). It is replaced by the
+   **detect-and-quarantine** posture specified below: keep `rust ≡ committed golden` byte-exact and hard, and
+   only SKIP the *live-original* cross-check leg (loudly, with reason) while the live original is provably the
+   case-folded image of its own golden — auto-restoring full strictness the instant the environment recovers.
+
+**What I independently verified (not taken on report):**
+- **Reproduced live, right now**, via the pristine committed `t1-equivalence-rust.test.ts` (unmodified):
+  RUST `echo-hello` = `hello\r\n` sha256 `cd2eca35…` = the committed golden (leg (a) GREEN); NODE original
+  = `HELLO\r\n` sha256 `be947859…`. `seq-3` and `fixed-width-fill` (no lowercase) are node≡rust **exact**;
+  `echo-hello`/`multi-line` (lowercase) diverge. The sole divergence is a **pure ASCII lowercase→uppercase
+  fold — nothing else** (2 failed / 8 passed).
+- **node-pty is NOT the cause.** A direct `node-pty` spawn (same shared binary, `node-pty@1.2.0-beta.11`,
+  native `pty.node` mtime **2026-05-19** — not rebuilt today) of **`/bin/bash -l`** (exactly what
+  `terminal-registry` spawns) AND of plain `/bin/bash` both return **lowercase** `hello`. node-pty and the
+  login-shell/profile path are exonerated.
+- **Not a source or bundle transform.** `git diff server/ shared/` is empty (source pristine); grepping the
+  built `dist/server/**` finds `toUpperCase` only in unrelated label/key/drive/model-name code — none on the
+  terminal-output byte path.
+- **The port is provably correct off the live original entirely:** the deterministic
+  `crates/freshell-terminal/tests/batch_wire_golden.rs` is **2/2 GREEN** (batch framing reproduces every
+  committed golden byte-for-byte + the UTF-16 `endOffset` proof), and RUST≡committed-golden is GREEN on the
+  live wire. Neither touches the compromised live original.
+- The node original boots from `dist/server/index.js` (`external-server.ts:25`; `ensureNodeBundle` →
+  `npm run build:server`), mtime **2026-07-05 21:40** (today) vs newest source **2026-07-04 20:13** — so the
+  node original executes a bundle rebuilt today. **Honesty caveat:** that rebuilt bundle contains no output
+  case-transform and node-pty's addon predates today, so the *precise trigger* of the fold (why this live
+  server-runtime uppercases when a direct node-pty of the same shell does not) is **UNDETERMINED**. This does
+  NOT change the classification — it is confined to the live node-original runtime and is neither the port
+  nor an inherent source defect — but I will not assert the rebuild is the proven cause.
+
+- **objective_defect:** NONE in the port or the pristine source. The "corrupts data" bar applies only to the
+  *live node-original process in this session*, not to freshell's code ⇒ no ledger deviation.
+- **original_behavior (pristine / durable):** case-correct lowercase (the committed goldens; a direct
+  node-pty of `/bin/bash -l`). **Live node-original (this session only):** folds ASCII lowercase→uppercase on
+  the PTY output byte stream, incl. inside ANSI (`\x1b[31m`→`\x1b[31M`).
+- **port_behavior:** portable-pty preserves case; reproduces every committed `<name>.golden` and
+  `<name>.batch.golden` byte-for-byte. **The port is CORRECT; nothing to change.**
+- **fingerprint:** **NONE — not a whitelisted deviation.** The differ gets zero tolerance and must never
+  case-fold. The environmental fault is handled by the oracle-test *quarantine* below, not by the differ.
+- **pinning_proof (port correctness, env-independent):** `crates/freshell-terminal/tests/batch_wire_golden.rs`
+  (2/2) + the `rust ≡ committed golden` legs of `t1-equivalence-rust.test.ts` /
+  `t1-batch-equivalence-rust.test.ts`.
+- **adjudicated_by:** antagonist-reviewer session `0000000000000000-cb72533e1e304bd5_anchors-architect`
+  (parent `1d2dea08-9a63-4ecf-bc4b-ee25a852a4d8`), 2026-07-05.
+- **status:** reclassified — environment/runtime artifact (ENV-0001); **not a deviation; case-fold
+  oracle-weakening REJECTED.**
+
+**EXACT oracle-test posture fix (to be applied by the IMPLEMENTER — I did NOT touch the harness/tests):**
+Keep the durable proof HARD; quarantine only the *live-original* leg. For each scenario let `g` = committed
+golden text, `o`/`r` = live-original / rust captures.
+- **Always-hard, unchanged (the real proof — currently GREEN):** every `rust ≡ committed golden` assertion —
+  `t1-equivalence-rust.test.ts` leg (a); `t1-batch-equivalence-rust.test.ts` legs (a)(b)(c)(d)(e)(f). No
+  case-folding anywhere in these.
+- **`t1-batch-equivalence-rust.test.ts`, the `(PRIZE)` block (lines 265-293):** DELETE the
+  `o.toUpperCase() === r.toUpperCase()` assertions and gate instead:
+  - if `o === g` → `expect(o).toBe(r)` **byte-exact** (full live equivalence);
+  - else if `r === g` **and** `o === g.toUpperCase()` (the original is exactly the ASCII-uppercased image of
+    the golden — the detected ENV-0001 signature) → **SKIP this leg loudly** via `ctx.skip()` (or
+    `it.skipIf(...)`) with, e.g. `[T1-batch][PRIZE] live-original leg SKIPPED for "<name>": node-original
+    ENV-0001 case-fold; rust proven ≡ committed golden. See DEVIATIONS.md ENV-0001.` — derive NO pass from
+    `o`;
+  - else → `expect(o).toBe(r)` (fails — a real, non-case divergence).
+  Keep the `seq-3` exact tail assertion (line 292): it proves live original≡rust EXACTLY where the fold
+  cannot manifest.
+- **`t1-equivalence-rust.test.ts`, the `(b) THE PRIZE` block (lines 167-196), now RED on echo-hello +
+  multi-line:** apply the identical guard — byte-exact `expect(origCap.goldenBytes).toEqual(rustCap.goldenBytes)`
+  when `o === g`; **skip (b) with the ENV-0001 reason** when `r === g && o === g.toUpperCase()` (turning the
+  2 RED into 2 flagged SKIPS) while leg (a) rust≡golden stays hard/green; any other diff still fails.
+- **Why this is NOT a re-weakening:** `toUpperCase` here is used only as a *classifier* to RECOGNIZE the
+  known fault signature and then SKIP — never as the equivalence *assertion* (contrast the rejected use,
+  where it WAS the assertion). The skip is (i) NARROW — fires only when the original is the exact
+  case-folded image of its own golden; (ii) LOUD — a reported skip/warn, never a silent green;
+  (iii) SELF-EXTINGUISHING — the instant the live original returns lowercase, the guard falls through to the
+  hard byte-exact `original ≡ rust` assertion automatically. `toUpperCase()===toUpperCase()` would instead
+  permanently accept case-mangling forever. Full power to catch a genuine port case-defect is retained
+  because `rust ≡ committed golden` stays byte-exact and hard.
+
+**ENV-0001 — root-cause follow-up (NON-BLOCKING; does NOT gate landing the batch work).**
+The batch-framing code and the corrected oracle posture may land now: the port is proven correct against the
+durable goldens, a direct node-pty, and the deterministic crate golden — none of which involve the
+compromised live original, so there is nothing in port/source that depends on the fold's mechanism. Deeper
+root-cause is NOT required before landing, but MUST be tracked before the live `original ≡ rust` cross-check
+is relied on again (it is a valuable belt-and-suspenders leg): (a) re-run after a clean
+`npm run build:server` / fresh environment and re-capture; (b) if it persists, bisect the today-rebuilt
+`dist/server` bundle vs a session/toolchain change and read the live server's pty master bytes directly;
+(c) confirm whether a slave-visible termios flag (OLCUC/IUCLC/XCASE) or an above-line-discipline transform is
+responsible (the builder's note reports all three flags OFF). Until resolved, the quarantine above keeps the
+oracle honest.
+
+**Blast radius (ruled): T1/batch live-original leg ONLY.** The fold is at the terminal PTY output byte
+layer. T2 assistant invariants arrive via provider SDK/SSE/JSON-RPC + provider DB (not the terminal PTY) and
+are structural booleans / a fixed sentinel token we send — a PTY case-fold cannot flip them, so T2 greens
+stand (if any future T2 assertion ever compared literal lowercase text captured from a PTY, revisit — none
+does today). T3 runs against the RUST server and asserts presence/output/layout, not exact terminal case; its
+committed visual baselines stand. All EARLIER green T1/batch results stand — captured before this session's
+regression from a healthy (lowercase) original; the durable proof (rust≡committed golden, re-verified now) is
+independent of the live original's later drift. Only the live-original cross-check is temporarily quarantined,
+and only for lowercase-bearing scenarios (`seq-3`/`fixed-width-fill` still match exactly, proving the wire
+path itself is intact).
+
 <!--
 Template:
 

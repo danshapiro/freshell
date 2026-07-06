@@ -322,9 +322,10 @@ impl ReplayRing {
     /// store as a non-barrier ground frame.
     pub fn append(&mut self, data: &str, stream_id: &str) -> ReplayFrame {
         let normalized = self.normalize_frame_data(data);
-        // 3.3b: `wasTruncated` would flip this frame to a conservative 'control'
-        // barrier via the scanner. Never triggers for the < maxBytes chunks T1
-        // produces. See `stub_3b::conservative_truncated_classification`.
+        // `wasTruncated` would flip this frame to a conservative 'control' barrier via
+        // the scanner (`replay-ring.ts:65-68`). Never triggers for the < maxBytes
+        // chunks a graded flow produces; barrier classification for the batch path is
+        // computed at the registry ingest by [`crate::barrier_scanner`].
         self.storage.append(ReplayFrameInput {
             data: normalized,
             stream_id: Some(stream_id.to_string()),

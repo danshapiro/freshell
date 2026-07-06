@@ -1,0 +1,20 @@
+{
+  "scenario": "multibyte-utf16",
+  "description": "emoji (4 bytes / 2 UTF-16 units) + CJK (3 bytes / 1 unit) — proves endOffset is UTF-16, not bytes",
+  "shell": "system",
+  "mode": "shell",
+  "inputLines": [
+    "printf 'a\\xf0\\x9f\\x98\\x80b\\xe4\\xb8\\xad\\xe6\\x96\\x87\\n'"
+  ],
+  "capabilities": {
+    "terminalOutputBatchV1": true
+  },
+  "cols": 120,
+  "rows": 30,
+  "reassembledLength": 582,
+  "byteLength": 14,
+  "sha256": "5860161ccd00d880e0e611fe007816fb9bb3f3768661fc21ab65e35de7341b24",
+  "outputTypeCounts": {
+    "terminal.output.batch": 8
+  }
+}

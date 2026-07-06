@@ -54,6 +54,11 @@ use freshell_protocol::{
     TerminalExit, TerminalOutput, TerminalRunStatus,
 };
 
+use crate::barrier_scanner::{BarrierReason, BarrierScanner, ScannerState};
+use crate::batch::{
+    build_batch_wire_payloads, build_terminal_output_batches, BatchBuildInput, BatchInputFrame,
+};
+use crate::fragment::terminal_stream_batch_max_bytes;
 use crate::pty::{MessageSink, PtyTerminal};
 
 /// Deliver one server→client message to a single attached connection's socket.
@@ -84,6 +89,41 @@ struct Subscriber {
     /// receives (`TerminalView#isCurrentAttachMessage` drops unstamped/mismatched
     /// frames — see 3.10). Per-subscriber, so two clients get their OWN id.
     attach_request_id: Option<String>,
+    /// `hello.capabilities.terminalOutputBatchV1` for this connection (`ws-handler.ts:1846-1848`,
+    /// stored on the attachment `broker.ts:399`). Batch framing is used **only** when
+    /// this is set AND `attach_request_id` is present (`broker.ts:1315-1343`); otherwise
+    /// the connection receives legacy per-frame `terminal.output` (the T1 default).
+    terminal_output_batch_v1: bool,
+}
+
+/// One retained produced frame plus its persistent barrier classification (the ring's
+/// `ReplayFrame` role — `replay-ring.ts:9-20`). The `output` is the canonical
+/// (unstamped) `terminal.output` for legacy replay/fan-out; the classification fields
+/// feed the `terminal.output.batch` merge for batch-capable subscribers.
+#[derive(Clone)]
+struct RetainedFrame {
+    output: TerminalOutput,
+    barrier: bool,
+    barrier_reason: Option<BarrierReason>,
+    state_before: ScannerState,
+    state_after: ScannerState,
+}
+
+impl RetainedFrame {
+    /// Project to a [`BatchInputFrame`] for the batch builder.
+    fn to_batch_input(&self) -> BatchInputFrame {
+        BatchInputFrame {
+            seq_start: self.output.seq_start,
+            seq_end: self.output.seq_end,
+            data: self.output.data.clone(),
+            bytes: self.output.data.len(),
+            stream_id: self.output.stream_id.clone(),
+            barrier: self.barrier,
+            barrier_reason: self.barrier_reason,
+            state_before: self.state_before,
+            state_after: self.state_after,
+        }
+    }
 }
 
 /// The per-terminal stream state the reader-thread sink mutates and the registry
@@ -93,11 +133,16 @@ struct Subscriber {
 struct TerminalShared {
     terminal_id: String,
     stream_id: String,
-    /// Every produced `terminal.output` frame, in seq order — the authoritative
-    /// replay buffer (`ReplayRing` role; the PTY's `OutputFramer` already assigned
-    /// the seqs). Stored canonical/unstamped; each delivery stamps per-subscriber.
-    replay: VecDeque<TerminalOutput>,
+    /// Every produced frame (with its persistent barrier classification), in seq
+    /// order — the authoritative replay buffer (`ReplayRing` role; the PTY's
+    /// `OutputFramer` already assigned the seqs). Stored canonical/unstamped; each
+    /// delivery stamps per-subscriber and projects to `terminal.output` (legacy) or
+    /// `terminal.output.batch` (batch-capable).
+    replay: VecDeque<RetainedFrame>,
     replay_bytes: usize,
+    /// The per-terminal stateful VT [`BarrierScanner`] (`replay-ring.ts:48`). Classifies
+    /// each ingested frame in order; its mode/CSI/string state persists across frames.
+    scanner: BarrierScanner,
     /// Highest `seqEnd` produced (drives `attach.ready.headSeq`).
     head_seq: i64,
     status: TerminalRunStatus,
@@ -220,6 +265,7 @@ impl TerminalRegistry {
             stream_id: stream_id.clone(),
             replay: VecDeque::new(),
             replay_bytes: 0,
+            scanner: BarrierScanner::new(),
             head_seq: 0,
             status: TerminalRunStatus::Running,
             created_at: now,
@@ -274,6 +320,7 @@ impl TerminalRegistry {
         sink: FrameSink,
         attach_request_id: Option<String>,
         since_seq: i64,
+        terminal_output_batch_v1: bool,
     ) -> AttachOutcome {
         // Take the terminal's shared Arc under the registry lock, then drop the
         // registry lock so we hold ONLY the per-terminal lock during the handoff.
@@ -290,17 +337,17 @@ impl TerminalRegistry {
 
         // Snapshot the replay window: every retained frame newer than the client's
         // cursor (`replaySince`, `replay-deque.ts:89-98`).
-        let replay: Vec<TerminalOutput> = s
+        let replay: Vec<RetainedFrame> = s
             .replay
             .iter()
-            .filter(|f| f.seq_start > effective_since)
+            .filter(|f| f.output.seq_start > effective_since)
             .cloned()
             .collect();
         let head_seq = s.head_seq;
         // replayFromSeq/replayToSeq = first/last replayed span, else headSeq+1/headSeq
         // (`broker.ts:488-489`).
         let (replay_from, replay_to) = match (replay.first(), replay.last()) {
-            (Some(a), Some(b)) => (a.seq_start, b.seq_end),
+            (Some(a), Some(b)) => (a.output.seq_start, b.output.seq_end),
             _ => (head_seq + 1, head_seq),
         };
 
@@ -312,6 +359,7 @@ impl TerminalRegistry {
             Subscriber {
                 sink: Arc::clone(&sink),
                 attach_request_id: attach_request_id.clone(),
+                terminal_output_batch_v1,
             },
         );
 
@@ -331,10 +379,20 @@ impl TerminalRegistry {
         });
         sink(ready);
 
-        for mut frame in replay {
-            frame.attach_request_id = attach_request_id.clone();
-            frame.source = Some(OutputSource::Replay);
-            sink(ServerMessage::TerminalOutput(frame));
+        // Batch framing is used only with the capability AND an attachRequestId present
+        // (`broker.ts:1315-1343`); otherwise legacy per-frame `terminal.output` (T1).
+        match (terminal_output_batch_v1, attach_request_id.as_deref()) {
+            (true, Some(arid)) => {
+                deliver_batches(&sink, terminal_id, &replay, arid, "replay");
+            }
+            _ => {
+                for frame in replay {
+                    let mut out = frame.output;
+                    out.attach_request_id = attach_request_id.clone();
+                    out.source = Some(OutputSource::Replay);
+                    sink(ServerMessage::TerminalOutput(out));
+                }
+            }
         }
 
         AttachOutcome { found: true }
@@ -464,9 +522,10 @@ impl TerminalRegistry {
 }
 
 /// The reader-thread sink body (`onTerminalOutputRaw` → append + live flush,
-/// `broker.ts:777-826`): store the produced frame in the replay log and fan it out,
-/// stamped with each subscriber's `attachRequestId`, to every attached connection.
-/// Only `terminal.output` flows here (what the PTY framer emits).
+/// `broker.ts:777-826`): classify the produced frame with the persistent barrier
+/// scanner, store it in the replay log, and fan it out — stamped with each
+/// subscriber's `attachRequestId` — to every attached connection, as
+/// `terminal.output` (legacy) or `terminal.output.batch` (batch-capable).
 fn ingest(shared: &Arc<Mutex<TerminalShared>>, msg: ServerMessage) {
     let ServerMessage::TerminalOutput(frame) = msg else {
         return;
@@ -475,20 +534,80 @@ fn ingest(shared: &Arc<Mutex<TerminalShared>>, msg: ServerMessage) {
     s.head_seq = s.head_seq.max(frame.seq_end);
     s.last_activity_at = now_ms();
 
-    // Fan out LIVE (source stays 'live' as produced), stamped per-subscriber.
+    // Classify with the persistent per-terminal scanner (state persists across frames,
+    // `replay-ring.ts:62-79`). Non-truncated frames (every graded chunk) classify by
+    // the scan result directly.
+    let classification = s.scanner.scan(&frame.data);
+    let retained = RetainedFrame {
+        output: frame,
+        barrier: classification.barrier,
+        barrier_reason: classification.reason,
+        state_before: classification.state_before,
+        state_after: classification.state_after,
+    };
+    let terminal_id = s.terminal_id.clone();
+
+    // Fan out LIVE per-subscriber. Batch-capable subscribers (cap + attachRequestId)
+    // receive `terminal.output.batch`; everyone else the legacy `terminal.output`
+    // (source stays 'live'). A single live frame is one small batch — the merge logic
+    // is the same as replay's (proven byte-exact by the deterministic crate goldens).
     for sub in s.subscribers.values() {
-        let mut f = frame.clone();
-        f.attach_request_id = sub.attach_request_id.clone();
-        (sub.sink)(ServerMessage::TerminalOutput(f));
+        match (sub.terminal_output_batch_v1, sub.attach_request_id.as_deref()) {
+            (true, Some(arid)) => {
+                deliver_batches(&sub.sink, &terminal_id, std::slice::from_ref(&retained), arid, "live");
+            }
+            _ => {
+                let mut f = retained.output.clone();
+                f.attach_request_id = sub.attach_request_id.clone();
+                (sub.sink)(ServerMessage::TerminalOutput(f));
+            }
+        }
     }
 
     // Retain canonical (unstamped) for future replay; whole-frame FIFO eviction past
     // the byte cap (keep at least one frame).
-    s.replay_bytes += frame.data.len();
-    s.replay.push_back(frame);
+    s.replay_bytes += retained.output.data.len();
+    s.replay.push_back(retained);
     while s.replay_bytes > DEFAULT_REPLAY_LOG_MAX_BYTES && s.replay.len() > 1 {
         if let Some(old) = s.replay.pop_front() {
-            s.replay_bytes -= old.data.len();
+            s.replay_bytes -= old.output.data.len();
+        }
+    }
+}
+
+/// Build `terminal.output.batch` wire payloads from a run of classified frames and
+/// deliver them to one subscriber's sink (`broker.ts:1315-1343` flush → batch path).
+/// A batch payload deserializes into `ServerMessage::TerminalOutputBatch`; an oversize
+/// single-segment fallback deserializes into `ServerMessage::TerminalOutput`.
+fn deliver_batches(
+    sink: &FrameSink,
+    terminal_id: &str,
+    frames: &[RetainedFrame],
+    attach_request_id: &str,
+    source: &str,
+) {
+    if frames.is_empty() {
+        return;
+    }
+    let batch_max = terminal_stream_batch_max_bytes() as i64;
+    let inputs: Vec<BatchInputFrame> = frames.iter().map(|f| f.to_batch_input()).collect();
+    let batches = build_terminal_output_batches(&BatchBuildInput {
+        frames: &inputs,
+        max_serialized_bytes: batch_max,
+        max_total_serialized_bytes: None,
+        terminal_id: terminal_id.to_string(),
+        attach_request_id: Some(attach_request_id.to_string()),
+        source: Some(source.to_string()),
+    });
+    for batch in &batches {
+        for payload in
+            build_batch_wire_payloads(terminal_id, batch, attach_request_id, source, batch_max)
+        {
+            // The wire payload is exact JSON (camelCase, `type`-tagged); it round-trips
+            // into the frozen `ServerMessage` variant it names.
+            if let Ok(msg) = serde_json::from_value::<ServerMessage>(payload) {
+                sink(msg);
+            }
         }
     }
 }
@@ -528,6 +647,7 @@ mod tests {
                 stream_id: stream_id.to_string(),
                 replay: VecDeque::new(),
                 replay_bytes: 0,
+                scanner: BarrierScanner::new(),
                 head_seq: 0,
                 status: TerminalRunStatus::Running,
                 created_at: now,
@@ -571,6 +691,90 @@ mod tests {
         })
     }
 
+    fn batches(seen: &Arc<StdMutex<Vec<ServerMessage>>>) -> Vec<freshell_protocol::TerminalOutputBatch> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|m| match m {
+                ServerMessage::TerminalOutputBatch(b) => Some(b.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn batch_capability_gates_output_framing_legacy_stays_default() {
+        // The T1 no-regression invariant AT THE REGISTRY: a subscriber that does NOT
+        // negotiate the capability receives legacy per-frame `terminal.output`; one that
+        // DOES receives `terminal.output.batch` — and both reassemble to identical bytes.
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        // Background scrollback (replayed on attach).
+        reg.feed("T", frame(1, "hello ", "S"));
+        reg.feed("T", frame(2, "world\r\n", "S"));
+
+        // (a) legacy subscriber (no capability) — must get `terminal.output` only.
+        let (legacy_sink, legacy_seen) = collector();
+        reg.attach("T", 1, legacy_sink, Some("legacy".into()), 0, false);
+        let legacy = outputs(&legacy_seen);
+        assert!(!legacy.is_empty(), "legacy attach replays terminal.output frames");
+        assert!(batches(&legacy_seen).is_empty(), "legacy attach must NOT emit batch frames");
+        let legacy_data: String = {
+            let mut v: Vec<_> = legacy.iter().map(|f| (f.seq_start, f.data.clone())).collect();
+            v.sort_by_key(|(s, _)| *s);
+            v.into_iter().map(|(_, d)| d).collect()
+        };
+
+        // (b) batch subscriber (capability + attachRequestId) — must get
+        // `terminal.output.batch`, reassembling to the SAME bytes, with UTF-16
+        // endOffsets and a self-consistent serializedBytes.
+        let (batch_sink, batch_seen) = collector();
+        reg.attach("T", 2, batch_sink, Some("batch".into()), 0, true);
+        let bs = batches(&batch_seen);
+        assert!(!bs.is_empty(), "batch attach emits terminal.output.batch frames");
+        assert!(outputs(&batch_seen).is_empty(), "batch attach must NOT emit legacy terminal.output");
+        let batch_data: String = {
+            let mut v: Vec<_> = bs.iter().map(|b| (b.seq_start, b.data.clone())).collect();
+            v.sort_by_key(|(s, _)| *s);
+            v.into_iter().map(|(_, d)| d).collect()
+        };
+        assert_eq!(batch_data, legacy_data, "batch and legacy reassemble to identical bytes");
+        assert_eq!(batch_data, "hello world\r\n");
+        for b in &bs {
+            assert_eq!(b.attach_request_id, "batch");
+            assert!(matches!(b.source, freshell_protocol::OutputSource::Replay));
+            assert!(b.serialized_bytes > 0, "serializedBytes fixpoint converged");
+            // Segment endOffsets are UTF-16 cumulative and slice the data exactly.
+            let mut prev = 0i64;
+            let mut reassembled = String::new();
+            for seg in &b.segments {
+                reassembled.push_str(&crate::batch::slice_utf16(&b.data, prev, seg.end_offset));
+                prev = seg.end_offset;
+            }
+            assert_eq!(reassembled, b.data, "UTF-16 endOffsets reconstruct the batch data");
+        }
+    }
+
+    #[test]
+    fn batch_multibyte_endoffset_is_utf16_not_bytes() {
+        // A batch containing an emoji must carry a UTF-16 endOffset (2 per emoji), not
+        // the 4-byte UTF-8 length — the §9.3 Top-risk-#2 proof at the registry.
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.feed("T", frame(1, "a\u{1F600}b\r\n", "S")); // a😀b␍␊
+
+        let (sink, seen) = collector();
+        reg.attach("T", 1, sink, Some("m".into()), 0, true);
+        let bs = batches(&seen);
+        assert_eq!(bs.len(), 1);
+        let b = &bs[0];
+        assert_eq!(b.data, "a\u{1F600}b\r\n");
+        // "a😀b␍␊" = 1+2+1+1+1 = 6 UTF-16 code units, but 8 UTF-8 bytes.
+        let last = b.segments.last().unwrap();
+        assert_eq!(last.end_offset, 6, "UTF-16 code units");
+        assert_ne!(last.end_offset, 8, "must NOT be the byte length");
+    }
+
     #[test]
     fn attach_replays_scrollback_in_seq_order_stamped_as_replay() {
         let reg = TerminalRegistry::new();
@@ -581,7 +785,7 @@ mod tests {
         reg.feed("T", frame(3, "three\r\n", "S"));
 
         let (sink, seen) = collector();
-        let out = reg.attach("T", 1, sink, Some("att-1".into()), 0);
+        let out = reg.attach("T", 1, sink, Some("att-1".into()), 0, false);
         assert!(out.found);
 
         // attach.ready first, then the 3 replayed frames.
@@ -610,7 +814,7 @@ mod tests {
         reg.insert_headless("T", "S");
 
         let (sink_a, seen_a) = collector();
-        reg.attach("T", 1, sink_a, Some("a".into()), 0);
+        reg.attach("T", 1, sink_a, Some("a".into()), 0, false);
         reg.feed("T", frame(1, "before\r\n", "S"));
         assert_eq!(outputs(&seen_a).len(), 1);
 
@@ -623,7 +827,7 @@ mod tests {
 
         // A fresh attach replays the FULL scrollback (both frames).
         let (sink_b, seen_b) = collector();
-        reg.attach("T", 2, sink_b, Some("b".into()), 0);
+        reg.attach("T", 2, sink_b, Some("b".into()), 0, false);
         let replayed = outputs(&seen_b);
         assert_eq!(
             replayed.iter().map(|f| f.data.as_str()).collect::<Vec<_>>(),
@@ -638,9 +842,9 @@ mod tests {
 
         let (sink_a, seen_a) = collector();
         let (sink_b, seen_b) = collector();
-        reg.attach("T", 1, sink_a, Some("aaa".into()), 0);
+        reg.attach("T", 1, sink_a, Some("aaa".into()), 0, false);
         // Second attach: geometry authority flips to multi_client_unknown.
-        reg.attach("T", 2, sink_b, Some("bbb".into()), 0);
+        reg.attach("T", 2, sink_b, Some("bbb".into()), 0, false);
         let ready_b = attach_ready(&seen_b).unwrap();
         assert_eq!(ready_b.geometry_authority, Some(GeometryAuthority::MultiClientUnknown));
 
@@ -661,7 +865,7 @@ mod tests {
         let reg = TerminalRegistry::new();
         reg.insert_headless("T", "S");
         let (sink_a, seen_a) = collector();
-        reg.attach("T", 1, sink_a, Some("a".into()), 0);
+        reg.attach("T", 1, sink_a, Some("a".into()), 0, false);
         for i in 1..=5 {
             reg.feed("T", frame(i, &format!("line-{i}\r\n"), "S"));
         }
@@ -671,7 +875,7 @@ mod tests {
         // with sinceSeq=3. Only frames 4 and 5 are replayed (seqStart > 3).
         reg.detach("T", 1);
         let (sink_r, seen_r) = collector();
-        reg.attach("T", 2, sink_r, Some("a2".into()), 3);
+        reg.attach("T", 2, sink_r, Some("a2".into()), 3, false);
         let ready = attach_ready(&seen_r).unwrap();
         assert_eq!(ready.effective_since_seq, Some(3));
         assert_eq!(ready.replay_from_seq, 4);
@@ -690,7 +894,7 @@ mod tests {
         reg.feed("T", frame(1, "old\r\n", "S"));
 
         let (sink, seen) = collector();
-        reg.attach("T", 7, sink, Some("z".into()), 0);
+        reg.attach("T", 7, sink, Some("z".into()), 0, false);
         // A live frame produced AFTER attach must arrive after the replayed one.
         reg.feed("T", frame(2, "new\r\n", "S"));
 
@@ -710,7 +914,7 @@ mod tests {
     fn attach_to_unknown_terminal_reports_not_found() {
         let reg = TerminalRegistry::new();
         let (sink, seen) = collector();
-        let out = reg.attach("nope", 1, sink, None, 0);
+        let out = reg.attach("nope", 1, sink, None, 0, false);
         assert!(!out.found);
         assert!(seen.lock().unwrap().is_empty());
     }
@@ -721,7 +925,7 @@ mod tests {
         reg.insert_headless("T", "S");
         let rev_before = reg.revision();
         let (sink, seen) = collector();
-        reg.attach("T", 1, sink, Some("a".into()), 0);
+        reg.attach("T", 1, sink, Some("a".into()), 0, false);
 
         assert!(reg.kill("T"));
         assert!(!reg.is_running("T"), "killed terminal is removed");
@@ -763,13 +967,13 @@ mod tests {
         let (sink, seen) = collector();
         // default 120x30, epoch 1.
         reg.resize("T", 120, 30); // unchanged -> no epoch bump
-        reg.attach("T", 1, sink, Some("a".into()), 0);
+        reg.attach("T", 1, sink, Some("a".into()), 0, false);
         assert_eq!(attach_ready(&seen).unwrap().geometry_epoch, Some(1));
 
         // A real change bumps the epoch (observed on the next attach.ready).
         reg.resize("T", 100, 40);
         let (sink2, seen2) = collector();
-        reg.attach("T", 2, sink2, Some("b".into()), 0);
+        reg.attach("T", 2, sink2, Some("b".into()), 0, false);
         assert_eq!(attach_ready(&seen2).unwrap().geometry_epoch, Some(2));
     }
 
@@ -780,8 +984,8 @@ mod tests {
         reg.insert_headless("T2", "S2");
         let (sink1, seen1) = collector();
         let (sink2, seen2) = collector();
-        reg.attach("T1", 42, sink1, Some("a".into()), 0);
-        reg.attach("T2", 42, sink2, Some("a".into()), 0);
+        reg.attach("T1", 42, sink1, Some("a".into()), 0, false);
+        reg.attach("T2", 42, sink2, Some("a".into()), 0, false);
 
         reg.remove_connection(42);
         // Both terminals survive; the swept connection receives no further output.
