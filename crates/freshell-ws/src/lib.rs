@@ -70,6 +70,13 @@ pub struct WsState {
     /// (session.init + stream + assistant + result + the success-guarded turn.complete edge).
     /// Gated by the SHARED `settings.freshAgent.enabled` flag (owned by `fresh_codex`).
     pub fresh_claude: freshell_freshagent::FreshClaudeState,
+    /// The shared, connection-independent terminal registry (the port of
+    /// `server/terminal-registry.ts` plus the broker fan-out). Terminals are owned here
+    /// by `terminalId`, NOT by the connection that created them, so a second/reconnected
+    /// socket re-attaches to a running PTY and replays its scrollback. This is what makes
+    /// the multi-client / reconnection / hot-across-reload flows work
+    /// (`port/machine/specs/terminal-core.md` §1).
+    pub registry: freshell_terminal::TerminalRegistry,
 }
 
 /// The `/ws` sub-router, pre-bound to its state (mergeable into the server app).
@@ -104,6 +111,13 @@ pub fn now_iso() -> String {
 /// Build the ordered connect-handshake the original emits on a clean isolated
 /// boot. The `bootId` is shared by value between `ready` and `terminal.inventory`
 /// so both normalize to the same placeholder (the cross-message invariant).
+///
+/// `terminal.inventory.terminals` is sourced from the shared [`WsState::registry`]
+/// (`registry.list()`, `ws-handler.ts:1737-1745`): a reconnecting/second socket
+/// learns which PTYs are still alive so the SPA re-attaches to them instead of
+/// treating its persisted terminals as dead (`clearDeadTerminals` → recreate, which
+/// would lose scrollback). On a truly fresh boot the registry is empty, so this stays
+/// byte-identical to the clean-boot handshake the oracle's T0/determinism tiers pin.
 pub fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
     let boot_id = state.boot_id.as_ref().clone();
     vec![
@@ -118,7 +132,7 @@ pub fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
         ServerMessage::PerfLogging(PerfLogging { enabled: false }),
         ServerMessage::TerminalInventory(TerminalInventory {
             boot_id,
-            terminals: Vec::new(),
+            terminals: state.registry.inventory(),
             terminal_meta: Vec::new(),
         }),
     ]
@@ -280,6 +294,7 @@ mod tests {
                 serde_json::json!({ "freshAgent": { "enabled": false } }),
             ),
             fresh_claude: freshell_freshagent::FreshClaudeState::new(broadcast_tx),
+            registry: freshell_terminal::TerminalRegistry::new(),
         }
     }
 

@@ -1,42 +1,45 @@
 //! Terminal-over-the-wire — the `terminal.*` dispatch of `server/ws-handler.ts`
-//! (the `mode:'shell'` path only), wired to the [`freshell_terminal`] PTY core.
+//! (the `mode:'shell'` path only), wired to the shared
+//! [`TerminalRegistry`](freshell_terminal::TerminalRegistry).
 //!
-//! This is the transport seam the oracle's **T1** rung grades: it must let the
-//! capture harness (`port/oracle/harness/pty-capture.ts`) drive a real PTY over
-//! `/ws` and reassemble byte-identical output. The handled flow, per that harness:
+//! ## Connection-independent terminals (Phase 3.12)
+//!
+//! Earlier steps owned a terminal on the connection that created it: its PTY and
+//! output frames streamed to that one socket and were killed on socket close. That
+//! fails every detach/attach/background-session flow — a *second* or *reconnected*
+//! socket has nothing shared to re-attach to. This dispatch now resolves every
+//! terminal through [`WsState::registry`], which owns terminals by `terminalId`
+//! across all connections:
 //!
 //! ```text
-//! terminal.create  -> spawn PTY (freshell-terminal), reply terminal.created{terminalId}
-//! terminal.attach  -> reply terminal.attach.ready{streamId,…}, then STREAM output
-//! terminal.input   -> pty.write(data)                         (no wire reply)
-//! (PTY output)     -> terminal.output{streamId,seqStart,seqEnd,data} frames
-//! terminal.kill    -> pty.kill(), reply terminal.exit{exitCode}
+//! terminal.create  -> registry.create() spawns + registers a running PTY (no attach)
+//! terminal.attach  -> registry.attach(): attach.ready, replay scrollback, stream live
+//! terminal.input   -> registry.input()  (pty.write; no wire reply)
+//! terminal.resize  -> registry.resize()
+//! terminal.detach  -> registry.detach() (PTY KEEPS RUNNING — background session)
+//! terminal.kill    -> registry.kill()   (terminal.exit fanned out to every viewer)
+//! socket close     -> registry.remove_connection() (all PTYs keep running)
 //! ```
-//!
-//! ## Scope (3.4b, batch OFF)
-//!
-//! The capture client advertises **no** `terminalOutputBatchV1` capability, so
-//! output is single-frame `terminal.output` (not `terminal.output.batch`), exactly
-//! the variant [`freshell_terminal::OutputFramer`] emits. Coding-CLI durability,
-//! gaps under backpressure, geometry epochs, multi-client fan-out, and the batch
-//! path are out of scope for this step (see `port/machine/specs/terminal-core.md`).
 //!
 //! ## Concurrency model
 //!
-//! One `tokio::select!` loop per connection. The PTY reader is a sync thread
-//! (`freshell-terminal`); it forwards each framed `terminal.output` message through
-//! an unbounded [`mpsc`] channel (the [`MessageSink`]) into the async loop. The
-//! loop multiplexes inbound client frames (`ws_rx`) with outbound PTY frames
-//! (`out_rx`), so output streams live the moment it is produced. Frames produced
-//! **before** the client attaches are buffered per-terminal and flushed on attach
-//! (the reference's replay-then-live handoff), preserving strict seq order.
+//! One `tokio::select!` loop per connection. The connection owns a single mpsc
+//! channel (`conn_rx`); a [`FrameSink`] wrapping its sender is what the registry
+//! hands to `attach` — so `terminal.attach.ready`, the replayed scrollback, and the
+//! live fan-out for THIS connection all arrive on the one channel, in strict seq
+//! order (the registry enqueues the replay under the per-terminal lock before any
+//! live frame). The loop drains `conn_rx` to the socket. The `attachRequestId`
+//! stamping from 3.10 is preserved per-connection by the registry.
 //!
 //! ## Safety
 //!
-//! Every spawned PTY is reaped: [`PtyTerminal::kill`] on `terminal.kill` and on
-//! connection teardown, plus `Drop` (SIGKILL + reader-thread join). No orphans.
+//! A socket close does NOT kill terminals (they are background sessions, reattachable
+//! by a future socket). Every PTY is still reaped: `terminal.kill` reaps it, and the
+//! registry — dropped on server shutdown — drops every [`PtyTerminal`], whose `Drop`
+//! SIGKILLs + joins. No orphans.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket};
@@ -48,33 +51,15 @@ use uuid::Uuid;
 use freshell_platform::detect::{host_os_live, is_wsl_env_live};
 use freshell_platform::{build_spawn_spec, RealEnv, RealFileProbe, ShellType};
 use freshell_protocol::{
-    ClientMessage, GeometryAuthority, ServerMessage, Shell, TerminalAttach, TerminalAttachReady,
-    TerminalCreate, TerminalCreated, TerminalExit, TerminalIdOnly, TerminalInput, TerminalKill,
-    TerminalOutput, TerminalResize,
+    ClientMessage, ServerMessage, Shell, TerminalAttach, TerminalCreate, TerminalCreated,
+    TerminalIdOnly, TerminalKill, TerminalResize,
 };
-use freshell_terminal::{build_child_env_from_process, MessageSink, PtyTerminal};
+use freshell_terminal::{build_child_env_from_process, FrameSink};
 
 use crate::WsState;
 
 /// The write half of a split axum WebSocket.
 type WsSink = SplitSink<WebSocket, Message>;
-
-/// Per-terminal state held for the life of a connection.
-struct TerminalEntry {
-    /// The live PTY (reaped on kill / drop).
-    pty: PtyTerminal,
-    /// This terminal's single live stream id (`randomUUID()` analogue).
-    stream_id: String,
-    /// Whether a client has attached (gates live forwarding vs. buffering).
-    attached: bool,
-    /// Echoed client attach correlation id (opaque), if the attach carried one.
-    attach_request_id: Option<String>,
-    /// Output frames produced before attach, flushed in seq order on attach
-    /// (the reference's replay-then-live handoff).
-    pending: Vec<TerminalOutput>,
-    /// Highest `seqEnd` observed so far (drives `attach.ready.headSeq`).
-    last_seq: i64,
-}
 
 /// Serialize + send one server→client message. Returns `false` if the socket is
 /// closed/errored (the caller then tears the connection down).
@@ -106,21 +91,29 @@ fn map_shell(shell: Shell) -> ShellType {
 /// Serve one authenticated connection's `terminal.*` traffic (and fan out the
 /// shared broadcast bus) until the socket closes. `socket` has already had the
 /// connect handshake written by the caller; `bcast_rx` is this connection's
-/// subscription to the server→client broadcast bus (`ui.command` /
-/// `freshAgent.session.materialized` / `sessions.changed`, pushed by REST handlers).
+/// subscription to the server→client broadcast bus.
 pub async fn run(
     socket: WebSocket,
     state: &WsState,
     mut bcast_rx: tokio::sync::broadcast::Receiver<String>,
 ) {
-    let fresh_codex = &state.fresh_codex;
-    let fresh_claude = &state.fresh_claude;
     let (mut ws_tx, mut ws_rx) = socket.split();
-    // Single per-connection output channel. Every terminal's reader-thread sink
-    // sends here; the select loop routes by `terminalId`. Held open for the whole
-    // connection so `recv()` never yields `None` while a terminal could still emit.
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMessage>();
-    let mut terminals: HashMap<String, TerminalEntry> = HashMap::new();
+
+    // Identify this connection so the registry can key its terminal subscriptions
+    // (and sweep them on close).
+    let conn_id = state.registry.new_connection_id();
+
+    // This connection's single outbound channel. The registry delivers this
+    // connection's attach.ready / replay / live-output / exit frames here (via the
+    // FrameSink below); the loop drains it to the socket in FIFO — hence in-order.
+    let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let conn_sink: FrameSink = {
+        let tx = conn_tx.clone();
+        Arc::new(move |msg| {
+            let _ = tx.send(msg);
+        })
+    };
+
     // Whether the broadcast bus is still open (guards the select branch so a closed
     // bus can never busy-loop). The bus outlives every connection in practice.
     let mut bus_open = true;
@@ -133,10 +126,9 @@ pub async fn run(
                         if !handle_client_text(
                             text.as_str(),
                             &mut ws_tx,
-                            &mut terminals,
-                            &out_tx,
-                            fresh_codex,
-                            fresh_claude,
+                            state,
+                            conn_id,
+                            &conn_sink,
                         )
                         .await
                         {
@@ -149,9 +141,10 @@ pub async fn run(
                     _ => {}
                 }
             }
-            maybe_out = out_rx.recv() => {
+            maybe_out = conn_rx.recv() => {
                 if let Some(out) = maybe_out {
-                    if !route_output(out, &mut ws_tx, &mut terminals).await {
+                    // A terminal frame destined for THIS connection (registry fan-out).
+                    if !send(&mut ws_tx, &out).await {
                         break;
                     }
                 }
@@ -164,7 +157,7 @@ pub async fn run(
                             break;
                         }
                     }
-                    // Slow consumer dropped some frames: the T2 broadcast set is tiny and
+                    // Slow consumer dropped some frames: the broadcast set is tiny and
                     // paced, so this is not expected; skip the gap and keep serving.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     // Sender gone (server shutting down): stop polling the bus.
@@ -176,41 +169,10 @@ pub async fn run(
         }
     }
 
-    // Teardown: reap every PTY this connection spawned (Drop also kills + joins).
-    for (_, mut entry) in terminals.drain() {
-        entry.pty.kill();
-    }
-}
-
-/// Route one PTY-produced `terminal.output` frame: forward it live if its terminal
-/// is attached, else buffer it (flushed on attach). Returns `false` on send error.
-async fn route_output(
-    out: ServerMessage,
-    ws_tx: &mut WsSink,
-    terminals: &mut HashMap<String, TerminalEntry>,
-) -> bool {
-    let ServerMessage::TerminalOutput(frame) = out else {
-        return true; // only terminal.output flows through the sink today
-    };
-    let Some(entry) = terminals.get_mut(&frame.terminal_id) else {
-        return true; // terminal already killed/removed — drop the straggler frame
-    };
-    entry.last_seq = entry.last_seq.max(frame.seq_end);
-    if entry.attached {
-        // Stamp the LIVE frame with the current attach's correlation id. The client
-        // (`TerminalView#isCurrentAttachMessage`) DROPS any stream frame whose
-        // `attachRequestId` is absent or does not match the active attach — so an
-        // unstamped frame renders nothing. The original echoes `m.attachRequestId`
-        // onto every output frame (`ws-handler.ts`); this reproduces that.
-        let mut frame = frame;
-        frame.attach_request_id = entry.attach_request_id.clone();
-        send(ws_tx, &ServerMessage::TerminalOutput(frame)).await
-    } else {
-        // Buffer un-stamped; the pending frames are stamped with the attach's id at
-        // flush time (an attach that arrives later owns the replay generation).
-        entry.pending.push(frame);
-        true
-    }
+    // Teardown: drop this connection's subscriptions. Terminals KEEP RUNNING as
+    // background sessions — a future socket re-attaches. (PTYs are reaped by
+    // terminal.kill or, on shutdown, the registry's Drop.)
+    state.registry.remove_connection(conn_id);
 }
 
 /// Parse + dispatch one inbound client text frame. Returns `false` to close the
@@ -218,10 +180,9 @@ async fn route_output(
 async fn handle_client_text(
     text: &str,
     ws_tx: &mut WsSink,
-    terminals: &mut HashMap<String, TerminalEntry>,
-    out_tx: &mpsc::UnboundedSender<ServerMessage>,
-    fresh_codex: &freshell_freshagent::FreshCodexState,
-    fresh_claude: &freshell_freshagent::FreshClaudeState,
+    state: &WsState,
+    conn_id: u64,
+    conn_sink: &FrameSink,
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
     // runtime's tolerance; the handshake already gated auth).
@@ -229,37 +190,40 @@ async fn handle_client_text(
         return true;
     };
     match message {
-        ClientMessage::TerminalCreate(create) => {
-            handle_create(create, ws_tx, terminals, out_tx).await
+        ClientMessage::TerminalCreate(create) => handle_create(create, ws_tx, state).await,
+        ClientMessage::TerminalAttach(attach) => {
+            handle_attach(attach, state, conn_id, conn_sink);
+            true
         }
-        ClientMessage::TerminalAttach(attach) => handle_attach(attach, ws_tx, terminals).await,
         ClientMessage::TerminalInput(input) => {
-            handle_input(input, terminals);
+            state.registry.input(&input.terminal_id, input.data.as_bytes());
             true
         }
         ClientMessage::TerminalResize(resize) => {
-            handle_resize(resize, terminals);
+            handle_resize(resize, state);
             true
         }
         ClientMessage::TerminalDetach(detach) => {
-            handle_detach(&detach.terminal_id, ws_tx, terminals).await
+            handle_detach(&detach.terminal_id, ws_tx, state, conn_id).await
         }
-        ClientMessage::TerminalKill(kill) => handle_kill(kill, ws_tx, terminals).await,
+        ClientMessage::TerminalKill(kill) => {
+            handle_kill(kill, state);
+            true
+        }
         // freshAgent.create / freshAgent.send (codex + claude slices): dispatch to the
-        // shared provider state as a DETACHED task so the cold sidecar spawn + the live turn
-        // never block this connection's select loop (which must keep fanning out the
-        // broadcast bus so the provider `freshAgent.*` frames the task emits reach the
-        // client). The create gate is the SHARED `settings.freshAgent.enabled` flag (owned by
-        // FreshCodexState). Non-codex/claude providers are deferred.
+        // shared provider state as a DETACHED task so the cold sidecar spawn + the live
+        // turn never block this connection's select loop (which must keep fanning out
+        // the broadcast bus so the provider `freshAgent.*` frames reach the client).
+        // The create gate is the SHARED `settings.freshAgent.enabled` flag.
         ClientMessage::FreshAgentCreate(create) => {
-            if fresh_codex.is_enabled() {
+            if state.fresh_codex.is_enabled() {
                 match create.provider {
                     Some(freshell_protocol::AgentProvider::Codex) => {
-                        let fresh_codex = fresh_codex.clone();
+                        let fresh_codex = state.fresh_codex.clone();
                         tokio::spawn(async move { fresh_codex.handle_create(create).await });
                     }
                     Some(freshell_protocol::AgentProvider::Claude) => {
-                        let fresh_claude = fresh_claude.clone();
+                        let fresh_claude = state.fresh_claude.clone();
                         tokio::spawn(async move { fresh_claude.handle_create(create).await });
                     }
                     _ => {}
@@ -270,30 +234,27 @@ async fn handle_client_text(
         ClientMessage::FreshAgentSend(send) => {
             match send.provider {
                 freshell_protocol::AgentProvider::Codex => {
-                    let fresh_codex = fresh_codex.clone();
+                    let fresh_codex = state.fresh_codex.clone();
                     tokio::spawn(async move { fresh_codex.handle_send(send).await });
                 }
                 freshell_protocol::AgentProvider::Claude => {
-                    let fresh_claude = fresh_claude.clone();
+                    let fresh_claude = state.fresh_claude.clone();
                     tokio::spawn(async move { fresh_claude.handle_send(send).await });
                 }
                 _ => {}
             }
             true
         }
-        // Everything else (opencode/claude fresh-agent, activity lists, ui.*, ping) is
-        // out of scope for this path; ignore.
+        // Everything else (opencode fresh-agent, activity lists, ui.*, ping) is out of
+        // scope for this path; ignore.
         _ => true,
     }
 }
 
-/// `terminal.create` — spawn the PTY (`registry.create`) and reply `terminal.created`.
-async fn handle_create(
-    create: TerminalCreate,
-    ws_tx: &mut WsSink,
-    terminals: &mut HashMap<String, TerminalEntry>,
-    out_tx: &mpsc::UnboundedSender<ServerMessage>,
-) -> bool {
+/// `terminal.create` — spawn + register the PTY in the shared registry (owned by no
+/// connection), then reply `terminal.created`. Create does NOT attach; the client
+/// sends `terminal.attach` next.
+async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsState) -> bool {
     // `terminalId` via UUID (nanoid-alphabet-compatible for the oracle validator);
     // `streamId` via UUIDv4 (the reference's randomUUID()).
     let terminal_id = Uuid::new_v4().simple().to_string();
@@ -305,8 +266,8 @@ async fn handle_create(
     let mut overrides = BTreeMap::new();
     overrides.insert("FRESHELL_TERMINAL_ID".to_string(), terminal_id.clone());
 
-    // Spawn at the default geometry (`opts.cols||120`, `opts.rows||30`) — create
-    // carries no cols/rows; the harness attaches at 120x30, so no resize occurs.
+    // Spawn at the default geometry (`opts.cols||120`, `opts.rows||30`); the client
+    // attaches then resizes to its viewport.
     let spec = build_spawn_spec(
         shell,
         host_os_live(),
@@ -320,39 +281,14 @@ async fn handle_create(
     );
     let child_env = build_child_env_from_process(&spec);
 
-    // The reader-thread sink: forward every framed message into the connection's
-    // output channel (non-blocking; callable from the sync reader thread).
-    let sink_tx = out_tx.clone();
-    let sink: MessageSink = Box::new(move |msg| {
-        let _ = sink_tx.send(msg);
-    });
-
-    let pty = match PtyTerminal::spawn_with_sink(
-        &spec,
-        &child_env,
-        terminal_id.clone(),
-        stream_id.clone(),
-        None,
-        Some(sink),
-    ) {
-        Ok(pty) => pty,
-        Err(err) => {
-            eprintln!("terminal.create: PTY spawn failed: {err}");
-            return true; // reference would surface an error; T1 never hits this path
-        }
-    };
-
-    terminals.insert(
-        terminal_id.clone(),
-        TerminalEntry {
-            pty,
-            stream_id,
-            attached: false,
-            attach_request_id: None,
-            pending: Vec::new(),
-            last_seq: 0,
-        },
-    );
+    if let Err(err) =
+        state
+            .registry
+            .create(&spec, &child_env, terminal_id.clone(), stream_id, None)
+    {
+        eprintln!("terminal.create: PTY spawn failed: {err}");
+        return true; // reference would surface an error; T1 never hits this path
+    }
 
     let created = ServerMessage::TerminalCreated(TerminalCreated {
         created_at: now_ms(),
@@ -367,107 +303,48 @@ async fn handle_create(
     send(ws_tx, &created).await
 }
 
-/// `terminal.attach` — reply `terminal.attach.ready` then start streaming output.
-async fn handle_attach(
-    attach: TerminalAttach,
-    ws_tx: &mut WsSink,
-    terminals: &mut HashMap<String, TerminalEntry>,
-) -> bool {
-    let Some(entry) = terminals.get_mut(&attach.terminal_id) else {
-        return true; // attach to an unknown terminal: reference errors; T1 never does
-    };
-
-    entry.attach_request_id = attach.attach_request_id.clone();
-    let head_seq = entry.last_seq;
-    // Derive the replay window from the frames buffered before this attach (the
-    // reference derives replayFromSeq/replayToSeq from the replayed frame span).
-    let (replay_from_seq, replay_to_seq) = match (entry.pending.first(), entry.pending.last()) {
-        (Some(first), Some(last)) => (first.seq_start, last.seq_end),
-        _ => (head_seq + 1, head_seq),
-    };
-    let requested_since_seq = attach.since_seq.unwrap_or(0);
-
-    let ready = ServerMessage::TerminalAttachReady(TerminalAttachReady {
-        head_seq,
-        replay_from_seq,
-        replay_to_seq,
-        stream_id: entry.stream_id.clone(),
-        terminal_id: attach.terminal_id.clone(),
-        attach_request_id: entry.attach_request_id.clone(),
-        effective_since_seq: Some(0),
-        geometry_authority: Some(GeometryAuthority::SingleClient),
-        geometry_epoch: Some(1),
-        replay_reset_reason: None,
-        requested_since_seq: Some(requested_since_seq),
-        session_ref: None,
-    });
-    if !send(ws_tx, &ready).await {
-        return false;
-    }
-
-    // Flush buffered pre-attach frames (replay) in seq order, then go live. Stamp
-    // each replayed frame with THIS attach's correlation id so the client accepts
-    // them as replay for the active attach generation (see `route_output`).
-    let pending = std::mem::take(&mut entry.pending);
-    let attach_request_id = entry.attach_request_id.clone();
-    for mut frame in pending {
-        frame.attach_request_id = attach_request_id.clone();
-        if !send(ws_tx, &ServerMessage::TerminalOutput(frame)).await {
-            return false;
-        }
-    }
-    // Re-borrow (the send loop released the &mut borrow) to flip the live flag.
-    if let Some(entry) = terminals.get_mut(&attach.terminal_id) {
-        entry.attached = true;
-    }
-    true
+/// `terminal.attach` — resolve the terminal in the shared registry and attach THIS
+/// connection to it: the registry enqueues `terminal.attach.ready`, replays the
+/// scrollback (seq-ordered, stamped with this attach's id + `source:'replay'`), and
+/// registers the connection so live output fans out — all onto `conn_sink`, which
+/// the select loop drains to the socket. Attaching to an unknown terminal is a no-op
+/// (the reference surfaces `INVALID_TERMINAL_ID`; the SPA recreates on its own).
+fn handle_attach(attach: TerminalAttach, state: &WsState, conn_id: u64, conn_sink: &FrameSink) {
+    state.registry.attach(
+        &attach.terminal_id,
+        conn_id,
+        Arc::clone(conn_sink),
+        attach.attach_request_id.clone(),
+        attach.since_seq.unwrap_or(0),
+    );
 }
 
-/// `terminal.input` — write bytes to the PTY (`writeTerminalInput`); no wire reply.
-fn handle_input(input: TerminalInput, terminals: &mut HashMap<String, TerminalEntry>) {
-    if let Some(entry) = terminals.get_mut(&input.terminal_id) {
-        let _ = entry.pty.write_input(input.data.as_bytes());
-    }
+/// `terminal.resize` — resize the shared PTY (`registry.resize`); no dedicated wire
+/// reply. `unchanged` when the geometry already matches.
+fn handle_resize(resize: TerminalResize, state: &WsState) {
+    let cols = resize.cols.clamp(0, u16::MAX as i64) as u16;
+    let rows = resize.rows.clamp(0, u16::MAX as i64) as u16;
+    state.registry.resize(&resize.terminal_id, cols, rows);
 }
 
-/// `terminal.resize` — resize the PTY (`registry.resize`); no dedicated wire reply.
-fn handle_resize(resize: TerminalResize, terminals: &mut HashMap<String, TerminalEntry>) {
-    if let Some(entry) = terminals.get_mut(&resize.terminal_id) {
-        let cols = resize.cols.clamp(0, u16::MAX as i64) as u16;
-        let rows = resize.rows.clamp(0, u16::MAX as i64) as u16;
-        entry.pty.resize(cols, rows);
-    }
-}
-
-/// `terminal.detach` — drop the attachment (terminal keeps running); reply detached.
+/// `terminal.detach` — drop THIS connection's subscription (the terminal keeps
+/// running as a background session); reply `terminal.detached`.
 async fn handle_detach(
     terminal_id: &str,
     ws_tx: &mut WsSink,
-    terminals: &mut HashMap<String, TerminalEntry>,
+    state: &WsState,
+    conn_id: u64,
 ) -> bool {
-    if let Some(entry) = terminals.get_mut(terminal_id) {
-        entry.attached = false;
-    }
+    state.registry.detach(terminal_id, conn_id);
     let detached = ServerMessage::TerminalDetached(TerminalIdOnly {
         terminal_id: terminal_id.to_string(),
     });
     send(ws_tx, &detached).await
 }
 
-/// `terminal.kill` — SIGKILL + reap the PTY and reply `terminal.exit{exitCode}`.
-async fn handle_kill(
-    kill: TerminalKill,
-    ws_tx: &mut WsSink,
-    terminals: &mut HashMap<String, TerminalEntry>,
-) -> bool {
-    if let Some(mut entry) = terminals.remove(&kill.terminal_id) {
-        entry.pty.kill();
-        let exit = ServerMessage::TerminalExit(TerminalExit {
-            // On kill the reference defaults an unknown exit code to 0.
-            exit_code: 0,
-            terminal_id: kill.terminal_id,
-        });
-        return send(ws_tx, &exit).await;
-    }
-    true
+/// `terminal.kill` — SIGKILL + reap the shared PTY and remove it. The registry fans
+/// `terminal.exit{exitCode:0}` out to every attached connection (including this one,
+/// via `conn_sink`), so no direct reply is needed here.
+fn handle_kill(kill: TerminalKill, state: &WsState) {
+    state.registry.kill(&kill.terminal_id);
 }

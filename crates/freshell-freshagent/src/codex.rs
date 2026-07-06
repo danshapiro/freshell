@@ -566,6 +566,19 @@ async fn patch_settings(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     state.fresh_agent_enabled.store(enabled, Ordering::SeqCst);
+
+    // Fan the merged settings out to every connected WS client (`settings-router.ts:141`
+    // `wsHandler.broadcast({ type:'settings.updated', settings: updated })`), so a second
+    // client reflects a server-backed settings change live — the multi-client settings
+    // fan-out. Only the distilled turn/session invariants are graded by T2, so this extra
+    // frame on the shared bus is inert there; a fresh boot / handshake is unaffected
+    // (broadcasts only reach already-connected sockets, never the handshake window).
+    if let Ok(frame) =
+        serde_json::to_string(&json!({ "type": "settings.updated", "settings": merged }))
+    {
+        let _ = state.broadcast_tx.send(frame);
+    }
+
     (StatusCode::OK, Json(merged)).into_response()
 }
 

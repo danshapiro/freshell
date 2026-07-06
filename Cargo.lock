@@ -463,6 +463,7 @@ dependencies = [
  "freshell-freshagent",
  "freshell-platform",
  "freshell-protocol",
+ "freshell-terminal",
  "freshell-ws",
  "serde_json",
  "tokio",

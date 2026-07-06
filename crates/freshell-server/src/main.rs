@@ -81,6 +81,10 @@ async fn main() -> ExitCode {
     // create gate is the SHARED settings.freshAgent.enabled flag (owned by fresh_codex).
     let fresh_claude_state = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
 
+    // The shared, connection-independent terminal registry: terminals are owned by
+    // `terminalId` here (not by the socket that created them), so a second/reconnected
+    // socket re-attaches to a running PTY and replays its scrollback. This is what
+    // makes the multi-client / reconnection / hot-across-reload flows work.
     let ws_state = WsState {
         auth_token: Arc::clone(&auth_token),
         server_instance_id,
@@ -89,6 +93,7 @@ async fn main() -> ExitCode {
         broadcast_tx: Arc::clone(&broadcast_tx),
         fresh_codex: fresh_codex_state.clone(),
         fresh_claude: fresh_claude_state.clone(),
+        registry: freshell_terminal::TerminalRegistry::new(),
     };
     let api_state = ApiState {
         auth_token: Arc::clone(&auth_token),

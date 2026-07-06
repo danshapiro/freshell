@@ -26,6 +26,9 @@ freshell-api = { path = "../freshell-api" }
 freshell-freshagent = { path = "../freshell-freshagent" }
 # Platform detection (`/proc/version` → platform string) for the SPA boot payload.
 freshell-platform = { path = "../freshell-platform" }
+# The shared terminal registry constructed into WsState (terminals owned by
+# terminalId across connections — the multi-client / reconnection backbone).
+freshell-terminal = { path = "../freshell-terminal" }
 # `sync` = the shared broadcast bus; `signal` = graceful SIGTERM shutdown (serve reaping).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 axum = "0.8"

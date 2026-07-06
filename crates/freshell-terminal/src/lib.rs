@@ -32,10 +32,12 @@ pub mod decode;
 pub mod fragment;
 pub mod framing;
 pub mod pty;
+pub mod registry;
 pub mod replay_ring;
 pub mod stub_3b;
 
 pub use decode::Utf8StreamDecoder;
 pub use framing::{reassemble_stream, OutputFramer};
 pub use pty::{build_child_env, build_child_env_from_process, MessageSink, PtyTerminal};
+pub use registry::{AttachOutcome, FrameSink, TerminalRegistry};
 pub use replay_ring::{ReplayDeque, ReplayFrame, ReplayRing};
