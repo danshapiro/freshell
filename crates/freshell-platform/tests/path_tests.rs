@@ -280,8 +280,19 @@ fn launch_cwd_windows_process_matrix() {
     assert_eq!(r.launch_cwd.as_deref(), Some("C:\\b"));
     assert_eq!(r.conversion, LaunchCwdConversion::None);
 
-    // UNC / slash-UNC / rooted / drive-relative -> None.
-    for c in ["\\\\srv\\share", "//srv/share", "\\rooted", "C:rel"] {
+    // UNC / slash-UNC / rooted / drive-relative -> None. Includes the WSL UNC forms
+    // (`\\wsl.localhost\..`, `\\wsl$\..`, `//wsl.localhost/..`) that cmd.exe rejects:
+    // the reference returns `undefined` (no cwd) rather than pass an unsupported path
+    // (launch-cwd.ts:108-118 windows-process).
+    for c in [
+        "\\\\srv\\share",
+        "//srv/share",
+        "\\rooted",
+        "C:rel",
+        "\\\\wsl.localhost\\Ubuntu\\home\\dan",
+        "\\\\wsl$\\Ubuntu\\home\\dan",
+        "//wsl.localhost/Ubuntu/home/dan",
+    ] {
         assert_eq!(resolve_launch_cwd(Some(c), wp, &env, true).launch_cwd, None, "{c:?}");
     }
 }

@@ -155,6 +155,62 @@ fn wsl_powershell_uses_windows_powershell_with_set_location() {
     );
 }
 
+// --- PORT FIX: WSL Windows-shell cwd is INHERITED via the /mnt mount when it exists,
+// so cmd/powershell start in the resolved Windows dir instead of failing the interop-
+// fragile in-command `cd`/`Set-Location` and stranding in C:\Windows. Probe-gated: the
+// goldens above (bash_probe, no /mnt entries) keep the faithful in-command fallback.
+
+#[test]
+fn wsl_cmd_inherits_mount_cwd_when_present() {
+    let env = MapEnv::new();
+    // The /mnt/c/proj mount exists per the probe -> cmd inherits it, no in-command cd.
+    let probe = bash_probe().with("/mnt/c/proj");
+    let got = build(ShellType::Cmd, HostOs::Linux, true, Some("/mnt/c/proj"), &env, &probe);
+    assert_eq!(
+        got,
+        spec("/mnt/c/Windows/System32/cmd.exe", &["/K"], Some("/mnt/c/proj"))
+    );
+}
+
+#[test]
+fn wsl_powershell_inherits_mount_cwd_when_present() {
+    let env = MapEnv::new();
+    let probe = bash_probe().with("/mnt/c/proj");
+    let got = build(ShellType::Powershell, HostOs::Linux, true, Some("/mnt/c/proj"), &env, &probe);
+    assert_eq!(
+        got,
+        spec(
+            "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+            &["-NoLogo"],
+            Some("/mnt/c/proj"),
+        )
+    );
+}
+
+#[test]
+fn wsl_cmd_no_cwd_inherits_mnt_c_root_when_present() {
+    // No cwd -> winCwd = C:\ (default) -> inherit /mnt/c when it exists.
+    let env = MapEnv::new();
+    let probe = bash_probe().with("/mnt/c");
+    let got = build(ShellType::Cmd, HostOs::Linux, true, None, &env, &probe);
+    assert_eq!(
+        got,
+        spec("/mnt/c/Windows/System32/cmd.exe", &["/K"], Some("/mnt/c"))
+    );
+}
+
+#[test]
+fn wsl_cmd_falls_back_to_in_command_cd_when_mount_absent() {
+    // Mount not present per the probe -> keep the faithful `cd /d` + proc cwd None
+    // (never risk a chdir spawn failure on a missing mount).
+    let env = MapEnv::new();
+    let got = build(ShellType::Cmd, HostOs::Linux, true, Some("/mnt/c/proj"), &env, &bash_probe());
+    assert_eq!(
+        got,
+        spec("/mnt/c/Windows/System32/cmd.exe", &["/K", r#"cd /d "C:\proj""#], None)
+    );
+}
+
 #[test]
 fn wsl_honors_env_overrides_for_exe_paths_and_custom_mount() {
     // WSL_WINDOWS_SYS32 changes both the exe path AND the mount prefix used for cwd conversion.

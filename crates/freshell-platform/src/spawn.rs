@@ -422,6 +422,15 @@ pub fn build_spawn_spec(
             // mode === 'shell'
             if in_wsl {
                 if let Some(wc) = win_cwd.as_deref() {
+                    // PORT FIX (see wsl_windows_shell_inherit_cwd): let cmd.exe INHERIT
+                    // a valid /mnt mount cwd instead of the original's in-command
+                    // `cd /d "<win>"`, which WSL argv->cmdline interop breaks (embedded
+                    // `"` -> `\"`, which cmd's builtin `cd` rejects -> "syntax is
+                    // incorrect"; and with no proc cwd the child inherits the server's
+                    // non-mount cwd as a \\wsl.localhost UNC path -> C:\Windows).
+                    if let Some(inherit) = wsl_windows_shell_inherit_cwd(wc, env, is_wsl_env, probe) {
+                        return spec(file, vec!["/K".to_string()], Some(inherit));
+                    }
                     return spec(
                         file,
                         vec!["/K".to_string(), format!("cd /d {}", quote_cmd_arg(wc))],
@@ -440,6 +449,15 @@ pub fn build_spawn_spec(
         // mode === 'shell'
         if in_wsl {
             if let Some(wc) = win_cwd.as_deref() {
+                // PORT FIX (see wsl_windows_shell_inherit_cwd): inherit a valid /mnt
+                // mount cwd instead of relying on the in-command `Set-Location`, so the
+                // shell never inherits the server's non-mount cwd as a \\wsl.localhost
+                // UNC path. (Set-Location's single-quoted literal survives interop, so
+                // this is belt-and-suspenders for powershell but essential for cmd; kept
+                // symmetric so both Windows shells resolve cwd identically.)
+                if let Some(inherit) = wsl_windows_shell_inherit_cwd(wc, env, is_wsl_env, probe) {
+                    return spec(file, vec!["-NoLogo".to_string()], Some(inherit));
+                }
                 return spec(
                     file,
                     vec![
@@ -506,6 +524,38 @@ pub fn build_cli_spawn_spec(
         cols: cols.unwrap_or(DEFAULT_COLS),
         rows: rows.unwrap_or(DEFAULT_ROWS),
     }
+}
+
+/// PORT FIX (deliberate, reported divergence from `buildSpawnSpec`
+/// `terminal-registry.ts:1177-1248`): the Linux **mount** cwd a WSL-spawned Windows
+/// shell (`cmd.exe`/`powershell.exe`) should INHERIT so it starts in `win_cwd`.
+///
+/// The reference passes `cwd: undefined` to node-pty on WSL and changes directory
+/// *inside* the launched shell (`cd /d "<win>"` / `Set-Location -LiteralPath '<win>'`).
+/// That mechanism is broken for `cmd` when the shell is launched from WSL: a Linux
+/// process `exec`s the `.exe` through WSL interop, whose argv->Windows-cmdline
+/// conversion escapes every embedded `"` as `\"` (verified via `%CMDCMDLINE%`), and
+/// cmd's builtin `cd` rejects `\"…\"` with *"The filename, directory name, or volume
+/// label syntax is incorrect."* — leaving cmd stranded in `C:\Windows` (the child also
+/// inherits the server's non-mount cwd as a `\\wsl.localhost\…` UNC path, which cmd
+/// refuses: *"UNC paths are not supported. Defaulting to the Windows directory."*).
+/// Both are shared with the original but leave cmd in the wrong directory.
+///
+/// The robust fix: hand the child a valid **Linux** cwd (`/mnt/<d>/…`) that WSL maps
+/// to the intended Windows directory, so the shell inherits it with no UNC and no
+/// in-command `cd`. Gated on the mount actually existing (via [`FileProbe`]) so a
+/// missing/unmounted target never induces a `chdir` spawn failure — the caller then
+/// keeps the faithful in-command fallback. Because the unit-test probes carry no
+/// `/mnt` entries, every transcribed `buildSpawnSpec` golden is preserved; the fix
+/// only engages against the real filesystem at runtime.
+fn wsl_windows_shell_inherit_cwd(
+    win_cwd: &str,
+    env: &dyn Env,
+    is_wsl_env: bool,
+    probe: &dyn FileProbe,
+) -> Option<String> {
+    let mount = convert_windows_path_to_wsl_path(win_cwd, env, is_wsl_env)?;
+    probe.exists(&mount).then_some(mount)
 }
 
 /// `winCwd = inWsl ? (resolveWindowsShellCwd(cwd) || getWindowsDefaultCwd()) :
