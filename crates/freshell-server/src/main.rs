@@ -67,6 +67,12 @@ async fn main() -> ExitCode {
         serde_json::to_value(settings.as_ref()).unwrap_or_else(|_| serde_json::json!({})),
     );
 
+    // The freshclaude WS fresh-agent slice: shares the broadcast bus so its
+    // freshAgent.created/send.accepted/event frames reach every WS client (incl. the
+    // oracle's capture socket). It drives the ONE sanctioned Node claude sidecar; the
+    // create gate is the SHARED settings.freshAgent.enabled flag (owned by fresh_codex).
+    let fresh_claude_state = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+
     let ws_state = WsState {
         auth_token: Arc::clone(&auth_token),
         server_instance_id,
@@ -74,6 +80,7 @@ async fn main() -> ExitCode {
         settings,
         broadcast_tx: Arc::clone(&broadcast_tx),
         fresh_codex: fresh_codex_state.clone(),
+        fresh_claude: fresh_claude_state.clone(),
     };
     let api_state = ApiState {
         auth_token: Arc::clone(&auth_token),
@@ -112,6 +119,10 @@ async fn main() -> ExitCode {
     // Reap every owned codex app-server sidecar (SIGKILL + `/proc` ownership sweep) so a
     // freshcodex T2 run leaves no orphaned app-server.
     fresh_codex_state.shutdown().await;
+    // Reap every owned claude Node sidecar (SIGTERM → it kills its own claude CLI via the
+    // SDK abort → SIGKILL straggler + `/proc` ownership sweep) so a freshclaude T2 run
+    // leaves no orphaned sidecar or claude CLI grandchild.
+    fresh_claude_state.shutdown().await;
     if let Err(err) = serve_result {
         eprintln!("freshell-server: serve error: {err}");
         return ExitCode::FAILURE;

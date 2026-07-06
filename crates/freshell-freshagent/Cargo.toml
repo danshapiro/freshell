@@ -43,8 +43,15 @@ serde_json = { workspace = true }
 # The shared broadcast bus (String frames), the create/turn async orchestration, the codex
 # app-server sidecar spawn (`process`), and its stdio drain (`io-util`).
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "process", "io-util"] }
-# paneId / tabId / placeholder-suffix / submittedTurnId minting.
+# paneId / tabId / placeholder-suffix / submittedTurnId + claude-sidecar ownership-id minting.
 uuid = { version = "1", features = ["v4"] }
+
+# Linux /proc ownership reaper for the claude Node sidecar + its `claude` CLI grandchild
+# (SIGTERM anything carrying our FRESHELL_CLAUDE_SIDECAR_ID tag) — the claude analog of the
+# codex reaper, so a freshclaude T2 run leaves no orphan (the oracle `ownership.cleanup`
+# invariant). Linux-only (matches the reference's platform guard).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

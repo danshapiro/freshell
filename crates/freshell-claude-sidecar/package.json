@@ -1,0 +1,14 @@
+{
+  "name": "freshell-claude-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The ONE sanctioned Node sidecar for the freshell Rust port (ADR Decision 2). A thin stdio JSON protocol server wrapping @anthropic-ai/claude-agent-sdk (SdkBridge), which has NO Rust equivalent. Spoken newline-JSON over stdin/stdout by crates/freshell-freshagent (claude WS slice). Its @anthropic-ai/claude-agent-sdk dependency is VENDORED in THIS package's node_modules, never the repo root. Graded by the oracle T2 claude/Haiku tier.",
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.40"
+  }
+}

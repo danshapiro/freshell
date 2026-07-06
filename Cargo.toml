@@ -7,6 +7,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# freshell-claude-sidecar is a Node package (the ONE sanctioned JS sidecar, ADR
+# Decision 2), NOT a Rust crate — its @anthropic-ai/claude-agent-sdk is vendored
+# in its own node_modules. Exclude it so the `crates/*` glob never treats it as a
+# cargo member.
+exclude = ["crates/freshell-claude-sidecar"]
 
 [workspace.package]
 edition = "2021"

@@ -54,7 +54,7 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { startExternalServer, type ExternalServerHandle } from './external-server.js'
+import { startExternalServer, type ExternalServerHandle, type OracleTarget } from './external-server.js'
 import { WsCaptureClient, type CapturedMessage } from './ws-capture-client.js'
 import { collectSentinelOwnedPids, reapSentinelOwned } from './t2-live.js'
 import { type T2Observation, type T2SessionMaterializedEvent } from './invariants.js'
@@ -415,6 +415,16 @@ export interface RunClaudeT2Options {
   turnTimeoutMs?: number
   /** Pipe the spawned server's stdout/stderr. */
   verbose?: boolean
+  /**
+   * Which server to drive: the node original (`'node'`, default) or the Rust port
+   * (`'rust'`). The SAME driver produces the T2Observation for both, so the oracle's
+   * original-vs-rust comparison is a true same-driver / different-SUT differential
+   * (mirrors the opencode/codex T2-rust equivalence paths). Both drive the identical WS
+   * `freshAgent.*` surface; for `'rust'` the server drives the ONE sanctioned Node claude
+   * sidecar (wrapping @anthropic-ai/claude-agent-sdk), which spawns the SAME real `claude`
+   * CLI under the isolated CLAUDE_HOME.
+   */
+  target?: OracleTarget
 }
 
 export interface T2TeardownFacts {
@@ -425,6 +435,8 @@ export interface T2TeardownFacts {
 
 export interface ClaudeT2Run {
   handle: ExternalServerHandle
+  /** Which server was driven ('node' original or 'rust' port). */
+  target: OracleTarget
   /** Isolated project cwd created for this run (removed on teardown). */
   cwd: string
   /** Absolute isolated projects dir observed for transcripts. */
@@ -445,6 +457,7 @@ export async function runClaudeHaikuT2(options: RunClaudeT2Options = {}): Promis
   const turnTimeoutMs = options.turnTimeoutMs ?? 150_000
   const traceOn = options.verbose === true || !!process.env.FRESHELL_T2_TRACE
   const startedAt = Date.now()
+  const target: OracleTarget = options.target ?? 'node'
 
   if (resolveClaudeBinary() === null) {
     throw new Error('claude binary not resolvable on PATH (required for the claude T2 harness)')
@@ -462,6 +475,7 @@ export async function runClaudeHaikuT2(options: RunClaudeT2Options = {}): Promis
   let handle: ExternalServerHandle
   try {
     handle = await startExternalServer({
+      target,
       provider: 'oracle-t2-claude',
       startTimeoutMs: 90_000,
       verbose: options.verbose ?? false,
@@ -719,7 +733,7 @@ export async function runClaudeHaikuT2(options: RunClaudeT2Options = {}): Promis
     return facts
   }
 
-  return { handle, cwd, projectsDir, observation, teardown }
+  return { handle, target, cwd, projectsDir, observation, teardown }
 }
 
 /** Re-exported so tests can assert ownership without importing t2-live directly. */

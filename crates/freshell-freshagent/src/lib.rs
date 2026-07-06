@@ -36,8 +36,10 @@
 //! [`FreshAgentState::shutdown`] (SIGTERM + the `/proc` ownership sweep) and, as a
 //! backstop, by the harness sentinel sweep — no orphans.
 
+pub mod claude;
 pub mod codex;
 
+pub use claude::FreshClaudeState;
 pub use codex::FreshCodexState;
 
 use std::collections::HashMap;

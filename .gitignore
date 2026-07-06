@@ -44,3 +44,6 @@ sdk.session.snapshot
 /target
 **/*.rs.bk
 # Note: Cargo.lock IS committed for the workspace (it will host binaries).
+
+# claude sidecar deps (npm install in the sidecar dir; not vendored in git)
+crates/freshell-claude-sidecar/node_modules/

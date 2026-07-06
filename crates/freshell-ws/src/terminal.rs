@@ -114,6 +114,7 @@ pub async fn run(
     mut bcast_rx: tokio::sync::broadcast::Receiver<String>,
 ) {
     let fresh_codex = &state.fresh_codex;
+    let fresh_claude = &state.fresh_claude;
     let (mut ws_tx, mut ws_rx) = socket.split();
     // Single per-connection output channel. Every terminal's reader-thread sink
     // sends here; the select loop routes by `terminalId`. Held open for the whole
@@ -135,6 +136,7 @@ pub async fn run(
                             &mut terminals,
                             &out_tx,
                             fresh_codex,
+                            fresh_claude,
                         )
                         .await
                         {
@@ -210,6 +212,7 @@ async fn handle_client_text(
     terminals: &mut HashMap<String, TerminalEntry>,
     out_tx: &mpsc::UnboundedSender<ServerMessage>,
     fresh_codex: &freshell_freshagent::FreshCodexState,
+    fresh_claude: &freshell_freshagent::FreshClaudeState,
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
     // runtime's tolerance; the handshake already gated auth).
@@ -233,24 +236,39 @@ async fn handle_client_text(
             handle_detach(&detach.terminal_id, ws_tx, terminals).await
         }
         ClientMessage::TerminalKill(kill) => handle_kill(kill, ws_tx, terminals).await,
-        // freshAgent.create / freshAgent.send (codex slice): dispatch to the shared
-        // FreshCodexState as a DETACHED task so the cold app-server spawn + the live turn
+        // freshAgent.create / freshAgent.send (codex + claude slices): dispatch to the
+        // shared provider state as a DETACHED task so the cold sidecar spawn + the live turn
         // never block this connection's select loop (which must keep fanning out the
-        // broadcast bus so the codex `freshAgent.*` frames the task emits reach the client).
-        // Non-codex providers are deferred (the task no-ops on a missing/unsupported gate).
+        // broadcast bus so the provider `freshAgent.*` frames the task emits reach the
+        // client). The create gate is the SHARED `settings.freshAgent.enabled` flag (owned by
+        // FreshCodexState). Non-codex/claude providers are deferred.
         ClientMessage::FreshAgentCreate(create) => {
-            if matches!(create.provider, Some(freshell_protocol::AgentProvider::Codex))
-                && fresh_codex.is_enabled()
-            {
-                let fresh_codex = fresh_codex.clone();
-                tokio::spawn(async move { fresh_codex.handle_create(create).await });
+            if fresh_codex.is_enabled() {
+                match create.provider {
+                    Some(freshell_protocol::AgentProvider::Codex) => {
+                        let fresh_codex = fresh_codex.clone();
+                        tokio::spawn(async move { fresh_codex.handle_create(create).await });
+                    }
+                    Some(freshell_protocol::AgentProvider::Claude) => {
+                        let fresh_claude = fresh_claude.clone();
+                        tokio::spawn(async move { fresh_claude.handle_create(create).await });
+                    }
+                    _ => {}
+                }
             }
             true
         }
         ClientMessage::FreshAgentSend(send) => {
-            if matches!(send.provider, freshell_protocol::AgentProvider::Codex) {
-                let fresh_codex = fresh_codex.clone();
-                tokio::spawn(async move { fresh_codex.handle_send(send).await });
+            match send.provider {
+                freshell_protocol::AgentProvider::Codex => {
+                    let fresh_codex = fresh_codex.clone();
+                    tokio::spawn(async move { fresh_codex.handle_send(send).await });
+                }
+                freshell_protocol::AgentProvider::Claude => {
+                    let fresh_claude = fresh_claude.clone();
+                    tokio::spawn(async move { fresh_claude.handle_send(send).await });
+                }
+                _ => {}
             }
             true
         }

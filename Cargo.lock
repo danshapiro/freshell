@@ -424,6 +424,7 @@ dependencies = [
  "freshell-codex",
  "freshell-opencode",
  "freshell-protocol",
+ "libc",
  "serde_json",
  "tokio",
  "uuid",

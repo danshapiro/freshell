@@ -63,6 +63,13 @@ pub struct WsState {
     /// app-server sidecar and broadcasts `freshAgent.created` / `freshAgent.send.accepted`
     /// / `freshAgent.event` (session.snapshot + the status-guarded turn.complete edge).
     pub fresh_codex: freshell_freshagent::FreshCodexState,
+    /// The freshclaude WS fresh-agent slice: the post-handshake loop dispatches
+    /// `freshAgent.create` / `freshAgent.send` (claude/kilroy) here, which spawns the ONE
+    /// sanctioned Node sidecar wrapping `@anthropic-ai/claude-agent-sdk` and broadcasts
+    /// `freshAgent.created` / `freshAgent.send.accepted` / `freshAgent.event`
+    /// (session.init + stream + assistant + result + the success-guarded turn.complete edge).
+    /// Gated by the SHARED `settings.freshAgent.enabled` flag (owned by `fresh_codex`).
+    pub fresh_claude: freshell_freshagent::FreshClaudeState,
 }
 
 /// The `/ws` sub-router, pre-bound to its state (mergeable into the server app).
@@ -269,9 +276,10 @@ mod tests {
             broadcast_tx: Arc::clone(&broadcast_tx),
             fresh_codex: freshell_freshagent::FreshCodexState::new(
                 auth_token,
-                broadcast_tx,
+                Arc::clone(&broadcast_tx),
                 serde_json::json!({ "freshAgent": { "enabled": false } }),
             ),
+            fresh_claude: freshell_freshagent::FreshClaudeState::new(broadcast_tx),
         }
     }
 
