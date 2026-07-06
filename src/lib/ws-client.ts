@@ -114,6 +114,8 @@ export class WsClient {
   private baseReconnectDelay = 1000
   private maxReconnectDelay = 4000
   private postShutdownBaseDelay = 500
+  private slowReconnectDelay = 15000
+  private slowRetryAnnounced = false
   private wasConnectedOnce = false
   private fastReconnectMode = false
 
@@ -323,6 +325,7 @@ export class WsClient {
         this._state = 'connected'
         this.reconnectAttempts = 0
         this.fastReconnectMode = false
+        this.slowRetryAnnounced = false
 
         // Send hello with token in message body (not URL).
         const token = getAuthToken()
@@ -459,19 +462,27 @@ export class WsClient {
   }
 
   private scheduleReconnect(opts?: { minDelayMs?: number }) {
+    let delay: number
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      // Giving up is a genuine degraded state worth surfacing once — but it is
-      // not an error/crash (the server may simply be intentionally down), so warn.
-      log.warn('max reconnect attempts reached')
-      return
+      // Fast-backoff budget exhausted. Never give up permanently: an expected
+      // outage can outlast the budget (slow rebuild/restart), and recovery
+      // paths elsewhere (disk-sync poll, editor restore) are gated on this
+      // connection coming back. Fall back to a slow steady retry and surface
+      // the degraded state once, at warn (it is not an error/crash — the
+      // server may simply be down for a while).
+      if (!this.slowRetryAnnounced) {
+        this.slowRetryAnnounced = true
+        log.warn('max reconnect attempts reached; falling back to slow retry')
+      }
+      delay = this.slowReconnectDelay
+    } else {
+      const base = this.fastReconnectMode ? this.postShutdownBaseDelay : this.baseReconnectDelay
+      const exponential = base * Math.pow(2, this.reconnectAttempts)
+      const capped = Math.min(exponential, this.maxReconnectDelay)
+      const jitter = capped * (0.8 + Math.random() * 0.4)
+      delay = Math.max(Math.round(jitter), opts?.minDelayMs ?? 0)
+      this.reconnectAttempts++
     }
-
-    const base = this.fastReconnectMode ? this.postShutdownBaseDelay : this.baseReconnectDelay
-    const exponential = base * Math.pow(2, this.reconnectAttempts)
-    const capped = Math.min(exponential, this.maxReconnectDelay)
-    const jitter = capped * (0.8 + Math.random() * 0.4)
-    const delay = Math.max(Math.round(jitter), opts?.minDelayMs ?? 0)
-    this.reconnectAttempts++
 
     this.clearReconnectTimer()
     this.reconnectTimer = window.setTimeout(() => {

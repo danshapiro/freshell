@@ -528,8 +528,8 @@ export default function App() {
               break
             } catch (err) {
               lastBootstrapError = err
-              const isTransientFetchFailure = isTransientRequestFailure(err)
-              if (attempt === 0 && isTransientFetchFailure && !cancelled) {
+              const isTransientFailure = isTransientRequestFailure(err)
+              if (attempt === 0 && isTransientFailure && !cancelled) {
                 await new Promise((resolve) => setTimeout(resolve, 150))
                 continue
               }

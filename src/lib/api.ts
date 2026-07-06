@@ -138,6 +138,11 @@ function isAbortError(error: unknown): boolean {
  * *successful* response) is NOT transient — it's a real bug and must surface.
  * Only the dedicated {@link NetworkError} thrown by `request()`, an abort, or a
  * gateway-unavailable {@link ApiError} qualify.
+ *
+ * CAVEAT: some freshell endpoints return 503 in *steady state* (e.g. the
+ * fresh-agent routes respond 503 when the runtime is not available on this
+ * server). Do not use this helper to gate calls to those endpoints — a 503
+ * there is a meaningful answer, not a transient outage.
  */
 export function isTransientRequestFailure(error: unknown): boolean {
   if (error instanceof NetworkError) return true

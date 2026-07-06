@@ -109,15 +109,15 @@ describe('WsClient reconnect noise', () => {
     expect(called(debugSpy, 'reconnect failed')).toBe(true)
   })
 
-  it('surfaces giving up (max attempts) at warn, never error', async () => {
+  it('falls back to slow retry after max attempts: warns once, never errors, keeps trying, and recovers', async () => {
     const c = new WsClient('ws://example/ws')
     const p = c.connect()
     MockWebSocket.instances[0]._open()
     MockWebSocket.instances[0]._message({ type: 'ready' })
     await p
 
-    // Kick off reconnection, then keep failing every attempt until the client
-    // gives up.
+    // Kick off reconnection, then keep failing every attempt until the fast
+    // backoff budget is exhausted.
     MockWebSocket.instances[0]._close(4009, 'server-shutdown')
 
     for (let i = 0; i < 20 && !called(warnSpy, 'max reconnect attempts reached'); i += 1) {
@@ -131,5 +131,29 @@ describe('WsClient reconnect noise', () => {
 
     expect(called(warnSpy, 'max reconnect attempts reached')).toBe(true)
     expect(errorSpy).not.toHaveBeenCalled()
+
+    // The client must NOT be wedged: it keeps retrying on a slow cadence, and
+    // the degraded-state warn is emitted exactly once (no slow-cycle spam).
+    const warnCountAfterGiveUp = warnSpy.mock.calls.length
+    const socketsBefore = MockWebSocket.instances.length
+    for (let i = 0; i < 3; i += 1) {
+      await vi.advanceTimersByTimeAsync(15000)
+      const latest = latestSocket()
+      if (latest) {
+        latest._close(1006, 'still-down')
+        await vi.advanceTimersByTimeAsync(0)
+      }
+    }
+    expect(MockWebSocket.instances.length).toBeGreaterThan(socketsBefore)
+    expect(warnSpy.mock.calls.length).toBe(warnCountAfterGiveUp)
+    expect(errorSpy).not.toHaveBeenCalled()
+
+    // Server finally comes back: the next slow retry connects and reaches ready.
+    await vi.advanceTimersByTimeAsync(15000)
+    const revived = latestSocket()
+    revived._open()
+    revived._message({ type: 'ready' })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(c.isReady).toBe(true)
   })
 })

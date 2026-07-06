@@ -158,7 +158,9 @@ export default function EditorPane({
   // Latest-value mirror so async catch handlers can re-check connectivity as of
   // *now* (the effect closure's value may be stale if the server died mid-poll).
   const connectionStatusRef = useRef(connectionStatus)
-  connectionStatusRef.current = connectionStatus
+  useEffect(() => {
+    connectionStatusRef.current = connectionStatus
+  }, [connectionStatus])
   const mountedRef = useRef(true)
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -628,6 +630,11 @@ export default function EditorPane({
             lastSavedContent.current = value
           }
         } catch (err) {
+          // Expected while the server is restarting: stay silent. The edit is
+          // not lost — pendingContent still differs from lastSavedContent, so
+          // the reconnect effect below re-schedules this save once the
+          // connection returns (and further typing re-schedules it too).
+          if (isTransientRequestFailure(err) || connectionStatusRef.current !== 'ready') return
           const message = err instanceof Error ? err.message : String(err)
           log.error(
             JSON.stringify({
@@ -641,6 +648,18 @@ export default function EditorPane({
     },
     [filePath, readOnly, resolvePath]
   )
+
+  // Retry a pending (unsaved) edit once the connection returns. A save that
+  // failed transiently during an outage leaves pendingContent !== lastSaved;
+  // re-scheduling through the normal debounce path lets the disk-sync poll win
+  // first if the file changed on disk meanwhile (it cancels the timer and
+  // raises the conflict UI), so no conflict handling is bypassed here.
+  useEffect(() => {
+    if (connectionStatus !== 'ready') return
+    if (pendingContent.current !== lastSavedContent.current) {
+      scheduleAutoSave(pendingContent.current)
+    }
+  }, [connectionStatus, scheduleAutoSave])
 
   const performSave = useCallback(async () => {
     if (readOnly) return
@@ -665,6 +684,9 @@ export default function EditorPane({
         lastSavedContent.current = value
       }
     } catch (err) {
+      // Same policy as autosave: a transient failure during an outage is
+      // expected and the pending edit is retried on reconnect.
+      if (isTransientRequestFailure(err) || connectionStatusRef.current !== 'ready') return
       const message = err instanceof Error ? err.message : String(err)
       log.error(
         JSON.stringify({
@@ -691,6 +713,9 @@ export default function EditorPane({
         column: position?.column,
       })
     } catch (err) {
+      // A transient failure while the server is unreachable is expected — the
+      // user can retry once it's back; only unexpected failures are logged.
+      if (isTransientRequestFailure(err) || connectionStatusRef.current !== 'ready') return
       const message = err instanceof Error ? err.message : String(err)
       log.error(
         JSON.stringify({
