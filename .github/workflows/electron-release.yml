@@ -7,8 +7,9 @@ on:
 jobs:
   release:
     strategy:
+      fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
+        os: [macos-latest, ubuntu-latest, windows-2022]
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
