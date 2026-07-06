@@ -90,6 +90,19 @@ export const DEFAULT_T2_SENTINEL = 'freshell-t2-ok'
 const OPENCODE_DATA_SUBPATH = ['.local', 'share', 'opencode'] as const
 const CAPTURE_TEXT_CAP = 4000
 
+/**
+ * DETERMINISM GATE for the T2 DB snapshot (fixes the T2-opencode structural flake).
+ * After the sentinel reply text lands in a `part` row (~0.5s), the third-party
+ * `opencode serve` binary commits the assistant MESSAGE row a few seconds later
+ * (the committed original baseline settled at ~+5.5s with dbMessageCount=2). The
+ * harness must WAIT for that durable steady state before snapshotting the DB, or it
+ * reads dbMessageCount/dbHasAssistantMessage at a NON-DETERMINISTIC instant
+ * (msgs=1/false before the row commits vs 2/true after). 15s is ~3x the observed
+ * settle time; poll every 250ms.
+ */
+const DB_STEADY_STATE_BUDGET_MS = 15_000
+const DB_STEADY_STATE_POLL_MS = 250
+
 /** Elapsed-time breadcrumbs to stderr; gated so green runs stay quiet. */
 function trace(enabled: boolean, startedAt: number, msg: string): void {
   if (!enabled) return
@@ -379,6 +392,44 @@ async function waitForAssistantReply(
     await sleep(500)
   }
   return { facts: last, latencyMs: Date.now() - started }
+}
+
+/**
+ * The durable STEADY STATE the T2 DB snapshot must wait for: the assistant reply
+ * text is present AND opencode has committed the assistant MESSAGE row (>=2 rows:
+ * the user turn + the assistant reply). Message counts only grow within a single
+ * turn, so this predicate is MONOTONIC — once true it stays true, so gating on it
+ * can never re-introduce a race.
+ */
+function dbFactsAtSteadyState(f: DbFacts): boolean {
+  return f.assistantContainsSentinel && f.messageCount >= 2 && f.hasAssistantMessage
+}
+
+/**
+ * DETERMINISM GATE — poll the isolated DB until it reaches the durable steady state
+ * (assistant MESSAGE row committed), bounded by `budgetMs`. Returns the settled
+ * facts and whether the steady state was actually reached (false ⇒ the caller must
+ * FAIL LOUD rather than snapshot a non-deterministic partial state).
+ *
+ * The `opencode serve` binary that writes this DB is IDENTICAL for the node original
+ * and the rust port, so this only changes WHEN the harness reads the DB — never any
+ * server/port behavior. Called from the shared driver, so the original-side capture
+ * and the rust-side capture wait identically and read the SAME settled DB state.
+ */
+async function waitForDbSteadyState(
+  dbPath: string,
+  sessionId: string,
+  sentinel: string,
+  budgetMs: number,
+): Promise<{ facts: DbFacts; reachedSteadyState: boolean }> {
+  const deadline = Date.now() + budgetMs
+  let last: DbFacts = EMPTY_DB_FACTS
+  for (;;) {
+    try { last = readDbFacts(dbPath, sessionId, sentinel) } catch { /* DB mid-write; retry */ }
+    if (dbFactsAtSteadyState(last)) return { facts: last, reachedSteadyState: true }
+    if (Date.now() >= deadline) return { facts: last, reachedSteadyState: false }
+    await sleep(DB_STEADY_STATE_POLL_MS)
+  }
 }
 
 // ── authenticated HTTP against the isolated server ───────────────────────────
@@ -732,8 +783,31 @@ export async function runOpencodeKimiT2(options: RunT2Options = {}): Promise<T2R
     // 4. SECONDARY corroboration: wait for the assistant reply (with the sentinel)
     //    to PERSIST into the isolated store — confirms the idle edge from step 5.
     if (durableId) {
-      const { facts, latencyMs } = await waitForAssistantReply(seededDbPath, durableId, sentinel, turnTimeoutMs)
+      // (a) BEHAVIORAL completion edge: the reply text (sentinel) lands FAST in a
+      //     `part` row (~0.5s). This is what `turnCompleted` corroborates.
+      const { facts: replyFacts, latencyMs } = await waitForAssistantReply(
+        seededDbPath, durableId, sentinel, turnTimeoutMs,
+      )
       observation.assistantReplyLatencyMs = latencyMs
+
+      // (b) DETERMINISM GATE: the sentinel part appears BEFORE opencode commits the
+      //     assistant MESSAGE row, so snapshotting here would read dbMessageCount /
+      //     dbHasAssistantMessage at a non-deterministic instant (the T2-opencode
+      //     flake: msgs=1/false vs 2/true). Wait, bounded, for the DURABLE STEADY
+      //     STATE (message row committed) before snapshotting, so both the node
+      //     original and the rust port read the SAME settled DB. Only gated when the
+      //     sentinel actually landed — a missing reply is a separate, already-asserted
+      //     turn-completion failure and must NOT be masked by (or wait out) this gate.
+      let facts = replyFacts
+      let reachedSteadyState = dbFactsAtSteadyState(replyFacts)
+      if (replyFacts.assistantContainsSentinel && !reachedSteadyState) {
+        const settled = await waitForDbSteadyState(
+          seededDbPath, durableId, sentinel, DB_STEADY_STATE_BUDGET_MS,
+        )
+        facts = settled.facts
+        reachedSteadyState = settled.reachedSteadyState
+      }
+
       observation.dbSessionRowPresent = facts.sessionRowPresent
       observation.dbSessionRow = facts.sessionRow
       observation.dbMessageCount = facts.messageCount
@@ -741,7 +815,26 @@ export async function runOpencodeKimiT2(options: RunT2Options = {}): Promise<T2R
       observation.dbHasAssistantMessage = facts.hasAssistantMessage
       observation.transcriptParseable = facts.transcriptParseable
       observation.turnCompleted = facts.assistantContainsSentinel
-      trace(traceOn, startedAt, `reply persisted=${facts.assistantContainsSentinel} in ${latencyMs}ms (msgs=${facts.messageCount} parts=${facts.partCount})`)
+      trace(
+        traceOn, startedAt,
+        `reply persisted=${facts.assistantContainsSentinel} in ${latencyMs}ms ` +
+          `(msgs=${facts.messageCount} parts=${facts.partCount} ` +
+          `hasAssistant=${facts.hasAssistantMessage} steadyState=${reachedSteadyState})`,
+      )
+
+      // FAIL LOUD if the assistant reply landed but the durable MESSAGE row never
+      // committed within the bound — refuse to snapshot a non-deterministic partial
+      // DB state (do NOT silently snapshot early). Per the diagnosis the row commits
+      // at ~+5.5s, so the 15s bound is ~3x margin; a genuine miss is worth surfacing.
+      if (facts.assistantContainsSentinel && !reachedSteadyState) {
+        throw new Error(
+          `[t2-opencode] assistant reply persisted but the durable assistant message row did ` +
+            `not commit within ${DB_STEADY_STATE_BUDGET_MS}ms ` +
+            `(dbMessageCount=${facts.messageCount}, dbHasAssistantMessage=${facts.hasAssistantMessage}, ` +
+            `dbPartCount=${facts.partCount}). Refusing to snapshot a non-deterministic partial DB ` +
+            `state for the T2 structural baseline.`,
+        )
+      }
     }
 
     // 5. AWAIT the PRIMARY completion edge: send-keys resolves when the turn goes
