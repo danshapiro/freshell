@@ -7,7 +7,7 @@ import { updatePaneContent } from '@/store/panesSlice'
 import type { EditorPaneContent } from '@/store/paneTypes'
 import EditorToolbar from './EditorToolbar'
 import MarkdownPreview from './MarkdownPreview'
-import { api, isTransientNetworkError } from '@/lib/api'
+import { api, isTransientRequestFailure } from '@/lib/api'
 import { getFirstTerminalCwd } from '@/lib/pane-utils'
 import { isAbsolutePath, joinPath } from '@/lib/path-utils'
 import { copyText } from '@/lib/clipboard'
@@ -155,6 +155,10 @@ export default function EditorPane({
   // Gating on the WS-derived connection status means an expected server restart
   // pauses polling instead of hammering a dead endpoint and flooding the logs.
   const connectionStatus = useAppSelector((s) => s.connection.status)
+  // Latest-value mirror so async catch handlers can re-check connectivity as of
+  // *now* (the effect closure's value may be stale if the server died mid-poll).
+  const connectionStatusRef = useRef(connectionStatus)
+  connectionStatusRef.current = connectionStatus
   const mountedRef = useRef(true)
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -247,6 +251,10 @@ export default function EditorPane({
         setTerminalCwds(nextMap)
       } catch (err) {
         if (cancelled) return
+        setTerminalCwds({})
+        // A transient transport/gateway failure (server unreachable/restarting)
+        // is expected — don't log it as an error.
+        if (isTransientRequestFailure(err)) return
         const message = err instanceof Error ? err.message : String(err)
         log.error(
           JSON.stringify({
@@ -255,7 +263,6 @@ export default function EditorPane({
             error: message,
           })
         )
-        setTerminalCwds({})
       }
     }
 
@@ -297,6 +304,10 @@ export default function EditorPane({
           setSuggestions(response?.suggestions || [])
         } catch (err) {
           if (!mountedRef.current) return
+          setSuggestions([])
+          // A transient transport/gateway failure (server unreachable/restarting)
+          // is expected — don't log it as an error.
+          if (isTransientRequestFailure(err)) return
           const message = err instanceof Error ? err.message : String(err)
           log.error(
             JSON.stringify({
@@ -305,7 +316,6 @@ export default function EditorPane({
               error: message,
             })
           )
-          setSuggestions([])
         }
       }, 300),
     [defaultBrowseRoot]
@@ -404,10 +414,11 @@ export default function EditorPane({
         setSuggestions([])
       } catch (err) {
         if (!mountedRef.current) return
-        // A transport failure (server unreachable / restarting) is expected and
-        // transient — don't surface it as an error. The user can retry once the
-        // server is back; only genuinely unexpected failures are logged.
-        if (isTransientNetworkError(err)) return
+        // A transient failure (server unreachable/restarting or gateway 5xx), or
+        // one that coincided with the WS observing a disconnect, is expected —
+        // don't surface it as an error. The disk-sync poll re-reads once the
+        // connection is back; only genuinely unexpected failures are logged.
+        if (isTransientRequestFailure(err) || connectionStatusRef.current !== 'ready') return
         const message = err instanceof Error ? err.message : String(err)
         log.error(
           JSON.stringify({
@@ -428,11 +439,15 @@ export default function EditorPane({
   const restoredRef = useRef(false)
   useEffect(() => {
     if (restoredRef.current) return
+    // Wait for the server to be reachable before restoring — a fetch against a
+    // down/restarting server can only fail. Not marking restoredRef keeps the
+    // restore pending; this effect re-runs when the connection becomes ready.
+    if (connectionStatus !== 'ready') return
     if (filePath && !content) {
       restoredRef.current = true
       handlePathSelect(filePath)
     }
-  }, [filePath, content, handlePathSelect])
+  }, [filePath, content, handlePathSelect, connectionStatus])
 
   const handleFileInputChange = useCallback(
     async (event: ChangeEvent<HTMLInputElement>) => {
@@ -793,11 +808,12 @@ export default function EditorPane({
           })
         }
       } catch (err) {
-        // A transport failure here means the server became unreachable between
-        // ticks (restart / dropped connection) — an expected, transient event,
-        // not a surprising one. Stay silent; the connectivity gate above will
-        // pause polling on the next render. Only log genuinely unexpected errors.
-        if (isTransientNetworkError(err)) return
+        // Expected during a restart/outage: either the request failed transiently
+        // (server unreachable / gateway 502-504), or the server died mid-poll and
+        // the WS has since observed the disconnect. Stay silent in both cases.
+        // Only a genuinely unexpected failure while still connected is logged
+        // (e.g. a bug processing the response — that must surface, not be eaten).
+        if (isTransientRequestFailure(err) || connectionStatusRef.current !== 'ready') return
         const message = err instanceof Error ? err.message : String(err)
         log.error(
           JSON.stringify({

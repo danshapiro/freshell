@@ -52,10 +52,12 @@ describe('WsClient reconnect noise', () => {
   let warnSpy: ReturnType<typeof vi.spyOn>
   let errorSpy: ReturnType<typeof vi.spyOn>
   let previousLevel: ClientLogLevel
+  let originalWebSocket: typeof globalThis.WebSocket
 
   beforeEach(() => {
     vi.useFakeTimers()
     MockWebSocket.instances = []
+    originalWebSocket = globalThis.WebSocket
     // @ts-expect-error - test override
     globalThis.WebSocket = MockWebSocket
     localStorage.setItem('freshell.auth-token', 't')
@@ -73,6 +75,7 @@ describe('WsClient reconnect noise', () => {
 
   afterEach(() => {
     resetWsClientForTests()
+    globalThis.WebSocket = originalWebSocket
     debugSpy.mockRestore()
     warnSpy.mockRestore()
     errorSpy.mockRestore()

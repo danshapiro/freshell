@@ -47,6 +47,29 @@ export class ApiError extends Error {
     this.status = status
     this.details = details
   }
+
+  // `Error.prototype.message` is non-enumerable, so a bare `JSON.stringify` of an
+  // Error drops it. Preserve the shape the previous plain-object ApiError had.
+  toJSON() {
+    return { name: this.name, status: this.status, message: this.message, details: this.details }
+  }
+}
+
+/**
+ * A `fetch()` call failed at the transport layer — the request never received an
+ * HTTP response (server unreachable/restarting, connection dropped). `request()`
+ * throws this so callers can classify precisely by type, instead of guessing from
+ * an engine-specific `TypeError` message (which also risked swallowing unrelated
+ * `TypeError`s thrown while processing a successful response).
+ */
+export class NetworkError extends Error {
+  readonly cause?: unknown
+
+  constructor(message = 'Failed to reach the server', cause?: unknown) {
+    super(message)
+    this.name = 'NetworkError'
+    this.cause = cause
+  }
 }
 
 export type ApiRequestOptions = {
@@ -92,29 +115,34 @@ export function isApiUnauthorizedError(error: unknown): error is ApiError {
   )
 }
 
-/**
- * True when a `fetch()` call failed at the transport layer — the request never
- * received an HTTP response. This happens when the server is unreachable (down,
- * restarting, network dropped) or the request was aborted.
- *
- * These are EXPECTED, transient conditions — not application errors — so callers
- * should treat them quietly (retry/skip) rather than logging error/warn noise;
- * otherwise every server restart floods the logs.
- *
- * Note: an HTTP response with an error status (4xx/5xx) is NOT a transport
- * failure — it surfaces as {@link ApiError} and should be handled explicitly.
- */
-export function isTransientNetworkError(error: unknown): boolean {
-  // Aborted requests (AbortController / navigation) reject with an AbortError,
-  // which is a DOMException in browsers (not an Error subclass everywhere).
+// Gateway/availability statuses: the server (or a proxy in front of it, e.g. the
+// Vite dev proxy) couldn't service the request right now. During a restart these
+// are expected and transient — unlike a 500 (app bug) or 4xx (client error).
+const TRANSIENT_HTTP_STATUSES = new Set([502, 503, 504])
+
+function isAbortError(error: unknown): boolean {
   if (typeof DOMException !== 'undefined' && error instanceof DOMException) {
     return error.name === 'AbortError'
   }
-  if (error instanceof Error && error.name === 'AbortError') return true
-  // fetch() rejects with a TypeError on any network-level failure. The message
-  // is engine-specific ("Failed to fetch" in Chromium, "NetworkError…" in
-  // Firefox, "Load failed" in WebKit), so classify by type, not by text.
-  if (error instanceof TypeError) return true
+  return error instanceof Error && error.name === 'AbortError'
+}
+
+/**
+ * True when a request failed for an EXPECTED, transient reason — the server was
+ * momentarily unreachable or unavailable (unreachable/restarting, connection
+ * dropped, request aborted, or a gateway 502/503/504). Callers should treat
+ * these quietly (retry/skip) rather than logging error/warn noise; otherwise
+ * every server restart floods the logs.
+ *
+ * Deliberately precise: a bare `TypeError` (e.g. a null-deref while processing a
+ * *successful* response) is NOT transient — it's a real bug and must surface.
+ * Only the dedicated {@link NetworkError} thrown by `request()`, an abort, or a
+ * gateway-unavailable {@link ApiError} qualify.
+ */
+export function isTransientRequestFailure(error: unknown): boolean {
+  if (error instanceof NetworkError) return true
+  if (isAbortError(error)) return true
+  if (error instanceof ApiError && TRANSIENT_HTTP_STATUSES.has(error.status)) return true
   return false
 }
 
@@ -133,9 +161,27 @@ async function request<T = any>(path: string, options: RequestInit = {}): Promis
     headers.set('x-auth-token', token)
   }
 
-  const res = await fetch(path, { ...options, headers })
+  let res: Response
+  try {
+    res = await fetch(path, { ...options, headers })
+  } catch (err) {
+    // fetch() rejects only on a transport-level failure or an abort. Preserve
+    // abort semantics; wrap genuine network failures in a typed error so callers
+    // can classify them precisely (see isTransientRequestFailure) without
+    // matching engine-specific messages or over-broad `instanceof TypeError`.
+    if (isAbortError(err)) throw err
+    throw new NetworkError('Failed to reach the server', err)
+  }
   const headersAt = perfEnabled ? performance.now() : 0
-  const text = await res.text()
+  let text: string
+  try {
+    text = await res.text()
+  } catch (err) {
+    // The connection can also die mid-body (e.g. the server was killed while
+    // responding) — that is the same transport-level failure as a rejected fetch.
+    if (isAbortError(err)) throw err
+    throw new NetworkError('Connection lost while reading the response', err)
+  }
   const bodyAt = perfEnabled ? performance.now() : 0
 
   let data: any = null

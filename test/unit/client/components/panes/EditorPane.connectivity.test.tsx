@@ -46,7 +46,7 @@ const createStore = (status: ConnectionStatus) => {
   return store
 }
 
-const renderEditor = (store: ReturnType<typeof createStore>) =>
+const renderEditor = (store: ReturnType<typeof createStore>, content = 'initial') =>
   render(
     <Provider store={store}>
       <EditorPane
@@ -55,16 +55,19 @@ const renderEditor = (store: ReturnType<typeof createStore>) =>
         filePath="/test.ts"
         language="typescript"
         readOnly={false}
-        content="initial"
+        content={content}
         viewMode="source"
       />
     </Provider>
   )
 
-const statCalls = () =>
+const callsTo = (fragment: string) =>
   vi.mocked(fetch).mock.calls.filter(
-    (call) => typeof call[0] === 'string' && (call[0] as string).includes('/api/files/stat')
+    (call) => typeof call[0] === 'string' && (call[0] as string).includes(fragment)
   )
+
+const statCalls = () => callsTo('/api/files/stat')
+const readCalls = () => callsTo('/api/files/read')
 
 describe('EditorPane disk-sync poll — connectivity gating', () => {
   beforeEach(() => {
@@ -139,12 +142,86 @@ describe('EditorPane disk-sync poll — connectivity gating', () => {
     expect(logSpies.warn).not.toHaveBeenCalled()
   })
 
-  it('still logs an error when a poll fails with an unexpected (non-transport) error', async () => {
+  it('still logs an error when the response body is malformed (bugs must surface)', async () => {
+    // Regression guard: a TypeError thrown while *processing* a successful
+    // response (null body -> null.exists) is a real bug, not a transient
+    // network failure, and must not be silently classified away.
     vi.mocked(fetch).mockReset()
     vi.mocked(fetch).mockImplementation((url: string | Request | URL) => {
       const u = typeof url === 'string' ? url : url.toString()
       if (u.includes('/api/files/stat')) {
-        return Promise.reject(new Error('unexpected boom'))
+        return Promise.resolve(okText(null))
+      }
+      return Promise.resolve(okText({}))
+    })
+
+    const store = createStore('ready')
+    renderEditor(store)
+
+    await act(async () => {
+      vi.advanceTimersByTime(3500)
+    })
+
+    expect(logSpies.error).toHaveBeenCalled()
+    expect(String(logSpies.error.mock.calls[0][0])).toContain('editor_stat_poll_failed')
+  })
+
+  it('defers the mount auto-restore until the connection is ready', async () => {
+    const store = createStore('disconnected')
+    renderEditor(store, '') // filePath set, content empty -> restoration path
+
+    await act(async () => {
+      vi.advanceTimersByTime(1000)
+    })
+    expect(readCalls()).toHaveLength(0)
+    expect(logSpies.error).not.toHaveBeenCalled()
+    expect(logSpies.warn).not.toHaveBeenCalled()
+
+    await act(async () => {
+      store.dispatch(setStatus('ready'))
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    expect(readCalls().length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('does not log error/warn when the auto-restore load fails transiently', async () => {
+    vi.mocked(fetch).mockReset()
+    vi.mocked(fetch).mockImplementation((url: string | Request | URL) => {
+      const u = typeof url === 'string' ? url : url.toString()
+      if (u.includes('/api/files/read')) {
+        return Promise.reject(new TypeError('Failed to fetch'))
+      }
+      return Promise.resolve(okText({ exists: false, size: null, modifiedAt: null }))
+    })
+
+    const store = createStore('ready')
+    renderEditor(store, '')
+
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    expect(readCalls().length).toBeGreaterThanOrEqual(1) // it did attempt
+    expect(logSpies.error).not.toHaveBeenCalled()
+    expect(logSpies.warn).not.toHaveBeenCalled()
+  })
+
+  it('still logs an error when a poll fails with an unexpected HTTP error (500)', async () => {
+    // A 500 means the server responded and something is genuinely wrong — that
+    // must surface even though the connection is fine.
+    vi.mocked(fetch).mockReset()
+    vi.mocked(fetch).mockImplementation((url: string | Request | URL) => {
+      const u = typeof url === 'string' ? url : url.toString()
+      if (u.includes('/api/files/stat')) {
+        return Promise.resolve({
+          ok: false,
+          status: 500,
+          statusText: 'Internal Server Error',
+          text: () => Promise.resolve(JSON.stringify({ error: 'boom' })),
+        } as Response)
       }
       return Promise.resolve(okText({}))
     })

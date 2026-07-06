@@ -137,7 +137,7 @@ vi.mock('@/lib/api', () => ({
   getTerminalDirectoryPage: (options?: unknown, init?: unknown) => getTerminalDirectoryPage(options, init),
   searchTerminalView: (terminalId: string, query: string, options?: unknown) => searchTerminalView(terminalId, query, options),
   isApiUnauthorizedError: (err: any) => !!err && typeof err === 'object' && err.status === 401,
-  isTransientNetworkError: (err: any) => err instanceof TypeError || (err instanceof Error && err.name === 'AbortError'),
+  isTransientRequestFailure: (err: any) => !!err && (err.name === 'NetworkError' || err.name === 'AbortError'),
 }))
 
 function createStore(options?: {

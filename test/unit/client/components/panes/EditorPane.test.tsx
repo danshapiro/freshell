@@ -384,11 +384,13 @@ describe('EditorPane', () => {
       consoleSpy.mockRestore()
     })
 
-    it('logs error when fetch throws', async () => {
+    it('stays silent when the file load fails at the transport layer (server unreachable)', async () => {
+      // fetch() rejects only on transport failures — expected while the server
+      // is restarting, so no error should be logged (the poll re-syncs later).
       const user = userEvent.setup()
       const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
       mockFetch.mockImplementation(
-        createRoutedFetch({ throwOnRead: new Error('Network error') }) as any
+        createRoutedFetch({ throwOnRead: new TypeError('Failed to fetch') }) as any
       )
 
       render(
@@ -409,13 +411,17 @@ describe('EditorPane', () => {
       await user.clear(input)
       await user.type(input, '/test.ts{enter}')
 
+      // Wait for the read attempt to complete, then confirm nothing was logged.
       await waitFor(() => {
-        // EditorPane uses structured JSON logging
-        expect(consoleSpy).toHaveBeenCalledWith(
-          '[EditorPane]',
-          expect.stringContaining('"event":"editor_file_load_failed"')
-        )
+        expect(
+          mockFetch.mock.calls.some((call) => String(call[0]).includes('/api/files/read'))
+        ).toBe(true)
       })
+
+      expect(consoleSpy).not.toHaveBeenCalledWith(
+        '[EditorPane]',
+        expect.stringContaining('"event":"editor_file_load_failed"')
+      )
 
       consoleSpy.mockRestore()
     })

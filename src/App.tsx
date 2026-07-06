@@ -9,7 +9,7 @@ import {
   resetWsSnapshotReceived,
 } from '@/store/sessionsSlice'
 import { addTab, closeTab, reopenClosedTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
-import { api, isApiUnauthorizedError, isTransientNetworkError, type VersionInfo } from '@/lib/api'
+import { api, isApiUnauthorizedError, isTransientRequestFailure, type VersionInfo } from '@/lib/api'
 import {
   fetchSessionWindow,
   loadInitialSessionsWindow,
@@ -528,7 +528,7 @@ export default function App() {
               break
             } catch (err) {
               lastBootstrapError = err
-              const isTransientFetchFailure = isTransientNetworkError(err)
+              const isTransientFetchFailure = isTransientRequestFailure(err)
               if (attempt === 0 && isTransientFetchFailure && !cancelled) {
                 await new Promise((resolve) => setTimeout(resolve, 150))
                 continue
