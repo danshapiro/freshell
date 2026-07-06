@@ -9,16 +9,27 @@
 //! - `server/terminal-registry.ts` — **live** shell resolution + `buildSpawnSpec`
 //!   (lines 862-1266) and the env-var WSL detector (Regime A, line 870).
 //!
-//! ## Scope of THIS step (Phase 3.2, step 1): the DETERMINISTIC CORE only
+//! ## Deterministic core
 //!
 //! - [`detect`] — OS / WSL detection (BOTH regimes, kept separate — see CD-1 below).
 //! - [`path`]   — WSL <-> Windows path conversion + flavor detection + launch-cwd.
 //! - [`spawn`]  — the shell [`SpawnSpec`](spawn::SpawnSpec) builder.
 //!
-//! The live-process pieces (firewall/netsh, elevated PowerShell, WSL port-forward,
-//! network bind/LAN) are **deferred** to a later sub-step; their module surface is
-//! scaffolded as clearly-marked stubs with no behavior: [`firewall`], [`network`],
-//! [`port_forward`], [`elevated`].
+//! ## Live-process layer (Phase 3, step 14)
+//!
+//! The OS-integration command *builders* — firewall detection + rule commands
+//! ([`firewall`]), WSL `netsh portproxy` + firewall companion + plan/idempotency
+//! ([`port_forward`]), elevated-PowerShell arg building + the two-phase
+//! confirmation-token gate ([`elevated`]), and network bind/LAN/CORS
+//! ([`network`]) — are implemented here. Every one is a pure builder tested
+//! against **golden strings** transcribed from `server/*.ts`.
+//!
+//! **All subprocess execution is injected** through [`CommandRunner`]. The real
+//! edge ([`StdCommandRunner`]) is used **only for READ-ONLY verification**
+//! (`netsh … show`, `ip … show`, `powershell -Command $PSVersionTable`). Every
+//! **mutating** path (`netsh … add/delete`, elevated `Start-Process -Verb RunAs`)
+//! is only ever *constructed* as a command string and, in tests, driven through a
+//! [`FakeCommandRunner`] — it is never executed against a live host.
 //!
 //! ## Fidelity constraints baked in
 //!
@@ -44,16 +55,26 @@ pub mod detect;
 pub mod path;
 pub mod spawn;
 
-// ---- Deferred live-process module surface (stubs, no behavior — later sub-step) ----
+// ---- Live-process modules (Phase 3, step 14) — builders + injected CommandRunner ----
 pub mod elevated;
 pub mod firewall;
 pub mod network;
 pub mod port_forward;
 
 pub use detect::{HostOs, Platform};
+pub use elevated::{
+    build_elevated_powershell_args, ConfirmationAction, ConfirmationGate, ELEVATED_POWERSHELL_TIMEOUT_MS,
+};
+pub use firewall::{detect_firewall, firewall_commands, FirewallInfo, FirewallPlatform};
+pub use network::{
+    build_allowed_origins, is_remote_access_enabled, resolve_bind_host, BindHostConfig,
+};
 pub use path::{
     convert_windows_path_to_wsl_path, convert_wsl_drive_path_to_windows_path,
     detect_user_path_flavor, sanitize_user_path_input, UserPathFlavor,
+};
+pub use port_forward::{
+    build_port_forwarding_script, build_wsl_port_forwarding_plan, WslPortForwardingPlan,
 };
 pub use spawn::{build_spawn_spec, ShellType, SpawnSpec};
 
@@ -158,6 +179,216 @@ impl MapFileProbe {
 impl FileProbe for MapFileProbe {
     fn exists(&self, path: &str) -> bool {
         self.present.contains(path)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Injected process layer (`execFile`) — the ONLY way this crate runs subprocesses
+// ---------------------------------------------------------------------------
+
+/// The "settled" result of running an external command (mirrors Node's
+/// `execFile` callback `{ error, stdout, stderr }`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandOutput {
+    /// Process exit code, or `None` when the process failed to spawn (missing
+    /// binary), was killed by a signal, or timed out. This mirrors
+    /// `getExecExitCode` (`wsl-port-forward.ts:90-104`), which returns `null`
+    /// for a non-numeric `error.code` (e.g. the `'ENOENT'` string).
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl CommandOutput {
+    /// A successful (exit-0) run with the given stdout and empty stderr.
+    pub fn success(stdout: impl Into<String>) -> Self {
+        Self { exit_code: Some(0), stdout: stdout.into(), stderr: String::new() }
+    }
+
+    /// A failed run (non-zero exit) with the given exit code / streams.
+    pub fn failure(exit_code: i32, stdout: impl Into<String>, stderr: impl Into<String>) -> Self {
+        Self { exit_code: Some(exit_code), stdout: stdout.into(), stderr: stderr.into() }
+    }
+
+    /// A spawn failure (binary absent / killed): `error.code` is not numeric, so
+    /// [`CommandOutput::exit_code`] is `None` (matches `getExecExitCode` → null).
+    pub fn spawn_failure(stderr: impl Into<String>) -> Self {
+        Self { exit_code: None, stdout: String::new(), stderr: stderr.into() }
+    }
+
+    /// `true` iff the process ran and exited 0 — Node's `error === null`.
+    pub fn ok(&self) -> bool {
+        self.exit_code == Some(0)
+    }
+
+    /// `tryExec` semantics (`firewall.ts:27-34`): `stdout` on success, else `None`
+    /// (`execFileAsync` rejects on any non-zero exit / spawn failure).
+    pub fn stdout_on_success(&self) -> Option<&str> {
+        if self.ok() {
+            Some(&self.stdout)
+        } else {
+            None
+        }
+    }
+}
+
+/// The injected process layer. Every subprocess this crate would run (`netsh`,
+/// `ip`, `hostname`, `ipconfig.exe`, `powershell.exe`, `ufw`, …) goes through a
+/// `CommandRunner`, so tests drive a [`FakeCommandRunner`] and **no mutating
+/// command is ever executed against a real host**.
+///
+/// `args` is an argument vector (no shell), matching `execFile(cmd, args)`.
+pub trait CommandRunner {
+    fn run(&self, command: &str, args: &[&str]) -> CommandOutput;
+}
+
+/// The real edge: `std::process::Command` with a wall-clock timeout and
+/// kill-on-timeout (so an unattended run can never leak an orphan). Pipes are
+/// drained on threads to avoid buffer-fill deadlocks.
+///
+/// **Used only for READ-ONLY verification in this crate.**
+#[derive(Debug, Clone, Copy)]
+pub struct StdCommandRunner {
+    pub timeout: std::time::Duration,
+}
+
+impl Default for StdCommandRunner {
+    fn default() -> Self {
+        // Matches the reference's 5s `tryExec` timeout (`firewall.ts:29`).
+        Self { timeout: std::time::Duration::from_secs(5) }
+    }
+}
+
+impl StdCommandRunner {
+    pub fn with_timeout(timeout: std::time::Duration) -> Self {
+        Self { timeout }
+    }
+}
+
+impl CommandRunner for StdCommandRunner {
+    fn run(&self, command: &str, args: &[&str]) -> CommandOutput {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
+        let mut child = match Command::new(command)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => return CommandOutput::spawn_failure(e.to_string()),
+        };
+
+        // Drain both pipes on their own threads (prevents deadlock on large output).
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
+        let out_handle = std::thread::spawn(move || {
+            let mut s = String::new();
+            if let Some(p) = stdout_pipe.as_mut() {
+                let _ = p.read_to_string(&mut s);
+            }
+            s
+        });
+        let err_handle = std::thread::spawn(move || {
+            let mut s = String::new();
+            if let Some(p) = stderr_pipe.as_mut() {
+                let _ = p.read_to_string(&mut s);
+            }
+            s
+        });
+
+        let deadline = std::time::Instant::now() + self.timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+                Err(_) => break None,
+            }
+        };
+
+        let stdout = out_handle.join().unwrap_or_default();
+        let stderr = err_handle.join().unwrap_or_default();
+        match status {
+            Some(s) => CommandOutput { exit_code: s.code(), stdout, stderr },
+            None => CommandOutput { exit_code: None, stdout, stderr },
+        }
+    }
+}
+
+/// A scripted [`CommandRunner`] for deterministic tests. Matches by exact
+/// `command` plus a set of argument substrings that must all be present, and
+/// records every invocation so tests can assert *what* would have been run
+/// (crucial for proving a mutating command is only ever *constructed*).
+#[derive(Default)]
+pub struct FakeCommandRunner {
+    rules: Vec<FakeRule>,
+    default: Option<CommandOutput>,
+    calls: std::cell::RefCell<Vec<(String, Vec<String>)>>,
+}
+
+struct FakeRule {
+    command: String,
+    needles: Vec<String>,
+    output: CommandOutput,
+}
+
+impl FakeCommandRunner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a scripted response: when `command` matches exactly and every string
+    /// in `arg_needles` appears among the args, return `output`.
+    pub fn on(mut self, command: &str, arg_needles: &[&str], output: CommandOutput) -> Self {
+        self.rules.push(FakeRule {
+            command: command.to_string(),
+            needles: arg_needles.iter().map(|s| s.to_string()).collect(),
+            output,
+        });
+        self
+    }
+
+    /// Fallback response for unmatched commands (default: a spawn failure, i.e.
+    /// "binary absent").
+    pub fn with_default(mut self, output: CommandOutput) -> Self {
+        self.default = Some(output);
+        self
+    }
+
+    /// Every `(command, args)` this runner was asked to run, in order.
+    pub fn calls(&self) -> Vec<(String, Vec<String>)> {
+        self.calls.borrow().clone()
+    }
+
+    /// How many commands were run (== number of mutating invocations when the
+    /// fake is wired behind an elevation path).
+    pub fn call_count(&self) -> usize {
+        self.calls.borrow().len()
+    }
+}
+
+impl CommandRunner for FakeCommandRunner {
+    fn run(&self, command: &str, args: &[&str]) -> CommandOutput {
+        self.calls
+            .borrow_mut()
+            .push((command.to_string(), args.iter().map(|s| s.to_string()).collect()));
+        for rule in &self.rules {
+            if rule.command == command && rule.needles.iter().all(|n| args.iter().any(|a| a.contains(n.as_str()))) {
+                return rule.output.clone();
+            }
+        }
+        self.default
+            .clone()
+            .unwrap_or_else(|| CommandOutput::spawn_failure(format!("no fake rule for {command}")))
     }
 }
 
