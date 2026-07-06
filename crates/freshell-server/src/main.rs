@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use freshell_api::ApiState;
 use freshell_freshagent::FreshAgentState;
-use freshell_platform::detect::{detect_platform_proc, host_os_live, read_proc_version};
+use freshell_platform::detect::{detect_platform_proc, host_os_live, is_wsl_proc, read_proc_version};
 use freshell_ws::WsState;
 use uuid::Uuid;
 
@@ -306,13 +306,28 @@ fn resolve_port() -> u16 {
         .unwrap_or(3001)
 }
 
-/// Resolve the bind host. Mirrors `get-network-host.ts`'s `FRESHELL_BIND_HOST`
-/// override: honor an explicit `127.0.0.1` / `0.0.0.0`, otherwise force loopback.
+/// Resolve the bind host, faithfully to `server/get-network-host.ts`:
+/// an explicit `FRESHELL_BIND_HOST` (`0.0.0.0`/`127.0.0.1`) wins; otherwise **on WSL
+/// bind `0.0.0.0`** so the Windows host (browser / the legacy Electron app) can reach
+/// the server across the WSL2 NAT boundary — "not remote access, basic WSL2
+/// functionality" (get-network-host.ts:11-13,40-42); else fall back to `127.0.0.1`.
+///
+/// NOTE: the earlier loopback-only default diverged from the original (it left the
+/// server unreachable from Windows). The oracle never caught it because the harness
+/// always forces `FRESHELL_BIND_HOST=127.0.0.1` for test isolation — which this still
+/// honors, so T0/T1/T2/T3 remain loopback and unaffected.
 fn resolve_bind_host() -> String {
-    match std::env::var("FRESHELL_BIND_HOST").ok().as_deref() {
-        Some("0.0.0.0") => "0.0.0.0".to_string(),
-        _ => "127.0.0.1".to_string(),
-    }
+    let is_wsl = is_wsl_proc(read_proc_version().as_deref());
+    freshell_platform::network::resolve_bind_host(
+        &freshell_platform::RealEnv,
+        is_wsl,
+        // No config-file host override wired here; FRESHELL_BIND_HOST + the WSL
+        // default + the `HOST` env fallback are what the standalone run needs.
+        freshell_platform::network::BindHostConfig::Ok {
+            raw_host: None,
+            configured: false,
+        },
+    )
 }
 
 /// Resolve the isolated home whose `.freshell/config.json` supplies the network
