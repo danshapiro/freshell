@@ -56,7 +56,8 @@ vi.mock('@/lib/api', () => ({
   },
   fetchSidebarSessionsSnapshot: (options?: unknown) => fetchSidebarSessionsSnapshot(options),
   isApiUnauthorizedError: (err: any) => !!err && typeof err === 'object' && err.status === 401,
-  isTransientRequestFailure: (err: any) => !!err && (err.name === 'NetworkError' || err.name === 'AbortError'),
+  isTransientRequestFailure: (err: any) =>
+    !!err && (err.name === 'NetworkError' || err.name === 'AbortError' || [502, 503, 504].includes(err.status)),
 }))
 
 vi.mock('@/components/TabContent', () => ({

@@ -135,6 +135,7 @@ describe('WsClient reconnect noise', () => {
     // The client must NOT be wedged: it keeps retrying on a slow cadence, and
     // the degraded-state warn is emitted exactly once (no slow-cycle spam).
     const warnCountAfterGiveUp = warnSpy.mock.calls.length
+    expect(warnCountAfterGiveUp).toBe(1)
     const socketsBefore = MockWebSocket.instances.length
     for (let i = 0; i < 3; i += 1) {
       await vi.advanceTimersByTimeAsync(15000)

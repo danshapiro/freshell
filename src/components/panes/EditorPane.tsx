@@ -157,10 +157,20 @@ export default function EditorPane({
   const connectionStatus = useAppSelector((s) => s.connection.status)
   // Latest-value mirror so async catch handlers can re-check connectivity as of
   // *now* (the effect closure's value may be stale if the server died mid-poll).
+  // Written during render rather than in an effect deliberately: effects run
+  // after paint, and that wider window let handlers read a stale 'ready' after
+  // the WS had already observed a disconnect. The write is idempotent, so
+  // StrictMode double-renders are harmless.
   const connectionStatusRef = useRef(connectionStatus)
-  useEffect(() => {
-    connectionStatusRef.current = connectionStatus
-  }, [connectionStatus])
+  connectionStatusRef.current = connectionStatus
+  // Failures that are expected during a server outage: the request failed
+  // transiently (unreachable / gateway 502-504 / aborted), or the WS has
+  // already observed the disconnect. Applies ONLY to server API calls — never
+  // to local File System Access writes, which don't involve the server.
+  const isExpectedOutageFailure = useCallback(
+    (err: unknown) => isTransientRequestFailure(err) || connectionStatusRef.current !== 'ready',
+    []
+  )
   const mountedRef = useRef(true)
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -420,7 +430,7 @@ export default function EditorPane({
         // one that coincided with the WS observing a disconnect, is expected —
         // don't surface it as an error. The disk-sync poll re-reads once the
         // connection is back; only genuinely unexpected failures are logged.
-        if (isTransientRequestFailure(err) || connectionStatusRef.current !== 'ready') return
+        if (isExpectedOutageFailure(err)) return
         const message = err instanceof Error ? err.message : String(err)
         log.error(
           JSON.stringify({
@@ -433,7 +443,7 @@ export default function EditorPane({
         if (mountedRef.current) setIsLoading(false)
       }
     },
-    [defaultBrowseRoot, updateContent]
+    [defaultBrowseRoot, updateContent, isExpectedOutageFailure]
   )
 
   // Auto-fetch file content on mount if filePath is set but content is empty.
@@ -610,31 +620,44 @@ export default function EditorPane({
       }
 
       autoSaveTimer.current = setTimeout(async () => {
-        try {
-          const handle = fileHandleRef.current
-          if (handle?.createWritable) {
+        const handle = fileHandleRef.current
+        if (handle?.createWritable) {
+          // Local File System Access write — the server plays no part here, so
+          // failures (permissions, quota) are never outage-related: always log.
+          try {
             const writable = await handle.createWritable()
             await writable.write(value)
             await writable.close()
-            return
-          }
-
-          if (filePath) {
-            const resolved = resolvePath(filePath)
-            if (!resolved) return
-            const saveResult = await api.post<{ success: boolean; modifiedAt?: string }>('/api/files/write', {
-              path: resolved,
-              content: value,
-            })
-            lastKnownMtime.current = saveResult?.modifiedAt || null
             lastSavedContent.current = value
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err)
+            log.error(
+              JSON.stringify({
+                severity: 'error',
+                event: 'editor_autosave_failed',
+                error: message,
+              })
+            )
           }
+          return
+        }
+
+        if (!filePath) return
+        const resolved = resolvePath(filePath)
+        if (!resolved) return
+        try {
+          const saveResult = await api.post<{ success: boolean; modifiedAt?: string }>('/api/files/write', {
+            path: resolved,
+            content: value,
+          })
+          lastKnownMtime.current = saveResult?.modifiedAt || null
+          lastSavedContent.current = value
         } catch (err) {
-          // Expected while the server is restarting: stay silent. The edit is
-          // not lost — pendingContent still differs from lastSavedContent, so
-          // the reconnect effect below re-schedules this save once the
-          // connection returns (and further typing re-schedules it too).
-          if (isTransientRequestFailure(err) || connectionStatusRef.current !== 'ready') return
+          // Expected while the server is restarting: stay silent. While the
+          // pane stays mounted the edit is kept in pendingContent, and the
+          // reconnect effect below re-schedules this save once the connection
+          // returns (further typing re-schedules it too).
+          if (isExpectedOutageFailure(err)) return
           const message = err instanceof Error ? err.message : String(err)
           log.error(
             JSON.stringify({
@@ -646,47 +669,84 @@ export default function EditorPane({
         }
       }, AUTO_SAVE_DELAY)
     },
-    [filePath, readOnly, resolvePath]
+    [filePath, readOnly, resolvePath, isExpectedOutageFailure]
   )
 
-  // Retry a pending (unsaved) edit once the connection returns. A save that
-  // failed transiently during an outage leaves pendingContent !== lastSaved;
-  // re-scheduling through the normal debounce path lets the disk-sync poll win
-  // first if the file changed on disk meanwhile (it cancels the timer and
-  // raises the conflict UI), so no conflict handling is bypassed here.
+  // Retry a pending (unsaved) edit once the connection returns — but only after
+  // confirming the file did NOT change on disk during the outage. If it did,
+  // stay hands-off: the disk-sync poll raises the conflict UI within one tick
+  // and the user decides. Without this stat guard, the retried write could race
+  // the poll and silently overwrite external changes (e.g. a git checkout that
+  // happened while the server was down).
+  // Local File System Access files are excluded: their writes never touch the
+  // server, so an outage cannot have failed them.
   useEffect(() => {
     if (connectionStatus !== 'ready') return
-    if (pendingContent.current !== lastSavedContent.current) {
-      scheduleAutoSave(pendingContent.current)
+    if (fileHandleRef.current) return
+    if (conflictState) return
+    if (pendingContent.current === lastSavedContent.current) return
+    if (!filePath) return
+    const resolved = resolvePath(filePath)
+    if (!resolved) return
+
+    let cancelled = false
+    void (async () => {
+      try {
+        const statResult = await api.get<{ exists: boolean; modifiedAt: string | null }>(
+          `/api/files/stat?path=${encodeURIComponent(resolved)}`
+        )
+        if (cancelled || !mountedRef.current) return
+        // Disk changed while we were away: leave it to the poll's conflict flow.
+        if (statResult.exists && statResult.modifiedAt !== lastKnownMtime.current) return
+        scheduleAutoSave(pendingContent.current)
+      } catch {
+        // Transient failure right after reconnect: leave the edit pending; the
+        // next keystroke or reconnect re-triggers this path.
+      }
+    })()
+    return () => {
+      cancelled = true
     }
-  }, [connectionStatus, scheduleAutoSave])
+  }, [connectionStatus, conflictState, filePath, resolvePath, scheduleAutoSave])
 
   const performSave = useCallback(async () => {
     if (readOnly) return
     if (!filePath && !fileHandleRef.current) return
     const value = pendingContent.current
-    try {
-      const handle = fileHandleRef.current
-      if (handle?.createWritable) {
+    const handle = fileHandleRef.current
+    if (handle?.createWritable) {
+      // Local File System Access write — never outage-related: always log.
+      try {
         const writable = await handle.createWritable()
         await writable.write(value)
         await writable.close()
-        return
-      }
-      if (filePath) {
-        const resolved = resolvePath(filePath)
-        if (!resolved) return
-        const saveResult = await api.post<{ success: boolean; modifiedAt?: string }>('/api/files/write', {
-          path: resolved,
-          content: value,
-        })
-        lastKnownMtime.current = saveResult?.modifiedAt || null
         lastSavedContent.current = value
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        log.error(
+          JSON.stringify({
+            severity: 'error',
+            event: 'editor_manual_save_failed',
+            error: message,
+          })
+        )
       }
+      return
+    }
+    if (!filePath) return
+    const resolved = resolvePath(filePath)
+    if (!resolved) return
+    try {
+      const saveResult = await api.post<{ success: boolean; modifiedAt?: string }>('/api/files/write', {
+        path: resolved,
+        content: value,
+      })
+      lastKnownMtime.current = saveResult?.modifiedAt || null
+      lastSavedContent.current = value
     } catch (err) {
       // Same policy as autosave: a transient failure during an outage is
       // expected and the pending edit is retried on reconnect.
-      if (isTransientRequestFailure(err) || connectionStatusRef.current !== 'ready') return
+      if (isExpectedOutageFailure(err)) return
       const message = err instanceof Error ? err.message : String(err)
       log.error(
         JSON.stringify({
@@ -696,7 +756,7 @@ export default function EditorPane({
         })
       )
     }
-  }, [filePath, readOnly, resolvePath])
+  }, [filePath, readOnly, resolvePath, isExpectedOutageFailure])
 
   const openInEditor = useCallback(async (reveal: boolean) => {
     const resolved = resolvePath(filePath)
@@ -715,7 +775,7 @@ export default function EditorPane({
     } catch (err) {
       // A transient failure while the server is unreachable is expected — the
       // user can retry once it's back; only unexpected failures are logged.
-      if (isTransientRequestFailure(err) || connectionStatusRef.current !== 'ready') return
+      if (isExpectedOutageFailure(err)) return
       const message = err instanceof Error ? err.message : String(err)
       log.error(
         JSON.stringify({
@@ -725,7 +785,7 @@ export default function EditorPane({
         })
       )
     }
-  }, [filePath, resolvePath])
+  }, [filePath, resolvePath, isExpectedOutageFailure])
 
   const handleEditorChange = useCallback(
     (value: string | undefined) => {
@@ -838,7 +898,7 @@ export default function EditorPane({
         // the WS has since observed the disconnect. Stay silent in both cases.
         // Only a genuinely unexpected failure while still connected is logged
         // (e.g. a bug processing the response — that must surface, not be eaten).
-        if (isTransientRequestFailure(err) || connectionStatusRef.current !== 'ready') return
+        if (isExpectedOutageFailure(err)) return
         const message = err instanceof Error ? err.message : String(err)
         log.error(
           JSON.stringify({
@@ -858,7 +918,7 @@ export default function EditorPane({
         pollIntervalRef.current = null
       }
     }
-  }, [filePath, resolvePath, conflictState, updateContent, connectionStatus])
+  }, [filePath, resolvePath, conflictState, updateContent, connectionStatus, isExpectedOutageFailure])
 
   useEffect(() => {
     return registerEditorActions(paneId, {

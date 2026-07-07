@@ -137,7 +137,8 @@ vi.mock('@/lib/api', () => ({
   getTerminalDirectoryPage: (options?: unknown, init?: unknown) => getTerminalDirectoryPage(options, init),
   searchTerminalView: (terminalId: string, query: string, options?: unknown) => searchTerminalView(terminalId, query, options),
   isApiUnauthorizedError: (err: any) => !!err && typeof err === 'object' && err.status === 401,
-  isTransientRequestFailure: (err: any) => !!err && (err.name === 'NetworkError' || err.name === 'AbortError'),
+  isTransientRequestFailure: (err: any) =>
+    !!err && (err.name === 'NetworkError' || err.name === 'AbortError' || [502, 503, 504].includes(err.status)),
 }))
 
 function createStore(options?: {
@@ -478,7 +479,10 @@ describe('App WS bootstrap recovery', () => {
     apiGet.mockImplementation((url: string) => {
       if (url === '/api/bootstrap') {
         bootstrapCalls += 1
-        if (bootstrapCalls === 1) {
+        // 503 is transient, so the bootstrap loop retries once (150ms) before
+        // giving up — reject both the initial attempt and its retry so recovery
+        // still flows through the WS ready re-run this test exercises.
+        if (bootstrapCalls <= 2) {
           return Promise.reject({ status: 503, message: 'Service Unavailable' })
         }
         return Promise.resolve({
@@ -548,7 +552,7 @@ describe('App WS bootstrap recovery', () => {
 
     await waitFor(() => {
       expect(store.getState().connection.status).toBe('disconnected')
-      expect(bootstrapCalls).toBe(1)
+      expect(bootstrapCalls).toBe(2) // initial attempt + one transient-503 retry
       expect(sidebarCalls).toBe(1)
     })
 
@@ -589,7 +593,7 @@ describe('App WS bootstrap recovery', () => {
       'Manual Session',
     ])
 
-    expect(bootstrapCalls).toBe(2)
+    expect(bootstrapCalls).toBe(3) // + the successful re-run after WS ready
     expect(sidebarCalls).toBe(2)
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'opencode.activity.list' }))

@@ -312,6 +312,74 @@ describe('EditorPane disk-sync poll — connectivity gating', () => {
     expect(logSpies.warn).not.toHaveBeenCalled()
   })
 
+  it('does not retry the pending save when the file changed on disk during the outage — conflict wins', async () => {
+    // The reconnect retry must never overwrite external changes that landed
+    // while the server was down (e.g. a git checkout). It stats first; on a
+    // mtime mismatch it stands down and the disk-sync poll raises the conflict UI.
+    let serverUp = true
+    let diskMtime = '2026-01-01T00:00:00.000Z'
+    vi.mocked(fetch).mockReset()
+    vi.mocked(fetch).mockImplementation((url: string | Request | URL) => {
+      const u = typeof url === 'string' ? url : url.toString()
+      if (u.includes('/api/files/write')) {
+        if (!serverUp) return Promise.reject(new TypeError('Failed to fetch'))
+        return Promise.resolve(okText({ success: true, modifiedAt: diskMtime }))
+      }
+      if (u.includes('/api/files/stat')) {
+        return Promise.resolve(okText({ exists: true, size: 9, modifiedAt: diskMtime }))
+      }
+      if (u.includes('/api/files/read')) {
+        return Promise.resolve(
+          okText({
+            content: diskMtime === '2026-01-01T00:00:00.000Z' ? 'initial' : 'external change',
+            modifiedAt: diskMtime,
+          })
+        )
+      }
+      return Promise.resolve(okText({}))
+    })
+
+    const store = createStore('ready')
+    renderEditor(store)
+
+    // First poll tick establishes lastKnownMtime.
+    await act(async () => {
+      vi.advanceTimersByTime(3500)
+    })
+
+    // User edits; server dies before the debounced autosave fires.
+    serverUp = false
+    const editor = screen.getByTestId('monaco-mock')
+    await act(async () => {
+      fireEvent.change(editor, { target: { value: 'local edit' } })
+    })
+    await act(async () => {
+      store.dispatch(setStatus('disconnected'))
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(5500) // autosave attempt fails silently
+    })
+    expect(callsTo('/api/files/write')).toHaveLength(1)
+
+    // The file changes on disk during the outage; then the server returns.
+    diskMtime = '2026-01-02T00:00:00.000Z'
+    serverUp = true
+    await act(async () => {
+      store.dispatch(setStatus('ready'))
+    })
+    // Give the retry stat, the next poll tick, and any (wrongly) scheduled
+    // autosave ample time to run.
+    await act(async () => {
+      vi.advanceTimersByTime(9000)
+    })
+
+    // No further write happened — the conflict UI decides, not a silent overwrite.
+    expect(callsTo('/api/files/write')).toHaveLength(1)
+    expect(screen.getByTestId('editor-conflict-banner')).toBeInTheDocument()
+    expect(logSpies.error).not.toHaveBeenCalled()
+    expect(logSpies.warn).not.toHaveBeenCalled()
+  })
+
   it('recovers pane content via the disk-sync poll after a transiently failed restore', async () => {
     // The mount auto-restore latches restoredRef even if the fetch fails
     // transiently; the disk-sync poll is the documented backstop that re-reads

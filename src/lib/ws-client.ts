@@ -474,7 +474,9 @@ export class WsClient {
         this.slowRetryAnnounced = true
         log.warn('max reconnect attempts reached; falling back to slow retry')
       }
-      delay = this.slowReconnectDelay
+      // Honor caller-requested floors (e.g. the 4008 backpressure path) even in
+      // slow mode; slowReconnectDelay is normally the larger of the two.
+      delay = Math.max(this.slowReconnectDelay, opts?.minDelayMs ?? 0)
     } else {
       const base = this.fastReconnectMode ? this.postShutdownBaseDelay : this.baseReconnectDelay
       const exponential = base * Math.pow(2, this.reconnectAttempts)
@@ -516,6 +518,9 @@ export class WsClient {
     this._serverInstanceId = undefined
     this.connectPromise = null
     this.reconnectAttempts = 0
+    // Keep state resets symmetric with onopen: a later reconnect cycle that
+    // exhausts its fast budget should announce the slow fallback again.
+    this.slowRetryAnnounced = false
   }
 
   private clearReconnectTimer() {
