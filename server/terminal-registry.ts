@@ -38,6 +38,26 @@ import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-
 import { generateMcpInjection, cleanupMcpConfig } from './mcp/config-writer.js'
 import { CODEX_MANAGED_REMOTE_CONFIG_ARGS } from './coding-cli/codex-managed-config.js'
 import { deregisterCodexChild, registerCodexChild } from './coding-cli/codex-child-registry.js'
+
+// Stage 1a (plan §6, panel m8): a codex resume pty is a process-GROUP registration (pgid == pid),
+// and the pty leader exiting does not prove the group is gone — descendants (the actual codex log
+// DB holders) can survive it. Deregister only when a signal-0 probe of the group confirms ESRCH;
+// while any member survives the entry stays registered so exit-time reap can still cover it. On
+// non-Linux platforms (no negative-pid probe semantics guaranteed + reapSync is a no-op there)
+// keep the previous unconditional deregistration.
+function deregisterCodexPtyIfGroupGone(pid: number): void {
+  if (process.platform === 'linux') {
+    try {
+      process.kill(-pid, 0)
+      return // group still has members: keep it registered
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
+        return // could not confirm the group is gone (e.g. EPERM): keep it registered
+      }
+    }
+  }
+  deregisterCodexChild(pid)
+}
 import type { CodexLaunchPlan, CodexLaunchSidecar } from './coding-cli/codex-app-server/launch-planner.js'
 import { isCodexSidecarTeardownError } from './coding-cli/codex-app-server/launch-planner.js'
 import {
@@ -1757,9 +1777,10 @@ export class TerminalRegistry extends EventEmitter {
     })
 
     ptyProc.onExit((e) => {
-      // Stage 1a (plan §6): this pty process is gone — drop it from the codex child registry
-      // before any dispatch guards below. No-op for non-codex ptys and double exits.
-      deregisterCodexChild(ptyProc.pid)
+      // Stage 1a (plan §6): the pty leader exited — deregister the group only if it is confirmed
+      // gone (m8), and only for codex panes, mirroring the registration gate above (m6). Runs
+      // before any dispatch guards below; no-op for double exits.
+      if (opts.mode === 'codex') deregisterCodexPtyIfGroupGone(ptyProc.pid)
       if (this.hasHandledPtyExit(record, ptyProc)) return
       this.markHandledPtyExit(record, ptyProc)
       if (!record.codexRecoveryFinalClose && record.codexRecoveryRetiringPty === ptyProc) {
@@ -3759,8 +3780,9 @@ export class TerminalRegistry extends EventEmitter {
     })
 
     ptyProc.onExit((event) => {
-      // Stage 1a (plan §6): the pty process is gone — deregister before any dispatch guards.
-      deregisterCodexChild(ptyProc.pid)
+      // Stage 1a (plan §6): deregister only on confirmed group death (m8), codex-gated to mirror
+      // registration (m6; recovery records are codex by construction). Before any dispatch guards.
+      if (record.mode === 'codex') deregisterCodexPtyIfGroupGone(ptyProc.pid)
       if (this.hasHandledPtyExit(record, ptyProc)) return
       this.markHandledPtyExit(record, ptyProc)
       if (candidate) {

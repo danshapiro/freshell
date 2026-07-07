@@ -168,6 +168,20 @@ export type ReapOrphanedSidecarsOptions = {
   metadataDir?: string
   serverInstanceId: string
   terminateGraceMs?: number
+  /**
+   * Total wall-clock budget for group teardowns (the signal-and-wait part) in one pass. The boot
+   * pass runs pre-listen, so runCodexStartupReaper caps it at CODEX_REAPER_BOOT_BUDGET_MS; records
+   * past the budget skip teardown and are deferred with retry state (surfaced in the summary and
+   * retried by the hourly tick, which stays unbudgeted). Omit for unbudgeted behavior.
+   */
+  teardownBudgetMs?: number
+  /**
+   * Skip records whose per-record retry backoff window has not elapsed (no attempt increment, no
+   * log). Passed by the hourly maintenance tick; boot passes always attempt every record.
+   */
+  respectRetryBackoff?: boolean
+  /** Clock seam for the teardown budget (tests only). */
+  nowFn?: () => number
 }
 
 export type ReapOrphanedSidecarsResult = {
@@ -182,6 +196,8 @@ export type ReapOrphanedSidecarsResult = {
   quarantinedRecords: string[]
   /** Records retried in place with backoff state in `<record>.reaper.json` (never quarantined). */
   retriedOwnershipIds: string[]
+  /** Records whose group teardown was skipped because the pass's teardown time budget ran out. */
+  deferredForBudget: string[]
   /** Quarantined records promoted back into the metadata dir because their process group is alive. */
   promotedFromQuarantine: string[]
   /** True when reaping was skipped this pass (metadata dir unreadable or /proc proof unavailable). */
@@ -823,8 +839,18 @@ const QUARANTINE_DIR_NAME = 'quarantine'
 const REAPER_RETRY_SIDECAR_SUFFIX = '.reaper.json'
 const QUARANTINE_NOTE_SUFFIX = '.note.json'
 const HOUR_MS = 60 * 60 * 1000
-/** Retry logging escalates from info to warn once a record has been re-attempted this many times. */
-export const CODEX_REAPER_LOG_ESCALATION_ATTEMPTS = 3
+/**
+ * Retry logging escalates from info to warn once a record has been PENDING this long (wall-time,
+ * plan §7.4). Never attempt-count based: tsx-watch restart storms and two instances sharing the
+ * metadata dir would burn an attempt budget in minutes.
+ */
+export const CODEX_REAPER_LOG_ESCALATION_MS = 6 * HOUR_MS
+/**
+ * Total group-teardown time budget for the pre-listen BOOT reap pass (panel M2). Each stuck
+ * (D-state) record costs ~2s of signal-and-wait plus two full /proc scans; without a budget every
+ * restart pays that per record. Classification and the quarantine rescan (cheap) always run.
+ */
+export const CODEX_REAPER_BOOT_BUDGET_MS = 3_000
 
 function reaperRetrySidecarPath(metadataPath: string): string {
   return `${metadataPath}${REAPER_RETRY_SIDECAR_SUFFIX}`
@@ -848,6 +874,16 @@ export function isCodexReaperRetryDue(state: CodexReaperRetryState, nowMs: numbe
   const lastAttemptMs = Date.parse(state.lastAttempt)
   if (!Number.isFinite(firstSeenMs) || !Number.isFinite(lastAttemptMs)) return true
   return nowMs - lastAttemptMs >= codexReaperRetryIntervalMs(nowMs - firstSeenMs)
+}
+
+/**
+ * Wall-time log escalation (panel M4): warn only once the record has been pending for
+ * CODEX_REAPER_LOG_ESCALATION_MS. `attempts` stays in the payload as informational context.
+ */
+export function isCodexReaperEscalationDue(state: CodexReaperRetryState, nowMs: number = Date.now()): boolean {
+  const firstSeenMs = Date.parse(state.firstSeen)
+  if (!Number.isFinite(firstSeenMs)) return true // unparseable anchor: escalate rather than hide
+  return nowMs - firstSeenMs >= CODEX_REAPER_LOG_ESCALATION_MS
 }
 
 function isCodexReaperRetryState(value: unknown): value is CodexReaperRetryState {
@@ -902,7 +938,7 @@ function logCodexReaperRetry(
 ): void {
   const payload = { ...fields, firstSeen: state.firstSeen, attempts: state.attempts, lastAttempt: state.lastAttempt }
   const message = `Codex startup reaper left an ownership record in place for retry with backoff (${why})`
-  if (state.attempts >= CODEX_REAPER_LOG_ESCALATION_ATTEMPTS) {
+  if (isCodexReaperEscalationDue(state)) {
     logger.warn(payload, message)
   } else {
     logger.info(payload, message)
@@ -935,13 +971,9 @@ async function quarantineCodexOwnershipRecord(
   const quarantineDir = quarantineDirPath(metadataDir)
   await fsp.mkdir(quarantineDir, { recursive: true })
   const quarantinePath = path.join(quarantineDir, path.basename(metadataPath))
-  try {
-    await fsp.rename(metadataPath, quarantinePath)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-    throw error
-  }
-  await fsp.chmod(quarantinePath, 0o600).catch(() => undefined)
+  // m3: write the note BEFORE the rename — a cross-instance quarantine rescan can promote the
+  // record the instant it lands, and a note written after the rename would be stranded as an
+  // orphan. rescanCodexReaperQuarantine also unlinks any note whose record file is absent.
   await atomicWriteJson(`${quarantinePath}${QUARANTINE_NOTE_SUFFIX}`, {
     reason,
     firstSeen: retryState?.firstSeen ?? recordStat.mtime.toISOString(),
@@ -949,6 +981,17 @@ async function quarantineCodexOwnershipRecord(
   }).catch((error) => {
     logger.warn({ quarantinePath, err: error }, 'Codex startup reaper could not write a quarantine note')
   })
+  try {
+    await fsp.rename(metadataPath, quarantinePath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      // A concurrent boot handled the record first; drop the note we pre-wrote for it.
+      await fsp.unlink(`${quarantinePath}${QUARANTINE_NOTE_SUFFIX}`).catch(() => undefined)
+      return null
+    }
+    throw error
+  }
+  await fsp.chmod(quarantinePath, 0o600).catch(() => undefined)
   await fsp.unlink(reaperRetrySidecarPath(metadataPath)).catch(() => undefined)
   logger.warn({ metadataPath, quarantinePath, reason }, 'Codex startup reaper quarantined an ownership record')
   return quarantinePath
@@ -974,7 +1017,14 @@ export async function rescanCodexReaperQuarantine(
     return { promotedRecords, quarantinedCount }
   }
   for (const entry of entries) {
-    if (!entry.endsWith('.json') || entry.endsWith(QUARANTINE_NOTE_SUFFIX)) continue
+    if (entry.endsWith(QUARANTINE_NOTE_SUFFIX)) {
+      // m3: a note without its record is an orphan (quarantine/promote race); unlink it.
+      const recordName = entry.slice(0, -QUARANTINE_NOTE_SUFFIX.length)
+      const recordExists = await fsp.stat(path.join(quarantineDir, recordName)).then(() => true, () => false)
+      if (!recordExists) await fsp.unlink(path.join(quarantineDir, entry)).catch(() => undefined)
+      continue
+    }
+    if (!entry.endsWith('.json')) continue
     quarantinedCount += 1
     const quarantinePath = path.join(quarantineDir, entry)
     try {
@@ -1054,9 +1104,12 @@ export async function reapOrphanedCodexAppServerSidecars(
     unreadableRecords: [],
     quarantinedRecords: [],
     retriedOwnershipIds: [],
+    deferredForBudget: [],
     promotedFromQuarantine: [],
     reapingSkipped: false,
   }
+  const nowFn = options.nowFn ?? Date.now
+  const passStartedAt = nowFn()
 
   // Safety net first: promote quarantined records whose process group is still alive so this same
   // pass retries them (a quarantined record must never hide a live DB holder).
@@ -1090,11 +1143,30 @@ export async function reapOrphanedCodexAppServerSidecars(
   }
 
   for (const entry of entries) {
+    // m9: purge atomic-write tmp files stranded by a crash mid-write; anything older than an hour
+    // can never be renamed into place by its (dead) writer. Best-effort, never fatal.
+    if (entry.includes('.tmp-')) {
+      try {
+        const tmpPath = path.join(metadataDir, entry)
+        const tmpStat = await fsp.stat(tmpPath)
+        if (Date.now() - tmpStat.mtimeMs >= HOUR_MS) await fsp.unlink(tmpPath)
+      } catch {
+        // best-effort cleanup only
+      }
+      continue
+    }
     if (!entry.endsWith('.json') || entry.endsWith(REAPER_RETRY_SIDECAR_SUFFIX)) continue
     const metadataPath = path.join(metadataDir, entry)
     let ownershipId: string | undefined
     // Per-record isolation (I4): one bad record affects only itself, never the scan or the boot.
     try {
+      // m2: hourly (non-boot) passes gate PER RECORD on the time-based backoff — a record that is
+      // not yet due is skipped entirely (no attempt increment, no log), even when another record
+      // being due triggered the pass.
+      if (options.respectRetryBackoff) {
+        const retryState = await readCodexReaperRetryStateFile(reaperRetrySidecarPath(metadataPath))
+        if (retryState && !isCodexReaperRetryDue(retryState)) continue
+      }
       let raw: string
       try {
         raw = await fsp.readFile(metadataPath, 'utf8')
@@ -1186,6 +1258,25 @@ export async function reapOrphanedCodexAppServerSidecars(
       }
 
       const ownership: ActiveOwnership = { metadataDir, metadataPath, metadata }
+      // M2: once the pass's teardown budget is exhausted, skip the signal-and-wait teardown for
+      // the remaining records. They keep retry state (so they surface in the boot summary and the
+      // hourly tick re-attempts them) and are marked deferred — never dropped.
+      if (options.teardownBudgetMs !== undefined && nowFn() - passStartedAt > options.teardownBudgetMs) {
+        const state = await recordCodexReaperRetryAttempt(metadataPath)
+        logCodexReaperRetry(
+          {
+            ownershipId: metadata.ownershipId,
+            metadataPath,
+            wrapperPid: metadata.wrapperPid,
+            processGroupId: metadata.processGroupId,
+            teardownBudgetMs: options.teardownBudgetMs,
+          },
+          state,
+          'teardown budget exhausted this pass; deferred',
+        )
+        result.deferredForBudget.push(metadata.ownershipId)
+        continue
+      }
       const reaped = await teardownOwnedProcessGroup(ownership, options.terminateGraceMs ?? DEFAULT_TERMINATE_GRACE_MS)
       if (reaped) {
         result.reapedOwnershipIds.push(metadata.ownershipId)
@@ -1226,7 +1317,8 @@ export async function reapOrphanedCodexAppServerSidecars(
 export async function runCodexStartupReaper(
   options: ReapOrphanedSidecarsOptions,
 ): Promise<ReapOrphanedSidecarsResult> {
-  const result = await reapOrphanedCodexAppServerSidecars(options)
+  // Boot pass runs pre-listen: cap the total teardown time (panel M2). Callers may override.
+  const result = await reapOrphanedCodexAppServerSidecars({ teardownBudgetMs: CODEX_REAPER_BOOT_BUDGET_MS, ...options })
   summarizeCodexStartupReaperResult(result)
   return result
 }
@@ -1238,6 +1330,7 @@ function summarizeCodexStartupReaperResult(result: ReapOrphanedSidecarsResult): 
     + result.unreadableRecords.length
     + result.quarantinedRecords.length
     + result.retriedOwnershipIds.length
+    + result.deferredForBudget.length
   if (!result.reapingSkipped && unresolved === 0) return
   logger.warn(
     {
@@ -1246,6 +1339,7 @@ function summarizeCodexStartupReaperResult(result: ReapOrphanedSidecarsResult): 
       unreadableRecords: result.unreadableRecords,
       quarantinedRecords: result.quarantinedRecords,
       retriedOwnershipIds: [...new Set(result.retriedOwnershipIds)],
+      deferredForBudget: [...new Set(result.deferredForBudget)],
       promotedFromQuarantine: result.promotedFromQuarantine,
     },
     'Codex startup reaper completed with unresolved ownership records; continuing boot (fail-open)',
@@ -1539,6 +1633,9 @@ export class CodexAppServerRuntime {
     try {
       for await (const entry of dir) {
         if (!entry.isFile() || !entry.name.endsWith('.json')) continue
+        // m5: reaper backoff sidecars and quarantine notes are NOT ownership records; counting
+        // them as malformed would misreport the launch diagnostics.
+        if (entry.name.endsWith(REAPER_RETRY_SIDECAR_SUFFIX) || entry.name.endsWith(QUARANTINE_NOTE_SUFFIX)) continue
         if (total >= LAUNCH_DIAGNOSTIC_METADATA_RECORD_CAP) {
           capReached = true
           break
@@ -1971,6 +2068,20 @@ export class CodexAppServerRuntime {
     if (!ownership) {
       if (child && child.exitCode === null && child.signalCode === null) {
         child.kill('SIGTERM')
+      }
+      // m1: spawn failed before ownership was created, so teardownOwnedProcessGroup will never
+      // run for this child — deregister on its exit (or now, if it already exited) to avoid a
+      // permanent registry leak and a misleading codexChildren snapshot. Children WITH ownership
+      // are deregistered exclusively by confirmed-group-death teardown, never here.
+      const pid = child?.pid
+      if (child && pid) {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          deregisterCodexChild(pid)
+        } else {
+          child.once('exit', () => {
+            deregisterCodexChild(pid)
+          })
+        }
       }
       return
     }

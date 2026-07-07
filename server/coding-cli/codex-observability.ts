@@ -1,3 +1,4 @@
+import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -12,16 +13,25 @@ import {
 // Stage 1c observability (plan §7.5): one structured `codex-log-db:` line at boot and then hourly,
 // plus the hourly retry of pending reaper records and the quarantine rescan trigger.
 //
-// STRICTLY read-only over codex state: `fs.stat` on the WAL and a `/proc/*/fd` readlink scan. This
-// module MUST NOT open the SQLite database and MUST NOT signal any process (I1/I3). Every path is
-// try/catch'd: the monitor can never throw, crash the server, or block boot (I4).
+// The status/emit/count functions below (emitCodexLogDbStatus, countCodexLogDbHolders,
+// statWalBytes) are STRICTLY read-only over codex state — `fs.stat` on the WAL and a `/proc/*/fd`
+// readlink scan — and MUST NOT open the SQLite database or signal any process (I1/I3). The hourly
+// maintenance tick is the one exception by design: it delegates to the ownership-gated reaper in
+// runtime.ts, which owns all signalling decisions. Every path is try/catch'd: the monitor can
+// never throw, crash the server, or block boot (I4).
 
 export const CODEX_LOG_DB_FILENAME = 'logs_2.sqlite'
-/** Warn once the WAL exceeds this size (≈ weeks of margin before the ~5 GB launch-wedge cliff). */
-export const CODEX_LOG_DB_WAL_WARN_BYTES = 500 * 1024 * 1024
+/**
+ * Warn once the WAL exceeds this size. The launch-wedge cliff is ~5 GB and the measured worst-case
+ * churn on the incident machine is ~22 MB/min (accepted until Stage 2), so 2 GiB leaves hours of
+ * margin — not weeks — while keeping the hourly line quiet during known-noisy-but-accepted churn.
+ */
+export const CODEX_LOG_DB_WAL_WARN_BYTES = 2 * 1024 * 1024 * 1024
 /** Warn once this many processes hold the log DB open (~2 per pane; normal is tens, not hundreds). */
 export const CODEX_LOG_DB_HOLDER_WARN_THRESHOLD = 64
 export const CODEX_OBSERVABILITY_INTERVAL_MS = 60 * 60 * 1000
+/** Bounded fan-out for the /proc fd scan: at most this many pids are probed concurrently (M3). */
+export const CODEX_HOLDER_SCAN_CONCURRENCY = 12
 
 export type CodexObservabilityLogger = {
   info: (fields: Record<string, unknown>, message: string) => void
@@ -55,51 +65,100 @@ export function resolveCodexLogDbPath(codexHome: string): string {
   return path.join(codexHome, CODEX_LOG_DB_FILENAME)
 }
 
-async function statWalBytes(walPath: string): Promise<number> {
+// Symlink-proof canonicalization so fd readlink targets (always fully resolved) compare against
+// the same string. Falls back to a plain resolve when the DB does not exist yet.
+function canonicalizeDbPath(dbPath: string): string {
   try {
-    return (await fsp.stat(walPath)).size
+    return fs.realpathSync.native(dbPath)
   } catch {
-    return 0 // missing or unreadable WAL reads as empty; the monitor never throws
+    return path.resolve(dbPath)
+  }
+}
+
+type WalStat = { walBytes: number; walStatFailed: boolean }
+
+// ENOENT genuinely means "no WAL" (an idle or absent DB) and reads as 0. Any OTHER stat failure is
+// reported as walBytes=-1 + walStatFailed so a permission/IO problem can never masquerade as an
+// empty WAL (panel M5).
+async function statWalBytes(walPath: string): Promise<WalStat> {
+  try {
+    return { walBytes: (await fsp.stat(walPath)).size, walStatFailed: false }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { walBytes: 0, walStatFailed: false }
+    return { walBytes: -1, walStatFailed: true }
   }
 }
 
 // Counts processes holding the log DB (or its -wal/-shm siblings) open via a read-only /proc fd
-// readlink scan. Unreadable fd tables (EACCES, exited mid-scan) are skipped, never fatal.
-export async function countCodexLogDbHolders(dbPath: string, procRoot = '/proc'): Promise<number> {
+// readlink scan. Cost-bounded (panel M3): only pids whose cmdline mentions codex are probed (they
+// are the only holders this line cares to count), the server itself is skipped, and at most
+// CODEX_HOLDER_SCAN_CONCURRENCY pids are in flight at once. Unreadable cmdlines/fd tables (EACCES,
+// exited mid-scan) are skipped, never fatal. fd targets of unlinked-but-open files carry a
+// ' (deleted)' suffix which is stripped before comparison.
+export async function countCodexLogDbHolders(
+  dbPath: string,
+  procRoot = '/proc',
+  selfPid: number = process.pid,
+): Promise<number> {
+  const resolvedDbPath = canonicalizeDbPath(dbPath)
   let entries: string[]
   try {
     entries = await fsp.readdir(procRoot)
   } catch {
     return 0
   }
+  const pids = entries.filter((entry) => /^\d+$/.test(entry) && Number(entry) !== selfPid)
+  const matchesDb = (rawTarget: string): boolean => {
+    const target = rawTarget.endsWith(' (deleted)')
+      ? rawTarget.slice(0, -' (deleted)'.length)
+      : rawTarget
+    return target === resolvedDbPath || target.startsWith(`${resolvedDbPath}-`)
+  }
   let holders = 0
-  await Promise.all(entries.map(async (entry) => {
-    if (!/^\d+$/.test(entry)) return
-    const fdDir = path.join(procRoot, entry, 'fd')
-    let fds: string[]
-    try {
-      fds = await fsp.readdir(fdDir)
-    } catch {
-      return
-    }
-    for (const fd of fds) {
-      let target: string
+  let next = 0
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const index = next
+      next += 1
+      if (index >= pids.length) return
+      const pid = pids[index]
+      // Prefilter: one cheap cmdline read gates the (much more expensive) per-fd readlink walk.
+      let cmdline: string
       try {
-        target = await fsp.readlink(path.join(fdDir, fd))
+        cmdline = (await fsp.readFile(path.join(procRoot, pid, 'cmdline'))).toString('utf8')
       } catch {
         continue
       }
-      if (target === dbPath || target.startsWith(`${dbPath}-`)) {
-        holders += 1
-        return
+      if (!cmdline.includes('codex')) continue
+      const fdDir = path.join(procRoot, pid, 'fd')
+      let fds: string[]
+      try {
+        fds = await fsp.readdir(fdDir)
+      } catch {
+        continue
+      }
+      for (const fd of fds) {
+        let target: string
+        try {
+          target = await fsp.readlink(path.join(fdDir, fd))
+        } catch {
+          continue
+        }
+        if (matchesDb(target)) {
+          holders += 1
+          break
+        }
       }
     }
-  }))
+  }
+  const workerCount = Math.max(1, Math.min(CODEX_HOLDER_SCAN_CONCURRENCY, pids.length))
+  await Promise.all(Array.from({ length: workerCount }, () => worker()))
   return holders
 }
 
 export type CodexLogDbStatus = {
   walBytes: number
+  walStatFailed: boolean
   holders: number
   quarantined: number
   warned: boolean
@@ -111,24 +170,25 @@ export async function emitCodexLogDbStatus(
   const log = options.log ?? defaultLog
   try {
     const codexHome = options.codexHome ?? resolveCodexHome(options.env)
-    const dbPath = path.resolve(resolveCodexLogDbPath(codexHome))
+    const dbPath = canonicalizeDbPath(resolveCodexLogDbPath(codexHome))
     const walPath = `${dbPath}-wal`
-    const [walBytes, holders, quarantined] = await Promise.all([
+    const [walStat, holders, quarantined] = await Promise.all([
       statWalBytes(walPath),
       countCodexLogDbHolders(dbPath, options.procRoot ?? '/proc'),
       countCodexQuarantinedRecords(options.metadataDir),
     ])
+    const { walBytes, walStatFailed } = walStat
     const walWarnBytes = options.walWarnBytes ?? CODEX_LOG_DB_WAL_WARN_BYTES
     const holderWarnThreshold = options.holderWarnThreshold ?? CODEX_LOG_DB_HOLDER_WARN_THRESHOLD
-    const warned = walBytes > walWarnBytes || holders > holderWarnThreshold
-    const fields = { walBytes, holders, quarantined, walPath, dbPath }
+    const warned = walBytes > walWarnBytes || holders > holderWarnThreshold || walStatFailed
+    const fields = { walBytes, walStatFailed, holders, quarantined, walPath, dbPath }
     const message = `codex-log-db: wal_bytes=${walBytes} holders=${holders} quarantined=${quarantined}`
     if (warned) {
       log.warn(fields, message)
     } else {
       log.info(fields, message)
     }
-    return { walBytes, holders, quarantined, warned }
+    return { walBytes, walStatFailed, holders, quarantined, warned }
   } catch (error) {
     try {
       log.warn({ err: error }, 'codex-log-db observability probe failed')
@@ -142,7 +202,9 @@ export async function emitCodexLogDbStatus(
 // Hourly maintenance (plan §7.3–.5): trigger the quarantine rescan and, when any retry-in-place
 // record's time-based backoff window has elapsed (or a quarantined record was just promoted),
 // re-run the reaper. The per-boot reap attempt always runs at startup; backoff gates only this
-// hourly cadence and the reaper's log escalation.
+// hourly cadence (per record, via respectRetryBackoff) and the reaper's log escalation. NOTE:
+// unlike the read-only status functions above, this tick deliberately delegates to the
+// ownership-gated reaper, which may signal provably-owned process groups.
 export async function runCodexReaperMaintenanceTick(options: CodexReaperMaintenanceOptions): Promise<void> {
   const log = options.log ?? defaultLog
   try {
@@ -151,6 +213,8 @@ export async function runCodexReaperMaintenanceTick(options: CodexReaperMaintena
     if (promotedRecords.length === 0 && !due) return
     await reapOrphanedCodexAppServerSidecars({
       serverInstanceId: options.serverInstanceId,
+      // m2: per-record backoff gating — only due records are re-attempted (and re-counted).
+      respectRetryBackoff: true,
       ...(options.metadataDir !== undefined ? { metadataDir: options.metadataDir } : {}),
       ...(options.terminateGraceMs !== undefined ? { terminateGraceMs: options.terminateGraceMs } : {}),
     })
@@ -166,7 +230,8 @@ export async function runCodexReaperMaintenanceTick(options: CodexReaperMaintena
 export type CodexObservabilityHandle = { stop(): void }
 
 // Started from server/index.ts at boot. Emits one status line immediately, then hourly on an
-// unref()'d interval timer (it can never hold the process open). Fully fail-open.
+// unref()'d interval timer (it can never hold the process open). Fully fail-open. index.ts keeps
+// the handle and calls stop() as the first step of shutdown() so a tick cannot race teardown (m7).
 export function startCodexObservability(options: CodexObservabilityOptions): CodexObservabilityHandle {
   let timer: NodeJS.Timeout | null = null
   const tick = async (): Promise<void> => {

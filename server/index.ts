@@ -264,7 +264,7 @@ async function main() {
   }
   // Boot + hourly codex-log-db line (WAL size, holder count, quarantine count), hourly retry of
   // pending reaper records, and the quarantine rescan trigger. Observation-only; unref()'d timer.
-  startCodexObservability({ serverInstanceId })
+  const codexObservability = startCodexObservability({ serverInstanceId })
   const freshAgentModelCapabilityRegistry = new FreshAgentModelCapabilityRegistry()
 
   let sdkBridge: SdkBridge
@@ -1090,14 +1090,28 @@ async function main() {
   // (SIGTERM/SIGINT/SIGHUP) share the same hang exposure in joinCodexShutdownOwners below. A
   // *throw* from joinCodexShutdownOwners already dies on its own: shutdown() is invoked un-awaited,
   // so the rejection is unhandled -> default-fatal -> 'exit' -> reapSync. The timer exists for the
-  // hang case, where teardown never settles and 'exit' would otherwise never fire.
-  const SHUTDOWN_HARD_EXIT_TIMEOUT_MS = 15_000
+  // hang case, where teardown never settles and 'exit' would otherwise never fire. 30s (panel M6):
+  // a legitimately slow-but-healthy shutdown awaits in-flight HTTP responses plus several bounded
+  // steps that can sum near 15s, so the old 15s budget force-killed healthy teardowns.
+  const SHUTDOWN_HARD_EXIT_TIMEOUT_MS = 30_000
   const shutdown = async (signal: string) => {
     if (isShuttingDown) return
     isShuttingDown = true
 
+    // m7 (first step): stop the hourly codex observability/maintenance tick so it cannot race
+    // teardown (e.g. re-running the reaper while sidecars are being torn down).
+    codexObservability.stop()
+
     const hardExitTimer = setTimeout(() => {
-      log.error({ signal, timeoutMs: SHUTDOWN_HARD_EXIT_TIMEOUT_MS }, 'Shutdown hung; forcing process exit')
+      // May be slow rather than hung — but past the budget we force the exit either way. Write the
+      // final line synchronously too: async pino may not flush before process.exit.
+      const message = `Shutdown did not complete within ${SHUTDOWN_HARD_EXIT_TIMEOUT_MS}ms; forcing exit`
+      try {
+        log.error({ signal, timeoutMs: SHUTDOWN_HARD_EXIT_TIMEOUT_MS }, message)
+      } catch {
+        // stderr below is the fallback
+      }
+      process.stderr.write(`${message}\n`)
       process.exit(1)
     }, SHUTDOWN_HARD_EXIT_TIMEOUT_MS)
     hardExitTimer.unref()
@@ -1119,6 +1133,10 @@ async function main() {
         resolve()
       })
     })
+    // M6: server.close() only stops NEW connections — keep-alive/in-flight sockets would otherwise
+    // hold httpServerClosed open toward the hard-exit budget. Sever them now (Node >=18.2 API,
+    // optional-chained defensively).
+    server.closeAllConnections?.()
 
     // 3. Stop any coalesced sessions publish timers
     sessionsSync.shutdown()
@@ -1164,7 +1182,8 @@ async function main() {
     // 10. Stop session repair service
     await sessionRepairService.stop()
 
-    // 11. Exit cleanly
+    // 11. Exit cleanly (hygiene: the force-exit timer is unref()d, but clear it anyway)
+    clearTimeout(hardExitTimer)
     log.info('Shutdown complete')
     process.exit(0)
   }

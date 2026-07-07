@@ -10,7 +10,7 @@ import { logger } from '../logger.js'
 //   caller (`reapSync`), and `reapSync` is referenced only from the `'exit'` binding — both are
 //   enforced structurally by test/unit/server/coding-cli/codex-child-registry.test.ts.
 // - I4: nothing here may throw out of an exit path or block boot. Every reap step is per-entry
-//   try/catch'd; registration is a Map write.
+//   try/catch'd; registration is a Map write plus a best-effort /proc stat read.
 //
 // Platform gating: the negative-pid group kill and the /proc identity re-check are Linux-only
 // (consistent with `assertUnixSidecarSupport` in codex-app-server/runtime.ts). On win32 (and any
@@ -24,6 +24,12 @@ export type CodexChildEntry = {
   /** Process group id. Both child kinds are spawned as group/session leaders, so pgid == pid. */
   pgid: number
   kind: CodexChildKind
+  /**
+   * /proc/<pid>/stat starttime (field 22, clock ticks since boot) captured at registration.
+   * Registration is best-effort: undefined when the stat was unreadable/unparseable at register
+   * time, in which case reapSync falls back to the pgrp+cmdline identity checks for this entry.
+   */
+  startTimeTicks?: number
 }
 
 export type CodexChildRegistryLogger = {
@@ -46,8 +52,10 @@ export type CodexChildProcessLike = {
 
 export type CodexChildRegistryDeps = {
   platform?: NodeJS.Platform
-  /** Sync read used for /proc/self/stat (own pgid) and /proc/<pid>/cmdline (identity re-check). */
+  /** Sync read used for /proc/<pid>/stat and /proc/<pid>/cmdline identity checks. */
   readFileSync?: (filePath: string) => Buffer
+  /** Sync directory listing used only by the dead-pid group-membership fallback scan. */
+  readdirSync?: (dirPath: string) => string[]
   /** The raw signal syscall. Only `killProcessGroupSync` may invoke it with a negative pid. */
   killSync?: (pid: number, signal: NodeJS.Signals) => void
   proc?: CodexChildProcessLike
@@ -62,18 +70,26 @@ export type CodexChildRegistry = {
   installExitHandlers: (options: CodexChildExitHandlerOptions) => void
 }
 
-/** Parses the pgrp field (field 5) of a `/proc/<pid>/stat` line; comm may contain spaces/parens. */
-function parseStatPgid(stat: string): number | null {
+type ProcStatInfo = { pgrp: number; startTimeTicks: number }
+
+/**
+ * Parses pgrp (field 5) and starttime (field 22) of a `/proc/<pid>/stat` line; comm may contain
+ * spaces/parens, so fields are counted after the LAST close paren.
+ */
+function parseProcStatInfo(stat: string): ProcStatInfo | null {
   const closeParen = stat.lastIndexOf(')')
   if (closeParen === -1) return null
   const fields = stat.slice(closeParen + 2).trim().split(/\s+/)
   const pgrp = Number(fields[2])
-  return Number.isInteger(pgrp) ? pgrp : null
+  const startTimeTicks = Number(fields[19])
+  if (!Number.isInteger(pgrp) || !Number.isFinite(startTimeTicks)) return null
+  return { pgrp, startTimeTicks }
 }
 
 export function createCodexChildRegistry(deps: CodexChildRegistryDeps = {}): CodexChildRegistry {
   const platform = deps.platform ?? process.platform
   const readFileSync = deps.readFileSync ?? ((filePath: string) => fs.readFileSync(filePath))
+  const readdirSync = deps.readdirSync ?? ((dirPath: string) => fs.readdirSync(dirPath))
   const killSync = deps.killSync ?? ((pid: number, signal: NodeJS.Signals) => process.kill(pid, signal))
   const proc = deps.proc ?? (process as CodexChildProcessLike)
   const log = deps.log ?? logger.child({ component: 'codex-child-registry' })
@@ -88,8 +104,25 @@ export function createCodexChildRegistry(deps: CodexChildRegistryDeps = {}): Cod
       log.warn({ entry }, 'Refusing to register codex child with invalid pid/pgid')
       return
     }
+    // Pin the pid's identity at registration (panel M1a): entries can outlive a recycled pid by
+    // days, so the exit-time reap must be able to prove the pid still names the SAME process.
+    // Best-effort — an unreadable stat stores undefined and that entry falls back to the
+    // pgrp+cmdline checks alone.
+    let startTimeTicks: number | undefined
+    if (platform === 'linux') {
+      try {
+        startTimeTicks = parseProcStatInfo(readFileSync(`/proc/${entry.pid}/stat`).toString('utf8'))?.startTimeTicks
+      } catch {
+        startTimeTicks = undefined
+      }
+    }
     // Double-registration of the same pid is safe: latest registration wins (plan §6 idempotency).
-    children.set(entry.pid, { pid: entry.pid, pgid: entry.pgid, kind: entry.kind })
+    children.set(entry.pid, {
+      pid: entry.pid,
+      pgid: entry.pgid,
+      kind: entry.kind,
+      ...(startTimeTicks !== undefined ? { startTimeTicks } : {}),
+    })
   }
 
   function deregister(pid: number): boolean {
@@ -109,15 +142,81 @@ export function createCodexChildRegistry(deps: CodexChildRegistryDeps = {}): Cod
   }
 
   /**
+   * Dead-pid fallback (panel M1b): the registered wrapper pid being gone does NOT mean the group
+   * is gone — live grandchildren (the actual DB holders) can survive it, and that is precisely the
+   * case the registry exists for. Bounded sync scan of /proc: kill only when a member of the
+   * registered pgid is provably a codex process; if members exist but none are codex the pgid was
+   * recycled — never signal it. Fully synchronous, per-pid try/catch'd.
+   */
+  function groupHasCodexMemberSync(pgid: number): boolean {
+    let names: string[]
+    try {
+      names = readdirSync('/proc')
+    } catch {
+      return false // cannot enumerate: fail towards not signalling (I3)
+    }
+    for (const name of names) {
+      if (!/^\d+$/.test(name)) continue
+      try {
+        const info = parseProcStatInfo(readFileSync(`/proc/${name}/stat`).toString('utf8'))
+        if (!info || info.pgrp !== pgid) continue
+        const cmdline = readFileSync(`/proc/${name}/cmdline`).toString('utf8')
+        if (cmdline.includes('codex')) return true
+      } catch {
+        continue // member vanished mid-scan or is unreadable: not proof either way
+      }
+    }
+    return false // no members (group gone) or only non-codex members (pgid recycled)
+  }
+
+  /**
+   * Identity verdict for one registered entry (panel M1a). Kill only when EVERY provable check
+   * passes: recorded starttime matches exactly (when recorded), the pid is still in the registered
+   * process group, and its cmdline still looks like codex. Any mismatch means the entry is stale
+   * (pid recycled — possibly by the OTHER server instance's live codex pane) and must be skipped.
+   * A pid that is gone from /proc routes to the dead-pid group fallback above.
+   */
+  function shouldKillEntrySync(entry: CodexChildEntry): boolean {
+    let statRaw: string | null
+    try {
+      statRaw = readFileSync(`/proc/${entry.pid}/stat`).toString('utf8')
+    } catch {
+      statRaw = null
+    }
+    if (statRaw === null) {
+      // Registered pid is dead; the group may still hold live codex grandchildren.
+      return groupHasCodexMemberSync(entry.pgid)
+    }
+    const info = parseProcStatInfo(statRaw)
+    if (!info) return false // present but unprovable: never signal (I3)
+    if (entry.startTimeTicks !== undefined && info.startTimeTicks !== entry.startTimeTicks) {
+      return false // pid recycled by a different process: stale entry
+    }
+    if (info.pgrp !== entry.pgid) return false // pid no longer in the registered group: stale entry
+    let cmdline: string
+    try {
+      cmdline = readFileSync(`/proc/${entry.pid}/cmdline`).toString('utf8')
+    } catch {
+      // stat readable but cmdline not (e.g. zombie wrapper): treat as dead-pid, scan the group.
+      return groupHasCodexMemberSync(entry.pgid)
+    }
+    if (cmdline.length === 0) {
+      // Zombie wrapper (empty cmdline): the wrapper is dead but grandchildren may live.
+      return groupHasCodexMemberSync(entry.pgid)
+    }
+    return cmdline.includes('codex')
+  }
+
+  /**
    * Synchronous best-effort reap of still-registered codex process groups, for `process.on('exit')`.
    * After a graceful shutdown the registry has been drained (children deregistered on confirmed
    * group death / pty exit), so this is a no-op.
    *
-   * Residual pgid-reuse window (accepted, plan §6): the sync cmdline re-check narrows — but cannot
-   * close — the check-then-kill race. Between reading /proc/<pid>/cmdline and kill(-pgid) the pid
-   * could exit and the pgid be reused. This is narrower than signalling blindly but wider than the
-   * async reaper's fresh ownership classification (runtime.ts classifyOwnedProcessGroup); at
-   * process-death time there is no async alternative.
+   * Residual pgid-reuse window (accepted, plan §6): the sync starttime+pgrp+cmdline re-check
+   * narrows — but cannot close — the check-then-kill race. Between the /proc reads and kill(-pgid)
+   * the pid could exit and the pgid be reused. This is narrower than signalling blindly but wider
+   * than the async reaper's fresh ownership classification (runtime.ts classifyOwnedProcessGroup);
+   * at process-death time there is no async alternative.
    */
   function reapSync(): void {
     try {
@@ -129,7 +228,7 @@ export function createCodexChildRegistry(deps: CodexChildRegistryDeps = {}): Cod
       // anything (fail towards not signalling — I3 over reap completeness).
       let ownPgid: number | null = null
       try {
-        ownPgid = parseStatPgid(readFileSync('/proc/self/stat').toString('utf8'))
+        ownPgid = parseProcStatInfo(readFileSync('/proc/self/stat').toString('utf8'))?.pgrp ?? null
       } catch {
         ownPgid = null
       }
@@ -142,17 +241,7 @@ export function createCodexChildRegistry(deps: CodexChildRegistryDeps = {}): Cod
           // Guards (I3): only registered pgids; never -1/0/1, our own pid's group, or our own pgid.
           if (!Number.isInteger(pgid) || pgid <= 1) continue
           if (pgid === proc.pid || pgid === ownPgid) continue
-
-          // Cheap sync identity re-check: the registered pid must still be a codex process. A read
-          // failure means the process is gone (nothing to reap); a non-codex cmdline means the pid
-          // was reused (never signal it).
-          let cmdline: string
-          try {
-            cmdline = readFileSync(`/proc/${pid}/cmdline`).toString('utf8')
-          } catch {
-            continue
-          }
-          if (!cmdline.includes('codex')) continue
+          if (!shouldKillEntrySync(entry)) continue
 
           killProcessGroupSync(pgid)
         } catch {

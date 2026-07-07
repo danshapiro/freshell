@@ -6,10 +6,14 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
+  CODEX_REAPER_BOOT_BUDGET_MS,
+  CODEX_REAPER_LOG_ESCALATION_MS,
   CodexAppServerRuntime,
   codexReaperRetryIntervalMs,
+  isCodexReaperEscalationDue,
   isCodexReaperRetryDue,
   reapOrphanedCodexAppServerSidecars,
+  rescanCodexReaperQuarantine,
   runCodexStartupReaper,
 } from '../../../../../server/coding-cli/codex-app-server/runtime.js'
 import { allocateLocalhostPort, type LoopbackServerEndpoint } from '../../../../../server/local-port.js'
@@ -1452,6 +1456,105 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     }
     expect(isCodexReaperRetryDue(state, now)).toBe(false)
     expect(isCodexReaperRetryDue({ ...state, lastAttempt: new Date(now - HOUR).toISOString() }, now)).toBe(true)
+  })
+
+  it('escalates retry logging on wall-time pending age, not attempt count (M4)', () => {
+    const HOUR = 60 * 60 * 1000
+    expect(CODEX_REAPER_LOG_ESCALATION_MS).toBe(6 * HOUR)
+    const now = Date.parse('2026-07-06T12:00:00.000Z')
+    // Young record hammered by tsx-watch restarts: high attempts must NOT escalate…
+    const young = {
+      firstSeen: new Date(now - 5 * HOUR).toISOString(),
+      attempts: 50,
+      lastAttempt: new Date(now).toISOString(),
+    }
+    expect(isCodexReaperEscalationDue(young, now)).toBe(false)
+    // …while a record pending past the wall-time threshold escalates even at one attempt.
+    const old = { ...young, firstSeen: new Date(now - 7 * HOUR).toISOString(), attempts: 1 }
+    expect(isCodexReaperEscalationDue(old, now)).toBe(true)
+  })
+
+  it('defers group teardowns past the boot time budget with retry state, without throwing (M2)', async () => {
+    const metadataDir = await makeTempDir()
+    const writeOrphanRecord = async (name: string, ownershipId: string) => {
+      const now = new Date().toISOString()
+      await fsp.writeFile(path.join(metadataDir, name), JSON.stringify({
+        schemaVersion: 1,
+        ownershipId,
+        serverInstanceId: 'srv-previous',
+        ownerServerPid: 999_999_999,
+        terminalId: null,
+        generation: null,
+        wsUrl: 'ws://127.0.0.1:1',
+        wrapperPid: 999_999_998,
+        processGroupId: 999_999_997,
+        wrapperIdentity: { commandLine: ['codex'], cwd: '/tmp', startTimeTicks: 1 },
+        createdAt: now,
+        updatedAt: now,
+      }), { mode: 0o600 })
+    }
+    await writeOrphanRecord('a.json', 'budget-a')
+    await writeOrphanRecord('b.json', 'budget-b')
+    await writeOrphanRecord('c.json', 'budget-c')
+
+    // Fake clock simulating a slow teardown: the pass starts at 0; the first record's budget check
+    // sees 0ms elapsed (attempted), the second sees 4s (over the 3s budget), the third 8s.
+    const times = [0, 0, 4_000, 8_000]
+    let call = 0
+    const nowFn = () => times[Math.min(call++, times.length - 1)]
+
+    const result = await reapOrphanedCodexAppServerSidecars({
+      metadataDir,
+      serverInstanceId: 'srv-current',
+      terminateGraceMs: 1,
+      teardownBudgetMs: CODEX_REAPER_BOOT_BUDGET_MS,
+      nowFn,
+    })
+
+    // Within budget: attempted (owner dead + group gone -> reaped).
+    expect(result.reapedOwnershipIds).toEqual(['budget-a'])
+    // Past budget: deferred, never dropped — records stay in place with retry state written.
+    expect(result.deferredForBudget).toEqual(['budget-b', 'budget-c'])
+    for (const name of ['b.json', 'c.json']) {
+      await expect(fsp.stat(path.join(metadataDir, name))).resolves.toBeDefined()
+      const state = JSON.parse(await fsp.readFile(path.join(metadataDir, `${name}.reaper.json`), 'utf8'))
+      expect(state.attempts).toBe(1)
+    }
+    await expect(fsp.stat(path.join(metadataDir, 'a.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('purges stranded atomic-write tmp files older than an hour (m9)', async () => {
+    const metadataDir = await makeTempDir()
+    const stalePath = path.join(metadataDir, 'dead.json.tmp-1234-5678')
+    const freshPath = path.join(metadataDir, 'live.json.tmp-1234-9999')
+    await fsp.writeFile(stalePath, '{}')
+    await fsp.writeFile(freshPath, '{}')
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000)
+    await fsp.utimes(stalePath, twoHoursAgo, twoHoursAgo)
+
+    await reapOrphanedCodexAppServerSidecars({ metadataDir, serverInstanceId: 'srv-current', terminateGraceMs: 1 })
+
+    await expect(fsp.stat(stalePath)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fsp.stat(freshPath)).resolves.toBeDefined()
+  })
+
+  it('unlinks orphaned quarantine notes whose record file is absent (m3)', async () => {
+    const metadataDir = await makeTempDir()
+    const quarantineDir = path.join(metadataDir, 'quarantine')
+    await fsp.mkdir(quarantineDir, { recursive: true })
+    const orphanNote = path.join(quarantineDir, 'ghost.json.note.json')
+    await fsp.writeFile(orphanNote, JSON.stringify({ reason: 'unparseable-record' }))
+    // A note whose record IS present must be left alone.
+    const keptRecord = path.join(quarantineDir, 'kept.json')
+    const keptNote = path.join(quarantineDir, 'kept.json.note.json')
+    await fsp.writeFile(keptRecord, 'not json (unparseable, never promoted)')
+    await fsp.writeFile(keptNote, JSON.stringify({ reason: 'unparseable-record' }))
+
+    await rescanCodexReaperQuarantine(metadataDir)
+
+    await expect(fsp.stat(orphanNote)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fsp.stat(keptNote)).resolves.toBeDefined()
+    await expect(fsp.stat(keptRecord)).resolves.toBeDefined()
   })
 
   it('reports a skipped new-schema ownership record when the owner pid is live', async () => {

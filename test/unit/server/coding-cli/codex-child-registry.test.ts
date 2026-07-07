@@ -31,10 +31,18 @@ function makeFakeProc(pid = 7_777): FakeProc {
   return emitter
 }
 
-function statLine(pid: number, pgrp: number): string {
-  // pid (comm) state ppid pgrp ... — comm intentionally contains a space + paren to exercise the
-  // lastIndexOf(')') parse.
-  return `${pid} (no de)s) S 1 ${pgrp} ${pgrp} 0 -1 4194560 100 0 0 0`
+// pid (comm) state ppid pgrp sess tty tpgid flags ... starttime(field 22) — comm intentionally
+// contains a space + paren to exercise the lastIndexOf(')') parse. Field 22 (index 19 after the
+// close paren) is starttime.
+function statLine(pid: number, pgrp: number, startTimeTicks = 100): string {
+  const tail = [
+    'S', '1', String(pgrp), String(pgrp), '0', '-1', '4194560',
+    '100', '0', '0', '0', // minflt cminflt majflt cmajflt
+    '5', '3', '0', '0', // utime stime cutime cstime
+    '20', '0', '1', '0', // priority nice threads itrealvalue
+    String(startTimeTicks), '1024', '0', // starttime vsize rss
+  ]
+  return `${pid} (no de)s) ${tail.join(' ')}`
 }
 
 function makeHarness(overrides: {
@@ -58,6 +66,15 @@ function makeHarness(overrides: {
     }
     return Buffer.from(content)
   })
+  // Directory listing derived from the fake file map (dead-pid group fallback scan).
+  const readdirSync = vi.fn((dirPath: string): string[] => {
+    const names = new Set<string>()
+    for (const key of files.keys()) {
+      if (!key.startsWith(`${dirPath}/`)) continue
+      names.add(key.slice(dirPath.length + 1).split('/')[0])
+    }
+    return [...names]
+  })
   const killSync = vi.fn((pid: number, signal: NodeJS.Signals) => {
     kills.push({ pid, signal })
   })
@@ -66,11 +83,12 @@ function makeHarness(overrides: {
   const registry = createCodexChildRegistry({
     platform: overrides.platform ?? 'linux',
     readFileSync,
+    readdirSync,
     killSync,
     proc,
     log,
   })
-  return { registry, kills, killSync, readFileSync, log, proc, files }
+  return { registry, kills, killSync, readFileSync, readdirSync, log, proc, files }
 }
 
 function entry(pid: number, kind: CodexChildEntry['kind'] = 'app-server', pgid = pid): CodexChildEntry {
@@ -92,6 +110,19 @@ describe('codex child registry', () => {
       expect(registry.deregister(100)).toBe(true)
       expect(registry.snapshot()).toEqual([{ pid: 200, pgid: 200, kind: 'resume-pty' }])
       expect(registry.deregister(100)).toBe(false)
+    })
+
+    it('captures the /proc starttime at registration (best-effort identity pin)', () => {
+      const { registry, files } = makeHarness()
+      files.set('/proc/100/stat', statLine(100, 100, 777))
+      registry.register(entry(100))
+      // pid 200 has no readable stat: registration still succeeds without the pin.
+      registry.register(entry(200, 'resume-pty'))
+
+      expect(registry.snapshot()).toEqual([
+        { pid: 100, pgid: 100, kind: 'app-server', startTimeTicks: 777 },
+        { pid: 200, pgid: 200, kind: 'resume-pty' },
+      ])
     })
 
     it('is safe to double-register the same pid (latest registration wins)', () => {
@@ -126,13 +157,14 @@ describe('codex child registry', () => {
   })
 
   describe('reapSync', () => {
-    it('SIGKILLs only registered entries whose /proc identity still looks like codex', () => {
+    it('SIGKILLs only registered entries whose /proc identity still verifies (starttime+pgrp+cmdline)', () => {
       const { registry, kills, files } = makeHarness()
+      files.set('/proc/100/stat', statLine(100, 100, 11))
       files.set('/proc/100/cmdline', '/usr/local/bin/codex\0resume\0abc\0')
-      // pid 200 has no /proc entry (already gone); pid 300 was reused by a non-codex process.
+      // pid 300 was reused by a non-codex process (same pid, non-codex cmdline).
+      files.set('/proc/300/stat', statLine(300, 300, 33))
       files.set('/proc/300/cmdline', '/bin/bash\0')
       registry.register(entry(100, 'app-server'))
-      registry.register(entry(200, 'resume-pty'))
       registry.register(entry(300, 'resume-pty'))
 
       registry.reapSync()
@@ -144,9 +176,83 @@ describe('codex child registry', () => {
       expect(kills).toHaveLength(1)
     })
 
+    it('kills the group when the registered pid is dead but a live codex member remains (M1b)', () => {
+      const { registry, kills, files } = makeHarness()
+      // The registered wrapper (pid 200) is gone from /proc, but grandchild 250 still lives in
+      // pgid 200 and is provably codex — this is the D-state-holder case the registry exists for.
+      files.set('/proc/250/stat', statLine(250, 200, 55))
+      files.set('/proc/250/cmdline', '/usr/local/bin/codex\0app-server\0')
+      registry.register(entry(200, 'app-server'))
+
+      registry.reapSync()
+
+      expect(kills).toEqual([{ pid: -200, signal: 'SIGKILL' }])
+    })
+
+    it('skips a dead pid whose pgid was recycled by non-codex processes (M1b)', () => {
+      const { registry, kills, files } = makeHarness()
+      files.set('/proc/250/stat', statLine(250, 200, 55))
+      files.set('/proc/250/cmdline', '/bin/bash\0')
+      registry.register(entry(200, 'app-server'))
+
+      registry.reapSync()
+
+      expect(kills).toEqual([])
+    })
+
+    it('skips a dead pid whose group has no remaining members', () => {
+      const { registry, kills } = makeHarness()
+      registry.register(entry(200, 'app-server'))
+
+      registry.reapSync()
+
+      expect(kills).toEqual([])
+    })
+
+    it('skips an entry whose recorded starttime no longer matches (pid recycled, M1a)', () => {
+      const { registry, kills, files } = makeHarness()
+      files.set('/proc/100/stat', statLine(100, 100, 11))
+      files.set('/proc/100/cmdline', 'codex\0')
+      registry.register(entry(100))
+      // The pid was recycled: same pid+pgrp+codex-looking cmdline, different starttime — e.g. the
+      // OTHER server instance's live codex pane. Must never be signaled.
+      files.set('/proc/100/stat', statLine(100, 100, 999))
+
+      registry.reapSync()
+
+      expect(kills).toEqual([])
+    })
+
+    it('skips an entry whose pid left the registered process group (M1a)', () => {
+      const { registry, kills, files } = makeHarness()
+      files.set('/proc/100/stat', statLine(100, 100, 11))
+      files.set('/proc/100/cmdline', 'codex\0')
+      registry.register(entry(100))
+      files.set('/proc/100/stat', statLine(100, 999, 11))
+
+      registry.reapSync()
+
+      expect(kills).toEqual([])
+    })
+
+    it('verifies pgrp+cmdline when no starttime was recorded at registration (fallback pin)', () => {
+      const { registry, kills, files } = makeHarness()
+      // No stat available at register time (startTimeTicks undefined)...
+      registry.register(entry(100))
+      // ...but readable at reap time: pgrp matches and cmdline is codex, so the kill proceeds.
+      files.set('/proc/100/stat', statLine(100, 100, 11))
+      files.set('/proc/100/cmdline', 'codex\0')
+
+      registry.reapSync()
+
+      expect(kills).toEqual([{ pid: -100, signal: 'SIGKILL' }])
+    })
+
     it('never signals our own process group or our own pid group', () => {
       const { registry, kills, files } = makeHarness({ ownPgid: 4_242, procPid: 7_777 })
+      files.set('/proc/555/stat', statLine(555, 4_242))
       files.set('/proc/555/cmdline', 'codex\0')
+      files.set('/proc/556/stat', statLine(556, 7_777))
       files.set('/proc/556/cmdline', 'codex\0')
       registry.register({ pid: 555, pgid: 4_242, kind: 'app-server' }) // own pgid
       registry.register({ pid: 556, pgid: 7_777, kind: 'app-server' }) // our pid's group
@@ -158,6 +264,7 @@ describe('codex child registry', () => {
 
     it('signals nothing when our own pgid cannot be proven', () => {
       const { registry, kills, files } = makeHarness({ ownPgid: 'unreadable' })
+      files.set('/proc/100/stat', statLine(100, 100))
       files.set('/proc/100/cmdline', 'codex\0')
       registry.register(entry(100))
 
@@ -179,7 +286,9 @@ describe('codex child registry', () => {
 
     it('never throws out of the exit path and keeps reaping after a kill failure', () => {
       const { registry, killSync, kills, files } = makeHarness()
+      files.set('/proc/100/stat', statLine(100, 100, 11))
       files.set('/proc/100/cmdline', 'codex\0')
+      files.set('/proc/200/stat', statLine(200, 200, 22))
       files.set('/proc/200/cmdline', 'codex\0')
       killSync.mockImplementationOnce(() => {
         throw Object.assign(new Error('EPERM'), { code: 'EPERM' })
@@ -242,7 +351,9 @@ describe('codex child registry', () => {
       // killProcessGroupSync appears exactly twice: its definition and its single call site…
       const references = source.match(/killProcessGroupSync\(/g) ?? []
       expect(references).toHaveLength(2)
-      // …and the call site is inside reapSync's body.
+      // …and the call site is inside reapSync's body. The identity helpers between the primitive
+      // and reapSync (groupHasCodexMemberSync/shouldKillEntrySync) only return verdicts — they
+      // must never signal.
       const reapBody = source.slice(
         source.indexOf('function reapSync'),
         source.indexOf('function installExitHandlers'),
@@ -298,9 +409,16 @@ describe('codex child registry', () => {
         runtimeSource.indexOf('private async stopActiveChild'),
       )
       expect(wrapperExitBody).not.toContain('deregisterCodexChild')
+      // m1: the spawn-failure-before-ownership path deregisters on the child's exit (the only
+      // case where ownership teardown will never run for the child).
+      const stopActiveChildBody = runtimeSource.slice(
+        runtimeSource.indexOf('private async stopActiveChild'),
+        runtimeSource.indexOf('private async waitForOwnershipTeardown'),
+      )
+      expect(stopActiveChildBody).toContain('deregisterCodexChild')
     })
 
-    it('terminal-registry.ts registers codex ptys at both spawn sites and deregisters in onExit', () => {
+    it('terminal-registry.ts registers codex ptys at both spawn sites and deregisters only on confirmed group death', () => {
       const registrySource = fs.readFileSync(path.join(SERVER_DIR, 'terminal-registry.ts'), 'utf8')
       const registrations = registrySource.match(
         /registerCodexChild\(\{ pid: ptyProc\.pid, pgid: ptyProc\.pid, kind: 'resume-pty' \}\)/g,
@@ -308,9 +426,15 @@ describe('codex child registry', () => {
       expect(registrations).toHaveLength(2)
       // The primary spawn site registers codex panes only.
       expect(registrySource).toContain("if (opts.mode === 'codex' && ptyProc.pid) {")
-      // Both spawn-site onExit handlers deregister; kill() never does (it only sends a signal).
-      const deregistrations = registrySource.match(/deregisterCodexChild\(ptyProc\.pid\)/g) ?? []
+      // Both spawn-site onExit handlers route through the liveness-probing deregister helper (m8),
+      // gated with the same codex condition as registration (m6). kill() never deregisters (it
+      // only sends a signal).
+      const deregistrations = registrySource.match(/deregisterCodexPtyIfGroupGone\(ptyProc\.pid\)/g) ?? []
       expect(deregistrations).toHaveLength(2)
+      expect(registrySource).toContain("if (opts.mode === 'codex') deregisterCodexPtyIfGroupGone(ptyProc.pid)")
+      expect(registrySource).toContain("if (record.mode === 'codex') deregisterCodexPtyIfGroupGone(ptyProc.pid)")
+      // m8: the helper only deregisters when the group is confirmed gone (ESRCH probe) on Linux.
+      expect(registrySource).toContain('process.kill(-pid, 0)')
       const killBody = registrySource.slice(
         registrySource.indexOf('kill(terminalId: string'),
         registrySource.indexOf('private markCodexRecoveryFinalClose'),
@@ -318,11 +442,17 @@ describe('codex child registry', () => {
       expect(killBody).not.toContain('deregisterCodexChild')
     })
 
-    it('index.ts installs the bindings once and arms an unref()d 15s hard-exit timer in shutdown()', () => {
+    it('index.ts installs the bindings once and arms an unref()d 30s hard-exit timer in shutdown()', () => {
       const indexSource = fs.readFileSync(path.join(SERVER_DIR, 'index.ts'), 'utf8')
       expect(indexSource.match(/installCodexChildExitHandlers\(\{/g)).toHaveLength(1)
-      expect(indexSource).toContain('const SHUTDOWN_HARD_EXIT_TIMEOUT_MS = 15_000')
+      expect(indexSource).toContain('const SHUTDOWN_HARD_EXIT_TIMEOUT_MS = 30_000')
       expect(indexSource).toContain('hardExitTimer.unref()')
+      // M6: slow-but-healthy shutdowns get their connections severed; the force-exit line is also
+      // written synchronously (async pino may not flush before exit); the happy path clears the timer.
+      expect(indexSource).toContain('server.closeAllConnections?.()')
+      expect(indexSource).toContain('process.stderr.write(')
+      expect(indexSource).toContain('clearTimeout(hardExitTimer)')
+      expect(indexSource).toContain("forcing exit")
       expect(indexSource).toContain('process.exit(1)\n    }, SHUTDOWN_HARD_EXIT_TIMEOUT_MS)')
     })
   })
@@ -358,11 +488,13 @@ describeWithLinuxProc('codex child registry runtime integration', () => {
 
     const ready = await runtime.ensureReady()
 
-    expect(snapshotCodexChildren()).toContainEqual({
+    // The live registration also pins the wrapper's /proc starttime (M1a).
+    expect(snapshotCodexChildren()).toContainEqual(expect.objectContaining({
       pid: ready.processPid,
       pgid: ready.processPid,
       kind: 'app-server',
-    })
+      startTimeTicks: expect.any(Number),
+    }))
 
     await runtime.shutdown()
 

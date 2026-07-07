@@ -14,6 +14,7 @@ import {
 const tempDirs = new Set<string>()
 
 afterEach(async () => {
+  vi.restoreAllMocks()
   await Promise.all([...tempDirs].map(async (dir) => {
     tempDirs.delete(dir)
     await fsp.rm(dir, { recursive: true, force: true })
@@ -39,13 +40,26 @@ async function makeCodexHomeFixture(walBytes: number): Promise<{ codexHome: stri
   return { codexHome, dbPath, walPath }
 }
 
-// Builds a fake /proc root: each key is a pid whose fd dir contains symlinks to the given targets.
-async function makeProcFixture(pidFdTargets: Record<string, string[]>): Promise<string> {
+type ProcPidSpec = {
+  fds: string[]
+  /** Written to /proc/<pid>/cmdline; defaults to a codex-looking command line. */
+  cmdline?: string | null
+}
+
+// Builds a fake /proc root: each key is a pid whose fd dir contains symlinks to the given targets
+// and whose cmdline defaults to codex (the M3 prefilter only probes codex processes).
+async function makeProcFixture(pids: Record<string, string[] | ProcPidSpec>): Promise<string> {
   const procRoot = await makeTempDir()
-  for (const [pid, targets] of Object.entries(pidFdTargets)) {
-    const fdDir = path.join(procRoot, pid, 'fd')
+  for (const [pid, value] of Object.entries(pids)) {
+    const spec: ProcPidSpec = Array.isArray(value) ? { fds: value } : value
+    const pidDir = path.join(procRoot, pid)
+    const fdDir = path.join(pidDir, 'fd')
     await fsp.mkdir(fdDir, { recursive: true })
-    for (const [index, target] of targets.entries()) {
+    const cmdline = spec.cmdline === undefined ? '/usr/local/bin/codex\0app-server\0' : spec.cmdline
+    if (cmdline !== null) {
+      await fsp.writeFile(path.join(pidDir, 'cmdline'), cmdline)
+    }
+    for (const [index, target] of spec.fds.entries()) {
       await fsp.symlink(target, path.join(fdDir, String(index + 3)))
     }
   }
@@ -79,8 +93,8 @@ describe('codex-observability resolveCodexHome', () => {
     expect(resolveCodexHome({} as NodeJS.ProcessEnv)).toBe(path.join(os.homedir(), '.codex'))
   })
 
-  it('keeps the documented 500 MB WAL warn threshold', () => {
-    expect(CODEX_LOG_DB_WAL_WARN_BYTES).toBe(500 * 1024 * 1024)
+  it('keeps the 2 GiB WAL warn threshold (hours of margin before the ~5 GB cliff at ~22 MB/min churn)', () => {
+    expect(CODEX_LOG_DB_WAL_WARN_BYTES).toBe(2 * 1024 * 1024 * 1024)
   })
 })
 
@@ -103,11 +117,11 @@ describeWithLinuxProc('codex-observability monitor', () => {
     const log = createLogSpy()
     const status = await emitCodexLogDbStatus({ codexHome, metadataDir, procRoot, log })
 
-    expect(status).toEqual({ walBytes: 2048, holders: 2, quarantined: 1, warned: false })
+    expect(status).toEqual({ walBytes: 2048, walStatFailed: false, holders: 2, quarantined: 1, warned: false })
     expect(log.warn).not.toHaveBeenCalled()
     expect(log.info).toHaveBeenCalledTimes(1)
     expect(log.info).toHaveBeenCalledWith(
-      expect.objectContaining({ walBytes: 2048, holders: 2, quarantined: 1 }),
+      expect.objectContaining({ walBytes: 2048, walStatFailed: false, holders: 2, quarantined: 1 }),
       'codex-log-db: wal_bytes=2048 holders=2 quarantined=1',
     )
   })
@@ -129,6 +143,45 @@ describeWithLinuxProc('codex-observability monitor', () => {
     expect(log.info).not.toHaveBeenCalled()
   })
 
+  it('reports wal_bytes=-1 and walStatFailed when the WAL stat fails for a non-ENOENT reason (M5)', async () => {
+    const { codexHome, walPath } = await makeCodexHomeFixture(1024)
+    const originalStat = fsp.stat.bind(fsp)
+    vi.spyOn(fsp, 'stat').mockImplementation(((target: any, opts?: any) => {
+      if (String(target) === walPath) {
+        return Promise.reject(Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }))
+      }
+      return originalStat(target, opts) as any
+    }) as typeof fsp.stat)
+    const log = createLogSpy()
+
+    const status = await emitCodexLogDbStatus({
+      codexHome,
+      metadataDir: await makeTempDir(),
+      procRoot: await makeProcFixture({}),
+      log,
+    })
+
+    expect(status).toEqual({ walBytes: -1, walStatFailed: true, holders: 0, quarantined: 0, warned: true })
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ walBytes: -1, walStatFailed: true }),
+      expect.stringContaining('wal_bytes=-1'),
+    )
+  })
+
+  it('reads a missing WAL as empty, not as a stat failure', async () => {
+    const codexHome = await makeTempDir() // no db, no wal
+    const log = createLogSpy()
+
+    const status = await emitCodexLogDbStatus({
+      codexHome,
+      metadataDir: await makeTempDir(),
+      procRoot: await makeProcFixture({}),
+      log,
+    })
+
+    expect(status).toEqual({ walBytes: 0, walStatFailed: false, holders: 0, quarantined: 0, warned: false })
+  })
+
   it('warns when the holder count exceeds the threshold', async () => {
     const { codexHome, dbPath } = await makeCodexHomeFixture(0)
     const procRoot = await makeProcFixture({
@@ -145,7 +198,7 @@ describeWithLinuxProc('codex-observability monitor', () => {
       holderWarnThreshold: 1,
     })
 
-    expect(status).toEqual({ walBytes: 0, holders: 2, quarantined: 0, warned: true })
+    expect(status).toEqual({ walBytes: 0, walStatFailed: false, holders: 2, quarantined: 0, warned: true })
     expect(log.warn).toHaveBeenCalledTimes(1)
   })
 
@@ -159,7 +212,7 @@ describeWithLinuxProc('codex-observability monitor', () => {
       log,
     })
 
-    expect(status).toEqual({ walBytes: 0, holders: 0, quarantined: 0, warned: false })
+    expect(status).toEqual({ walBytes: 0, walStatFailed: false, holders: 0, quarantined: 0, warned: false })
   })
 
   it('holds no file descriptor on the sqlite files after probing (read-only monitor)', async () => {
@@ -181,10 +234,43 @@ describeWithLinuxProc('codex-observability monitor', () => {
   it('ignores unreadable fd directories in the holder scan', async () => {
     const { dbPath } = await makeCodexHomeFixture(0)
     const procRoot = await makeProcFixture({ '401': [dbPath] })
-    // A pid dir without an fd subdirectory (readdir will fail for it).
+    // A codex pid dir without an fd subdirectory (readdir will fail for it).
     await fsp.mkdir(path.join(procRoot, '402'), { recursive: true })
+    await fsp.writeFile(path.join(procRoot, '402', 'cmdline'), 'codex\0')
 
     expect(await countCodexLogDbHolders(dbPath, procRoot)).toBe(1)
+  })
+
+  it('prefilters non-codex processes: only codex cmdlines are probed as holders (M3)', async () => {
+    const { dbPath } = await makeCodexHomeFixture(0)
+    const procRoot = await makeProcFixture({
+      '501': { fds: [dbPath] }, // codex, holds the db -> counted
+      '502': { fds: [dbPath], cmdline: '/usr/bin/some-other-daemon\0' }, // non-codex holder -> skipped
+      '503': { fds: [dbPath], cmdline: null }, // unreadable cmdline -> skipped
+    })
+
+    expect(await countCodexLogDbHolders(dbPath, procRoot)).toBe(1)
+  })
+
+  it('skips the server process itself in the holder scan (M3)', async () => {
+    const { dbPath } = await makeCodexHomeFixture(0)
+    const procRoot = await makeProcFixture({
+      [String(process.pid)]: [dbPath],
+      '601': [dbPath],
+    })
+
+    expect(await countCodexLogDbHolders(dbPath, procRoot)).toBe(1)
+  })
+
+  it("matches fd targets that carry the ' (deleted)' suffix (M3)", async () => {
+    const { dbPath } = await makeCodexHomeFixture(0)
+    const procRoot = await makeProcFixture({
+      '701': [`${dbPath} (deleted)`],
+      '702': [`${dbPath}-wal (deleted)`],
+      '703': ['/tmp/unrelated (deleted)'],
+    })
+
+    expect(await countCodexLogDbHolders(dbPath, procRoot)).toBe(2)
   })
 })
 
@@ -213,6 +299,38 @@ describeWithLinuxProc('codex-observability reaper maintenance tick', () => {
     }), { mode: 0o600 })
     await runCodexReaperMaintenanceTick({ serverInstanceId: 'srv-tick', metadataDir, terminateGraceMs: 1 })
     await expect(fsp.stat(recordPath)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('gates re-attempts per record: a not-yet-due record is untouched even when another is due (m2)', async () => {
+    const metadataDir = await makeTempDir()
+    const now = Date.now()
+
+    // Due record: owner dead, group gone -> gets reaped by the tick.
+    const duePath = path.join(metadataDir, 'due.json')
+    await fsp.writeFile(duePath, JSON.stringify(buildValidOwnershipRecord({ ownershipId: 'obs-due' })), { mode: 0o600 })
+    await fsp.writeFile(`${duePath}.reaper.json`, JSON.stringify({
+      firstSeen: new Date(now - 3 * 60 * 60 * 1000).toISOString(),
+      attempts: 2,
+      lastAttempt: new Date(now - 2 * 60 * 60 * 1000).toISOString(),
+    }), { mode: 0o600 })
+
+    // Fresh record: attempted seconds ago -> must be skipped entirely (no attempt increment).
+    const freshPath = path.join(metadataDir, 'fresh.json')
+    await fsp.writeFile(freshPath, JSON.stringify(buildValidOwnershipRecord({ ownershipId: 'obs-fresh' })), { mode: 0o600 })
+    const freshState = {
+      firstSeen: new Date(now - 60_000).toISOString(),
+      attempts: 1,
+      lastAttempt: new Date(now).toISOString(),
+    }
+    await fsp.writeFile(`${freshPath}.reaper.json`, JSON.stringify(freshState), { mode: 0o600 })
+
+    await runCodexReaperMaintenanceTick({ serverInstanceId: 'srv-tick', metadataDir, terminateGraceMs: 1 })
+
+    await expect(fsp.stat(duePath)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fsp.stat(freshPath)).resolves.toBeDefined()
+    const stateAfter = JSON.parse(await fsp.readFile(`${freshPath}.reaper.json`, 'utf8'))
+    expect(stateAfter.attempts).toBe(1)
+    expect(stateAfter.lastAttempt).toBe(freshState.lastAttempt)
   })
 
   it('never throws when the metadata dir is missing', async () => {
