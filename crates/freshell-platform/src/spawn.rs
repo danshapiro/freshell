@@ -526,6 +526,186 @@ pub fn build_cli_spawn_spec(
     }
 }
 
+/// Build the **coding-CLI** launch [`SpawnSpec`] on **native Windows** — the CLI
+/// tails of `buildSpawnSpec`'s Windows branches (`terminal-registry.ts`):
+///
+/// - `windowsMode === 'wsl'` (`:1163-1172`): `wsl.exe [-d <distro>] [--cd <linux cwd>]
+///   --exec <cli.command> <cli.args...>` — faithful.
+/// - `windowsMode === 'cmd'` (`:1202-1208`): `cmd.exe /K <cd?><buildCmdCommand(...)>`
+///   with the process cwd set (`procCwd = winCwd` on native Windows) — see the
+///   PORT FIX quoting notes on [`cmd_cd_prefix`] / [`build_cmd_command`].
+/// - default PowerShell (`:1235-1248`): `powershell.exe -NoLogo -NoExit -Command
+///   "<Set-Location?><& '<cmd>' '<args>'...>"` — faithful (single-quoted literals
+///   carry no `"` so they survive the spawn layer's ArgvQuote intact).
+///
+/// `shell` is the pane's requested shell (CLI panes are created with
+/// `shell:'system'`, which `resolveShell` maps to `cmd` on native Windows); the
+/// `windowsMode` resolution (force-WSL on a Linux cwd, `WINDOWS_SHELL` fallback)
+/// mirrors [`build_spawn_spec`] exactly.
+///
+/// Scope: callers use this only when `is_windows(host_os)`; the reduced-fidelity
+/// notes on [`resolve_cli_launch`] (no MCP/notification/resume arg layers) apply
+/// here identically.
+#[allow(clippy::too_many_arguments)]
+pub fn build_windows_cli_spawn_spec(
+    launch: &CliLaunch,
+    shell: ShellType,
+    host_os: HostOs,
+    is_wsl_env: bool,
+    cwd: Option<&str>,
+    env: &dyn Env,
+    user_env_overrides: &BTreeMap<String, String>,
+    cols: Option<u16>,
+    rows: Option<u16>,
+) -> SpawnSpec {
+    // Env layer: forced overrides + user overrides, then `...cli.env` on top
+    // (`{ ...env, ...cli.env }`, `terminal-registry.ts:1208/1247`).
+    let mut env_overrides = build_env_overrides(env, user_env_overrides);
+    for (k, v) in &launch.env {
+        env_overrides.insert(k.clone(), v.clone());
+    }
+    let cols = cols.unwrap_or(DEFAULT_COLS);
+    let rows = rows.unwrap_or(DEFAULT_ROWS);
+    let spec = |program: String, args: Vec<String>, cwd: Option<String>| SpawnSpec {
+        program,
+        args,
+        env_overrides: env_overrides.clone(),
+        cwd,
+        cols,
+        rows,
+    };
+
+    // Same windowsMode resolution as build_spawn_spec (`:1130-1137`).
+    let effective_shell = resolve_shell(shell, host_os, is_wsl_env);
+    let force_wsl = is_windows(host_os) && cwd.is_some_and(is_linux_path);
+    let windows_mode = if force_wsl {
+        "wsl".to_string()
+    } else if effective_shell != ShellType::System {
+        effective_shell.as_str().to_string()
+    } else {
+        env.or_default("WINDOWS_SHELL", "wsl").to_lowercase()
+    };
+
+    if windows_mode == "wsl" {
+        // `:1141-1172`: the CLI runs inside WSL; launch stays Unix.
+        let wsl = env.or_default("WSL_EXE", "wsl.exe");
+        let mut args: Vec<String> = Vec::new();
+        if let Some(distro) = env.get("WSL_DISTRO") {
+            if !distro.is_empty() {
+                args.push("-d".to_string());
+                args.push(distro);
+            }
+        }
+        let wsl_child_cwd = cwd.map(|c| {
+            if is_linux_path(c) {
+                c.to_string()
+            } else {
+                convert_windows_path_to_wsl_path(c, env, is_wsl_env).unwrap_or_else(|| c.to_string())
+            }
+        });
+        if let Some(child_cwd) = wsl_child_cwd {
+            args.push("--cd".to_string());
+            args.push(child_cwd);
+        }
+        // `args.push('--exec', cli.command, ...cli.args)` (`:1171`).
+        args.push("--exec".to_string());
+        args.push(launch.command.clone());
+        args.extend(launch.args.iter().cloned());
+        return spec(wsl, args, None);
+    }
+
+    let in_wsl = is_wsl_env; // false on native Windows (the only caller context)
+    let win_cwd = compute_win_cwd(cwd, in_wsl, env, is_wsl_env);
+    let proc_cwd = if in_wsl { None } else { win_cwd.clone() };
+
+    if windows_mode == "cmd" {
+        // `:1202-1208`: `{ file, args: ['/K', `${cd}${command}`], cwd: procCwd }`.
+        let file = get_windows_exe(WindowsExe::Cmd, host_os, env);
+        let invocation = build_cmd_command(&launch.command, &launch.args);
+        let cd = win_cwd.as_deref().and_then(cmd_cd_prefix).unwrap_or_default();
+        return spec(
+            file,
+            vec!["/K".to_string(), format!("{cd}{invocation}")],
+            proc_cwd,
+        );
+    }
+
+    // default: PowerShell (`:1235-1248`).
+    let file = get_windows_exe(WindowsExe::Powershell, host_os, env);
+    let invocation = build_powershell_command(&launch.command, &launch.args);
+    let cd = win_cwd
+        .as_deref()
+        .map(|wc| format!("Set-Location -LiteralPath {}; ", quote_powershell_literal(wc)))
+        .unwrap_or_default();
+    spec(
+        file,
+        vec![
+            "-NoLogo".to_string(),
+            "-NoExit".to_string(),
+            "-Command".to_string(),
+            format!("{cd}{invocation}"),
+        ],
+        proc_cwd,
+    )
+}
+
+/// `buildCmdCommand` (`terminal-registry.ts:1046-1048`) with a **PORT FIX quoting
+/// gate** (deliberate, reported divergence): the reference `quoteCmdArg`s every
+/// part unconditionally, relying on node-pty's `argsToCommandLine` + cmd.exe to
+/// round-trip the embedded `"`. The port's spawn layer (portable-pty) rebuilds the
+/// Windows command line with MSVC ArgvQuote rules, which re-escape every embedded
+/// `"` as `\"` — and cmd.exe (where `\` is NOT an escape character) then fails to
+/// parse the payload (same interop-mangling class as [`wsl_windows_shell_inherit_cwd`]).
+/// Fix: emit each part **bare** when it needs no quoting (the universal case for a
+/// CLI launch: `claude`, npm-shim commands, simple flags), and `quote_cmd_arg` only
+/// the parts that genuinely need it. A bare-parts payload contains no `"` at all, so
+/// portable-pty wraps it in exactly one outer quote pair, which `cmd /K` strips
+/// (the documented "old behavior" quote rule) — the payload arrives verbatim.
+fn build_cmd_command(command: &str, args: &[String]) -> String {
+    std::iter::once(command)
+        .chain(args.iter().map(String::as_str))
+        .map(|part| {
+            if cmd_token_is_plain(part) {
+                part.to_string()
+            } else {
+                quote_cmd_arg(part)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A cmd.exe token that needs no `quoteCmdArg` quoting: non-empty, and free of
+/// whitespace, quotes, `%` expansion, and cmd metacharacters (`& | < > ^ ( ) @ ; ,`).
+fn cmd_token_is_plain(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '\\' | '/' | '+' | '=' | '~')
+        })
+}
+
+/// The `cd /d ${quoteCmdArg(winCwd)} && ` prefix (`terminal-registry.ts:1207`)
+/// under the same PORT FIX quoting gate as [`build_cmd_command`]: emitted
+/// **unquoted** (cmd's `cd` builtin does not treat spaces as delimiters) when the
+/// path is free of cmd metacharacters / `%` / quotes; otherwise omitted entirely —
+/// safe because on native Windows the process cwd (`procCwd = winCwd`) is set too,
+/// so the prefix is belt-and-suspenders exactly as in the reference.
+fn cmd_cd_prefix(win_cwd: &str) -> Option<String> {
+    let plain = !win_cwd.is_empty()
+        && !win_cwd.chars().any(|c| {
+            matches!(c, '"' | '&' | '|' | '<' | '>' | '^' | '(' | ')' | '@' | '%' | '\n' | '\r' | '\t')
+        });
+    plain.then(|| format!("cd /d {win_cwd} && "))
+}
+
+/// `buildPowerShellCommand` (`terminal-registry.ts:1054-1057`), faithful:
+/// `& '<command>' '<arg>'...` with `quotePowerShellLiteral` on every part.
+fn build_powershell_command(command: &str, args: &[String]) -> String {
+    let mut parts = vec!["&".to_string(), quote_powershell_literal(command)];
+    parts.extend(args.iter().map(|a| quote_powershell_literal(a)));
+    parts.join(" ")
+}
+
 /// PORT FIX (deliberate, reported divergence from `buildSpawnSpec`
 /// `terminal-registry.ts:1177-1248`): the Linux **mount** cwd a WSL-spawned Windows
 /// shell (`cmd.exe`/`powershell.exe`) should INHERIT so it starts in `win_cwd`.
@@ -626,6 +806,205 @@ mod helper_tests {
         assert_eq!(quote_cmd_arg("a%PATH%b"), "\"a%%PATH%%b\"");
         assert_eq!(quote_cmd_arg("a\\\"b"), "\"a\\\\\\\"b\"");
         assert_eq!(quote_cmd_arg(""), "\"\"");
+    }
+
+    struct MapEnv(BTreeMap<String, String>);
+    impl crate::Env for MapEnv {
+        fn get(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+    }
+
+    fn cli(command: &str, args: &[&str]) -> CliLaunch {
+        CliLaunch {
+            command: command.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            env: BTreeMap::new(),
+        }
+    }
+
+    fn empty_env() -> MapEnv {
+        MapEnv(BTreeMap::new())
+    }
+
+    #[test]
+    fn windows_cli_system_shell_launches_via_cmd_in_workspace() {
+        // CLI panes are created with shell:'system' -> cmd on native Windows.
+        let spec = build_windows_cli_spawn_spec(
+            &cli("claude", &[]),
+            ShellType::System,
+            HostOs::Windows,
+            false,
+            Some("C:\\Users\\Public\\freshell-matrix-ws-x"),
+            &empty_env(),
+            &BTreeMap::new(),
+            None,
+            None,
+        );
+        assert_eq!(spec.program, "cmd.exe");
+        assert_eq!(
+            spec.args,
+            vec![
+                "/K".to_string(),
+                "cd /d C:\\Users\\Public\\freshell-matrix-ws-x && claude".to_string()
+            ]
+        );
+        // procCwd = winCwd on native Windows (belt-and-suspenders with the cd).
+        assert_eq!(spec.cwd.as_deref(), Some("C:\\Users\\Public\\freshell-matrix-ws-x"));
+        assert_eq!((spec.cols, spec.rows), (DEFAULT_COLS, DEFAULT_ROWS));
+    }
+
+    #[test]
+    fn windows_cli_cmd_quotes_only_parts_that_need_it() {
+        let spec = build_windows_cli_spawn_spec(
+            &cli("claude", &["--flag", "a b"]),
+            ShellType::Cmd,
+            HostOs::Windows,
+            false,
+            Some("C:\\ws"),
+            &empty_env(),
+            &BTreeMap::new(),
+            None,
+            None,
+        );
+        assert_eq!(spec.args[0], "/K");
+        assert_eq!(spec.args[1], "cd /d C:\\ws && claude --flag \"a b\"");
+    }
+
+    #[test]
+    fn windows_cli_cmd_omits_cd_prefix_for_metachar_cwd_but_keeps_proc_cwd() {
+        let spec = build_windows_cli_spawn_spec(
+            &cli("codex", &[]),
+            ShellType::System,
+            HostOs::Windows,
+            false,
+            Some("C:\\a&b"),
+            &empty_env(),
+            &BTreeMap::new(),
+            None,
+            None,
+        );
+        assert_eq!(spec.args, vec!["/K".to_string(), "codex".to_string()]);
+        assert_eq!(spec.cwd.as_deref(), Some("C:\\a&b"));
+    }
+
+    #[test]
+    fn windows_cli_powershell_is_faithful_set_location_plus_invocation() {
+        let spec = build_windows_cli_spawn_spec(
+            &cli("gemini", &["--yolo"]),
+            ShellType::Powershell,
+            HostOs::Windows,
+            false,
+            Some("C:\\ws"),
+            &empty_env(),
+            &BTreeMap::new(),
+            None,
+            None,
+        );
+        assert_eq!(spec.program, "powershell.exe");
+        assert_eq!(
+            spec.args,
+            vec![
+                "-NoLogo".to_string(),
+                "-NoExit".to_string(),
+                "-Command".to_string(),
+                "Set-Location -LiteralPath 'C:\\ws'; & 'gemini' '--yolo'".to_string(),
+            ]
+        );
+        assert_eq!(spec.cwd.as_deref(), Some("C:\\ws"));
+    }
+
+    #[test]
+    fn windows_cli_linux_cwd_forces_wsl_exec() {
+        let spec = build_windows_cli_spawn_spec(
+            &cli("claude", &[]),
+            ShellType::System,
+            HostOs::Windows,
+            false,
+            Some("/home/u/proj"),
+            &empty_env(),
+            &BTreeMap::new(),
+            None,
+            None,
+        );
+        assert_eq!(spec.program, "wsl.exe");
+        assert_eq!(
+            spec.args,
+            vec![
+                "--cd".to_string(),
+                "/home/u/proj".to_string(),
+                "--exec".to_string(),
+                "claude".to_string(),
+            ]
+        );
+        assert_eq!(spec.cwd, None);
+    }
+
+    #[test]
+    fn windows_cli_wsl_shell_passes_distro_and_cli_args() {
+        let mut env = BTreeMap::new();
+        env.insert("WSL_DISTRO".to_string(), "Ubuntu".to_string());
+        let spec = build_windows_cli_spawn_spec(
+            &cli("codex", &["--model", "o3"]),
+            ShellType::Wsl,
+            HostOs::Windows,
+            false,
+            Some("C:\\Users\\Public\\ws"),
+            &MapEnv(env),
+            &BTreeMap::new(),
+            None,
+            None,
+        );
+        assert_eq!(spec.program, "wsl.exe");
+        assert_eq!(
+            spec.args,
+            vec![
+                "-d".to_string(),
+                "Ubuntu".to_string(),
+                "--cd".to_string(),
+                "/mnt/c/Users/Public/ws".to_string(),
+                "--exec".to_string(),
+                "codex".to_string(),
+                "--model".to_string(),
+                "o3".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_cli_env_layer_applies_cli_env_on_top() {
+        let mut launch = cli("claude", &[]);
+        launch.env.insert("FOO".to_string(), "bar".to_string());
+        let spec = build_windows_cli_spawn_spec(
+            &launch,
+            ShellType::System,
+            HostOs::Windows,
+            false,
+            Some("C:\\ws"),
+            &empty_env(),
+            &BTreeMap::new(),
+            None,
+            None,
+        );
+        assert_eq!(spec.env_overrides.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(
+            spec.env_overrides.get("TERM").map(String::as_str),
+            Some("xterm-256color")
+        );
+    }
+
+    #[test]
+    fn cmd_command_and_cd_prefix_quoting_gate() {
+        assert_eq!(build_cmd_command("claude", &[]), "claude");
+        assert_eq!(
+            build_cmd_command("C:\\Program Files\\x\\cli.exe", &[]),
+            "\"C:\\Program Files\\x\\cli.exe\""
+        );
+        assert_eq!(cmd_cd_prefix("C:\\ws"), Some("cd /d C:\\ws && ".to_string()));
+        assert_eq!(cmd_cd_prefix("C:\\with space"), Some("cd /d C:\\with space && ".to_string()));
+        assert_eq!(cmd_cd_prefix("C:\\a&b"), None);
+        assert_eq!(cmd_cd_prefix("C:\\100%done"), None);
+        assert_eq!(cmd_cd_prefix(""), None);
     }
 
     #[test]

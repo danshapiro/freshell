@@ -50,7 +50,8 @@ use uuid::Uuid;
 
 use freshell_platform::detect::{host_os_live, is_wsl_env_live, is_windows};
 use freshell_platform::{
-    build_cli_spawn_spec, build_spawn_spec, resolve_cli_launch, RealEnv, RealFileProbe, ShellType,
+    build_cli_spawn_spec, build_spawn_spec, build_windows_cli_spawn_spec, resolve_cli_launch,
+    RealEnv, RealFileProbe, ShellType,
 };
 use freshell_protocol::{
     ClientMessage, ServerMessage, Shell, TerminalAttach, TerminalCreate, TerminalCreated,
@@ -314,21 +315,29 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
     overrides.insert("FRESHELL_TERMINAL_ID".to_string(), terminal_id.clone());
 
     // `terminal.create` carries `mode`: 'shell' or a registered coding-CLI provider
-    // (claude/codex/opencode). For a CLI mode on the non-Windows / WSL-Linux-shell
-    // path (CLI panes are always shell:'system'), launch the real CLI via the
-    // `resolveCodingCliCommand` base slice; otherwise spawn the shell. Native-Windows
-    // CLI launch is deferred (falls back to the shell path); an unknown mode also
-    // falls back to shell (the reference throws UnknownTerminalModeError — kept
-    // lenient here so a bad mode never tears down the connection).
-    let cli = if is_windows(host_os) {
-        None
-    } else {
-        resolve_cli_launch(&state.cli_commands, &create.mode, &RealEnv)
-    };
+    // (claude/codex/opencode/...). For a CLI mode, launch the real CLI via the
+    // `resolveCodingCliCommand` base slice: on native Windows through the Windows
+    // CLI branches (`build_windows_cli_spawn_spec` — cmd.exe `/K <cli>` with the
+    // workspace as process cwd, per `terminal-registry.ts:1202-1248`), elsewhere
+    // through the unix tail (`build_cli_spawn_spec`). An unknown mode falls back to
+    // shell (the reference throws UnknownTerminalModeError — kept lenient here so a
+    // bad mode never tears down the connection).
+    let cli = resolve_cli_launch(&state.cli_commands, &create.mode, &RealEnv);
 
     // Spawn at the default geometry (`opts.cols||120`, `opts.rows||30`); the client
     // attaches then resizes to its viewport.
     let spec = match &cli {
+        Some(launch) if is_windows(host_os) => build_windows_cli_spawn_spec(
+            launch,
+            shell,
+            host_os,
+            is_wsl,
+            create.cwd.as_deref(),
+            &RealEnv,
+            &overrides,
+            None,
+            None,
+        ),
         Some(launch) => build_cli_spawn_spec(
             launch,
             is_wsl,

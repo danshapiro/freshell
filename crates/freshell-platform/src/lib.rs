@@ -77,8 +77,8 @@ pub use port_forward::{
     build_port_forwarding_script, build_wsl_port_forwarding_plan, WslPortForwardingPlan,
 };
 pub use spawn::{
-    build_cli_spawn_spec, build_spawn_spec, resolve_cli_launch, CliCommandSpec, CliLaunch,
-    ShellType, SpawnSpec,
+    build_cli_spawn_spec, build_spawn_spec, build_windows_cli_spawn_spec, resolve_cli_launch,
+    CliCommandSpec, CliLaunch, ShellType, SpawnSpec,
 };
 
 // ---------------------------------------------------------------------------
