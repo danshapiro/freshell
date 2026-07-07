@@ -1539,6 +1539,67 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     await expect(fsp.stat(path.join(metadataDir, 'a.json'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
+  it('deferral write never clobbers a concurrent attempt landing between its read and write (R3-m3)', async () => {
+    const metadataDir = await makeTempDir()
+    const now = new Date().toISOString()
+    const recordPath = path.join(metadataDir, 'race.json')
+    await fsp.writeFile(recordPath, JSON.stringify({
+      schemaVersion: 1,
+      ownershipId: 'race-a',
+      serverInstanceId: 'srv-previous',
+      ownerServerPid: 999_999_999,
+      terminalId: null,
+      generation: null,
+      wsUrl: 'ws://127.0.0.1:1',
+      wrapperPid: 999_999_998,
+      processGroupId: 999_999_997,
+      wrapperIdentity: { commandLine: ['codex'], cwd: '/tmp', startTimeTicks: 1 },
+      createdAt: now,
+      updatedAt: now,
+    }), { mode: 0o600 })
+
+    const sidecarPath = `${recordPath}.reaper.json`
+    // The state a CONCURRENT instance's recordCodexReaperRetryAttempt writes between the
+    // deferral's read (no sidecar yet) and its create-exclusive write.
+    const concurrentState = {
+      firstSeen: new Date(Date.now() - 60_000).toISOString(),
+      attempts: 7,
+      lastAttempt: new Date(Date.now() - 1_000).toISOString(),
+    }
+    const realWriteFile = fsp.writeFile.bind(fsp) as typeof fsp.writeFile
+    const writeFileSpy = vi.spyOn(fsp, 'writeFile')
+    writeFileSpy.mockImplementation(async (file, data, options) => {
+      const flag = options && typeof options === 'object' ? (options as { flag?: string }).flag : undefined
+      if (file === sidecarPath && flag === 'wx') {
+        // Simulate the interleaving: the attempt lands first, then the wx write must EEXIST.
+        await realWriteFile(sidecarPath, JSON.stringify(concurrentState), { mode: 0o600 })
+      }
+      return realWriteFile(file, data as Parameters<typeof realWriteFile>[1], options)
+    })
+
+    try {
+      // Fake clock: the pass starts at 0; the single record's budget check sees 4s (over the 3s
+      // budget), so it takes the deferral path and its sidecar write races the concurrent attempt.
+      const times = [0, 4_000]
+      let call = 0
+      const result = await reapOrphanedCodexAppServerSidecars({
+        metadataDir,
+        serverInstanceId: 'srv-current',
+        terminateGraceMs: 1,
+        teardownBudgetMs: CODEX_REAPER_BOOT_BUDGET_MS,
+        nowFn: () => times[Math.min(call++, times.length - 1)],
+      })
+
+      expect(result.deferredForBudget).toEqual(['race-a'])
+      // The concurrent attempt's state wins: attempts/lastAttempt are NOT reset to a fresh
+      // deferral sidecar (which would restart the backoff and re-arm the hourly tick early).
+      const after = JSON.parse(await fsp.readFile(sidecarPath, 'utf8'))
+      expect(after).toEqual(concurrentState)
+    } finally {
+      writeFileSpy.mockRestore()
+    }
+  })
+
   it('purges stranded atomic-write tmp files older than an hour in the main dir AND quarantine/ (m9, r2-8)', async () => {
     const metadataDir = await makeTempDir()
     const quarantineDir = path.join(metadataDir, 'quarantine')

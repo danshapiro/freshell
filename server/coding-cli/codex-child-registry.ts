@@ -50,6 +50,11 @@ export type CodexChildEntry = {
 
 export type CodexChildRegistryLogger = {
   warn: (fields: Record<string, unknown>, message: string) => void
+  /**
+   * R3-M1: optional debug hook -- used to distinguish "provably not ours" from "ownership marker
+   * unreachable past a truncated environ read". Absent on minimal injected loggers (no-op then).
+   */
+  debug?: (fields: Record<string, unknown>, message: string) => void
 }
 
 export type CodexChildExitHandlerOptions = {
@@ -113,12 +118,23 @@ export type CodexChildRegistry = {
   installExitHandlers: (options: CodexChildExitHandlerOptions) => void
 }
 
-/** r2-3: hard byte bound for exit-path /proc cmdline/environ reads. */
+/** r2-3: hard byte bound for exit-path /proc cmdline reads. */
 export const PROC_READ_MAX_BYTES = 4096
+
+/**
+ * R3-M1: hard byte bound for exit-path /proc environ reads. Both spawn sites append the ownership
+ * marker LAST in env-spread order (reordering would break override semantics when the dev server
+ * itself runs inside a freshell pane whose parentEnv already carries FRESHELL_TERMINAL_ID), and
+ * real environs on this host run ~5,900 bytes -- so the previous 4096-byte bound left the marker
+ * unreachable on essentially every spawn and the dead-pid group reap silently never fired. Linux
+ * caps a single env string at 128 KiB, so 256 KiB stays a hard bound while comfortably covering
+ * any realistic environ.
+ */
+export const PROC_ENVIRON_READ_MAX_BYTES = 256 * 1024
 
 type ProcStatInfo = { pgrp: number; startTimeTicks: number }
 
-type BoundedRead = { data: Buffer; truncated: boolean }
+export type BoundedRead = { data: Buffer; truncated: boolean }
 
 /** pgid -> live member pids, built at most once per reap pass (r2-4). */
 type ProcGroupIndex = Map<number, number[]>
@@ -162,7 +178,7 @@ export function cmdlineHasCodexToken(rawCmdline: string): boolean {
  * buffer, never fs.readFileSync (a pathological cmdline/environ cannot balloon exit-time memory
  * or latency). Reads one byte past maxBytes purely to detect truncation.
  */
-function readProcFileBoundedSync(filePath: string, maxBytes: number): BoundedRead {
+export function readProcFileBoundedSync(filePath: string, maxBytes: number): BoundedRead {
   const fd = fs.openSync(filePath, 'r')
   try {
     const buffer = Buffer.allocUnsafe(maxBytes + 1)
@@ -351,9 +367,23 @@ export function createCodexChildRegistry(deps: CodexChildRegistryDeps = {}): Cod
         if (!cmdlineHasCodexToken(cmdline.data.toString('utf8'))) continue
         // Ownership proof: the exact NAME=VALUE marker injected at spawn. A marker that is absent
         // from a truncated read could live past the cutoff — that is absence of proof, not proof
-        // of absence, so it never justifies a kill (r2-3 fail-closed).
-        const environ = readFileBoundedSync(`/proc/${pid}/environ`, PROC_READ_MAX_BYTES)
-        if (environ.data.toString('utf8').split('\0').includes(marker)) return true
+        // of absence, so it never justifies a kill (r2-3 fail-closed). R3-M1: the environ bound is
+        // deliberately larger than the cmdline bound because the spawn sites append the marker LAST.
+        const environ = readFileBoundedSync(`/proc/${pid}/environ`, PROC_ENVIRON_READ_MAX_BYTES)
+        const tokens = environ.data.toString('utf8').split('\0')
+        // R3-m2: a truncated read can cut mid-token; the final element is potentially partial and
+        // must never count as proof (`MARKER=valueEXTRA` cut exactly at the bound reads back as
+        // `MARKER=value`).
+        if (environ.truncated) tokens.pop()
+        if (tokens.includes(marker)) return true
+        if (environ.truncated) {
+          // R3-M1: make "marker unreachable past the read bound" distinguishable from "provably
+          // not ours" in the logs. Fail-closed behavior is unchanged either way.
+          log.debug?.(
+            { pid, pgid: entry.pgid, markerName: entry.envMarker.name, maxBytes: PROC_ENVIRON_READ_MAX_BYTES },
+            'Truncated environ read without ownership marker; failing closed (not treated as owned)',
+          )
+        }
       } catch {
         continue // member vanished mid-scan or is unreadable: not proof either way
       }

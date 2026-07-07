@@ -969,8 +969,17 @@ async function recordCodexReaperDeferral(metadataPath: string): Promise<CodexRea
     attempts: 0,
   }
   try {
-    await atomicWriteJson(sidecarPath, state)
+    // R3-m3: create-exclusive, NOT atomic-rename. A concurrent instance's
+    // recordCodexReaperRetryAttempt can land between the sidecar read above and this write; a
+    // rename would clobber its attempts/lastAttempt back to zero. `wx` makes the race lose
+    // loudly (EEXIST), in which case the concurrent state wins and is returned as-is.
+    await fsp.writeFile(sidecarPath, `${JSON.stringify(state, null, 2)}\n`, { flag: 'wx', mode: 0o600 })
   } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      const concurrent = await readCodexReaperRetryStateFile(sidecarPath)
+      if (concurrent) return concurrent
+      return state // sidecar appeared but is unreadable/invalid: stay advisory, never throw
+    }
     logReaperSidecarWriteFailure(sidecarPath, error)
   }
   return state

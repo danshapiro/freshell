@@ -10,6 +10,8 @@ import {
   cmdlineHasCodexToken,
   createCodexChildRegistry,
   deregisterCodexChild,
+  PROC_ENVIRON_READ_MAX_BYTES,
+  readProcFileBoundedSync,
   snapshotCodexChildren,
   type CodexChildEntry,
   type CodexChildProcessLike,
@@ -83,7 +85,7 @@ function makeHarness(overrides: {
   const killSync = vi.fn((pid: number, signal: NodeJS.Signals) => {
     kills.push({ pid, signal })
   })
-  const log = { warn: vi.fn() }
+  const log = { warn: vi.fn(), debug: vi.fn() }
   const proc = makeFakeProc(procPid)
   const registry = createCodexChildRegistry({
     platform: overrides.platform ?? 'linux',
@@ -251,11 +253,48 @@ describe('codex child registry', () => {
       expect(kills).toEqual([])
     })
 
-    it('never group-kills when the marker sits past the 4096-byte environ bound (r2-3 fail-closed)', () => {
+    it('never group-kills when the marker sits past the environ read bound (r2-3/R3-M1 fail-closed)', () => {
+      const { registry, kills, files, log } = makeHarness()
+      files.set('/proc/250/stat', statLine(250, 200, 55))
+      files.set('/proc/250/cmdline', '/usr/local/bin/codex\0')
+      // The filler alone exceeds PROC_ENVIRON_READ_MAX_BYTES, so the trailing marker is unreachable.
+      files.set('/proc/250/environ', `FILLER=${'A'.repeat(PROC_ENVIRON_READ_MAX_BYTES)}\0${MARKER_ENV}\0`)
+      registry.register({ ...entry(200, 'app-server'), envMarker: MARKER })
+
+      registry.reapSync()
+
+      expect(kills).toEqual([])
+      // R3-M1: "marker unreachable past the bound" is distinguishable from "provably not ours".
+      expect(log.debug).toHaveBeenCalledWith(
+        expect.objectContaining({ pid: 250, pgid: 200, maxBytes: PROC_ENVIRON_READ_MAX_BYTES }),
+        expect.stringContaining('Truncated environ read without ownership marker'),
+      )
+    })
+
+    it('group-kills when the marker sits at the real-world ~5,900-byte environ position (R3-M1)', () => {
       const { registry, kills, files } = makeHarness()
       files.set('/proc/250/stat', statLine(250, 200, 55))
       files.set('/proc/250/cmdline', '/usr/local/bin/codex\0')
-      files.set('/proc/250/environ', `FILLER=${'A'.repeat(5000)}\0${MARKER_ENV}\0`)
+      // Both spawn sites append the marker LAST in env-spread order and real environs on this host
+      // run ~5,900 bytes; under the old 4096-byte bound this marker was unreachable on essentially
+      // every spawn, so the dead-pid group reap silently never fired.
+      files.set('/proc/250/environ', `FILLER=${'A'.repeat(5_900)}\0${MARKER_ENV}\0`)
+      registry.register({ ...entry(200, 'app-server'), envMarker: MARKER })
+
+      registry.reapSync()
+
+      expect(kills).toEqual([{ pid: -200, signal: 'SIGKILL' }])
+    })
+
+    it('never counts a truncation-torn trailing token as the marker (R3-m2)', () => {
+      const { registry, kills, files } = makeHarness()
+      files.set('/proc/250/stat', statLine(250, 200, 55))
+      files.set('/proc/250/cmdline', '/usr/local/bin/codex\0')
+      // A DIFFERENT env value (`${MARKER_ENV}EXTRA`) cut exactly at the read bound leaves visible
+      // bytes identical to the real marker. The torn final token must never count as ownership
+      // proof, so this member is "not provably ours" and the group is never signalled.
+      const prefix = `FILLER=${'A'.repeat(PROC_ENVIRON_READ_MAX_BYTES - 'FILLER=\0'.length - MARKER_ENV.length)}\0`
+      files.set('/proc/250/environ', `${prefix}${MARKER_ENV}EXTRA\0`)
       registry.register({ ...entry(200, 'app-server'), envMarker: MARKER })
 
       registry.reapSync()
@@ -263,11 +302,11 @@ describe('codex child registry', () => {
       expect(kills).toEqual([])
     })
 
-    it('group-kills when the marker is within the 4096-byte bound of a large environ (r2-3)', () => {
+    it('group-kills when the marker is within the read bound of a truncated environ (r2-3)', () => {
       const { registry, kills, files } = makeHarness()
       files.set('/proc/250/stat', statLine(250, 200, 55))
       files.set('/proc/250/cmdline', '/usr/local/bin/codex\0')
-      files.set('/proc/250/environ', `${MARKER_ENV}\0FILLER=${'A'.repeat(8000)}\0`)
+      files.set('/proc/250/environ', `${MARKER_ENV}\0FILLER=${'A'.repeat(PROC_ENVIRON_READ_MAX_BYTES)}\0`)
       registry.register({ ...entry(200, 'app-server'), envMarker: MARKER })
 
       registry.reapSync()
@@ -483,6 +522,39 @@ describe('codex child registry', () => {
       expect(cmdlineHasCodexToken('/usr/bin/codex-tui\0')).toBe(false)
       expect(cmdlineHasCodexToken('bash\0-c\0echo codex\0')).toBe(false)
       expect(cmdlineHasCodexToken('')).toBe(false)
+    })
+  })
+
+  describe('readProcFileBoundedSync (R3-m4: the production openSync/readSync helper)', () => {
+    it('bounds oversized files, returns small files whole, and throws ENOENT for missing paths', () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-bounded-read-'))
+      try {
+        const bigPath = path.join(dir, 'big')
+        const smallPath = path.join(dir, 'small')
+        fs.writeFileSync(bigPath, Buffer.alloc(4096 + 500, 0x41))
+        fs.writeFileSync(smallPath, 'MARKER=value\0')
+
+        // Oversized content: exactly maxBytes bytes back, flagged truncated.
+        const big = readProcFileBoundedSync(bigPath, 4096)
+        expect(big.truncated).toBe(true)
+        expect(big.data.length).toBe(4096)
+        expect(big.data.equals(Buffer.alloc(4096, 0x41))).toBe(true)
+
+        // Undersized content: returned whole, not truncated.
+        const small = readProcFileBoundedSync(smallPath, 4096)
+        expect(small.truncated).toBe(false)
+        expect(small.data.toString('utf8')).toBe('MARKER=value\0')
+
+        // Exact-bound content is NOT flagged (the helper reads one byte past to detect overflow).
+        const exact = readProcFileBoundedSync(bigPath, 4096 + 500)
+        expect(exact.truncated).toBe(false)
+        expect(exact.data.length).toBe(4096 + 500)
+
+        // Missing file: the open throws (callers per-pid try/catch and fail closed).
+        expect(() => readProcFileBoundedSync(path.join(dir, 'missing'), 4096)).toThrow(/ENOENT/)
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
     })
   })
 
