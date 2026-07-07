@@ -100,7 +100,14 @@ documented log-level knob.
 
 ---
 
-## 3. Stage 0-pre — Validate the dampening mechanism (BLOCKS 0a implementation)
+## 3. Stage 0-pre — Validate the dampening mechanism (RESOLVED 2026-07-06: ALL CANDIDATES FAILED — 0a DROPPED)
+
+> **Outcome:** the full protocol was run the same night (see
+> `2026-07-06-codex-launch-leak-s3-validation-results.md`). Best candidate
+> achieved −25% vs the ≥90% bar; `RUST_LOG=off` proved the sink ignores the env
+> filter entirely. **Candidate 3 (the drop path) is invoked: 0a is dropped**,
+> the upstream issue is drafted in the results doc, and protection reduces to
+> 0b + 1c observability + 1a/1c, with Stage 2 as the load-bearing fix.
 
 The v1 plan bet its sequencing on `RUST_LOG=error` gating codex's SQLite log sink.
 The first review demanded validation before implementation; an initial experiment was
@@ -172,7 +179,7 @@ and stands.
   incrementally attributed insert bytes) vs the same-evening undampened control, and
   the pane still functions (turn completes, rollout file written).
 
-## 4. Stage 0a — Codex spawn-env log dampening (conditional on §3)
+## 4. Stage 0a — Codex spawn-env log dampening (DROPPED — §3 candidates all failed; retained for reference)
 
 ### Change
 
