@@ -1,5 +1,19 @@
 import { describe, it, expect } from 'vitest'
-import { isSystemContext, extractFromIdeContext, extractUserAuthoredText } from '../../../../server/coding-cli/utils'
+import { isSystemContext, extractFromIdeContext, extractUserAuthoredText, statMtimeMs } from '../../../../server/coding-cli/utils'
+
+describe('statMtimeMs()', () => {
+  it('floors fractional mtimeMs (sub-ms precision on WSL2/ext4) to integer epoch-ms', () => {
+    expect(statMtimeMs({ mtimeMs: 1783380081359.8726, mtime: new Date(1783380081359) })).toBe(1783380081359)
+  })
+
+  it('returns integer mtimeMs unchanged', () => {
+    expect(statMtimeMs({ mtimeMs: 1700000000000, mtime: new Date(1700000000000) })).toBe(1700000000000)
+  })
+
+  it('falls back to mtime.getTime() when mtimeMs is 0/falsy', () => {
+    expect(statMtimeMs({ mtimeMs: 0, mtime: new Date(1700000000123) })).toBe(1700000000123)
+  })
+})
 
 describe('isSystemContext()', () => {
   describe('XML-wrapped context', () => {

@@ -115,6 +115,16 @@ export async function resolveGitBranchAndDirty(cwd: string): Promise<{ branch?: 
   }
 }
 
+/**
+ * Integer epoch-ms mtime for a stat result. On some filesystems (e.g. ext4 under
+ * WSL2), fs.Stats.mtimeMs carries sub-millisecond precision and is fractional.
+ * Downstream consumers (shared read-model schemas) require integer epoch-ms, so
+ * we always floor. Falls back to mtime.getTime() when mtimeMs is 0/falsy.
+ */
+export function statMtimeMs(stat: { mtimeMs: number; mtime: Date }): number {
+  return Math.floor(stat.mtimeMs || stat.mtime.getTime())
+}
+
 export function resolveInvocationCwd(envVars: NodeJS.ProcessEnv = process.env): string | undefined {
   const candidate = envVars.INIT_CWD || envVars.PWD
   if (candidate) return candidate
