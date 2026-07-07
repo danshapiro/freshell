@@ -19,8 +19,8 @@ export const LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY = `${LAYOUT_STORAGE_KEY}.fresh
 export const LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY = `${LAYOUT_STORAGE_KEY}.fresh-agent-centralization-pending`
 export const LAYOUT_FRESH_AGENT_MIGRATION_ID = 'fresh-agent-centralization'
 
-const zTabMode = z.enum(['shell', 'claude', 'codex', 'opencode', 'gemini', 'kimi'])
-const zCodingCliProvider = z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
+const zTabMode = z.string().min(1)
+const zCodingCliProvider = z.string().min(1)
 
 const zTab = z.object({
   id: z.string().min(1),
