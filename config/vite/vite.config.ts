@@ -30,8 +30,14 @@ function silenceStartupErrors(proxy: HttpProxy.Server) {
     if (TRANSIENT_PROXY_ERROR_CODES.has(code) && 'writeHead' in res) {
       if (!res.headersSent) {
         res.writeHead(503)
+        res.end()
+      } else {
+        // Headers (and possibly part of the body) already went out: ending
+        // cleanly would make a truncated payload look like a successful
+        // response. Destroy the connection so the client sees a transport
+        // failure (NetworkError -> classified transient) instead.
+        res.destroy()
       }
-      res.end()
     }
   })
 }
