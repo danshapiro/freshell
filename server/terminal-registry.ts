@@ -37,6 +37,16 @@ import type {
 import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-launch.js'
 import { generateMcpInjection, cleanupMcpConfig } from './mcp/config-writer.js'
 import { CODEX_MANAGED_REMOTE_CONFIG_ARGS } from './coding-cli/codex-managed-config.js'
+// Stage 1a (plan §6, panel m8): a codex resume pty is a process-GROUP registration (pgid == pid),
+// and the pty leader exiting does not prove the group is gone — descendants (the actual codex log
+// DB holders) can survive it. The registry helper deregisters only when a signal-0 probe of the
+// group confirms ESRCH; 'alive'/EPERM keep the entry registered so exit-time reap still covers it
+// (r2-13b: the logic lives in codex-child-registry.ts behind an injectable probe seam; non-Linux
+// platforms deregister unconditionally there).
+import {
+  deregisterCodexChildIfGroupGone as deregisterCodexPtyIfGroupGone,
+  registerCodexChild,
+} from './coding-cli/codex-child-registry.js'
 import type { CodexLaunchPlan, CodexLaunchSidecar } from './coding-cli/codex-app-server/launch-planner.js'
 import { isCodexSidecarTeardownError } from './coding-cli/codex-app-server/launch-planner.js'
 import {
@@ -1611,6 +1621,20 @@ export class TerminalRegistry extends EventEmitter {
     }
     endSpawnTimer({ cwd: procCwd })
 
+    // Stage 1a (plan §6): codex resume ptys are spawned as session/group leaders (pgid == pid);
+    // track them for exit-time reaping. Deregistered on the pty's onExit below — kill() only
+    // *sends* a signal, it does not confirm death. Codex panes only.
+    if (opts.mode === 'codex' && ptyProc.pid) {
+      registerCodexChild({
+        pid: ptyProc.pid,
+        pgid: ptyProc.pid,
+        kind: 'resume-pty',
+        // R2-M1: ownership proof for the registry's dead-pid group-scan fallback —
+        // buildTerminalBaseEnv already put FRESHELL_TERMINAL_ID=<terminalId> into the pty env.
+        envMarker: { name: 'FRESHELL_TERMINAL_ID', value: terminalId },
+      })
+    }
+
     const title = getModeLabel(opts.mode)
 
     const initialCodexDurability: CodexDurabilityRef | undefined = opts.mode === 'codex' && resumeForBinding
@@ -1749,6 +1773,10 @@ export class TerminalRegistry extends EventEmitter {
     })
 
     ptyProc.onExit((e) => {
+      // Stage 1a (plan §6): the pty leader exited — deregister the group only if it is confirmed
+      // gone (m8), and only for codex panes, mirroring the registration gate above (m6). Runs
+      // before any dispatch guards below; no-op for double exits.
+      if (opts.mode === 'codex') deregisterCodexPtyIfGroupGone(ptyProc.pid)
       if (this.hasHandledPtyExit(record, ptyProc)) return
       this.markHandledPtyExit(record, ptyProc)
       if (!record.codexRecoveryFinalClose && record.codexRecoveryRetiringPty === ptyProc) {
@@ -3698,6 +3726,17 @@ export class TerminalRegistry extends EventEmitter {
       cwd: procCwd,
       env: env as any,
     })
+    // Stage 1a (plan §6): recovery ptys are codex resume ptys by construction; same registry
+    // contract as the primary spawn site (deregistered in the onExit handler).
+    if (ptyProc.pid) {
+      registerCodexChild({
+        pid: ptyProc.pid,
+        pgid: ptyProc.pid,
+        kind: 'resume-pty',
+        // R2-M1: same ownership proof as the primary spawn site (buildTerminalBaseEnv env).
+        envMarker: { name: 'FRESHELL_TERMINAL_ID', value: record.terminalId },
+      })
+    }
     const candidate = { pty: ptyProc, mcpCwd, exited: false, exitCode: undefined as number | undefined }
     this.attachCodexRecoveryPtyHandlers(record, ptyProc, candidate)
     return candidate
@@ -3743,6 +3782,9 @@ export class TerminalRegistry extends EventEmitter {
     })
 
     ptyProc.onExit((event) => {
+      // Stage 1a (plan §6): deregister only on confirmed group death (m8), codex-gated to mirror
+      // registration (m6; recovery records are codex by construction). Before any dispatch guards.
+      if (record.mode === 'codex') deregisterCodexPtyIfGroupGone(ptyProc.pid)
       if (this.hasHandledPtyExit(record, ptyProc)) return
       this.markHandledPtyExit(record, ptyProc)
       if (candidate) {
