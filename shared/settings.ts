@@ -57,11 +57,6 @@ const PANE_SNAP_THRESHOLD_MIN = 0
 const PANE_SNAP_THRESHOLD_MAX = 8
 const SIDEBAR_WIDTH_MIN = 200
 const SIDEBAR_WIDTH_MAX = 500
-const FRESH_AGENT_FONT_SCALE_MIN = 1
-const FRESH_AGENT_FONT_SCALE_MAX = 2
-// Fresh-agent panes render 50% larger than the base UI by default.
-export const FRESH_AGENT_FONT_SCALE_DEFAULT = 1.5
-export const FRESH_AGENT_FONT_SCALE_OPTIONS = [1, 1.25, 1.5, 1.75, 2] as const
 export const FRESH_AGENT_STYLE_VALUES = ['sans', 'serif', 'mono'] as const
 export type FreshAgentStyle = (typeof FRESH_AGENT_STYLE_VALUES)[number]
 export const DEFAULT_FRESH_AGENT_STYLE: FreshAgentStyle = 'sans'
@@ -92,7 +87,6 @@ const FRESH_AGENT_LOCAL_KEYS = [
   'showThinking',
   'showTools',
   'showTimecodes',
-  'fontScale',
 ] as const
 
 export type ThemeMode = (typeof THEME_VALUES)[number]
@@ -221,7 +215,6 @@ export type LocalSettings = {
     showThinking: boolean
     showTools: boolean
     showTimecodes: boolean
-    fontScale: number
   }
   notifications: {
     soundEnabled: boolean
@@ -467,13 +460,6 @@ function normalizeRoundedClampedNumber(value: unknown, min: number, max: number)
   return Math.round(normalized)
 }
 
-function normalizeFreshAgentFontScale(value: unknown): number {
-  return (
-    normalizeClampedNumber(value, FRESH_AGENT_FONT_SCALE_MIN, FRESH_AGENT_FONT_SCALE_MAX)
-    ?? FRESH_AGENT_FONT_SCALE_DEFAULT
-  )
-}
-
 export function normalizeFreshAgentStyleOverride(value: unknown): FreshAgentStyle | undefined {
   return FreshAgentStyleSchema.safeParse(value).success
     ? value as FreshAgentStyle
@@ -482,10 +468,6 @@ export function normalizeFreshAgentStyleOverride(value: unknown): FreshAgentStyl
 
 export function normalizeFreshAgentStyle(value: unknown): FreshAgentStyle {
   return normalizeFreshAgentStyleOverride(value) ?? DEFAULT_FRESH_AGENT_STYLE
-}
-
-function normalizeLocalFreshAgent(value: LocalSettings['freshAgent']): LocalSettings['freshAgent'] {
-  return { ...value, fontScale: normalizeFreshAgentFontScale(value.fontScale) }
 }
 
 function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSettingsPatch | undefined {
@@ -619,14 +601,6 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
     }
     if (typeof patch.freshAgent.showTimecodes === 'boolean') {
       freshAgent.showTimecodes = patch.freshAgent.showTimecodes as boolean
-    }
-    const normalizedFontScale = normalizeClampedNumber(
-      patch.freshAgent.fontScale,
-      FRESH_AGENT_FONT_SCALE_MIN,
-      FRESH_AGENT_FONT_SCALE_MAX,
-    )
-    if (normalizedFontScale !== undefined) {
-      freshAgent.fontScale = normalizedFontScale
     }
     if (Object.keys(freshAgent).length > 0) {
       normalized.freshAgent = freshAgent
@@ -883,7 +857,6 @@ export const defaultLocalSettings: LocalSettings = {
     showThinking: false,
     showTools: false,
     showTimecodes: false,
-    fontScale: FRESH_AGENT_FONT_SCALE_DEFAULT,
   },
   notifications: {
     soundEnabled: true,
@@ -906,14 +879,6 @@ function sanitizeFreshAgentLocalSettingsPatchInput(
   }
   if (typeof rawFreshAgent.showTimecodes === 'boolean') {
     freshAgent.showTimecodes = rawFreshAgent.showTimecodes
-  }
-  const normalizedFontScale = normalizeClampedNumber(
-    rawFreshAgent.fontScale,
-    FRESH_AGENT_FONT_SCALE_MIN,
-    FRESH_AGENT_FONT_SCALE_MAX,
-  )
-  if (normalizedFontScale !== undefined) {
-    freshAgent.fontScale = normalizedFontScale
   }
   return Object.keys(freshAgent).length > 0 ? freshAgent : undefined
 }
@@ -1291,7 +1256,7 @@ export function resolveLocalSettings(patch?: LocalSettingsPatch): LocalSettings 
       sortMode: normalizeLocalSortMode(patch?.sidebar?.sortMode),
       worktreeGrouping: normalizeWorktreeGrouping(patch?.sidebar?.worktreeGrouping),
     },
-    freshAgent: normalizeLocalFreshAgent(mergeDefined(defaultLocalSettings.freshAgent, freshAgentPatch)),
+    freshAgent: mergeDefined(defaultLocalSettings.freshAgent, freshAgentPatch),
     notifications: mergeDefined(defaultLocalSettings.notifications, patch?.notifications),
   }
 }

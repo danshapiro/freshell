@@ -159,7 +159,7 @@ describe('shared settings contract', () => {
 
     expect(resolved.freshAgent.showTools).toBe(true)
     expect(resolved.freshAgent.showThinking).toBe(true)
-    expect(resolved.freshAgent.fontScale).toBe(1.25)
+    expect('fontScale' in resolved.freshAgent).toBe(false)
     expect('agentChat' in resolved).toBe(false)
   })
 
@@ -604,49 +604,47 @@ describe('shared settings contract', () => {
     expect(schema.safeParse({ panes: { multirowTabs: true } }).success).toBe(false)
   })
 
-  describe('legacy fresh-agent font scale settings', () => {
-    it('keeps the legacy fresh-agent font scale default for old stored settings', () => {
-      const resolved = resolveLocalSettings(undefined)
-      expect(resolved.freshAgent.fontScale).toBe(1.5)
+  describe('deprecated fresh-agent font scale is dropped', () => {
+    it('resolves the default fresh-agent settings without a fontScale key', () => {
+      expect(resolveLocalSettings(undefined).freshAgent).toEqual({
+        showThinking: false,
+        showTools: false,
+        showTimecodes: false,
+      })
     })
 
-    it('resolves a configured fresh-agent font scale without mirroring agentChat', () => {
-      const resolved = resolveLocalSettings({ freshAgent: { fontScale: 1.75 } })
-      expect(resolved.freshAgent.fontScale).toBe(1.75)
+    it('drops a canonical freshAgent.fontScale regardless of value', () => {
+      for (const value of [1.75, 5, 'big']) {
+        expect(resolveLocalSettings({ freshAgent: { fontScale: value } } as never).freshAgent).toEqual({
+          showThinking: false,
+          showTools: false,
+          showTimecodes: false,
+        })
+      }
+    })
+
+    it('drops the legacy agentChat alias fontScale while keeping its siblings', () => {
+      const resolved = resolveLocalSettings({ agentChat: { showTools: true, fontScale: 1.25 } } as never)
+      expect(resolved.freshAgent.showTools).toBe(true)
+      expect('fontScale' in resolved.freshAgent).toBe(false)
       expect('agentChat' in resolved).toBe(false)
     })
 
-    it('accepts the legacy fresh-agent font scale through the agentChat alias', () => {
-      const resolved = resolveLocalSettings({ agentChat: { fontScale: 1.25 } } as never)
-      expect(resolved.freshAgent.fontScale).toBe(1.25)
-      expect('agentChat' in resolved).toBe(false)
-    })
-
-    it('clamps an out-of-range legacy fresh-agent font scale into the supported range', () => {
-      expect(resolveLocalSettings({ freshAgent: { fontScale: 5 } }).freshAgent.fontScale).toBe(2)
-      expect(resolveLocalSettings({ freshAgent: { fontScale: 0.1 } }).freshAgent.fontScale).toBe(1)
-    })
-
-    it('falls back to the default when the legacy fresh-agent font scale is not a finite number', () => {
-      expect(
-        resolveLocalSettings({
-          freshAgent: { fontScale: 'big' as unknown as number },
-        }).freshAgent.fontScale,
-      ).toBe(1.5)
-    })
-
-    it('keeps the resolved legacy fresh-agent font scale in composed settings', () => {
+    it('carries no fontScale into composed settings', () => {
       const resolved = composeResolvedSettings(
         createDefaultServerSettings({ loggingDebug: false }),
-        resolveLocalSettings({ freshAgent: { fontScale: 2 } }),
+        resolveLocalSettings({ freshAgent: { fontScale: 2 } } as never),
       )
-      expect(resolved.freshAgent.fontScale).toBe(2)
+      expect('fontScale' in resolved.freshAgent).toBe(false)
     })
 
-    it('clamps the legacy fresh-agent font scale when extracting a local seed', () => {
+    it('drops fontScale when extracting a legacy local seed', () => {
       expect(
         extractLegacyLocalSettingsSeed({ agentChat: { fontScale: 9 } } as Record<string, unknown>),
-      ).toEqual({ freshAgent: { fontScale: 2 } })
+      ).toEqual(undefined)
+      expect(
+        extractLegacyLocalSettingsSeed({ agentChat: { showTools: true, fontScale: 9 } } as Record<string, unknown>),
+      ).toEqual({ freshAgent: { showTools: true } })
     })
   })
 })

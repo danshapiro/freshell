@@ -876,8 +876,8 @@ test.describe('Fresh Agent', () => {
     const transcript = paneRoot.locator('[data-context="fresh-agent-transcript"]')
     await expect.poll(async () => transcript.evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1)
 
-    // Changing the terminal font size updates the transcript size. The legacy
-    // freshAgent.fontScale setting no longer drives Fresh Agent body text.
+    // Changing the terminal font size updates the transcript size. The removed
+    // freshAgent.fontScale setting is ignored when present in a dispatched patch.
     await page.evaluate(() => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({
         type: 'settings/updateSettingsLocal',
