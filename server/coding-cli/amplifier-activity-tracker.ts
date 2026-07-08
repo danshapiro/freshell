@@ -1,18 +1,40 @@
 import { EventEmitter } from 'events'
 import { isSubmitInput } from '../../shared/turn-complete-signal.js'
 import type { TerminalTurnCompletionSnapshot } from '../../shared/ws-protocol.js'
+import type { AmplifierReducerEffect } from './amplifier-events-reducer.js'
+import { TurnCompletionLedger } from './turn-completion-ledger.js'
 
-// Failsafe: a busy terminal silent this long self-heals to idle (and completes the
-// turn). Mirrors the Claude lane's deadman, but Amplifier's deadman ALSO emits a
-// turn.complete because Amplifier has no other end-of-turn signal.
+// Deadman: a busy terminal silent this long triggers the lane-specific failsafe
+// (docs/plans/2026-07-08-amplifier-session-durability-plan.md §6):
+// - EVENTS lane (the normal case once a session is bound): request a force-read
+//   of events.jsonl (WSL2 inotify backstop) and STAY busy — never fabricate a
+//   completion; `prompt:complete` / `session:end` records are the only turn ends.
+// - DEGRADED lane (pre-bind, tailer error, schema mismatch): self-heal to idle
+//   AND emit a turn.complete, because the timing heuristic has no other
+//   end-of-turn signal to fall back on.
 export const AMPLIFIER_BUSY_DEADMAN_MS = 120_000
 export const AMPLIFIER_ACTIVITY_SWEEP_MS = 5_000
-// Output-idle window that marks a turn complete. Amplifier has no turn-complete BEL,
-// so once the first post-submit output has arrived, this much output-silence is
-// treated as the end of the turn.
+// Output-idle window that marks a turn complete. DEGRADED lane only: without the
+// events.jsonl lifecycle records there is no turn-complete signal in the PTY
+// stream (no BEL), so once the first post-submit output has arrived, this much
+// output-silence is treated as the end of the turn. In the EVENTS lane this
+// timer is never armed — `prompt:complete` is the single turn boundary (E2/E3).
 export const AMPLIFIER_IDLE_DEBOUNCE_MS = 2_000
+// Events lane: a PTY Enter is only PROVISIONALLY busy. Empty-Enter writes zero
+// events (plan §2 E5), so if no `prompt:submit` record confirms the turn within
+// this window the tracker silently reverts to idle (no turn.complete). Because
+// a silently-dead watcher (WSL2 inotify) would also look like "no record", the
+// FIRST expiry requests a force-read of the events tail and extends the grace
+// once; only the second expiry reverts (adversarial finding D).
+export const AMPLIFIER_SUBMIT_GRACE_MS = 2_000
+// After this many CONSECUTIVE grace reversions on one terminal a single
+// 'amplifier_events_lane_suspect' warn is logged (soak monitoring for dead
+// watchers). Never auto-degrades: empty-Enters are legitimate reversions.
+export const AMPLIFIER_GRACE_REVERSION_SUSPECT_THRESHOLD = 3
 
 export type AmplifierActivityPhase = 'idle' | 'busy'
+
+export type AmplifierActivityLane = 'degraded' | 'events'
 
 export type AmplifierActivityRecord = {
   terminalId: string
@@ -33,6 +55,18 @@ export type AmplifierActivityChange = {
   remove: string[]
 }
 
+/**
+ * Emitted (event name 'events.force-read') when a busy events-lane terminal has
+ * been silent past the deadman: the integration must force-read the events tail
+ * (WSL2 inotify backstop). The tracker stays busy — it never fabricates a
+ * completion in the events lane.
+ */
+export type AmplifierEventsForceReadRequest = {
+  terminalId: string
+  sessionId?: string
+  at: number
+}
+
 type TrackerLogger = {
   warn: (payload: object, message?: string) => void
 }
@@ -43,31 +77,59 @@ type AmplifierTerminalActivity = {
   phase: AmplifierActivityPhase
   updatedAt: number
   lastObservedAt: number
-  lastSubmitAt?: number
   // True after a submit until the first output arrives. While true the idle-debounce
   // timer is deliberately NOT armed so pre-first-token latency cannot look like idle.
+  // DEGRADED lane only.
   awaitingFirstOutput: boolean
   idleTimer?: ReturnType<typeof setTimeout>
+  // ---- events lane (plan §6) ----
+  lane: AmplifierActivityLane
+  // Events lane: true once a `prompt:submit` record confirmed the current busy
+  // phase; false while busy is provisional (PTY Enter, awaiting the record).
+  busyConfirmed: boolean
+  submitGraceTimer?: ReturnType<typeof setTimeout>
+  // True once the current provisional busy already spent its one force-read
+  // retry (finding D): the next grace expiry reverts.
+  submitGraceRetried: boolean
+  // Consecutive silent grace reversions; reset by any confirmed turn.began.
+  graceReversionCount: number
+  // Deadman force-read warn is logged once per stuck-busy period.
+  forceReadLogged: boolean
+  // Finding G: disableEventsLane during a busy turn may race a read that had
+  // already pulled a turn.completed off disk — honor exactly one such
+  // completion during the transition (cleared by any new degraded-lane turn).
+  pendingDegradeCompletion: boolean
 }
 
 /**
  * Server-authoritative Amplifier turn lifecycle, keyed by terminalId.
  *
- * - A submit (whole-payload newline) marks busy, (re)arms the deadman and sets
- *   awaitingFirstOutput. It does NOT arm the idle-debounce timer yet.
- * - The first output after a submit clears awaitingFirstOutput; every output while
- *   busy (re)starts the idle-debounce timer. When that timer elapses with no further
- *   output the turn ends: phase → idle and one turn.complete is emitted.
- * - A busy terminal silent past the deadman self-heals to idle and also emits a
- *   turn.complete (Amplifier has no BEL, so the deadman is the only failsafe end).
+ * Two lanes per terminal (docs/plans/2026-07-08-amplifier-session-durability-plan.md §6):
  *
- * Unlike the Claude tracker this lane detects turn-END via OUTPUT-IDLE, not the
- * Stop-hook BEL parser.
+ * - DEGRADED lane (default; the pre-events heuristic, verbatim):
+ *   - A submit (whole-payload newline) marks busy, (re)arms the deadman and sets
+ *     awaitingFirstOutput. It does NOT arm the idle-debounce timer yet.
+ *   - The first output after a submit clears awaitingFirstOutput; every output while
+ *     busy (re)starts the idle-debounce timer. When that timer elapses with no further
+ *     output the turn ends: phase → idle and one turn.complete is emitted.
+ *   - A busy terminal silent past the deadman self-heals to idle and also emits a
+ *     turn.complete (without the events.jsonl records this lane has no real
+ *     end-of-turn signal, so its deadman is the only failsafe end).
+ *
+ * - EVENTS lane (enabled by the integration once a session is bound and the
+ *   events.jsonl tailer is attached): lifecycle comes from reducer effects fed via
+ *   applyLifecycle(). PTY Enter is only a provisional busy with a grace reversion;
+ *   `turn.began` confirms, `turn.completed` is the single turn boundary; PTY output
+ *   only refreshes liveness (no idle-debounce); the deadman requests a force-read
+ *   and never fabricates a completion. PTY exit stays authoritative in both lanes.
+ *
+ * The public surface (list/getActivity/listLatestCompletions/trackTerminal/
+ * bindSession/noteInput/noteOutput/noteExit/expire/dispose + 'changed'/'turn.complete',
+ * phase 'idle' | 'busy') is frozen; lanes are internal.
  */
 export class AmplifierActivityTracker extends EventEmitter {
   private readonly states = new Map<string, AmplifierTerminalActivity>()
-  private readonly completionSeqByTerminalId = new Map<string, number>()
-  private readonly latestCompletions = new Map<string, TerminalTurnCompletionSnapshot>()
+  private readonly completionLedger = new TurnCompletionLedger()
   private readonly log?: TrackerLogger
 
   constructor(input: { log?: TrackerLogger } = {}) {
@@ -85,7 +147,7 @@ export class AmplifierActivityTracker extends EventEmitter {
   }
 
   listLatestCompletions(): TerminalTurnCompletionSnapshot[] {
-    return Array.from(this.latestCompletions.values())
+    return this.completionLedger.listLatestCompletions()
   }
 
   trackTerminal(input: { terminalId: string; sessionId?: string; at: number }): void {
@@ -105,6 +167,12 @@ export class AmplifierActivityTracker extends EventEmitter {
       updatedAt: input.at,
       lastObservedAt: input.at,
       awaitingFirstOutput: false,
+      lane: 'degraded',
+      busyConfirmed: false,
+      submitGraceRetried: false,
+      graceReversionCount: 0,
+      forceReadLogged: false,
+      pendingDegradeCompletion: false,
     }
     this.commitState(state, undefined)
   }
@@ -118,13 +186,133 @@ export class AmplifierActivityTracker extends EventEmitter {
     this.commitState(state, previous)
   }
 
+  /**
+   * Switch a terminal to the events lane (session bound + tailer attached).
+   * Degraded-lane machinery goes quiescent: the idle-debounce timer is cleared and
+   * never re-armed while in this lane. If the terminal is currently busy (timing
+   * lane saw the submit before the bind), the busy phase becomes provisional and a
+   * submit-grace timer is armed — the replayed `prompt:submit` record confirms it.
+   */
+  enableEventsLane(terminalId: string): void {
+    const state = this.states.get(terminalId)
+    if (!state || state.lane === 'events') return
+    state.lane = 'events'
+    this.clearIdleTimer(state)
+    state.awaitingFirstOutput = false
+    state.busyConfirmed = false
+    state.forceReadLogged = false
+    state.pendingDegradeCompletion = false
+    if (state.phase === 'busy') {
+      state.submitGraceRetried = false
+      this.armSubmitGrace(state, Date.now())
+    }
+  }
+
+  /**
+   * Fall back to the degraded (timing) lane — tailer error, schema mismatch, file
+   * reset (plan §6 last row). The current heuristics take over immediately: a
+   * mid-turn busy phase is treated like a fresh submit (awaitingFirstOutput), so
+   * the next output arms the idle-debounce and the degraded deadman remains the
+   * failsafe end. The single 'amplifier_events_lane_degraded' warn is the
+   * integration's responsibility.
+   */
+  disableEventsLane(terminalId: string, reason: string): void {
+    void reason
+    const state = this.states.get(terminalId)
+    if (!state || state.lane === 'degraded') return
+    state.lane = 'degraded'
+    this.clearSubmitGrace(state)
+    state.busyConfirmed = false
+    state.forceReadLogged = false
+    if (state.phase === 'busy') {
+      state.awaitingFirstOutput = true
+      // A read in flight at degrade time may already hold this turn's
+      // turn.completed (finding G): honor it once during the transition.
+      state.pendingDegradeCompletion = true
+    }
+  }
+
+  /**
+   * Consume a reducer effect (events lane input; plan §6 transition table).
+   * `lane.degrade` is honored in any lane; other effects are ignored unless the
+   * terminal is in the events lane.
+   */
+  applyLifecycle(terminalId: string, effect: AmplifierReducerEffect): void {
+    const state = this.states.get(terminalId)
+    if (!state) return
+    if (effect.kind === 'lane.degrade') {
+      this.disableEventsLane(terminalId, effect.reason)
+      return
+    }
+    if (state.lane !== 'events') {
+      // Finding G: a lane degrade racing an in-flight read must not drop a
+      // turn.completed the tailer had already read — honor exactly one such
+      // completion during the transition, then go fully inert.
+      if (effect.kind === 'turn.completed' && state.pendingDegradeCompletion) {
+        state.pendingDegradeCompletion = false
+        this.completeTurn(state, parseEffectAt(effect.at))
+      }
+      return
+    }
+
+    switch (effect.kind) {
+      case 'turn.began': {
+        // The only input that (re)enters busy (E2/E5). Confirms a provisional busy.
+        const at = parseEffectAt(effect.at)
+        this.clearSubmitGrace(state)
+        state.busyConfirmed = true
+        state.forceReadLogged = false
+        state.graceReversionCount = 0
+        state.lastObservedAt = at
+        if (state.phase !== 'busy') {
+          const previous = this.toRecord(state)
+          state.phase = 'busy'
+          state.updatedAt = at
+          this.commitState(state, previous)
+        }
+        return
+      }
+      case 'turn.completed': {
+        // The single turn boundary (E2/E3): exactly one turn.complete per turn.
+        this.completeTurn(state, parseEffectAt(effect.at))
+        return
+      }
+      case 'session.identified': {
+        if (!effect.sessionId || state.sessionId === effect.sessionId) return
+        const previous = this.toRecord(state)
+        state.sessionId = effect.sessionId
+        this.commitState(state, previous)
+        return
+      }
+      default:
+        return
+    }
+  }
+
   noteInput(input: { terminalId: string; data: string; at: number }): void {
     const state = this.states.get(input.terminalId)
     if (!state) return
     if (!isSubmitInput(input.data)) return
+    if (state.lane === 'events') {
+      // Events lane (plan §6): idle + PTY submit → provisional busy with a grace
+      // timer (empty-Enter writes zero events, E5). Submit during busy re-arms
+      // NOTHING — mid-turn typing is queued steering within the same turn (E5).
+      state.lastObservedAt = input.at
+      if (state.phase === 'busy') return
+      const previous = this.toRecord(state)
+      state.phase = 'busy'
+      state.busyConfirmed = false
+      state.submitGraceRetried = false
+      state.updatedAt = input.at
+      this.armSubmitGrace(state, input.at)
+      this.commitState(state, previous)
+      return
+    }
     const previous = this.toRecord(state)
-    state.lastSubmitAt = input.at
     state.lastObservedAt = input.at
+    // A fresh degraded-lane turn owns its own end: stale events-lane
+    // completions from before the degrade no longer apply (finding G).
+    state.pendingDegradeCompletion = false
     // Turn onset: go busy and (re)arm the deadman via lastObservedAt. Wait for the
     // first output before arming the idle-debounce timer.
     state.awaitingFirstOutput = true
@@ -140,6 +328,14 @@ export class AmplifierActivityTracker extends EventEmitter {
     const state = this.states.get(input.terminalId)
     if (!state) return
     if (state.phase !== 'busy') return
+    if (state.lane === 'events') {
+      // Events lane: output only refreshes liveness (feeds the deadman). The
+      // idle-debounce timer is NEVER armed here — `prompt:complete` is the only
+      // turn boundary.
+      state.lastObservedAt = input.at
+      state.forceReadLogged = false
+      return
+    }
     state.lastObservedAt = input.at
     // First output after submit clears the awaiting flag; every output (re)starts the
     // idle-debounce timer so the turn ends only after output-silence.
@@ -166,6 +362,87 @@ export class AmplifierActivityTracker extends EventEmitter {
     }
   }
 
+  private armSubmitGrace(state: AmplifierTerminalActivity, at: number): void {
+    this.clearSubmitGrace(state)
+    const terminalId = state.terminalId
+    const expiryAt = at + AMPLIFIER_SUBMIT_GRACE_MS
+    const timer = setTimeout(() => {
+      this.handleSubmitGraceTimeout(terminalId, expiryAt)
+    }, AMPLIFIER_SUBMIT_GRACE_MS)
+    ;(timer as unknown as { unref?: () => void }).unref?.()
+    state.submitGraceTimer = timer
+  }
+
+  private clearSubmitGrace(state: AmplifierTerminalActivity): void {
+    if (state.submitGraceTimer !== undefined) {
+      clearTimeout(state.submitGraceTimer)
+      state.submitGraceTimer = undefined
+    }
+  }
+
+  private handleSubmitGraceTimeout(terminalId: string, at: number): void {
+    const state = this.states.get(terminalId)
+    if (!state) return
+    state.submitGraceTimer = undefined
+    if (state.lane !== 'events') return
+    if (state.phase !== 'busy' || state.busyConfirmed) return
+    if (!state.submitGraceRetried) {
+      // Backstop for silently-dead watchers (WSL2 inotify; adversarial finding
+      // D): "no prompt:submit seen" may just mean "no change event delivered".
+      // Request a force-read of the events tail and extend the grace ONCE — a
+      // drained prompt:submit confirms busy via the normal turn.began path.
+      // Never reverts-then-corrects, so clients see no idle→busy flap.
+      state.submitGraceRetried = true
+      this.emit('events.force-read', {
+        terminalId: state.terminalId,
+        ...(state.sessionId ? { sessionId: state.sessionId } : {}),
+        at,
+      } satisfies AmplifierEventsForceReadRequest)
+      this.armSubmitGrace(state, at)
+      return
+    }
+    // Silent reversion (plan §6, validated by E5): no `prompt:submit` record
+    // followed the Enter (nor the force-read), so the turn never started.
+    // NO turn.complete.
+    const previous = this.toRecord(state)
+    state.phase = 'idle'
+    state.updatedAt = at
+    state.lastObservedAt = at
+    state.graceReversionCount += 1
+    if (state.graceReversionCount === AMPLIFIER_GRACE_REVERSION_SUSPECT_THRESHOLD) {
+      // Soak signal only (Phase 5): repeated reversions can mean a dead watcher
+      // OR repeated legitimate empty-Enters — never auto-degrade.
+      this.log?.warn({
+        component: 'amplifier-activity-tracker',
+        event: 'amplifier_events_lane_suspect',
+        terminalId: state.terminalId,
+        reversions: state.graceReversionCount,
+      }, 'Amplifier events lane saw repeated submit-grace reversions; the events watcher may be dead (staying in events lane).')
+    }
+    this.commitState(state, previous)
+  }
+
+  /** Shared turn-completion path (events-lane turn.completed + finding-G transition grant). */
+  private completeTurn(state: AmplifierTerminalActivity, at: number): void {
+    if (state.phase !== 'busy') return
+    const previous = this.toRecord(state)
+    this.clearSubmitGrace(state)
+    this.clearIdleTimer(state)
+    state.phase = 'idle'
+    state.busyConfirmed = false
+    state.forceReadLogged = false
+    state.awaitingFirstOutput = false
+    state.updatedAt = at
+    state.lastObservedAt = at
+    const completion = this.completionLedger.recordTurnCompletion({
+      terminalId: state.terminalId,
+      ...(state.sessionId ? { sessionId: state.sessionId } : {}),
+      at,
+    })
+    this.commitState(state, previous)
+    this.emit('turn.complete', completion)
+  }
+
   private handleIdleTimeout(terminalId: string, at: number): void {
     const state = this.states.get(terminalId)
     if (!state) return
@@ -176,7 +453,7 @@ export class AmplifierActivityTracker extends EventEmitter {
     state.awaitingFirstOutput = false
     state.updatedAt = at
     state.lastObservedAt = at
-    const completion = this.recordTurnCompletion({
+    const completion = this.completionLedger.recordTurnCompletion({
       terminalId: state.terminalId,
       ...(state.sessionId ? { sessionId: state.sessionId } : {}),
       at,
@@ -185,25 +462,8 @@ export class AmplifierActivityTracker extends EventEmitter {
     this.emit('turn.complete', completion)
   }
 
-  private recordTurnCompletion(input: {
-    terminalId: string
-    sessionId?: string
-    at: number
-  }): AmplifierTurnCompleteEvent {
-    const completionSeq = (this.completionSeqByTerminalId.get(input.terminalId) ?? 0) + 1
-    this.completionSeqByTerminalId.set(input.terminalId, completionSeq)
-    this.latestCompletions.set(input.terminalId, {
-      terminalId: input.terminalId,
-      at: input.at,
-      completionSeq,
-    })
-    return {
-      ...input,
-      completionSeq,
-    }
-  }
-
   noteExit(input: { terminalId: string }): void {
+    // PTY exit is the authoritative end — unconditional, both lanes (plan §6).
     this.removeState(input.terminalId)
   }
 
@@ -212,6 +472,26 @@ export class AmplifierActivityTracker extends EventEmitter {
       if (state.phase !== 'busy') continue
       const idleAgeMs = at - state.lastObservedAt
       if (idleAgeMs <= AMPLIFIER_BUSY_DEADMAN_MS) continue
+      if (state.lane === 'events') {
+        // Missed-signal failsafe (plan §6): never fabricate a completion in the
+        // events lane. Request a force-read of the tail (WSL2 inotify backstop);
+        // if nothing surfaces the terminal stays busy (genuine long turn).
+        if (!state.forceReadLogged) {
+          state.forceReadLogged = true
+          this.log?.warn({
+            component: 'amplifier-activity-tracker',
+            event: 'amplifier_activity_deadman_force_read',
+            terminalId: state.terminalId,
+            ageMs: idleAgeMs,
+          }, 'Amplifier events-lane terminal silent past deadman; requesting force-read (staying busy).')
+        }
+        this.emit('events.force-read', {
+          terminalId: state.terminalId,
+          ...(state.sessionId ? { sessionId: state.sessionId } : {}),
+          at,
+        } satisfies AmplifierEventsForceReadRequest)
+        continue
+      }
       const previous = this.toRecord(state)
       this.clearIdleTimer(state)
       state.phase = 'idle'
@@ -224,7 +504,7 @@ export class AmplifierActivityTracker extends EventEmitter {
         terminalId: state.terminalId,
         ageMs: idleAgeMs,
       }, 'Amplifier terminal stuck busy past deadman; clearing to idle.')
-      const completion = this.recordTurnCompletion({
+      const completion = this.completionLedger.recordTurnCompletion({
         terminalId: state.terminalId,
         ...(state.sessionId ? { sessionId: state.sessionId } : {}),
         at,
@@ -234,10 +514,11 @@ export class AmplifierActivityTracker extends EventEmitter {
     }
   }
 
-  /** Clear every per-terminal debounce timer (called on wiring dispose). */
+  /** Clear every per-terminal debounce/grace timer (called on wiring dispose). */
   dispose(): void {
     for (const state of this.states.values()) {
       this.clearIdleTimer(state)
+      this.clearSubmitGrace(state)
     }
   }
 
@@ -252,6 +533,7 @@ export class AmplifierActivityTracker extends EventEmitter {
     const state = this.states.get(terminalId)
     if (!state) return
     this.clearIdleTimer(state)
+    this.clearSubmitGrace(state)
     this.states.delete(terminalId)
     this.emit('changed', { upsert: [], remove: [terminalId] } satisfies AmplifierActivityChange)
   }
@@ -269,4 +551,14 @@ export class AmplifierActivityTracker extends EventEmitter {
     if (!previous) return true
     return previous.phase !== next.phase || previous.sessionId !== next.sessionId
   }
+}
+
+/** Effect timestamps are ISO strings carried through from the log (plan §6:
+ *  never used to gate transitions, only for `updatedAt`/`at` fields). */
+function parseEffectAt(at: string | undefined): number {
+  if (at) {
+    const parsed = Date.parse(at)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return Date.now()
 }

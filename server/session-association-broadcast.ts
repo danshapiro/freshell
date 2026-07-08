@@ -6,7 +6,14 @@ import type {
   TerminalSeedRecord,
 } from './terminal-metadata-service.js'
 
-type AssociationBroadcastSource = 'indexer_update' | 'claude_new_session' | 'opencode_controller' | 'codex_durability'
+/** Single source of truth — session-observability.ts imports this type. */
+export type AssociationBroadcastSource =
+  | 'indexer_update'
+  | 'claude_new_session'
+  | 'opencode_controller'
+  | 'codex_durability'
+  | 'amplifier_locator'
+  | 'amplifier_new_session'
 
 export type AssociationPublicationStatus =
   | 'published'

@@ -28,6 +28,10 @@ export interface CodingCliProvider {
    * grows even though the primary session file is unchanged.
    */
   getActivityMtimeMs?(filePath: string): Promise<number | undefined>
+  /** Absolute path of the live lifecycle event log sibling to the given canonical
+   *  session file, if this provider maintains one. Enables event-driven activity
+   *  tracking without hardcoding sidecar layouts outside the provider. */
+  getLiveEventsPath?(filePath: string): string | undefined
   getSessionWatchBases?(): string[]
   listSessionFiles(): Promise<string[]>
   parseSessionFile(content: string, filePath: string): Promise<ParsedSessionMeta>

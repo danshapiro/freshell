@@ -13,6 +13,7 @@ import type {
   SessionBindingReason,
 } from '../terminal-stream/registry-events.js'
 import type { CodingCliSession, ProjectGroup } from './types.js'
+import { TurnCompletionLedger } from './turn-completion-ledger.js'
 
 export const PENDING_SUBMIT_GATE_MS = 6000
 export const PENDING_SNAPSHOT_GRACE_MS = 15000
@@ -95,8 +96,7 @@ function buildProjectIndex(projects: ProjectGroup[]): Map<string, CodingCliSessi
 
 export class CodexActivityTracker extends EventEmitter {
   private readonly states = new Map<string, CodexTerminalActivity>()
-  private readonly completionSeqByTerminalId = new Map<string, number>()
-  private readonly latestCompletions = new Map<string, TerminalTurnCompletionSnapshot>()
+  private readonly completionLedger = new TurnCompletionLedger()
   private pendingCompletions: CodexTurnCompleteEvent[] = []
 
   list(): CodexActivityRecord[] {
@@ -108,7 +108,7 @@ export class CodexActivityTracker extends EventEmitter {
   }
 
   listLatestCompletions(): TerminalTurnCompletionSnapshot[] {
-    return Array.from(this.latestCompletions.values())
+    return this.completionLedger.listLatestCompletions()
   }
 
   isPromptBlocked(terminalId: string, at?: number): boolean {
@@ -444,7 +444,7 @@ export class CodexActivityTracker extends EventEmitter {
     if (state.phase !== 'idle') return
     if (state.lastEmittedTurnKey === turnKey) return
     state.lastEmittedTurnKey = turnKey
-    this.pendingCompletions.push(this.recordTurnCompletion({
+    this.pendingCompletions.push(this.completionLedger.recordTurnCompletion({
       terminalId: state.terminalId,
       ...(state.sessionId ? { sessionId: state.sessionId } : {}),
       at,
@@ -457,24 +457,6 @@ export class CodexActivityTracker extends EventEmitter {
     this.pendingCompletions = []
     for (const completion of out) {
       this.emit('turn.complete', completion)
-    }
-  }
-
-  private recordTurnCompletion(input: {
-    terminalId: string
-    sessionId?: string
-    at: number
-  }): CodexTurnCompleteEvent {
-    const completionSeq = (this.completionSeqByTerminalId.get(input.terminalId) ?? 0) + 1
-    this.completionSeqByTerminalId.set(input.terminalId, completionSeq)
-    this.latestCompletions.set(input.terminalId, {
-      terminalId: input.terminalId,
-      at: input.at,
-      completionSeq,
-    })
-    return {
-      ...input,
-      completionSeq,
     }
   }
 

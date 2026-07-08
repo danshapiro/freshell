@@ -1,94 +1,32 @@
+import { logger } from '../logger.js'
 import {
   AMPLIFIER_ACTIVITY_SWEEP_MS,
   AmplifierActivityTracker,
 } from './amplifier-activity-tracker.js'
-import type {
-  TerminalInputRawEvent,
-  TerminalOutputRawEvent,
-  TerminalSessionBoundEvent,
-} from '../terminal-stream/registry-events.js'
+import { wirePtyActivityTracker, type ActivityWiringRegistry } from './activity-wiring-factory.js'
 
-type AmplifierTerminalSnapshot = {
-  terminalId: string
-  mode: string
-  status: string
-}
+type AmplifierActivityRegistry = ActivityWiringRegistry
 
-type AmplifierActivityRegistry = {
-  list: () => Array<{ terminalId: string }>
-  get: (terminalId: string) => AmplifierTerminalSnapshot | undefined | null
-  on: (event: string, handler: (...args: any[]) => void) => void
-  off: (event: string, handler: (...args: any[]) => void) => void
-}
-
+/**
+ * Registry→tracker wiring for Amplifier's PTY (degraded-lane) signals. Thin
+ * wrapper over the shared wirePtyActivityTracker factory (Phase 4
+ * consolidation with the claude wiring); the public surface is unchanged.
+ * The events lane layers on top via amplifier-activity-integration.ts.
+ */
 export function wireAmplifierActivityTracker(input: {
   registry: AmplifierActivityRegistry
   now?: () => number
   setIntervalFn?: typeof setInterval
   clearIntervalFn?: typeof clearInterval
 }) {
-  const {
-    registry,
-    now = () => Date.now(),
-    setIntervalFn = setInterval,
-    clearIntervalFn = clearInterval,
-  } = input
-
-  const tracker = new AmplifierActivityTracker()
-
-  const startTracking = (record: AmplifierTerminalSnapshot) => {
-    if (record.mode !== 'amplifier' || record.status !== 'running') return
-    tracker.trackTerminal({ terminalId: record.terminalId, at: now() })
-  }
-
-  const onCreated = (record: AmplifierTerminalSnapshot) => {
-    startTracking(record)
-  }
-  const onBound = (event: TerminalSessionBoundEvent) => {
-    if (event.provider !== 'amplifier') return
-    // Production emits 'terminal.session.bound' BEFORE 'terminal.created', so a plain
-    // bindSession would be a no-op (no record yet) and drop the sessionId. Ensure the
-    // record exists with its sessionId first (trackTerminal is idempotent and updates
-    // the sessionId on an existing record); a later 'terminal.created' won't clobber it.
-    tracker.trackTerminal({ terminalId: event.terminalId, sessionId: event.sessionId, at: now() })
-    tracker.bindSession({ terminalId: event.terminalId, sessionId: event.sessionId, at: now() })
-  }
-  const onInput = (event: TerminalInputRawEvent) => {
-    tracker.noteInput({ terminalId: event.terminalId, data: event.data, at: event.at })
-  }
-  const onOutput = (event: TerminalOutputRawEvent) => {
-    tracker.noteOutput({ terminalId: event.terminalId, data: event.data, at: event.at })
-  }
-  const onExit = (event: { terminalId?: string }) => {
-    if (!event.terminalId) return
-    tracker.noteExit({ terminalId: event.terminalId })
-  }
-
-  registry.on('terminal.created', onCreated)
-  registry.on('terminal.session.bound', onBound)
-  registry.on('terminal.input.raw', onInput)
-  registry.on('terminal.output.raw', onOutput)
-  registry.on('terminal.exit', onExit)
-
-  for (const listed of registry.list()) {
-    const record = registry.get(listed.terminalId)
-    if (record) startTracking(record)
-  }
-
-  const sweepTimer = setIntervalFn(() => {
-    tracker.expire(now())
-  }, AMPLIFIER_ACTIVITY_SWEEP_MS)
-
-  return {
-    tracker,
-    dispose(): void {
-      registry.off('terminal.created', onCreated)
-      registry.off('terminal.session.bound', onBound)
-      registry.off('terminal.input.raw', onInput)
-      registry.off('terminal.output.raw', onOutput)
-      registry.off('terminal.exit', onExit)
-      clearIntervalFn(sweepTimer)
-      tracker.dispose()
-    },
-  }
+  return wirePtyActivityTracker({
+    mode: 'amplifier',
+    // The tracker's own warns (deadman force-read, events-lane-suspect) must
+    // reach the production log for Phase-5 soak monitoring.
+    tracker: new AmplifierActivityTracker({ log: logger.child({ component: 'amplifier-activity-tracker' }) }),
+    sweepIntervalMs: AMPLIFIER_ACTIVITY_SWEEP_MS,
+    // The amplifier tracker owns per-terminal debounce/grace timers.
+    disposeTracker: (tracker) => tracker.dispose(),
+    ...input,
+  })
 }

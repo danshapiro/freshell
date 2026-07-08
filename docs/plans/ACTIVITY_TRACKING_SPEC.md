@@ -1,5 +1,70 @@
 # Terminal Activity Tracking Feature Specification
 
+> **Note (2026-07):** Sections below under "Historical: client-side activity
+> indicators" describe a client-side feature from Jan 2026 that was rolled
+> back. Current activity tracking is **server-authoritative**, per provider —
+> see [Server-side coding-CLI activity tracking](#server-side-coding-cli-activity-tracking-2026-07)
+> for the current design, including Amplifier's two-lane tracker.
+
+## Server-side coding-CLI activity tracking (2026-07)
+
+Each coding-CLI provider has a server-side activity tracker keyed by
+`terminalId` (`server/coding-cli/*-activity-tracker.ts`) that derives turn
+lifecycle (busy/idle + `turn.complete` events) from provider-native signals:
+
+| Provider | Turn-start signal | Turn-end signal |
+|---|---|---|
+| claude | PTY submit (Enter) | Stop-hook BEL in PTY output |
+| codex | PTY submit / app-server `onTurnStarted` | app-server `onTurnCompleted` / BEL / JSONL reconcile (deduped per turn) |
+| opencode | SSE `session.status: busy` | SSE `session.idle` |
+| amplifier | see two-lane design below | see two-lane design below |
+
+All four trackers share a `TurnCompletionLedger`
+(`server/coding-cli/turn-completion-ledger.ts`): a per-terminal monotonic
+`completionSeq` plus the latest `TerminalTurnCompletionSnapshot`
+(`shared/ws-protocol.ts`), surfaced via each tracker's
+`listLatestCompletions()`. Ledger state is intentionally never cleared on
+terminal removal, so the sequence stays monotonic across re-tracks and
+late-attaching clients still receive the last completion.
+
+### Amplifier two-lane design
+
+Implemented per `docs/plans/2026-07-08-amplifier-session-durability-plan.md`
+(§6); gated by `FRESHELL_AMPLIFIER_EVENTS_TRACKING` (default **on**;
+`off`/`0`/`false` reverts to degraded-lane-only behavior).
+
+Amplifier writes a schema-versioned event log per session
+(`~/.amplifier/projects/<slug>/sessions/<id>/events.jsonl`, schema
+`amplifier.log` ver 1.x) carrying `prompt:submit` / `prompt:complete` /
+`session:end` lifecycle records. The tracker
+(`server/coding-cli/amplifier-activity-tracker.ts`) runs one of two lanes per
+terminal:
+
+- **Events lane** (normal, once a session is bound and the tailer attached):
+  `prompt:submit` is the only input that (re)enters busy; `prompt:complete` is
+  the single turn boundary (exactly one `turn.complete`); `session:end` also
+  ends a busy turn. PTY Enter is only *provisionally* busy with a 2s grace
+  reversion (empty-Enter writes no events); PTY output only refreshes
+  liveness. The 120s deadman **never fabricates a completion** — it requests a
+  force-read of the events tail (WSL2 inotify backstop) and stays busy.
+- **Degraded lane** (pre-bind, tailer error, schema mismatch, file reset): the
+  original timing heuristic, verbatim — submit → busy, first output arms a 2s
+  output-idle debounce that ends the turn, and the 120s deadman self-heals to
+  idle *and* emits the completion (no other end-of-turn signal exists in this
+  lane).
+
+PTY exit is the authoritative end in both lanes. Composition:
+`amplifier-events-tailer` → `amplifier-events-reducer` (pure) →
+`tracker.applyLifecycle()`, assembled by `amplifier-activity-integration.ts`.
+Fresh-session PTY↔session association is handled by
+`amplifier-session-locator.ts` (first-prompt ↔ new-dir correlation) +
+`amplifier-session-controller.ts`, with the coordinator slow path and the
+indexer fast path (`source: 'amplifier_new_session'`) as fallbacks.
+
+---
+
+## Historical: client-side activity indicators (Jan 2026, rolled back)
+
 This document captures the implementation of terminal activity tracking that was added between commits `f910fbf` and `9d9f9cc` (12 commits total, implemented Jan 31 2026).
 
 ## Feature Overview

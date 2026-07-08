@@ -1,0 +1,3 @@
+{"ts": "2026-07-08T16:02:43.157049338+00:00", "lvl": "INFO", "schema": {"name": "amplifier.log", "ver": "1.0.0"}, "event": "cleanup:finally_begin", "session_id": "1326337c-f0fb-49ff-9ff6-06722c5e0bab", "data": {"parent_id": null}}
+{"ts": "2026-07-08T16:02:43.159587467+00:00", "lvl": "INFO", "schema": {"name": "amplifier.log", "ver": "1.0.0"}, "event": "session:end", "redaction": {"applied": true, "rules": ["secrets", "pii-basic"]}, "session_id": "1326337c-f0fb-49ff-9ff6-06722c5e0bab", "data": {"parent_id": null}}
+{"ts": "2026-07-08T16:02:43.161258748+00:00", "lvl": "INFO", "schema": {"name": "amplifier.log", "ver": "1.0.0"}, "event": "cleanup:finally_end", "session_id": "1326337c-f0fb-49ff-9ff6-06722c5e0bab", "data": {"parent_id": null}}

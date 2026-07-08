@@ -200,6 +200,20 @@ export const amplifierProvider: CodingCliProvider = {
     return maxDefined(...mtimes)
   },
 
+  getLiveEventsPath(filePath: string): string | undefined {
+    // Same sidecar-layout knowledge as getActivityMtimeMs: a session dir holds
+    // metadata.json + transcript.jsonl + events.jsonl side by side.
+    return path.join(path.dirname(filePath), 'events.jsonl')
+  },
+
+  // INDEXER POLICY for metadata-less dirs (plan §7, Phase 0 finding E6): a session
+  // dir containing only events.jsonl (process killed before its first
+  // prompt:complete) never gains metadata.json and is NOT resumable. Discovery
+  // deliberately keys on metadata.json, so such dirs are skipped — this is
+  // explicit, intentional behavior, not an accident. Live visibility while such a
+  // session is running comes from the activity pipeline (events.jsonl tailer),
+  // never from the index; the sidebar entry appears naturally when metadata.json
+  // lands at the first prompt:complete.
   async listSessionFiles() {
     const projectsDir = path.join(this.homeDir, 'projects')
     const files = await walkMetadataFiles(projectsDir)

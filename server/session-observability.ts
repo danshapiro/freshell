@@ -1,5 +1,8 @@
 import { sessionLifecycleLogger } from './logger.js'
 import type { CodingCliProviderName } from './coding-cli/types.js'
+// Type-only import (erased at compile time), so the runtime dependency stays
+// one-way: session-association-broadcast.ts -> session-observability.ts.
+import type { AssociationBroadcastSource } from './session-association-broadcast.js'
 import type { TerminalMode } from './terminal-registry.js'
 
 type SessionLifecycleSink = Pick<typeof sessionLifecycleLogger, 'info' | 'warn'>
@@ -94,7 +97,7 @@ export type SessionLifecycleEvent =
     provider: CodingCliProviderName
     terminalId: string
     sessionId: string
-    source: 'indexer_update' | 'claude_new_session' | 'opencode_controller' | 'codex_durability'
+    source: AssociationBroadcastSource
   }
   | {
     kind: 'terminal_session_bound'

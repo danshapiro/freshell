@@ -24,6 +24,9 @@ import { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { wireCodexActivityTracker } from './coding-cli/codex-activity-wiring.js'
 import { wireClaudeActivityTracker } from './coding-cli/claude-activity-wiring.js'
 import { wireAmplifierActivityTracker } from './coding-cli/amplifier-activity-wiring.js'
+import { createAmplifierActivityIntegration, isAmplifierEventsTrackingEnabled } from './coding-cli/amplifier-activity-integration.js'
+import { AmplifierSessionLocator } from './coding-cli/amplifier-session-locator.js'
+import { AmplifierSessionController } from './coding-cli/amplifier-session-controller.js'
 import { createOpencodeActivityIntegration } from './coding-cli/opencode-activity-integration.js'
 import { claudeProvider } from './coding-cli/providers/claude.js'
 import { codexProvider } from './coding-cli/providers/codex.js'
@@ -252,6 +255,33 @@ async function main() {
   const codexActivity = wireCodexActivityTracker({ registry, codingCliIndexer })
   const claudeActivity = wireClaudeActivityTracker({ registry })
   const amplifierActivity = wireAmplifierActivityTracker({ registry })
+  // Events-lane layer (plan 2026-07-08 §6/§9 Phase 2): tailer→reducer→tracker on
+  // top of the timing wiring above. Gated by FRESHELL_AMPLIFIER_EVENTS_TRACKING
+  // (default on); fully inert when disabled. Composition only — path discovery
+  // goes through the indexer + the amplifier provider capability.
+  const amplifierEventsIntegration = createAmplifierActivityIntegration({
+    registry,
+    tracker: amplifierActivity.tracker,
+    resolveEventsPath: (sessionId) => {
+      const sessionFilePath = codingCliIndexer.getFilePathForSession(sessionId, 'amplifier')
+      if (!sessionFilePath) return undefined
+      return amplifierProvider.getLiveEventsPath?.(sessionFilePath)
+    },
+    log: logger,
+  })
+  // Phase 3 (plan 2026-07-08 §5): deterministic PTY↔session association for
+  // fresh amplifier sessions via first-prompt correlation. Same flag as the
+  // events lane; the coordinator slow-path below stays untouched as fallback.
+  const amplifierEventsTrackingEnabled = isAmplifierEventsTrackingEnabled()
+  const amplifierSessionLocator = amplifierEventsTrackingEnabled
+    ? new AmplifierSessionLocator({
+        registry,
+        amplifierHome: amplifierProvider.homeDir,
+      })
+    : undefined
+  const amplifierSessionController = amplifierSessionLocator
+    ? new AmplifierSessionController({ registry, locator: amplifierSessionLocator })
+    : undefined
   const opencodeActivity = createOpencodeActivityIntegration({ registry, opencodeProvider })
 
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
@@ -574,6 +604,25 @@ async function main() {
     } catch (err) {
       log.warn({ err, terminalId, sessionId }, 'Failed to broadcast OpenCode session association')
     }
+  })
+  amplifierSessionController?.on('associated', ({ terminalId, sessionId, eventsPath }) => {
+    try {
+      broadcastTerminalSessionAssociation({
+        wsHandler,
+        terminalMetadata,
+        broadcastTerminalMetaUpserts,
+        provider: 'amplifier',
+        terminalId,
+        sessionId,
+        source: 'amplifier_locator',
+      })
+    } catch (err) {
+      log.warn({ err, terminalId, sessionId }, 'Failed to broadcast Amplifier session association')
+    }
+    // Fresh session: attach the events tailer at offset 0 (plan §5 step 6). The
+    // indexer cannot resolve this path yet — metadata.json only lands at the
+    // first prompt:complete — so the locator-discovered path is passed through.
+    void amplifierEventsIntegration.attachTailer(terminalId, sessionId, eventsPath, 'start')
   })
 
   const broadcastTerminalMetaUpserts = (upsert: ReturnType<TerminalMetadataService['list']>) => {
@@ -907,16 +956,23 @@ async function main() {
     })
   })
 
-  // Fast-path session association for newly discovered Claude sessions.
-  // Most providers now associate from onUpdate, but onNewSession still reduces the
-  // delay before a freshly discovered Claude session binds to a matching terminal.
+  // Fast-path session association for newly discovered Claude and Amplifier
+  // sessions. Most providers now associate from onUpdate, but onNewSession still
+  // reduces the delay before a freshly discovered session binds to a matching
+  // terminal. For amplifier this is the plan 2026-07-08 §5 step 8 safety net
+  // (fires when metadata.json lands if the locator missed) and is disabled with
+  // the same FRESHELL_AMPLIFIER_EVENTS_TRACKING flag.
   //
   // Broadcast message type: { type: 'terminal.session.associated', terminalId: string, sessionId: string }
   codingCliIndexer.onNewSession((session) => {
-    if (session.provider !== 'claude') return
+    if (
+      session.provider !== 'claude'
+      && !(session.provider === 'amplifier' && amplifierEventsTrackingEnabled)
+    ) return
     if (!session.cwd) return
+    const provider = session.provider
     const shouldAssociate = associationCoordinator.noteSession({
-      provider: 'claude',
+      provider,
       sessionId: session.sessionId,
       projectPath: session.projectPath,
       lastActivityAt: session.lastActivityAt,
@@ -924,7 +980,7 @@ async function main() {
     })
     if (!shouldAssociate) return
     const result = associationCoordinator.associateSingleSession({
-      provider: 'claude',
+      provider,
       sessionId: session.sessionId,
       projectPath: session.projectPath,
       lastActivityAt: session.lastActivityAt,
@@ -934,7 +990,7 @@ async function main() {
     const terminalId = result.terminalId
     log.info({
       event: 'session_bind_applied',
-      provider: 'claude',
+      provider,
       terminalId,
       sessionId: session.sessionId,
     }, 'session_bind_applied')
@@ -943,24 +999,24 @@ async function main() {
         wsHandler,
         terminalMetadata,
         broadcastTerminalMetaUpserts,
-        provider: 'claude',
+        provider,
         terminalId,
         sessionId: session.sessionId,
-        source: 'claude_new_session',
+        source: provider === 'claude' ? 'claude_new_session' : 'amplifier_new_session',
       })
     } catch (err) {
       log.warn({ err, terminalId, sessionId: session.sessionId }, 'Failed to broadcast session association')
     }
 
     void (async () => {
-      const latestClaudeSession = findCodingCliSession('claude', session.sessionId)
-      if (!latestClaudeSession) return
-      const upsert = await terminalMetadata.applySessionMetadata(terminalId, latestClaudeSession)
+      const latestSession = findCodingCliSession(provider, session.sessionId)
+      if (!latestSession) return
+      const upsert = await terminalMetadata.applySessionMetadata(terminalId, latestSession)
       if (upsert) {
         broadcastTerminalMetaUpserts([upsert])
       }
     })().catch((err) => {
-      log.warn({ err, terminalId, sessionId: session.sessionId }, 'Failed to apply Claude terminal metadata after association')
+      log.warn({ err, terminalId, sessionId: session.sessionId }, 'Failed to apply terminal metadata after association')
     })
   })
 
@@ -1184,6 +1240,9 @@ async function main() {
     codexActivity.dispose()
     claudeActivity.dispose()
     amplifierActivity.dispose()
+    await amplifierEventsIntegration.dispose()
+    amplifierSessionController?.dispose()
+    await amplifierSessionLocator?.dispose()
     opencodeActivity.dispose()
 
     // 10. Stop session repair service
