@@ -9,6 +9,7 @@ import {
   mergeServerSettings,
   resolveLocalSettings,
   stripLocalSettings,
+  UI_SCALE_PERCENT_OPTIONS,
 } from '@shared/settings'
 
 describe('shared settings contract', () => {
@@ -440,6 +441,33 @@ describe('shared settings contract', () => {
         width: 200,
       },
     })
+  })
+
+  it('clamps oversized uiScale to the 400% maximum when extracting a legacy seed', () => {
+    expect(extractLegacyLocalSettingsSeed({
+      uiScale: 999,
+    })).toEqual({
+      uiScale: 4,
+    })
+  })
+
+  it('pins the UI scale percent options: 5% steps to 200, 25% steps to 400', () => {
+    expect(UI_SCALE_PERCENT_OPTIONS).toEqual([
+      75, 80, 85, 90, 95, 100, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150,
+      155, 160, 165, 170, 175, 180, 185, 190, 195, 200,
+      225, 250, 275, 300, 325, 350, 375, 400,
+    ])
+
+    // Invariants: ascending integers spanning the shared clamp range.
+    expect(UI_SCALE_PERCENT_OPTIONS[0]).toBe(75)
+    expect(UI_SCALE_PERCENT_OPTIONS[UI_SCALE_PERCENT_OPTIONS.length - 1]).toBe(400)
+    for (let i = 0; i < UI_SCALE_PERCENT_OPTIONS.length; i++) {
+      expect(Number.isInteger(UI_SCALE_PERCENT_OPTIONS[i])).toBe(true)
+      if (i === 0) continue
+      const delta = UI_SCALE_PERCENT_OPTIONS[i] - UI_SCALE_PERCENT_OPTIONS[i - 1]
+      expect(delta).toBeGreaterThan(0)
+      expect(delta).toBe(UI_SCALE_PERCENT_OPTIONS[i] <= 200 ? 5 : 25)
+    }
   })
 
   it('strips moved local settings while preserving server-backed settings', () => {

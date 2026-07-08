@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 
 import {
+  parsePersistedLayoutRaw,
   parsePersistedTabsRaw,
   parsePersistedPanesRaw,
   TABS_STORAGE_KEY,
@@ -144,6 +145,84 @@ describe('persistedState parsers', () => {
       expect(parsed!.tabs.tabs[0].sessionRef).toBeUndefined()
       expect(parsed!.tabs.tabs[0].codingCliSessionId).toBeUndefined()
       expect(parsed!.tabs.tabs[0].claudeSessionId).toBeUndefined()
+    })
+
+    it('accepts Amplifier tabs and preserves their durable session identity', () => {
+      const raw = JSON.stringify({
+        version: TABS_SCHEMA_VERSION,
+        tabs: {
+          activeTabId: 'amplifier-tab',
+          tabs: [{
+            id: 'amplifier-tab',
+            title: 'Amplifier',
+            createdAt: 1,
+            mode: 'amplifier',
+            codingCliProvider: 'amplifier',
+            resumeSessionId: 'amp-session-1',
+          }],
+        },
+      })
+
+      const parsed = parsePersistedTabsRaw(raw)
+      expect(parsed).not.toBeNull()
+      expect(parsed!.tabs.tabs[0]).toEqual(expect.objectContaining({
+        id: 'amplifier-tab',
+        mode: 'amplifier',
+        codingCliProvider: 'amplifier',
+        sessionRef: { provider: 'amplifier', sessionId: 'amp-session-1' },
+      }))
+      expect(parsed!.tabs.tabs[0].resumeSessionId).toBeUndefined()
+    })
+  })
+
+  describe('parsePersistedLayoutRaw', () => {
+    it('does not reject a combined layout because one tab uses Amplifier mode', () => {
+      const raw = JSON.stringify({
+        version: 4,
+        tabs: {
+          activeTabId: 'amplifier-tab',
+          tabs: [{
+            id: 'amplifier-tab',
+            title: 'Amplifier',
+            createdAt: 1,
+            mode: 'amplifier',
+            codingCliProvider: 'amplifier',
+            sessionRef: { provider: 'amplifier', sessionId: 'amp-session-1' },
+          }],
+        },
+        panes: {
+          version: PANES_SCHEMA_VERSION,
+          layouts: {
+            'amplifier-tab': {
+              type: 'leaf',
+              id: 'amplifier-pane',
+              content: {
+                kind: 'terminal',
+                mode: 'amplifier',
+                createRequestId: 'req-amplifier',
+                status: 'running',
+                sessionRef: { provider: 'amplifier', sessionId: 'amp-session-1' },
+              },
+            },
+          },
+          activePane: { 'amplifier-tab': 'amplifier-pane' },
+          paneTitles: {},
+          paneTitleSetByUser: {},
+        },
+        tombstones: [],
+      })
+
+      const parsed = parsePersistedLayoutRaw(raw)
+      expect(parsed).not.toBeNull()
+      expect(parsed!.tabs.tabs[0]).toEqual(expect.objectContaining({
+        id: 'amplifier-tab',
+        mode: 'amplifier',
+        sessionRef: { provider: 'amplifier', sessionId: 'amp-session-1' },
+      }))
+      expect(((parsed!.panes.layouts['amplifier-tab'] as any).content)).toEqual(expect.objectContaining({
+        mode: 'amplifier',
+        sessionRef: { provider: 'amplifier', sessionId: 'amp-session-1' },
+      }))
     })
   })
 

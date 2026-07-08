@@ -74,6 +74,21 @@ describe('amplifier-provider', () => {
     expect(parseAmplifierMetadata('not json')).toEqual({})
   })
 
+  it('parseAmplifierMetadata floors fractional numeric timestamps to integer epoch-ms', () => {
+    // Numeric timestamps can be fractional (sub-ms precision); createdAt and
+    // lastActivityAt are validated downstream with z.number().int().
+    const meta = parseAmplifierMetadata(
+      JSON.stringify({
+        session_id: 's1',
+        working_dir: '/x',
+        created: 1783380081359.8726,
+        description_updated_at: 1783380090000.5,
+      }),
+    )
+    expect(meta.createdAt).toBe(1783380081359)
+    expect(meta.lastActivityAt).toBe(1783380090000)
+  })
+
   it('marks the provider name as an authoritative provider-generated title', () => {
     const meta = parseAmplifierMetadata(
       JSON.stringify({ session_id: 's1', working_dir: '/x', name: 'Real Provider Name' }),
@@ -191,6 +206,31 @@ describe('amplifier-provider', () => {
         expect(typeof amplifierProvider.getActivityMtimeMs).toBe('function')
         const result = await amplifierProvider.getActivityMtimeMs!(metadataPath)
         expect(result).toBe(eventsMtimeMs)
+      } finally {
+        await fsp.rm(dir, { recursive: true, force: true })
+      }
+    })
+
+    it('returns integer epoch-ms even when the sidecar mtime has sub-ms precision', async () => {
+      const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'amplifier-activity-'))
+      try {
+        const metadataPath = path.join(dir, 'metadata.json')
+        const transcriptPath = path.join(dir, 'transcript.jsonl')
+        await fsp.writeFile(metadataPath, JSON.stringify({ session_id: 's', working_dir: '/x' }))
+        await fsp.writeFile(transcriptPath, '{"role":"user","content":"hi"}\n')
+
+        // Set a fractional mtime (sub-ms precision). Filesystems like ext4 (WSL2)
+        // preserve this, making fs.Stats.mtimeMs fractional; downstream schemas
+        // require integer epoch-ms. On coarser filesystems the fraction is dropped
+        // and the assertions still hold.
+        const fractionalSeconds = 1783380081.3598726
+        await fsp.utimes(transcriptPath, fractionalSeconds, fractionalSeconds)
+        const rawMtimeMs = (await fsp.stat(transcriptPath)).mtimeMs
+
+        const result = await amplifierProvider.getActivityMtimeMs!(metadataPath)
+        expect(result).toBeDefined()
+        expect(Number.isInteger(result)).toBe(true)
+        expect(result).toBe(Math.floor(rawMtimeMs))
       } finally {
         await fsp.rm(dir, { recursive: true, force: true })
       }

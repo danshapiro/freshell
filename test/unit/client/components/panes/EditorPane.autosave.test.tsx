@@ -5,6 +5,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import EditorPane from '@/components/panes/EditorPane'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
+import connectionReducer, { setStatus } from '@/store/connectionSlice'
 
 vi.mock('@monaco-editor/react', () => {
   const MonacoMock = ({ value, onChange }: any) => (
@@ -22,13 +23,18 @@ vi.mock('@monaco-editor/react', () => {
 
 global.fetch = vi.fn()
 
-const createMockStore = () =>
-  configureStore({
+const createMockStore = () => {
+  const store = configureStore({
     reducer: {
       panes: panesReducer,
       settings: settingsReducer,
+      connection: connectionReducer,
     },
   })
+  // The disk-sync poll only runs while the connection is 'ready'.
+  store.dispatch(setStatus('ready'))
+  return store
+}
 
 describe('EditorPane auto-save', () => {
   let store: ReturnType<typeof createMockStore>

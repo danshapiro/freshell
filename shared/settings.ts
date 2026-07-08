@@ -33,7 +33,14 @@ export const CLAUDE_PERMISSION_MODE_VALUES = ['default', 'plan', 'acceptEdits', 
 const EXTERNAL_EDITOR_VALUES = ['auto', 'cursor', 'code', 'custom'] as const
 const NETWORK_HOST_VALUES = ['127.0.0.1', '0.0.0.0'] as const
 const UI_SCALE_MIN = 0.75
-const UI_SCALE_MAX = 1.5
+const UI_SCALE_MAX = 4
+// Slider stops for the UI scale control, in integer percent (avoids float drift).
+// Fine 5% steps up to 200%, coarse 25% steps to 400%.
+export const UI_SCALE_PERCENT_OPTIONS: readonly number[] = [
+  75, 80, 85, 90, 95, 100, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150,
+  155, 160, 165, 170, 175, 180, 185, 190, 195, 200,
+  225, 250, 275, 300, 325, 350, 375, 400,
+]
 const TERMINAL_FONT_SIZE_MIN = 12
 const TERMINAL_FONT_SIZE_MAX = 32
 const TERMINAL_LINE_HEIGHT_MIN = 1

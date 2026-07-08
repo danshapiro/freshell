@@ -211,6 +211,42 @@ describe('OpencodeProvider', () => {
     ])
   })
 
+  it('floors fractional sqlite REAL timestamps to integer epoch-ms', async () => {
+    // SQLite columns are dynamically typed: time_updated/time_created can arrive
+    // as REAL. The direct listing path never traverses the indexer's mtime fold,
+    // so the provider itself must emit integer epoch-ms.
+    const dbPath = path.join(tempDir, 'opencode.db')
+    await fsp.writeFile(dbPath, 'fake sqlite file', 'utf8')
+    FakeDatabaseSync.seed(dbPath, {
+      projects: [
+        { id: 'project-1', worktree: '/repo/root' },
+      ],
+      sessions: [
+        {
+          id: 'session-fractional',
+          project_id: 'project-1',
+          parent_id: null,
+          directory: '/repo/root',
+          title: 'Fractional timestamps',
+          time_created: 1783380081359.8726,
+          time_updated: 1783380090000.5,
+          time_archived: null,
+        },
+      ],
+    })
+
+    const provider = new OpencodeProvider(tempDir, { queryRunner: inProcessListingRunner })
+    const sessions = await provider.listSessionsDirect()
+
+    expect(sessions).toEqual([
+      expect.objectContaining({
+        sessionId: 'session-fractional',
+        createdAt: 1783380081359,
+        lastActivityAt: 1783380090000,
+      }),
+    ])
+  })
+
   it('watches OpenCode sqlite database and WAL but not SHM', () => {
     const provider = new OpencodeProvider(tempDir, { queryRunner: inProcessListingRunner })
     const dbPath = path.join(tempDir, 'opencode.db')

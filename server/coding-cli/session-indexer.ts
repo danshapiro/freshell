@@ -11,7 +11,7 @@ import type { CodingCliProvider } from './provider.js'
 import { makeSessionKey, type CodingCliSession, type CodingCliProviderName, type ParsedSessionTitleSource, type ProjectGroup } from './types.js'
 import { sanitizeCodexTaskEventsForTruncatedSnippet } from './providers/codex.js'
 import { extractClaudeGeneratedTitleFromJsonlObject } from './providers/claude-title.js'
-import { extractUserAuthoredText, resolveGitCheckoutRoot, resolveGitRepoRoot } from './utils.js'
+import { extractUserAuthoredText, resolveGitCheckoutRoot, resolveGitRepoRoot, statMtimeMs } from './utils.js'
 import { diffProjects } from '../sessions-sync/diff.js'
 import type { SessionMetadataStore, SessionMetadataEntry } from '../session-metadata-store.js'
 
@@ -295,7 +295,7 @@ async function readLightweightMeta(
 ): Promise<LightweightFileMeta> {
   try {
     const stat = await fsp.stat(filePath)
-    const mtimeMs = stat.mtimeMs || stat.mtime.getTime()
+    const mtimeMs = statMtimeMs(stat)
     const size = stat.size
     if (size === 0) return { filePath, mtimeMs, size }
 
@@ -340,7 +340,8 @@ async function readLightweightMeta(
           if (typeof c === 'string' && (c.startsWith('/') || (IS_WINDOWS && /^[a-zA-Z]:/.test(c)))) cwd = c
         }
         if (!createdAt && obj?.timestamp) {
-          const parsed = typeof obj.timestamp === 'number' ? obj.timestamp : Date.parse(obj.timestamp)
+          // Floor numeric timestamps: downstream read-model schemas require integer epoch-ms.
+          const parsed = typeof obj.timestamp === 'number' ? Math.floor(obj.timestamp) : Date.parse(obj.timestamp)
           if (Number.isFinite(parsed)) createdAt = parsed
         }
         if (!title) {
@@ -390,7 +391,8 @@ async function readLightweightMeta(
               tailGeneratedTitleFound = true
             }
             if (!lastActivityAt && obj?.timestamp) {
-              const parsed = typeof obj.timestamp === 'number' ? obj.timestamp : Date.parse(obj.timestamp)
+              // Floor numeric timestamps: downstream read-model schemas require integer epoch-ms.
+              const parsed = typeof obj.timestamp === 'number' ? Math.floor(obj.timestamp) : Date.parse(obj.timestamp)
               if (Number.isFinite(parsed)) lastActivityAt = parsed
             }
           } catch { /* skip malformed lines */ }
@@ -885,7 +887,7 @@ export class CodingCliSessionIndexer {
       return
     }
 
-    const mtimeMs = stat.mtimeMs || stat.mtime.getTime()
+    const mtimeMs = statMtimeMs(stat)
     const size = stat.size
     // Newest activity-sidecar mtime (Amplifier transcript.jsonl / events.jsonl). Statted
     // once here and reused by both the re-parse gate and the recency fold below. Only
@@ -972,7 +974,7 @@ export class CodingCliSessionIndexer {
     // Fold real file activity (newest sidecar mtime) into recency so a session that was
     // active/resumed after its metadata timestamps still rises in the recency-sorted
     // sidebar. maxDefined never regresses below the metadata-derived value.
-    lastActivityAt = maxDefined(lastActivityAt, activityMtimeMs) ?? lastActivityAt
+    lastActivityAt = Math.floor(maxDefined(lastActivityAt, activityMtimeMs) ?? 0)
 
     const checkoutRoot = meta.cwd ? await resolveGitCheckoutRoot(meta.cwd) : undefined
     const checkoutPath = checkoutRoot && checkoutRoot !== projectPath ? checkoutRoot : undefined
@@ -1316,7 +1318,7 @@ export class CodingCliSessionIndexer {
             let mtime = statCache.get(cacheKey)
             if (mtime === undefined) {
               const stat = await fsp.stat(filePath)
-              mtime = stat.mtimeMs || stat.mtime.getTime()
+              mtime = statMtimeMs(stat)
               statCache.set(cacheKey, mtime)
             }
             lastActivityAt = mtime

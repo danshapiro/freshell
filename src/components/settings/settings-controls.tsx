@@ -1,6 +1,6 @@
 // Reusable form controls for settings pages — sections, rows, toggles, sliders, etc.
 
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { cn } from '@/lib/utils'
 
 export function SettingsSection({
@@ -207,6 +207,117 @@ export function RangeSlider({
         )}
       />
       <span className={cn('text-sm tabular-nums', labelWidth)}>{format(displayValue)}</span>
+    </div>
+  )
+}
+
+function nearestIndex(values: readonly number[], value: number): number {
+  let best = 0
+  for (let i = 1; i < values.length; i++) {
+    if (Math.abs(values[i] - value) < Math.abs(values[best] - value)) best = i
+  }
+  return best
+}
+
+// Discrete slider over an ascending allowed-values list plus a numeric input.
+// The slider steps by index (one stop per arrow press, aria-valuetext announces
+// the real value); the numeric input accepts any integer in range (no snapping).
+// Pointer drags defer commit until release; keyboard changes commit immediately.
+export function SteppedRangeInput({
+  value,
+  values,
+  onChange,
+  'aria-label': ariaLabel,
+  unit = '',
+  width = 'w-full md:w-32',
+}: {
+  value: number
+  values: readonly number[]
+  onChange: (value: number) => void
+  'aria-label': string
+  unit?: string
+  width?: string
+}) {
+  const [pendingIndex, setPendingIndex] = useState<number | null>(null)
+  const [draft, setDraft] = useState<string | null>(null)
+  const pointerActive = useRef(false)
+
+  const min = values[0]
+  const max = values[values.length - 1]
+  const displayValue = pendingIndex !== null ? values[pendingIndex] : value
+
+  const commitPending = () => {
+    pointerActive.current = false
+    if (pendingIndex !== null) {
+      onChange(values[pendingIndex])
+      setPendingIndex(null)
+    }
+  }
+
+  const commitDraft = () => {
+    if (draft === null) return
+    setDraft(null)
+    const trimmed = draft.trim()
+    if (trimmed === '') return
+    const parsed = Number(trimmed)
+    if (!Number.isFinite(parsed)) return
+    const result = Math.min(max, Math.max(min, Math.round(parsed)))
+    if (result !== value) onChange(result)
+  }
+
+  return (
+    <div className="flex w-full items-center gap-3 md:w-auto">
+      <input
+        type="range"
+        min={0}
+        max={values.length - 1}
+        step={1}
+        value={pendingIndex ?? nearestIndex(values, value)}
+        aria-label={ariaLabel}
+        aria-valuetext={`${displayValue}${unit}`}
+        onChange={(e) => {
+          const idx = Number(e.target.value)
+          if (pointerActive.current) {
+            setPendingIndex(idx)
+          } else {
+            onChange(values[idx])
+          }
+        }}
+        onPointerDown={() => {
+          pointerActive.current = true
+        }}
+        onPointerUp={commitPending}
+        onPointerLeave={commitPending}
+        className={cn(
+          width,
+          'h-1.5 bg-muted rounded-full appearance-none cursor-pointer',
+          '[&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-foreground'
+        )}
+      />
+      <input
+        type="number"
+        inputMode="numeric"
+        min={min}
+        max={max}
+        step={1}
+        aria-label={ariaLabel}
+        value={draft ?? String(displayValue)}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commitDraft}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') {
+            commitDraft()
+          } else if (e.key === 'Escape') {
+            setDraft(null)
+          }
+        }}
+        className="h-10 w-16 px-2 text-right text-sm tabular-nums bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8"
+      />
+      {unit && (
+        <span aria-hidden="true" className="text-sm text-muted-foreground">
+          {unit}
+        </span>
+      )}
     </div>
   )
 }

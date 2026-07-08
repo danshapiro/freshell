@@ -926,7 +926,7 @@ describe('State Edge Cases', () => {
           })
         )
 
-        expect(store.getState().settings.settings.uiScale).toBe(1.5)
+        expect(store.getState().settings.settings.uiScale).toBe(4)
         expect(store.getState().settings.settings.terminal.fontSize).toBe(32)
       })
     })

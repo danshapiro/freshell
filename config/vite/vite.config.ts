@@ -9,12 +9,35 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const projectRoot = path.resolve(__dirname, '../..')
 
-/** Suppress ECONNREFUSED proxy errors during startup (server not ready yet). */
+/**
+ * Transport-level proxy failures that mean "the backend is down or restarting":
+ * refused (not yet listening), reset/pipe (killed mid-request), timeout/host
+ * unreachable. Answer 503 so the client classifies them as a transient outage
+ * (isTransientRequestFailure) instead of surfacing a 500 "server bug".
+ */
+const TRANSIENT_PROXY_ERROR_CODES = new Set([
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EPIPE',
+  'ETIMEDOUT',
+  'EHOSTUNREACH',
+])
+
+/** Suppress transport-level proxy errors while the backend is down/restarting. */
 function silenceStartupErrors(proxy: HttpProxy.Server) {
   proxy.on('error', (err, _req, res) => {
-    if ('code' in err && err.code === 'ECONNREFUSED' && 'writeHead' in res) {
-      res.writeHead(503)
-      res.end()
+    const code = 'code' in err ? String(err.code) : ''
+    if (TRANSIENT_PROXY_ERROR_CODES.has(code) && 'writeHead' in res) {
+      if (!res.headersSent) {
+        res.writeHead(503)
+        res.end()
+      } else {
+        // Headers (and possibly part of the body) already went out: ending
+        // cleanly would make a truncated payload look like a successful
+        // response. Destroy the connection so the client sees a transport
+        // failure (NetworkError -> classified transient) instead.
+        res.destroy()
+      }
     }
   })
 }

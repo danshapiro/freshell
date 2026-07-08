@@ -3,7 +3,7 @@ import os from 'os'
 import fsp from 'fs/promises'
 import type { CodingCliProvider } from '../provider.js'
 import { normalizeFirstUserMessage, type NormalizedEvent, type ParsedSessionMeta } from '../types.js'
-import { resolveGitRepoRoot } from '../utils.js'
+import { resolveGitRepoRoot, statMtimeMs } from '../utils.js'
 
 // Amplifier transcripts can grow to tens of MB. For the sidebar's first-user-message
 // preview we only ever read a bounded prefix of the sibling transcript, never the whole file.
@@ -14,7 +14,8 @@ export function defaultAmplifierHome(): string {
 }
 
 function parseTimestampMs(value: unknown): number | undefined {
-  if (typeof value === 'number' && Number.isFinite(value)) return value
+  // Floor numeric passthroughs: downstream read-model schemas require integer epoch-ms.
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.floor(value)
   if (typeof value === 'string' && value.trim()) {
     const parsed = Date.parse(value)
     if (Number.isFinite(parsed)) return parsed
@@ -190,7 +191,7 @@ export const amplifierProvider: CodingCliProvider = {
       sidecars.map(async (name) => {
         try {
           const stat = await fsp.stat(path.join(dir, name))
-          return stat.mtimeMs || stat.mtime.getTime()
+          return statMtimeMs(stat)
         } catch {
           return undefined
         }

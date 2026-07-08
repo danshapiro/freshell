@@ -5,12 +5,14 @@ import { terminalThemes, darkThemes, lightThemes, getTerminalTheme } from '@/lib
 import { resolveTerminalFontFamily } from '@/lib/terminal-fonts'
 import type { AppSettings, TerminalTheme } from '@/store/types'
 import type { SettingsSectionProps } from './settings-types'
+import { UI_SCALE_PERCENT_OPTIONS } from '@shared/settings'
 import {
   SettingsSection,
   SettingsRow,
   SegmentedControl,
   Toggle,
   RangeSlider,
+  SteppedRangeInput,
 } from './settings-controls'
 
 type PreviewTokenKind =
@@ -307,15 +309,13 @@ export default function AppearanceSettings({
         </SettingsRow>
 
         <SettingsRow label="UI scale">
-          <RangeSlider
-            value={settings.uiScale ?? 1.0}
-            min={0.75}
-            max={1.5}
-            step={0.05}
-            labelWidth="w-12"
-            format={(v) => `${Math.round(v * 100)}%`}
-            onChange={(v) => {
-              applyLocalSetting({ uiScale: v })
+          <SteppedRangeInput
+            value={Math.round((settings.uiScale ?? 1.0) * 100)}
+            values={UI_SCALE_PERCENT_OPTIONS}
+            unit="%"
+            aria-label="UI scale"
+            onChange={(pct) => {
+              applyLocalSetting({ uiScale: pct / 100 })
             }}
           />
         </SettingsRow>

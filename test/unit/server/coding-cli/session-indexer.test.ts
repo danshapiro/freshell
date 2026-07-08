@@ -668,6 +668,34 @@ describe('CodingCliSessionIndexer', () => {
       expect(session?.lastActivityAt).toBe(metadataLastActivityAt)
     })
 
+    it('floors fractional activity mtimes so lastActivityAt stays integer epoch-ms', async () => {
+      // fs.Stats.mtimeMs can be fractional (sub-ms precision on WSL2/ext4); the shared
+      // read-model schemas validate lastActivityAt with z.number().int().
+      const file = path.join(tempDir, 'session-fractional.jsonl')
+      await fsp.writeFile(file, JSON.stringify({ cwd: '/project/a', title: 'Deploy' }) + '\n')
+
+      const fractionalActivityMtimeMs = 1_783_380_081_359.8726
+
+      const provider = makeProvider([file], {
+        parseSessionFile: async () => ({
+          cwd: '/project/a',
+          sessionId: 'session-fractional',
+          title: 'Deploy',
+          createdAt: 500,
+          lastActivityAt: 1_000,
+          messageCount: 1,
+        }),
+        getActivityMtimeMs: async () => fractionalActivityMtimeMs,
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+
+      const session = indexer.getProjects()[0]?.sessions[0]
+      expect(session?.lastActivityAt).toBe(1_783_380_081_359)
+      expect(Number.isInteger(session?.lastActivityAt)).toBe(true)
+    })
+
     it('re-parses and advances lastActivityAt when the sidecar grows but metadata.json is byte-identical', async () => {
       const file = path.join(tempDir, 'session-resumed.jsonl')
       await fsp.writeFile(file, JSON.stringify({ cwd: '/project/a', title: 'Deploy' }) + '\n')

@@ -208,7 +208,9 @@ describe('SettingsView core sections', () => {
       const store = createSettingsViewStore({ settings: { uiScale: 1.5 } })
       renderSettingsView(store)
 
-      expect(screen.getByText('150%')).toBeInTheDocument()
+      const uiScaleInput = screen.getByRole('spinbutton', { name: 'UI scale' }) as HTMLInputElement
+      expect(uiScaleInput.value).toBe('150')
+      expect(screen.getByRole('slider', { name: 'UI scale' }).getAttribute('aria-valuetext')).toBe('150%')
     })
 
     it('displays current line height value', () => {

@@ -63,17 +63,72 @@ describe('SettingsView behavior sections', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
-      const uiScaleSlider = getSlider((slider) => {
-        const min = slider.getAttribute('min')
-        const step = slider.getAttribute('step')
-        return min === '0.75' && step === '0.05'
-      })
+      const uiScaleSlider = screen.getByRole('slider', { name: 'UI scale' })
 
-      fireEvent.change(uiScaleSlider, { target: { value: '1.5' } })
+      fireEvent.change(uiScaleSlider, { target: { value: '33' } })
       fireEvent.pointerUp(uiScaleSlider)
 
-      expect(store.getState().settings.settings.uiScale).toBe(1.5)
-      expect(screen.getByText('150%')).toBeInTheDocument()
+      expect(store.getState().settings.settings.uiScale).toBe(4)
+      const spinbutton = screen.getByRole('spinbutton', { name: 'UI scale' }) as HTMLInputElement
+      expect(spinbutton.value).toBe('400')
+    })
+
+    it('commits keyboard-only slider changes across the 200% boundary', () => {
+      const store = createSettingsViewStore({ settings: { uiScale: 2.0 } })
+      renderSettingsView(store)
+
+      const uiScaleSlider = screen.getByRole('slider', { name: 'UI scale' })
+
+      // No pointer events: keyboard changes must commit immediately.
+      fireEvent.change(uiScaleSlider, { target: { value: '26' } })
+
+      expect(store.getState().settings.settings.uiScale).toBe(2.25)
+    })
+
+    it('clamps numeric UI scale input to the supported range without calling /api/settings', async () => {
+      const store = createSettingsViewStore()
+      renderSettingsView(store)
+
+      const uiScaleInput = screen.getByRole('spinbutton', { name: 'UI scale' })
+
+      fireEvent.change(uiScaleInput, { target: { value: '999' } })
+      fireEvent.blur(uiScaleInput)
+      expect(store.getState().settings.settings.uiScale).toBe(4)
+
+      fireEvent.change(uiScaleInput, { target: { value: '50' } })
+      fireEvent.keyDown(uiScaleInput, { key: 'Enter' })
+      expect(store.getState().settings.settings.uiScale).toBe(0.75)
+
+      await act(async () => {
+        vi.advanceTimersByTime(500)
+      })
+
+      expect(api.patch).not.toHaveBeenCalled()
+    })
+
+    it('commits typed off-list UI scale percentages without snapping', () => {
+      const store = createSettingsViewStore()
+      renderSettingsView(store)
+
+      const uiScaleInput = screen.getByRole('spinbutton', { name: 'UI scale' })
+
+      fireEvent.change(uiScaleInput, { target: { value: '137' } })
+      fireEvent.blur(uiScaleInput)
+
+      expect(store.getState().settings.settings.uiScale).toBeCloseTo(1.37)
+    })
+
+    it('ignores invalid numeric UI scale input', () => {
+      const store = createSettingsViewStore()
+      renderSettingsView(store)
+      const initialUiScale = store.getState().settings.settings.uiScale
+
+      const uiScaleInput = screen.getByRole('spinbutton', { name: 'UI scale' })
+
+      fireEvent.change(uiScaleInput, { target: { value: 'abc' } })
+      fireEvent.blur(uiScaleInput)
+
+      expect(store.getState().settings.settings.uiScale).toBe(initialUiScale)
     })
 
     it('updates sidebar sort mode locally without calling /api/settings', async () => {

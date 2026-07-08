@@ -72,15 +72,36 @@ Subagent session dirs are also named `0000...-<hash>_<agent-name>`.
 {"role": "tool", "name": "read_file", "tool_call_id": "toolu_...", "content": "..."}
 ```
 
-### MCP — KNOWN LIMITATION (must document, do not try to “fix”)
-The default Amplifier bundle (`anchors`/`foundation`) does **not** mount a `tool-mcp` module
-(verified: `amplifier module list` shows tool-search/bash/mode/recipes/apply-patch/skills but
-**no tool-mcp**). Therefore setting `AMPLIFIER_MCP_CONFIG` is a **no-op until the user's Amplifier
-bundle includes `tool-mcp`**. Freshell still injects it idiomatically (that's freshell's job);
-whether Amplifier honors it is an Amplifier-side prerequisite, exactly like needing `codex`
-installed for the codex integration. `tool-mcp` discovery chain (once mounted):
-`AMPLIFIER_MCP_CONFIG` → `./.amplifier/mcp.json` → `~/.amplifier/mcp.json`; the config format is
-the standard `{ "mcpServers": { "freshell": {...} } }` (same file `writeMcpConfigFile` already writes).
+### MCP — Amplifier-side prerequisites (must document, do not try to “fix”)
+Freshell injects MCP idiomatically (that's freshell's job); whether Amplifier honors it depends on
+**two** Amplifier-side prerequisites, exactly like needing `codex` installed for the codex integration:
+
+1. **The user's Amplifier bundle must mount `tool-mcp`.** The default bundles (`anchors`/`foundation`)
+   do **not**. Supported user-level fix — add to `~/.amplifier/settings.yaml`:
+   ```yaml
+   modules:
+     tools:
+     - module: tool-mcp
+       source: git+https://github.com/microsoft/amplifier-module-tool-mcp@main
+   ```
+   (Alternative: `amplifier bundle add git+https://github.com/microsoft/amplifier-module-tool-mcp@main#subdirectory=behaviors/mcp.yaml --app`.)
+2. **The `mcp` Python SDK must be installed in Amplifier's venv.** `tool-mcp` imports `mcp` at mount
+   time; if it's missing, Amplifier **swallows the mount failure as a silent warning**
+   (`amplifier_core/_session_init.py`) — no error, no MCP tools, no server log. This is the failure
+   mode that looks identical to "no servers configured". For a uv-tool install of Amplifier, fix with:
+   ```bash
+   uv tool install "git+https://github.com/microsoft/amplifier@main" --with "mcp>=1.0.0" --force
+   ```
+   (`--with` is recorded in the uv receipt, so upgrades keep it.)
+
+Both were satisfied on this machine 2026-07-06; end-to-end verified: env var injected → tool-mcp
+config loader reports `servers seen: ['freshell']` → stdio server responds to `initialize`.
+
+`tool-mcp` discovery chain (once mounted): inline `config.servers` / `AMPLIFIER_MCP_CONFIG` /
+`./.amplifier/mcp.json` / `~/.amplifier/mcp.json` — sources are **merged** (priority on name
+collision: inline > env > project > user). Keep `~/.amplifier/mcp.json` nonexistent to preserve the
+"no MCPs outside freshell" property. The config format is the standard
+`{ "mcpServers": { "freshell": {...} } }` (same file `writeMcpConfigFile` already writes).
 The freshell MCP stdio child inherits `FRESHELL_URL`/`FRESHELL_TOKEN`/`FRESHELL_TAB_ID`/`FRESHELL_PANE_ID`
 from the terminal env (`buildTerminalBaseEnv`, `server/terminal-registry.ts`), so no `env` block is needed in the config.
 

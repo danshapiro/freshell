@@ -6,6 +6,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import EditorPane from '@/components/panes/EditorPane'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
+import connectionReducer, { setStatus } from '@/store/connectionSlice'
 
 // Render MarkdownRenderer synchronously to avoid React.lazy timing issues
 // when running in the full test suite (dynamic import may not resolve in time)
@@ -78,11 +79,12 @@ function createRoutedFetch(opts?: {
   }
 }
 
-const createMockStore = (overrides?: { theme?: string }) =>
-  configureStore({
+const createMockStore = (overrides?: { theme?: string }) => {
+  const store = configureStore({
     reducer: {
       panes: panesReducer,
       settings: settingsReducer,
+      connection: connectionReducer,
     },
     preloadedState: overrides
       ? {
@@ -102,6 +104,9 @@ const createMockStore = (overrides?: { theme?: string }) =>
         }
       : undefined,
   })
+  store.dispatch(setStatus('ready'))
+  return store
+}
 
 describe('EditorPane', () => {
   let store: ReturnType<typeof createMockStore>
@@ -379,11 +384,13 @@ describe('EditorPane', () => {
       consoleSpy.mockRestore()
     })
 
-    it('logs error when fetch throws', async () => {
+    it('stays silent when the file load fails at the transport layer (server unreachable)', async () => {
+      // fetch() rejects only on transport failures — expected while the server
+      // is restarting, so no error should be logged (the poll re-syncs later).
       const user = userEvent.setup()
       const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
       mockFetch.mockImplementation(
-        createRoutedFetch({ throwOnRead: new Error('Network error') }) as any
+        createRoutedFetch({ throwOnRead: new TypeError('Failed to fetch') }) as any
       )
 
       render(
@@ -404,13 +411,17 @@ describe('EditorPane', () => {
       await user.clear(input)
       await user.type(input, '/test.ts{enter}')
 
+      // Wait for the read attempt to complete, then confirm nothing was logged.
       await waitFor(() => {
-        // EditorPane uses structured JSON logging
-        expect(consoleSpy).toHaveBeenCalledWith(
-          '[EditorPane]',
-          expect.stringContaining('"event":"editor_file_load_failed"')
-        )
+        expect(
+          mockFetch.mock.calls.some((call) => String(call[0]).includes('/api/files/read'))
+        ).toBe(true)
       })
+
+      expect(consoleSpy).not.toHaveBeenCalledWith(
+        '[EditorPane]',
+        expect.stringContaining('"event":"editor_file_load_failed"')
+      )
 
       consoleSpy.mockRestore()
     })
