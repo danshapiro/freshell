@@ -360,7 +360,7 @@ describe('ConfigStore', () => {
       expect(loaded.legacyLocalSettingsSeed).toEqual({
         uiScale: 0.75,
         terminal: {
-          fontSize: 32,
+          fontSize: 64,
           lineHeight: 1,
         },
         sidebar: {
@@ -372,7 +372,7 @@ describe('ConfigStore', () => {
       expect(saved.legacyLocalSettingsSeed).toEqual({
         uiScale: 0.75,
         terminal: {
-          fontSize: 32,
+          fontSize: 64,
           lineHeight: 1,
         },
         sidebar: {

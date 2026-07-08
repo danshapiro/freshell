@@ -230,6 +230,7 @@ export function SteppedRangeInput({
   'aria-label': ariaLabel,
   unit = '',
   width = 'w-full md:w-32',
+  annotation,
 }: {
   value: number
   values: readonly number[]
@@ -237,6 +238,7 @@ export function SteppedRangeInput({
   'aria-label': string
   unit?: string
   width?: string
+  annotation?: (value: number) => string
 }) {
   const [pendingIndex, setPendingIndex] = useState<number | null>(null)
   const [draft, setDraft] = useState<string | null>(null)
@@ -274,7 +276,7 @@ export function SteppedRangeInput({
         step={1}
         value={pendingIndex ?? nearestIndex(values, value)}
         aria-label={ariaLabel}
-        aria-valuetext={`${displayValue}${unit}`}
+        aria-valuetext={annotation ? `${displayValue}${unit} ${annotation(displayValue)}` : `${displayValue}${unit}`}
         onChange={(e) => {
           const idx = Number(e.target.value)
           if (pointerActive.current) {
@@ -316,6 +318,11 @@ export function SteppedRangeInput({
       {unit && (
         <span aria-hidden="true" className="text-sm text-muted-foreground">
           {unit}
+        </span>
+      )}
+      {annotation && (
+        <span aria-hidden="true" className="text-sm text-muted-foreground tabular-nums whitespace-nowrap">
+          {annotation(displayValue)}
         </span>
       )}
     </div>

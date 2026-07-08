@@ -5,7 +5,7 @@ import { terminalThemes, darkThemes, lightThemes, getTerminalTheme } from '@/lib
 import { resolveTerminalFontFamily } from '@/lib/terminal-fonts'
 import type { AppSettings, TerminalTheme } from '@/store/types'
 import type { SettingsSectionProps } from './settings-types'
-import { UI_SCALE_PERCENT_OPTIONS } from '@shared/settings'
+import { TERMINAL_FONT_SIZE_PX_OPTIONS, UI_SCALE_PERCENT_OPTIONS } from '@shared/settings'
 import {
   SettingsSection,
   SettingsRow,
@@ -358,13 +358,12 @@ export default function AppearanceSettings({
         </SettingsRow>
 
         <SettingsRow label="Font size">
-          <RangeSlider
+          <SteppedRangeInput
             value={settings.terminal.fontSize}
-            min={12}
-            max={32}
-            step={1}
-            labelWidth="w-20"
-            format={(v) => `${v}px (${Math.round(v / 16 * 100)}%)`}
+            values={TERMINAL_FONT_SIZE_PX_OPTIONS}
+            unit="px"
+            annotation={(v) => `(${Math.round((v / 16) * 100)}%)`}
+            aria-label="Font size"
             onChange={(v) => {
               applyLocalSetting({ terminal: { fontSize: v } })
             }}

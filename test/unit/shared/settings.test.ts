@@ -9,6 +9,7 @@ import {
   mergeServerSettings,
   resolveLocalSettings,
   stripLocalSettings,
+  TERMINAL_FONT_SIZE_PX_OPTIONS,
   UI_SCALE_PERCENT_OPTIONS,
 } from '@shared/settings'
 
@@ -431,7 +432,7 @@ describe('shared settings contract', () => {
     })).toEqual({
       uiScale: 0.75,
       terminal: {
-        fontSize: 32,
+        fontSize: 64,
         lineHeight: 1,
       },
       panes: {
@@ -468,6 +469,48 @@ describe('shared settings contract', () => {
       expect(delta).toBeGreaterThan(0)
       expect(delta).toBe(UI_SCALE_PERCENT_OPTIONS[i] <= 200 ? 5 : 25)
     }
+  })
+
+  it('pins the terminal font size px options: 1px steps to 32, 2px to 48, 4px to 64', () => {
+    expect(TERMINAL_FONT_SIZE_PX_OPTIONS).toEqual([
+      12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+      34, 36, 38, 40, 42, 44, 46, 48,
+      52, 56, 60, 64,
+    ])
+  })
+
+  it('keeps the terminal font size px options strictly ascending integers spanning 12..64', () => {
+    expect(TERMINAL_FONT_SIZE_PX_OPTIONS[0]).toBe(12)
+    expect(TERMINAL_FONT_SIZE_PX_OPTIONS[TERMINAL_FONT_SIZE_PX_OPTIONS.length - 1]).toBe(64)
+    for (let i = 0; i < TERMINAL_FONT_SIZE_PX_OPTIONS.length; i++) {
+      expect(Number.isInteger(TERMINAL_FONT_SIZE_PX_OPTIONS[i])).toBe(true)
+      if (i === 0) continue
+      expect(TERMINAL_FONT_SIZE_PX_OPTIONS[i]).toBeGreaterThan(TERMINAL_FONT_SIZE_PX_OPTIONS[i - 1])
+    }
+    // Backward compatibility: every previously reachable value 12..32 stays on-list.
+    for (let px = 12; px <= 32; px++) {
+      expect(TERMINAL_FONT_SIZE_PX_OPTIONS).toContain(px)
+    }
+  })
+
+  it('ties the font size options max to the legacy-seed clamp maximum', () => {
+    const clamped = extractLegacyLocalSettingsSeed({
+      terminal: { fontSize: 1_000_000 },
+    })
+    expect(clamped).toEqual({
+      terminal: {
+        fontSize: TERMINAL_FONT_SIZE_PX_OPTIONS[TERMINAL_FONT_SIZE_PX_OPTIONS.length - 1],
+      },
+    })
+  })
+
+  it('clamps legacy-seed font sizes at the 64px boundary with round-after-clamp', () => {
+    expect(extractLegacyLocalSettingsSeed({ terminal: { fontSize: 64 } }))
+      .toEqual({ terminal: { fontSize: 64 } })
+    expect(extractLegacyLocalSettingsSeed({ terminal: { fontSize: 65 } }))
+      .toEqual({ terminal: { fontSize: 64 } })
+    expect(extractLegacyLocalSettingsSeed({ terminal: { fontSize: 63.5 } }))
+      .toEqual({ terminal: { fontSize: 64 } })
   })
 
   it('strips moved local settings while preserving server-backed settings', () => {
