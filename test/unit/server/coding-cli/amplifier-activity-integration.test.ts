@@ -8,7 +8,6 @@ import {
 import {
   AMPLIFIER_CATCHUP_MAX_BYTES,
   createAmplifierActivityIntegration,
-  isAmplifierEventsTrackingEnabled,
   type AmplifierEventsWatchFactory,
   type AmplifierEventsWatcher,
 } from '../../../../server/coding-cli/amplifier-activity-integration.js'
@@ -122,7 +121,6 @@ async function flush(rounds = 8): Promise<void> {
 const EVENTS_PATH = '/fake/projects/-work/sessions/session-1/events.jsonl'
 
 function setup(options: {
-  env?: Record<string, string | undefined>
   resolveEventsPath?: (sessionId: string) => string | undefined
 } = {}) {
   const registry = new FakeRegistry()
@@ -136,7 +134,6 @@ function setup(options: {
     registry,
     tracker,
     resolveEventsPath: options.resolveEventsPath ?? (() => EVENTS_PATH),
-    env: options.env ?? {},
     log: { warn },
     watchImpl: factory,
     fsImpl: fsStore.fsImpl,
@@ -157,45 +154,7 @@ function bound(registry: FakeRegistry, input: {
   })
 }
 
-describe('isAmplifierEventsTrackingEnabled', () => {
-  it('defaults to on and disables for off/0/false (case-insensitive)', () => {
-    expect(isAmplifierEventsTrackingEnabled({})).toBe(true)
-    expect(isAmplifierEventsTrackingEnabled({ FRESHELL_AMPLIFIER_EVENTS_TRACKING: '1' })).toBe(true)
-    expect(isAmplifierEventsTrackingEnabled({ FRESHELL_AMPLIFIER_EVENTS_TRACKING: 'on' })).toBe(true)
-    expect(isAmplifierEventsTrackingEnabled({ FRESHELL_AMPLIFIER_EVENTS_TRACKING: 'off' })).toBe(false)
-    expect(isAmplifierEventsTrackingEnabled({ FRESHELL_AMPLIFIER_EVENTS_TRACKING: 'OFF' })).toBe(false)
-    expect(isAmplifierEventsTrackingEnabled({ FRESHELL_AMPLIFIER_EVENTS_TRACKING: '0' })).toBe(false)
-    expect(isAmplifierEventsTrackingEnabled({ FRESHELL_AMPLIFIER_EVENTS_TRACKING: 'false' })).toBe(false)
-  })
-})
-
 describe('amplifier activity integration', () => {
-  it('is fully inert when the flag is off', async () => {
-    const registry = new FakeRegistry()
-    const onSpy = vi.spyOn(registry, 'on')
-    const tracker = new AmplifierActivityTracker()
-    const enableSpy = vi.spyOn(tracker, 'enableEventsLane')
-    const { factory, watchers } = createFakeWatchFactory()
-    const fsStore = createFakeFsStore()
-    fsStore.write(EVENTS_PATH, line('session:start'))
-    const integration = createAmplifierActivityIntegration({
-      registry,
-      tracker,
-      resolveEventsPath: () => EVENTS_PATH,
-      env: { FRESHELL_AMPLIFIER_EVENTS_TRACKING: 'off' },
-      watchImpl: factory,
-      fsImpl: fsStore.fsImpl,
-    })
-
-    expect(onSpy).not.toHaveBeenCalled()
-    bound(registry, {})
-    await integration.attachTailer('t1', 'session-1', EVENTS_PATH, 'start')
-    await flush()
-    expect(watchers).toHaveLength(0)
-    expect(enableSpy).not.toHaveBeenCalled()
-    await integration.dispose()
-  })
-
   it('fresh bind over already-finished turns adopts final state without phantom completions (catch-up suppression)', async () => {
     const { registry, tracker, completions, fsStore, watchers } = setup()
     // Fast-path/coordinator binds fire only AFTER metadata.json lands (= after
@@ -214,7 +173,7 @@ describe('amplifier activity integration', () => {
     await flush()
 
     // Catch-up drain: state adopted (idle), ZERO replayed turn.completes —
-    // the degraded lane already emitted these completions live (finding C).
+    // turns that finished before the bind are history, not live turns (finding C).
     expect(completions).toHaveLength(0)
     expect(tracker.getActivity('t1')).toMatchObject({ phase: 'idle', sessionId: 'session-1' })
     expect(watchers).toHaveLength(1)
@@ -347,9 +306,9 @@ describe('amplifier activity integration', () => {
     expect(tracker.getActivity('t1')?.phase).toBe('busy')
   })
 
-  it('reducer lane.degrade disables the events lane once with a single warn and closes the watcher', async () => {
+  it('reducer lane.degrade stops events tracking once with a single warn and closes the watcher', async () => {
     const { registry, tracker, fsStore, watchers, warn } = setup()
-    const disableSpy = vi.spyOn(tracker, 'disableEventsLane')
+    const signalLostSpy = vi.spyOn(tracker, 'noteEventsSignalLost')
     fsStore.write(EVENTS_PATH, line('session:start', 1000))
 
     bound(registry, {})
@@ -357,12 +316,12 @@ describe('amplifier activity integration', () => {
     expect(warn).not.toHaveBeenCalled()
 
     // The tailer's schema gate only checks the first record of the file; a later
-    // bad-schema record reaches the reducer, which degrades the lane.
+    // bad-schema record reaches the reducer, which degrades the tracking.
     fsStore.append(EVENTS_PATH, badSchemaLine('prompt:submit', 2000))
     watchers[0].fire('change', EVENTS_PATH)
     await flush()
 
-    expect(disableSpy).toHaveBeenCalledWith('t1', 'schema_version_unsupported')
+    expect(signalLostSpy).toHaveBeenCalledWith('t1')
     expect(warn).toHaveBeenCalledTimes(1)
     expect(warn.mock.calls[0][0]).toMatchObject({
       event: 'amplifier_events_lane_degraded',
@@ -371,7 +330,7 @@ describe('amplifier activity integration', () => {
     })
     expect(watchers[0].closed).toBe(true)
 
-    // Further watcher noise is ignored: no second warn, no lane churn.
+    // Further watcher noise is ignored: no second warn, no churn.
     fsStore.append(EVENTS_PATH, line('prompt:submit', 3000))
     watchers[0].fire('change', EVENTS_PATH)
     await flush()
@@ -379,8 +338,8 @@ describe('amplifier activity integration', () => {
     expect(tracker.getActivity('t1')?.phase).toBe('idle')
   })
 
-  it('tailer error mid-turn degrades once and leaves the terminal busy for the timing lane', async () => {
-    const { registry, tracker, fsStore, watchers, warn } = setup()
+  it('tailer error mid-turn degrades once: idle with NO completion (no timing fallback)', async () => {
+    const { registry, tracker, completions, fsStore, watchers, warn } = setup()
     fsStore.write(EVENTS_PATH, line('session:start', 1000))
     bound(registry, {})
     await flush()
@@ -399,8 +358,11 @@ describe('amplifier activity integration', () => {
       terminalId: 't1',
       reason: 'read_error',
     })
-    // Mid-turn: still busy — the degraded timing lane owns the turn end now.
-    expect(tracker.getActivity('t1')?.phase).toBe('busy')
+    // Signal-loss policy: the in-flight turn is dropped — idle silently, no
+    // fabricated turn.complete, and nothing ever finishes it later.
+    expect(tracker.getActivity('t1')?.phase).toBe('idle')
+    expect(completions).toHaveLength(0)
+    expect(watchers[0].closed).toBe(true)
   })
 
   it('deadman force-read recovers a completion missed by the watcher (WSL2 backstop)', async () => {
@@ -474,7 +436,7 @@ describe('amplifier activity integration', () => {
   it('a synchronous throw during attach degrades the terminal instead of escaping the chain (N2)', async () => {
     const registry = new FakeRegistry()
     const tracker = new AmplifierActivityTracker()
-    const disableSpy = vi.spyOn(tracker, 'disableEventsLane')
+    const signalLostSpy = vi.spyOn(tracker, 'noteEventsSignalLost')
     const fsStore = createFakeFsStore()
     fsStore.write(EVENTS_PATH, line('session:start', 1000))
     const warn = vi.fn()
@@ -486,7 +448,6 @@ describe('amplifier activity integration', () => {
       registry,
       tracker,
       resolveEventsPath: () => EVENTS_PATH,
-      env: {},
       log: { warn },
       watchImpl: (watchPath, options) => {
         watchCalls += 1
@@ -501,7 +462,7 @@ describe('amplifier activity integration', () => {
     // Must RESOLVE (contained), never escape as an unhandled rejection.
     await expect(integration.attachTailer('t1', 'session-1', EVENTS_PATH, 'start'))
       .resolves.toBeUndefined()
-    expect(disableSpy).toHaveBeenCalledWith('t1', 'attach_error')
+    expect(signalLostSpy).toHaveBeenCalledWith('t1')
     expect(warn).toHaveBeenCalledTimes(1)
     expect(warn.mock.calls[0][0]).toMatchObject({
       event: 'amplifier_events_lane_degraded',
@@ -510,12 +471,10 @@ describe('amplifier activity integration', () => {
     })
 
     // The serialized chain recovered: the NEXT attach for the same terminal
-    // works normally (watcher created, events lane live again).
-    const enableSpy = vi.spyOn(tracker, 'enableEventsLane')
+    // works normally (watcher created, events tracking live again).
     await expect(integration.attachTailer('t1', 'session-1', EVENTS_PATH, 'start'))
       .resolves.toBeUndefined()
     await flush()
-    expect(enableSpy).toHaveBeenCalledWith('t1')
     expect(watchers).toHaveLength(1)
     expect(watchers[0].closed).toBe(false)
     fsStore.append(EVENTS_PATH, line('prompt:submit', 2000))
@@ -560,7 +519,6 @@ describe('amplifier activity integration', () => {
       registry,
       tracker,
       resolveEventsPath: () => EVENTS_PATH,
-      env: {},
       watchImpl: factory,
       fsImpl: fsStore.fsImpl,
     })

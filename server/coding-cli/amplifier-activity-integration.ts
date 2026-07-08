@@ -1,13 +1,17 @@
 /**
- * Composition root for Amplifier's events-lane activity tracking (plan
+ * Composition root for Amplifier's events-driven activity tracking (plan
  * docs/plans/2026-07-08-amplifier-session-durability-plan.md §6/§9 Phase 2).
  *
  * Composes, per bound amplifier terminal: an events.jsonl tailer (offset-based,
- * Phase 1) → the pure reducer (Phase 1) → the two-lane tracker (applyLifecycle /
- * enableEventsLane / disableEventsLane). Imitates the composition style of
+ * Phase 1) → the pure reducer (Phase 1) → the tracker (applyLifecycle /
+ * noteEventsSignalLost). Imitates the composition style of
  * `opencode-activity-integration.ts` but LAYERS on top of the frozen
  * `amplifier-activity-wiring.ts` (which keeps feeding the tracker PTY signals)
- * instead of replacing it.
+ * instead of replacing it. The integration attaches/detaches tailers — nothing
+ * else: when the tailer degrades (schema mismatch, file reset, persistent read
+ * errors, attach failure) the terminal's tracking reverts to idle-and-stop
+ * (tracker.noteEventsSignalLost) with a single 'amplifier_events_lane_degraded'
+ * warn. There is no timing-heuristic fallback (removed 2026-07-08).
  *
  * Reads are caller-driven (the tailer owns no watchers): a chokidar watch on the
  * session dir (session-indexer hygiene: ignoreInitial, close().catch(() => {});
@@ -18,9 +22,6 @@
  * Path discovery stays OUTSIDE this module: callers hand attachTailer() an
  * explicit events path (Phase 3's locator) or provide resolveEventsPath (Phase 2:
  * indexer file path + provider.getLiveEventsPath).
- *
- * Gated by FRESHELL_AMPLIFIER_EVENTS_TRACKING (default on; 'off'/'0'/'false'
- * disables — reverting to today's degraded-lane behavior exactly).
  */
 
 import path from 'node:path'
@@ -40,8 +41,6 @@ import type { AmplifierEventsForceReadRequest } from './amplifier-activity-track
 import type { AmplifierReducerEffect } from './amplifier-events-reducer.js'
 import type { TerminalSessionBoundEvent } from '../terminal-stream/registry-events.js'
 
-export const AMPLIFIER_EVENTS_TRACKING_ENV = 'FRESHELL_AMPLIFIER_EVENTS_TRACKING'
-
 /**
  * Catch-up cap (adversarial finding C): an offset-0 attach whose backlog
  * exceeds this many bytes skips the catch-up drain entirely and attaches at
@@ -49,14 +48,6 @@ export const AMPLIFIER_EVENTS_TRACKING_ENV = 'FRESHELL_AMPLIFIER_EVENTS_TRACKING
  * reach hundreds of MB — replaying them at attach is never acceptable.
  */
 export const AMPLIFIER_CATCHUP_MAX_BYTES = 4 * 1024 * 1024
-
-/** Default ON; 'off' / '0' / 'false' (case-insensitive) disables. */
-export function isAmplifierEventsTrackingEnabled(
-  env: Record<string, string | undefined> = process.env,
-): boolean {
-  const raw = (env[AMPLIFIER_EVENTS_TRACKING_ENV] ?? '').trim().toLowerCase()
-  return !(raw === 'off' || raw === '0' || raw === 'false')
-}
 
 export type AmplifierEventsWatcher = {
   on(event: string, handler: (...args: any[]) => void): unknown
@@ -74,8 +65,7 @@ type IntegrationLogger = {
 
 type IntegrationTracker = {
   trackTerminal(input: { terminalId: string; sessionId?: string; at: number }): void
-  enableEventsLane(terminalId: string): void
-  disableEventsLane(terminalId: string, reason: string): void
+  noteEventsSignalLost(terminalId: string): void
   applyLifecycle(terminalId: string, effect: AmplifierReducerEffect): void
   on(event: string, handler: (...args: any[]) => void): unknown
   off(event: string, handler: (...args: any[]) => void): unknown
@@ -106,7 +96,6 @@ export type AmplifierActivityIntegrationInput = {
    * hands such sessions to attachTailer() with an explicit path instead.
    */
   resolveEventsPath: (sessionId: string) => string | undefined
-  env?: Record<string, string | undefined>
   log?: IntegrationLogger
   now?: () => number
   /** Injected for tests; defaults to chokidar.watch. */
@@ -160,21 +149,11 @@ export function createAmplifierActivityIntegration(
     registry,
     tracker,
     resolveEventsPath,
-    env = process.env,
     log,
     now = () => Date.now(),
     watchImpl = (watchPath, options) => chokidar.watch(watchPath, options),
     fsImpl,
   } = input
-
-  if (!isAmplifierEventsTrackingEnabled(env)) {
-    // Flag off: fully inert — no listeners, no watchers, no lane switches.
-    return {
-      async attachTailer() {},
-      async dispose() {},
-      getAttachChainCount: () => 0,
-    }
-  }
 
   const attachments = new Map<string, Attachment>()
   // Per-terminal attach/detach serialization (adversarial finding B): binds can
@@ -214,7 +193,9 @@ export function createAmplifierActivityIntegration(
   const degrade = (attachment: Attachment, reason: string, message?: string): void => {
     if (attachment.degraded) return
     attachment.degraded = true
-    tracker.disableEventsLane(attachment.terminalId, reason)
+    // Signal-loss policy (plan §6, 2026-07-08): no timing fallback. The
+    // terminal reverts to idle silently and stays events-less from here on.
+    tracker.noteEventsSignalLost(attachment.terminalId)
     log?.warn({
       component: 'amplifier-activity-integration',
       event: 'amplifier_events_lane_degraded',
@@ -222,7 +203,7 @@ export function createAmplifierActivityIntegration(
       sessionId: attachment.sessionId,
       reason,
       ...(message ? { message } : {}),
-    }, 'Amplifier events lane degraded; timing heuristics take over for this terminal.')
+    }, 'Amplifier events tracking degraded; terminal reverted to idle (no busy/turn signals until re-attach).')
     const watcher = attachment.watcher
     attachment.watcher = undefined
     void watcher?.close().catch(() => {})
@@ -310,7 +291,7 @@ export function createAmplifierActivityIntegration(
       if (attachment) {
         degrade(attachment, 'attach_error', message)
       } else {
-        tracker.disableEventsLane(terminalId, 'attach_error')
+        tracker.noteEventsSignalLost(terminalId)
         log?.warn({
           component: 'amplifier-activity-integration',
           event: 'amplifier_events_lane_degraded',
@@ -318,7 +299,7 @@ export function createAmplifierActivityIntegration(
           sessionId,
           reason: 'attach_error',
           message,
-        }, 'Amplifier events lane degraded; timing heuristics take over for this terminal.')
+        }, 'Amplifier events tracking degraded; terminal reverted to idle (no busy/turn signals until re-attach).')
       }
     }
   }
@@ -394,9 +375,8 @@ export function createAmplifierActivityIntegration(
 
     // Idempotent: production emits 'terminal.session.bound' before
     // 'terminal.created' (see amplifier-activity-wiring.ts), so ensure the
-    // tracker record exists before switching lanes.
+    // tracker record exists before lifecycle effects arrive.
     tracker.trackTerminal({ terminalId, sessionId, at: now() })
-    tracker.enableEventsLane(terminalId)
 
     if (requestedAttachAt === 'start' && !fileExists) {
       // events.jsonl may not exist yet (lazy creation, E1): leave the first read

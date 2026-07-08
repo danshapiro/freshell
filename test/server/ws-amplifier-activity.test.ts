@@ -227,7 +227,7 @@ describe('ws amplifier activity protocol', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Events-lane integration over the wire (plan 2026-07-08 §9 Phase 2): real
+// Events-driven integration over the wire (plan 2026-07-08 §9 Phase 2): real
 // tracker + wiring + integration composed exactly like server/index.ts, with
 // injected fs/watch fakes standing in for events.jsonl and chokidar.
 // ---------------------------------------------------------------------------
@@ -337,7 +337,7 @@ class EventedFakeRegistry extends EventEmitter {
   findRunningClaudeTerminalBySession() { return undefined }
 }
 
-describe('ws amplifier events-lane activity', () => {
+describe('ws amplifier events-driven activity', () => {
   let server: http.Server
   let port: number
   let wsHandler: any
@@ -374,7 +374,6 @@ describe('ws amplifier events-lane activity', () => {
       registry: registry as any,
       tracker: amplifierActivity.tracker,
       resolveEventsPath: (sessionId: string) => eventsPathBySession[sessionId],
-      env: {},
       log: { warn },
       watchImpl: watch.factory as any,
       fsImpl: fsStore.fsImpl as any,
@@ -458,7 +457,7 @@ describe('ws amplifier events-lane activity', () => {
     ws.close()
   })
 
-  it('falls back to the timing lane on tailer error mid-turn and completes the turn via output-idle', async () => {
+  it('tailer failure mid-turn reverts the phase to idle with NO turn.complete (single degrade warn)', async () => {
     const ws = await connect()
 
     fsStore.write(eventsPathBySession['s-ev2'], eventsLine('session:start'))
@@ -478,20 +477,32 @@ describe('ws amplifier events-lane activity', () => {
       msg.type === 'amplifier.activity.updated'
       && msg.upsert?.some((record: any) => record.terminalId === 'term-ev2' && record.phase === 'busy'))
 
-    // Tailer error mid-turn → single degrade warn, terminal stays busy.
+    // Tailer error mid-turn → single degrade warn + silent idle reversion over
+    // the wire. Attach the idle listener BEFORE firing so the broadcast cannot
+    // race past it.
+    const idlePromise = waitForMessage(ws, (msg) =>
+      msg.type === 'amplifier.activity.updated'
+      && msg.upsert?.some((record: any) => record.terminalId === 'term-ev2' && record.phase === 'idle'))
     fsStore.failStat(eventsPathBySession['s-ev2'])
     watcher.fire('change', eventsPathBySession['s-ev2'])
     await waitUntil(() => warn.mock.calls.some((call) =>
       (call[0] as any)?.event === 'amplifier_events_lane_degraded' && (call[0] as any)?.terminalId === 'term-ev2'))
+    const idle = await idlePromise
+    expect(idle.upsert.find((record: any) => record.terminalId === 'term-ev2')).toMatchObject({ phase: 'idle' })
+    const degradeWarns = warn.mock.calls.filter((call) =>
+      (call[0] as any)?.event === 'amplifier_events_lane_degraded' && (call[0] as any)?.terminalId === 'term-ev2')
+    expect(degradeWarns).toHaveLength(1)
 
-    // Degraded timing lane finishes the turn: output, then 2s of output-silence.
+    // NO timing fallback: PTY output after the degrade must not resurrect the
+    // turn or fabricate a completion (the removed heuristic fired ~2s after
+    // output-silence, so the window is held open past that).
     registry.emit('terminal.output.raw', { terminalId: 'term-ev2', data: 'tool output', at: Date.now() })
-    const completed = await waitForMessage(
-      ws,
-      (msg) => msg.type === 'terminal.turn.complete' && msg.terminalId === 'term-ev2',
-      5000,
-    )
-    expect(completed).toMatchObject({ provider: 'amplifier', terminalId: 'term-ev2', completionSeq: 1 })
+    await expect(expectNoMatchingMessage(ws, (msg) =>
+      (msg.type === 'terminal.turn.complete' && msg.terminalId === 'term-ev2')
+      || (msg.type === 'amplifier.activity.updated'
+        && msg.upsert?.some((record: any) => record.terminalId === 'term-ev2' && record.phase === 'busy')),
+    2600)).resolves.toBeUndefined()
+    expect(amplifierActivity.tracker.getActivity('term-ev2')?.phase).toBe('idle')
 
     ws.close()
   })

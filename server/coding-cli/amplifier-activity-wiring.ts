@@ -8,10 +8,10 @@ import { wirePtyActivityTracker, type ActivityWiringRegistry } from './activity-
 type AmplifierActivityRegistry = ActivityWiringRegistry
 
 /**
- * Registry→tracker wiring for Amplifier's PTY (degraded-lane) signals. Thin
- * wrapper over the shared wirePtyActivityTracker factory (Phase 4
+ * Registry→tracker wiring for Amplifier's PTY signals (submit/output/exit).
+ * Thin wrapper over the shared wirePtyActivityTracker factory (Phase 4
  * consolidation with the claude wiring); the public surface is unchanged.
- * The events lane layers on top via amplifier-activity-integration.ts.
+ * The events.jsonl lifecycle layers on top via amplifier-activity-integration.ts.
  */
 export function wireAmplifierActivityTracker(input: {
   registry: AmplifierActivityRegistry

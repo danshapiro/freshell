@@ -1,7 +1,7 @@
 import { EventEmitter } from 'events'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { wireAmplifierActivityTracker } from '../../../../server/coding-cli/amplifier-activity-wiring'
-import { AMPLIFIER_IDLE_DEBOUNCE_MS } from '../../../../server/coding-cli/amplifier-activity-tracker'
+import { AMPLIFIER_SUBMIT_GRACE_MS } from '../../../../server/coding-cli/amplifier-activity-tracker'
 
 class FakeRegistry extends EventEmitter {
   records = new Map<string, { terminalId: string; mode: string; status: string }>()
@@ -17,7 +17,7 @@ describe('wireAmplifierActivityTracker', () => {
     vi.useRealTimers()
   })
 
-  it('tracks only amplifier terminals and drives phase via submit + output-idle', () => {
+  it('tracks only amplifier terminals and drives provisional busy via PTY submit', () => {
     const registry = new FakeRegistry()
     const now = vi.fn(() => 1000)
     const { tracker, dispose } = wireAmplifierActivityTracker({
@@ -30,7 +30,7 @@ describe('wireAmplifierActivityTracker', () => {
     registry.emit('terminal.created', { terminalId: 'shell-1', mode: 'shell', status: 'running' })
     registry.emit('terminal.created', { terminalId: 'claude-1', mode: 'claude', status: 'running' })
     registry.emit('terminal.created', { terminalId: 't1', mode: 'amplifier', status: 'running' })
-    // Neither the shell nor the claude terminal is tracked by the amplifier lane.
+    // Neither the shell nor the claude terminal is tracked by the amplifier tracker.
     expect(tracker.getActivity('shell-1')).toBeUndefined()
     expect(tracker.getActivity('claude-1')).toBeUndefined()
     expect(tracker.getActivity('t1')?.phase).toBe('idle')
@@ -38,12 +38,13 @@ describe('wireAmplifierActivityTracker', () => {
     registry.emit('terminal.input.raw', { terminalId: 't1', data: '\r', at: 2000 })
     expect(tracker.getActivity('t1')?.phase).toBe('busy')
 
-    // Output holds it busy; there is no turn-complete BEL for amplifier.
+    // Output only refreshes liveness; it never ends a turn.
     registry.emit('terminal.output.raw', { terminalId: 't1', data: 'thinking', at: 2500 })
     expect(tracker.getActivity('t1')?.phase).toBe('busy')
 
-    // Output-idle after the debounce ends the turn.
-    vi.advanceTimersByTime(AMPLIFIER_IDLE_DEBOUNCE_MS)
+    // No prompt:submit record ever arrives (no events tailer in this test):
+    // one force-read retry, then the submit-grace reverts silently to idle.
+    vi.advanceTimersByTime(AMPLIFIER_SUBMIT_GRACE_MS * 2)
     expect(tracker.getActivity('t1')?.phase).toBe('idle')
 
     registry.emit('terminal.exit', { terminalId: 't1' })

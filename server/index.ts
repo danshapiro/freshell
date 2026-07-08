@@ -24,7 +24,7 @@ import { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { wireCodexActivityTracker } from './coding-cli/codex-activity-wiring.js'
 import { wireClaudeActivityTracker } from './coding-cli/claude-activity-wiring.js'
 import { wireAmplifierActivityTracker } from './coding-cli/amplifier-activity-wiring.js'
-import { createAmplifierActivityIntegration, isAmplifierEventsTrackingEnabled } from './coding-cli/amplifier-activity-integration.js'
+import { createAmplifierActivityIntegration } from './coding-cli/amplifier-activity-integration.js'
 import { AmplifierSessionLocator } from './coding-cli/amplifier-session-locator.js'
 import { AmplifierSessionController } from './coding-cli/amplifier-session-controller.js'
 import { createOpencodeActivityIntegration } from './coding-cli/opencode-activity-integration.js'
@@ -255,10 +255,9 @@ async function main() {
   const codexActivity = wireCodexActivityTracker({ registry, codingCliIndexer })
   const claudeActivity = wireClaudeActivityTracker({ registry })
   const amplifierActivity = wireAmplifierActivityTracker({ registry })
-  // Events-lane layer (plan 2026-07-08 §6/§9 Phase 2): tailer→reducer→tracker on
-  // top of the timing wiring above. Gated by FRESHELL_AMPLIFIER_EVENTS_TRACKING
-  // (default on); fully inert when disabled. Composition only — path discovery
-  // goes through the indexer + the amplifier provider capability.
+  // Events layer (plan 2026-07-08 §6/§9 Phase 2): tailer→reducer→tracker on
+  // top of the PTY wiring above. Composition only — path discovery goes
+  // through the indexer + the amplifier provider capability.
   const amplifierEventsIntegration = createAmplifierActivityIntegration({
     registry,
     tracker: amplifierActivity.tracker,
@@ -270,18 +269,13 @@ async function main() {
     log: logger,
   })
   // Phase 3 (plan 2026-07-08 §5): deterministic PTY↔session association for
-  // fresh amplifier sessions via first-prompt correlation. Same flag as the
-  // events lane; the coordinator slow-path below stays untouched as fallback.
-  const amplifierEventsTrackingEnabled = isAmplifierEventsTrackingEnabled()
-  const amplifierSessionLocator = amplifierEventsTrackingEnabled
-    ? new AmplifierSessionLocator({
-        registry,
-        amplifierHome: amplifierProvider.homeDir,
-      })
-    : undefined
-  const amplifierSessionController = amplifierSessionLocator
-    ? new AmplifierSessionController({ registry, locator: amplifierSessionLocator })
-    : undefined
+  // fresh amplifier sessions via first-prompt correlation; the coordinator
+  // slow-path below stays untouched as fallback.
+  const amplifierSessionLocator = new AmplifierSessionLocator({
+    registry,
+    amplifierHome: amplifierProvider.homeDir,
+  })
+  const amplifierSessionController = new AmplifierSessionController({ registry, locator: amplifierSessionLocator })
   const opencodeActivity = createOpencodeActivityIntegration({ registry, opencodeProvider })
 
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
@@ -605,7 +599,7 @@ async function main() {
       log.warn({ err, terminalId, sessionId }, 'Failed to broadcast OpenCode session association')
     }
   })
-  amplifierSessionController?.on('associated', ({ terminalId, sessionId, eventsPath }) => {
+  amplifierSessionController.on('associated', ({ terminalId, sessionId, eventsPath }) => {
     try {
       broadcastTerminalSessionAssociation({
         wsHandler,
@@ -960,15 +954,11 @@ async function main() {
   // sessions. Most providers now associate from onUpdate, but onNewSession still
   // reduces the delay before a freshly discovered session binds to a matching
   // terminal. For amplifier this is the plan 2026-07-08 §5 step 8 safety net
-  // (fires when metadata.json lands if the locator missed) and is disabled with
-  // the same FRESHELL_AMPLIFIER_EVENTS_TRACKING flag.
+  // (fires when metadata.json lands if the locator missed).
   //
   // Broadcast message type: { type: 'terminal.session.associated', terminalId: string, sessionId: string }
   codingCliIndexer.onNewSession((session) => {
-    if (
-      session.provider !== 'claude'
-      && !(session.provider === 'amplifier' && amplifierEventsTrackingEnabled)
-    ) return
+    if (session.provider !== 'claude' && session.provider !== 'amplifier') return
     if (!session.cwd) return
     const provider = session.provider
     const shouldAssociate = associationCoordinator.noteSession({
@@ -1241,8 +1231,8 @@ async function main() {
     claudeActivity.dispose()
     amplifierActivity.dispose()
     await amplifierEventsIntegration.dispose()
-    amplifierSessionController?.dispose()
-    await amplifierSessionLocator?.dispose()
+    amplifierSessionController.dispose()
+    await amplifierSessionLocator.dispose()
     opencodeActivity.dispose()
 
     // 10. Stop session repair service

@@ -23,7 +23,6 @@ import { SessionAssociationCoordinator } from '../../server/session-association-
 import { broadcastTerminalSessionAssociation } from '../../server/session-association-broadcast'
 import { AmplifierSessionLocator } from '../../server/coding-cli/amplifier-session-locator'
 import { AmplifierSessionController } from '../../server/coding-cli/amplifier-session-controller'
-import { isAmplifierEventsTrackingEnabled } from '../../server/coding-cli/amplifier-activity-integration'
 import { recordSessionLifecycleEvent } from '../../server/session-observability'
 
 vi.mock('node-pty', () => ({
@@ -191,21 +190,16 @@ describe('amplifier locator association end-to-end', () => {
 })
 
 describe('amplifier fast path via indexer onNewSession', () => {
-  function setupFastPath(env: Record<string, string | undefined> = {}) {
+  function setupFastPath() {
     const registry = new TerminalRegistry()
     const indexer = new CodingCliSessionIndexer([])
     const coordinator = new SessionAssociationCoordinator(registry, 30_000)
     const broadcasts: any[] = []
     const wsHandler = { broadcast: (message: unknown) => broadcasts.push(message) }
 
-    // Replicates the widened index.ts onNewSession fast path (claude always;
-    // amplifier only while FRESHELL_AMPLIFIER_EVENTS_TRACKING is enabled).
-    const amplifierEventsTrackingEnabled = isAmplifierEventsTrackingEnabled(env)
+    // Replicates the widened index.ts onNewSession fast path (claude + amplifier).
     indexer.onNewSession((session) => {
-      if (
-        session.provider !== 'claude'
-        && !(session.provider === 'amplifier' && amplifierEventsTrackingEnabled)
-      ) return
+      if (session.provider !== 'claude' && session.provider !== 'amplifier') return
       if (!session.cwd) return
       const provider = session.provider
       const shouldAssociate = coordinator.noteSession({
@@ -288,42 +282,6 @@ describe('amplifier fast path via indexer onNewSession', () => {
       provider: 'claude',
       source: 'claude_new_session',
     }))
-
-    registry.shutdown()
-  })
-
-  it('flag off (FRESHELL_AMPLIFIER_EVENTS_TRACKING=off) reverts the fast path to claude-only', () => {
-    const { registry, indexer, broadcasts } = setupFastPath({ FRESHELL_AMPLIFIER_EVENTS_TRACKING: 'off' })
-    const amplifierTerminal = registry.create({ mode: 'amplifier', cwd: '/home/user/project' })
-    const claudeTerminal = registry.create({ mode: 'claude', cwd: '/home/user/other' })
-
-    ;(indexer as any)['detectNewSessions']([{
-      provider: 'amplifier',
-      sessionId: SESSION_ID,
-      projectPath: '/home/user/project',
-      lastActivityAt: Date.now(),
-      cwd: '/home/user/project',
-    }])
-
-    // Amplifier never takes the fast path with the flag off (today's behavior).
-    expect(registry.get(amplifierTerminal.terminalId)?.resumeSessionId).toBeUndefined()
-    expect(broadcasts).toHaveLength(0)
-
-    ;(indexer as any)['detectNewSessions']([{
-      provider: 'claude',
-      sessionId: CLAUDE_SESSION_ID,
-      projectPath: '/home/user/other',
-      lastActivityAt: Date.now(),
-      cwd: '/home/user/other',
-    }])
-
-    // The claude fast path is unaffected by the amplifier flag.
-    expect(registry.get(claudeTerminal.terminalId)?.resumeSessionId).toBe(CLAUDE_SESSION_ID)
-    expect(broadcasts).toContainEqual({
-      type: 'terminal.session.associated',
-      terminalId: claudeTerminal.terminalId,
-      sessionRef: { provider: 'claude', sessionId: CLAUDE_SESSION_ID },
-    })
 
     registry.shutdown()
   })

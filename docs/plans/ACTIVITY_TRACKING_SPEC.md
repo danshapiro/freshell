@@ -4,7 +4,7 @@
 > indicators" describe a client-side feature from Jan 2026 that was rolled
 > back. Current activity tracking is **server-authoritative**, per provider —
 > see [Server-side coding-CLI activity tracking](#server-side-coding-cli-activity-tracking-2026-07)
-> for the current design, including Amplifier's two-lane tracker.
+> for the current design, including Amplifier's events-driven tracker.
 
 ## Server-side coding-CLI activity tracking (2026-07)
 
@@ -17,7 +17,7 @@ lifecycle (busy/idle + `turn.complete` events) from provider-native signals:
 | claude | PTY submit (Enter) | Stop-hook BEL in PTY output |
 | codex | PTY submit / app-server `onTurnStarted` | app-server `onTurnCompleted` / BEL / JSONL reconcile (deduped per turn) |
 | opencode | SSE `session.status: busy` | SSE `session.idle` |
-| amplifier | see two-lane design below | see two-lane design below |
+| amplifier | see events-driven design below | see events-driven design below |
 
 All four trackers share a `TurnCompletionLedger`
 (`server/coding-cli/turn-completion-ledger.ts`): a per-terminal monotonic
@@ -27,39 +27,44 @@ All four trackers share a `TurnCompletionLedger`
 terminal removal, so the sequence stays monotonic across re-tracks and
 late-attaching clients still receive the last completion.
 
-### Amplifier two-lane design
+### Amplifier events-driven design (single path)
 
 Implemented per `docs/plans/2026-07-08-amplifier-session-durability-plan.md`
-(§6); gated by `FRESHELL_AMPLIFIER_EVENTS_TRACKING` (default **on**;
-`off`/`0`/`false` reverts to degraded-lane-only behavior).
+(§6). 2026-07-08: the feature flag (`FRESHELL_AMPLIFIER_EVENTS_TRACKING`) and
+the degraded timing lane were removed by maintainer decision — single code
+path; sessions without `events.jsonl` get no busy/turn signal.
 
 Amplifier writes a schema-versioned event log per session
 (`~/.amplifier/projects/<slug>/sessions/<id>/events.jsonl`, schema
 `amplifier.log` ver 1.x) carrying `prompt:submit` / `prompt:complete` /
 `session:end` lifecycle records. The tracker
-(`server/coding-cli/amplifier-activity-tracker.ts`) runs one of two lanes per
+(`server/coding-cli/amplifier-activity-tracker.ts`) runs one state machine per
 terminal:
 
-- **Events lane** (normal, once a session is bound and the tailer attached):
-  `prompt:submit` is the only input that (re)enters busy; `prompt:complete` is
-  the single turn boundary (exactly one `turn.complete`); `session:end` also
-  ends a busy turn. PTY Enter is only *provisionally* busy with a 2s grace
-  reversion (empty-Enter writes no events); PTY output only refreshes
-  liveness. The 120s deadman **never fabricates a completion** — it requests a
-  force-read of the events tail (WSL2 inotify backstop) and stays busy.
-- **Degraded lane** (pre-bind, tailer error, schema mismatch, file reset): the
-  original timing heuristic, verbatim — submit → busy, first output arms a 2s
-  output-idle debounce that ends the turn, and the 120s deadman self-heals to
-  idle *and* emits the completion (no other end-of-turn signal exists in this
-  lane).
+- `prompt:submit` is the only input that (re)enters busy; `prompt:complete` is
+  the single turn boundary (exactly one `turn.complete` via the
+  `TurnCompletionLedger`); `session:end` also ends a busy turn. PTY Enter is
+  only *provisionally* busy with a 2s grace reversion (one force-read retry,
+  then a silent revert — empty-Enter writes no events); PTY output only
+  refreshes liveness. The 120s deadman **never fabricates a completion** — it
+  requests a force-read of the events tail (WSL2 inotify backstop) and stays
+  busy. PTY exit removes state unconditionally.
+- **Signal loss** (tailer error, schema mismatch, file reset, attach failure,
+  detach): no timing fallback. The phase reverts to idle silently (no
+  `turn.complete`), a single `amplifier_events_lane_degraded` warn is logged,
+  and tracking stops — the terminal then only shows the 2s provisional-busy
+  pulses from submit-grace. Terminals whose session never produces an
+  `events.jsonl` (bundle without the hooks-logging module) behave the same:
+  never confirmed busy, never `turn.complete` — acceptable, documented
+  behavior.
 
-PTY exit is the authoritative end in both lanes. Composition:
-`amplifier-events-tailer` → `amplifier-events-reducer` (pure) →
-`tracker.applyLifecycle()`, assembled by `amplifier-activity-integration.ts`.
-Fresh-session PTY↔session association is handled by
-`amplifier-session-locator.ts` (first-prompt ↔ new-dir correlation) +
-`amplifier-session-controller.ts`, with the coordinator slow path and the
-indexer fast path (`source: 'amplifier_new_session'`) as fallbacks.
+Composition: `amplifier-events-tailer` → `amplifier-events-reducer` (pure) →
+`tracker.applyLifecycle()`, assembled by `amplifier-activity-integration.ts`
+(which only attaches/detaches tailers). Fresh-session PTY↔session association
+is handled by `amplifier-session-locator.ts` (first-prompt ↔ new-dir
+correlation) + `amplifier-session-controller.ts`, with the coordinator slow
+path and the indexer fast path (`source: 'amplifier_new_session'`) as
+fallbacks.
 
 ---
 

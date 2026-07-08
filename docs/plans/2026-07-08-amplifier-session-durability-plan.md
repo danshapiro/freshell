@@ -104,24 +104,41 @@ server/coding-cli/turn-completion-ledger.ts        # Phase 4 consolidation
 
 ## 6. Tracker state machine
 
-`AmplifierActivityTracker`'s **public surface is frozen**: `list` / `getActivity` / `listLatestCompletions` / `trackTerminal` / `bindSession` / `noteInput` / `noteOutput` / `noteExit` / `expire` / `dispose` + `'changed'` / `'turn.complete'` events, public phase `'idle' | 'busy'`. The integration module feeds it via new methods: `enableEventsLane(terminalId)`, `disableEventsLane(terminalId, reason)`, `applyLifecycle(terminalId, reducedEffect)`. Downstream (`amplifier-activity-wiring.ts`, `ws-handler`, `amplifierActivitySlice`, `pane-activity.ts`) is untouched; no new WS message family.
+> **2026-07-08:** feature flag and degraded timing lane removed by maintainer
+> decision — single code path; sessions without events.jsonl get no busy/turn
+> signal. This supersedes §3 goal 3 and every "lane"/flag mention elsewhere in
+> this plan (kept below only as historical record of the original design).
+
+`AmplifierActivityTracker`'s **public surface is frozen**: `list` / `getActivity` / `listLatestCompletions` / `trackTerminal` / `bindSession` / `noteInput` / `noteOutput` / `noteExit` / `expire` / `dispose` + `'changed'` / `'turn.complete'` / `'events.force-read'` events, public phase `'idle' | 'busy'`. The integration module feeds it via `applyLifecycle(terminalId, reducedEffect)` and `noteEventsSignalLost(terminalId)`. Downstream (`amplifier-activity-wiring.ts`, `ws-handler`, `amplifierActivitySlice`, `pane-activity.ts`) is untouched; no new WS message family.
 
 ### Per-terminal state
 
 ```
-lane:        'degraded' | 'events'
-phase:       'idle' | 'busy'              // public
-submitGrace: timer | undefined            // events lane: provisional busy awaiting prompt:submit
-awaitingFirstOutput / idleTimer           // degraded lane only (existing fields, unchanged)
-lastObservedAt                            // feeds deadman in both lanes
+phase:         'idle' | 'busy'            // public
+submitGrace:   timer | undefined          // provisional busy awaiting prompt:submit
+busyConfirmed: boolean                    // prompt:submit record confirmed the busy phase
+lastObservedAt                            // feeds the deadman force-read failsafe
 ```
 
-### Lanes
+### Single events-driven path (no lanes)
 
-- **Degraded lane** — the current heuristic **verbatim** (submit → busy; first-output gate; 2s output-idle → `turn.complete`; 120s deadman completes). Active: before a session binds, when the tailer errors, or on schema mismatch. Existing tracker tests must pass unchanged against this lane.
-- **Events lane** — active once a session is bound, the tailer is attached, and the schema gate passed (`amplifier.log` major version 1; E10). Timing signals demote to hints.
+There is exactly one state machine. `prompt:submit` / `prompt:complete` /
+`session:end` records from `events.jsonl` are the only turn boundaries. PTY
+Enter is only a provisional busy (submit-grace with one force-read retry, then
+a silent revert); PTY output only refreshes liveness; PTY exit removes state.
 
-### Events (inputs) and transitions — events lane
+**Signal-loss policy:** when the tailer degrades (schema mismatch — the
+`amplifier.log` major-version-1 gate, E10 — file reset, persistent read
+errors, attach failure) or detaches, there is **no fallback to timing
+heuristics**. The terminal's phase reverts to idle silently (no
+`turn.complete`), the single structured `amplifier_events_lane_degraded` warn
+is logged, and tracking stops: from then on the terminal only ever shows the
+2s provisional-busy pulses from submit-grace. The same holds for terminals
+whose session never produces an `events.jsonl` (bundle without the
+hooks-logging module): they simply never get confirmed busy or
+`turn.complete` — acceptable, documented behavior.
+
+### Events (inputs) and transitions
 
 | Current | Input | Next | Effects / notes |
 |---|---|---|---|
@@ -136,8 +153,8 @@ lastObservedAt                            // feeds deadman in both lanes
 | any | `session:resume` record | idle (no change) | Resume does not imply busy. Same-file append; tailer already at EOF. |
 | any | PTY Ctrl+C | (no change) | Writes no events, cancels nothing (E5). Not a lifecycle input. |
 | any | `noteExit` (PTY exit) | state removed | **PTY exit is the authoritative end** — unconditional, both lanes. Tailer for that terminal is closed by the integration. |
-| busy | deadman sweep (`expire`, silent ≥120s in file growth AND PTY output) | (see effect) | **Repurposed as missed-signal failsafe:** trigger a **force-read** of the tail (stat + manual incremental read — the WSL2 inotify backstop; we run on WSL2 where inotify on 9p/drvfs paths can silently drop). If the read surfaces `prompt:complete`/`session:end` → process normally. If not → **stay busy** (genuine long turn) and log once. **Never fabricate a completion in events lane.** |
-| any | tailer error / schema mismatch / file reset (size < offset) | lane → degraded | Single warn (`amplifier_events_lane_degraded`, with reason). Degraded lane takes over immediately with current heuristics. |
+| busy | deadman sweep (`expire`, silent ≥120s in file growth AND PTY output) | (see effect) | **Missed-signal failsafe ONLY:** trigger a **force-read** of the tail (stat + manual incremental read — the WSL2 inotify backstop; we run on WSL2 where inotify on 9p/drvfs paths can silently drop). If the read surfaces `prompt:complete`/`session:end` → process normally. If not → **stay busy** (genuine long turn) and log once. **Never fabricates a completion.** |
+| any | tailer error / schema mismatch / file reset (size < offset) / detach | idle (silent) | Signal loss (`noteEventsSignalLost`): single warn (`amplifier_events_lane_degraded`, with reason), phase → idle with **no** `turn.complete`, tracking stops. No timing fallback. |
 
 **Out-of-order tolerance (E3):** the reducer keys transitions on event **type** only; timestamps are carried through for `updatedAt`/`at` fields but never used to order or gate transitions. Unbalanced records (orphan `session:end`, missing `session:start` on continue-attach) are legal inputs.
 
@@ -162,7 +179,7 @@ getLiveEventsPath?(filePath: string): string | undefined
 
 **Indexer policy for metadata-less dirs (E6):** dirs containing only `events.jsonl` (kill -9 before first `prompt:complete`) never gain `metadata.json` and are **not resumable**. Policy: **the indexer skips them** — which is already the emergent behavior, since discovery keys on `metadata.json` (`providers/amplifier.ts:168-170,203-210`). We now make that explicit and intentional (comment in the provider + test). Live visibility while such a session is running comes from the *activity* pipeline instead: the locator binds the sessionId to the live terminal, so busy/idle and turn-complete work from first submit; the sidebar entry appears naturally when `metadata.json` lands at first `prompt:complete`. If the process dies before that, the dir is dead weight and correctly invisible.
 
-**Feature flag:** `FRESHELL_AMPLIFIER_EVENTS_TRACKING` (default **on**). `off`/`0` disables the events lane, the locator, and the fast-path extension — reverting to today's behavior exactly. Remove the flag after one release of soak (§9 Phase 5).
+**Feature flag:** removed 2026-07-08 (maintainer decision — see §6 note). The events tracking, the locator/controller, and the fast-path extension are unconditional; there is no `FRESHELL_AMPLIFIER_EVENTS_TRACKING` environment variable and no degraded timing lane to revert to.
 
 ---
 
@@ -184,7 +201,7 @@ getLiveEventsPath?(filePath: string): string | undefined
 
 | File | Change |
 |---|---|
-| `server/coding-cli/amplifier-activity-tracker.ts` | Two-lane internals; `enableEventsLane`/`disableEventsLane`/`applyLifecycle`; deadman repurposed (events lane: force-read request, never fabricate); degraded lane code paths unchanged; public surface frozen |
+| `server/coding-cli/amplifier-activity-tracker.ts` | Single events-driven state machine (`applyLifecycle`/`noteEventsSignalLost`); deadman = force-read request only, never fabricates; timing-heuristic code deleted (2026-07-08); public surface frozen |
 | `server/coding-cli/provider.ts` | `getLiveEventsPath?` capability (:30 vicinity) |
 | `server/coding-cli/providers/amplifier.ts` | Implement `getLiveEventsPath`; explicit metadata-less-dir policy comment |
 | `server/session-association-broadcast.ts` | `AssociationBroadcastSource` (:9) += `'amplifier_locator' \| 'amplifier_new_session'` |
@@ -213,12 +230,12 @@ Reducer + tailer + fixtures. No behavior change in the running app.
 - Tailer tests (injected `fsImpl`): partial trailing line buffering, EOF-attach for resume, appended-bytes-only reads, pre-filter skips noise records without parsing, `size < offset` → degrade, force-read path.
 - `npm test` green; zero changes under `server/` wiring.
 
-### Phase 2 — Two-lane tracker + integration (flagged)
-Tracker gains lanes; integration composes tailer→reducer→tracker; `index.ts` wires it behind `FRESHELL_AMPLIFIER_EVENTS_TRACKING`.
+### Phase 2 — Events-driven tracker + integration
+Tracker becomes the single events-driven state machine; integration composes tailer→reducer→tracker; `index.ts` wires it unconditionally. (Originally shipped as a flagged two-lane design; flag and degraded lane removed 2026-07-08 — see §6 note.)
 
 **Success criteria**
-- All **existing** tracker/wiring tests pass verbatim (degraded lane untouched).
-- Extended `test/server/ws-amplifier-activity.test.ts` (existing harness): busy on `prompt:submit`; exactly one `terminal.turn.complete` (correct `completionSeq`) on `prompt:complete`; a simulated 10-minute silent tool call produces **no** fabricated completion; post-complete naming events do not re-busy; submit-grace reversion on empty-Enter; tailer error mid-turn → degraded lane finishes the turn via timing.
+- Tracker/wiring tests cover the events-driven semantics (the old timing-heuristic tests were deleted with the behavior).
+- Extended `test/server/ws-amplifier-activity.test.ts` (existing harness): busy on `prompt:submit`; exactly one `terminal.turn.complete` (correct `completionSeq`) on `prompt:complete`; a simulated 10-minute silent tool call produces **no** fabricated completion; post-complete naming events do not re-busy; submit-grace reversion on empty-Enter; tailer error mid-turn → phase reverts to idle with **no** `turn.complete` + single warn.
 - Deadman force-read test: suppress watcher events (WSL2 simulation), confirm completion is recovered by force-read, and confirm a genuinely-busy session stays busy.
 
 ### Phase 3 — Locator + association
@@ -239,8 +256,9 @@ Extract `TurnCompletionLedger`; adopt in all four trackers.
 - Claude/amplifier wiring unification attempted; merged only if the diff is trivially reviewable, else a `TODO` note referencing this plan.
 
 ### Phase 5 — Rollout & cleanup
-- Ship with `FRESHELL_AMPLIFIER_EVENTS_TRACKING` default-on for one release; watch `amplifier_events_lane_degraded`, `amplifier_locator_ambiguous`, `amplifier_events_lane_suspect`, and deadman-force-read log rates.
-- After soak: remove the flag (events lane becomes unconditional; degraded lane remains permanently as the fallback), update `docs/plans/ACTIVITY_TRACKING_SPEC.md` with the amplifier lanes, and file/refresh the upstream issues (§12).
+- 2026-07-08: the feature flag AND the degraded timing lane were removed ahead of soak by maintainer decision — single code path, no revert lever. Signal loss ⇒ idle-and-stop (§6 signal-loss policy); sessions without events.jsonl get no busy/turn signal.
+- Soak monitoring stays: watch `amplifier_events_lane_degraded`, `amplifier_locator_ambiguous`, `amplifier_events_lane_suspect`, and deadman-force-read log rates.
+- `docs/plans/ACTIVITY_TRACKING_SPEC.md` updated with the single-path amplifier design; file/refresh the upstream issues (§12).
 
 ### Adversarial review round (post-build hardening)
 
@@ -328,13 +346,13 @@ synthesized fixture.
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| Upstream schema change (`amplifier.log` ver ≠ 1.x) — README warns "breaking changes happen" | Medium | Events lane unusable | Version gate → automatic degraded lane + single warn; degraded lane is today's shipped behavior, so worst case = status quo |
+| Upstream schema change (`amplifier.log` ver ≠ 1.x) — README warns "breaking changes happen" | Medium | Events tracking unusable | Version gate → signal-loss policy (§6): idle-and-stop + single warn; worst case = no busy/turn signal for that terminal |
 | WSL2 inotify drops events on the sessions tree | Medium (we run on WSL2) | Stuck busy | Deadman repurposed as force-read (stat + manual incremental read every sweep past 120s silence); recovers missed `prompt:complete` without fabricating |
 | Two same-cwd terminals first-prompted within the 2s window | Low | Wrong/no binding | cwd confirm via `session:config` first; residual ambiguity → refuse + coordinator slow-path (watermarked, single-candidate) — never guess |
 | `events.jsonl` volume (~450KB/turn, raw LLM payloads inside) | High (normal) | CPU/IO cost | Offset-based appended-bytes reads; substring pre-filter before parse; one tailer per *bound live terminal* only, closed on exit |
-| Log truncation/rotation appears upstream later | Low (never observed) | Tailer confusion | `size < offset` ⇒ degrade lane + warn; no guessing |
+| Log truncation/rotation appears upstream later | Low (never observed) | Tailer confusion | `size < offset` ⇒ signal loss (idle-and-stop) + warn; no guessing |
 | Locator watcher lifetime bugs (leaks) | Low | fd leaks | Single shared watcher, active only while ≥1 unbound terminal; unregister on bind/exit; disposal test asserts closed |
-| Regression in degraded lane while refactoring tracker | Low | Amplifier UX regression | Degraded-lane code paths kept verbatim; existing test suite must pass unmodified; flag provides full revert |
+| Sessions without events.jsonl (bundle lacks the hooks-logging module) | Low | No busy/turn signal for those terminals | Accepted by design (2026-07-08 decision): submit-grace pulses only; documented in §6 signal-loss policy |
 | Fast-path extension destabilizes claude path | Very low | Association regressions | Change is a provider-set widening only; coordinator guards unchanged; covered by existing coordinator tests + new amplifier fast-path test |
 | Metadata-less orphan dirs accumulate | Certain (E6) | Cosmetic disk noise | Explicitly out of scope to clean; documented policy (§7); not indexed, not resumable |
 
@@ -347,17 +365,17 @@ synthesized fixture.
 - `amplifier-events-tailer.test.ts` — injected `fsImpl` (pattern: `codex-app-server/durability-proof.ts`): partial lines, EOF attach, append-only reads, pre-filter, reset detection, force-read.
 - `amplifier-session-locator.test.ts` — mkdtemp + `AMPLIFIER_HOME` + `utimes` (pattern: `amplifier-provider.test.ts`): snapshot semantics, correlation window, cwd confirm, ambiguity refusal, subagent guards, watcher lifetime, spawn-order inversion (E8).
 - `amplifier-session-controller.test.ts` — mode/status validation, bind result handling, reject paths (pattern: opencode controller tests).
-- `amplifier-activity-tracker.test.ts` — extended: lane switching, submit-grace reversion, deadman force-read request, PTY-exit authority; **existing cases unmodified and green**.
+- `amplifier-activity-tracker.test.ts` — events-driven semantics: submit-grace reversion (with the one-time force-read retry), lifecycle-record turn boundaries, deadman force-read request, PTY-exit authority, signal-loss idle-and-stop. (The pre-existing timing-heuristic cases were deleted with the behavior, 2026-07-08.)
 - `turn-completion-ledger.test.ts` + before/after snapshot tests on all four trackers (Phase 4).
 
 **Integration (`test/server/`)**
-- `ws-amplifier-activity.test.ts` extended (existing WS harness): full events-lane turn over the wire (`terminal.turn.complete` with provider-scoped `completionSeq` per `shared/ws-protocol.ts:189`); degraded-lane fallback mid-turn; no new WS message types asserted.
+- `ws-amplifier-activity.test.ts` extended (existing WS harness): full events-driven turn over the wire (`terminal.turn.complete` with provider-scoped `completionSeq` per `shared/ws-protocol.ts:189`); tailer failure mid-turn → idle with no `turn.complete` + single warn; no new WS message types asserted.
 - Association end-to-end: spawn-fake → Enter → dir appears (fixture writer) → `terminal.session.associated` broadcast with `source: 'amplifier_locator'`; fast-path variant with `metadata.json` drop-in.
 
 **Real-CLI smoke (`test/integration/real/`, gated on amplifier binary presence)**
 - Extend `amplifier-launch-smoke.test.ts`: launch, prompt, assert bind + busy + single turn-complete against the real CLI; resume a session and assert EOF-attach (no historical replay of completions).
 
-**Manual acceptance (WSL2, before flag removal)**
+**Manual acceptance (WSL2)**
 - Two panes, same cwd, prompt second-spawned first → both bind correctly.
 - Long tool call (>2 min silent) → stays busy, completes exactly once.
 - Ctrl+C mid-turn → no state flap; PTY kill → pane cleans up.
@@ -385,8 +403,7 @@ Now grounded in hard refutations (E9) — file as issues, link back here:
 | `AMPLIFIER_DIR_PRE_EPSILON_MS` | 250 | Clock-jitter/event-reorder allowance only — dirs meaningfully older than the Enter are foreign sessions (adversarial finding F) |
 | `AMPLIFIER_SUBMIT_GRACE_MS` | 2_000 | Empty-Enter writes nothing (E5); provisional busy must revert. First expiry force-reads + extends once (finding D); second expiry reverts |
 | `AMPLIFIER_GRACE_REVERSION_SUSPECT_THRESHOLD` | 3 | Consecutive silent reversions before the single `amplifier_events_lane_suspect` warn (finding D; soak signal, never auto-degrades) |
-| `AMPLIFIER_BUSY_DEADMAN_MS` | 120_000 (existing) | Repurposed: force-read trigger in events lane; completion-fabricator only in degraded lane |
-| `AMPLIFIER_IDLE_DEBOUNCE_MS` | 2_000 (existing) | Degraded lane only, verbatim |
+| `AMPLIFIER_BUSY_DEADMAN_MS` | 120_000 (existing) | Force-read trigger ONLY (missed-signal failsafe); never fabricates a completion |
 | `AMPLIFIER_CATCHUP_MAX_BYTES` | 4 MiB | Offset-0 attach backlog cap (finding C): larger backlogs attach at EOF; observed events files reach hundreds of MB |
 | `AMPLIFIER_TAILER_PARTIAL_MAX_BYTES` | 8 MiB | Partial-line buffer cap (finding E): oversized `llm:request` lines are dropped to the next newline, never degrading |
 | `AMPLIFIER_TAILER_READ_BATCH_MAX_BYTES` | 16 MiB | Single read-batch cap (finding E): no `Buffer.concat` scales with file size |

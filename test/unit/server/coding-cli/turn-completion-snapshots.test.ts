@@ -14,7 +14,6 @@ import { ClaudeActivityTracker, type ClaudeTurnCompleteEvent } from '../../../..
 import { CodexActivityTracker, type CodexTurnCompleteEvent } from '../../../../server/coding-cli/codex-activity-tracker'
 import { OpencodeActivityTracker } from '../../../../server/coding-cli/opencode-activity-tracker'
 import {
-  AMPLIFIER_IDLE_DEBOUNCE_MS,
   AmplifierActivityTracker,
   type AmplifierTurnCompleteEvent,
 } from '../../../../server/coding-cli/amplifier-activity-tracker'
@@ -157,15 +156,14 @@ describe('AmplifierActivityTracker turn-completion snapshot', () => {
     vi.useRealTimers()
   })
 
-  it('scripted turns across both lanes: exact completionSeq sequence and byte-identical listLatestCompletions()', () => {
+  it('scripted events-driven turns: exact completionSeq sequence and byte-identical listLatestCompletions()', () => {
     const tracker = new AmplifierActivityTracker()
     const completions: AmplifierTurnCompleteEvent[] = []
     tracker.on('turn.complete', (e: AmplifierTurnCompleteEvent) => completions.push(e))
 
-    // Events-lane turn (prompt:complete is the single boundary).
+    // Events-driven turn (prompt:complete is the single boundary).
     tracker.trackTerminal({ terminalId: 't1', at: 1000 })
     tracker.bindSession({ terminalId: 't1', sessionId: 's-1', at: 1000 })
-    tracker.enableEventsLane('t1')
     tracker.applyLifecycle('t1', { kind: 'turn.began', at: new Date(2000).toISOString() })
     tracker.applyLifecycle('t1', { kind: 'turn.completed', at: new Date(5000).toISOString() })
 
@@ -174,18 +172,18 @@ describe('AmplifierActivityTracker turn-completion snapshot', () => {
     tracker.noteExit({ terminalId: 't1' })
     tracker.trackTerminal({ terminalId: 't1', at: 6000 })
 
-    // Degraded-lane turn: output-idle debounce completes at lastOutputAt + debounce.
+    // Second turn: PTY submit is provisional; the lifecycle records own the boundary.
     tracker.noteInput({ terminalId: 't1', data: '\r', at: 7000 })
-    tracker.noteOutput({ terminalId: 't1', data: 'streaming', at: 7100 })
-    vi.advanceTimersByTime(AMPLIFIER_IDLE_DEBOUNCE_MS)
+    tracker.applyLifecycle('t1', { kind: 'turn.began', at: new Date(7100).toISOString() })
+    tracker.applyLifecycle('t1', { kind: 'turn.completed', at: new Date(9000).toISOString() })
 
     expect(completions).toEqual([
       { terminalId: 't1', sessionId: 's-1', at: 5000, completionSeq: 1 },
-      { terminalId: 't1', at: 7100 + AMPLIFIER_IDLE_DEBOUNCE_MS, completionSeq: 2 },
+      { terminalId: 't1', at: 9000, completionSeq: 2 },
     ])
     expect(completions.map((c) => c.completionSeq)).toEqual([1, 2])
     expect(JSON.stringify(tracker.listLatestCompletions())).toBe(
-      `[{"terminalId":"t1","at":${7100 + AMPLIFIER_IDLE_DEBOUNCE_MS},"completionSeq":2}]`,
+      '[{"terminalId":"t1","at":9000,"completionSeq":2}]',
     )
   })
 })
