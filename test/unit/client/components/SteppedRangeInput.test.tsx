@@ -22,6 +22,24 @@ function renderControl({ value = 80, onChange = vi.fn() }: { value?: number; onC
   }
 }
 
+function renderAnnotatedControl({ value = 80, onChange = vi.fn() }: { value?: number; onChange?: ReturnType<typeof vi.fn> } = {}) {
+  render(
+    <SteppedRangeInput
+      value={value}
+      values={VALUES}
+      onChange={onChange}
+      aria-label="Test scale"
+      unit="%"
+      annotation={(v) => `(${v * 2})`}
+    />
+  )
+  return {
+    onChange,
+    slider: screen.getByRole('slider', { name: 'Test scale' }) as HTMLInputElement,
+    spin: screen.getByRole('spinbutton', { name: 'Test scale' }) as HTMLInputElement,
+  }
+}
+
 afterEach(() => {
   cleanup()
 })
@@ -155,6 +173,48 @@ describe('SteppedRangeInput', () => {
       fireEvent.blur(spin)
 
       expect(onChange).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('annotation prop', () => {
+    it('appends the annotation to aria-valuetext', () => {
+      const { slider } = renderAnnotatedControl({ value: 80 })
+
+      expect(slider.getAttribute('aria-valuetext')).toBe('80% (160)')
+    })
+
+    it('renders a visible aria-hidden span with the annotation text', () => {
+      renderAnnotatedControl({ value: 80 })
+
+      const annotationSpan = screen.getByText('(160)')
+      expect(annotationSpan).toBeInTheDocument()
+      expect(annotationSpan.getAttribute('aria-hidden')).toBe('true')
+    })
+
+    it('live-previews the annotation during a pointer drag and commits once on pointer-up', () => {
+      const { onChange, slider } = renderAnnotatedControl({ value: 80 })
+
+      fireEvent.pointerDown(slider)
+      fireEvent.change(slider, { target: { value: '3' } })
+
+      expect(onChange).not.toHaveBeenCalled()
+      expect(slider.getAttribute('aria-valuetext')).toBe('225% (450)')
+      expect(screen.getByText('(450)')).toBeInTheDocument()
+      expect(screen.queryByText('(160)')).toBeNull()
+
+      fireEvent.pointerUp(slider)
+
+      expect(onChange).toHaveBeenCalledTimes(1)
+      expect(onChange).toHaveBeenCalledWith(225)
+    })
+
+    it('renders no annotation span and a plain aria-valuetext when absent', () => {
+      const { slider } = renderControl({ value: 80 })
+
+      expect(slider.getAttribute('aria-valuetext')).toBe('80%')
+      expect(screen.queryByText('(160)')).toBeNull()
+      // Only the unit span is aria-hidden; no extra annotation span renders.
+      expect(document.querySelectorAll('span[aria-hidden="true"]')).toHaveLength(1)
     })
   })
 })

@@ -42,7 +42,15 @@ export const UI_SCALE_PERCENT_OPTIONS: readonly number[] = [
   225, 250, 275, 300, 325, 350, 375, 400,
 ]
 const TERMINAL_FONT_SIZE_MIN = 12
-const TERMINAL_FONT_SIZE_MAX = 32
+const TERMINAL_FONT_SIZE_MAX = 64
+// Slider stops for the terminal font size control, in px.
+// Fine 1px steps up to 32 (every previously reachable value stays on-list),
+// then 2px steps to 48 and 4px steps to 64 (~6-8% relative change per stop).
+export const TERMINAL_FONT_SIZE_PX_OPTIONS: readonly number[] = [
+  12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+  34, 36, 38, 40, 42, 44, 46, 48,
+  52, 56, 60, 64,
+]
 const TERMINAL_LINE_HEIGHT_MIN = 1
 const TERMINAL_LINE_HEIGHT_MAX = 1.8
 const PANE_SNAP_THRESHOLD_MIN = 0

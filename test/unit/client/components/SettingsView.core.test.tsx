@@ -29,14 +29,6 @@ function getFontFamilySelect() {
   })!
 }
 
-function getFontSizeSlider() {
-  return screen.getAllByRole('slider').find((slider) => {
-    const min = slider.getAttribute('min')
-    const max = slider.getAttribute('max')
-    return min === '12' && max === '32'
-  })!
-}
-
 describe('SettingsView core sections', () => {
   describe('renders settings form', () => {
     it('renders the Settings header', () => {
@@ -201,7 +193,10 @@ describe('SettingsView core sections', () => {
       const store = createSettingsViewStore({ settings: { terminal: { fontSize: 16 } } })
       renderSettingsView(store)
 
-      expect(screen.getByText('16px (100%)')).toBeInTheDocument()
+      const fontSizeInput = screen.getByRole('spinbutton', { name: 'Font size' }) as HTMLInputElement
+      expect(fontSizeInput.value).toBe('16')
+      expect(screen.getByRole('slider', { name: 'Font size' }).getAttribute('aria-valuetext')).toBe('16px (100%)')
+      expect(screen.getByText('(100%)')).toBeInTheDocument()
     })
 
     it('displays current UI scale value', () => {
@@ -361,9 +356,9 @@ describe('SettingsView core sections', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
-      const fontSizeSlider = getFontSizeSlider()
-      fireEvent.change(fontSizeSlider, { target: { value: '18' } })
-      fireEvent.pointerUp(fontSizeSlider)
+      const fontSizeSlider = screen.getByRole('slider', { name: 'Font size' })
+      // Keyboard-path change commits immediately; '6' is the index of 18px.
+      fireEvent.change(fontSizeSlider, { target: { value: '6' } })
 
       expect(store.getState().settings.settings.terminal.fontSize).toBe(18)
     })
@@ -372,22 +367,26 @@ describe('SettingsView core sections', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
-      fireEvent.change(getFontSizeSlider(), { target: { value: '20' } })
-      expect(screen.getByText('20px (125%)')).toBeInTheDocument()
+      const fontSizeSlider = screen.getByRole('slider', { name: 'Font size' })
+      // '8' is the index of 20px.
+      fireEvent.change(fontSizeSlider, { target: { value: '8' } })
+
+      expect(fontSizeSlider.getAttribute('aria-valuetext')).toBe('20px (125%)')
+      expect(screen.getByText('(125%)')).toBeInTheDocument()
     })
 
     it('keeps font size changes local without calling /api/settings', async () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
-      const fontSizeSlider = getFontSizeSlider()
-      fireEvent.change(fontSizeSlider, { target: { value: '18' } })
-      fireEvent.pointerUp(fontSizeSlider)
+      const fontSizeSlider = screen.getByRole('slider', { name: 'Font size' })
+      fireEvent.change(fontSizeSlider, { target: { value: '6' } })
 
       await act(async () => {
         vi.advanceTimersByTime(500)
       })
 
+      expect(store.getState().settings.settings.terminal.fontSize).toBe(18)
       expect(api.patch).not.toHaveBeenCalled()
     })
   })

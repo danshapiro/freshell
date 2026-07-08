@@ -32,32 +32,29 @@ test.describe('Settings', () => {
     await expect(page.getByRole('tab', { name: /^Safety$/i })).toHaveCount(0)
   })
 
-  test('terminal font size slider changes setting', async ({ freshellPage, page, harness }) => {
+  test('terminal font size input changes setting', async ({ freshellPage, page, harness }) => {
     await openSettings(page)
 
-    // SettingsRow label="Font size" renders as <span> text, not <label>.
-    // The control is a RangeSlider which renders <input type="range">.
-    // Find the "Font size" row, then locate its range input.
-    const fontSizeRow = page.getByText('Font size')
-    await expect(fontSizeRow).toBeVisible()
+    // The Font size row renders a SteppedRangeInput: an index-based slider plus
+    // a numeric input. The slider's value is a stop *index*, not px, so drive
+    // the setting through the px-valued spinbutton instead.
+    const fontSizeInput = page.getByRole('spinbutton', { name: 'Font size' })
+    await expect(fontSizeInput).toBeVisible()
 
-    // The range input is within the same SettingsRow container.
-    // Use the row's parent to scope the range input.
-    const fontSizeSlider = fontSizeRow.locator('..').locator('input[type="range"]')
-    await expect(fontSizeSlider).toBeVisible()
-
-    // Change the slider value via JavaScript (range inputs are hard to drag in Playwright)
     const settingsBefore = await harness.getSettings()
     const fontSizeBefore = settingsBefore.terminal.fontSize
 
-    await fontSizeSlider.fill('20')
-    // Trigger the pointerup event to commit the value
-    await fontSizeSlider.dispatchEvent('pointerup')
+    await fontSizeInput.fill('20')
+    await fontSizeInput.press('Enter')
     await page.waitForTimeout(500)
 
     const settingsAfter = await harness.getSettings()
     expect(settingsAfter.terminal.fontSize).toBe(20)
     expect(settingsAfter.terminal.fontSize).not.toBe(fontSizeBefore)
+
+    // The slider announces the px value with its percent annotation.
+    const fontSizeSlider = page.getByRole('slider', { name: 'Font size' })
+    await expect(fontSizeSlider).toHaveAttribute('aria-valuetext', '20px (125%)')
   })
 
   test('terminal color scheme selection', async ({ freshellPage, page, harness }) => {

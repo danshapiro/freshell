@@ -1030,19 +1030,22 @@ describe('Component Edge Cases', () => {
 
         const sliders = screen.getAllByRole('slider')
         const fontSizeSlider = sliders.find(
-          (s) => s.getAttribute('min') === '12' && s.getAttribute('max') === '32'
+          (s) => s.getAttribute('aria-label') === 'Font size'
         )!
 
-        // Rapidly move slider
-        for (let i = 12; i <= 32; i++) {
+        // Rapidly move the index-based slider (33 stops -> indices 0..32)
+        for (let i = 0; i <= 32; i++) {
           fireEvent.change(fontSizeSlider, { target: { value: String(i) } })
         }
-        for (let i = 32; i >= 12; i--) {
+        for (let i = 32; i >= 0; i--) {
           fireEvent.change(fontSizeSlider, { target: { value: String(i) } })
         }
 
-        // Should not crash and value should be set
-        expect(store.getState().settings.settings.terminal.fontSize).toBeDefined()
+        // Should not crash and value should be set within the supported range
+        const fontSize = store.getState().settings.settings.terminal.fontSize
+        expect(fontSize).toBeDefined()
+        expect(fontSize).toBeGreaterThanOrEqual(12)
+        expect(fontSize).toBeLessThanOrEqual(64)
       })
     })
   })
