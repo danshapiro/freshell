@@ -28,6 +28,7 @@ pub mod config;
 pub mod external_url;
 pub mod health;
 pub mod hotkey;
+pub mod provisioning;
 pub mod renderer_recovery;
 pub mod server;
 pub mod shim;
@@ -92,7 +93,15 @@ pub fn run() {
         .setup({
             let server_slot = server_slot.clone();
             move |app| {
-                setup_app_bound(app, &server_slot)?;
+                // Remote provisioning first (electron/entry.ts:260-274 applies the
+                // provision file BEFORE runStartup; startup.ts:360-380 then connects
+                // a configured remote with NO app-bound spawn). Env pair or the
+                // one-shot desktop.provision file → remote; else app-bound.
+                if let Some(remote) = provisioning::resolve_provisioned_remote() {
+                    setup_remote(app, &remote)?;
+                } else {
+                    setup_app_bound(app, &server_slot)?;
+                }
                 Ok(())
             }
         })
@@ -198,6 +207,63 @@ fn setup_app_bound(
 
     // Headless-smoke hook: auto-quit after N ms so an xvfb smoke can prove the full
     // spawn→health→window→reap path and exit cleanly. No-op in normal use.
+    install_smoke_exit(app);
+
+    Ok(())
+}
+
+/// The remote boot path (provisioned remote, `startup.ts:360-380`): NO app-bound
+/// spawn — health-gate the remote's `/api/health` (`checkRemoteReachable`,
+/// `startup.ts:79-96`, made a bounded wait since there is no child to fail-fast
+/// on), then load `<remoteUrl>/?token=<remoteToken>` with the same injected shim.
+/// An unreachable remote aborts the launch (the reference would fall back to the
+/// launch chooser — a deferred 3.14 window — so fail-fast is the honest analog).
+fn setup_remote(
+    app: &mut tauri::App,
+    remote: &provisioning::RemoteConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let phase = runnable_phase(decide_initial_phase(BootInputs {
+        // Provisioning marks setupCompleted:true (desktop-provisioning.ts:68-73).
+        setup_completed: true,
+        server_mode: ServerMode::Remote,
+    }));
+    debug_assert_eq!(phase, ShellPhase::Main, "a provisioned remote boots Main");
+
+    let load_url = provisioning::remote_load_url(&remote.remote_url, &remote.remote_token);
+    let parsed: url::Url = load_url.parse()?;
+    let host = parsed
+        .host_str()
+        .ok_or("remote URL has no host")?
+        .to_string();
+    let port = parsed
+        .port_or_known_default()
+        .ok_or("remote URL has no port")?;
+
+    eprintln!("freshell-tauri: remote mode — connecting to {host}:{port} (no app-bound spawn)");
+    if let Err(err) = health::wait_for_health(&host, port, health::DEFAULT_TIMEOUT, || false) {
+        eprintln!("freshell-tauri: remote server health gate failed: {err}");
+        return Err(Box::new(err));
+    }
+    eprintln!("freshell-tauri: remote server healthy on {host}:{port}");
+
+    WebviewWindowBuilder::new(app.handle(), "main", WebviewUrl::External(parsed))
+        .title("Freshell")
+        .inner_size(1200.0, 800.0)
+        .initialization_script(shim::desktop_shim_script())
+        .build()?;
+    eprintln!(
+        "freshell-tauri: main window loading {}",
+        redact_token(&load_url)
+    );
+
+    wire_desktop_features(app, ServerMode::Remote);
+    install_smoke_exit(app);
+    Ok(())
+}
+
+/// Headless-smoke hook shared by both boot paths: auto-quit after
+/// `FRESHELL_TAURI_SMOKE_EXIT_MS` ms. No-op in normal use.
+fn install_smoke_exit(app: &tauri::App) {
     if let Some(ms) = std::env::var("FRESHELL_TAURI_SMOKE_EXIT_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -209,8 +275,6 @@ fn setup_app_bound(
             handle.exit(0);
         });
     }
-
-    Ok(())
 }
 
 /// Whether the spawned server child has exited (fail-fast input to the health gate).
