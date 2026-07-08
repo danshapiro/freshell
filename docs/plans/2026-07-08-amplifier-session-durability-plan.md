@@ -194,7 +194,7 @@ getLiveEventsPath?(filePath: string): string | undefined
 | `server/coding-cli/amplifier-activity-wiring.ts` | Phase 4 wiring unification: delegates to `wirePtyActivityTracker` (behavior-preserving; tracker disposal clears per-terminal timers) |
 | `server/session-observability.ts` | Type-only change: `session_association_broadcast.source` uses the exported `AssociationBroadcastSource` union from `session-association-broadcast.ts` (dedupe) |
 
-**Untouched (by design):** `server/coding-cli/amplifier-activity-wiring.ts`, `server/ws-handler.ts`, `shared/ws-protocol.ts`, client `amplifierActivitySlice` / `pane-activity.ts`, `session-association-coordinator.ts`.
+**Untouched (by design):** `server/ws-handler.ts`, `shared/ws-protocol.ts`, client `amplifierActivitySlice` / `pane-activity.ts`, `session-association-coordinator.ts`. (`amplifier-activity-wiring.ts` was originally in this list, but was ultimately unified in Phase 4 -- see the Modified table above, which supersedes the earlier "untouched" intent.)
 
 **Deferred (noted, not scheduled):** unifying the near-identical claude/amplifier wiring modules — do it opportunistically in Phase 4 *only if* it falls out trivially from the ledger adoption; otherwise leave for a future mechanical-consolidation pass.
 

@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import path from 'path'
 import os from 'os'
 import fsp from 'fs/promises'
@@ -247,6 +247,81 @@ describe('amplifier-provider', () => {
         expect(result).toBeUndefined()
       } finally {
         await fsp.rm(dir, { recursive: true, force: true })
+      }
+    })
+  })
+
+  describe('listSessionFiles()', () => {
+    const originalEnv = process.env.AMPLIFIER_HOME
+
+    afterEach(() => {
+      if (originalEnv === undefined) {
+        delete process.env.AMPLIFIER_HOME
+      } else {
+        process.env.AMPLIFIER_HOME = originalEnv
+      }
+      vi.resetModules()
+    })
+
+    it('skips metadata-less orphan dirs (kill -9 before first prompt:complete)', async () => {
+      // Pins the INDEXER POLICY documented in providers/amplifier.ts (plan §7,
+      // Phase 0 finding E6): a session dir containing only events.jsonl -- created
+      // when amplifier is killed before its first prompt:complete, so metadata.json
+      // never appears -- is NOT resumable and must be excluded from discovery.
+      // Discovery deliberately keys on metadata.json.
+      const home = await fsp.mkdtemp(path.join(os.tmpdir(), 'amplifier-home-'))
+      try {
+        const sessionsDir = path.join(home, 'projects', '-home-dan-code-freshell', 'sessions')
+        const normalDir = path.join(sessionsDir, 'normal-session')
+        const orphanDir = path.join(sessionsDir, 'orphan-session')
+        await fsp.mkdir(normalDir, { recursive: true })
+        await fsp.mkdir(orphanDir, { recursive: true })
+
+        // (a) Normal session dir: metadata.json (+ transcript.jsonl).
+        await fsp.writeFile(
+          path.join(normalDir, 'metadata.json'),
+          JSON.stringify({ session_id: 'normal-session', working_dir: '/home/dan/code/freshell' }),
+        )
+        await fsp.writeFile(
+          path.join(normalDir, 'transcript.jsonl'),
+          '{"role":"user","content":"hi"}\n',
+        )
+
+        // (b) Orphan session dir: ONLY events.jsonl. Realistic records mirror the
+        // amplifier.log 1.0.0 schema; the log ends after prompt:submit because the
+        // process was killed before prompt:complete.
+        const orphanEvents = [
+          JSON.stringify({
+            ts: '2026-07-08T16:01:27.255264049+00:00',
+            lvl: 'INFO',
+            schema: { name: 'amplifier.log', ver: '1.0.0' },
+            event: 'session:start',
+            session_id: 'orphan-session',
+            data: { parent_id: null },
+          }),
+          JSON.stringify({
+            ts: '2026-07-08T16:01:27.259046323+00:00',
+            lvl: 'INFO',
+            schema: { name: 'amplifier.log', ver: '1.0.0' },
+            event: 'prompt:submit',
+            session_id: 'orphan-session',
+            data: { parent_id: null },
+          }),
+        ].join('\n')
+        await fsp.writeFile(path.join(orphanDir, 'events.jsonl'), `${orphanEvents}\n`)
+
+        // homeDir is captured at module load, so point AMPLIFIER_HOME at the temp
+        // home and re-import a fresh provider instance.
+        process.env.AMPLIFIER_HOME = home
+        vi.resetModules()
+        const { amplifierProvider: freshProvider } = await import(
+          '../../../../server/coding-cli/providers/amplifier'
+        )
+
+        const files = await freshProvider.listSessionFiles()
+        expect(files).toEqual([path.join(normalDir, 'metadata.json')])
+      } finally {
+        await fsp.rm(home, { recursive: true, force: true })
       }
     })
   })
