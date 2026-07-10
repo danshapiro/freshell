@@ -1,13 +1,112 @@
-# HANDOFF v2 — freshell Rust + Tauri Port
+# HANDOFF v3 — freshell Rust + Tauri Port
 
-**Written 2026-07-10 at branch `feat/rust-tauri-port` @ `b1b9a46b`.**
-**This document REPLACES the 2026-07-08 handoff (deleted in the same commit). This is
-the only handoff.**
+**Updated 2026-07-10 on `SurfaceBookPro9`, branch `feat/rust-tauri-port`, from
+bootstrap commit `b7b50fff`.**
+**This document REPLACES all earlier handoffs. This is the only handoff.**
 
-**Audience:** the next agent, running on a NEW host (not the original dev machine).
+**Audience:** the next Amplifier session taking over on this WSL host.
 Read this whole file, then `port/GOAL.md` (the success criteria you are held to), then
 `port/machine/STATE.yaml`, `port/oracle/EQUIVALENCE-REPORT.md`,
 `port/oracle/DEVIATIONS.md`, and `port/machine/specs/cli-argv-fidelity.md` (rev 2.1).
+
+---
+
+## SETUP-ONLY RELAY — read before §0
+
+**The port campaign has NOT started on this host.** The setup agent intentionally did
+not run the Phase-0 probe, recipes, builds, tests, servers, oracle, or implementation.
+Do not interpret installed dependencies as new equivalence evidence. Begin §9 item 1
+only after every preflight gate below is green.
+
+### Current checkout and Amplifier
+
+- Checkout: `/home/dan/code/freshell`, clean `feat/rust-tauri-port`, tracking
+  `origin/feat/rust-tauri-port`; cloned directly at bootstrap commit `b7b50fff`.
+- Amplifier: `2026.07.09-dad1c21` (`core 1.6.0`). Global active bundle is
+  `self-driving`.
+- Always-composed Amplifier app bundles: Microsoft `skills` (including
+  `cranky-old-sam`, `crusty-old-engineer`, `intent-keeper`, `tester-breaker`,
+  `user-advocate`, `council`, `council-here`, and `personafy`) plus `dev-memory`.
+- Selectable bundles already registered: `recipes`, `superpowers`, `longbuilder`,
+  `self-driving`, `parallax-discovery`, and `workgraph`.
+- GitHub CLI is authenticated as `danshapiro` with push-capable repo scope.
+- Amplifier's Anthropic provider is **NOT usable yet**. The requested staging
+  directory `/mnt/c/Users/Public/freshell-bootstrap/` was absent, so
+  `amplifier-config.tgz` could not be extracted, `~/amplifier-overrides/` does not
+  exist, and no staged live API key was installed. `amplifier provider test
+  anthropic` currently fails authentication. Never invent a key, commit a key, or
+  print a key while repairing this.
+
+### User-space provisioning completed
+
+- Node `v24.12.0`, npm `11.6.2`.
+- Rust stable `1.97.0`; installed targets:
+  `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-gnu`.
+- Root `npm ci` completed; `crates/freshell-claude-sidecar/npm install` completed.
+  The install reported the repository's existing npm audit findings; do **not** run
+  `npm audit fix` because that would mutate the locked dependency graph.
+- Playwright Chromium 1208, headless shell 1208, and FFmpeg 1011 payloads are in
+  `~/.cache/ms-playwright`. Their Linux shared-library prerequisites are not yet
+  installed.
+- WSL CLI binaries are installed: Claude Code `2.1.32`, Codex CLI `0.144.1`, and
+  OpenCode `1.17.18`.
+- WSL CLI auth: Codex reports `Logged in using ChatGPT`; Claude's existing credential
+  gets HTTP 401; OpenCode reports zero credentials. Windows-side `claude`, `codex`,
+  and `opencode` are all absent.
+
+### System provisioning blocked on sudo
+
+The committed `port/laptop-bootstrap/2-bootstrap-wsl.sh` was used after the staged
+copy proved absent. Its apt and Playwright `--with-deps` phases reached an interactive
+sudo password prompt. Consequently `cc`, `make`, `pkg-config`, the MinGW linker,
+Tauri/WebKitGTK development libraries, ImageMagick, tesseract, and xdotool are still
+missing. No readiness build was attempted with a knowingly incomplete compiler.
+
+### Preflight gates before starting §9 item 1
+
+1. **Restage and securely install Amplifier auth/config.** The Windows-side operator
+   must place `amplifier-config.tgz` back in
+   `/mnt/c/Users/Public/freshell-bootstrap/`. Then, without displaying its contents:
+
+   ```bash
+   tar xzf /mnt/c/Users/Public/freshell-bootstrap/amplifier-config.tgz -C ~
+   chmod 600 ~/.amplifier/keys.env
+   rm /mnt/c/Users/Public/freshell-bootstrap/amplifier-config.tgz
+   ```
+
+   The archive's `~/.amplifier/settings.yaml` and `~/amplifier-overrides/` are a
+   matched pair: settings pins `provider-anthropic` to the local override and
+   `keys.env` supplies its `${VAR}` values. Extraction may replace the current bundle
+   registry, so afterward verify `amplifier bundle list`; restore the app/selectable
+   bundles listed above if absent, select `self-driving` globally, and require
+   `amplifier provider test anthropic` to pass.
+
+2. **Complete the sudo-owned toolchain phase** (a human must enter the WSL password):
+
+   ```bash
+   sudo apt-get update -y
+   sudo apt-get install -y build-essential curl git pkg-config libssl-dev unzip \
+     mingw-w64 imagemagick tesseract-ocr xdotool \
+     libwebkit2gtk-4.1-dev libgtk-3-dev \
+     libayatana-appindicator3-dev librsvg2-dev
+   ```
+
+   Then rerun the authoritative committed bootstrap, not a guessed replacement:
+
+   ```bash
+   cd /home/dan/code/freshell
+   bash port/laptop-bootstrap/2-bootstrap-wsl.sh
+   ```
+
+3. **Complete the human-only CLI credentials once:** repair `claude` auth and run
+   `opencode auth login`. Codex and `gh` are already authenticated. Install/auth the
+   Windows-side CLIs where the §7 matrix requires them, or later record each missing
+   leg as ENV-LIMITED with the §8.5 proof standard.
+
+4. **Only after gates 1–3:** launch Amplifier from this checkout with the active
+   `self-driving` bundle, read the full document chain named above, and begin with the
+   recorded Phase-0 capability probe in §3 / work queue §9 item 1. Do not jump directly
+   to CLI argv implementation or live QA.
 
 ---
 
