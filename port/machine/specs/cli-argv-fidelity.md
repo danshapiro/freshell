@@ -13,6 +13,13 @@ the settings store **does** enforce enums for `sandbox`/`permissionMode`
 `generateMcpInjection` (§2.4) — gemini is the **only env-returning branch**;
 (6) U3 closed by executed extraction of the bell strings (byte-identical to rev 1's
 derivation); (7) dev-mode tsx path corrected to `dist/loader.mjs`.
+**rev 2.1** (2026-07-10): restored six review items lost to context truncation during
+rev 2 — (a) error-frame `code` pinning + the unknown-mode divergence (§3.3);
+(b) the PS-branch "safe by construction" claim struck (B1); (c) the
+`replaceAll`-vs-first-occurrence template-substitution split (§3.1);
+(d) default-cwd resolution feeding `mcp_cwd` (§3.3); (e) `resolveCodingCliCommand`
+has FOUR call sites, not three (§1.1); (f) the port allocator seam is
+`LoopbackPortAllocator` in `freshell-opencode/src/transport.rs:323`, not `serve.rs`.
 **Scope:** `claude`, `codex`, `opencode` terminal launches (`terminal.create { mode }`).
 **Out of scope:** `gemini`, `kimi` (documented only where their code shares a path),
 fresh-agent / SDK launches, the Codex app-server sidecar lifecycle itself
@@ -63,8 +70,9 @@ The Rust port already implements this base slice
 
 ### 1.1 Inputs to `resolveCodingCliCommand` and where they come from
 
-Called from `buildSpawnSpec` at three sites, with `target` (`'unix' | 'windows'`)
-and the **MCP cwd** varying by platform branch:
+Called from `buildSpawnSpec` at **four** sites (rev 2.1 count fix — wsl / cmd /
+powershell / unix branches: `tr:1165, 1204, 1237, 1262`), with `target`
+(`'unix' | 'windows'`) and the **MCP cwd** varying by platform branch:
 
 - WSL-from-native-Windows branch: `resolveCodingCliCommand(mode, resume, 'unix', providerSettings, terminalId, wslMcpCwd, launchIntent)` — `terminal-registry.ts:1165`; args appended after `wsl.exe [-d distro] [--cd <linux cwd>] --exec` (`:1171`).
 - Native `cmd` branch: `(..., 'windows', ..., cmdMcpCwd, ...)` — `terminal-registry.ts:1204`; the whole CLI invocation is flattened into ONE string via `buildCmdCommand` (`:1046-1048`, `quoteCmdArg` `:1014-1044`) and passed as `['/K', `${cd}${command}`]` (`:1206-1208`).
@@ -423,8 +431,14 @@ Extend the existing pure builders; keep IO (file writes, port allocation) out.
        pub permission_mode_args: Option<Vec<String>>, // "{{permissionMode}}"
    }
    ```
-   Template substitution = plain string replace of the placeholder in each element
-   (`index.ts:248-252`). Populate from the extension registry in
+   Template substitution semantics differ WITHIN the reference (rev 2.1 pin):
+   `compileArgTemplate` uses `replaceAll` for the model/sandbox/permissionMode/
+   createSession templates (`index.ts:100`), but `resumeArgs` uses
+   first-occurrence-only `.replace` (`index.ts:250-251`). Rust `str::replace`
+   replaces ALL occurrences — correct for the compiled templates, but use
+   `replacen(.., 1)` for `{{sessionId}}` in resume args. (No shipped template
+   repeats a placeholder today, so this is byte-fidelity insurance, not a live
+   bug — pin it anyway.) Populate from the extension registry in
    `crates/freshell-server/src/main.rs:129-141` (currently maps only
    name/env_var/default_cmd from `cli_detection_specs()` — extend the registry
    accessor to expose the full `cli` block).
@@ -510,26 +524,42 @@ Port `server/mcp/config-writer.ts` semantics; this is the only file-writing piec
 - opencode: allocate the loopback endpoint (Tokio `TcpListener::bind(("127.0.0.1",0))`,
   then drop — `local-port.ts:13-41`) **before** building the launch; record it on
   the terminal record analog (needed later for control-endpoint clients; the
-  allocator seam already exists as `PortAllocator` in
-  `crates/freshell-opencode/src/serve.rs` (§`PortAllocator`/`allocateLocalhostPort` port) — reuse it).
+  allocator seam already exists as `LoopbackPortAllocator` in
+  `crates/freshell-opencode/src/transport.rs:323` (rev 2.1 location fix — NOT
+  `serve.rs`) — reuse it).
 - codex: obtain `codex_remote_ws_url` from the `freshell-codex` app-server launch
   plan (`crates/freshell-codex/src/app_server.rs`; reference plan shape
   `launch-planner.ts:48-52` `remote.wsUrl`). Until the Rust codex launch planner
   is wired into terminal.create, gate the `--remote` pair on availability and
   record the deviation (UNCERTAIN U2).
+- Resolve the effective cwd BEFORE any branch/mcp computation, exactly as the
+  reference does: `cwd = opts.cwd || getDefaultCwd(settings) || os.homedir()`
+  (`tr:1565`). `mcp_cwd` derives from THIS resolved value, not the raw request
+  cwd — getting it wrong flips opencode's throw-vs-launch behavior
+  (`cw:304-309`). (rev 2.1 addition)
 - Compute `mcp_cwd` per branch (`tr:1153,1203,1236,1262`) and call the §3.2
   generator; pass its result into `resolve_cli_launch`'s inputs.
 - Base env: extend `overrides` (`terminal.rs:314-315`) with `FRESHELL`,
   `FRESHELL_URL`, `FRESHELL_TOKEN`, `FRESHELL_TAB_ID`/`FRESHELL_PANE_ID`
   (`tr:1529-1542`; `tab_id`/`pane_id` are already on `TerminalCreate`).
-- On `CliLaunchError`, reply with an `error` frame (reference: throw →
-  `terminal.create failed`, `ws-handler.ts:2605`) instead of falling back to shell.
+- On `CliLaunchError`, reply with an `error` frame whose **`code` matches the
+  reference's real error surface** (`ws-handler.ts:2606-2614` — the `sendError`
+  call, NOT just the `:2605` log line): `CodexLaunchConfigError` →
+  `INVALID_MESSAGE`; `TerminalCreateAdmissionError` → `INTERNAL_ERROR`;
+  everything else (the opencode/claude/start-intent throws of §2) →
+  `PTY_SPAWN_FAILED`; `message` = the exact reference string. Success criterion 3
+  pins the `code`, not merely "an error frame" (rev 2.1). Related divergence to
+  handle EXPLICITLY, not silently: for an UNKNOWN mode the reference throws
+  `UnknownTerminalModeError` (`tr:1073-1074`) while the port currently falls back
+  to shell (`terminal.rs:322-325`) — closing or ledgering that divergence is part
+  of this work item.
 
 ### 3.4 `crates/freshell-opencode` / `crates/freshell-codex`
 
 - `freshell-opencode`: the serve-manager (`src/serve.rs`) already owns the
   `opencode serve` **fresh-agent** sidecar; the terminal-launch loopback endpoint
-  (§2.3(3)) is a different consumer but should share the `PortAllocator` seam.
+  (§2.3(3)) is a different consumer but should share the `LoopbackPortAllocator`
+  seam (`src/transport.rs:323`).
   No argv changes inside this crate.
 - `freshell-codex`: source of `codex_remote_ws_url` (app-server/remote-proxy port,
   `src/app_server.rs`, `src/transport.rs`); terminal.create must consume its plan
@@ -781,8 +811,13 @@ env:  {}
   PORT FIX). **Pre-condition for declaring the native-Windows leg done:** a live
   native-Windows check that a claude pane launched via the default (cmd) branch
   receives the `--settings` JSON intact (hook fires / `claude --settings` parses),
-  or an adjudicated deviation routing CLI launches to the powershell branch (whose
-  single-quote literals are safe by construction).
+  or an adjudicated deviation routing CLI launches to the powershell branch —
+  noting (rev 2.1, review correction) that the PS branch is **NOT "safe by
+  construction" for quote-BEARING payloads**: claude's `--settings` JSON inside a
+  single-quoted PS literal still lands raw `"` in the single `-Command` argv
+  element, which rides through the same portable-pty ArgvQuote layer. BOTH
+  branches therefore need the live quote-bearing check before the native-Windows
+  leg is declared done.
 - **U6 — `FRESHELL_URL`/`FRESHELL_TOKEN` values in the Rust server.** The
   reference computes them from `process.env.PORT`/`AUTH_TOKEN`
   (`tr:1533-1537`). The Rust server's canonical port/token plumbing lives in
