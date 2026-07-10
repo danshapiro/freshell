@@ -7,6 +7,31 @@ and `port/oracle/DEVIATIONS.md`.
 
 Last updated: 2026-07-08. Handoff written at branch `feat/rust-tauri-port` @ `1c2c9c7d`.
 
+> ## ADDENDUM 2026-07-10 — the VM detour (read before using §8's recipes)
+>
+> Between this handoff and now, a session ran on the **TauriDebugVM** with no command
+> execution and left four artifacts, since reconciled (adversarially reviewed, hardened,
+> committed):
+>
+> - `port/machine/BLOCKER-2026-07-08-vm-session.md` — why the VM sandbox couldn't
+>   execute anything. **RESOLVED-BY-RELOCATION** (addendum in the file): on 2026-07-10
+>   the user brought the session back to DANDESKTOP WSL2. The interim "operate ONLY on
+>   the TauriDebugVM" directive is **rescinded** — this handoff's DANDESKTOP recipes
+>   (§8) are live again.
+> - `port/vm-bridge/` — file-drop execution bridge, **DORMANT, do not start** (its
+>   README carries the security hardening: gitignored inboxes, startup quarantine,
+>   temp-then-rename protocol).
+> - `port/machine/PLAN-2026-07-09-vm-windows-on-windows.md` — **SUPERSEDED** (banner in
+>   place); keep for salvage: legacy Electron installer location (its D9), VM inventory.
+> - `port/machine/specs/cli-argv-fidelity.md` — the spec for queue item §9.4, now
+>   **rev 2**: corrected per adversarial review (live fresh-claude `--session-id`
+>   preallocation; native-Windows-host MCP path forms; U5/cmd.exe reclassified as a
+>   blocker for the default native-Windows CLI path; gemini/kimi
+>   `generateMcpInjection` branches added). Use it when implementing argv fidelity.
+>
+> `port/machine/STATE.yaml` (`constraints.vm_only`, `blockers[0]`) records the
+> supersession authoritatively.
+
 ---
 
 ## 1. Mission (what the user asked for)

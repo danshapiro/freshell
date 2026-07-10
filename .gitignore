@@ -47,3 +47,15 @@ sdk.session.snapshot
 
 # claude sidecar deps (npm install in the sidecar dir; not vendored in git)
 crates/freshell-claude-sidecar/node_modules/
+
+# --- vm-bridge session scratch (SECURITY: mandatory, per 2026-07-10 adversarial
+# security review). The bridge watchers EXECUTE any *.cmd that appears in an
+# inbox. If an inbox file were ever committed, `git pull`/checkout would drop it
+# into a watched folder and it would run on any machine with a watcher live --
+# i.e. git becomes an RCE channel. These patterns keep every bridge artifact
+# (inboxes, outboxes, liveness beacons, quarantine, outbound bundles) out of git.
+port/vm-bridge/inbox-*/
+port/vm-bridge/outbox-*/
+port/vm-bridge/quarantine-*/
+port/vm-bridge/alive-*.txt
+port/vm-bridge/outbound/

@@ -6,7 +6,7 @@ base_commit: 98ed121c            # frozen. origin/main has since advanced to 6e8
                                  # do NOT rebase unless the user asks.
 worktree: .worktrees/rust-tauri-port
 branch: feat/rust-tauri-port
-updated: 2026-07-04
+updated: 2026-07-10
 
 current_phase: 5                 # 0=oracle bootstrap, 1=understand, 2=architect, 3=port, 4=self-qa, 5=converge
 # PHASES 0-2 COMPLETE: oracle (T0/T1/T2/T3 + mutation 28/28), 4 ground-truth specs, frozen ADR.
@@ -42,6 +42,14 @@ current_phase: 5                 # 0=oracle bootstrap, 1=understand, 2=architect
 
 # --- Confirmed user constraints (this run) ---------------------------------
 constraints:
+  vm_only: "SUPERSEDED 2026-07-10 (do NOT obey): the 2026-07-08 directive read
+            'the agent operates ONLY on the TauriDebugVM; do not execute anything
+            on DANDESKTOP'. On 2026-07-10 the user brought the session back to
+            DANDESKTOP WSL2 and rescinded it - execution on DANDESKTOP is
+            sanctioned again; the VM leg is closed (RESOLVED-BY-RELOCATION, see
+            blockers below). port/vm-bridge/ is retained DORMANT (security-hardened,
+            see its README) - do not start a watcher. The 'host:' constraint below
+            is authoritative again."
   gemini: OUT of scope — not ported, not QA'd
   languages: Rust only (Go dropped). JS/Node allowed ONLY as a spawned sidecar
              when it is a massive net savings (no Rust equivalent); justify in ADR.
@@ -159,7 +167,23 @@ phases:
   4_self_qa:     { status: pending, bundle: self-driving }
   5_converge:    { status: pending }
 
-blockers: []                     # write here and STOP rather than guess on unrecoverable ambiguity
+blockers:                        # write here and STOP rather than guess on unrecoverable ambiguity
+  - id: ENV-VM-EXEC-2026-07-08
+    status: RESOLVED-BY-RELOCATION   # 2026-07-10: user moved the session back to
+                                     # DANDESKTOP WSL2 (working shell); the VM-only
+                                     # directive was rescinded. Nothing was fixed ON
+                                     # the VM - the blocker is moot, not solved.
+                                     # vm-bridge kept DORMANT; addendum in
+                                     # BLOCKER-2026-07-08-vm-session.md.
+    summary: >-
+      Session launched on the TauriDebugVM (Windows 11, user Admin) against the worktree
+      via \\tsclient\Z. The agent has NO command execution there: the amplifier bash tool
+      resolves bash -> C:\Windows\System32\bash.exe (WSL launcher) and the VM has no WSL
+      distro installed; the write sandbox is worktree-only, so the VM's PowerShell bridge
+      (C:\Scripts\console-inbox) is unreachable; no MCP/exec tools configured. Build, test,
+      run, screenshot, and git are all impossible from that sandbox. Full evidence and the
+      unblock playbook: port/machine/BLOCKER-2026-07-08-vm-session.md. Unblock scripts
+      staged in port/vm-bridge/ (start one watcher, or run the session on DANDESKTOP WSL2).
 
 guardrails:
   equivalence: differential (T0 protocol, T1 deterministic, T2 live-invariant, T3 e2e/visual) + deviation ledger; never byte-identical LLM output
