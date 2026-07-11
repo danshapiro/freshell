@@ -1,7 +1,7 @@
 # HANDOFF v3 — freshell Rust + Tauri Port
 
-**Updated 2026-07-10 on `SurfaceBookPro9`, branch `feat/rust-tauri-port`, from
-bootstrap commit `b7b50fff`.**
+**Updated 2026-07-11 on `SurfaceBookPro9`, branch `feat/rust-tauri-port`, from
+setup-handoff commit `c8240743`.**
 **This document REPLACES all earlier handoffs. This is the only handoff.**
 
 **Audience:** the next Amplifier session taking over on this WSL host.
@@ -30,12 +30,13 @@ only after every preflight gate below is green.
 - Selectable bundles already registered: `recipes`, `superpowers`, `longbuilder`,
   `self-driving`, `parallax-discovery`, and `workgraph`.
 - GitHub CLI is authenticated as `danshapiro` with push-capable repo scope.
-- Amplifier's Anthropic provider is **NOT usable yet**. The requested staging
-  directory `/mnt/c/Users/Public/freshell-bootstrap/` was absent, so
-  `amplifier-config.tgz` could not be extracted, `~/amplifier-overrides/` does not
-  exist, and no staged live API key was installed. `amplifier provider test
-  anthropic` currently fails authentication. Never invent a key, commit a key, or
-  print a key while repairing this.
+- Amplifier auth/config is installed. The restaged archive matched SHA-256 prefix
+  `78c95a94b896a606`; its matched `~/.amplifier/settings.yaml`, mode-600
+  `~/.amplifier/keys.env`, and `~/amplifier-overrides/provider-anthropic/` were
+  extracted as the normal WSL user. Both Anthropic and OpenAI pass
+  `amplifier provider test`. A real Anthropic/Haiku single-turn call returned exactly
+  `AMPLIFIER_E2E_OK`, after which the live-key tarball was deleted from the public
+  Windows staging directory. Never print or commit the installed keys.
 
 ### User-space provisioning completed
 
@@ -64,22 +65,13 @@ missing. No readiness build was attempted with a knowingly incomplete compiler.
 
 ### Preflight gates before starting §9 item 1
 
-1. **Restage and securely install Amplifier auth/config.** The Windows-side operator
-   must place `amplifier-config.tgz` back in
-   `/mnt/c/Users/Public/freshell-bootstrap/`. Then, without displaying its contents:
-
-   ```bash
-   tar xzf /mnt/c/Users/Public/freshell-bootstrap/amplifier-config.tgz -C ~
-   chmod 600 ~/.amplifier/keys.env
-   rm /mnt/c/Users/Public/freshell-bootstrap/amplifier-config.tgz
-   ```
-
-   The archive's `~/.amplifier/settings.yaml` and `~/amplifier-overrides/` are a
-   matched pair: settings pins `provider-anthropic` to the local override and
-   `keys.env` supplies its `${VAR}` values. Extraction may replace the current bundle
-   registry, so afterward verify `amplifier bundle list`; restore the app/selectable
-   bundles listed above if absent, select `self-driving` globally, and require
-   `amplifier provider test anthropic` to pass.
+1. **Amplifier auth/config — COMPLETE (2026-07-11).** The archive hash was verified,
+   the matched settings/keys/local-provider override were installed, mode 600 was
+   applied to `keys.env`, both providers passed discovery, and Anthropic completed a
+   real Haiku turn. The public live-key archive was then securely removed. The import
+   retained the selectable bundle registry but replaced app/active settings; `skills`
+   and `dev-memory` were restored as app bundles and `self-driving` was restored as
+   the global active bundle.
 
 2. **Complete the sudo-owned toolchain phase** (a human must enter the WSL password):
 
