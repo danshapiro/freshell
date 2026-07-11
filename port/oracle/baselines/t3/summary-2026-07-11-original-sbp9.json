@@ -34,6 +34,16 @@
     "skipped": 0,
     "duration_ms": 963590
   },
+  "flake_reclassifications": [
+    {
+      "spec": "fresh-agent.spec.ts:98",
+      "recorded": "RED (1 run)",
+      "classification": "FLAKY-on-original",
+      "evidence": "4/4 isolated re-runs GREEN against original :17871 same commit/host 2026-07-11; GREEN in prior-host full run and both rust full-suite runs",
+      "adjudicated": "2026-07-11, antagonist reviewer session 0000000000000000-58346ba0034d4442_self-driving-reviewer",
+      "effective_comparison_target": "118 green / 8 red"
+    }
+  ],
   "visual_baselines": {
     "count": 7,
     "matched": 6,

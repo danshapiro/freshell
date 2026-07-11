@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-07-11T17:27:59.199Z",
+  "generatedAt": "2026-07-11T21:10:09.386Z",
   "task": "HANDOFF §7.C REST surface parity sweep (node original :17871 vs rust port :17872)",
   "normalizedFields": {
     "instanceId": "id",
@@ -37,8 +37,8 @@
   ],
   "summary": {
     "total": 111,
-    "pass": 6,
-    "divergence": 105,
+    "pass": 111,
+    "divergence": 0,
     "deferred": 0
   },
   "orphanCheck": {
@@ -77,7 +77,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -92,14 +92,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "health.bad-auth",
@@ -131,7 +125,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -146,14 +140,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "version.happy",
@@ -180,29 +168,18 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
           "json": {
             "currentVersion": "<VERSION>",
-            "updateCheck": null
+            "updateCheck": "<OPAQUE>"
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.updateCheck",
-          "node": "<OPAQUE>",
-          "rust": null
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "version.cookie-auth",
@@ -229,29 +206,18 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
           "json": {
             "currentVersion": "<VERSION>",
-            "updateCheck": null
+            "updateCheck": "<OPAQUE>"
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.updateCheck",
-          "node": "<OPAQUE>",
-          "rust": null
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "version.no-auth",
@@ -277,7 +243,7 @@
       "rust": {
         "status": 401,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -286,14 +252,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "version.bad-auth",
@@ -319,7 +279,7 @@
       "rust": {
         "status": 401,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -328,14 +288,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "version.bad-cookie",
@@ -361,7 +315,7 @@
       "rust": {
         "status": 401,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -370,14 +324,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "platform.happy",
@@ -415,7 +363,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -436,14 +384,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "platform.no-auth",
@@ -469,7 +411,7 @@
       "rust": {
         "status": 401,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -478,14 +420,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "platform.bad-auth",
@@ -511,7 +447,7 @@
       "rust": {
         "status": 401,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -520,14 +456,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "extensions.list",
@@ -647,7 +577,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -750,14 +680,8 @@
           ]
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "extensions.no-auth",
@@ -783,7 +707,7 @@
       "rust": {
         "status": 401,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -792,14 +716,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "extensions.single",
@@ -841,81 +759,37 @@
         }
       },
       "rust": {
-        "status": 404,
+        "status": 200,
         "headers": {
           "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
           "json": {
-            "error": "Not found"
+            "name": "claude",
+            "version": "<VERSION>",
+            "label": "Claude CLI",
+            "description": "Anthropic's Claude Code CLI agent",
+            "category": "cli",
+            "serverRunning": false,
+            "picker": {
+              "shortcut": "L",
+              "group": "agents"
+            },
+            "cli": {
+              "supportsPermissionMode": true,
+              "supportsResume": true,
+              "resumeCommandTemplate": [
+                "claude",
+                "--resume",
+                "{{sessionId}}"
+              ]
+            }
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.category",
-          "node": "cli",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.cli",
-          "node": {
-            "supportsPermissionMode": true,
-            "supportsResume": true,
-            "resumeCommandTemplate": [
-              "claude",
-              "--resume",
-              "{{sessionId}}"
-            ]
-          },
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.description",
-          "node": "Anthropic's Claude Code CLI agent",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.error",
-          "node": "<missing>",
-          "rust": "Not found"
-        },
-        {
-          "path": "$.body.json.label",
-          "node": "Claude CLI",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.name",
-          "node": "claude",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.picker",
-          "node": {
-            "shortcut": "L",
-            "group": "agents"
-          },
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.serverRunning",
-          "node": false,
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.version",
-          "node": "<VERSION>",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.status",
-          "node": 200,
-          "rust": 404
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "extensions.single.missing",
@@ -946,18 +820,12 @@
         "body": {
           "kind": "json",
           "json": {
-            "error": "Not found"
+            "error": "Extension not found: 'does-not-exist'"
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.error",
-          "node": "Extension not found: 'does-not-exist'",
-          "rust": "Not found"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.read.happy",
@@ -985,7 +853,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -996,14 +864,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.read.missing",
@@ -1029,7 +891,7 @@
       "rust": {
         "status": 404,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -1038,14 +900,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.read.directory",
@@ -1071,7 +927,7 @@
       "rust": {
         "status": 400,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -1080,14 +936,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.read.nopath",
@@ -1113,7 +963,7 @@
       "rust": {
         "status": 400,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -1122,14 +972,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.read.no-auth",
@@ -1155,7 +999,7 @@
       "rust": {
         "status": 401,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -1164,14 +1008,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.stat.happy",
@@ -1199,7 +1037,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -1210,14 +1048,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.stat.missing",
@@ -1245,7 +1077,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -1256,14 +1088,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.stat.directory",
@@ -1291,7 +1117,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -1302,14 +1128,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.stat.nopath",
@@ -1335,7 +1155,7 @@
       "rust": {
         "status": 400,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -1344,14 +1164,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.write.happy",
@@ -1382,7 +1196,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -1392,14 +1206,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.write.readback",
@@ -1427,7 +1235,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -1438,14 +1246,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.write.nopath",
@@ -1474,7 +1276,7 @@
       "rust": {
         "status": 400,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -1483,14 +1285,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.write.nocontent",
@@ -1519,7 +1315,7 @@
       "rust": {
         "status": 400,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -1528,14 +1324,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.complete.dir",
@@ -1578,7 +1368,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -1604,14 +1394,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.complete.partial",
@@ -1646,7 +1430,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -1664,14 +1448,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.complete.dirsonly",
@@ -1702,7 +1480,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -1716,14 +1494,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.complete.noprefix",
@@ -1749,7 +1521,7 @@
       "rust": {
         "status": 400,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -1758,14 +1530,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.complete.missingdir",
@@ -1791,7 +1557,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -1800,14 +1566,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.mkdir.happy",
@@ -1838,7 +1598,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -1849,14 +1609,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.mkdir.again",
@@ -1887,30 +1641,19 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
           "json": {
             "created": true,
-            "existed": true,
+            "existed": false,
             "resolvedPath": "<SCRATCH_HOME>/qa-files/newdir"
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.existed",
-          "node": false,
-          "rust": true
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.mkdir.overfile",
@@ -1939,7 +1682,7 @@
       "rust": {
         "status": 409,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -1948,14 +1691,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.mkdir.nopath",
@@ -1982,7 +1719,7 @@
       "rust": {
         "status": 400,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -1991,14 +1728,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.validate-dir.happy",
@@ -2028,7 +1759,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -2038,14 +1769,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.validate-dir.missing",
@@ -2075,7 +1800,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -2085,14 +1810,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.validate-dir.file",
@@ -2122,7 +1841,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -2132,14 +1851,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.validate-dir.blank",
@@ -2168,7 +1881,7 @@
       "rust": {
         "status": 400,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -2177,14 +1890,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.validate-dir.nopath",
@@ -2211,7 +1918,7 @@
       "rust": {
         "status": 400,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -2220,14 +1927,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.candidate-dirs",
@@ -2253,30 +1954,17 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
           "json": {
-            "directories": [
-              "<SCRATCH_HOME>"
-            ]
+            "directories": []
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.directories[0]",
-          "node": "<missing>",
-          "rust": "<SCRATCH_HOME>"
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "sd.empty.happy",
@@ -2304,7 +1992,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -2315,14 +2003,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "sd.empty.background",
@@ -2350,7 +2032,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -2361,14 +2043,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "sd.nopriority",
@@ -2405,69 +2081,32 @@
         }
       },
       "rust": {
-        "status": 200,
+        "status": 400,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
           "json": {
-            "items": [],
-            "nextCursor": null,
-            "revision": "<SEQ>"
+            "error": "Invalid request",
+            "details": [
+              {
+                "code": "invalid_value",
+                "values": [
+                  "visible",
+                  "background"
+                ],
+                "path": [
+                  "priority"
+                ],
+                "message": "Invalid option: expected one of \"visible\"|\"background\""
+              }
+            ]
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.details",
-          "node": [
-            {
-              "code": "invalid_value",
-              "values": [
-                "visible",
-                "background"
-              ],
-              "path": [
-                "priority"
-              ],
-              "message": "Invalid option: expected one of \"visible\"|\"background\""
-            }
-          ],
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.error",
-          "node": "Invalid request",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.items",
-          "node": "<missing>",
-          "rust": []
-        },
-        {
-          "path": "$.body.json.nextCursor",
-          "node": "<missing>",
-          "rust": null
-        },
-        {
-          "path": "$.body.json.revision",
-          "node": "<missing>",
-          "rust": "<SEQ>"
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        },
-        {
-          "path": "$.status",
-          "node": 400,
-          "rust": 200
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "sd.badlimit",
@@ -2502,67 +2141,30 @@
         }
       },
       "rust": {
-        "status": 200,
+        "status": 400,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
           "json": {
-            "items": [],
-            "nextCursor": null,
-            "revision": "<SEQ>"
+            "error": "Invalid request",
+            "details": [
+              {
+                "expected": "number",
+                "code": "invalid_type",
+                "received": "NaN",
+                "path": [
+                  "limit"
+                ],
+                "message": "Invalid input: expected number, received NaN"
+              }
+            ]
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.details",
-          "node": [
-            {
-              "expected": "number",
-              "code": "invalid_type",
-              "received": "NaN",
-              "path": [
-                "limit"
-              ],
-              "message": "Invalid input: expected number, received NaN"
-            }
-          ],
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.error",
-          "node": "Invalid request",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.items",
-          "node": "<missing>",
-          "rust": []
-        },
-        {
-          "path": "$.body.json.nextCursor",
-          "node": "<missing>",
-          "rust": null
-        },
-        {
-          "path": "$.body.json.revision",
-          "node": "<missing>",
-          "rust": "<SEQ>"
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        },
-        {
-          "path": "$.status",
-          "node": 400,
-          "rust": 200
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "sd.badpriority",
@@ -2599,69 +2201,32 @@
         }
       },
       "rust": {
-        "status": 200,
+        "status": 400,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
           "json": {
-            "items": [],
-            "nextCursor": null,
-            "revision": "<SEQ>"
+            "error": "Invalid request",
+            "details": [
+              {
+                "code": "invalid_value",
+                "values": [
+                  "visible",
+                  "background"
+                ],
+                "path": [
+                  "priority"
+                ],
+                "message": "Invalid option: expected one of \"visible\"|\"background\""
+              }
+            ]
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.details",
-          "node": [
-            {
-              "code": "invalid_value",
-              "values": [
-                "visible",
-                "background"
-              ],
-              "path": [
-                "priority"
-              ],
-              "message": "Invalid option: expected one of \"visible\"|\"background\""
-            }
-          ],
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.error",
-          "node": "Invalid request",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.items",
-          "node": "<missing>",
-          "rust": []
-        },
-        {
-          "path": "$.body.json.nextCursor",
-          "node": "<missing>",
-          "rust": null
-        },
-        {
-          "path": "$.body.json.revision",
-          "node": "<missing>",
-          "rust": "<SEQ>"
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        },
-        {
-          "path": "$.status",
-          "node": 400,
-          "rust": 200
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "sd.badcursor",
@@ -2687,7 +2252,7 @@
       "rust": {
         "status": 400,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -2696,14 +2261,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "sd.no-auth",
@@ -2729,7 +2288,7 @@
       "rust": {
         "status": 401,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -2738,14 +2297,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "sd.seeded.happy",
@@ -2786,7 +2339,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -2798,6 +2351,7 @@
                 "projectPath": "/home/qa/demo",
                 "lastActivityAt": "<TS>",
                 "isRunning": false,
+                "archived": false,
                 "title": "hello parity sweep session",
                 "firstUserMessage": "hello parity sweep session",
                 "createdAt": "<TS>",
@@ -2809,19 +2363,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.items[0].archived",
-          "node": false,
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "sd.seeded.query",
@@ -2864,7 +2407,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -2876,6 +2419,7 @@
                 "projectPath": "/home/qa/demo",
                 "lastActivityAt": "<TS>",
                 "isRunning": false,
+                "archived": false,
                 "title": "hello parity sweep session",
                 "firstUserMessage": "hello parity sweep session",
                 "createdAt": "<TS>",
@@ -2889,19 +2433,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.items[0].archived",
-          "node": false,
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "sd.seeded.query-nomatch",
@@ -2929,7 +2462,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -2940,14 +2473,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "sd.seeded.include-flags",
@@ -2988,7 +2515,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -3000,19 +2527,11 @@
                 "projectPath": "/home/qa/demo",
                 "lastActivityAt": "<TS>",
                 "isRunning": false,
+                "archived": false,
                 "title": "hello parity sweep session",
                 "firstUserMessage": "hello parity sweep session",
                 "createdAt": "<TS>",
                 "cwd": "/home/qa/demo"
-              },
-              {
-                "sessionId": "11111111-1111-4111-8111-111111111111",
-                "provider": "claude",
-                "projectPath": "unknown",
-                "lastActivityAt": "<TS>",
-                "isRunning": false,
-                "createdAt": "<TS>",
-                "isNonInteractive": true
               }
             ],
             "nextCursor": null,
@@ -3020,32 +2539,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.items[0].archived",
-          "node": false,
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.items[1]",
-          "node": "<missing>",
-          "rust": {
-            "sessionId": "11111111-1111-4111-8111-111111111111",
-            "provider": "claude",
-            "projectPath": "unknown",
-            "lastActivityAt": "<TS>",
-            "isRunning": false,
-            "createdAt": "<TS>",
-            "isNonInteractive": true
-          }
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "sd.seeded.limit",
@@ -3086,7 +2581,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -3098,6 +2593,7 @@
                 "projectPath": "/home/qa/demo",
                 "lastActivityAt": "<TS>",
                 "isRunning": false,
+                "archived": false,
                 "title": "hello parity sweep session",
                 "firstUserMessage": "hello parity sweep session",
                 "createdAt": "<TS>",
@@ -3109,19 +2605,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.items[0].archived",
-          "node": false,
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "network.status.happy",
@@ -3167,7 +2652,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -3196,14 +2681,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "network.status.no-auth",
@@ -3229,7 +2708,7 @@
       "rust": {
         "status": 401,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -3238,14 +2717,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "proxy.happy",
@@ -3339,7 +2812,7 @@
       "rust": {
         "status": 401,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -3348,14 +2821,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "proxy.badport.oversize",
@@ -3381,7 +2848,7 @@
       "rust": {
         "status": 400,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -3390,14 +2857,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "proxy.badport.nan",
@@ -3423,7 +2884,7 @@
       "rust": {
         "status": 400,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -3432,14 +2893,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "proxy.deadport",
@@ -3465,7 +2920,7 @@
       "rust": {
         "status": 502,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -3474,14 +2929,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "shots.badscope",
@@ -3512,7 +2961,7 @@
       "rust": {
         "status": 400,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -3522,14 +2971,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "shots.pane-no-paneid",
@@ -3560,7 +3003,7 @@
       "rust": {
         "status": 400,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -3570,14 +3013,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "shots.tab-no-tabid",
@@ -3608,7 +3045,7 @@
       "rust": {
         "status": 400,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -3618,14 +3055,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "shots.emptyname",
@@ -3654,36 +3085,20 @@
         }
       },
       "rust": {
-        "status": 503,
+        "status": 400,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
           "json": {
             "status": "error",
-            "message": "No screenshot-capable UI client connected"
+            "message": "name required"
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.message",
-          "node": "name required",
-          "rust": "No screenshot-capable UI client connected"
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        },
-        {
-          "path": "$.status",
-          "node": 400,
-          "rust": 503
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "shots.sep-in-name",
@@ -3712,36 +3127,20 @@
         }
       },
       "rust": {
-        "status": 503,
+        "status": 400,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
           "json": {
             "status": "error",
-            "message": "No screenshot-capable UI client connected"
+            "message": "name must not contain path separators"
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.message",
-          "node": "name must not contain path separators",
-          "rust": "No screenshot-capable UI client connected"
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        },
-        {
-          "path": "$.status",
-          "node": 400,
-          "rust": 503
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "shots.dup409",
@@ -3771,36 +3170,20 @@
         }
       },
       "rust": {
-        "status": 503,
+        "status": 409,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
           "json": {
             "status": "error",
-            "message": "No screenshot-capable UI client connected"
+            "message": "output file already exists (use --overwrite)"
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.message",
-          "node": "output file already exists (use --overwrite)",
-          "rust": "No screenshot-capable UI client connected"
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        },
-        {
-          "path": "$.status",
-          "node": 409,
-          "rust": 503
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "shots.noclient503",
@@ -3832,7 +3215,7 @@
       "rust": {
         "status": 503,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -3842,14 +3225,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "shots.no-auth",
@@ -3879,7 +3256,7 @@
       "rust": {
         "status": 401,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -3888,14 +3265,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "shots.roundtrip.ok",
@@ -3936,7 +3307,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -3955,14 +3326,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "shots.roundtrip.ui-command-frame",
@@ -4074,7 +3439,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -4093,14 +3458,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "shots.roundtrip.422",
@@ -4132,7 +3491,7 @@
       "rust": {
         "status": 422,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -4142,14 +3501,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "settings.get.default",
@@ -4228,7 +3581,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -4247,7 +3600,13 @@
                 },
                 "codex": {}
               },
-              "knownProviders": []
+              "knownProviders": [
+                "claude",
+                "codex",
+                "gemini",
+                "kimi",
+                "opencode"
+              ]
             },
             "editor": {
               "externalEditor": "auto"
@@ -4284,39 +3643,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.codingCli.knownProviders[0]",
-          "node": "claude",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[1]",
-          "node": "codex",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[2]",
-          "node": "gemini",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[3]",
-          "node": "kimi",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[4]",
-          "node": "opencode",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "settings.no-auth",
@@ -4342,7 +3670,7 @@
       "rust": {
         "status": 401,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -4351,14 +3679,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "settings.put.happy",
@@ -4440,35 +3762,13 @@
         }
       },
       "rust": {
-        "status": 405,
-        "headers": {},
+        "status": 200,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
         "body": {
-          "kind": "text",
-          "text": ""
-        }
-      },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json",
-          "node": {
-            "logging": {
-              "debug": false
-            },
-            "safety": {
-              "autoKillIdleMinutes": 20
-            },
-            "terminal": {
-              "scrollback": 10000
-            },
-            "panes": {
-              "defaultNewPane": "ask"
-            },
-            "sidebar": {
-              "excludeFirstChatSubstrings": [],
-              "excludeFirstChatMustStart": false,
-              "autoGenerateTitles": true
-            },
+          "kind": "json",
+          "json": {
             "ai": {},
             "codingCli": {
               "enabledProviders": [
@@ -4476,13 +3776,13 @@
                 "codex",
                 "opencode"
               ],
+              "mcpServer": true,
               "providers": {
                 "claude": {
                   "permissionMode": "default"
                 },
                 "codex": {}
               },
-              "mcpServer": true,
               "knownProviders": [
                 "claude",
                 "codex",
@@ -4494,42 +3794,40 @@
             "editor": {
               "externalEditor": "auto"
             },
-            "freshAgent": {
-              "enabled": false,
-              "defaultPlugins": [],
-              "providers": {}
-            },
             "extensions": {
               "disabled": []
             },
+            "freshAgent": {
+              "defaultPlugins": [],
+              "enabled": false,
+              "providers": {}
+            },
+            "logging": {
+              "debug": false
+            },
             "network": {
-              "host": "127.0.0.1",
-              "configured": true
+              "configured": true,
+              "host": "127.0.0.1"
+            },
+            "panes": {
+              "defaultNewPane": "ask"
+            },
+            "safety": {
+              "autoKillIdleMinutes": 20
+            },
+            "sidebar": {
+              "autoGenerateTitles": true,
+              "excludeFirstChatMustStart": false,
+              "excludeFirstChatSubstrings": []
+            },
+            "terminal": {
+              "scrollback": 10000
             }
-          },
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.kind",
-          "node": "json",
-          "rust": "text"
-        },
-        {
-          "path": "$.body.text",
-          "node": "<missing>",
-          "rust": ""
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.status",
-          "node": 200,
-          "rust": 405
+          }
         }
-      ]
+      },
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "settings.updated-broadcast.put",
@@ -4551,7 +3849,7 @@
                 "debug": false
               },
               "safety": {
-                "autoKillIdleMinutes": 15
+                "autoKillIdleMinutes": 20
               },
               "terminal": {
                 "scrollback": 10000
@@ -4627,7 +3925,13 @@
                   },
                   "codex": {}
                 },
-                "knownProviders": []
+                "knownProviders": [
+                  "claude",
+                  "codex",
+                  "gemini",
+                  "kimi",
+                  "opencode"
+                ]
               },
               "editor": {
                 "externalEditor": "auto"
@@ -4651,7 +3955,7 @@
                 "defaultNewPane": "ask"
               },
               "safety": {
-                "autoKillIdleMinutes": 15
+                "autoKillIdleMinutes": 20
               },
               "sidebar": {
                 "autoGenerateTitles": true,
@@ -4665,34 +3969,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.settings.codingCli.knownProviders[0]",
-          "node": "claude",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.settings.codingCli.knownProviders[1]",
-          "node": "codex",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.settings.codingCli.knownProviders[2]",
-          "node": "gemini",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.settings.codingCli.knownProviders[3]",
-          "node": "kimi",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.settings.codingCli.knownProviders[4]",
-          "node": "opencode",
-          "rust": "<missing>"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "settings.patch.happy",
@@ -4776,7 +4054,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -4795,7 +4073,13 @@
                 },
                 "codex": {}
               },
-              "knownProviders": []
+              "knownProviders": [
+                "claude",
+                "codex",
+                "gemini",
+                "kimi",
+                "opencode"
+              ]
             },
             "editor": {
               "externalEditor": "auto"
@@ -4832,39 +4116,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.codingCli.knownProviders[0]",
-          "node": "claude",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[1]",
-          "node": "codex",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[2]",
-          "node": "gemini",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[3]",
-          "node": "kimi",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[4]",
-          "node": "opencode",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "settings.updated-broadcast.patch",
@@ -4962,7 +4215,13 @@
                   },
                   "codex": {}
                 },
-                "knownProviders": []
+                "knownProviders": [
+                  "claude",
+                  "codex",
+                  "gemini",
+                  "kimi",
+                  "opencode"
+                ]
               },
               "editor": {
                 "externalEditor": "auto"
@@ -5000,34 +4259,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.settings.codingCli.knownProviders[0]",
-          "node": "claude",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.settings.codingCli.knownProviders[1]",
-          "node": "codex",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.settings.codingCli.knownProviders[2]",
-          "node": "gemini",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.settings.codingCli.knownProviders[3]",
-          "node": "kimi",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.settings.codingCli.knownProviders[4]",
-          "node": "opencode",
-          "rust": "<missing>"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "settings.get.after-put",
@@ -5106,7 +4339,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -5125,7 +4358,13 @@
                 },
                 "codex": {}
               },
-              "knownProviders": []
+              "knownProviders": [
+                "claude",
+                "codex",
+                "gemini",
+                "kimi",
+                "opencode"
+              ]
             },
             "editor": {
               "externalEditor": "auto"
@@ -5149,7 +4388,7 @@
               "defaultNewPane": "ask"
             },
             "safety": {
-              "autoKillIdleMinutes": 15
+              "autoKillIdleMinutes": 25
             },
             "sidebar": {
               "autoGenerateTitles": true,
@@ -5162,44 +4401,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.codingCli.knownProviders[0]",
-          "node": "claude",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[1]",
-          "node": "codex",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[2]",
-          "node": "gemini",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[3]",
-          "node": "kimi",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[4]",
-          "node": "opencode",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.safety.autoKillIdleMinutes",
-          "node": 25,
-          "rust": 15
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "settings.put.enum-invalid",
@@ -5244,18 +4447,13 @@
         }
       },
       "rust": {
-        "status": 405,
-        "headers": {},
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
         "body": {
-          "kind": "text",
-          "text": ""
-        }
-      },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json",
-          "node": {
+          "kind": "json",
+          "json": {
             "error": "Invalid request",
             "details": [
               {
@@ -5273,30 +4471,11 @@
                 "message": "Invalid option: expected one of \"auto\"|\"cursor\"|\"code\"|\"custom\""
               }
             ]
-          },
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.kind",
-          "node": "json",
-          "rust": "text"
-        },
-        {
-          "path": "$.body.text",
-          "node": "<missing>",
-          "rust": ""
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.status",
-          "node": 400,
-          "rust": 405
+          }
         }
-      ]
+      },
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "settings.put.type-invalid",
@@ -5333,53 +4512,29 @@
         }
       },
       "rust": {
-        "status": 405,
-        "headers": {},
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
         "body": {
-          "kind": "text",
-          "text": ""
-        }
-      },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json",
-          "node": {
+          "kind": "json",
+          "json": {
             "error": "Invalid request",
             "details": [
               {
-                "expected": "array",
                 "code": "invalid_type",
+                "expected": "array",
                 "path": [
                   "allowedFilePaths"
                 ],
                 "message": "Invalid input: expected array, received string"
               }
             ]
-          },
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.kind",
-          "node": "json",
-          "rust": "text"
-        },
-        {
-          "path": "$.body.text",
-          "node": "<missing>",
-          "rust": ""
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.status",
-          "node": 400,
-          "rust": 405
+          }
         }
-      ]
+      },
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "settings.put.agentchat-migrated",
@@ -5406,43 +4561,19 @@
         }
       },
       "rust": {
-        "status": 405,
-        "headers": {},
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
         "body": {
-          "kind": "text",
-          "text": ""
+          "kind": "json",
+          "json": {
+            "error": "agentChat settings have been migrated; use freshAgent"
+          }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json",
-          "node": {
-            "error": "agentChat settings have been migrated; use freshAgent"
-          },
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.kind",
-          "node": "json",
-          "rust": "text"
-        },
-        {
-          "path": "$.body.text",
-          "node": "<missing>",
-          "rust": ""
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.status",
-          "node": 400,
-          "rust": 405
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "settings.put.nested-enum-invalid",
@@ -5487,18 +4618,13 @@
         }
       },
       "rust": {
-        "status": 405,
-        "headers": {},
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
         "body": {
-          "kind": "text",
-          "text": ""
-        }
-      },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json",
-          "node": {
+          "kind": "json",
+          "json": {
             "error": "Invalid request",
             "details": [
               {
@@ -5516,30 +4642,11 @@
                 "message": "Invalid option: expected one of \"ask\"|\"shell\"|\"browser\"|\"editor\""
               }
             ]
-          },
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.kind",
-          "node": "json",
-          "rust": "text"
-        },
-        {
-          "path": "$.body.text",
-          "node": "<missing>",
-          "rust": ""
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.status",
-          "node": 400,
-          "rust": 405
+          }
         }
-      ]
+      },
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "settings.put.client-key-rejected",
@@ -5576,18 +4683,13 @@
         }
       },
       "rust": {
-        "status": 405,
-        "headers": {},
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
         "body": {
-          "kind": "text",
-          "text": ""
-        }
-      },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json",
-          "node": {
+          "kind": "json",
+          "json": {
             "error": "Invalid request",
             "details": [
               {
@@ -5599,30 +4701,11 @@
                 "message": "Unrecognized key: \"theme\""
               }
             ]
-          },
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.kind",
-          "node": "json",
-          "rust": "text"
-        },
-        {
-          "path": "$.body.text",
-          "node": "<missing>",
-          "rust": ""
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.status",
-          "node": 400,
-          "rust": 405
+          }
         }
-      ]
+      },
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "settings.put.unknown-key",
@@ -5659,18 +4742,13 @@
         }
       },
       "rust": {
-        "status": 405,
-        "headers": {},
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
         "body": {
-          "kind": "text",
-          "text": ""
-        }
-      },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json",
-          "node": {
+          "kind": "json",
+          "json": {
             "error": "Invalid request",
             "details": [
               {
@@ -5682,30 +4760,11 @@
                 "message": "Unrecognized key: \"totallyUnknownKey\""
               }
             ]
-          },
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.kind",
-          "node": "json",
-          "rust": "text"
-        },
-        {
-          "path": "$.body.text",
-          "node": "<missing>",
-          "rust": ""
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.status",
-          "node": 400,
-          "rust": 405
+          }
         }
-      ]
+      },
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "settings.patch.sandbox-on",
@@ -5792,7 +4851,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -5811,7 +4870,13 @@
                 },
                 "codex": {}
               },
-              "knownProviders": []
+              "knownProviders": [
+                "claude",
+                "codex",
+                "gemini",
+                "kimi",
+                "opencode"
+              ]
             },
             "editor": {
               "externalEditor": "auto"
@@ -5851,39 +4916,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.codingCli.knownProviders[0]",
-          "node": "claude",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[1]",
-          "node": "codex",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[2]",
-          "node": "gemini",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[3]",
-          "node": "kimi",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[4]",
-          "node": "opencode",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.sandbox.allowed",
@@ -5911,7 +4945,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -5922,14 +4956,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.sandbox.denied-read",
@@ -5953,52 +4981,19 @@
         }
       },
       "rust": {
-        "status": 200,
+        "status": 403,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
           "json": {
-            "content": "outside the sandbox\n",
-            "size": 20,
-            "modifiedAt": "<TS>"
+            "error": "Path not allowed"
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.content",
-          "node": "<missing>",
-          "rust": "outside the sandbox\n"
-        },
-        {
-          "path": "$.body.json.error",
-          "node": "Path not allowed",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.modifiedAt",
-          "node": "<missing>",
-          "rust": "<TS>"
-        },
-        {
-          "path": "$.body.json.size",
-          "node": "<missing>",
-          "rust": 20
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        },
-        {
-          "path": "$.status",
-          "node": 403,
-          "rust": 200
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.sandbox.denied-complete",
@@ -6022,74 +5017,19 @@
         }
       },
       "rust": {
-        "status": 200,
+        "status": 403,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
           "json": {
-            "suggestions": [
-              {
-                "path": "<SCRATCH_HOME>/.claude",
-                "isDirectory": true
-              },
-              {
-                "path": "<SCRATCH_HOME>/.freshell",
-                "isDirectory": true
-              },
-              {
-                "path": "<SCRATCH_HOME>/qa-files",
-                "isDirectory": true
-              },
-              {
-                "path": "<SCRATCH_HOME>/outside.txt",
-                "isDirectory": false
-              }
-            ]
+            "error": "Path not allowed"
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.error",
-          "node": "Path not allowed",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.suggestions",
-          "node": "<missing>",
-          "rust": [
-            {
-              "path": "<SCRATCH_HOME>/.claude",
-              "isDirectory": true
-            },
-            {
-              "path": "<SCRATCH_HOME>/.freshell",
-              "isDirectory": true
-            },
-            {
-              "path": "<SCRATCH_HOME>/qa-files",
-              "isDirectory": true
-            },
-            {
-              "path": "<SCRATCH_HOME>/outside.txt",
-              "isDirectory": false
-            }
-          ]
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        },
-        {
-          "path": "$.status",
-          "node": 403,
-          "rust": 200
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.sandbox.denied-write",
@@ -6117,46 +5057,19 @@
         }
       },
       "rust": {
-        "status": 200,
+        "status": 403,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
           "json": {
-            "success": true,
-            "modifiedAt": "<TS>"
+            "error": "Path not allowed"
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.error",
-          "node": "Path not allowed",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.modifiedAt",
-          "node": "<missing>",
-          "rust": "<TS>"
-        },
-        {
-          "path": "$.body.json.success",
-          "node": "<missing>",
-          "rust": true
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        },
-        {
-          "path": "$.status",
-          "node": 403,
-          "rust": 200
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.sandbox.denied-mkdir",
@@ -6183,52 +5096,19 @@
         }
       },
       "rust": {
-        "status": 200,
+        "status": 403,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
           "json": {
-            "created": true,
-            "existed": false,
-            "resolvedPath": "<SCRATCH_HOME>/qa-outside-dir"
+            "error": "Path not allowed"
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.created",
-          "node": "<missing>",
-          "rust": true
-        },
-        {
-          "path": "$.body.json.error",
-          "node": "Path not allowed",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.existed",
-          "node": "<missing>",
-          "rust": false
-        },
-        {
-          "path": "$.body.json.resolvedPath",
-          "node": "<missing>",
-          "rust": "<SCRATCH_HOME>/qa-outside-dir"
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        },
-        {
-          "path": "$.status",
-          "node": 403,
-          "rust": 200
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "settings.patch.sandbox-off",
@@ -6311,7 +5191,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -6330,7 +5210,13 @@
                 },
                 "codex": {}
               },
-              "knownProviders": []
+              "knownProviders": [
+                "claude",
+                "codex",
+                "gemini",
+                "kimi",
+                "opencode"
+              ]
             },
             "editor": {
               "externalEditor": "auto"
@@ -6368,39 +5254,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.codingCli.knownProviders[0]",
-          "node": "claude",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[1]",
-          "node": "codex",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[2]",
-          "node": "gemini",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[3]",
-          "node": "kimi",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[4]",
-          "node": "opencode",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "files.sandbox.cleared",
@@ -6428,7 +5283,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -6439,14 +5294,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "settings.configjson-shape",
@@ -6538,139 +5387,74 @@
           "json": {
             "version": 1,
             "settings": {
+              "ai": {},
+              "codingCli": {
+                "enabledProviders": [
+                  "claude",
+                  "codex",
+                  "opencode"
+                ],
+                "mcpServer": true,
+                "providers": {
+                  "claude": {
+                    "permissionMode": "default"
+                  },
+                  "codex": {}
+                },
+                "knownProviders": [
+                  "claude",
+                  "codex",
+                  "gemini",
+                  "kimi",
+                  "opencode"
+                ]
+              },
+              "editor": {
+                "externalEditor": "auto"
+              },
+              "extensions": {
+                "disabled": []
+              },
+              "freshAgent": {
+                "defaultPlugins": [],
+                "enabled": false,
+                "providers": {}
+              },
+              "logging": {
+                "debug": false
+              },
               "network": {
                 "configured": true,
                 "host": "127.0.0.1"
-              }
+              },
+              "panes": {
+                "defaultNewPane": "ask"
+              },
+              "safety": {
+                "autoKillIdleMinutes": 25
+              },
+              "sidebar": {
+                "autoGenerateTitles": true,
+                "excludeFirstChatMustStart": false,
+                "excludeFirstChatSubstrings": []
+              },
+              "terminal": {
+                "scrollback": 10000
+              },
+              "allowedFilePaths": []
+            },
+            "sessionOverrides": {},
+            "terminalOverrides": {},
+            "projectColors": {},
+            "recentDirectories": [],
+            "serverSecrets": {
+              "codexDisplayIdSecret": "<OPAQUE>"
             }
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.projectColors",
-          "node": {},
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.recentDirectories",
-          "node": [],
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.serverSecrets",
-          "node": {
-            "codexDisplayIdSecret": "<OPAQUE>"
-          },
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.sessionOverrides",
-          "node": {},
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.settings.ai",
-          "node": {},
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.settings.allowedFilePaths",
-          "node": [],
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.settings.codingCli",
-          "node": {
-            "enabledProviders": [
-              "claude",
-              "codex",
-              "opencode"
-            ],
-            "providers": {
-              "claude": {
-                "permissionMode": "default"
-              },
-              "codex": {}
-            },
-            "mcpServer": true,
-            "knownProviders": [
-              "claude",
-              "codex",
-              "gemini",
-              "kimi",
-              "opencode"
-            ]
-          },
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.settings.editor",
-          "node": {
-            "externalEditor": "auto"
-          },
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.settings.extensions",
-          "node": {
-            "disabled": []
-          },
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.settings.freshAgent",
-          "node": {
-            "enabled": false,
-            "defaultPlugins": [],
-            "providers": {}
-          },
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.settings.logging",
-          "node": {
-            "debug": false
-          },
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.settings.panes",
-          "node": {
-            "defaultNewPane": "ask"
-          },
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.settings.safety",
-          "node": {
-            "autoKillIdleMinutes": 25
-          },
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.settings.sidebar",
-          "node": {
-            "excludeFirstChatSubstrings": [],
-            "excludeFirstChatMustStart": false,
-            "autoGenerateTitles": true
-          },
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.settings.terminal",
-          "node": {
-            "scrollback": 10000
-          },
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.terminalOverrides",
-          "node": {},
-          "rust": "<missing>"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "spa.root",
@@ -6695,7 +5479,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "text/html; charset=utf-8",
+          "content-type": "text/html; charset=UTF-8",
           "cache-control": "no-cache, no-store, must-revalidate"
         },
         "body": {
@@ -6703,14 +5487,8 @@
           "text": "<!doctype html>\n<html lang=\"en\">\n  <head>\n    <meta charset=\"UTF-8\" />\n    <link rel=\"icon\" type=\"image/x-icon\" href=\"/favicon.ico\" />\n    <link rel=\"manifest\" href=\"/manifest.webmanifest\" />\n    <link rel=\"apple-touch-icon\" href=\"/apple-touch-icon.png\" />\n    <meta name=\"apple-mobile-web-app-capable\" content=\"yes\" />\n    <meta name=\"apple-mobile-web-app-status-bar-style\" content=\"black-translucent\" />\n    <meta name=\"theme-color\" content=\"#0f172a\" />\n    <meta\n      name=\"viewport\"\n      content=\"width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no, viewport-fit=cover\"\n    />\n    <title>freshell</title>\n    <script type=\"module\" crossorigin src=\"/assets/index-D_eGSKof.js\"></script>\n    <link rel=\"stylesheet\" crossorigin href=\"/assets/index-DuDz0fFK.css\">\n  </head>\n  <body class=\"h-full\">\n    <script>\n      // Capture console.error calls and uncaught errors from the very first\n      // moment the page loads.  Browser-use preflight checks query this array\n      // via `window.__consoleErrors` to abort early when the app is broken.\n      (function () {\n        var errors = (window.__consoleErrors = []);\n        var orig = console.error;\n        console.error = function () {\n          errors.push({\n            ts: Date.now(),\n            args: Array.prototype.slice.call(arguments).map(String),\n          });\n          return orig.apply(console, arguments);\n        };\n        window.addEventListener(\"error\", function (e) {\n          errors.push({ ts: Date.now(), args: [e.message || \"Unknown error\"] });\n        });\n      })();\n    </script>\n    <div id=\"root\"></div>\n  </body>\n</html>\n"
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "text/html; charset=UTF-8",
-          "rust": "text/html; charset=utf-8"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "spa.root.token-query",
@@ -6735,7 +5513,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "text/html; charset=utf-8",
+          "content-type": "text/html; charset=UTF-8",
           "cache-control": "no-cache, no-store, must-revalidate"
         },
         "body": {
@@ -6743,14 +5521,8 @@
           "text": "<!doctype html>\n<html lang=\"en\">\n  <head>\n    <meta charset=\"UTF-8\" />\n    <link rel=\"icon\" type=\"image/x-icon\" href=\"/favicon.ico\" />\n    <link rel=\"manifest\" href=\"/manifest.webmanifest\" />\n    <link rel=\"apple-touch-icon\" href=\"/apple-touch-icon.png\" />\n    <meta name=\"apple-mobile-web-app-capable\" content=\"yes\" />\n    <meta name=\"apple-mobile-web-app-status-bar-style\" content=\"black-translucent\" />\n    <meta name=\"theme-color\" content=\"#0f172a\" />\n    <meta\n      name=\"viewport\"\n      content=\"width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no, viewport-fit=cover\"\n    />\n    <title>freshell</title>\n    <script type=\"module\" crossorigin src=\"/assets/index-D_eGSKof.js\"></script>\n    <link rel=\"stylesheet\" crossorigin href=\"/assets/index-DuDz0fFK.css\">\n  </head>\n  <body class=\"h-full\">\n    <script>\n      // Capture console.error calls and uncaught errors from the very first\n      // moment the page loads.  Browser-use preflight checks query this array\n      // via `window.__consoleErrors` to abort early when the app is broken.\n      (function () {\n        var errors = (window.__consoleErrors = []);\n        var orig = console.error;\n        console.error = function () {\n          errors.push({\n            ts: Date.now(),\n            args: Array.prototype.slice.call(arguments).map(String),\n          });\n          return orig.apply(console, arguments);\n        };\n        window.addEventListener(\"error\", function (e) {\n          errors.push({ ts: Date.now(), args: [e.message || \"Unknown error\"] });\n        });\n      })();\n    </script>\n    <div id=\"root\"></div>\n  </body>\n</html>\n"
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "text/html; charset=UTF-8",
-          "rust": "text/html; charset=utf-8"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "spa.deeplink",
@@ -6775,7 +5547,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "text/html; charset=utf-8",
+          "content-type": "text/html; charset=UTF-8",
           "cache-control": "no-cache, no-store, must-revalidate"
         },
         "body": {
@@ -6783,14 +5555,8 @@
           "text": "<!doctype html>\n<html lang=\"en\">\n  <head>\n    <meta charset=\"UTF-8\" />\n    <link rel=\"icon\" type=\"image/x-icon\" href=\"/favicon.ico\" />\n    <link rel=\"manifest\" href=\"/manifest.webmanifest\" />\n    <link rel=\"apple-touch-icon\" href=\"/apple-touch-icon.png\" />\n    <meta name=\"apple-mobile-web-app-capable\" content=\"yes\" />\n    <meta name=\"apple-mobile-web-app-status-bar-style\" content=\"black-translucent\" />\n    <meta name=\"theme-color\" content=\"#0f172a\" />\n    <meta\n      name=\"viewport\"\n      content=\"width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no, viewport-fit=cover\"\n    />\n    <title>freshell</title>\n    <script type=\"module\" crossorigin src=\"/assets/index-D_eGSKof.js\"></script>\n    <link rel=\"stylesheet\" crossorigin href=\"/assets/index-DuDz0fFK.css\">\n  </head>\n  <body class=\"h-full\">\n    <script>\n      // Capture console.error calls and uncaught errors from the very first\n      // moment the page loads.  Browser-use preflight checks query this array\n      // via `window.__consoleErrors` to abort early when the app is broken.\n      (function () {\n        var errors = (window.__consoleErrors = []);\n        var orig = console.error;\n        console.error = function () {\n          errors.push({\n            ts: Date.now(),\n            args: Array.prototype.slice.call(arguments).map(String),\n          });\n          return orig.apply(console, arguments);\n        };\n        window.addEventListener(\"error\", function (e) {\n          errors.push({ ts: Date.now(), args: [e.message || \"Unknown error\"] });\n        });\n      })();\n    </script>\n    <div id=\"root\"></div>\n  </body>\n</html>\n"
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "text/html; charset=UTF-8",
-          "rust": "text/html; charset=utf-8"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "spa.asset.real",
@@ -6816,7 +5582,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "text/javascript; charset=utf-8",
+          "content-type": "application/javascript; charset=UTF-8",
           "cache-control": "public, max-age=31536000, immutable"
         },
         "body": {
@@ -6825,14 +5591,8 @@
           "bytes": 31949
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/javascript; charset=UTF-8",
-          "rust": "text/javascript; charset=utf-8"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "spa.asset.missing",
@@ -6856,21 +5616,15 @@
       "rust": {
         "status": 404,
         "headers": {
-          "content-type": "text/plain; charset=utf-8"
+          "content-type": "text/html; charset=utf-8"
         },
         "body": {
           "kind": "text",
           "text": "Not found"
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "text/html; charset=utf-8",
-          "rust": "text/plain; charset=utf-8"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "spa.nonasset.missing",
@@ -6895,7 +5649,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "text/html; charset=utf-8",
+          "content-type": "text/html; charset=UTF-8",
           "cache-control": "no-cache, no-store, must-revalidate"
         },
         "body": {
@@ -6903,14 +5657,8 @@
           "text": "<!doctype html>\n<html lang=\"en\">\n  <head>\n    <meta charset=\"UTF-8\" />\n    <link rel=\"icon\" type=\"image/x-icon\" href=\"/favicon.ico\" />\n    <link rel=\"manifest\" href=\"/manifest.webmanifest\" />\n    <link rel=\"apple-touch-icon\" href=\"/apple-touch-icon.png\" />\n    <meta name=\"apple-mobile-web-app-capable\" content=\"yes\" />\n    <meta name=\"apple-mobile-web-app-status-bar-style\" content=\"black-translucent\" />\n    <meta name=\"theme-color\" content=\"#0f172a\" />\n    <meta\n      name=\"viewport\"\n      content=\"width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no, viewport-fit=cover\"\n    />\n    <title>freshell</title>\n    <script type=\"module\" crossorigin src=\"/assets/index-D_eGSKof.js\"></script>\n    <link rel=\"stylesheet\" crossorigin href=\"/assets/index-DuDz0fFK.css\">\n  </head>\n  <body class=\"h-full\">\n    <script>\n      // Capture console.error calls and uncaught errors from the very first\n      // moment the page loads.  Browser-use preflight checks query this array\n      // via `window.__consoleErrors` to abort early when the app is broken.\n      (function () {\n        var errors = (window.__consoleErrors = []);\n        var orig = console.error;\n        console.error = function () {\n          errors.push({\n            ts: Date.now(),\n            args: Array.prototype.slice.call(arguments).map(String),\n          });\n          return orig.apply(console, arguments);\n        };\n        window.addEventListener(\"error\", function (e) {\n          errors.push({ ts: Date.now(), args: [e.message || \"Unknown error\"] });\n        });\n      })();\n    </script>\n    <div id=\"root\"></div>\n  </body>\n</html>\n"
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "text/html; charset=UTF-8",
-          "rust": "text/html; charset=utf-8"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "spa.favicon",
@@ -6992,25 +5740,14 @@
               }
             ],
             "close": {
-              "code": 1006,
-              "reason": ""
+              "code": 4001,
+              "reason": "Invalid token"
             }
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.close.code",
-          "node": 4001,
-          "rust": 1006
-        },
-        {
-          "path": "$.body.json.close.reason",
-          "node": "Invalid token",
-          "rust": ""
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "ws.notoken",
@@ -7056,25 +5793,14 @@
               }
             ],
             "close": {
-              "code": 1006,
-              "reason": ""
+              "code": 4001,
+              "reason": "Invalid token"
             }
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.close.code",
-          "node": 4001,
-          "rust": 1006
-        },
-        {
-          "path": "$.body.json.close.reason",
-          "node": "Invalid token",
-          "rust": ""
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "ws.protomismatch",
@@ -7120,25 +5846,14 @@
               }
             ],
             "close": {
-              "code": 1006,
-              "reason": ""
+              "code": 4010,
+              "reason": "Protocol version mismatch"
             }
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.close.code",
-          "node": 4010,
-          "rust": 1006
-        },
-        {
-          "path": "$.body.json.close.reason",
-          "node": "Protocol version mismatch",
-          "rust": ""
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "api.unknown-route",
@@ -7198,30 +5913,19 @@
         }
       },
       "rust": {
-        "status": 404,
+        "status": 401,
         "headers": {
           "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
           "json": {
-            "error": "Not found"
+            "error": "Unauthorized"
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.error",
-          "node": "Unauthorized",
-          "rust": "Not found"
-        },
-        {
-          "path": "$.status",
-          "node": 401,
-          "rust": 404
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "settings.persist.restart",
@@ -7301,7 +6005,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -7320,7 +6024,13 @@
                 },
                 "codex": {}
               },
-              "knownProviders": []
+              "knownProviders": [
+                "claude",
+                "codex",
+                "gemini",
+                "kimi",
+                "opencode"
+              ]
             },
             "editor": {
               "externalEditor": "auto"
@@ -7344,7 +6054,7 @@
               "defaultNewPane": "ask"
             },
             "safety": {
-              "autoKillIdleMinutes": 15
+              "autoKillIdleMinutes": 25
             },
             "sidebar": {
               "autoGenerateTitles": true,
@@ -7353,53 +6063,13 @@
             },
             "terminal": {
               "scrollback": 10000
-            }
+            },
+            "allowedFilePaths": []
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.body.json.allowedFilePaths",
-          "node": [],
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[0]",
-          "node": "claude",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[1]",
-          "node": "codex",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[2]",
-          "node": "gemini",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[3]",
-          "node": "kimi",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.codingCli.knownProviders[4]",
-          "node": "opencode",
-          "rust": "<missing>"
-        },
-        {
-          "path": "$.body.json.safety.autoKillIdleMinutes",
-          "node": 25,
-          "rust": 15
-        },
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     },
     {
       "id": "health.after-restart",
@@ -7431,7 +6101,7 @@
       "rust": {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "application/json; charset=utf-8"
         },
         "body": {
           "kind": "json",
@@ -7446,14 +6116,8 @@
           }
         }
       },
-      "verdict": "DIVERGENCE",
-      "diffs": [
-        {
-          "path": "$.headers.content-type",
-          "node": "application/json; charset=utf-8",
-          "rust": "application/json"
-        }
-      ]
+      "verdict": "PASS",
+      "diffs": []
     }
   ]
 }

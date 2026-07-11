@@ -75,3 +75,38 @@ keep all 117 green tests green (+ 6/6 visual MATCH); the 9 red are red-on-origin
   was never touched (reserved ORIGINAL port 17871 used, never 3000-3010).
 - Purity: `git diff --name-only server/ shared/ src/` empty; no test/spec files
   modified; no assertions weakened; nothing committed.
+
+## ADJUDICATION UPDATE (2026-07-11, later session): `fresh-agent.spec.ts:98` reclassified
+
+The one newly-red spec this re-baseline recorded as "single run, unclassified
+flaky-vs-hard" (above) has been adjudicated.
+
+**Ruling: option (i) — FLAKY-on-original.** Adjudicated by the antagonist reviewer,
+session `0000000000000000-58346ba0034d4442_self-driving-reviewer`, 2026-07-11.
+
+**Grounds:** the spec's assertions are `toHaveCount(0)`, which auto-retry until the
+expect timeout — so the recorded RED means the Freshclaude tile was present and
+STAYED present during that baseline full-suite run (suite-scope leaked state across
+the shared external server/scratch home), a condition transient across runs, not a
+deterministic behavior of the original server on this host.
+
+**Evidence chain:**
+- 4/4 isolated re-runs of `fresh-agent.spec.ts:98` GREEN against the original on
+  :17871, same commit and host, 2026-07-11 (single-spec runs against a reused
+  server — they demonstrate non-deterministic-RED, though they do not reproduce the
+  full-suite leakage context; provenance in
+  `port/oracle/notes/t3-rust-vs-original-2026-07-11.md`).
+- GREEN in the prior host's full-suite run (`fresh-agent.spec.ts` 9/9 in
+  `summary.json`).
+- GREEN in both Rust full-suite runs on this host (pre-fix and post-fix).
+- RED exactly once: this baseline's single full-suite pass.
+
+**Effect:** the effective Rust-port comparison target on this host is
+**118 green / 8 red** (the 8 EQUIVALENT-reds shared with the prior host), not
+117/9. Recorded additively in
+`port/oracle/baselines/t3/summary-2026-07-11-original-sbp9.json` under
+`flake_reclassifications` — the recorded 117/9 totals and the raw report are
+untouched (what was observed stays observed; the reclassification is layered on
+top, never rewritten). The post-fix Rust full-suite run
+(`summary-2026-07-11-rust-sbp9.json`, 118/8 with the identical failing set and
+6/6 visual MATCH) matches this effective target exactly.
