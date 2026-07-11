@@ -49,11 +49,24 @@ only after every preflight gate below is green.
 - Playwright Chromium 1208, headless shell 1208, and FFmpeg 1011 payloads are in
   `~/.cache/ms-playwright`. Their Linux shared-library prerequisites are not yet
   installed.
-- WSL CLI binaries are installed: Claude Code `2.1.32`, Codex CLI `0.144.1`, and
+- WSL CLI binaries are installed: Claude Code `2.1.207`, Codex CLI `0.144.1`, and
   OpenCode `1.17.18`.
-- WSL CLI auth: Codex reports `Logged in using ChatGPT`; Claude's existing credential
-  gets HTTP 401; OpenCode reports zero credentials. Windows-side `claude`, `codex`,
-  and `opencode` are all absent.
+- WSL CLI auth: Claude uses the user's Claude Max account; Codex reports `Logged in
+  using ChatGPT`; the user has live-verified Claude and OpenCode with their cheapest
+  models. Absolute-path `"$WIN_WHERE"` probing finds Windows-side Claude and Codex;
+  Windows-side OpenCode is absent.
+
+### Windows interop command policy — absolute paths only
+
+`/etc/wsl.conf` intentionally sets `[interop] appendWindowsPath=false`. **Do not
+change that setting and do not append Windows directories to `PATH`, globally or for
+the session.** Windows interop is live, but every WSL→Windows process invocation must
+use an explicit executable path (or a shell-local variable containing that absolute
+path). Never assume `cmd.exe`, `powershell.exe`, `where.exe`, `netstat.exe`,
+`netsh.exe`, `ipconfig.exe`, or `wsl.exe` resolves through `PATH`.
+
+The Phase-0 snippet in §3 defines the canonical shell-local variables. Re-establish
+them in each new shell/session; do not export a modified PATH as a shortcut.
 
 ### System provisioning blocked on sudo
 
@@ -105,9 +118,10 @@ missing. No readiness build was attempted with a knowingly incomplete compiler.
 ## 0. Your environment (differs from prior sessions — read first)
 
 - **WSL2 Linux is your shell.** You execute from WSL.
-- **Windows interop works:** you can run `powershell.exe`, `cmd.exe`, `netstat.exe`,
-  and Windows binaries from WSL → the **WSL × Windows combinations ARE verifiable
-  here** (native-Windows server, Windows shells, PowerShell screenshots).
+- **Windows interop works through absolute executable paths.** Windows PATH import is
+  intentionally disabled and must remain disabled; use the §3 `WIN_*` shell-local
+  variables for every WSL→Windows call. The **WSL × Windows combinations ARE
+  verifiable here** (native-Windows server, Windows shells, PowerShell screenshots).
 - **NO legacy freshell installation.** No installed Electron `Freshell.exe`, no
   pre-existing `.env` token, and no live production server to protect. Everything you
   need is in this repo: the ORIGINAL server runs from source (`npm start`), and the
@@ -233,17 +247,28 @@ matrix legs.** (A stale binary produced a false FAIL once; don't repeat it.)
 Run and RECORD (paste outputs into your first report):
 
 ```bash
+# Windows PATH import is intentionally disabled. Define shell-local absolute paths;
+# NEVER modify PATH or /etc/wsl.conf to make these commands resolve by basename.
+WIN_SYSTEM32=/mnt/c/Windows/System32
+WIN_CMD="$WIN_SYSTEM32/cmd.exe"
+WIN_WHERE="$WIN_SYSTEM32/where.exe"
+WIN_NETSTAT="$WIN_SYSTEM32/netstat.exe"
+WIN_NETSH="$WIN_SYSTEM32/netsh.exe"
+WIN_IPCONFIG="$WIN_SYSTEM32/ipconfig.exe"
+WIN_WSL="$WIN_SYSTEM32/wsl.exe"
+WIN_POWERSHELL="$WIN_SYSTEM32/WindowsPowerShell/v1.0/powershell.exe"
+
 node --version; npm --version                      # need ≥ 20.x per package.json engines
 rustc --version; rustup target list --installed    # need stable + x86_64-pc-windows-gnu
 cat .cargo/config.toml                             # windows-gnu linker wiring (committed)
 npx playwright --version; ls ~/.cache/ms-playwright 2>/dev/null | head -3   # browsers?
 echo "DISPLAY=$DISPLAY WAYLAND=$WAYLAND_DISPLAY"; ls /mnt/wslg 2>/dev/null && echo WSLg  # GUI?
-powershell.exe -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'   # interop?
-powershell.exe -NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width"  # can screenshot the Windows desktop?
+"$WIN_POWERSHELL" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'   # interop?
+"$WIN_POWERSHELL" -NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width"  # can screenshot the Windows desktop?
 which import convert tesseract xdotool             # screenshots + OCR
 for c in claude codex opencode gemini; do printf "%-10s wsl:%s win:%s\n" "$c" \
   "$(which $c >/dev/null && echo Y || echo n)" \
-  "$(where.exe $c >/dev/null 2>&1 && echo Y || echo n)"; done
+  "$("$WIN_WHERE" "$c" >/dev/null 2>&1 && echo Y || echo n)"; done
 ip -4 addr show eth0 | grep -oE 'inet [0-9.]+'     # WSL IP (Windows→WSL reachability)
 ip route show default | awk '{print $3}'           # WINDOWS HOST IP (WSL→Windows-process)
 ```
@@ -342,21 +367,23 @@ then visible on your LAN — token-gated, but keep such runs short).
 
 ### 5.3 The Rust server as a NATIVE WINDOWS process (port 17873)
 
-WSL env does NOT propagate into a Windows .exe, and cmd.exe cannot cd to a
+WSL env does NOT propagate into a Windows .exe, and `%SystemRoot%\System32\cmd.exe`
+cannot cd to a
 `\\wsl.localhost\...` UNC path. The proven launch:
 
 ```bash
+# Requires the shell-local WIN_* absolute paths from §3; never modify PATH.
 # 1. SPA at a NATIVE Windows path (cmd cannot serve from a UNC path reliably):
-WINTMP_W='C:\Users\<winuser>\AppData\Local\Temp'   # discover <winuser> via: cmd.exe /c "echo %USERNAME%"
+WINTMP_W='C:\Users\<winuser>\AppData\Local\Temp'   # discover via: "$WIN_CMD" /c "echo %USERNAME%"
 cp -r dist/client "$(wslpath -u "$WINTMP_W")/freshell-qa-winclient"
-# 2. Launch with a cmd.exe set-wrapper (NO space before &&, or values get a trailing space):
-cmd.exe /d /c "cd /d $WINTMP_W && set PORT=17873&& set AUTH_TOKEN=$TOK&& set FRESHELL_BIND_HOST=0.0.0.0&& set FRESHELL_CLIENT_DIR=$WINTMP_W\freshell-qa-winclient&& $(wslpath -w target/x86_64-pc-windows-gnu/release/freshell-server.exe)" &
+# 2. Launch with an absolute-path cmd set-wrapper (NO space before &&, or values get a trailing space):
+"$WIN_CMD" /d /c "cd /d $WINTMP_W && set PORT=17873&& set AUTH_TOKEN=$TOK&& set FRESHELL_BIND_HOST=0.0.0.0&& set FRESHELL_CLIENT_DIR=$WINTMP_W\freshell-qa-winclient&& $(wslpath -w target/x86_64-pc-windows-gnu/release/freshell-server.exe)" &
 # 3. Reach it from WSL at the WINDOWS HOST IP (NOT 127.0.0.1 — that relay is one-way):
 WINIP=$(ip route show default | awk '{print $3}')
 curl -s http://$WINIP:17873/api/health            # → "app":"freshell"
 # 4. REAP (taskkill.exe and wmic are BROKEN over interop — use this):
-netstat.exe -ano | grep ':17873 '                 # → PID column
-powershell.exe -NoProfile -Command "Stop-Process -Id <pid> -Force"
+"$WIN_NETSTAT" -ano | grep ':17873 '             # → PID column
+"$WIN_POWERSHELL" -NoProfile -Command "Stop-Process -Id <pid> -Force"
 ```
 
 Native Windows clients (Chrome/Electron/Tauri on the Windows side) reach it at
@@ -418,7 +445,7 @@ Electron ^33 is a devDependency, so the legacy desktop client is fully buildable
   `run-matrix-win.mjs` (Windows leg) — self-booting, self-reaping, write PNGs +
   `*-report.json`. Adapt; don't rewrite.
 - Windows-desktop screenshots from WSL:
-  `powershell.exe -NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $bmp=New-Object System.Drawing.Bitmap($b.Width,$b.Height); $g=[System.Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen(0,0,0,0,$b.Size); $bmp.Save('C:\\...\\shot.png')"`
+  `"$WIN_POWERSHELL" -NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $bmp=New-Object System.Drawing.Bitmap($b.Width,$b.Height); $g=[System.Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen(0,0,0,0,$b.Size); $bmp.Save('C:\\...\\shot.png')"`
   then `cp` it into the worktree.
 
 ---
@@ -523,7 +550,8 @@ documented error cases. The list (from `server/index.ts` routing):
 3. `/api/settings` GET/PUT — including the `settings.updated` WS broadcast on PUT,
    enum validation failures, and persistence across restart (config.json shape in the
    scratch home).
-4. `/api/platform` (availableClis matches the host's real `which`/`where.exe` truth).
+4. `/api/platform` (availableClis matches WSL `which` and absolute-path
+   `"$WIN_WHERE"` truth; never rely on Windows PATH import).
 5. `/api/extensions` (5-entry registry, exact ClientExtensionEntry shape).
 6. `/api/files/*`: read/write/stat/complete/mkdir/candidate-dirs/validate-dir —
    incl. the `allowedFilePaths` sandbox, 404-vs-400 semantics, directory-vs-file
@@ -606,11 +634,12 @@ reference.
    UNC paths dropped (never passed to cmd.exe).
 4. Interop quoting: the documented ArgvQuote gate — commands whose args carry spaces
    and quotes survive spawn on both systems (and B1, §D.3).
-5. Env-wrapper correctness (§5.3) and reap path (`netstat.exe` + `Stop-Process`).
+5. Env-wrapper correctness (§5.3) and absolute-path reap calls
+   (`"$WIN_NETSTAT"` + `"$WIN_POWERSHELL"` `Stop-Process`).
 6. Reachability matrix: Windows client→WSL server via localhost; WSL→Windows server
    via $WINIP; both directions token-gated.
-7. Network status READS on Windows (`netsh ... show`, `ipconfig.exe`) — shape parity;
-   **zero mutating netsh/elevated calls, ever**.
+7. Network status READS on Windows (`"$WIN_NETSH" ... show`,
+   `"$WIN_IPCONFIG"`) — shape parity; **zero mutating netsh/elevated calls, ever**.
 
 ### H. Desktop-shell parity (Tauri vs the Electron reference behavior)
 
@@ -638,7 +667,7 @@ reference.
    fixtures) — identical session-directory output; no panics (bug #7 regression).
 6. Kill -9 the server → clients show the same disconnect UX; no orphaned PTYs.
 7. After EVERY run: ownership-based orphan sweep (`pgrep -x freshell-server`,
-   `netstat.exe` for 1787x listeners, PTY child processes) → zero owned leftovers.
+   `"$WIN_NETSTAT"` for 1787x listeners, PTY child processes) → zero owned leftovers.
 
 ---
 
@@ -680,7 +709,7 @@ image input.
 ### 8.5 ENV-LIMITED protocol
 
 A leg may be declared unverifiable ONLY with proof of the limitation (the failing
-probe's output, e.g. `where.exe opencode` → not found), recorded in the final report
+probe's output, e.g. `"$WIN_WHERE" opencode` → not found), recorded in the final report
 AND in `port/machine/STATE.yaml`. Silent skips are defects. If provisioning could
 remove the limitation cheaply (install a CLI, playwright browsers), provision instead.
 
@@ -736,11 +765,12 @@ every result from committed files alone.
 ## 10. Known traps (each cost real time once — do not rediscover)
 
 1. WSL env does NOT reach Windows .exes → cmd `set` wrapper, NO space before `&&`.
-2. `taskkill.exe`/`wmic.exe` are broken over interop → `netstat.exe -ano` +
-   `powershell.exe Stop-Process -Id <pid> -Force`.
+2. `taskkill.exe`/`wmic.exe` are broken over interop → `"$WIN_NETSTAT" -ano` +
+   `"$WIN_POWERSHELL" -NoProfile -Command "Stop-Process -Id <pid> -Force"`.
 3. WSL→Windows-process is NOT localhost → use the Windows host IP
    (`ip route show default | awk '{print $3}'`).
-4. cmd.exe cannot cd to `\\wsl.localhost\...` (UNC) → cwd translation / inherit-cwd.
+4. Windows cmd cannot cd to `\\wsl.localhost\...` (UNC) → cwd translation /
+   inherit-cwd. Invoke it as `"$WIN_CMD"`; never rely on PATH.
 5. Codex refuses helper binaries under `/tmp` → scratch homes under `$HOME`.
 6. Codex's first screen in a fresh dir is the TRUST PROMPT (contains no "codex" text).
 7. npm `.cmd`-shim CLIs cold-start slowly on Windows → 90s launch windows.
