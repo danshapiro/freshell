@@ -98,6 +98,9 @@ impl DirItem {
         o.insert("projectPath".into(), json!(self.project_path));
         o.insert("lastActivityAt".into(), json!(self.last_activity_at));
         o.insert("isRunning".into(), json!(self.is_running));
+        // R10a: the original always emits `archived` (a `SessionOverride` field
+        // defaulted to `false`, `shared/read-models.ts:51`); this port omitted it.
+        o.insert("archived".into(), json!(false));
         if let Some(v) = &self.title {
             o.insert("title".into(), json!(v));
         }
@@ -142,16 +145,115 @@ struct DirQuery {
     include_empty: bool,
 }
 
-fn parse_query(raw: &std::collections::HashMap<String, String>) -> DirQuery {
+/// R9: `SessionDirectoryQuerySchema` (`shared/read-models.ts:28-38`) makes
+/// `priority` REQUIRED (`ReadModelPrioritySchema` has no `.optional()`) and
+/// `limit` a strictly-typed `z.number().int().positive().max(50)`. The original
+/// builds the zod input as `req.query.limit` coerced via `Number(...)` before
+/// validating (`sessions-router.ts:74-84`), so a non-numeric limit becomes `NaN`
+/// (JS `Number('abc')`), not a string-type error. `safeParse` collects ALL
+/// issues across every violated field (verified empirically against the
+/// ORIGINAL: `priority=bogus&limit=abc` returns both issues in one `details`
+/// array, order priority-then-limit).
+///
+/// Error shapes below are byte-matched against a live probe of the ORIGINAL
+/// (zod v4 `safeParse` issue shapes), not guessed.
+fn validate_query(raw: &std::collections::HashMap<String, String>) -> Result<DirQuery, Value> {
+    let mut details: Vec<Value> = Vec::new();
+
+    match raw.get("priority").map(String::as_str) {
+        Some("visible") | Some("background") => {}
+        _ => details.push(json!({
+            "code": "invalid_value",
+            "values": ["visible", "background"],
+            "path": ["priority"],
+            "message": "Invalid option: expected one of \"visible\"|\"background\"",
+        })),
+    }
+
+    let limit = match raw.get("limit") {
+        None => None,
+        Some(raw_limit) => match validate_limit(raw_limit) {
+            Ok(v) => Some(v),
+            Err(issue) => {
+                details.push(issue);
+                None
+            }
+        },
+    };
+
+    if !details.is_empty() {
+        return Err(json!(details));
+    }
+
     let flag = |k: &str| raw.get(k).map(|v| v == "1" || v == "true").unwrap_or(false);
-    DirQuery {
+    Ok(DirQuery {
         query: raw.get("query").filter(|s| !s.is_empty()).cloned(),
         cursor: raw.get("cursor").filter(|s| !s.is_empty()).cloned(),
-        limit: raw.get("limit").and_then(|v| v.parse::<usize>().ok()),
+        limit,
         include_subagents: flag("includeSubagents"),
         include_non_interactive: flag("includeNonInteractive"),
         include_empty: flag("includeEmpty"),
+    })
+}
+
+/// `Number(str)` (JS coercion) semantics the original relies on before zod sees
+/// the value: trimmed-empty → `0`, `0x`-prefixed → hex, else a bare float parse;
+/// anything else → `NaN`.
+fn js_number(raw: &str) -> f64 {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return 0.0;
     }
+    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        return i64::from_str_radix(hex, 16).map(|v| v as f64).unwrap_or(f64::NAN);
+    }
+    trimmed.parse::<f64>().unwrap_or(f64::NAN)
+}
+
+/// `z.number().int().positive().max(MAX_DIRECTORY_PAGE_ITEMS)` — checked in
+/// that order (verified: `limit=1.5` reports ONLY the int failure, never
+/// positive/max too).
+fn validate_limit(raw_limit: &str) -> Result<usize, Value> {
+    let n = js_number(raw_limit);
+    if n.is_nan() {
+        return Err(json!({
+            "expected": "number",
+            "code": "invalid_type",
+            "received": "NaN",
+            "path": ["limit"],
+            "message": "Invalid input: expected number, received NaN",
+        }));
+    }
+    if n.fract() != 0.0 {
+        return Err(json!({
+            "expected": "int",
+            "format": "safeint",
+            "code": "invalid_type",
+            "path": ["limit"],
+            "message": "Invalid input: expected int, received number",
+        }));
+    }
+    if n <= 0.0 {
+        return Err(json!({
+            "origin": "number",
+            "code": "too_small",
+            "minimum": 0,
+            "inclusive": false,
+            "path": ["limit"],
+            "message": "Too small: expected number to be >0",
+        }));
+    }
+    if n > MAX_DIRECTORY_PAGE_ITEMS as f64 {
+        return Err(json!({
+            "origin": "number",
+            "code": "too_big",
+            "maximum": MAX_DIRECTORY_PAGE_ITEMS,
+            "inclusive": true,
+            "path": ["limit"],
+            "message": format!("Too big: expected number to be <={MAX_DIRECTORY_PAGE_ITEMS}"),
+        }));
+    }
+    Ok(n as usize)
 }
 
 /// The session-directory sub-router (`GET /api/session-directory`).
@@ -169,7 +271,18 @@ async fn session_directory(
     if !is_authed(&headers, &state.auth_token) {
         return unauthorized();
     }
-    let query = parse_query(&raw);
+    // R9: query-shape validation (`SessionDirectoryQuerySchema.safeParse`) BEFORE
+    // any work -- mirrors `sessions-router.ts:74-88`'s early 400 return.
+    let query = match validate_query(&raw) {
+        Ok(q) => q,
+        Err(details) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Invalid request", "details": details })),
+            )
+                .into_response()
+        }
+    };
     let items = match &state.home {
         Some(home) => list_claude_sessions(&claude_home(home)),
         None => Vec::new(),
@@ -258,6 +371,19 @@ fn parse_claude_file(path: &Path, force_subagent: bool) -> Option<DirItem> {
         ..Default::default()
     };
     let meta = parse_session_content(&content, &opts);
+    // R10b: the original's `session-indexer.ts` NEVER registers a session that
+    // lacks a resolvable `cwd` (`if (!meta.cwd) continue`, both the incremental
+    // `detectNewSessions` gate at :756 and the lightweight full-rescan gate at
+    // :1124) \u2014 the exclusion happens at DISCOVERY time, before any
+    // include-flag filtering exists to hide it. A file with no `cwd` in any
+    // record (e.g. the non-coding-cli "repair" fixtures: plain-string `message`
+    // fields, no `cwd` anywhere) is therefore invisible under EVERY flag
+    // combination, not merely hidden by the default empty/non-interactive
+    // filters. Verified empirically: seeding `test/fixtures/sessions/healthy.jsonl`
+    // and querying the ORIGINAL with
+    // `includeSubagents&includeNonInteractive&includeEmpty=true` still returns
+    // `{items:[],nextCursor:null,revision:0}` \u2014 the file was never indexed at all.
+    meta.cwd.as_ref()?;
     Some(item_from_meta(&meta, "claude", &fallback, force_subagent))
 }
 
@@ -477,11 +603,13 @@ mod tests {
 
     #[test]
     fn default_query_hides_non_interactive_fixtures() {
-        // All committed fixtures parse as non-interactive → the default History
-        // browse (no includeNonInteractive) hides them all → empty page.
+        // `real-corrupted.jsonl` has a `cwd` and parses as non-interactive → the
+        // default History browse (no includeNonInteractive) hides it → empty
+        // page. `healthy.jsonl` has NO `cwd` anywhere → excluded entirely at
+        // discovery (R10b), never reaching the item list at all.
         let home = claude_home_with(&["real-corrupted.jsonl", "healthy.jsonl"]);
         let items = list_claude_sessions(&claude_home(&home));
-        assert_eq!(items.len(), 2, "both fixtures discovered + parsed");
+        assert_eq!(items.len(), 1, "the cwd-less repair fixture is never indexed (R10b)");
         let page = apply_query(items, &default_query()).unwrap();
         assert_eq!(page["items"].as_array().unwrap().len(), 0);
         assert_eq!(page["nextCursor"], Value::Null);
@@ -510,6 +638,11 @@ mod tests {
 
     #[test]
     fn include_empty_surfaces_untitled_sessions_sorted_desc() {
+        // `healthy.jsonl` has no `cwd` → excluded at discovery (R10b) even with
+        // every include flag set; only the cwd-bearing `real-corrupted.jsonl`
+        // (itself untitled-if-you-squint but DOES have a title) surfaces here.
+        // (See `r10b_cwdless_repair_fixture_never_surfaces_under_any_flags`
+        // below for the dedicated pin of the never-surfaces behavior.)
         let home = claude_home_with(&["real-corrupted.jsonl", "healthy.jsonl"]);
         let items = list_claude_sessions(&claude_home(&home));
         let q = DirQuery {
@@ -519,10 +652,45 @@ mod tests {
         };
         let page = apply_query(items, &q).unwrap();
         let arr = page["items"].as_array().unwrap();
-        assert_eq!(arr.len(), 2);
-        // Sorted lastActivityAt DESC: real-corrupted (…759_234) before healthy (…205_000).
+        assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["sessionId"], json!("b7936c10-4935-441c-837c-c1f33cafec2d"));
-        assert_eq!(arr[1]["sessionId"], json!("healthy"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn r10b_cwdless_repair_fixture_never_surfaces_under_any_flags() {
+        // Byte-matched against a live probe of the ORIGINAL: seeding
+        // `healthy.jsonl` (renamed to a canonical UUID filename, exactly as
+        // `port/oracle/rest-parity/sweep.mjs#seedClaudeSessions` does) and
+        // querying with every include flag set still returns `items:[]` — the
+        // file is never indexed (`session-indexer.ts:756,1124`:
+        // `if (!meta.cwd) continue`), not merely hidden by a visibility filter.
+        let home = std::env::temp_dir().join(format!(
+            "freshell-r10b-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let project = home.join(".claude").join("projects").join("-home-qa-demo");
+        std::fs::create_dir_all(&project).unwrap();
+        let content = std::fs::read_to_string(fixtures_dir().join("healthy.jsonl")).unwrap();
+        std::fs::write(
+            project.join("11111111-1111-4111-8111-111111111111.jsonl"),
+            content,
+        )
+        .unwrap();
+
+        let items = list_claude_sessions(&claude_home(&home));
+        assert!(items.is_empty(), "a cwd-less session must never be indexed");
+
+        let q = DirQuery {
+            include_subagents: true,
+            include_non_interactive: true,
+            include_empty: true,
+            ..DirQuery::default()
+        };
+        let page = apply_query(items, &q).unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 0);
+        assert_eq!(page["revision"], json!(0));
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -601,5 +769,145 @@ mod tests {
     fn missing_home_projects_yields_empty_list() {
         let items = list_claude_sessions(Path::new("/nonexistent-claude-home-xyz"));
         assert!(items.is_empty());
+    }
+
+    // ── R9: query validation (byte-matched against a live probe of the ── //
+    // ── ORIGINAL: `node dist/server/index.js`, zod v4 `safeParse` shapes) //
+
+    fn q(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn missing_priority_is_400_invalid_value() {
+        let err = validate_query(&q(&[])).unwrap_err();
+        assert_eq!(
+            err,
+            json!([{
+                "code": "invalid_value",
+                "values": ["visible", "background"],
+                "path": ["priority"],
+                "message": "Invalid option: expected one of \"visible\"|\"background\"",
+            }])
+        );
+    }
+
+    #[test]
+    fn bogus_priority_is_400_same_shape_as_missing() {
+        let err = validate_query(&q(&[("priority", "bogus")])).unwrap_err();
+        assert_eq!(
+            err,
+            json!([{
+                "code": "invalid_value",
+                "values": ["visible", "background"],
+                "path": ["priority"],
+                "message": "Invalid option: expected one of \"visible\"|\"background\"",
+            }])
+        );
+    }
+
+    #[test]
+    fn valid_priorities_are_accepted() {
+        assert!(validate_query(&q(&[("priority", "visible")])).is_ok());
+        assert!(validate_query(&q(&[("priority", "background")])).is_ok());
+    }
+
+    #[test]
+    fn non_numeric_limit_is_400_invalid_type_nan() {
+        let err = validate_query(&q(&[("priority", "visible"), ("limit", "abc")])).unwrap_err();
+        assert_eq!(
+            err,
+            json!([{
+                "expected": "number",
+                "code": "invalid_type",
+                "received": "NaN",
+                "path": ["limit"],
+                "message": "Invalid input: expected number, received NaN",
+            }])
+        );
+    }
+
+    #[test]
+    fn empty_limit_string_js_coerces_to_zero_then_too_small() {
+        // `Number('')` === 0 in JS, not NaN \u2014 the ORIGINAL's coercion (verified live).
+        let err = validate_query(&q(&[("priority", "visible"), ("limit", "")])).unwrap_err();
+        assert_eq!(err[0]["code"], json!("too_small"));
+    }
+
+    #[test]
+    fn zero_and_negative_limit_are_too_small() {
+        for bad in ["0", "-1"] {
+            let err = validate_query(&q(&[("priority", "visible"), ("limit", bad)])).unwrap_err();
+            assert_eq!(
+                err,
+                json!([{
+                    "origin": "number",
+                    "code": "too_small",
+                    "minimum": 0,
+                    "inclusive": false,
+                    "path": ["limit"],
+                    "message": "Too small: expected number to be >0",
+                }]),
+                "limit={bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversize_limit_is_too_big() {
+        let err = validate_query(&q(&[("priority", "visible"), ("limit", "51")])).unwrap_err();
+        assert_eq!(
+            err,
+            json!([{
+                "origin": "number",
+                "code": "too_big",
+                "maximum": 50,
+                "inclusive": true,
+                "path": ["limit"],
+                "message": "Too big: expected number to be <=50",
+            }])
+        );
+    }
+
+    #[test]
+    fn fractional_limit_is_invalid_int() {
+        let err = validate_query(&q(&[("priority", "visible"), ("limit", "1.5")])).unwrap_err();
+        assert_eq!(
+            err,
+            json!([{
+                "expected": "int",
+                "format": "safeint",
+                "code": "invalid_type",
+                "path": ["limit"],
+                "message": "Invalid input: expected int, received number",
+            }])
+        );
+    }
+
+    #[test]
+    fn boundary_limit_values_are_accepted() {
+        assert!(validate_query(&q(&[("priority", "visible"), ("limit", "1")])).is_ok());
+        assert!(validate_query(&q(&[("priority", "visible"), ("limit", "50")])).is_ok());
+    }
+
+    #[test]
+    fn multiple_violations_collect_into_one_details_array_priority_then_limit() {
+        // Verified live: zod's safeParse reports ALL violated fields, in
+        // declaration order (priority before limit).
+        let err = validate_query(&q(&[("priority", "bogus"), ("limit", "abc")])).unwrap_err();
+        let arr = err.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["path"], json!(["priority"]));
+        assert_eq!(arr[1]["path"], json!(["limit"]));
+    }
+
+    #[test]
+    fn badcursor_still_400s_with_original_message_r9_parity_untouched() {
+        // R9 only tightened priority/limit; the pre-existing cursor 400 (already
+        // parity, S1-only) must be unaffected.
+        let query = validate_query(&q(&[("priority", "visible"), ("cursor", "!!!not-base64!!!")]))
+            .unwrap();
+        let err = apply_query(Vec::new(), &query).unwrap_err();
+        assert!(err.to_lowercase().contains("cursor"));
     }
 }

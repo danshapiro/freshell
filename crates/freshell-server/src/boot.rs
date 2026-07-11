@@ -36,23 +36,26 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Path as AxumPath, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use freshell_protocol::ServerSettings;
 use serde_json::{json, Value};
+
+use crate::settings_store::SettingsStore;
 
 /// Shared, cheaply-cloneable state for the boot REST surface.
 #[derive(Clone)]
 pub struct BootState {
     /// The required auth token (`AUTH_TOKEN`) — the gate for every route here.
     pub auth_token: Arc<String>,
-    /// The server-settings tree returned by `GET /api/settings` and embedded in
-    /// the `bootstrap` payload's `settings` field.
-    pub settings: Arc<ServerSettings>,
+    /// The LIVE server-settings store (R2): embedded in the `bootstrap` payload's
+    /// `settings` field. `GET /api/settings` itself now lives in
+    /// `settings_store::router` (merged separately in `main.rs`), so the settings
+    /// state here is read-only from this module's point of view.
+    pub settings: SettingsStore,
     /// The precomputed platform payload
     /// (`{ platform, availableClis, hostName, featureFlags }`) shared by
     /// `GET /api/platform` and `bootstrap.platform`.
@@ -68,6 +71,10 @@ pub struct BootState {
     /// `GET /api/extensions` (Follow-up 3.19) so the SPA's picker knows the real
     /// CLI agents. Precomputed at boot (immutable for the process life).
     pub extensions: std::sync::Arc<Vec<Value>>,
+    /// R5: the live GitHub-release update checker backing `GET /api/version`'s
+    /// `updateCheck` field (`crate::updater`). Cloneable (an `Arc`-backed cache
+    /// inside), shared across every request.
+    pub update_checker: crate::updater::UpdateChecker,
 }
 
 /// The boot REST sub-router, pre-bound to its state (mergeable into the app).
@@ -79,9 +86,9 @@ pub fn router(state: BootState) -> Router {
         .route("/api/bootstrap", get(bootstrap))
         .route("/api/platform", get(platform))
         .route("/api/version", get(version))
-        .route("/api/settings", get(get_settings))
         .route("/api/terminals", get(terminals))
         .route("/api/extensions", get(extensions))
+        .route("/api/extensions/{name}", get(extension_by_name))
         .route("/api/logs/client", post(logs_client))
         .route("/api/tabs-sync/client-retire", post(tabs_sync_client_retire))
         .with_state(state)
@@ -94,12 +101,38 @@ async fn bootstrap(State(state): State<BootState>, headers: HeaderMap) -> Respon
     if !is_authed(&headers, &state.auth_token) {
         return unauthorized();
     }
+    let settings = state.settings.get().await;
     Json(json!({
-        "settings": &*state.settings,
+        "settings": settings,
         "platform": &*state.platform,
         "shell": { "authenticated": true },
     }))
     .into_response()
+}
+
+/// `GET /api/extensions/:name` \u2192 the single `ClientExtensionEntry` (R6). A
+/// missing extension is `404 {"error":"Extension not found: '<name>'"}`, byte-
+/// matching `extension-routes.ts:20-24`.
+async fn extension_by_name(
+    State(state): State<BootState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return unauthorized();
+    }
+    match state
+        .extensions
+        .iter()
+        .find(|e| e.get("name").and_then(Value::as_str) == Some(name.as_str()))
+    {
+        Some(entry) => Json(entry.clone()).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("Extension not found: '{name}'") })),
+        )
+            .into_response(),
+    }
 }
 
 /// `GET /api/platform` → `{ platform, availableClis, hostName, featureFlags }`.
@@ -115,15 +148,11 @@ async fn version(State(state): State<BootState>, headers: HeaderMap) -> Response
     if !is_authed(&headers, &state.auth_token) {
         return unauthorized();
     }
-    Json(json!({ "currentVersion": &*state.app_version, "updateCheck": null })).into_response()
-}
-
-/// `GET /api/settings` → the full `ServerSettings` tree (`configStore.getSettings()`).
-async fn get_settings(State(state): State<BootState>, headers: HeaderMap) -> Response {
-    if !is_authed(&headers, &state.auth_token) {
-        return unauthorized();
-    }
-    Json(&*state.settings).into_response()
+    // R5: a LIVE GitHub update check (`crate::updater`), not a static `null` \u2014
+    // verified against the ORIGINAL in this environment (real internet egress).
+    let update_check = state.update_checker.check(&state.app_version).await;
+    Json(json!({ "currentVersion": &*state.app_version, "updateCheck": update_check }))
+        .into_response()
 }
 
 /// `GET /api/terminals` → the terminal directory. Empty array on a clean boot

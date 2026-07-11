@@ -935,6 +935,23 @@ async function main() {
     try {
       await obsNode.connect()
       await obsRust.connect()
+      // RULING 3(a) — antagonist adjudication
+      // `0000000000000000-dc849de1bd584a39_self-driving-reviewer` (2026-07-11):
+      // `connect()` resolves as soon as the `ready` frame lands, but each side's
+      // OWN post-hello handshake snapshot still emits a `settings.updated` frame
+      // shortly after — asynchronously, not yet guaranteed to have arrived. A
+      // `clear()` issued immediately after `connect()` therefore raced that
+      // still-in-flight snapshot: if it landed in the buffer AFTER the clear
+      // (and before/alongside the PUT-triggered broadcast), the `.put` row's
+      // `waitForType('settings.updated')` could return the stale handshake
+      // snapshot instead of the PUT-triggered one — a handshake-vs-broadcast
+      // lottery. Fix (mirrors the `.patch` row's protocol, which only clears
+      // AFTER the prior expected frame has been explicitly consumed): wait for
+      // and consume each side's handshake `settings.updated` HERE, so the
+      // `clear()` below is draining a frame we know already arrived, not
+      // racing one still in flight. This makes the `.put` row's broadcast
+      // capture deterministic.
+      await Promise.all([obsNode.waitForType('settings.updated'), obsRust.waitForType('settings.updated')])
       broadcastReady = true
     } catch (err) {
       recordDeferred(

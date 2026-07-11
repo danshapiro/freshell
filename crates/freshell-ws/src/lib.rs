@@ -215,6 +215,7 @@ async fn handle_socket(mut socket: WebSocket, state: WsState) {
         HelloOutcome::Accept => {}
         HelloOutcome::NotHello => {
             let _ = send_error(&mut socket, ErrorCode::NotAuthenticated, "Send hello first").await;
+            let _ = close_with(&mut socket, CLOSE_NOT_AUTHENTICATED, "Invalid token").await;
             return;
         }
         HelloOutcome::ProtocolMismatch => {
@@ -222,10 +223,17 @@ async fn handle_socket(mut socket: WebSocket, state: WsState) {
                 "Expected protocol version {WS_PROTOCOL_VERSION}. Please reload the page."
             );
             let _ = send_error(&mut socket, ErrorCode::ProtocolMismatch, &msg).await;
+            // S3: the original closes with a real WS close frame (code 4010,
+            // reason "Protocol version mismatch") \u2014 without it the client only
+            // observes an abnormal 1006 closure.
+            let _ = close_with(&mut socket, CLOSE_PROTOCOL_MISMATCH, "Protocol version mismatch").await;
             return;
         }
         HelloOutcome::BadToken => {
             let _ = send_error(&mut socket, ErrorCode::NotAuthenticated, "Invalid token").await;
+            // S3: covers both a wrong AND a missing token (both evaluate to
+            // `BadToken`) \u2014 the original closes 4001 "Invalid token" in both cases.
+            let _ = close_with(&mut socket, CLOSE_NOT_AUTHENTICATED, "Invalid token").await;
             return;
         }
     }
@@ -271,6 +279,25 @@ async fn handle_socket(mut socket: WebSocket, state: WsState) {
     if ui_screenshot_v1 {
         state.screenshots.remove_capable_client();
     }
+}
+
+/// WS close codes (`ws-handler.ts`'s `CLOSE_CODES`). S3: the original always
+/// follows an auth/protocol reject error frame with a real close frame carrying
+/// one of these codes + a short reason; the port previously just dropped the
+/// connection, which a client observes as an abnormal `1006` closure.
+const CLOSE_NOT_AUTHENTICATED: u16 = 4001;
+const CLOSE_PROTOCOL_MISMATCH: u16 = 4010;
+
+/// Send a WS close frame with the given code/reason, best-effort (the socket
+/// may already be gone).
+async fn close_with(socket: &mut WebSocket, code: u16, reason: &'static str) -> Result<(), axum::Error> {
+    use axum::extract::ws::CloseFrame;
+    socket
+        .send(Message::Close(Some(CloseFrame {
+            code,
+            reason: reason.into(),
+        })))
+        .await
 }
 
 /// Best-effort structured error (used only on the non-graded reject paths). The

@@ -3,14 +3,18 @@
 //!
 //! * serve any real file under `dist/client` (index.html, `/assets/*`, icons,
 //!   manifest, favicon) with the same cache policy the original applies;
-//! * a missing `/assets/*` asset → `404` (never the SPA shell — a stale hashed
+//! * a missing `/assets/*` asset \u2192 `404` (never the SPA shell \u2014 a stale hashed
 //!   asset must fail loudly, not silently resolve to index.html);
-//! * every other unmatched path → `index.html` (the SPA client-router entry),
+//! * every other unmatched path \u2192 `index.html` (the SPA client-router entry),
 //!   served `no-store`.
 //!
-//! Unmatched `/api/*` requests get a clean `404 {error}` JSON here (mirroring the
-//! original's `app.use('/api', 404)` guard that sits before the SPA fallback), so
-//! an unimplemented endpoint never returns the HTML shell to a `fetch()` caller.
+//! Unmatched `/api/*` requests are gated by the SAME auth check the original
+//! applies BEFORE routing (`app.use('/api', httpAuthMiddleware)` \u2014
+//! `server/index.ts:173` \u2014 runs ahead of every `/api` route, including the
+//! catch-all 404 at `server/index.ts:667`): an unauthenticated unmatched `/api/*`
+//! request is `401`, never a `404` that would disclose route existence (R12).
+//! An authenticated unmatched `/api/*` request still gets a clean `404 {error}`
+//! JSON here, never the HTML shell.
 //!
 //! Hand-rolled (no new crate deps) so the build stays hermetic; the content-type
 //! and cache-header tables below cover Vite's output surface.
@@ -20,24 +24,34 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    http::{header, HeaderValue, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
 };
 
 /// The axum fallback: resolve a request to a static file, the SPA shell, or a
-/// clean 404 (for `/api/*` and missing hashed assets).
-pub async fn serve(uri: Uri, client_dir: Arc<PathBuf>) -> Response {
+/// clean 404/401 (for `/api/*` and missing hashed assets).
+pub async fn serve(
+    uri: Uri,
+    headers: HeaderMap,
+    client_dir: Arc<PathBuf>,
+    auth_token: Arc<String>,
+) -> Response {
     let raw_path = uri.path();
 
-    // Unmatched /api/* (and bare /api) → clean 404 JSON, never the SPA shell.
+    // Unmatched /api/* (and bare /api): auth gate FIRST (R12), matching the
+    // original's `app.use('/api', httpAuthMiddleware)` running ahead of the
+    // catch-all 404 \u2014 an unauthenticated caller never learns the route is missing.
     if raw_path == "/api" || raw_path.starts_with("/api/") {
+        if !crate::boot::is_authed(&headers, &auth_token) {
+            return crate::boot::unauthorized();
+        }
         return not_found_json();
     }
 
     let index = client_dir.join("index.html");
     let rel = sanitize_path(raw_path);
 
-    // Root → the SPA entry.
+    // Root \u2192 the SPA entry.
     if rel.as_os_str().is_empty() {
         return serve_index(&index).await;
     }
@@ -85,7 +99,9 @@ async fn serve_index(index: &Path) -> Response {
         Ok(bytes) => {
             let mut response = (StatusCode::OK, bytes).into_response();
             let h = response.headers_mut();
-            h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+            // S2: Express's `res.type('html')` / `sendFile` reports the charset in
+            // UPPERCASE (`UTF-8`) for the SPA shell \u2014 byte-match it exactly.
+            h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=UTF-8"));
             set_no_store(h);
             response
         }
@@ -114,7 +130,7 @@ fn file_response(rel: &Path, bytes: Vec<u8>) -> Response {
     if file_name == "index.html" {
         set_no_store(h);
     } else if is_hashed_asset(rel) {
-        // Vite content-hashes everything under /assets/ → safe to cache forever.
+        // Vite content-hashes everything under /assets/ \u2192 safe to cache forever.
         h.insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("public, max-age=31536000, immutable"),
@@ -160,10 +176,14 @@ fn extension(rel: &Path) -> &str {
 }
 
 /// Map a file extension to a content-type covering Vite's output surface.
+///
+/// S2: `.js`/`.mjs` match Express's `mime`-package default of
+/// `application/javascript` (not `text/javascript`), and the HTML shell's
+/// charset casing is `UTF-8` (uppercase) to byte-match the original.
 fn content_type(rel: &Path) -> &'static str {
     match extension(rel) {
-        "html" => "text/html; charset=utf-8",
-        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "html" => "text/html; charset=UTF-8",
+        "js" | "mjs" => "application/javascript; charset=UTF-8",
         "css" => "text/css; charset=utf-8",
         "json" | "map" => "application/json; charset=utf-8",
         "webmanifest" => "application/manifest+json; charset=utf-8",
@@ -182,7 +202,8 @@ fn content_type(rel: &Path) -> &'static str {
     }
 }
 
-/// Clean JSON 404 for unmatched `/api/*` (mirrors `res.status(404).json`).
+/// Clean JSON 404 for an authenticated unmatched `/api/*` (mirrors
+/// `res.status(404).json`).
 fn not_found_json() -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -192,9 +213,16 @@ fn not_found_json() -> Response {
         .into_response()
 }
 
-/// Plain 404 for a missing static/asset file.
+/// Plain 404 for a missing static/asset file. S2: Express's default
+/// `res.status(404).send('Not found')` reports `text/html; charset=utf-8`
+/// (lowercase, connect's plain-text-as-html default) \u2014 NOT `text/plain`.
 fn not_found_plain() -> Response {
-    (StatusCode::NOT_FOUND, "Not found").into_response()
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        Body::from("Not found"),
+    )
+        .into_response()
 }
 
 /// Minimal `%XX` percent-decoder for request-path segments. Invalid escapes pass
@@ -243,8 +271,8 @@ mod tests {
 
     #[test]
     fn content_types_cover_bundle_surface() {
-        assert_eq!(content_type(Path::new("index.html")), "text/html; charset=utf-8");
-        assert_eq!(content_type(Path::new("assets/x.js")), "text/javascript; charset=utf-8");
+        assert_eq!(content_type(Path::new("index.html")), "text/html; charset=UTF-8");
+        assert_eq!(content_type(Path::new("assets/x.js")), "application/javascript; charset=UTF-8");
         assert_eq!(content_type(Path::new("assets/x.css")), "text/css; charset=utf-8");
         assert_eq!(content_type(Path::new("manifest.webmanifest")), "application/manifest+json; charset=utf-8");
         assert_eq!(content_type(Path::new("favicon.ico")), "image/x-icon");
@@ -255,5 +283,41 @@ mod tests {
     fn percent_decode_paths() {
         assert_eq!(percent_decode("a%20b"), "a b");
         assert_eq!(percent_decode("plain.js"), "plain.js");
+    }
+
+    #[tokio::test]
+    async fn unmatched_api_route_without_auth_is_401_not_404() {
+        // R12: the auth gate must run BEFORE the unmatched-route 404, matching the
+        // original's `app.use('/api', httpAuthMiddleware)` ordering.
+        let dir = Arc::new(std::env::temp_dir());
+        let auth = Arc::new("s3cr3t".to_string());
+        let resp = serve(
+            Uri::from_static("/api/definitely-not-a-route"),
+            HeaderMap::new(),
+            dir,
+            auth,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn unmatched_api_route_with_auth_is_404_json() {
+        let dir = Arc::new(std::env::temp_dir());
+        let auth = Arc::new("s3cr3t".to_string());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-token", "s3cr3t".parse().unwrap());
+        let resp = serve(
+            Uri::from_static("/api/definitely-not-a-route"),
+            headers,
+            dir,
+            auth,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json; charset=utf-8"
+        );
     }
 }

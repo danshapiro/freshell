@@ -421,6 +421,43 @@ independent of the live original's later drift. Only the live-original cross-che
 and only for lowercase-bearing scenarios (`seq-3`/`fixed-width-fill` still match exactly, proving the wire
 path itself is intact).
 
+### DEV-0004 — updater's live GitHub update-check gets a 5s bounded timeout (original's fetch is unbounded)
+
+- **objective_defect:** *breaks an invariant the code itself asserts* — same bar as DEV-0001's
+  un-timed health probe. The original's `GET /api/version` handler resolves `updateCheck` via
+  `server/updater/version-checker.ts`'s `checkForUpdate`, which calls the bare Node `fetch()`
+  against `https://api.github.com/repos/danshapiro/freshell/releases/latest` with **no timeout,
+  no `AbortController`, no bound of any kind**. A slow or hung GitHub API (or a captive-portal/
+  DNS-blackhole network) therefore blocks that request indefinitely, and — because
+  `/api/version` awaits it inline — hangs the whole `/api/version` response with it. This is the
+  identical bounded-wait defect class DEV-0001 already accepted: an un-timed network fetch on a
+  path the caller expects to complete, breaking any bounded-wait expectation and risking an
+  indefinite hang under real-world network conditions.
+- **original_behavior:** `checkForUpdate` issues one un-timed `fetch()` to the GitHub releases
+  API; a slow/unreachable GitHub blocks the call (and `/api/version`) with no upper bound.
+- **port_behavior:** `crates/freshell-server/src/updater.rs`'s `check_for_update_live` issues the
+  same GitHub call via `reqwest`, with `.timeout(REQUEST_TIMEOUT)` where
+  `REQUEST_TIMEOUT = Duration::from_secs(5)` (`updater.rs:33`). On timeout/any transport error the
+  call degrades to the same `UpdateCheckResult` shape with a populated `error` string (never a
+  panic, never a hang) instead of blocking `/api/version`. A successful result is cached for 10
+  minutes, success-only (`UpdateChecker::check`, `updater.rs:171-193` — an errored check is never
+  cached, so a transient failure is retried on the very next request, matching the original's
+  `createCachedUpdateChecker`, `version-checker.ts:80-99`).
+- **fingerprint:** REST-parity sweep, `version.happy`/`version.cookie-auth` rows — timing-only:
+  the differ tolerates the port completing (bounded, ≤5s) where the original could in principle
+  hang; the `updateCheck` VALUES themselves (`updateAvailable`/`currentVersion`/`latestVersion`/
+  `releaseUrl`/`error`) are still compared byte-for-byte (this is R5's fix, not a value-masking
+  deviation — `updateCheck` is already registered `opaque` in the sweep's normalization list for
+  the live-network-data reason, unrelated to this timeout).
+- **pinning_test:** `crates/freshell-server/src/updater.rs`'s `updater::tests` module — `request_timeout_is_bounded_at_five_seconds`
+  (pins the bound itself, deterministic/network-free) plus
+  `unreachable_host_degrades_to_error_field_not_panic` (asserts the degrade-to-`error`-field shape,
+  never a panic/hang) and `cache_reuses_result_within_ttl_for_same_version` (the success-only
+  cache). All three existed or were extended for this entry; verified present and passing.
+- **adjudicated_by:** antagonist-reviewer session
+  `0000000000000000-dc849de1bd584a39_self-driving-reviewer`, 2026-07-11.
+- **status:** accepted.
+
 <!--
 Template:
 

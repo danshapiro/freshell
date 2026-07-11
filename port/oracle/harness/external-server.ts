@@ -86,6 +86,18 @@ export interface StartExternalServerOptions {
    * lazily spawns any coding-CLI sidecars). Used by T2 to seed provider auth.
    */
   setupHome?: (homeDir: string) => Promise<void>
+  /**
+   * RULING 2 (antagonist adjudication
+   * `0000000000000000-dc849de1bd584a39_self-driving-reviewer`, 2026-07-11):
+   * comparator bite-proof support. Defaults to `'isolated'` (the T0 cwd-parity
+   * fix from RULING 1: an isolated scratch root with no `extensions/` dir, for
+   * BOTH targets). Pass `'project'` to instead boot from the real checkout
+   * (`PROJECT_ROOT`) on BOTH targets, so a non-empty `extensions/` dir is
+   * genuinely discovered by both — used by the
+   * `t0-known-providers-discovery-rust` rot-guard case to prove the comparator
+   * still catches a real `knownProviders` divergence.
+   */
+  cwdMode?: 'isolated' | 'project'
 }
 
 export function serverEntryPath(root: string = PROJECT_ROOT): string {
@@ -180,6 +192,40 @@ function resolveTarget(options: StartExternalServerOptions): OracleTarget {
 }
 
 /**
+ * T0 harness cwd-parity fix (RULING 1, antagonist adjudication
+ * `0000000000000000-dc849de1bd584a39_self-driving-reviewer`, 2026-07-11):
+ * `startRustServer` used to spawn the rust binary with `cwd: PROJECT_ROOT`
+ * (the real checkout, whose real `extensions/` dir it faithfully discovers),
+ * while `startNodeServer` boots the original through `TestServer`
+ * (`test-server.ts`'s `createIsolatedRuntimeRoot`), which spawns from an
+ * ISOLATED mkdtemp root containing only `package.json` + `dist/` (no
+ * `extensions/`). That asymmetry made T0 case (c) spuriously diverge on
+ * `codingCli.knownProviders` (rust saw real extensions/, node's isolated root
+ * never has any). This mirrors `createIsolatedRuntimeRoot` byte-for-byte so
+ * both targets get the SAME cwd semantics: an isolated scratch root with no
+ * `extensions/` dir, so both report `knownProviders: []` in the T0 harness.
+ * (The REST-parity sweep is unaffected: its recipe boots both servers with
+ * `cwd = checkout` by design, so both still see the real extensions there.)
+ */
+async function createIsolatedRustRuntimeRoot(): Promise<string> {
+  ensureServerBuilt() // require dist/ to exist, mirroring test-server.ts's requireBuiltServerEntry
+  const runtimeRootsParent = path.join(PROJECT_ROOT, '.worktrees')
+  await fsp.mkdir(runtimeRootsParent, { recursive: true })
+  const runtimeRoot = await fsp.mkdtemp(path.join(runtimeRootsParent, 'oracle-rust-runtime-'))
+  try {
+    await fsp.copyFile(path.join(PROJECT_ROOT, 'package.json'), path.join(runtimeRoot, 'package.json'))
+    await fsp.cp(path.join(PROJECT_ROOT, 'dist'), path.join(runtimeRoot, 'dist'), {
+      recursive: true,
+      filter: (source) => path.basename(source) !== '.env',
+    })
+    return runtimeRoot
+  } catch (error) {
+    await fsp.rm(runtimeRoot, { recursive: true, force: true }).catch(() => {})
+    throw error
+  }
+}
+
+/**
  * Boot the freshell server (original OR Rust port) as an isolated external
  * process and return a handle for driving + reaping it.
  */
@@ -211,7 +257,11 @@ async function startNodeServer(
 
   const server = new TestServer({
     authStrategy: 'explicit-env',
-    runtimeRootMode: 'isolated',
+    // RULING 2 (adjudication `...dc849de1bd584a39_self-driving-reviewer`,
+    // 2026-07-11): default 'isolated' (RULING 1's T0 cwd-parity fix); the
+    // rot-guard case opts into 'project' on BOTH targets so a real non-empty
+    // extensions/ dir is genuinely discovered by both sides.
+    runtimeRootMode: options.cwdMode === 'project' ? 'project' : 'isolated',
     startTimeoutMs: options.startTimeoutMs ?? 60_000,
     verbose: options.verbose ?? false,
     ...(options.setupHome ? { setupHome: options.setupHome } : {}),
@@ -271,6 +321,14 @@ async function startRustServer(
   sentinelPath: string,
 ): Promise<ExternalServerHandle> {
   const bin = ensureRustServerBuilt()
+  // RULING 1 (see createIsolatedRustRuntimeRoot doc comment above): spawn from
+  // an isolated scratch root, matching startNodeServer's isolated runtimeRoot,
+  // instead of the real checkout (cwd parity for T0). RULING 2: `cwdMode:
+  // 'project'` opts BOTH targets into the real checkout instead, for the
+  // rot-guard case that needs a genuinely non-empty extensions/ dir.
+  const runtimeRoot =
+    options.cwdMode === 'project' ? PROJECT_ROOT : await createIsolatedRustRuntimeRoot()
+  const ownsRuntimeRoot = options.cwdMode !== 'project'
 
   const port = options.env?.PORT ? Number(options.env.PORT) : await findFreePort()
   const token = randomUUID()
@@ -312,7 +370,7 @@ async function startRustServer(
   )
 
   const child: ChildProcess = spawn(bin, [], {
-    cwd: PROJECT_ROOT,
+    cwd: runtimeRoot,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -336,6 +394,11 @@ async function startRustServer(
   const cleanupHomes = async () => {
     await fsp.rm(homeDir, { recursive: true, force: true }).catch(() => {})
     await fsp.rm(probeHome, { recursive: true, force: true }).catch(() => {})
+    // RULING 1: clean up the isolated runtime root alongside homeDir/probeHome.
+    // RULING 2: never remove PROJECT_ROOT itself (cwdMode:'project' reuses it).
+    if (ownsRuntimeRoot) {
+      await fsp.rm(runtimeRoot, { recursive: true, force: true }).catch(() => {})
+    }
   }
 
   let stopped = false

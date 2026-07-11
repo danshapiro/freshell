@@ -193,6 +193,23 @@ impl ExtensionRegistry {
             .collect()
     }
 
+    /// The names of GENUINELY discovered CLI extension manifests -- NO
+    /// [`DEFAULT_CLI_DETECTION_SPECS`] fallback. This is the source for
+    /// `codingCli.knownProviders` (settings tree): the original seeds
+    /// `knownProviders` strictly from discovered extension manifests
+    /// (`server/index.ts:276-294`), genuinely empty when none are found --
+    /// unlike `availableClis` detection, which DOES fall back to a built-in
+    /// CLI set for probing. Conflating the two made the port's `knownProviders`
+    /// non-empty in environments where the original's is empty (verified: T0
+    /// handshake `settings.updated` diverged on this before the fix).
+    pub fn discovered_cli_names(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|e| e.manifest.category == "cli" && e.manifest.cli.is_some())
+            .map(|e| e.manifest.name.clone())
+            .collect()
+    }
+
     /// Build CLI detection specs from the CLI extensions (`server/index.ts:257-264`).
     /// Falls back to [`DEFAULT_CLI_DETECTION_SPECS`] when no CLI extension is present
     /// (mirrors `detectAvailableClis`'s default parameter).

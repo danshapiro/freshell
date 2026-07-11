@@ -25,6 +25,8 @@ mod screenshots;
 mod serve_client;
 mod session_directory;
 mod settings;
+mod settings_store;
+mod updater;
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -38,7 +40,6 @@ use freshell_ws::WsState;
 use uuid::Uuid;
 
 use crate::boot::BootState;
-use crate::settings::load_server_settings;
 
 /// App version reported by `GET /api/version` (mirrors `package.json` `version`).
 /// Overridable via `FRESHELL_APP_VERSION` for parity when a run needs it.
@@ -81,7 +82,41 @@ async fn main() -> ExitCode {
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     );
 
-    let settings = Arc::new(load_server_settings(home.as_deref()));
+    // R2/R3/R4 root-cause fix: a single LIVE settings store, not a boot-time
+    // snapshot. `known_providers` is discovered here (cheap early scan; the full
+    // `extension_registry` below reuses the same read-only directory walk) so
+    // `codingCli.knownProviders` is never `[]` (R4).
+    // R4/T0 fix: `knownProviders` must reflect ONLY genuinely-discovered
+    // extension manifests (empty when none are found), NOT
+    // `cli_detection_specs()`'s built-in-CLI-set fallback (that fallback is
+    // correct for `availableClis` PROBING below, but conflating the two made
+    // `knownProviders` non-empty in environments where the original's is
+    // genuinely empty -- caught by the T0 handshake equivalence test).
+    // `knownProviders` uses ONLY cwd/home-relative dirs (`userExtDir`,
+    // `localExtDir`, `builtinExtDir` -- ALL `process.cwd()`/home relative in
+    // the original, `server/index.ts:225-227`; no compiled-in path). Unlike
+    // `resolve_extension_dirs`'s baked-in `CARGO_MANIFEST_DIR` dev/test
+    // fallback (used below for `availableClis` probing, where a fallback to
+    // a default CLI set is itself faithful, `platform.ts:97-103`), a
+    // knownProviders derivation MUST see genuine emptiness when no
+    // `<cwd>/extensions` exists, or it diverges from the original whenever
+    // the process cwd isn't the repo checkout (caught by the T0 handshake
+    // equivalence test).
+    let known_provider_dirs: Vec<std::path::PathBuf> = {
+        let mut dirs = Vec::new();
+        if let Some(h) = home.as_deref() {
+            dirs.push(h.join(".freshell").join("extensions"));
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            dirs.push(cwd.join(".freshell").join("extensions"));
+            dirs.push(cwd.join("extensions"));
+        }
+        dirs
+    };
+    let known_providers: Vec<String> =
+        extensions::ExtensionRegistry::scan(&known_provider_dirs).discovered_cli_names();
+    let settings_store = settings_store::SettingsStore::load(home.as_deref(), known_providers);
+    let settings = Arc::new(settings_store.get().await);
 
     // The shared server→client broadcast bus (pre-serialized frames). REST handlers
     // (fresh-agent create/send) push here; every `/ws` connection fans it out to its
@@ -182,13 +217,15 @@ async fn main() -> ExitCode {
     // and the resolved `dist/client` dir the SPA is served from.
     let boot_state = BootState {
         auth_token: Arc::clone(&auth_token),
-        settings: Arc::clone(&settings),
+        settings: settings_store.clone(),
         platform: Arc::new(build_platform_payload(available_clis)),
         // The SAME resolved version `GET /api/health` reports (shared above), so
         // `/api/version` `currentVersion` and health `version` never diverge.
         app_version: Arc::clone(&app_version),
         tabs: tabs.clone(),
         extensions: Arc::clone(&extensions_registry),
+        // R5: one shared live GitHub update-checker (its own internal cache).
+        update_checker: updater::UpdateChecker::new(),
     };
     // The read-only network status surface (`GET /api/network/status`, Follow-up
     // 3.19): the full `NetworkStatus` shape, with firewall/LAN facts detected
@@ -217,7 +254,7 @@ async fn main() -> ExitCode {
     // registry (for the running terminals' cwds).
     let files_state = files::FilesState {
         auth_token: Arc::clone(&auth_token),
-        settings: Arc::clone(&settings),
+        settings: settings_store.clone(),
         registry: registry.clone(),
     };
 
@@ -236,11 +273,21 @@ async fn main() -> ExitCode {
     // One axum app serving REST (`/api/health` + fresh-agent + `PATCH /api/settings`
     // + the SPA boot endpoints + files) + the WS upgrade (`/ws`) + static
     // `dist/client` with SPA-fallback routing. The fallback also returns a clean 404
+    // (or 401, matching the original's auth-first middleware ordering \u2014 R12)
     // for any unmatched `/api/*` (never the HTML shell), mirroring the original ordering.
+    let fallback_auth_token = Arc::clone(&auth_token);
     let app = freshell_api::router(api_state)
         .merge(freshell_ws::router(ws_state))
         .merge(freshell_freshagent::router(fresh_agent_state.clone()))
-        .merge(fresh_codex_state.settings_router())
+        // R1/R2/R3/R4: the ONE `/api/settings` router (GET+PATCH+PUT), backed by
+        // the live `settings_store` \u2014 replaces the old split between this boot
+        // module's frozen GET and the freshcodex slice's disconnected PATCH.
+        .merge(settings_store::router(settings_store::SettingsRouterState {
+            store: settings_store.clone(),
+            auth_token: Arc::clone(&auth_token),
+            broadcast_tx: Arc::clone(&broadcast_tx),
+            fresh_codex: fresh_codex_state.clone(),
+        }))
         .merge(boot::router(boot_state))
         .merge(network::router(network_state))
         .merge(session_directory::router(session_directory_state))
@@ -249,11 +296,18 @@ async fn main() -> ExitCode {
         .merge(screenshots::router(screenshots_state))
         .fallback({
             let client_dir = Arc::clone(&client_dir);
-            move |uri: axum::http::Uri| {
+            move |uri: axum::http::Uri, headers: axum::http::HeaderMap| {
                 let client_dir = Arc::clone(&client_dir);
-                async move { serve_client::serve(uri, client_dir).await }
+                let auth_token = Arc::clone(&fallback_auth_token);
+                async move { serve_client::serve(uri, headers, client_dir, auth_token).await }
             }
-        });
+        })
+        // S1: the original (Express `res.json`) always emits
+        // `application/json; charset=utf-8`; axum's `Json` extractor emits bare
+        // `application/json`. Normalize every plain-`application/json` response to
+        // the original's exact charset suffix, globally, so no individual handler
+        // has to remember it.
+        .layer(axum::middleware::map_response(ensure_json_charset));
 
     let ip: IpAddr = bind_host.parse().unwrap_or(IpAddr::from([127, 0, 0, 1]));
     let addr = SocketAddr::new(ip, port);
@@ -314,6 +368,30 @@ async fn shutdown_signal() {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
+}
+
+/// S1 fix: rewrite a bare `application/json` response Content-Type to the
+/// original's exact `application/json; charset=utf-8` (Express's `res.json`
+/// always emits the charset suffix; axum's `Json` extractor does not). Applied
+/// as a global response-mapping layer so no individual handler has to remember
+/// it. Idempotent: a response that already carries a charset (or isn't JSON at
+/// all, e.g. the SPA/static responses) passes through unchanged.
+async fn ensure_json_charset(
+    mut response: axum::response::Response,
+) -> axum::response::Response {
+    use axum::http::{header, HeaderValue};
+    let is_bare_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        == Some("application/json");
+    if is_bare_json {
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+    }
+    response
 }
 
 /// Resolve the port to bind. Mirrors `server/index.ts`: `PORT` env or 3001.

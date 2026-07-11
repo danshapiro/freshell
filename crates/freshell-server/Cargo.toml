@@ -40,10 +40,13 @@ serde_json = { workspace = true }
 # Boot-scoped identifiers: `srv-<uuidv4>` / `boot-<uuidv4>`.
 uuid = { version = "1", features = ["v4"] }
 # The browser-pane HTTP reverse proxy (`/api/proxy/http/{port}/*`) forwards to a
-# loopback target and streams the response back. `default-features = false`
-# (no TLS \u2014 loopback http only) + `stream` for the response byte stream. Same
-# config already vendored by freshell-opencode, so no new transitive download.
-reqwest = { version = "0.13", default-features = false, features = ["stream"] }
+# loopback target and streams the response back over plain HTTP (`stream`).
+# `rustls-tls` additionally backs the R5 `GET /api/version` live GitHub update
+# check (`updater.rs`), the one caller in this crate that needs real TLS
+# (`https://api.github.com`) -- `rustls-tls` (not `-no-provider`) so a crypto
+# provider (`ring`) is actually installed; see freshell-protocol's Cargo.toml
+# for the `rustls-tls-no-provider` hazard this deliberately avoids.
+reqwest = { version = "0.13", default-features = false, features = ["stream", "rustls"] }
 # Decode the base64 PNG the UI returns in `ui.screenshot.result` before writing it
 # (POST /api/screenshots). Already resolved in the workspace lock (no new download).
 base64 = "0.22"

@@ -83,15 +83,9 @@ async fn create_screenshot(
         return fail(StatusCode::BAD_REQUEST, "tabId required for tab scope");
     }
 
-    // No capable UI connected → 503 (the reference's NO_SCREENSHOT_CLIENT path).
-    if !state.broker.has_capable_client() {
-        return fail(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "No screenshot-capable UI client connected",
-        );
-    }
-
-    // Resolve the output path (`screenshot-path.ts`); a bad name/path is 400.
+    // R11: resolve/validate the output path and the no-overwrite conflict BEFORE
+    // checking for a capable UI client (the original validates request shape
+    // first; a malformed request must never be masked by a 503).
     let name = body.get("name").and_then(Value::as_str).unwrap_or("");
     let path_input = body.get("path").and_then(Value::as_str);
     let output_path = match resolve_screenshot_output_path(name, path_input) {
@@ -103,6 +97,14 @@ async fn create_screenshot(
         return fail(
             StatusCode::CONFLICT,
             "output file already exists (use --overwrite)",
+        );
+    }
+
+    // No capable UI connected → 503 (the reference's NO_SCREENSHOT_CLIENT path).
+    if !state.broker.has_capable_client() {
+        return fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No screenshot-capable UI client connected",
         );
     }
 

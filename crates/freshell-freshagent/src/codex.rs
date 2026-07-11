@@ -148,6 +148,15 @@ impl FreshCodexState {
         self.fresh_agent_enabled.load(Ordering::SeqCst)
     }
 
+    /// Set the `settings.freshAgent.enabled` gate directly. Called by the
+    /// consolidated `/api/settings` router (`freshell-server::settings_store`)
+    /// after every successful merge, so the codex create-gate reflects the ONE
+    /// live settings source of truth instead of this slice's own (now-unused
+    /// for HTTP purposes) internal settings copy.
+    pub fn set_enabled(&self, enabled: bool) {
+        self.fresh_agent_enabled.store(enabled, Ordering::SeqCst);
+    }
+
     /// Reap every owned codex app-server sidecar (SIGKILL child + `/proc` ownership sweep)
     /// and abort the consumer tasks. Called on server shutdown so no sidecar leaks.
     pub async fn shutdown(&self) {
