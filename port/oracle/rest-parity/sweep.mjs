@@ -1103,6 +1103,21 @@ async function main() {
     await runCase({ id: 'settings.patch.sandbox-off', group: 'settings', description: 'clear allowedFilePaths sandbox', method: 'PATCH', path: '/api/settings', auth: 'header', json: { allowedFilePaths: [] } })
     await runCase({ id: 'files.sandbox.cleared', group: 'files', description: 'outside path readable again', path: '/api/files/read?path=' + encodeURIComponent('~/outside.txt'), auth: 'header' })
 
+    // codingCli provider-name validation (allowlist = boot-discovered CLI
+    // extension names — the sweep boots both servers with cwd=repo, so the 5
+    // bundled extensions are the allowlist on BOTH sides) + knownProviders
+    // patch-wins semantics. Shapes/order pinned live 2026-07-12 (M/E battery,
+    // task-005e part 2).
+    await runCase({ id: 'settings.patch.provider-bogus', group: 'settings', description: '400 unknown CLI provider in enabledProviders (custom zod issue)', method: 'PATCH', path: '/api/settings', auth: 'header', json: { codingCli: { enabledProviders: ['claude', 'bogus'] } } })
+    await runCase({ id: 'settings.patch.provider-multi-issue', group: 'settings', description: '400 aggregated issues: enabledProviders → knownProviders → providers record key', method: 'PATCH', path: '/api/settings', auth: 'header', json: { codingCli: { enabledProviders: ['bogusA'], knownProviders: ['bogusB'], providers: { bogusC: {} } } } })
+    await runCase({ id: 'settings.patch.provider-mixed-types', group: 'settings', description: '400 per-item invalid_type + custom issues in item order', method: 'PATCH', path: '/api/settings', auth: 'header', json: { codingCli: { knownProviders: [42, 'bogus', 'claude'] } } })
+    await runCase({ id: 'settings.patch.provider-empty-string', group: 'settings', description: "400 '' yields too_small AND the custom allowlist issue", method: 'PATCH', path: '/api/settings', auth: 'header', json: { codingCli: { enabledProviders: [''] } } })
+    await runCase({ id: 'settings.patch.codingcli-strict', group: 'settings', description: '400 codingCli nested unrecognized key (strict sub-object)', method: 'PATCH', path: '/api/settings', auth: 'header', json: { codingCli: { zzz: 1 } } })
+    await runCase({ id: 'settings.patch.unknown-key-last', group: 'settings', description: '400 nested field issue first, top-level unrecognized_keys LAST', method: 'PATCH', path: '/api/settings', auth: 'header', json: { zzz: 1, codingCli: { enabledProviders: ['bogusA'] } } })
+    await runCase({ id: 'settings.patch.knownproviders-wins', group: 'settings', description: 'valid knownProviders PATCH replaces the persisted list (patch-wins, live-pinned)', method: 'PATCH', path: '/api/settings', auth: 'header', json: { codingCli: { knownProviders: ['claude'] } } })
+    await runCase({ id: 'settings.get.knownproviders-patched', group: 'settings', description: 'GET reflects the patched knownProviders', path: '/api/settings', auth: 'header' })
+    await runCase({ id: 'settings.patch.knownproviders-restore', group: 'settings', description: 'restore the full discovered knownProviders list', method: 'PATCH', path: '/api/settings', auth: 'header', json: { codingCli: { knownProviders: ['claude', 'codex', 'gemini', 'kimi', 'opencode'] } } })
+
     // config.json persisted shape (direct scratch-home read, normalized)
     const cfgNode = JSON.parse(await fsp.readFile(path.join(HOME_NODE, '.freshell', 'config.json'), 'utf8'))
     const cfgRust = JSON.parse(await fsp.readFile(path.join(HOME_RUST, '.freshell', 'config.json'), 'utf8'))

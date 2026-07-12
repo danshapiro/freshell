@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-07-12T13:27:57.185Z",
+  "generatedAt": "2026-07-12T14:18:01.273Z",
   "task": "HANDOFF §7.C REST surface parity sweep (node original :17871 vs rust port :17872)",
   "normalizedFields": {
     "terminalId": "id",
@@ -37,8 +37,8 @@
     "<TOKEN>"
   ],
   "summary": {
-    "total": 166,
-    "pass": 166,
+    "total": 175,
+    "pass": 175,
     "divergence": 0,
     "deferred": 0
   },
@@ -6432,8 +6432,8 @@
             "error": "Invalid request",
             "details": [
               {
-                "code": "invalid_type",
                 "expected": "array",
+                "code": "invalid_type",
                 "path": [
                   "allowedFilePaths"
                 ],
@@ -7201,6 +7201,952 @@
             "content": "outside the sandbox\n",
             "size": 20,
             "modifiedAt": "<TS>"
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
+      "id": "settings.patch.provider-bogus",
+      "group": "settings",
+      "description": "400 unknown CLI provider in enabledProviders (custom zod issue)",
+      "request": {
+        "method": "PATCH",
+        "path": "/api/settings",
+        "auth": "header",
+        "json": {
+          "codingCli": {
+            "enabledProviders": [
+              "claude",
+              "bogus"
+            ]
+          }
+        }
+      },
+      "node": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "code": "custom",
+                "message": "Unknown CLI provider: 'bogus'",
+                "path": [
+                  "codingCli",
+                  "enabledProviders",
+                  1
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "rust": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "code": "custom",
+                "message": "Unknown CLI provider: 'bogus'",
+                "path": [
+                  "codingCli",
+                  "enabledProviders",
+                  1
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
+      "id": "settings.patch.provider-multi-issue",
+      "group": "settings",
+      "description": "400 aggregated issues: enabledProviders → knownProviders → providers record key",
+      "request": {
+        "method": "PATCH",
+        "path": "/api/settings",
+        "auth": "header",
+        "json": {
+          "codingCli": {
+            "enabledProviders": [
+              "bogusA"
+            ],
+            "knownProviders": [
+              "bogusB"
+            ],
+            "providers": {
+              "bogusC": {}
+            }
+          }
+        }
+      },
+      "node": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "code": "custom",
+                "message": "Unknown CLI provider: 'bogusA'",
+                "path": [
+                  "codingCli",
+                  "enabledProviders",
+                  0
+                ]
+              },
+              {
+                "code": "custom",
+                "message": "Unknown CLI provider: 'bogusB'",
+                "path": [
+                  "codingCli",
+                  "knownProviders",
+                  0
+                ]
+              },
+              {
+                "code": "invalid_key",
+                "origin": "record",
+                "issues": [
+                  {
+                    "code": "custom",
+                    "message": "Unknown CLI provider: 'bogusC'",
+                    "path": []
+                  }
+                ],
+                "path": [
+                  "codingCli",
+                  "providers",
+                  "bogusC"
+                ],
+                "message": "Invalid key in record"
+              }
+            ]
+          }
+        }
+      },
+      "rust": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "code": "custom",
+                "message": "Unknown CLI provider: 'bogusA'",
+                "path": [
+                  "codingCli",
+                  "enabledProviders",
+                  0
+                ]
+              },
+              {
+                "code": "custom",
+                "message": "Unknown CLI provider: 'bogusB'",
+                "path": [
+                  "codingCli",
+                  "knownProviders",
+                  0
+                ]
+              },
+              {
+                "code": "invalid_key",
+                "origin": "record",
+                "issues": [
+                  {
+                    "code": "custom",
+                    "message": "Unknown CLI provider: 'bogusC'",
+                    "path": []
+                  }
+                ],
+                "path": [
+                  "codingCli",
+                  "providers",
+                  "bogusC"
+                ],
+                "message": "Invalid key in record"
+              }
+            ]
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
+      "id": "settings.patch.provider-mixed-types",
+      "group": "settings",
+      "description": "400 per-item invalid_type + custom issues in item order",
+      "request": {
+        "method": "PATCH",
+        "path": "/api/settings",
+        "auth": "header",
+        "json": {
+          "codingCli": {
+            "knownProviders": [
+              42,
+              "bogus",
+              "claude"
+            ]
+          }
+        }
+      },
+      "node": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "expected": "string",
+                "code": "invalid_type",
+                "path": [
+                  "codingCli",
+                  "knownProviders",
+                  0
+                ],
+                "message": "Invalid input: expected string, received number"
+              },
+              {
+                "code": "custom",
+                "message": "Unknown CLI provider: 'bogus'",
+                "path": [
+                  "codingCli",
+                  "knownProviders",
+                  1
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "rust": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "expected": "string",
+                "code": "invalid_type",
+                "path": [
+                  "codingCli",
+                  "knownProviders",
+                  0
+                ],
+                "message": "Invalid input: expected string, received number"
+              },
+              {
+                "code": "custom",
+                "message": "Unknown CLI provider: 'bogus'",
+                "path": [
+                  "codingCli",
+                  "knownProviders",
+                  1
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
+      "id": "settings.patch.provider-empty-string",
+      "group": "settings",
+      "description": "400 '' yields too_small AND the custom allowlist issue",
+      "request": {
+        "method": "PATCH",
+        "path": "/api/settings",
+        "auth": "header",
+        "json": {
+          "codingCli": {
+            "enabledProviders": [
+              ""
+            ]
+          }
+        }
+      },
+      "node": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "origin": "string",
+                "code": "too_small",
+                "minimum": 1,
+                "inclusive": true,
+                "path": [
+                  "codingCli",
+                  "enabledProviders",
+                  0
+                ],
+                "message": "Too small: expected string to have >=1 characters"
+              },
+              {
+                "code": "custom",
+                "message": "Unknown CLI provider: ''",
+                "path": [
+                  "codingCli",
+                  "enabledProviders",
+                  0
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "rust": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "origin": "string",
+                "code": "too_small",
+                "minimum": 1,
+                "inclusive": true,
+                "path": [
+                  "codingCli",
+                  "enabledProviders",
+                  0
+                ],
+                "message": "Too small: expected string to have >=1 characters"
+              },
+              {
+                "code": "custom",
+                "message": "Unknown CLI provider: ''",
+                "path": [
+                  "codingCli",
+                  "enabledProviders",
+                  0
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
+      "id": "settings.patch.codingcli-strict",
+      "group": "settings",
+      "description": "400 codingCli nested unrecognized key (strict sub-object)",
+      "request": {
+        "method": "PATCH",
+        "path": "/api/settings",
+        "auth": "header",
+        "json": {
+          "codingCli": {
+            "zzz": 1
+          }
+        }
+      },
+      "node": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "code": "unrecognized_keys",
+                "keys": [
+                  "zzz"
+                ],
+                "path": [
+                  "codingCli"
+                ],
+                "message": "Unrecognized key: \"zzz\""
+              }
+            ]
+          }
+        }
+      },
+      "rust": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "code": "unrecognized_keys",
+                "keys": [
+                  "zzz"
+                ],
+                "path": [
+                  "codingCli"
+                ],
+                "message": "Unrecognized key: \"zzz\""
+              }
+            ]
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
+      "id": "settings.patch.unknown-key-last",
+      "group": "settings",
+      "description": "400 nested field issue first, top-level unrecognized_keys LAST",
+      "request": {
+        "method": "PATCH",
+        "path": "/api/settings",
+        "auth": "header",
+        "json": {
+          "zzz": 1,
+          "codingCli": {
+            "enabledProviders": [
+              "bogusA"
+            ]
+          }
+        }
+      },
+      "node": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "code": "custom",
+                "message": "Unknown CLI provider: 'bogusA'",
+                "path": [
+                  "codingCli",
+                  "enabledProviders",
+                  0
+                ]
+              },
+              {
+                "code": "unrecognized_keys",
+                "keys": [
+                  "zzz"
+                ],
+                "path": [],
+                "message": "Unrecognized key: \"zzz\""
+              }
+            ]
+          }
+        }
+      },
+      "rust": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "code": "custom",
+                "message": "Unknown CLI provider: 'bogusA'",
+                "path": [
+                  "codingCli",
+                  "enabledProviders",
+                  0
+                ]
+              },
+              {
+                "code": "unrecognized_keys",
+                "keys": [
+                  "zzz"
+                ],
+                "path": [],
+                "message": "Unrecognized key: \"zzz\""
+              }
+            ]
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
+      "id": "settings.patch.knownproviders-wins",
+      "group": "settings",
+      "description": "valid knownProviders PATCH replaces the persisted list (patch-wins, live-pinned)",
+      "request": {
+        "method": "PATCH",
+        "path": "/api/settings",
+        "auth": "header",
+        "json": {
+          "codingCli": {
+            "knownProviders": [
+              "claude"
+            ]
+          }
+        }
+      },
+      "node": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "allowedFilePaths": [],
+            "logging": {
+              "debug": false
+            },
+            "safety": {
+              "autoKillIdleMinutes": 25
+            },
+            "terminal": {
+              "scrollback": 10000
+            },
+            "panes": {
+              "defaultNewPane": "ask"
+            },
+            "sidebar": {
+              "excludeFirstChatSubstrings": [],
+              "excludeFirstChatMustStart": false,
+              "autoGenerateTitles": true
+            },
+            "ai": {},
+            "codingCli": {
+              "enabledProviders": [
+                "claude",
+                "codex",
+                "opencode"
+              ],
+              "providers": {
+                "claude": {
+                  "permissionMode": "default"
+                },
+                "codex": {}
+              },
+              "mcpServer": true,
+              "knownProviders": [
+                "claude"
+              ]
+            },
+            "editor": {
+              "externalEditor": "auto"
+            },
+            "freshAgent": {
+              "enabled": false,
+              "defaultPlugins": [],
+              "providers": {}
+            },
+            "extensions": {
+              "disabled": []
+            },
+            "network": {
+              "host": "127.0.0.1",
+              "configured": true
+            }
+          }
+        }
+      },
+      "rust": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "ai": {},
+            "codingCli": {
+              "enabledProviders": [
+                "claude",
+                "codex",
+                "opencode"
+              ],
+              "mcpServer": true,
+              "providers": {
+                "claude": {
+                  "permissionMode": "default"
+                },
+                "codex": {}
+              },
+              "knownProviders": [
+                "claude"
+              ]
+            },
+            "editor": {
+              "externalEditor": "auto"
+            },
+            "extensions": {
+              "disabled": []
+            },
+            "freshAgent": {
+              "defaultPlugins": [],
+              "enabled": false,
+              "providers": {}
+            },
+            "logging": {
+              "debug": false
+            },
+            "network": {
+              "configured": true,
+              "host": "127.0.0.1"
+            },
+            "panes": {
+              "defaultNewPane": "ask"
+            },
+            "safety": {
+              "autoKillIdleMinutes": 25
+            },
+            "sidebar": {
+              "autoGenerateTitles": true,
+              "excludeFirstChatMustStart": false,
+              "excludeFirstChatSubstrings": []
+            },
+            "terminal": {
+              "scrollback": 10000
+            },
+            "allowedFilePaths": []
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
+      "id": "settings.get.knownproviders-patched",
+      "group": "settings",
+      "description": "GET reflects the patched knownProviders",
+      "request": {
+        "method": "GET",
+        "path": "/api/settings",
+        "auth": "header"
+      },
+      "node": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "allowedFilePaths": [],
+            "logging": {
+              "debug": false
+            },
+            "safety": {
+              "autoKillIdleMinutes": 25
+            },
+            "terminal": {
+              "scrollback": 10000
+            },
+            "panes": {
+              "defaultNewPane": "ask"
+            },
+            "sidebar": {
+              "excludeFirstChatSubstrings": [],
+              "excludeFirstChatMustStart": false,
+              "autoGenerateTitles": true
+            },
+            "ai": {},
+            "codingCli": {
+              "enabledProviders": [
+                "claude",
+                "codex",
+                "opencode"
+              ],
+              "providers": {
+                "claude": {
+                  "permissionMode": "default"
+                },
+                "codex": {}
+              },
+              "mcpServer": true,
+              "knownProviders": [
+                "claude"
+              ]
+            },
+            "editor": {
+              "externalEditor": "auto"
+            },
+            "freshAgent": {
+              "enabled": false,
+              "defaultPlugins": [],
+              "providers": {}
+            },
+            "extensions": {
+              "disabled": []
+            },
+            "network": {
+              "host": "127.0.0.1",
+              "configured": true
+            }
+          }
+        }
+      },
+      "rust": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "ai": {},
+            "codingCli": {
+              "enabledProviders": [
+                "claude",
+                "codex",
+                "opencode"
+              ],
+              "mcpServer": true,
+              "providers": {
+                "claude": {
+                  "permissionMode": "default"
+                },
+                "codex": {}
+              },
+              "knownProviders": [
+                "claude"
+              ]
+            },
+            "editor": {
+              "externalEditor": "auto"
+            },
+            "extensions": {
+              "disabled": []
+            },
+            "freshAgent": {
+              "defaultPlugins": [],
+              "enabled": false,
+              "providers": {}
+            },
+            "logging": {
+              "debug": false
+            },
+            "network": {
+              "configured": true,
+              "host": "127.0.0.1"
+            },
+            "panes": {
+              "defaultNewPane": "ask"
+            },
+            "safety": {
+              "autoKillIdleMinutes": 25
+            },
+            "sidebar": {
+              "autoGenerateTitles": true,
+              "excludeFirstChatMustStart": false,
+              "excludeFirstChatSubstrings": []
+            },
+            "terminal": {
+              "scrollback": 10000
+            },
+            "allowedFilePaths": []
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
+      "id": "settings.patch.knownproviders-restore",
+      "group": "settings",
+      "description": "restore the full discovered knownProviders list",
+      "request": {
+        "method": "PATCH",
+        "path": "/api/settings",
+        "auth": "header",
+        "json": {
+          "codingCli": {
+            "knownProviders": [
+              "claude",
+              "codex",
+              "gemini",
+              "kimi",
+              "opencode"
+            ]
+          }
+        }
+      },
+      "node": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "allowedFilePaths": [],
+            "logging": {
+              "debug": false
+            },
+            "safety": {
+              "autoKillIdleMinutes": 25
+            },
+            "terminal": {
+              "scrollback": 10000
+            },
+            "panes": {
+              "defaultNewPane": "ask"
+            },
+            "sidebar": {
+              "excludeFirstChatSubstrings": [],
+              "excludeFirstChatMustStart": false,
+              "autoGenerateTitles": true
+            },
+            "ai": {},
+            "codingCli": {
+              "enabledProviders": [
+                "claude",
+                "codex",
+                "opencode"
+              ],
+              "providers": {
+                "claude": {
+                  "permissionMode": "default"
+                },
+                "codex": {}
+              },
+              "mcpServer": true,
+              "knownProviders": [
+                "claude",
+                "codex",
+                "gemini",
+                "kimi",
+                "opencode"
+              ]
+            },
+            "editor": {
+              "externalEditor": "auto"
+            },
+            "freshAgent": {
+              "enabled": false,
+              "defaultPlugins": [],
+              "providers": {}
+            },
+            "extensions": {
+              "disabled": []
+            },
+            "network": {
+              "host": "127.0.0.1",
+              "configured": true
+            }
+          }
+        }
+      },
+      "rust": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "ai": {},
+            "codingCli": {
+              "enabledProviders": [
+                "claude",
+                "codex",
+                "opencode"
+              ],
+              "mcpServer": true,
+              "providers": {
+                "claude": {
+                  "permissionMode": "default"
+                },
+                "codex": {}
+              },
+              "knownProviders": [
+                "claude",
+                "codex",
+                "gemini",
+                "kimi",
+                "opencode"
+              ]
+            },
+            "editor": {
+              "externalEditor": "auto"
+            },
+            "extensions": {
+              "disabled": []
+            },
+            "freshAgent": {
+              "defaultPlugins": [],
+              "enabled": false,
+              "providers": {}
+            },
+            "logging": {
+              "debug": false
+            },
+            "network": {
+              "configured": true,
+              "host": "127.0.0.1"
+            },
+            "panes": {
+              "defaultNewPane": "ask"
+            },
+            "safety": {
+              "autoKillIdleMinutes": 25
+            },
+            "sidebar": {
+              "autoGenerateTitles": true,
+              "excludeFirstChatMustStart": false,
+              "excludeFirstChatSubstrings": []
+            },
+            "terminal": {
+              "scrollback": 10000
+            },
+            "allowedFilePaths": []
           }
         }
       },

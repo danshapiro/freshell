@@ -84,38 +84,21 @@ async fn main() -> ExitCode {
     );
 
     // R2/R3/R4 root-cause fix: a single LIVE settings store, not a boot-time
-    // snapshot. `known_providers` is discovered here (cheap early scan; the full
-    // `extension_registry` below reuses the same read-only directory walk) so
-    // `codingCli.knownProviders` is never `[]` (R4).
-    // R4/T0 fix: `knownProviders` must reflect ONLY genuinely-discovered
-    // extension manifests (empty when none are found), NOT
-    // `cli_detection_specs()`'s built-in-CLI-set fallback (that fallback is
-    // correct for `availableClis` PROBING below, but conflating the two made
-    // `knownProviders` non-empty in environments where the original's is
-    // genuinely empty -- caught by the T0 handshake equivalence test).
-    // `knownProviders` uses ONLY cwd/home-relative dirs (`userExtDir`,
-    // `localExtDir`, `builtinExtDir` -- ALL `process.cwd()`/home relative in
-    // the original, `server/index.ts:225-227`; no compiled-in path). Unlike
-    // `resolve_extension_dirs`'s baked-in `CARGO_MANIFEST_DIR` dev/test
-    // fallback (used below for `availableClis` probing, where a fallback to
-    // a default CLI set is itself faithful, `platform.ts:97-103`), a
-    // knownProviders derivation MUST see genuine emptiness when no
-    // `<cwd>/extensions` exists, or it diverges from the original whenever
-    // the process cwd isn't the repo checkout (caught by the T0 handshake
-    // equivalence test).
-    let known_provider_dirs: Vec<std::path::PathBuf> = {
-        let mut dirs = Vec::new();
-        if let Some(h) = home.as_deref() {
-            dirs.push(h.join(".freshell").join("extensions"));
-        }
-        if let Ok(cwd) = std::env::current_dir() {
-            dirs.push(cwd.join(".freshell").join("extensions"));
-            dirs.push(cwd.join("extensions"));
-        }
-        dirs
-    };
-    let known_providers: Vec<String> =
-        extensions::ExtensionRegistry::scan(&known_provider_dirs).discovered_cli_names();
+    // snapshot. `allCliNames` (`server/index.ts:267-269`) is discovered here via
+    // the SAME cwd/home-relative dirs the original scans (`userExtDir`,
+    // `localExtDir`, `builtinExtDir` — `server/index.ts:225-227`; NO compiled-in
+    // fallback, see `resolve_builtin_extensions_dir`). `SettingsStore::load`
+    // runs the original's startup knownProviders migration against it
+    // (`server/index.ts:271-299`): seed-when-missing, append-new + auto-enable
+    // otherwise — pinned live 2026-07-12 (cwd-neutral fresh boot ⇒ `[]`;
+    // cwd=repo fresh boot ⇒ 5 names; persisted `[]` + cwd=repo reboot ⇒
+    // knownProviders grows AND enabledProviders auto-enables the new names).
+    // The same discovered set is the PATCH validation allowlist
+    // (`validCliProviders: allCliNames`, `server/index.ts:585`).
+    let known_providers: Vec<String> = extensions::ExtensionRegistry::scan(
+        &extensions::resolve_extension_dirs(home.as_deref()),
+    )
+    .discovered_cli_names();
     let settings_store = settings_store::SettingsStore::load(home.as_deref(), known_providers);
     let settings = Arc::new(settings_store.get().await);
 

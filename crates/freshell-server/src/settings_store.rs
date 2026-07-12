@@ -41,7 +41,11 @@ use crate::boot::{is_authed, unauthorized};
 pub struct SettingsStore {
     inner: Arc<RwLock<ServerSettings>>,
     home: Option<Arc<PathBuf>>,
-    known_providers: Arc<Vec<String>>,
+    /// The PATCH-validation allowlist: the CLI extension names discovered at
+    /// boot (`validCliProviders: allCliNames`, `server/index.ts:585`). Fixed
+    /// for the process lifetime \u2014 NOT the live `knownProviders` value (which
+    /// is regular patchable state).
+    valid_cli_providers: Arc<Vec<String>>,
     /// `serverSecrets.codexDisplayIdSecret` (`config-store.ts`): per-boot
     /// generated secret material persisted alongside `settings` in
     /// `config.json` (R2 evidence: `settings.configjson-shape`). Read back
@@ -59,20 +63,103 @@ pub struct SettingsStore {
 impl SettingsStore {
     /// Load the full persisted settings tree (defaults deep-merged with
     /// `<home>/.freshell/config.json`'s `settings` object \u2014 mirrors
-    /// `mergeServerSettings(defaults, persisted)`), then overlay the
-    /// boot-discovered `knownProviders` (R4).
-    pub fn load(home: Option<&Path>, known_providers: Vec<String>) -> Self {
+    /// `mergeServerSettings(defaults, persisted)`), then run the ORIGINAL's
+    /// startup knownProviders migration (`server/index.ts:271-299`, pinned by
+    /// live probes 2026-07-12):
+    ///
+    /// * legacy `enabledProviders == ['claude','codex']` (as a set, trimmed +
+    ///   deduped) gains the discovered members of the modern default set
+    ///   (`server/settings-migrate.ts#migrateLegacyDefaultEnabledProviders`);
+    /// * persisted `knownProviders` MISSING (fresh home, or non-array \u2014 the
+    ///   read normalization drops non-arrays, `shared/settings.ts:1072`) \u21d2
+    ///   SEED it with the discovered CLI extension names and persist \u2014 even
+    ///   when the discovered set is empty (live: fresh cwd-neutral boot writes
+    ///   `knownProviders: []` to config.json);
+    /// * otherwise, newly discovered names are APPENDED to `knownProviders`
+    ///   AND auto-enabled (appended to `enabledProviders` if absent), then
+    ///   persisted. With nothing new, the persisted list is served AS-IS \u2014
+    ///   a cwd-neutral reboot does NOT shrink a previously-seeded list.
+    ///
+    /// `knownProviders` is REGULAR persisted, patchable state in the original
+    /// (a PATCH replaces it \u2014 pinned live); only the PATCH-validation
+    /// allowlist is fixed at boot to the discovered set (`validCliProviders:
+    /// allCliNames`, `server/index.ts:585`).
+    pub fn load(home: Option<&Path>, discovered_cli_names: Vec<String>) -> Self {
         let mut settings = load_full_settings(home);
-        settings.coding_cli.known_providers = Some(known_providers.clone());
+
+        // (1) Legacy default-enabled migration (`settings-migrate.ts:17-49`).
+        let mut migrated_legacy = false;
+        {
+            const LEGACY: [&str; 2] = ["claude", "codex"];
+            const DEFAULTS: [&str; 3] = ["claude", "codex", "opencode"];
+            let enabled_norm = normalize_trimmed_string_list(&settings.coding_cli.enabled_providers);
+            let legacy_match = enabled_norm.len() == LEGACY.len()
+                && LEGACY.iter().all(|l| enabled_norm.iter().any(|e| e == l));
+            if legacy_match {
+                let additional: Vec<String> = DEFAULTS
+                    .iter()
+                    .filter(|p| {
+                        discovered_cli_names.iter().any(|d| d == **p)
+                            && !enabled_norm.iter().any(|e| e == **p)
+                    })
+                    .map(|p| (*p).to_string())
+                    .collect();
+                if !additional.is_empty() {
+                    let mut enabled = enabled_norm;
+                    enabled.extend(additional);
+                    settings.coding_cli.enabled_providers = enabled;
+                    migrated_legacy = true;
+                }
+            }
+        }
+
+        // (2) Seed-when-missing / append-new + auto-enable (`index.ts:276-299`).
+        let mut needs_persist = false;
+        match read_persisted_known_providers(home) {
+            None => {
+                // MIGRATION: seed with ALL discovered CLI names (the original
+                // always calls `patchSettings` here, so config.json is written
+                // even when the seed is `[]`).
+                settings.coding_cli.known_providers = Some(discovered_cli_names.clone());
+                needs_persist = true;
+            }
+            Some(known) => {
+                let new_providers: Vec<String> = discovered_cli_names
+                    .iter()
+                    .filter(|d| !known.contains(d))
+                    .cloned()
+                    .collect();
+                if !new_providers.is_empty() || migrated_legacy {
+                    let mut kp = known;
+                    kp.extend(new_providers.iter().cloned());
+                    settings.coding_cli.known_providers = Some(kp);
+                    let mut enabled = settings.coding_cli.enabled_providers.clone();
+                    for name in &new_providers {
+                        if !enabled.contains(name) {
+                            enabled.push(name.clone());
+                        }
+                    }
+                    settings.coding_cli.enabled_providers = enabled;
+                    needs_persist = true;
+                } else {
+                    settings.coding_cli.known_providers = Some(known);
+                }
+            }
+        }
+
         let codex_display_id_secret = load_or_mint_codex_display_id_secret(home);
         let terminal_overrides = load_terminal_overrides(home);
-        Self {
-            inner: Arc::new(RwLock::new(settings)),
+        let store = Self {
+            inner: Arc::new(RwLock::new(settings.clone())),
             home: home.map(|p| Arc::new(p.to_path_buf())),
-            known_providers: Arc::new(known_providers),
+            valid_cli_providers: Arc::new(discovered_cli_names),
             codex_display_id_secret: Arc::new(codex_display_id_secret),
             terminal_overrides: Arc::new(std::sync::Mutex::new(terminal_overrides)),
+        };
+        if needs_persist {
+            store.persist(&settings);
         }
+        store
     }
 
     /// A clone of the live settings tree.
@@ -96,7 +183,7 @@ impl SettingsStore {
                 ));
             }
         }
-        if let Some(details) = validate_patch(patch_body) {
+        if let Some(details) = validate_patch(patch_body, &self.valid_cli_providers) {
             return Err((
                 StatusCode::BAD_REQUEST,
                 json!({ "error": "Invalid request", "details": details }),
@@ -106,8 +193,10 @@ impl SettingsStore {
         let mut guard = self.inner.write().await;
         let mut value = serde_json::to_value(&*guard).unwrap_or_else(|_| json!({}));
         deep_merge(&mut value, patch_body);
-        // knownProviders is derived, never user-writable (R4).
-        value["codingCli"]["knownProviders"] = json!(self.known_providers.as_ref());
+        // NOTE: `knownProviders` is regular patchable, persisted state in the
+        // original (pinned live 2026-07-12: PATCH `{codingCli:{knownProviders:
+        // ["claude"]}}` replaces and persists it); names are validated against
+        // the boot-discovered allowlist above, exactly like `enabledProviders`.
         let merged: ServerSettings = match serde_json::from_value(value) {
             Ok(s) => s,
             Err(_) => {
@@ -285,62 +374,189 @@ fn deep_merge(target: &mut Value, patch: &Value) {
     }
 }
 
-/// A faithful-subset validator covering the specific violations the parity
-/// sweep probes (`buildServerSettingsPatchSchema`'s strict top-level schema +
-/// the enum/type fields it exercises): unknown top-level keys (the schema is
-/// `.strict()`), `editor.externalEditor` / `panes.defaultNewPane` enums, and
-/// `allowedFilePaths` must be an array. Returns the zod-shaped `details` array
-/// on a violation, or `None` when the patch is structurally valid.
-fn validate_patch(patch: &Value) -> Option<Value> {
+/// A faithful-subset validator covering the violations the parity sweep probes
+/// against `buildServerSettingsPatchSchema` (`shared/settings.ts:738-781`):
+/// the strict top-level schema, `editor.externalEditor` / `panes.defaultNewPane`
+/// enums, `allowedFilePaths` array-ness, and the `codingCli` provider-name
+/// allowlist (`createCliProviderNameSchema(validCliProviders)`; allowlist =
+/// boot-discovered CLI extension names, `server/index.ts:585`).
+///
+/// zod v4 AGGREGATES issues: every violated field contributes, in the schema's
+/// key-definition order (defaultCwd, allowedFilePaths, logging, safety,
+/// terminal, panes, sidebar, ai, codingCli, editor, freshAgent, extensions,
+/// network), with a strict-object `unrecognized_keys` issue appended LAST \u2014
+/// all shapes + ordering below byte-matched against live probes of the
+/// ORIGINAL (M1\u2013M8/E1\u2013E5 battery, 2026-07-12). Returns the zod-shaped
+/// `details` array on any violation, or `None` when the patch passes.
+fn validate_patch(patch: &Value, valid_cli_providers: &[String]) -> Option<Value> {
     let Value::Object(map) = patch else { return None };
+    let mut issues: Vec<Value> = Vec::new();
+
+    if let Some(v) = map.get("allowedFilePaths") {
+        if !v.is_array() {
+            issues.push(invalid_type_issue("array", &json!(["allowedFilePaths"]), v));
+        }
+    }
+    // EXTERNAL_EDITOR_VALUES / DEFAULT_NEW_PANE_VALUES (`shared/settings.ts:25,33`).
+    if let Some(v) = map.get("panes").and_then(|v| v.get("defaultNewPane")) {
+        const VALID: &[&str] = &["ask", "shell", "browser", "editor"];
+        if v.as_str().map(|s| !VALID.contains(&s)).unwrap_or(true) {
+            issues.push(enum_issue(&["panes", "defaultNewPane"], VALID));
+        }
+    }
+    if let Some(cli) = map.get("codingCli") {
+        validate_coding_cli_patch(cli, valid_cli_providers, &mut issues);
+    }
+    if let Some(v) = map.get("editor").and_then(|v| v.get("externalEditor")) {
+        const VALID: &[&str] = &["auto", "cursor", "code", "custom"];
+        if v.as_str().map(|s| !VALID.contains(&s)).unwrap_or(true) {
+            issues.push(enum_issue(&["editor", "externalEditor"], VALID));
+        }
+    }
+
+    // Strict-object unknown-key issue: ONE issue carrying ALL unknown keys,
+    // appended LAST (live-pinned M3/M6).
     const KNOWN_TOP_LEVEL: &[&str] = &[
         "ai", "codingCli", "editor", "extensions", "freshAgent", "logging", "network", "panes",
         "safety", "sidebar", "terminal", "allowedFilePaths", "defaultCwd",
     ];
-    for key in map.keys() {
-        if !KNOWN_TOP_LEVEL.contains(&key.as_str()) {
-            // Byte-matched against a live probe of the ORIGINAL: singular
-            // "Unrecognized key" (not zod's stock plural "key(s) in object"
-            // wording) -- `buildServerSettingsPatchSchema` overrides the
-            // strict-object error message (`shared/settings.ts`).
-            return Some(json!([{
-                "code": "unrecognized_keys",
-                "keys": [key],
-                "path": [],
-                "message": format!("Unrecognized key: \"{key}\""),
-            }]));
-        }
+    let unknown: Vec<&str> = map
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !KNOWN_TOP_LEVEL.contains(k))
+        .collect();
+    if !unknown.is_empty() {
+        issues.push(unrecognized_keys_issue(&unknown, &json!([])));
     }
-    // EXTERNAL_EDITOR_VALUES / DEFAULT_NEW_PANE_VALUES (`shared/settings.ts:25,33`).
-    if let Some(v) = map.get("editor").and_then(|v| v.get("externalEditor")) {
-        const VALID: &[&str] = &["auto", "cursor", "code", "custom"];
-        if v.as_str().map(|s| !VALID.contains(&s)).unwrap_or(true) {
-            return Some(enum_details(&["editor", "externalEditor"], VALID, v));
-        }
+
+    if issues.is_empty() {
+        None
+    } else {
+        Some(Value::Array(issues))
     }
-    if let Some(v) = map.get("panes").and_then(|v| v.get("defaultNewPane")) {
-        const VALID: &[&str] = &["ask", "shell", "browser", "editor"];
-        if v.as_str().map(|s| !VALID.contains(&s)).unwrap_or(true) {
-            return Some(enum_details(&["panes", "defaultNewPane"], VALID, v));
-        }
-    }
-    if let Some(v) = map.get("allowedFilePaths") {
-        if !v.is_array() {
-            return Some(json!([{
-                "code": "invalid_type",
-                "expected": "array",
-                "path": ["allowedFilePaths"],
-                "message": "Invalid input: expected array, received string",
-            }]));
-        }
-    }
-    None
 }
 
-fn enum_details(path: &[&str], valid: &[&str], _got: &Value) -> Value {
-    // Byte-matched against a live probe of the ORIGINAL: this zod enum issue
-    // shape carries NO `received` field (unlike some other zod issue kinds).
-    json!([{
+/// The `codingCli` sub-schema (`enabledProviders`, `knownProviders`,
+/// `providers` record keys, then its own strict unknown-key issue) \u2014 issue
+/// shapes byte-matched live (M2/M5/E1\u2013E5).
+fn validate_coding_cli_patch(cli: &Value, valid: &[String], issues: &mut Vec<Value>) {
+    let Value::Object(cli_map) = cli else {
+        issues.push(invalid_type_issue("object", &json!(["codingCli"]), cli));
+        return;
+    };
+    for field in ["enabledProviders", "knownProviders"] {
+        let Some(v) = cli_map.get(field) else { continue };
+        let Value::Array(items) = v else {
+            issues.push(invalid_type_issue("array", &json!(["codingCli", field]), v));
+            continue;
+        };
+        for (i, item) in items.iter().enumerate() {
+            let path = json!(["codingCli", field, i]);
+            let Value::String(s) = item else {
+                issues.push(invalid_type_issue("string", &path, item));
+                continue;
+            };
+            if s.is_empty() {
+                // `z.string().min(1)` \u2014 AND the allowlist superRefine still
+                // runs, so '' yields BOTH issues (live-pinned E1).
+                issues.push(json!({
+                    "origin": "string",
+                    "code": "too_small",
+                    "minimum": 1,
+                    "inclusive": true,
+                    "path": path,
+                    "message": "Too small: expected string to have >=1 characters",
+                }));
+            }
+            if !valid.iter().any(|p| p == s) {
+                issues.push(json!({
+                    "code": "custom",
+                    "message": format!("Unknown CLI provider: '{s}'"),
+                    "path": path,
+                }));
+            }
+        }
+    }
+    if let Some(v) = cli_map.get("providers") {
+        if let Value::Object(provs) = v {
+            for key in provs.keys() {
+                if !valid.iter().any(|p| p == key) {
+                    issues.push(json!({
+                        "code": "invalid_key",
+                        "origin": "record",
+                        "issues": [{
+                            "code": "custom",
+                            "message": format!("Unknown CLI provider: '{key}'"),
+                            "path": [],
+                        }],
+                        "path": ["codingCli", "providers", key],
+                        "message": "Invalid key in record",
+                    }));
+                }
+            }
+        } else {
+            issues.push(invalid_type_issue("record", &json!(["codingCli", "providers"]), v));
+        }
+    }
+    // `codingCli` is itself `.strict()` (live-pinned E3).
+    const CLI_KEYS: &[&str] = &["enabledProviders", "knownProviders", "providers", "mcpServer"];
+    let unknown: Vec<&str> = cli_map
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !CLI_KEYS.contains(k))
+        .collect();
+    if !unknown.is_empty() {
+        issues.push(unrecognized_keys_issue(&unknown, &json!(["codingCli"])));
+    }
+}
+
+/// zod v4 `invalid_type` issue \u2014 key order `{expected, code, path, message}`,
+/// NO `received` field (only in the message text); live-pinned M4/M5/E2/E4/E5.
+fn invalid_type_issue(expected: &str, path: &Value, got: &Value) -> Value {
+    json!({
+        "expected": expected,
+        "code": "invalid_type",
+        "path": path,
+        "message": format!("Invalid input: expected {expected}, received {}", received_type(got)),
+    })
+}
+
+/// zod v4's parsed-type word for the "received X" message suffix.
+fn received_type(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// zod v4 strict-object `unrecognized_keys` issue: ONE issue with ALL unknown
+/// keys; message singular for one key, plural + comma-joined for several
+/// (live-pinned M6, nested path variant E3).
+fn unrecognized_keys_issue(keys: &[&str], path: &Value) -> Value {
+    let message = if keys.len() == 1 {
+        format!("Unrecognized key: \"{}\"", keys[0])
+    } else {
+        format!(
+            "Unrecognized keys: {}",
+            keys.iter().map(|k| format!("\"{k}\"")).collect::<Vec<_>>().join(", ")
+        )
+    };
+    json!({
+        "code": "unrecognized_keys",
+        "keys": keys,
+        "path": path,
+        "message": message,
+    })
+}
+
+/// zod enum issue (`invalid_value`) \u2014 carries NO `received` field; byte-matched
+/// against a live probe of the ORIGINAL.
+fn enum_issue(path: &[&str], valid: &[&str]) -> Value {
+    json!({
         "code": "invalid_value",
         "values": valid,
         "path": path,
@@ -348,7 +564,44 @@ fn enum_details(path: &[&str], valid: &[&str], _got: &Value) -> Value {
             "Invalid option: expected one of {}",
             valid.iter().map(|v| format!("\"{v}\"")).collect::<Vec<_>>().join("|")
         ),
-    }])
+    })
+}
+
+/// `normalizeTrimmedStringList` (`shared/string-list.ts`): trim, drop empties,
+/// dedup (first occurrence wins).
+fn normalize_trimmed_string_list(values: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for item in values {
+        let trimmed = item.trim();
+        if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
+            continue;
+        }
+        out.push(trimmed.to_string());
+    }
+    out
+}
+
+/// The PERSISTED `codingCli.knownProviders`, as the original's config read
+/// normalization sees it (`shared/settings.ts:1072`): `Some(items)` only when
+/// the key exists AND is an array (items filtered to non-empty strings \u2014
+/// `CliProviderNameSchema` is `z.string().min(1)` with no allowlist at the
+/// config-store layer); a missing file/key or a non-array value reads as
+/// MISSING \u2192 the boot migration seeds it.
+fn read_persisted_known_providers(home: Option<&Path>) -> Option<Vec<String>> {
+    let home = home?;
+    let text = std::fs::read_to_string(home.join(".freshell").join("config.json")).ok()?;
+    let doc = serde_json::from_str::<Value>(&text).ok()?;
+    let known = doc.pointer("/settings/codingCli/knownProviders")?;
+    let items = known.as_array()?;
+    Some(
+        items
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 // \u2500\u2500 HTTP surface \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -412,24 +665,128 @@ mod tests {
         SettingsStore::load(Some(dir), vec!["claude".into(), "codex".into()])
     }
 
+    /// Live-pinned 2026-07-12: `knownProviders` is SEEDED from discovery when
+    /// missing (persisted, `server/index.ts:280-286`) and PATCHABLE with names
+    /// from the boot-discovered allowlist (patch-wins, persisted); unknown
+    /// names are rejected with the original's custom zod issue.
     #[tokio::test]
-    async fn known_providers_seeded_and_immutable_via_patch() {
+    async fn known_providers_seeded_persisted_and_patchable() {
         let dir = std::env::temp_dir().join(format!("frs-settings-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
         let store = store_at(&dir);
         let s = store.get().await;
         assert_eq!(
             s.coding_cli.known_providers,
             Some(vec!["claude".to_string(), "codex".to_string()])
         );
-        // A patch cannot overwrite the derived field.
-        let merged = store
+        // The seed migration persists (the original always calls patchSettings).
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg["settings"]["codingCli"]["knownProviders"], json!(["claude", "codex"]));
+
+        // An unknown name is rejected (allowlist = boot-discovered set).
+        let (status, body) = store
             .patch(&json!({ "codingCli": { "knownProviders": ["bogus"] } }))
             .await
-            .unwrap();
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(
-            merged.coding_cli.known_providers,
+            body["details"][0],
+            json!({
+                "code": "custom",
+                "message": "Unknown CLI provider: 'bogus'",
+                "path": ["codingCli", "knownProviders", 0],
+            })
+        );
+
+        // A valid patch WINS (live-pinned: replaces + persists).
+        let merged = store
+            .patch(&json!({ "codingCli": { "knownProviders": ["claude"] } }))
+            .await
+            .unwrap();
+        assert_eq!(merged.coding_cli.known_providers, Some(vec!["claude".to_string()]));
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg["settings"]["codingCli"]["knownProviders"], json!(["claude"]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Live-pinned 2026-07-12 (persisted `knownProviders: ["claude"]`,
+    /// `enabledProviders: ["claude"]`, then a boot discovering 5 extensions):
+    /// new names are APPENDED to `knownProviders` AND auto-enabled
+    /// (`server/index.ts:288-297`).
+    #[tokio::test]
+    async fn newly_discovered_providers_append_and_auto_enable() {
+        let dir = std::env::temp_dir().join(format!("frs-settings-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            r#"{"version":1,"settings":{"codingCli":{"enabledProviders":["claude"],"knownProviders":["claude"],"providers":{},"mcpServer":true}}}"#,
+        )
+        .unwrap();
+        let store = store_at(&dir); // discovers ["claude","codex"]
+        let s = store.get().await;
+        assert_eq!(
+            s.coding_cli.known_providers,
             Some(vec!["claude".to_string(), "codex".to_string()])
         );
+        assert_eq!(s.coding_cli.enabled_providers, vec!["claude", "codex"]);
+        // Persisted.
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg["settings"]["codingCli"]["knownProviders"], json!(["claude", "codex"]));
+        assert_eq!(cfg["settings"]["codingCli"]["enabledProviders"], json!(["claude", "codex"]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Live-pinned 2026-07-12 (S4 direction): a previously-seeded list is
+    /// served AS-IS when a later boot discovers NOTHING (cwd-neutral reboot
+    /// does not shrink it \u2014 `newProviders` is empty so no patch happens).
+    #[tokio::test]
+    async fn persisted_known_providers_survive_cwd_neutral_reboot() {
+        let dir = std::env::temp_dir().join(format!("frs-settings-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            r#"{"version":1,"settings":{"codingCli":{"enabledProviders":["claude"],"knownProviders":["claude","codex","gemini"],"providers":{},"mcpServer":true}}}"#,
+        )
+        .unwrap();
+        let store = SettingsStore::load(Some(&dir), Vec::new());
+        let s = store.get().await;
+        assert_eq!(
+            s.coding_cli.known_providers,
+            Some(vec!["claude".to_string(), "codex".to_string(), "gemini".to_string()])
+        );
+        assert_eq!(s.coding_cli.enabled_providers, vec!["claude"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `migrateLegacyDefaultEnabledProviders` (`settings-migrate.ts`), pinned
+    /// live 2026-07-12 (home6 probe): legacy `["claude","codex"]` gains the
+    /// discovered modern-default members (here `opencode`), the seed still
+    /// covers ALL discovered names, and non-default providers are NOT enabled
+    /// by the seed path.
+    #[tokio::test]
+    async fn legacy_default_enabled_providers_migrated() {
+        let dir = std::env::temp_dir().join(format!("frs-settings-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            r#"{"version":1,"settings":{"codingCli":{"enabledProviders":["claude","codex"],"providers":{},"mcpServer":true}}}"#,
+        )
+        .unwrap();
+        let discovered: Vec<String> =
+            ["claude", "codex", "gemini", "kimi", "opencode"].iter().map(|s| s.to_string()).collect();
+        let store = SettingsStore::load(Some(&dir), discovered.clone());
+        let s = store.get().await;
+        assert_eq!(s.coding_cli.enabled_providers, vec!["claude", "codex", "opencode"]);
+        assert_eq!(s.coding_cli.known_providers, Some(discovered));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -467,30 +824,158 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn valid5() -> Vec<String> {
+        ["claude", "codex", "gemini", "kimi", "opencode"].iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn agent_chat_key_rejected() {
-        let err = validate_patch(&json!({ "ai": {} }));
+        let err = validate_patch(&json!({ "ai": {} }), &valid5());
         assert!(err.is_none());
     }
 
     #[test]
     fn unknown_top_level_key_rejected() {
-        let details = validate_patch(&json!({ "totallyUnknownKey": true })).unwrap();
+        let details = validate_patch(&json!({ "totallyUnknownKey": true }), &valid5()).unwrap();
         assert_eq!(details[0]["code"], "unrecognized_keys");
     }
 
     #[test]
     fn client_only_key_rejected_by_strict_schema() {
-        let details = validate_patch(&json!({ "theme": "dark" })).unwrap();
+        let details = validate_patch(&json!({ "theme": "dark" }), &valid5()).unwrap();
         assert_eq!(details[0]["code"], "unrecognized_keys");
     }
 
     #[test]
     fn enum_and_type_violations_rejected() {
-        assert!(validate_patch(&json!({ "editor": { "externalEditor": "bogus" } })).is_some());
-        assert!(validate_patch(&json!({ "panes": { "defaultNewPane": "bogus" } })).is_some());
-        assert!(validate_patch(&json!({ "allowedFilePaths": "not-an-array" })).is_some());
-        assert!(validate_patch(&json!({ "allowedFilePaths": ["ok"] })).is_none());
+        let v = valid5();
+        assert!(validate_patch(&json!({ "editor": { "externalEditor": "bogus" } }), &v).is_some());
+        assert!(validate_patch(&json!({ "panes": { "defaultNewPane": "bogus" } }), &v).is_some());
+        assert!(validate_patch(&json!({ "allowedFilePaths": "not-an-array" }), &v).is_some());
+        assert!(validate_patch(&json!({ "allowedFilePaths": ["ok"] }), &v).is_none());
+    }
+
+    /// Every shape/order below is byte-matched against the live ORIGINAL
+    /// (M1\u2013M8/E1\u2013E5 probe battery, 2026-07-12, cwd=repo server with the 5
+    /// bundled CLI extensions discovered).
+    #[test]
+    fn provider_name_validation_matches_the_original_byte_for_byte() {
+        let v = valid5();
+
+        // M1: every bad name yields its own custom issue, in item order.
+        let details =
+            validate_patch(&json!({ "codingCli": { "enabledProviders": ["bogus1", "bogus2"] } }), &v)
+                .unwrap();
+        assert_eq!(
+            details,
+            json!([
+                { "code": "custom", "message": "Unknown CLI provider: 'bogus1'", "path": ["codingCli", "enabledProviders", 0] },
+                { "code": "custom", "message": "Unknown CLI provider: 'bogus2'", "path": ["codingCli", "enabledProviders", 1] },
+            ])
+        );
+
+        // M2: enabledProviders \u2192 knownProviders \u2192 providers record key, in
+        // schema-definition order.
+        let details = validate_patch(
+            &json!({ "codingCli": { "enabledProviders": ["bogusA"], "knownProviders": ["bogusB"], "providers": { "bogusC": {} } } }),
+            &v,
+        )
+        .unwrap();
+        assert_eq!(
+            details,
+            json!([
+                { "code": "custom", "message": "Unknown CLI provider: 'bogusA'", "path": ["codingCli", "enabledProviders", 0] },
+                { "code": "custom", "message": "Unknown CLI provider: 'bogusB'", "path": ["codingCli", "knownProviders", 0] },
+                { "code": "invalid_key", "origin": "record",
+                  "issues": [{ "code": "custom", "message": "Unknown CLI provider: 'bogusC'", "path": [] }],
+                  "path": ["codingCli", "providers", "bogusC"], "message": "Invalid key in record" },
+            ])
+        );
+
+        // M3: nested field issues FIRST, top-level unrecognized_keys LAST.
+        let details = validate_patch(
+            &json!({ "zzz": 1, "codingCli": { "enabledProviders": ["bogusA"] } }),
+            &v,
+        )
+        .unwrap();
+        assert_eq!(details[0]["code"], "custom");
+        assert_eq!(
+            details[1],
+            json!({ "code": "unrecognized_keys", "keys": ["zzz"], "path": [], "message": "Unrecognized key: \"zzz\"" })
+        );
+
+        // M5: per-item invalid_type (expected FIRST key, no `received` field)
+        // and custom issues interleaved in item order; valid item silent.
+        let details =
+            validate_patch(&json!({ "codingCli": { "knownProviders": [42, "bogus", "claude"] } }), &v)
+                .unwrap();
+        assert_eq!(
+            details,
+            json!([
+                { "expected": "string", "code": "invalid_type", "path": ["codingCli", "knownProviders", 0], "message": "Invalid input: expected string, received number" },
+                { "code": "custom", "message": "Unknown CLI provider: 'bogus'", "path": ["codingCli", "knownProviders", 1] },
+            ])
+        );
+
+        // M6: several unknown top-level keys \u2192 ONE plural issue.
+        let details = validate_patch(&json!({ "zzz": 1, "yyy": 2 }), &v).unwrap();
+        assert_eq!(
+            details,
+            json!([{ "code": "unrecognized_keys", "keys": ["zzz", "yyy"], "path": [], "message": "Unrecognized keys: \"zzz\", \"yyy\"" }])
+        );
+
+        // M7: codingCli issues precede editor issues (schema key order).
+        let details = validate_patch(
+            &json!({ "editor": { "externalEditor": "bogus" }, "codingCli": { "enabledProviders": ["bogusA"] } }),
+            &v,
+        )
+        .unwrap();
+        assert_eq!(details[0]["code"], "custom");
+        assert_eq!(details[1]["code"], "invalid_value");
+
+        // M8: allowedFilePaths precedes panes (schema key order).
+        let details = validate_patch(
+            &json!({ "panes": { "defaultNewPane": "bogus" }, "allowedFilePaths": "x" }),
+            &v,
+        )
+        .unwrap();
+        assert_eq!(details[0]["code"], "invalid_type");
+        assert_eq!(details[1]["code"], "invalid_value");
+
+        // E1: '' yields too_small AND the custom allowlist issue.
+        let details =
+            validate_patch(&json!({ "codingCli": { "enabledProviders": [""] } }), &v).unwrap();
+        assert_eq!(
+            details,
+            json!([
+                { "origin": "string", "code": "too_small", "minimum": 1, "inclusive": true,
+                  "path": ["codingCli", "enabledProviders", 0],
+                  "message": "Too small: expected string to have >=1 characters" },
+                { "code": "custom", "message": "Unknown CLI provider: ''", "path": ["codingCli", "enabledProviders", 0] },
+            ])
+        );
+
+        // E2/E4/E5: container-level invalid_type shapes.
+        let details = validate_patch(&json!({ "codingCli": { "providers": "x" } }), &v).unwrap();
+        assert_eq!(details[0]["message"], "Invalid input: expected record, received string");
+        let details = validate_patch(&json!({ "codingCli": "x" }), &v).unwrap();
+        assert_eq!(details[0]["message"], "Invalid input: expected object, received string");
+        let details = validate_patch(&json!({ "codingCli": { "knownProviders": null } }), &v).unwrap();
+        assert_eq!(details[0]["message"], "Invalid input: expected array, received null");
+
+        // E3: codingCli is strict \u2014 nested unrecognized key.
+        let details = validate_patch(&json!({ "codingCli": { "zzz": 1 } }), &v).unwrap();
+        assert_eq!(
+            details,
+            json!([{ "code": "unrecognized_keys", "keys": ["zzz"], "path": ["codingCli"], "message": "Unrecognized key: \"zzz\"" }])
+        );
+
+        // Valid names pass (allowlist = discovered set).
+        assert!(validate_patch(&json!({ "codingCli": { "knownProviders": ["claude"], "enabledProviders": ["claude", "codex"] } }), &v).is_none());
+        // Empty allowlist rejects everything (cwd-neutral live probe).
+        let details = validate_patch(&json!({ "codingCli": { "knownProviders": ["claude"] } }), &[])
+            .unwrap();
+        assert_eq!(details[0]["message"], "Unknown CLI provider: 'claude'");
     }
 
     /// Byte-matched against a live probe of the ORIGINAL: the enum VALUES
@@ -500,27 +985,30 @@ mod tests {
     /// worked at all).
     #[test]
     fn enum_values_and_unrecognized_key_message_match_the_original() {
-        let details = validate_patch(&json!({ "editor": { "externalEditor": "bogus" } })).unwrap();
+        let v = valid5();
+        let details =
+            validate_patch(&json!({ "editor": { "externalEditor": "bogus" } }), &v).unwrap();
         assert_eq!(
             details[0]["message"],
             json!("Invalid option: expected one of \"auto\"|\"cursor\"|\"code\"|\"custom\"")
         );
 
-        let details = validate_patch(&json!({ "panes": { "defaultNewPane": "bogus" } })).unwrap();
+        let details =
+            validate_patch(&json!({ "panes": { "defaultNewPane": "bogus" } }), &v).unwrap();
         assert_eq!(
             details[0]["message"],
             json!("Invalid option: expected one of \"ask\"|\"shell\"|\"browser\"|\"editor\"")
         );
 
-        let details = validate_patch(&json!({ "theme": "dark" })).unwrap();
+        let details = validate_patch(&json!({ "theme": "dark" }), &v).unwrap();
         assert_eq!(details[0]["message"], json!("Unrecognized key: \"theme\""));
 
         // "vscode"/"terminal" were the WRONG (pre-fix) accepted values -- must
         // now be rejected, and the real values must be accepted.
-        assert!(validate_patch(&json!({ "editor": { "externalEditor": "vscode" } })).is_some());
-        assert!(validate_patch(&json!({ "editor": { "externalEditor": "cursor" } })).is_none());
-        assert!(validate_patch(&json!({ "panes": { "defaultNewPane": "terminal" } })).is_some());
-        assert!(validate_patch(&json!({ "panes": { "defaultNewPane": "editor" } })).is_none());
+        assert!(validate_patch(&json!({ "editor": { "externalEditor": "vscode" } }), &v).is_some());
+        assert!(validate_patch(&json!({ "editor": { "externalEditor": "cursor" } }), &v).is_none());
+        assert!(validate_patch(&json!({ "panes": { "defaultNewPane": "terminal" } }), &v).is_some());
+        assert!(validate_patch(&json!({ "panes": { "defaultNewPane": "editor" } }), &v).is_none());
     }
 
     fn uuid_like() -> String {

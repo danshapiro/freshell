@@ -35,8 +35,11 @@ use serde_json::{json, Map, Value};
 const MANIFEST_FILE: &str = "freshell.json";
 
 /// `DEFAULT_CLI_DETECTION_SPECS` (`server/platform.ts:97-103`) — the built-in CLI
-/// set, used as the fallback when no `extensions/` dir is present (mirrors the
-/// original's default parameter of `detectAvailableClis`).
+/// set behind `detectAvailableClis`'s JS *default parameter*. NOT used on the
+/// server boot path: `server/index.ts` always passes its extension-derived
+/// `cliDetectionSpecs` array (possibly empty), so this set never applies there
+/// (pinned by a cwd-neutral live probe, 2026-07-12: `availableClis: {}` when no
+/// `extensions/` dir is present). Kept for reference parity with `platform.ts`.
 pub const DEFAULT_CLI_DETECTION_SPECS: &[(&str, &str, &str)] = &[
     ("claude", "CLAUDE_CMD", "claude"),
     ("codex", "CODEX_CMD", "codex"),
@@ -211,19 +214,15 @@ impl ExtensionRegistry {
     }
 
     /// Build CLI detection specs from the CLI extensions (`server/index.ts:257-264`).
-    /// Falls back to [`DEFAULT_CLI_DETECTION_SPECS`] when no CLI extension is present
-    /// (mirrors `detectAvailableClis`'s default parameter).
+    /// GENUINELY EMPTY when no CLI extension is discovered: the original always
+    /// passes its extension-derived `cliDetectionSpecs` array to
+    /// `detectAvailableClis(cliDetectionSpecs)` (`server/index.ts`), so
+    /// `DEFAULT_CLI_DETECTION_SPECS` — a JS *default parameter* that only applies
+    /// when the argument is omitted entirely — never kicks in there. A previous
+    /// fallback here made `availableClis` a 5-key map when the process cwd had no
+    /// `extensions/` dir, where the live original serves `availableClis: {}`
+    /// (pinned by a cwd-neutral two-server differential, 2026-07-12).
     pub fn cli_detection_specs(&self) -> Vec<CliDetectionSpec> {
-        if !self.has_cli() {
-            return DEFAULT_CLI_DETECTION_SPECS
-                .iter()
-                .map(|(name, env_var, cmd)| CliDetectionSpec {
-                    name: (*name).to_string(),
-                    env_var: Some((*env_var).to_string()),
-                    default_cmd: (*cmd).to_string(),
-                })
-                .collect();
-        }
         self.entries
             .iter()
             .filter(|e| e.manifest.category == "cli")
@@ -406,10 +405,14 @@ fn resolve_builtin_extensions_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("FRESHELL_EXTENSIONS_DIR") {
         return PathBuf::from(dir);
     }
-    let compiled = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../extensions");
-    if compiled.exists() {
-        return compiled;
-    }
+    // `path.join(process.cwd(), 'extensions')` (`server/index.ts:227`): the
+    // original's "builtin" dir is CWD-RELATIVE — there is NO compiled-in
+    // fallback. A previous `CARGO_MANIFEST_DIR` fallback here made
+    // `GET /api/extensions` and `availableClis` non-empty when the process cwd
+    // wasn't the repo checkout, diverging from the live original (pinned by a
+    // cwd-neutral two-server differential, 2026-07-12: original with fresh HOME
+    // + cwd outside the repo serves `extensions=[]`, `availableClis={}`,
+    // `knownProviders=[]`).
     PathBuf::from("extensions")
 }
 
@@ -546,11 +549,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_registry_falls_back_to_default_specs() {
+    fn empty_registry_yields_empty_specs() {
+        // `detectAvailableClis(cliDetectionSpecs)` is always called with the
+        // extension-derived array in `server/index.ts` — an empty registry means
+        // an EMPTY spec list (original cwd-neutral live probe: `availableClis: {}`),
+        // never the `DEFAULT_CLI_DETECTION_SPECS` default-parameter set.
         let reg = ExtensionRegistry::default();
-        let specs = reg.cli_detection_specs();
-        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["claude", "codex", "opencode", "gemini", "kimi"]);
+        assert!(reg.cli_detection_specs().is_empty());
     }
 
     #[test]
