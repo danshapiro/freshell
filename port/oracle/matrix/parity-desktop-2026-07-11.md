@@ -100,3 +100,81 @@ mirror harness's kill helper got `[]` from the Rust server while live PTYs exist
 (original-vs-port divergence; not covered by the §7.C sweep list, which omits
 /api/terminals). **Status: PORT_DEFECT → implement directory GET (+ assess PATCH/DELETE
 /subroutes) with regression tests, rebuild both binaries, re-run oracle + REST sweep.**
+
+## Electron legs (task-005d) — Electron-from-source (WSLg) × both Rust servers — §7.E/§7.H
+
+Build once: `build:electron` + `build:wizard` + `build:launch-chooser`; entry is
+`dist/electron/electron/entry.js` (package.json `main`). Launched with an ISOLATED
+config home (`HOME`/`XDG_CONFIG_HOME` → scratch; configDir = `$HOME/.freshell`).
+NOTE: the `FRESHELL_REMOTE_URL`/`FRESHELL_TOKEN` **env pair is a Tauri-only
+mechanism** — `electron/` never reads them from `process.env` (verified by grep);
+Electron's own provisioning mechanism is the one-time `desktop.provision` file
+(`electron/desktop-provisioning.ts`), which is what both legs used.
+
+### Electron leg 1 — × Rust server (WSL, 17872)
+
+- **Provisioning file: PASS.** `desktop.provision` (`FRESHELL_REMOTE_URL=http://127.0.0.1:17872`
+  + `FRESHELL_TOKEN`) consumed (DELETED after apply → `desktop.json`), window loaded the
+  REMOTE SPA: first-run Remote Access wizard rendered = authenticated SPA
+  (`sbp9-elwsl-initial.png`, vision PASS); dismissed natively via xdotool click
+  ("No, just this computer").
+- **8-kind matrix on 17872 (mirror client): 8/8 PASS** (`sbp9-elwsl-report.json`) —
+  cmd/powershell/wsl land in the `/mnt/c/Users/Public/...` workspace, editor Monaco
+  mounts, browser renders example.com, claude/codex/opencode steady UIs paint.
+  Assertions identical to the Chromium/Tauri legs. Per-kind DESKTOP-window screenshots
+  were md5-duplicates (desktop client's active tab does not follow tabs created by a
+  second client — same behavior as the Tauri legs; SPA byte-identical) → deleted as
+  non-evidence, exactly as in the Tauri legs.
+- **Native in-window pane: PASS.** WSL pane created by clicking the picker IN the
+  Electron window. xdotool keyboard input flaked (Weston focus — same artifact as
+  Tauri leg B; click input path proven by the modal + picker clicks), so the marker
+  line was driven via WS `terminal.input` to the SAME terminal id; the Electron window
+  rendered the live PTY output: `freshell-matrix-OK` + `pwd` + full `uname -a`
+  (`sbp9-elwsl-elwin-wsl.png`, vision PASS).
+- **kill -9 (remote mode): PASS.** SIGKILL of the Electron main process → ALL electron
+  processes exited, zero orphans; the external server was (correctly) untouched.
+
+### Electron leg 2 — × Rust server (NATIVE WINDOWS, 17873)
+
+Server per §5.3 (`FRESHELL_BIND_HOST=0.0.0.0`, reached at `http://$WINIP:17873`).
+
+- **Provisioning file: PASS.** Fresh config home; provision file consumed; window
+  loaded the remote SPA served by the native-Windows rust server (Remote Access modal
+  = authenticated SPA; `sbp9-elwin-initial.png`, vision PASS); dismissed natively.
+  Observed: picker grid omits OpenCode (Windows `availableClis` — opencode absent on
+  the Windows side, host-legit).
+- **Native in-window pane: PASS.** CMD pane created by clicking the picker in the
+  Electron window (ConPTY spawn on the Windows side); marker via WS input; window
+  rendered `echo freshell-matrix-OK && ver` → `freshell-matrix-OK` +
+  `Microsoft Windows [Version 10.0.26200.8655]` (`sbp9-elwin-elwin-cmd.png`, vision PASS).
+
+### App-bound Electron (kill -9 orphan comparison owed from Tauri leg A caveat)
+
+**ENV-LIMITED (live run), with proof — architectural comparison recorded.**
+From-source Electron cannot run app-bound on this host:
+
+- production spawn mode requires a PACKAGED install (`startup.ts` needs
+  `resourcesPath/bundled-node/bin/node` + `resources/server/index.js`); observed:
+  `Error: Server process exited before health check succeeded`.
+- dev spawn mode resolves `server/index.ts` relative to the config dir; observed:
+  `ERR_MODULE_NOT_FOUND … url: file://<configDir>/.freshell/server/index.ts`.
+
+Architectural parity: `electron/server-spawner.ts` spawns the server with
+`detached: false` and NO parent-death watchdog → SIGKILL of the Electron shell
+orphans the server child by POSIX semantics — the SAME orphan class observed for
+the Tauri app-bound server after the synthetic WSLg SIGKILL (leg A caveat). Both
+shells reap the server on the GRACEFUL exit path (Tauri: live smoke-exit reap
+proven; Electron: `stop()` path unit-covered). No parity defect.
+
+### Native-Windows Electron (`electron:build:win`) — deep probe
+
+**ENV-LIMITED, with proof.** `scripts/assert-native-windows-build.ts` requires
+native win32 (node-pty must compile for win32). Windows side has node v22.5.1 +
+npm 10.8.2 (`C:\Program Files\nodejs`) and Python 3.11/3.12, **but no MSVC
+toolchain**: `where.exe cl` → not found; `vswhere.exe` ABSENT; no
+`Microsoft Visual Studio` directory under either Program Files root → `node-gyp`
+cannot build node-pty; installing VS Build Tools requires elevation (blocked on
+this host). Additionally the repo lives on the WSL filesystem and `cmd.exe` cannot
+cd to `\\wsl.localhost` UNC paths, so the required Windows-side `npm install`
+would first need a full native-path repo copy. The WSLg Electron legs above fully
+exercise the same `electron/` TypeScript against both Rust servers.
