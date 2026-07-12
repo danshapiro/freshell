@@ -6,7 +6,7 @@ base_commit: 98ed121c            # frozen. origin/main has since advanced to 6e8
                                  # do NOT rebase unless the user asks.
 worktree: .worktrees/rust-tauri-port
 branch: feat/rust-tauri-port
-updated: 2026-07-10
+updated: 2026-07-12
 
 current_phase: 5                 # 0=oracle bootstrap, 1=understand, 2=architect, 3=port, 4=self-qa, 5=converge
 # PHASES 0-2 COMPLETE: oracle (T0/T1/T2/T3 + mutation 28/28), 4 ground-truth specs, frozen ADR.
@@ -23,6 +23,20 @@ current_phase: 5                 # 0=oracle bootstrap, 1=understand, 2=architect
 #   ACCEPT-WITH-CONDITIONS; 404-pin in sweep; follow-up task-005f (search path) is a HARD GATE for task-009.
 #   T2-opencode flake fixed (093c1050, harness determinism). One PORT_DEFECT found+fixed
 #   (attachRequestId, invisible to T1, caught by T3).
+# TASK-005 CLOSED 2026-07-12 (this-host matrix + REST parity convergence, restarts #6-#9):
+#   ALL matrix legs done+vision-verified: Chromium x3 (e19dfead, 26/26), Tauri leg A app-bound +
+#   leg B remote/provisioning.rs first live run (305eb7c6), Electron-from-source WSLg x 17872 +
+#   x native-Win 17873 (9866ec2a; app-bound SIGKILL + electron:build:win ENV-LIMITED w/ proof).
+#   [task-005e p1, eaf3fd16] owed T3 spot-check EQUIVALENT (suite-order artifact, no regression);
+#   spot-sweep vs native-Win found+fixed bootstrap shell.ready/tasks+perf and strict logs/client
+#   zod validation (byte-matched live). [task-005e p2, 24ecdb8e] knownProviders mechanism PINNED
+#   (prior "cwd-neutral 5 providers" observation was a cwd=repo launch artifact): builtin extension
+#   dir is cwd-relative, knownProviders is persisted/patchable state w/ seed+append+auto-enable
+#   startup migration - all ported, PATCH provider-name validation byte-matched (17/17 battery);
+#   compiled-in extension-dir fallback removed (cwd-neutral extensions/availableClis now match).
+#   [c5e23374] native-Win machineHostname (hostname.exe==os.hostname()) + lanIps (Up-adapter
+#   PowerShell enum == os.networkInterfaces ground truth) live-verified on 17873.
+#   REST sweep now 175/175; oracle 174 passed/6 T2-skipped; cargo workspace green; purity held.
 # DEVIATIONS: DEV-0001 fixed+pinned (3/3), DEV-0002 fixed+pinned (4/4), DEV-0003 REJECTED (zero-tol).
 #   Open candidates CD-1..CD-8 + candidate-dirs (tracked in architecture-spec.md §8 / in-code notes).
 # DISCIPLINE HELD END-TO-END: original source NEVER mutated (git diff server/ shared/ empty at all
