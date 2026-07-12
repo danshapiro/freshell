@@ -363,6 +363,89 @@ pub fn detect_lan_ips_via_ipconfig(runner: &dyn CommandRunner) -> Vec<String> {
     rank_windows_host_ips(&parse_windows_host_ips(&out.stdout))
 }
 
+/// `rankLanIpCandidates` (`bootstrap.ts:87-92`): stable sort of `(address,
+/// netmask)` candidates by [`score_lan_ip`] descending (JS `Array.sort` is
+/// stable), mapped to addresses. Used by the off-WSL
+/// `detectLanIpsFromInterfaces` path with REAL per-address netmasks.
+pub fn rank_lan_ip_candidates(candidates: &[(String, String)]) -> Vec<String> {
+    let mut ranked: Vec<(String, String)> = candidates.to_vec();
+    ranked.sort_by_key(|(ip, mask)| std::cmp::Reverse(score_lan_ip(ip, mask)));
+    ranked.into_iter().map(|(ip, _)| ip).collect()
+}
+
+/// Dotted-quad netmask for an IPv4 prefix length (`24` → `255.255.255.0`) —
+/// what `os.networkInterfaces()` reports as `netmask` and PowerShell's
+/// `Get-NetIPAddress` reports as `PrefixLength`.
+pub fn prefix_len_to_netmask(prefix: u32) -> String {
+    let prefix = prefix.min(32);
+    let mask: u32 = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    format!(
+        "{}.{}.{}.{}",
+        (mask >> 24) & 0xff,
+        (mask >> 16) & 0xff,
+        (mask >> 8) & 0xff,
+        mask & 0xff
+    )
+}
+
+/// Parse the `"<IPv4> <PrefixLength>"` lines emitted by the PowerShell probe in
+/// [`detect_lan_ips_from_windows_interfaces`] into `(address, netmask)`
+/// candidates, dropping loopback (`127.*`) addresses — the `internal: true`
+/// entries `collectLanIpCandidates` (`bootstrap.ts:94-107`) skips.
+pub fn parse_powershell_ip_prefix_lines(output: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in output.lines() {
+        let mut parts = line.trim().split_whitespace();
+        let (Some(ip), Some(prefix)) = (parts.next(), parts.next()) else { continue };
+        if parts.next().is_some() {
+            continue;
+        }
+        let octets: Vec<&str> = ip.split('.').collect();
+        if octets.len() != 4 || !octets.iter().all(|o| o.parse::<u8>().is_ok()) {
+            continue;
+        }
+        if ip.starts_with("127.") {
+            continue; // loopback == os.networkInterfaces() `internal: true`
+        }
+        let Ok(prefix) = prefix.parse::<u32>() else { continue };
+        if prefix > 32 {
+            continue;
+        }
+        out.push((ip.to_string(), prefix_len_to_netmask(prefix)));
+    }
+    out
+}
+
+/// The PowerShell object query behind [`detect_lan_ips_from_windows_interfaces`]:
+/// IPv4 addresses restricted to adapters whose `Status` is `Up` — libuv's
+/// `uv_interface_addresses` (behind `os.networkInterfaces()`) skips adapters
+/// with `OperStatus != IfOperStatusUp`, which is exactly what drops the
+/// disconnected-adapter APIPA `169.254.*` addresses a raw `Get-NetIPAddress`
+/// still lists (live-verified on the QA host: with this filter the enumerated
+/// set equals the win-side `node os.networkInterfaces()` ground truth).
+/// Loopback never appears in `Get-NetAdapter`, but `127.*` is filtered in the
+/// parser anyway (the reference's `internal: true` skip).
+const WINDOWS_IP_PROBE: &str = "$up = (Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }).ifIndex; Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $up -contains $_.InterfaceIndex } | ForEach-Object { \"$($_.IPAddress) $($_.PrefixLength)\" }";
+
+/// `detectLanIpsFromInterfaces` (`bootstrap.ts:151-153`) for a NATIVE WINDOWS
+/// process: every non-internal IPv4 of an Up interface with its REAL netmask,
+/// ranked by [`score_lan_ip`] (stable). The reference reads
+/// `os.networkInterfaces()` (libuv `GetAdaptersAddresses`); this edge
+/// enumerates the same set via a READ-ONLY, locale-independent PowerShell
+/// object query (property names, not localized display text). Virtual
+/// adapters (vEthernet/WSL) are INCLUDED — only the original's WSL branch
+/// filters those.
+pub fn detect_lan_ips_from_windows_interfaces(runner: &dyn CommandRunner) -> Vec<String> {
+    let out = runner.run(
+        "powershell",
+        &["-NoProfile", "-NonInteractive", "-Command", WINDOWS_IP_PROBE],
+    );
+    if !out.ok() {
+        return Vec::new();
+    }
+    rank_lan_ip_candidates(&parse_powershell_ip_prefix_lines(&out.stdout))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,6 +646,58 @@ Ethernet adapter vEthernet (WSL):\r\n\
         assert_eq!(
             rank_windows_host_ips(&ips),
             vec!["192.168.1.5", "172.20.0.1", "10.200.0.4"]
+        );
+    }
+
+    #[test]
+    fn prefix_len_to_netmask_dotted_quads() {
+        assert_eq!(prefix_len_to_netmask(24), "255.255.255.0");
+        assert_eq!(prefix_len_to_netmask(32), "255.255.255.255");
+        assert_eq!(prefix_len_to_netmask(20), "255.255.240.0");
+        assert_eq!(prefix_len_to_netmask(8), "255.0.0.0");
+        assert_eq!(prefix_len_to_netmask(0), "0.0.0.0");
+    }
+
+    #[test]
+    fn parse_powershell_ip_prefix_lines_filters_loopback_and_junk() {
+        let out = "192.168.1.50 24\r\n127.0.0.1 8\r\n172.27.64.1 20\r\nnot-an-ip 24\r\n10.0.0.5 abc\r\n169.254.7.9 16\r\n";
+        assert_eq!(
+            parse_powershell_ip_prefix_lines(out),
+            vec![
+                ("192.168.1.50".to_string(), "255.255.255.0".to_string()),
+                ("172.27.64.1".to_string(), "255.255.240.0".to_string()),
+                ("169.254.7.9".to_string(), "255.255.0.0".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rank_lan_ip_candidates_uses_real_netmasks_and_is_stable() {
+        // A /32 (VPN-style) 192.168 address scores 1 — REAL netmask matters
+        // (rank_windows_host_ips' assumed /24 would have scored it 100).
+        let cands = vec![
+            ("192.168.9.9".to_string(), "255.255.255.255".to_string()),
+            ("10.200.0.4".to_string(), "255.255.255.0".to_string()),
+            ("192.168.1.5".to_string(), "255.255.255.0".to_string()),
+            ("169.254.7.9".to_string(), "255.255.0.0".to_string()),
+            ("100.100.1.2".to_string(), "255.255.255.0".to_string()),
+        ];
+        assert_eq!(
+            rank_lan_ip_candidates(&cands),
+            vec!["192.168.1.5", "10.200.0.4", "169.254.7.9", "100.100.1.2", "192.168.9.9"]
+        );
+    }
+
+    #[test]
+    fn detect_lan_ips_from_windows_interfaces_fake() {
+        let runner = FakeCommandRunner::new().on(
+            "powershell",
+            &["-NoProfile", "-NonInteractive", "-Command", WINDOWS_IP_PROBE],
+            CommandOutput::success("172.27.64.1 20\r\n192.168.1.50 24\r\n127.0.0.1 8\r\n"),
+        );
+        assert_eq!(
+            detect_lan_ips_from_windows_interfaces(&runner),
+            vec!["192.168.1.50", "172.27.64.1"]
         );
     }
 

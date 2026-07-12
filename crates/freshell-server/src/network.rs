@@ -230,11 +230,20 @@ fn resolve_live_network_facts() -> LiveNetworkFacts {
     // READ-ONLY firewall state (`netsh … show` / `ufw status` / `defaults read`).
     let firewall = detect_firewall(host_os, is_wsl2, &runner);
 
-    // LAN IPs: on WSL, query the Windows host's physical adapters (READ-ONLY
-    // `ipconfig.exe`, ranked). Off-WSL, `os.networkInterfaces()` is a live edge
-    // left unwired (empty) — documented; only affects the 0.0.0.0 share path.
+    // LAN IPs (`detectLanIps`, `bootstrap.ts:182-193`): on WSL, query the
+    // Windows host's physical adapters (READ-ONLY `ipconfig.exe`, ranked with
+    // the reference's assumed /24). On NATIVE WINDOWS, the reference falls
+    // through to `detectLanIpsFromInterfaces()` (`os.networkInterfaces()`,
+    // every non-internal IPv4 with its real netmask, ranked) — wired here via
+    // a READ-ONLY PowerShell object query (task-005e part 2, item 2; verified
+    // against the win-side `node os.networkInterfaces()` ground truth). On
+    // other non-WSL hosts (native Linux/macOS — outside this port's verified
+    // matrix), the interfaces edge remains unwired (empty) — documented; it
+    // only affects the 0.0.0.0 share path.
     let lan_ips = if is_wsl2 {
         freshell_platform::network::detect_lan_ips_via_ipconfig(&runner)
+    } else if cfg!(windows) {
+        freshell_platform::network::detect_lan_ips_from_windows_interfaces(&runner)
     } else {
         Vec::new()
     };
@@ -247,13 +256,31 @@ fn resolve_live_network_facts() -> LiveNetworkFacts {
 }
 
 /// `os.hostname().replace(/\.local$/, '')` (`network-manager.ts:385`).
+///
+/// Unix/WSL: `/proc/sys/kernel/hostname` → `HOSTNAME` env → `"localhost"`.
+/// NATIVE WINDOWS: `hostname.exe` (whose output equals Node's
+/// `os.hostname()`/`gethostname()` byte-for-byte — verified live on the QA
+/// host: both print `SurfaceBookPro9` while `COMPUTERNAME` is the UPPERCASED
+/// NetBIOS name `SURFACEBOOKPRO9`, which would be WRONG) → `COMPUTERNAME`
+/// env → `"localhost"` (task-005e part 2, item 2).
 fn read_machine_hostname() -> String {
-    let raw = std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| "localhost".to_string());
+    let raw = if cfg!(windows) {
+        std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("COMPUTERNAME").ok().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| "localhost".to_string())
+    } else {
+        std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| "localhost".to_string())
+    };
     raw.strip_suffix(".local").unwrap_or(&raw).to_string()
 }
 

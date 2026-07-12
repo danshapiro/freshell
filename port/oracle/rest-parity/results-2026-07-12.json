@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-07-12T14:18:01.273Z",
+  "generatedAt": "2026-07-12T14:33:50.163Z",
   "task": "HANDOFF §7.C REST surface parity sweep (node original :17871 vs rust port :17872)",
   "normalizedFields": {
     "terminalId": "id",
