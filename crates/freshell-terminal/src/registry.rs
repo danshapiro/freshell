@@ -153,6 +153,16 @@ struct TerminalShared {
     rows: u16,
     geometry_epoch: i64,
     cwd: Option<String>,
+    /// Directory metadata (`terminal-registry.ts:1614` stores `getModeLabel(opts.mode)`
+    /// as the title at create; `getModeLabel('shell') === 'Shell'`). Defaults preserve
+    /// the pre-meta behavior for the shell-only create path; `set_meta` (called from
+    /// the WS `terminal.create` handler once CLI panes land) overrides per-mode.
+    title: String,
+    description: Option<String>,
+    /// `TerminalMode` (`'shell' | 'claude' | 'codex' | …`).
+    mode: String,
+    /// The session id a CLI pane resumed from (feeds the directory `sessionRef`).
+    resume_session_id: Option<String>,
     /// Attached connections, keyed by connection id (multi-client fan-out, `§7.3`).
     subscribers: HashMap<u64, Subscriber>,
 }
@@ -177,17 +187,40 @@ impl TerminalShared {
         InventoryTerminal {
             created_at: self.created_at,
             last_activity_at: self.last_activity_at,
-            mode: "shell".to_string(),
+            mode: self.mode.clone(),
             status: self.status,
             terminal_id: self.terminal_id.clone(),
-            title: "Shell".to_string(),
+            title: self.title.clone(),
             codex_durability: None,
             cwd: self.cwd.clone(),
-            description: None,
+            description: self.description.clone(),
             runtime_status: None,
             session_ref: None,
         }
     }
+}
+
+/// One terminal's row for the REST terminal directory (`registry.list()` as consumed
+/// by `terminal-view/service.ts#listTerminalDirectory`): the raw registry record the
+/// `/api/terminals` router projects into the wire `TerminalDirectoryItem` (override
+/// merge, `sessionRef` derivation, and `lastLine` extraction happen in the router).
+#[derive(Debug, Clone)]
+pub struct DirectoryEntry {
+    pub terminal_id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub mode: String,
+    pub resume_session_id: Option<String>,
+    pub created_at: i64,
+    pub last_activity_at: i64,
+    pub status: TerminalRunStatus,
+    /// `clients.size > 0` — whether any connection is currently attached.
+    pub has_clients: bool,
+    pub cwd: Option<String>,
+    /// The retained scrollback reassembled in seq order (the original's
+    /// `record.buffer.snapshot()` — both sides are byte-capped rings, so this is
+    /// the same tail the original's `lastEmittedLine` reads).
+    pub snapshot: String,
 }
 
 /// The registry's control handle for one terminal: the shared stream state plus the
@@ -274,6 +307,10 @@ impl TerminalRegistry {
             rows: spec.rows,
             geometry_epoch: 1,
             cwd: spec.cwd.clone(),
+            title: "Shell".to_string(),
+            description: None,
+            mode: "shell".to_string(),
+            resume_session_id: None,
             subscribers: HashMap::new(),
         }));
 
@@ -510,6 +547,84 @@ impl TerminalRegistry {
         out
     }
 
+    /// Set a terminal's directory metadata (title/description/mode/resumeSessionId) —
+    /// the values `terminal-registry.ts:1544-1740` derives at create time
+    /// (`getModeLabel(opts.mode)` title, the CLI resume session id, …). Split from
+    /// [`create`](Self::create) so the shell-only create path keeps its signature;
+    /// the WS `terminal.create` handler calls this with mode context. `None` leaves
+    /// a field unchanged.
+    pub fn set_meta(
+        &self,
+        terminal_id: &str,
+        title: Option<String>,
+        description: Option<String>,
+        mode: Option<String>,
+        resume_session_id: Option<String>,
+    ) {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner.terminals.get(terminal_id).map(|h| Arc::clone(&h.shared))
+        };
+        if let Some(shared) = shared {
+            let mut s = shared.lock().expect("terminal lock");
+            if let Some(title) = title {
+                s.title = title;
+            }
+            if let Some(description) = description {
+                s.description = Some(description);
+            }
+            if let Some(mode) = mode {
+                s.mode = mode;
+            }
+            if let Some(rsid) = resume_session_id {
+                s.resume_session_id = Some(rsid);
+            }
+        }
+    }
+
+    /// `registry.updateTitle()` — the PATCH `/api/terminals/:id` write-through when a
+    /// non-empty `titleOverride` lands (`terminals-router.ts:303`).
+    pub fn update_title(&self, terminal_id: &str, title: &str) {
+        self.set_meta(terminal_id, Some(title.to_string()), None, None, None);
+    }
+
+    /// `registry.updateDescription()` — the PATCH write-through for
+    /// `descriptionOverride` (`terminals-router.ts:304`).
+    pub fn update_description(&self, terminal_id: &str, description: &str) {
+        self.set_meta(terminal_id, None, Some(description.to_string()), None, None);
+    }
+
+    /// `registry.list()` as consumed by the `/api/terminals` directory
+    /// (`terminal-view/service.ts#listTerminalDirectory`): every registered
+    /// terminal's raw record, including the reassembled scrollback snapshot the
+    /// `lastLine` extraction reads. Unsorted — the router applies the original's
+    /// `compareTerminals` (lastActivityAt desc, then terminalId desc).
+    pub fn directory(&self) -> Vec<DirectoryEntry> {
+        let shareds: Vec<Arc<Mutex<TerminalShared>>> = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner.terminals.values().map(|h| Arc::clone(&h.shared)).collect()
+        };
+        shareds
+            .iter()
+            .map(|shared| {
+                let s = shared.lock().expect("terminal lock");
+                DirectoryEntry {
+                    terminal_id: s.terminal_id.clone(),
+                    title: s.title.clone(),
+                    description: s.description.clone(),
+                    mode: s.mode.clone(),
+                    resume_session_id: s.resume_session_id.clone(),
+                    created_at: s.created_at,
+                    last_activity_at: s.last_activity_at,
+                    status: s.status,
+                    has_clients: !s.subscribers.is_empty(),
+                    cwd: s.cwd.clone(),
+                    snapshot: s.replay.iter().map(|f| f.output.data.as_str()).collect(),
+                }
+            })
+            .collect()
+    }
+
     /// The current `terminals.changed.revision` (run-monotonic, `§7.5`).
     pub fn revision(&self) -> i64 {
         self.inner.lock().expect("registry lock").revision
@@ -656,6 +771,10 @@ mod tests {
                 rows: 30,
                 geometry_epoch: 1,
                 cwd: None,
+                title: "Shell".to_string(),
+                description: None,
+                mode: "shell".to_string(),
+                resume_session_id: None,
                 subscribers: HashMap::new(),
             }));
             let mut inner = self.inner.lock().unwrap();
@@ -958,6 +1077,65 @@ mod tests {
         let inv2 = reg.inventory();
         assert_eq!(inv2.len(), 1);
         assert_eq!(inv2[0].terminal_id, "T-b");
+    }
+
+    #[test]
+    fn set_meta_flows_into_inventory_and_directory_defaults_stay_shell() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+
+        // Defaults preserve the pre-meta behavior (getModeLabel('shell') === 'Shell').
+        let inv = reg.inventory();
+        assert_eq!(inv[0].title, "Shell");
+        assert_eq!(inv[0].mode, "shell");
+        assert_eq!(inv[0].description, None);
+        let dir = reg.directory();
+        assert_eq!(dir[0].title, "Shell");
+        assert_eq!(dir[0].mode, "shell");
+        assert_eq!(dir[0].resume_session_id, None);
+        assert!(!dir[0].has_clients);
+
+        // set_meta (the WS create handler's mode context) overrides all fields.
+        reg.set_meta(
+            "T",
+            Some("Claude".into()),
+            Some("resumed pane".into()),
+            Some("claude".into()),
+            Some("sess-1".into()),
+        );
+        let inv = reg.inventory();
+        assert_eq!(inv[0].title, "Claude");
+        assert_eq!(inv[0].mode, "claude");
+        assert_eq!(inv[0].description.as_deref(), Some("resumed pane"));
+        let dir = reg.directory();
+        assert_eq!(dir[0].mode, "claude");
+        assert_eq!(dir[0].resume_session_id.as_deref(), Some("sess-1"));
+
+        // None leaves fields unchanged (updateTitle only touches the title).
+        reg.update_title("T", "Renamed");
+        let dir = reg.directory();
+        assert_eq!(dir[0].title, "Renamed");
+        assert_eq!(dir[0].mode, "claude");
+        reg.update_description("T", "new desc");
+        assert_eq!(reg.directory()[0].description.as_deref(), Some("new desc"));
+    }
+
+    #[test]
+    fn directory_reassembles_snapshot_and_reports_clients() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.feed("T", frame(1, "hello ", "S"));
+        reg.feed("T", frame(2, "world\r\n", "S"));
+        let dir = reg.directory();
+        assert_eq!(dir[0].snapshot, "hello world\r\n");
+        assert_eq!(dir[0].status, TerminalRunStatus::Running);
+        assert!(!dir[0].has_clients);
+
+        let (sink, _seen) = collector();
+        reg.attach("T", 9, sink, Some("a".into()), 0, false);
+        assert!(reg.directory()[0].has_clients);
+        reg.detach("T", 9);
+        assert!(!reg.directory()[0].has_clients);
     }
 
     #[test]

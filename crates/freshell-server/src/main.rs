@@ -26,6 +26,7 @@ mod serve_client;
 mod session_directory;
 mod settings;
 mod settings_store;
+mod terminals;
 mod updater;
 
 use std::net::{IpAddr, SocketAddr};
@@ -258,6 +259,18 @@ async fn main() -> ExitCode {
         registry: registry.clone(),
     };
 
+    // The `/api/terminals` directory surface (GET list/page + PATCH/DELETE
+    // overrides): reads the SAME registry the WS terminal path owns, patches
+    // `config.terminalOverrides` through the live settings store, and broadcasts
+    // `terminals.changed` on the shared bus.
+    let terminals_state = terminals::TerminalsState {
+        auth_token: Arc::clone(&auth_token),
+        settings: settings_store.clone(),
+        registry: registry.clone(),
+        broadcast_tx: Arc::clone(&broadcast_tx),
+        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+    };
+
     // The browser-pane HTTP reverse proxy (`/api/proxy/http/{port}/*`): the SPA's
     // BrowserPane rewrites loopback URLs to this same-origin path so its iframe can
     // render dev-server content with the iframe-blocking headers stripped.
@@ -292,6 +305,7 @@ async fn main() -> ExitCode {
         .merge(network::router(network_state))
         .merge(session_directory::router(session_directory_state))
         .merge(files::router(files_state))
+        .merge(terminals::router(terminals_state))
         .merge(proxy::router(proxy_state))
         .merge(screenshots::router(screenshots_state))
         .fallback({

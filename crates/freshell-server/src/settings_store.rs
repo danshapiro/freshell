@@ -49,6 +49,11 @@ pub struct SettingsStore {
     /// otherwise. Its VALUE is never compared by the oracle (registry
     /// `opaque` normalization) -- only its presence is.
     codex_display_id_secret: Arc<String>,
+    /// `config.terminalOverrides` (`server/config-store.ts`): per-terminal
+    /// user overrides (`titleOverride`/`descriptionOverride`/`deleted`) the
+    /// `/api/terminals` router reads (directory merge/filter) and patches.
+    /// A std `Mutex` (not tokio) so the sync `persist` path can snapshot it.
+    terminal_overrides: Arc<std::sync::Mutex<serde_json::Map<String, Value>>>,
 }
 
 impl SettingsStore {
@@ -60,11 +65,13 @@ impl SettingsStore {
         let mut settings = load_full_settings(home);
         settings.coding_cli.known_providers = Some(known_providers.clone());
         let codex_display_id_secret = load_or_mint_codex_display_id_secret(home);
+        let terminal_overrides = load_terminal_overrides(home);
         Self {
             inner: Arc::new(RwLock::new(settings)),
             home: home.map(|p| Arc::new(p.to_path_buf())),
             known_providers: Arc::new(known_providers),
             codex_display_id_secret: Arc::new(codex_display_id_secret),
+            terminal_overrides: Arc::new(std::sync::Mutex::new(terminal_overrides)),
         }
     }
 
@@ -131,7 +138,7 @@ impl SettingsStore {
             "version": 1,
             "settings": settings,
             "sessionOverrides": {},
-            "terminalOverrides": {},
+            "terminalOverrides": Value::Object(self.terminal_overrides.lock().expect("terminal overrides lock").clone()),
             "projectColors": {},
             "recentDirectories": [],
             "serverSecrets": { "codexDisplayIdSecret": &*self.codex_display_id_secret },
@@ -143,6 +150,76 @@ impl SettingsStore {
             let _ = std::fs::rename(&tmp, &path);
         }
     }
+
+    /// A snapshot of `config.terminalOverrides` (the `/api/terminals` directory
+    /// reads it to merge titles/descriptions and filter `deleted`).
+    pub fn terminal_overrides(&self) -> serde_json::Map<String, Value> {
+        self.terminal_overrides.lock().expect("terminal overrides lock").clone()
+    }
+
+    /// `configStore.patchTerminalOverride(id, patch)` (`config-store.ts:530-542`)
+    /// with the ORIGINAL's exact JS-spread semantics: `next = {...existing, ...patch}`
+    /// where the router's patch object carries **all** of its keys — a key patched
+    /// with `undefined` (here `None`) OVERWRITES the existing value and is then
+    /// dropped by `JSON.stringify` on persist/response. So callers pass every key
+    /// they want overwritten: `Some(v)` sets it, `None` clears it; keys NOT in
+    /// `patch` are preserved from the existing override (the `deleteTerminal`
+    /// single-key `{deleted:true}` path).
+    ///
+    /// Returns the merged override (`next`) — the PATCH response body.
+    pub async fn patch_terminal_override(
+        &self,
+        terminal_id: &str,
+        patch: &[(&str, Option<Value>)],
+    ) -> Value {
+        let next = {
+            let mut all = self.terminal_overrides.lock().expect("terminal overrides lock");
+            let mut next = all
+                .get(terminal_id)
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            for (key, value) in patch {
+                match value {
+                    // serde_json's preserve_order Map keeps an overwritten key's
+                    // position and appends new keys — the JS spread's key order.
+                    Some(v) => {
+                        next.insert((*key).to_string(), v.clone());
+                    }
+                    None => {
+                        next.remove(*key);
+                    }
+                }
+            }
+            all.insert(terminal_id.to_string(), Value::Object(next.clone()));
+            next
+        };
+        // Persist the whole config.json (same atomic tmp+rename write as a
+        // settings patch; the doc embeds the live settings tree + overrides).
+        let settings = self.get().await;
+        self.persist(&settings);
+        Value::Object(next)
+    }
+}
+
+/// Load `config.terminalOverrides` from `<home>/.freshell/config.json` (tolerant:
+/// any read/parse error or non-object degrades to empty, matching
+/// `config-store.ts#readConfigFile`).
+fn load_terminal_overrides(home: Option<&Path>) -> serde_json::Map<String, Value> {
+    let Some(home) = home else {
+        return serde_json::Map::new();
+    };
+    let config_path = home.join(".freshell").join("config.json");
+    let Ok(text) = std::fs::read_to_string(&config_path) else {
+        return serde_json::Map::new();
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&text) else {
+        return serde_json::Map::new();
+    };
+    doc.get("terminalOverrides")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Load the FULL persisted settings tree (not just the `network` slice

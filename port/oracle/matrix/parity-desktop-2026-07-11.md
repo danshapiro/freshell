@@ -66,7 +66,25 @@ Rust server booted on **17874** (WSL, scratch home, session token).
   remoteToken:<verbatim>, setupCompleted:true}`, window loaded the remote SPA
   (`sbp9-tauriB-provisionfile.png`).
 
-## PORT DEFECT found (open — fix before task-005 close)
+## PORT DEFECT found — **FIXED** (task-005c)
+
+**Resolution (task-005c commit):** full `/api/terminals` port landed —
+`crates/freshell-server/src/terminals.rs` (GET directory incl. override merge /
+deleted filter / lastLine algorithm / sort + the paged read-model branch with
+exact zod-v4 issue objects and keyset cursor; PATCH `/:id` with cleanString +
+JS-spread override merge + registry write-through + `terminals.changed`
+broadcast + express strict-JSON 400-HTML parity; DELETE `/:id` → `{ok:true}`),
+`registry.rs` meta fields (`set_meta`/`update_title`/`update_description`/
+`directory()`), `settings_store.rs` persisted `terminalOverrides`. Verified by
+the extended REST differential sweep vs the live original: **151/151 PASS**
+(30 new /api/terminals cases incl. live WS-created terminals on both servers),
+oracle T0/T1/batch/mutation green, cargo workspace green. The
+viewport/scrollback/search read-model subroutes remain deliberately unported —
+council-adjudicated **PORT-GAP-002** (ACCEPT-WITH-CONDITIONS), pinned to clean
+JSON 404 by sweep case `terminals.subroutes.rust-interim-404-pin`; see
+`port/oracle/EQUIVALENCE-REPORT.md` §8/§10.
+
+### Original defect record (historical)
 
 **`GET /api/terminals` on the Rust server is a stub returning `[]` always**
 (`crates/freshell-server/src/boot.rs:158-166`), while the ORIGINAL returns the live

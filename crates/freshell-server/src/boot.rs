@@ -18,8 +18,6 @@
 //!   `auth.spec.ts` probes to assert unauthenticated requests are rejected 401.
 //! * `GET /api/session-directory` — an empty read-model page for a clean isolated
 //!   boot (`SessionDirectoryPageSchema`-shaped).
-//! * `GET /api/terminals` — the terminal directory (an empty array on a clean
-//!   boot; the shape `TestHarness.killAllTerminals` + the directory listing read).
 //! * `GET /api/network/status` — a minimal loopback status so `fetchNetworkStatus`
 //!   resolves rather than erroring.
 //!
@@ -86,7 +84,6 @@ pub fn router(state: BootState) -> Router {
         .route("/api/bootstrap", get(bootstrap))
         .route("/api/platform", get(platform))
         .route("/api/version", get(version))
-        .route("/api/terminals", get(terminals))
         .route("/api/extensions", get(extensions))
         .route("/api/extensions/{name}", get(extension_by_name))
         .route("/api/logs/client", post(logs_client))
@@ -153,16 +150,6 @@ async fn version(State(state): State<BootState>, headers: HeaderMap) -> Response
     let update_check = state.update_checker.check(&state.app_version).await;
     Json(json!({ "currentVersion": &*state.app_version, "updateCheck": update_check }))
         .into_response()
-}
-
-/// `GET /api/terminals` → the terminal directory. Empty array on a clean boot
-/// (the no-read-model-query shape `terminalViewService.listTerminalDirectory()`
-/// returns, which `TestHarness.killAllTerminals` consumes as an array).
-async fn terminals(State(state): State<BootState>, headers: HeaderMap) -> Response {
-    if !is_authed(&headers, &state.auth_token) {
-        return unauthorized();
-    }
-    Json(json!([])).into_response()
 }
 
 /// `GET /api/extensions` → the client extensions registry (`toClientRegistry()`,

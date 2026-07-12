@@ -18,6 +18,9 @@ current_phase: 5                 # 0=oracle bootstrap, 1=understand, 2=architect
 #   original≡rust: T0 5/5 (handshake deep-equal), T1 10/10 (bytes sha256-identical), T2 matrix
 #   (opencode+codex+claude) structural deep-equal + 9/9 invariants each, T3 117/126 (+6/6 visual;
 #   8 EQUIVALENT red-on-original, 1 deferred PORT-GAP). Mutation 28/28. cargo workspace 400.
+#   [task-005c] full /api/terminals port landed (REST sweep 151/151 vs live original). PORT-GAP-002 open:
+#   GET /api/terminals/:id/{viewport,scrollback,search} unported (TerminalViewMirror) — council
+#   ACCEPT-WITH-CONDITIONS; 404-pin in sweep; follow-up task-005f (search path) is a HARD GATE for task-009.
 #   T2-opencode flake fixed (093c1050, harness determinism). One PORT_DEFECT found+fixed
 #   (attachRequestId, invisible to T1, caught by T3).
 # DEVIATIONS: DEV-0001 fixed+pinned (3/3), DEV-0002 fixed+pinned (4/4), DEV-0003 REJECTED (zero-tol).

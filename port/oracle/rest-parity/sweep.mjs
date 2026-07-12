@@ -76,6 +76,9 @@ const SHOTS_REL = '.worktrees/qa-rp-shots/'
  *   opaque    — live third-party network data, never value-compared
  */
 const NORMALIZED_FIELDS = {
+  // terminalIds are server-minted uuids — never value-comparable across the
+  // two servers; presence + same-key-position still compared.
+  terminalId: 'id',
   instanceId: 'id',
   serverInstanceId: 'id',
   bootId: 'id',
@@ -645,6 +648,78 @@ class UiScreenshotClient {
   }
 }
 
+/**
+ * Create a shell terminal over WS (`terminal.create` → `terminal.created`),
+ * optionally driving one input line, then close the socket (the terminal keeps
+ * running detached — hasClients:false on both sides). Returns the terminalId.
+ */
+function createTerminalWs(baseUrl, { input } = {}) {
+  const wsUrl = baseUrl.replace('http://', 'ws://') + '/ws'
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(wsUrl)
+    const requestId = crypto.randomUUID()
+    const timer = setTimeout(() => {
+      try {
+        ws.close()
+      } catch {
+        /* noop */
+      }
+      reject(new Error('terminal.create timeout'))
+    }, 15_000)
+    ws.on('message', (data) => {
+      let msg
+      try {
+        msg = JSON.parse(data.toString())
+      } catch {
+        return
+      }
+      if (msg.type === 'ready') {
+        ws.send(JSON.stringify({ type: 'terminal.create', requestId, mode: 'shell', shell: 'system' }))
+      }
+      if (msg.type === 'terminal.created' && msg.requestId === requestId) {
+        const terminalId = msg.terminalId
+        if (input) ws.send(JSON.stringify({ type: 'terminal.input', terminalId, data: input }))
+        // give the input a beat to reach the PTY before dropping the socket
+        setTimeout(() => {
+          clearTimeout(timer)
+          try {
+            ws.close()
+          } catch {
+            /* noop */
+          }
+          resolve(terminalId)
+        }, 300)
+      }
+    })
+    ws.on('error', (err) => {
+      clearTimeout(timer)
+      reject(err)
+    })
+    ws.on('open', () =>
+      ws.send(JSON.stringify({ type: 'hello', token: TOKEN, protocolVersion: WS_PROTOCOL_VERSION })),
+    )
+  })
+}
+
+/** Poll GET /api/terminals until the terminal's lastLine equals `marker`. */
+async function waitForLastLine(baseUrl, terminalId, marker, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(baseUrl + '/api/terminals', { headers: { 'x-auth-token': TOKEN } })
+      if (res.ok) {
+        const arr = await res.json()
+        const item = Array.isArray(arr) ? arr.find((t) => t.terminalId === terminalId) : null
+        if (item && item.lastLine === marker) return true
+      }
+    } catch {
+      /* retry */
+    }
+    await sleep(200)
+  }
+  return false
+}
+
 class BroadcastObserver {
   constructor(baseUrl) {
     this.baseUrl = baseUrl
@@ -1018,6 +1093,162 @@ async function main() {
 
     obsNode.close()
     obsRust.close()
+
+    // 10c. /api/terminals — directory GET (list + read-model page), PATCH/DELETE
+    // overrides (server/terminals-router.ts). Terminals are created live over WS
+    // (terminal.create) per side; ids are server-minted so real-id PATCH/DELETE
+    // requests are per-side (recordManual) while every fixed-path case stays
+    // byte-identical. The viewport/scrollback/search read-model subroutes are
+    // NOT ported (TerminalViewMirror) — recorded as a deferred deviation, not
+    // swept (see port/oracle/DEVIATIONS.md).
+    await runCase({ id: 'terminals.empty', group: 'terminals', description: 'empty directory on a boot with no terminals', path: '/api/terminals', auth: 'header' })
+    await runCase({ id: 'terminals.page.empty', group: 'terminals', description: 'empty read-model page (priority=visible)', path: '/api/terminals?priority=visible', auth: 'header' })
+    await runCase({ id: 'terminals.no-auth', group: 'terminals', description: '401 without credentials', path: '/api/terminals' })
+    await runCase({ id: 'terminals.bad-auth', group: 'terminals', description: '401 with bad token', path: '/api/terminals', auth: 'bad' })
+    // read-model query validation (exact zod issue objects)
+    await runCase({ id: 'terminals.page.nopriority', group: 'terminals', description: 'priority omitted with cursor present → 400 (priority is required)', path: '/api/terminals?cursor=abc', auth: 'header' })
+    await runCase({ id: 'terminals.page.badpriority', group: 'terminals', description: '400 unknown priority', path: '/api/terminals?priority=critical', auth: 'header' })
+    await runCase({ id: 'terminals.page.cursor-empty', group: 'terminals', description: 'empty cursor → 400 (cursor too_small + priority required)', path: '/api/terminals?cursor=', auth: 'header' })
+    await runCase({ id: 'terminals.page.revision-nan', group: 'terminals', description: '400 non-numeric revision', path: '/api/terminals?priority=visible&revision=abc', auth: 'header' })
+    await runCase({ id: 'terminals.page.revision-neg', group: 'terminals', description: '400 negative revision', path: '/api/terminals?priority=visible&revision=-1', auth: 'header' })
+    await runCase({ id: 'terminals.page.limit-zero', group: 'terminals', description: '400 limit=0 (positive())', path: '/api/terminals?priority=visible&limit=0', auth: 'header' })
+    await runCase({ id: 'terminals.page.limit-51', group: 'terminals', description: '400 limit over MAX_DIRECTORY_PAGE_ITEMS', path: '/api/terminals?priority=visible&limit=51', auth: 'header' })
+    await runCase({ id: 'terminals.page.limit-float', group: 'terminals', description: '400 non-integer limit (safeint)', path: '/api/terminals?priority=visible&limit=1.5', auth: 'header' })
+    await runCase({ id: 'terminals.page.bad-cursor', group: 'terminals', description: '400 undecodable cursor', path: '/api/terminals?cursor=@@@@&priority=visible', auth: 'header' })
+    await runCase({ id: 'terminals.page.cursor-wrong-shape', group: 'terminals', description: '400 cursor decodes to wrong JSON shape', path: '/api/terminals?cursor=eyJ4IjoxfQ&priority=visible', auth: 'header' })
+    await runCase({ id: 'terminals.page.revision-ok', group: 'terminals', description: 'valid revision param is accepted (and unused)', path: '/api/terminals?priority=visible&revision=5', auth: 'header' })
+    // override PATCH/DELETE on a FIXED (nonexistent) id — byte-identical paths;
+    // the original keeps overrides for unknown terminals (no 404 anywhere here).
+    await runCase({ id: 'terminals.patch.unknown-id', group: 'terminals', description: 'PATCH unknown id → 200 merged override; cleanString trims', method: 'PATCH', path: '/api/terminals/qa-fixed-id', auth: 'header', json: { titleOverride: '  QA Title  ' } })
+    await runCase({ id: 'terminals.patch.spread-overwrite', group: 'terminals', description: 'second PATCH drops keys absent from the body (JS-spread undefined overwrite)', method: 'PATCH', path: '/api/terminals/qa-fixed-id', auth: 'header', json: { descriptionOverride: 'D2' } })
+    await runCase({ id: 'terminals.patch.empty-body', group: 'terminals', description: 'PATCH {} → 200 {} (all override keys cleared)', method: 'PATCH', path: '/api/terminals/qa-fixed-id', auth: 'header', json: {} })
+    await runCase({ id: 'terminals.patch.null-clears', group: 'terminals', description: 'explicit nulls validate and clear (cleanString(null) → undefined)', method: 'PATCH', path: '/api/terminals/qa-fixed-id', auth: 'header', json: { titleOverride: null, descriptionOverride: null } })
+    await runCase({ id: 'terminals.patch.whitespace-title', group: 'terminals', description: 'whitespace-only title clears rather than sets', method: 'PATCH', path: '/api/terminals/qa-fixed-id', auth: 'header', json: { titleOverride: '   ', descriptionOverride: 'kept' } })
+    await runCase({ id: 'terminals.patch.title-toolong', group: 'terminals', description: '400 titleOverride > 500 chars', method: 'PATCH', path: '/api/terminals/qa-fixed-id', auth: 'header', json: { titleOverride: 'x'.repeat(501) } })
+    await runCase({ id: 'terminals.patch.desc-toolong', group: 'terminals', description: '400 descriptionOverride > 2000 chars', method: 'PATCH', path: '/api/terminals/qa-fixed-id', auth: 'header', json: { descriptionOverride: 'y'.repeat(2001) } })
+    await runCase({ id: 'terminals.patch.title-number', group: 'terminals', description: '400 titleOverride wrong type', method: 'PATCH', path: '/api/terminals/qa-fixed-id', auth: 'header', json: { titleOverride: 5 } })
+    await runCase({ id: 'terminals.patch.deleted-string', group: 'terminals', description: '400 deleted wrong type', method: 'PATCH', path: '/api/terminals/qa-fixed-id', auth: 'header', json: { deleted: 'yes' } })
+    await runCase({ id: 'terminals.patch.nonobject', group: 'terminals', description: '400 non-object body', method: 'PATCH', path: '/api/terminals/qa-fixed-id', auth: 'header', json: 5 })
+    await runCase({ id: 'terminals.patch.unknown-keys-stripped', group: 'terminals', description: 'unknown body keys stripped (schema not strict)', method: 'PATCH', path: '/api/terminals/qa-fixed-id', auth: 'header', json: { bogus: 1, titleOverride: 'T' } })
+    await runCase({ id: 'terminals.patch.no-auth', group: 'terminals', description: '401 without credentials', method: 'PATCH', path: '/api/terminals/qa-fixed-id', json: { titleOverride: 'x' } })
+    await runCase({ id: 'terminals.delete.unknown', group: 'terminals', description: 'DELETE unknown id → {ok:true} (no 404)', method: 'DELETE', path: '/api/terminals/qa-fixed-id-2', auth: 'header' })
+    await runCase({ id: 'terminals.delete.no-auth', group: 'terminals', description: '401 without credentials', method: 'DELETE', path: '/api/terminals/qa-fixed-id-2' })
+
+    // live terminals: create per side over WS, drive deterministic output, then
+    // compare the populated directory + page + override write-throughs.
+    const T1_MARKER = 'qa-last-line-parity-one'
+    const T2_MARKER = 'qa-last-line-parity-two'
+    let liveIds = null
+    try {
+      const t1node = await createTerminalWs(servers.node.baseUrl, { input: `printf '${T1_MARKER}\\n'\n` })
+      const t1rust = await createTerminalWs(servers.rust.baseUrl, { input: `printf '${T1_MARKER}\\n'\n` })
+      const ok1 = await Promise.all([
+        waitForLastLine(servers.node.baseUrl, t1node, T1_MARKER),
+        waitForLastLine(servers.rust.baseUrl, t1rust, T1_MARKER),
+      ])
+      if (!ok1.every(Boolean)) throw new Error(`t1 lastLine did not settle (node=${ok1[0]} rust=${ok1[1]})`)
+      liveIds = { t1node, t1rust }
+    } catch (err) {
+      recordDeferred(
+        { id: 'terminals.live.*', group: 'terminals', description: 'live-terminal directory cases' },
+        `terminal.create/lastLine settle failed: ${err.message}`,
+      )
+    }
+    if (liveIds) {
+      await runCase({ id: 'terminals.list.one', group: 'terminals', description: 'one live shell terminal — full item shape incl. lastLine/last_line', path: '/api/terminals', auth: 'header' })
+      // second terminal → deterministic 2-item ordering + keyset pagination
+      const t2node = await createTerminalWs(servers.node.baseUrl, { input: `printf '${T2_MARKER}\\n'\n` })
+      const t2rust = await createTerminalWs(servers.rust.baseUrl, { input: `printf '${T2_MARKER}\\n'\n` })
+      const ok2 = await Promise.all([
+        waitForLastLine(servers.node.baseUrl, t2node, T2_MARKER),
+        waitForLastLine(servers.rust.baseUrl, t2rust, T2_MARKER),
+      ])
+      if (ok2.every(Boolean)) {
+        await runCase({ id: 'terminals.list.two', group: 'terminals', description: 'two terminals sorted lastActivityAt desc', path: '/api/terminals', auth: 'header' })
+        await runCase({ id: 'terminals.page.limit1', group: 'terminals', description: 'page limit=1 → newest item + non-null nextCursor', path: '/api/terminals?priority=visible&limit=1', auth: 'header' })
+        // follow each side's OWN nextCursor (server-minted → per-side requests)
+        const follow = async (baseUrl) => {
+          // fetch the RAW page (doRequest normalizes cursors) to get the real nextCursor
+          const res = await fetch(baseUrl + '/api/terminals?priority=visible&limit=1', { headers: { 'x-auth-token': TOKEN } })
+          const raw = await res.json()
+          return doRequest(baseUrl, { path: `/api/terminals?priority=visible&limit=1&cursor=${encodeURIComponent(raw.nextCursor)}`, auth: 'header' })
+        }
+        recordManual(
+          { id: 'terminals.page.follow-cursor', group: 'terminals', description: 'second page via each side\'s own nextCursor → older item, null nextCursor', method: 'GET', path: '/api/terminals?priority=visible&limit=1&cursor=<own>', auth: 'header' },
+          await follow(servers.node.baseUrl),
+          await follow(servers.rust.baseUrl),
+        )
+        // PATCH the REAL t1 per side (ids differ) + broadcast observation
+        const obsNode = new BroadcastObserver(servers.node.baseUrl)
+        const obsRust = new BroadcastObserver(servers.rust.baseUrl)
+        await obsNode.connect()
+        await obsRust.connect()
+        recordManual(
+          { id: 'terminals.patch.real-title', group: 'terminals', description: 'PATCH real terminal: override response + registry write-through', method: 'PATCH', path: '/api/terminals/<own-t1>', auth: 'header', json: { titleOverride: 'QA Renamed', descriptionOverride: 'QA Desc' } },
+          await doRequest(servers.node.baseUrl, { method: 'PATCH', path: `/api/terminals/${liveIds.t1node}`, auth: 'header', json: { titleOverride: 'QA Renamed', descriptionOverride: 'QA Desc' } }),
+          await doRequest(servers.rust.baseUrl, { method: 'PATCH', path: `/api/terminals/${liveIds.t1rust}`, auth: 'header', json: { titleOverride: 'QA Renamed', descriptionOverride: 'QA Desc' } }),
+        )
+        const bcNode = await obsNode.waitForType('terminals.changed')
+        const bcRust = await obsRust.waitForType('terminals.changed')
+        recordManual(
+          { id: 'terminals.changed.broadcast', group: 'terminals', description: 'PATCH broadcasts terminals.changed {type, revision} to WS clients', method: 'WS', path: '(broadcast frame after PATCH)', auth: 'header' },
+          { status: bcNode ? 200 : 0, headers: {}, body: { kind: 'json', json: normalizeJson(bcNode) } },
+          { status: bcRust ? 200 : 0, headers: {}, body: { kind: 'json', json: normalizeJson(bcRust) } },
+        )
+        obsNode.close()
+        obsRust.close()
+        await runCase({ id: 'terminals.list.renamed', group: 'terminals', description: 'directory reflects title/description overrides', path: '/api/terminals', auth: 'header' })
+        // spread semantics on a LIVE terminal: PATCH {deleted:false} clears the
+        // title/description overrides; the list falls back to the registry title
+        // (which the earlier write-through renamed on BOTH sides).
+        recordManual(
+          { id: 'terminals.patch.real-spread', group: 'terminals', description: 'PATCH {deleted:false} on real terminal → response only {deleted:false}', method: 'PATCH', path: '/api/terminals/<own-t1>', auth: 'header', json: { deleted: false } },
+          await doRequest(servers.node.baseUrl, { method: 'PATCH', path: `/api/terminals/${liveIds.t1node}`, auth: 'header', json: { deleted: false } }),
+          await doRequest(servers.rust.baseUrl, { method: 'PATCH', path: `/api/terminals/${liveIds.t1rust}`, auth: 'header', json: { deleted: false } }),
+        )
+        await runCase({ id: 'terminals.list.after-spread', group: 'terminals', description: 'overrides cleared; title falls back to registry (write-through) title', path: '/api/terminals', auth: 'header' })
+        // DELETE the REAL t2 per side → {ok:true}; directory filters it out
+        recordManual(
+          { id: 'terminals.delete.real', group: 'terminals', description: 'DELETE real terminal → {ok:true}', method: 'DELETE', path: '/api/terminals/<own-t2>', auth: 'header' },
+          await doRequest(servers.node.baseUrl, { method: 'DELETE', path: `/api/terminals/${t2node}`, auth: 'header' }),
+          await doRequest(servers.rust.baseUrl, { method: 'DELETE', path: `/api/terminals/${t2rust}`, auth: 'header' }),
+        )
+        await runCase({ id: 'terminals.list.after-delete', group: 'terminals', description: 'deleted-override terminal filtered from the directory', path: '/api/terminals', auth: 'header' })
+        // PINNING (council-adjudicated PORT-GAP-002 condition 3, NOT an
+        // original-parity case): the viewport/scrollback/search read-model
+        // subroutes are deliberately unported on the Rust server (TerminalViewMirror
+        // subsystem — deferred, gated before task-009). Pin the interim contract:
+        // clean JSON 404 for live AND unknown ids — never 500/hang/SPA-shell.
+        // The "node" column below is the DECLARED contract, not the original server.
+        {
+          const routes = []
+          for (const id of [liveIds.t1rust, 'qa-missing-id']) {
+            for (const sub of ['viewport', 'scrollback', 'search']) {
+              const res = await fetch(`${servers.rust.baseUrl}/api/terminals/${id}/${sub}`, { headers: { 'x-auth-token': TOKEN } })
+              const text = await res.text()
+              let isJson = false
+              try {
+                isJson = typeof JSON.parse(text) === 'object'
+              } catch {
+                isJson = false
+              }
+              routes.push({ route: `${id === 'qa-missing-id' ? 'unknown-id' : 'live-id'}/${sub}`, status: res.status, json: isJson, html: text.includes('<!DOCTYPE html>') })
+            }
+          }
+          const expected = routes.map((r) => ({ route: r.route, status: 404, json: true, html: false }))
+          recordManual(
+            { id: 'terminals.subroutes.rust-interim-404-pin', group: 'terminals', description: 'PORT-GAP-002 pinning: unported viewport/scrollback/search answer clean JSON 404 (rust interim contract, declared — not original parity)', method: 'GET', path: '/api/terminals/:id/{viewport,scrollback,search}', auth: 'header' },
+            { status: 200, headers: {}, body: { kind: 'json', json: expected } },
+            { status: 200, headers: {}, body: { kind: 'json', json: routes } },
+          )
+        }
+      } else {
+        recordDeferred(
+          { id: 'terminals.live.second', group: 'terminals', description: 'two-terminal ordering/pagination/override cases' },
+          `t2 lastLine did not settle (node=${ok2[0]} rust=${ok2[1]})`,
+        )
+      }
+    }
 
     // 11. SPA serving + /ws upgrade auth
     await runCase({ id: 'spa.root', group: 'spa', description: 'GET / serves index.html no-store', path: '/' })
