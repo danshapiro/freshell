@@ -831,6 +831,27 @@ async function main() {
     await runCase({ id: 'platform.no-auth', group: 'platform', description: '401 without credentials', path: '/api/platform' })
     await runCase({ id: 'platform.bad-auth', group: 'platform', description: '401 with bad token', path: '/api/platform', auth: 'bad' })
 
+    // 4b. /api/bootstrap (task-005e: found untested by the win spot-sweep —
+    // the shell-critical first-paint payload incl. `shell.ready`/`shell.tasks`
+    // (`startupState.snapshot().tasks`) and `perf.logging`)
+    await runCase({ id: 'bootstrap.happy', group: 'bootstrap', description: 'GET /api/bootstrap: settings+platform+shell{ready,tasks}+perf', path: '/api/bootstrap', auth: 'header' })
+    await runCase({ id: 'bootstrap.no-auth', group: 'bootstrap', description: '401 without credentials', path: '/api/bootstrap' })
+
+    // 4c. POST /api/logs/client (task-005e: found untested — strict zod
+    // ClientLogsPayloadSchema; 204 on success, 400 {error,details} on failure)
+    await runCase({ id: 'logsclient.valid', group: 'logsclient', description: '204 on a valid payload', method: 'POST', path: '/api/logs/client', auth: 'header', json: { entries: [{ timestamp: '2026-01-01T00:00:00.000Z', severity: 'info', message: 'sweep parity probe' }] } })
+    await runCase({ id: 'logsclient.valid.client', group: 'logsclient', description: '204 with client info object', method: 'POST', path: '/api/logs/client', auth: 'header', json: { client: { id: 'sweep', userAgent: 'ua' }, entries: [{ timestamp: 't', severity: 'debug', event: 'e' }] } })
+    await runCase({ id: 'logsclient.entry-unknown-key', group: 'logsclient', description: 'entry unknown keys are stripped (204)', method: 'POST', path: '/api/logs/client', auth: 'header', json: { entries: [{ timestamp: 't', severity: 'warn', bogus: 1 }] } })
+    await runCase({ id: 'logsclient.missing-entries', group: 'logsclient', description: '400 invalid_type entries undefined', method: 'POST', path: '/api/logs/client', auth: 'header', json: {} })
+    await runCase({ id: 'logsclient.entries-empty', group: 'logsclient', description: '400 too_small (min 1)', method: 'POST', path: '/api/logs/client', auth: 'header', json: { entries: [] } })
+    await runCase({ id: 'logsclient.entries-too-big', group: 'logsclient', description: '400 too_big (max 200)', method: 'POST', path: '/api/logs/client', auth: 'header', json: { entries: Array.from({ length: 201 }, () => ({ timestamp: 't', severity: 'info' })) } })
+    await runCase({ id: 'logsclient.bad-severity', group: 'logsclient', description: '400 invalid_value enum', method: 'POST', path: '/api/logs/client', auth: 'header', json: { entries: [{ timestamp: 't', severity: 'fatal' }] } })
+    await runCase({ id: 'logsclient.bad-types', group: 'logsclient', description: '400 per-field invalid_type battery in schema order', method: 'POST', path: '/api/logs/client', auth: 'header', json: { entries: [{ timestamp: 5, severity: 'info', message: 7, event: 8, consoleMethod: 9, args: 'no', stack: 10, context: 'no' }] } })
+    await runCase({ id: 'logsclient.combined-order', group: 'logsclient', description: '400 issue ordering: client → entry fields → unrecognized_keys', method: 'POST', path: '/api/logs/client', auth: 'header', json: { entries: [{ timestamp: 5, severity: 'bad' }], zzz: 1, client: 5 } })
+    await runCase({ id: 'logsclient.unknown-top', group: 'logsclient', description: '400 strict unrecognized_keys (plural message)', method: 'POST', path: '/api/logs/client', auth: 'header', json: { entries: [{ timestamp: 't', severity: 'info' }], extra: 1, logs: 2 } })
+    await runCase({ id: 'logsclient.top-array', group: 'logsclient', description: '400 invalid_type: array passes express, fails zod', method: 'POST', path: '/api/logs/client', auth: 'header', json: [1, 2] })
+    await runCase({ id: 'logsclient.no-auth', group: 'logsclient', description: '401 without credentials', method: 'POST', path: '/api/logs/client', json: { entries: [{ timestamp: 't', severity: 'info' }] } })
+
     // 5. /api/extensions
     const extList = await runCase({ id: 'extensions.list', group: 'extensions', description: '5-entry registry, exact shape', path: '/api/extensions', auth: 'header' })
     await runCase({ id: 'extensions.no-auth', group: 'extensions', description: '401 without credentials', path: '/api/extensions' })

@@ -573,7 +573,7 @@ fn validate_patch_string(body: &Map<String, Value>, key: &str, max: usize, issue
 }
 
 /// zod v4's `received` type-name for a JSON value.
-fn zod_received(v: &Value) -> &'static str {
+pub(crate) fn zod_received(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
         Value::Bool(_) => "boolean",
@@ -714,7 +714,7 @@ async fn delete_terminal(
 /// rejects (`entity.parse.failed`) — byte-captured from the LIVE original
 /// (`PATCH /api/terminals/:id` with body `5`): 400, `text/html`, CSP
 /// `default-src 'none'`, and the canonical "Bad Request" error page.
-fn express_bad_request() -> Response {
+pub(crate) fn express_bad_request() -> Response {
     (
         StatusCode::BAD_REQUEST,
         [

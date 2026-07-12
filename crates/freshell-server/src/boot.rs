@@ -99,12 +99,41 @@ async fn bootstrap(State(state): State<BootState>, headers: HeaderMap) -> Respon
         return unauthorized();
     }
     let settings = state.settings.get().await;
+    // `shell`: `server/index.ts:191` wires `getShellTaskStatus` to
+    // `startupState.snapshot().tasks`; the original registers exactly two
+    // startup tasks (`sessionRepairService` @ index.ts:886, `codingCliIndexer`
+    // @ index.ts:901 — key order as observed live) and `ready` is
+    // `Object.values(tasks).every(Boolean)`. The port performs its equivalent
+    // init before binding the listener, so the steady-state snapshot (all
+    // true) is the faithful response for every observable request.
+    // `perf`: `getPerfLogging` (`index.ts:192`) → `{ logging: perfConfig.enabled }`,
+    // where enabled = parseBoolean(PERF_LOGGING) || parseBoolean(PERF_DEBUG)
+    // (`server/perf-logger.ts:33-35`).
     Json(json!({
         "settings": settings,
         "platform": &*state.platform,
-        "shell": { "authenticated": true },
+        "shell": {
+            "authenticated": true,
+            "ready": true,
+            "tasks": { "sessionRepairService": true, "codingCliIndexer": true },
+        },
+        "perf": { "logging": perf_logging_enabled() },
     }))
     .into_response()
+}
+
+/// `parseBoolean(env.PERF_LOGGING) || parseBoolean(env.PERF_DEBUG)`
+/// (`server/perf-logger.ts:20-24,35`): trimmed, lowercased ∈ {1,true,yes,on}.
+fn perf_logging_enabled() -> bool {
+    fn parse(k: &str) -> bool {
+        std::env::var(k)
+            .map(|v| {
+                let n = v.trim().to_lowercase();
+                n == "1" || n == "true" || n == "yes" || n == "on"
+            })
+            .unwrap_or(false)
+    }
+    parse("PERF_LOGGING") || parse("PERF_DEBUG")
 }
 
 /// `GET /api/extensions/:name` \u2192 the single `ClientExtensionEntry` (R6). A
@@ -165,13 +194,214 @@ async fn extensions(State(state): State<BootState>, headers: HeaderMap) -> Respo
     Json(&*state.extensions).into_response()
 }
 
-/// `POST /api/logs/client` → the client-log sink. Accept-and-ack (the SPA ignores
-/// the body); returning 200 stops the boot-time 404.
-async fn logs_client(State(state): State<BootState>, headers: HeaderMap) -> Response {
+/// `POST /api/logs/client` → the client-log sink (`server/client-logs.ts`).
+/// The original validates the body against the strict zod
+/// `ClientLogsPayloadSchema` (`{ client?, entries: ClientLogEntry[1..200] }`),
+/// answering `400 { error: "Invalid request", details: issues }` on failure and
+/// **204 No Content** on success (the entries are only logged server-side).
+/// Issue objects below are ground-truthed against the LIVE original (zod v4).
+async fn logs_client(
+    State(state): State<BootState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
     if !is_authed(&headers, &state.auth_token) {
         return unauthorized();
     }
-    Json(json!({ "ok": true })).into_response()
+    // express.json() strict mode: empty body → `{}` (then fails zod on the
+    // missing `entries`); malformed / non-object-or-array top-level JSON →
+    // express's own 400 HTML error page BEFORE the route runs.
+    let parsed: Value = if body.is_empty() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        match serde_json::from_slice::<Value>(&body) {
+            Ok(v @ (Value::Object(_) | Value::Array(_))) => v,
+            Ok(_) | Err(_) => return crate::terminals::express_bad_request(),
+        }
+    };
+    let issues = client_logs_issues(&parsed);
+    if issues.is_empty() {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Invalid request", "details": issues })),
+        )
+            .into_response()
+    }
+}
+
+/// zod-v4 issue list for `ClientLogsPayloadSchema.safeParse(body)`
+/// (`server/client-logs.ts:6-29`). Field order follows schema declaration
+/// (`client`, then `entries`, per-entry: timestamp, severity, message, event,
+/// consoleMethod, args, stack, context); strict-object `unrecognized_keys` is
+/// appended last — all as observed live.
+fn client_logs_issues(body: &Value) -> Vec<Value> {
+    use crate::terminals::zod_received;
+    let mut issues: Vec<Value> = Vec::new();
+    let obj = match body {
+        Value::Object(m) => m,
+        other => {
+            issues.push(json!({
+                "expected": "object", "code": "invalid_type", "path": [],
+                "message": format!("Invalid input: expected object, received {}", zod_received(other))
+            }));
+            return issues;
+        }
+    };
+
+    // `client: ClientInfoSchema.optional()` — absent is fine; present must be
+    // a plain object of optional strings (id, userAgent, url, path, language,
+    // platform — declaration order).
+    if let Some(client) = obj.get("client") {
+        match client {
+            Value::Object(c) => {
+                for key in ["id", "userAgent", "url", "path", "language", "platform"] {
+                    if let Some(v) = c.get(key) {
+                        if !v.is_string() {
+                            issues.push(json!({
+                                "expected": "string", "code": "invalid_type", "path": ["client", key],
+                                "message": format!("Invalid input: expected string, received {}", zod_received(v))
+                            }));
+                        }
+                    }
+                }
+            }
+            other => issues.push(json!({
+                "expected": "object", "code": "invalid_type", "path": ["client"],
+                "message": format!("Invalid input: expected object, received {}", zod_received(other))
+            })),
+        }
+    }
+
+    // `entries: z.array(ClientLogEntrySchema).min(1).max(200)` (required).
+    match obj.get("entries") {
+        None => issues.push(json!({
+            "expected": "array", "code": "invalid_type", "path": ["entries"],
+            "message": "Invalid input: expected array, received undefined"
+        })),
+        Some(Value::Array(arr)) => {
+            if arr.is_empty() {
+                issues.push(json!({
+                    "origin": "array", "code": "too_small", "minimum": 1, "inclusive": true,
+                    "path": ["entries"],
+                    "message": "Too small: expected array to have >=1 items"
+                }));
+            } else if arr.len() > 200 {
+                issues.push(json!({
+                    "origin": "array", "code": "too_big", "maximum": 200, "inclusive": true,
+                    "path": ["entries"],
+                    "message": "Too big: expected array to have <=200 items"
+                }));
+            } else {
+                for (i, entry) in arr.iter().enumerate() {
+                    entry_issues(entry, i, &mut issues);
+                }
+            }
+        }
+        Some(other) => issues.push(json!({
+            "expected": "array", "code": "invalid_type", "path": ["entries"],
+            "message": format!("Invalid input: expected array, received {}", zod_received(other))
+        })),
+    }
+
+    // `.strict()` on the top-level object only (entry objects strip silently).
+    let unknown: Vec<&str> = obj
+        .keys()
+        .filter(|k| k.as_str() != "client" && k.as_str() != "entries")
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        let quoted: Vec<String> = unknown.iter().map(|k| format!("\"{k}\"")).collect();
+        let message = if unknown.len() == 1 {
+            format!("Unrecognized key: {}", quoted[0])
+        } else {
+            format!("Unrecognized keys: {}", quoted.join(", "))
+        };
+        issues.push(json!({
+            "code": "unrecognized_keys", "keys": unknown, "path": [], "message": message
+        }));
+    }
+    issues
+}
+
+/// Per-entry issues for `ClientLogEntrySchema` (non-strict object: unknown
+/// entry keys are stripped without error — verified live).
+fn entry_issues(entry: &Value, index: usize, issues: &mut Vec<Value>) {
+    use crate::terminals::zod_received;
+    let e = match entry {
+        Value::Object(m) => m,
+        other => {
+            issues.push(json!({
+                "expected": "object", "code": "invalid_type", "path": ["entries", index],
+                "message": format!("Invalid input: expected object, received {}", zod_received(other))
+            }));
+            return;
+        }
+    };
+    // timestamp: z.string() (required)
+    match e.get("timestamp") {
+        Some(v) if v.is_string() => {}
+        Some(v) => issues.push(json!({
+            "expected": "string", "code": "invalid_type", "path": ["entries", index, "timestamp"],
+            "message": format!("Invalid input: expected string, received {}", zod_received(v))
+        })),
+        None => issues.push(json!({
+            "expected": "string", "code": "invalid_type", "path": ["entries", index, "timestamp"],
+            "message": "Invalid input: expected string, received undefined"
+        })),
+    }
+    // severity: z.enum(['debug','info','warn','error']) (required) — any
+    // missing/invalid value yields `invalid_value` (verified live).
+    let severity_ok = matches!(
+        e.get("severity").and_then(Value::as_str),
+        Some("debug" | "info" | "warn" | "error")
+    );
+    if !severity_ok {
+        issues.push(json!({
+            "code": "invalid_value", "values": ["debug", "info", "warn", "error"],
+            "path": ["entries", index, "severity"],
+            "message": "Invalid option: expected one of \"debug\"|\"info\"|\"warn\"|\"error\""
+        }));
+    }
+    // optional string fields, declaration order
+    for key in ["message", "event", "consoleMethod"] {
+        if let Some(v) = e.get(key) {
+            if !v.is_string() {
+                issues.push(json!({
+                    "expected": "string", "code": "invalid_type", "path": ["entries", index, key],
+                    "message": format!("Invalid input: expected string, received {}", zod_received(v))
+                }));
+            }
+        }
+    }
+    // args: z.array(z.unknown()).optional()
+    if let Some(v) = e.get("args") {
+        if !v.is_array() {
+            issues.push(json!({
+                "expected": "array", "code": "invalid_type", "path": ["entries", index, "args"],
+                "message": format!("Invalid input: expected array, received {}", zod_received(v))
+            }));
+        }
+    }
+    // stack: z.string().optional()
+    if let Some(v) = e.get("stack") {
+        if !v.is_string() {
+            issues.push(json!({
+                "expected": "string", "code": "invalid_type", "path": ["entries", index, "stack"],
+                "message": format!("Invalid input: expected string, received {}", zod_received(v))
+            }));
+        }
+    }
+    // context: z.record(z.string(), z.unknown()).optional()
+    if let Some(v) = e.get("context") {
+        if !v.is_object() {
+            issues.push(json!({
+                "expected": "record", "code": "invalid_type", "path": ["entries", index, "context"],
+                "message": format!("Invalid input: expected record, received {}", zod_received(v))
+            }));
+        }
+    }
 }
 
 /// `POST /api/tabs-sync/client-retire` → retire a client's tab snapshot from the
