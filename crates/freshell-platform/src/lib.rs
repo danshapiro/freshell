@@ -149,6 +149,14 @@ impl Env for RealEnv {
 /// An injected view of `fs.existsSync(path)` (used by `getSystemShell`).
 pub trait FileProbe {
     fn exists(&self, path: &str) -> bool;
+
+    /// Directory-aware probe (DEV-0005 condition 3): `wsl_windows_shell_inherit_cwd`
+    /// must never hand the child PTY a cwd that exists as a *file* (a chdir failure
+    /// mode the original could never produce). Defaults to `exists` for probes that
+    /// cannot distinguish (legacy behavior).
+    fn is_dir(&self, path: &str) -> bool {
+        self.exists(path)
+    }
 }
 
 /// The real filesystem (the live edge).
@@ -159,12 +167,17 @@ impl FileProbe for RealFileProbe {
     fn exists(&self, path: &str) -> bool {
         std::path::Path::new(path).exists()
     }
+
+    fn is_dir(&self, path: &str) -> bool {
+        std::path::Path::new(path).is_dir()
+    }
 }
 
 /// A set-backed [`FileProbe`] for deterministic unit tests.
 #[derive(Debug, Default, Clone)]
 pub struct MapFileProbe {
     present: std::collections::BTreeSet<String>,
+    files: std::collections::BTreeSet<String>,
 }
 
 impl MapFileProbe {
@@ -172,9 +185,17 @@ impl MapFileProbe {
         Self::default()
     }
 
-    /// Builder-style: register `path` as existing.
+    /// Builder-style: register `path` as existing (as a directory-like entry).
     pub fn with(mut self, path: &str) -> Self {
         self.present.insert(path.to_string());
+        self
+    }
+
+    /// Builder-style: register `path` as existing **as a plain file** (DEV-0005
+    /// condition 3: `is_dir` returns false for these).
+    pub fn with_file(mut self, path: &str) -> Self {
+        self.present.insert(path.to_string());
+        self.files.insert(path.to_string());
         self
     }
 }
@@ -182,6 +203,10 @@ impl MapFileProbe {
 impl FileProbe for MapFileProbe {
     fn exists(&self, path: &str) -> bool {
         self.present.contains(path)
+    }
+
+    fn is_dir(&self, path: &str) -> bool {
+        self.present.contains(path) && !self.files.contains(path)
     }
 }
 

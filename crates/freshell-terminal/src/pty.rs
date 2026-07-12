@@ -134,18 +134,39 @@ impl PtyTerminal {
             })
             .map_err(to_io)?;
 
-        let mut cmd = CommandBuilder::new(&spec.program);
-        cmd.args(&spec.args);
-        // node-pty *replaces* the environment: clear inherited, set the computed map.
-        cmd.env_clear();
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
-        if let Some(cwd) = &spec.cwd {
-            cmd.cwd(cwd);
-        }
+        let build_cmd = |with_cwd: bool| {
+            let mut cmd = CommandBuilder::new(&spec.program);
+            cmd.args(&spec.args);
+            // node-pty *replaces* the environment: clear inherited, set the computed map.
+            cmd.env_clear();
+            for (key, value) in env {
+                cmd.env(key, value);
+            }
+            if with_cwd {
+                if let Some(cwd) = &spec.cwd {
+                    cmd.cwd(cwd);
+                }
+            }
+            cmd
+        };
 
-        let child = pair.slave.spawn_command(cmd).map_err(to_io)?;
+        // DEV-0005 condition 4 (TOCTOU guard): if the spawn fails WITH a process cwd
+        // (e.g. an inherited /mnt mount that vanished between the FileProbe check and
+        // this spawn, or any cwd that stopped being a directory), log + degrade by
+        // retrying once without the cwd (the child then inherits the server's cwd —
+        // the reference's own behavior on WSL) instead of surfacing a raw spawn error
+        // the original could never produce.
+        let child = match pair.slave.spawn_command(build_cmd(true)) {
+            Ok(child) => child,
+            Err(err) if spec.cwd.is_some() => {
+                eprintln!(
+                    "[freshell-terminal] PTY spawn with cwd {:?} failed ({err}); degrading to cwd-less spawn (DEV-0005 TOCTOU guard)",
+                    spec.cwd.as_deref().unwrap_or("")
+                );
+                pair.slave.spawn_command(build_cmd(false)).map_err(to_io)?
+            }
+            Err(err) => return Err(to_io(err)),
+        };
         // Drop the parent's slave handle so the master EOFs once the child exits.
         drop(pair.slave);
 

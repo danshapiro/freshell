@@ -212,6 +212,36 @@ fn wsl_cmd_falls_back_to_in_command_cd_when_mount_absent() {
 }
 
 #[test]
+fn wsl_cmd_falls_back_when_mount_exists_as_a_file() {
+    // DEV-0005 condition 3 (adjudicated 2026-07-11): a resolved mount path that
+    // exists as a plain FILE must never become the child's process cwd (a chdir
+    // spawn failure the original could never produce) -> keep the faithful
+    // in-command `cd /d` fallback.
+    let env = MapEnv::new();
+    let probe = bash_probe().with_file("/mnt/c/proj");
+    let got = build(ShellType::Cmd, HostOs::Linux, true, Some("/mnt/c/proj"), &env, &probe);
+    assert_eq!(
+        got,
+        spec("/mnt/c/Windows/System32/cmd.exe", &["/K", r#"cd /d "C:\proj""#], None)
+    );
+}
+
+#[test]
+fn wsl_powershell_falls_back_when_mount_exists_as_a_file() {
+    let env = MapEnv::new();
+    let probe = bash_probe().with_file("/mnt/c/proj");
+    let got = build(ShellType::Powershell, HostOs::Linux, true, Some("/mnt/c/proj"), &env, &probe);
+    assert_eq!(
+        got,
+        spec(
+            "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+            &["-NoLogo", "-NoExit", "-Command", r"Set-Location -LiteralPath 'C:\proj'"],
+            None,
+        )
+    );
+}
+
+#[test]
 fn wsl_honors_env_overrides_for_exe_paths_and_custom_mount() {
     // WSL_WINDOWS_SYS32 changes both the exe path AND the mount prefix used for cwd conversion.
     let env = MapEnv::new().with("WSL_WINDOWS_SYS32", "/custom/c/Windows/System32");

@@ -1,0 +1,96 @@
+[
+  {
+    "kind": "cmd",
+    "label": "CMD",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-wsl-chrome-cmd.png",
+    "status": "PASS",
+    "detail": "marker x>=2 · landed in workspace (freshell-matrix-ws-sbp9-wsl-chrome-nj2891ij)",
+    "bufferExcerpt": "C:\\Users\\Public\\freshell-matrix-ws-sbp9-wsl-chrome-nj2891ij>echo freshell-matrix-OK | freshell-matrix-OK | C:\\Users\\Public\\freshell-matrix-ws-sbp9-wsl-chrome-nj2891ij>",
+    "terminalId": "08171f57ad6744609257e062f7b7de80",
+    "tabId": "6PalZxPObq45-sJXRnVZZ"
+  },
+  {
+    "kind": "powershell",
+    "label": "PowerShell",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-wsl-chrome-powershell.png",
+    "status": "PASS",
+    "detail": "marker x>=2 · landed in workspace (freshell-matrix-ws-sbp9-wsl-chrome-nj2891ij)",
+    "bufferExcerpt": "PS C:\\Users\\Public\\freshell-matrix-ws-sbp9-wsl-chrome-nj2891ij> echo freshell-matrix-OK | freshell-matrix-OK | PS C:\\Users\\Public\\freshell-matrix-ws-sbp9-wsl-chrome-nj2891ij> ",
+    "terminalId": "535d2ca93ccb483dbd893299af02df1d",
+    "tabId": "N7am0YqTwaMFSvpQndAIm"
+  },
+  {
+    "kind": "wsl",
+    "label": "WSL",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-wsl-chrome-wsl.png",
+    "status": "PASS",
+    "detail": "marker x>=2 · landed in workspace (freshell-matrix-ws-sbp9-wsl-chrome-nj2891ij)",
+    "bufferExcerpt": "sLinux SurfaceBookPro9 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64 x | 86_64 x86_64 GNU/Linux | dan@SurfaceBookPro9:/mnt/c/Users/Public/freshell-matrix-ws-sbp9-wsl-chrome-nj2891ij$ echo freshell-matrix-OK && pwd | freshell-matrix-OK | /mnt/c/Users/Public/freshell-matrix-ws-sbp9-wsl-chrome-nj2891ij | dan@SurfaceBookPro9:/mnt/c/Users/Public/freshell-ma",
+    "terminalId": "31e6c50d40c646d2b35c78665739e5db",
+    "tabId": "zNwksdOQcpK4LPsEdJ-5Y"
+  },
+  {
+    "kind": "editor",
+    "label": "Editor",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-wsl-chrome-editor.png",
+    "status": "PASS",
+    "detail": "Monaco mounted + text visible · jsdelivr/monaco responses: 13 (13×2xx-3xx)",
+    "bufferExcerpt": "",
+    "tabId": "uqFG0UkDMTFzT6YOkDq_g"
+  },
+  {
+    "kind": "browser",
+    "label": "Browser",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-wsl-chrome-browser.png",
+    "status": "PASS",
+    "detail": "navigated http://example.com → page content rendered",
+    "bufferExcerpt": "",
+    "tabId": "wmZ7O7NxPAuvLBdEU7Oot"
+  },
+  {
+    "kind": "claude",
+    "label": "Claude CLI",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-wsl-chrome-claude.png",
+    "status": "PASS",
+    "detail": "launched + steady UI painted (/\\? for shortcuts|for shortcuts|bypass permissions|╰─+|>\\s*$|try \"|/i)",
+    "bufferExcerpt": "  2 -  console.log(\"Hello, World!\");                                                                                 |   2 +  console.log(\"Hello, Claude!\");                                                                                |   3  } |  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ | ╌╌╌ |   Syntax theme: Monokai Exte",
+    "terminalId": "bc48ad9366b5430a97d238447e21927b",
+    "tabId": "iOLVe8g9jp6FC3wWNh8UM"
+  },
+  {
+    "kind": "codex",
+    "label": "Codex CLI",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-wsl-chrome-codex.png",
+    "status": "PASS",
+    "detail": "launched + steady UI painted (/sign in with chatgpt|press enter to continue|provide your own api key|welcome to codex|to get started|describe a task|\\/status|model:|yes, continue/i)",
+    "bufferExcerpt": "     Usage included with Plus, Pro, Business, and Enterprise plans |   2. Sign in with Device Code |      Sign in from another device with a one-time code |   3. Provide your own API key |      Pay for what you use |   Press enter to continue",
+    "terminalId": "72050289d8c247d3ae5b155ae00398cc",
+    "tabId": "qpKg2D0BXZuK_5mi5udRi"
+  },
+  {
+    "kind": "opencode",
+    "label": "OpenCode",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-wsl-chrome-opencode.png",
+    "status": "PASS",
+    "detail": "launched + steady UI painted (/ask anything|esc\\s|ctrl\\+|\\/help|tab\\s+agents|▌|>_/i)",
+    "bufferExcerpt": "                       ┃                                                                                     |                        ┃  Build · GPT-5.3 Chat (latest) OpenAI                                               |                        ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀           |                                                                    ",
+    "terminalId": "d36ec28285004c2ab2f7fb13356061b8",
+    "tabId": "El_1a1KX4crLJ_Psyyez8"
+  }
+]

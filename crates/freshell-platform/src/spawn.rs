@@ -734,8 +734,12 @@ fn wsl_windows_shell_inherit_cwd(
     is_wsl_env: bool,
     probe: &dyn FileProbe,
 ) -> Option<String> {
+    // DEV-0005 condition 3: gate on is_dir (not mere existence) so a mount path that
+    // exists as a plain FILE never becomes the child's process cwd (a chdir spawn
+    // failure the original could never produce); such paths keep the faithful
+    // in-command fallback.
     let mount = convert_windows_path_to_wsl_path(win_cwd, env, is_wsl_env)?;
-    probe.exists(&mount).then_some(mount)
+    probe.is_dir(&mount).then_some(mount)
 }
 
 /// `winCwd = inWsl ? (resolveWindowsShellCwd(cwd) || getWindowsDefaultCwd()) :

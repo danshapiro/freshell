@@ -458,6 +458,61 @@ path itself is intact).
   `0000000000000000-dc849de1bd584a39_self-driving-reviewer`, 2026-07-11.
 - **status:** accepted.
 
+### DEV-0005 — WSL-hosted `cmd` shell pane strands the user in `C:\Windows` instead of the requested workspace cwd
+
+- **objective_defect:** *errors* (primary bar — per adjudication condition 1): the original
+  deterministically prints TWO error banners on every WSL-hosted cmd pane launch with a valid `/mnt`
+  workspace cwd, and lands the user in the wrong directory. Secondary corroboration only: *breaks an
+  invariant the code itself asserts* — the reference's cmd branch exists specifically to land the shell
+  in the requested directory (on WSL it passes `cwd: undefined` to node-pty and injects `cd /d <winCwd>`
+  into the `/K` command, `server/terminal-registry.ts:1177-1199`, comment "Use /K with cd command to
+  change to Windows directory"). At runtime BOTH halves of that mechanism fail deterministically on a
+  real WSL host:
+  1. cmd.exe inherits the server's Linux cwd as a `\\wsl.localhost\...` UNC path → *"CMD.EXE was started
+     with the above path as the current directory. UNC paths are not supported. Defaulting to Windows
+     directory."*
+  2. The injected `cd /d "<winCwd>"` is destroyed by WSL-interop argv→Windows-cmdline conversion (every
+     embedded `"` from `quoteCmdArg`, `terminal-registry.ts:1014-1044`, arrives escaped as `\"`), and
+     cmd's builtin `cd` rejects it → *"The filename, directory name, or volume label syntax is
+     incorrect."* The shell is stranded in `C:\Windows`.
+  Evidence: reproduced 3/3 against the freshly-booted pristine original (17871) with a valid, existing
+  DrvFs workspace `/mnt/c/Users/Public/freshell-matrix-ws-*` — `port/oracle/matrix/notes-orig-cmd-fallback.md`
+  (OCR transcript of `recheck-orig-cmd-1-cmd.png` shows both error banners + the `C:\Windows>` prompt).
+  PowerShell is unaffected (its `Set-Location -LiteralPath '<path>'` uses single quotes that survive
+  interop) — matching the matrix (original powershell PASS).
+- **original_behavior:** A `terminal.create {shell:'cmd'}` with a valid `/mnt/<drive>/...` cwd on a
+  WSL-hosted server opens cmd.exe in `C:\Windows` (after printing the two error banners), silently
+  discarding the requested workspace directory.
+- **port_behavior:** `wsl_windows_shell_inherit_cwd` (`crates/freshell-platform/src/spawn.rs:709-739`,
+  in-code flagged "PORT FIX (deliberate, reported divergence)"): the port hands the child PTY a valid
+  Linux mount cwd (`/mnt/<d>/...`) that WSL interop maps to the intended Windows directory — no UNC
+  inheritance, no in-command `cd`. Gated on the mount actually existing (`FileProbe`), so a missing
+  mount falls back to the faithful in-command mechanism. The cmd pane lands in the requested workspace.
+- **fingerprint:** Matrix §7.E, `cmd` pane-kind cell on WSL-hosted servers only: differ tolerates
+  original={cwd falls back to `C:\Windows`} vs port={cwd lands in the requested workspace}. Marker
+  echo and every other cmd-cell assertion (creation, output round-trip, screenshot) must still match.
+  No tolerance for the native-Windows-hosted server (17873): no interop layer there; both systems must
+  land in the workspace.
+- **pinning_test:** `crates/freshell-platform/tests/spawn_tests.rs` —
+  `wsl_cmd_inherits_mount_cwd_when_present` (probe WITH the mount ⇒ spec carries the `/mnt` cwd and
+  bare `/K`), `wsl_cmd_no_cwd_inherits_mnt_c_root_when_present`, and
+  `wsl_cmd_falls_back_to_in_command_cd_when_mount_absent` (probe WITHOUT ⇒ the faithful
+  `['/K','cd /d ...']` golden preserved) — pre-existing since the PORT FIX landed (4e148667 class).
+  Live proof: matrix cmd cells (`sbp9-wsl-chrome-report.json`, `sbp9-win-chrome-report.json` PASS
+  in-workspace) vs 3/3 original fallback re-drives (`recheck-orig-cmd-{1,2,3}-report.json`).
+- **adjudicated_by:** council panel (intent-keeper, cranky-old-sam, crusty-old-engineer, user-advocate,
+  tester-breaker; restless-old-brian unavailable — bundle not installed, gap disclosed), forked session
+  `5b30a1942db44dc0-ccb27c93a63b41eb_self`, 2026-07-11. Verdict: **ACCEPT-WITH-CONDITIONS** — (A) objective
+  defect: YES on the "errors" bar (primary) + code-asserted-intent (secondary); (B) proper DELIBERATE_FIX,
+  not scope creep; (C) fingerprint appropriately narrow; (D) pinning tests directionally sufficient with
+  named gaps. All 5 conditions SATISFIED same-day: (1) objective_defect reordered to lead with the errors
+  bar; (2) fields closed (this entry); (3) is-dir gate — `FileProbe::is_dir` + `wsl_windows_shell_inherit_cwd`
+  gates on it + `wsl_{cmd,powershell}_falls_back_when_mount_exists_as_a_file` tests; (4) TOCTOU guard —
+  `PtyTerminal::spawn` degrades to a cwd-less spawn (logged) when the cwd spawn fails, never a raw error
+  the original couldn't produce; (5) host-gated live integration tests
+  `crates/freshell-terminal/tests/wsl_interop_live.rs` (`#[ignore]`, run green on this host — see commit).
+- **status:** accepted
+
 <!--
 Template:
 
