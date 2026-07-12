@@ -16,11 +16,28 @@
 //! * `DELETE /api/terminals/{id}` → `patchTerminalOverride(id, {deleted:true})`
 //!   (single-key patch — other override keys survive), broadcast, `{ok:true}`.
 //!
+//! * `GET /api/terminals/{id}/search` (task-005f, PORT-GAP-002 condition) —
+//!   `terminalViewService.searchTerminal` + `TerminalViewMirror.search`
+//!   (`terminal-view/mirror.ts:111-134`): the mirror's logical-line model is
+//!   the terminal's raw output normalized (`\r\n`→`\n`, bare `\r` dropped, CSI
+//!   escapes stripped) and split on `\n`; matching is per-line lowercased
+//!   `indexOf` (column = UTF-16 units into the LOWERCASED line), `limit`
+//!   default 50, `nextCursor = String(lastMatchLine+1)` while more lines
+//!   remain. JS quirks replicated byte-for-byte from live probes (2026-07-12,
+//!   `~/freshell-scratch-005e/search-truth-orig.json`): `Number(cursor)`
+//!   coercion (`"abc"`→NaN→empty page, `" "`→0, `"0x5"`/`"1e1"`/`"+5"`/`"5.0"`
+//!   numeric, `"-0"`→0), and NEGATIVE/FRACTIONAL cursors reproduce the
+//!   original's 500 `{"error":"Cannot read properties of undefined (reading
+//!   'toLowerCase')"}` (`this.lines[-3]` is `undefined`). zod validation
+//!   (outer route parse + `TerminalSearchQuerySchema`) with exact zod-v4 issue
+//!   shapes/order.
+//!
 //! ## Deliberately NOT ported here (recorded in the parity ledger)
 //!
-//! * `GET /:id/viewport|scrollback|search` — backed by the original's
-//!   `TerminalViewMirror` (a server-side VT screen mirror). Deferred with an
-//!   adjudicated deviation entry; axum answers 404 for these subroutes.
+//! * `GET /:id/viewport|scrollback` — backed by the original's
+//!   `TerminalViewMirror` viewport state. NO production callers (SPA uses only
+//!   the search subroute) — YAGNI per the council adjudication of PORT-GAP-002;
+//!   axum answers 404 for these two subroutes (pinned in the sweep).
 //! * The CLI-session rename cascade (`cascadeTerminalRenameToSession`): the Rust
 //!   server has no terminal-metadata service yet (CLI panes land with the argv
 //!   fidelity task); a PATCH title still write-throughs to the registry.
@@ -79,6 +96,7 @@ pub fn router(state: TerminalsState) -> Router {
             "/api/terminals/{terminal_id}",
             patch(patch_terminal).delete(delete_terminal),
         )
+        .route("/api/terminals/{terminal_id}/search", get(search_terminal))
         .with_state(state)
 }
 
@@ -118,6 +136,238 @@ fn js_number(s: &str) -> f64 {
         return i64::from_str_radix(hex, 16).map(|v| v as f64).unwrap_or(f64::NAN);
     }
     t.parse::<f64>().unwrap_or(f64::NAN)
+}
+
+// ── GET /{id}/search ────────────────────────────────────────────────────────
+
+/// `GET /api/terminals/{id}/search` (`terminals-router.ts:229-286` +
+/// `TerminalViewMirror.search`). Validation → 404 → mirror search; every
+/// status/body byte-matched against the live original (probe battery
+/// 2026-07-12).
+async fn search_terminal(
+    State(state): State<TerminalsState>,
+    AxumPath(terminal_id): AxumPath<String>,
+    headers: HeaderMap,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return unauthorized();
+    }
+
+    let query = query_param(&pairs, "query").value;
+    let cursor = query_param(&pairs, "cursor").value;
+    let limit_raw = query_param(&pairs, "limit").value;
+
+    // OUTER route parse (`z.coerce.number()` on `limit`): the only outer
+    // failure a non-empty path segment allows is a NaN limit. On outer
+    // failure the INNER schema re-runs with ALL-undefined inputs and the
+    // issue arrays are CONCATENATED (`terminals-router.ts:248-254`).
+    let limit_num = limit_raw.as_deref().map(js_number);
+    if let Some(v) = limit_num {
+        if v.is_nan() {
+            let details = json!([
+                {
+                    "expected": "number",
+                    "code": "invalid_type",
+                    "received": "NaN",
+                    "path": ["limit"],
+                    "message": "Invalid input: expected number, received NaN",
+                },
+                {
+                    "expected": "string",
+                    "code": "invalid_type",
+                    "path": ["query"],
+                    "message": "Invalid input: expected string, received undefined",
+                },
+            ]);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Invalid request", "details": details })),
+            )
+                .into_response();
+        }
+    }
+
+    // INNER `TerminalSearchQuerySchema` (`shared/read-models.ts:111-115`):
+    // issues aggregate in schema field order query → cursor → limit; per
+    // field the FIRST failing check wins (live: `-1.5` yields ONLY the
+    // int/safeint issue; `-5` yields ONLY too_small).
+    let mut issues: Vec<Value> = Vec::new();
+    match query.as_deref() {
+        None => issues.push(json!({
+            "expected": "string",
+            "code": "invalid_type",
+            "path": ["query"],
+            "message": "Invalid input: expected string, received undefined",
+        })),
+        Some("") => issues.push(json!({
+            "origin": "string",
+            "code": "too_small",
+            "minimum": 1,
+            "inclusive": true,
+            "path": ["query"],
+            "message": "Too small: expected string to have >=1 characters",
+        })),
+        Some(_) => {}
+    }
+    if cursor.as_deref() == Some("") {
+        issues.push(json!({
+            "origin": "string",
+            "code": "too_small",
+            "minimum": 1,
+            "inclusive": true,
+            "path": ["cursor"],
+            "message": "Too small: expected string to have >=1 characters",
+        }));
+    }
+    if let Some(v) = limit_num {
+        const MAX_SAFE: f64 = 9007199254740991.0;
+        if v.fract() != 0.0 || v.abs() > MAX_SAFE {
+            issues.push(json!({
+                "expected": "int",
+                "format": "safeint",
+                "code": "invalid_type",
+                "path": ["limit"],
+                "message": "Invalid input: expected int, received number",
+            }));
+        } else if v <= 0.0 {
+            issues.push(json!({
+                "origin": "number",
+                "code": "too_small",
+                "minimum": 0,
+                "inclusive": false,
+                "path": ["limit"],
+                "message": "Too small: expected number to be >0",
+            }));
+        } else if v > 200.0 {
+            issues.push(json!({
+                "origin": "number",
+                "code": "too_big",
+                "maximum": 200,
+                "inclusive": true,
+                "path": ["limit"],
+                "message": "Too big: expected number to be <=200",
+            }));
+        }
+    }
+    if !issues.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Invalid request", "details": issues })),
+        )
+            .into_response();
+    }
+
+    // `registry.get(terminalId)` — exited-but-undeleted terminals stay
+    // registered and searchable; only an unknown id is 404.
+    let Some(entry) = state
+        .registry
+        .directory()
+        .into_iter()
+        .find(|e| e.terminal_id == terminal_id)
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Terminal not found" })),
+        )
+            .into_response();
+    };
+
+    let lines = mirror_lines(&entry.snapshot);
+    let cursor_val = cursor.as_deref().map(js_number).unwrap_or(0.0);
+    let limit_val = limit_num.map(|v| v as usize).unwrap_or(50);
+    match mirror_search(&lines, &query.unwrap_or_default(), cursor_val, limit_val) {
+        Ok(page) => Json(page).into_response(),
+        Err(message) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": message })),
+        )
+            .into_response(),
+    }
+}
+
+/// The mirror's logical-line model (`TerminalViewMirror`): raw output
+/// normalized (`\r\n`→`\n`, bare `\r` removed, CSI escapes stripped —
+/// `mirror.ts:9-16`; note this is CSI-ONLY, unlike `lastEmittedLine`'s wider
+/// strip) and split on `\n` (lines start `['']` + `appendLines` ==
+/// `split('\n')` of the concatenation).
+fn mirror_lines(snapshot: &str) -> Vec<String> {
+    let no_cr = snapshot.replace("\r\n", "\n").replace('\r', "");
+    strip_csi_escapes(&no_cr).split('\n').map(str::to_string).collect()
+}
+
+/// `/\u001B\[[0-9;?]*[ -\/]*[@-~]/gu` (`mirror.ts:9`): a CSI sequence is ESC
+/// `[`, then `[0-9;?]*` params, `[ -/]*` intermediates, and a REQUIRED final
+/// `[@-~]`. An incomplete sequence does not match (the regex leaves the raw
+/// bytes in place) — replicated by emitting the ESC and rescanning from `[`.
+fn strip_csi_escapes(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\u{1B}' && i + 1 < chars.len() && chars[i + 1] == '[' {
+            let mut j = i + 2;
+            while j < chars.len() && matches!(chars[j], '0'..='9' | ';' | '?') {
+                j += 1;
+            }
+            while j < chars.len() && (' '..='/').contains(&chars[j]) {
+                j += 1;
+            }
+            if j < chars.len() && ('@'..='~').contains(&chars[j]) {
+                i = j + 1; // full CSI match — drop it
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// `TerminalViewMirror.search` (`mirror.ts:111-134`) with JS array/loop
+/// semantics preserved: `for (let i = cursor; i < lines.length; i += 1)` where
+/// `cursor = Number(cursorParam)`. NaN/`+Infinity` never enter the loop (empty
+/// page); NEGATIVE or FRACTIONAL indices make `this.lines[i]` `undefined`, so
+/// the original throws the TypeError the route surfaces as a 500 — replicated
+/// byte-for-byte. `column` counts UTF-16 units into the LOWERCASED line
+/// (`line.toLowerCase().indexOf(query.toLowerCase())`), while `text` is the
+/// original line.
+fn mirror_search(
+    lines: &[String],
+    query: &str,
+    cursor: f64,
+    limit: usize,
+) -> Result<Value, String> {
+    let needle = query.to_lowercase();
+    let mut matches: Vec<Value> = Vec::new();
+    let mut last_line: Option<usize> = None;
+
+    let mut i = cursor;
+    while i < lines.len() as f64 {
+        if matches.len() >= limit {
+            break;
+        }
+        // JS `lines[i]`: only a non-negative integer index (incl. `-0`) is a
+        // real element; anything else is `undefined` → TypeError.
+        if i < 0.0 || i.fract() != 0.0 {
+            return Err("Cannot read properties of undefined (reading 'toLowerCase')".to_string());
+        }
+        let idx = i as usize;
+        let line = &lines[idx];
+        let lower = line.to_lowercase();
+        if let Some(byte_pos) = lower.find(&needle) {
+            let column = lower[..byte_pos].encode_utf16().count();
+            matches.push(json!({ "line": idx, "column": column, "text": line }));
+            last_line = Some(idx);
+        }
+        i += 1.0;
+    }
+
+    let next_cursor = match last_line {
+        Some(l) if l + 1 < lines.len() => Value::String((l + 1).to_string()),
+        _ => Value::Null,
+    };
+    Ok(json!({ "matches": matches, "nextCursor": next_cursor }))
 }
 
 async fn list_terminals(
@@ -741,6 +991,73 @@ mod tests {
     use super::*;
 
     // ── lastEmittedLine (ported reference cases) ──
+
+    fn ln(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Byte shapes/quirks pinned live 2026-07-12
+    /// (`~/freshell-scratch-005e/search-truth-orig.json`, 22-case battery
+    /// rust≡original).
+    #[test]
+    fn mirror_search_matches_js_semantics() {
+        let lines = ln(&["alpha TOKEN", "nothing", "token again", "tail"]);
+        // Case-insensitive indexOf; column in UTF-16 units of the lowercased line.
+        let page = mirror_search(&lines, "TOKEN", 0.0, 50).unwrap();
+        assert_eq!(
+            page,
+            json!({ "matches": [
+                { "line": 0, "column": 6, "text": "alpha TOKEN" },
+                { "line": 2, "column": 0, "text": "token again" },
+            ], "nextCursor": "3" })
+        );
+        // limit pagination: nextCursor = String(lastMatchLine+1).
+        let page = mirror_search(&lines, "token", 0.0, 1).unwrap();
+        assert_eq!(page["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(page["nextCursor"], json!("1"));
+        // cursor past matches / past end.
+        assert_eq!(
+            mirror_search(&lines, "token", 3.0, 50).unwrap(),
+            json!({ "matches": [], "nextCursor": null })
+        );
+        assert_eq!(
+            mirror_search(&lines, "token", 99999.0, 50).unwrap(),
+            json!({ "matches": [], "nextCursor": null })
+        );
+        // NaN / +Infinity never enter the loop.
+        assert_eq!(mirror_search(&lines, "token", f64::NAN, 50).unwrap()["matches"], json!([]));
+        assert_eq!(
+            mirror_search(&lines, "token", f64::INFINITY, 50).unwrap()["nextCursor"],
+            json!(null)
+        );
+        // Negative / fractional / -Infinity → the original's TypeError 500.
+        for bad in [-3.0, 1.5, -0.5, f64::NEG_INFINITY] {
+            assert_eq!(
+                mirror_search(&lines, "token", bad, 50).unwrap_err(),
+                "Cannot read properties of undefined (reading 'toLowerCase')"
+            );
+        }
+        // -0 indexes as 0 (JS `lines[-0] === lines[0]`).
+        assert_eq!(mirror_search(&lines, "alpha", -0.0, 50).unwrap()["matches"][0]["line"], json!(0));
+        // Regex specials are literal (indexOf, not a regex).
+        assert_eq!(mirror_search(&lines, "token.*", 0.0, 50).unwrap()["matches"], json!([]));
+        // nextCursor null when the last match is the final line.
+        let page = mirror_search(&ln(&["x", "token"]), "token", 0.0, 50).unwrap();
+        assert_eq!(page["nextCursor"], json!(null));
+    }
+
+    #[test]
+    fn mirror_lines_normalizes_like_the_original_mirror() {
+        // \r\n → \n, bare \r dropped (NOT converted), CSI stripped.
+        assert_eq!(mirror_lines("a\r\nb\rc"), ln(&["a", "bc"]));
+        assert_eq!(mirror_lines("x\u{1B}[31mred\u{1B}[0my"), ln(&["xredy"]));
+        // Non-CSI escapes (e.g. OSC) are KEPT — mirror.ts strips CSI only.
+        assert_eq!(mirror_lines("a\u{1B}]0;title\u{7}b"), ln(&["a\u{1B}]0;title\u{7}b"]));
+        // Incomplete CSI at end-of-input stays raw (the regex needs a final byte).
+        assert_eq!(mirror_lines("a\u{1B}[12"), ln(&["a\u{1B}[12"]));
+        // Empty snapshot == the mirror's initial [''] line model.
+        assert_eq!(mirror_lines(""), ln(&[""]));
+    }
 
     #[test]
     fn last_emitted_line_strips_ansi_and_prompts_and_takes_last() {

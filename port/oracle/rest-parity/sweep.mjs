@@ -1250,16 +1250,66 @@ async function main() {
           await doRequest(servers.rust.baseUrl, { method: 'DELETE', path: `/api/terminals/${t2rust}`, auth: 'header' }),
         )
         await runCase({ id: 'terminals.list.after-delete', group: 'terminals', description: 'deleted-override terminal filtered from the directory', path: '/api/terminals', auth: 'header' })
-        // PINNING (council-adjudicated PORT-GAP-002 condition 3, NOT an
-        // original-parity case): the viewport/scrollback/search read-model
-        // subroutes are deliberately unported on the Rust server (TerminalViewMirror
-        // subsystem — deferred, gated before task-009). Pin the interim contract:
-        // clean JSON 404 for live AND unknown ids — never 500/hang/SPA-shell.
-        // The "node" column below is the DECLARED contract, not the original server.
+        // /:id/search — REAL parity (task-005f discharged the PORT-GAP-002
+        // search condition): validation battery on a fixed id (validation
+        // precedes the registry lookup — byte-comparable), then live-terminal
+        // cases per side (server-minted ids → recordManual). Shapes/quirks
+        // pinned live 2026-07-12 (~/freshell-scratch-005e/search-truth-*.json).
+        await runCase({ id: 'terminals.search.no-query', group: 'terminals', description: '400 query missing (invalid_type undefined)', path: '/api/terminals/qa-missing-id/search', auth: 'header' })
+        await runCase({ id: 'terminals.search.empty-query', group: 'terminals', description: '400 empty query (too_small >=1)', path: '/api/terminals/qa-missing-id/search?query=', auth: 'header' })
+        await runCase({ id: 'terminals.search.empty-cursor', group: 'terminals', description: '400 empty cursor (too_small >=1)', path: '/api/terminals/qa-missing-id/search?query=x&cursor=', auth: 'header' })
+        await runCase({ id: 'terminals.search.limit-zero', group: 'terminals', description: '400 limit=0 (too_small >0)', path: '/api/terminals/qa-missing-id/search?query=x&limit=0', auth: 'header' })
+        await runCase({ id: 'terminals.search.limit-201', group: 'terminals', description: '400 limit=201 (too_big <=200)', path: '/api/terminals/qa-missing-id/search?query=x&limit=201', auth: 'header' })
+        await runCase({ id: 'terminals.search.limit-float', group: 'terminals', description: '400 limit=1.5 (invalid_type int/safeint)', path: '/api/terminals/qa-missing-id/search?query=x&limit=1.5', auth: 'header' })
+        await runCase({ id: 'terminals.search.limit-nan', group: 'terminals', description: '400 limit=abc (outer NaN issue + inner query-undefined issue, concatenated)', path: '/api/terminals/qa-missing-id/search?query=x&limit=abc', auth: 'header' })
+        await runCase({ id: 'terminals.search.unknown-id', group: 'terminals', description: '404 Terminal not found (after validation)', path: '/api/terminals/qa-missing-id/search?query=x', auth: 'header' })
+        await runCase({ id: 'terminals.search.no-auth', group: 'terminals', description: '401 without credentials', path: '/api/terminals/qa-missing-id/search?query=x' })
+        // Live-terminal legs: t1 printed T1_MARKER — the mirror lines (raw
+        // output incl. prompt/banner) can differ across servers, so compare
+        // the MATCH SET for the marker (present on both) plus the JS-quirk
+        // empty/error pages, normalizing per-side ids.
+        const searchLeg = async (baseUrl, id, qs) => {
+          const res = await fetch(`${baseUrl}/api/terminals/${id}/search?${qs}`, { headers: { 'x-auth-token': TOKEN } })
+          const text = await res.text()
+          let body
+          try {
+            body = JSON.parse(text)
+          } catch {
+            body = { raw: text }
+          }
+          if (body && Array.isArray(body.matches)) {
+            // Normalize per-side line numbering/prompt differences: keep only
+            // whether the marker matched and the matched text's marker slice.
+            return { status: res.status, matched: body.matches.length > 0, texts: body.matches.map((m) => m.text.includes(T1_MARKER)) }
+          }
+          return { status: res.status, body }
+        }
+        recordManual(
+          { id: 'terminals.search.live-happy', group: 'terminals', description: 'live terminal: marker query matches (normalized: match-presence per side)', method: 'GET', path: '/api/terminals/<own-t1>/search?query=<marker>', auth: 'header' },
+          { status: 0, headers: {}, body: { kind: 'json', json: await searchLeg(servers.node.baseUrl, liveIds.t1node, `query=${T1_MARKER}`) } },
+          { status: 0, headers: {}, body: { kind: 'json', json: await searchLeg(servers.rust.baseUrl, liveIds.t1rust, `query=${T1_MARKER}`) } },
+        )
+        recordManual(
+          { id: 'terminals.search.live-nan-cursor', group: 'terminals', description: 'live terminal: cursor=abc → Number()=NaN → empty page (byte-identical)', method: 'GET', path: '/api/terminals/<own-t1>/search?query=x&cursor=abc', auth: 'header' },
+          { status: 0, headers: {}, body: { kind: 'json', json: await searchLeg(servers.node.baseUrl, liveIds.t1node, 'query=zzznomatch&cursor=abc') } },
+          { status: 0, headers: {}, body: { kind: 'json', json: await searchLeg(servers.rust.baseUrl, liveIds.t1rust, 'query=zzznomatch&cursor=abc') } },
+        )
+        recordManual(
+          { id: 'terminals.search.live-negative-cursor', group: 'terminals', description: "live terminal: cursor=-1 → the original's lines[-1] TypeError 500 (byte-identical)", method: 'GET', path: '/api/terminals/<own-t1>/search?query=x&cursor=-1', auth: 'header' },
+          { status: 0, headers: {}, body: { kind: 'json', json: await searchLeg(servers.node.baseUrl, liveIds.t1node, 'query=x&cursor=-1') } },
+          { status: 0, headers: {}, body: { kind: 'json', json: await searchLeg(servers.rust.baseUrl, liveIds.t1rust, 'query=x&cursor=-1') } },
+        )
+        // PINNING (council-adjudicated PORT-GAP-002 conditions, NOT an
+        // original-parity case): the viewport/scrollback read-model subroutes
+        // remain deliberately unported on the Rust server (TerminalViewMirror
+        // viewport state — NO production callers, YAGNI). Pin the interim
+        // contract: clean JSON 404 for live AND unknown ids — never
+        // 500/hang/SPA-shell. The "node" column below is the DECLARED
+        // contract, not the original server.
         {
           const routes = []
           for (const id of [liveIds.t1rust, 'qa-missing-id']) {
-            for (const sub of ['viewport', 'scrollback', 'search']) {
+            for (const sub of ['viewport', 'scrollback']) {
               const res = await fetch(`${servers.rust.baseUrl}/api/terminals/${id}/${sub}`, { headers: { 'x-auth-token': TOKEN } })
               const text = await res.text()
               let isJson = false

@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-07-12T14:33:50.163Z",
+  "generatedAt": "2026-07-12T14:59:29.474Z",
   "task": "HANDOFF §7.C REST surface parity sweep (node original :17871 vs rust port :17872)",
   "normalizedFields": {
     "terminalId": "id",
@@ -37,8 +37,8 @@
     "<TOKEN>"
   ],
   "summary": {
-    "total": 175,
-    "pass": 175,
+    "total": 187,
+    "pass": 187,
     "divergence": 0,
     "deferred": 0
   },
@@ -10339,6 +10339,624 @@
       "diffs": []
     },
     {
+      "id": "terminals.search.no-query",
+      "group": "terminals",
+      "description": "400 query missing (invalid_type undefined)",
+      "request": {
+        "method": "GET",
+        "path": "/api/terminals/qa-missing-id/search",
+        "auth": "header"
+      },
+      "node": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "expected": "string",
+                "code": "invalid_type",
+                "path": [
+                  "query"
+                ],
+                "message": "Invalid input: expected string, received undefined"
+              }
+            ]
+          }
+        }
+      },
+      "rust": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "expected": "string",
+                "code": "invalid_type",
+                "path": [
+                  "query"
+                ],
+                "message": "Invalid input: expected string, received undefined"
+              }
+            ]
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
+      "id": "terminals.search.empty-query",
+      "group": "terminals",
+      "description": "400 empty query (too_small >=1)",
+      "request": {
+        "method": "GET",
+        "path": "/api/terminals/qa-missing-id/search?query=",
+        "auth": "header"
+      },
+      "node": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "origin": "string",
+                "code": "too_small",
+                "minimum": 1,
+                "inclusive": true,
+                "path": [
+                  "query"
+                ],
+                "message": "Too small: expected string to have >=1 characters"
+              }
+            ]
+          }
+        }
+      },
+      "rust": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "origin": "string",
+                "code": "too_small",
+                "minimum": 1,
+                "inclusive": true,
+                "path": [
+                  "query"
+                ],
+                "message": "Too small: expected string to have >=1 characters"
+              }
+            ]
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
+      "id": "terminals.search.empty-cursor",
+      "group": "terminals",
+      "description": "400 empty cursor (too_small >=1)",
+      "request": {
+        "method": "GET",
+        "path": "/api/terminals/qa-missing-id/search?query=x&cursor=",
+        "auth": "header"
+      },
+      "node": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "origin": "string",
+                "code": "too_small",
+                "minimum": 1,
+                "inclusive": true,
+                "path": [
+                  "cursor"
+                ],
+                "message": "Too small: expected string to have >=1 characters"
+              }
+            ]
+          }
+        }
+      },
+      "rust": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "origin": "string",
+                "code": "too_small",
+                "minimum": 1,
+                "inclusive": true,
+                "path": [
+                  "cursor"
+                ],
+                "message": "Too small: expected string to have >=1 characters"
+              }
+            ]
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
+      "id": "terminals.search.limit-zero",
+      "group": "terminals",
+      "description": "400 limit=0 (too_small >0)",
+      "request": {
+        "method": "GET",
+        "path": "/api/terminals/qa-missing-id/search?query=x&limit=0",
+        "auth": "header"
+      },
+      "node": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "origin": "number",
+                "code": "too_small",
+                "minimum": 0,
+                "inclusive": false,
+                "path": [
+                  "limit"
+                ],
+                "message": "Too small: expected number to be >0"
+              }
+            ]
+          }
+        }
+      },
+      "rust": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "origin": "number",
+                "code": "too_small",
+                "minimum": 0,
+                "inclusive": false,
+                "path": [
+                  "limit"
+                ],
+                "message": "Too small: expected number to be >0"
+              }
+            ]
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
+      "id": "terminals.search.limit-201",
+      "group": "terminals",
+      "description": "400 limit=201 (too_big <=200)",
+      "request": {
+        "method": "GET",
+        "path": "/api/terminals/qa-missing-id/search?query=x&limit=201",
+        "auth": "header"
+      },
+      "node": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "origin": "number",
+                "code": "too_big",
+                "maximum": 200,
+                "inclusive": true,
+                "path": [
+                  "limit"
+                ],
+                "message": "Too big: expected number to be <=200"
+              }
+            ]
+          }
+        }
+      },
+      "rust": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "origin": "number",
+                "code": "too_big",
+                "maximum": 200,
+                "inclusive": true,
+                "path": [
+                  "limit"
+                ],
+                "message": "Too big: expected number to be <=200"
+              }
+            ]
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
+      "id": "terminals.search.limit-float",
+      "group": "terminals",
+      "description": "400 limit=1.5 (invalid_type int/safeint)",
+      "request": {
+        "method": "GET",
+        "path": "/api/terminals/qa-missing-id/search?query=x&limit=1.5",
+        "auth": "header"
+      },
+      "node": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "expected": "int",
+                "format": "safeint",
+                "code": "invalid_type",
+                "path": [
+                  "limit"
+                ],
+                "message": "Invalid input: expected int, received number"
+              }
+            ]
+          }
+        }
+      },
+      "rust": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "expected": "int",
+                "format": "safeint",
+                "code": "invalid_type",
+                "path": [
+                  "limit"
+                ],
+                "message": "Invalid input: expected int, received number"
+              }
+            ]
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
+      "id": "terminals.search.limit-nan",
+      "group": "terminals",
+      "description": "400 limit=abc (outer NaN issue + inner query-undefined issue, concatenated)",
+      "request": {
+        "method": "GET",
+        "path": "/api/terminals/qa-missing-id/search?query=x&limit=abc",
+        "auth": "header"
+      },
+      "node": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "expected": "number",
+                "code": "invalid_type",
+                "received": "NaN",
+                "path": [
+                  "limit"
+                ],
+                "message": "Invalid input: expected number, received NaN"
+              },
+              {
+                "expected": "string",
+                "code": "invalid_type",
+                "path": [
+                  "query"
+                ],
+                "message": "Invalid input: expected string, received undefined"
+              }
+            ]
+          }
+        }
+      },
+      "rust": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Invalid request",
+            "details": [
+              {
+                "expected": "number",
+                "code": "invalid_type",
+                "received": "NaN",
+                "path": [
+                  "limit"
+                ],
+                "message": "Invalid input: expected number, received NaN"
+              },
+              {
+                "expected": "string",
+                "code": "invalid_type",
+                "path": [
+                  "query"
+                ],
+                "message": "Invalid input: expected string, received undefined"
+              }
+            ]
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
+      "id": "terminals.search.unknown-id",
+      "group": "terminals",
+      "description": "404 Terminal not found (after validation)",
+      "request": {
+        "method": "GET",
+        "path": "/api/terminals/qa-missing-id/search?query=x",
+        "auth": "header"
+      },
+      "node": {
+        "status": 404,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Terminal not found"
+          }
+        }
+      },
+      "rust": {
+        "status": 404,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Terminal not found"
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
+      "id": "terminals.search.no-auth",
+      "group": "terminals",
+      "description": "401 without credentials",
+      "request": {
+        "method": "GET",
+        "path": "/api/terminals/qa-missing-id/search?query=x",
+        "auth": "none"
+      },
+      "node": {
+        "status": 401,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Unauthorized"
+          }
+        }
+      },
+      "rust": {
+        "status": 401,
+        "headers": {
+          "content-type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "kind": "json",
+          "json": {
+            "error": "Unauthorized"
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
+      "id": "terminals.search.live-happy",
+      "group": "terminals",
+      "description": "live terminal: marker query matches (normalized: match-presence per side)",
+      "request": {
+        "method": "GET",
+        "path": "/api/terminals/<own-t1>/search?query=<marker>",
+        "auth": "header"
+      },
+      "node": {
+        "status": 0,
+        "headers": {},
+        "body": {
+          "kind": "json",
+          "json": {
+            "status": 200,
+            "matched": true,
+            "texts": [
+              true,
+              true,
+              true
+            ]
+          }
+        }
+      },
+      "rust": {
+        "status": 0,
+        "headers": {},
+        "body": {
+          "kind": "json",
+          "json": {
+            "status": 200,
+            "matched": true,
+            "texts": [
+              true,
+              true,
+              true
+            ]
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
+      "id": "terminals.search.live-nan-cursor",
+      "group": "terminals",
+      "description": "live terminal: cursor=abc → Number()=NaN → empty page (byte-identical)",
+      "request": {
+        "method": "GET",
+        "path": "/api/terminals/<own-t1>/search?query=x&cursor=abc",
+        "auth": "header"
+      },
+      "node": {
+        "status": 0,
+        "headers": {},
+        "body": {
+          "kind": "json",
+          "json": {
+            "status": 200,
+            "matched": false,
+            "texts": []
+          }
+        }
+      },
+      "rust": {
+        "status": 0,
+        "headers": {},
+        "body": {
+          "kind": "json",
+          "json": {
+            "status": 200,
+            "matched": false,
+            "texts": []
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
+      "id": "terminals.search.live-negative-cursor",
+      "group": "terminals",
+      "description": "live terminal: cursor=-1 → the original's lines[-1] TypeError 500 (byte-identical)",
+      "request": {
+        "method": "GET",
+        "path": "/api/terminals/<own-t1>/search?query=x&cursor=-1",
+        "auth": "header"
+      },
+      "node": {
+        "status": 0,
+        "headers": {},
+        "body": {
+          "kind": "json",
+          "json": {
+            "status": 500,
+            "body": {
+              "error": "Cannot read properties of undefined (reading 'toLowerCase')"
+            }
+          }
+        }
+      },
+      "rust": {
+        "status": 0,
+        "headers": {},
+        "body": {
+          "kind": "json",
+          "json": {
+            "status": 500,
+            "body": {
+              "error": "Cannot read properties of undefined (reading 'toLowerCase')"
+            }
+          }
+        }
+      },
+      "verdict": "PASS",
+      "diffs": []
+    },
+    {
       "id": "terminals.subroutes.rust-interim-404-pin",
       "group": "terminals",
       "description": "PORT-GAP-002 pinning: unported viewport/scrollback/search answer clean JSON 404 (rust interim contract, declared — not original parity)",
@@ -10366,12 +10984,6 @@
               "html": false
             },
             {
-              "route": "live-id/search",
-              "status": 404,
-              "json": true,
-              "html": false
-            },
-            {
               "route": "unknown-id/viewport",
               "status": 404,
               "json": true,
@@ -10379,12 +10991,6 @@
             },
             {
               "route": "unknown-id/scrollback",
-              "status": 404,
-              "json": true,
-              "html": false
-            },
-            {
-              "route": "unknown-id/search",
               "status": 404,
               "json": true,
               "html": false
@@ -10411,12 +11017,6 @@
               "html": false
             },
             {
-              "route": "live-id/search",
-              "status": 404,
-              "json": true,
-              "html": false
-            },
-            {
               "route": "unknown-id/viewport",
               "status": 404,
               "json": true,
@@ -10424,12 +11024,6 @@
             },
             {
               "route": "unknown-id/scrollback",
-              "status": 404,
-              "json": true,
-              "html": false
-            },
-            {
-              "route": "unknown-id/search",
               "status": 404,
               "json": true,
               "html": false
