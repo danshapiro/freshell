@@ -10,3 +10,4 @@ publish.workspace = true
 # The deferred live-process modules (tokio::process/reqwest for netsh/ipconfig/etc.)
 # will add deps when implemented in a later sub-step.
 [dependencies]
+serde_json = { workspace = true }

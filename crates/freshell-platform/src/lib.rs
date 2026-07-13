@@ -51,7 +51,9 @@
 //! injected source ([`Env`], [`FileProbe`], [`path::WslPathResolver`]). Thin `*_live`
 //! wrappers at the edges perform the real reads and delegate to the pure core.
 
+pub mod cli_launch;
 pub mod detect;
+pub mod mcp_inject;
 pub mod path;
 pub mod spawn;
 

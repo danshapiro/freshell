@@ -193,6 +193,11 @@ pub struct TerminalCreate {
     pub recovery_intent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restore: Option<bool>,
+    /// The spawn-time resume session id (`ws-handler.ts:656-658` — distinct from
+    /// `sessionRef`; spec `cli-argv-fidelity.md` §3.3/U7: only the spawn-time id
+    /// is modeled here, the binding/repair pipeline stays with coding-cli.md).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
     #[serde(skip_serializing_if = "Option::is_none")]

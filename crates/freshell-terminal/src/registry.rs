@@ -291,6 +291,7 @@ impl TerminalRegistry {
         terminal_id: String,
         stream_id: String,
         ring_max_bytes: Option<i64>,
+        on_exit: Option<crate::pty::ExitHook>,
     ) -> io::Result<()> {
         let now = now_ms();
         let shared = Arc::new(Mutex::new(TerminalShared {
@@ -327,6 +328,7 @@ impl TerminalRegistry {
             stream_id,
             ring_max_bytes,
             Some(sink),
+            on_exit,
         )?;
 
         let mut inner = self.inner.lock().expect("registry lock");

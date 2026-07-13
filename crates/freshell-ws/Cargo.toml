@@ -47,3 +47,8 @@ futures-util = "0.3"
 # A UUIDv4's [0-9a-f-] is a subset of the oracle's url-safe id alphabet, so it
 # satisfies BOTH the `nanoid` and `streamId` shape validators (normalize.ts:176).
 uuid = { version = "1", features = ["v4"] }
+# The opencode loopback control-endpoint allocator (`allocateLocalhostPort`,
+# server/local-port.ts) — task-006 §3.3 reuses the LoopbackPortAllocator seam
+# (freshell-opencode/src/transport.rs). real-transport is already enabled
+# transitively via freshell-freshagent.
+freshell-opencode = { path = "../freshell-opencode", features = ["real-transport"] }

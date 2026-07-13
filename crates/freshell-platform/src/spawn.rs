@@ -63,73 +63,17 @@ pub enum WindowsExe {
 }
 
 // ===========================================================================
-// Coding-CLI launch (mode != 'shell') — the deterministic base-command slice of
-// `resolveCodingCliCommand`/`buildSpawnSpec` (`terminal-registry.ts:274-320,
-// 1256-1266`).
+// Coding-CLI launch resolution moved to `crate::cli_launch` (task-006 §3.1
+// file split — campaign ≤1K-lines-per-file limit). Re-exported here so the
+// established `spawn::` paths keep working.
 // ===========================================================================
-
-/// A registered coding-CLI's command resolution inputs (the subset of
-/// `CodingCliCommandSpec` this port consumes: `terminal-registry.ts:77-90`).
-/// Populated from the extension registry's `cli` block (`freshell.json`) or the
-/// `FALLBACK_CODING_CLI_COMMAND_SPECS` seed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CliCommandSpec {
-    /// The terminal mode / provider name (`claude` | `codex` | `opencode` | ...).
-    pub name: String,
-    /// The env var that overrides the command (`spec.envVar`); `None` = no override.
-    pub env_var: Option<String>,
-    /// `spec.defaultCommand` — the executable to run when no override is set.
-    pub default_cmd: String,
-}
-
-/// A resolved coding-CLI launch (`resolveCodingCliCommand` return, reduced).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CliLaunch {
-    /// `cli.command` — `(env[spec.envVar] || spec.defaultCommand)`.
-    pub command: String,
-    /// `cli.args` — the base launch args (empty for a fresh, non-resume launch).
-    pub args: Vec<String>,
-    /// `cli.env` — CLI-specific env overrides (empty in the reduced port).
-    pub env: BTreeMap<String, String>,
-}
-
-/// `resolveCodingCliCommand(mode, ...)` base-command slice
-/// (`terminal-registry.ts:283-286`): look up the spec for `mode`, then resolve
-/// `command = (env[spec.envVar] || spec.defaultCommand)`. Returns `None` for
-/// `mode == 'shell'` or an unregistered mode (the caller then uses the shell path,
-/// mirroring `buildSpawnSpec`'s `mode === 'shell'` branch; the reference *throws*
-/// `UnknownTerminalModeError` for a truly-unknown mode — see the caller).
-///
-/// **REDUCED FIDELITY (deferred, tracked as a candidate deviation):** this resolves
-/// only the base `command` + (empty) base `args` + (empty) `env`. The reference also
-/// injects, per provider: MCP config (`generateMcpInjection` — writes a config file
-/// / `-c mcp_servers.*`), turn-complete notification args
-/// (`providerNotificationArgs` — codex `-c tui.*`, claude `--settings <hook json>`),
-/// the OpenCode loopback control endpoint (`--hostname/--port`, server-allocated),
-/// and resume/model/sandbox/permission args from provider settings. Those layers are
-/// NOT ported here; a fresh CLI still launches and renders its interactive UI, which
-/// is what this matrix validates (it does not drive a live model turn).
-pub fn resolve_cli_launch(
-    specs: &[CliCommandSpec],
-    mode: &str,
-    env: &dyn Env,
-) -> Option<CliLaunch> {
-    if mode == "shell" {
-        return None;
-    }
-    let spec = specs.iter().find(|s| s.name == mode)?;
-    let command = spec
-        .env_var
-        .as_deref()
-        .and_then(|var| env.get(var))
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| spec.default_cmd.clone());
-    Some(CliLaunch {
-        command,
-        args: Vec::new(),
-        env: BTreeMap::new(),
-    })
-}
+pub use crate::cli_launch::{
+    claude_settings_json, get_opencode_env_overrides, resolve_cli_launch,
+    resolve_coding_cli_command, resolve_opencode_launch_model, CliCommandSpec, CliLaunch,
+    CliLaunchError, CliLaunchInputs, LaunchIntent, McpInjection, ProviderTarget,
+    CLAUDE_BELL_COMMAND_UNIX, CLAUDE_BELL_COMMAND_WINDOWS, CODEX_MANAGED_REMOTE_CONFIG_ARGS,
+    CODEX_TUI_NOTIFICATION_ARGS,
+};
 
 /// The resolved shell spawn specification (shell mode).
 ///
@@ -283,12 +227,74 @@ pub fn get_system_shell(host_os: HostOs, env: &dyn Env, probe: &dyn FileProbe) -
     "/bin/sh".to_string()
 }
 
-fn resolve_windows_shell_cwd(cwd: Option<&str>, env: &dyn Env, is_wsl_env: bool) -> Option<String> {
+/// `resolveWindowsShellCwd` (`terminal-registry.ts:903-905`). Public since
+/// task-006: `resolve_mcp_cwd` needs it from the ws layer.
+pub fn resolve_windows_shell_cwd(
+    cwd: Option<&str>,
+    env: &dyn Env,
+    is_wsl_env: bool,
+) -> Option<String> {
     resolve_launch_cwd(cwd, LaunchCwdTargetRuntime::WindowsProcess, env, is_wsl_env).launch_cwd
 }
 
-fn resolve_unix_shell_cwd(cwd: Option<&str>, env: &dyn Env, is_wsl_env: bool) -> Option<String> {
+/// `resolveUnixShellCwd` (`terminal-registry.ts:907-909`). Public since
+/// task-006: the unix-tail `mcpCwd` (`terminal-registry.ts:1262`) is this value.
+pub fn resolve_unix_shell_cwd(cwd: Option<&str>, env: &dyn Env, is_wsl_env: bool) -> Option<String> {
     resolve_launch_cwd(cwd, LaunchCwdTargetRuntime::LinuxProcess, env, is_wsl_env).launch_cwd
+}
+
+/// `resolveMcpCwd` (`terminal-registry.ts:911-914`): the HOST-native resolution of
+/// the terminal cwd handed to `generateMcpInjection` and to exit cleanup —
+/// `targetRuntime = isWindows() ? 'windows-process' : 'linux-process'` (host-based,
+/// not branch-based). On the non-Windows tail the reference passes
+/// `resolveUnixShellCwd(cwd)` instead (`tr:1262`), which is the same value on a
+/// non-Windows host.
+pub fn resolve_mcp_cwd(
+    cwd: Option<&str>,
+    env: &dyn Env,
+    host_os: HostOs,
+    is_wsl_env: bool,
+) -> Option<String> {
+    if is_windows(host_os) {
+        resolve_windows_shell_cwd(cwd, env, is_wsl_env)
+    } else {
+        resolve_unix_shell_cwd(cwd, env, is_wsl_env)
+    }
+}
+
+/// The `ProviderTarget` a `terminal.create { mode: <cli> }` resolves to
+/// (`cli-argv-fidelity.md` §2.6): `Windows` ONLY on the native `cmd`/`powershell`
+/// branches (`terminal-registry.ts:1204,1237`); the WSL-from-Windows branch and
+/// the non-Windows tail use `Unix` (`tr:1165,1262`). Mirrors `buildSpawnSpec`'s
+/// branch selection exactly: `isWindowsLike() && !inWslWithLinuxShell`, then the
+/// `windowsMode` resolution (`forceWsl` on a Linux cwd from native Windows,
+/// `effectiveShell`, `WINDOWS_SHELL || 'wsl'` fallback; `tr:1127-1137`) — every
+/// non-`wsl` windowsMode lands on the cmd or (default) powershell branch.
+pub fn cli_provider_target(
+    shell: ShellType,
+    host_os: HostOs,
+    is_wsl_env: bool,
+    cwd: Option<&str>,
+    env: &dyn Env,
+) -> ProviderTarget {
+    let effective_shell = resolve_shell(shell, host_os, is_wsl_env);
+    let in_wsl_with_linux_shell = is_wsl_env && effective_shell == ShellType::System;
+    if !(crate::detect::is_windows_like(host_os, is_wsl_env) && !in_wsl_with_linux_shell) {
+        return ProviderTarget::Unix;
+    }
+    let force_wsl = is_windows(host_os) && cwd.is_some_and(is_linux_path);
+    let windows_mode = if force_wsl {
+        "wsl".to_string()
+    } else if effective_shell != ShellType::System {
+        effective_shell.as_str().to_string()
+    } else {
+        env.or_default("WINDOWS_SHELL", "wsl").to_lowercase()
+    };
+    if windows_mode == "wsl" {
+        ProviderTarget::Unix
+    } else {
+        ProviderTarget::Windows
+    }
 }
 
 // ===========================================================================
@@ -543,9 +549,10 @@ pub fn build_cli_spawn_spec(
 /// `windowsMode` resolution (force-WSL on a Linux cwd, `WINDOWS_SHELL` fallback)
 /// mirrors [`build_spawn_spec`] exactly.
 ///
-/// Scope: callers use this only when `is_windows(host_os)`; the reduced-fidelity
-/// notes on [`resolve_cli_launch`] (no MCP/notification/resume arg layers) apply
-/// here identically.
+/// Scope: callers use this when the Windows-shell branches apply (native Windows,
+/// or WSL with an explicit `cmd`/`powershell` pane shell). The full arg/env layers
+/// (MCP/notification/settings/resume) are produced by [`resolve_coding_cli_command`]
+/// per `port/machine/specs/cli-argv-fidelity.md` and arrive in `launch`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_windows_cli_spawn_spec(
     launch: &CliLaunch,
@@ -824,6 +831,7 @@ mod helper_tests {
             command: command.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
             env: BTreeMap::new(),
+            label: command.to_string(),
         }
     }
 

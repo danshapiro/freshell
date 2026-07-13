@@ -148,18 +148,10 @@ async fn main() -> ExitCode {
     let extension_registry =
         extensions::ExtensionRegistry::scan(&extensions::resolve_extension_dirs(home.as_deref()));
     // The coding-CLI command specs the WS terminal handler resolves `terminal.create
-    // { mode: <cli> }` against (claude/codex/opencode → the real CLI launch).
-    let cli_commands = Arc::new(
-        extension_registry
-            .cli_detection_specs()
-            .into_iter()
-            .map(|s| freshell_platform::CliCommandSpec {
-                name: s.name,
-                env_var: s.env_var,
-                default_cmd: s.default_cmd,
-            })
-            .collect::<Vec<_>>(),
-    );
+    // { mode: <cli> }` against (claude/codex/opencode → the real CLI launch). Full
+    // manifest compilation per `server/index.ts:231-255` (arg templates + env),
+    // spec `port/machine/specs/cli-argv-fidelity.md` §3.1.
+    let cli_commands = Arc::new(extension_registry.cli_command_specs());
 
     let ws_state = WsState {
         auth_token: Arc::clone(&auth_token),

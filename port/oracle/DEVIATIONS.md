@@ -513,6 +513,26 @@ path itself is intact).
   `crates/freshell-terminal/tests/wsl_interop_live.rs` (`#[ignore]`, run green on this host — see commit).
 - **status:** accepted
 
+
+### DEV-0006 — codex terminal panes launch WITHOUT the `--remote <wsUrl> -c features.apps=false` pair (spec cli-argv-fidelity.md rev 2.1 §5 U2)
+- objective_defect: none in the original — this is a PORT-SIDE reduced-scope deviation, pre-committed by the spec itself ("must be tracked as a deviation, not silently shipped", §5 U2).
+- original_behavior: every live `terminal.create {mode:'codex'}` plans a codex app-server launch (`planCodexLaunch`, ws-handler.ts:934-943, 2474-2492) and emits `["--remote", "<ws://127.0.0.1:...>", "-c", "features.apps=false"]` as the first four codex argv tokens (live capture 2026-07-13, `~/freshell-scratch-006/orig-codex.json`: `[codex, --remote, ws://127.0.0.1:40781, -c, features.apps=false, -c, tui.notification_method=bel, ...]`).
+- port_behavior: identical argv EXCEPT those four tokens are absent (`~/freshell-scratch-006/rust-codex.json`) — the codex TUI runs **unmanaged**: no app-server attach, and `features.apps` remains at the CLI default instead of being forced off. The rest of the argv (tui notification pair, inline MCP TOML) is byte-identical to the original.
+- gating_site: `crates/freshell-ws/src/terminal.rs` (`codex_remote_ws_url: Option<String> = None`, comment references this entry). The resolver itself is argv-complete for `--remote` (goldens G-X1/G-X2/G-W2 in `crates/freshell-platform/src/cli_launch_goldens.rs` pass); only the terminal.create wiring to the `freshell-codex` launch plan is missing.
+- pinning_test: `g_x0_codex_shipped_deviation_shape_dev_0006` (`cli_launch_goldens.rs`) pins the shipped gap-shape byte-for-byte so a refactor cannot half-emit the pair unnoticed (council condition 6).
+- closure: wiring `freshell-codex`'s app-server launch plan into `terminal.create` — `port/machine/specs/coding-cli.md` (sidecar-lifecycle scope) remaining-work; owner: port campaign orchestrator (self-driving queue).
+- user_facing_disclosure: to be carried in the EQUIVALENCE-REPORT known-limitations addendum (task-009): "codex panes in the Rust build run standalone, without freshell's managed app-server integration."
+- adjudicated_by: /council fork, session e1b497f11d874275-50ff1d609ef44de9_self, 2026-07-13 — APPROVE (conditional, all conditions above incorporated). Implementer: restart #12 orchestrator (distinct from adjudicating panel).
+- status: accepted (open gap, tracked for closure)
+
+### U1-RATIFICATION — injected MCP server command adopts option (a): the reference's own Node repo layout (spec cli-argv-fidelity.md rev 2.1 §5 U1)
+- decision: option (a) — resolve the SAME Node repo layout the reference resolves and inject `node --import <root>/node_modules/tsx/dist/loader.mjs <root>/server/mcp/server.ts` (dev) / `<root>/dist/server/mcp/server.js` (`NODE_ENV=production` + built). Rejected: (b) new Rust MCP server binary (bigger lift, out of task scope), (c) omit injection behind a flag (breaks live fidelity now).
+- known_divergence (kept visible, not "no divergence"): reference walks up from its own module dir (`server/mcp/` __dirname) with fallback `__dirname/../..`; Rust walks up (max 5) from process CWD with fallback to the start dir (`crates/freshell-platform/src/mcp_inject.rs::find_repo_root`). Identical result whenever the server runs from inside the freshell checkout (the deployment under test); divergent only when the Rust server's cwd is outside any freshell repo — then the injected repo paths are bogus (MCP server fails to start inside the CLI; the CLI pane itself still works), same failure class as the reference run from a relocated build. tsx unresolvable raises the reference-exact error (pinned: `real_runtime_tsx_unresolvable_raises_reference_error`).
+- evidence: 2026-07-13 live differential — claude/codex/opencode child argv byte-identical (modulo terminalId/uuid/port) between original 17871 and rust 17872, incl. MCP args (`~/freshell-scratch-006/*-{claude,codex,opencode}.json`, `oc-probe.mjs` lifecycle probe: config merge + $schema race + refcount + cleanup identical).
+- seam: goldens inject `McpRuntime::server_command_args` so this ratification is revisitable (e.g. future Rust MCP server) without invalidating golden coverage.
+- adjudicated_by: /council fork, session e1b497f11d874275-50ff1d609ef44de9_self, 2026-07-13 — APPROVE.
+- status: accepted
+
 <!--
 Template:
 

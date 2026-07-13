@@ -59,16 +59,28 @@ struct TerminalBehavior {
     scroll_input_policy: Option<String>,
 }
 
-/// The CLI config block (`extension-manifest.ts:50-66`). Only the fields the
-/// client registry + detection use are modeled; the rest (args/env/modelArgs/…)
-/// are tolerated-and-ignored (lenient parse).
+/// The CLI config block (`extension-manifest.ts:50-66`). The full arg-template
+/// fields (`args`/`env`/`modelArgs`/`sandboxArgs`/`permissionModeArgs`/
+/// `createSessionArgs`) are modeled since task-006: they feed the coding-CLI
+/// command specs (`server/index.ts:231-255` compilation), per
+/// `port/machine/specs/cli-argv-fidelity.md` §3.1.
 #[derive(Debug, Clone, Deserialize)]
 struct CliConfig {
     command: String,
     #[serde(rename = "envVar")]
     env_var: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<std::collections::BTreeMap<String, String>>,
     #[serde(rename = "resumeArgs")]
     resume_args: Option<Vec<String>>,
+    #[serde(rename = "createSessionArgs")]
+    create_session_args: Option<Vec<String>>,
+    #[serde(rename = "modelArgs")]
+    model_args: Option<Vec<String>>,
+    #[serde(rename = "sandboxArgs")]
+    sandbox_args: Option<Vec<String>>,
+    #[serde(rename = "permissionModeArgs")]
+    permission_mode_args: Option<Vec<String>>,
     #[serde(rename = "supportsPermissionMode")]
     supports_permission_mode: Option<bool>,
     #[serde(rename = "supportsModel")]
@@ -222,6 +234,38 @@ impl ExtensionRegistry {
     /// fallback here made `availableClis` a 5-key map when the process cwd had no
     /// `extensions/` dir, where the live original serves `availableClis: {}`
     /// (pinned by a cwd-neutral two-server differential, 2026-07-12).
+    /// Build the full coding-CLI command specs from the CLI extensions —
+    /// `server/index.ts:231-255` (`compileArgTemplate` + `registerCodingCliCommands`),
+    /// per `port/machine/specs/cli-argv-fidelity.md` §3.1. Like the reference's
+    /// `registerCodingCliCommands(cliCommandsMap)`, the result is GENUINELY EMPTY
+    /// when no CLI extension is discovered (the `FALLBACK_CODING_CLI_COMMAND_SPECS`
+    /// seed at `terminal-registry.ts:128-130` is REPLACED on boot, not merged).
+    /// Template substitution semantics (replaceAll vs first-occurrence resume)
+    /// are applied at resolve time by `freshell_platform::cli_launch`; the
+    /// templates ride through verbatim here.
+    pub fn cli_command_specs(&self) -> Vec<freshell_platform::CliCommandSpec> {
+        self.entries
+            .iter()
+            .filter(|e| e.manifest.category == "cli")
+            .filter_map(|e| e.manifest.cli.as_ref().map(|cli| (e, cli)))
+            .map(|(e, cli)| freshell_platform::CliCommandSpec {
+                name: e.manifest.name.clone(),
+                label: e.manifest.label.clone(),
+                // `envVar: cli.envVar || ''` then `spec.envVar && env[...]`:
+                // empty is falsy, so model it as `None`.
+                env_var: cli.env_var.clone().filter(|v| !v.is_empty()),
+                default_cmd: cli.command.clone(),
+                base_args: cli.args.clone().unwrap_or_default(),
+                base_env: cli.env.clone().unwrap_or_default(),
+                resume_args: cli.resume_args.clone(),
+                create_session_args: cli.create_session_args.clone(),
+                model_args: cli.model_args.clone(),
+                sandbox_args: cli.sandbox_args.clone(),
+                permission_mode_args: cli.permission_mode_args.clone(),
+            })
+            .collect()
+    }
+
     pub fn cli_detection_specs(&self) -> Vec<CliDetectionSpec> {
         self.entries
             .iter()

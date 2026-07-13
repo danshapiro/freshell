@@ -49,13 +49,18 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use freshell_platform::detect::{host_os_live, is_wsl_env_live, is_windows};
+use freshell_platform::mcp_inject::{cleanup_mcp_config, generate_mcp_injection, RealMcpRuntime};
+use freshell_platform::spawn::{
+    cli_provider_target, resolve_coding_cli_command, resolve_mcp_cwd, resolve_shell,
+    CliLaunchInputs, LaunchIntent, McpInjection,
+};
 use freshell_platform::{
-    build_cli_spawn_spec, build_spawn_spec, build_windows_cli_spawn_spec, resolve_cli_launch,
-    RealEnv, RealFileProbe, ShellType,
+    build_cli_spawn_spec, build_spawn_spec, build_windows_cli_spawn_spec, Env, RealEnv,
+    RealFileProbe, ShellType,
 };
 use freshell_protocol::{
-    ClientMessage, ServerMessage, Shell, TerminalAttach, TerminalCreate, TerminalCreated,
-    TerminalIdOnly, TerminalKill, TerminalResize,
+    ClientMessage, ErrorCode, ErrorMsg, ServerMessage, Shell, TerminalAttach, TerminalCreate,
+    TerminalCreated, TerminalIdOnly, TerminalKill, TerminalResize,
 };
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
@@ -397,35 +402,208 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
     let host_os = host_os_live();
     let is_wsl = is_wsl_env_live();
     let shell = map_shell(create.shell);
-    // buildTerminalBaseEnv carries FRESHELL_TERMINAL_ID (FRESHELL_URL/TOKEN are not
-    // part of the PTY byte stream — the T1 goldens exclude them). Present for faith.
-    let mut overrides = BTreeMap::new();
-    overrides.insert("FRESHELL_TERMINAL_ID".to_string(), terminal_id.clone());
+    let mode = create.mode.clone();
 
-    // `terminal.create` carries `mode`: 'shell' or a registered coding-CLI provider
-    // (claude/codex/opencode/...). For a CLI mode, launch the real CLI via the
-    // `resolveCodingCliCommand` base slice: on native Windows through the Windows
-    // CLI branches (`build_windows_cli_spawn_spec` — cmd.exe `/K <cli>` with the
-    // workspace as process cwd, per `terminal-registry.ts:1202-1248`), elsewhere
-    // through the unix tail (`build_cli_spawn_spec`). An unknown mode falls back to
-    // shell (the reference throws UnknownTerminalModeError — kept lenient here so a
-    // bad mode never tears down the connection).
-    let cli = resolve_cli_launch(&state.cli_commands, &create.mode, &RealEnv);
+    // Reject modes that are neither 'shell' nor a registered coding CLI — the
+    // reference throws `UnknownTerminalModeError` (`terminal-registry.ts:1073-1074`,
+    // message `tr:160-165`), surfaced as an `error` frame with the generic
+    // `PTY_SPAWN_FAILED` code (`ws-handler.ts:2606-2614` — not CodexLaunchConfigError
+    // / TerminalCreateAdmissionError). This CLOSES the former port divergence that
+    // silently fell back to a shell launch (spec `cli-argv-fidelity.md` §3.3).
+    let cli_spec_known = mode == "shell" || state.cli_commands.iter().any(|s| s.name == mode);
+    if !cli_spec_known {
+        let valid = std::iter::once("shell".to_string())
+            .chain(state.cli_commands.iter().map(|s| s.name.clone()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return send_create_error(
+            ws_tx,
+            ErrorCode::PtySpawnFailed,
+            format!("Invalid terminal mode: '{mode}'. Valid: {valid}"),
+            &create.request_id,
+        )
+        .await;
+    }
 
-    // Resolve the effective cwd BEFORE building the spawn spec (see
+    // Resolve the effective cwd BEFORE any branch/mcp computation (`tr:1565` via
     // `resolve_create_cwd`): explicit `create.cwd`, else `settings.defaultCwd`,
-    // else (non-Windows) `$HOME` — never bare `create.cwd.as_deref()`, which left
-    // every default-directory terminal without a reported `cwd`.
+    // else (non-Windows) `$HOME`. `mcp_cwd` derives from THIS resolved value
+    // (spec §3.3 rev 2.1 — getting it wrong flips opencode's throw-vs-launch).
     let resolved_cwd = resolve_create_cwd(
         create.cwd.as_deref(),
         state.settings.default_cwd.as_deref(),
         host_os,
     );
 
+    // Spawn-time resume id + launch intent (`ws-handler.ts:2040-2067`; U7: only
+    // the spawn-time id is modeled here — the sessionRef binding/repair pipeline
+    // stays with specs/coding-cli.md). LIVE-PATH LAW (spec §2.1(3)): fresh claude
+    // ALWAYS gets a server-preallocated `--session-id` (`ws:2048-2064`).
+    let mut launch_intent = LaunchIntent::Resume;
+    let mut resume_session_id: Option<String> = None;
+    if mode != "shell" {
+        let requested_ref = create.session_ref.as_ref().filter(|r| r.provider == mode);
+        let should_preallocate_fresh_claude = mode == "claude"
+            && create.restore != Some(true)
+            && create.session_ref.is_none()
+            && create
+                .resume_session_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .is_none();
+        if should_preallocate_fresh_claude {
+            // `reserveClaudeFreshSessionId` → randomUUID() (`ws:969-975`); the
+            // per-requestId dedupe cache is a retry concern this single-shot
+            // handler does not have.
+            resume_session_id = Some(Uuid::new_v4().to_string());
+            launch_intent = LaunchIntent::Start;
+        } else if mode == "codex" {
+            // Raw codex resume (the durable-thread restore planner is
+            // coding-cli.md scope); `launchIntent` stays 'resume' (`tr:1570-1571`).
+            resume_session_id = create
+                .resume_session_id
+                .clone()
+                .filter(|s| !s.is_empty());
+        } else {
+            // `requestedSessionRef.provider === mode ? sessionRef.sessionId :
+            // m.resumeSessionId` (`ws:2040-2047`).
+            resume_session_id = requested_ref
+                .map(|r| r.session_id.clone())
+                .or_else(|| create.resume_session_id.clone())
+                .filter(|s| !s.is_empty());
+        }
+    }
+
+    // Provider settings `codingCli.providers[mode]` (`ws:2317-2319`), with the
+    // codex strip (`ws:2464-2465` — model/sandbox/permissionMode route to the
+    // app-server plan instead). Boot-snapshot settings (same documented caveat
+    // as `defaultCwd` above).
+    let mut permission_mode: Option<String> = None;
+    let mut model: Option<String> = None;
+    let mut sandbox: Option<String> = None;
+    if mode != "shell" && mode != "codex" {
+        if let Some(p) = state.settings.coding_cli.providers.get(&mode) {
+            permission_mode = p
+                .get("permissionMode")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            model = p.get("model").and_then(|v| v.as_str()).map(str::to_string);
+            sandbox = p.get("sandbox").and_then(|v| v.as_str()).map(str::to_string);
+        }
+    }
+
+    // opencode: allocate the loopback control endpoint BEFORE building the launch
+    // (`ws:2471-2473`; `local-port.ts:13-41`), via the freshell-opencode
+    // `LoopbackPortAllocator` seam (spec §3.3 rev 2.1 — transport.rs:323). The
+    // port rides into argv (`--hostname/--port`), which is also its record.
+    let opencode_endpoint = if mode == "opencode" {
+        use freshell_opencode::serve::PortAllocator as _;
+        match freshell_opencode::transport::LoopbackPortAllocator.allocate() {
+            Ok(ep) => Some(ep),
+            Err(e) => {
+                return send_create_error(
+                    ws_tx,
+                    ErrorCode::PtySpawnFailed,
+                    e,
+                    &create.request_id,
+                )
+                .await
+            }
+        }
+    } else {
+        None
+    };
+
+    // codex `--remote <wsUrl>`: the Rust codex app-server launch planner is NOT
+    // wired into terminal.create yet, so codex TUI panes launch WITHOUT the
+    // `--remote ... -c features.apps=false` pair — a real behavioral divergence
+    // tracked as DEVIATIONS.md DEV-0006 (spec §5 U2), NOT silently shipped.
+    let codex_remote_ws_url: Option<String> = None;
+
+    // ProviderTarget + host-native mcp cwd (`tr:911-914,1153,1203,1236,1262`).
+    let target = cli_provider_target(shell, host_os, is_wsl, resolved_cwd.as_deref(), &RealEnv);
+    let mcp_cwd = if mode == "shell" {
+        None
+    } else {
+        resolve_mcp_cwd(resolved_cwd.as_deref(), &RealEnv, host_os, is_wsl)
+    };
+
+    // MCP injection (§3.2 IO layer). Reference parity: a throw here propagates out
+    // of buildSpawnSpec BEFORE the pty.spawn try — no cleanup call on this path.
+    let mcp_injection = if mode == "shell" {
+        McpInjection::default()
+    } else {
+        match generate_mcp_injection(
+            &RealMcpRuntime,
+            &mode,
+            &terminal_id,
+            mcp_cwd.as_deref(),
+            target,
+        ) {
+            Ok(i) => i,
+            Err(e) => {
+                return send_create_error(
+                    ws_tx,
+                    ErrorCode::PtySpawnFailed,
+                    e.message,
+                    &create.request_id,
+                )
+                .await
+            }
+        }
+    };
+
+    // The full `resolveCodingCliCommand` (`tr:274-375`) — typed throws surface as
+    // `error` frames with the reference-exact message; never a bare-command launch.
+    let inputs = CliLaunchInputs {
+        mode: &mode,
+        target,
+        resume_session_id: resume_session_id.as_deref(),
+        launch_intent,
+        permission_mode: permission_mode.as_deref(),
+        model: model.as_deref(),
+        sandbox: sandbox.as_deref(),
+        codex_remote_ws_url: codex_remote_ws_url.as_deref(),
+        opencode_server: opencode_endpoint
+            .as_ref()
+            .map(|ep| (ep.hostname.as_str(), ep.port as i64)),
+        mcp_injection,
+    };
+    let cli = match resolve_coding_cli_command(&state.cli_commands, &inputs, &RealEnv) {
+        Ok(l) => l,
+        Err(e) => {
+            return send_create_error(
+                ws_tx,
+                ErrorCode::PtySpawnFailed,
+                e.message(),
+                &create.request_id,
+            )
+            .await
+        }
+    };
+
+    // `buildTerminalBaseEnv` (`tr:1529-1542`): FRESHELL/FRESHELL_URL/FRESHELL_TOKEN/
+    // FRESHELL_TERMINAL_ID/+TAB/PANE. U6 resolution: the Rust server's canonical
+    // port/token plumbing IS `PORT`/`AUTH_TOKEN` (main.rs), so the reference's
+    // env-derived computation carries over verbatim.
+    let overrides = build_terminal_base_env(
+        &RealEnv,
+        &terminal_id,
+        create.tab_id.as_deref(),
+        create.pane_id.as_deref(),
+    );
+
+    // Branch selection mirrors `buildSpawnSpec` (`tr:1127-1137`): the Windows-shell
+    // branches apply on native Windows AND on WSL with an explicit cmd/powershell
+    // pane shell (`isWindowsLike() && !inWslWithLinuxShell`).
+    let effective_shell = resolve_shell(shell, host_os, is_wsl);
+    let windows_like =
+        is_windows(host_os) || (is_wsl && effective_shell != ShellType::System);
+
     // Spawn at the default geometry (`opts.cols||120`, `opts.rows||30`); the client
     // attaches then resizes to its viewport.
     let spec = match &cli {
-        Some(launch) if is_windows(host_os) => build_windows_cli_spawn_spec(
+        Some(launch) if windows_like => build_windows_cli_spawn_spec(
             launch,
             shell,
             host_os,
@@ -459,14 +637,54 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
     };
     let child_env = build_child_env_from_process(&spec);
 
-    if let Err(err) =
-        state
-            .registry
-            .create(&spec, &child_env, terminal_id.clone(), stream_id, None)
-    {
-        eprintln!("terminal.create: PTY spawn failed: {err}");
-        return true; // reference would surface an error; T1 never hits this path
+    // Exit-cleanup hook (`tr:1491` handlePtyExit → cleanupMcpConfig): fires once
+    // when the PTY stream ends — natural exit AND kill both funnel there.
+    let on_exit: Option<freshell_terminal::pty::ExitHook> = {
+        let tid = terminal_id.clone();
+        let cleanup_mode = mode.clone();
+        let cleanup_cwd = mcp_cwd.clone();
+        Some(Box::new(move || {
+            cleanup_mcp_config(&RealMcpRuntime, &tid, &cleanup_mode, cleanup_cwd.as_deref());
+        }))
+    };
+
+    if let Err(err) = state.registry.create(
+        &spec,
+        &child_env,
+        terminal_id.clone(),
+        stream_id,
+        None,
+        on_exit,
+    ) {
+        // Failed-spawn parity (`tr:1601-1610`): clean up MCP side-effects with the
+        // mcpCwd (NOT procCwd), then surface `wrapTerminalSpawnError`'s message as
+        // an `error{code:PTY_SPAWN_FAILED}` frame.
+        cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
+        let label = mode_label(&mode, cli.as_ref());
+        let env_var = state
+            .cli_commands
+            .iter()
+            .find(|s| s.name == mode)
+            .and_then(|s| s.env_var.clone());
+        let message = wrap_terminal_spawn_error(
+            &err,
+            &label,
+            &spec.program,
+            env_var.as_deref(),
+            resume_session_id.is_some(),
+        );
+        return send_create_error(ws_tx, ErrorCode::PtySpawnFailed, message, &create.request_id)
+            .await;
     }
+
+    // Directory metadata (`tr:1614` getModeLabel title + the CLI resume session id).
+    state.registry.set_meta(
+        &terminal_id,
+        Some(mode_label(&mode, cli.as_ref())),
+        None,
+        Some(mode.clone()),
+        resume_session_id.clone(),
+    );
 
     let created = ServerMessage::TerminalCreated(TerminalCreated {
         created_at: now_ms(),
@@ -479,6 +697,141 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         session_ref: None,
     });
     send(ws_tx, &created).await
+}
+
+/// Send the reference's `sendError` frame for a failed `terminal.create`
+/// (`ws-handler.ts:2606-2614`): `{ code, message, requestId }`.
+async fn send_create_error(
+    ws_tx: &mut WsSink,
+    code: ErrorCode,
+    message: String,
+    request_id: &str,
+) -> bool {
+    let msg = ServerMessage::Error(ErrorMsg {
+        code,
+        message,
+        timestamp: crate::now_iso(),
+        actual_session_ref: None,
+        expected_session_ref: None,
+        request_id: Some(request_id.to_string()),
+        terminal_exit_code: None,
+        terminal_id: None,
+    });
+    send(ws_tx, &msg).await
+}
+
+/// `getModeLabel` (`terminal-registry.ts:439-443`): `'Shell'` for shell, the CLI
+/// spec label otherwise (capitalized-mode fallback is unreachable here — unknown
+/// modes are rejected before launch).
+fn mode_label(mode: &str, cli: Option<&freshell_platform::CliLaunch>) -> String {
+    if mode == "shell" {
+        return "Shell".to_string();
+    }
+    match cli {
+        Some(l) if !l.label.is_empty() => l.label.clone(),
+        _ => {
+            let mut chars = mode.chars();
+            match chars.next() {
+                Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        }
+    }
+}
+
+/// `buildTerminalBaseEnv` (`terminal-registry.ts:1529-1542`). U6 resolution: the
+/// Rust server's canonical port/token plumbing IS `PORT`/`AUTH_TOKEN` (see
+/// `freshell-server/src/main.rs` — `PORT` env or 3001; `AUTH_TOKEN` mandatory),
+/// so the reference's env-derived values carry over verbatim.
+fn build_terminal_base_env(
+    env: &dyn Env,
+    terminal_id: &str,
+    tab_id: Option<&str>,
+    pane_id: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    out.insert("FRESHELL".to_string(), "1".to_string());
+    // `const port = Number(process.env.PORT || 3001)` (truthy: '' → 3001).
+    let port_raw = env
+        .get("PORT")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "3001".to_string());
+    let url = env
+        .get("FRESHELL_URL")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| format!("http://localhost:{}", js_number_string(&port_raw)));
+    out.insert("FRESHELL_URL".to_string(), url);
+    out.insert(
+        "FRESHELL_TOKEN".to_string(),
+        env.get("AUTH_TOKEN").unwrap_or_default(),
+    );
+    out.insert("FRESHELL_TERMINAL_ID".to_string(), terminal_id.to_string());
+    if let Some(t) = tab_id.filter(|s| !s.is_empty()) {
+        out.insert("FRESHELL_TAB_ID".to_string(), t.to_string());
+    }
+    if let Some(p) = pane_id.filter(|s| !s.is_empty()) {
+        out.insert("FRESHELL_PANE_ID".to_string(), p.to_string());
+    }
+    out
+}
+
+/// JS `String(Number(s))` for the `PORT` template slot: every real deployment is
+/// a plain integer; whitespace-only → `0`, unparseable → `NaN` (faithful to the
+/// reference's `Number(...)` coercion in the template literal).
+fn js_number_string(s: &str) -> String {
+    let t = s.trim();
+    if t.is_empty() {
+        return "0".to_string();
+    }
+    match t.parse::<f64>() {
+        Ok(n) if n.is_finite() => {
+            if n.fract() == 0.0 && n.abs() < 1e15 {
+                format!("{}", n as i64)
+            } else {
+                format!("{n}")
+            }
+        }
+        _ => "NaN".to_string(),
+    }
+}
+
+/// `wrapTerminalSpawnError` (`terminal-registry.ts:450-481`): the user-facing
+/// spawn-failure message. `NotFound` maps the reference's `ENOENT` branch; other
+/// errors get the `${action}: ${message}` prefix (the base message here is the
+/// OS error text — node-pty's phrasing differs, an accepted seam).
+fn wrap_terminal_spawn_error(
+    err: &std::io::Error,
+    label: &str,
+    file: &str,
+    env_var: Option<&str>,
+    resumed: bool,
+) -> String {
+    let action = if resumed {
+        format!("Could not restore {label}")
+    } else {
+        format!("Could not start {label}")
+    };
+    if err.kind() == std::io::ErrorKind::NotFound {
+        let common = format!(
+            "\"{file}\" could not be started because the executable or working directory was not found on the server."
+        );
+        return match env_var {
+            Some(v) => {
+                format!("{action}: {common} Reinstall it or set {v} to the correct executable.")
+            }
+            None => format!(
+                "{action}: {common} Check that the executable exists and the working directory is valid."
+            ),
+        };
+    }
+    let base = err.to_string();
+    if base.is_empty() {
+        format!("{action}: Failed to spawn terminal")
+    } else if base.starts_with(&format!("{action}:")) {
+        base
+    } else {
+        format!("{action}: {base}")
+    }
 }
 
 /// `terminal.attach` — resolve the terminal in the shared registry and attach THIS
@@ -739,5 +1092,91 @@ mod resolve_create_cwd_tests {
     fn no_home_fallback_on_native_windows() {
         let resolved = resolve_create_cwd(None, None, HostOs::Windows);
         assert_eq!(resolved, None);
+    }
+}
+
+#[cfg(test)]
+mod cli_create_helper_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    struct MapEnv(BTreeMap<String, String>);
+    impl Env for MapEnv {
+        fn get(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+    }
+    fn env_of(pairs: &[(&str, &str)]) -> MapEnv {
+        MapEnv(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())
+    }
+
+    /// Success criterion 5 (spec §6): the FRESHELL* base env parity
+    /// (`terminal-registry.ts:1529-1542`), modulo U6 (resolved: same env vars).
+    #[test]
+    fn base_env_carries_all_freshell_vars() {
+        let env = env_of(&[("PORT", "17872"), ("AUTH_TOKEN", "tok-1")]);
+        let out = build_terminal_base_env(&env, "term1", Some("tab1"), Some("pane1"));
+        let expected: BTreeMap<String, String> = [
+            ("FRESHELL", "1"),
+            ("FRESHELL_URL", "http://localhost:17872"),
+            ("FRESHELL_TOKEN", "tok-1"),
+            ("FRESHELL_TERMINAL_ID", "term1"),
+            ("FRESHELL_TAB_ID", "tab1"),
+            ("FRESHELL_PANE_ID", "pane1"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn base_env_defaults_and_omissions() {
+        // No PORT → 3001; no AUTH_TOKEN → ''; tabId/paneId absent → keys absent
+        // (`...(envContext?.tabId ? {...} : {})`); FRESHELL_URL env override wins.
+        let out = build_terminal_base_env(&env_of(&[]), "t2", None, Some(""));
+        assert_eq!(out.get("FRESHELL_URL").unwrap(), "http://localhost:3001");
+        assert_eq!(out.get("FRESHELL_TOKEN").unwrap(), "");
+        assert!(!out.contains_key("FRESHELL_TAB_ID"));
+        assert!(!out.contains_key("FRESHELL_PANE_ID"));
+        let out2 = build_terminal_base_env(
+            &env_of(&[("FRESHELL_URL", "http://example:9")]),
+            "t3",
+            None,
+            None,
+        );
+        assert_eq!(out2.get("FRESHELL_URL").unwrap(), "http://example:9");
+    }
+
+    #[test]
+    fn js_number_string_coercion() {
+        assert_eq!(js_number_string("17872"), "17872");
+        assert_eq!(js_number_string(" 17872 "), "17872");
+        assert_eq!(js_number_string("abc"), "NaN");
+        assert_eq!(js_number_string(" "), "0");
+    }
+
+    #[test]
+    fn wrap_terminal_spawn_error_enoent_variants() {
+        let enoent = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            wrap_terminal_spawn_error(&enoent, "Claude CLI", "claude", Some("CLAUDE_CMD"), false),
+            "Could not start Claude CLI: \"claude\" could not be started because the executable or working directory was not found on the server. Reinstall it or set CLAUDE_CMD to the correct executable."
+        );
+        assert_eq!(
+            wrap_terminal_spawn_error(&enoent, "Shell", "/bin/bash", None, true),
+            "Could not restore Shell: \"/bin/bash\" could not be started because the executable or working directory was not found on the server. Check that the executable exists and the working directory is valid."
+        );
+        let other = std::io::Error::other("boom");
+        assert_eq!(
+            wrap_terminal_spawn_error(&other, "Codex CLI", "codex", Some("CODEX_CMD"), false),
+            "Could not start Codex CLI: boom"
+        );
+    }
+
+    #[test]
+    fn mode_label_shell_and_fallback() {
+        assert_eq!(mode_label("shell", None), "Shell");
+        assert_eq!(mode_label("kimi", None), "Kimi");
     }
 }

@@ -1299,6 +1299,9 @@ dependencies = [
 [[package]]
 name = "freshell-platform"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "freshell-protocol"
@@ -1375,6 +1378,7 @@ dependencies = [
  "axum",
  "chrono",
  "freshell-freshagent",
+ "freshell-opencode",
  "freshell-platform",
  "freshell-protocol",
  "freshell-terminal",

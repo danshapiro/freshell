@@ -44,6 +44,12 @@ use crate::framing::{reassemble_stream, OutputFramer};
 /// dependency): the caller decides where each message goes (a channel, a buffer…).
 pub type MessageSink = Box<dyn FnMut(ServerMessage) + Send>;
 
+/// A hook the reader thread invokes exactly once when the PTY stream ends (the
+/// master EOFs — natural child exit OR kill). The registry uses it for
+/// `cleanupMcpConfig(record.terminalId, record.mode, record.mcpCwd)` parity
+/// (`terminal-registry.ts:1491` — the handlePtyExit cleanup call).
+pub type ExitHook = Box<dyn FnOnce() + Send>;
+
 fn to_io<E: std::fmt::Display>(err: E) -> io::Error {
     io::Error::other(err.to_string())
 }
@@ -106,7 +112,7 @@ impl PtyTerminal {
         stream_id: impl Into<String>,
         ring_max_bytes: Option<i64>,
     ) -> io::Result<Self> {
-        Self::spawn_with_sink(spec, env, terminal_id, stream_id, ring_max_bytes, None)
+        Self::spawn_with_sink(spec, env, terminal_id, stream_id, ring_max_bytes, None, None)
     }
 
     /// As [`spawn`](Self::spawn), but the reader thread also forwards every framed
@@ -120,6 +126,7 @@ impl PtyTerminal {
         stream_id: impl Into<String>,
         ring_max_bytes: Option<i64>,
         sink: Option<MessageSink>,
+        on_exit: Option<ExitHook>,
     ) -> io::Result<Self> {
         let terminal_id = terminal_id.into();
         let stream_id = stream_id.into();
@@ -175,7 +182,7 @@ impl PtyTerminal {
 
         let captured = Arc::new(Mutex::new(Captured::default()));
         let framer = OutputFramer::new(terminal_id.clone(), stream_id.clone(), ring_max_bytes);
-        let reader_thread = spawn_reader(reader, framer, Arc::clone(&captured), sink);
+        let reader_thread = spawn_reader(reader, framer, Arc::clone(&captured), sink, on_exit);
 
         Ok(Self {
             child,
@@ -258,6 +265,7 @@ fn spawn_reader(
     mut framer: OutputFramer,
     captured: Arc<Mutex<Captured>>,
     mut sink: Option<MessageSink>,
+    on_exit: Option<ExitHook>,
 ) -> JoinHandle<()> {
     // Capture in-memory and (if wired) forward each framed message to the live sink.
     // The sink sees frames in the SAME seq order they are appended (single producer).
@@ -294,6 +302,11 @@ fn spawn_reader(
         let tail = decoder.finish();
         if !tail.is_empty() {
             emit(framer.append_output(&tail));
+        }
+        // The PTY stream ended (natural child exit or kill) — run the exit hook
+        // (`terminal-registry.ts:1491` cleanupMcpConfig parity).
+        if let Some(hook) = on_exit {
+            hook();
         }
     })
 }
