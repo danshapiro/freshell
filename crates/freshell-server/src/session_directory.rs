@@ -363,7 +363,15 @@ fn list_claude_sessions(claude_home: &Path) -> Vec<DirItem> {
 /// Read + parse one claude transcript file into a [`DirItem`]. Corruption-tolerant
 /// (the parser never panics); an unreadable file is skipped (`None`).
 fn parse_claude_file(path: &Path, force_subagent: bool) -> Option<DirItem> {
-    let content = std::fs::read_to_string(path).ok()?;
+    // Lossy UTF-8, NOT `read_to_string`: the original reads transcripts with
+    // `fs.readFile(file, 'utf8')` (Node), which never fails on invalid UTF-8 —
+    // it substitutes U+FFFD per the WHATWG maximal-subpart policy and still
+    // indexes the session. `read_to_string` would silently DROP such a file
+    // (differential-proven divergence: seeded invalid-UTF-8 transcript was
+    // indexed by the original with `\u{FFFD}` in the title but omitted here,
+    // which also skewed the page `revision` = max lastActivityAt). Rust's
+    // `from_utf8_lossy` implements the same replacement policy byte-for-byte.
+    let content = String::from_utf8_lossy(&std::fs::read(path).ok()?).into_owned();
     // `fallbackSessionId = basename(filePath, '.jsonl')` (claude.ts:583).
     let fallback = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
     let opts = ParseSessionOptions {
@@ -599,6 +607,30 @@ mod tests {
         );
         let item = item_from_meta(&meta, "claude", "healthy", false);
         assert_eq!(item.session_id, "healthy"); // not a canonical UUID
+    }
+
+    #[test]
+    fn invalid_utf8_transcript_is_indexed_lossily_like_node() {
+        // Regression (bug #7 class, found by the 007 seeded-home differential):
+        // Node reads transcripts with `fs.readFile(file,'utf8')` -> invalid
+        // bytes become U+FFFD and the session IS indexed; `read_to_string`
+        // silently dropped the whole file (and skewed page `revision`).
+        let home = claude_home_with(&[]);
+        let project = claude_home(&home).join("projects").join("-home-dan-proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(br#"{"parentUuid":null,"cwd":"/home/dan/proj","sessionId":"cccc1111-2222-4333-8444-555566667777","type":"user","message":{"role":"user","content":"bad "#);
+        bytes.extend_from_slice(&[0xC3, 0x28, 0x20, 0xE2, 0x82, 0x20, 0xF0, 0x9F, 0x98]); // invalid UTF-8 subsequences
+        bytes.extend_from_slice(br#" end"},"uuid":"cccc0001-0000-4000-8000-000000000001","timestamp":"2026-01-30T08:00:00.000Z"}"#);
+        bytes.push(b'\n');
+        std::fs::write(project.join("cccc1111-2222-4333-8444-555566667777.jsonl"), bytes).unwrap();
+
+        let items = list_claude_sessions(&claude_home(&home));
+        assert_eq!(items.len(), 1, "invalid-UTF-8 transcript must still be indexed (lossy), not dropped");
+        let title = items[0].title.as_deref().unwrap_or("");
+        assert!(title.contains('\u{FFFD}'), "title carries U+FFFD replacements, got {title:?}");
+        assert!(title.starts_with("bad ") && title.ends_with(" end"), "surrounding valid text preserved: {title:?}");
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
