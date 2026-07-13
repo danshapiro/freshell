@@ -1,0 +1,14 @@
+[
+  {
+    "kind": "opencode",
+    "label": "OpenCode",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/t6-orig-chrome-opencode.png",
+    "status": "PASS",
+    "detail": "launched + steady UI painted (/ask anything|esc\\s|ctrl\\+|\\/help|tab\\s+agents|▌|>_/i)",
+    "bufferExcerpt": "                 ┃  Ask anything... \"Fix broken tests\"                                                       |                  ┃                                                                                           |                  ┃  Build · GPT-5 OpenAI                                                                     |                  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+    "terminalId": "QtDFdKor1SClQGLyCPwzy",
+    "tabId": "O0P_RbSov1Jpg8V016g0M"
+  }
+]

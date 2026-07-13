@@ -37,6 +37,27 @@ current_phase: 5                 # 0=oracle bootstrap, 1=understand, 2=architect
 #   [c5e23374] native-Win machineHostname (hostname.exe==os.hostname()) + lanIps (Up-adapter
 #   PowerShell enum == os.networkInterfaces ground truth) live-verified on 17873.
 #   REST sweep now 175/175; oracle 174 passed/6 T2-skipped; cargo workspace green; purity held.
+# TASK-006 CLOSED 2026-07-13 (CLI argv/env fidelity, spec cli-argv-fidelity.md rev 2.1; restarts #10-#13):
+#   [d60d22fc] resolve_cli_launch + generateMcpInjection (all 5 modes) + terminal.create wiring;
+#   goldens G-C1..G-K1 + G-X0; live /proc argv+environ differential: claude byte-identical,
+#   codex identical minus --remote 4-tuple (DEV-0006, council APPROVE, ledgered w/ G-X0 pin +
+#   EQUIVALENCE-REPORT disclosure owed at task-009), opencode identical modulo port w/ identical
+#   config merge/refcount/cleanup lifecycle. U1 ratified option (a); U6/U7 resolved.
+#   [2eae97dd] BLOCKER B1 discharged (DEV-0007, council option (a)): native-Windows live check on
+#   17873 - ORIGINAL's default cmd branch cannot launch claude at all (exact node-pty bytes replayed:
+#   'not recognized'); rust PORT-FIX launches claude, settings arrive still-escaped (strictly milder,
+#   scope-limited to this argv/quoting class); powershell branch flattened line BYTE-IDENTICAL and
+#   identically broken (PS 5.1 quote strip) = bug-for-bug EQUIVALENT. Windows ConPTY exit/kill wedge
+#   found+fixed in pty.rs (waiter thread owns child; master dropped on Windows at exit so the reader
+#   EOFs - kill no longer wedges the server; natural-exit registry fan-out parity deferred to task-007).
+#   [s7.D.4] per-provider pane rendering: claude/codex/opencode on rust-WSL 17872 vs original 17871,
+#   harness 3/3 PASS both legs, vision 6/6 PASS (opencode re-driven per s8.4; see
+#   port/oracle/matrix/vision-review-t6-2026-07-13.md). Windows opencode absent (ENV-LIMITED).
+#   s6 success criteria: (1) goldens byte-for-byte PASS (147 platform tests); (2) segment ordering
+#   pinned incl all-segments tests; (3) four throw conditions reference-exact via PTY_SPAWN_FAILED;
+#   (4) MCP side-effects integration-tested + live-verified, cleanup on exit+failed spawn; (5) FRESHELL*
+#   base env asserted (U6); (6) purity held, REDUCED-FIDELITY notes retired to the ledger (DEV-0006/0007);
+#   (7) all 5 injection modes + B1 resolved before native-Windows leg declared done.
 # DEVIATIONS: DEV-0001 fixed+pinned (3/3), DEV-0002 fixed+pinned (4/4), DEV-0003 REJECTED (zero-tol).
 #   Open candidates CD-1..CD-8 + candidate-dirs (tracked in architecture-spec.md §8 / in-code notes).
 # DISCIPLINE HELD END-TO-END: original source NEVER mutated (git diff server/ shared/ empty at all
