@@ -530,6 +530,47 @@ impl TerminalRegistry {
         true
     }
 
+    /// `finishTerminalPtyExit` (`terminal-registry.ts:1479-1510`), non-codex core —
+    /// the NATURAL-exit path (the kill path stays in [`kill`](Self::kill), which
+    /// removes the record first so this lookup misses, mirroring the original's
+    /// `record.status === 'exited'` early-return at `tr:1760`). Marks the record
+    /// `exited` (RETAINED in the inventory — the original reaps only beyond
+    /// `MAX_EXITED_TERMINALS`, `tr:1512-1528`), stamps `lastActivityAt`, fans
+    /// `terminal.exit{exitCode}` out to every attached connection, and drops the
+    /// subscriptions (`record.clients.clear()`). Live-pinned against the original
+    /// 2026-07-13 (`~/freshell-scratch-007/exit-{orig,rust}.json`): typing `exit`
+    /// yields `terminal.exit{exitCode:0}` + inventory `status:"exited"`,
+    /// `hasClients:false`, record retained.
+    ///
+    /// Called from the PTY reader thread's exit hook (after the final output
+    /// frame; the exit code comes from the waiter thread's `child.wait()`).
+    /// Deliberately does NOT drop the `TerminalHandle.pty` here — that would join
+    /// the very reader thread this runs on.
+    pub fn finish_pty_exit(&self, terminal_id: &str, exit_code: i64) -> bool {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            match inner.terminals.get(terminal_id) {
+                Some(handle) => Arc::clone(&handle.shared),
+                None => return false, // killed (kill removes the record) or unknown
+            }
+        };
+        let mut s = shared.lock().expect("terminal lock");
+        if s.status == TerminalRunStatus::Exited {
+            return false;
+        }
+        s.status = TerminalRunStatus::Exited;
+        s.last_activity_at = now_ms();
+        let exit = ServerMessage::TerminalExit(TerminalExit {
+            exit_code,
+            terminal_id: terminal_id.to_string(),
+        });
+        for sub in s.subscribers.values() {
+            (sub.sink)(exit.clone());
+        }
+        s.subscribers.clear();
+        true
+    }
+
     /// The live terminals for `terminal.inventory.terminals` (handshake + any refetch),
     /// sorted by `createdAt` then `terminalId` for a deterministic order.
     pub fn inventory(&self) -> Vec<InventoryTerminal> {

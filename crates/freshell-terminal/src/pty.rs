@@ -45,10 +45,14 @@ use crate::framing::{reassemble_stream, OutputFramer};
 pub type MessageSink = Box<dyn FnMut(ServerMessage) + Send>;
 
 /// A hook the reader thread invokes exactly once when the PTY stream ends (the
-/// master EOFs — natural child exit OR kill). The registry uses it for
-/// `cleanupMcpConfig(record.terminalId, record.mode, record.mcpCwd)` parity
-/// (`terminal-registry.ts:1491` — the handlePtyExit cleanup call).
-pub type ExitHook = Box<dyn FnOnce() + Send>;
+/// master EOFs — natural child exit OR kill), with the child's exit code (the
+/// node-pty `onExit({exitCode})` payload, `terminal-registry.ts:1751`). The ws
+/// layer uses it for `cleanupMcpConfig` parity (`tr:1491`) and the natural-exit
+/// `finishTerminalPtyExit` fan-out (`tr:1479-1510`). Fired from the READER
+/// thread only after every produced byte has been framed (the exit code itself
+/// comes from the waiter thread's `child.wait()` via a rendezvous channel), so
+/// `terminal.exit` can never overtake the final `terminal.output` frames.
+pub type ExitHook = Box<dyn FnOnce(i64) + Send>;
 
 fn to_io<E: std::fmt::Display>(err: E) -> io::Error {
     io::Error::other(err.to_string())
@@ -194,7 +198,6 @@ impl PtyTerminal {
 
         let captured = Arc::new(Mutex::new(Captured::default()));
         let framer = OutputFramer::new(terminal_id.clone(), stream_id.clone(), ring_max_bytes);
-        let reader_thread = spawn_reader(reader, framer, Arc::clone(&captured), sink, on_exit);
 
         // The child is owned by a waiter thread that blocks in `wait()` (node-pty's
         // Windows agent does the same with RegisterWaitForSingleObject). On Windows
@@ -206,13 +209,20 @@ impl PtyTerminal {
         let master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>> =
             Arc::new(Mutex::new(Some(pair.master)));
         let waiter_master = Arc::clone(&master);
+        let (code_tx, code_rx) = std::sync::mpsc::channel::<i64>();
         let mut child = child;
         let waiter_thread = std::thread::spawn(move || {
-            let _ = child.wait();
+            let code = match child.wait() {
+                Ok(status) => status.exit_code() as i64,
+                Err(_) => 0,
+            };
+            let _ = code_tx.send(code);
             if cfg!(windows) {
                 waiter_master.lock().expect("master mutex").take();
             }
         });
+        let reader_thread =
+            spawn_reader(reader, framer, Arc::clone(&captured), sink, on_exit, code_rx);
 
         Ok(Self {
             killer,
@@ -306,6 +316,7 @@ fn spawn_reader(
     captured: Arc<Mutex<Captured>>,
     mut sink: Option<MessageSink>,
     on_exit: Option<ExitHook>,
+    code_rx: std::sync::mpsc::Receiver<i64>,
 ) -> JoinHandle<()> {
     // Capture in-memory and (if wired) forward each framed message to the live sink.
     // The sink sees frames in the SAME seq order they are appended (single producer).
@@ -344,9 +355,13 @@ fn spawn_reader(
             emit(framer.append_output(&tail));
         }
         // The PTY stream ended (natural child exit or kill) — run the exit hook
-        // (`terminal-registry.ts:1491` cleanupMcpConfig parity).
+        // (`terminal-registry.ts:1491` cleanupMcpConfig + tr:1479 finishTerminalPtyExit
+        // parity) with the exit code from the waiter thread. The recv is bounded:
+        // stream EOF implies the child is exiting, so `child.wait()` completes and
+        // the waiter always sends exactly once.
         if let Some(hook) = on_exit {
-            hook();
+            let code = code_rx.recv().unwrap_or(0);
+            hook(code);
         }
     })
 }

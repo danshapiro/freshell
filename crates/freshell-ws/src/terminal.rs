@@ -637,14 +637,19 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
     };
     let child_env = build_child_env_from_process(&spec);
 
-    // Exit-cleanup hook (`tr:1491` handlePtyExit → cleanupMcpConfig): fires once
-    // when the PTY stream ends — natural exit AND kill both funnel there.
+    // Exit hook (`tr:1479-1510` finishTerminalPtyExit): fires once when the PTY
+    // stream ends — natural exit AND kill both funnel there. Order matches the
+    // reference: cleanupMcpConfig (`tr:1491`) BEFORE the terminal.exit fan-out
+    // (`tr:1495`). On the kill path the registry already removed the record and
+    // sent terminal.exit, so finish_pty_exit no-ops (tr:1760 parity).
     let on_exit: Option<freshell_terminal::pty::ExitHook> = {
         let tid = terminal_id.clone();
         let cleanup_mode = mode.clone();
         let cleanup_cwd = mcp_cwd.clone();
-        Some(Box::new(move || {
+        let registry = state.registry.clone();
+        Some(Box::new(move |exit_code: i64| {
             cleanup_mcp_config(&RealMcpRuntime, &tid, &cleanup_mode, cleanup_cwd.as_deref());
+            registry.finish_pty_exit(&tid, exit_code);
         }))
     };
 
