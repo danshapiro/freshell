@@ -29,7 +29,7 @@ use std::thread::JoinHandle;
 use freshell_platform::spawn::STRIP_ENV;
 use freshell_platform::SpawnSpec;
 use freshell_protocol::ServerMessage;
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
 use crate::decode::Utf8StreamDecoder;
 use crate::framing::{reassemble_stream, OutputFramer};
@@ -87,10 +87,22 @@ struct Captured {
 /// A live shell PTY: the spawned child, the master writer, and a background reader
 /// that frames output into `terminal.output` messages.
 pub struct PtyTerminal {
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    // Kill handle for the child (the child itself is owned by `waiter_thread`,
+    // which blocks in `child.wait()` \u2014 the node-pty agent's process-exit wait).
+    killer: Box<dyn ChildKiller + Send + Sync>,
     writer: Box<dyn Write + Send>,
     // Kept alive for the lifetime of the terminal so the master fd stays open.
-    _master: Box<dyn portable_pty::MasterPty + Send>,
+    // Shared with the waiter thread: on WINDOWS the waiter drops it when the
+    // child exits, because a ConPTY master read NEVER EOFs on child death alone
+    // (only `ClosePseudoConsole` \u2014 i.e. dropping the master \u2014 EOFs the reader).
+    // Live-pinned 2026-07-13 on the native-Windows server: without this,
+    // `registry.kill` joined a reader that never EOF'd and wedged the server,
+    // and natural child exit was never detected. node-pty parity: its Windows
+    // agent waits on the process handle, fires onExit, and closes the pty.
+    // On unix the master stays open until Drop so the reader drains every
+    // pending byte and EOFs via EIO exactly as before (T1 golden semantics).
+    master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
+    waiter_thread: Option<JoinHandle<()>>,
     reader_thread: Option<JoinHandle<()>>,
     captured: Arc<Mutex<Captured>>,
     terminal_id: String,
@@ -184,10 +196,29 @@ impl PtyTerminal {
         let framer = OutputFramer::new(terminal_id.clone(), stream_id.clone(), ring_max_bytes);
         let reader_thread = spawn_reader(reader, framer, Arc::clone(&captured), sink, on_exit);
 
+        // The child is owned by a waiter thread that blocks in `wait()` (node-pty's
+        // Windows agent does the same with RegisterWaitForSingleObject). On Windows
+        // it then drops the master: ConPTY flushes pending output to the still-
+        // draining reader and EOFs it \u2014 the ONLY way a ConPTY reader ever EOFs.
+        // On unix the reader EOFs by itself (slave closed \u2192 EIO), and the master
+        // must stay open until Drop so no pending output is truncated.
+        let killer = child.clone_killer();
+        let master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>> =
+            Arc::new(Mutex::new(Some(pair.master)));
+        let waiter_master = Arc::clone(&master);
+        let mut child = child;
+        let waiter_thread = std::thread::spawn(move || {
+            let _ = child.wait();
+            if cfg!(windows) {
+                waiter_master.lock().expect("master mutex").take();
+            }
+        });
+
         Ok(Self {
-            child,
+            killer,
             writer,
-            _master: pair.master,
+            master,
+            waiter_thread: Some(waiter_thread),
             reader_thread: Some(reader_thread),
             captured,
             terminal_id,
@@ -200,12 +231,14 @@ impl PtyTerminal {
     /// `terminal-registry.ts:3989` `pty.resize(cols,rows)`). Errors are swallowed
     /// exactly as the reference swallows node-pty resize errors.
     pub fn resize(&self, cols: u16, rows: u16) {
-        let _ = self._master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        if let Some(master) = self.master.lock().expect("master mutex").as_ref() {
+            let _ = master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        }
     }
 
     pub fn terminal_id(&self) -> &str {
@@ -235,22 +268,29 @@ impl PtyTerminal {
         reassemble_stream(&messages, &self.stream_id)
     }
 
-    /// SIGKILL + reap the child (`registry.kill`, `terminal-registry.ts:3997-4033`).
-    /// Idempotent. Closing the child drops its slave fds so the reader thread EOFs.
+    /// SIGKILL the child (`registry.kill`, `terminal-registry.ts:3997-4033`).
+    /// Idempotent. The waiter thread reaps it (`child.wait()`) and \u2014 on Windows \u2014
+    /// closes the ConPTY master so the reader thread EOFs; on unix the child's
+    /// death closes its slave fds and the reader EOFs via EIO after draining.
     pub fn kill(&mut self) {
         if self.reaped {
             return;
         }
         self.reaped = true;
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.killer.kill();
     }
 }
 
 impl Drop for PtyTerminal {
     fn drop(&mut self) {
-        // Reap the child, then join the reader (it exits once the master EOFs).
+        // Kill the child, then join the waiter (returns once the child is reaped;
+        // on Windows it also closes the master) and the reader (it exits once the
+        // stream EOFs \u2014 unix: slave EIO; Windows: master closed by the waiter).
+        // Both joins are bounded: kill() guarantees the child is exiting.
         self.kill();
+        if let Some(handle) = self.waiter_thread.take() {
+            let _ = handle.join();
+        }
         if let Some(handle) = self.reader_thread.take() {
             let _ = handle.join();
         }

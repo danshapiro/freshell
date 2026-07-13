@@ -533,6 +533,57 @@ path itself is intact).
 - adjudicated_by: /council fork, session e1b497f11d874275-50ff1d609ef44de9_self, 2026-07-13 — APPROVE.
 - status: accepted
 
+### DEV-0007 — native-Windows cmd-branch CLI launch of a quote-heavy payload fails MILDER than the reference (spec cli-argv-fidelity.md rev 2.1 §5 B1)
+- objective_defect: in the ORIGINAL — its default native-Windows CLI path is completely broken: the
+  flattened `quoteCmdArg`-everything + node-pty `argsToCommandLine` line makes cmd.exe fail with
+  `'\"claude\"' is not recognized as an internal or external command` (claude never launches). Proof
+  2026-07-13: reference bytes computed with the verbatim sources (terminal-registry.ts:1014-1048 +
+  node_modules/node-pty/lib/windowsPtyAgent.js:220-273) and REPLAYED live via CreateProcess
+  (`~/freshell-scratch-006/b1-tail-orig-cmd.txt` + `replay.mjs`, exit 1, error above).
+- original_behavior (native Windows, `terminal.create {mode:'claude', shell:'system'}` → cmd branch,
+  tr:949-953/1133-1137): claude never launches; the pane drops to a bare cmd prompt after the
+  "not recognized" error. PS branch (`shell:'powershell'`): claude launches but PowerShell 5.1's
+  child-argument passing strips the embedded quotes — `Error: Settings file not found: {hooks:...`.
+- port_behavior: PS branch — flattened CreateProcess line BYTE-IDENTICAL to the reference
+  (`~/freshell-scratch-006/b1-flatten-ps.txt`, live pane `b1-claude-ps.json`) → identically broken,
+  bug-for-bug EQUIVALENT, no deviation. cmd branch — the previously-ratified **PORT-FIX quoting gate**
+  (`spawn.rs build_cmd_command`, bare-when-plain) produces different bytes
+  (`b1-flatten-cmd.txt` first diff at offset 31): claude LAUNCHES, parses argv, rejects the
+  still-escaped `--settings` value (`Error: Settings file not found: "{\"hooks\":...`) and exits to the
+  cmd prompt. A strictly MILDER failure of an already-broken-in-reference path. In NEITHER system does
+  the settings/hook payload arrive intact on native Windows.
+- scope_limit (council condition): this "reference-equivalent or strictly-milder failure, fully
+  documented" criterion is a CONSEQUENCE of the already-ratified PORT-FIX quoting gate and applies to
+  THIS argv/quoting bug class only. It is NOT a general license for future deviations; "bug-for-bug"
+  remains the operative bar elsewhere.
+- environment_pin: 2026-07-13, SurfaceBookPro9, Windows 10.0.26200.8655, cmd.exe + Windows
+  PowerShell 5.1.26100.8655 (not pwsh 7), claude.exe 2.1.59 (`c:\Users\dan\.local\bin\claude.exe`),
+  node-pty 1.2.0-beta.11, portable-pty 0.8.1. RE-VERIFY if any of: claude's argv/settings parsing
+  changes, the default Windows shell resolution moves to pwsh 7, or portable-pty's ArgvQuote changes.
+- evidence_gap (named, open hardening — not a blocker): "strictly milder" is proven for the shipped
+  claude settings payload only. Adversarial payloads bearing cmd metacharacters (`&`, `|`, `^`, `%`,
+  unbalanced quotes) through the PORT-FIX bare-token path are untested and could fail worse. The
+  orphaned `freshell-mcp/<id>.json` on a failed-in-claude launch is cleaned by the pane exit hook
+  (reference lifecycle parity), not leaked per-retry.
+- upstream: the underlying product breakage (native-Windows CLI panes never receive their bootstrap
+  settings in the reference) is out of the port's mandate; not tracked upstream by this campaign —
+  recorded here so that is explicit rather than ambiguous.
+- user_facing_disclosure (EQUIVALENCE-REPORT known-limitations addendum, task-009): "On native
+  Windows, coding-CLI panes do not receive their bootstrap `--settings`/hook payload — claude starts
+  and prints a settings error (in the original it fails to launch at all via the default shell). This
+  is a known, permanent condition of the current Windows shell-quoting pipeline; no workaround exists."
+  Council standing note for the human: a user-reachable known-issues note (docs/release notes) is
+  recommended at productization; product-surface decision, not taken unilaterally here.
+- pinning: flattened-line truth files `~/freshell-scratch-006/b1-flatten-{cmd,ps}.txt`,
+  live pane captures `b1-claude-{cmd,ps}.json`, replay outputs (orig cmd tail → "not recognized";
+  rust cmd tail → claude settings error). Goldens G-C4 (cli_launch_goldens.rs) continue to pin the
+  pre-flattening argv; the PORT-FIX gate keeps its existing coverage.
+- adjudicated_by: /council fork, session 4e6e24ceb0414802-3dcecf0d6f4848e9_self, 2026-07-13 —
+  option (a) adjudicated with conditions (all folded in above). Implementer: restart #13 orchestrator
+  (distinct from adjudicating panel).
+- status: accepted (B1 discharged: PS branch bug-for-bug equivalent; cmd branch milder-failure
+  documented under the ratified PORT-FIX; native-Windows leg "done" per the council's scoped criterion)
+
 <!--
 Template:
 
