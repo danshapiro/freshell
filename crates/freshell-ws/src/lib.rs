@@ -95,6 +95,12 @@ pub struct WsState {
     /// (`resolveCodingCliCommand`). Populated from the extension registry at boot;
     /// empty in unit tests (shell-only).
     pub cli_commands: Arc<Vec<freshell_platform::CliCommandSpec>>,
+    /// Graceful-shutdown signal (`ws-handler.ts:1087` / `:3843`): on SIGTERM/SIGINT
+    /// the server notifies every live connection, which closes with
+    /// `4009 "Server shutting down"` (CLOSE_CODES.SERVER_SHUTDOWN) — live-pinned
+    /// 2026-07-13: the original's client observes {code:4009, reason:'Server
+    /// shutting down'}; the port previously died with an abnormal 1006.
+    pub shutdown: Arc<tokio::sync::Notify>,
 }
 
 /// The `/ws` sub-router, pre-bound to its state (mergeable into the server app).
@@ -367,6 +373,7 @@ mod tests {
             ),
             fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
             registry: freshell_terminal::TerminalRegistry::new(),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
             tabs: crate::tabs::TabsRegistry::new(),
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             cli_commands: Arc::new(Vec::new()),

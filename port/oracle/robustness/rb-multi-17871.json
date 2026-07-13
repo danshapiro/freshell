@@ -1,0 +1,7 @@
+{
+ "scenario": "multi",
+ "tids": 3,
+ "distinct": 3,
+ "crossTalk": [],
+ "inventoryCount": 5
+}

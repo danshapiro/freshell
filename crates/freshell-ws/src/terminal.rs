@@ -129,6 +129,15 @@ pub async fn run(
 
     loop {
         tokio::select! {
+            // Graceful shutdown (`ws-handler.ts:3843`): close 4009 "Server shutting
+            // down" so a live client sees the original's exact disconnect UX.
+            _ = state.shutdown.notified() => {
+                use axum::extract::ws::CloseFrame;
+                let _ = ws_tx
+                    .send(Message::Close(Some(CloseFrame { code: 4009, reason: "Server shutting down".into() })))
+                    .await;
+                break;
+            }
             inbound = ws_rx.next() => {
                 match inbound {
                     Some(Ok(Message::Text(text))) => {

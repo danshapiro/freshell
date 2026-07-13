@@ -1,0 +1,156 @@
+{
+ "terminalId": "AajAQfGC6F01WU6Q7KFAP",
+ "frames": [
+  {
+   "type": "ready",
+   "timestamp": "2026-07-13T04:28:25.364Z",
+   "serverInstanceId": "srv-2b60ff91-bd79-4de5-8402-43f95937c809",
+   "bootId": "boot-0ea8002b-299e-4aaf-87c4-e0c1511039d6"
+  },
+  {
+   "type": "terminal.created",
+   "requestId": "x-1783916905352",
+   "terminalId": "AajAQfGC6F01WU6Q7KFAP",
+   "createdAt": 1783916905369,
+   "cwd": "/home/dan/.freshell-qa-007-orig"
+  },
+  {
+   "type": "terminals.changed",
+   "revision": 1
+  },
+  {
+   "type": "settings.updated",
+   "settings": {
+    "logging": {
+     "debug": false
+    },
+    "safety": {
+     "autoKillIdleMinutes": 15
+    },
+    "terminal": {
+     "scrollback": 10000
+    },
+    "panes": {
+     "defaultNewPane": "ask"
+    },
+    "sidebar": {
+     "excludeFirstChatSubstrings": [],
+     "excludeFirstChatMustStart": false,
+     "autoGenerateTitles": true
+    },
+    "ai": {},
+    "codingCli": {
+     "enabledProviders": [
+      "claude",
+      "codex",
+      "opencode"
+     ],
+     "providers": {
+      "claude": {
+       "permissionMode": "default"
+      },
+      "codex": {}
+     },
+     "mcpServer": true,
+     "knownProviders": [
+      "claude",
+      "codex",
+      "gemini",
+      "kimi",
+      "opencode"
+     ]
+    },
+    "editor": {
+     "externalEditor": "auto"
+    },
+    "freshAgent": {
+     "enabled": false,
+     "defaultPlugins": [],
+     "providers": {}
+    },
+    "extensions": {
+     "disabled": []
+    },
+    "network": {
+     "host": "127.0.0.1",
+     "configured": false
+    }
+   }
+  },
+  {
+   "type": "perf.logging",
+   "enabled": false
+  },
+  {
+   "type": "terminal.inventory",
+   "bootId": "boot-0ea8002b-299e-4aaf-87c4-e0c1511039d6",
+   "terminals": [
+    {
+     "terminalId": "AajAQfGC6F01WU6Q7KFAP",
+     "title": "Shell",
+     "mode": "shell",
+     "createdAt": 1783916905369,
+     "lastActivityAt": 1783916905369,
+     "status": "running",
+     "hasClients": false,
+     "cwd": "/home/dan/.freshell-qa-007-orig"
+    }
+   ],
+   "terminalMeta": []
+  },
+  {
+   "type": "terminal.attach.ready",
+   "terminalId": "AajAQfGC6F01WU6Q7KFAP",
+   "streamId": "89f9a592-6f36-46d2-a65d-83e9846091d7",
+   "geometryEpoch": 1,
+   "geometryAuthority": "single_client",
+   "requestedSinceSeq": 0,
+   "effectiveSinceSeq": 0,
+   "headSeq": 0,
+   "replayFromSeq": 1,
+   "replayToSeq": 0,
+   "attachRequestId": "att-x-1783916905352"
+  },
+  {
+   "type": "terminal.meta.updated",
+   "upsert": [
+    {
+     "terminalId": "AajAQfGC6F01WU6Q7KFAP",
+     "cwd": "/home/dan/.freshell-qa-007-orig",
+     "checkoutRoot": "/home/dan/.freshell-qa-007-orig",
+     "repoRoot": "/home/dan/.freshell-qa-007-orig",
+     "displaySubdir": ".freshell-qa-007-orig",
+     "updatedAt": 1783916905389
+    }
+   ],
+   "remove": []
+  },
+  {
+   "type": "terminal.exit",
+   "terminalId": "AajAQfGC6F01WU6Q7KFAP",
+   "exitCode": 0
+  },
+  {
+   "type": "terminal.meta.updated",
+   "upsert": [],
+   "remove": [
+    "AajAQfGC6F01WU6Q7KFAP"
+   ]
+  }
+ ],
+ "inventoryAfter": [
+  {
+   "terminalId": "AajAQfGC6F01WU6Q7KFAP",
+   "title": "Shell",
+   "mode": "shell",
+   "createdAt": 1783916905369,
+   "lastActivityAt": 1783916907879,
+   "status": "exited",
+   "hasClients": false,
+   "cwd": "/home/dan/.freshell-qa-007-orig",
+   "lastLine": "logout",
+   "last_line": "logout"
+  }
+ ],
+ "bufferTail": "ase create the\r\n/home/dan/.freshell-qa-007-orig/.hushlogin file.\r\n\u001b[?2004hdan@SurfaceBookPro9:~$ exit\r\n\u001b[?2004l\rlogout\r\n"
+}

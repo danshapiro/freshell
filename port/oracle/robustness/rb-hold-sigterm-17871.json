@@ -1,0 +1,10 @@
+{
+ "scenario": "holdclient",
+ "tid": "oi-DvA7zYi2D302-Ym1MT",
+ "closed": {
+  "code": 4009,
+  "reason": "Server shutting down",
+  "at": 1783917903544
+ },
+ "framesAfterHold": []
+}

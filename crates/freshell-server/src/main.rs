@@ -153,6 +153,9 @@ async fn main() -> ExitCode {
     // spec `port/machine/specs/cli-argv-fidelity.md` §3.1.
     let cli_commands = Arc::new(extension_registry.cli_command_specs());
 
+    // Graceful-shutdown notify: on SIGTERM/SIGINT every live WS connection closes
+    // with `4009 "Server shutting down"` (ws-handler.ts:3843 parity).
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let ws_state = WsState {
         auth_token: Arc::clone(&auth_token),
         // Shared (not moved) so `GET /api/health` reports the SAME `instanceId`.
@@ -166,6 +169,7 @@ async fn main() -> ExitCode {
         tabs: tabs.clone(),
         screenshots: screenshots.clone(),
         cli_commands: Arc::clone(&cli_commands),
+        shutdown: Arc::clone(&shutdown_notify),
     };
     let api_state = ApiState {
         auth_token: Arc::clone(&auth_token),
@@ -314,7 +318,7 @@ async fn main() -> ExitCode {
     // Serve with graceful shutdown on SIGTERM/SIGINT so the fresh-agent opencode
     // serve sidecar is reaped (SIGTERM + `/proc` ownership sweep) — no orphans.
     let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(Arc::clone(&shutdown_notify)))
         .await;
     fresh_agent_state.shutdown().await;
     // Reap every owned codex app-server sidecar (SIGKILL + `/proc` ownership sweep) so a
@@ -334,7 +338,7 @@ async fn main() -> ExitCode {
 /// Resolve once a shutdown signal arrives (SIGTERM from the oracle harness's
 /// `stop()`, or Ctrl-C). Drives `axum`'s graceful shutdown so the opencode serve
 /// sidecar is reaped before exit.
-async fn shutdown_signal() {
+async fn shutdown_signal(notify_ws: Arc<tokio::sync::Notify>) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -357,6 +361,11 @@ async fn shutdown_signal() {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
+    // Close every live WS connection with `4009 "Server shutting down"`
+    // (ws-handler.ts:3843 parity) and give the close frames a beat to flush
+    // before axum tears the listener down.
+    notify_ws.notify_waiters();
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 }
 
 /// S1 fix: rewrite a bare `application/json` response Content-Type to the
