@@ -1,5 +1,9 @@
 # AGENTS.md — guardrails for the autonomous port machine
 
+## Active completion checklist
+
+- [Rust/Tauri parity completion checklist](../docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md) — remaining implementation work and required Playwright proof for every item.
+
 These rules bind every agent/session in the Rust/Tauri port campaign. They are
 **in addition to** the repo root `AGENTS.md`. The root rules and any specific
 user instruction always win on conflict.
