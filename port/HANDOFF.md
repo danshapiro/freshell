@@ -757,7 +757,11 @@ every result from committed files alone.
 6. **CLI argv fidelity** (§7.D.2): implement per spec rev 2.1, golden-test, verify
    goldens against the live original, B1 live check on native Windows, one live turn
    per provider. Move the in-code REDUCED-FIDELITY flag to the ledger as resolved.
-7. **Interchange + robustness** (§7.F, §7.I).
+7. **Interchange + robustness** (§7.F, §7.I). DONE 2026-07-14 (reports under
+   `port/oracle/{robustness,interchange}/`). Tracked remaining-work out of this item:
+   **terminal-metadata push subsystem** (`terminal.meta.updated` / TerminalMetadataService) —
+   documented gap DEV-0008, closes together with DEV-0006's coding-CLI
+   sidecar-lifecycle scope (`port/machine/specs/coding-cli.md`).
 8. **T2 live** on this host (needs credentials — if absent, escalate loudly as the
    one human dependency).
 9. **Close-out** (§8.8): final reports, STATE.yaml, push.

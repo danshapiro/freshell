@@ -246,10 +246,7 @@ async fn handle_client_text(
         ClientMessage::TerminalDetach(detach) => {
             handle_detach(&detach.terminal_id, ws_tx, state, conn_id).await
         }
-        ClientMessage::TerminalKill(kill) => {
-            handle_kill(kill, state);
-            true
-        }
+        ClientMessage::TerminalKill(kill) => handle_kill(kill, ws_tx, state).await,
         // freshAgent.create / freshAgent.send (codex + claude slices): dispatch to the
         // shared provider state as a DETACHED task so the cold sidecar spawn + the live
         // turn never block this connection's select loop (which must keep fanning out
@@ -710,7 +707,36 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         restore_error: None,
         session_ref: None,
     });
-    send(ws_tx, &created).await
+    let sent = send(ws_tx, &created).await;
+    // "Notify all clients that list changed" (`ws-handler.ts:2570`); the original's
+    // failed-delivery arm (`ws:2553`) broadcasts too, so once the terminal record
+    // exists this is unconditional. Live-pinned frame order (exit-orig.json):
+    // `terminal.created` then `terminals.changed`.
+    broadcast_terminals_changed(state);
+    sent
+}
+
+/// `wsHandler.broadcastTerminalsChanged()` (`ws-handler.ts:3670-3679`) from the WS
+/// terminal lifecycle paths: bump the handler-scoped revision (SHARED with the REST
+/// `/api/terminals` PATCH/DELETE broadcasts — one monotonic sequence, like the
+/// original's single `terminalsRevision`) and fan `{type:'terminals.changed',
+/// revision}` to every authenticated connection via the broadcast bus.
+///
+/// Wired call sites mirror the reference: `terminal.create` success/failed-delivery
+/// (`ws:2553`/`ws:2570`) and valid `terminal.kill` (`ws:2988`). NOT wired: the
+/// natural-exit path — the original broadcasts on exit only for
+/// `recoverableForRestore` terminals (`ws:571-578`, session-repair subsystem,
+/// unported), and the live capture (`port/oracle/robustness/exit-orig.json`) shows
+/// no `terminals.changed` on a plain exit. `recoverableTerminalIds` never applies
+/// on the wired paths.
+fn broadcast_terminals_changed(state: &WsState) {
+    let revision = state
+        .terminals_revision
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
+    let frame =
+        serde_json::json!({ "type": "terminals.changed", "revision": revision }).to_string();
+    let _ = state.broadcast_tx.send(frame);
 }
 
 /// Send the reference's `sendError` frame for a failed `terminal.create`
@@ -896,9 +922,40 @@ async fn handle_detach(
 
 /// `terminal.kill` — SIGKILL + reap the shared PTY and remove it. The registry fans
 /// `terminal.exit{exitCode:0}` out to every attached connection (including this one,
-/// via `conn_sink`), so no direct reply is needed here.
-fn handle_kill(kill: TerminalKill, state: &WsState) {
-    state.registry.kill(&kill.terminal_id);
+/// via `conn_sink`), so no direct success reply is needed here. A kill that actually
+/// removed a terminal is followed by `terminals.changed` (`ws-handler.ts:2988`); an
+/// unknown terminalId gets the original's `error{code:INVALID_TERMINAL_ID, message:
+/// 'Unknown terminalId', terminalId}` reply and NO broadcast (`ws:2978-2987` —
+/// live-pinned 2026-07-14 in the kill re-probe, `kill-orig-r16.json`: the invalid
+/// kill draws an `error` frame on the original; the port previously dropped it
+/// silently).
+async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) -> bool {
+    if kill_and_broadcast(state, &kill.terminal_id) {
+        return true;
+    }
+    let msg = ServerMessage::Error(ErrorMsg {
+        code: ErrorCode::InvalidTerminalId,
+        message: "Unknown terminalId".to_string(),
+        timestamp: crate::now_iso(),
+        actual_session_ref: None,
+        expected_session_ref: None,
+        request_id: None,
+        terminal_id: Some(kill.terminal_id),
+        terminal_exit_code: None,
+    });
+    send(ws_tx, &msg).await
+}
+
+/// The kill core, split from the socket reply for testability: `true` = the
+/// terminal existed, was killed/removed, and `terminals.changed` was broadcast
+/// (`ws:2988`); `false` = unknown id, nothing broadcast (the caller sends the
+/// `INVALID_TERMINAL_ID` error).
+fn kill_and_broadcast(state: &WsState, terminal_id: &str) -> bool {
+    if state.registry.kill(terminal_id) {
+        broadcast_terminals_changed(state);
+        return true;
+    }
+    false
 }
 
 // ── tabs.sync.* (ws-handler.ts:3058-3145) ────────────────────────────────────
@@ -1192,5 +1249,91 @@ mod cli_create_helper_tests {
     fn mode_label_shell_and_fallback() {
         assert_eq!(mode_label("shell", None), "Shell");
         assert_eq!(mode_label("kimi", None), "Kimi");
+    }
+}
+
+#[cfg(test)]
+mod terminals_changed_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn state_with_bus() -> (WsState, tokio::sync::broadcast::Receiver<String>) {
+        let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
+        let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
+        let rx = broadcast_tx.subscribe();
+        let state = WsState {
+            auth_token: Arc::clone(&auth_token),
+            server_instance_id: Arc::new("srv-1111".to_string()),
+            boot_id: Arc::new("boot-2222".to_string()),
+            settings: Arc::new(
+                serde_json::from_value(serde_json::json!({
+                    "ai": {},
+                    "codingCli": { "enabledProviders": [], "mcpServer": true, "providers": {} },
+                    "editor": { "externalEditor": "auto" },
+                    "extensions": { "disabled": [] },
+                    "freshAgent": { "defaultPlugins": [], "enabled": false, "providers": {} },
+                    "logging": { "debug": false },
+                    "network": { "configured": true, "host": "127.0.0.1" },
+                    "panes": { "defaultNewPane": "ask" },
+                    "safety": { "autoKillIdleMinutes": 15 },
+                    "sidebar": {
+                        "autoGenerateTitles": true,
+                        "excludeFirstChatMustStart": false,
+                        "excludeFirstChatSubstrings": []
+                    },
+                    "terminal": { "scrollback": 10000 }
+                }))
+                .unwrap(),
+            ),
+            broadcast_tx: Arc::clone(&broadcast_tx),
+            fresh_codex: freshell_freshagent::FreshCodexState::new(
+                auth_token,
+                Arc::clone(&broadcast_tx),
+                serde_json::json!({ "freshAgent": { "enabled": false } }),
+            ),
+            fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+            registry: freshell_terminal::TerminalRegistry::new(),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            tabs: crate::tabs::TabsRegistry::new(),
+            screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
+            terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            cli_commands: Arc::new(Vec::new()),
+        };
+        (state, rx)
+    }
+
+    /// `ws-handler.ts:3670-3679` frame shape + the single handler-scoped monotonic
+    /// revision: `{type:'terminals.changed', revision}` with revision 1, 2, ... —
+    /// exactly what the live capture pinned after `terminal.created`
+    /// (`port/oracle/robustness/exit-orig.json`, revision 1 on first create).
+    #[test]
+    fn broadcast_emits_monotonic_revision_frames() {
+        let (state, mut rx) = state_with_bus();
+        broadcast_terminals_changed(&state);
+        broadcast_terminals_changed(&state);
+        let f1: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        let f2: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            f1,
+            serde_json::json!({ "type": "terminals.changed", "revision": 1 })
+        );
+        assert_eq!(
+            f2,
+            serde_json::json!({ "type": "terminals.changed", "revision": 2 })
+        );
+    }
+
+    /// `terminal.kill` with an unknown id must NOT broadcast — the original's
+    /// invalid-id arm (`ws-handler.ts:2980-2987`) returns (with an
+    /// `INVALID_TERMINAL_ID` error, sent by `handle_kill`'s socket half) before
+    /// `broadcastTerminalsChanged()` at `ws:2988`.
+    #[test]
+    fn kill_of_unknown_terminal_does_not_broadcast() {
+        let (state, mut rx) = state_with_bus();
+        assert!(!kill_and_broadcast(&state, "does-not-exist"));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 }

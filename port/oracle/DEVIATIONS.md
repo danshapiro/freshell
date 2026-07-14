@@ -584,6 +584,73 @@ path itself is intact).
 - status: accepted (B1 discharged: PS branch bug-for-bug equivalent; cmd branch milder-failure
   documented under the ratified PORT-FIX; native-Windows leg "done" per the council's scoped criterion)
 
+### DEV-0008 — `terminal.meta.updated` push subsystem (TerminalMetadataService) left unported; `terminals.changed` WS-lifecycle wiring ported to exact parity
+- objective_defect: none — PORT-SIDE reduced-scope deviation found by the task-007 robustness battery's
+  live frame capture (`port/oracle/robustness/exit-orig.json`): around terminal create/exit the original
+  emits (a) `terminals.changed {revision}` and (b) `terminal.meta.updated {upsert/remove}`; the rust
+  server emitted neither from the WS paths.
+- resolution split:
+  - `terminals.changed` — PORTED (this commit, exact parity): shared monotonic revision counter across
+    REST `/api/terminals` PATCH/DELETE and WS lifecycle (one sequence, like the original's single
+    `WsHandler.terminalsRevision`); broadcast after `terminal.create` success/failed-delivery
+    (ws-handler.ts:2553/2570) and valid `terminal.kill` (ws:2988); NOT on plain natural exit (original
+    broadcasts on exit only for `recoverableForRestore` terminals — session-repair subsystem, unported;
+    live capture confirms no `terminals.changed` on a plain exit). Code:
+    `crates/freshell-ws/src/terminal.rs::broadcast_terminals_changed` + tests
+    (`terminals_changed_tests`); live re-probe frames match original ordering
+    (`terminal.created` → `terminals.changed`).
+  - `terminal.meta.updated` — DOCUMENTED GAP (council option (a)): rust emits NO
+    `terminal.meta.updated` frames. Producer is `server/terminal-metadata-service.ts` (302 lines:
+    git-enriched per-terminal records via 3 live `git` probes per update, retire-TTL 1h,
+    commit-if-changed dedupe) whose update triggers are entangled with subsystems already documented
+    as unported (coding-CLI session association from codex/opencode controllers + claude session
+    watchers, `server/index.ts:475-532,:727,:869`; rename-cascade; session-association-broadcast) —
+    see DEV-0006. A PARTIAL port (create-upsert/exit-remove only) was REJECTED by council as strictly
+    worse: confidently-divergent records in coding-CLI flows vs a clean, honest absence.
+- client_behavior_verification (council condition 2 — the three tester-breaker scenarios, run/verified
+  before task-007 close):
+  1. Fresh connect, zero meta pushes ever: the SPA's `terminal.inventory` handler treats a missing
+     `terminalMeta` field as `[]` (`src/App.tsx:962`) and `PaneContainer` falls back to an EMPTY map
+     (`src/components/panes/PaneContainer.tsx:220-221`) — badges are simply ABSENT, never
+     stale-but-confident; no crash, no `undefined` render. Live: every rust rendering/interchange leg
+     (t6 vision 6/6 PASS at 878846f5; leg3-rust cross-client screenshots this task) ran with zero
+     `terminal.meta.updated` frames and rendered correctly.
+  2. WS reconnect: on every (re)connect the inventory snapshot RECONCILES the client store — records
+     absent from the incoming `terminalMeta` (and not locally newer) are removed
+     (`src/App.tsx:964-975` + `setTerminalMetaSnapshot`), so stale records cannot survive a reconnect;
+     on the rust server the store is always empty anyway. Live: interchange leg1/leg2 URL-switch legs
+     (full reload + reconnect, tabs restore, marker replay) PASS both directions.
+  3. Long-uptime terminal-ID reuse: rust terminal ids are UUIDv4 (no reuse); no meta record is ever
+     pushed, so no cached record exists to misattach; the snapshot reconciliation (scenario 2) would
+     clear any leftover on the next inventory regardless. Verified by code inspection (same cites).
+  Net: the user-advocate's "stale-but-confident badge" failure mode CANNOT occur on the rust server —
+  metadata badges are absent, not frozen: no creation-time push ever seeds them.
+- sidebar_data_path: directory/titles still refresh via REST — the client schedules
+  `fetchTerminalDirectoryWindow` + session-window refresh on `terminals.changed`
+  (`src/lib/terminal-invalidation-handler.ts:107-120`), which the rust server now emits at
+  create/kill; `/api/terminals` + `/api/session-directory` are ported byte-parity (task-005f/007
+  differentials).
+- user_facing_disclosure (EQUIVALENCE-REPORT known-limitations addendum, task-009 — council condition 1
+  wording, user-visible consequence not mechanism): "On the Rust server, live sidebar terminal metadata
+  badges (git branch/dirty state, token usage) are not populated at all: the push channel that feeds
+  them is not implemented, so those badges stay absent for the life of a terminal — they never show
+  stale data, they show none. Terminal titles and the session directory still load and refresh via REST."
+- client_tweak_option (council condition 4, optional): visually marking the fields non-live would touch
+  `src/` — BLOCKED by the campaign's additive-only purity rule (server/ shared/ src/ diff must stay
+  empty); not taken. Moot in practice: on the rust server the fields render absent, not stale.
+- closure (council condition 3, concrete tracked reference): port `TerminalMetadataService` +
+  `terminal.meta.updated` WHEN the coding-CLI controllers/session-association subsystem is ported —
+  same tracked remaining-work item as DEV-0006's closure (`port/machine/specs/coding-cli.md`
+  sidecar-lifecycle scope; listed in port/HANDOFF.md §9 remaining-work and STATE.yaml TASK-007 block
+  as "terminal-metadata push subsystem (DEV-0008)"); owner: port campaign orchestrator (self-driving
+  queue).
+- adjudicated_by: /council fork, session 55810a6c465e42c7-ae6c385e4065492e_self, 2026-07-14 —
+  option (a) APPROVE with conditions 1-3 mandatory (all discharged above), condition 4 recommended
+  (recorded as blocked-by-purity + moot). Options (b) partial port and (c) full port now: REJECT
+  unanimous. Implementer: restart #16 orchestrator (distinct from adjudicating panel).
+- status: accepted (terminals.changed parity CLOSED; terminal.meta.updated open gap, tracked for
+  closure with DEV-0006)
+
 <!--
 Template:
 

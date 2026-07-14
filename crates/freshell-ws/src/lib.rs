@@ -90,6 +90,12 @@ pub struct WsState {
     /// `POST /api/screenshots` knows a capable UI exists, and its inbound
     /// `ui.screenshot.result` is routed back to the waiting REST handler.
     pub screenshots: crate::screenshot::ScreenshotBroker,
+    /// The handler-scoped monotonic `terminals.changed` revision counter
+    /// (`ws-handler.ts:566` `terminalsRevision`). SHARED with the REST
+    /// `/api/terminals` PATCH/DELETE broadcasts (`terminals::TerminalsState`),
+    /// so WS create/kill and REST override changes stamp ONE monotonic sequence,
+    /// exactly like the original's single per-handler counter.
+    pub terminals_revision: Arc<std::sync::atomic::AtomicI64>,
     /// The registered coding-CLI command specs (`claude`/`codex`/`opencode`/...),
     /// used to resolve `terminal.create { mode: <cli> }` into a real CLI launch
     /// (`resolveCodingCliCommand`). Populated from the extension registry at boot;
@@ -376,6 +382,7 @@ mod tests {
             shutdown: Arc::new(tokio::sync::Notify::new()),
             tabs: crate::tabs::TabsRegistry::new(),
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
+            terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
         }
     }

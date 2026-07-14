@@ -58,6 +58,29 @@ current_phase: 5                 # 0=oracle bootstrap, 1=understand, 2=architect
 #   (4) MCP side-effects integration-tested + live-verified, cleanup on exit+failed spawn; (5) FRESHELL*
 #   base env asserted (U6); (6) purity held, REDUCED-FIDELITY notes retired to the ledger (DEV-0006/0007);
 #   (7) all 5 injection modes + B1 resolved before native-Windows leg declared done.
+# TASK-007 CLOSED 2026-07-14 (natural-exit + robustness + indexer + interchange + Tauri window-state;
+#   restarts #13-#16):
+#   [b0133b97] natural-exit parity: finishTerminalPtyExit core ported (terminal.exit w/ real exit code
+#   from waiter rendezvous, fired at reader EOF; kill path no-ops it - tr:1760 parity).
+#   [9665acc6] s7.I robustness battery EQUIVALENT (storm/multi/scroll/kill-9; 100k-line scrollback
+#   replay byte-identical 689191) + SIGTERM 4009 'Server shutting down' close parity ported.
+#   [959e9d9b] s7.I.5 indexer seeded-home differential: found+fixed parse_claude_file invalid-UTF-8
+#   lossy-read parity (bug#7 class); 12 fixture variants + cursor chain EQUAL deep-key-sorted.
+#   [this commit] s7.F interchange: leg1 rust-WSL<->rust-native-win same-token URL-only switch (tabs
+#   2->2 both, marker replay, vision PASS incl C:\Users\dan> proof of 17873); leg2 orig<->rust ditto;
+#   leg3 cross-client differential EQUIVALENT (tabs client-local BOTH, live mirror BOTH, buffers
+#   byte-identical 338); leg4 Chromium+Tauri same server simultaneous (tab does NOT cross clients =
+#   original behavior; liveness control resize proves capture pipeline live; 9/9 vision PASS).
+#   s7.H.4 Tauri window-state: move/resize -> debounced save exact -> restart -> SIZE restored exact,
+#   off-screen clamp -5000,-4000 -> 320,180 live-verified (ledgered extra vs Electron verbatim
+#   restore); ENV-LIMITED: WSLg Weston applies +(6,27) to EVERY move request (xdotool control proves
+#   compositor-imposed, not port math) - position exact-restore unverifiable on this display server.
+#   terminals.changed WS-lifecycle wiring PORTED (shared monotonic revision w/ REST; create/kill; NOT
+#   plain exit) + invalid-kill INVALID_TERMINAL_ID error frame; live re-probes revision-match 1:1.
+#   terminal.meta.updated = DEV-0008 documented gap (council option (a), conditions discharged; closes
+#   w/ DEV-0006 coding-CLI sidecar-lifecycle scope). Reports: port/oracle/robustness/report-2026-07-13.md
+#   + port/oracle/interchange/report-2026-07-14.md. Gates: cargo 41 suites, oracle 174/6, 3 binaries
+#   rebuilt, purity empty, zero orphans.
 # DEVIATIONS: DEV-0001 fixed+pinned (3/3), DEV-0002 fixed+pinned (4/4), DEV-0003 REJECTED (zero-tol).
 #   Open candidates CD-1..CD-8 + candidate-dirs (tracked in architecture-spec.md §8 / in-code notes).
 # DISCIPLINE HELD END-TO-END: original source NEVER mutated (git diff server/ shared/ empty at all

@@ -156,6 +156,11 @@ async fn main() -> ExitCode {
     // Graceful-shutdown notify: on SIGTERM/SIGINT every live WS connection closes
     // with `4009 "Server shutting down"` (ws-handler.ts:3843 parity).
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    // ONE handler-scoped `terminals.changed` revision counter, shared by the WS
+    // terminal lifecycle paths (create/kill, ws-handler.ts:2553/2570/2988) and the
+    // REST `/api/terminals` PATCH/DELETE broadcasts — the original keeps a single
+    // `terminalsRevision` on the WsHandler that both surfaces stamp.
+    let terminals_revision = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let ws_state = WsState {
         auth_token: Arc::clone(&auth_token),
         // Shared (not moved) so `GET /api/health` reports the SAME `instanceId`.
@@ -168,6 +173,7 @@ async fn main() -> ExitCode {
         registry: registry.clone(),
         tabs: tabs.clone(),
         screenshots: screenshots.clone(),
+        terminals_revision: Arc::clone(&terminals_revision),
         cli_commands: Arc::clone(&cli_commands),
         shutdown: Arc::clone(&shutdown_notify),
     };
@@ -247,7 +253,7 @@ async fn main() -> ExitCode {
         settings: settings_store.clone(),
         registry: registry.clone(),
         broadcast_tx: Arc::clone(&broadcast_tx),
-        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        terminals_revision: Arc::clone(&terminals_revision),
     };
 
     // The browser-pane HTTP reverse proxy (`/api/proxy/http/{port}/*`): the SPA's

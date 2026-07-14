@@ -15,8 +15,8 @@
 //!
 //! Single-instance (focus-first) via `tauri-plugin-single-instance`; the re-entrant
 //! Electron `main()` becomes the explicit [`state_machine`]. Tray / global-shortcut
-//! / updater / window-state / setup-wizard / launch-chooser / renderer-recovery /
-//! daemon managers are DEFERRED to Phase 3.14 and cleanly omitted here.
+//! / updater / window-state are wired (Phase 3.17 + task-007 §7.H.4); setup-wizard
+//! / launch-chooser / renderer-recovery / daemon managers remain DEFERRED.
 //!
 //! Additive only: nothing under `server/` or `shared/` is touched; the spawned
 //! server is the same `freshell-server` binary the oracle grades. The modules are
@@ -186,14 +186,11 @@ fn setup_app_bound(
     }
     eprintln!("freshell-tauri: server healthy on 127.0.0.1:{port}");
 
-    // 3. Load the retained SPA at the ?token= URL with the 2-property shim.
+    // 3. Load the retained SPA at the ?token= URL with the 2-property shim,
+    //    restoring persisted window state (`startup.ts:139-160`).
     let load_url = shim::build_load_url(host, port, &token);
     let parsed: url::Url = load_url.parse()?;
-    WebviewWindowBuilder::new(app.handle(), "main", WebviewUrl::External(parsed))
-        .title("Freshell")
-        .inner_size(1200.0, 800.0)
-        .initialization_script(shim::desktop_shim_script())
-        .build()?;
+    create_main_window(app, parsed)?;
     eprintln!(
         "freshell-tauri: main window loading {}",
         redact_token(&load_url)
@@ -246,11 +243,7 @@ fn setup_remote(
     }
     eprintln!("freshell-tauri: remote server healthy on {host}:{port}");
 
-    WebviewWindowBuilder::new(app.handle(), "main", WebviewUrl::External(parsed))
-        .title("Freshell")
-        .inner_size(1200.0, 800.0)
-        .initialization_script(shim::desktop_shim_script())
-        .build()?;
+    create_main_window(app, parsed)?;
     eprintln!(
         "freshell-tauri: main window loading {}",
         redact_token(&load_url)
@@ -259,6 +252,168 @@ fn setup_remote(
     wire_desktop_features(app, ServerMode::Remote);
     install_smoke_exit(app);
     Ok(())
+}
+
+/// Build the main window at `url` with persisted window state restored, then wire
+/// state persistence — the faithful analog of `startup.ts:139-201`:
+///
+///  * load `desktop.json.windowState` (defaults 1200×800, `window-state.ts:19-40`);
+///  * create the window with the saved x/y/width/height (x/y optional → OS picks,
+///    like the reference's `x?/y?`), maximize if saved maximized (`startup.ts:157-159`);
+///  * debounced (500 ms) save of `{x,y,width,height,maximized}` on every
+///    move/resize (`startup.ts:189-201` → `patchDesktopConfig({windowState})`).
+///
+/// One deliberate, flagged extra vs the reference: saved bounds are clamped
+/// on-screen via [`window_state::clamp_to_monitors`] (the guard
+/// `tauri-plugin-window-state` provides; Electron restores off-screen verbatim —
+/// documented as a latent original gap in `window_state.rs`).
+fn create_main_window(
+    app: &tauri::App,
+    url: url::Url,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let state = load_persisted_window_state();
+    let mut builder = WebviewWindowBuilder::new(app.handle(), "main", WebviewUrl::External(url))
+        .title("Freshell")
+        .inner_size(state.width as f64, state.height as f64)
+        .initialization_script(shim::desktop_shim_script());
+
+    if let (Some(x), Some(y)) = (state.x, state.y) {
+        let monitors = monitor_rects(app.handle());
+        let clamped = window_state::clamp_to_monitors(
+            window_state::Rect {
+                x,
+                y,
+                width: state.width,
+                height: state.height,
+            },
+            &monitors,
+        );
+        if clamped.adjusted {
+            eprintln!(
+                "freshell-tauri: persisted window bounds clamped on-screen ({x},{y} {}x{} -> {},{} {}x{})",
+                state.width, state.height,
+                clamped.rect.x, clamped.rect.y, clamped.rect.width, clamped.rect.height
+            );
+        }
+        builder = builder
+            .inner_size(clamped.rect.width as f64, clamped.rect.height as f64)
+            .position(clamped.rect.x as f64, clamped.rect.y as f64);
+    }
+
+    let window = builder.build()?;
+    if state.maximized {
+        let _ = window.maximize();
+    }
+    wire_window_state_persistence(&window);
+    Ok(())
+}
+
+/// Load the persisted window state from `desktop.json`, best-effort — a missing or
+/// unreadable/malformed config yields defaults (`window-state.ts:26-31`).
+fn load_persisted_window_state() -> window_state::WindowState {
+    let Some(path) = config::desktop_config_path() else {
+        return window_state::WindowState::default();
+    };
+    match config::read_config_at(&path) {
+        Ok(cfg) => window_state::load_from_config(&cfg),
+        Err(_) => window_state::WindowState::default(),
+    }
+}
+
+/// The available monitors as logical-coordinate rects (clamp input). Empty on
+/// query failure → [`window_state::clamp_to_monitors`] falls back to no-op.
+fn monitor_rects<R: Runtime>(app: &AppHandle<R>) -> Vec<window_state::Rect> {
+    app.available_monitors()
+        .map(|monitors| {
+            monitors
+                .iter()
+                .map(|m| {
+                    let scale = m.scale_factor();
+                    let pos = m.position().to_logical::<f64>(scale);
+                    let size = m.size().to_logical::<f64>(scale);
+                    window_state::Rect {
+                        x: pos.x.round() as i32,
+                        y: pos.y.round() as i32,
+                        width: size.width.round() as i32,
+                        height: size.height.round() as i32,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Debounce for the move/resize window-state save (`startup.ts:189-201`, 500 ms).
+const WINDOW_STATE_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// Wire the debounced window-state save onto the main window's move/resize events —
+/// the analog of `window.on('resize'|'move', saveState)` (`startup.ts:199-201`).
+/// Debounce = generation counter: each event bumps it and spawns a delayed saver
+/// that only persists if no newer event superseded it (the `clearTimeout` analog).
+fn wire_window_state_persistence(window: &tauri::WebviewWindow) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let generation = Arc::new(AtomicU64::new(0));
+    let win = window.clone();
+    window.on_window_event(move |event| {
+        if matches!(
+            event,
+            tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)
+        ) {
+            let my_gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
+            let win = win.clone();
+            let generation = generation.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(WINDOW_STATE_SAVE_DEBOUNCE);
+                if generation.load(Ordering::SeqCst) != my_gen {
+                    return; // superseded by a newer move/resize
+                }
+                save_window_state_now(&win);
+            });
+        }
+    });
+}
+
+/// Capture the window's current bounds and persist them as
+/// `desktop.json.windowState` (`saveState`, `startup.ts:189-198`). Best-effort:
+/// query/IO failures are logged, never fatal.
+fn save_window_state_now(win: &tauri::WebviewWindow) {
+    let Some(path) = config::desktop_config_path() else {
+        return;
+    };
+    let scale = win.scale_factor().unwrap_or(1.0);
+    // inner_position, NOT outer_position: on GTK/X11 (WSLg) `position()` places
+    // the CLIENT origin while `outer_position()` reports the frame origin ~32px
+    // up-left of it — saving outer would drift the window up-left by the frame
+    // inset on every restart. Saving the inner origin makes save→restore a
+    // fixed point (verified live: outer-based save drifted (148,108)→(116,76)).
+    // Electron's getBounds() is outer-based, but the reference requirement is
+    // "the window comes back where you left it", which this preserves.
+    let (Ok(pos), Ok(size)) = (win.inner_position(), win.inner_size()) else {
+        return;
+    };
+    let maximized = win.is_maximized().unwrap_or(false);
+    let pos = pos.to_logical::<f64>(scale);
+    let size = size.to_logical::<f64>(scale);
+    let bounds = window_state::SavedBounds {
+        x: pos.x.round() as i32,
+        y: pos.y.round() as i32,
+        width: size.width.round() as i32,
+        height: size.height.round() as i32,
+        maximized,
+    };
+    let mut cfg = match config::read_config_at(&path) {
+        Ok(cfg) => cfg,
+        // Malformed config: reference's patchDesktopConfig would fail its read
+        // too; keep the window state rather than lose it (defensive, logged).
+        Err(err) => {
+            eprintln!("freshell-tauri: desktop.json unreadable on window-state save: {err}");
+            serde_json::json!({})
+        }
+    };
+    window_state::save_into_config(&mut cfg, &bounds);
+    if let Err(err) = config::write_config_atomic(&path, &cfg) {
+        eprintln!("freshell-tauri: window-state save failed: {err}");
+    }
 }
 
 /// Headless-smoke hook shared by both boot paths: auto-quit after
