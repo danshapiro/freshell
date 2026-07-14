@@ -70,6 +70,91 @@ CI-rotted on the original) + a few deep endpoints no failing spec gates.
 
 ---
 
+## 0.2 Addendum — this-host campaign re-verification (2026-07-10 → 2026-07-14, SurfaceBookPro9 WSL2 + native Windows)
+
+The self-driving port campaign (port/HANDOFF.md §9 queue, tasks 001–009, commits `8735bfce..HEAD`)
+re-proved and extended the capstone above on THIS host. Everything below is evidence-linked to
+committed artifacts.
+
+### 0.2.1 Tier counts on this host (final, at task-009 close)
+
+| Gate | Result on this host |
+|---|---|
+| Oracle deterministic suite (T0+T1+batch+mutation+pins) | **174 passed / 6 skipped** (the 6 = T2 live gates), re-run after every crate change; last run at `aadd41a6` |
+| REST parity sweep (`port/oracle/rest-parity/sweep.mjs`) | **187/187** original ≡ rust (incl. 22-case terminal-search battery, zod-v4 byte shapes, PATCH/DELETE, session-directory) |
+| Cargo workspace | **41 suites green** (incl. freshell-tauri 145) |
+| T2 live (this host, task-008) | claude ✅ deep-equal, codex ✅ deep-equal (`liveModelCalls=1` each); **opencode SKIPPED — credentials absent, escalated** (`port/oracle/t2-live-rust-2026-07-14.md`) |
+| Robustness battery (§7.I) | storm/multi/scroll/kill-9/SIGTERM **EQUIVALENT** (`port/oracle/robustness/report-2026-07-13.md`); 100k-line scrollback replay byte-identical (689191 bytes both) |
+| Indexer seeded-home differential (§7.I.5) | 12 fixture variants (incl. multibyte + invalid-UTF-8) + cursor chain **EQUAL deep-key-sorted** (found+fixed lossy-read parity, `959e9d9b`) |
+| Interchange (§7.F) + Tauri window-state (§7.H.4) | all legs PASS, 9/9 skeptical vision PASS (`port/oracle/interchange/report-2026-07-14.md`) |
+
+### 0.2.2 Client × server matrix (this host; every leg vision-verified per §8.4)
+
+| Client | Server | Evidence (screenshots + reports, `port/oracle/matrix/` unless noted) |
+|---|---|---|
+| Chromium | original 17871 (WSL) | `sbp9-orig-chrome-*.png` (overview/wsl/cmd/powershell/claude/codex/opencode/editor/browser), `vision-review-chrome-2026-07-11.md` |
+| Chromium | rust 17872 (WSL) | `wsl-chrome-*.png`, `vision-review-chrome-2026-07-11.md` |
+| Chromium | rust 17873 (native Windows) | `win-chrome-*.png` (incl. gemini) |
+| Chromium — per-provider rendering differential (task-006 §7.D.4) | rust 17872 vs orig 17871 | `t6-wsl-chrome-{claude,codex,opencode,overview}.png` + orig leg, harness 3/3 PASS both, vision 6/6 PASS: `vision-review-t6-2026-07-13.md` |
+| Tauri leg A (app-bound, spawns own rust server) | rust (app-bound) | `sbp9-tauriA-report.json`, `vision-review-tauri-2026-07-11.md` |
+| Tauri leg B (remote mode, first live `provisioning.rs` run) | rust 17872 | `vision-review-tauri-2026-07-11.md` |
+| Tauri + Chromium simultaneously (§7.F leg 4, liveness-controlled) | rust 17872 | `port/oracle/interchange/tauri-r16-{1..4}*.png` |
+| Tauri window-state restore/clamp (§7.H.4) | rust 17872 | `port/oracle/interchange/ws-r16-run{1,2,4}-*.png` + `tauri-ws-r16-run*.log` |
+| Electron (built from source) | rust 17872 (WSL) | `sbp9-elwsl-*.png`, `vision-review-electron-2026-07-11.md` |
+| Electron | rust 17873 (native Windows) | `sbp9-elwin-*.png` |
+| Client-interchange (same token, URL-only switch; cross-client) | 17871↔17872↔17873 | `port/oracle/interchange/leg{1,2,3}-*.png`, `interchange-results.json`, `report-2026-07-14.md` |
+
+### 0.2.3 User-facing disclosures (council-mandated, verbatim from `port/oracle/DEVIATIONS.md`)
+
+- **DEV-0006:** "codex panes in the Rust build run standalone, without freshell's managed
+  app-server integration."
+- **DEV-0007:** "On native Windows, coding-CLI panes do not receive their bootstrap
+  `--settings`/hook payload — claude starts and prints a settings error (in the original it fails
+  to launch at all via the default shell). This is a known, permanent condition of the current
+  Windows shell-quoting pipeline; no workaround exists." (Council standing note: a user-reachable
+  known-issues note is recommended at productization; product-surface decision, not taken here.)
+- **DEV-0008:** "On the Rust server, live sidebar terminal metadata badges (git branch/dirty
+  state, token usage) are not populated at all: the push channel that feeds them is not
+  implemented, so those badges stay absent for the life of a terminal — they never show stale
+  data, they show none. Terminal titles and the session directory still load and refresh via REST."
+- **DEV-0004** (port-side bounded fix, disclosed): the updater's GitHub update-check is bounded at
+  5s in the rust build (the original's fetch is unbounded); on a hung GitHub API the rust
+  `/api/version` returns with `updateCheck` omitted instead of hanging.
+- **DEV-0005** (original defect, bug-for-bug preserved surface): WSL-hosted `cmd` panes land in
+  `C:\Windows` with two error banners — identical in original and port (see ledger for the
+  adjudicated handling).
+
+### 0.2.4 ENV-LIMITED / honest ceiling on this host (final enumeration)
+
+1. **macOS: spec-only.** No macOS host; all macOS behavior unexercised (unchanged from §9).
+2. **Elevated Windows `netsh`/UAC mutation: never executed.** Golden-string-only (§9.2).
+3. **Windows opencode: absent** — opencode is not installed on the native-Windows side; the 17873
+   matrix legs omit it (`vision-review-t6-2026-07-13.md` note).
+4. **T2 opencode live on this host: credentials absent** (task-008 escalation):
+   `~/.local/share/opencode/auth.json` does not exist and `opencode.jsonc` has no umans provider
+   config. The one human dependency; original-side baseline committed, rust re-run is
+   credential-only. Proof: `port/oracle/t2-live-rust-2026-07-14.md`.
+5. **App-bound Electron SIGKILL semantics + `electron:build:win`**: proven only to the depth in
+   `port/oracle/matrix/parity-desktop-2026-07-11.md` (WSLg/source-build ceiling; no signed
+   packaged installer on this host).
+6. **8 EQUIVALENT-red T3 specs** (+ the `:98` flake ruling): red on the pristine original on this
+   host too — findings against the CI-rotted reference, not port gaps (§8).
+7. **`pty-determinism-t1` echo-hello**: FLAKY-on-original under load (ruled at task-006: 2/3
+   focused + full-suite green); re-run focused before believing a red.
+8. **PORT-GAP-002**: DISCHARGED at task-005f (`b90b1d5d`) — search ported + byte-matched;
+   viewport/scrollback remain YAGNI-deferred with the 404 pin (§8 status update).
+9. **terminal.meta.updated push subsystem: DEV-0008 documented gap** — `terminals.changed`
+   WS-lifecycle parity PORTED (aadd41a6); the metadata push closes together with DEV-0006's
+   sidecar-lifecycle scope.
+10. **WSLg Weston window-position offset**: the compositor applies +(6,27) to EVERY window move
+    request (proven with a plain `xdotool windowmove` control) — Tauri window-state SIZE restore
+    is exact; POSITION exact-restore is unverifiable on this display server (any client,
+    including the Electron reference, gets the same shift). `port/oracle/interchange/report-2026-07-14.md`.
+11. **Windows ConPTY exit/kill wedge**: found + fixed in the port at task-006 (`2eae97dd`);
+    native-Windows kill/exit lifecycle live-verified on 17873 after the fix.
+
+---
+
 ## 1. Rust crate map → which oracle tier proves each
 
 The workspace has **11 Rust crates + 1 Node sidecar** (`cargo metadata --no-deps` = 11 packages; `freshell-claude-sidecar` is the one sanctioned Node package per ADR Decision 2 and is excluded from the cargo workspace).

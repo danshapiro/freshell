@@ -763,8 +763,14 @@ every result from committed files alone.
    documented gap DEV-0008, closes together with DEV-0006's coding-CLI
    sidecar-lifecycle scope (`port/machine/specs/coding-cli.md`).
 8. **T2 live** on this host (needs credentials — if absent, escalate loudly as the
-   one human dependency).
-9. **Close-out** (§8.8): final reports, STATE.yaml, push.
+   one human dependency). DONE 2026-07-14 (969933ed): claude + codex PASS deep-equal;
+   opencode ESCALATED — credentials absent on this host
+   (`port/oracle/t2-live-rust-2026-07-14.md`); re-run the same command after
+   `opencode auth login`, no development owed.
+9. **Close-out** (§8.8): final reports, STATE.yaml, push. DONE 2026-07-14:
+   EQUIVALENCE-REPORT §0.2 this-host addendum (tier counts, client×server matrix,
+   DEV-0004..0008 disclosures, 11-item ENV-LIMITED enumeration); STATE.yaml
+   TASK-005..009 CLOSED blocks. Items 1-7 above: all DONE (see STATE.yaml).
 
 ## 10. Known traps (each cost real time once — do not rediscover)
 

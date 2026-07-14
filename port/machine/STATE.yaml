@@ -6,7 +6,7 @@ base_commit: 98ed121c            # frozen. origin/main has since advanced to 6e8
                                  # do NOT rebase unless the user asks.
 worktree: .worktrees/rust-tauri-port
 branch: feat/rust-tauri-port
-updated: 2026-07-12
+updated: 2026-07-14
 
 current_phase: 5                 # 0=oracle bootstrap, 1=understand, 2=architect, 3=port, 4=self-qa, 5=converge
 # PHASES 0-2 COMPLETE: oracle (T0/T1/T2/T3 + mutation 28/28), 4 ground-truth specs, frozen ADR.
@@ -81,6 +81,20 @@ current_phase: 5                 # 0=oracle bootstrap, 1=understand, 2=architect
 #   w/ DEV-0006 coding-CLI sidecar-lifecycle scope). Reports: port/oracle/robustness/report-2026-07-13.md
 #   + port/oracle/interchange/report-2026-07-14.md. Gates: cargo 41 suites, oracle 174/6, 3 binaries
 #   rebuilt, purity empty, zero orphans.
+# TASK-008 CLOSED 2026-07-14 (T2 live on this host; restart #16, commit 969933ed):
+#   claude(haiku) PASS + codex(gpt-5.3-codex-spark) PASS - one live turn each through the RUST server,
+#   all FATAL T2 invariants, structural projections deep-equal to the original baselines; user auth
+#   stores untouched. opencode(umans kimi-k2.7) SKIPPED-AND-ESCALATED: ~/.local/share/opencode/auth.json
+#   ABSENT + opencode.jsonc has no umans provider config (proof in port/oracle/t2-live-rust-2026-07-14.md)
+#   - the ONE human dependency (run 'opencode auth login', then re-run the same driver, no dev owed).
+# TASK-009 CLOSED 2026-07-14 (campaign close-out; restart #16):
+#   EQUIVALENCE-REPORT s0.2 this-host addendum (tier counts, full client x server matrix w/ screenshot
+#   paths, DEV-0004..0008 user-facing disclosures verbatim, 11-item ENV-LIMITED enumeration).
+#   Campaign status: CONVERGED to the equivalence thesis within the documented this-host ceiling.
+#   Cross-links: DEV-0004 (bounded update-check, port-side fix), DEV-0005 (WSL cmd-pane cwd, original
+#   defect preserved bug-for-bug), DEV-0006 (codex --remote gap, disclosure carried), DEV-0007 (native-Win
+#   quoting, strictly-milder, disclosure carried), DEV-0008 (terminal.meta.updated documented gap;
+#   terminals.changed WS parity PORTED at aadd41a6). Open human dependency: T2-opencode credentials.
 # DEVIATIONS: DEV-0001 fixed+pinned (3/3), DEV-0002 fixed+pinned (4/4), DEV-0003 REJECTED (zero-tol).
 #   Open candidates CD-1..CD-8 + candidate-dirs (tracked in architecture-spec.md §8 / in-code notes).
 # DISCIPLINE HELD END-TO-END: original source NEVER mutated (git diff server/ shared/ empty at all
