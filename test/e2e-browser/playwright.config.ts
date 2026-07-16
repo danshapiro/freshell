@@ -15,6 +15,14 @@ const MATRIX_SPECS = [
   /settings-persistence-split\.spec\.ts$/,
   /harness-02-matrix-bite\.spec\.ts$/,
   /terminal-lifecycle\.spec\.ts$/,
+  // HARNESS-02 Finding 1 -- round out the acceptance-named scenario
+  // categories (settings, session, terminal, browser-pane, multi-client).
+  // These three use only the generic `e2eServerKind`-routed fixtures (no
+  // server-kind-specific assertions), so they run identically against both
+  // projects.
+  /browser-pane\.spec\.ts$/,
+  /multi-client\.spec\.ts$/,
+  /session-directory-matrix\.spec\.ts$/,
 ]
 
 export default defineConfig({
