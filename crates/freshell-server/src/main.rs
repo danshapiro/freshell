@@ -49,8 +49,28 @@ use crate::boot::BootState;
 /// Overridable via `FRESHELL_APP_VERSION` for parity when a run needs it.
 const APP_VERSION: &str = "0.7.0";
 
+/// Load `.env` from `dir` into the process environment — legacy parity for the
+/// original's `import 'dotenv/config'` (`server/index.ts:2-3`), which resolves
+/// against `process.cwd()` before anything else in the module reads `process.env`
+/// (including its own `AUTH_TOKEN` read). Node `dotenv`'s default semantics
+/// (and `dotenvy`'s, mirrored here): a process env var that is ALREADY set is
+/// never overridden by the file. A missing `.env` file is a silent no-op —
+/// `dotenvy::from_path` returns an `Io(NotFound)` error we deliberately ignore,
+/// matching `dotenv/config`'s own silent-missing-file behavior.
+fn load_dotenv_from(dir: &Path) {
+    let _ = dotenvy::from_path(dir.join(".env"));
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Legacy parity: `import 'dotenv/config'` (`server/index.ts:2-3`) loads
+    // `.env` from cwd before the module reads ANY process env — including the
+    // AUTH_TOKEN check immediately below. A cwd we can't resolve, or a cwd with
+    // no `.env`, is a silent no-op either way.
+    if let Ok(cwd) = std::env::current_dir() {
+        load_dotenv_from(&cwd);
+    }
+
     // AUTH_TOKEN is mandatory — refuse to start without it (matches the original).
     let auth_token = match std::env::var("AUTH_TOKEN") {
         Ok(token) if !token.is_empty() => Arc::new(token),
@@ -555,5 +575,66 @@ mod tests {
             payload["featureFlags"],
             serde_json::json!({ "kilroy": false, "aiEnabled": false })
         );
+    }
+
+    // `load_dotenv_from` (legacy parity: `import 'dotenv/config'`,
+    // `server/index.ts:2-3`). Each test uses its own temp dir + a uniquely-named
+    // sentinel var, so parallel test execution can't collide.
+
+    #[test]
+    fn load_dotenv_from_sets_var_absent_from_process_env() {
+        let dir = std::env::temp_dir().join("freshell-dotenv-test-unset");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".env"),
+            "FRESHELL_TASK7_TEST_VAR_UNSET=from-dotenv\n",
+        )
+        .unwrap();
+        std::env::remove_var("FRESHELL_TASK7_TEST_VAR_UNSET");
+
+        load_dotenv_from(&dir);
+
+        assert_eq!(
+            std::env::var("FRESHELL_TASK7_TEST_VAR_UNSET").as_deref(),
+            Ok("from-dotenv")
+        );
+
+        std::env::remove_var("FRESHELL_TASK7_TEST_VAR_UNSET");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_dotenv_from_never_overrides_existing_process_env_var() {
+        let dir = std::env::temp_dir().join("freshell-dotenv-test-set");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".env"),
+            "FRESHELL_TASK7_TEST_VAR_SET=from-dotenv\n",
+        )
+        .unwrap();
+        std::env::set_var("FRESHELL_TASK7_TEST_VAR_SET", "already-set");
+
+        load_dotenv_from(&dir);
+
+        assert_eq!(
+            std::env::var("FRESHELL_TASK7_TEST_VAR_SET").as_deref(),
+            Ok("already-set")
+        );
+
+        std::env::remove_var("FRESHELL_TASK7_TEST_VAR_SET");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_dotenv_from_missing_file_is_noop() {
+        let dir = std::env::temp_dir().join("freshell-dotenv-test-missing");
+        // Deliberately no `.env` written into this dir.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::remove_file(dir.join(".env")).ok();
+
+        // Must not panic.
+        load_dotenv_from(&dir);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
