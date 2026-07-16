@@ -282,6 +282,25 @@ async fn handle_client_text(
             }
             true
         }
+        // `freshAgent.interrupt` / `freshAgent.kill`: PR-1 wires ONLY the codex provider
+        // (`is_codex_provider`) to `FreshCodexState::handle_interrupt`/`handle_kill`. Claude
+        // and opencode keep the prior swallow behavior (their handlers land in a later PR).
+        // Detached tasks, same pattern as `FreshAgentCreate`/`FreshAgentSend` above, so a cold
+        // interrupt/kill RPC never blocks this connection's select loop.
+        ClientMessage::FreshAgentInterrupt(interrupt) => {
+            if is_codex_provider(interrupt.provider) {
+                let fresh_codex = state.fresh_codex.clone();
+                tokio::spawn(async move { fresh_codex.handle_interrupt(interrupt).await });
+            }
+            true
+        }
+        ClientMessage::FreshAgentKill(kill) => {
+            if is_codex_provider(kill.provider) {
+                let fresh_codex = state.fresh_codex.clone();
+                tokio::spawn(async move { fresh_codex.handle_kill(kill).await });
+            }
+            true
+        }
         // `ui.screenshot.result` (`ui-commands.ts:51`): the capable UI's reply to a
         // `screenshot.capture` command. Route it to the broker, waking the awaiting
         // `POST /api/screenshots` handler (`ws-handler.ts:1916`). Late duplicates for
@@ -956,6 +975,13 @@ fn kill_and_broadcast(state: &WsState, terminal_id: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Whether a `freshAgent.interrupt`/`freshAgent.kill` frame should route to the codex
+/// handler. PR-1 scope: only `codex` is wired to `FreshCodexState`; other providers keep
+/// the prior swallow behavior until a later PR adds their handlers.
+fn is_codex_provider(provider: freshell_protocol::AgentProvider) -> bool {
+    matches!(provider, freshell_protocol::AgentProvider::Codex)
 }
 
 // ── tabs.sync.* (ws-handler.ts:3058-3145) ────────────────────────────────────

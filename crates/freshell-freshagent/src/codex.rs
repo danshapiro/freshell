@@ -42,7 +42,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -53,17 +53,19 @@ use axum::{
     Json, Router,
 };
 use serde_json::{json, Map, Value};
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{oneshot, Mutex as TokioMutex};
 
 use freshell_codex::transport::{reap_owned_codex_sidecars, TungsteniteTransport};
 use freshell_codex::{
-    mint_ownership_id, normalize_freshcodex_effort, normalize_freshcodex_model,
-    to_codex_reasoning_effort, CodexAdapterEvent, CodexAppServerClient, CodexNotification,
-    CodexSubscription, StartThreadParams, StartTurnParams, CODEX_SIDECAR_OWNERSHIP_ENV,
+    mint_ownership_id, normalize_codex_thread_status, normalize_freshcodex_effort,
+    normalize_freshcodex_model, to_codex_reasoning_effort, CodexAdapterEvent, CodexAppServerClient,
+    CodexNotification, CodexStatus, CodexSubscription, StartThreadParams, StartTurnParams,
+    CODEX_SIDECAR_OWNERSHIP_ENV,
 };
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentCreate, FreshAgentCreated, FreshAgentCreateFailed,
-    FreshAgentEvent, FreshAgentSend, ServerMessage, SessionLocator,
+    FreshAgentEvent, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentSend,
+    ServerMessage, SessionLocator,
 };
 
 /// The codex fresh-agent `sessionType` (`AGENT_SESSION_TYPES.codex`).
@@ -107,12 +109,21 @@ struct CodexSession {
     sandbox: Option<String>,
     /// Raw create permissionMode (e.g. `never`) → the turn's `approvalPolicy`.
     permission_mode: Option<String>,
-    /// The `/proc` reaper tag for this session's detached app-server sidecar.
-    ownership_id: String,
-    /// The owned sidecar child (SIGKILL on shutdown; kill_on_drop backstop).
-    child: tokio::process::Child,
-    /// The notification-consumer task (aborted on shutdown).
+    /// Legacy `activeTurnByThread.get(sessionId)` mirror (adapter.ts:295,980,1009,1027): set
+    /// immediately after `turn/start` resolves (`handle_send`), cleared on a successful
+    /// `handle_interrupt` and whenever the notification consumer observes the turn/thread end
+    /// (`reduce_notification`). Lets `freshAgent.interrupt` target the in-flight turn.
+    active_turn: Arc<StdMutex<Option<String>>>,
+    /// The notification-consumer task (aborted on shutdown/kill).
     consumer: tokio::task::JoinHandle<()>,
+    /// Signals the exit-watcher to gracefully tear the sidecar down (a REQUESTED
+    /// `freshAgent.kill`); single-shot, so `None` once sent.
+    kill_tx: Option<oneshot::Sender<()>>,
+    /// Owns the sidecar child. An UNREQUESTED exit self-heals (adapter.ts:935-946): the
+    /// watcher broadcasts the terminal `exited` status with NO chime and does NOT remove the
+    /// session (stays mapped, matching the reference's "lazy restart on next send" invariant
+    /// \u2014 PR-1 does not yet implement the restart itself; see module docs / report).
+    watcher: tokio::task::JoinHandle<()>,
 }
 
 impl FreshCodexState {
@@ -167,9 +178,12 @@ impl FreshCodexState {
         for session in drained {
             session.consumer.abort();
             session.client.close().await;
-            let mut child = session.child;
-            let _ = child.start_kill();
-            reap_owned_codex_sidecars(&session.ownership_id);
+            if let Some(kill_tx) = session.kill_tx {
+                let _ = kill_tx.send(());
+            }
+            // The exit-watcher performs start_kill + reap_owned_codex_sidecars on this
+            // requested-kill path; wait for it so shutdown() only returns once torn down.
+            let _ = session.watcher.await;
         }
     }
 
@@ -230,8 +244,23 @@ impl FreshCodexState {
             }
         };
 
+        // Legacy `activeTurnByThread` mirror for THIS session (adapter.ts:295) \u2014 set on
+        // `handle_send`, read/cleared by `handle_interrupt`, cleared by the consumer below.
+        let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+
         // Start the notification consumer (the status-guarded completion edge lives here).
-        let consumer = self.spawn_consumer(notifs, thread_id.clone());
+        let consumer = self.spawn_consumer(notifs, thread_id.clone(), active_turn.clone());
+
+        // The exit-watcher owns the sidecar child: a REQUESTED kill (via `kill_tx`) tears it
+        // down with no self-heal event; an UNREQUESTED exit self-heals (adapter.ts:935-946).
+        let (kill_tx, kill_rx) = oneshot::channel();
+        let watcher = spawn_exit_watcher(
+            child,
+            ownership_id.clone(),
+            thread_id.clone(),
+            self.broadcast_tx.clone(),
+            kill_rx,
+        );
 
         self.sessions.lock().await.insert(
             thread_id.clone(),
@@ -242,9 +271,10 @@ impl FreshCodexState {
                 cwd,
                 sandbox,
                 permission_mode,
-                ownership_id,
-                child,
+                active_turn,
                 consumer,
+                kill_tx: Some(kill_tx),
+                watcher,
             },
         );
 
@@ -292,10 +322,13 @@ impl FreshCodexState {
                     s.cwd.clone().or_else(|| cwd.clone()),
                     s.sandbox.clone(),
                     s.permission_mode.clone(),
+                    s.active_turn.clone(),
                 )
             })
         };
-        let Some((client, model, effort, turn_cwd, sandbox, permission_mode)) = looked_up else {
+        let Some((client, model, effort, turn_cwd, sandbox, permission_mode, active_turn)) =
+            looked_up
+        else {
             self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
             return;
         };
@@ -324,7 +357,12 @@ impl FreshCodexState {
         };
 
         let submitted_turn_id = match client.start_turn(params).await {
-            Ok(started) => started.turn_id,
+            Ok(started) => {
+                // adapter.ts:980 -- track the active turn immediately (before any
+                // turn/started notification), so a fast-follow interrupt has a target.
+                *active_turn.lock().expect("active_turn mutex") = Some(started.turn_id.clone());
+                started.turn_id
+            }
             Err(err) => {
                 self.send_error(&request_id, "CODEX_TURN_START_FAILED", &err.to_string());
                 return;
@@ -354,6 +392,82 @@ impl FreshCodexState {
             request_id: request_id.clone(),
             terminal_exit_code: None,
             terminal_id: None,
+        }));
+    }
+
+    // ── freshAgent.interrupt (WS) ────────────────────────────────────────────
+
+    /// Handle a `freshAgent.interrupt` for codex: issue `turn/interrupt` for the tracked
+    /// active turn (`activeTurnByThread.get(sessionId)`, adapter.ts:1009) and clear it on
+    /// success (adapter.ts:1027). There is NO wire ack on success — the app-server's
+    /// resulting `turn/completed{interrupted}` notification flows through the existing
+    /// STATUS-GUARDED consumer (`reduce_notification` -> `CodexSubscription::on_turn_completed`),
+    /// which emits the idle `freshAgent.session.snapshot` with NO `freshAgent.turn.complete`
+    /// chime (an interrupt is not a positive completion). Mirrors `ws-handler.ts:3503-3516`
+    /// (fire-and-forget; `INTERNAL_ERROR` on failure).
+    pub async fn handle_interrupt(&self, msg: FreshAgentInterrupt) {
+        let session_id = msg.session_id.clone();
+
+        let looked_up = {
+            let guard = self.sessions.lock().await;
+            guard.get(&session_id).map(|s| (s.client.clone(), s.active_turn.clone()))
+        };
+        let Some((client, active_turn)) = looked_up else {
+            self.send_error(&None, "SESSION_NOT_FOUND", "codex session not found");
+            return;
+        };
+
+        let turn_id = active_turn.lock().expect("active_turn mutex").clone();
+        let Some(turn_id) = turn_id else {
+            // adapter.ts:1017-1019 — no tracked active turn to target.
+            self.send_error(
+                &None,
+                "CODEX_INTERRUPT_FAILED",
+                &format!("No active Codex turn is tracked for {session_id}."),
+            );
+            return;
+        };
+
+        match client.interrupt_turn(&session_id, &turn_id).await {
+            Ok(()) => {
+                // adapter.ts:1027 — the turn is over from this call's perspective; the
+                // resulting turn/completed notification also clears it (redundant, harmless).
+                *active_turn.lock().expect("active_turn mutex") = None;
+            }
+            Err(err) => {
+                self.send_error(&None, "CODEX_INTERRUPT_FAILED", &err.to_string());
+            }
+        }
+    }
+
+    // ── freshAgent.kill (WS) ─────────────────────────────────────────────────
+
+    /// Handle a `freshAgent.kill` for codex: remove the session and gracefully tear down its
+    /// owned sidecar (consumer abort, client close, the exit-watcher's REQUESTED-kill path —
+    /// `start_kill` + reap, reusing [`reap_owned_codex_sidecars`]), then broadcast
+    /// `freshAgent.killed`. Idempotent for an unknown session id (mirrors `adapter.kill`'s
+    /// unconditional `return true`, adapter.ts:1211-1215) — `ws-handler.ts:3607-3626` always
+    /// sends `success:true`. Never touches a process this session did not itself spawn.
+    pub async fn handle_kill(&self, msg: FreshAgentKill) {
+        let session_id = msg.session_id.clone();
+
+        let removed = self.sessions.lock().await.remove(&session_id);
+        if let Some(session) = removed {
+            session.consumer.abort();
+            session.client.close().await;
+            if let Some(kill_tx) = session.kill_tx {
+                let _ = kill_tx.send(());
+            }
+            // The exit-watcher performs start_kill + reap on this requested-kill path; wait
+            // for it so the sidecar is actually gone before we broadcast success.
+            let _ = session.watcher.await;
+        }
+
+        self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+            provider: PROVIDER.to_string(),
+            session_id,
+            session_type: SESSION_TYPE.to_string(),
+            success: true,
         }));
     }
 
@@ -460,12 +574,13 @@ impl FreshCodexState {
         &self,
         mut notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
         thread_id: String,
+        active_turn: Arc<StdMutex<Option<String>>>,
     ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
         tokio::spawn(async move {
             let mut subscription = CodexSubscription::new(thread_id.clone());
             while let Some(notification) = notifs.recv().await {
-                let events = reduce_notification(&mut subscription, notification);
+                let events = reduce_notification(&mut subscription, notification, &active_turn);
                 for event in events {
                     let frame = adapter_event_to_frame(&event, &thread_id);
                     if let Some(frame) = frame {
@@ -477,10 +592,56 @@ impl FreshCodexState {
     }
 }
 
-/// Reduce one codex notification through the subscription into adapter events.
+/// Watch an owned sidecar child to completion. Two ways out:
+///
+/// - The child exits ON ITS OWN (crash / unexpected disconnect, never requested): self-heal
+///   (adapter.ts:935-946) — reap via [`reap_owned_codex_sidecars`] and broadcast the terminal
+///   `exited` status with NO chime (a crash is not a positive completion). The session is
+///   intentionally left mapped by the caller (this fn does not touch `sessions`) — matching
+///   the reference's "leave the runtime mapped for lazy restart" invariant.
+/// - A `freshAgent.kill` REQUESTS teardown via `kill_rx`: gracefully `start_kill` + reap, with
+///   NO self-heal event (the caller broadcasts its own `freshAgent.killed`).
+fn spawn_exit_watcher(
+    mut child: tokio::process::Child,
+    ownership_id: String,
+    thread_id: String,
+    broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    kill_rx: oneshot::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = child.wait() => {
+                reap_owned_codex_sidecars(&ownership_id);
+                let event = CodexAdapterEvent::Status {
+                    session_id: thread_id.clone(),
+                    status: CodexStatus::Exited,
+                };
+                if let Some(frame) = adapter_event_to_frame(&event, &thread_id) {
+                    let _ = broadcast_tx.send(frame);
+                }
+            }
+            _ = kill_rx => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                reap_owned_codex_sidecars(&ownership_id);
+            }
+        }
+    })
+}
+
+/// Clear the shared active-turn field (the `activeTurnByThread.delete(sessionId)` mirror).
+fn clear_active_turn(active_turn: &Arc<StdMutex<Option<String>>>) {
+    *active_turn.lock().expect("active_turn mutex") = None;
+}
+
+/// Reduce one codex notification through the subscription into adapter events. Also mirrors
+/// the legacy `activeTurnByThread` clear points onto `active_turn` (adapter.ts:901,913,1101-1103
+/// — leaving running/starting, a turn completing, or the thread closing all clear it;
+/// `turn/started` SETS it too, as a fallback alongside `handle_send`'s direct set).
 fn reduce_notification(
     subscription: &mut CodexSubscription,
     notification: CodexNotification,
+    active_turn: &Arc<StdMutex<Option<String>>>,
 ) -> Vec<CodexAdapterEvent> {
     match notification {
         CodexNotification::ThreadStarted { thread } => {
@@ -495,20 +656,40 @@ fn reduce_notification(
                 .into_iter()
                 .collect()
         }
-        CodexNotification::ThreadStatusChanged { thread_id, status } => subscription
-            .on_thread_status_changed(&thread_id, &status)
-            .into_iter()
-            .collect(),
+        CodexNotification::ThreadStatusChanged { thread_id, status } => {
+            // adapter.ts:898-903 — unconditional clear (harmless if unset) once the thread
+            // leaves running/starting, regardless of whether TurnStarted ever fired.
+            if thread_id == subscription.session_id() {
+                let normalized = normalize_codex_thread_status(&status);
+                if normalized != CodexStatus::Running && normalized != CodexStatus::Starting {
+                    clear_active_turn(active_turn);
+                }
+            }
+            subscription
+                .on_thread_status_changed(&thread_id, &status)
+                .into_iter()
+                .collect()
+        }
         CodexNotification::TurnCompleted(event) => {
+            // adapter.ts:912-913 — the turn is over regardless of status; clear unconditionally.
+            if event.thread_id == subscription.session_id() {
+                clear_active_turn(active_turn);
+            }
             subscription.on_turn_completed(&event, now_ms())
         }
         CodexNotification::TurnStarted(event) => {
             if let Some(turn_id) = &event.turn_id {
                 subscription.set_active_turn(turn_id.clone());
+                if event.thread_id == subscription.session_id() {
+                    *active_turn.lock().expect("active_turn mutex") = Some(turn_id.clone());
+                }
             }
             Vec::new()
         }
         CodexNotification::ThreadClosed { thread_id } => {
+            if thread_id == subscription.session_id() {
+                clear_active_turn(active_turn);
+            }
             subscription.on_thread_closed(&thread_id).into_iter().collect()
         }
         CodexNotification::FsChanged { .. } | CodexNotification::Other { .. } => Vec::new(),
@@ -841,5 +1022,282 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(st.is_enabled());
+    }
+
+    // ── freshAgent.interrupt / freshAgent.kill / onExit self-heal (PR-1) ───────
+
+    fn state_with_bus() -> (FreshCodexState, tokio::sync::broadcast::Receiver<String>) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+        let st = FreshCodexState::new(
+            Arc::new("tok".to_string()),
+            Arc::new(tx),
+            json!({ "freshAgent": { "enabled": false } }),
+        );
+        (st, rx)
+    }
+
+    /// Insert a `CodexSession` directly (bypassing the real sidecar spawn `handle_create`
+    /// requires) so `handle_interrupt`/`handle_kill` can be exercised against a scripted
+    /// [`freshell_codex::ChannelPeer`] / a real-but-harmless child process.
+    async fn insert_fake_session(
+        state: &FreshCodexState,
+        thread_id: &str,
+        client: Arc<CodexAppServerClient>,
+        active_turn: Arc<StdMutex<Option<String>>>,
+        child: tokio::process::Child,
+        ownership_id: &str,
+    ) -> tokio::sync::broadcast::Receiver<String> {
+        // no-op consumer: these tests drive the reducer/RPC surfaces directly.
+        let consumer = tokio::spawn(async {});
+        let (kill_tx, kill_rx) = oneshot::channel();
+        let watcher = spawn_exit_watcher(
+            child,
+            ownership_id.to_string(),
+            thread_id.to_string(),
+            state.broadcast_tx.clone(),
+            kill_rx,
+        );
+        state.sessions.lock().await.insert(
+            thread_id.to_string(),
+            CodexSession {
+                client,
+                model: "gpt-5.3-codex-spark".to_string(),
+                effort: None,
+                cwd: None,
+                sandbox: None,
+                permission_mode: None,
+                active_turn,
+                consumer,
+                kill_tx: Some(kill_tx),
+                watcher,
+            },
+        );
+        state.broadcast_tx.subscribe()
+    }
+
+    /// A harmless real child that stays alive until reaped (the interrupt/kill tests' fake
+    /// "owned sidecar" -- no real `codex` binary needed).
+    fn spawn_sleeper() -> tokio::process::Child {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30");
+        cmd.kill_on_drop(true);
+        cmd.spawn().expect("spawn sleep fixture")
+    }
+
+    #[tokio::test]
+    async fn handle_interrupt_issues_rpc_for_tracked_turn_and_clears_it() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, _rx) = state_with_bus();
+        let active_turn = Arc::new(StdMutex::new(Some("turn-1".to_string())));
+        insert_fake_session(
+            &st,
+            "thread-1",
+            client,
+            active_turn.clone(),
+            spawn_sleeper(),
+            "codex-sidecar-test-interrupt",
+        )
+        .await;
+
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_interrupt(FreshAgentInterrupt {
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thread-1".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    cwd: None,
+                })
+                .await;
+            })
+        };
+
+        // `interrupt_turn` gates on the initialize handshake first (client.ts:777-778) since
+        // this fresh client never initialized.
+        let (init_id, init_method, _p) = peer.expect_request().await;
+        assert_eq!(init_method, "initialize");
+        peer.respond(
+            &init_id,
+            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+        );
+        let _ = peer.expect_notification().await;
+
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "turn/interrupt");
+        assert_eq!(params["threadId"], json!("thread-1"));
+        assert_eq!(params["turnId"], json!("turn-1"));
+        peer.respond(&id, json!({}));
+
+        driver.await.expect("handle_interrupt task");
+        assert_eq!(
+            *active_turn.lock().unwrap(),
+            None,
+            "active turn cleared on a successful interrupt (adapter.ts:1027)"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_interrupt_errors_when_no_active_turn_is_tracked() {
+        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, mut rx) = state_with_bus();
+        insert_fake_session(
+            &st,
+            "thread-1",
+            client,
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-no-turn",
+        )
+        .await;
+
+        st.handle_interrupt(FreshAgentInterrupt {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "thread-1".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+
+        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "error");
+        assert!(
+            frame["message"]
+                .as_str()
+                .unwrap()
+                .contains("No active Codex turn is tracked for thread-1"),
+            "{frame}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_interrupt_errors_for_unknown_session() {
+        let (st, mut rx) = state_with_bus();
+
+        st.handle_interrupt(FreshAgentInterrupt {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "does-not-exist".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+
+        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "error");
+    }
+
+    #[tokio::test]
+    async fn handle_kill_removes_session_kills_owned_child_and_broadcasts_killed() {
+        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, mut rx) = state_with_bus();
+        let child = spawn_sleeper();
+        let pid = child.id().expect("pid");
+        insert_fake_session(
+            &st,
+            "thread-1",
+            client,
+            Arc::new(StdMutex::new(None)),
+            child,
+            "codex-sidecar-test-kill",
+        )
+        .await;
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "thread-1".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+
+        // The owned child was actually reaped (handle_kill awaits the watcher).
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the owned sidecar child must be killed"
+        );
+
+        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "freshAgent.killed");
+        assert_eq!(frame["sessionId"], "thread-1");
+        assert_eq!(frame["provider"], "codex");
+        assert_eq!(frame["success"], true);
+
+        assert!(!st.sessions.lock().await.contains_key("thread-1"), "session removed");
+    }
+
+    #[tokio::test]
+    async fn handle_kill_of_unknown_session_still_broadcasts_success() {
+        // adapter.kill() is unconditional (adapter.ts:1211-1215) -- idempotent kill of a
+        // session that doesn't exist still yields `success:true`.
+        let (st, mut rx) = state_with_bus();
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "does-not-exist".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+
+        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "freshAgent.killed");
+        assert_eq!(frame["success"], true);
+    }
+
+    #[tokio::test]
+    async fn onexit_self_heal_emits_exited_status_with_no_chime_and_keeps_session_mapped() {
+        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, mut rx) = state_with_bus();
+
+        // A child that exits ON ITS OWN almost immediately -- the UNREQUESTED-exit / crash
+        // path (never signaled via kill_tx).
+        let mut cmd = tokio::process::Command::new("true");
+        cmd.kill_on_drop(true);
+        let child = cmd.spawn().expect("spawn true fixture");
+
+        insert_fake_session(
+            &st,
+            "thread-1",
+            client,
+            Arc::new(StdMutex::new(None)),
+            child,
+            "codex-sidecar-test-exit",
+        )
+        .await;
+
+        let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(raw) = rx.recv().await {
+                    return serde_json::from_str::<Value>(&raw).unwrap();
+                }
+            }
+        })
+        .await
+        .expect("the watcher self-heals within the budget");
+
+        assert_eq!(frame["type"], "freshAgent.event");
+        assert_eq!(frame["provider"], "codex");
+        assert_eq!(frame["sessionId"], "thread-1");
+        assert_eq!(frame["event"]["type"], "freshAgent.status");
+        assert_eq!(frame["event"]["status"], "exited");
+
+        // No accompanying chime, and the session STAYS mapped (adapter.ts:937-944 invariant
+        // -- PR-1 leaves the actual lazy-restart-on-next-send unimplemented; see report).
+        assert!(rx.try_recv().is_err(), "no turn.complete chime alongside the exit status");
+        assert!(
+            st.sessions.lock().await.contains_key("thread-1"),
+            "the session stays mapped after an unrequested exit"
+        );
     }
 }
