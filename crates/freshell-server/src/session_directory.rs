@@ -60,6 +60,9 @@ pub struct SessionDirectoryState {
     /// The isolated home whose `.claude/projects` holds the claude transcripts.
     /// `None` → an empty page (no home resolvable).
     pub home: Option<PathBuf>,
+    /// `config.sessionOverrides` source: overlaid onto parsed items by
+    /// [`apply_session_overrides`] before `apply_query` runs.
+    pub settings: crate::settings_store::SettingsStore,
 }
 
 /// One directory item, typed for the sort/filter/cursor derivation. Serialized to
@@ -78,6 +81,9 @@ struct DirItem {
     is_subagent: bool,
     is_non_interactive: bool,
     is_running: bool,
+    /// `SessionOverride.archived` (`shared/read-models.ts:51`), defaulted `false`
+    /// and overlaid from `config.sessionOverrides` by [`apply_session_overrides`].
+    archived: bool,
     // Search annotations (set by title-tier search).
     matched_in: Option<String>,
     snippet: Option<String>,
@@ -99,8 +105,9 @@ impl DirItem {
         o.insert("lastActivityAt".into(), json!(self.last_activity_at));
         o.insert("isRunning".into(), json!(self.is_running));
         // R10a: the original always emits `archived` (a `SessionOverride` field
-        // defaulted to `false`, `shared/read-models.ts:51`); this port omitted it.
-        o.insert("archived".into(), json!(false));
+        // defaulted to `false`, `shared/read-models.ts:51`); overlaid from
+        // `config.sessionOverrides` by `apply_session_overrides`.
+        o.insert("archived".into(), json!(self.archived));
         if let Some(v) = &self.title {
             o.insert("title".into(), json!(v));
         }
@@ -204,8 +211,13 @@ fn js_number(raw: &str) -> f64 {
     if trimmed.is_empty() {
         return 0.0;
     }
-    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
-        return i64::from_str_radix(hex, 16).map(|v| v as f64).unwrap_or(f64::NAN);
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        return i64::from_str_radix(hex, 16)
+            .map(|v| v as f64)
+            .unwrap_or(f64::NAN);
     }
     trimmed.parse::<f64>().unwrap_or(f64::NAN)
 }
@@ -287,6 +299,7 @@ async fn session_directory(
         Some(home) => list_claude_sessions(&claude_home(home)),
         None => Vec::new(),
     };
+    let items = apply_session_overrides(items, &state.settings.session_overrides());
     match apply_query(items, &query) {
         Ok(page) => Json(page).into_response(),
         // Bad cursor → 400, matching `querySessionDirectory`'s `/cursor/i` → 400.
@@ -373,7 +386,11 @@ fn parse_claude_file(path: &Path, force_subagent: bool) -> Option<DirItem> {
     // `from_utf8_lossy` implements the same replacement policy byte-for-byte.
     let content = String::from_utf8_lossy(&std::fs::read(path).ok()?).into_owned();
     // `fallbackSessionId = basename(filePath, '.jsonl')` (claude.ts:583).
-    let fallback = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+    let fallback = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
     let opts = ParseSessionOptions {
         fallback_session_id: Some(fallback.clone()),
         ..Default::default()
@@ -421,9 +438,40 @@ fn item_from_meta(
         is_subagent: force_subagent || meta.is_subagent.unwrap_or(false),
         is_non_interactive: meta.is_non_interactive.unwrap_or(false),
         is_running: false,
+        // Default; overlaid from `config.sessionOverrides` by `apply_session_overrides`.
+        archived: false,
         matched_in: None,
         snippet: None,
     }
+}
+
+/// Overlay `config.sessionOverrides` onto parsed items (`service.ts` metadata-store
+/// flavor merge): `title`/`summary` prefer the override; `archived` reflects the
+/// override (default false); a `deleted: true` override removes the item. Keyed by
+/// `provider:sessionId` (`buildSessionKey`, `service.ts:36-38`).
+fn apply_session_overrides(
+    items: Vec<DirItem>,
+    overrides: &serde_json::Map<String, Value>,
+) -> Vec<DirItem> {
+    items
+        .into_iter()
+        .filter_map(|mut item| {
+            let ov = overrides.get(&item.key()).and_then(Value::as_object);
+            if let Some(ov) = ov {
+                if ov.get("deleted").and_then(Value::as_bool).unwrap_or(false) {
+                    return None;
+                }
+                if let Some(t) = ov.get("titleOverride").and_then(Value::as_str) {
+                    item.title = Some(t.to_string());
+                }
+                if let Some(s) = ov.get("summaryOverride").and_then(Value::as_str) {
+                    item.summary = Some(s.to_string());
+                }
+                item.archived = ov.get("archived").and_then(Value::as_bool).unwrap_or(false);
+            }
+            Some(item)
+        })
+        .collect()
 }
 
 // ── Cursor (base64url of `{lastActivityAt, key}`) ───────────────────────────
@@ -453,14 +501,22 @@ fn decode_cursor(cursor: &str) -> Result<(i64, String), String> {
 /// pre-filter, cursor page, revision. Returns the `SessionDirectoryPage` value, or
 /// an error string when the cursor is invalid (→ 400).
 fn apply_query(mut items: Vec<DirItem>, q: &DirQuery) -> Result<Value, String> {
-    let limit = q.limit.unwrap_or(MAX_DIRECTORY_PAGE_ITEMS).min(MAX_DIRECTORY_PAGE_ITEMS);
+    let limit = q
+        .limit
+        .unwrap_or(MAX_DIRECTORY_PAGE_ITEMS)
+        .min(MAX_DIRECTORY_PAGE_ITEMS);
     let cursor = match &q.cursor {
         Some(c) => Some(decode_cursor(c)?),
         None => None,
     };
 
     // revision = max(0, all lastActivityAt) (no terminal meta here).
-    let revision = items.iter().map(|i| i.last_activity_at).max().unwrap_or(0).max(0);
+    let revision = items
+        .iter()
+        .map(|i| i.last_activity_at)
+        .max()
+        .unwrap_or(0)
+        .max(0);
 
     // Sort: lastActivityAt DESC, then session-key DESC (projection.ts:51-62).
     items.sort_by(|a, b| {
@@ -477,7 +533,13 @@ fn apply_query(mut items: Vec<DirItem>, q: &DirQuery) -> Result<Value, String> {
         items.retain(|i| !i.is_non_interactive);
     }
     if !q.include_empty {
-        items.retain(|i| i.is_running || i.title.as_deref().map(str::trim).is_some_and(|t| !t.is_empty()));
+        items.retain(|i| {
+            i.is_running
+                || i.title
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|t| !t.is_empty())
+        });
     }
 
     // Cursor filter (service.ts:254-259).
@@ -582,14 +644,20 @@ mod tests {
         let item = item_from_meta(&meta, "claude", "real-corrupted", false);
         assert_eq!(item.session_id, "b7936c10-4935-441c-837c-c1f33cafec2d");
         assert_eq!(item.provider, "claude");
-        assert_eq!(item.project_path, "D:\\Users\\Dan\\GoogleDrivePersonal\\code\\freshell");
+        assert_eq!(
+            item.project_path,
+            "D:\\Users\\Dan\\GoogleDrivePersonal\\code\\freshell"
+        );
         assert_eq!(item.title.as_deref(), Some("Test session 1"));
         assert_eq!(item.last_activity_at, 1_769_753_759_234);
         assert!(item.is_non_interactive);
 
         // Item value shape has the required keys.
         let v = item.to_value();
-        assert_eq!(v["sessionId"], json!("b7936c10-4935-441c-837c-c1f33cafec2d"));
+        assert_eq!(
+            v["sessionId"],
+            json!("b7936c10-4935-441c-837c-c1f33cafec2d")
+        );
         assert_eq!(v["provider"], json!("claude"));
         assert_eq!(v["isRunning"], json!(false));
         assert_eq!(v["lastActivityAt"], json!(1_769_753_759_234i64));
@@ -623,13 +691,27 @@ mod tests {
         bytes.extend_from_slice(&[0xC3, 0x28, 0x20, 0xE2, 0x82, 0x20, 0xF0, 0x9F, 0x98]); // invalid UTF-8 subsequences
         bytes.extend_from_slice(br#" end"},"uuid":"cccc0001-0000-4000-8000-000000000001","timestamp":"2026-01-30T08:00:00.000Z"}"#);
         bytes.push(b'\n');
-        std::fs::write(project.join("cccc1111-2222-4333-8444-555566667777.jsonl"), bytes).unwrap();
+        std::fs::write(
+            project.join("cccc1111-2222-4333-8444-555566667777.jsonl"),
+            bytes,
+        )
+        .unwrap();
 
         let items = list_claude_sessions(&claude_home(&home));
-        assert_eq!(items.len(), 1, "invalid-UTF-8 transcript must still be indexed (lossy), not dropped");
+        assert_eq!(
+            items.len(),
+            1,
+            "invalid-UTF-8 transcript must still be indexed (lossy), not dropped"
+        );
         let title = items[0].title.as_deref().unwrap_or("");
-        assert!(title.contains('\u{FFFD}'), "title carries U+FFFD replacements, got {title:?}");
-        assert!(title.starts_with("bad ") && title.ends_with(" end"), "surrounding valid text preserved: {title:?}");
+        assert!(
+            title.contains('\u{FFFD}'),
+            "title carries U+FFFD replacements, got {title:?}"
+        );
+        assert!(
+            title.starts_with("bad ") && title.ends_with(" end"),
+            "surrounding valid text preserved: {title:?}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -641,7 +723,11 @@ mod tests {
         // discovery (R10b), never reaching the item list at all.
         let home = claude_home_with(&["real-corrupted.jsonl", "healthy.jsonl"]);
         let items = list_claude_sessions(&claude_home(&home));
-        assert_eq!(items.len(), 1, "the cwd-less repair fixture is never indexed (R10b)");
+        assert_eq!(
+            items.len(),
+            1,
+            "the cwd-less repair fixture is never indexed (R10b)"
+        );
         let page = apply_query(items, &default_query()).unwrap();
         assert_eq!(page["items"].as_array().unwrap().len(), 0);
         assert_eq!(page["nextCursor"], Value::Null);
@@ -685,7 +771,10 @@ mod tests {
         let page = apply_query(items, &q).unwrap();
         let arr = page["items"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["sessionId"], json!("b7936c10-4935-441c-837c-c1f33cafec2d"));
+        assert_eq!(
+            arr[0]["sessionId"],
+            json!("b7936c10-4935-441c-837c-c1f33cafec2d")
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -769,11 +858,15 @@ mod tests {
             is_subagent: false,
             is_non_interactive: false,
             is_running: false,
+            archived: false,
             matched_in: None,
             snippet: None,
         };
         let items = vec![mk("a", 100), mk("b", 200)];
-        let q = DirQuery { limit: Some(1), ..DirQuery::default() };
+        let q = DirQuery {
+            limit: Some(1),
+            ..DirQuery::default()
+        };
         let page = apply_query(items, &q).unwrap();
         let arr = page["items"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -782,7 +875,11 @@ mod tests {
 
         // Page 2 via the cursor → the older item.
         let items2 = vec![mk("a", 100), mk("b", 200)];
-        let q2 = DirQuery { limit: Some(1), cursor: Some(cursor.to_string()), ..DirQuery::default() };
+        let q2 = DirQuery {
+            limit: Some(1),
+            cursor: Some(cursor.to_string()),
+            ..DirQuery::default()
+        };
         let page2 = apply_query(items2, &q2).unwrap();
         let arr2 = page2["items"].as_array().unwrap();
         assert_eq!(arr2.len(), 1);
@@ -792,7 +889,10 @@ mod tests {
 
     #[test]
     fn invalid_cursor_is_rejected() {
-        let q = DirQuery { cursor: Some("!!!not-base64!!!".into()), ..DirQuery::default() };
+        let q = DirQuery {
+            cursor: Some("!!!not-base64!!!".into()),
+            ..DirQuery::default()
+        };
         let err = apply_query(Vec::new(), &q).unwrap_err();
         assert!(err.to_lowercase().contains("cursor"));
     }
@@ -807,7 +907,10 @@ mod tests {
     // ── ORIGINAL: `node dist/server/index.js`, zod v4 `safeParse` shapes) //
 
     fn q(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -937,9 +1040,80 @@ mod tests {
     fn badcursor_still_400s_with_original_message_r9_parity_untouched() {
         // R9 only tightened priority/limit; the pre-existing cursor 400 (already
         // parity, S1-only) must be unaffected.
-        let query = validate_query(&q(&[("priority", "visible"), ("cursor", "!!!not-base64!!!")]))
-            .unwrap();
+        let query = validate_query(&q(&[
+            ("priority", "visible"),
+            ("cursor", "!!!not-base64!!!"),
+        ]))
+        .unwrap();
         let err = apply_query(Vec::new(), &query).unwrap_err();
         assert!(err.to_lowercase().contains("cursor"));
+    }
+
+    // ── Task 2: sessionOverrides overlay ──────────────────────────────────
+
+    #[test]
+    fn overrides_overlay_applies_title_summary_archived_and_filters_deleted() {
+        // Two synthetic titled items.
+        let mk = |sid: &str| DirItem {
+            session_id: sid.into(),
+            provider: "claude".into(),
+            project_path: "/p".into(),
+            title: Some("parsed".into()),
+            summary: Some("parsed-sum".into()),
+            first_user_message: None,
+            last_activity_at: 100,
+            created_at: None,
+            cwd: Some("/p".into()),
+            is_subagent: false,
+            is_non_interactive: false,
+            is_running: false,
+            archived: false,
+            matched_in: None,
+            snippet: None,
+        };
+        let items = vec![mk("keep"), mk("gone")];
+
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "claude:keep".into(),
+            json!({
+                "titleOverride": "Renamed", "summaryOverride": "New sum", "archived": true
+            }),
+        );
+        overrides.insert("claude:gone".into(), json!({ "deleted": true }));
+
+        let overlaid = apply_session_overrides(items, &overrides);
+        assert_eq!(overlaid.len(), 1, "deleted item filtered out");
+        let v = overlaid[0].to_value();
+        assert_eq!(v["sessionId"], json!("keep"));
+        assert_eq!(v["title"], json!("Renamed"));
+        assert_eq!(v["summary"], json!("New sum"));
+        assert_eq!(v["archived"], json!(true));
+    }
+
+    #[test]
+    fn overlay_shape_unchanged_when_no_overrides_archived_always_present() {
+        let item = DirItem {
+            session_id: "x".into(),
+            provider: "claude".into(),
+            project_path: "/p".into(),
+            title: Some("t".into()),
+            summary: None,
+            first_user_message: None,
+            last_activity_at: 1,
+            created_at: None,
+            cwd: None,
+            is_subagent: false,
+            is_non_interactive: false,
+            is_running: false,
+            archived: false,
+            matched_in: None,
+            snippet: None,
+        };
+        let overlaid = apply_session_overrides(vec![item], &serde_json::Map::new());
+        let v = overlaid[0].to_value();
+        // Oracle-compat: archived is ALWAYS present, defaulted false.
+        assert_eq!(v["archived"], json!(false));
+        assert_eq!(v["title"], json!("t"));
     }
 }

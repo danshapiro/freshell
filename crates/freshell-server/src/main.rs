@@ -36,7 +36,9 @@ use std::sync::Arc;
 
 use freshell_api::ApiState;
 use freshell_freshagent::FreshAgentState;
-use freshell_platform::detect::{detect_platform_proc, host_os_live, is_wsl_proc, read_proc_version};
+use freshell_platform::detect::{
+    detect_platform_proc, host_os_live, is_wsl_proc, read_proc_version,
+};
 use freshell_ws::WsState;
 use uuid::Uuid;
 
@@ -72,16 +74,14 @@ async fn main() -> ExitCode {
     // The app version string, resolved ONCE and shared (Arc::clone) into BOTH
     // `GET /api/version` (`currentVersion`) and `GET /api/health` (`version`), so
     // the two endpoints can never disagree. Overridable via `FRESHELL_APP_VERSION`.
-    let app_version = Arc::new(
-        std::env::var("FRESHELL_APP_VERSION").unwrap_or_else(|_| APP_VERSION.to_string()),
-    );
+    let app_version =
+        Arc::new(std::env::var("FRESHELL_APP_VERSION").unwrap_or_else(|_| APP_VERSION.to_string()));
 
     // The server-start timestamp, captured once here as an ISO-8601 string
     // (millisecond precision + `Z`, matching JS `Date.toISOString()` in
     // `server/health-router.ts`). Surfaced as health `startedAt`.
-    let started_at = Arc::new(
-        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-    );
+    let started_at =
+        Arc::new(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
 
     // R2/R3/R4 root-cause fix: a single LIVE settings store, not a boot-time
     // snapshot. `allCliNames` (`server/index.ts:267-269`) is discovered here via
@@ -95,10 +95,9 @@ async fn main() -> ExitCode {
     // knownProviders grows AND enabledProviders auto-enables the new names).
     // The same discovered set is the PATCH validation allowlist
     // (`validCliProviders: allCliNames`, `server/index.ts:585`).
-    let known_providers: Vec<String> = extensions::ExtensionRegistry::scan(
-        &extensions::resolve_extension_dirs(home.as_deref()),
-    )
-    .discovered_cli_names();
+    let known_providers: Vec<String> =
+        extensions::ExtensionRegistry::scan(&extensions::resolve_extension_dirs(home.as_deref()))
+            .discovered_cli_names();
     let settings_store = settings_store::SettingsStore::load(home.as_deref(), known_providers);
     let settings = Arc::new(settings_store.get().await);
 
@@ -189,7 +188,8 @@ async fn main() -> ExitCode {
     };
     // The fresh-agent REST surface (opencode slice): shares the auth token + the
     // broadcast bus so its create/send broadcasts reach every WS client.
-    let fresh_agent_state = FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx));
+    let fresh_agent_state =
+        FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx));
 
     // Detect which coding-CLI agents are on PATH (so the PanePicker surfaces the real
     // claude/codex/opencode agents, was `{}`) and serialize the client registry for
@@ -230,6 +230,7 @@ async fn main() -> ExitCode {
     let session_directory_state = session_directory::SessionDirectoryState {
         auth_token: Arc::clone(&auth_token),
         home: home.clone(),
+        settings: settings_store.clone(),
     };
 
     let client_dir = Arc::new(resolve_client_dir());
@@ -280,12 +281,14 @@ async fn main() -> ExitCode {
         // R1/R2/R3/R4: the ONE `/api/settings` router (GET+PATCH+PUT), backed by
         // the live `settings_store` \u2014 replaces the old split between this boot
         // module's frozen GET and the freshcodex slice's disconnected PATCH.
-        .merge(settings_store::router(settings_store::SettingsRouterState {
-            store: settings_store.clone(),
-            auth_token: Arc::clone(&auth_token),
-            broadcast_tx: Arc::clone(&broadcast_tx),
-            fresh_codex: fresh_codex_state.clone(),
-        }))
+        .merge(settings_store::router(
+            settings_store::SettingsRouterState {
+                store: settings_store.clone(),
+                auth_token: Arc::clone(&auth_token),
+                broadcast_tx: Arc::clone(&broadcast_tx),
+                fresh_codex: fresh_codex_state.clone(),
+            },
+        ))
         .merge(boot::router(boot_state))
         .merge(network::router(network_state))
         .merge(session_directory::router(session_directory_state))
@@ -380,9 +383,7 @@ async fn shutdown_signal(notify_ws: Arc<tokio::sync::Notify>) {
 /// as a global response-mapping layer so no individual handler has to remember
 /// it. Idempotent: a response that already carries a charset (or isn't JSON at
 /// all, e.g. the SPA/static responses) passes through unchanged.
-async fn ensure_json_charset(
-    mut response: axum::response::Response,
-) -> axum::response::Response {
+async fn ensure_json_charset(mut response: axum::response::Response) -> axum::response::Response {
     use axum::http::{header, HeaderValue};
     let is_bare_json = response
         .headers()

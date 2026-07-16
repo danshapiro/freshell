@@ -309,12 +309,6 @@ impl SettingsStore {
 
     /// A snapshot of `config.sessionOverrides` (the session-directory read model
     /// overlays it; the `/api/sessions` router patches it).
-    ///
-    /// `#[allow(dead_code)]`: consumed by the session-directory overlay and the
-    /// `/api/sessions` router, both landing in a later task of the
-    /// session-actions parity plan (`docs/plans/2026-07-16-session-actions-parity-fixes.md`
-    /// Tasks 2/3). Task 1 lands this foundation first; only tests call it here.
-    #[allow(dead_code)]
     pub fn session_overrides(&self) -> serde_json::Map<String, Value> {
         self.session_overrides
             .lock()
