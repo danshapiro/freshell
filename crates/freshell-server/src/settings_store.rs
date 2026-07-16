@@ -58,6 +58,12 @@ pub struct SettingsStore {
     /// `/api/terminals` router reads (directory merge/filter) and patches.
     /// A std `Mutex` (not tokio) so the sync `persist` path can snapshot it.
     terminal_overrides: Arc<std::sync::Mutex<serde_json::Map<String, Value>>>,
+    /// `config.sessionOverrides` (`server/config-store.ts:492-514`): per-session
+    /// user overrides (`titleOverride`/`titleSource`/`summaryOverride`/`archived`/
+    /// `deleted`/`createdAtOverride`) the `/api/sessions` router patches and the
+    /// session-directory read model overlays. std `Mutex` so the sync `persist`
+    /// path can snapshot it (same as `terminal_overrides`).
+    session_overrides: Arc<std::sync::Mutex<serde_json::Map<String, Value>>>,
 }
 
 impl SettingsStore {
@@ -92,7 +98,8 @@ impl SettingsStore {
         {
             const LEGACY: [&str; 2] = ["claude", "codex"];
             const DEFAULTS: [&str; 3] = ["claude", "codex", "opencode"];
-            let enabled_norm = normalize_trimmed_string_list(&settings.coding_cli.enabled_providers);
+            let enabled_norm =
+                normalize_trimmed_string_list(&settings.coding_cli.enabled_providers);
             let legacy_match = enabled_norm.len() == LEGACY.len()
                 && LEGACY.iter().all(|l| enabled_norm.iter().any(|e| e == l));
             if legacy_match {
@@ -149,12 +156,14 @@ impl SettingsStore {
 
         let codex_display_id_secret = load_or_mint_codex_display_id_secret(home);
         let terminal_overrides = load_terminal_overrides(home);
+        let session_overrides = load_session_overrides(home);
         let store = Self {
             inner: Arc::new(RwLock::new(settings.clone())),
             home: home.map(|p| Arc::new(p.to_path_buf())),
             valid_cli_providers: Arc::new(discovered_cli_names),
             codex_display_id_secret: Arc::new(codex_display_id_secret),
             terminal_overrides: Arc::new(std::sync::Mutex::new(terminal_overrides)),
+            session_overrides: Arc::new(std::sync::Mutex::new(session_overrides)),
         };
         if needs_persist {
             store.persist(&settings);
@@ -226,13 +235,15 @@ impl SettingsStore {
         let doc = json!({
             "version": 1,
             "settings": settings,
-            "sessionOverrides": {},
+            "sessionOverrides": Value::Object(self.session_overrides.lock().expect("session overrides lock").clone()),
             "terminalOverrides": Value::Object(self.terminal_overrides.lock().expect("terminal overrides lock").clone()),
             "projectColors": {},
             "recentDirectories": [],
             "serverSecrets": { "codexDisplayIdSecret": &*self.codex_display_id_secret },
         });
-        let Ok(text) = serde_json::to_string_pretty(&doc) else { return };
+        let Ok(text) = serde_json::to_string_pretty(&doc) else {
+            return;
+        };
         let path = dir.join("config.json");
         let tmp = dir.join(format!("config.json.tmp-{}", std::process::id()));
         if std::fs::write(&tmp, &text).is_ok() {
@@ -243,7 +254,10 @@ impl SettingsStore {
     /// A snapshot of `config.terminalOverrides` (the `/api/terminals` directory
     /// reads it to merge titles/descriptions and filter `deleted`).
     pub fn terminal_overrides(&self) -> serde_json::Map<String, Value> {
-        self.terminal_overrides.lock().expect("terminal overrides lock").clone()
+        self.terminal_overrides
+            .lock()
+            .expect("terminal overrides lock")
+            .clone()
     }
 
     /// `configStore.patchTerminalOverride(id, patch)` (`config-store.ts:530-542`)
@@ -262,7 +276,10 @@ impl SettingsStore {
         patch: &[(&str, Option<Value>)],
     ) -> Value {
         let next = {
-            let mut all = self.terminal_overrides.lock().expect("terminal overrides lock");
+            let mut all = self
+                .terminal_overrides
+                .lock()
+                .expect("terminal overrides lock");
             let mut next = all
                 .get(terminal_id)
                 .and_then(Value::as_object)
@@ -289,6 +306,126 @@ impl SettingsStore {
         self.persist(&settings);
         Value::Object(next)
     }
+
+    /// A snapshot of `config.sessionOverrides` (the session-directory read model
+    /// overlays it; the `/api/sessions` router patches it).
+    ///
+    /// `#[allow(dead_code)]`: consumed by the session-directory overlay and the
+    /// `/api/sessions` router, both landing in a later task of the
+    /// session-actions parity plan (`docs/plans/2026-07-16-session-actions-parity-fixes.md`
+    /// Tasks 2/3). Task 1 lands this foundation first; only tests call it here.
+    #[allow(dead_code)]
+    pub fn session_overrides(&self) -> serde_json::Map<String, Value> {
+        self.session_overrides
+            .lock()
+            .expect("session overrides lock")
+            .clone()
+    }
+
+    /// `configStore.patchSessionOverride(key, patch)` (`config-store.ts:492-514`):
+    /// JS-spread merge `next = {...existing, ...patch}` (`Some(v)` sets, `None`
+    /// clears a key), THEN the title-source ladder: a `(titleOverride, titleSource)`
+    /// write only lands if `canUpgradeTitle(existing.titleSource, incoming)` — else
+    /// the existing title+source are restored while every OTHER patched field still
+    /// applies. A resolved-no-op (`next == existing`) skips the disk write.
+    /// Returns the merged override (the PATCH response body).
+    ///
+    /// `#[allow(dead_code)]`: see `session_overrides` above — the consuming
+    /// `/api/sessions` router lands in a later task; only tests call it here.
+    #[allow(dead_code)]
+    pub async fn patch_session_override(
+        &self,
+        key: &str,
+        patch: &[(&str, Option<Value>)],
+    ) -> Value {
+        let (next, changed) = {
+            let mut all = self
+                .session_overrides
+                .lock()
+                .expect("session overrides lock");
+            let existing = all
+                .get(key)
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let mut next = existing.clone();
+            for (k, v) in patch {
+                match v {
+                    Some(v) => {
+                        next.insert((*k).to_string(), v.clone());
+                    }
+                    None => {
+                        next.remove(*k);
+                    }
+                }
+            }
+            // Title-source ladder — only when BOTH title keys are present in the patch.
+            let patches_title = patch.iter().any(|(k, _)| *k == "titleOverride")
+                && patch.iter().any(|(k, _)| *k == "titleSource");
+            if patches_title {
+                let incoming = next.get("titleSource").and_then(Value::as_str);
+                let existing_src = existing.get("titleSource").and_then(Value::as_str);
+                if let Some(incoming) = incoming {
+                    if !can_upgrade_title(existing_src, incoming) {
+                        match existing.get("titleOverride") {
+                            Some(v) => {
+                                next.insert("titleOverride".into(), v.clone());
+                            }
+                            None => {
+                                next.remove("titleOverride");
+                            }
+                        }
+                        match existing.get("titleSource") {
+                            Some(v) => {
+                                next.insert("titleSource".into(), v.clone());
+                            }
+                            None => {
+                                next.remove("titleSource");
+                            }
+                        }
+                    }
+                }
+            }
+            let changed = next != existing;
+            if changed {
+                all.insert(key.to_string(), Value::Object(next.clone()));
+            }
+            (Value::Object(next), changed)
+        };
+        if changed {
+            let settings = self.get().await;
+            self.persist(&settings);
+        }
+        next
+    }
+}
+
+/// `canUpgradeTitle` (`shared/title-source.ts:50-57`): user always wins; a
+/// finalized source (anything != "dir") is never auto-overwritten; otherwise a
+/// strictly-higher rank upgrades. Absence ranks 0.
+///
+/// `#[allow(dead_code)]`: only reachable via `patch_session_override` above,
+/// which itself isn't wired to production call sites until a later task.
+#[allow(dead_code)]
+fn can_upgrade_title(existing: Option<&str>, incoming: &str) -> bool {
+    fn rank(s: Option<&str>) -> i32 {
+        match s {
+            Some("user") => 5,
+            Some("ai") => 4,
+            Some("first-message") => 3,
+            Some("legacy") => 2,
+            Some("dir") => 1,
+            _ => 0,
+        }
+    }
+    if incoming == "user" {
+        return true;
+    }
+    let finalized = matches!(existing, Some(s) if s != "dir");
+    if finalized {
+        return false;
+    }
+    rank(Some(incoming)) > rank(existing)
 }
 
 /// Load `config.terminalOverrides` from `<home>/.freshell/config.json` (tolerant:
@@ -306,6 +443,26 @@ fn load_terminal_overrides(home: Option<&Path>) -> serde_json::Map<String, Value
         return serde_json::Map::new();
     };
     doc.get("terminalOverrides")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Load `config.sessionOverrides` from `<home>/.freshell/config.json` (tolerant:
+/// any read/parse error or non-object degrades to empty, matching
+/// `config-store.ts#readConfigFile`).
+fn load_session_overrides(home: Option<&Path>) -> serde_json::Map<String, Value> {
+    let Some(home) = home else {
+        return serde_json::Map::new();
+    };
+    let config_path = home.join(".freshell").join("config.json");
+    let Ok(text) = std::fs::read_to_string(&config_path) else {
+        return serde_json::Map::new();
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&text) else {
+        return serde_json::Map::new();
+    };
+    doc.get("sessionOverrides")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default()
@@ -365,7 +522,10 @@ fn deep_merge(target: &mut Value, patch: &Value) {
     match (target, patch) {
         (Value::Object(target_map), Value::Object(patch_map)) => {
             for (key, patch_value) in patch_map {
-                deep_merge(target_map.entry(key.clone()).or_insert(Value::Null), patch_value);
+                deep_merge(
+                    target_map.entry(key.clone()).or_insert(Value::Null),
+                    patch_value,
+                );
             }
         }
         (target_slot, patch_value) => {
@@ -389,7 +549,9 @@ fn deep_merge(target: &mut Value, patch: &Value) {
 /// ORIGINAL (M1\u2013M8/E1\u2013E5 battery, 2026-07-12). Returns the zod-shaped
 /// `details` array on any violation, or `None` when the patch passes.
 fn validate_patch(patch: &Value, valid_cli_providers: &[String]) -> Option<Value> {
-    let Value::Object(map) = patch else { return None };
+    let Value::Object(map) = patch else {
+        return None;
+    };
     let mut issues: Vec<Value> = Vec::new();
 
     if let Some(v) = map.get("allowedFilePaths") {
@@ -417,8 +579,19 @@ fn validate_patch(patch: &Value, valid_cli_providers: &[String]) -> Option<Value
     // Strict-object unknown-key issue: ONE issue carrying ALL unknown keys,
     // appended LAST (live-pinned M3/M6).
     const KNOWN_TOP_LEVEL: &[&str] = &[
-        "ai", "codingCli", "editor", "extensions", "freshAgent", "logging", "network", "panes",
-        "safety", "sidebar", "terminal", "allowedFilePaths", "defaultCwd",
+        "ai",
+        "codingCli",
+        "editor",
+        "extensions",
+        "freshAgent",
+        "logging",
+        "network",
+        "panes",
+        "safety",
+        "sidebar",
+        "terminal",
+        "allowedFilePaths",
+        "defaultCwd",
     ];
     let unknown: Vec<&str> = map
         .keys()
@@ -445,7 +618,9 @@ fn validate_coding_cli_patch(cli: &Value, valid: &[String], issues: &mut Vec<Val
         return;
     };
     for field in ["enabledProviders", "knownProviders"] {
-        let Some(v) = cli_map.get(field) else { continue };
+        let Some(v) = cli_map.get(field) else {
+            continue;
+        };
         let Value::Array(items) = v else {
             issues.push(invalid_type_issue("array", &json!(["codingCli", field]), v));
             continue;
@@ -495,11 +670,20 @@ fn validate_coding_cli_patch(cli: &Value, valid: &[String], issues: &mut Vec<Val
                 }
             }
         } else {
-            issues.push(invalid_type_issue("record", &json!(["codingCli", "providers"]), v));
+            issues.push(invalid_type_issue(
+                "record",
+                &json!(["codingCli", "providers"]),
+                v,
+            ));
         }
     }
     // `codingCli` is itself `.strict()` (live-pinned E3).
-    const CLI_KEYS: &[&str] = &["enabledProviders", "knownProviders", "providers", "mcpServer"];
+    const CLI_KEYS: &[&str] = &[
+        "enabledProviders",
+        "knownProviders",
+        "providers",
+        "mcpServer",
+    ];
     let unknown: Vec<&str> = cli_map
         .keys()
         .map(String::as_str)
@@ -542,7 +726,10 @@ fn unrecognized_keys_issue(keys: &[&str], path: &Value) -> Value {
     } else {
         format!(
             "Unrecognized keys: {}",
-            keys.iter().map(|k| format!("\"{k}\"")).collect::<Vec<_>>().join(", ")
+            keys.iter()
+                .map(|k| format!("\"{k}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     };
     json!({
@@ -684,7 +871,10 @@ mod tests {
             &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(cfg["settings"]["codingCli"]["knownProviders"], json!(["claude", "codex"]));
+        assert_eq!(
+            cfg["settings"]["codingCli"]["knownProviders"],
+            json!(["claude", "codex"])
+        );
 
         // An unknown name is rejected (allowlist = boot-discovered set).
         let (status, body) = store
@@ -706,12 +896,18 @@ mod tests {
             .patch(&json!({ "codingCli": { "knownProviders": ["claude"] } }))
             .await
             .unwrap();
-        assert_eq!(merged.coding_cli.known_providers, Some(vec!["claude".to_string()]));
+        assert_eq!(
+            merged.coding_cli.known_providers,
+            Some(vec!["claude".to_string()])
+        );
         let cfg: Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(cfg["settings"]["codingCli"]["knownProviders"], json!(["claude"]));
+        assert_eq!(
+            cfg["settings"]["codingCli"]["knownProviders"],
+            json!(["claude"])
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -740,8 +936,14 @@ mod tests {
             &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(cfg["settings"]["codingCli"]["knownProviders"], json!(["claude", "codex"]));
-        assert_eq!(cfg["settings"]["codingCli"]["enabledProviders"], json!(["claude", "codex"]));
+        assert_eq!(
+            cfg["settings"]["codingCli"]["knownProviders"],
+            json!(["claude", "codex"])
+        );
+        assert_eq!(
+            cfg["settings"]["codingCli"]["enabledProviders"],
+            json!(["claude", "codex"])
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -761,7 +963,11 @@ mod tests {
         let s = store.get().await;
         assert_eq!(
             s.coding_cli.known_providers,
-            Some(vec!["claude".to_string(), "codex".to_string(), "gemini".to_string()])
+            Some(vec![
+                "claude".to_string(),
+                "codex".to_string(),
+                "gemini".to_string()
+            ])
         );
         assert_eq!(s.coding_cli.enabled_providers, vec!["claude"]);
         std::fs::remove_dir_all(&dir).ok();
@@ -781,11 +987,16 @@ mod tests {
             r#"{"version":1,"settings":{"codingCli":{"enabledProviders":["claude","codex"],"providers":{},"mcpServer":true}}}"#,
         )
         .unwrap();
-        let discovered: Vec<String> =
-            ["claude", "codex", "gemini", "kimi", "opencode"].iter().map(|s| s.to_string()).collect();
+        let discovered: Vec<String> = ["claude", "codex", "gemini", "kimi", "opencode"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let store = SettingsStore::load(Some(&dir), discovered.clone());
         let s = store.get().await;
-        assert_eq!(s.coding_cli.enabled_providers, vec!["claude", "codex", "opencode"]);
+        assert_eq!(
+            s.coding_cli.enabled_providers,
+            vec!["claude", "codex", "opencode"]
+        );
         assert_eq!(s.coding_cli.known_providers, Some(discovered));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -797,7 +1008,9 @@ mod tests {
         let store = store_at(&dir);
 
         let merged = store
-            .patch(&json!({ "safety": { "autoKillIdleMinutes": 25 }, "allowedFilePaths": ["/tmp"] }))
+            .patch(
+                &json!({ "safety": { "autoKillIdleMinutes": 25 }, "allowedFilePaths": ["/tmp"] }),
+            )
             .await
             .unwrap();
         assert_eq!(merged.safety.auto_kill_idle_minutes, 25);
@@ -825,7 +1038,10 @@ mod tests {
     }
 
     fn valid5() -> Vec<String> {
-        ["claude", "codex", "gemini", "kimi", "opencode"].iter().map(|s| s.to_string()).collect()
+        ["claude", "codex", "gemini", "kimi", "opencode"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     #[test]
@@ -863,9 +1079,11 @@ mod tests {
         let v = valid5();
 
         // M1: every bad name yields its own custom issue, in item order.
-        let details =
-            validate_patch(&json!({ "codingCli": { "enabledProviders": ["bogus1", "bogus2"] } }), &v)
-                .unwrap();
+        let details = validate_patch(
+            &json!({ "codingCli": { "enabledProviders": ["bogus1", "bogus2"] } }),
+            &v,
+        )
+        .unwrap();
         assert_eq!(
             details,
             json!([
@@ -906,9 +1124,11 @@ mod tests {
 
         // M5: per-item invalid_type (expected FIRST key, no `received` field)
         // and custom issues interleaved in item order; valid item silent.
-        let details =
-            validate_patch(&json!({ "codingCli": { "knownProviders": [42, "bogus", "claude"] } }), &v)
-                .unwrap();
+        let details = validate_patch(
+            &json!({ "codingCli": { "knownProviders": [42, "bogus", "claude"] } }),
+            &v,
+        )
+        .unwrap();
         assert_eq!(
             details,
             json!([
@@ -957,11 +1177,21 @@ mod tests {
 
         // E2/E4/E5: container-level invalid_type shapes.
         let details = validate_patch(&json!({ "codingCli": { "providers": "x" } }), &v).unwrap();
-        assert_eq!(details[0]["message"], "Invalid input: expected record, received string");
+        assert_eq!(
+            details[0]["message"],
+            "Invalid input: expected record, received string"
+        );
         let details = validate_patch(&json!({ "codingCli": "x" }), &v).unwrap();
-        assert_eq!(details[0]["message"], "Invalid input: expected object, received string");
-        let details = validate_patch(&json!({ "codingCli": { "knownProviders": null } }), &v).unwrap();
-        assert_eq!(details[0]["message"], "Invalid input: expected array, received null");
+        assert_eq!(
+            details[0]["message"],
+            "Invalid input: expected object, received string"
+        );
+        let details =
+            validate_patch(&json!({ "codingCli": { "knownProviders": null } }), &v).unwrap();
+        assert_eq!(
+            details[0]["message"],
+            "Invalid input: expected array, received null"
+        );
 
         // E3: codingCli is strict \u2014 nested unrecognized key.
         let details = validate_patch(&json!({ "codingCli": { "zzz": 1 } }), &v).unwrap();
@@ -973,8 +1203,11 @@ mod tests {
         // Valid names pass (allowlist = discovered set).
         assert!(validate_patch(&json!({ "codingCli": { "knownProviders": ["claude"], "enabledProviders": ["claude", "codex"] } }), &v).is_none());
         // Empty allowlist rejects everything (cwd-neutral live probe).
-        let details = validate_patch(&json!({ "codingCli": { "knownProviders": ["claude"] } }), &[])
-            .unwrap();
+        let details = validate_patch(
+            &json!({ "codingCli": { "knownProviders": ["claude"] } }),
+            &[],
+        )
+        .unwrap();
         assert_eq!(details[0]["message"], "Unknown CLI provider: 'claude'");
     }
 
@@ -1007,7 +1240,9 @@ mod tests {
         // now be rejected, and the real values must be accepted.
         assert!(validate_patch(&json!({ "editor": { "externalEditor": "vscode" } }), &v).is_some());
         assert!(validate_patch(&json!({ "editor": { "externalEditor": "cursor" } }), &v).is_none());
-        assert!(validate_patch(&json!({ "panes": { "defaultNewPane": "terminal" } }), &v).is_some());
+        assert!(
+            validate_patch(&json!({ "panes": { "defaultNewPane": "terminal" } }), &v).is_some()
+        );
         assert!(validate_patch(&json!({ "panes": { "defaultNewPane": "editor" } }), &v).is_none());
     }
 
@@ -1061,5 +1296,186 @@ mod tests {
             actual, expected_settings,
             "Rust default settings + network overlay must equal the captured original settings"
         );
+    }
+
+    #[tokio::test]
+    async fn session_overrides_persist_and_survive_settings_and_terminal_writes() {
+        let dir = std::env::temp_dir().join(format!("frs-sessov-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = store_at(&dir);
+
+        // Write a session override.
+        let next = store
+            .patch_session_override(
+                "claude:abc",
+                &[
+                    ("titleOverride", Some(json!("Renamed"))),
+                    ("titleSource", Some(json!("user"))),
+                ],
+            )
+            .await;
+        assert_eq!(next["titleOverride"], json!("Renamed"));
+        assert_eq!(next["titleSource"], json!("user"));
+
+        // A SETTINGS patch must NOT wipe sessionOverrides (the :229 corruption trap).
+        store
+            .patch(&json!({ "safety": { "autoKillIdleMinutes": 25 } }))
+            .await
+            .unwrap();
+        // A TERMINAL-override patch must NOT wipe sessionOverrides either.
+        store
+            .patch_terminal_override("term-1", &[("deleted", Some(json!(true)))])
+            .await;
+
+        // Reload from disk (a "restart") and confirm the session override survived.
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg["sessionOverrides"]["claude:abc"]["titleOverride"],
+            json!("Renamed")
+        );
+        assert_eq!(
+            cfg["sessionOverrides"]["claude:abc"]["titleSource"],
+            json!("user")
+        );
+        assert_eq!(cfg["sessionOverrides"]["terminalOverrides"], Value::Null); // not clobbered by shape
+
+        let restored = store_at(&dir);
+        let snap = restored.session_overrides();
+        assert_eq!(snap["claude:abc"]["titleOverride"], json!("Renamed"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn session_override_title_ladder_and_clear_and_noop() {
+        let dir = std::env::temp_dir().join(format!("frs-sessov-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = store_at(&dir);
+
+        // Seed the initial "dir" placeholder (existing = None -> not finalized,
+        // so ANY first write lands regardless of rank).
+        store
+            .patch_session_override(
+                "claude:x",
+                &[
+                    ("titleOverride", Some(json!("Directory name"))),
+                    ("titleSource", Some(json!("dir"))),
+                ],
+            )
+            .await;
+
+        // first-message (rank 3) upgrades "dir" (rank 1, NOT finalized per
+        // `isFinalizedTitleSource`/`shared/title-source.ts:37-39` -- "dir" is
+        // the one source that is never considered finalized).
+        let after_first_message = store
+            .patch_session_override(
+                "claude:x",
+                &[
+                    ("titleOverride", Some(json!("From message"))),
+                    ("titleSource", Some(json!("first-message"))),
+                ],
+            )
+            .await;
+        assert_eq!(after_first_message["titleOverride"], json!("From message"));
+        assert_eq!(after_first_message["titleSource"], json!("first-message"));
+
+        // ai (rank 4) does NOT beat a finalized first-message (rank 3): per
+        // `canUpgradeTitle` (`shared/title-source.ts:50-57`) / the legacy
+        // `patchSessionOverride` (`server/config-store.ts:492-514`), ANY
+        // source other than "dir" is finalized and frozen against every
+        // automatic writer regardless of rank -- only an explicit "user"
+        // rename can replace it. (The plan's original draft of this test
+        // asserted "ai beats first-message" here; that contradicts the frozen
+        // reference and has been corrected -- see task report.) The title
+        // stays put, but the non-title `archived` field STILL merges.
+        let blocked = store
+            .patch_session_override(
+                "claude:x",
+                &[
+                    ("titleOverride", Some(json!("AI name"))),
+                    ("titleSource", Some(json!("ai"))),
+                    ("archived", Some(json!(true))), // non-title field STILL applies.
+                ],
+            )
+            .await;
+        assert_eq!(blocked["titleOverride"], json!("From message"));
+        assert_eq!(blocked["titleSource"], json!("first-message"));
+        assert_eq!(blocked["archived"], json!(true));
+
+        // A fresh key: ai (rank 4) DOES land when existing is absent/unfinalized
+        // (rank 4 > rank 0) -- this is the valid form of "ai" winning a write.
+        let ai_from_absent = store
+            .patch_session_override(
+                "claude:y",
+                &[
+                    ("titleOverride", Some(json!("AI name"))),
+                    ("titleSource", Some(json!("ai"))),
+                ],
+            )
+            .await;
+        assert_eq!(ai_from_absent["titleOverride"], json!("AI name"));
+        assert_eq!(ai_from_absent["titleSource"], json!("ai"));
+
+        // user (5) always beats ai (4), including a finalized ai.
+        let user = store
+            .patch_session_override(
+                "claude:y",
+                &[
+                    ("titleOverride", Some(json!("User rename"))),
+                    ("titleSource", Some(json!("user"))),
+                ],
+            )
+            .await;
+        assert_eq!(user["titleOverride"], json!("User rename"));
+        assert_eq!(user["titleSource"], json!("user"));
+
+        // first-message (3) does NOT downgrade a finalized user (5): title
+        // unchanged...
+        let user_blocked = store
+            .patch_session_override(
+                "claude:y",
+                &[
+                    ("titleOverride", Some(json!("late msg"))),
+                    ("titleSource", Some(json!("first-message"))),
+                ],
+            )
+            .await;
+        assert_eq!(user_blocked["titleOverride"], json!("User rename"));
+        assert_eq!(user_blocked["titleSource"], json!("user"));
+
+        // Clear-on-empty: None removes the key from the merged override.
+        let cleared = store
+            .patch_session_override("claude:y", &[("summaryOverride", None)])
+            .await;
+        assert!(cleared.get("summaryOverride").is_none());
+
+        // No-op skip: a ladder-blocked title-only patch that resolves to the
+        // existing value returns without changing anything.
+        let before_mtime = std::fs::metadata(dir.join(".freshell").join("config.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let noop = store
+            .patch_session_override(
+                "claude:y",
+                &[
+                    ("titleOverride", Some(json!("ignored"))),
+                    ("titleSource", Some(json!("first-message"))), // < user, blocked
+                ],
+            )
+            .await;
+        assert_eq!(noop["titleOverride"], json!("User rename")); // unchanged
+        let after_mtime = std::fs::metadata(dir.join(".freshell").join("config.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            before_mtime, after_mtime,
+            "no-op patch must not rewrite config.json"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
