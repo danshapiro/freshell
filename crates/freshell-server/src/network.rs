@@ -42,13 +42,13 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use freshell_protocol::{NetworkHost, ServerSettings};
 use freshell_platform::detect::{host_os_live, is_wsl2_proc_live};
 use freshell_platform::network::{access_url, is_remote_access_enabled, NetworkIntent};
 use freshell_platform::port_forward::is_wsl_port_forwarding_disabled_by_env;
 use freshell_platform::{
     detect_firewall, firewall_commands, FirewallInfo, FirewallPlatform, RealEnv, StdCommandRunner,
 };
+use freshell_protocol::{NetworkHost, ServerSettings};
 use serde_json::{json, Value};
 use tokio::sync::OnceCell;
 
@@ -322,9 +322,18 @@ mod tests {
 
         // Full NetworkStatus shape present.
         for key in [
-            "configured", "host", "remoteAccessEnabled", "remoteAccessRequested",
-            "remoteAccessNeedsRepair", "port", "lanIps", "machineHostname",
-            "firewall", "rebinding", "devMode", "accessUrl",
+            "configured",
+            "host",
+            "remoteAccessEnabled",
+            "remoteAccessRequested",
+            "remoteAccessNeedsRepair",
+            "port",
+            "lanIps",
+            "machineHostname",
+            "firewall",
+            "rebinding",
+            "devMode",
+            "accessUrl",
         ] {
             assert!(status.get(key).is_some(), "missing {key}");
         }
@@ -347,7 +356,10 @@ mod tests {
         assert_eq!(fw_v["configuring"], json!(false));
 
         // accessUrl carries the (encoded) token, localhost (no share route).
-        assert_eq!(status["accessUrl"], json!("http://localhost:51234/?token=tok-abc"));
+        assert_eq!(
+            status["accessUrl"],
+            json!("http://localhost:51234/?token=tok-abc")
+        );
     }
 
     #[test]
@@ -377,7 +389,10 @@ mod tests {
             status["firewall"]["commands"],
             json!(firewall_commands(FirewallPlatform::LinuxUfw, &[3001]))
         );
-        assert!(!status["firewall"]["commands"].as_array().unwrap().is_empty());
+        assert!(!status["firewall"]["commands"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         // portOpen unknown (deferred probe) → null; remoteAccessEnabled false.
         assert_eq!(status["firewall"]["portOpen"], Value::Null);
         assert_eq!(status["remoteAccessEnabled"], json!(false));

@@ -36,7 +36,11 @@ pub fn default_server_settings() -> ServerSettings {
             title_prompt: None,
         },
         coding_cli: SettingsCodingCli {
-            enabled_providers: vec!["claude".to_string(), "codex".to_string(), "opencode".to_string()],
+            enabled_providers: vec![
+                "claude".to_string(),
+                "codex".to_string(),
+                "opencode".to_string(),
+            ],
             mcp_server: true,
             providers: json!({ "claude": { "permissionMode": "default" }, "codex": {} }),
             known_providers: Some(Vec::new()),

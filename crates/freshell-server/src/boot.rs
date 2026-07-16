@@ -87,7 +87,10 @@ pub fn router(state: BootState) -> Router {
         .route("/api/extensions", get(extensions))
         .route("/api/extensions/{name}", get(extension_by_name))
         .route("/api/logs/client", post(logs_client))
-        .route("/api/tabs-sync/client-retire", post(tabs_sync_client_retire))
+        .route(
+            "/api/tabs-sync/client-retire",
+            post(tabs_sync_client_retire),
+        )
         .with_state(state)
 }
 
@@ -465,7 +468,10 @@ pub(crate) fn is_authed(headers: &HeaderMap, token: &str) -> bool {
             return true;
         }
     }
-    if let Some(cookie_header) = headers.get(header::COOKIE).and_then(|value| value.to_str().ok()) {
+    if let Some(cookie_header) = headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+    {
         if let Some(raw) = cookie_value(cookie_header, "freshell-auth") {
             let decoded = percent_decode(&raw);
             if freshell_api::constant_time_eq(decoded.as_bytes(), token.as_bytes()) {
@@ -541,7 +547,10 @@ mod tests {
 
     #[test]
     fn wrong_and_absent_token_rejected() {
-        assert!(!is_authed(&headers_with("x-auth-token", "nope"), "s3cr3t-token-abcdef"));
+        assert!(!is_authed(
+            &headers_with("x-auth-token", "nope"),
+            "s3cr3t-token-abcdef"
+        ));
         assert!(!is_authed(&HeaderMap::new(), "s3cr3t-token-abcdef"));
     }
 

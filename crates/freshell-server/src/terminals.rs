@@ -112,10 +112,18 @@ struct QueryParam {
 }
 
 fn query_param(pairs: &[(String, String)], key: &str) -> QueryParam {
-    let values: Vec<&String> = pairs.iter().filter(|(k, _)| k == key).map(|(_, v)| v).collect();
+    let values: Vec<&String> = pairs
+        .iter()
+        .filter(|(k, _)| k == key)
+        .map(|(_, v)| v)
+        .collect();
     QueryParam {
         present: !values.is_empty(),
-        value: if values.len() == 1 { Some(values[0].clone()) } else { None },
+        value: if values.len() == 1 {
+            Some(values[0].clone())
+        } else {
+            None
+        },
     }
 }
 
@@ -133,7 +141,9 @@ fn js_number(s: &str) -> f64 {
     }
     // JS also accepts 0x/0o/0b literals; the SPA never sends them but parity is cheap.
     if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        return i64::from_str_radix(hex, 16).map(|v| v as f64).unwrap_or(f64::NAN);
+        return i64::from_str_radix(hex, 16)
+            .map(|v| v as f64)
+            .unwrap_or(f64::NAN);
     }
     t.parse::<f64>().unwrap_or(f64::NAN)
 }
@@ -293,7 +303,10 @@ async fn search_terminal(
 /// `split('\n')` of the concatenation).
 fn mirror_lines(snapshot: &str) -> Vec<String> {
     let no_cr = snapshot.replace("\r\n", "\n").replace('\r', "");
-    strip_csi_escapes(&no_cr).split('\n').map(str::to_string).collect()
+    strip_csi_escapes(&no_cr)
+        .split('\n')
+        .map(str::to_string)
+        .collect()
 }
 
 /// `/\u001B\[[0-9;?]*[ -\/]*[@-~]/gu` (`mirror.ts:9`): a CSI sequence is ESC
@@ -414,7 +427,11 @@ async fn list_terminals(
         })),
     }
     if let Some(r) = &revision.value {
-        issues.extend(number_issues(js_number(r), "revision", NumberRule::NonNegativeInt));
+        issues.extend(number_issues(
+            js_number(r),
+            "revision",
+            NumberRule::NonNegativeInt,
+        ));
     }
     let mut limit_num: Option<f64> = None;
     if let Some(l) = &limit.value {
@@ -462,7 +479,10 @@ async fn list_terminals(
         Some((cur_activity, cur_id)) => items
             .iter()
             .filter(|item| {
-                let a = item.get("lastActivityAt").and_then(Value::as_i64).unwrap_or(0);
+                let a = item
+                    .get("lastActivityAt")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
                 let id = item.get("terminalId").and_then(Value::as_str).unwrap_or("");
                 a < *cur_activity || (a == *cur_activity && id < cur_id.as_str())
             })
@@ -473,11 +493,17 @@ async fn list_terminals(
         .map(|n| n as i64)
         .unwrap_or(MAX_DIRECTORY_PAGE_ITEMS)
         .min(MAX_DIRECTORY_PAGE_ITEMS) as usize;
-    let page_items: Vec<Value> = filtered.iter().take(limit_eff).map(|v| (*v).clone()).collect();
+    let page_items: Vec<Value> = filtered
+        .iter()
+        .take(limit_eff)
+        .map(|v| (*v).clone())
+        .collect();
     let next_cursor: Value = if filtered.len() > limit_eff {
         match page_items.last() {
             Some(tail) => Value::String(encode_cursor(
-                tail.get("lastActivityAt").and_then(Value::as_i64).unwrap_or(0),
+                tail.get("lastActivityAt")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
                 tail.get("terminalId").and_then(Value::as_str).unwrap_or(""),
             )),
             None => Value::Null,
@@ -624,7 +650,11 @@ async fn directory_items(state: &TerminalsState) -> Vec<Value> {
             let title = match ov.and_then(|o| o.get("titleOverride")) {
                 Some(Value::String(s)) if !s.is_empty() => s.clone(),
                 v if js_truthy(v) => v
-                    .map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
+                    .map(|v| {
+                        v.as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| v.to_string())
+                    })
                     .unwrap_or_else(|| e.title.clone()),
                 _ => e.title.clone(),
             };
@@ -800,7 +830,12 @@ fn clean_string(v: &Value) -> Option<String> {
 
 /// Validate one `TerminalPatchSchema` string field (`string().max(N).optional()
 /// .nullable()`); pushes the exact zod v4 issue on violation.
-fn validate_patch_string(body: &Map<String, Value>, key: &str, max: usize, issues: &mut Vec<Value>) {
+fn validate_patch_string(
+    body: &Map<String, Value>,
+    key: &str,
+    max: usize,
+    issues: &mut Vec<Value>,
+) {
     match body.get(key) {
         None | Some(Value::Null) => {}
         Some(Value::String(s)) => {
@@ -877,7 +912,12 @@ async fn patch_terminal(
         }
     };
     let mut issues: Vec<Value> = Vec::new();
-    validate_patch_string(&body_obj, "titleOverride", MAX_TITLE_OVERRIDE_LEN, &mut issues);
+    validate_patch_string(
+        &body_obj,
+        "titleOverride",
+        MAX_TITLE_OVERRIDE_LEN,
+        &mut issues,
+    );
     validate_patch_string(
         &body_obj,
         "descriptionOverride",
@@ -1025,7 +1065,10 @@ mod tests {
             json!({ "matches": [], "nextCursor": null })
         );
         // NaN / +Infinity never enter the loop.
-        assert_eq!(mirror_search(&lines, "token", f64::NAN, 50).unwrap()["matches"], json!([]));
+        assert_eq!(
+            mirror_search(&lines, "token", f64::NAN, 50).unwrap()["matches"],
+            json!([])
+        );
         assert_eq!(
             mirror_search(&lines, "token", f64::INFINITY, 50).unwrap()["nextCursor"],
             json!(null)
@@ -1038,9 +1081,15 @@ mod tests {
             );
         }
         // -0 indexes as 0 (JS `lines[-0] === lines[0]`).
-        assert_eq!(mirror_search(&lines, "alpha", -0.0, 50).unwrap()["matches"][0]["line"], json!(0));
+        assert_eq!(
+            mirror_search(&lines, "alpha", -0.0, 50).unwrap()["matches"][0]["line"],
+            json!(0)
+        );
         // Regex specials are literal (indexOf, not a regex).
-        assert_eq!(mirror_search(&lines, "token.*", 0.0, 50).unwrap()["matches"], json!([]));
+        assert_eq!(
+            mirror_search(&lines, "token.*", 0.0, 50).unwrap()["matches"],
+            json!([])
+        );
         // nextCursor null when the last match is the final line.
         let page = mirror_search(&ln(&["x", "token"]), "token", 0.0, 50).unwrap();
         assert_eq!(page["nextCursor"], json!(null));
@@ -1052,7 +1101,10 @@ mod tests {
         assert_eq!(mirror_lines("a\r\nb\rc"), ln(&["a", "bc"]));
         assert_eq!(mirror_lines("x\u{1B}[31mred\u{1B}[0my"), ln(&["xredy"]));
         // Non-CSI escapes (e.g. OSC) are KEPT — mirror.ts strips CSI only.
-        assert_eq!(mirror_lines("a\u{1B}]0;title\u{7}b"), ln(&["a\u{1B}]0;title\u{7}b"]));
+        assert_eq!(
+            mirror_lines("a\u{1B}]0;title\u{7}b"),
+            ln(&["a\u{1B}]0;title\u{7}b"])
+        );
         // Incomplete CSI at end-of-input stays raw (the regex needs a final byte).
         assert_eq!(mirror_lines("a\u{1B}[12"), ln(&["a\u{1B}[12"]));
         // Empty snapshot == the mirror's initial [''] line model.
@@ -1118,7 +1170,10 @@ mod tests {
             c,
             "eyJsYXN0QWN0aXZpdHlBdCI6MTc1MjIwMDAwMDAwMCwidGVybWluYWxJZCI6InRlcm0tYWJjIn0"
         );
-        assert_eq!(decode_cursor(&c), Ok((1752200000000, "term-abc".to_string())));
+        assert_eq!(
+            decode_cursor(&c),
+            Ok((1752200000000, "term-abc".to_string()))
+        );
         assert!(decode_cursor("not-json!").is_err());
         assert!(decode_cursor("eyJ4IjoxfQ").is_err()); // {"x":1} — wrong shape
     }
@@ -1130,30 +1185,42 @@ mod tests {
         // NaN
         assert_eq!(
             number_issues(f64::NAN, "revision", NumberRule::NonNegativeInt),
-            vec![json!({"expected":"number","code":"invalid_type","received":"NaN","path":["revision"],"message":"Invalid input: expected number, received NaN"})]
+            vec![
+                json!({"expected":"number","code":"invalid_type","received":"NaN","path":["revision"],"message":"Invalid input: expected number, received NaN"})
+            ]
         );
         // float → safeint issue (also for negative floats — int check wins)
         assert_eq!(
             number_issues(-1.5, "revision", NumberRule::NonNegativeInt),
-            vec![json!({"expected":"int","format":"safeint","code":"invalid_type","path":["revision"],"message":"Invalid input: expected int, received number"})]
+            vec![
+                json!({"expected":"int","format":"safeint","code":"invalid_type","path":["revision"],"message":"Invalid input: expected int, received number"})
+            ]
         );
         // negative int
         assert_eq!(
             number_issues(-1.0, "revision", NumberRule::NonNegativeInt),
-            vec![json!({"origin":"number","code":"too_small","minimum":0,"inclusive":true,"path":["revision"],"message":"Too small: expected number to be >=0"})]
+            vec![
+                json!({"origin":"number","code":"too_small","minimum":0,"inclusive":true,"path":["revision"],"message":"Too small: expected number to be >=0"})
+            ]
         );
         // limit 0 / -3 → >0; 51 → too_big; Infinity → invalid_type number
         assert_eq!(
             number_issues(0.0, "limit", NumberRule::PositiveIntMax50),
-            vec![json!({"origin":"number","code":"too_small","minimum":0,"inclusive":false,"path":["limit"],"message":"Too small: expected number to be >0"})]
+            vec![
+                json!({"origin":"number","code":"too_small","minimum":0,"inclusive":false,"path":["limit"],"message":"Too small: expected number to be >0"})
+            ]
         );
         assert_eq!(
             number_issues(51.0, "limit", NumberRule::PositiveIntMax50),
-            vec![json!({"origin":"number","code":"too_big","maximum":50,"inclusive":true,"path":["limit"],"message":"Too big: expected number to be <=50"})]
+            vec![
+                json!({"origin":"number","code":"too_big","maximum":50,"inclusive":true,"path":["limit"],"message":"Too big: expected number to be <=50"})
+            ]
         );
         assert_eq!(
             number_issues(f64::INFINITY, "revision", NumberRule::NonNegativeInt),
-            vec![json!({"expected":"number","code":"invalid_type","received":"Infinity","path":["revision"],"message":"Invalid input: expected number, received number"})]
+            vec![
+                json!({"expected":"number","code":"invalid_type","received":"Infinity","path":["revision"],"message":"Invalid input: expected number, received number"})
+            ]
         );
         // valid values → no issues
         assert!(number_issues(0.0, "revision", NumberRule::NonNegativeInt).is_empty());

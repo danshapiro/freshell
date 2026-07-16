@@ -101,7 +101,10 @@ async fn serve_index(index: &Path) -> Response {
             let h = response.headers_mut();
             // S2: Express's `res.type('html')` / `sendFile` reports the charset in
             // UPPERCASE (`UTF-8`) for the SPA shell \u2014 byte-match it exactly.
-            h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=UTF-8"));
+            h.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=UTF-8"),
+            );
             set_no_store(h);
             response
         }
@@ -123,10 +126,7 @@ fn file_response(rel: &Path, bytes: Vec<u8>) -> Response {
         HeaderValue::from_static(content_type(rel)),
     );
 
-    let file_name = rel
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
+    let file_name = rel.file_name().and_then(|n| n.to_str()).unwrap_or_default();
     if file_name == "index.html" {
         set_no_store(h);
     } else if is_hashed_asset(rel) {
@@ -254,9 +254,15 @@ mod tests {
     #[test]
     fn sanitize_strips_and_contains_traversal() {
         assert_eq!(sanitize_path("/"), PathBuf::new());
-        assert_eq!(sanitize_path("/assets/app-abc123.js"), PathBuf::from("assets/app-abc123.js"));
+        assert_eq!(
+            sanitize_path("/assets/app-abc123.js"),
+            PathBuf::from("assets/app-abc123.js")
+        );
         // `..` can never escape the root.
-        assert_eq!(sanitize_path("/../../etc/passwd"), PathBuf::from("etc/passwd"));
+        assert_eq!(
+            sanitize_path("/../../etc/passwd"),
+            PathBuf::from("etc/passwd")
+        );
         assert_eq!(sanitize_path("/a/../b"), PathBuf::from("b"));
     }
 
@@ -271,10 +277,22 @@ mod tests {
 
     #[test]
     fn content_types_cover_bundle_surface() {
-        assert_eq!(content_type(Path::new("index.html")), "text/html; charset=UTF-8");
-        assert_eq!(content_type(Path::new("assets/x.js")), "application/javascript; charset=UTF-8");
-        assert_eq!(content_type(Path::new("assets/x.css")), "text/css; charset=utf-8");
-        assert_eq!(content_type(Path::new("manifest.webmanifest")), "application/manifest+json; charset=utf-8");
+        assert_eq!(
+            content_type(Path::new("index.html")),
+            "text/html; charset=UTF-8"
+        );
+        assert_eq!(
+            content_type(Path::new("assets/x.js")),
+            "application/javascript; charset=UTF-8"
+        );
+        assert_eq!(
+            content_type(Path::new("assets/x.css")),
+            "text/css; charset=utf-8"
+        );
+        assert_eq!(
+            content_type(Path::new("manifest.webmanifest")),
+            "application/manifest+json; charset=utf-8"
+        );
         assert_eq!(content_type(Path::new("favicon.ico")), "image/x-icon");
         assert_eq!(content_type(Path::new("icon-512.png")), "image/png");
     }

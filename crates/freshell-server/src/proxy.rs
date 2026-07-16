@@ -117,7 +117,16 @@ async fn proxy(
         Some((port, rest)) => (port, rest),
         None => (tail.as_str(), ""),
     };
-    forward(state, port_raw.to_string(), rest.to_string(), method, headers, uri, body).await
+    forward(
+        state,
+        port_raw.to_string(),
+        rest.to_string(),
+        method,
+        headers,
+        uri,
+        body,
+    )
+    .await
 }
 
 /// The shared forward path.

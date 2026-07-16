@@ -25,7 +25,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-const GITHUB_RELEASES_URL: &str = "https://api.github.com/repos/danshapiro/freshell/releases/latest";
+const GITHUB_RELEASES_URL: &str =
+    "https://api.github.com/repos/danshapiro/freshell/releases/latest";
 const CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 /// The original's `fetch()` has no explicit timeout; the port bounds it so a
 /// slow/unreachable network degrades to `updateCheck.error` instead of hanging
@@ -219,11 +220,26 @@ mod tests {
 
     #[test]
     fn minor_or_major_newer_ignores_patch_only_bumps() {
-        assert!(!is_minor_or_major_newer("0.7.0", "0.7.1"), "patch-only is ignored");
-        assert!(is_minor_or_major_newer("0.7.0", "0.8.0"), "minor bump counts");
-        assert!(is_minor_or_major_newer("0.7.0", "1.0.0"), "major bump counts");
-        assert!(!is_minor_or_major_newer("0.7.0", "0.6.9"), "older is never newer");
-        assert!(!is_minor_or_major_newer("0.7.0", "0.7.0"), "equal is never newer");
+        assert!(
+            !is_minor_or_major_newer("0.7.0", "0.7.1"),
+            "patch-only is ignored"
+        );
+        assert!(
+            is_minor_or_major_newer("0.7.0", "0.8.0"),
+            "minor bump counts"
+        );
+        assert!(
+            is_minor_or_major_newer("0.7.0", "1.0.0"),
+            "major bump counts"
+        );
+        assert!(
+            !is_minor_or_major_newer("0.7.0", "0.6.9"),
+            "older is never newer"
+        );
+        assert!(
+            !is_minor_or_major_newer("0.7.0", "0.7.0"),
+            "equal is never newer"
+        );
     }
 
     #[tokio::test]

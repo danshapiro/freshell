@@ -323,7 +323,10 @@ fn client_entry(m: &ExtensionManifest) -> Value {
         obj.insert("contentSchema".into(), cs.clone());
     }
     if let Some(p) = &m.picker {
-        obj.insert("picker".into(), serde_json::to_value(p).unwrap_or(Value::Null));
+        obj.insert(
+            "picker".into(),
+            serde_json::to_value(p).unwrap_or(Value::Null),
+        );
     }
     if m.category == "cli" {
         if let Some(cli) = &m.cli {
@@ -398,7 +401,11 @@ pub fn detect_available_clis(
     runner: &dyn CommandRunner,
 ) -> Value {
     // `process.platform === 'win32' ? 'where.exe' : 'which'` (platform.ts:85).
-    let finder = if is_windows(host_os) { "where.exe" } else { "which" };
+    let finder = if is_windows(host_os) {
+        "where.exe"
+    } else {
+        "which"
+    };
     let mut map = Map::new();
     for spec in specs {
         let cmd = spec
@@ -419,12 +426,7 @@ pub fn detect_available_clis(
 /// the live host-OS finder.
 pub fn detect_available_clis_live(specs: &[CliDetectionSpec]) -> Value {
     let runner = StdCommandRunner::default();
-    detect_available_clis(
-        specs,
-        &|k| std::env::var(k).ok(),
-        host_os_live(),
-        &runner,
-    )
+    detect_available_clis(specs, &|k| std::env::var(k).ok(), host_os_live(), &runner)
 }
 
 // ── Live directory resolution ───────────────────────────────────────────────
@@ -467,7 +469,10 @@ fn encode_uri_component(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for &b in input.as_bytes() {
         let unreserved = b.is_ascii_alphanumeric()
-            || matches!(b, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')');
+            || matches!(
+                b,
+                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
+            );
         if unreserved {
             out.push(b as char);
         } else {
@@ -618,8 +623,24 @@ mod tests {
         ];
         // `which claude-real` → found (exit 0); `which codex` → not found.
         let runner = FakeCommandRunner::new()
-            .on("which", &["claude-real"], CommandOutput { exit_code: Some(0), stdout: "/usr/bin/claude-real".into(), stderr: String::new() })
-            .on("which", &["codex"], CommandOutput { exit_code: Some(1), stdout: String::new(), stderr: String::new() });
+            .on(
+                "which",
+                &["claude-real"],
+                CommandOutput {
+                    exit_code: Some(0),
+                    stdout: "/usr/bin/claude-real".into(),
+                    stderr: String::new(),
+                },
+            )
+            .on(
+                "which",
+                &["codex"],
+                CommandOutput {
+                    exit_code: Some(1),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            );
         let mut env = HashMap::new();
         env.insert("CLAUDE_CMD".to_string(), "claude-real".to_string());
         let get = |k: &str| env.get(k).cloned();
@@ -639,7 +660,11 @@ mod tests {
         let runner = FakeCommandRunner::new().on(
             "where.exe",
             &["claude"],
-            CommandOutput { exit_code: Some(0), stdout: "C:\\claude.exe".into(), stderr: String::new() },
+            CommandOutput {
+                exit_code: Some(0),
+                stdout: "C:\\claude.exe".into(),
+                stderr: String::new(),
+            },
         );
         let get = |_: &str| None;
         let out = detect_available_clis(&specs, &get, HostOs::Windows, &runner);

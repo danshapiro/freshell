@@ -145,7 +145,12 @@ async fn create_screenshot(
 
     let bytes = match base64::engine::general_purpose::STANDARD.decode(image_base64.as_bytes()) {
         Ok(bytes) => bytes,
-        Err(_) => return fail(StatusCode::UNPROCESSABLE_ENTITY, "invalid screenshot image data"),
+        Err(_) => {
+            return fail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid screenshot image data",
+            )
+        }
     };
 
     if let Err(err) = write_file_atomic(&output_path, &bytes) {
@@ -190,7 +195,8 @@ fn resolve_screenshot_output_path(name: &str, path_input: Option<&str>) -> Resul
     let candidate = absolutize(&normalized);
     let meta = std::fs::metadata(&candidate).ok();
     let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-    let looks_like_dir = meta.is_none() && (normalized.ends_with('/') || normalized.ends_with('\\'));
+    let looks_like_dir =
+        meta.is_none() && (normalized.ends_with('/') || normalized.ends_with('\\'));
 
     if is_dir || looks_like_dir {
         std::fs::create_dir_all(&candidate).map_err(|e| e.to_string())?;
@@ -312,7 +318,11 @@ fn unauthorized() -> Response {
 /// `<status> { "status": "error", "message": <msg> }` — the agent-response `fail`
 /// envelope (`agent-api/response.ts:6`).
 fn fail(status: StatusCode, message: &str) -> Response {
-    (status, Json(json!({ "status": "error", "message": message }))).into_response()
+    (
+        status,
+        Json(json!({ "status": "error", "message": message })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -322,7 +332,10 @@ mod tests {
     #[test]
     fn base_name_rules_match_original() {
         assert_eq!(normalize_screenshot_base_name("shot").unwrap(), "shot.png");
-        assert_eq!(normalize_screenshot_base_name("shot.PNG").unwrap(), "shot.PNG");
+        assert_eq!(
+            normalize_screenshot_base_name("shot.PNG").unwrap(),
+            "shot.PNG"
+        );
         assert_eq!(normalize_screenshot_base_name("  a  ").unwrap(), "a.png");
         assert!(normalize_screenshot_base_name("").is_err());
         assert!(normalize_screenshot_base_name("a/b").is_err());

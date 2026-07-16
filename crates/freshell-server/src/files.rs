@@ -141,7 +141,11 @@ async fn validate_dir(
     let raw = body.get("path").and_then(Value::as_str).unwrap_or("");
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "path is required" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "path is required" })),
+        )
+            .into_response();
     }
 
     let normalized_path = normalize_user_path(trimmed);
@@ -158,7 +162,11 @@ async fn validate_dir(
 /// directory is `400`, a missing file `404`, a sandbox-denied path `403` \u2014 the
 /// original's exact shapes. On the POSIX oracle host the normalized user path IS
 /// the filesystem path (the `\\wsl$\u2026` Windows flavor is a documented later step).
-async fn read_file(State(state): State<FilesState>, headers: HeaderMap, Query(q): Query<PathQuery>) -> Response {
+async fn read_file(
+    State(state): State<FilesState>,
+    headers: HeaderMap,
+    Query(q): Query<PathQuery>,
+) -> Response {
     if !crate::boot::is_authed(&headers, &state.auth_token) {
         return unauthorized();
     }
@@ -193,7 +201,11 @@ async fn read_file(State(state): State<FilesState>, headers: HeaderMap, Query(q)
 ///
 /// `EditorPane`'s external-change poll (`EditorPane.tsx:745`). A directory or a
 /// missing file is reported as `{ exists:false, size:null, modifiedAt:null }`.
-async fn stat_file(State(state): State<FilesState>, headers: HeaderMap, Query(q): Query<PathQuery>) -> Response {
+async fn stat_file(
+    State(state): State<FilesState>,
+    headers: HeaderMap,
+    Query(q): Query<PathQuery>,
+) -> Response {
     if !crate::boot::is_authed(&headers, &state.auth_token) {
         return unauthorized();
     }
@@ -225,11 +237,19 @@ async fn stat_file(State(state): State<FilesState>, headers: HeaderMap, Query(q)
 /// `POST /api/files/write` `{ path, content }` \u2192 `{ success, modifiedAt }`
 /// (`files-router.ts:140`). `EditorPane`'s save (`EditorPane.tsx:600`); creates
 /// parent dirs, writes UTF-8, returns the new mtime.
-async fn write_file(State(state): State<FilesState>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+async fn write_file(
+    State(state): State<FilesState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
     if !crate::boot::is_authed(&headers, &state.auth_token) {
         return unauthorized();
     }
-    let Some(path) = body.get("path").and_then(Value::as_str).filter(|p| !p.is_empty()) else {
+    let Some(path) = body
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|p| !p.is_empty())
+    else {
         return bad_request("path is required");
     };
     let Some(content) = body.get("content").and_then(Value::as_str) else {
@@ -249,7 +269,9 @@ async fn write_file(State(state): State<FilesState>, headers: HeaderMap, Json(bo
         return internal_error(&err.to_string());
     }
     match std::fs::metadata(&resolved) {
-        Ok(meta) => Json(json!({ "success": true, "modifiedAt": mtime_iso(&meta) })).into_response(),
+        Ok(meta) => {
+            Json(json!({ "success": true, "modifiedAt": mtime_iso(&meta) })).into_response()
+        }
         Err(err) => internal_error(&err.to_string()),
     }
 }
@@ -257,7 +279,11 @@ async fn write_file(State(state): State<FilesState>, headers: HeaderMap, Json(bo
 /// `GET /api/files/complete?prefix=<p>&root=<r>&dirs=<b>` \u2192
 /// `{ suggestions:[{ path, isDirectory }] }` (`files-router.ts:168`). The path
 /// autocomplete for `EditorPane` / `DirectoryPicker` / `FreshAgentComposer`.
-async fn complete(State(state): State<FilesState>, headers: HeaderMap, Query(q): Query<CompleteQuery>) -> Response {
+async fn complete(
+    State(state): State<FilesState>,
+    headers: HeaderMap,
+    Query(q): Query<CompleteQuery>,
+) -> Response {
     if !crate::boot::is_authed(&headers, &state.auth_token) {
         return unauthorized();
     }
@@ -304,7 +330,10 @@ async fn complete(State(state): State<FilesState>, headers: HeaderMap, Query(q):
                 if dirs_only && !is_dir {
                     return None;
                 }
-                let joined = Path::new(&dir_display).join(&name).to_string_lossy().into_owned();
+                let joined = Path::new(&dir_display)
+                    .join(&name)
+                    .to_string_lossy()
+                    .into_owned();
                 Some((joined, is_dir))
             })
             .collect(),
@@ -339,11 +368,20 @@ async fn complete(State(state): State<FilesState>, headers: HeaderMap, Query(q):
 /// therefore never pre-checks existence \u2014 it always attempts the create and
 /// reports `existed` purely from what `create_dir_all` tells it (i.e. never true
 /// on success), matching the original's observable behavior exactly.
-async fn mkdir(State(state): State<FilesState>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+async fn mkdir(
+    State(state): State<FilesState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
     if !crate::boot::is_authed(&headers, &state.auth_token) {
         return unauthorized();
     }
-    let Some(path) = body.get("path").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()) else {
+    let Some(path) = body
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    else {
         return bad_request("path is required");
     };
     let resolved = normalize_user_path(path);
@@ -352,13 +390,18 @@ async fn mkdir(State(state): State<FilesState>, headers: HeaderMap, Json(body): 
         return forbidden();
     }
     match std::fs::create_dir_all(&resolved) {
-        Ok(()) => Json(json!({ "created": true, "existed": false, "resolvedPath": resolved })).into_response(),
+        Ok(()) => Json(json!({ "created": true, "existed": false, "resolvedPath": resolved }))
+            .into_response(),
         Err(err) => match err.kind() {
             std::io::ErrorKind::PermissionDenied => forbidden_msg("Permission denied"),
             _ => {
                 // A path component that exists but is not a directory \u2192 409.
                 if Path::new(&resolved).exists() {
-                    (StatusCode::CONFLICT, Json(json!({ "error": "Path exists but is not a directory" }))).into_response()
+                    (
+                        StatusCode::CONFLICT,
+                        Json(json!({ "error": "Path exists but is not a directory" })),
+                    )
+                        .into_response()
                 } else {
                     internal_error(&err.to_string())
                 }
@@ -438,10 +481,9 @@ fn trim_trailing_separators(input: &str) -> String {
 /// An mtime as an ISO-8601 / RFC-3339 millis-precision `Z` string, byte-shape
 /// compatible with JS `stat.mtime.toISOString()`.
 fn mtime_iso(meta: &std::fs::Metadata) -> String {
-    let modified = meta
-        .modified()
-        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    chrono::DateTime::<chrono::Utc>::from(modified).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    chrono::DateTime::<chrono::Utc>::from(modified)
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 /// Port of `isPathAllowed` (`path-utils.ts`): a target is allowed iff there are no
@@ -504,7 +546,11 @@ fn bad_request(msg: &str) -> Response {
 
 /// `403 { "error": "Path not allowed" }` \u2014 the sandbox-deny shape (`files-router.ts:79`).
 fn forbidden() -> Response {
-    (StatusCode::FORBIDDEN, Json(json!({ "error": "Path not allowed" }))).into_response()
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": "Path not allowed" })),
+    )
+        .into_response()
 }
 
 /// `403 { "error": <msg> }` \u2014 the mkdir permission-deny shape.
@@ -519,7 +565,11 @@ fn not_found(msg: &str) -> Response {
 
 /// `500 { "error": <msg> }`.
 fn internal_error(msg: &str) -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": msg }))).into_response()
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": msg })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -586,7 +636,10 @@ mod tests {
         // Absolute prefix ignores root.
         assert_eq!(resolve_completion_input("/abs/x", Some("/root")), "/abs/x");
         // Relative prefix joins the (normalized) root.
-        assert_eq!(resolve_completion_input("sub/x", Some("/root")), "/root/sub/x");
+        assert_eq!(
+            resolve_completion_input("sub/x", Some("/root")),
+            "/root/sub/x"
+        );
     }
 
     #[test]
@@ -595,7 +648,9 @@ mod tests {
         let tmp = std::env::temp_dir();
         assert!(std::fs::metadata(&tmp).map(|m| m.is_dir()).unwrap_or(false));
         let bogus = tmp.join("freshell-nonexistent-xyz-123456");
-        assert!(!std::fs::metadata(&bogus).map(|m| m.is_dir()).unwrap_or(false));
+        assert!(!std::fs::metadata(&bogus)
+            .map(|m| m.is_dir())
+            .unwrap_or(false));
     }
 
     #[tokio::test]
@@ -620,7 +675,9 @@ mod tests {
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["created"], true);
         assert_eq!(v["existed"], false);
@@ -638,7 +695,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-auth-token", "tok".parse().unwrap());
         let resp = candidate_dirs(State(state), headers).await.into_response();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["directories"], json!([]));
     }
