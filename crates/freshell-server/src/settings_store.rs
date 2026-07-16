@@ -323,10 +323,6 @@ impl SettingsStore {
     /// the existing title+source are restored while every OTHER patched field still
     /// applies. A resolved-no-op (`next == existing`) skips the disk write.
     /// Returns the merged override (the PATCH response body).
-    ///
-    /// `#[allow(dead_code)]`: see `session_overrides` above — the consuming
-    /// `/api/sessions` router lands in a later task; only tests call it here.
-    #[allow(dead_code)]
     pub async fn patch_session_override(
         &self,
         key: &str,
@@ -397,10 +393,6 @@ impl SettingsStore {
 /// `canUpgradeTitle` (`shared/title-source.ts:50-57`): user always wins; a
 /// finalized source (anything != "dir") is never auto-overwritten; otherwise a
 /// strictly-higher rank upgrades. Absence ranks 0.
-///
-/// `#[allow(dead_code)]`: only reachable via `patch_session_override` above,
-/// which itself isn't wired to production call sites until a later task.
-#[allow(dead_code)]
 fn can_upgrade_title(existing: Option<&str>, incoming: &str) -> bool {
     fn rank(s: Option<&str>) -> i32 {
         match s {

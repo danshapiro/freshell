@@ -24,6 +24,7 @@ mod proxy;
 mod screenshots;
 mod serve_client;
 mod session_directory;
+mod sessions;
 mod settings;
 mod settings_store;
 mod terminals;
@@ -292,6 +293,10 @@ async fn main() -> ExitCode {
         .merge(boot::router(boot_state))
         .merge(network::router(network_state))
         .merge(session_directory::router(session_directory_state))
+        .merge(sessions::router(sessions::SessionsState {
+            auth_token: Arc::clone(&auth_token),
+            settings: settings_store.clone(),
+        }))
         .merge(files::router(files_state))
         .merge(terminals::router(terminals_state))
         .merge(proxy::router(proxy_state))

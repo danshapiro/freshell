@@ -55,3 +55,7 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Query-param structs for the files read/stat/complete endpoints.
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# `ServiceExt::oneshot` for in-process axum router handler tests (`sessions.rs`).
+tower = { version = "0.5", features = ["util"] }
