@@ -579,6 +579,8 @@ fn apply_query(mut items: Vec<DirItem>, q: &DirQuery) -> Result<Value, String> {
         .max(0);
 
     // Sort: lastActivityAt DESC, then session-key DESC (projection.ts:51-62).
+    // sort retained per accepted Batch B deviation -- snapshot is pre-sorted;
+    // this is an idempotent guard.
     items.sort_by(|a, b| {
         b.last_activity_at
             .cmp(&a.last_activity_at)
@@ -663,6 +665,7 @@ fn apply_title_search(mut item: DirItem, query_text: &str) -> Option<DirItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn fixtures_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/sessions")
@@ -1350,5 +1353,129 @@ mod tests {
         assert_eq!(page["items"].as_array().unwrap().len(), 0);
         assert_eq!(page["nextCursor"], Value::Null);
         assert_eq!(page["revision"], json!(0));
+    }
+
+    /// Batch B review fix: a `SessionSource` wrapper that counts `discover()`
+    /// and `parse()` calls, used to prove overrides never touch the
+    /// underlying `SessionIndex`.
+    struct CountingClaudeSource {
+        inner: freshell_sessions::directory_index::ClaudeSource,
+        discover_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        parse_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SessionSource for CountingClaudeSource {
+        fn discover(&self) -> Vec<freshell_sessions::directory_index::FileStat> {
+            self.discover_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.discover()
+        }
+
+        fn parse(&self, path: &Path) -> Option<freshell_sessions::directory_index::IndexedSession> {
+            self.parse_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.parse(path)
+        }
+    }
+
+    /// override_no_rebuild: two handler-level `GET /api/session-directory`
+    /// requests, with a session override applied BETWEEN them via
+    /// `patch_session_override`, must not touch the underlying
+    /// `SessionIndex` at all -- overrides are overlaid per-request from
+    /// `state.settings.session_overrides()` (`apply_session_overrides`,
+    /// above `apply_query`) AFTER the (cached) snapshot is read, so applying
+    /// one can never trigger a discover/parse.
+    #[tokio::test]
+    async fn override_no_rebuild() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let home = claude_home_with(&["real-corrupted.jsonl"]);
+        let settings =
+            crate::settings_store::SettingsStore::load(Some(&home), vec!["claude".into()]);
+        let auth_token: std::sync::Arc<String> = std::sync::Arc::new("tok".into());
+        let discover_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let parse_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = CountingClaudeSource {
+            inner: ClaudeSource::new(claude_home(&home)),
+            discover_calls: std::sync::Arc::clone(&discover_calls),
+            parse_calls: std::sync::Arc::clone(&parse_calls),
+        };
+        // Long TTL: both requests must land within the same cached window --
+        // this test is about overrides never forcing a rebuild, not about TTL
+        // expiry (that's B-T3/B-T4/the incremental-cache tests).
+        let session_index = std::sync::Arc::new(SessionIndex::with_ttl(
+            vec![std::sync::Arc::new(source) as std::sync::Arc<dyn SessionSource>],
+            Duration::from_secs(60),
+        ));
+        let state = SessionDirectoryState {
+            auth_token: std::sync::Arc::clone(&auth_token),
+            settings: settings.clone(),
+            session_index: Some(session_index),
+        };
+        let app = router(state);
+
+        let get_page = |app: Router| async {
+            app.oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible&includeNonInteractive=1")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+
+        let resp1 = get_page(app.clone()).await;
+        assert_eq!(resp1.status(), axum::http::StatusCode::OK);
+        let bytes1 = axum::body::to_bytes(resp1.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page1: Value = serde_json::from_slice(&bytes1).unwrap();
+        assert_eq!(
+            page1["items"].as_array().unwrap()[0]["archived"],
+            json!(false)
+        );
+        let discover_after_first = discover_calls.load(std::sync::atomic::Ordering::SeqCst);
+        let parse_after_first = parse_calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            discover_after_first >= 1,
+            "sanity: the cold request did sweep"
+        );
+
+        // Apply an override BETWEEN the two requests.
+        settings
+            .patch_session_override(
+                "claude:b7936c10-4935-441c-837c-c1f33cafec2d",
+                &[("archived", Some(json!(true)))],
+            )
+            .await;
+
+        let resp2 = get_page(app).await;
+        assert_eq!(resp2.status(), axum::http::StatusCode::OK);
+        let bytes2 = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page2: Value = serde_json::from_slice(&bytes2).unwrap();
+        // The override took effect...
+        assert_eq!(
+            page2["items"].as_array().unwrap()[0]["archived"],
+            json!(true)
+        );
+        // ...without the index doing a single extra discover/parse.
+        assert_eq!(
+            discover_calls.load(std::sync::atomic::Ordering::SeqCst),
+            discover_after_first,
+            "applying a session override must not trigger a SessionIndex refresh"
+        );
+        assert_eq!(
+            parse_calls.load(std::sync::atomic::Ordering::SeqCst),
+            parse_after_first,
+            "applying a session override must not re-parse any file"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
     }
 }
