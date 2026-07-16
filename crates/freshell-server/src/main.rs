@@ -205,7 +205,10 @@ async fn main() -> ExitCode {
     let boot_state = BootState {
         auth_token: Arc::clone(&auth_token),
         settings: settings_store.clone(),
-        platform: Arc::new(build_platform_payload(available_clis)),
+        platform: Arc::new(build_platform_payload(
+            available_clis,
+            &freshell_platform::RealEnv,
+        )),
         // The SAME resolved version `GET /api/health` reports (shared above), so
         // `/api/version` `currentVersion` and health `version` never diverge.
         app_version: Arc::clone(&app_version),
@@ -451,16 +454,28 @@ fn resolve_home() -> Option<PathBuf> {
 /// SPA reads on boot (mirrors `server/platform-router.ts`). `platform` is the
 /// real `/proc/version`-derived string (`detect_platform_proc`); `availableClis`
 /// is the extension-driven `which`/`where.exe` detection result (Follow-up 3.19,
-/// so the PanePicker surfaces the real coding-CLI agents), and `featureFlags`
-/// defaults off.
-fn build_platform_payload(available_clis: serde_json::Value) -> serde_json::Value {
+/// so the PanePicker surfaces the real coding-CLI agents); `featureFlags.kilroy`
+/// defaults off (no `KILROY_ENABLED` wiring yet); `featureFlags.aiEnabled`
+/// mirrors `AI_CONFIG.enabled()` (see [`ai_enabled`]).
+fn build_platform_payload(
+    available_clis: serde_json::Value,
+    env: &dyn freshell_platform::Env,
+) -> serde_json::Value {
     let platform = detect_platform_proc(host_os_live(), read_proc_version().as_deref());
     serde_json::json!({
         "platform": platform,
         "availableClis": available_clis,
         "hostName": read_host_name(),
-        "featureFlags": { "kilroy": false, "aiEnabled": false },
+        "featureFlags": { "kilroy": false, "aiEnabled": ai_enabled(env) },
     })
+}
+
+/// `AI_CONFIG.enabled()` (`server/ai-prompts.ts:12-15`):
+/// `enabled: () => Boolean(process.env.GOOGLE_GENERATIVE_AI_API_KEY)`. JS
+/// `Boolean(str | undefined)` is true iff the var is set AND non-empty, which
+/// is exactly [`freshell_platform::Env::truthy`]'s semantics.
+fn ai_enabled(env: &dyn freshell_platform::Env) -> bool {
+    env.truthy("GOOGLE_GENERATIVE_AI_API_KEY")
 }
 
 /// The OS hostname (mirrors `detectHostName`). `/proc/sys/kernel/hostname` →
@@ -489,4 +504,56 @@ fn resolve_client_dir() -> PathBuf {
         return compiled;
     }
     PathBuf::from("dist/client")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use freshell_platform::MapEnv;
+
+    // `AI_CONFIG.enabled()` (`server/ai-prompts.ts:12-15`):
+    // `enabled: () => Boolean(process.env.GOOGLE_GENERATIVE_AI_API_KEY)`.
+    // These use an injected `MapEnv` (not real process env), so they need no
+    // env-isolation guard: each test constructs its own independent view.
+
+    #[test]
+    fn ai_enabled_true_when_key_set_non_empty() {
+        let env = MapEnv::new().with("GOOGLE_GENERATIVE_AI_API_KEY", "sk-live-abc123");
+        assert!(ai_enabled(&env));
+    }
+
+    #[test]
+    fn ai_enabled_false_when_key_unset() {
+        let env = MapEnv::new();
+        assert!(!ai_enabled(&env));
+    }
+
+    #[test]
+    fn ai_enabled_false_when_key_set_empty() {
+        // JS `Boolean("")` is `false` — an explicitly-empty var is still falsy.
+        let env = MapEnv::new().with("GOOGLE_GENERATIVE_AI_API_KEY", "");
+        assert!(!ai_enabled(&env));
+    }
+
+    #[test]
+    fn platform_payload_feature_flags_shape_matches_legacy() {
+        // `server/platform-router.ts#detectFeatureFlags`: `{ kilroy, aiEnabled }`,
+        // camelCase, no extra fields — mirrored 1:1 in the Rust payload.
+        let env = MapEnv::new().with("GOOGLE_GENERATIVE_AI_API_KEY", "sk-live-abc123");
+        let payload = build_platform_payload(serde_json::json!({}), &env);
+        assert_eq!(
+            payload["featureFlags"],
+            serde_json::json!({ "kilroy": false, "aiEnabled": true })
+        );
+    }
+
+    #[test]
+    fn platform_payload_ai_enabled_false_without_key() {
+        let env = MapEnv::new();
+        let payload = build_platform_payload(serde_json::json!({}), &env);
+        assert_eq!(
+            payload["featureFlags"],
+            serde_json::json!({ "kilroy": false, "aiEnabled": false })
+        );
+    }
 }
