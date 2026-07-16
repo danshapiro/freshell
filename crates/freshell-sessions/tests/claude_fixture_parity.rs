@@ -126,6 +126,64 @@ fn real_corrupted_extracts_full_metadata_and_token_usage() {
     assert_eq!(meta, expected);
 }
 
+fn parse_str(content: &str) -> ParsedSessionMeta {
+    parse_session_content(content, &ParseSessionOptions::default())
+}
+
+#[test]
+fn title_precedence_custom_title_then_agent_name_then_first_message() {
+    // Pins the precedence chain at claude.rs:459 -- `custom_title.or(agent_name).or(title)`.
+    // If this ordering ever flips, one of the assertions below fails.
+
+    // (a) customTitle set alongside a user message -> customTitle wins over the
+    // first-user-message-derived title.
+    let a = parse_str(concat!(
+        "{\"type\":\"custom-title\",\"customTitle\":\"My Custom Title\"}\n",
+        "{\"type\":\"user\",\"role\":\"user\",\"content\":\"First message content here\"}\n",
+    ));
+    assert_eq!(a.title, Some("My Custom Title".to_string()));
+
+    // (b) agentName set, no customTitle -> agentName wins over the
+    // first-user-message-derived title.
+    let b = parse_str(concat!(
+        "{\"type\":\"agent-name\",\"agentName\":\"Agent Smith\"}\n",
+        "{\"type\":\"user\",\"role\":\"user\",\"content\":\"Second message content here\"}\n",
+    ));
+    assert_eq!(b.title, Some("Agent Smith".to_string()));
+
+    // (c) plain user message, no customTitle/agentName -> falls back to the
+    // first-user-message-derived title.
+    let c = parse_str(
+        "{\"type\":\"user\",\"role\":\"user\",\"content\":\"Third message content here\"}\n",
+    );
+    assert_eq!(c.title, Some("Third message content here".to_string()));
+
+    // (d) both customTitle and agentName present -> customTitle wins. This pins the
+    // ordering between the two fallbacks, not just each against the title fallback.
+    let d = parse_str(concat!(
+        "{\"type\":\"custom-title\",\"customTitle\":\"Custom Wins\"}\n",
+        "{\"type\":\"agent-name\",\"agentName\":\"Agent Loses\"}\n",
+        "{\"type\":\"user\",\"role\":\"user\",\"content\":\"Fourth message content here\"}\n",
+    ));
+    assert_eq!(d.title, Some("Custom Wins".to_string()));
+}
+
+#[test]
+fn ai_title_records_are_ignored_for_parity() {
+    // Real Claude CLI transcripts may contain `{"type":"ai-title","aiTitle":"..."}`
+    // records. The legacy server does not parse ai-title records (verified against
+    // the reference parser; adjudicated 2026-07-16), so parity requires the Rust
+    // parser to ignore them too -- the title must still derive from the first user
+    // message, not the aiTitle field, and parsing must not error.
+    let meta = parse_str(concat!(
+        "{\"type\":\"ai-title\",\"aiTitle\":\"Something Else\",\"sessionId\":\"11111111-1111-4111-8111-111111111111\"}\n",
+        "{\"type\":\"user\",\"role\":\"user\",\"content\":\"Real title from message\"}\n",
+    ));
+    assert_eq!(meta.title, Some("Real title from message".to_string()));
+    assert_ne!(meta.title, Some("Something Else".to_string()));
+    assert_eq!(meta.message_count, 2);
+}
+
 #[test]
 fn malformed_line_never_panics_across_all_committed_fixtures() {
     // The corruption-tolerance guarantee: parsing any committed fixture returns Ok-shaped
