@@ -18,19 +18,35 @@ import type { E2eServerHandle } from './external-target.js'
  * Builds/locates `freshell-server`, starts it on an ephemeral loopback port
  * with a unique token and an isolated `FRESHELL_HOME`, records its exact PID
  * (spawned as the leader of its OWN process group), waits for `/api/health`,
- * and stops ONLY that PID and its owned children — `kill(-pid, ...)` targets
- * the whole process group this fixture created, never a process it didn't
+ * and stops ONLY that PID and its owned tree — never a process it didn't
  * spawn (e.g. the user's live `:3001` server, or an unrelated sentinel).
+ *
+ * **Process-group boundary (read before touching kill logic):**
+ * `kill(-pid, ...)` (group-kill) only reaches processes that stayed in the
+ * server's OWN process group. PTY shell children the server spawns
+ * (`crates/freshell-terminal/src/pty.rs`, via `portable-pty`) become the
+ * leader of their OWN session/group on Unix -- their PPID stays the server's
+ * PID for as long as they live, but their PGID is their own, so `kill(-pid,
+ * ...)` cannot reach OR observe them at all. The mechanism that actually
+ * reaps them is the Rust server's OWN graceful SIGTERM shutdown
+ * (`main.rs`'s `shutdown_signal` -> each `PtyTerminal`'s `Drop` -> exact-PID
+ * kill + wait -- "no orphan shells" by design, see that module's doc
+ * comment). `killCurrentProcess()` below enumerates the server's live
+ * descendant tree BEFORE signaling and individually verifies + backstops it
+ * AFTER; this closes the narrow gap where the 5s SIGKILL escalation fires
+ * before the server's graceful path finishes running. It is a backstop, not
+ * the primary reap mechanism.
  *
  * This mirrors the Node `TestServer` (`test-server.ts`) isolation contract so
  * both fixtures share one safety story, and reuses its `findFreePort` /
- * `applyIsolatedHomeEnvironment` helpers directly. The binary-path/build and
- * health-poll logic is PORTED (not imported) from the oracle harness's
- * `port/oracle/harness/external-server.ts` (`rustServerBinPath`,
- * `ensureRustServerBuilt`, `startRustServer`, `waitForRustHealth`) — ported
- * rather than imported so the general-purpose `test/e2e-browser/helpers/`
- * seam does not take a dependency on the `port/oracle/` module tree. If that
- * source drifts, re-sync the pieces below against it.
+ * `applyIsolatedHomeEnvironment` / `ensureSetupWizardBypassConfig` helpers
+ * directly. The binary-path/build and health-poll logic is PORTED (not
+ * imported) from the oracle harness's `port/oracle/harness/external-server.ts`
+ * (`rustServerBinPath`, `ensureRustServerBuilt`, `startRustServer`,
+ * `waitForRustHealth`) — ported rather than imported so the general-purpose
+ * `test/e2e-browser/helpers/` seam does not take a dependency on the
+ * `port/oracle/` module tree. If that source drifts, re-sync the pieces
+ * below against it.
  */
 
 const __filename = fileURLToPath(import.meta.url)
@@ -109,6 +125,11 @@ async function readJsonFileIfPresent(filePath: string): Promise<Record<string, u
  * Pre-seed `.freshell/config.json` with the setup-wizard bypass, byte-for-byte
  * the fields `test-server.ts`'s `ensureSetupWizardBypassConfig` writes for the
  * Node original, so both fixtures skip the same first-run wizard.
+ * Source of truth: `test-server.ts`'s `ensureSetupWizardBypassConfig`
+ * (currently module-private there, so this is a byte-for-byte PORT, not an
+ * import -- same rationale as the `port/oracle/` pieces below: keep this
+ * general-purpose fixture's imports scoped to what `test-server.ts` already
+ * exports today). If that source drifts, re-sync this copy against it.
  */
 async function ensureSetupWizardBypassConfig(configPath: string): Promise<void> {
   const existing = await readJsonFileIfPresent(configPath)
@@ -131,6 +152,58 @@ async function ensureSetupWizardBypassConfig(configPath: string): Promise<void> 
       },
     },
   }, null, 2))
+}
+
+/**
+ * Recursively enumerate the live descendant PIDs of `pid` (children,
+ * grandchildren, ...) by walking `ps --ppid` breadth-first. Used to find PTY
+ * shell children the Rust server spawns: they `setsid()` into their OWN
+ * session/group (see the class doc comment below), so `kill(-pid, ...)`
+ * cannot reach or observe them, but their PPID chain up to `pid` is
+ * unaffected by that -- PPID tracks parentage, PGID tracks the signal-group
+ * boundary, and these children only change the latter.
+ *
+ * Ownership-safe to individually signal any PID this returns: each one was
+ * discovered by walking the OWN descendant tree of a PID this fixture
+ * spawned, so it can never be a sibling/unrelated process.
+ */
+function listChildPids(parentPid: number): number[] {
+  const result = spawnSync('ps', ['-o', 'pid=', '--ppid', String(parentPid)], {
+    encoding: 'utf8',
+  })
+  if (result.status !== 0 || !result.stdout) return []
+  return result.stdout
+    .split('\n')
+    .map((line) => Number.parseInt(line.trim(), 10))
+    .filter((n) => Number.isInteger(n) && n > 0)
+}
+
+export function ownedDescendantPids(rootPid: number): number[] {
+  const seen = new Set<number>()
+  let frontier = [rootPid]
+  while (frontier.length > 0) {
+    const next: number[] = []
+    for (const pid of frontier) {
+      for (const child of listChildPids(pid)) {
+        if (!seen.has(child)) {
+          seen.add(child)
+          next.push(child)
+        }
+      }
+    }
+    frontier = next
+  }
+  return Array.from(seen)
+}
+
+/** True if `pid` is alive right now (an exact PID, never a process-group). */
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH'
+  }
 }
 
 export interface RustServerOptions {
@@ -222,16 +295,21 @@ export class RustServer implements E2eServerHandle {
   private async boot(homeDir: string, port: number, token: string): Promise<TestServerInfo> {
     const bin = ensureRustServerBuilt()
 
+    // Ordering matches `TestServer.start()`: `setupHome` runs BEFORE the
+    // wizard-bypass config write, so a caller-provided `setupHome` may
+    // itself seed `.freshell/config.json` and have `ensureSetupWizardBypassConfig`
+    // merge on top of it (rather than the bypass write happening first and
+    // setupHome silently clobbering it).
+    if (this.options.setupHome) {
+      await this.options.setupHome(homeDir)
+    }
+
     const freshellDir = path.join(homeDir, '.freshell')
     await fsp.mkdir(freshellDir, { recursive: true })
     await ensureSetupWizardBypassConfig(path.join(freshellDir, 'config.json'))
 
     const logsDir = path.join(freshellDir, 'logs')
     await fsp.mkdir(logsDir, { recursive: true })
-
-    if (this.options.setupHome) {
-      await this.options.setupHome(homeDir)
-    }
 
     const env = applyIsolatedHomeEnvironment(
       {
@@ -259,8 +337,13 @@ export class RustServer implements E2eServerHandle {
       cwd: PROJECT_ROOT,
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
-      // New process group: lets stop() reap the whole owned tree via
+      // New process group: lets stop() group-kill this server PID via
       // `kill(-pid, ...)` without ever touching a PID it did not spawn.
+      // NOTE: this covers same-group descendants only. PTY shell children
+      // the server spawns become their OWN session/group leader (see the
+      // class doc comment above) and are reaped by the server's own
+      // graceful SIGTERM shutdown, backstopped by `killCurrentProcess()`'s
+      // individual-PID sweep below.
       detached: true,
     })
 
@@ -298,9 +381,31 @@ export class RustServer implements E2eServerHandle {
   }
 
   /**
+   * Live descendant PIDs of the CURRENT server process right now (e.g. PTY
+   * shell children) -- see the class doc comment for why these are NOT
+   * reachable via `kill(-pid, ...)`. Ownership-safe to individually signal:
+   * each one was discovered by walking the descendant tree of a PID this
+   * fixture spawned, so it can never be a sibling/unrelated process.
+   * Returns `[]` if the server isn't running or currently has no children.
+   */
+  ownedChildPids(): number[] {
+    const pid = this.process?.pid
+    if (!pid) return []
+    return ownedDescendantPids(pid)
+  }
+
+  /**
    * Terminate the current process (SIGTERM, escalating to SIGKILL after 5s)
    * WITHOUT touching the isolated HOME. Used directly by `restart()`, and as
    * the first step of `stopProcess()`.
+   *
+   * Group-kill (`kill(-pid, ...)`) only reaches same-group descendants. PTY
+   * shell children `setsid()` into their OWN session/group (class doc
+   * comment above) and are reaped by the server's OWN graceful SIGTERM
+   * shutdown -- NOT by this group-kill. To backstop the narrow case where
+   * the 5s SIGKILL escalation fires before that graceful path finishes, this
+   * snapshots the live descendant tree BEFORE signaling, then individually
+   * verifies + (if needed) reaps any survivors AFTER the group-kill settles.
    */
   private async killCurrentProcess(): Promise<void> {
     const proc = this.process
@@ -308,6 +413,8 @@ export class RustServer implements E2eServerHandle {
     this.process = null
 
     if (!proc || !pid) return
+
+    const childPidsBeforeKill = ownedDescendantPids(pid)
 
     await new Promise<void>((resolve) => {
       const timeout = setTimeout(() => {
@@ -325,15 +432,50 @@ export class RustServer implements E2eServerHandle {
       })
 
       try {
-        // Negative pid targets the WHOLE process group this fixture
-        // created (the server + any children it spawned), never a
-        // sibling/unrelated process.
+        // Negative pid targets the server's OWN process-group leader (the
+        // server + any children that stayed in its group), never a
+        // sibling/unrelated process. Does NOT reach PTY shell children --
+        // see the class doc comment and `childPidsBeforeKill` below.
         process.kill(-pid, 'SIGTERM')
       } catch {
         clearTimeout(timeout)
         resolve()
       }
     })
+
+    await this.reapSurvivingChildren(childPidsBeforeKill)
+  }
+
+  /**
+   * Backstop for the SIGKILL-escalation gap: individually verify each PID
+   * enumerated BEFORE the group-kill above is actually dead, and if any
+   * survived, SIGTERM then SIGKILL it directly. Ownership-safe because every
+   * PID here was discovered by walking the descendant tree of a PID this
+   * fixture spawned (see `ownedDescendantPids`).
+   */
+  private async reapSurvivingChildren(pids: number[]): Promise<void> {
+    const alive = pids.filter((childPid) => isPidAlive(childPid))
+    if (alive.length === 0) return
+
+    for (const childPid of alive) {
+      try {
+        process.kill(childPid, 'SIGTERM')
+      } catch {
+        // Already gone.
+      }
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 500))
+
+    for (const childPid of alive) {
+      if (isPidAlive(childPid)) {
+        try {
+          process.kill(childPid, 'SIGKILL')
+        } catch {
+          // Already gone.
+        }
+      }
+    }
   }
 
   private async stopProcess(forceRemoveHome: boolean): Promise<void> {

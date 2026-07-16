@@ -20,9 +20,17 @@ import { TerminalHelper } from '../helpers/terminal-helpers.js'
  *   3. restart()s the SAME owned server against the SAME isolated home/port/
  *      token and proves the reconnected client is functionally alive (a
  *      fresh command still executes) -- not just stale DOM content.
- *   4. stop()s the fixture and proves the server PID *and* its whole process
- *      group (all fixture-owned children, e.g. the PTY shell) are dead, the
- *      port is freed, and the unrelated sentinel is still alive.
+ *   4. Captures the REAL PTY shell child PID(s) (via `server.ownedChildPids()`)
+ *      while the post-restart server is confirmed alive, then stop()s the
+ *      fixture and proves: the server PID is dead; its OWN process-group
+ *      leader is dead (`kill(-pid, ...)`, which reaches same-group
+ *      descendants only -- NOT the PTY shell, which `setsid()`s into its own
+ *      session/group, see `rust-server.ts`'s class doc comment); EACH
+ *      captured PTY child PID is individually dead (the assertion that
+ *      actually proves Rust-side reaping, since it is untouched by
+ *      group-kill and would catch a regression in the server's graceful
+ *      SIGTERM shutdown / `PtyTerminal` `Drop`-kill path); the port is
+ *      freed; and the unrelated sentinel is still alive.
  *   5. Proves the REAL `os.homedir()/.freshell` was never created or modified.
  */
 
@@ -134,14 +142,34 @@ test.describe('HARNESS-01: owned Rust-server fixture', () => {
       const xtermText = await page.locator('.xterm').first().textContent()
       expect(xtermText).not.toContain('[Error]')
 
+      // --- capture the REAL PTY shell child PID(s) BEFORE stop() ---
+      // `kill(-pid, ...)` cannot reach these (PTY shells `setsid()` into
+      // their OWN session/group -- see `rust-server.ts`'s class doc
+      // comment), so this is the only assertion below that actually proves
+      // Rust-side child reaping and would catch a regression in it.
+      const childPidsBeforeStop = server.ownedChildPids()
+      // Non-empty, or the "each child is dead" assertion below would be
+      // vacuously true even if reaping were completely broken.
+      expect(childPidsBeforeStop.length).toBeGreaterThan(0)
+
       // --- (4) stop() and prove full process-group reap + port release ---
       const finalPid = server.info.pid
       await server.stop()
 
       expect(isProcessAlive(finalPid)).toBe(false)
-      // Negative pid checks the whole process group (server + any PTY
-      // children it spawned) -- proves ALL fixture-owned children died too.
+      // Negative pid confirms the server's OWN process-group leader is dead.
+      // This does NOT cover the PTY shell child -- it lives in a SEPARATE
+      // session/group it created for itself, invisible to `kill(-pid, ...)`.
       expect(isProcessAlive(-finalPid)).toBe(false)
+      // The PTY child reap proof: each PID captured above (real descendants
+      // of the server, confirmed non-empty above) must now be dead. This is
+      // reaped by the Rust server's OWN graceful SIGTERM shutdown (`Drop`
+      // kill by exact PID), backstopped by the fixture's post-signal sweep
+      // for the SIGKILL-escalation edge case -- either way, if Rust-side
+      // child reaping regresses, this loop is what catches it.
+      for (const childPid of childPidsBeforeStop) {
+        expect(isProcessAlive(childPid)).toBe(false)
+      }
       await expect(async () => {
         expect(await isPortFree(priorPort)).toBe(true)
       }).toPass({ timeout: 10_000 })
