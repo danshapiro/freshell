@@ -505,11 +505,20 @@ mod tests {
         assert_eq!(patch_resp.status(), StatusCode::OK);
 
         // Query the session-directory read model with the SAME settings store.
+        // Batch B: the read model is backed by a `SessionIndex` now, not a
+        // per-request `home: Option<PathBuf>` scan.
+        let session_index =
+            std::sync::Arc::new(freshell_sessions::directory_index::SessionIndex::new(vec![
+                std::sync::Arc::new(freshell_sessions::directory_index::ClaudeSource::new(
+                    crate::session_directory::claude_home(&home),
+                ))
+                    as std::sync::Arc<dyn freshell_sessions::directory_index::SessionSource>,
+            ]));
         let dir_app =
             crate::session_directory::router(crate::session_directory::SessionDirectoryState {
                 auth_token: std::sync::Arc::clone(&auth_token),
-                home: Some(home.clone()),
                 settings,
+                session_index: Some(session_index),
             });
         let dir_resp = dir_app
             .oneshot(

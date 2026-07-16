@@ -1348,6 +1348,7 @@ dependencies = [
  "notify",
  "rusqlite",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

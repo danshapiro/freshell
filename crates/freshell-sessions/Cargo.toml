@@ -16,6 +16,11 @@ notify = "6"
 # compiles the SQLite amalgamation so the parser is not coupled to the host's
 # libsqlite3 version (deterministic across dev/CI/Windows).
 rusqlite = { version = "0.31", features = ["bundled"] }
+# Batch B (`directory_index`): the refreshable session-directory cache. `sync`
+# for the refresh-serializing async Mutex, `rt`/`rt-multi-thread` for
+# `spawn_blocking` (the full-sweep scan runs off the async executor thread),
+# `time` for the TTL-expiry test, `macros` for `#[tokio::test]`.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 
 [dev-dependencies]
 # The opencode SQLite parity test builds fixture databases with a writable connection

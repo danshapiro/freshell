@@ -44,7 +44,14 @@ use axum::{
     Json, Router,
 };
 use base64::Engine as _;
+use freshell_sessions::directory_index::{IndexedSession, SessionIndex};
+// Batch B: only the `#[cfg(test)]`-gated reference functions below
+// (`list_claude_sessions`/`parse_claude_file`/`item_from_meta`) still need the
+// raw parse layer directly -- production reads `IndexedSession` from the
+// `SessionIndex` instead.
+#[cfg(test)]
 use freshell_sessions::meta::ParsedSessionMeta;
+#[cfg(test)]
 use freshell_sessions::{parse_session_content, ParseSessionOptions};
 use serde_json::{json, Map, Value};
 
@@ -57,12 +64,14 @@ const MAX_DIRECTORY_PAGE_ITEMS: usize = 50;
 #[derive(Clone)]
 pub struct SessionDirectoryState {
     pub auth_token: Arc<String>,
-    /// The isolated home whose `.claude/projects` holds the claude transcripts.
-    /// `None` → an empty page (no home resolvable).
-    pub home: Option<PathBuf>,
     /// `config.sessionOverrides` source: overlaid onto parsed items by
     /// [`apply_session_overrides`] before `apply_query` runs.
     pub settings: crate::settings_store::SettingsStore,
+    /// Batch B: the in-memory, TTL-refreshed session cache (avoids a full
+    /// filesystem rescan + reparse of every provider transcript on every
+    /// request). `None` → an empty page (no home resolvable), matching the
+    /// prior "no home" behavior before the index existed.
+    pub session_index: Option<Arc<SessionIndex>>,
 }
 
 /// One directory item, typed for the sort/filter/cursor derivation. Serialized to
@@ -295,8 +304,18 @@ async fn session_directory(
                 .into_response()
         }
     };
-    let items = match &state.home {
-        Some(home) => list_claude_sessions(&claude_home(home)),
+    // Batch B: read the cached, pre-sorted snapshot instead of re-walking +
+    // re-parsing every provider transcript on every request. Overrides and
+    // the query (visibility filters, search, cursor paging) still compose
+    // freshly PER REQUEST, same as before -- only the expensive filesystem
+    // scan itself is now cached.
+    let items: Vec<DirItem> = match &state.session_index {
+        Some(index) => index
+            .snapshot()
+            .await
+            .iter()
+            .map(dir_item_from_indexed)
+            .collect(),
         None => Vec::new(),
     };
     let items = apply_session_overrides(items, &state.settings.session_overrides());
@@ -311,17 +330,52 @@ async fn session_directory(
     }
 }
 
-/// `getClaudeHome()` (`server/claude-home.ts:4-7`): `CLAUDE_HOME` env else `<home>/.claude`.
-fn claude_home(home: &Path) -> PathBuf {
+/// `getClaudeHome()` (`server/claude-home.ts:4-7`): `CLAUDE_HOME` env else
+/// `<home>/.claude`. `pub(crate)` so `main.rs` (boot-time `SessionIndex`
+/// wiring) and `sessions.rs` (the cross-router override-overlay test) resolve
+/// the SAME claude home this module's own reference scan uses.
+pub(crate) fn claude_home(home: &Path) -> PathBuf {
     match std::env::var("CLAUDE_HOME") {
         Ok(v) if !v.is_empty() => PathBuf::from(v),
         _ => home.join(".claude"),
     }
 }
 
+/// Map a cached [`IndexedSession`] to a request-scoped [`DirItem`]. The
+/// per-request-only fields (`is_running`, `archived`, search annotations)
+/// take their defaults here, exactly as `item_from_meta` did before the
+/// index existed -- `apply_session_overrides` / `apply_title_search` overlay
+/// them afterwards, unchanged.
+fn dir_item_from_indexed(idx: &IndexedSession) -> DirItem {
+    DirItem {
+        session_id: idx.session_id.clone(),
+        provider: idx.provider.clone(),
+        project_path: idx.project_path.clone(),
+        title: idx.title.clone(),
+        summary: idx.summary.clone(),
+        first_user_message: idx.first_user_message.clone(),
+        last_activity_at: idx.last_activity_at,
+        created_at: idx.created_at,
+        cwd: idx.cwd.clone(),
+        is_subagent: idx.is_subagent,
+        is_non_interactive: idx.is_non_interactive,
+        is_running: false,
+        archived: false,
+        matched_in: None,
+        snippet: None,
+    }
+}
+
 /// Walk `<claudeHome>/projects/*/…*.jsonl` and parse each into a [`DirItem`],
 /// mirroring `claudeProvider.listSessionFiles()` (`claude.ts:529-580`): top-level
 /// `.jsonl` are sessions; `<project>/<session>/subagents/*.jsonl` are subagents.
+///
+/// Batch B: the production path no longer calls this per request (see
+/// `freshell_sessions::directory_index::ClaudeSource`, which is a faithful
+/// lift of this exact logic). This function is KEPT, `#[cfg(test)]`-only, as
+/// the differential-oracle reference the B-T1 test pins `ClaudeSource::scan()`
+/// against — deliberately duplicated during the migration, not dead code.
+#[cfg(test)]
 fn list_claude_sessions(claude_home: &Path) -> Vec<DirItem> {
     let projects_dir = claude_home.join("projects");
     let Ok(project_entries) = std::fs::read_dir(&projects_dir) else {
@@ -375,6 +429,9 @@ fn list_claude_sessions(claude_home: &Path) -> Vec<DirItem> {
 
 /// Read + parse one claude transcript file into a [`DirItem`]. Corruption-tolerant
 /// (the parser never panics); an unreadable file is skipped (`None`).
+///
+/// `#[cfg(test)]`: test-only, same rationale as `list_claude_sessions` above.
+#[cfg(test)]
 fn parse_claude_file(path: &Path, force_subagent: bool) -> Option<DirItem> {
     // Lossy UTF-8, NOT `read_to_string`: the original reads transcripts with
     // `fs.readFile(file, 'utf8')` (Node), which never fails on invalid UTF-8 —
@@ -414,6 +471,9 @@ fn parse_claude_file(path: &Path, force_subagent: bool) -> Option<DirItem> {
 
 /// Build a [`DirItem`] from a parsed meta (pure — unit-tested). `session_id` falls
 /// back to the file basename when the parser found no canonical id.
+///
+/// `#[cfg(test)]`: test-only, same rationale as `list_claude_sessions` above.
+#[cfg(test)]
 fn item_from_meta(
     meta: &ParsedSessionMeta,
     provider: &str,
@@ -1115,5 +1175,180 @@ mod tests {
         // Oracle-compat: archived is ALWAYS present, defaulted false.
         assert_eq!(v["archived"], json!(false));
         assert_eq!(v["title"], json!("t"));
+    }
+
+    // -- Batch B: the `SessionIndex`-backed production path --
+    //
+    // RED (this commit, before the wiring existed): `SessionDirectoryState`
+    // had no `session_index` field, so these three tests failed to compile.
+
+    use freshell_sessions::directory_index::{ClaudeSource, SessionIndex, SessionSource};
+
+    /// Comparable projection of either `DirItem` or `IndexedSession`, keyed
+    /// the same way, for the B-T1 differential assertion (the two types are
+    /// deliberately distinct -- one server-local, one in `freshell_sessions`
+    /// -- so this test-only helper is how they're compared field-for-field).
+    #[derive(Debug, PartialEq, PartialOrd, Ord, Eq)]
+    struct Comparable {
+        key: String,
+        last_activity_at: i64,
+        title: Option<String>,
+        summary: Option<String>,
+        first_user_message: Option<String>,
+        created_at: Option<i64>,
+        cwd: Option<String>,
+        project_path: String,
+        is_subagent: bool,
+        is_non_interactive: bool,
+    }
+
+    impl From<&DirItem> for Comparable {
+        fn from(i: &DirItem) -> Self {
+            Comparable {
+                key: i.key(),
+                last_activity_at: i.last_activity_at,
+                title: i.title.clone(),
+                summary: i.summary.clone(),
+                first_user_message: i.first_user_message.clone(),
+                created_at: i.created_at,
+                cwd: i.cwd.clone(),
+                project_path: i.project_path.clone(),
+                is_subagent: i.is_subagent,
+                is_non_interactive: i.is_non_interactive,
+            }
+        }
+    }
+
+    impl From<&freshell_sessions::directory_index::IndexedSession> for Comparable {
+        fn from(i: &freshell_sessions::directory_index::IndexedSession) -> Self {
+            Comparable {
+                key: i.key(),
+                last_activity_at: i.last_activity_at,
+                title: i.title.clone(),
+                summary: i.summary.clone(),
+                first_user_message: i.first_user_message.clone(),
+                created_at: i.created_at,
+                cwd: i.cwd.clone(),
+                project_path: i.project_path.clone(),
+                is_subagent: i.is_subagent,
+                is_non_interactive: i.is_non_interactive,
+            }
+        }
+    }
+
+    /// B-T1 (differential): `ClaudeSource::scan()` (the production path) must
+    /// produce EXACTLY the same session set as `list_claude_sessions()` (the
+    /// KEPT reference oracle) for the same fixture-populated home.
+    #[test]
+    fn b_t1_claude_source_matches_list_claude_sessions_reference_scan() {
+        let home = claude_home_with(&["real-corrupted.jsonl", "healthy.jsonl"]);
+        let mut reference: Vec<Comparable> = list_claude_sessions(&claude_home(&home))
+            .iter()
+            .map(Comparable::from)
+            .collect();
+        let mut production: Vec<Comparable> = ClaudeSource::new(claude_home(&home))
+            .scan()
+            .iter()
+            .map(Comparable::from)
+            .collect();
+        reference.sort();
+        production.sort();
+        assert_eq!(
+            production, reference,
+            "the index's ClaudeSource must produce the same session set as the kept reference scan"
+        );
+        assert!(
+            !reference.is_empty(),
+            "sanity: the fixture home has a session"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// B-T7 (end-to-end server wiring): `GET /api/session-directory` served
+    /// through the full router, backed by a `SessionIndex`, returns the SAME
+    /// response shape as before (`items`/`nextCursor`/`revision`, `archived`
+    /// always present) with data sourced from the index, not a per-request
+    /// `list_claude_sessions` call.
+    #[tokio::test]
+    async fn b_t7_router_get_session_directory_is_backed_by_the_session_index() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let home = claude_home_with(&["real-corrupted.jsonl"]);
+        let settings =
+            crate::settings_store::SettingsStore::load(Some(&home), vec!["claude".into()]);
+        let auth_token: std::sync::Arc<String> = std::sync::Arc::new("tok".into());
+        let session_index =
+            std::sync::Arc::new(SessionIndex::new(vec![
+                std::sync::Arc::new(ClaudeSource::new(claude_home(&home)))
+                    as std::sync::Arc<dyn SessionSource>,
+            ]));
+        let state = SessionDirectoryState {
+            auth_token: std::sync::Arc::clone(&auth_token),
+            settings,
+            session_index: Some(session_index),
+        };
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible&includeNonInteractive=1")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        let items = page["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["title"], json!("Test session 1"));
+        // Oracle-compat: archived always present.
+        assert_eq!(items[0]["archived"], json!(false));
+        assert_eq!(page["nextCursor"], Value::Null);
+        assert_eq!(page["revision"], json!(1_769_753_759_234i64));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// B-T8: no home (`session_index: None`) still yields an empty page --
+    /// the prior "no home resolvable" behavior, now expressed as an absent
+    /// index instead of an absent `home: Option<PathBuf>`.
+    #[tokio::test]
+    async fn b_t8_no_session_index_yields_empty_page() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let settings = crate::settings_store::SettingsStore::load(None, vec!["claude".into()]);
+        let auth_token: std::sync::Arc<String> = std::sync::Arc::new("tok".into());
+        let state = SessionDirectoryState {
+            auth_token: std::sync::Arc::clone(&auth_token),
+            settings,
+            session_index: None,
+        };
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 0);
+        assert_eq!(page["nextCursor"], Value::Null);
+        assert_eq!(page["revision"], json!(0));
     }
 }

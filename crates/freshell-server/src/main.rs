@@ -251,10 +251,30 @@ async fn main() -> ExitCode {
     // The History read model (`GET /api/session-directory`, Follow-up 3.19): list
     // the coding-CLI sessions from the isolated home's provider transcript dirs,
     // reusing `freshell-sessions` parsers. Replaces the earlier empty-page stub.
+    //
+    // Batch B: `session_directory` no longer re-walks + re-parses every
+    // transcript on every request -- it reads a cached, TTL-refreshed
+    // `SessionIndex` (claude only; codex/opencode sources are additive,
+    // Batch C). `None` home -> no index -> the prior empty-page behavior.
+    let session_index = home.as_ref().map(|h| {
+        Arc::new(freshell_sessions::directory_index::SessionIndex::new(vec![
+            Arc::new(freshell_sessions::directory_index::ClaudeSource::new(
+                session_directory::claude_home(h),
+            )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
+        ]))
+    });
+    // Warm the cache in the background so the first real request never pays
+    // the cold full-sweep cost. The scan itself runs in `spawn_blocking`
+    // (inside `SessionIndex::snapshot`), so this never delays serving other
+    // requests while it's in flight.
+    if let Some(index) = &session_index {
+        let index = Arc::clone(index);
+        tokio::spawn(async move { index.warm().await });
+    }
     let session_directory_state = session_directory::SessionDirectoryState {
         auth_token: Arc::clone(&auth_token),
-        home: home.clone(),
         settings: settings_store.clone(),
+        session_index,
     };
 
     let client_dir = Arc::new(resolve_client_dir());

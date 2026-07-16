@@ -14,6 +14,7 @@
 //!    watcher must log + degrade + rescan, never abort). Pinned by the mandatory liveness
 //!    test in `tests/late_root_watcher_liveness.rs`.
 
+pub mod directory_index;
 pub mod indexer;
 pub mod meta;
 pub mod parse;
