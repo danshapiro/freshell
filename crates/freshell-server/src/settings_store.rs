@@ -221,30 +221,92 @@ impl SettingsStore {
         Ok(merged)
     }
 
-    /// Persist the current tree to `<home>/.freshell/config.json` in the
-    /// original's `UserConfig` shape (`version`, `settings`, and the sibling
-    /// maps the original always writes back, even when empty) so a restart
-    /// round-trips the patch (R2). A missing/unwritable home degrades silently
-    /// (matches the isolated-runtime / no-HOME case).
+    /// Persist the current tree to `<home>/.freshell/config.json`, COPYING
+    /// FORWARD whatever is already on disk and overlaying only the keys this
+    /// store owns (R2). This mirrors the original's `{...existing, ...}`
+    /// write (`server/config-store.ts:343-361`): any top-level key the Rust
+    /// store does not manage -- `completedMigrations`, `recentDirectories`, a
+    /// future key added later, an unknown subkey of a known section -- round-
+    /// trips untouched instead of being silently dropped.
+    ///
+    /// PAST BUG (data-loss incident, fixed here): this used to build the
+    /// document from a FIXED key set (`json!({...})`), so ANY persist --
+    /// even one triggered by an unrelated settings/override patch --
+    /// rewrote `config.json` from scratch and permanently deleted every
+    /// key it didn't know about (observed in staging: `completedMigrations`
+    /// removed entirely, `recentDirectories` emptied from 20 entries to 0).
+    ///
+    /// A missing/unwritable home degrades silently (matches the isolated-
+    /// runtime / no-HOME case). A missing/unparseable/non-object existing
+    /// file degrades to `{}` (fresh install, or an already-corrupt file
+    /// we're about to overwrite anyway) -- same tolerance as every other
+    /// read in this module (`config-store.ts#readConfigFile`).
     fn persist(&self, settings: &ServerSettings) {
         let Some(home) = &self.home else { return };
         let dir = home.join(".freshell");
         if std::fs::create_dir_all(&dir).is_err() {
             return;
         }
-        let doc = json!({
-            "version": 1,
-            "settings": settings,
-            "sessionOverrides": Value::Object(self.session_overrides.lock().expect("session overrides lock").clone()),
-            "terminalOverrides": Value::Object(self.terminal_overrides.lock().expect("terminal overrides lock").clone()),
-            "projectColors": {},
-            "recentDirectories": [],
-            "serverSecrets": { "codexDisplayIdSecret": &*self.codex_display_id_secret },
-        });
+        let path = dir.join("config.json");
+
+        let mut doc = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        let map = doc
+            .as_object_mut()
+            .expect("filtered to an object above, or defaulted to one");
+
+        // Keys this store OWNS: always fully replaced with live in-memory
+        // state, never copy-forwarded.
+        map.insert("version".to_string(), json!(1));
+        map.insert(
+            "settings".to_string(),
+            serde_json::to_value(settings).unwrap_or_else(|_| json!({})),
+        );
+        map.insert(
+            "sessionOverrides".to_string(),
+            Value::Object(
+                self.session_overrides
+                    .lock()
+                    .expect("session overrides lock")
+                    .clone(),
+            ),
+        );
+        map.insert(
+            "terminalOverrides".to_string(),
+            Value::Object(
+                self.terminal_overrides
+                    .lock()
+                    .expect("terminal overrides lock")
+                    .clone(),
+            ),
+        );
+        // `serverSecrets` is overlaid onto whatever was already there (not
+        // replaced wholesale), so a sibling secret this store doesn't know
+        // about would survive too.
+        let mut secrets = map
+            .get("serverSecrets")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        secrets.insert(
+            "codexDisplayIdSecret".to_string(),
+            json!(&*self.codex_display_id_secret),
+        );
+        map.insert("serverSecrets".to_string(), Value::Object(secrets));
+
+        // Everything else -- `completedMigrations`, `recentDirectories`,
+        // `projectColors`, any unrecognized top-level key -- is left exactly
+        // as loaded above. Only seed the original's first-write defaults
+        // when truly absent (`config-store.ts:356-360`).
+        map.entry("projectColors").or_insert_with(|| json!({}));
+        map.entry("recentDirectories").or_insert_with(|| json!([]));
+
         let Ok(text) = serde_json::to_string_pretty(&doc) else {
             return;
         };
-        let path = dir.join("config.json");
         let tmp = dir.join(format!("config.json.tmp-{}", std::process::id()));
         if std::fs::write(&tmp, &text).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
@@ -1460,6 +1522,147 @@ mod tests {
         assert_eq!(
             before_mtime, after_mtime,
             "no-op patch must not rewrite config.json"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Seeds a `config.json` shaped like a real staged incident: known
+    /// managed keys (`settings`, overrides) PLUS keys this store never
+    /// manages (`completedMigrations`, `recentDirectories`, a hypothetical
+    /// future top-level key). `store_at` is given `discovered_cli_names` and
+    /// a seed `codingCli.knownProviders`/`enabledProviders` that exactly
+    /// match, so `SettingsStore::load` does not itself trigger a persist
+    /// (no seed/legacy-migration path fires) -- the ONLY write in each test
+    /// below is the one explicit patch under test.
+    fn lossless_fixture_text() -> &'static str {
+        r#"{
+            "version": 1,
+            "settings": {
+                "codingCli": {
+                    "enabledProviders": ["claude", "codex"],
+                    "knownProviders": ["claude", "codex"],
+                    "providers": {},
+                    "mcpServer": true
+                }
+            },
+            "completedMigrations": ["ai-title-shadow-cleanup"],
+            "recentDirectories": ["/a", "/b", "/c"],
+            "serverSecrets": { "codexDisplayIdSecret": "seed-secret-value" },
+            "zzFutureKey": { "a": 1 },
+            "sessionOverrides": {},
+            "terminalOverrides": {},
+            "projectColors": {}
+        }"#
+    }
+
+    fn assert_unmanaged_document_state_preserved(cfg: &Value) {
+        assert_eq!(
+            cfg["completedMigrations"],
+            json!(["ai-title-shadow-cleanup"]),
+            "completedMigrations must round-trip"
+        );
+        assert_eq!(
+            cfg["recentDirectories"],
+            json!(["/a", "/b", "/c"]),
+            "recentDirectories must round-trip with its real entries, not be emptied"
+        );
+        assert_eq!(
+            cfg["serverSecrets"]["codexDisplayIdSecret"],
+            json!("seed-secret-value"),
+            "serverSecrets must round-trip"
+        );
+        assert_eq!(
+            cfg["zzFutureKey"],
+            json!({ "a": 1 }),
+            "an unknown top-level key must round-trip untouched"
+        );
+    }
+
+    /// R-DATALOSS regression: reproduces a staging incident byte-for-byte --
+    /// an accepted `PATCH /api/settings {"logging":{"debug":false}}` rewrote
+    /// `config.json` and REMOVED `completedMigrations` entirely and EMPTIED
+    /// `recentDirectories` (20 entries -> 0), because `persist()` used to
+    /// build the document from a fixed key set instead of round-tripping the
+    /// on-disk document.
+    #[tokio::test]
+    async fn settings_patch_preserves_unmanaged_top_level_document_state() {
+        let dir = std::env::temp_dir().join(format!("frs-lossless-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            lossless_fixture_text(),
+        )
+        .unwrap();
+        let store = store_at(&dir);
+
+        store
+            .patch(&json!({ "logging": { "debug": false } }))
+            .await
+            .unwrap();
+
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_unmanaged_document_state_preserved(&cfg);
+        assert_eq!(cfg["settings"]["logging"]["debug"], json!(false));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same document-preservation guarantee through the terminal-override
+    /// persist path (`patch_terminal_override`).
+    #[tokio::test]
+    async fn terminal_override_patch_preserves_unmanaged_top_level_document_state() {
+        let dir = std::env::temp_dir().join(format!("frs-lossless-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            lossless_fixture_text(),
+        )
+        .unwrap();
+        let store = store_at(&dir);
+
+        store
+            .patch_terminal_override("term-1", &[("deleted", Some(json!(true)))])
+            .await;
+
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_unmanaged_document_state_preserved(&cfg);
+        assert_eq!(cfg["terminalOverrides"]["term-1"]["deleted"], json!(true));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same document-preservation guarantee through the session-override
+    /// persist path (`patch_session_override`).
+    #[tokio::test]
+    async fn session_override_patch_preserves_unmanaged_top_level_document_state() {
+        let dir = std::env::temp_dir().join(format!("frs-lossless-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            lossless_fixture_text(),
+        )
+        .unwrap();
+        let store = store_at(&dir);
+
+        store
+            .patch_session_override("claude:abc", &[("archived", Some(json!(true)))])
+            .await;
+
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_unmanaged_document_state_preserved(&cfg);
+        assert_eq!(
+            cfg["sessionOverrides"]["claude:abc"]["archived"],
+            json!(true)
         );
 
         std::fs::remove_dir_all(&dir).ok();
