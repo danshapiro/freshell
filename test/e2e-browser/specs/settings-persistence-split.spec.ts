@@ -1,35 +1,43 @@
 import fs from 'fs/promises'
 import path from 'path'
 import { test as base, expect } from '../helpers/fixtures.js'
-import { TestServer } from '../helpers/test-server.js'
+import { createE2eServerHandle } from '../helpers/external-target.js'
 
 const BROWSER_PREFERENCES_STORAGE_KEY = 'freshell.browser-preferences.v1'
 
+// Routed through the generalized E2eServerHandle seam (HARNESS-02) so this
+// SAME spec exercises the legacy Node server or the owned Rust server
+// depending on the active project's `e2eServerKind` option. `setupHome` is
+// part of the construction-options surface shared by both `TestServer` and
+// `RustServer`.
 const test = base.extend({
-  testServer: [async ({}, use) => {
-    const server = new TestServer({
-      setupHome: async (homeDir) => {
-        const freshellDir = path.join(homeDir, '.freshell')
-        await fs.mkdir(freshellDir, { recursive: true })
-        await fs.writeFile(path.join(freshellDir, 'config.json'), JSON.stringify({
-          version: 1,
-          settings: {
-            network: {
-              configured: true,
-              host: '127.0.0.1',
-            },
-            codingCli: {
-              providers: {
-                claude: {
-                  cwd: homeDir,
+  testServer: [async ({ e2eServerKind }, use) => {
+    const server = await createE2eServerHandle(process.env, {
+      kind: e2eServerKind,
+      construct: {
+        setupHome: async (homeDir) => {
+          const freshellDir = path.join(homeDir, '.freshell')
+          await fs.mkdir(freshellDir, { recursive: true })
+          await fs.writeFile(path.join(freshellDir, 'config.json'), JSON.stringify({
+            version: 1,
+            settings: {
+              network: {
+                configured: true,
+                host: '127.0.0.1',
+              },
+              codingCli: {
+                providers: {
+                  claude: {
+                    cwd: homeDir,
+                  },
                 },
               },
             },
-          },
-          legacyLocalSettingsSeed: {
-            theme: 'light',
-          },
-        }, null, 2))
+            legacyLocalSettingsSeed: {
+              theme: 'light',
+            },
+          }, null, 2))
+        },
       },
     })
     await server.start()

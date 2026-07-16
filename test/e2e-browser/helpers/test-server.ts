@@ -234,6 +234,10 @@ export class TestServer {
   private _info: TestServerInfo | null = null
   private configDir: string | null = null
   private runtimeRootDir: string | null = null
+  // Remembered across both modes (unlike `runtimeRootDir`, which is only set
+  // for 'isolated' mode cleanup) so `restart()` can re-spawn against the
+  // exact same runtime root the first `start()` resolved.
+  private runtimeRoot: string | null = null
   private stdoutBuffer = ''
   private stderrBuffer = ''
   private readonly options: TestServerOptions
@@ -257,19 +261,24 @@ export class TestServer {
     }
     this.configDir = null
     this.runtimeRootDir = null
+    this.runtimeRoot = null
     this._info = null
     this.stdoutBuffer = ''
     this.stderrBuffer = ''
   }
 
-  private async stopProcess(forceRemoveHome: boolean): Promise<void> {
+  /**
+   * Terminate the CURRENT process only (SIGTERM, escalating to SIGKILL after
+   * 5s) without touching any on-disk artifacts (isolated HOME / runtime
+   * root). Shared by `stopProcess()` and `restart()` -- mirrors
+   * `RustServer`'s `killCurrentProcess()` / `stopProcess()` split so both
+   * fixtures expose the same recovery-testing contract.
+   */
+  private async terminateProcess(): Promise<void> {
     const proc = this.process
     this.process = null
 
-    if (!proc) {
-      await this.cleanupArtifacts(forceRemoveHome)
-      return
-    }
+    if (!proc) return
 
     await new Promise<void>((resolve) => {
       const timeout = setTimeout(() => {
@@ -283,9 +292,12 @@ export class TestServer {
       })
 
       proc.kill('SIGTERM')
-    }).finally(async () => {
-      await this.cleanupArtifacts(forceRemoveHome)
     })
+  }
+
+  private async stopProcess(forceRemoveHome: boolean): Promise<void> {
+    await this.terminateProcess()
+    await this.cleanupArtifacts(forceRemoveHome)
   }
 
   async start(): Promise<TestServerInfo> {
@@ -322,81 +334,144 @@ export class TestServer {
         : projectRoot
 
       this.runtimeRootDir = runtimeRootMode === 'isolated' ? runtimeRoot : null
+      // Remembered regardless of mode so restart() can re-spawn against the
+      // exact same runtime root without re-deriving/re-copying it.
+      this.runtimeRoot = runtimeRoot
 
       // We need the built server and client for production mode
       const serverEntry = requireBuiltServerEntry(runtimeRoot)
 
       const authStrategy = this.options.authStrategy ?? 'explicit-env'
-      const env = applyTestServerHomeEnvironment({
-        ...process.env as Record<string, string>,
-        PORT: String(port),
-        NODE_ENV: 'production',
-        FRESHELL_LOG_DIR: logsDir,
-        HIDE_STARTUP_TOKEN: 'true',
-        // Keep the E2E server loopback-only so browser tests stay isolated to the
-        // local machine instead of exposing a LAN listener.
-        FRESHELL_BIND_HOST: '127.0.0.1',
-        ...this.options.env,
-      }, homeDir, runtimeRootMode)
 
-      if (authStrategy === 'explicit-env') {
-        env.AUTH_TOKEN = explicitToken
-      } else {
-        delete env.AUTH_TOKEN
-      }
-
-      // Remove any env vars that might interfere
-      delete env.VITE_PORT
-
-      this.process = spawn('node', [serverEntry], {
-        cwd: runtimeRoot,
-        env,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
-
-      const pid = this.process.pid!
-      const debugLogPath = resolveDebugLogPath(env, homeDir) ?? path.join(logsDir, `server-debug.production.${port}.jsonl`)
-
-      this.process.stdout!.on('data', (chunk: Buffer) => {
-        const text = chunk.toString()
-        this.stdoutBuffer += text
-        if (this.options.verbose) process.stdout.write(`[test-server:${pid}] ${text}`)
-      })
-
-      this.process.stderr!.on('data', (chunk: Buffer) => {
-        const text = chunk.toString()
-        this.stderrBuffer += text
-        if (this.options.verbose) process.stderr.write(`[test-server:${pid}] ${text}`)
-      })
-
-      const baseUrl = `http://127.0.0.1:${port}`
-      const wsUrl = `ws://127.0.0.1:${port}/ws`
-
-      // Wait for health check to pass (confirms server is listening on the port)
-      const timeoutMs = this.options.startTimeoutMs ?? 30_000
-      await this.waitForHealth(baseUrl, timeoutMs)
-
-      const token = authStrategy === 'bootstrap'
-        ? readAuthTokenFromEnvFile(await fsp.readFile(path.join(runtimeRoot, '.env'), 'utf8'))
-        : explicitToken
-
-      this._info = {
-        port,
-        baseUrl,
-        wsUrl,
-        token,
-        configDir: homeDir,
+      return await this.bootProcess({
         homeDir,
-        logsDir,
-        debugLogPath,
-        pid,
+        port,
         runtimeRoot,
-      }
-      return this._info
+        serverEntry,
+        logsDir,
+        tokenMode: authStrategy === 'bootstrap' ? 'bootstrap' : 'explicit',
+        token: explicitToken,
+      })
     } catch (error) {
       await this.stopProcess(true)
       throw error
     }
+  }
+
+  /**
+   * Stop the current process (keeping the isolated HOME and runtime root)
+   * and boot a fresh process bound to the SAME home, port, and token.
+   * Mirrors `RustServer.restart()` so both owned fixtures share one
+   * restart/recovery-testing contract (HARNESS-02).
+   *
+   * Always uses explicit-token mode on restart -- even if the server was
+   * originally started with `authStrategy: 'bootstrap'` -- so a reconnecting
+   * browser client's pinned token keeps working across the restart instead
+   * of depending on the bootstrap flow re-deriving (or not) the same token.
+   */
+  async restart(): Promise<TestServerInfo> {
+    const priorInfo = this._info
+    if (!priorInfo || !this.configDir || !this.runtimeRoot) {
+      throw new Error('TestServer not started; cannot restart()')
+    }
+
+    const serverEntry = requireBuiltServerEntry(this.runtimeRoot)
+
+    await this.terminateProcess()
+
+    return this.bootProcess({
+      homeDir: this.configDir,
+      port: priorInfo.port,
+      runtimeRoot: this.runtimeRoot,
+      serverEntry,
+      logsDir: priorInfo.logsDir,
+      tokenMode: 'explicit',
+      token: priorInfo.token,
+    })
+  }
+
+  /** Spawn the compiled server bound to the given home/port/token, wait for health, and record `info`. */
+  private async bootProcess(params: {
+    homeDir: string
+    port: number
+    runtimeRoot: string
+    serverEntry: string
+    logsDir: string
+    tokenMode: 'explicit' | 'bootstrap'
+    token: string
+  }): Promise<TestServerInfo> {
+    const { homeDir, port, runtimeRoot, serverEntry, logsDir, tokenMode, token } = params
+    const runtimeRootMode = this.options.runtimeRootMode ?? 'project'
+
+    const env = applyTestServerHomeEnvironment({
+      ...process.env as Record<string, string>,
+      PORT: String(port),
+      NODE_ENV: 'production',
+      FRESHELL_LOG_DIR: logsDir,
+      HIDE_STARTUP_TOKEN: 'true',
+      // Keep the E2E server loopback-only so browser tests stay isolated to the
+      // local machine instead of exposing a LAN listener.
+      FRESHELL_BIND_HOST: '127.0.0.1',
+      ...this.options.env,
+    }, homeDir, runtimeRootMode)
+
+    if (tokenMode === 'explicit') {
+      env.AUTH_TOKEN = token
+    } else {
+      delete env.AUTH_TOKEN
+    }
+
+    // Remove any env vars that might interfere
+    delete env.VITE_PORT
+
+    this.stdoutBuffer = ''
+    this.stderrBuffer = ''
+
+    this.process = spawn('node', [serverEntry], {
+      cwd: runtimeRoot,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+
+    const pid = this.process.pid!
+    const debugLogPath = resolveDebugLogPath(env, homeDir) ?? path.join(logsDir, `server-debug.production.${port}.jsonl`)
+
+    this.process.stdout!.on('data', (chunk: Buffer) => {
+      const text = chunk.toString()
+      this.stdoutBuffer += text
+      if (this.options.verbose) process.stdout.write(`[test-server:${pid}] ${text}`)
+    })
+
+    this.process.stderr!.on('data', (chunk: Buffer) => {
+      const text = chunk.toString()
+      this.stderrBuffer += text
+      if (this.options.verbose) process.stderr.write(`[test-server:${pid}] ${text}`)
+    })
+
+    const baseUrl = `http://127.0.0.1:${port}`
+    const wsUrl = `ws://127.0.0.1:${port}/ws`
+
+    // Wait for health check to pass (confirms server is listening on the port)
+    const timeoutMs = this.options.startTimeoutMs ?? 30_000
+    await this.waitForHealth(baseUrl, timeoutMs)
+
+    const resolvedToken = tokenMode === 'bootstrap'
+      ? readAuthTokenFromEnvFile(await fsp.readFile(path.join(runtimeRoot, '.env'), 'utf8'))
+      : token
+
+    this._info = {
+      port,
+      baseUrl,
+      wsUrl,
+      token: resolvedToken,
+      configDir: homeDir,
+      homeDir,
+      logsDir,
+      debugLogPath,
+      pid,
+      runtimeRoot,
+    }
+    return this._info
   }
 
   async stop(): Promise<void> {

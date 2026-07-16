@@ -23,13 +23,59 @@ import type { TestServerInfo } from './test-server.js'
  */
 
 /**
- * The minimal server surface the fixtures rely on. Both the local `TestServer`
- * and the `ExternalServer` satisfy this structurally.
+ * The minimal server surface the fixtures rely on. `TestServer`, `RustServer`,
+ * and `ExternalServer` all satisfy this structurally.
  */
 export interface E2eServerHandle {
   start(): Promise<TestServerInfo>
   stop(): Promise<void>
   readonly info: TestServerInfo
+  /**
+   * Optional: stop the CURRENT owned process (keeping its isolated home) and
+   * boot a fresh process bound to the SAME home/port/token. Implemented by
+   * the owned fixtures (`TestServer`, `RustServer`) for restart/recovery
+   * specs (HARNESS-02). `ExternalServer` does not implement this -- it never
+   * owns the target process, so it has nothing to restart.
+   */
+  restart?(): Promise<TestServerInfo>
+}
+
+/**
+ * HARNESS-02 -- which real server implementation a worker's fixtures should
+ * boot: the legacy Node server (`TestServer`) or the owned Rust binary
+ * (`RustServer`). Selected per Playwright PROJECT via the `e2eServerKind`
+ * fixture option (see `helpers/fixtures.ts` and `playwright.config.ts`), NOT
+ * by this module -- this module only knows how to construct the handle once
+ * a kind has been chosen.
+ */
+export type E2eServerKind = 'legacy' | 'rust'
+
+/**
+ * Construction options common to BOTH owned server kinds (a structural
+ * subset of `TestServerOptions` and `RustServerOptions`). Kept here, rather
+ * than importing either concrete options type, so this module does not
+ * prefer one implementation's option surface over the other's.
+ */
+export interface E2eServerConstructOptions {
+  /** Extra environment variables merged into (and able to override) the spawned server's environment. */
+  env?: Record<string, string>
+  /** Hook to populate the isolated HOME before the server boots. */
+  setupHome?: (homeDir: string) => Promise<void>
+  /** Preserve the isolated HOME after stop() (for audit/debugging). */
+  preserveHomeOnStop?: boolean
+  /** Use a specific auth token instead of generating a random one. */
+  token?: string
+  /** Timeout in ms to wait for the server to become healthy. */
+  startTimeoutMs?: number
+  /** Pipe the spawned server's stdout/stderr to this process's console. */
+  verbose?: boolean
+}
+
+export interface CreateE2eServerHandleOptions {
+  /** Which owned implementation to boot when no external target is configured (default: 'legacy'). */
+  kind?: E2eServerKind
+  /** Construction options forwarded to the chosen owned implementation's constructor. */
+  construct?: E2eServerConstructOptions
 }
 
 export function externalTargetConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -147,17 +193,33 @@ export class ExternalServer implements E2eServerHandle {
 /**
  * Returns the server handle the e2e fixtures should use for a worker:
  * - `ExternalServer` when `FRESHELL_E2E_TARGET_URL` is set (grade the port);
- * - a fresh local `TestServer` otherwise (the original, default behavior).
+ *   this ALWAYS takes priority, regardless of `options.kind` -- it is the T3
+ *   oracle seam and predates the HARNESS-02 matrix.
+ * - otherwise, an owned `RustServer` when `options.kind === 'rust'`
+ *   (HARNESS-02 matrix);
+ * - otherwise a fresh local `TestServer` -- the original, default behavior,
+ *   unchanged for every existing caller that does not pass `kind`.
  *
- * `TestServer` is imported lazily so that an external-target run does not even
- * load the local-spawn machinery.
+ * Both `TestServer` and `RustServer` are imported lazily so that a run only
+ * ever loads the local-spawn machinery for the implementation it actually
+ * needs (an external-target run loads neither).
  */
 export async function createE2eServerHandle(
   env: NodeJS.ProcessEnv = process.env,
+  options: CreateE2eServerHandleOptions = {},
 ): Promise<E2eServerHandle> {
   if (externalTargetConfigured(env)) {
     return new ExternalServer(env)
   }
+
+  const kind = options.kind ?? 'legacy'
+  const construct = options.construct ?? {}
+
+  if (kind === 'rust') {
+    const { RustServer } = await import('./rust-server.js')
+    return new RustServer(construct)
+  }
+
   const { TestServer } = await import('./test-server.js')
-  return new TestServer()
+  return new TestServer(construct)
 }

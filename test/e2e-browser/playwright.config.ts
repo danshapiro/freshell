@@ -1,5 +1,22 @@
 import { defineConfig, devices } from '@playwright/test'
 
+// HARNESS-02 -- the curated "matrix smoke" set: specs that are verified to
+// run identically against BOTH the legacy Node server and the owned Rust
+// server (via the `e2eServerKind` project option, see helpers/fixtures.ts).
+// Deliberately a SUBSET of `./specs`, not the whole suite -- running every
+// spec against a freshly-built Rust binary on every default `test:e2e`
+// invocation would multiply CI runtime and require the Rust toolchain for a
+// run that previously needed only Node. Grow this list as more specs are
+// verified against the Rust target; run the full suite against Rust
+// explicitly via `--project=rust-chromium` with a broader `testMatch`
+// override when that verification work happens.
+const MATRIX_SPECS = [
+  /server-restart-recovery\.spec\.ts$/,
+  /settings-persistence-split\.spec\.ts$/,
+  /harness-02-matrix-bite\.spec\.ts$/,
+  /terminal-lifecycle\.spec\.ts$/,
+]
+
 export default defineConfig({
   testDir: './specs',
   fullyParallel: true,
@@ -24,6 +41,23 @@ export default defineConfig({
     {
       name: 'chromium',
       use: { ...devices['Desktop Chrome'] },
+    },
+    // HARNESS-02 -- the Node/Rust matrix. Both projects run the SAME spec
+    // files (`MATRIX_SPECS`) over the SAME testDir; only the `e2eServerKind`
+    // project option differs, selecting which real server implementation
+    // `helpers/fixtures.ts`'s `testServer` fixture boots for the worker.
+    {
+      name: 'legacy-chromium',
+      use: { ...devices['Desktop Chrome'], e2eServerKind: 'legacy' },
+      testMatch: MATRIX_SPECS,
+    },
+    {
+      name: 'rust-chromium',
+      use: { ...devices['Desktop Chrome'], e2eServerKind: 'rust' },
+      // Also includes the HARNESS-01 self-test, which always drives an owned
+      // RustServer directly (independent of `e2eServerKind`) and therefore
+      // only needs to run once, under this project.
+      testMatch: [...MATRIX_SPECS, /harness-01-rust-server\.spec\.ts$/],
     },
     ...(process.env.CI ? [
       {

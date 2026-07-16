@@ -2,7 +2,7 @@ import { test as base, type Page } from '@playwright/test'
 import { type TestServerInfo } from './test-server.js'
 import { TestHarness } from './test-harness.js'
 import { TerminalHelper } from './terminal-helpers.js'
-import { createE2eServerHandle, type E2eServerHandle } from './external-target.js'
+import { createE2eServerHandle, type E2eServerHandle, type E2eServerKind } from './external-target.js'
 
 /**
  * Select a shell from the PanePicker, handling the race condition where
@@ -63,16 +63,28 @@ export const test = base.extend<{
   harness: TestHarness
   terminal: TerminalHelper
   freshellPage: Page
+}, {
+  // HARNESS-02 -- a worker-scoped Playwright PROJECT OPTION selecting which
+  // real server implementation `testServer` should boot: the legacy Node
+  // server or the owned Rust binary. Projects set this via `use:
+  // { e2eServerKind: 'rust' }` (see playwright.config.ts's `rust-chromium`
+  // project); every other project (and any caller that doesn't set it)
+  // inherits the 'legacy' default below, so this is a NO-OP for existing
+  // projects/specs.
+  e2eServerKind: E2eServerKind
 }>({
+  e2eServerKind: ['legacy', { option: true, scope: 'worker' }],
+
   // The server handle is scoped per-worker for efficiency: each test file
   // shares one server.
   //
   // Seam (T3 oracle): when FRESHELL_E2E_TARGET_URL is set, createE2eServerHandle
   // returns a handle that points at an already-running EXTERNAL server (e.g. the
   // Rust port) instead of spawning a fresh local TestServer. When it is unset,
-  // this is a normal TestServer and the behavior is identical to before.
-  testServer: [async ({}, use) => {
-    const server = await createE2eServerHandle()
+  // `e2eServerKind` (HARNESS-02) picks 'legacy' (a normal TestServer -- behavior
+  // identical to before) or 'rust' (an owned RustServer) per Playwright project.
+  testServer: [async ({ e2eServerKind }, use) => {
+    const server = await createE2eServerHandle(process.env, { kind: e2eServerKind })
     await server.start()
     await use(server)
     await server.stop()

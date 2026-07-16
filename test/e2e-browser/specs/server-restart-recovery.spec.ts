@@ -1,12 +1,15 @@
 import { test as base, expect } from '../helpers/fixtures.js'
-import { TestServer } from '../helpers/test-server.js'
+import { createE2eServerHandle } from '../helpers/external-target.js'
 import { TestHarness } from '../helpers/test-harness.js'
 
-// Override the worker-scoped testServer so this spec manages its own lifecycle.
+// Override the worker-scoped testServer so this spec manages its own lifecycle,
+// but keep it routed through the generalized E2eServerHandle seam (HARNESS-02)
+// so this SAME spec exercises the legacy Node server or the owned Rust server
+// depending on the active project's `e2eServerKind` option.
 const test = base.extend({
-  testServer: [async ({}, use) => {
-    // Provide a dummy -- the test creates its own servers.
-    const server = new TestServer()
+  testServer: [async ({ e2eServerKind }, use) => {
+    // Provide a dummy -- the test creates its own server handle.
+    const server = await createE2eServerHandle(process.env, { kind: e2eServerKind })
     await server.start()
     await use(server)
     await server.stop()
@@ -14,12 +17,12 @@ const test = base.extend({
 })
 
 test.describe('Server Restart Recovery', () => {
-  // This test starts two servers sequentially and waits for multi-pane recovery,
-  // so it needs more time than the default 60s.
+  // This test starts a server, then restart()s it in place, waiting for
+  // multi-pane recovery, so it needs more time than the default 60s.
   test.setTimeout(120_000)
 
-  test('all panes recover after server restart without rate limit errors', async ({ page }) => {
-    const server1 = new TestServer()
+  test('all panes recover after server restart without rate limit errors', async ({ page, e2eServerKind }) => {
+    const server1 = await createE2eServerHandle(process.env, { kind: e2eServerKind })
     const info1 = await server1.start()
 
     try {
@@ -85,57 +88,53 @@ test.describe('Server Restart Recovery', () => {
         }
       }).toPass({ timeout: 20_000 })
 
-      // Stop server1 (all PTYs and terminal state are lost)
-      await server1.stop()
+      // Restart the SAME owned server in place (same home/port/token; all
+      // PTYs and terminal state are lost). Both `TestServer` and `RustServer`
+      // implement `restart()` (HARNESS-02), so this exercises the SAME
+      // restart-recovery flow regardless of `e2eServerKind`.
+      //
+      // The client's WS auto-reconnect will reach the restarted process,
+      // authenticate with the original token, and try to attach to
+      // terminals that no longer exist, triggering INVALID_TERMINAL_ID ->
+      // recreate for each pane.
+      if (!server1.restart) {
+        throw new Error(`${e2eServerKind} E2eServerHandle does not implement restart()`)
+      }
+      await server1.restart()
 
-      // Start a fresh server on the SAME port with the SAME token.
-      // This simulates a server restart. The client's WS auto-reconnect
-      // will reach server2, authenticate with the original token, and
-      // try to attach to terminals that no longer exist, triggering
-      // INVALID_TERMINAL_ID -> recreate for each pane.
-      const server2 = new TestServer({
-        port: info1.port,
-        token: info1.token,
-      })
-      await server2.start()
+      // Wait for WS to reconnect and reach 'ready' state
+      await expect(async () => {
+        const status = await page.evaluate(() =>
+          window.__FRESHELL_TEST_HARNESS__?.getWsReadyState()
+        )
+        expect(status).toBe('ready')
+      }).toPass({ timeout: 30_000 })
 
-      try {
-        // Wait for WS to reconnect and reach 'ready' state
-        await expect(async () => {
-          const status = await page.evaluate(() =>
-            window.__FRESHELL_TEST_HARNESS__?.getWsReadyState()
-          )
-          expect(status).toBe('ready')
-        }).toPass({ timeout: 30_000 })
-
-        // Wait for all panes to get new terminalIds (INVALID_TERMINAL_ID ->
-        // recreate with restore:true flow for each pane)
-        await expect(async () => {
-          const state = await page.evaluate(() =>
-            window.__FRESHELL_TEST_HARNESS__?.getState()
-          )
-          for (const tab of state!.tabs.tabs) {
-            const layout = state!.panes.layouts[tab.id] as any
-            // Terminal should be running or creating -- NOT error
-            expect(layout?.content?.status).not.toBe('error')
-            // Must have a new terminalId (proof that recreation succeeded)
-            expect(layout?.content?.terminalId).toBeTruthy()
-          }
-        }).toPass({ timeout: 30_000 })
-
-        // Verify no rate limit errors appeared -- check terminal output
-        // by switching to each tab and verifying no "[Error]" text
+      // Wait for all panes to get new terminalIds (INVALID_TERMINAL_ID ->
+      // recreate with restore:true flow for each pane)
+      await expect(async () => {
         const state = await page.evaluate(() =>
           window.__FRESHELL_TEST_HARNESS__?.getState()
         )
         for (const tab of state!.tabs.tabs) {
-          await page.locator(`[data-context="tab"][data-tab-id="${tab.id}"]`).click()
-          await page.waitForTimeout(500)
-          const xtermContent = await page.locator('.xterm').first().textContent()
-          expect(xtermContent).not.toContain('[Error]')
+          const layout = state!.panes.layouts[tab.id] as any
+          // Terminal should be running or creating -- NOT error
+          expect(layout?.content?.status).not.toBe('error')
+          // Must have a new terminalId (proof that recreation succeeded)
+          expect(layout?.content?.terminalId).toBeTruthy()
         }
-      } finally {
-        await server2.stop()
+      }).toPass({ timeout: 30_000 })
+
+      // Verify no rate limit errors appeared -- check terminal output
+      // by switching to each tab and verifying no "[Error]" text
+      const state = await page.evaluate(() =>
+        window.__FRESHELL_TEST_HARNESS__?.getState()
+      )
+      for (const tab of state!.tabs.tabs) {
+        await page.locator(`[data-context="tab"][data-tab-id="${tab.id}"]`).click()
+        await page.waitForTimeout(500)
+        const xtermContent = await page.locator('.xterm').first().textContent()
+        expect(xtermContent).not.toContain('[Error]')
       }
     } finally {
       await server1.stop().catch(() => {})
