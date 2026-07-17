@@ -17,6 +17,7 @@
 //!   supplies the persisted `network` overlay for `settings.updated`.
 
 mod boot;
+mod checkpoints;
 mod extensions;
 mod files;
 mod network;
@@ -361,11 +362,23 @@ async fn main() -> ExitCode {
         store: session_metadata_store,
     };
 
+    // `POST /api/fresh-agent/checkpoints` (`fresh-agent-extras-router.ts:346-368`):
+    // the fire-and-forget pre-turn shadow-git snapshot the SPA takes on every
+    // fresh-agent send. `home` mirrors `os.homedir()` (checkpoints live under
+    // `<home>/.freshell/checkpoints/`, same isolated home the session-metadata
+    // store above resolves) -- a `None` home (no `FRESHELL_HOME`/`HOME`) falls
+    // back to the cwd-relative `.` the other home-relative state above uses.
+    let checkpoints_state = checkpoints::CheckpointsApiState {
+        auth_token: Arc::clone(&auth_token),
+        home: Arc::new(home.clone().unwrap_or_else(|| PathBuf::from("."))),
+    };
+
     let app = freshell_api::router(api_state)
         .merge(freshell_ws::router(ws_state))
         .merge(freshell_freshagent::router(fresh_agent_state.clone()))
         .merge(freshell_freshagent::snapshot::router(snapshot_state))
         .merge(session_metadata::router(session_metadata_state))
+        .merge(checkpoints::router(checkpoints_state))
         // R1/R2/R3/R4: the ONE `/api/settings` router (GET+PATCH+PUT), backed by
         // the live `settings_store` \u2014 replaces the old split between this boot
         // module's frozen GET and the freshcodex slice's disconnected PATCH.

@@ -56,6 +56,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Query-param structs for the files read/stat/complete endpoints.
 serde = { version = "1", features = ["derive"] }
 dotenvy = "0.15.7"
+# Shadow-checkpoint-repo directory naming (`checkpoints.rs`): a stable, short
+# digest of the resolved cwd path, mirroring `checkpointGitDir`'s
+# `createHash('sha1')` (`fresh-agent-extras-router.ts:76`) -- not a security
+# use of SHA-1, just a deterministic per-cwd bucket name.
+sha1 = "0.10"
 
 [dev-dependencies]
 # `ServiceExt::oneshot` for in-process axum router handler tests (`sessions.rs`).
