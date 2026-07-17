@@ -23,8 +23,10 @@
 
 use std::path::PathBuf;
 
-use freshell_terminal::batch::{build_batch_wire_payloads, build_terminal_output_batches, BatchBuildInput};
-use freshell_terminal::{BatchInputFrame, BarrierScanner};
+use freshell_terminal::batch::{
+    build_batch_wire_payloads, build_terminal_output_batches, BatchBuildInput,
+};
+use freshell_terminal::{BarrierScanner, BatchInputFrame};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -115,7 +117,13 @@ fn reproduce(golden: &Value) -> Vec<Value> {
     });
     let mut out = Vec::new();
     for batch in &batches {
-        out.extend(build_batch_wire_payloads(terminal_id, batch, attach_request_id, source, batch_max));
+        out.extend(build_batch_wire_payloads(
+            terminal_id,
+            batch,
+            attach_request_id,
+            source,
+            batch_max,
+        ));
     }
     out
 }
@@ -187,7 +195,10 @@ fn multibyte_golden_proves_endoffset_is_utf16_not_bytes() {
     let payloads = golden["payloads"].as_array().unwrap();
     assert_eq!(payloads.len(), 1);
     let p = &payloads[0];
-    assert_eq!(p["data"].as_str().unwrap(), "a\u{1F600}b\u{4E2D}\u{6587}\r\n");
+    assert_eq!(
+        p["data"].as_str().unwrap(),
+        "a\u{1F600}b\u{4E2D}\u{6587}\r\n"
+    );
     let segs = p["segments"].as_array().unwrap();
     // frame 0 = "a😀b" → 1 + 2 + 1 = 4 UTF-16 units (would be 6 bytes).
     assert_eq!(segs[0]["endOffset"].as_i64().unwrap(), 4);
@@ -198,8 +209,20 @@ fn multibyte_golden_proves_endoffset_is_utf16_not_bytes() {
     let actual = reproduce(&golden);
     let seg0 = &actual[0]["segments"][0];
     let seg1 = &actual[0]["segments"][1];
-    assert_eq!(seg0["endOffset"].as_i64().unwrap(), 4, "rust emoji endOffset is UTF-16");
-    assert_eq!(seg1["endOffset"].as_i64().unwrap(), 8, "rust CJK cumulative endOffset is UTF-16");
+    assert_eq!(
+        seg0["endOffset"].as_i64().unwrap(),
+        4,
+        "rust emoji endOffset is UTF-16"
+    );
+    assert_eq!(
+        seg1["endOffset"].as_i64().unwrap(),
+        8,
+        "rust CJK cumulative endOffset is UTF-16"
+    );
     // Byte length of the data proves these are NOT byte offsets.
-    assert_eq!(p["data"].as_str().unwrap().len(), 14, "UTF-8 byte length (≠ the 8 UTF-16 endOffset)");
+    assert_eq!(
+        p["data"].as_str().unwrap().len(),
+        14,
+        "UTF-8 byte length (≠ the 8 UTF-16 endOffset)"
+    );
 }

@@ -49,10 +49,7 @@ impl McpRuntime for FakeRt {
     }
     fn convert_to_windows_path(&self, linux_path: &str) -> String {
         // Deterministic wslpath -w stand-in: /repo/... → \\wsl.localhost\Ubuntu\repo\...
-        format!(
-            "\\\\wsl.localhost\\Ubuntu{}",
-            linux_path.replace('/', "\\")
-        )
+        format!("\\\\wsl.localhost\\Ubuntu{}", linux_path.replace('/', "\\"))
     }
     fn server_command_args(&self) -> Result<Vec<McpServerArg>, McpInjectError> {
         Ok(self.args.clone())
@@ -79,8 +76,7 @@ fn fake_rt(tmp: &Path, wsl: bool) -> FakeRt {
 fn claude_writes_tmp_json_0600_pretty_two_space() {
     let scratch = Scratch::new("claude");
     let rt = fake_rt(scratch.path(), false);
-    let inj =
-        generate_mcp_injection(&rt, "claude", "term1", None, ProviderTarget::Unix).unwrap();
+    let inj = generate_mcp_injection(&rt, "claude", "term1", None, ProviderTarget::Unix).unwrap();
     let expected_path = scratch.path().join("freshell-mcp/term1.json");
     assert_eq!(
         inj.args,
@@ -96,7 +92,10 @@ fn claude_writes_tmp_json_0600_pretty_two_space() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&expected_path).unwrap().permissions().mode();
+        let mode = std::fs::metadata(&expected_path)
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600);
     }
 }
@@ -106,12 +105,13 @@ fn claude_writes_tmp_json_0600_pretty_two_space() {
 fn g_g1_gemini_env_only_injection() {
     let scratch = Scratch::new("gemini");
     let rt = fake_rt(scratch.path(), false);
-    let inj =
-        generate_mcp_injection(&rt, "gemini", "term1", None, ProviderTarget::Unix).unwrap();
+    let inj = generate_mcp_injection(&rt, "gemini", "term1", None, ProviderTarget::Unix).unwrap();
     assert!(inj.args.is_empty());
     let expected_path = scratch.path().join("freshell-mcp/term1.json");
     assert_eq!(
-        inj.env.get("GEMINI_CLI_SYSTEM_DEFAULTS_PATH").map(String::as_str),
+        inj.env
+            .get("GEMINI_CLI_SYSTEM_DEFAULTS_PATH")
+            .map(String::as_str),
         Some(expected_path.to_string_lossy().as_ref())
     );
     assert!(expected_path.is_file());
@@ -139,8 +139,7 @@ fn g_k1_kimi_mcp_config_file_flag() {
 fn g_x4_codex_windows_target_on_wsl_unc_toml() {
     let scratch = Scratch::new("codexwsl");
     let rt = fake_rt(scratch.path(), true);
-    let inj =
-        generate_mcp_injection(&rt, "codex", "term1", None, ProviderTarget::Windows).unwrap();
+    let inj = generate_mcp_injection(&rt, "codex", "term1", None, ProviderTarget::Windows).unwrap();
     assert_eq!(inj.args[0], "-c");
     assert_eq!(inj.args[1], "mcp_servers.freshell.command=\"node\"");
     assert_eq!(inj.args[2], "-c");
@@ -155,8 +154,7 @@ fn g_x4_codex_windows_target_on_wsl_unc_toml() {
 fn codex_unix_target_on_wsl_keeps_host_paths() {
     let scratch = Scratch::new("codexunix");
     let rt = fake_rt(scratch.path(), true);
-    let inj =
-        generate_mcp_injection(&rt, "codex", "term1", None, ProviderTarget::Unix).unwrap();
+    let inj = generate_mcp_injection(&rt, "codex", "term1", None, ProviderTarget::Unix).unwrap();
     assert_eq!(
         inj.args[3],
         "mcp_servers.freshell.args=[\"--import\", \"/repo/node_modules/tsx/dist/loader.mjs\", \"/repo/server/mcp/server.ts\"]"
@@ -179,8 +177,7 @@ fn g_w1_native_windows_host_unix_target_keeps_windows_paths() {
             McpServerArg::Path("C:\\repo\\server\\mcp\\server.ts".to_string()),
         ],
     };
-    let inj =
-        generate_mcp_injection(&rt, "codex", "term1", None, ProviderTarget::Unix).unwrap();
+    let inj = generate_mcp_injection(&rt, "codex", "term1", None, ProviderTarget::Unix).unwrap();
     assert_eq!(
         inj.args[3],
         "mcp_servers.freshell.args=[\"C:\\\\repo\\\\node_modules\\\\tsx\\\\dist\\\\loader.mjs\", \"C:\\\\repo\\\\server\\\\mcp\\\\server.ts\"]"
@@ -206,8 +203,7 @@ fn shell_and_unknown_modes_are_empty() {
     let scratch = Scratch::new("none");
     let rt = fake_rt(scratch.path(), false);
     for mode in ["shell", "mystery"] {
-        let inj =
-            generate_mcp_injection(&rt, mode, "term1", None, ProviderTarget::Unix).unwrap();
+        let inj = generate_mcp_injection(&rt, mode, "term1", None, ProviderTarget::Unix).unwrap();
         assert_eq!(inj, McpInjection::default());
     }
 }
@@ -217,8 +213,8 @@ fn shell_and_unknown_modes_are_empty() {
 fn opencode_cwd_errors() {
     let scratch = Scratch::new("occwd");
     let rt = fake_rt(scratch.path(), false);
-    let err = generate_mcp_injection(&rt, "opencode", "term1", None, ProviderTarget::Unix)
-        .unwrap_err();
+    let err =
+        generate_mcp_injection(&rt, "opencode", "term1", None, ProviderTarget::Unix).unwrap_err();
     assert!(err.message.contains("cwd is required"), "{}", err.message);
     let missing = scratch.path().join("does-not-exist");
     let err2 = generate_mcp_injection(
@@ -247,8 +243,7 @@ fn opencode_merge_refcount_and_cleanup_lifecycle() {
 
     // Spawn 1: creates dir/file/entry, refCount 1.
     let inj =
-        generate_mcp_injection(&rt, "opencode", "t1", Some(&cwd), ProviderTarget::Unix)
-            .unwrap();
+        generate_mcp_injection(&rt, "opencode", "t1", Some(&cwd), ProviderTarget::Unix).unwrap();
     assert_eq!(inj, McpInjection::default());
     let config_path = opencode_config_path(&cwd);
     let config: serde_json::Value =
@@ -275,11 +270,17 @@ fn opencode_merge_refcount_and_cleanup_lifecycle() {
 
     // Spawn 2: refCount 2.
     generate_mcp_injection(&rt, "opencode", "t2", Some(&cwd), ProviderTarget::Unix).unwrap();
-    assert_eq!(read_sidecar(&cwd).unwrap()["refCount"], serde_json::json!(2));
+    assert_eq!(
+        read_sidecar(&cwd).unwrap()["refCount"],
+        serde_json::json!(2)
+    );
 
     // Cleanup 1: decrement only.
     cleanup_mcp_config(&rt, "t2", "opencode", Some(&cwd));
-    assert_eq!(read_sidecar(&cwd).unwrap()["refCount"], serde_json::json!(1));
+    assert_eq!(
+        read_sidecar(&cwd).unwrap()["refCount"],
+        serde_json::json!(1)
+    );
     assert!(config_path.exists());
 
     // Cleanup 2: created-by-freshell file with only the freshell entry —
@@ -291,7 +292,10 @@ fn opencode_merge_refcount_and_cleanup_lifecycle() {
     assert!(!config_path.exists());
     assert!(!opencode_sidecar_path(&cwd).exists());
     let dir = config_path.parent().unwrap();
-    assert!(dir.exists(), "reference leaves the empty .opencode dir behind");
+    assert!(
+        dir.exists(),
+        "reference leaves the empty .opencode dir behind"
+    );
     assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0, "dir is empty");
 }
 
@@ -372,9 +376,8 @@ fn opencode_invalid_existing_config_errors() {
         let config_path = opencode_config_path(&cwd);
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         std::fs::write(&config_path, contents).unwrap();
-        let err =
-            generate_mcp_injection(&rt, "opencode", "t1", Some(&cwd), ProviderTarget::Unix)
-                .unwrap_err();
+        let err = generate_mcp_injection(&rt, "opencode", "t1", Some(&cwd), ProviderTarget::Unix)
+            .unwrap_err();
         assert!(
             err.message.contains(expected),
             "contents {contents:?}: {}",
@@ -409,7 +412,8 @@ fn lock_contention_and_stale_lock() {
     // Fresh foreign lock → 5 retries then the reference-exact error.
     let err = acquire_lock(&cwd).unwrap_err();
     assert!(
-        err.message.contains("Failed to acquire lock at") && err.message.contains("after 5 retries"),
+        err.message.contains("Failed to acquire lock at")
+            && err.message.contains("after 5 retries"),
         "{}",
         err.message
     );

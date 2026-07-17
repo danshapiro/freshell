@@ -48,7 +48,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use freshell_platform::detect::{host_os_live, is_wsl_env_live, is_windows};
+use freshell_platform::detect::{host_os_live, is_windows, is_wsl_env_live};
 use freshell_platform::mcp_inject::{cleanup_mcp_config, generate_mcp_injection, RealMcpRuntime};
 use freshell_platform::spawn::{
     cli_provider_target, resolve_coding_cli_command, resolve_mcp_cwd, resolve_shell,
@@ -236,7 +236,9 @@ async fn handle_client_text(
             true
         }
         ClientMessage::TerminalInput(input) => {
-            state.registry.input(&input.terminal_id, input.data.as_bytes());
+            state
+                .registry
+                .input(&input.terminal_id, input.data.as_bytes());
             true
         }
         ClientMessage::TerminalResize(resize) => {
@@ -522,10 +524,7 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         } else if mode == "codex" {
             // Raw codex resume (the durable-thread restore planner is
             // coding-cli.md scope); `launchIntent` stays 'resume' (`tr:1570-1571`).
-            resume_session_id = create
-                .resume_session_id
-                .clone()
-                .filter(|s| !s.is_empty());
+            resume_session_id = create.resume_session_id.clone().filter(|s| !s.is_empty());
         } else {
             // `requestedSessionRef.provider === mode ? sessionRef.sessionId :
             // m.resumeSessionId` (`ws:2040-2047`).
@@ -550,7 +549,10 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
             model = p.get("model").and_then(|v| v.as_str()).map(str::to_string);
-            sandbox = p.get("sandbox").and_then(|v| v.as_str()).map(str::to_string);
+            sandbox = p
+                .get("sandbox")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
         }
     }
 
@@ -563,13 +565,8 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         match freshell_opencode::transport::LoopbackPortAllocator.allocate() {
             Ok(ep) => Some(ep),
             Err(e) => {
-                return send_create_error(
-                    ws_tx,
-                    ErrorCode::PtySpawnFailed,
-                    e,
-                    &create.request_id,
-                )
-                .await
+                return send_create_error(ws_tx, ErrorCode::PtySpawnFailed, e, &create.request_id)
+                    .await
             }
         }
     } else {
@@ -659,8 +656,7 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
     // branches apply on native Windows AND on WSL with an explicit cmd/powershell
     // pane shell (`isWindowsLike() && !inWslWithLinuxShell`).
     let effective_shell = resolve_shell(shell, host_os, is_wsl);
-    let windows_like =
-        is_windows(host_os) || (is_wsl && effective_shell != ShellType::System);
+    let windows_like = is_windows(host_os) || (is_wsl && effective_shell != ShellType::System);
 
     // Spawn at the default geometry (`opts.cols||120`, `opts.rows||30`); the client
     // attaches then resizes to its viewport.
@@ -740,8 +736,13 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
             env_var.as_deref(),
             resume_session_id.is_some(),
         );
-        return send_create_error(ws_tx, ErrorCode::PtySpawnFailed, message, &create.request_id)
-            .await;
+        return send_create_error(
+            ws_tx,
+            ErrorCode::PtySpawnFailed,
+            message,
+            &create.request_id,
+        )
+        .await;
     }
 
     // Directory metadata (`tr:1614` getModeLabel title + the CLI resume session id).
@@ -1029,7 +1030,10 @@ fn is_codex_provider(provider: freshell_protocol::AgentProvider) -> bool {
 /// original's `catch` arm; the SPA maps a `/tabs/i` error to its sync-error state).
 async fn handle_tabs_push(value: &serde_json::Value, ws_tx: &mut WsSink, state: &WsState) -> bool {
     let device_id = value.get("deviceId").and_then(|v| v.as_str()).unwrap_or("");
-    let device_label = value.get("deviceLabel").and_then(|v| v.as_str()).unwrap_or("");
+    let device_label = value
+        .get("deviceLabel")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let client_instance_id = value
         .get("clientInstanceId")
         .and_then(|v| v.as_str())
@@ -1069,7 +1073,10 @@ async fn handle_tabs_query(value: &serde_json::Value, ws_tx: &mut WsSink, state:
         .get("clientInstanceId")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let request_id = value.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
+    let request_id = value
+        .get("requestId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     let data = state.tabs.query(device_id, client_instance_id);
     let frame = serde_json::json!({
@@ -1241,7 +1248,12 @@ mod cli_create_helper_tests {
         }
     }
     fn env_of(pairs: &[(&str, &str)]) -> MapEnv {
-        MapEnv(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())
+        MapEnv(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
     }
 
     /// Success criterion 5 (spec §6): the FRESHELL* base env parity

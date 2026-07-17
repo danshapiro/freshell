@@ -92,7 +92,10 @@ pub enum CodexAdapterEvent {
     /// `sdk.status { status: 'exited' }` — a terminal clear with NO chime, emitted on
     /// `thread_closed` (`adapter.ts:891-896`) and `onExit` crash/disconnect
     /// (`adapter.ts:935-946`).
-    Status { session_id: String, status: CodexStatus },
+    Status {
+        session_id: String,
+        status: CodexStatus,
+    },
 }
 
 /// One codex thread subscription's completion/status reducer. Holds the per-thread
@@ -107,7 +110,11 @@ pub struct CodexSubscription {
 
 impl CodexSubscription {
     pub fn new(session_id: impl Into<String>) -> Self {
-        Self { session_id: session_id.into(), last_turn_complete_at: None, active_turn_id: None }
+        Self {
+            session_id: session_id.into(),
+            last_turn_complete_at: None,
+            active_turn_id: None,
+        }
     }
 
     pub fn session_id(&self) -> &str {
@@ -136,7 +143,11 @@ impl CodexSubscription {
     /// `sdk.turn.complete` chime ONLY if `params.turn?.status ?? params.status === 'completed'`.
     /// `interrupted` / `failed` / `inProgress` / absent statuses yield the snapshot but NO
     /// chime. A `turn/completed` for a DIFFERENT thread yields nothing.
-    pub fn on_turn_completed(&mut self, event: &CodexTurnEvent, now: i64) -> Vec<CodexAdapterEvent> {
+    pub fn on_turn_completed(
+        &mut self,
+        event: &CodexTurnEvent,
+        now: i64,
+    ) -> Vec<CodexAdapterEvent> {
         // adapter.ts:912 — ignore completions for other threads.
         if event.thread_id != self.session_id {
             return Vec::new();
@@ -161,14 +172,21 @@ impl CodexSubscription {
         // adapter.ts:925-927 — monotonic `at`, then the positive chime.
         let at = next_monotonic_turn_complete_at(self.last_turn_complete_at, now);
         self.last_turn_complete_at = Some(at);
-        out.push(CodexAdapterEvent::TurnComplete { session_id: self.session_id.clone(), at });
+        out.push(CodexAdapterEvent::TurnComplete {
+            session_id: self.session_id.clone(),
+            at,
+        });
         out
     }
 
     /// `thread_status_changed` handler (`adapter.ts:898-903`): clear the active turn once the
     /// thread leaves `running`/`starting`, then emit the normalized status snapshot. Other
     /// threads are ignored.
-    pub fn on_thread_status_changed(&mut self, thread_id: &str, status: &Value) -> Option<CodexAdapterEvent> {
+    pub fn on_thread_status_changed(
+        &mut self,
+        thread_id: &str,
+        status: &Value,
+    ) -> Option<CodexAdapterEvent> {
         if thread_id != self.session_id {
             return None;
         }
@@ -185,7 +203,12 @@ impl CodexSubscription {
 
     /// `thread_started` evidence (`adapter.ts:882-885`): a status snapshot stamped with the
     /// thread's `updatedAt` revision. Other threads are ignored.
-    pub fn on_thread_started(&self, thread_id: &str, status: &Value, updated_at: Option<f64>) -> Option<CodexAdapterEvent> {
+    pub fn on_thread_started(
+        &self,
+        thread_id: &str,
+        status: &Value,
+        updated_at: Option<f64>,
+    ) -> Option<CodexAdapterEvent> {
         if thread_id != self.session_id {
             return None;
         }
@@ -203,14 +226,20 @@ impl CodexSubscription {
             return None;
         }
         self.active_turn_id = None;
-        Some(CodexAdapterEvent::Status { session_id: self.session_id.clone(), status: CodexStatus::Exited })
+        Some(CodexAdapterEvent::Status {
+            session_id: self.session_id.clone(),
+            status: CodexStatus::Exited,
+        })
     }
 
     /// `onExit` handler (`adapter.ts:935-946`): a crash/disconnect clears the pane to `exited`
     /// with NO chime (a crash is not a positive completion). The runtime is intentionally left
     /// mapped for lazy restart (`adapter.ts:936-944`).
     pub fn on_exit(&self) -> CodexAdapterEvent {
-        CodexAdapterEvent::Status { session_id: self.session_id.clone(), status: CodexStatus::Exited }
+        CodexAdapterEvent::Status {
+            session_id: self.session_id.clone(),
+            status: CodexStatus::Exited,
+        }
     }
 }
 
@@ -222,7 +251,10 @@ mod tests {
     fn turn_event(thread_id: &str, params: Value) -> CodexTurnEvent {
         CodexTurnEvent {
             thread_id: thread_id.to_string(),
-            turn_id: params.get("turnId").and_then(Value::as_str).map(str::to_string),
+            turn_id: params
+                .get("turnId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             params: params.as_object().cloned().unwrap_or_default(),
         }
     }
@@ -234,15 +266,28 @@ mod tests {
         let mut sub = CodexSubscription::new("thread-1");
         // Inline turn.status = 'completed' (the codex-cli 0.142.x shape, adapter.ts:1123).
         let out = sub.on_turn_completed(
-            &turn_event("thread-1", json!({ "threadId": "thread-1", "turn": { "id": "t", "status": "completed" } })),
+            &turn_event(
+                "thread-1",
+                json!({ "threadId": "thread-1", "turn": { "id": "t", "status": "completed" } }),
+            ),
             1000,
         );
         assert_eq!(out.len(), 2, "idle snapshot + one chime: {out:?}");
         assert_eq!(
             out[0],
-            CodexAdapterEvent::StatusSnapshot { session_id: "thread-1".into(), status: CodexStatus::Idle, revision: None }
+            CodexAdapterEvent::StatusSnapshot {
+                session_id: "thread-1".into(),
+                status: CodexStatus::Idle,
+                revision: None
+            }
         );
-        assert_eq!(out[1], CodexAdapterEvent::TurnComplete { session_id: "thread-1".into(), at: 1000 });
+        assert_eq!(
+            out[1],
+            CodexAdapterEvent::TurnComplete {
+                session_id: "thread-1".into(),
+                at: 1000
+            }
+        );
     }
 
     #[test]
@@ -250,22 +295,42 @@ mod tests {
         // Flat params.status = 'completed' (the app-server client test shape, adapter.ts:1221).
         let mut sub = CodexSubscription::new("thread-1");
         let out = sub.on_turn_completed(
-            &turn_event("thread-1", json!({ "threadId": "thread-1", "turnId": "t", "status": "completed" })),
+            &turn_event(
+                "thread-1",
+                json!({ "threadId": "thread-1", "turnId": "t", "status": "completed" }),
+            ),
             5,
         );
-        assert!(matches!(out.as_slice(), [CodexAdapterEvent::StatusSnapshot { .. }, CodexAdapterEvent::TurnComplete { .. }]));
+        assert!(matches!(
+            out.as_slice(),
+            [
+                CodexAdapterEvent::StatusSnapshot { .. },
+                CodexAdapterEvent::TurnComplete { .. }
+            ]
+        ));
     }
 
     #[test]
     fn interrupted_status_emits_snapshot_but_never_chimes() {
         let mut sub = CodexSubscription::new("thread-1");
         let out = sub.on_turn_completed(
-            &turn_event("thread-1", json!({ "threadId": "thread-1", "turn": { "id": "t", "status": "interrupted" } })),
+            &turn_event(
+                "thread-1",
+                json!({ "threadId": "thread-1", "turn": { "id": "t", "status": "interrupted" } }),
+            ),
             1000,
         );
         assert_eq!(out.len(), 1, "idle snapshot only, no chime");
-        assert!(matches!(out[0], CodexAdapterEvent::StatusSnapshot { status: CodexStatus::Idle, .. }));
-        assert!(!out.iter().any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })));
+        assert!(matches!(
+            out[0],
+            CodexAdapterEvent::StatusSnapshot {
+                status: CodexStatus::Idle,
+                ..
+            }
+        ));
+        assert!(!out
+            .iter()
+            .any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })));
         assert_eq!(sub.last_turn_complete_at(), None, "no completion recorded");
     }
 
@@ -273,20 +338,30 @@ mod tests {
     fn failed_status_never_chimes() {
         let mut sub = CodexSubscription::new("thread-1");
         let out = sub.on_turn_completed(
-            &turn_event("thread-1", json!({ "threadId": "thread-1", "status": "failed" })),
+            &turn_event(
+                "thread-1",
+                json!({ "threadId": "thread-1", "status": "failed" }),
+            ),
             1000,
         );
-        assert!(!out.iter().any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })));
+        assert!(!out
+            .iter()
+            .any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })));
     }
 
     #[test]
     fn in_progress_status_never_chimes() {
         let mut sub = CodexSubscription::new("thread-1");
         let out = sub.on_turn_completed(
-            &turn_event("thread-1", json!({ "threadId": "thread-1", "status": "inProgress" })),
+            &turn_event(
+                "thread-1",
+                json!({ "threadId": "thread-1", "status": "inProgress" }),
+            ),
             1000,
         );
-        assert!(!out.iter().any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })));
+        assert!(!out
+            .iter()
+            .any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })));
     }
 
     #[test]
@@ -309,7 +384,11 @@ mod tests {
             ),
             1000,
         );
-        assert!(!out.iter().any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })), "inline interrupted wins");
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })),
+            "inline interrupted wins"
+        );
     }
 
     #[test]
@@ -318,7 +397,10 @@ mod tests {
         // thread produces nothing at all.
         let mut sub = CodexSubscription::new("thread-1");
         let out = sub.on_turn_completed(
-            &turn_event("other-thread", json!({ "threadId": "other-thread", "turn": { "status": "completed" } })),
+            &turn_event(
+                "other-thread",
+                json!({ "threadId": "other-thread", "turn": { "status": "completed" } }),
+            ),
             1000,
         );
         assert!(out.is_empty());
@@ -332,27 +414,55 @@ mod tests {
         let a = sub.on_turn_completed(&turn_event("thread-1", completed.clone()), 1000);
         let b = sub.on_turn_completed(&turn_event("thread-1", completed.clone()), 1000); // same ms
         let c = sub.on_turn_completed(&turn_event("thread-1", completed), 999); // clock stepped back
-        let at = |v: &[CodexAdapterEvent]| match v.iter().find(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })) {
+        let at = |v: &[CodexAdapterEvent]| match v
+            .iter()
+            .find(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. }))
+        {
             Some(CodexAdapterEvent::TurnComplete { at, .. }) => *at,
             _ => panic!("expected a chime"),
         };
         assert_eq!(at(&a), 1000);
         assert_eq!(at(&b), 1001, "same-ms completion is bumped +1");
-        assert_eq!(at(&c), 1002, "backwards clock step still strictly increases");
+        assert_eq!(
+            at(&c),
+            1002,
+            "backwards clock step still strictly increases"
+        );
     }
 
     // ── thread-status normalization ────────────────────────────────────────────────────
 
     #[test]
     fn thread_status_normalization_matches_reference() {
-        assert_eq!(normalize_codex_thread_status(&json!({ "type": "active", "activeFlags": [] })), CodexStatus::Running);
-        assert_eq!(normalize_codex_thread_status(&json!({ "type": "notLoaded" })), CodexStatus::Starting);
-        assert_eq!(normalize_codex_thread_status(&json!({ "type": "systemError" })), CodexStatus::Exited);
-        assert_eq!(normalize_codex_thread_status(&json!({ "type": "idle" })), CodexStatus::Idle);
+        assert_eq!(
+            normalize_codex_thread_status(&json!({ "type": "active", "activeFlags": [] })),
+            CodexStatus::Running
+        );
+        assert_eq!(
+            normalize_codex_thread_status(&json!({ "type": "notLoaded" })),
+            CodexStatus::Starting
+        );
+        assert_eq!(
+            normalize_codex_thread_status(&json!({ "type": "systemError" })),
+            CodexStatus::Exited
+        );
+        assert_eq!(
+            normalize_codex_thread_status(&json!({ "type": "idle" })),
+            CodexStatus::Idle
+        );
         // Unknown type / non-object → idle.
-        assert_eq!(normalize_codex_thread_status(&json!({ "type": "weird" })), CodexStatus::Idle);
-        assert_eq!(normalize_codex_thread_status(&json!("idle")), CodexStatus::Idle);
-        assert_eq!(normalize_codex_thread_status(&Value::Null), CodexStatus::Idle);
+        assert_eq!(
+            normalize_codex_thread_status(&json!({ "type": "weird" })),
+            CodexStatus::Idle
+        );
+        assert_eq!(
+            normalize_codex_thread_status(&json!("idle")),
+            CodexStatus::Idle
+        );
+        assert_eq!(
+            normalize_codex_thread_status(&Value::Null),
+            CodexStatus::Idle
+        );
     }
 
     #[test]
@@ -363,11 +473,22 @@ mod tests {
         sub.on_thread_status_changed("thread-1", &json!({ "type": "active", "activeFlags": [] }));
         assert_eq!(sub.active_turn_id(), Some("turn-1"));
         // idle clears it.
-        let ev = sub.on_thread_status_changed("thread-1", &json!({ "type": "idle" })).unwrap();
-        assert_eq!(ev, CodexAdapterEvent::StatusSnapshot { session_id: "thread-1".into(), status: CodexStatus::Idle, revision: None });
+        let ev = sub
+            .on_thread_status_changed("thread-1", &json!({ "type": "idle" }))
+            .unwrap();
+        assert_eq!(
+            ev,
+            CodexAdapterEvent::StatusSnapshot {
+                session_id: "thread-1".into(),
+                status: CodexStatus::Idle,
+                revision: None
+            }
+        );
         assert_eq!(sub.active_turn_id(), None);
         // Other thread ignored.
-        assert!(sub.on_thread_status_changed("other", &json!({ "type": "idle" })).is_none());
+        assert!(sub
+            .on_thread_status_changed("other", &json!({ "type": "idle" }))
+            .is_none());
     }
 
     #[test]
@@ -375,22 +496,34 @@ mod tests {
         let mut sub = CodexSubscription::new("thread-1");
         assert_eq!(
             sub.on_thread_closed("thread-1"),
-            Some(CodexAdapterEvent::Status { session_id: "thread-1".into(), status: CodexStatus::Exited })
+            Some(CodexAdapterEvent::Status {
+                session_id: "thread-1".into(),
+                status: CodexStatus::Exited
+            })
         );
         assert!(sub.on_thread_closed("other").is_none());
         assert_eq!(
             sub.on_exit(),
-            CodexAdapterEvent::Status { session_id: "thread-1".into(), status: CodexStatus::Exited }
+            CodexAdapterEvent::Status {
+                session_id: "thread-1".into(),
+                status: CodexStatus::Exited
+            }
         );
     }
 
     #[test]
     fn thread_started_carries_updated_at_revision() {
         let sub = CodexSubscription::new("thread-1");
-        let ev = sub.on_thread_started("thread-1", &json!({ "type": "idle" }), Some(7.0)).unwrap();
+        let ev = sub
+            .on_thread_started("thread-1", &json!({ "type": "idle" }), Some(7.0))
+            .unwrap();
         assert_eq!(
             ev,
-            CodexAdapterEvent::StatusSnapshot { session_id: "thread-1".into(), status: CodexStatus::Idle, revision: Some(7.0) }
+            CodexAdapterEvent::StatusSnapshot {
+                session_id: "thread-1".into(),
+                status: CodexStatus::Idle,
+                revision: Some(7.0)
+            }
         );
     }
 }

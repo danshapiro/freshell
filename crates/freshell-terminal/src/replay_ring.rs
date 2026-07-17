@@ -134,7 +134,9 @@ impl ReplayDeque {
             data: input.data,
             bytes,
             at: input.at.unwrap_or_else(now_ms),
-            stream_id: input.stream_id.unwrap_or_else(|| DEFAULT_STREAM_ID.to_string()),
+            stream_id: input
+                .stream_id
+                .unwrap_or_else(|| DEFAULT_STREAM_ID.to_string()),
             barrier: input.barrier,
         };
 
@@ -156,10 +158,16 @@ impl ReplayDeque {
         let normalized = self.normalize_since_seq(since_seq);
         let missed_from_seq = self.missed_from_seq(normalized);
         if self.retained_count() == 0 {
-            return ReplaySince { frames: Vec::new(), missed_from_seq };
+            return ReplaySince {
+                frames: Vec::new(),
+                missed_from_seq,
+            };
         }
         let frames = self.collect_replay_frames(normalized, i64::MAX);
-        ReplaySince { frames, missed_from_seq }
+        ReplaySince {
+            frames,
+            missed_from_seq,
+        }
     }
 
     /// `totalBytes` (`replay-deque.ts:131-133`).
@@ -439,20 +447,33 @@ mod tests {
             deque.append(ring_input(c, "s"));
         }
         assert_eq!(deque.total_bytes(), 3);
-        assert!(!deque.consume_retention_loss(), "no loss yet at exactly budget");
+        assert!(
+            !deque.consume_retention_loss(),
+            "no loss yet at exactly budget"
+        );
 
         let f4 = deque.append(ring_input("d", "s")); // pushes over -> evict "a"
         assert_eq!(f4.seq_start, 4);
         assert_eq!(deque.total_bytes(), 3, "still 3 retained bytes (b,c,d)");
-        assert!(deque.consume_retention_loss(), "eviction set retention loss");
+        assert!(
+            deque.consume_retention_loss(),
+            "eviction set retention loss"
+        );
         assert_eq!(deque.head_seq(), 4, "head keeps advancing");
         assert_eq!(deque.tail_seq(), 2, "tail advanced past evicted seq 1");
 
         // seq 1 is now older than the retained window -> replay reports a gap.
         let r = deque.replay_since(Some(1));
-        assert_eq!(r.frames.iter().map(|f| f.seq_start).collect::<Vec<_>>(), vec![2, 3, 4]);
+        assert_eq!(
+            r.frames.iter().map(|f| f.seq_start).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
         let r0 = deque.replay_since(Some(0));
-        assert_eq!(r0.missed_from_seq, Some(1), "since 0 < firstSeq-1 -> missed from 1");
+        assert_eq!(
+            r0.missed_from_seq,
+            Some(1),
+            "since 0 < firstSeq-1 -> missed from 1"
+        );
     }
 
     #[test]
@@ -467,7 +488,14 @@ mod tests {
         assert_eq!(all.missed_from_seq, None);
         // since 1 -> frames after seq 1.
         let after1 = deque.replay_since(Some(1));
-        assert_eq!(after1.frames.iter().map(|f| f.seq_start).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(
+            after1
+                .frames
+                .iter()
+                .map(|f| f.seq_start)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
         // since head -> empty, no gap.
         let after_head = deque.replay_since(Some(3));
         assert!(after_head.frames.is_empty());
@@ -477,7 +505,10 @@ mod tests {
     #[test]
     fn ring_append_default_ring_is_1mib_and_no_op_normalizes() {
         let mut ring = ReplayRing::new(None);
-        assert_eq!(ring.retention_max_bytes(), DEFAULT_TERMINAL_REPLAY_RING_MAX_BYTES);
+        assert_eq!(
+            ring.retention_max_bytes(),
+            DEFAULT_TERMINAL_REPLAY_RING_MAX_BYTES
+        );
         let f = ring.append("hello\r\n", "stream-x");
         assert_eq!(f.data, "hello\r\n");
         assert_eq!(f.bytes, 7);

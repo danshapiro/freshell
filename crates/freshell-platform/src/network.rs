@@ -21,7 +21,10 @@ use crate::{CommandRunner, Env};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindHostConfig {
     /// Config read/parsed OK: `settings.network.{host,configured}`.
-    Ok { raw_host: Option<String>, configured: bool },
+    Ok {
+        raw_host: Option<String>,
+        configured: bool,
+    },
     /// Read or JSON parse failed — the `catch` branch.
     Failed,
 }
@@ -56,7 +59,10 @@ pub fn resolve_bind_host(env: &dyn Env, is_wsl: bool, config: BindHostConfig) ->
     }
 
     match config {
-        BindHostConfig::Ok { raw_host, configured } => {
+        BindHostConfig::Ok {
+            raw_host,
+            configured,
+        } => {
             let host = match raw_host.as_deref() {
                 Some(h) if is_valid_bind(h) => h,
                 _ => "127.0.0.1",
@@ -247,7 +253,10 @@ pub fn access_url(
     } else {
         "localhost"
     };
-    format!("http://{host}:{access_port}/?token={}", encode_uri_component(token))
+    format!(
+        "http://{host}:{access_port}/?token={}",
+        encode_uri_component(token)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -335,7 +344,11 @@ fn parse_ipv4_after_label(line: &str) -> Option<String> {
     }
     let candidate = &rest[..i];
     let parts: Vec<&str> = candidate.split('.').collect();
-    if parts.len() == 4 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) {
+    if parts.len() == 4
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    {
         Some(candidate.to_string())
     } else {
         None
@@ -378,7 +391,11 @@ pub fn rank_lan_ip_candidates(candidates: &[(String, String)]) -> Vec<String> {
 /// `Get-NetIPAddress` reports as `PrefixLength`.
 pub fn prefix_len_to_netmask(prefix: u32) -> String {
     let prefix = prefix.min(32);
-    let mask: u32 = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    let mask: u32 = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
     format!(
         "{}.{}.{}.{}",
         (mask >> 24) & 0xff,
@@ -396,7 +413,9 @@ pub fn parse_powershell_ip_prefix_lines(output: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for line in output.lines() {
         let mut parts = line.trim().split_whitespace();
-        let (Some(ip), Some(prefix)) = (parts.next(), parts.next()) else { continue };
+        let (Some(ip), Some(prefix)) = (parts.next(), parts.next()) else {
+            continue;
+        };
         if parts.next().is_some() {
             continue;
         }
@@ -407,7 +426,9 @@ pub fn parse_powershell_ip_prefix_lines(output: &str) -> Vec<(String, String)> {
         if ip.starts_with("127.") {
             continue; // loopback == os.networkInterfaces() `internal: true`
         }
-        let Ok(prefix) = prefix.parse::<u32>() else { continue };
+        let Ok(prefix) = prefix.parse::<u32>() else {
+            continue;
+        };
         if prefix > 32 {
             continue;
         }
@@ -438,7 +459,12 @@ const WINDOWS_IP_PROBE: &str = "$up = (Get-NetAdapter | Where-Object { $_.Status
 pub fn detect_lan_ips_from_windows_interfaces(runner: &dyn CommandRunner) -> Vec<String> {
     let out = runner.run(
         "powershell",
-        &["-NoProfile", "-NonInteractive", "-Command", WINDOWS_IP_PROBE],
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_IP_PROBE,
+        ],
     );
     if !out.ok() {
         return Vec::new();
@@ -457,67 +483,123 @@ mod tests {
     fn bind_override_wins() {
         let env = MapEnv::new().with("FRESHELL_BIND_HOST", "0.0.0.0");
         // Even non-WSL with a failed config, the override wins.
-        assert_eq!(resolve_bind_host(&env, false, BindHostConfig::Failed), "0.0.0.0");
+        assert_eq!(
+            resolve_bind_host(&env, false, BindHostConfig::Failed),
+            "0.0.0.0"
+        );
     }
 
     #[test]
     fn bind_override_invalid_falls_through() {
         let env = MapEnv::new().with("FRESHELL_BIND_HOST", "1.2.3.4");
-        assert_eq!(resolve_bind_host(&env, true, BindHostConfig::Failed), "0.0.0.0"); // WSL
+        assert_eq!(
+            resolve_bind_host(&env, true, BindHostConfig::Failed),
+            "0.0.0.0"
+        ); // WSL
     }
 
     #[test]
     fn wsl_forces_0000() {
-        assert_eq!(resolve_bind_host(&MapEnv::new(), true, BindHostConfig::Failed), "0.0.0.0");
+        assert_eq!(
+            resolve_bind_host(&MapEnv::new(), true, BindHostConfig::Failed),
+            "0.0.0.0"
+        );
     }
 
     #[test]
     fn config_host_whitelisted() {
-        let cfg = BindHostConfig::Ok { raw_host: Some("0.0.0.0".into()), configured: true };
+        let cfg = BindHostConfig::Ok {
+            raw_host: Some("0.0.0.0".into()),
+            configured: true,
+        };
         assert_eq!(resolve_bind_host(&MapEnv::new(), false, cfg), "0.0.0.0");
-        let bad = BindHostConfig::Ok { raw_host: Some("evil".into()), configured: true };
+        let bad = BindHostConfig::Ok {
+            raw_host: Some("evil".into()),
+            configured: true,
+        };
         assert_eq!(resolve_bind_host(&MapEnv::new(), false, bad), "127.0.0.1");
     }
 
     #[test]
     fn host_env_only_when_unconfigured() {
         let env = MapEnv::new().with("HOST", "0.0.0.0");
-        let unconfigured = BindHostConfig::Ok { raw_host: Some("127.0.0.1".into()), configured: false };
+        let unconfigured = BindHostConfig::Ok {
+            raw_host: Some("127.0.0.1".into()),
+            configured: false,
+        };
         assert_eq!(resolve_bind_host(&env, false, unconfigured), "0.0.0.0");
-        let configured = BindHostConfig::Ok { raw_host: Some("127.0.0.1".into()), configured: true };
+        let configured = BindHostConfig::Ok {
+            raw_host: Some("127.0.0.1".into()),
+            configured: true,
+        };
         assert_eq!(resolve_bind_host(&env, false, configured), "127.0.0.1");
     }
 
     #[test]
     fn failed_config_falls_back_to_host_then_localhost() {
         assert_eq!(
-            resolve_bind_host(&MapEnv::new().with("HOST", "0.0.0.0"), false, BindHostConfig::Failed),
+            resolve_bind_host(
+                &MapEnv::new().with("HOST", "0.0.0.0"),
+                false,
+                BindHostConfig::Failed
+            ),
             "0.0.0.0"
         );
-        assert_eq!(resolve_bind_host(&MapEnv::new(), false, BindHostConfig::Failed), "127.0.0.1");
+        assert_eq!(
+            resolve_bind_host(&MapEnv::new(), false, BindHostConfig::Failed),
+            "127.0.0.1"
+        );
     }
 
     // ---- P16: remote-access truth table -----------------------------------
 
     #[test]
     fn remote_access_host_0000_is_true() {
-        let n = NetworkIntent { configured: false, host: "0.0.0.0".into() };
-        assert!(is_remote_access_enabled(Some(&n), "127.0.0.1", FirewallPlatform::Windows));
+        let n = NetworkIntent {
+            configured: false,
+            host: "0.0.0.0".into(),
+        };
+        assert!(is_remote_access_enabled(
+            Some(&n),
+            "127.0.0.1",
+            FirewallPlatform::Windows
+        ));
     }
 
     #[test]
     fn remote_access_wsl2_is_false_unless_host_0000() {
-        let n = NetworkIntent { configured: false, host: "127.0.0.1".into() };
+        let n = NetworkIntent {
+            configured: false,
+            host: "127.0.0.1".into(),
+        };
         // wsl2 alone isn't "remote" even though it binds 0.0.0.0.
-        assert!(!is_remote_access_enabled(Some(&n), "0.0.0.0", FirewallPlatform::Wsl2));
+        assert!(!is_remote_access_enabled(
+            Some(&n),
+            "0.0.0.0",
+            FirewallPlatform::Wsl2
+        ));
     }
 
     #[test]
     fn remote_access_unconfigured_effective_0000() {
-        let n = NetworkIntent { configured: false, host: "127.0.0.1".into() };
-        assert!(is_remote_access_enabled(Some(&n), "0.0.0.0", FirewallPlatform::Windows));
-        let c = NetworkIntent { configured: true, host: "127.0.0.1".into() };
-        assert!(!is_remote_access_enabled(Some(&c), "0.0.0.0", FirewallPlatform::Windows));
+        let n = NetworkIntent {
+            configured: false,
+            host: "127.0.0.1".into(),
+        };
+        assert!(is_remote_access_enabled(
+            Some(&n),
+            "0.0.0.0",
+            FirewallPlatform::Windows
+        ));
+        let c = NetworkIntent {
+            configured: true,
+            host: "127.0.0.1".into(),
+        };
+        assert!(!is_remote_access_enabled(
+            Some(&c),
+            "0.0.0.0",
+            FirewallPlatform::Windows
+        ));
     }
 
     // ---- P14: allowed origins ---------------------------------------------
@@ -568,11 +650,14 @@ mod tests {
     #[test]
     fn origin_advisory_token_is_the_real_gate() {
         let env = MapEnv::new(); // default allowlist (no evil origin)
-        // A hostile origin is NOT in the allowlist ...
+                                 // A hostile origin is NOT in the allowlist ...
         assert!(!is_origin_allowed(Some("http://evil.example"), &env));
         // ... yet a request bearing the correct token still authorizes (origin is
         // advisory; the WS handler never rejects on it).
-        assert!(timing_safe_compare("s3cret-token-1234567", "s3cret-token-1234567"));
+        assert!(timing_safe_compare(
+            "s3cret-token-1234567",
+            "s3cret-token-1234567"
+        ));
         // A wrong token is what actually fails.
         assert!(!timing_safe_compare("s3cret-token-1234567", "nope"));
     }
@@ -590,7 +675,10 @@ mod tests {
     fn parse_allowed_origins_default_and_env() {
         assert_eq!(parse_allowed_origins(&MapEnv::new()).len(), 6);
         let env = MapEnv::new().with("ALLOWED_ORIGINS", "http://a:1, http://b:2 ,");
-        assert_eq!(parse_allowed_origins(&env), vec!["http://a:1", "http://b:2"]);
+        assert_eq!(
+            parse_allowed_origins(&env),
+            vec!["http://a:1", "http://b:2"]
+        );
     }
 
     // ---- P15: access URL ---------------------------------------------------
@@ -613,7 +701,10 @@ mod tests {
 
     #[test]
     fn access_url_falls_back_to_localhost_without_lan() {
-        assert_eq!(access_url(true, &[], 3001, "tok"), "http://localhost:3001/?token=tok");
+        assert_eq!(
+            access_url(true, &[], 3001, "tok"),
+            "http://localhost:3001/?token=tok"
+        );
     }
 
     // ---- P12: LAN scoring / ipconfig parse --------------------------------
@@ -642,7 +733,11 @@ Ethernet adapter vEthernet (WSL):\r\n\
 
     #[test]
     fn rank_windows_host_ips_orders_by_score() {
-        let ips = vec!["10.200.0.4".into(), "192.168.1.5".into(), "172.20.0.1".into()];
+        let ips = vec![
+            "10.200.0.4".into(),
+            "192.168.1.5".into(),
+            "172.20.0.1".into(),
+        ];
         assert_eq!(
             rank_windows_host_ips(&ips),
             vec!["192.168.1.5", "172.20.0.1", "10.200.0.4"]
@@ -684,7 +779,13 @@ Ethernet adapter vEthernet (WSL):\r\n\
         ];
         assert_eq!(
             rank_lan_ip_candidates(&cands),
-            vec!["192.168.1.5", "10.200.0.4", "169.254.7.9", "100.100.1.2", "192.168.9.9"]
+            vec![
+                "192.168.1.5",
+                "10.200.0.4",
+                "169.254.7.9",
+                "100.100.1.2",
+                "192.168.9.9"
+            ]
         );
     }
 
@@ -692,7 +793,12 @@ Ethernet adapter vEthernet (WSL):\r\n\
     fn detect_lan_ips_from_windows_interfaces_fake() {
         let runner = FakeCommandRunner::new().on(
             "powershell",
-            &["-NoProfile", "-NonInteractive", "-Command", WINDOWS_IP_PROBE],
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                WINDOWS_IP_PROBE,
+            ],
             CommandOutput::success("172.27.64.1 20\r\n192.168.1.50 24\r\n127.0.0.1 8\r\n"),
         );
         assert_eq!(

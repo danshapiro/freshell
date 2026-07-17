@@ -114,7 +114,9 @@ impl McpRuntime for RealMcpRuntime {
             .map(|v| v == "production")
             .unwrap_or(false);
         if node_env_production && built.is_file() {
-            return Ok(vec![McpServerArg::Path(built.to_string_lossy().into_owned())]);
+            return Ok(vec![McpServerArg::Path(
+                built.to_string_lossy().into_owned(),
+            )]);
         }
         // `require.resolve('tsx')` resolves the package export "." →
         // `./dist/loader.mjs` (rev 2 pin vs node_modules/tsx/package.json).
@@ -222,10 +224,7 @@ pub fn build_mcp_server_command_args(
 
 /// `tomlEscape` (`cw:142-144`): wrap in `"` with `\` → `\\` and `"` → `\"`.
 pub fn toml_escape(value: &str) -> String {
-    format!(
-        "\"{}\"",
-        value.replace('\\', "\\\\").replace('"', "\\\"")
-    )
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// The codex inline-TOML `-c` pair (`cw:264-275`): elements tomlEscape'd and
@@ -246,14 +245,16 @@ pub fn codex_inline_toml_args(server_args: &[String]) -> Vec<String> {
 }
 
 fn tmp_file_path(rt: &dyn McpRuntime, terminal_id: &str) -> PathBuf {
-    rt.tmp_dir().join("freshell-mcp").join(format!("{terminal_id}.json"))
+    rt.tmp_dir()
+        .join("freshell-mcp")
+        .join(format!("{terminal_id}.json"))
 }
 
 /// Write a file with `JSON.stringify(value, null, 2)` bytes at mode 0o600
 /// (mode applied at creation, matching `fs.writeFileSync`'s `mode` option).
 fn write_json_0600(path: &Path, value: &serde_json::Value) -> Result<(), McpInjectError> {
-    let bytes = serde_json::to_string_pretty(value)
-        .map_err(|e| McpInjectError::new(e.to_string()))?;
+    let bytes =
+        serde_json::to_string_pretty(value).map_err(|e| McpInjectError::new(e.to_string()))?;
     write_string_0600(path, &bytes)
 }
 
@@ -310,11 +311,15 @@ fn opencode_config_path(cwd: &str) -> PathBuf {
 }
 
 fn opencode_sidecar_path(cwd: &str) -> PathBuf {
-    Path::new(cwd).join(".opencode").join(".freshell-mcp-state.json")
+    Path::new(cwd)
+        .join(".opencode")
+        .join(".freshell-mcp-state.json")
 }
 
 fn opencode_lock_path(cwd: &str) -> PathBuf {
-    Path::new(cwd).join(".opencode").join(".freshell-mcp-state.lock")
+    Path::new(cwd)
+        .join(".opencode")
+        .join(".freshell-mcp-state.lock")
 }
 
 /// `acquireLock` (`cw:178-214`): O_EXCL create; stale (>30s mtime) locks are
@@ -403,7 +408,10 @@ fn opencode_inject(
     }
 
     let config_path = opencode_config_path(cwd);
-    let dir_path = config_path.parent().expect("config path has parent").to_path_buf();
+    let dir_path = config_path
+        .parent()
+        .expect("config path has parent")
+        .to_path_buf();
 
     let acquired = acquire_lock(cwd)?;
     let result = (|| -> Result<(), McpInjectError> {
@@ -550,10 +558,7 @@ pub fn generate_mcp_injection(
             let file_path = write_mcp_config_file(rt, terminal_id, target)?;
             let mut env = BTreeMap::new();
             env.insert("GEMINI_CLI_SYSTEM_DEFAULTS_PATH".to_string(), file_path);
-            Ok(McpInjection {
-                args: vec![],
-                env,
-            })
+            Ok(McpInjection { args: vec![], env })
         }
         "kimi" => {
             let file_path = write_mcp_config_file(rt, terminal_id, target)?;
@@ -591,7 +596,10 @@ fn cleanup_opencode(cwd: &str) {
         let Some(sidecar) = read_sidecar(cwd) else {
             return Ok(()); // No sidecar = user-managed; don't touch.
         };
-        let ref_count = sidecar.get("refCount").and_then(|v| v.as_i64()).unwrap_or(0);
+        let ref_count = sidecar
+            .get("refCount")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         if ref_count > 1 {
             let mut updated = sidecar.clone();
             if let Some(obj) = updated.as_object_mut() {

@@ -66,5 +66,9 @@ fn combined_surface_is_79() {
     assert_eq!(all.len(), 79, "27 client + 52 server = 79 discriminants");
     // sorted + unique
     let unique: BTreeSet<&str> = all.iter().copied().collect();
-    assert_eq!(unique.len(), 79, "no discriminant collides across directions");
+    assert_eq!(
+        unique.len(),
+        79,
+        "no discriminant collides across directions"
+    );
 }

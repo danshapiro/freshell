@@ -35,7 +35,9 @@ impl ServeHttp for IdleHttp {
     fn request<'a>(
         &'a self,
         req: ServeHttpRequest,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+    > {
         let body = if req.url.contains("/global/health") {
             b"{}".to_vec()
         } else if req.url.contains("/session/status") {
@@ -50,7 +52,10 @@ impl ServeHttp for IdleHttp {
 struct FakeAllocator;
 impl PortAllocator for FakeAllocator {
     fn allocate(&self) -> Result<Endpoint, String> {
-        Ok(Endpoint { hostname: "127.0.0.1".into(), port: 1 })
+        Ok(Endpoint {
+            hostname: "127.0.0.1".into(),
+            port: 1,
+        })
     }
 }
 
@@ -81,10 +86,15 @@ impl EventSource for NoopEventSource {
     }
 }
 
-async fn started_manager(status_body: serde_json::Value, idle_poll_ms: u64) -> OpencodeServeManager {
+async fn started_manager(
+    status_body: serde_json::Value,
+    idle_poll_ms: u64,
+) -> OpencodeServeManager {
     let deps = ServeDeps {
         spawner: Arc::new(FakeSpawner),
-        http: Arc::new(IdleHttp { status_body: serde_json::to_vec(&status_body).unwrap() }),
+        http: Arc::new(IdleHttp {
+            status_body: serde_json::to_vec(&status_body).unwrap(),
+        }),
         ports: Arc::new(FakeAllocator),
         events: Arc::new(NoopEventSource),
     };
@@ -93,7 +103,9 @@ async fn started_manager(status_body: serde_json::Value, idle_poll_ms: u64) -> O
         ..ServeConfig::default()
     };
     let mgr = OpencodeServeManager::new(deps, config);
-    mgr.ensure_started().await.expect("healthy fake serve starts");
+    mgr.ensure_started()
+        .await
+        .expect("healthy fake serve starts");
     mgr
 }
 
@@ -108,12 +120,21 @@ async fn resolves_on_sse_session_idle() {
     let mgr = started_manager(json!({}), 500).await;
     let rx = mgr.subscribe("ses_x");
     // Buffered before the wait polls: cannot be missed.
-    mgr.dispatch_event(event(json!({ "type": "session.idle", "properties": { "sessionID": "ses_x" } })));
+    mgr.dispatch_event(event(
+        json!({ "type": "session.idle", "properties": { "sessionID": "ses_x" } }),
+    ));
 
-    let result = tokio::time::timeout(Duration::from_secs(3), mgr.await_idle("ses_x", rx, Duration::from_secs(2), None))
-        .await
-        .expect("must not hang");
-    assert_eq!(result, Ok(()), "the SSE session.idle edge resolves onceIdle");
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        mgr.await_idle("ses_x", rx, Duration::from_secs(2), None),
+    )
+    .await
+    .expect("must not hang");
+    assert_eq!(
+        result,
+        Ok(()),
+        "the SSE session.idle edge resolves onceIdle"
+    );
 }
 
 #[tokio::test]
@@ -124,10 +145,17 @@ async fn resolves_on_sse_status_idle() {
         json!({ "type": "session.status", "properties": { "sessionID": "ses_x", "status": { "type": "idle" } } }),
     ));
 
-    let result = tokio::time::timeout(Duration::from_secs(3), mgr.await_idle("ses_x", rx, Duration::from_secs(2), None))
-        .await
-        .expect("must not hang");
-    assert_eq!(result, Ok(()), "the SSE session.status{{idle}} edge resolves onceIdle");
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        mgr.await_idle("ses_x", rx, Duration::from_secs(2), None),
+    )
+    .await
+    .expect("must not hang");
+    assert_eq!(
+        result,
+        Ok(()),
+        "the SSE session.status{{idle}} edge resolves onceIdle"
+    );
 }
 
 #[tokio::test]
@@ -141,10 +169,17 @@ async fn resolves_via_status_poll_fallback_after_activity() {
         json!({ "type": "session.status", "properties": { "sessionID": "ses_x", "status": { "type": "busy" } } }),
     ));
 
-    let result = tokio::time::timeout(Duration::from_secs(3), mgr.await_idle("ses_x", rx, Duration::from_secs(2), None))
-        .await
-        .expect("must not hang");
-    assert_eq!(result, Ok(()), "the idle status-poll fallback resolves onceIdle when SSE idle is missed");
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        mgr.await_idle("ses_x", rx, Duration::from_secs(2), None),
+    )
+    .await
+    .expect("must not hang");
+    assert_eq!(
+        result,
+        Ok(()),
+        "the idle status-poll fallback resolves onceIdle when SSE idle is missed"
+    );
 }
 
 #[tokio::test]
@@ -155,9 +190,12 @@ async fn does_not_resolve_from_status_idle_without_prior_activity() {
     let mgr = started_manager(json!({ "ses_x": { "type": "idle" } }), 15).await;
     let rx = mgr.subscribe("ses_x");
 
-    let result = tokio::time::timeout(Duration::from_secs(3), mgr.await_idle("ses_x", rx, Duration::from_millis(150), None))
-        .await
-        .expect("must not hang");
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        mgr.await_idle("ses_x", rx, Duration::from_millis(150), None),
+    )
+    .await
+    .expect("must not hang");
     assert!(
         matches!(result, Err(ServeError::IdleTimeout { .. })),
         "idle status without prior activity must not resolve, got {result:?}"
@@ -170,9 +208,12 @@ async fn rejects_on_sidecar_lost() {
     let rx = mgr.subscribe("ses_x");
     mgr.emit_lost_for_all();
 
-    let result = tokio::time::timeout(Duration::from_secs(3), mgr.await_idle("ses_x", rx, Duration::from_secs(2), None))
-        .await
-        .expect("must not hang");
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        mgr.await_idle("ses_x", rx, Duration::from_secs(2), None),
+    )
+    .await
+    .expect("must not hang");
     assert!(
         matches!(result, Err(ServeError::SidecarLost { .. })),
         "a lost sidecar rejects onceIdle, got {result:?}"
@@ -185,11 +226,17 @@ async fn rejects_on_idle_timeout() {
     let mgr = started_manager(json!({}), 500).await;
     let rx = mgr.subscribe("ses_x");
 
-    let result = tokio::time::timeout(Duration::from_secs(3), mgr.await_idle("ses_x", rx, Duration::from_millis(120), None))
-        .await
-        .expect("must not hang");
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        mgr.await_idle("ses_x", rx, Duration::from_millis(120), None),
+    )
+    .await
+    .expect("must not hang");
     match result {
-        Err(ServeError::IdleTimeout { session_id, timeout_ms }) => {
+        Err(ServeError::IdleTimeout {
+            session_id,
+            timeout_ms,
+        }) => {
             assert_eq!(session_id, "ses_x");
             assert_eq!(timeout_ms, 120);
         }

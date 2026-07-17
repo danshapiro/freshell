@@ -146,7 +146,10 @@ mod tests {
     #[test]
     fn configured_daemon_and_remote_also_reach_main() {
         for mode in [ServerMode::Daemon, ServerMode::Remote] {
-            let inputs = BootInputs { setup_completed: true, server_mode: mode };
+            let inputs = BootInputs {
+                setup_completed: true,
+                server_mode: mode,
+            };
             assert_eq!(decide_initial_phase(inputs), ShellPhase::Main);
         }
     }

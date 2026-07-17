@@ -76,7 +76,10 @@ pub enum IncomingMessage {
     /// `{ id, error }` — rejects the pending request `id`.
     RpcError { id: RequestId, error: RpcError },
     /// `{ method, params }` — a server-initiated notification.
-    Notification { method: String, params: Option<Value> },
+    Notification {
+        method: String,
+        params: Option<Value>,
+    },
 }
 
 /// A turn lifecycle event carrying the FULL notification params (`emitTurnEvent`,
@@ -99,13 +102,19 @@ pub enum CodexNotification {
     /// `thread/status/changed` (`protocol.ts:366-374`).
     ThreadStatusChanged { thread_id: String, status: Value },
     /// `fs/changed` (`protocol.ts:382-388`).
-    FsChanged { watch_id: String, changed_paths: Vec<String> },
+    FsChanged {
+        watch_id: String,
+        changed_paths: Vec<String>,
+    },
     /// `turn/started` (`protocol.ts:390-396`).
     TurnStarted(CodexTurnEvent),
     /// `turn/completed` (`protocol.ts:398-415`) — status-guarded downstream.
     TurnCompleted(CodexTurnEvent),
     /// Any other notification method (generic `handleNotification`, `client.ts:643-661`).
-    Other { method: String, params: Option<Value> },
+    Other {
+        method: String,
+        params: Option<Value>,
+    },
 }
 
 // ── frame building (client.ts:796,807-808) ────────────────────────────────────────────
@@ -147,7 +156,11 @@ fn parse_rpc_error(value: &Value) -> Option<RpcError> {
     let code = obj.get("code")?.as_i64()?;
     let message = obj.get("message")?.as_str()?.to_string();
     let data = obj.get("data").cloned();
-    Some(RpcError { code, message, data })
+    Some(RpcError {
+        code,
+        message,
+        data,
+    })
 }
 
 /// Decode one server→client frame. Mirrors the reference discrimination: a frame WITH an
@@ -162,10 +175,16 @@ pub fn parse_incoming_frame(raw: &str) -> Option<IncomingMessage> {
     if obj.contains_key("id") {
         let id = parse_request_id(obj.get("id")?)?;
         if let Some(result) = obj.get("result") {
-            return Some(IncomingMessage::Response { id, result: result.clone() });
+            return Some(IncomingMessage::Response {
+                id,
+                result: result.clone(),
+            });
         }
         if let Some(error) = obj.get("error") {
-            return Some(IncomingMessage::RpcError { id, error: parse_rpc_error(error)? });
+            return Some(IncomingMessage::RpcError {
+                id,
+                error: parse_rpc_error(error)?,
+            });
         }
         // Has id but neither result nor error → not a recognizable envelope; drop.
         return None;
@@ -182,8 +201,15 @@ pub fn parse_incoming_frame(raw: &str) -> Option<IncomingMessage> {
 /// server side is the `ws` `on('message')` handler (`fake-app-server.mjs:418-426`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClientFrame {
-    Request { id: RequestId, method: String, params: Value },
-    Notification { method: String, params: Option<Value> },
+    Request {
+        id: RequestId,
+        method: String,
+        params: Value,
+    },
+    Notification {
+        method: String,
+        params: Option<Value>,
+    },
 }
 
 /// Decode a client→server frame: a frame WITH an `id` key is a request, else a notification
@@ -198,7 +224,10 @@ pub fn parse_client_frame(raw: &str) -> Option<ClientFrame> {
         let params = obj.get("params").cloned().unwrap_or(Value::Null);
         return Some(ClientFrame::Request { id, method, params });
     }
-    Some(ClientFrame::Notification { method, params: obj.get("params").cloned() })
+    Some(ClientFrame::Notification {
+        method,
+        params: obj.get("params").cloned(),
+    })
 }
 
 // ── notification classification (client.ts:576-615) ─────────────────────────────────────
@@ -210,8 +239,15 @@ fn required_string(map: &Map<String, Value>, key: &str) -> Option<String> {
 fn turn_event_from_params(params: Option<&Value>) -> Option<CodexTurnEvent> {
     let obj = params?.as_object()?;
     let thread_id = required_string(obj, "threadId")?;
-    let turn_id = obj.get("turnId").and_then(Value::as_str).map(str::to_string);
-    Some(CodexTurnEvent { thread_id, turn_id, params: obj.clone() })
+    let turn_id = obj
+        .get("turnId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some(CodexTurnEvent {
+        thread_id,
+        turn_id,
+        params: obj.clone(),
+    })
 }
 
 /// Classify a notification method+params into a typed [`CodexNotification`]
@@ -246,9 +282,16 @@ pub fn classify_notification(method: &str, params: Option<&Value>) -> CodexNotif
                     let changed_paths = p
                         .get("changedPaths")
                         .and_then(Value::as_array)
-                        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect()
+                        })
                         .unwrap_or_default();
-                    return CodexNotification::FsChanged { watch_id, changed_paths };
+                    return CodexNotification::FsChanged {
+                        watch_id,
+                        changed_paths,
+                    };
                 }
             }
         }
@@ -264,7 +307,10 @@ pub fn classify_notification(method: &str, params: Option<&Value>) -> CodexNotif
         }
         _ => {}
     }
-    CodexNotification::Other { method: method.to_string(), params: params.cloned() }
+    CodexNotification::Other {
+        method: method.to_string(),
+        params: params.cloned(),
+    }
 }
 
 /// The RAW completion status the adapter guard reads: `params.turn?.status ?? params.status`
@@ -280,15 +326,25 @@ pub fn turn_status(params: &Map<String, Value>) -> Option<String> {
     if let Some(status) = nested {
         return Some(status.to_string());
     }
-    params.get("status").and_then(Value::as_str).map(str::to_string)
+    params
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// The result of the validated turn-notification classifier
 /// ([`extract_turn_notification_event`]).
 #[derive(Clone, Debug, PartialEq)]
 pub enum TurnNotificationEvent {
-    Started { thread_id: String, turn_id: Option<String> },
-    Completed { thread_id: String, turn_id: Option<String>, status: Option<String> },
+    Started {
+        thread_id: String,
+        turn_id: Option<String>,
+    },
+    Completed {
+        thread_id: String,
+        turn_id: Option<String>,
+        status: Option<String>,
+    },
     /// The reference's `{ ok:false, reason }` (`json-rpc-side-effects.ts`). The CORE reports
     /// the reason string verbatim for the common cases (`unsupported_shape`, `malformed_json`).
     Rejected { reason: String },
@@ -301,27 +357,43 @@ pub enum TurnNotificationEvent {
 /// which is what the CORE consumes. A bogus/absent-required field is `Rejected`.
 pub fn extract_turn_notification_event(raw: &str) -> TurnNotificationEvent {
     let Ok(value) = serde_json::from_str::<Value>(raw) else {
-        return TurnNotificationEvent::Rejected { reason: "malformed_json".to_string() };
+        return TurnNotificationEvent::Rejected {
+            reason: "malformed_json".to_string(),
+        };
     };
     let Some(obj) = value.as_object() else {
-        return TurnNotificationEvent::Rejected { reason: "unsupported_shape".to_string() };
+        return TurnNotificationEvent::Rejected {
+            reason: "unsupported_shape".to_string(),
+        };
     };
     let method = obj.get("method").and_then(Value::as_str).unwrap_or("");
     if method != "turn/started" && method != "turn/completed" {
-        return TurnNotificationEvent::Rejected { reason: "unsupported_shape".to_string() };
+        return TurnNotificationEvent::Rejected {
+            reason: "unsupported_shape".to_string(),
+        };
     }
     let Some(params) = obj.get("params").and_then(Value::as_object) else {
-        return TurnNotificationEvent::Rejected { reason: "unsupported_shape".to_string() };
+        return TurnNotificationEvent::Rejected {
+            reason: "unsupported_shape".to_string(),
+        };
     };
     let thread_id = match required_string(params, "threadId") {
         Some(id) if !id.is_empty() => id,
-        _ => return TurnNotificationEvent::Rejected { reason: "unsupported_shape".to_string() },
+        _ => {
+            return TurnNotificationEvent::Rejected {
+                reason: "unsupported_shape".to_string(),
+            }
+        }
     };
     // turnId, if present, must be a string.
     let turn_id = match params.get("turnId") {
         None => None,
         Some(Value::String(s)) => Some(s.clone()),
-        Some(_) => return TurnNotificationEvent::Rejected { reason: "unsupported_shape".to_string() },
+        Some(_) => {
+            return TurnNotificationEvent::Rejected {
+                reason: "unsupported_shape".to_string(),
+            }
+        }
     };
 
     if method == "turn/started" {
@@ -332,10 +404,16 @@ pub fn extract_turn_notification_event(raw: &str) -> TurnNotificationEvent {
     let status = turn_status(params);
     if let Some(ref s) = status {
         if !TURN_STATUSES.contains(&s.as_str()) {
-            return TurnNotificationEvent::Rejected { reason: "unsupported_shape".to_string() };
+            return TurnNotificationEvent::Rejected {
+                reason: "unsupported_shape".to_string(),
+            };
         }
     }
-    TurnNotificationEvent::Completed { thread_id, turn_id, status }
+    TurnNotificationEvent::Completed {
+        thread_id,
+        turn_id,
+        status,
+    }
 }
 
 #[cfg(test)]
@@ -347,15 +425,28 @@ mod tests {
     #[test]
     fn request_frame_has_id_method_params_and_no_jsonrpc_tag() {
         // Mirrors client.ts:796 exactly: { id, method, params } with no jsonrpc tag.
-        let frame = build_request_frame(&RequestId::Int(1), "initialize", &json!({ "clientInfo": {} }));
-        assert_eq!(frame, r#"{"id":1,"method":"initialize","params":{"clientInfo":{}}}"#);
-        assert!(!frame.contains("jsonrpc"), "the reference does not emit a jsonrpc tag");
+        let frame = build_request_frame(
+            &RequestId::Int(1),
+            "initialize",
+            &json!({ "clientInfo": {} }),
+        );
+        assert_eq!(
+            frame,
+            r#"{"id":1,"method":"initialize","params":{"clientInfo":{}}}"#
+        );
+        assert!(
+            !frame.contains("jsonrpc"),
+            "the reference does not emit a jsonrpc tag"
+        );
     }
 
     #[test]
     fn notification_frame_omits_params_when_absent() {
         // `notify('initialized')` sends { method } with no params (client.ts:807).
-        assert_eq!(build_notification_frame("initialized", None), r#"{"method":"initialized"}"#);
+        assert_eq!(
+            build_notification_frame("initialized", None),
+            r#"{"method":"initialized"}"#
+        );
         assert_eq!(
             build_notification_frame("x", Some(&json!({ "a": 1 }))),
             r#"{"method":"x","params":{"a":1}}"#
@@ -370,19 +461,27 @@ mod tests {
         let msg = parse_incoming_frame(r#"{"id":3,"result":{"turn":{"id":"turn-1"}}}"#).unwrap();
         assert_eq!(
             msg,
-            IncomingMessage::Response { id: RequestId::Int(3), result: json!({ "turn": { "id": "turn-1" } }) }
+            IncomingMessage::Response {
+                id: RequestId::Int(3),
+                result: json!({ "turn": { "id": "turn-1" } })
+            }
         );
     }
 
     #[test]
     fn parses_error_envelope() {
         // fake-app-server.mjs:428-434 sends { id, error:{code,message} }.
-        let msg = parse_incoming_frame(r#"{"id":5,"error":{"code":-32600,"message":"bad"}}"#).unwrap();
+        let msg =
+            parse_incoming_frame(r#"{"id":5,"error":{"code":-32600,"message":"bad"}}"#).unwrap();
         assert_eq!(
             msg,
             IncomingMessage::RpcError {
                 id: RequestId::Int(5),
-                error: RpcError { code: -32600, message: "bad".into(), data: None },
+                error: RpcError {
+                    code: -32600,
+                    message: "bad".into(),
+                    data: None
+                },
             }
         );
     }
@@ -417,7 +516,13 @@ mod tests {
     #[test]
     fn parses_string_request_ids_too() {
         let msg = parse_incoming_frame(r#"{"id":"req-7","result":{}}"#).unwrap();
-        assert_eq!(msg, IncomingMessage::Response { id: RequestId::Str("req-7".into()), result: json!({}) });
+        assert_eq!(
+            msg,
+            IncomingMessage::Response {
+                id: RequestId::Str("req-7".into()),
+                result: json!({})
+            }
+        );
     }
 
     // ── notification classification (client.ts fan-out) ─────────────────────────────────
@@ -446,12 +551,16 @@ mod tests {
             "turn/completed",
             Some(&json!({ "threadId": "thread-1", "turnId": "turn-1", "status": "completed" })),
         );
-        assert!(matches!(flat, CodexNotification::TurnCompleted(ref e) if e.thread_id == "thread-1"));
+        assert!(
+            matches!(flat, CodexNotification::TurnCompleted(ref e) if e.thread_id == "thread-1")
+        );
 
         // Inline turn.status (codex-adapter.test.ts:1109 shape).
         let inline = classify_notification(
             "turn/completed",
-            Some(&json!({ "threadId": "thread-1", "turn": { "id": "turn-1", "status": "completed" } })),
+            Some(
+                &json!({ "threadId": "thread-1", "turn": { "id": "turn-1", "status": "completed" } }),
+            ),
         );
         assert!(matches!(inline, CodexNotification::TurnCompleted(_)));
     }
@@ -460,25 +569,35 @@ mod tests {
     fn classifies_thread_lifecycle_and_fs_changed() {
         assert_eq!(
             classify_notification("thread/started", Some(&json!({ "thread": { "id": "t1" } }))),
-            CodexNotification::ThreadStarted { thread: json!({ "id": "t1" }) }
+            CodexNotification::ThreadStarted {
+                thread: json!({ "id": "t1" })
+            }
         );
         assert_eq!(
             classify_notification("thread/closed", Some(&json!({ "threadId": "t1" }))),
-            CodexNotification::ThreadClosed { thread_id: "t1".into() }
+            CodexNotification::ThreadClosed {
+                thread_id: "t1".into()
+            }
         );
         assert_eq!(
             classify_notification(
                 "thread/status/changed",
                 Some(&json!({ "threadId": "t1", "status": { "type": "idle" } }))
             ),
-            CodexNotification::ThreadStatusChanged { thread_id: "t1".into(), status: json!({ "type": "idle" }) }
+            CodexNotification::ThreadStatusChanged {
+                thread_id: "t1".into(),
+                status: json!({ "type": "idle" })
+            }
         );
         assert_eq!(
             classify_notification(
                 "fs/changed",
                 Some(&json!({ "watchId": "w1", "changedPaths": ["/a", "/b"] }))
             ),
-            CodexNotification::FsChanged { watch_id: "w1".into(), changed_paths: vec!["/a".into(), "/b".into()] }
+            CodexNotification::FsChanged {
+                watch_id: "w1".into(),
+                changed_paths: vec!["/a".into(), "/b".into()]
+            }
         );
     }
 
@@ -486,7 +605,10 @@ mod tests {
     fn unknown_notification_is_other() {
         assert_eq!(
             classify_notification("something/else", Some(&json!({ "x": 1 }))),
-            CodexNotification::Other { method: "something/else".into(), params: Some(json!({ "x": 1 })) }
+            CodexNotification::Other {
+                method: "something/else".into(),
+                params: Some(json!({ "x": 1 }))
+            }
         );
     }
 
@@ -496,10 +618,16 @@ mod tests {
     fn turn_status_prefers_inline_then_flat() {
         // Inline turn.status wins.
         let inline = json!({ "turn": { "status": "completed" }, "status": "interrupted" });
-        assert_eq!(turn_status(inline.as_object().unwrap()).as_deref(), Some("completed"));
+        assert_eq!(
+            turn_status(inline.as_object().unwrap()).as_deref(),
+            Some("completed")
+        );
         // Falls back to flat status when no inline turn.status.
         let flat = json!({ "status": "failed" });
-        assert_eq!(turn_status(flat.as_object().unwrap()).as_deref(), Some("failed"));
+        assert_eq!(
+            turn_status(flat.as_object().unwrap()).as_deref(),
+            Some("failed")
+        );
         // Neither → None.
         let neither = json!({ "threadId": "t" });
         assert_eq!(turn_status(neither.as_object().unwrap()), None);
@@ -528,13 +656,17 @@ mod tests {
             extract_turn_notification_event(
                 r#"{"method":"turn/completed","params":{"threadId":"thread-1","turnId":"t","status":"bogus"}}"#
             ),
-            TurnNotificationEvent::Rejected { reason: "unsupported_shape".into() }
+            TurnNotificationEvent::Rejected {
+                reason: "unsupported_shape".into()
+            }
         );
         assert_eq!(
             extract_turn_notification_event(
                 r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"t","status":"bogus"}}}"#
             ),
-            TurnNotificationEvent::Rejected { reason: "unsupported_shape".into() }
+            TurnNotificationEvent::Rejected {
+                reason: "unsupported_shape".into()
+            }
         );
     }
 
@@ -544,20 +676,33 @@ mod tests {
             extract_turn_notification_event(
                 r#"{"method":"turn/started","params":{"threadId":"thread-1","turnId":"turn-1","extra":true}}"#
             ),
-            TurnNotificationEvent::Started { thread_id: "thread-1".into(), turn_id: Some("turn-1".into()) }
+            TurnNotificationEvent::Started {
+                thread_id: "thread-1".into(),
+                turn_id: Some("turn-1".into())
+            }
         );
         // Wrong method, missing threadId, non-object params, malformed json.
         assert_eq!(
-            extract_turn_notification_event(r#"{"method":"thread/closed","params":{"threadId":"t"}}"#),
-            TurnNotificationEvent::Rejected { reason: "unsupported_shape".into() }
+            extract_turn_notification_event(
+                r#"{"method":"thread/closed","params":{"threadId":"t"}}"#
+            ),
+            TurnNotificationEvent::Rejected {
+                reason: "unsupported_shape".into()
+            }
         );
         assert_eq!(
-            extract_turn_notification_event(r#"{"method":"turn/completed","params":{"turnId":"t"}}"#),
-            TurnNotificationEvent::Rejected { reason: "unsupported_shape".into() }
+            extract_turn_notification_event(
+                r#"{"method":"turn/completed","params":{"turnId":"t"}}"#
+            ),
+            TurnNotificationEvent::Rejected {
+                reason: "unsupported_shape".into()
+            }
         );
         assert_eq!(
             extract_turn_notification_event("{bad"),
-            TurnNotificationEvent::Rejected { reason: "malformed_json".into() }
+            TurnNotificationEvent::Rejected {
+                reason: "malformed_json".into()
+            }
         );
     }
 }

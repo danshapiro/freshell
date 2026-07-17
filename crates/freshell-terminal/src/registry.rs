@@ -443,10 +443,17 @@ impl TerminalRegistry {
     pub fn detach(&self, terminal_id: &str, conn_id: u64) {
         let shared = {
             let inner = self.inner.lock().expect("registry lock");
-            inner.terminals.get(terminal_id).map(|h| Arc::clone(&h.shared))
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|h| Arc::clone(&h.shared))
         };
         if let Some(shared) = shared {
-            shared.lock().expect("terminal lock").subscribers.remove(&conn_id);
+            shared
+                .lock()
+                .expect("terminal lock")
+                .subscribers
+                .remove(&conn_id);
         }
     }
 
@@ -455,10 +462,18 @@ impl TerminalRegistry {
     pub fn remove_connection(&self, conn_id: u64) {
         let shareds: Vec<Arc<Mutex<TerminalShared>>> = {
             let inner = self.inner.lock().expect("registry lock");
-            inner.terminals.values().map(|h| Arc::clone(&h.shared)).collect()
+            inner
+                .terminals
+                .values()
+                .map(|h| Arc::clone(&h.shared))
+                .collect()
         };
         for shared in shareds {
-            shared.lock().expect("terminal lock").subscribers.remove(&conn_id);
+            shared
+                .lock()
+                .expect("terminal lock")
+                .subscribers
+                .remove(&conn_id);
         }
     }
 
@@ -470,7 +485,11 @@ impl TerminalRegistry {
             if let Some(pty) = handle.pty.as_mut() {
                 let _ = pty.write_input(data);
             }
-            handle.shared.lock().expect("terminal lock").last_activity_at = now_ms();
+            handle
+                .shared
+                .lock()
+                .expect("terminal lock")
+                .last_activity_at = now_ms();
         }
     }
 
@@ -576,7 +595,11 @@ impl TerminalRegistry {
     pub fn inventory(&self) -> Vec<InventoryTerminal> {
         let shareds: Vec<Arc<Mutex<TerminalShared>>> = {
             let inner = self.inner.lock().expect("registry lock");
-            inner.terminals.values().map(|h| Arc::clone(&h.shared)).collect()
+            inner
+                .terminals
+                .values()
+                .map(|h| Arc::clone(&h.shared))
+                .collect()
         };
         let mut out: Vec<InventoryTerminal> = shareds
             .iter()
@@ -606,7 +629,10 @@ impl TerminalRegistry {
     ) {
         let shared = {
             let inner = self.inner.lock().expect("registry lock");
-            inner.terminals.get(terminal_id).map(|h| Arc::clone(&h.shared))
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|h| Arc::clone(&h.shared))
         };
         if let Some(shared) = shared {
             let mut s = shared.lock().expect("terminal lock");
@@ -645,7 +671,11 @@ impl TerminalRegistry {
     pub fn directory(&self) -> Vec<DirectoryEntry> {
         let shareds: Vec<Arc<Mutex<TerminalShared>>> = {
             let inner = self.inner.lock().expect("registry lock");
-            inner.terminals.values().map(|h| Arc::clone(&h.shared)).collect()
+            inner
+                .terminals
+                .values()
+                .map(|h| Arc::clone(&h.shared))
+                .collect()
         };
         shareds
             .iter()
@@ -675,7 +705,11 @@ impl TerminalRegistry {
 
     /// Whether a terminal is currently registered (running). For teardown assertions.
     pub fn is_running(&self, terminal_id: &str) -> bool {
-        self.inner.lock().expect("registry lock").terminals.contains_key(terminal_id)
+        self.inner
+            .lock()
+            .expect("registry lock")
+            .terminals
+            .contains_key(terminal_id)
     }
 }
 
@@ -710,9 +744,18 @@ fn ingest(shared: &Arc<Mutex<TerminalShared>>, msg: ServerMessage) {
     // (source stays 'live'). A single live frame is one small batch — the merge logic
     // is the same as replay's (proven byte-exact by the deterministic crate goldens).
     for sub in s.subscribers.values() {
-        match (sub.terminal_output_batch_v1, sub.attach_request_id.as_deref()) {
+        match (
+            sub.terminal_output_batch_v1,
+            sub.attach_request_id.as_deref(),
+        ) {
             (true, Some(arid)) => {
-                deliver_batches(&sub.sink, &terminal_id, std::slice::from_ref(&retained), arid, "live");
+                deliver_batches(
+                    &sub.sink,
+                    &terminal_id,
+                    std::slice::from_ref(&retained),
+                    arid,
+                    "live",
+                );
             }
             _ => {
                 let mut f = retained.output.clone();
@@ -821,7 +864,10 @@ mod tests {
                 subscribers: HashMap::new(),
             }));
             let mut inner = self.inner.lock().unwrap();
-            inner.terminals.insert(terminal_id.to_string(), TerminalHandle { shared, pty: None });
+            inner.terminals.insert(
+                terminal_id.to_string(),
+                TerminalHandle { shared, pty: None },
+            );
             inner.revision += 1;
         }
 
@@ -853,7 +899,9 @@ mod tests {
         })
     }
 
-    fn batches(seen: &Arc<StdMutex<Vec<ServerMessage>>>) -> Vec<freshell_protocol::TerminalOutputBatch> {
+    fn batches(
+        seen: &Arc<StdMutex<Vec<ServerMessage>>>,
+    ) -> Vec<freshell_protocol::TerminalOutputBatch> {
         seen.lock()
             .unwrap()
             .iter()
@@ -879,10 +927,19 @@ mod tests {
         let (legacy_sink, legacy_seen) = collector();
         reg.attach("T", 1, legacy_sink, Some("legacy".into()), 0, false);
         let legacy = outputs(&legacy_seen);
-        assert!(!legacy.is_empty(), "legacy attach replays terminal.output frames");
-        assert!(batches(&legacy_seen).is_empty(), "legacy attach must NOT emit batch frames");
+        assert!(
+            !legacy.is_empty(),
+            "legacy attach replays terminal.output frames"
+        );
+        assert!(
+            batches(&legacy_seen).is_empty(),
+            "legacy attach must NOT emit batch frames"
+        );
         let legacy_data: String = {
-            let mut v: Vec<_> = legacy.iter().map(|f| (f.seq_start, f.data.clone())).collect();
+            let mut v: Vec<_> = legacy
+                .iter()
+                .map(|f| (f.seq_start, f.data.clone()))
+                .collect();
             v.sort_by_key(|(s, _)| *s);
             v.into_iter().map(|(_, d)| d).collect()
         };
@@ -893,14 +950,23 @@ mod tests {
         let (batch_sink, batch_seen) = collector();
         reg.attach("T", 2, batch_sink, Some("batch".into()), 0, true);
         let bs = batches(&batch_seen);
-        assert!(!bs.is_empty(), "batch attach emits terminal.output.batch frames");
-        assert!(outputs(&batch_seen).is_empty(), "batch attach must NOT emit legacy terminal.output");
+        assert!(
+            !bs.is_empty(),
+            "batch attach emits terminal.output.batch frames"
+        );
+        assert!(
+            outputs(&batch_seen).is_empty(),
+            "batch attach must NOT emit legacy terminal.output"
+        );
         let batch_data: String = {
             let mut v: Vec<_> = bs.iter().map(|b| (b.seq_start, b.data.clone())).collect();
             v.sort_by_key(|(s, _)| *s);
             v.into_iter().map(|(_, d)| d).collect()
         };
-        assert_eq!(batch_data, legacy_data, "batch and legacy reassemble to identical bytes");
+        assert_eq!(
+            batch_data, legacy_data,
+            "batch and legacy reassemble to identical bytes"
+        );
         assert_eq!(batch_data, "hello world\r\n");
         for b in &bs {
             assert_eq!(b.attach_request_id, "batch");
@@ -913,7 +979,10 @@ mod tests {
                 reassembled.push_str(&crate::batch::slice_utf16(&b.data, prev, seg.end_offset));
                 prev = seg.end_offset;
             }
-            assert_eq!(reassembled, b.data, "UTF-16 endOffsets reconstruct the batch data");
+            assert_eq!(
+                reassembled, b.data,
+                "UTF-16 endOffsets reconstruct the batch data"
+            );
         }
     }
 
@@ -955,7 +1024,10 @@ mod tests {
         assert_eq!(ready.head_seq, 3);
         assert_eq!(ready.replay_from_seq, 1);
         assert_eq!(ready.replay_to_seq, 3);
-        assert_eq!(ready.geometry_authority, Some(GeometryAuthority::SingleClient));
+        assert_eq!(
+            ready.geometry_authority,
+            Some(GeometryAuthority::SingleClient)
+        );
 
         let frames = outputs(&seen);
         assert_eq!(frames.len(), 3);
@@ -982,7 +1054,10 @@ mod tests {
 
         // Detach: subscription gone, but the terminal keeps running + buffering.
         reg.detach("T", 1);
-        assert!(reg.is_running("T"), "terminal survives detach (background session)");
+        assert!(
+            reg.is_running("T"),
+            "terminal survives detach (background session)"
+        );
         reg.feed("T", frame(2, "while-detached\r\n", "S"));
         // The detached connection receives nothing more.
         assert_eq!(outputs(&seen_a).len(), 1);
@@ -1008,7 +1083,10 @@ mod tests {
         // Second attach: geometry authority flips to multi_client_unknown.
         reg.attach("T", 2, sink_b, Some("bbb".into()), 0, false);
         let ready_b = attach_ready(&seen_b).unwrap();
-        assert_eq!(ready_b.geometry_authority, Some(GeometryAuthority::MultiClientUnknown));
+        assert_eq!(
+            ready_b.geometry_authority,
+            Some(GeometryAuthority::MultiClientUnknown)
+        );
 
         // One live frame fans out to BOTH sockets, each stamped with its own id.
         reg.feed("T", frame(1, "shared\r\n", "S"));
@@ -1069,7 +1147,9 @@ mod tests {
         assert_eq!(frames[0].source, Some(OutputSource::Replay));
         assert_eq!(frames[1].source, Some(OutputSource::Live));
         // Both stamped with the connection's attach id.
-        assert!(frames.iter().all(|f| f.attach_request_id.as_deref() == Some("z")));
+        assert!(frames
+            .iter()
+            .all(|f| f.attach_request_id.as_deref() == Some("z")));
     }
 
     #[test]
@@ -1094,7 +1174,11 @@ mod tests {
         assert!(reg.revision() > rev_before, "revision bumped");
 
         // The attached connection received terminal.exit.
-        let got_exit = seen.lock().unwrap().iter().any(|m| matches!(m, ServerMessage::TerminalExit(_)));
+        let got_exit = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| matches!(m, ServerMessage::TerminalExit(_)));
         assert!(got_exit);
         // Killing an unknown terminal is a no-op false.
         assert!(!reg.kill("T"));

@@ -267,10 +267,7 @@ fn setup_remote(
 /// on-screen via [`window_state::clamp_to_monitors`] (the guard
 /// `tauri-plugin-window-state` provides; Electron restores off-screen verbatim —
 /// documented as a latent original gap in `window_state.rs`).
-fn create_main_window(
-    app: &tauri::App,
-    url: url::Url,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn create_main_window(app: &tauri::App, url: url::Url) -> Result<(), Box<dyn std::error::Error>> {
     let state = load_persisted_window_state();
     let mut builder = WebviewWindowBuilder::new(app.handle(), "main", WebviewUrl::External(url))
         .title("Freshell")

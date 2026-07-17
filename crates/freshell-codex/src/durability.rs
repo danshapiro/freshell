@@ -44,7 +44,8 @@ pub fn mint_ownership_id() -> String {
 /// The default server-instance id: `FRESHELL_SERVER_INSTANCE_ID` or `srv-<pid>`
 /// (`runtime.ts:923`). Stamped into ownership metadata + durability records.
 pub fn default_server_instance_id() -> String {
-    std::env::var("FRESHELL_SERVER_INSTANCE_ID").unwrap_or_else(|_| format!("srv-{}", std::process::id()))
+    std::env::var("FRESHELL_SERVER_INSTANCE_ID")
+        .unwrap_or_else(|_| format!("srv-{}", std::process::id()))
 }
 
 /// `defaultCodexDurabilityStoreDir()` (`durability-store.ts:24-27`):
@@ -116,7 +117,11 @@ impl DurabilityCandidate {
 
     /// Pin the `{ candidateThreadId, rolloutPath }`. Idempotent for an identical re-set; an
     /// attempt to change an already-pinned field yields [`CandidateImmutableError`].
-    pub fn set(&mut self, candidate_thread_id: &str, rollout_path: &str) -> Result<(), CandidateImmutableError> {
+    pub fn set(
+        &mut self,
+        candidate_thread_id: &str,
+        rollout_path: &str,
+    ) -> Result<(), CandidateImmutableError> {
         if let Some(existing) = &self.candidate_thread_id {
             if existing != candidate_thread_id {
                 return Err(CandidateImmutableError {
@@ -188,7 +193,7 @@ mod tests {
         // The exact codex-gptmini.json placeholder/durable pattern.
         assert!(is_codex_thread_id("019810de-1e5f-7db3-9c47-1c2a3b4c5d6e"));
         assert!(is_codex_thread_id("ABCDEF01-2345-6789-abcd-ef0123456789")); // case-insensitive
-        // Rejections: too short, extra chars, non-hex, wrong grouping.
+                                                                             // Rejections: too short, extra chars, non-hex, wrong grouping.
         assert!(!is_codex_thread_id("thread-new-1"));
         assert!(!is_codex_thread_id("freshopencode-abc"));
         assert!(!is_codex_thread_id("019810de-1e5f-7db3-9c47-1c2a3b4c5d6")); // 11 in last group
@@ -207,15 +212,24 @@ mod tests {
             "019810de-1e5f-7db3-9c47-1c2a3b4c5d6e"
         );
         // No UUID → the basename verbatim (reference fallback).
-        assert_eq!(extract_session_id_from_filename("/x/session-activity.jsonl"), "session-activity");
-        assert_eq!(extract_session_id_from_filename("rollout-plain.jsonl"), "rollout-plain");
+        assert_eq!(
+            extract_session_id_from_filename("/x/session-activity.jsonl"),
+            "session-activity"
+        );
+        assert_eq!(
+            extract_session_id_from_filename("rollout-plain.jsonl"),
+            "rollout-plain"
+        );
     }
 
     #[test]
     fn ownership_id_and_needle_shapes() {
         let id = mint_ownership_id();
         assert!(id.starts_with("codex-sidecar-"));
-        assert!(is_codex_thread_id(id.trim_start_matches("codex-sidecar-")), "the tail is a UUID");
+        assert!(
+            is_codex_thread_id(id.trim_start_matches("codex-sidecar-")),
+            "the tail is a UUID"
+        );
         assert_eq!(
             ownership_needle("codex-sidecar-abc"),
             "FRESHELL_CODEX_SIDECAR_ID=codex-sidecar-abc"
@@ -236,11 +250,15 @@ mod tests {
     fn durability_candidate_is_immutable_once_set() {
         let mut candidate = DurabilityCandidate::default();
         assert_eq!(candidate.candidate_thread_id(), None);
-        candidate.set("thread-a", "/rollouts/a.jsonl").expect("first set");
+        candidate
+            .set("thread-a", "/rollouts/a.jsonl")
+            .expect("first set");
         assert_eq!(candidate.candidate_thread_id(), Some("thread-a"));
         assert_eq!(candidate.rollout_path(), Some("/rollouts/a.jsonl"));
         // Idempotent re-set with the same values is allowed.
-        candidate.set("thread-a", "/rollouts/a.jsonl").expect("idempotent re-set");
+        candidate
+            .set("thread-a", "/rollouts/a.jsonl")
+            .expect("idempotent re-set");
         // A different thread id is refused.
         let err = candidate.set("thread-b", "/rollouts/a.jsonl").unwrap_err();
         assert_eq!(err.field, "candidateThreadId");

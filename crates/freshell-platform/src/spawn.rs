@@ -183,7 +183,8 @@ pub fn get_windows_default_cwd(env: &dyn Env, is_wsl_env: bool) -> String {
     if let Some(user_profile) = env.get("USERPROFILE") {
         if !user_profile.trim().is_empty() {
             // resolveWindowsShellCwd(USERPROFILE)
-            if let Some(resolved) = resolve_windows_shell_cwd(Some(&user_profile), env, is_wsl_env) {
+            if let Some(resolved) = resolve_windows_shell_cwd(Some(&user_profile), env, is_wsl_env)
+            {
                 return resolved;
             }
         }
@@ -198,7 +199,8 @@ pub fn get_windows_default_cwd(env: &dyn Env, is_wsl_env: bool) -> String {
     }
     let system_drive = env.or_default("SYSTEMDRIVE", "C:");
     // path.win32.resolve(`${SYSTEMDRIVE}\\`)
-    crate::path::win32_resolve(&format!("{system_drive}\\")).unwrap_or_else(|| format!("{system_drive}\\"))
+    crate::path::win32_resolve(&format!("{system_drive}\\"))
+        .unwrap_or_else(|| format!("{system_drive}\\"))
 }
 
 /// `getSystemShell` (`terminal-registry.ts:971-989`). `fs.existsSync` is injected
@@ -239,7 +241,11 @@ pub fn resolve_windows_shell_cwd(
 
 /// `resolveUnixShellCwd` (`terminal-registry.ts:907-909`). Public since
 /// task-006: the unix-tail `mcpCwd` (`terminal-registry.ts:1262`) is this value.
-pub fn resolve_unix_shell_cwd(cwd: Option<&str>, env: &dyn Env, is_wsl_env: bool) -> Option<String> {
+pub fn resolve_unix_shell_cwd(
+    cwd: Option<&str>,
+    env: &dyn Env,
+    is_wsl_env: bool,
+) -> Option<String> {
     resolve_launch_cwd(cwd, LaunchCwdTargetRuntime::LinuxProcess, env, is_wsl_env).launch_cwd
 }
 
@@ -406,7 +412,8 @@ pub fn build_spawn_spec(
                 if is_linux_path(c) {
                     c.to_string()
                 } else {
-                    convert_windows_path_to_wsl_path(c, env, is_wsl_env).unwrap_or_else(|| c.to_string())
+                    convert_windows_path_to_wsl_path(c, env, is_wsl_env)
+                        .unwrap_or_else(|| c.to_string())
                 }
             });
             if let Some(child_cwd) = wsl_child_cwd {
@@ -434,7 +441,8 @@ pub fn build_spawn_spec(
                     // `"` -> `\"`, which cmd's builtin `cd` rejects -> "syntax is
                     // incorrect"; and with no proc cwd the child inherits the server's
                     // non-mount cwd as a \\wsl.localhost UNC path -> C:\Windows).
-                    if let Some(inherit) = wsl_windows_shell_inherit_cwd(wc, env, is_wsl_env, probe) {
+                    if let Some(inherit) = wsl_windows_shell_inherit_cwd(wc, env, is_wsl_env, probe)
+                    {
                         return spec(file, vec!["/K".to_string()], Some(inherit));
                     }
                     return spec(
@@ -607,7 +615,8 @@ pub fn build_windows_cli_spawn_spec(
             if is_linux_path(c) {
                 c.to_string()
             } else {
-                convert_windows_path_to_wsl_path(c, env, is_wsl_env).unwrap_or_else(|| c.to_string())
+                convert_windows_path_to_wsl_path(c, env, is_wsl_env)
+                    .unwrap_or_else(|| c.to_string())
             }
         });
         if let Some(child_cwd) = wsl_child_cwd {
@@ -629,7 +638,10 @@ pub fn build_windows_cli_spawn_spec(
         // `:1202-1208`: `{ file, args: ['/K', `${cd}${command}`], cwd: procCwd }`.
         let file = get_windows_exe(WindowsExe::Cmd, host_os, env);
         let invocation = build_cmd_command(&launch.command, &launch.args);
-        let cd = win_cwd.as_deref().and_then(cmd_cd_prefix).unwrap_or_default();
+        let cd = win_cwd
+            .as_deref()
+            .and_then(cmd_cd_prefix)
+            .unwrap_or_default();
         return spec(
             file,
             vec!["/K".to_string(), format!("{cd}{invocation}")],
@@ -642,7 +654,12 @@ pub fn build_windows_cli_spawn_spec(
     let invocation = build_powershell_command(&launch.command, &launch.args);
     let cd = win_cwd
         .as_deref()
-        .map(|wc| format!("Set-Location -LiteralPath {}; ", quote_powershell_literal(wc)))
+        .map(|wc| {
+            format!(
+                "Set-Location -LiteralPath {}; ",
+                quote_powershell_literal(wc)
+            )
+        })
         .unwrap_or_default();
     spec(
         file,
@@ -687,7 +704,8 @@ fn build_cmd_command(command: &str, args: &[String]) -> String {
 fn cmd_token_is_plain(s: &str) -> bool {
     !s.is_empty()
         && s.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '\\' | '/' | '+' | '=' | '~')
+            c.is_ascii_alphanumeric()
+                || matches!(c, '_' | '-' | '.' | ':' | '\\' | '/' | '+' | '=' | '~')
         })
 }
 
@@ -700,7 +718,10 @@ fn cmd_token_is_plain(s: &str) -> bool {
 fn cmd_cd_prefix(win_cwd: &str) -> Option<String> {
     let plain = !win_cwd.is_empty()
         && !win_cwd.chars().any(|c| {
-            matches!(c, '"' | '&' | '|' | '<' | '>' | '^' | '(' | ')' | '@' | '%' | '\n' | '\r' | '\t')
+            matches!(
+                c,
+                '"' | '&' | '|' | '<' | '>' | '^' | '(' | ')' | '@' | '%' | '\n' | '\r' | '\t'
+            )
         });
     plain.then(|| format!("cd /d {win_cwd} && "))
 }
@@ -751,7 +772,12 @@ fn wsl_windows_shell_inherit_cwd(
 
 /// `winCwd = inWsl ? (resolveWindowsShellCwd(cwd) || getWindowsDefaultCwd()) :
 ///                   (isLinuxPath(cwd) ? undefined : cwd)`.
-fn compute_win_cwd(cwd: Option<&str>, in_wsl: bool, env: &dyn Env, is_wsl_env: bool) -> Option<String> {
+fn compute_win_cwd(
+    cwd: Option<&str>,
+    in_wsl: bool,
+    env: &dyn Env,
+    is_wsl_env: bool,
+) -> Option<String> {
     if in_wsl {
         match resolve_windows_shell_cwd(cwd, env, is_wsl_env) {
             Some(s) if !s.is_empty() => Some(s),
@@ -770,7 +796,10 @@ fn compute_win_cwd(cwd: Option<&str>, in_wsl: bool, env: &dyn Env, is_wsl_env: b
 fn build_env_overrides(env: &dyn Env, user: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     out.insert("TERM".to_string(), env.or_default("TERM", "xterm-256color"));
-    out.insert("COLORTERM".to_string(), env.or_default("COLORTERM", "truecolor"));
+    out.insert(
+        "COLORTERM".to_string(),
+        env.or_default("COLORTERM", "truecolor"),
+    );
     out.insert("LANG".to_string(), "en_US.UTF-8".to_string());
     out.insert("LC_ALL".to_string(), "en_US.UTF-8".to_string());
     for (k, v) in user {
@@ -862,7 +891,10 @@ mod helper_tests {
             ]
         );
         // procCwd = winCwd on native Windows (belt-and-suspenders with the cd).
-        assert_eq!(spec.cwd.as_deref(), Some("C:\\Users\\Public\\freshell-matrix-ws-x"));
+        assert_eq!(
+            spec.cwd.as_deref(),
+            Some("C:\\Users\\Public\\freshell-matrix-ws-x")
+        );
         assert_eq!((spec.cols, spec.rows), (DEFAULT_COLS, DEFAULT_ROWS));
     }
 
@@ -998,7 +1030,10 @@ mod helper_tests {
             None,
             None,
         );
-        assert_eq!(spec.env_overrides.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(
+            spec.env_overrides.get("FOO").map(String::as_str),
+            Some("bar")
+        );
         assert_eq!(
             spec.env_overrides.get("TERM").map(String::as_str),
             Some("xterm-256color")
@@ -1012,8 +1047,14 @@ mod helper_tests {
             build_cmd_command("C:\\Program Files\\x\\cli.exe", &[]),
             "\"C:\\Program Files\\x\\cli.exe\""
         );
-        assert_eq!(cmd_cd_prefix("C:\\ws"), Some("cd /d C:\\ws && ".to_string()));
-        assert_eq!(cmd_cd_prefix("C:\\with space"), Some("cd /d C:\\with space && ".to_string()));
+        assert_eq!(
+            cmd_cd_prefix("C:\\ws"),
+            Some("cd /d C:\\ws && ".to_string())
+        );
+        assert_eq!(
+            cmd_cd_prefix("C:\\with space"),
+            Some("cd /d C:\\with space && ".to_string())
+        );
         assert_eq!(cmd_cd_prefix("C:\\a&b"), None);
         assert_eq!(cmd_cd_prefix("C:\\100%done"), None);
         assert_eq!(cmd_cd_prefix(""), None);

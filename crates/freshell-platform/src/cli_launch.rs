@@ -182,8 +182,7 @@ pub const CODEX_TUI_NOTIFICATION_ARGS: &[&str] = &[
 /// The claude unix bell command (`terminal-registry.ts:219`, runtime bytes —
 /// the source's `printf '\\a'` template-unescapes to a literal backslash-`a`).
 /// U3 (spec §5): pinned by executing the reference's own source lines.
-pub const CLAUDE_BELL_COMMAND_UNIX: &str =
-    "sh -lc \"printf '\\a' > /dev/tty 2>/dev/null || true\"";
+pub const CLAUDE_BELL_COMMAND_UNIX: &str = "sh -lc \"printf '\\a' > /dev/tty 2>/dev/null || true\"";
 
 /// The claude windows bell command (`terminal-registry.ts:218`, runtime bytes —
 /// `'\\\\.\\CONOUT$'` unescapes to `\\.\CONOUT$`, the Win32 console device path).
@@ -386,10 +385,13 @@ pub fn resolve_coding_cli_command(
             .chain(injection.args.iter().cloned())
             .collect()
     } else if inputs.mode == "claude" {
-        ["--settings".to_string(), claude_settings_json(inputs.target)]
-            .into_iter()
-            .chain(injection.args.iter().cloned())
-            .collect()
+        [
+            "--settings".to_string(),
+            claude_settings_json(inputs.target),
+        ]
+        .into_iter()
+        .chain(injection.args.iter().cloned())
+        .collect()
     } else {
         injection.args.clone()
     };
@@ -420,7 +422,11 @@ pub fn resolve_coding_cli_command(
             }
             remote_args.push("--remote".to_string());
             remote_args.push(ws_url.to_string());
-            remote_args.extend(CODEX_MANAGED_REMOTE_CONFIG_ARGS.iter().map(|s| s.to_string()));
+            remote_args.extend(
+                CODEX_MANAGED_REMOTE_CONFIG_ARGS
+                    .iter()
+                    .map(|s| s.to_string()),
+            );
         }
     }
 
@@ -469,13 +475,15 @@ pub fn resolve_coding_cli_command(
     if let (Some(model), Some(template)) = (&effective_model, &spec.model_args) {
         settings_args.extend(apply_template_all(template, "{{model}}", model));
     }
-    if let (Some(sandbox), Some(template)) = (
-        inputs.sandbox.filter(|s| !s.is_empty()),
-        &spec.sandbox_args,
-    ) {
+    if let (Some(sandbox), Some(template)) =
+        (inputs.sandbox.filter(|s| !s.is_empty()), &spec.sandbox_args)
+    {
         settings_args.extend(apply_template_all(template, "{{sandbox}}", sandbox));
     }
-    if let Some(pm) = inputs.permission_mode.filter(|s| !s.is_empty() && *s != "default") {
+    if let Some(pm) = inputs
+        .permission_mode
+        .filter(|s| !s.is_empty() && *s != "default")
+    {
         if let Some(template) = &spec.permission_mode_args {
             settings_args.extend(apply_template_all(template, "{{permissionMode}}", pm));
         }

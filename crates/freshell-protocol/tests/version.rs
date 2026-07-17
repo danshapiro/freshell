@@ -16,8 +16,8 @@ fn repo_path(rel: &str) -> PathBuf {
 }
 
 fn read_json(rel: &str) -> serde_json::Value {
-    let text = std::fs::read_to_string(repo_path(rel))
-        .unwrap_or_else(|e| panic!("read {rel}: {e}"));
+    let text =
+        std::fs::read_to_string(repo_path(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {rel}: {e}"))
 }
 

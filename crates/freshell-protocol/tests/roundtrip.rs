@@ -25,11 +25,14 @@ use serde_json::{json, Value};
 // --------------------------------------------------------------------------
 
 fn repo_path(rel: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(rel)
 }
 
 fn read_json(rel: &str) -> Value {
-    let text = std::fs::read_to_string(repo_path(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+    let text =
+        std::fs::read_to_string(repo_path(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {rel}: {e}"))
 }
 
@@ -62,9 +65,15 @@ fn server_roundtrip(wire: &str, type_name: &str) -> ServerMessage {
     let msg: ServerMessage =
         serde_json::from_str(wire).unwrap_or_else(|e| panic!("deserialize {type_name}: {e}"));
     let reser = serde_json::to_value(&msg).expect("serialize");
-    assert_eq!(reser, expected, "round-trip changed `{type_name}` structure");
+    assert_eq!(
+        reser, expected,
+        "round-trip changed `{type_name}` structure"
+    );
     let schema = outbound_schema()["messages"][type_name].clone();
-    assert!(!schema.is_null(), "no frozen schema for server `{type_name}`");
+    assert!(
+        !schema.is_null(),
+        "no frozen schema for server `{type_name}`"
+    );
     assert_conforms(&validator(&schema), &reser, type_name);
     msg
 }
@@ -75,7 +84,10 @@ fn client_roundtrip(wire: &str, type_name: &str) -> ClientMessage {
     let msg: ClientMessage =
         serde_json::from_str(wire).unwrap_or_else(|e| panic!("deserialize {type_name}: {e}"));
     let reser = serde_json::to_value(&msg).expect("serialize");
-    assert_eq!(reser, expected, "round-trip changed `{type_name}` structure");
+    assert_eq!(
+        reser, expected,
+        "round-trip changed `{type_name}` structure"
+    );
     let schema = inbound_schema()["schemas"]["ClientMessageSchema"].clone();
     assert_conforms(&validator(&schema), &reser, type_name);
     msg
@@ -88,7 +100,9 @@ fn client_roundtrip(wire: &str, type_name: &str) -> ClientMessage {
 #[test]
 fn handshake_transcript_roundtrips_and_conforms() {
     let transcript = read_json("port/oracle/fixtures/handshake-transcript.json");
-    let entries = transcript["transcript"].as_array().expect("transcript array");
+    let entries = transcript["transcript"]
+        .as_array()
+        .expect("transcript array");
     assert_eq!(entries.len(), 5, "transcript has hello + 4 server messages");
 
     let mut server_types_seen = Vec::new();
@@ -112,7 +126,10 @@ fn handshake_transcript_roundtrips_and_conforms() {
                 // server → client
                 let msg = server_roundtrip(raw, type_name);
                 let reser = serde_json::to_value(&msg).unwrap();
-                assert_eq!(&reser, parsed, "`{type_name}` must equal transcript `parsed`");
+                assert_eq!(
+                    &reser, parsed,
+                    "`{type_name}` must equal transcript `parsed`"
+                );
                 server_types_seen.push(type_name.to_string());
             }
             other => panic!("unexpected dir {other}"),
@@ -122,7 +139,12 @@ fn handshake_transcript_roundtrips_and_conforms() {
     server_types_seen.sort();
     assert_eq!(
         server_types_seen,
-        vec!["perf.logging", "ready", "settings.updated", "terminal.inventory"]
+        vec![
+            "perf.logging",
+            "ready",
+            "settings.updated",
+            "terminal.inventory"
+        ]
     );
 }
 
@@ -172,7 +194,10 @@ fn terminal_inventory_and_settings_parse_from_transcript() {
             assert_eq!(s.settings.safety.auto_kill_idle_minutes, 15);
             assert_eq!(s.settings.terminal.scrollback, 10000);
             assert_eq!(s.settings.network.host, NetworkHost::Loopback);
-            assert!(matches!(s.settings.editor.external_editor, ExternalEditor::Auto));
+            assert!(matches!(
+                s.settings.editor.external_editor,
+                ExternalEditor::Auto
+            ));
             assert_eq!(
                 s.settings.coding_cli.enabled_providers,
                 vec!["claude", "codex", "opencode"]
@@ -212,7 +237,10 @@ fn rich_server_messages() {
         ServerMessage::TerminalInventory(inv) => {
             let d = inv.terminals[0].codex_durability.as_ref().unwrap();
             assert_eq!(d.state, CodexDurabilityState::Durable);
-            assert_eq!(d.candidate.as_ref().unwrap().source, CodexDurabilitySource::ThreadStartResponse);
+            assert_eq!(
+                d.candidate.as_ref().unwrap().source,
+                CodexDurabilitySource::ThreadStartResponse
+            );
             let tu = inv.terminal_meta[0].token_usage.as_ref().unwrap();
             assert_eq!(tu.total_tokens, 6);
         }
@@ -238,7 +266,10 @@ fn rich_client_messages() {
     match client_roundtrip(wire, "terminal.create") {
         ClientMessage::TerminalCreate(c) => {
             assert_eq!(c.shell, Shell::Wsl);
-            assert_eq!(c.live_terminal.as_ref().unwrap().server_instance_id, "srv-1");
+            assert_eq!(
+                c.live_terminal.as_ref().unwrap().server_instance_id,
+                "srv-1"
+            );
         }
         other => panic!("expected TerminalCreate, got {other:?}"),
     }
@@ -301,7 +332,10 @@ fn double_option_distinguishes_absent_null_value() {
     match client_roundtrip(wire, "ui.layout.sync") {
         ClientMessage::UiLayoutSync(m) => {
             assert_eq!(m.active_tab_id, Some(None), "explicit null preserved");
-            assert_eq!(m.active_pane.get("pane1").map(String::as_str), Some("content-a"));
+            assert_eq!(
+                m.active_pane.get("pane1").map(String::as_str),
+                Some("content-a")
+            );
         }
         other => panic!("expected UiLayoutSync, got {other:?}"),
     }
@@ -341,7 +375,11 @@ fn flatten_passthrough_preserves_unknown_integer_keys() {
     match server_roundtrip(wire, "tabs.sync.snapshot") {
         ServerMessage::TabsSyncSnapshot(s) => {
             let extra = &s.data.local_open[0].extra;
-            assert_eq!(extra.get("extraCount"), Some(&json!(7)), "integer extra survives flatten");
+            assert_eq!(
+                extra.get("extraCount"),
+                Some(&json!(7)),
+                "integer extra survives flatten"
+            );
             assert_eq!(extra.get("tabId"), Some(&json!("tab1")));
         }
         other => panic!("expected TabsSyncSnapshot, got {other:?}"),

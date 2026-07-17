@@ -25,7 +25,12 @@ fn wsl_interop_available() -> bool {
 fn drive_pty(program: &str, args: &[&str], cwd: Option<&str>, needle: &str, secs: u64) -> String {
     let pty = native_pty_system();
     let pair = pty
-        .openpty(PtySize { rows: 30, cols: 120, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows: 30,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .expect("openpty");
     let mut cmd = CommandBuilder::new(program);
     cmd.args(args);
@@ -76,13 +81,22 @@ fn drive_pty(program: &str, args: &[&str], cwd: Option<&str>, needle: &str, secs
 #[ignore = "live WSL interop; run with -- --ignored on a WSL2 host"]
 fn live_cmd_inherits_mnt_mount_cwd_and_lands_in_workspace() {
     assert!(wsl_interop_available(), "requires WSL2 + Windows interop");
-    let ws = format!("/mnt/c/Users/Public/freshell-dev0005-live-{}", std::process::id());
+    let ws = format!(
+        "/mnt/c/Users/Public/freshell-dev0005-live-{}",
+        std::process::id()
+    );
     std::fs::create_dir_all(&ws).expect("mkdir workspace");
     // The PORT-FIX spec shape: cmd.exe, bare /K, inherited /mnt cwd. Wait for the
     // PROMPT containing the workspace dir itself (a bare ">" appears in banner
     // fragments long before the prompt paints; interop cold start can be slow).
     let win_tail = ws.trim_start_matches("/mnt/c/").replace('/', "\\");
-    let out = drive_pty("/mnt/c/Windows/System32/cmd.exe", &["/K"], Some(&ws), &win_tail, 90);
+    let out = drive_pty(
+        "/mnt/c/Windows/System32/cmd.exe",
+        &["/K"],
+        Some(&ws),
+        &win_tail,
+        90,
+    );
     assert!(
         out.to_lowercase().contains(&win_tail.to_lowercase()),
         "prompt must show the workspace dir (C:\\{win_tail}); got: {out:?}"
@@ -91,7 +105,10 @@ fn live_cmd_inherits_mnt_mount_cwd_and_lands_in_workspace() {
         !out.contains("UNC paths are not supported"),
         "must not strand via UNC fallback; got: {out:?}"
     );
-    assert!(!out.contains("C:\\Windows>"), "must not strand in C:\\Windows; got: {out:?}");
+    assert!(
+        !out.contains("C:\\Windows>"),
+        "must not strand in C:\\Windows; got: {out:?}"
+    );
     let _ = std::fs::remove_dir_all(&ws);
 }
 
@@ -102,7 +119,10 @@ fn live_toctou_vanished_cwd_degrades_instead_of_erroring() {
     // Exercise the PtyTerminal-level guard end-to-end via the public API.
     use freshell_platform::spawn::SpawnSpec;
     use freshell_terminal::PtyTerminal;
-    let gone = format!("/mnt/c/Users/Public/freshell-dev0005-gone-{}", std::process::id());
+    let gone = format!(
+        "/mnt/c/Users/Public/freshell-dev0005-gone-{}",
+        std::process::id()
+    );
     // Deliberately DO NOT create `gone` — simulates the mount/dir vanishing
     // between the FileProbe gate and the spawn (TOCTOU).
     let spec = SpawnSpec {

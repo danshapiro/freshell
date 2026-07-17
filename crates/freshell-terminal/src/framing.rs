@@ -70,12 +70,11 @@ impl OutputFramer {
         let terminal_id = self.terminal_id.clone();
         let stream_id = self.stream_id.clone();
 
-        let fragments = fragment_terminal_output_for_payload_budget(
-            data,
-            self.batch_max_bytes,
-            |chunk| measure_terminal_output_budget_payload_bytes(&terminal_id, &stream_id, chunk),
-        )
-        .expect("terminal.output batch budget (>= 16 KiB) always fits one code point");
+        let fragments =
+            fragment_terminal_output_for_payload_budget(data, self.batch_max_bytes, |chunk| {
+                measure_terminal_output_budget_payload_bytes(&terminal_id, &stream_id, chunk)
+            })
+            .expect("terminal.output batch budget (>= 16 KiB) always fits one code point");
 
         let mut frames = Vec::with_capacity(fragments.len());
         for fragment in &fragments {

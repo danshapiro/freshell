@@ -41,9 +41,15 @@ pub struct ParsedServeEvent {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SdkProviderEvent {
     /// `session.idle` / `session.status{busy|retry|idle}` → a lifecycle snapshot.
-    Snapshot { session_id: String, status: SnapshotStatus },
+    Snapshot {
+        session_id: String,
+        status: SnapshotStatus,
+    },
     /// A transcript/message invalidation or a non-lifecycle status change.
-    Changed { session_id: String, reason: ChangedReason },
+    Changed {
+        session_id: String,
+        reason: ChangedReason,
+    },
     /// A `session.error` surfaced during the turn.
     Error { session_id: String, message: String },
 }
@@ -195,7 +201,10 @@ fn is_opencode_transcript_event(kind: &str) -> bool {
 
 /// `serveEventToSdk(parsed, subscribedId)` (`serve-events.ts:99-118`): map to the `sdk.*`
 /// provider event stamped with the id the client first subscribed with.
-pub fn serve_event_to_sdk(parsed: &ParsedServeEvent, subscribed_id: &str) -> Option<SdkProviderEvent> {
+pub fn serve_event_to_sdk(
+    parsed: &ParsedServeEvent,
+    subscribed_id: &str,
+) -> Option<SdkProviderEvent> {
     match parsed.kind.as_str() {
         "session.idle" => Some(SdkProviderEvent::Snapshot {
             session_id: subscribed_id.to_string(),
@@ -343,7 +352,8 @@ mod tests {
     #[test]
     fn idle_edge_detection_covers_both_signals() {
         // session.idle is the direct idle edge.
-        let idle = parse(json!({ "type": "session.idle", "properties": { "sessionID": "s" } })).unwrap();
+        let idle =
+            parse(json!({ "type": "session.idle", "properties": { "sessionID": "s" } })).unwrap();
         assert!(is_idle_edge(&idle));
 
         // session.status{type:idle} is the equivalent idle edge.
@@ -367,7 +377,10 @@ mod tests {
         assert!(!is_idle_status_event(&retry));
 
         // A non-status event is never the idle edge.
-        let msg = parse(json!({ "type": "message.updated", "properties": { "info": { "sessionID": "s" } } })).unwrap();
+        let msg = parse(
+            json!({ "type": "message.updated", "properties": { "info": { "sessionID": "s" } } }),
+        )
+        .unwrap();
         assert!(!is_idle_edge(&msg));
         assert!(!event_shows_running_status_activity(&msg));
     }
@@ -385,10 +398,14 @@ mod tests {
 
     #[test]
     fn serve_event_to_sdk_maps_lifecycle() {
-        let idle = parse(json!({ "type": "session.idle", "properties": { "sessionID": "real" } })).unwrap();
+        let idle = parse(json!({ "type": "session.idle", "properties": { "sessionID": "real" } }))
+            .unwrap();
         assert_eq!(
             serve_event_to_sdk(&idle, "placeholder"),
-            Some(SdkProviderEvent::Snapshot { session_id: "placeholder".into(), status: SnapshotStatus::Idle })
+            Some(SdkProviderEvent::Snapshot {
+                session_id: "placeholder".into(),
+                status: SnapshotStatus::Idle
+            })
         );
 
         let busy =
@@ -396,7 +413,10 @@ mod tests {
                 .unwrap();
         assert_eq!(
             serve_event_to_sdk(&busy, "placeholder"),
-            Some(SdkProviderEvent::Snapshot { session_id: "placeholder".into(), status: SnapshotStatus::Running })
+            Some(SdkProviderEvent::Snapshot {
+                session_id: "placeholder".into(),
+                status: SnapshotStatus::Running
+            })
         );
 
         // A status without a mappable type is a generic change (invalidation).
@@ -405,34 +425,54 @@ mod tests {
                 .unwrap();
         assert_eq!(
             serve_event_to_sdk(&other, "placeholder"),
-            Some(SdkProviderEvent::Changed { session_id: "placeholder".into(), reason: ChangedReason::OpencodeStatus })
+            Some(SdkProviderEvent::Changed {
+                session_id: "placeholder".into(),
+                reason: ChangedReason::OpencodeStatus
+            })
         );
 
         let err = parse(json!({ "type": "session.error", "properties": { "sessionID": "real", "error": { "message": "boom" } } }))
             .unwrap();
         assert_eq!(
             serve_event_to_sdk(&err, "placeholder"),
-            Some(SdkProviderEvent::Error { session_id: "placeholder".into(), message: "boom".into() })
+            Some(SdkProviderEvent::Error {
+                session_id: "placeholder".into(),
+                message: "boom".into()
+            })
         );
 
         // Transcript events are invalidations, not lifecycle.
-        let msg = parse(json!({ "type": "message.updated", "properties": { "info": { "sessionID": "real" } } })).unwrap();
+        let msg = parse(
+            json!({ "type": "message.updated", "properties": { "info": { "sessionID": "real" } } }),
+        )
+        .unwrap();
         assert_eq!(
             serve_event_to_sdk(&msg, "placeholder"),
-            Some(SdkProviderEvent::Changed { session_id: "placeholder".into(), reason: ChangedReason::OpencodeMessage })
+            Some(SdkProviderEvent::Changed {
+                session_id: "placeholder".into(),
+                reason: ChangedReason::OpencodeMessage
+            })
         );
 
         // Unknown, non-transcript events map to nothing.
-        let unknown = parse(json!({ "type": "session.updated", "properties": { "sessionID": "real" } })).unwrap();
+        let unknown =
+            parse(json!({ "type": "session.updated", "properties": { "sessionID": "real" } }))
+                .unwrap();
         assert_eq!(serve_event_to_sdk(&unknown, "placeholder"), None);
     }
 
     #[test]
     fn session_error_falls_back_to_default_message() {
-        let err = parse(json!({ "type": "session.error", "properties": { "sessionID": "real", "error": {} } })).unwrap();
+        let err = parse(
+            json!({ "type": "session.error", "properties": { "sessionID": "real", "error": {} } }),
+        )
+        .unwrap();
         assert_eq!(
             serve_event_to_sdk(&err, "p"),
-            Some(SdkProviderEvent::Error { session_id: "p".into(), message: "OpenCode session error".into() })
+            Some(SdkProviderEvent::Error {
+                session_id: "p".into(),
+                message: "OpenCode session error".into()
+            })
         );
     }
 
@@ -445,11 +485,17 @@ mod tests {
         let events = dec.push_str(
             ": ping\n\ndata: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_1\"}}\n\ndata: {\"type\":\"server.heartbeat\"}\n\ndata: {\"type\":\"session.st",
         );
-        assert_eq!(events.len(), 1, "only the idle frame completed so far: {events:?}");
+        assert_eq!(
+            events.len(),
+            1,
+            "only the idle frame completed so far: {events:?}"
+        );
         assert_eq!(events[0].kind, "session.idle");
         assert_eq!(events[0].session_id.as_deref(), Some("ses_1"));
 
-        let more = dec.push_str("atus\",\"properties\":{\"sessionID\":\"ses_1\",\"status\":{\"type\":\"idle\"}}}\n\n");
+        let more = dec.push_str(
+            "atus\",\"properties\":{\"sessionID\":\"ses_1\",\"status\":{\"type\":\"idle\"}}}\n\n",
+        );
         assert_eq!(more.len(), 1);
         assert!(is_idle_edge(&more[0]));
     }
@@ -458,7 +504,11 @@ mod tests {
     fn sse_decoder_normalizes_crlf_and_joins_multiline_data() {
         let mut dec = SseDecoder::new();
         let events = dec.push_str("data: {\"type\":\"session.idle\",\r\ndata: \"properties\":{\"sessionID\":\"ses_x\"}}\r\n\r\n");
-        assert_eq!(events.len(), 1, "multi-line data joined into one JSON doc: {events:?}");
+        assert_eq!(
+            events.len(),
+            1,
+            "multi-line data joined into one JSON doc: {events:?}"
+        );
         assert_eq!(events[0].session_id.as_deref(), Some("ses_x"));
     }
 

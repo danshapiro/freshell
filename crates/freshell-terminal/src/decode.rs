@@ -26,7 +26,9 @@ pub struct Utf8StreamDecoder {
 
 impl Utf8StreamDecoder {
     pub fn new() -> Self {
-        Self { pending: Vec::new() }
+        Self {
+            pending: Vec::new(),
+        }
     }
 
     /// Feed the next raw read; returns the decoded text now available. An incomplete

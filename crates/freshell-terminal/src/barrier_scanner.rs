@@ -133,7 +133,10 @@ fn default_reason_for_mode(mode: ScannerMode) -> BarrierReason {
 /// `classifyCsiFinal` (`output-barrier-scanner.ts:83-92`).
 fn classify_csi_final(payload: &str, final_char: char) -> BarrierReason {
     // payload.replace(/[ -/]/gu, '') — strip 0x20..=0x2f.
-    let normalized: String = payload.chars().filter(|c| !(' '..='/').contains(c)).collect();
+    let normalized: String = payload
+        .chars()
+        .filter(|c| !(' '..='/').contains(c))
+        .collect();
     if final_char == 'n' && normalized.ends_with('6') {
         return BarrierReason::RequestMode;
     }
@@ -211,18 +214,15 @@ impl BarrierScanner {
     /// and advance the persistent parser state.
     pub fn scan(&mut self, data: &str) -> BarrierClassification {
         let state_before = ScannerState { mode: self.mode };
-        let mut barrier_reason: Option<BarrierReason> =
-            if self.mode != ScannerMode::Ground {
-                Some(default_reason_for_mode(self.mode))
-            } else {
-                None
-            };
+        let mut barrier_reason: Option<BarrierReason> = if self.mode != ScannerMode::Ground {
+            Some(default_reason_for_mode(self.mode))
+        } else {
+            None
+        };
 
-        let mark = |current: &mut Option<BarrierReason>, reason: BarrierReason| {
-            match *current {
-                Some(cur) if reason.priority() <= cur.priority() => {}
-                _ => *current = Some(reason),
-            }
+        let mark = |current: &mut Option<BarrierReason>, reason: BarrierReason| match *current {
+            Some(cur) if reason.priority() <= cur.priority() => {}
+            _ => *current = Some(reason),
         };
 
         for ch in data.chars() {

@@ -93,7 +93,10 @@ pub fn is_linux_path(p: &str) -> bool {
 /// `WINDOWS_DRIVE_PREFIX_RE = /^[A-Za-z]:([\\/]|$)/` (path-utils flavor).
 fn starts_windows_drive_or_end(s: &str) -> bool {
     let b = s.as_bytes();
-    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b.len() == 2 || b[2] == b'\\' || b[2] == b'/')
+    b.len() >= 2
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b.len() == 2 || b[2] == b'\\' || b[2] == b'/')
 }
 
 /// `/^[A-Za-z]:[\\/]/` (launch-cwd `WINDOWS_DRIVE_PREFIX_RE` — requires a separator).
@@ -105,7 +108,10 @@ fn starts_windows_drive_with_sep(s: &str) -> bool {
 /// `/^[A-Za-z]:(?![\\/])/` (launch-cwd `WINDOWS_DRIVE_RELATIVE_RE`).
 fn starts_windows_drive_relative(s: &str) -> bool {
     let b = s.as_bytes();
-    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b.len() == 2 || (b[2] != b'\\' && b[2] != b'/'))
+    b.len() >= 2
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b.len() == 2 || (b[2] != b'\\' && b[2] != b'/'))
 }
 
 /// `WINDOWS_UNC_PREFIX_RE = /^\\\\[^\\]+\\[^\\]+/`.
@@ -235,7 +241,8 @@ pub fn get_wsl_mount_prefix(env: &dyn Env) -> String {
 pub fn win32_resolve(input: &str) -> Option<String> {
     let b = input.as_bytes();
     // Drive-absolute: `X:` followed by a separator.
-    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') {
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+    {
         let device: String = format!("{}:", b[0] as char); // preserve drive-letter case
         let tail = &input[3..];
         let normalized_tail = normalize_win32_segments(tail);
@@ -365,7 +372,11 @@ pub fn convert_wsl_drive_path_to_windows_path(input: &str, env: &dyn Env) -> Opt
 ///   (case-insensitively, and only when `WSL_DISTRO_NAME` is non-empty).
 ///
 /// `is_wsl_env` is Regime A (`detect::is_wsl_env`), passed explicitly per CD-1.
-pub fn convert_windows_path_to_wsl_path(input: &str, env: &dyn Env, is_wsl_env: bool) -> Option<String> {
+pub fn convert_windows_path_to_wsl_path(
+    input: &str,
+    env: &dyn Env,
+    is_wsl_env: bool,
+) -> Option<String> {
     let cleaned = sanitize_user_path_input(input);
     if cleaned.is_empty() {
         return None;
@@ -606,8 +617,12 @@ pub fn resolve_launch_cwd(
         };
     }
     let (launch_cwd, conversion) = match target_runtime {
-        LaunchCwdTargetRuntime::LinuxProcess => resolve_linux_process_cwd(&cleaned, env, is_wsl_env),
-        LaunchCwdTargetRuntime::WindowsProcess => resolve_windows_process_cwd(&cleaned, env, is_wsl_env),
+        LaunchCwdTargetRuntime::LinuxProcess => {
+            resolve_linux_process_cwd(&cleaned, env, is_wsl_env)
+        }
+        LaunchCwdTargetRuntime::WindowsProcess => {
+            resolve_windows_process_cwd(&cleaned, env, is_wsl_env)
+        }
     };
     ResolvedLaunchCwd {
         target_runtime,
@@ -685,7 +700,9 @@ fn resolve_windows_process_cwd(
 
 /// `isWindowsAbsolutePath` (`launch-cwd.ts:46-50`): drive-with-sep OR UNC OR rooted.
 fn is_windows_absolute_launch(candidate: &str) -> bool {
-    starts_windows_drive_with_sep(candidate) || starts_windows_unc(candidate) || starts_windows_rooted(candidate)
+    starts_windows_drive_with_sep(candidate)
+        || starts_windows_unc(candidate)
+        || starts_windows_rooted(candidate)
 }
 
 #[cfg(test)]
@@ -701,7 +718,10 @@ mod helper_tests {
         assert_eq!(win32_resolve("C:\\a\\..\\b").as_deref(), Some("C:\\b"));
         assert_eq!(win32_resolve("C:\\a\\.\\b").as_deref(), Some("C:\\a\\b"));
         assert_eq!(win32_resolve("C:\\foo\\").as_deref(), Some("C:\\foo"));
-        assert_eq!(win32_resolve("C:\\foo\\\\bar").as_deref(), Some("C:\\foo\\bar"));
+        assert_eq!(
+            win32_resolve("C:\\foo\\\\bar").as_deref(),
+            Some("C:\\foo\\bar")
+        );
         assert_eq!(
             win32_resolve("\\\\wsl.localhost\\Ubuntu\\home\\dan").as_deref(),
             Some("\\\\wsl.localhost\\Ubuntu\\home\\dan")
@@ -753,7 +773,13 @@ mod helper_tests {
             match_wsl_unc("\\\\wsl.localhost\\Ubuntu\\home\\dan"),
             Some(("Ubuntu", Some("home\\dan")))
         );
-        assert_eq!(match_wsl_unc("\\\\wsl.localhost\\Ubuntu\\"), Some(("Ubuntu", Some(""))));
-        assert_eq!(match_wsl_unc("\\\\wsl.localhost\\Ubuntu"), Some(("Ubuntu", None)));
+        assert_eq!(
+            match_wsl_unc("\\\\wsl.localhost\\Ubuntu\\"),
+            Some(("Ubuntu", Some("")))
+        );
+        assert_eq!(
+            match_wsl_unc("\\\\wsl.localhost\\Ubuntu"),
+            Some(("Ubuntu", None))
+        );
     }
 }

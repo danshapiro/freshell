@@ -168,7 +168,10 @@ mod tests {
     #[test]
     fn batch_max_defaults_to_16k() {
         // Env unset in the test harness -> max(1024, 16384).
-        assert_eq!(terminal_stream_batch_max_bytes(), MAX_REALTIME_MESSAGE_BYTES);
+        assert_eq!(
+            terminal_stream_batch_max_bytes(),
+            MAX_REALTIME_MESSAGE_BYTES
+        );
     }
 
     #[test]
@@ -196,7 +199,10 @@ mod tests {
         // Sanity: a tiny data chunk's budgeted payload is well under 16 KiB, so no split.
         let bytes = measure_terminal_output_budget_payload_bytes("term", "stream", "hello\r\n");
         assert!(bytes > 512, "includes the 512-char attachRequestId reserve");
-        assert!(bytes < MAX_REALTIME_MESSAGE_BYTES, "still far under the batch budget");
+        assert!(
+            bytes < MAX_REALTIME_MESSAGE_BYTES,
+            "still far under the batch budget"
+        );
     }
 
     #[test]
@@ -212,8 +218,7 @@ mod tests {
     fn split_never_bisects_a_multibyte_scalar() {
         // "áé" = 2 scalars, 4 UTF-8 bytes. measure == UTF-8 byte length, budget = 2
         // must keep each 2-byte scalar whole (never emit a 1-byte half).
-        let frags =
-            fragment_terminal_output_for_payload_budget("áé", 2, |c| c.len()).unwrap();
+        let frags = fragment_terminal_output_for_payload_budget("áé", 2, |c| c.len()).unwrap();
         assert_eq!(frags, vec!["á", "é"]);
         assert_eq!(frags.concat(), "áé");
     }
@@ -236,7 +241,10 @@ mod tests {
             |c| measure_terminal_output_budget_payload_bytes("term", "stream", c),
         )
         .unwrap();
-        assert!(frags.len() >= 3, "40k of data exceeds several 16 KiB budgets");
+        assert!(
+            frags.len() >= 3,
+            "40k of data exceeds several 16 KiB budgets"
+        );
         assert_eq!(frags.concat(), data);
         for f in &frags {
             assert!(

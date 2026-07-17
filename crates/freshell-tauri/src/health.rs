@@ -44,7 +44,9 @@ impl std::fmt::Display for HealthError {
             HealthError::ChildExited => {
                 write!(f, "server process exited before health check succeeded")
             }
-            HealthError::Timeout(d) => write!(f, "health check timed out after {}ms", d.as_millis()),
+            HealthError::Timeout(d) => {
+                write!(f, "health check timed out after {}ms", d.as_millis())
+            }
         }
     }
 }
@@ -151,12 +153,27 @@ mod tests {
 
     #[test]
     fn backoff_doubles_then_caps_at_5s() {
-        assert_eq!(next_backoff(Duration::from_millis(100)), Duration::from_millis(200));
-        assert_eq!(next_backoff(Duration::from_millis(200)), Duration::from_millis(400));
-        assert_eq!(next_backoff(Duration::from_millis(2500)), Duration::from_millis(5000));
+        assert_eq!(
+            next_backoff(Duration::from_millis(100)),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            next_backoff(Duration::from_millis(200)),
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            next_backoff(Duration::from_millis(2500)),
+            Duration::from_millis(5000)
+        );
         // Cap holds.
-        assert_eq!(next_backoff(Duration::from_millis(5000)), Duration::from_millis(5000));
-        assert_eq!(next_backoff(Duration::from_millis(4000)), Duration::from_millis(5000));
+        assert_eq!(
+            next_backoff(Duration::from_millis(5000)),
+            Duration::from_millis(5000)
+        );
+        assert_eq!(
+            next_backoff(Duration::from_millis(4000)),
+            Duration::from_millis(5000)
+        );
     }
 
     #[test]
@@ -171,7 +188,11 @@ mod tests {
                 let n = attempts.get();
                 attempts.set(n + 1);
                 // NotReady twice, then Ready on the 3rd probe.
-                if n < 2 { HealthProbe::NotReady } else { HealthProbe::Ready }
+                if n < 2 {
+                    HealthProbe::NotReady
+                } else {
+                    HealthProbe::Ready
+                }
             },
             || false,
             |d| {
@@ -205,7 +226,10 @@ mod tests {
             Duration::from_secs(30),
         );
         assert_eq!(result, Err(HealthError::ChildExited));
-        assert!(!probed.get(), "must fail before probing when the child is dead");
+        assert!(
+            !probed.get(),
+            "must fail before probing when the child is dead"
+        );
     }
 
     #[test]
@@ -218,7 +242,10 @@ mod tests {
             || clock.get(),
             Duration::from_millis(1000),
         );
-        assert_eq!(result, Err(HealthError::Timeout(Duration::from_millis(1000))));
+        assert_eq!(
+            result,
+            Err(HealthError::Timeout(Duration::from_millis(1000)))
+        );
     }
 
     #[test]

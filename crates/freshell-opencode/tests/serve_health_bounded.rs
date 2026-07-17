@@ -20,8 +20,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use freshell_opencode::serve::{
-    Endpoint, EventSink, EventSource, EventStreamHandle, PortAllocator, ProcessSpawner, ServeConfig,
-    ServeDeps, ServeError, ServeHttp, ServeHttpRequest, ServeHttpResponse, ServeProcess, SpawnRequest,
+    Endpoint, EventSink, EventSource, EventStreamHandle, PortAllocator, ProcessSpawner,
+    ServeConfig, ServeDeps, ServeError, ServeHttp, ServeHttpRequest, ServeHttpResponse,
+    ServeProcess, SpawnRequest,
 };
 
 // ── injected fakes ───────────────────────────────────────────────────────────────
@@ -45,7 +46,13 @@ struct FakeHttp {
 impl FakeHttp {
     fn new(script: HealthScript) -> (Arc<Self>, Arc<AtomicUsize>) {
         let health_calls = Arc::new(AtomicUsize::new(0));
-        (Arc::new(Self { script, health_calls: health_calls.clone() }), health_calls)
+        (
+            Arc::new(Self {
+                script,
+                health_calls: health_calls.clone(),
+            }),
+            health_calls,
+        )
     }
 }
 
@@ -53,7 +60,9 @@ impl ServeHttp for FakeHttp {
     fn request<'a>(
         &'a self,
         req: ServeHttpRequest,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+    > {
         if req.url.contains("/global/health") {
             let n = self.health_calls.fetch_add(1, Ordering::SeqCst) + 1;
             let stalls = match self.script {
@@ -79,7 +88,10 @@ impl ServeHttp for FakeHttp {
 struct FakeAllocator;
 impl PortAllocator for FakeAllocator {
     fn allocate(&self) -> Result<Endpoint, String> {
-        Ok(Endpoint { hostname: "127.0.0.1".to_string(), port: 1 })
+        Ok(Endpoint {
+            hostname: "127.0.0.1".to_string(),
+            port: 1,
+        })
     }
 }
 
@@ -106,7 +118,9 @@ struct FakeSpawner {
 }
 impl ProcessSpawner for FakeSpawner {
     fn spawn(&self, _req: SpawnRequest) -> Result<Box<dyn ServeProcess>, String> {
-        Ok(Box::new(NeverExitsProcess { killed: self.killed.clone() }))
+        Ok(Box::new(NeverExitsProcess {
+            killed: self.killed.clone(),
+        }))
     }
 }
 
@@ -123,16 +137,26 @@ impl EventSource for NoopEventSource {
 fn manager(
     script: HealthScript,
     config: ServeConfig,
-) -> (freshell_opencode::OpencodeServeManager, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+) -> (
+    freshell_opencode::OpencodeServeManager,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+) {
     let (http, health_calls) = FakeHttp::new(script);
     let killed = Arc::new(AtomicUsize::new(0));
     let deps = ServeDeps {
-        spawner: Arc::new(FakeSpawner { killed: killed.clone() }),
+        spawner: Arc::new(FakeSpawner {
+            killed: killed.clone(),
+        }),
         http,
         ports: Arc::new(FakeAllocator),
         events: Arc::new(NoopEventSource),
     };
-    (freshell_opencode::OpencodeServeManager::new(deps, config), health_calls, killed)
+    (
+        freshell_opencode::OpencodeServeManager::new(deps, config),
+        health_calls,
+        killed,
+    )
 }
 
 fn bounded_config(health_ms: u64, probe_ms: u64, retry_ms: u64) -> ServeConfig {
@@ -154,7 +178,10 @@ fn bounded_config(health_ms: u64, probe_ms: u64, retry_ms: u64) -> ServeConfig {
 #[tokio::test]
 async fn settles_within_deadline_when_health_never_resolves() {
     let health_ms = 300;
-    let (mgr, health_calls, killed) = manager(HealthScript::NeverResolves, bounded_config(health_ms, 40, 10));
+    let (mgr, health_calls, killed) = manager(
+        HealthScript::NeverResolves,
+        bounded_config(health_ms, 40, 10),
+    );
 
     let started = Instant::now();
     // The outer guard is what turns a genuine hang (the NAIVE probe) into a test FAILURE
@@ -184,8 +211,14 @@ async fn settles_within_deadline_when_health_never_resolves() {
         "should have waited ~the full {health_ms}ms deadline, waited {elapsed:?}"
     );
     // And it settled well within the guard (no hang).
-    assert!(elapsed < Duration::from_secs(4), "settled far under the guard: {elapsed:?}");
-    assert!(killed.load(Ordering::SeqCst) >= 1, "a serve that never became healthy is killed");
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "settled far under the guard: {elapsed:?}"
+    );
+    assert!(
+        killed.load(Ordering::SeqCst) >= 1,
+        "a serve that never became healthy is killed"
+    );
 }
 
 /// Companion: a probe that STALLS (never resolves) on the first N attempts then answers
@@ -194,7 +227,10 @@ async fn settles_within_deadline_when_health_never_resolves() {
 #[tokio::test]
 async fn resolves_when_probe_stalls_then_succeeds() {
     // 3 stalls * 40ms bound + retries ≈ 150ms << 3000ms deadline.
-    let (mgr, health_calls, _killed) = manager(HealthScript::StallThenHealthy(3), bounded_config(3000, 40, 10));
+    let (mgr, health_calls, _killed) = manager(
+        HealthScript::StallThenHealthy(3),
+        bounded_config(3000, 40, 10),
+    );
 
     let outcome = tokio::time::timeout(Duration::from_secs(5), mgr.ensure_started())
         .await
@@ -213,7 +249,8 @@ async fn resolves_when_probe_stalls_then_succeeds() {
 /// happy path (it only caps a stalled probe).
 #[tokio::test]
 async fn healthy_immediately_resolves_fast() {
-    let (mgr, health_calls, _killed) = manager(HealthScript::Healthy, bounded_config(3000, 2000, 150));
+    let (mgr, health_calls, _killed) =
+        manager(HealthScript::Healthy, bounded_config(3000, 2000, 150));
 
     let started = Instant::now();
     let base_url = tokio::time::timeout(Duration::from_secs(5), mgr.ensure_started())
@@ -221,6 +258,14 @@ async fn healthy_immediately_resolves_fast() {
         .expect("no hang")
         .expect("healthy serve starts");
     assert_eq!(base_url, "http://127.0.0.1:1");
-    assert_eq!(health_calls.load(Ordering::SeqCst), 1, "one probe, immediately healthy");
-    assert!(started.elapsed() < Duration::from_millis(500), "healthy start is fast: {:?}", started.elapsed());
+    assert_eq!(
+        health_calls.load(Ordering::SeqCst),
+        1,
+        "one probe, immediately healthy"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "healthy start is fast: {:?}",
+        started.elapsed()
+    );
 }

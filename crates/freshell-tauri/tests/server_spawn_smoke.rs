@@ -84,7 +84,11 @@ fn app_bound_spawn_health_reap_end_to_end() {
     assert_eq!(health::http_probe("127.0.0.1", port), HealthProbe::Ready);
 
     // Reap: a live long-running server dies on SIGTERM within the grace window.
-    let outcome = server::reap_child(&mut child, Duration::from_secs(5), Duration::from_millis(50));
+    let outcome = server::reap_child(
+        &mut child,
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+    );
     assert_eq!(
         outcome,
         ReapOutcome::Graceful,

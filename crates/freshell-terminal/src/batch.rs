@@ -177,7 +177,11 @@ fn segment_for_frame(frame: &BatchInputFrame, offset: i64) -> BatchSegment {
         end_offset: offset + utf16_len(&frame.data),
         bytes: frame.bytes,
         barrier: frame.barrier,
-        barrier_reason: if frame.barrier { frame.barrier_reason } else { None },
+        barrier_reason: if frame.barrier {
+            frame.barrier_reason
+        } else {
+            None
+        },
         state_before: frame.state_before,
         state_after: frame.state_after,
     }
@@ -225,7 +229,13 @@ impl<'a> BatchBuildInput<'a> {
         self.attach_request_id.clone()
     }
 
-    fn measure_legacy_for(&self, data: &str, seq_start: i64, seq_end: i64, stream_id: &str) -> usize {
+    fn measure_legacy_for(
+        &self,
+        data: &str,
+        seq_start: i64,
+        seq_end: i64,
+        stream_id: &str,
+    ) -> usize {
         measure_legacy_output_bytes(
             &self.terminal_id,
             stream_id,
@@ -264,7 +274,12 @@ fn can_merge(current: &MutableBatch, next: &BatchInputFrame, input: &BatchBuildI
 
 fn start_mutable_batch(frame: &BatchInputFrame, input: &BatchBuildInput) -> MutableBatch {
     let attach_request_id = input.frame_attach_request_id(frame);
-    let legacy = input.measure_legacy_for(&frame.data, frame.seq_start, frame.seq_end, &frame.stream_id);
+    let legacy = input.measure_legacy_for(
+        &frame.data,
+        frame.seq_start,
+        frame.seq_end,
+        &frame.stream_id,
+    );
     MutableBatch {
         seq_start: frame.seq_start,
         seq_end: frame.seq_end,
@@ -283,7 +298,11 @@ fn start_mutable_batch(frame: &BatchInputFrame, input: &BatchBuildInput) -> Muta
 
 /// `measureMergedBatch` (`output-batch.ts:305-335`) — legacy envelope size of the
 /// merged data if `next` were appended.
-fn measure_merged(current: &MutableBatch, next: &BatchInputFrame, input: &BatchBuildInput) -> usize {
+fn measure_merged(
+    current: &MutableBatch,
+    next: &BatchInputFrame,
+    input: &BatchBuildInput,
+) -> usize {
     let mut data = current.chunks.concat();
     data.push_str(&next.data);
     input.measure_legacy_for(&data, current.seq_start, next.seq_end, &current.stream_id)
@@ -320,7 +339,12 @@ fn flush_mutable(b: MutableBatch) -> OutputBatch {
 
 fn build_single_batch(frame: &BatchInputFrame, input: &BatchBuildInput) -> OutputBatch {
     let attach_request_id = input.frame_attach_request_id(frame);
-    let legacy = input.measure_legacy_for(&frame.data, frame.seq_start, frame.seq_end, &frame.stream_id);
+    let legacy = input.measure_legacy_for(
+        &frame.data,
+        frame.seq_start,
+        frame.seq_end,
+        &frame.stream_id,
+    );
     OutputBatch {
         seq_start: frame.seq_start,
         seq_end: frame.seq_end,
@@ -330,7 +354,11 @@ fn build_single_batch(frame: &BatchInputFrame, input: &BatchBuildInput) -> Outpu
         attach_request_id,
         source: input.source.clone(),
         barrier: frame.barrier,
-        barrier_reason: if frame.barrier { frame.barrier_reason } else { None },
+        barrier_reason: if frame.barrier {
+            frame.barrier_reason
+        } else {
+            None
+        },
         state_before: frame.state_before,
         state_after: frame.state_after,
         segments: vec![segment_for_frame(frame, 0)],
@@ -540,23 +568,42 @@ pub fn build_batch_wire_payloads(
         return vec![full];
     }
     if seg_count <= 1 {
-        return vec![single_segment_fallback(terminal_id, batch, attach_request_id, source, 0)];
+        return vec![single_segment_fallback(
+            terminal_id,
+            batch,
+            attach_request_id,
+            source,
+            0,
+        )];
     }
 
     let mut payloads = Vec::new();
     let mut start = 0usize;
     while start < seg_count {
         let mut end = start + 1;
-        let current = build_batch_payload(terminal_id, batch, attach_request_id, source, start, end);
+        let current =
+            build_batch_payload(terminal_id, batch, attach_request_id, source, start, end);
         if payload_serialized_bytes(&current) > batch_max_bytes {
-            payloads.push(single_segment_fallback(terminal_id, batch, attach_request_id, source, start));
+            payloads.push(single_segment_fallback(
+                terminal_id,
+                batch,
+                attach_request_id,
+                source,
+                start,
+            ));
             start = end;
             continue;
         }
         let mut best = current;
         while end < seg_count {
-            let candidate =
-                build_batch_payload(terminal_id, batch, attach_request_id, source, start, end + 1);
+            let candidate = build_batch_payload(
+                terminal_id,
+                batch,
+                attach_request_id,
+                source,
+                start,
+                end + 1,
+            );
             if payload_serialized_bytes(&candidate) > batch_max_bytes {
                 break;
             }
@@ -590,7 +637,13 @@ pub fn frames_to_wire_payloads(
     let batches = build_terminal_output_batches(&input);
     let mut out = Vec::new();
     for batch in &batches {
-        out.extend(build_batch_wire_payloads(terminal_id, batch, attach_request_id, source, batch_max_bytes));
+        out.extend(build_batch_wire_payloads(
+            terminal_id,
+            batch,
+            attach_request_id,
+            source,
+            batch_max_bytes,
+        ));
     }
     out
 }
@@ -608,8 +661,12 @@ mod tests {
             stream_id: "stream-1".into(),
             barrier: false,
             barrier_reason: None,
-            state_before: ScannerState { mode: ScannerMode::Ground },
-            state_after: ScannerState { mode: ScannerMode::Ground },
+            state_before: ScannerState {
+                mode: ScannerMode::Ground,
+            },
+            state_after: ScannerState {
+                mode: ScannerMode::Ground,
+            },
         }
     }
     fn barrier(seq: i64, data: &str, reason: BarrierReason) -> BatchInputFrame {
@@ -655,8 +712,14 @@ mod tests {
             ],
             16 * 1024,
         );
-        assert_eq!(batches.iter().map(|b| b.data.clone()).collect::<Vec<_>>(), vec!["a", "\u{0007}", "b"]);
-        assert_eq!(batches.iter().map(|b| b.seq_start).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(
+            batches.iter().map(|b| b.data.clone()).collect::<Vec<_>>(),
+            vec!["a", "\u{0007}", "b"]
+        );
+        assert_eq!(
+            batches.iter().map(|b| b.seq_start).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
         assert!(batches[1].barrier);
         assert_eq!(batches[1].barrier_reason, Some(BarrierReason::TurnComplete));
     }
@@ -679,8 +742,20 @@ mod tests {
         let batches = build(vec![ground(1, "\u{1F600}"), ground(2, "b")], 16 * 1024);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].data, "\u{1F600}b");
-        assert_eq!((batches[0].segments[0].offset, batches[0].segments[0].end_offset), (0, 2));
-        assert_eq!((batches[0].segments[1].offset, batches[0].segments[1].end_offset), (2, 3));
+        assert_eq!(
+            (
+                batches[0].segments[0].offset,
+                batches[0].segments[0].end_offset
+            ),
+            (0, 2)
+        );
+        assert_eq!(
+            (
+                batches[0].segments[1].offset,
+                batches[0].segments[1].end_offset
+            ),
+            (2, 3)
+        );
     }
 
     #[test]
@@ -691,7 +766,13 @@ mod tests {
         assert_eq!(batches[0].seq_start, 1);
         assert_eq!(batches[0].seq_end, 4096);
         assert_eq!(batches[0].segments.len(), 4096);
-        assert_eq!((batches[0].segments[4095].offset, batches[0].segments[4095].end_offset), (4095, 4096));
+        assert_eq!(
+            (
+                batches[0].segments[4095].offset,
+                batches[0].segments[4095].end_offset
+            ),
+            (4095, 4096)
+        );
     }
 
     #[test]
@@ -733,7 +814,10 @@ mod tests {
         // Re-measure the exact emitted payload: serializedBytes must equal its own
         // JSON byte length (the fixpoint converged).
         let actual = measure_json_bytes(p) as i64;
-        assert_eq!(claimed, actual, "serializedBytes must equal the payload's own JSON byte length");
+        assert_eq!(
+            claimed, actual,
+            "serializedBytes must equal the payload's own JSON byte length"
+        );
     }
 
     #[test]

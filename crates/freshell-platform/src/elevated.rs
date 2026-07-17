@@ -157,7 +157,10 @@ impl ConfirmationGate {
         action: ConfirmationAction,
         token: &str,
     ) -> ConfirmationResponse {
-        self.current = Some(Confirmation { token: token.to_string(), action });
+        self.current = Some(Confirmation {
+            token: token.to_string(),
+            action,
+        });
         ConfirmationResponse::new(token)
     }
 
@@ -171,7 +174,11 @@ impl ConfirmationGate {
 
     /// `consumeConfirmation` (`network-router.ts:237-244`): if it matches, clear
     /// and return `true`.
-    pub fn consume_confirmation(&mut self, token: Option<&str>, action: ConfirmationAction) -> bool {
+    pub fn consume_confirmation(
+        &mut self,
+        token: Option<&str>,
+        action: ConfirmationAction,
+    ) -> bool {
         if self.matches_confirmation(token, action) {
             self.current = None;
             true
@@ -252,7 +259,9 @@ impl ConfirmationGate {
         // the fake completes synchronously, so we release right after.)
         let _out = spawn_elevated_powershell(runner, action.powershell_command(), script);
         self.release_repair_lock();
-        ElevationDecision::Started { method: action.response_method() }
+        ElevationDecision::Started {
+            method: action.response_method(),
+        }
     }
 }
 
@@ -298,11 +307,17 @@ protocol=tcp localport=3001 profile=private'"
     #[test]
     fn action_strings_and_powershell_and_method() {
         assert_eq!(ConfirmationAction::WindowsRepair.as_str(), "windows-repair");
-        assert_eq!(ConfirmationAction::WindowsDisable.as_str(), "windows-disable");
+        assert_eq!(
+            ConfirmationAction::WindowsDisable.as_str(),
+            "windows-disable"
+        );
         assert_eq!(ConfirmationAction::Wsl2Repair.as_str(), "wsl2-repair");
         assert_eq!(ConfirmationAction::Wsl2Disable.as_str(), "wsl2-disable");
 
-        assert_eq!(ConfirmationAction::WindowsRepair.powershell_command(), "powershell.exe");
+        assert_eq!(
+            ConfirmationAction::WindowsRepair.powershell_command(),
+            "powershell.exe"
+        );
         assert_eq!(
             ConfirmationAction::Wsl2Repair.powershell_command(),
             "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
@@ -312,7 +327,10 @@ protocol=tcp localport=3001 profile=private'"
             "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
         );
 
-        assert_eq!(ConfirmationAction::WindowsRepair.response_method(), "windows-elevated");
+        assert_eq!(
+            ConfirmationAction::WindowsRepair.response_method(),
+            "windows-elevated"
+        );
         assert_eq!(ConfirmationAction::Wsl2Repair.response_method(), "wsl2");
     }
 
@@ -377,7 +395,10 @@ protocol=tcp localport=3001 profile=private'"
         // byte-exact elevated args.
         assert_eq!(runner.call_count(), 1);
         let (cmd, args) = runner.calls().into_iter().next().unwrap();
-        assert_eq!(cmd, "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe");
+        assert_eq!(
+            cmd,
+            "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+        );
         assert_eq!(args[0], "-Command");
         assert_eq!(
             args[1],

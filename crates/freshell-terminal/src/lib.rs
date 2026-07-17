@@ -44,10 +44,12 @@ pub mod pty;
 pub mod registry;
 pub mod replay_ring;
 
-pub use barrier_scanner::{BarrierClassification, BarrierReason, BarrierScanner, ScannerMode, ScannerState};
+pub use barrier_scanner::{
+    BarrierClassification, BarrierReason, BarrierScanner, ScannerMode, ScannerState,
+};
 pub use batch::{
-    build_terminal_output_batches, frames_to_wire_payloads, slice_utf16, utf16_len, BatchBuildInput,
-    BatchInputFrame, OutputBatch,
+    build_terminal_output_batches, frames_to_wire_payloads, slice_utf16, utf16_len,
+    BatchBuildInput, BatchInputFrame, OutputBatch,
 };
 pub use chunk_ring::{snapshot_seed_if_ring_empty, ChunkRingBuffer};
 pub use decode::Utf8StreamDecoder;

@@ -25,7 +25,10 @@ async fn interrupt_turn_rpc_then_interrupted_completion_snapshots_without_chime(
     let driver = {
         let client = client.clone();
         tokio::spawn(async move {
-            client.start_thread(StartThreadParams::default()).await.expect("thread/start");
+            client
+                .start_thread(StartThreadParams::default())
+                .await
+                .expect("thread/start");
             let turn = client
                 .start_turn(StartTurnParams {
                     thread_id: THREAD_ID.to_string(),
@@ -38,7 +41,10 @@ async fn interrupt_turn_rpc_then_interrupted_completion_snapshots_without_chime(
                 })
                 .await
                 .expect("turn/start");
-            client.interrupt_turn(THREAD_ID, &turn.turn_id).await.expect("turn/interrupt");
+            client
+                .interrupt_turn(THREAD_ID, &turn.turn_id)
+                .await
+                .expect("turn/interrupt");
         })
     };
 
@@ -75,11 +81,15 @@ async fn interrupt_turn_rpc_then_interrupted_completion_snapshots_without_chime(
         other => panic!("expected TurnCompleted, got {other:?}"),
     };
     assert!(
-        events.iter().any(|e| matches!(e, CodexAdapterEvent::StatusSnapshot { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, CodexAdapterEvent::StatusSnapshot { .. })),
         "an idle snapshot always fires: {events:?}"
     );
     assert!(
-        !events.iter().any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })),
+        !events
+            .iter()
+            .any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })),
         "an interrupt must NEVER chime: {events:?}"
     );
 }

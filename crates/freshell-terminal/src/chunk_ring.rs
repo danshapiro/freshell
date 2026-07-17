@@ -127,7 +127,10 @@ fn slice_last_utf16(s: &str, max: i64) -> String {
 ///
 /// This is the exact predicate — the port must seed once and only once, else the
 /// replay would either duplicate the scrollback or start empty.
-pub fn snapshot_seed_if_ring_empty(ring_head_seq: i64, scrollback: &ChunkRingBuffer) -> Option<String> {
+pub fn snapshot_seed_if_ring_empty(
+    ring_head_seq: i64,
+    scrollback: &ChunkRingBuffer,
+) -> Option<String> {
     if ring_head_seq == 0 {
         let snap = scrollback.snapshot();
         if snap.is_empty() {
@@ -203,7 +206,10 @@ mod tests {
         let mut b = ChunkRingBuffer::new(DEFAULT_SCROLLBACK_MAX_CHARS);
         b.append("scrollback");
         // Ring empty (headSeq 0) → seed with the joined snapshot.
-        assert_eq!(snapshot_seed_if_ring_empty(0, &b).as_deref(), Some("scrollback"));
+        assert_eq!(
+            snapshot_seed_if_ring_empty(0, &b).as_deref(),
+            Some("scrollback")
+        );
         // Ring already has frames (headSeq > 0) → never re-seed.
         assert_eq!(snapshot_seed_if_ring_empty(5, &b), None);
         // Empty scrollback → nothing to seed.

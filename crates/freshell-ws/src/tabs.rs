@@ -129,7 +129,9 @@ impl TabsRegistry {
         let watermark_rev = state.client_revisions.get(&key).copied();
         let high_water = current_rev.unwrap_or(-1).max(watermark_rev.unwrap_or(-1));
         if snapshot_revision < high_water {
-            return Err("Stale snapshot revision rejected for tabs registry client snapshot".into());
+            return Err(
+                "Stale snapshot revision rejected for tabs registry client snapshot".into(),
+            );
         }
         if let Some(cur) = current_rev {
             if snapshot_revision == cur {
@@ -245,7 +247,9 @@ impl TabsRegistry {
 
         for snapshot in state.open_snapshots.values() {
             for record in &snapshot.records {
-                let Some(tab_key) = record_tab_key(record) else { continue };
+                let Some(tab_key) = record_tab_key(record) else {
+                    continue;
+                };
                 let replace = match winners.get(&tab_key) {
                     None => true,
                     Some((cur, _)) => compare_by_event_time(cur, record).is_lt(),
@@ -259,7 +263,9 @@ impl TabsRegistry {
             }
         }
         for record in state.closed_by_tab_key.values() {
-            let Some(tab_key) = record_tab_key(record) else { continue };
+            let Some(tab_key) = record_tab_key(record) else {
+                continue;
+            };
             let replace = match winners.get(&tab_key) {
                 None => true,
                 Some((cur, _)) => compare_by_event_time(cur, record).is_lt(),
@@ -368,7 +374,11 @@ fn compare_by_event_time(a: &Value, b: &Value) -> std::cmp::Ordering {
     let sa = record_status(a);
     let sb = record_status(b);
     if sa != sb {
-        return if sa == "closed" { Ordering::Greater } else { Ordering::Less };
+        return if sa == "closed" {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        };
     }
     source_key(a).cmp(&source_key(b))
 }
@@ -392,8 +402,14 @@ fn sort_by_updated_desc(a: &Value, b: &Value) -> std::cmp::Ordering {
 }
 
 fn sort_by_closed_desc(a: &Value, b: &Value) -> std::cmp::Ordering {
-    let a_closed = a.get("closedAt").and_then(Value::as_i64).unwrap_or_else(|| record_i64(a, "updatedAt"));
-    let b_closed = b.get("closedAt").and_then(Value::as_i64).unwrap_or_else(|| record_i64(b, "updatedAt"));
+    let a_closed = a
+        .get("closedAt")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| record_i64(a, "updatedAt"));
+    let b_closed = b
+        .get("closedAt")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| record_i64(b, "updatedAt"));
     b_closed.cmp(&a_closed)
 }
 
@@ -482,10 +498,24 @@ mod tests {
     #[test]
     fn local_vs_same_device_partition() {
         let reg = TabsRegistry::new();
-        reg.replace_client_snapshot("srv-1", "dev", "Dev", "c1", 1, vec![open_record("t1", "one", 10)])
-            .unwrap();
-        reg.replace_client_snapshot("srv-1", "dev", "Dev", "c2", 1, vec![open_record("t2", "two", 20)])
-            .unwrap();
+        reg.replace_client_snapshot(
+            "srv-1",
+            "dev",
+            "Dev",
+            "c1",
+            1,
+            vec![open_record("t1", "one", 10)],
+        )
+        .unwrap();
+        reg.replace_client_snapshot(
+            "srv-1",
+            "dev",
+            "Dev",
+            "c2",
+            1,
+            vec![open_record("t2", "two", 20)],
+        )
+        .unwrap();
         let data = reg.query("dev", "c1");
         // c1's own tab is local; c2's (same device) is sameDeviceOpen.
         assert_eq!(data["localOpen"].as_array().unwrap().len(), 1);
@@ -497,8 +527,15 @@ mod tests {
     #[test]
     fn stale_revision_rejected_and_retire_is_monotonic() {
         let reg = TabsRegistry::new();
-        reg.replace_client_snapshot("srv-1", "dev", "Dev", "c1", 5, vec![open_record("t1", "one", 10)])
-            .unwrap();
+        reg.replace_client_snapshot(
+            "srv-1",
+            "dev",
+            "Dev",
+            "c1",
+            5,
+            vec![open_record("t1", "one", 10)],
+        )
+        .unwrap();
         // A lower revision is rejected.
         assert!(reg
             .replace_client_snapshot("srv-1", "dev", "Dev", "c1", 4, vec![])
@@ -512,6 +549,9 @@ mod tests {
     fn envelope_records_reads_array() {
         let env = json!({ "type": "tabs.sync.push", "records": [open_record("t", "n", 1)] });
         assert_eq!(envelope_records(&env).len(), 1);
-        assert_eq!(envelope_records(&json!({ "type": "tabs.sync.push" })).len(), 0);
+        assert_eq!(
+            envelope_records(&json!({ "type": "tabs.sync.push" })).len(),
+            0
+        );
     }
 }

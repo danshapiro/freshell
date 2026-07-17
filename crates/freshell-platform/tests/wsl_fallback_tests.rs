@@ -67,7 +67,8 @@ fn mount_mapped_short_circuits_before_touching_wsl_exe() {
 
     // `/mnt/c/proj` is mount-mappable synchronously -> `C:\proj`, no reg/wsl probe.
     assert_eq!(
-        convert_wsl_path_to_windows("/mnt/c/proj", HostOs::Windows, &env, &resolver, &mut cache).as_deref(),
+        convert_wsl_path_to_windows("/mnt/c/proj", HostOs::Windows, &env, &resolver, &mut cache)
+            .as_deref(),
         Some("C:\\proj")
     );
     assert_eq!(*resolver.reg_calls.borrow(), 0);
@@ -97,14 +98,20 @@ fn falls_through_to_wslpath_and_caches_the_result() {
 
     let first =
         convert_wsl_path_to_windows("/home/dan", HostOs::Windows, &env, &resolver, &mut cache);
-    assert_eq!(first.as_deref(), Some("\\\\wsl.localhost\\Ubuntu\\home\\dan"));
+    assert_eq!(
+        first.as_deref(),
+        Some("\\\\wsl.localhost\\Ubuntu\\home\\dan")
+    );
     assert_eq!(*resolver.wslpath_calls.borrow(), 1);
     assert_eq!(cache.len(), 1);
 
     // Second call for the same path is served from cache (wsl.exe not called again).
     let second =
         convert_wsl_path_to_windows("/home/dan", HostOs::Windows, &env, &resolver, &mut cache);
-    assert_eq!(second.as_deref(), Some("\\\\wsl.localhost\\Ubuntu\\home\\dan"));
+    assert_eq!(
+        second.as_deref(),
+        Some("\\\\wsl.localhost\\Ubuntu\\home\\dan")
+    );
     assert_eq!(*resolver.wslpath_calls.borrow(), 1); // still 1 -> cache hit
 }
 

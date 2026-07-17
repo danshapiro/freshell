@@ -38,7 +38,9 @@ pub struct ReqwestServeHttp {
 impl ReqwestServeHttp {
     pub fn new() -> Self {
         // No TLS/proxy needed for a loopback serve; a plain client never fails to build.
-        let client = reqwest::Client::builder().build().unwrap_or_else(|_| reqwest::Client::new());
+        let client = reqwest::Client::builder()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self { client }
     }
 }
@@ -50,7 +52,10 @@ impl Default for ReqwestServeHttp {
 }
 
 impl ServeHttp for ReqwestServeHttp {
-    fn request<'a>(&'a self, req: ServeHttpRequest) -> BoxFuture<'a, Result<ServeHttpResponse, String>> {
+    fn request<'a>(
+        &'a self,
+        req: ServeHttpRequest,
+    ) -> BoxFuture<'a, Result<ServeHttpResponse, String>> {
         let client = self.client.clone();
         Box::pin(async move {
             let method = match req.method {
@@ -77,7 +82,11 @@ impl ServeHttp for ReqwestServeHttp {
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
             let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-            Ok(ServeHttpResponse { status, body: bytes.to_vec(), next_cursor })
+            Ok(ServeHttpResponse {
+                status,
+                body: bytes.to_vec(),
+                next_cursor,
+            })
         })
     }
 }
@@ -91,7 +100,11 @@ pub struct ReqwestEventSource {
 
 impl ReqwestEventSource {
     pub fn new() -> Self {
-        Self { client: reqwest::Client::builder().build().unwrap_or_else(|_| reqwest::Client::new()) }
+        Self {
+            client: reqwest::Client::builder()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+        }
     }
 }
 
@@ -129,10 +142,19 @@ impl EventSource for ReqwestEventSource {
 
 /// `consumeEvents` (`serve-manager.ts:529-571`): reconnect with backoff; per connection,
 /// stream body chunks into a UTF-8-boundary-safe [`SseDecoder`] and dispatch each event.
-async fn consume_events(client: reqwest::Client, url: String, sink: EventSink, cancel: Arc<AtomicBool>) {
+async fn consume_events(
+    client: reqwest::Client,
+    url: String,
+    sink: EventSink,
+    cancel: Arc<AtomicBool>,
+) {
     let mut backoff_ms: u64 = 250;
     while !cancel.load(Ordering::SeqCst) {
-        let response = client.get(&url).header("accept", "text/event-stream").send().await;
+        let response = client
+            .get(&url)
+            .header("accept", "text/event-stream")
+            .send()
+            .await;
         match response {
             Ok(mut resp) if resp.status().is_success() => {
                 backoff_ms = 250;
@@ -160,8 +182,8 @@ async fn consume_events(client: reqwest::Client, url: String, sink: EventSink, c
                                 }
                             }
                         }
-                        Ok(None) => break,  // stream ended cleanly → reconnect
-                        Err(_) => break,    // dropped → reconnect
+                        Ok(None) => break, // stream ended cleanly → reconnect
+                        Err(_) => break,   // dropped → reconnect
                     }
                 }
             }
@@ -200,7 +222,9 @@ impl ProcessSpawner for TokioProcessSpawner {
         for (key, value) in &req.env {
             cmd.env(key, value);
         }
-        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
         let mut child = cmd.spawn().map_err(|e| e.to_string())?;
@@ -296,11 +320,15 @@ fn reap_owned_processes(ownership_id: &str) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Ok(pid) = name.parse::<i32>() else { continue };
+        let Ok(pid) = name.parse::<i32>() else {
+            continue;
+        };
         let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
             continue;
         };
-        let carries_tag = environ.split(|&b| b == 0).any(|var| var == needle.as_bytes());
+        let carries_tag = environ
+            .split(|&b| b == 0)
+            .any(|var| var == needle.as_bytes());
         if carries_tag {
             // SIGTERM (15). Safe: we only signal processes carrying OUR unique tag.
             unsafe {
@@ -326,7 +354,10 @@ impl PortAllocator for LoopbackPortAllocator {
     fn allocate(&self) -> Result<Endpoint, String> {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
-        Ok(Endpoint { hostname: "127.0.0.1".to_string(), port: addr.port() })
+        Ok(Endpoint {
+            hostname: "127.0.0.1".to_string(),
+            port: addr.port(),
+        })
     }
 }
 

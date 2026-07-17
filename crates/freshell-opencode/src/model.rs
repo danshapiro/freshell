@@ -161,39 +161,75 @@ mod tests {
     #[test]
     fn model_trims_or_falls_back_to_default() {
         // Non-empty trimmed values pass through verbatim (opencode accepts any id).
-        assert_eq!(normalize_opencode_model(Some("opencode-go/glm-5.1")).as_deref(), Some("opencode-go/glm-5.1"));
-        assert_eq!(normalize_opencode_model(Some("  provider/model  ")).as_deref(), Some("provider/model"));
+        assert_eq!(
+            normalize_opencode_model(Some("opencode-go/glm-5.1")).as_deref(),
+            Some("opencode-go/glm-5.1")
+        );
+        assert_eq!(
+            normalize_opencode_model(Some("  provider/model  ")).as_deref(),
+            Some("provider/model")
+        );
         // The T2 baseline Kimi id survives normalization unchanged.
         assert_eq!(
             normalize_opencode_model(Some("umans-ai-coding-plan/umans-kimi-k2.7")).as_deref(),
             Some("umans-ai-coding-plan/umans-kimi-k2.7")
         );
         // Blank / missing → the freshopencode default model.
-        assert_eq!(normalize_opencode_model(Some("   ")).as_deref(), Some(FRESHOPENCODE_DEFAULT_MODEL));
-        assert_eq!(normalize_opencode_model(None).as_deref(), Some(FRESHOPENCODE_DEFAULT_MODEL));
+        assert_eq!(
+            normalize_opencode_model(Some("   ")).as_deref(),
+            Some(FRESHOPENCODE_DEFAULT_MODEL)
+        );
+        assert_eq!(
+            normalize_opencode_model(None).as_deref(),
+            Some(FRESHOPENCODE_DEFAULT_MODEL)
+        );
     }
 
     #[test]
     fn effort_clamps_to_menu_with_kimi() {
         let kimi = Some("umans-ai-coding-plan/umans-kimi-k2.7");
         // On-menu effort is kept.
-        assert_eq!(normalize_opencode_effort(kimi, Some("low")).as_deref(), Some("low"));
-        assert_eq!(normalize_opencode_effort(kimi, Some("minimal")).as_deref(), Some("minimal"));
-        assert_eq!(normalize_opencode_effort(kimi, Some("max")).as_deref(), Some("max"));
+        assert_eq!(
+            normalize_opencode_effort(kimi, Some("low")).as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            normalize_opencode_effort(kimi, Some("minimal")).as_deref(),
+            Some("minimal")
+        );
+        assert_eq!(
+            normalize_opencode_effort(kimi, Some("max")).as_deref(),
+            Some("max")
+        );
         // Absent effort → the model's defaultEffort ("max").
-        assert_eq!(normalize_opencode_effort(kimi, None).as_deref(), Some("max"));
+        assert_eq!(
+            normalize_opencode_effort(kimi, None).as_deref(),
+            Some("max")
+        );
         // Off-menu effort → clamped to the default ("max").
-        assert_eq!(normalize_opencode_effort(kimi, Some("bogus")).as_deref(), Some("max"));
+        assert_eq!(
+            normalize_opencode_effort(kimi, Some("bogus")).as_deref(),
+            Some("max")
+        );
         // 'xhigh' is NOT rewritten for opencode (codex-only) → off-menu → clamps to default.
-        assert_eq!(normalize_opencode_effort(kimi, Some("xhigh")).as_deref(), Some("max"));
+        assert_eq!(
+            normalize_opencode_effort(kimi, Some("xhigh")).as_deref(),
+            Some("max")
+        );
     }
 
     #[test]
     fn effort_for_unknown_model_uses_default_menu() {
         // An unknown-but-nonempty model resolves to the first menu option's efforts.
         let unknown = Some("some-other/model");
-        assert_eq!(normalize_opencode_effort(unknown, Some("high")).as_deref(), Some("high"));
-        assert_eq!(normalize_opencode_effort(unknown, None).as_deref(), Some("max"));
+        assert_eq!(
+            normalize_opencode_effort(unknown, Some("high")).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            normalize_opencode_effort(unknown, None).as_deref(),
+            Some("max")
+        );
     }
 
     #[test]
@@ -208,7 +244,10 @@ mod tests {
         // Split on FIRST slash only — the model id keeps later slashes.
         assert_eq!(
             split_opencode_model(Some("prov/a/b")),
-            Some(OpencodeModel { provider_id: "prov".into(), model_id: "a/b".into() })
+            Some(OpencodeModel {
+                provider_id: "prov".into(),
+                model_id: "a/b".into()
+            })
         );
         // Rejected: blank, slashless, leading/trailing slash.
         assert_eq!(split_opencode_model(None), None);

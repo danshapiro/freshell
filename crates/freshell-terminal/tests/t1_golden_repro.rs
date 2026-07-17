@@ -96,8 +96,7 @@ fn scenarios() -> Vec<Scenario> {
 
 fn baseline_dir() -> PathBuf {
     // CARGO_MANIFEST_DIR = <worktree>/crates/freshell-terminal
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../port/oracle/baselines/pty")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../port/oracle/baselines/pty")
 }
 
 fn read_golden(name: &str) -> Vec<u8> {
@@ -220,7 +219,12 @@ fn extract_golden(stream: &str, start: &str, end: &str) -> String {
     let rest = &stream[golden_start..];
     let end_idx = match rest.find(&format!("{end}\r\n")) {
         Some(i) => golden_start + i,
-        None => golden_start + rest.find(&format!("{end}\n")).expect("end sentinel after start"),
+        None => {
+            golden_start
+                + rest
+                    .find(&format!("{end}\n"))
+                    .expect("end sentinel after start")
+        }
     };
     stream[golden_start..end_idx].to_string()
 }
@@ -303,7 +307,9 @@ fn capture_scenario(scenario: &Scenario) -> Vec<u8> {
 fn t1_reproduces_all_four_pty_goldens_byte_for_byte() {
     let mut failures: Vec<String> = Vec::new();
 
-    println!("\n=== T1 crate-level golden reproduction (portable-pty /bin/bash -l, {COLS}x{ROWS}) ===");
+    println!(
+        "\n=== T1 crate-level golden reproduction (portable-pty /bin/bash -l, {COLS}x{ROWS}) ==="
+    );
     for scenario in scenarios() {
         let extracted = capture_scenario(&scenario);
         let golden = read_golden(scenario.name);

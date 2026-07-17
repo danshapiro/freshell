@@ -84,7 +84,10 @@ fn has_on_word(s: &str) -> bool {
 
 /// `tryExec` (`firewall.ts:27-34`): stdout on success, else `None`.
 fn try_exec(runner: &dyn CommandRunner, cmd: &str, args: &[&str]) -> Option<String> {
-    runner.run(cmd, args).stdout_on_success().map(|s| s.to_string())
+    runner
+        .run(cmd, args)
+        .stdout_on_success()
+        .map(|s| s.to_string())
 }
 
 fn detect_linux_firewall(runner: &dyn CommandRunner) -> FirewallInfo {
@@ -92,23 +95,35 @@ fn detect_linux_firewall(runner: &dyn CommandRunner) -> FirewallInfo {
     let ufw = try_exec(runner, "ufw", &["status"]);
     if let Some(ref out) = ufw {
         if out.contains("Status: active") {
-            return FirewallInfo { platform: FirewallPlatform::LinuxUfw, active: true };
+            return FirewallInfo {
+                platform: FirewallPlatform::LinuxUfw,
+                active: true,
+            };
         }
     }
 
     // firewalld (Fedora/RHEL/CentOS).
     if let Some(out) = try_exec(runner, "firewall-cmd", &["--state"]) {
         if out.trim() == "running" {
-            return FirewallInfo { platform: FirewallPlatform::LinuxFirewalld, active: true };
+            return FirewallInfo {
+                platform: FirewallPlatform::LinuxFirewalld,
+                active: true,
+            };
         }
     }
 
     // ufw present-but-inactive still reported (user may want to enable it).
     if ufw.is_some() {
-        return FirewallInfo { platform: FirewallPlatform::LinuxUfw, active: false };
+        return FirewallInfo {
+            platform: FirewallPlatform::LinuxUfw,
+            active: false,
+        };
     }
 
-    FirewallInfo { platform: FirewallPlatform::LinuxNone, active: false }
+    FirewallInfo {
+        platform: FirewallPlatform::LinuxNone,
+        active: false,
+    }
 }
 
 fn detect_mac_firewall(runner: &dyn CommandRunner) -> FirewallInfo {
@@ -123,17 +138,34 @@ fn detect_mac_firewall(runner: &dyn CommandRunner) -> FirewallInfo {
             platform: FirewallPlatform::Macos,
             active: crate::port_forward::parse_int_prefix(o.trim()).is_some_and(|n| n > 0),
         },
-        None => FirewallInfo { platform: FirewallPlatform::Macos, active: false },
+        None => FirewallInfo {
+            platform: FirewallPlatform::Macos,
+            active: false,
+        },
     }
 }
 
 fn detect_windows_firewall(is_wsl2: bool, runner: &dyn CommandRunner) -> FirewallInfo {
     let cmd = netsh_cmd(is_wsl2);
-    let out = try_exec(runner, cmd, &["advfirewall", "show", "currentprofile", "state"]);
-    let platform = if is_wsl2 { FirewallPlatform::Wsl2 } else { FirewallPlatform::Windows };
+    let out = try_exec(
+        runner,
+        cmd,
+        &["advfirewall", "show", "currentprofile", "state"],
+    );
+    let platform = if is_wsl2 {
+        FirewallPlatform::Wsl2
+    } else {
+        FirewallPlatform::Windows
+    };
     match out {
-        Some(o) => FirewallInfo { platform, active: has_on_word(&o) },
-        None => FirewallInfo { platform, active: false },
+        Some(o) => FirewallInfo {
+            platform,
+            active: has_on_word(&o),
+        },
+        None => FirewallInfo {
+            platform,
+            active: false,
+        },
     }
 }
 
@@ -157,9 +189,10 @@ pub fn detect_firewall(host_os: HostOs, is_wsl2: bool, runner: &dyn CommandRunne
 /// `firewallCommands` (`firewall.ts:129-163`) — suggested commands as data.
 pub fn firewall_commands(platform: FirewallPlatform, ports: &[u16]) -> Vec<String> {
     match platform {
-        FirewallPlatform::LinuxUfw => {
-            ports.iter().map(|p| format!("sudo ufw allow {p}/tcp")).collect()
-        }
+        FirewallPlatform::LinuxUfw => ports
+            .iter()
+            .map(|p| format!("sudo ufw allow {p}/tcp"))
+            .collect(),
         FirewallPlatform::LinuxFirewalld => {
             let port_args = ports
                 .iter()
@@ -376,7 +409,10 @@ dir=in action=allow protocol=TCP localport=3001 profile=private"
 
     #[test]
     fn normalize_dedupes_and_sorts() {
-        assert_eq!(normalize_windows_firewall_ports(&[3002, 3001, 3001, 0]), vec![3001, 3002]);
+        assert_eq!(
+            normalize_windows_firewall_ports(&[3002, 3001, 3001, 0]),
+            vec![3001, 3002]
+        );
     }
 
     #[test]
@@ -418,7 +454,13 @@ dir=in action=allow protocol=TCP localport=3001 profile=private"
             CommandOutput::success("Private Profile Settings:\r\nState  ON\r\nOk.\r\n"),
         );
         let info = detect_firewall(HostOs::Linux, true, &runner);
-        assert_eq!(info, FirewallInfo { platform: FirewallPlatform::Wsl2, active: true });
+        assert_eq!(
+            info,
+            FirewallInfo {
+                platform: FirewallPlatform::Wsl2,
+                active: true
+            }
+        );
     }
 
     #[test]
@@ -429,7 +471,13 @@ dir=in action=allow protocol=TCP localport=3001 profile=private"
             CommandOutput::success("State  OFF\r\nOk.\r\n"),
         );
         let info = detect_firewall(HostOs::Windows, false, &runner);
-        assert_eq!(info, FirewallInfo { platform: FirewallPlatform::Windows, active: false });
+        assert_eq!(
+            info,
+            FirewallInfo {
+                platform: FirewallPlatform::Windows,
+                active: false
+            }
+        );
     }
 
     #[test]
@@ -443,22 +491,39 @@ dir=in action=allow protocol=TCP localport=3001 profile=private"
 
     #[test]
     fn detect_linux_ufw_active() {
-        let runner = FakeCommandRunner::new()
-            .on("ufw", &["status"], CommandOutput::success("Status: active\n"));
+        let runner = FakeCommandRunner::new().on(
+            "ufw",
+            &["status"],
+            CommandOutput::success("Status: active\n"),
+        );
         assert_eq!(
             detect_firewall(HostOs::Linux, false, &runner),
-            FirewallInfo { platform: FirewallPlatform::LinuxUfw, active: true }
+            FirewallInfo {
+                platform: FirewallPlatform::LinuxUfw,
+                active: true
+            }
         );
     }
 
     #[test]
     fn detect_linux_ufw_inactive_falls_through_to_firewalld() {
         let runner = FakeCommandRunner::new()
-            .on("ufw", &["status"], CommandOutput::success("Status: inactive\n"))
-            .on("firewall-cmd", &["--state"], CommandOutput::success("running\n"));
+            .on(
+                "ufw",
+                &["status"],
+                CommandOutput::success("Status: inactive\n"),
+            )
+            .on(
+                "firewall-cmd",
+                &["--state"],
+                CommandOutput::success("running\n"),
+            );
         assert_eq!(
             detect_firewall(HostOs::Linux, false, &runner),
-            FirewallInfo { platform: FirewallPlatform::LinuxFirewalld, active: true }
+            FirewallInfo {
+                platform: FirewallPlatform::LinuxFirewalld,
+                active: true
+            }
         );
     }
 
@@ -468,7 +533,10 @@ dir=in action=allow protocol=TCP localport=3001 profile=private"
         let runner = FakeCommandRunner::new();
         assert_eq!(
             detect_firewall(HostOs::Linux, false, &runner),
-            FirewallInfo { platform: FirewallPlatform::LinuxNone, active: false }
+            FirewallInfo {
+                platform: FirewallPlatform::LinuxNone,
+                active: false
+            }
         );
     }
 
@@ -477,7 +545,11 @@ dir=in action=allow protocol=TCP localport=3001 profile=private"
         // 3001: exit 0 -> present. 3002: exit 1 but stdout has the name -> present.
         // 3003: exit 1 and no name -> absent.
         let runner = FakeCommandRunner::new()
-            .on("netsh", &["name=Freshell (port 3001)"], CommandOutput::success("Rule Name: ...\n"))
+            .on(
+                "netsh",
+                &["name=Freshell (port 3001)"],
+                CommandOutput::success("Rule Name: ...\n"),
+            )
             .on(
                 "netsh",
                 &["name=Freshell (port 3002)"],

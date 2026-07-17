@@ -26,7 +26,13 @@ fn env(distro: Option<&str>, interop: Option<&str>, wslenv: Option<&str>) -> Map
 // ===========================================================================
 
 /// (host, WSL_DISTRO_NAME, WSL_INTEROP, WSLENV, expected is_wsl_env)
-type RegimeARow = (HostOs, Option<&'static str>, Option<&'static str>, Option<&'static str>, bool);
+type RegimeARow = (
+    HostOs,
+    Option<&'static str>,
+    Option<&'static str>,
+    Option<&'static str>,
+    bool,
+);
 
 #[test]
 fn regime_a_env_matrix() {
@@ -35,7 +41,13 @@ fn regime_a_env_matrix() {
         (HostOs::Linux, Some("Ubuntu"), None, None, true),
         (HostOs::Linux, None, Some("/run/WSL/1_interop"), None, true),
         (HostOs::Linux, None, None, Some("WT_SESSION::"), true),
-        (HostOs::Linux, Some("Ubuntu"), Some("/run/WSL/x"), Some("y"), true),
+        (
+            HostOs::Linux,
+            Some("Ubuntu"),
+            Some("/run/WSL/x"),
+            Some("y"),
+            true,
+        ),
         // Linux + no vars / empty vars -> false (JS `!!` treats "" as falsy).
         (HostOs::Linux, None, None, None, false),
         (HostOs::Linux, Some(""), Some(""), Some(""), false),
@@ -61,7 +73,11 @@ fn regime_b_proc_matrix() {
     // (proc_version, is_wsl2, is_wsl)
     let rows: &[(Option<&str>, bool, bool)] = &[
         // The live host's marker.
-        (Some("Linux version 6.6.87.2-microsoft-standard-WSL2 (...)"), true, true),
+        (
+            Some("Linux version 6.6.87.2-microsoft-standard-WSL2 (...)"),
+            true,
+            true,
+        ),
         // 'wsl2' present but NOT 'microsoft': the two Regime-B predicates are
         // independent, so isWSL2()=true while isWSL()=false (`platform.ts:12-32`).
         (Some("... contains wsl2 ..."), true, false),
@@ -96,7 +112,10 @@ fn detect_platform_proc_and_resolved_platform() {
     assert_eq!(resolve_platform(HostOs::Linux, &e, wsl2), Platform::Wsl2);
     assert_eq!(resolve_platform(HostOs::Linux, &e, wsl1), Platform::Wsl1);
     assert_eq!(resolve_platform(HostOs::Linux, &e, linux), Platform::Linux);
-    assert_eq!(resolve_platform(HostOs::Windows, &e, None), Platform::Windows);
+    assert_eq!(
+        resolve_platform(HostOs::Windows, &e, None),
+        Platform::Windows
+    );
     assert_eq!(resolve_platform(HostOs::Macos, &e, None), Platform::Macos);
 }
 

@@ -117,7 +117,9 @@ pub struct WsState {
 
 /// The `/ws` sub-router, pre-bound to its state (mergeable into the server app).
 pub fn router(state: WsState) -> Router {
-    Router::new().route("/ws", get(ws_handler)).with_state(state)
+    Router::new()
+        .route("/ws", get(ws_handler))
+        .with_state(state)
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<WsState>) -> Response {
@@ -237,14 +239,18 @@ async fn handle_socket(mut socket: WebSocket, state: WsState) {
             return;
         }
         HelloOutcome::ProtocolMismatch => {
-            let msg = format!(
-                "Expected protocol version {WS_PROTOCOL_VERSION}. Please reload the page."
-            );
+            let msg =
+                format!("Expected protocol version {WS_PROTOCOL_VERSION}. Please reload the page.");
             let _ = send_error(&mut socket, ErrorCode::ProtocolMismatch, &msg).await;
             // S3: the original closes with a real WS close frame (code 4010,
             // reason "Protocol version mismatch") \u2014 without it the client only
             // observes an abnormal 1006 closure.
-            let _ = close_with(&mut socket, CLOSE_PROTOCOL_MISMATCH, "Protocol version mismatch").await;
+            let _ = close_with(
+                &mut socket,
+                CLOSE_PROTOCOL_MISMATCH,
+                "Protocol version mismatch",
+            )
+            .await;
             return;
         }
         HelloOutcome::BadToken => {
@@ -308,7 +314,11 @@ const CLOSE_PROTOCOL_MISMATCH: u16 = 4010;
 
 /// Send a WS close frame with the given code/reason, best-effort (the socket
 /// may already be gone).
-async fn close_with(socket: &mut WebSocket, code: u16, reason: &'static str) -> Result<(), axum::Error> {
+async fn close_with(
+    socket: &mut WebSocket,
+    code: u16,
+    reason: &'static str,
+) -> Result<(), axum::Error> {
     use axum::extract::ws::CloseFrame;
     socket
         .send(Message::Close(Some(CloseFrame {
@@ -418,31 +428,50 @@ mod tests {
     fn evaluate_hello_checks_version_before_token() {
         // Wrong version AND wrong token -> version wins (checked first).
         let v = json!({ "type": "hello", "protocolVersion": 6, "token": "nope" });
-        assert_eq!(evaluate_hello(&v, "s3cr3t-token-abcdef"), HelloOutcome::ProtocolMismatch);
+        assert_eq!(
+            evaluate_hello(&v, "s3cr3t-token-abcdef"),
+            HelloOutcome::ProtocolMismatch
+        );
 
         // Right version, wrong token.
         let v = json!({ "type": "hello", "protocolVersion": 7, "token": "nope" });
-        assert_eq!(evaluate_hello(&v, "s3cr3t-token-abcdef"), HelloOutcome::BadToken);
+        assert_eq!(
+            evaluate_hello(&v, "s3cr3t-token-abcdef"),
+            HelloOutcome::BadToken
+        );
 
         // Right version, right token.
         let v = json!({ "type": "hello", "protocolVersion": 7, "token": "s3cr3t-token-abcdef" });
-        assert_eq!(evaluate_hello(&v, "s3cr3t-token-abcdef"), HelloOutcome::Accept);
+        assert_eq!(
+            evaluate_hello(&v, "s3cr3t-token-abcdef"),
+            HelloOutcome::Accept
+        );
 
         // Not a hello.
         let v = json!({ "type": "ping" });
-        assert_eq!(evaluate_hello(&v, "s3cr3t-token-abcdef"), HelloOutcome::NotHello);
+        assert_eq!(
+            evaluate_hello(&v, "s3cr3t-token-abcdef"),
+            HelloOutcome::NotHello
+        );
     }
 
     #[test]
     fn handshake_is_ordered_with_shared_bootid() {
         let msgs = build_handshake(&state());
-        let wire: Vec<serde_json::Value> =
-            msgs.iter().map(|m| serde_json::to_value(m).unwrap()).collect();
+        let wire: Vec<serde_json::Value> = msgs
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
 
         let types: Vec<&str> = wire.iter().map(|v| v["type"].as_str().unwrap()).collect();
         assert_eq!(
             types,
-            vec!["ready", "settings.updated", "perf.logging", "terminal.inventory"]
+            vec![
+                "ready",
+                "settings.updated",
+                "perf.logging",
+                "terminal.inventory"
+            ]
         );
 
         // ready carries the boot-scoped ids + an ISO timestamp.

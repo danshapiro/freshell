@@ -128,7 +128,10 @@ pub fn remote_from_desktop_config(cfg: &serde_json::Value) -> Option<RemoteConfi
         return None;
     }
     let url = cfg.get("remoteUrl").and_then(|v| v.as_str()).unwrap_or("");
-    let token = cfg.get("remoteToken").and_then(|v| v.as_str()).unwrap_or("");
+    let token = cfg
+        .get("remoteToken")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     remote_from_env(Some(url), Some(token))
 }
 
@@ -229,7 +232,10 @@ mod tests {
         assert!(remote_from_env(Some("http://x:1"), Some("tok")).is_some());
         assert!(remote_from_env(Some("http://x:1"), None).is_none());
         assert!(remote_from_env(None, Some("tok")).is_none());
-        assert!(remote_from_env(Some(""), Some("tok")).is_none(), "'' is falsy");
+        assert!(
+            remote_from_env(Some(""), Some("tok")).is_none(),
+            "'' is falsy"
+        );
         assert!(remote_from_env(Some("http://x:1"), Some("")).is_none());
     }
 
@@ -256,14 +262,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let prov = dir.path().join("desktop.provision");
         let cfg = dir.path().join("desktop.json");
-        std::fs::write(&prov, "FRESHELL_REMOTE_URL=http://box:3051\nFRESHELL_TOKEN=tok=1\n")
-            .unwrap();
+        std::fs::write(
+            &prov,
+            "FRESHELL_REMOTE_URL=http://box:3051\nFRESHELL_TOKEN=tok=1\n",
+        )
+        .unwrap();
         assert!(apply_provisioning_file(&prov, &cfg));
-        assert!(!prov.exists(), "provision file is one-shot (always removed)");
+        assert!(
+            !prov.exists(),
+            "provision file is one-shot (always removed)"
+        );
         let value = config::read_config_at(&cfg).unwrap();
         assert_eq!(value["serverMode"], "remote");
         assert_eq!(value["remoteUrl"], "http://box:3051");
-        assert_eq!(value["remoteToken"], "tok=1", "token kept verbatim (incl. '=')");
+        assert_eq!(
+            value["remoteToken"], "tok=1",
+            "token kept verbatim (incl. '=')"
+        );
         assert_eq!(value["setupCompleted"], true);
     }
 
@@ -302,8 +317,9 @@ mod tests {
         assert_eq!(r.remote_url, "http://h:1");
         assert_eq!(r.remote_token, "t");
         // Non-remote modes and missing fields resolve to None.
-        assert!(remote_from_desktop_config(&serde_json::json!({"serverMode": "app-bound"}))
-            .is_none());
+        assert!(
+            remote_from_desktop_config(&serde_json::json!({"serverMode": "app-bound"})).is_none()
+        );
         assert!(remote_from_desktop_config(
             &serde_json::json!({"serverMode": "remote", "remoteUrl": "http://h:1"})
         )

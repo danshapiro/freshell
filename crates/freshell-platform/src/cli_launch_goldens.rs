@@ -105,8 +105,14 @@ fn codex_mcp_unix() -> McpInjection {
 /// Pins the exact byte-level notification constants (U3 executed proof).
 #[test]
 fn claude_settings_json_bytes_are_pinned() {
-    assert_eq!(claude_settings_json(ProviderTarget::Unix), CLAUDE_SETTINGS_UNIX);
-    assert_eq!(claude_settings_json(ProviderTarget::Windows), CLAUDE_SETTINGS_WIN);
+    assert_eq!(
+        claude_settings_json(ProviderTarget::Unix),
+        CLAUDE_SETTINGS_UNIX
+    );
+    assert_eq!(
+        claude_settings_json(ProviderTarget::Windows),
+        CLAUDE_SETTINGS_WIN
+    );
 }
 
 /// G-C1 — claude, linux, fresh, defaults — RESOLVER-LEVEL ONLY (the live path
@@ -350,7 +356,10 @@ fn all_segments_ordering_is_enforced() {
     assert!(pos("--base-flag") < pos("--model"));
     assert!(pos("--model") < pos("--sandbox"));
     assert!(pos("--sandbox") < pos("resume"));
-    assert_eq!(&a[a.len() - 2..], &["resume".to_string(), "sid1".to_string()]);
+    assert_eq!(
+        &a[a.len() - 2..],
+        &["resume".to_string(), "sid1".to_string()]
+    );
 }
 
 fn opencode_inputs<'a>() -> CliLaunchInputs<'a> {
@@ -413,7 +422,10 @@ fn g_o2_opencode_gemini_key_default_model_and_env_override() {
         ]
     );
     assert_eq!(
-        launch.env.get("GOOGLE_GENERATIVE_AI_API_KEY").map(String::as_str),
+        launch
+            .env
+            .get("GOOGLE_GENERATIVE_AI_API_KEY")
+            .map(String::as_str),
         Some("k1")
     );
 }
@@ -449,10 +461,9 @@ fn g_o3_opencode_resume_suppresses_model() {
     let mut inputs = opencode_inputs();
     inputs.resume_session_id = Some("ses_abc");
     inputs.model = Some("openai/gpt-5");
-    let launch =
-        resolve_coding_cli_command(&specs(), &inputs, &env_of(&[("OPENAI_API_KEY", "x")]))
-            .unwrap()
-            .unwrap();
+    let launch = resolve_coding_cli_command(&specs(), &inputs, &env_of(&[("OPENAI_API_KEY", "x")]))
+        .unwrap()
+        .unwrap();
     assert_eq!(
         launch.args,
         vec![
@@ -601,7 +612,10 @@ fn gemini_env_injection_passes_through_command_env() {
         .unwrap();
     assert!(launch.args.is_empty());
     assert_eq!(
-        launch.env.get("GEMINI_CLI_SYSTEM_DEFAULTS_PATH").map(String::as_str),
+        launch
+            .env
+            .get("GEMINI_CLI_SYSTEM_DEFAULTS_PATH")
+            .map(String::as_str),
         Some("/tmp/freshell-mcp/term1.json")
     );
 }
@@ -614,9 +628,10 @@ fn gemini_env_injection_passes_through_command_env() {
 /// this golden is REPLACED by G-X1 as the live-path shape.
 #[test]
 fn g_x0_codex_shipped_deviation_shape_dev_0006() {
-    let launch = resolve_coding_cli_command(&specs(), &codex_inputs(codex_mcp_unix()), &env_of(&[]))
-        .unwrap()
-        .unwrap();
+    let launch =
+        resolve_coding_cli_command(&specs(), &codex_inputs(codex_mcp_unix()), &env_of(&[]))
+            .unwrap()
+            .unwrap();
     assert_eq!(launch.command, "codex");
     assert_eq!(
         launch.args,

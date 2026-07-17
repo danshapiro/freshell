@@ -267,7 +267,10 @@ mod tests {
         // Regime A = false (env stripped), Regime B = true (/proc still WSL2).
         let scrubbed = MapEnv::new(); // no WSL_* vars
         let proc = Some("Linux version 6.6-microsoft-standard-WSL2 ...");
-        assert!(!is_wsl_env(HostOs::Linux, &scrubbed), "Regime A must be false");
+        assert!(
+            !is_wsl_env(HostOs::Linux, &scrubbed),
+            "Regime A must be false"
+        );
         assert!(is_wsl2_proc(proc), "Regime B must be true");
     }
 
@@ -303,7 +306,10 @@ mod tests {
             resolve_platform(HostOs::Linux, &env, Some("generic")),
             Platform::Linux
         );
-        assert_eq!(resolve_platform(HostOs::Windows, &env, None), Platform::Windows);
+        assert_eq!(
+            resolve_platform(HostOs::Windows, &env, None),
+            Platform::Windows
+        );
         assert_eq!(resolve_platform(HostOs::Macos, &env, None), Platform::Macos);
     }
 

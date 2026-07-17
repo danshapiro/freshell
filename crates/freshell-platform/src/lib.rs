@@ -65,7 +65,8 @@ pub mod port_forward;
 
 pub use detect::{HostOs, Platform};
 pub use elevated::{
-    build_elevated_powershell_args, ConfirmationAction, ConfirmationGate, ELEVATED_POWERSHELL_TIMEOUT_MS,
+    build_elevated_powershell_args, ConfirmationAction, ConfirmationGate,
+    ELEVATED_POWERSHELL_TIMEOUT_MS,
 };
 pub use firewall::{detect_firewall, firewall_commands, FirewallInfo, FirewallPlatform};
 pub use network::{
@@ -232,18 +233,30 @@ pub struct CommandOutput {
 impl CommandOutput {
     /// A successful (exit-0) run with the given stdout and empty stderr.
     pub fn success(stdout: impl Into<String>) -> Self {
-        Self { exit_code: Some(0), stdout: stdout.into(), stderr: String::new() }
+        Self {
+            exit_code: Some(0),
+            stdout: stdout.into(),
+            stderr: String::new(),
+        }
     }
 
     /// A failed run (non-zero exit) with the given exit code / streams.
     pub fn failure(exit_code: i32, stdout: impl Into<String>, stderr: impl Into<String>) -> Self {
-        Self { exit_code: Some(exit_code), stdout: stdout.into(), stderr: stderr.into() }
+        Self {
+            exit_code: Some(exit_code),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
     }
 
     /// A spawn failure (binary absent / killed): `error.code` is not numeric, so
     /// [`CommandOutput::exit_code`] is `None` (matches `getExecExitCode` → null).
     pub fn spawn_failure(stderr: impl Into<String>) -> Self {
-        Self { exit_code: None, stdout: String::new(), stderr: stderr.into() }
+        Self {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: stderr.into(),
+        }
     }
 
     /// `true` iff the process ran and exited 0 — Node's `error === null`.
@@ -285,7 +298,9 @@ pub struct StdCommandRunner {
 impl Default for StdCommandRunner {
     fn default() -> Self {
         // Matches the reference's 5s `tryExec` timeout (`firewall.ts:29`).
-        Self { timeout: std::time::Duration::from_secs(5) }
+        Self {
+            timeout: std::time::Duration::from_secs(5),
+        }
     }
 }
 
@@ -348,8 +363,16 @@ impl CommandRunner for StdCommandRunner {
         let stdout = out_handle.join().unwrap_or_default();
         let stderr = err_handle.join().unwrap_or_default();
         match status {
-            Some(s) => CommandOutput { exit_code: s.code(), stdout, stderr },
-            None => CommandOutput { exit_code: None, stdout, stderr },
+            Some(s) => CommandOutput {
+                exit_code: s.code(),
+                stdout,
+                stderr,
+            },
+            None => CommandOutput {
+                exit_code: None,
+                stdout,
+                stderr,
+            },
         }
     }
 }
@@ -408,11 +431,17 @@ impl FakeCommandRunner {
 
 impl CommandRunner for FakeCommandRunner {
     fn run(&self, command: &str, args: &[&str]) -> CommandOutput {
-        self.calls
-            .borrow_mut()
-            .push((command.to_string(), args.iter().map(|s| s.to_string()).collect()));
+        self.calls.borrow_mut().push((
+            command.to_string(),
+            args.iter().map(|s| s.to_string()).collect(),
+        ));
         for rule in &self.rules {
-            if rule.command == command && rule.needles.iter().all(|n| args.iter().any(|a| a.contains(n.as_str()))) {
+            if rule.command == command
+                && rule
+                    .needles
+                    .iter()
+                    .all(|n| args.iter().any(|a| a.contains(n.as_str())))
+            {
                 return rule.output.clone();
             }
         }

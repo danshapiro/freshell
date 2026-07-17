@@ -31,8 +31,8 @@ use serde_json::{Map, Value};
 use tokio::sync::broadcast;
 
 use crate::events::{
-    event_shows_running_status_activity, is_idle_edge, is_idle_status_type,
-    is_running_status_type, ParsedServeEvent,
+    event_shows_running_status_activity, is_idle_edge, is_idle_status_type, is_running_status_type,
+    ParsedServeEvent,
 };
 
 /// The ownership env tag written to the spawned serve so the reaper can find the
@@ -66,10 +66,22 @@ pub struct ServeHttpRequest {
 
 impl ServeHttpRequest {
     pub fn get(url: impl Into<String>) -> Self {
-        Self { method: HttpMethod::Get, url: url.into(), body: None, content_type: None, timeout: None }
+        Self {
+            method: HttpMethod::Get,
+            url: url.into(),
+            body: None,
+            content_type: None,
+            timeout: None,
+        }
     }
     pub fn post(url: impl Into<String>) -> Self {
-        Self { method: HttpMethod::Post, url: url.into(), body: None, content_type: None, timeout: None }
+        Self {
+            method: HttpMethod::Post,
+            url: url.into(),
+            body: None,
+            content_type: None,
+            timeout: None,
+        }
     }
     pub fn post_json(url: impl Into<String>, body: Vec<u8>) -> Self {
         Self {
@@ -97,7 +109,11 @@ pub struct ServeHttpResponse {
 
 impl ServeHttpResponse {
     pub fn new(status: u16, body: Vec<u8>) -> Self {
-        Self { status, body, next_cursor: None }
+        Self {
+            status,
+            body,
+            next_cursor: None,
+        }
     }
     /// `res.ok` — a 2xx status.
     pub fn ok(&self) -> bool {
@@ -114,7 +130,10 @@ impl ServeHttpResponse {
 /// The HTTP transport seam (`fetchFn`). One request/response round-trip. `Err(String)`
 /// is a transport/connection failure (e.g. connection refused before the serve is up).
 pub trait ServeHttp: Send + Sync {
-    fn request<'a>(&'a self, req: ServeHttpRequest) -> BoxFuture<'a, Result<ServeHttpResponse, String>>;
+    fn request<'a>(
+        &'a self,
+        req: ServeHttpRequest,
+    ) -> BoxFuture<'a, Result<ServeHttpResponse, String>>;
 }
 
 /// An endpoint the sidecar should bind (`allocateLocalhostPort`,
@@ -184,18 +203,36 @@ pub enum ServeError {
     ShuttingDown,
     StartupAborted,
     StartupFailed(String),
-    ProcessExited { code: i32 },
+    ProcessExited {
+        code: i32,
+    },
     PortAllocation(String),
     Spawn(String),
     /// The bounded readiness-wait failure (DEV-0001): the outer `health_timeout`
     /// elapsed without a healthy probe.
-    NotHealthy { timeout_ms: u64 },
-    Http { method: String, url: String, status: u16, body: String },
-    RequestTimeout { method: String, url: String, timeout_ms: u64 },
+    NotHealthy {
+        timeout_ms: u64,
+    },
+    Http {
+        method: String,
+        url: String,
+        status: u16,
+        body: String,
+    },
+    RequestTimeout {
+        method: String,
+        url: String,
+        timeout_ms: u64,
+    },
     Transport(String),
     Decode(String),
-    IdleTimeout { session_id: String, timeout_ms: u64 },
-    SidecarLost { session_id: String },
+    IdleTimeout {
+        session_id: String,
+        timeout_ms: u64,
+    },
+    SidecarLost {
+        session_id: String,
+    },
 }
 
 impl std::fmt::Display for ServeError {
@@ -258,7 +295,10 @@ pub struct ServeConfig {
 impl Default for ServeConfig {
     fn default() -> Self {
         Self {
-            command: std::env::var("OPENCODE_CMD").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "opencode".to_string()),
+            command: std::env::var("OPENCODE_CMD")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "opencode".to_string()),
             env: Vec::new(),
             health_timeout: Duration::from_millis(20_000),
             health_probe_timeout: Duration::from_millis(2_000),
@@ -347,7 +387,12 @@ impl OpencodeServeManager {
 
     /// The current base url, if started (`baseUrlOrUndefined`, `serve-manager.ts:594`).
     pub async fn base_url(&self) -> Option<String> {
-        self.inner.running.lock().await.as_ref().map(|r| r.base_url.clone())
+        self.inner
+            .running
+            .lock()
+            .await
+            .as_ref()
+            .map(|r| r.base_url.clone())
     }
 
     /// Idempotent start: allocate a loopback port, spawn the ownership-tagged sidecar,
@@ -362,12 +407,20 @@ impl OpencodeServeManager {
             return Ok(running.base_url.clone());
         }
 
-        let endpoint = self.inner.deps.ports.allocate().map_err(ServeError::PortAllocation)?;
+        let endpoint = self
+            .inner
+            .deps
+            .ports
+            .allocate()
+            .map_err(ServeError::PortAllocation)?;
         let base_url = format!("http://{}:{}", endpoint.hostname, endpoint.port);
         let ownership_id = uuid::Uuid::new_v4().to_string();
 
         let mut env = self.config().env.clone();
-        env.push((OPENCODE_SIDECAR_OWNERSHIP_ENV.to_string(), ownership_id.clone()));
+        env.push((
+            OPENCODE_SIDECAR_OWNERSHIP_ENV.to_string(),
+            ownership_id.clone(),
+        ));
         let process = self
             .inner
             .deps
@@ -387,9 +440,17 @@ impl OpencodeServeManager {
         }
 
         let sink = self.make_dispatch_sink();
-        let handle = self.inner.deps.events.connect(format!("{base_url}/global/event"), sink);
+        let handle = self
+            .inner
+            .deps
+            .events
+            .connect(format!("{base_url}/global/event"), sink);
 
-        *guard = Some(Arc::new(RunningServe { base_url: base_url.clone(), process, _event_handle: handle }));
+        *guard = Some(Arc::new(RunningServe {
+            base_url: base_url.clone(),
+            process,
+            _event_handle: handle,
+        }));
         Ok(base_url)
     }
 
@@ -407,7 +468,11 @@ impl OpencodeServeManager {
     /// exact scenario `tests/serve_health_bounded.rs` drives. A genuinely wedged serve
     /// still fails as [`ServeError::NotHealthy`] at the outer deadline — the fix does NOT
     /// mask a wedge.
-    async fn wait_for_health(&self, base_url: &str, process: &dyn ServeProcess) -> Result<(), ServeError> {
+    async fn wait_for_health(
+        &self,
+        base_url: &str,
+        process: &dyn ServeProcess,
+    ) -> Result<(), ServeError> {
         let deadline = Instant::now() + self.config().health_timeout;
         loop {
             if self.inner.shutdown.load(Ordering::SeqCst) {
@@ -429,8 +494,8 @@ impl OpencodeServeManager {
             // exceeded its bounded budget) is treated like "not up yet" — the loop advances
             // and retries instead of blocking, which is the whole fix.
             let probe_budget = self.config().health_probe_timeout.min(remaining);
-            let req =
-                ServeHttpRequest::get(format!("{base_url}/global/health")).with_timeout(probe_budget);
+            let req = ServeHttpRequest::get(format!("{base_url}/global/health"))
+                .with_timeout(probe_budget);
             match tokio::time::timeout(probe_budget, self.inner.deps.http.request(req)).await {
                 Ok(Ok(resp)) if resp.ok() && is_healthy_response(&resp.body) => return Ok(()),
                 // Non-healthy 2xx, transport error (connection refused), or a bounded-out
@@ -448,7 +513,9 @@ impl OpencodeServeManager {
             }
             tokio::time::sleep(sleep_for).await;
         }
-        Err(ServeError::NotHealthy { timeout_ms: self.config().health_timeout.as_millis() as u64 })
+        Err(ServeError::NotHealthy {
+            timeout_ms: self.config().health_timeout.as_millis() as u64,
+        })
     }
 
     fn make_dispatch_sink(&self) -> EventSink {
@@ -534,11 +601,23 @@ impl OpencodeServeManager {
             body.insert("parentID".into(), Value::String(p.to_string()));
         }
         let path = with_route("/session", &directory.map(|s| s.to_string()));
-        let value = self.json_request(HttpMethod::Post, &path, Some(Value::Object(body)), None).await?;
+        let value = self
+            .json_request(HttpMethod::Post, &path, Some(Value::Object(body)), None)
+            .await?;
         Ok(CreatedSession {
-            id: value.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
-            directory: value.get("directory").and_then(Value::as_str).map(str::to_string),
-            title: value.get("title").and_then(Value::as_str).map(str::to_string),
+            id: value
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            directory: value
+                .get("directory")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            title: value
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         })
     }
 
@@ -554,22 +633,40 @@ impl OpencodeServeManager {
     /// objects) so the caller renders text parts; the pagination cursor is not threaded
     /// here (a single page carries the whole short T2 turn). A 404 yields an empty array.
     pub async fn list_messages(&self, id: &str, route: &Route) -> Result<Value, ServeError> {
-        let path = with_route(&format!("/session/{}/message", encode_path_segment(id)), route);
-        self.json_request(HttpMethod::Get, &path, None, Some(Value::Array(Vec::new()))).await
+        let path = with_route(
+            &format!("/session/{}/message", encode_path_segment(id)),
+            route,
+        );
+        self.json_request(HttpMethod::Get, &path, None, Some(Value::Array(Vec::new())))
+            .await
     }
 
     /// `promptAsync(id, {parts, model?, variant?, agent?}, route)` — the send-turn call
     /// (`serve-manager.ts:355-365`). Returns once the serve accepts the prompt.
-    pub async fn prompt_async(&self, id: &str, body: Value, route: &Route) -> Result<(), ServeError> {
-        let path = with_route(&format!("/session/{}/prompt_async", encode_path_segment(id)), route);
-        self.json_request(HttpMethod::Post, &path, Some(body), None).await?;
+    pub async fn prompt_async(
+        &self,
+        id: &str,
+        body: Value,
+        route: &Route,
+    ) -> Result<(), ServeError> {
+        let path = with_route(
+            &format!("/session/{}/prompt_async", encode_path_segment(id)),
+            route,
+        );
+        self.json_request(HttpMethod::Post, &path, Some(body), None)
+            .await?;
         Ok(())
     }
 
     /// `getSessionStatusMap(route)` (`serve-manager.ts:328-330`) — sessionId → status.
-    pub async fn get_session_status_map(&self, route: &Route) -> Result<Map<String, Value>, ServeError> {
+    pub async fn get_session_status_map(
+        &self,
+        route: &Route,
+    ) -> Result<Map<String, Value>, ServeError> {
         let path = with_route("/session/status", route);
-        let value = self.json_request(HttpMethod::Get, &path, None, None).await?;
+        let value = self
+            .json_request(HttpMethod::Get, &path, None, None)
+            .await?;
         match value {
             Value::Object(map) => Ok(map),
             _ => Ok(Map::new()),
@@ -577,31 +674,52 @@ impl OpencodeServeManager {
     }
 
     /// `getSessionStatus(sessionId, route)` (`serve-manager.ts:332-335`).
-    pub async fn get_session_status(&self, id: &str, route: &Route) -> Result<Option<Value>, ServeError> {
+    pub async fn get_session_status(
+        &self,
+        id: &str,
+        route: &Route,
+    ) -> Result<Option<Value>, ServeError> {
         Ok(self.get_session_status_map(route).await?.get(id).cloned())
     }
 
     /// `abort(id, route)` (`serve-manager.ts:399-401`).
     pub async fn abort(&self, id: &str, route: &Route) -> Result<(), ServeError> {
-        let path = with_route(&format!("/session/{}/abort", encode_path_segment(id)), route);
-        self.json_request(HttpMethod::Post, &path, None, None).await?;
+        let path = with_route(
+            &format!("/session/{}/abort", encode_path_segment(id)),
+            route,
+        );
+        self.json_request(HttpMethod::Post, &path, None, None)
+            .await?;
         Ok(())
     }
 
     /// `fork(id, route)` (`serve-manager.ts:411-416`).
     pub async fn fork(&self, id: &str, route: &Route) -> Result<ForkedSession, ServeError> {
         let path = with_route(&format!("/session/{}/fork", encode_path_segment(id)), route);
-        let value = self.json_request(HttpMethod::Post, &path, None, None).await?;
+        let value = self
+            .json_request(HttpMethod::Post, &path, None, None)
+            .await?;
         Ok(ForkedSession {
-            id: value.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
-            directory: value.get("directory").and_then(Value::as_str).map(str::to_string),
+            id: value
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            directory: value
+                .get("directory")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         })
     }
 
     // ── SSE fan-out (serve-manager.ts:419-438) ──────────────────────────────────
 
     fn emitter_for(&self, session_id: &str) -> broadcast::Sender<SessionSignal> {
-        let mut emitters = self.inner.session_emitters.lock().expect("session emitters mutex");
+        let mut emitters = self
+            .inner
+            .session_emitters
+            .lock()
+            .expect("session emitters mutex");
         emitters
             .entry(session_id.to_string())
             .or_insert_with(|| broadcast::Sender::new(SESSION_CHANNEL_CAPACITY))
@@ -625,7 +743,11 @@ impl OpencodeServeManager {
     /// `serve-manager.ts:126-132`). Exposed for the sidecar-loss liveness path/tests.
     pub fn emit_lost_for_all(&self) {
         let emitters: Vec<broadcast::Sender<SessionSignal>> = {
-            let mut map = self.inner.session_emitters.lock().expect("session emitters mutex");
+            let mut map = self
+                .inner
+                .session_emitters
+                .lock()
+                .expect("session emitters mutex");
             let senders = map.values().cloned().collect();
             map.clear();
             senders
@@ -649,7 +771,12 @@ impl OpencodeServeManager {
     /// `session.status{type:idle}`) OR, as a fallback for a missed SSE idle, two
     /// consecutive idle status-map polls after observed running activity. Rejects on
     /// sidecar loss or `timeout`. Subscribes internally (`onceIdle`, `serve-manager.ts:440`).
-    pub async fn once_idle(&self, session_id: &str, timeout: Duration, route: Route) -> Result<(), ServeError> {
+    pub async fn once_idle(
+        &self,
+        session_id: &str,
+        timeout: Duration,
+        route: Route,
+    ) -> Result<(), ServeError> {
         let rx = self.subscribe(session_id);
         self.await_idle(session_id, rx, timeout, route).await
     }
@@ -794,7 +921,10 @@ fn dispatch_event_on(inner: &Arc<Inner>, event: ParsedServeEvent) {
         return;
     };
     let sender = {
-        let mut emitters = inner.session_emitters.lock().expect("session emitters mutex");
+        let mut emitters = inner
+            .session_emitters
+            .lock()
+            .expect("session emitters mutex");
         emitters
             .entry(session_id)
             .or_insert_with(|| broadcast::Sender::new(SESSION_CHANNEL_CAPACITY))
@@ -813,7 +943,10 @@ fn build_prompt_body(text: &str, model: Option<&str>, effort: Option<&str>) -> V
         Value::Array(vec![serde_json::json!({ "type": "text", "text": text })]),
     );
     if let Some(m) = crate::model::split_opencode_model(model) {
-        body.insert("model".into(), serde_json::json!({ "providerID": m.provider_id, "modelID": m.model_id }));
+        body.insert(
+            "model".into(),
+            serde_json::json!({ "providerID": m.provider_id, "modelID": m.model_id }),
+        );
     }
     if let Some(e) = effort.filter(|e| !e.is_empty()) {
         body.insert("variant".into(), Value::String(e.to_string()));
@@ -837,7 +970,9 @@ pub fn is_healthy_response(body: &[u8]) -> bool {
 /// server|EADDRINUSE/i`, `serve-manager.ts:281`).
 pub fn is_fatal_serve_stderr(stderr: &str) -> bool {
     let lower = stderr.to_ascii_lowercase();
-    lower.contains("serveerror") || lower.contains("failed to start server") || lower.contains("eaddrinuse")
+    lower.contains("serveerror")
+        || lower.contains("failed to start server")
+        || lower.contains("eaddrinuse")
 }
 
 /// `withRoute(requestPath, {cwd})` (`serve-manager.ts:72-78`): append `directory=<cwd>`
@@ -848,7 +983,10 @@ pub fn with_route(request_path: &str, route: &Route) -> String {
         _ => return request_path.to_string(),
     };
     let separator = if request_path.contains('?') { '&' } else { '?' };
-    format!("{request_path}{separator}directory={}", percent_encode_component(cwd))
+    format!(
+        "{request_path}{separator}directory={}",
+        percent_encode_component(cwd)
+    )
 }
 
 /// Minimal RFC-3986 percent-encoding for a query-component value (unreserved chars pass
@@ -858,7 +996,9 @@ fn percent_encode_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for &byte in value.as_bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
             _ => out.push_str(&format!("%{byte:02X}")),
         }
     }
@@ -890,7 +1030,9 @@ mod tests {
     fn fatal_stderr_detection_is_case_insensitive() {
         assert!(is_fatal_serve_stderr("ServeError: boom"));
         assert!(is_fatal_serve_stderr("Failed to start server on :0"));
-        assert!(is_fatal_serve_stderr("listen EADDRINUSE: address already in use"));
+        assert!(is_fatal_serve_stderr(
+            "listen EADDRINUSE: address already in use"
+        ));
         assert!(is_fatal_serve_stderr("eaddrinuse"));
         assert!(!is_fatal_serve_stderr("info: serve listening"));
         assert!(!is_fatal_serve_stderr(""));
@@ -900,7 +1042,10 @@ mod tests {
     fn with_route_appends_directory_preserving_query() {
         assert_eq!(with_route("/session", &None), "/session");
         assert_eq!(with_route("/session", &Some("  ".to_string())), "/session");
-        assert_eq!(with_route("/session", &Some("/home/u/p".to_string())), "/session?directory=%2Fhome%2Fu%2Fp");
+        assert_eq!(
+            with_route("/session", &Some("/home/u/p".to_string())),
+            "/session?directory=%2Fhome%2Fu%2Fp"
+        );
         assert_eq!(
             with_route("/session/x/message?limit=5", &Some("/a".to_string())),
             "/session/x/message?limit=5&directory=%2Fa"
@@ -916,21 +1061,41 @@ mod tests {
     #[test]
     fn not_healthy_error_message_contains_reference_phrase() {
         let msg = ServeError::NotHealthy { timeout_ms: 20_000 }.to_string();
-        assert!(msg.contains("did not become healthy within 20000ms"), "{msg}");
+        assert!(
+            msg.contains("did not become healthy within 20000ms"),
+            "{msg}"
+        );
     }
 
     #[test]
     fn idle_timeout_error_message_matches_reference() {
-        let msg = ServeError::IdleTimeout { session_id: "ses_1".into(), timeout_ms: 600_000 }.to_string();
-        assert!(msg.contains("Timed out after 600000ms waiting for OpenCode session ses_1 to go idle."), "{msg}");
+        let msg = ServeError::IdleTimeout {
+            session_id: "ses_1".into(),
+            timeout_ms: 600_000,
+        }
+        .to_string();
+        assert!(
+            msg.contains("Timed out after 600000ms waiting for OpenCode session ses_1 to go idle."),
+            "{msg}"
+        );
     }
 
     #[test]
     fn build_prompt_body_splits_model_and_sets_variant() {
-        let body = build_prompt_body("hi", Some("umans-ai-coding-plan/umans-kimi-k2.7"), Some("low"));
+        let body = build_prompt_body(
+            "hi",
+            Some("umans-ai-coding-plan/umans-kimi-k2.7"),
+            Some("low"),
+        );
         assert_eq!(body["parts"][0]["text"], serde_json::json!("hi"));
-        assert_eq!(body["model"]["providerID"], serde_json::json!("umans-ai-coding-plan"));
-        assert_eq!(body["model"]["modelID"], serde_json::json!("umans-kimi-k2.7"));
+        assert_eq!(
+            body["model"]["providerID"],
+            serde_json::json!("umans-ai-coding-plan")
+        );
+        assert_eq!(
+            body["model"]["modelID"],
+            serde_json::json!("umans-kimi-k2.7")
+        );
         assert_eq!(body["variant"], serde_json::json!("low"));
     }
 

@@ -128,7 +128,15 @@ impl PtyTerminal {
         stream_id: impl Into<String>,
         ring_max_bytes: Option<i64>,
     ) -> io::Result<Self> {
-        Self::spawn_with_sink(spec, env, terminal_id, stream_id, ring_max_bytes, None, None)
+        Self::spawn_with_sink(
+            spec,
+            env,
+            terminal_id,
+            stream_id,
+            ring_max_bytes,
+            None,
+            None,
+        )
     }
 
     /// As [`spawn`](Self::spawn), but the reader thread also forwards every framed
@@ -221,8 +229,14 @@ impl PtyTerminal {
                 waiter_master.lock().expect("master mutex").take();
             }
         });
-        let reader_thread =
-            spawn_reader(reader, framer, Arc::clone(&captured), sink, on_exit, code_rx);
+        let reader_thread = spawn_reader(
+            reader,
+            framer,
+            Arc::clone(&captured),
+            sink,
+            on_exit,
+            code_rx,
+        );
 
         Ok(Self {
             killer,
@@ -268,7 +282,11 @@ impl PtyTerminal {
 
     /// Snapshot of all captured `terminal.output` messages so far.
     pub fn captured_messages(&self) -> Vec<ServerMessage> {
-        self.captured.lock().expect("captured mutex").messages.clone()
+        self.captured
+            .lock()
+            .expect("captured mutex")
+            .messages
+            .clone()
     }
 
     /// The seq-ordered, chunk-boundary-independent reassembly of this terminal's
@@ -329,7 +347,11 @@ fn spawn_reader(
                 sink(message.clone());
             }
         }
-        captured.lock().expect("captured mutex").messages.extend(messages);
+        captured
+            .lock()
+            .expect("captured mutex")
+            .messages
+            .extend(messages);
     };
 
     std::thread::spawn(move || {
@@ -415,6 +437,9 @@ mod tests {
         assert_eq!(env.get("COLORTERM").map(String::as_str), Some("truecolor"));
         assert_eq!(env.get("LANG").map(String::as_str), Some("en_US.UTF-8"));
         assert_eq!(env.get("LC_ALL").map(String::as_str), Some("en_US.UTF-8"));
-        assert_eq!(env.get("FRESHELL_TERMINAL_ID").map(String::as_str), Some("t-123"));
+        assert_eq!(
+            env.get("FRESHELL_TERMINAL_ID").map(String::as_str),
+            Some("t-123")
+        );
     }
 }

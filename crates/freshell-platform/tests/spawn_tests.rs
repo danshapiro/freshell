@@ -43,7 +43,17 @@ fn build(
     env: &dyn Env,
     probe: &MapFileProbe,
 ) -> SpawnSpec {
-    build_spawn_spec(shell, host, is_wsl_env, cwd, env, probe, &BTreeMap::new(), None, None)
+    build_spawn_spec(
+        shell,
+        host,
+        is_wsl_env,
+        cwd,
+        env,
+        probe,
+        &BTreeMap::new(),
+        None,
+        None,
+    )
 }
 
 // ===========================================================================
@@ -55,9 +65,18 @@ fn linux_non_wsl_system_shell() {
     let env = MapEnv::new();
     let probe = bash_probe();
     // system/cmd/powershell/wsl all normalize to the system shell on plain Linux.
-    for shell in [ShellType::System, ShellType::Cmd, ShellType::Powershell, ShellType::Wsl] {
+    for shell in [
+        ShellType::System,
+        ShellType::Cmd,
+        ShellType::Powershell,
+        ShellType::Wsl,
+    ] {
         let got = build(shell, HostOs::Linux, false, Some("/home/dan"), &env, &probe);
-        assert_eq!(got, spec("/bin/bash", &["-l"], Some("/home/dan")), "{shell:?}");
+        assert_eq!(
+            got,
+            spec("/bin/bash", &["-l"], Some("/home/dan")),
+            "{shell:?}"
+        );
     }
 }
 
@@ -65,7 +84,14 @@ fn linux_non_wsl_system_shell() {
 fn linux_system_shell_fallbacks() {
     // No /bin/bash -> /bin/sh.
     let empty_probe = MapFileProbe::new();
-    let got = build(ShellType::System, HostOs::Linux, false, None, &MapEnv::new(), &empty_probe);
+    let got = build(
+        ShellType::System,
+        HostOs::Linux,
+        false,
+        None,
+        &MapEnv::new(),
+        &empty_probe,
+    );
     assert_eq!(got, spec("/bin/sh", &["-l"], None));
 
     // $SHELL set and existing wins.
@@ -76,7 +102,14 @@ fn linux_system_shell_fallbacks() {
 
     // $SHELL set but missing -> falls back to /bin/bash.
     let env = MapEnv::new().with("SHELL", "/nonexistent");
-    let got = build(ShellType::System, HostOs::Linux, false, None, &env, &bash_probe());
+    let got = build(
+        ShellType::System,
+        HostOs::Linux,
+        false,
+        None,
+        &env,
+        &bash_probe(),
+    );
     assert_eq!(got.program, "/bin/bash");
 }
 
@@ -85,9 +118,20 @@ fn linux_cwd_resolution() {
     let env = MapEnv::new();
     let probe = bash_probe();
     // None cwd stays None; a relative cwd resolves to None (launch-cwd linux-process).
-    assert_eq!(build(ShellType::System, HostOs::Linux, false, None, &env, &probe).cwd, None);
     assert_eq!(
-        build(ShellType::System, HostOs::Linux, false, Some("relative/dir"), &env, &probe).cwd,
+        build(ShellType::System, HostOs::Linux, false, None, &env, &probe).cwd,
+        None
+    );
+    assert_eq!(
+        build(
+            ShellType::System,
+            HostOs::Linux,
+            false,
+            Some("relative/dir"),
+            &env,
+            &probe
+        )
+        .cwd,
         None
     );
 }
@@ -112,14 +156,25 @@ fn wsl_system_and_wsl_use_linux_shell() {
     let probe = bash_probe();
     for shell in [ShellType::System, ShellType::Wsl] {
         let got = build(shell, HostOs::Linux, true, Some("/home/dan"), &env, &probe);
-        assert_eq!(got, spec("/bin/bash", &["-l"], Some("/home/dan")), "{shell:?}");
+        assert_eq!(
+            got,
+            spec("/bin/bash", &["-l"], Some("/home/dan")),
+            "{shell:?}"
+        );
     }
 }
 
 #[test]
 fn wsl_cmd_uses_windows_cmd_with_cd_in_command() {
     let env = MapEnv::new(); // default mount -> /mnt
-    let got = build(ShellType::Cmd, HostOs::Linux, true, Some("/mnt/c/proj"), &env, &bash_probe());
+    let got = build(
+        ShellType::Cmd,
+        HostOs::Linux,
+        true,
+        Some("/mnt/c/proj"),
+        &env,
+        &bash_probe(),
+    );
     assert_eq!(
         got,
         spec(
@@ -134,22 +189,45 @@ fn wsl_cmd_uses_windows_cmd_with_cd_in_command() {
 fn wsl_cmd_with_no_cwd_uses_windows_default_cwd() {
     // No cwd -> resolveWindowsShellCwd(undefined)=None -> getWindowsDefaultCwd()=C:\ (SYSTEMDRIVE root).
     let env = MapEnv::new();
-    let got = build(ShellType::Cmd, HostOs::Linux, true, None, &env, &bash_probe());
+    let got = build(
+        ShellType::Cmd,
+        HostOs::Linux,
+        true,
+        None,
+        &env,
+        &bash_probe(),
+    );
     assert_eq!(
         got,
-        spec("/mnt/c/Windows/System32/cmd.exe", &["/K", r#"cd /d "C:\\""#], None)
+        spec(
+            "/mnt/c/Windows/System32/cmd.exe",
+            &["/K", r#"cd /d "C:\\""#],
+            None
+        )
     );
 }
 
 #[test]
 fn wsl_powershell_uses_windows_powershell_with_set_location() {
     let env = MapEnv::new();
-    let got = build(ShellType::Powershell, HostOs::Linux, true, Some("/mnt/c/proj"), &env, &bash_probe());
+    let got = build(
+        ShellType::Powershell,
+        HostOs::Linux,
+        true,
+        Some("/mnt/c/proj"),
+        &env,
+        &bash_probe(),
+    );
     assert_eq!(
         got,
         spec(
             "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
-            &["-NoLogo", "-NoExit", "-Command", r"Set-Location -LiteralPath 'C:\proj'"],
+            &[
+                "-NoLogo",
+                "-NoExit",
+                "-Command",
+                r"Set-Location -LiteralPath 'C:\proj'"
+            ],
             None,
         )
     );
@@ -165,10 +243,21 @@ fn wsl_cmd_inherits_mount_cwd_when_present() {
     let env = MapEnv::new();
     // The /mnt/c/proj mount exists per the probe -> cmd inherits it, no in-command cd.
     let probe = bash_probe().with("/mnt/c/proj");
-    let got = build(ShellType::Cmd, HostOs::Linux, true, Some("/mnt/c/proj"), &env, &probe);
+    let got = build(
+        ShellType::Cmd,
+        HostOs::Linux,
+        true,
+        Some("/mnt/c/proj"),
+        &env,
+        &probe,
+    );
     assert_eq!(
         got,
-        spec("/mnt/c/Windows/System32/cmd.exe", &["/K"], Some("/mnt/c/proj"))
+        spec(
+            "/mnt/c/Windows/System32/cmd.exe",
+            &["/K"],
+            Some("/mnt/c/proj")
+        )
     );
 }
 
@@ -176,7 +265,14 @@ fn wsl_cmd_inherits_mount_cwd_when_present() {
 fn wsl_powershell_inherits_mount_cwd_when_present() {
     let env = MapEnv::new();
     let probe = bash_probe().with("/mnt/c/proj");
-    let got = build(ShellType::Powershell, HostOs::Linux, true, Some("/mnt/c/proj"), &env, &probe);
+    let got = build(
+        ShellType::Powershell,
+        HostOs::Linux,
+        true,
+        Some("/mnt/c/proj"),
+        &env,
+        &probe,
+    );
     assert_eq!(
         got,
         spec(
@@ -204,10 +300,21 @@ fn wsl_cmd_falls_back_to_in_command_cd_when_mount_absent() {
     // Mount not present per the probe -> keep the faithful `cd /d` + proc cwd None
     // (never risk a chdir spawn failure on a missing mount).
     let env = MapEnv::new();
-    let got = build(ShellType::Cmd, HostOs::Linux, true, Some("/mnt/c/proj"), &env, &bash_probe());
+    let got = build(
+        ShellType::Cmd,
+        HostOs::Linux,
+        true,
+        Some("/mnt/c/proj"),
+        &env,
+        &bash_probe(),
+    );
     assert_eq!(
         got,
-        spec("/mnt/c/Windows/System32/cmd.exe", &["/K", r#"cd /d "C:\proj""#], None)
+        spec(
+            "/mnt/c/Windows/System32/cmd.exe",
+            &["/K", r#"cd /d "C:\proj""#],
+            None
+        )
     );
 }
 
@@ -219,10 +326,21 @@ fn wsl_cmd_falls_back_when_mount_exists_as_a_file() {
     // in-command `cd /d` fallback.
     let env = MapEnv::new();
     let probe = bash_probe().with_file("/mnt/c/proj");
-    let got = build(ShellType::Cmd, HostOs::Linux, true, Some("/mnt/c/proj"), &env, &probe);
+    let got = build(
+        ShellType::Cmd,
+        HostOs::Linux,
+        true,
+        Some("/mnt/c/proj"),
+        &env,
+        &probe,
+    );
     assert_eq!(
         got,
-        spec("/mnt/c/Windows/System32/cmd.exe", &["/K", r#"cd /d "C:\proj""#], None)
+        spec(
+            "/mnt/c/Windows/System32/cmd.exe",
+            &["/K", r#"cd /d "C:\proj""#],
+            None
+        )
     );
 }
 
@@ -230,12 +348,24 @@ fn wsl_cmd_falls_back_when_mount_exists_as_a_file() {
 fn wsl_powershell_falls_back_when_mount_exists_as_a_file() {
     let env = MapEnv::new();
     let probe = bash_probe().with_file("/mnt/c/proj");
-    let got = build(ShellType::Powershell, HostOs::Linux, true, Some("/mnt/c/proj"), &env, &probe);
+    let got = build(
+        ShellType::Powershell,
+        HostOs::Linux,
+        true,
+        Some("/mnt/c/proj"),
+        &env,
+        &probe,
+    );
     assert_eq!(
         got,
         spec(
             "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
-            &["-NoLogo", "-NoExit", "-Command", r"Set-Location -LiteralPath 'C:\proj'"],
+            &[
+                "-NoLogo",
+                "-NoExit",
+                "-Command",
+                r"Set-Location -LiteralPath 'C:\proj'"
+            ],
             None,
         )
     );
@@ -245,15 +375,33 @@ fn wsl_powershell_falls_back_when_mount_exists_as_a_file() {
 fn wsl_honors_env_overrides_for_exe_paths_and_custom_mount() {
     // WSL_WINDOWS_SYS32 changes both the exe path AND the mount prefix used for cwd conversion.
     let env = MapEnv::new().with("WSL_WINDOWS_SYS32", "/custom/c/Windows/System32");
-    let got = build(ShellType::Cmd, HostOs::Linux, true, Some("/custom/c/proj"), &env, &bash_probe());
+    let got = build(
+        ShellType::Cmd,
+        HostOs::Linux,
+        true,
+        Some("/custom/c/proj"),
+        &env,
+        &bash_probe(),
+    );
     assert_eq!(
         got,
-        spec("/custom/c/Windows/System32/cmd.exe", &["/K", r#"cd /d "C:\proj""#], None)
+        spec(
+            "/custom/c/Windows/System32/cmd.exe",
+            &["/K", r#"cd /d "C:\proj""#],
+            None
+        )
     );
 
     // POWERSHELL_EXE override wins for the powershell exe.
     let env = MapEnv::new().with("POWERSHELL_EXE", "/opt/pwsh");
-    let got = build(ShellType::Powershell, HostOs::Linux, true, None, &env, &bash_probe());
+    let got = build(
+        ShellType::Powershell,
+        HostOs::Linux,
+        true,
+        None,
+        &env,
+        &bash_probe(),
+    );
     assert_eq!(got.program, "/opt/pwsh");
 }
 
@@ -265,24 +413,52 @@ fn wsl_honors_env_overrides_for_exe_paths_and_custom_mount() {
 fn native_windows_system_maps_to_cmd() {
     let env = MapEnv::new();
     let probe = bash_probe();
-    let got = build(ShellType::System, HostOs::Windows, false, Some(r"C:\Users\dan"), &env, &probe);
+    let got = build(
+        ShellType::System,
+        HostOs::Windows,
+        false,
+        Some(r"C:\Users\dan"),
+        &env,
+        &probe,
+    );
     // proc cwd IS passed on native Windows (isLinuxPath false -> cwd).
     assert_eq!(got, spec("cmd.exe", &["/K"], Some(r"C:\Users\dan")));
 
     // No cwd -> proc cwd None.
-    let got = build(ShellType::System, HostOs::Windows, false, None, &env, &probe);
+    let got = build(
+        ShellType::System,
+        HostOs::Windows,
+        false,
+        None,
+        &env,
+        &probe,
+    );
     assert_eq!(got, spec("cmd.exe", &["/K"], None));
 }
 
 #[test]
 fn native_windows_powershell() {
     let env = MapEnv::new();
-    let got = build(ShellType::Powershell, HostOs::Windows, false, Some(r"C:\proj"), &env, &bash_probe());
+    let got = build(
+        ShellType::Powershell,
+        HostOs::Windows,
+        false,
+        Some(r"C:\proj"),
+        &env,
+        &bash_probe(),
+    );
     assert_eq!(got, spec("powershell.exe", &["-NoLogo"], Some(r"C:\proj")));
 
     // POWERSHELL_EXE override.
     let env = MapEnv::new().with("POWERSHELL_EXE", "pwsh.exe");
-    let got = build(ShellType::Powershell, HostOs::Windows, false, None, &env, &bash_probe());
+    let got = build(
+        ShellType::Powershell,
+        HostOs::Windows,
+        false,
+        None,
+        &env,
+        &bash_probe(),
+    );
     assert_eq!(got, spec("pwsh.exe", &["-NoLogo"], None));
 }
 
@@ -290,15 +466,50 @@ fn native_windows_powershell() {
 fn native_windows_wsl_mode() {
     let env = MapEnv::new();
     // Explicit 'wsl' with a Windows cwd -> converts cwd to a WSL mount path.
-    let got = build(ShellType::Wsl, HostOs::Windows, false, Some(r"C:\proj"), &env, &bash_probe());
-    assert_eq!(got, spec("wsl.exe", &["--cd", "/mnt/c/proj", "--exec", "bash", "-l"], None));
-
-    // WSL_DISTRO + WSL_EXE overrides -> `-d <distro>` prepended, custom wsl.exe.
-    let env = MapEnv::new().with("WSL_DISTRO", "Ubuntu").with("WSL_EXE", "/opt/wsl.exe");
-    let got = build(ShellType::Wsl, HostOs::Windows, false, Some(r"C:\proj"), &env, &bash_probe());
+    let got = build(
+        ShellType::Wsl,
+        HostOs::Windows,
+        false,
+        Some(r"C:\proj"),
+        &env,
+        &bash_probe(),
+    );
     assert_eq!(
         got,
-        spec("/opt/wsl.exe", &["-d", "Ubuntu", "--cd", "/mnt/c/proj", "--exec", "bash", "-l"], None)
+        spec(
+            "wsl.exe",
+            &["--cd", "/mnt/c/proj", "--exec", "bash", "-l"],
+            None
+        )
+    );
+
+    // WSL_DISTRO + WSL_EXE overrides -> `-d <distro>` prepended, custom wsl.exe.
+    let env = MapEnv::new()
+        .with("WSL_DISTRO", "Ubuntu")
+        .with("WSL_EXE", "/opt/wsl.exe");
+    let got = build(
+        ShellType::Wsl,
+        HostOs::Windows,
+        false,
+        Some(r"C:\proj"),
+        &env,
+        &bash_probe(),
+    );
+    assert_eq!(
+        got,
+        spec(
+            "/opt/wsl.exe",
+            &[
+                "-d",
+                "Ubuntu",
+                "--cd",
+                "/mnt/c/proj",
+                "--exec",
+                "bash",
+                "-l"
+            ],
+            None
+        )
     );
 }
 
@@ -308,10 +519,21 @@ fn native_windows_force_wsl_on_linux_cwd_overrides_requested_shell() {
     // A Linux cwd on native Windows forces 'wsl' mode even when 'cmd' was requested
     // (forceWsl, terminal-registry.ts:1130-1133).
     for requested in [ShellType::System, ShellType::Cmd, ShellType::Powershell] {
-        let got = build(requested, HostOs::Windows, false, Some("/home/dan"), &env, &bash_probe());
+        let got = build(
+            requested,
+            HostOs::Windows,
+            false,
+            Some("/home/dan"),
+            &env,
+            &bash_probe(),
+        );
         assert_eq!(
             got,
-            spec("wsl.exe", &["--cd", "/home/dan", "--exec", "bash", "-l"], None),
+            spec(
+                "wsl.exe",
+                &["--cd", "/home/dan", "--exec", "bash", "-l"],
+                None
+            ),
             "requested {requested:?} + linux cwd -> forced wsl"
         );
     }
@@ -324,7 +546,9 @@ fn native_windows_force_wsl_on_linux_cwd_overrides_requested_shell() {
 #[test]
 fn env_overrides_layering_and_ptysize() {
     // TERM/COLORTERM fall back to env values; LANG/LC_ALL are forced; user overrides win.
-    let env = MapEnv::new().with("TERM", "screen-256color").with("COLORTERM", "24bit");
+    let env = MapEnv::new()
+        .with("TERM", "screen-256color")
+        .with("COLORTERM", "24bit");
     let mut user = BTreeMap::new();
     user.insert("LANG".to_string(), "C".to_string()); // user overrides the forced LANG
     user.insert("FOO".to_string(), "bar".to_string());
@@ -354,6 +578,13 @@ fn env_overrides_layering_and_ptysize() {
 
 #[test]
 fn default_pty_size_is_120x30() {
-    let got = build(ShellType::System, HostOs::Linux, false, None, &MapEnv::new(), &bash_probe());
+    let got = build(
+        ShellType::System,
+        HostOs::Linux,
+        false,
+        None,
+        &MapEnv::new(),
+        &bash_probe(),
+    );
     assert_eq!((got.cols, got.rows), (120, 30));
 }

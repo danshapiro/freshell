@@ -38,7 +38,10 @@ impl TungsteniteTransport {
     pub async fn connect(ws_url: &str) -> Result<Self, String> {
         let (stream, _response) = connect_async(ws_url).await.map_err(|e| e.to_string())?;
         let (write, read) = stream.split();
-        Ok(Self { write: TokioMutex::new(write), read: TokioMutex::new(read) })
+        Ok(Self {
+            write: TokioMutex::new(write),
+            read: TokioMutex::new(read),
+        })
     }
 }
 
@@ -93,11 +96,15 @@ pub fn reap_owned_codex_sidecars(ownership_id: &str) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Ok(pid) = name.parse::<i32>() else { continue };
+        let Ok(pid) = name.parse::<i32>() else {
+            continue;
+        };
         let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
             continue;
         };
-        let carries_tag = environ.split(|&b| b == 0).any(|var| var == needle.as_bytes());
+        let carries_tag = environ
+            .split(|&b| b == 0)
+            .any(|var| var == needle.as_bytes());
         if carries_tag {
             // SIGTERM (15). Safe: only processes carrying OUR tag are signaled.
             unsafe {

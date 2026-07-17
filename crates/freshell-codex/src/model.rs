@@ -181,11 +181,26 @@ mod tests {
     #[test]
     fn dev_0003_none_and_minimal_forward_verbatim() {
         // The heart of DEV-0003: these five values must survive the wire mapping unchanged.
-        assert_eq!(to_codex_reasoning_effort(Some("none")), Ok(Some("none".to_string())));
-        assert_eq!(to_codex_reasoning_effort(Some("minimal")), Ok(Some("minimal".to_string())));
-        assert_eq!(to_codex_reasoning_effort(Some("low")), Ok(Some("low".to_string())));
-        assert_eq!(to_codex_reasoning_effort(Some("medium")), Ok(Some("medium".to_string())));
-        assert_eq!(to_codex_reasoning_effort(Some("high")), Ok(Some("high".to_string())));
+        assert_eq!(
+            to_codex_reasoning_effort(Some("none")),
+            Ok(Some("none".to_string()))
+        );
+        assert_eq!(
+            to_codex_reasoning_effort(Some("minimal")),
+            Ok(Some("minimal".to_string()))
+        );
+        assert_eq!(
+            to_codex_reasoning_effort(Some("low")),
+            Ok(Some("low".to_string()))
+        );
+        assert_eq!(
+            to_codex_reasoning_effort(Some("medium")),
+            Ok(Some("medium".to_string()))
+        );
+        assert_eq!(
+            to_codex_reasoning_effort(Some("high")),
+            Ok(Some("high".to_string()))
+        );
     }
 
     #[test]
@@ -195,17 +210,31 @@ mod tests {
         let spark = Some(CHEAPEST_T2_MODEL);
         for effort in ["none", "minimal", "low", "medium", "high"] {
             let menu = normalize_freshcodex_effort(spark, Some(effort));
-            assert_eq!(menu.as_deref(), Some(effort), "menu stage must keep {effort} verbatim");
+            assert_eq!(
+                menu.as_deref(),
+                Some(effort),
+                "menu stage must keep {effort} verbatim"
+            );
             let wire = to_codex_reasoning_effort(menu.as_deref()).expect("wire map");
-            assert_eq!(wire.as_deref(), Some(effort), "wire stage must keep {effort} verbatim");
+            assert_eq!(
+                wire.as_deref(),
+                Some(effort),
+                "wire stage must keep {effort} verbatim"
+            );
         }
     }
 
     #[test]
     fn max_and_xhigh_map_to_xhigh_on_the_wire() {
         // `max`/`xhigh` → `xhigh` (`adapter.ts:129`) — NOT a DEV-0003 value; correctly mapped.
-        assert_eq!(to_codex_reasoning_effort(Some("max")), Ok(Some("xhigh".to_string())));
-        assert_eq!(to_codex_reasoning_effort(Some("xhigh")), Ok(Some("xhigh".to_string())));
+        assert_eq!(
+            to_codex_reasoning_effort(Some("max")),
+            Ok(Some("xhigh".to_string()))
+        );
+        assert_eq!(
+            to_codex_reasoning_effort(Some("xhigh")),
+            Ok(Some("xhigh".to_string()))
+        );
     }
 
     #[test]
@@ -215,7 +244,10 @@ mod tests {
 
     #[test]
     fn unsupported_effort_errors_like_the_reference() {
-        assert_eq!(to_codex_reasoning_effort(Some("bogus")), Err(CodexEffortError("bogus".to_string())));
+        assert_eq!(
+            to_codex_reasoning_effort(Some("bogus")),
+            Err(CodexEffortError("bogus".to_string()))
+        );
         assert!(to_codex_reasoning_effort(Some("ultra")).is_err());
     }
 
@@ -225,12 +257,21 @@ mod tests {
     fn model_clamps_to_freshcodex_allowlist() {
         // Allowlisted models pass through.
         assert_eq!(normalize_freshcodex_model(Some("gpt-5.5")), "gpt-5.5");
-        assert_eq!(normalize_freshcodex_model(Some("gpt-5.4-flash")), "gpt-5.4-flash");
-        assert_eq!(normalize_freshcodex_model(Some("gpt-5.3-codex-spark")), "gpt-5.3-codex-spark");
+        assert_eq!(
+            normalize_freshcodex_model(Some("gpt-5.4-flash")),
+            "gpt-5.4-flash"
+        );
+        assert_eq!(
+            normalize_freshcodex_model(Some("gpt-5.3-codex-spark")),
+            "gpt-5.3-codex-spark"
+        );
         // gpt-5.4-mini (in the codex catalog, NOT the freshcodex allowlist) → gpt-5.5.
         assert_eq!(normalize_freshcodex_model(Some("gpt-5.4-mini")), "gpt-5.5");
         // Unknown / missing → the freshcodex default.
-        assert_eq!(normalize_freshcodex_model(Some("random")), FRESHCODEX_DEFAULT_MODEL);
+        assert_eq!(
+            normalize_freshcodex_model(Some("random")),
+            FRESHCODEX_DEFAULT_MODEL
+        );
         assert_eq!(normalize_freshcodex_model(None), FRESHCODEX_DEFAULT_MODEL);
     }
 
@@ -240,34 +281,73 @@ mod tests {
     fn effort_menu_normalization_matches_reference() {
         let spark = Some("gpt-5.3-codex-spark");
         // On-menu efforts kept.
-        assert_eq!(normalize_freshcodex_effort(spark, Some("low")).as_deref(), Some("low"));
-        assert_eq!(normalize_freshcodex_effort(spark, Some("none")).as_deref(), Some("none"));
-        assert_eq!(normalize_freshcodex_effort(spark, Some("max")).as_deref(), Some("max"));
+        assert_eq!(
+            normalize_freshcodex_effort(spark, Some("low")).as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            normalize_freshcodex_effort(spark, Some("none")).as_deref(),
+            Some("none")
+        );
+        assert_eq!(
+            normalize_freshcodex_effort(spark, Some("max")).as_deref(),
+            Some("max")
+        );
         // codex xhigh → max at the menu stage (`:142`), and `max` is on spark's menu.
-        assert_eq!(normalize_freshcodex_effort(spark, Some("xhigh")).as_deref(), Some("max"));
+        assert_eq!(
+            normalize_freshcodex_effort(spark, Some("xhigh")).as_deref(),
+            Some("max")
+        );
         // Absent effort → the model's defaultEffort (`max` for spark).
-        assert_eq!(normalize_freshcodex_effort(spark, None).as_deref(), Some("max"));
+        assert_eq!(
+            normalize_freshcodex_effort(spark, None).as_deref(),
+            Some("max")
+        );
         // Off-menu effort → clamped to the default (`max`).
-        assert_eq!(normalize_freshcodex_effort(spark, Some("bogus")).as_deref(), Some("max"));
+        assert_eq!(
+            normalize_freshcodex_effort(spark, Some("bogus")).as_deref(),
+            Some("max")
+        );
     }
 
     #[test]
     fn effort_menu_for_flash_omits_max_and_defaults_high() {
         let flash = Some("gpt-5.4-flash");
         // flash has no `max` on its menu; `xhigh → max` then clamps to defaultEffort `high`.
-        assert_eq!(normalize_freshcodex_effort(flash, Some("xhigh")).as_deref(), Some("high"));
-        assert_eq!(normalize_freshcodex_effort(flash, Some("max")).as_deref(), Some("high"));
+        assert_eq!(
+            normalize_freshcodex_effort(flash, Some("xhigh")).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            normalize_freshcodex_effort(flash, Some("max")).as_deref(),
+            Some("high")
+        );
         // On-menu efforts kept, including the DEV-0003 pair.
-        assert_eq!(normalize_freshcodex_effort(flash, Some("none")).as_deref(), Some("none"));
-        assert_eq!(normalize_freshcodex_effort(flash, Some("minimal")).as_deref(), Some("minimal"));
-        assert_eq!(normalize_freshcodex_effort(flash, None).as_deref(), Some("high"));
+        assert_eq!(
+            normalize_freshcodex_effort(flash, Some("none")).as_deref(),
+            Some("none")
+        );
+        assert_eq!(
+            normalize_freshcodex_effort(flash, Some("minimal")).as_deref(),
+            Some("minimal")
+        );
+        assert_eq!(
+            normalize_freshcodex_effort(flash, None).as_deref(),
+            Some("high")
+        );
     }
 
     #[test]
     fn effort_for_unknown_model_uses_default_model_menu() {
         // An unknown model normalizes to gpt-5.5, whose menu includes `max`.
         let unknown = Some("mystery-model");
-        assert_eq!(normalize_freshcodex_effort(unknown, Some("medium")).as_deref(), Some("medium"));
-        assert_eq!(normalize_freshcodex_effort(unknown, None).as_deref(), Some("max"));
+        assert_eq!(
+            normalize_freshcodex_effort(unknown, Some("medium")).as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            normalize_freshcodex_effort(unknown, None).as_deref(),
+            Some("max")
+        );
     }
 }

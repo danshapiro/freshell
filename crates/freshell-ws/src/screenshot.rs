@@ -202,11 +202,23 @@ mod tests {
     async fn resolve_unknown_request_is_ignored() {
         let b = broker();
         // No panic, no effect.
-        b.resolve("nope", ScreenshotResult { ok: true, ..Default::default() });
+        b.resolve(
+            "nope",
+            ScreenshotResult {
+                ok: true,
+                ..Default::default()
+            },
+        );
         // A cancelled request never resolves.
         let rx = b.register("req-2".to_string());
         b.cancel("req-2");
-        b.resolve("req-2", ScreenshotResult { ok: true, ..Default::default() });
+        b.resolve(
+            "req-2",
+            ScreenshotResult {
+                ok: true,
+                ..Default::default()
+            },
+        );
         assert!(rx.await.is_err(), "cancelled sender dropped");
     }
 

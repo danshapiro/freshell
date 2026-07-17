@@ -13,8 +13,8 @@ use std::time::Duration;
 use serde_json::json;
 
 use freshell_codex::{
-    new_channel_transport, to_codex_reasoning_effort, ClientFrame, CodexAppServerClient,
-    CodexAdapterEvent, CodexNotification, CodexSubscription, StartThreadParams, StartTurnParams,
+    new_channel_transport, to_codex_reasoning_effort, ClientFrame, CodexAdapterEvent,
+    CodexAppServerClient, CodexNotification, CodexSubscription, StartThreadParams, StartTurnParams,
 };
 
 const THREAD_ID: &str = "019810de-1e5f-7db3-9c47-1c2a3b4c5d6e";
@@ -53,7 +53,9 @@ async fn full_drive_completed_turn_emits_the_positive_edge_with_verbatim_effort(
             assert_eq!(started.thread_id, THREAD_ID);
 
             // The effort is wire-mapped by the model layer, then forwarded verbatim by the client.
-            let effort = to_codex_reasoning_effort(Some("none")).expect("map").unwrap();
+            let effort = to_codex_reasoning_effort(Some("none"))
+                .expect("map")
+                .unwrap();
             let turn = client
                 .start_turn(StartTurnParams {
                     thread_id: THREAD_ID.to_string(),
@@ -78,13 +80,20 @@ async fn full_drive_completed_turn_emits_the_positive_edge_with_verbatim_effort(
     assert_eq!(start_method, "thread/start");
     assert_eq!(start_params["model"], json!("gpt-5.3-codex-spark"));
     assert_eq!(start_params["persistExtendedHistory"], json!(true));
-    peer.respond(&start_id, json!({ "thread": { "id": THREAD_ID }, "reasoningEffort": "none" }));
+    peer.respond(
+        &start_id,
+        json!({ "thread": { "id": THREAD_ID }, "reasoningEffort": "none" }),
+    );
 
     // turn/start — DEV-0003: effort crosses the wire VERBATIM as "none".
     let (turn_id, turn_method, turn_params) = peer.expect_request().await;
     assert_eq!(turn_method, "turn/start");
     assert_eq!(turn_params["threadId"], json!(THREAD_ID));
-    assert_eq!(turn_params["effort"], json!("none"), "DEV-0003: none forwarded verbatim");
+    assert_eq!(
+        turn_params["effort"],
+        json!("none"),
+        "DEV-0003: none forwarded verbatim"
+    );
     peer.respond(&turn_id, json!({ "turn": { "id": "turn-1" } }));
 
     driver.await.expect("driver task");
@@ -103,7 +112,9 @@ async fn full_drive_completed_turn_emits_the_positive_edge_with_verbatim_effort(
         other => panic!("expected TurnCompleted, got {other:?}"),
     };
     assert!(
-        events.iter().any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })),
         "completed → the positive sdk.turn.complete edge fired: {events:?}"
     );
 }
@@ -117,9 +128,14 @@ async fn full_drive_interrupted_turn_does_not_chime() {
     let driver = {
         let client = client.clone();
         tokio::spawn(async move {
-            client.start_thread(StartThreadParams::default()).await.expect("thread/start");
+            client
+                .start_thread(StartThreadParams::default())
+                .await
+                .expect("thread/start");
             // minimal effort — the OTHER DEV-0003 verbatim value.
-            let effort = to_codex_reasoning_effort(Some("minimal")).expect("map").unwrap();
+            let effort = to_codex_reasoning_effort(Some("minimal"))
+                .expect("map")
+                .unwrap();
             client
                 .start_turn(StartTurnParams {
                     thread_id: THREAD_ID.to_string(),
@@ -139,7 +155,11 @@ async fn full_drive_interrupted_turn_does_not_chime() {
     let (start_id, _m, _p) = peer.expect_request().await;
     peer.respond(&start_id, json!({ "thread": { "id": THREAD_ID } }));
     let (turn_id, _m, turn_params) = peer.expect_request().await;
-    assert_eq!(turn_params["effort"], json!("minimal"), "DEV-0003: minimal forwarded verbatim");
+    assert_eq!(
+        turn_params["effort"],
+        json!("minimal"),
+        "DEV-0003: minimal forwarded verbatim"
+    );
     peer.respond(&turn_id, json!({ "turn": { "id": "turn-1" } }));
     driver.await.expect("driver task");
 
@@ -156,11 +176,15 @@ async fn full_drive_interrupted_turn_does_not_chime() {
         other => panic!("expected TurnCompleted, got {other:?}"),
     };
     assert!(
-        !events.iter().any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })),
+        !events
+            .iter()
+            .any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })),
         "interrupted → NO chime: {events:?}"
     );
     assert!(
-        events.iter().any(|e| matches!(e, CodexAdapterEvent::StatusSnapshot { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, CodexAdapterEvent::StatusSnapshot { .. })),
         "interrupted still emits the idle snapshot"
     );
 }
@@ -174,7 +198,10 @@ async fn rpc_error_on_turn_start_surfaces_to_the_caller() {
     let driver = {
         let client = client.clone();
         tokio::spawn(async move {
-            client.start_thread(StartThreadParams::default()).await.expect("thread/start");
+            client
+                .start_thread(StartThreadParams::default())
+                .await
+                .expect("thread/start");
             client
                 .start_turn(StartTurnParams {
                     thread_id: THREAD_ID.to_string(),
@@ -196,7 +223,10 @@ async fn rpc_error_on_turn_start_surfaces_to_the_caller() {
     peer.respond_error(&turn_id, -32000, "turn rejected");
 
     let result = driver.await.expect("driver task");
-    assert!(result.is_err(), "an RPC error on turn/start propagates: {result:?}");
+    assert!(
+        result.is_err(),
+        "an RPC error on turn/start propagates: {result:?}"
+    );
 }
 
 /// The client→server request framing is exactly `{ id, method, params }` with no `jsonrpc`
@@ -222,7 +252,10 @@ async fn client_request_frames_carry_no_jsonrpc_tag() {
         other => panic!("expected a request, got {other:?}"),
     }
     // The follow-up initialized notification has no id.
-    assert!(matches!(peer.next_frame().await, Some(ClientFrame::Notification { .. })));
+    assert!(matches!(
+        peer.next_frame().await,
+        Some(ClientFrame::Notification { .. })
+    ));
 
     tokio::time::timeout(Duration::from_secs(1), driver)
         .await

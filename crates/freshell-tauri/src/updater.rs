@@ -368,7 +368,10 @@ mod tests {
             }
         });
         let cfg = parse_updater_config(&plugins);
-        assert_eq!(cfg.endpoints, vec!["https://releases.freshell.app/latest.json"]);
+        assert_eq!(
+            cfg.endpoints,
+            vec!["https://releases.freshell.app/latest.json"]
+        );
         assert_eq!(cfg.pubkey, "REPLACE_WITH_REAL_ED25519_PUBKEY");
         // The shipped placeholder key → disarmed (CD-7 surfaced, not silent).
         assert_eq!(updater_state(&cfg), UpdaterState::DisarmedNoPubkey);

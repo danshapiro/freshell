@@ -1528,10 +1528,11 @@ mod tests {
         )
         .unwrap();
 
-        let settings = crate::settings_store::SettingsStore::load(Some(&home), vec!["codex".into()]);
+        let settings =
+            crate::settings_store::SettingsStore::load(Some(&home), vec!["codex".into()]);
         let auth_token: Arc<String> = Arc::new("tok".into());
         let session_index = Arc::new(SessionIndex::new(vec![
-            Arc::new(CodexSource::new(codex_home)) as Arc<dyn SessionSource>
+            Arc::new(CodexSource::new(codex_home)) as Arc<dyn SessionSource>,
         ]));
         let state = SessionDirectoryState {
             auth_token: Arc::clone(&auth_token),
@@ -1619,8 +1620,10 @@ mod tests {
             .unwrap();
         }
 
-        let settings =
-            crate::settings_store::SettingsStore::load(Some(&home), vec!["codex".into(), "opencode".into()]);
+        let settings = crate::settings_store::SettingsStore::load(
+            Some(&home),
+            vec!["codex".into(), "opencode".into()],
+        );
         let auth_token: Arc<String> = Arc::new("tok".into());
         let session_index = Arc::new(SessionIndex::new(vec![
             Arc::new(CodexSource::new(codex_home)) as Arc<dyn SessionSource>,
@@ -1634,7 +1637,10 @@ mod tests {
         let app = router(state);
 
         settings
-            .patch_session_override("codex:codex-1", &[("titleOverride", Some(json!("Renamed Codex")))])
+            .patch_session_override(
+                "codex:codex-1",
+                &[("titleOverride", Some(json!("Renamed Codex")))],
+            )
             .await;
         settings
             .patch_session_override("opencode:oc-1", &[("archived", Some(json!(true)))])

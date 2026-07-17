@@ -60,8 +60,14 @@ pub enum WslPortForwardingPlan {
     NotWsl2,
     Disabled,
     Error(String),
-    Noop { wsl_ip: String },
-    Ready { wsl_ip: String, script_kind: ScriptKind, script: String },
+    Noop {
+        wsl_ip: String,
+    },
+    Ready {
+        wsl_ip: String,
+        script_kind: ScriptKind,
+        script: String,
+    },
 }
 
 /// `WslPortForwardingTeardownPlan` (`wsl-port-forward.ts:389-394`).
@@ -105,9 +111,9 @@ pub(crate) fn parse_int_prefix(s: &str) -> Option<i64> {
 fn is_ipv4_shape(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
     parts.len() == 4
-        && parts.iter().all(|p| {
-            !p.is_empty() && p.len() <= 3 && p.bytes().all(|b| b.is_ascii_digit())
-        })
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.len() <= 3 && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// `Array.from(new Set(...))` preserving first-seen insertion order.
@@ -152,12 +158,12 @@ pub fn parse_port_proxy_rules(output: &str) -> BTreeMap<u16, PortProxyRule> {
             continue;
         }
         let mut it = line.split_whitespace();
-        let (Some(f0), Some(f1), Some(f2), Some(f3)) =
-            (it.next(), it.next(), it.next(), it.next())
+        let (Some(f0), Some(f1), Some(f2), Some(f3)) = (it.next(), it.next(), it.next(), it.next())
         else {
             continue;
         };
-        let is_ip_chars = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'.');
+        let is_ip_chars =
+            |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'.');
         let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
         if !is_ip_chars(f0) || !all_digits(f1) || !is_ip_chars(f2) || !all_digits(f3) {
             continue;
@@ -170,7 +176,10 @@ pub fn parse_port_proxy_rules(output: &str) -> BTreeMap<u16, PortProxyRule> {
         };
         rules.insert(
             listen_port,
-            PortProxyRule { connect_address: f2.to_string(), connect_port },
+            PortProxyRule {
+                connect_address: f2.to_string(),
+                connect_port,
+            },
         );
     }
     rules
@@ -291,7 +300,11 @@ pub fn needs_port_forwarding_update(
 // ---------------------------------------------------------------------------
 
 fn join_ports(ports: &[u16]) -> String {
-    ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")
+    ports
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// `buildFirewallOnlyScript` (`wsl-port-forward.ts:289-296`).
@@ -325,7 +338,9 @@ pub fn build_port_forwarding_script(wsl_ip: &str, ports: &[u16], cleanup_ports: 
 listenport={port} connectaddress={wsl_ip} connectport={port}"
         ));
     }
-    cmds.push("netsh advfirewall firewall delete rule name=FreshellLANAccess 2>\\$null".to_string());
+    cmds.push(
+        "netsh advfirewall firewall delete rule name=FreshellLANAccess 2>\\$null".to_string(),
+    );
     cmds.push(format!(
         "netsh advfirewall firewall add rule name=FreshellLANAccess \
 dir=in action=allow protocol=tcp localport={} profile=private",
@@ -343,7 +358,9 @@ pub fn build_port_forwarding_teardown_script(ports: &[u16]) -> String {
             "netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport={port} 2>\\$null"
         ));
     }
-    cmds.push("netsh advfirewall firewall delete rule name=FreshellLANAccess 2>\\$null".to_string());
+    cmds.push(
+        "netsh advfirewall firewall delete rule name=FreshellLANAccess 2>\\$null".to_string(),
+    );
     cmds.join("; ")
 }
 
@@ -402,26 +419,37 @@ pub fn build_wsl_port_forwarding_plan(
     managed_ports: &[u16],
 ) -> WslPortForwardingPlan {
     let stale_firewall_ports = get_stale_firewall_ports(required_ports, existing_firewall_ports);
-    let stale_managed = get_stale_managed_port_proxy_ports(required_ports, managed_ports, existing_rules);
+    let stale_managed =
+        get_stale_managed_port_proxy_ports(required_ports, managed_ports, existing_rules);
     let stale_owned = unique_preserving_order(
         stale_firewall_ports
             .iter()
             .copied()
             .filter(|p| existing_rules.contains_key(p))
             .chain(stale_managed.iter().copied())
-            .chain(get_legacy_owned_port_proxy_ports(required_ports, known_owned_ports, existing_rules)),
+            .chain(get_legacy_owned_port_proxy_ports(
+                required_ports,
+                known_owned_ports,
+                existing_rules,
+            )),
     );
 
-    let ports_need_update =
-        needs_port_forwarding_update(wsl_ip, required_ports, existing_rules) || !stale_owned.is_empty();
-    let firewall_needs_update =
-        needs_firewall_update(required_ports, existing_firewall_ports) || !stale_firewall_ports.is_empty();
+    let ports_need_update = needs_port_forwarding_update(wsl_ip, required_ports, existing_rules)
+        || !stale_owned.is_empty();
+    let firewall_needs_update = needs_firewall_update(required_ports, existing_firewall_ports)
+        || !stale_firewall_ports.is_empty();
 
     if !ports_need_update && !firewall_needs_update {
-        return WslPortForwardingPlan::Noop { wsl_ip: wsl_ip.to_string() };
+        return WslPortForwardingPlan::Noop {
+            wsl_ip: wsl_ip.to_string(),
+        };
     }
 
-    let script_kind = if ports_need_update { ScriptKind::Full } else { ScriptKind::FirewallOnly };
+    let script_kind = if ports_need_update {
+        ScriptKind::Full
+    } else {
+        ScriptKind::FirewallOnly
+    };
     let cleanup_ports = unique_preserving_order(
         required_ports
             .iter()
@@ -455,9 +483,15 @@ pub fn build_wsl_port_forwarding_teardown_plan(
             .copied()
             .chain(existing_firewall_ports.iter().copied())
             .chain(managed_ports.iter().copied())
-            .chain(get_legacy_owned_port_proxy_ports(&[], known_owned_ports, existing_rules)),
+            .chain(get_legacy_owned_port_proxy_ports(
+                &[],
+                known_owned_ports,
+                existing_rules,
+            )),
     );
-    let has_relevant_port_proxy_rules = teardown_ports.iter().any(|p| existing_rules.contains_key(p));
+    let has_relevant_port_proxy_rules = teardown_ports
+        .iter()
+        .any(|p| existing_rules.contains_key(p));
     let has_freshell_firewall_rule = !existing_firewall_ports.is_empty();
 
     if !has_relevant_port_proxy_rules && !has_freshell_firewall_rule {
@@ -544,7 +578,13 @@ pub fn get_existing_port_proxy_rules(
 pub fn get_existing_firewall_ports(runner: &dyn CommandRunner) -> Option<Vec<u16>> {
     let out = runner.run(
         NETSH_PATH,
-        &["advfirewall", "firewall", "show", "rule", "name=FreshellLANAccess"],
+        &[
+            "advfirewall",
+            "firewall",
+            "show",
+            "rule",
+            "name=FreshellLANAccess",
+        ],
     );
     if out.ok() {
         return Some(parse_firewall_rule_ports(&out.stdout));
@@ -561,7 +601,10 @@ mod tests {
     use crate::{CommandOutput, FakeCommandRunner, MapEnv};
 
     fn rule(addr: &str, port: u16) -> PortProxyRule {
-        PortProxyRule { connect_address: addr.to_string(), connect_port: port }
+        PortProxyRule {
+            connect_address: addr.to_string(),
+            connect_port: port,
+        }
     }
 
     // ---- script builder golden strings (P21) ------------------------------
@@ -646,7 +689,8 @@ Address         Port        Address         Port\r\n\
 
     #[test]
     fn parse_firewall_ports_comma_split_and_dedup() {
-        let out = "Rule Name: FreshellLANAccess\r\nLocalPort:   3001, 3002 ,3001\r\nRemotePort: Any\r\n";
+        let out =
+            "Rule Name: FreshellLANAccess\r\nLocalPort:   3001, 3002 ,3001\r\nRemotePort: Any\r\n";
         assert_eq!(parse_firewall_rule_ports(out), vec![3001, 3002]);
     }
 
@@ -673,16 +717,28 @@ Address         Port        Address         Port\r\n\
     #[test]
     fn required_ports_default_and_env() {
         assert_eq!(get_required_ports(&MapEnv::new(), None), vec![3001]);
-        assert_eq!(get_required_ports(&MapEnv::new().with("PORT", "4000"), None), vec![4000]);
+        assert_eq!(
+            get_required_ports(&MapEnv::new().with("PORT", "4000"), None),
+            vec![4000]
+        );
         // invalid PORT -> default
-        assert_eq!(get_required_ports(&MapEnv::new().with("PORT", "abc"), None), vec![3001]);
+        assert_eq!(
+            get_required_ports(&MapEnv::new().with("PORT", "abc"), None),
+            vec![3001]
+        );
         // out of range -> default
-        assert_eq!(get_required_ports(&MapEnv::new().with("PORT", "70000"), None), vec![3001]);
+        assert_eq!(
+            get_required_ports(&MapEnv::new().with("PORT", "70000"), None),
+            vec![3001]
+        );
     }
 
     #[test]
     fn required_ports_dev_only_non_production() {
-        assert_eq!(get_required_ports(&MapEnv::new(), Some(5173)), vec![3001, 5173]);
+        assert_eq!(
+            get_required_ports(&MapEnv::new(), Some(5173)),
+            vec![3001, 5173]
+        );
         let prod = MapEnv::new().with("NODE_ENV", "production");
         assert_eq!(get_required_ports(&prod, Some(5173)), vec![3001]);
         // dev port equal to server port dedupes
@@ -715,15 +771,25 @@ Address         Port        Address         Port\r\n\
             &[3001],
             &[3001],
         );
-        assert_eq!(plan, WslPortForwardingPlan::Noop { wsl_ip: "172.30.149.249".into() });
+        assert_eq!(
+            plan,
+            WslPortForwardingPlan::Noop {
+                wsl_ip: "172.30.149.249".into()
+            }
+        );
     }
 
     #[test]
     fn plan_full_when_portproxy_missing() {
         let rules = BTreeMap::new(); // nothing configured yet
-        let plan = build_wsl_port_forwarding_plan(&[3001], &[3001], "172.30.149.249", &rules, &[], &[]);
+        let plan =
+            build_wsl_port_forwarding_plan(&[3001], &[3001], "172.30.149.249", &rules, &[], &[]);
         match plan {
-            WslPortForwardingPlan::Ready { script_kind, script, wsl_ip } => {
+            WslPortForwardingPlan::Ready {
+                script_kind,
+                script,
+                wsl_ip,
+            } => {
                 assert_eq!(script_kind, ScriptKind::Full);
                 assert_eq!(wsl_ip, "172.30.149.249");
                 assert!(script.contains("portproxy add"));
@@ -739,9 +805,14 @@ Address         Port        Address         Port\r\n\
         let mut rules = BTreeMap::new();
         rules.insert(3001, rule("172.30.149.249", 3001));
         // firewall rule has no ports -> needs firewall update, proxy fine.
-        let plan = build_wsl_port_forwarding_plan(&[3001], &[3001], "172.30.149.249", &rules, &[], &[]);
+        let plan =
+            build_wsl_port_forwarding_plan(&[3001], &[3001], "172.30.149.249", &rules, &[], &[]);
         match plan {
-            WslPortForwardingPlan::Ready { script_kind, script, .. } => {
+            WslPortForwardingPlan::Ready {
+                script_kind,
+                script,
+                ..
+            } => {
                 assert_eq!(script_kind, ScriptKind::FirewallOnly);
                 assert!(!script.contains("portproxy"));
                 assert!(script.contains("firewall add rule name=FreshellLANAccess"));
@@ -761,11 +832,15 @@ Address         Port        Address         Port\r\n\
             &[3001],
             "172.30.149.249",
             &rules,
-            &[3001],   // firewall already has 3001
-            &[4000],   // managed ports include stale 4000
+            &[3001], // firewall already has 3001
+            &[4000], // managed ports include stale 4000
         );
         match plan {
-            WslPortForwardingPlan::Ready { script_kind, script, .. } => {
+            WslPortForwardingPlan::Ready {
+                script_kind,
+                script,
+                ..
+            } => {
                 assert_eq!(script_kind, ScriptKind::Full);
                 // cleanup includes stale 4000 delete before the 3001 add
                 assert!(script.contains("delete v4tov4 listenaddress=0.0.0.0 listenport=4000"));
@@ -808,7 +883,8 @@ Address         Port        Address         Port\r\n\
 
     #[test]
     fn parse_eth0_ip_skips_inet6() {
-        let out = "    inet6 fe80::215:5dff:fe? scope link\n    inet 10.0.0.4/24 scope global eth0\n";
+        let out =
+            "    inet6 fe80::215:5dff:fe? scope link\n    inet 10.0.0.4/24 scope global eth0\n";
         assert_eq!(parse_eth0_ip(out).as_deref(), Some("10.0.0.4"));
     }
 
@@ -832,7 +908,11 @@ Address         Port        Address         Port\r\n\
         // eth0 fails -> hostname fallback
         let host = FakeCommandRunner::new()
             .on("ip", &["eth0"], CommandOutput::failure(1, "", "no eth0"))
-            .on("hostname", &["-I"], CommandOutput::success("172.17.0.1 10.1.2.3\n"));
+            .on(
+                "hostname",
+                &["-I"],
+                CommandOutput::success("172.17.0.1 10.1.2.3\n"),
+            );
         assert_eq!(get_wsl_ip(&host).as_deref(), Some("10.1.2.3"));
     }
 
@@ -891,7 +971,10 @@ Address         Port        Address         Port\r\n\
         let rules = get_existing_port_proxy_rules(&runner).expect("portproxy show should succeed");
         for (listen, r) in &rules {
             assert!(*listen >= 1);
-            assert!(is_ipv4_shape(&r.connect_address), "connect addr shape: {r:?}");
+            assert!(
+                is_ipv4_shape(&r.connect_address),
+                "connect addr shape: {r:?}"
+            );
         }
         eprintln!("LIVE portproxy rules (read-only): {} rule(s)", rules.len());
 

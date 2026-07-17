@@ -221,7 +221,11 @@ pub fn reap_child(child: &mut Child, grace: Duration, poll: Duration) -> ReapOut
     if request_terminate(child) {
         let deadline = Instant::now() + grace;
         loop {
-            match reap_step(!has_exited(child), deadline.saturating_duration_since(Instant::now()), grace) {
+            match reap_step(
+                !has_exited(child),
+                deadline.saturating_duration_since(Instant::now()),
+                grace,
+            ) {
                 ReapStep::Done => return ReapOutcome::Graceful,
                 ReapStep::Escalate => break,
                 ReapStep::WaitMore => std::thread::sleep(poll),
@@ -280,7 +284,10 @@ mod tests {
     fn plan_sets_program_and_core_env() {
         let plan = build_spawn_plan(&base_cfg());
         assert_eq!(plan.program, PathBuf::from("/opt/freshell/freshell-server"));
-        assert!(plan.args.is_empty(), "the Rust server takes no positional args");
+        assert!(
+            plan.args.is_empty(),
+            "the Rust server takes no positional args"
+        );
         assert_eq!(plan.env_get("PORT"), Some("51234"));
         assert_eq!(plan.env_get("AUTH_TOKEN"), Some("tok-abc123"));
         assert_eq!(plan.env_get("FRESHELL_BIND_HOST"), Some("127.0.0.1"));
@@ -299,7 +306,11 @@ mod tests {
     #[test]
     fn plan_without_home_or_client_dir_omits_them() {
         let plan = build_spawn_plan(&base_cfg());
-        assert_eq!(plan.env_get("HOME"), None, "inherit the real HOME when unset");
+        assert_eq!(
+            plan.env_get("HOME"),
+            None,
+            "inherit the real HOME when unset"
+        );
         assert_eq!(plan.env_get("FRESHELL_HOME"), None);
         assert_eq!(plan.env_get("FRESHELL_CLIENT_DIR"), None);
     }
@@ -312,7 +323,10 @@ mod tests {
         let plan = build_spawn_plan(&cfg);
         assert_eq!(plan.env_get("FRESHELL_HOME"), Some("/tmp/isolated-home"));
         assert_eq!(plan.env_get("HOME"), Some("/tmp/isolated-home"));
-        assert_eq!(plan.env_get("FRESHELL_CLIENT_DIR"), Some("/tmp/dist/client"));
+        assert_eq!(
+            plan.env_get("FRESHELL_CLIENT_DIR"),
+            Some("/tmp/dist/client")
+        );
     }
 
     #[test]
@@ -325,7 +339,10 @@ mod tests {
         for (k, _) in &plan.env {
             *seen.entry(k.as_str()).or_default() += 1;
         }
-        assert!(seen.values().all(|&n| n == 1), "duplicate env key in plan: {seen:?}");
+        assert!(
+            seen.values().all(|&n| n == 1),
+            "duplicate env key in plan: {seen:?}"
+        );
     }
 
     #[test]
@@ -344,7 +361,11 @@ mod tests {
     #[test]
     fn generated_token_is_nonempty_and_url_safe_hex() {
         let token = generate_auth_token();
-        assert_eq!(token.len(), 64, "two v4 uuids simple-formatted = 64 hex chars");
+        assert_eq!(
+            token.len(),
+            64,
+            "two v4 uuids simple-formatted = 64 hex chars"
+        );
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(generate_auth_token(), token, "tokens are per-call random");
     }
@@ -362,13 +383,28 @@ mod tests {
     fn reap_step_transitions() {
         let grace = Duration::from_secs(5);
         // Alive, still within grace → wait.
-        assert_eq!(reap_step(true, Duration::from_secs(1), grace), ReapStep::WaitMore);
+        assert_eq!(
+            reap_step(true, Duration::from_secs(1), grace),
+            ReapStep::WaitMore
+        );
         // Alive, grace elapsed → escalate.
-        assert_eq!(reap_step(true, Duration::from_secs(5), grace), ReapStep::Escalate);
-        assert_eq!(reap_step(true, Duration::from_secs(9), grace), ReapStep::Escalate);
+        assert_eq!(
+            reap_step(true, Duration::from_secs(5), grace),
+            ReapStep::Escalate
+        );
+        assert_eq!(
+            reap_step(true, Duration::from_secs(9), grace),
+            ReapStep::Escalate
+        );
         // Exited → done, regardless of elapsed.
-        assert_eq!(reap_step(false, Duration::from_secs(0), grace), ReapStep::Done);
-        assert_eq!(reap_step(false, Duration::from_secs(9), grace), ReapStep::Done);
+        assert_eq!(
+            reap_step(false, Duration::from_secs(0), grace),
+            ReapStep::Done
+        );
+        assert_eq!(
+            reap_step(false, Duration::from_secs(9), grace),
+            ReapStep::Done
+        );
     }
 
     #[test]
@@ -383,7 +419,11 @@ mod tests {
             .expect("spawn `true`");
         // Give it a moment to exit on its own.
         std::thread::sleep(Duration::from_millis(50));
-        let outcome = reap_child(&mut child, Duration::from_secs(5), Duration::from_millis(10));
+        let outcome = reap_child(
+            &mut child,
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+        );
         assert!(
             matches!(outcome, ReapOutcome::AlreadyExited | ReapOutcome::Graceful),
             "a self-exited process must not be Forced, got {outcome:?}"
@@ -401,7 +441,11 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn `sleep 600`");
-        let outcome = reap_child(&mut child, Duration::from_secs(5), Duration::from_millis(20));
+        let outcome = reap_child(
+            &mut child,
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+        );
         assert_eq!(outcome, ReapOutcome::Graceful);
         assert!(has_exited(&mut child), "child must be reaped, no orphan");
     }
