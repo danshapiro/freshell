@@ -50,16 +50,23 @@
 //! / `:624` — the sidecar's lifecycle is independent of any one session's).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde_json::{json, Value};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Mutex as TokioMutex;
 
-use freshell_opencode::{normalize_opencode_effort, normalize_opencode_model};
+use freshell_codex::next_monotonic_turn_complete_at;
+use freshell_opencode::{
+    normalize_opencode_effort, normalize_opencode_model, ChangedReason, OpencodeServeManager,
+    SdkProviderEvent, SessionSignal, SnapshotStatus,
+};
 use freshell_protocol::{
-    ErrorCode, ErrorMsg, FreshAgentCreate, FreshAgentCreated, FreshAgentInterrupt, FreshAgentKill,
-    FreshAgentKilled, FreshAgentSend, FreshAgentSendAccepted, FreshAgentSessionMaterialized,
-    ServerMessage, SessionLocator,
+    ErrorCode, ErrorMsg, FreshAgentCreate, FreshAgentCreated, FreshAgentEvent, FreshAgentInterrupt,
+    FreshAgentKill, FreshAgentKilled, FreshAgentSend, FreshAgentSendAccepted,
+    FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
 };
 
 use crate::FreshAgentState;
@@ -94,9 +101,43 @@ struct OpencodeSession {
     effort: Option<String>,
     /// The detached task running the current/most-recent turn (`manager.run_turn`), so
     /// `freshAgent.kill`/`freshAgent.interrupt` can abort it. Not serialized against a
-    /// concurrent `freshAgent.send` — PR-3's streaming bridge is where full turn
-    /// lifecycle tracking (mirroring `adapter.ts`'s `sendQueue`) lands.
+    /// concurrent `freshAgent.send` — mirrors `adapter.ts`'s `sendQueue` only loosely
+    /// (this crate does not yet serialize overlapping sends).
     turn_task: Option<tokio::task::JoinHandle<()>>,
+    /// PR-3: set by `handle_interrupt` (BEFORE aborting) so a racing in-flight turn's
+    /// completion gating suppresses `freshAgent.turn.complete` (`state.turnAborted`,
+    /// adapter.ts:521,334-335). Reset to `false` at the top of every `handle_send`.
+    turn_aborted: Arc<AtomicBool>,
+    /// PR-3: flipped `true` by the serve-stream bridge when it observes a `session.error`
+    /// SSE event during the in-flight turn (`state.turnErrored`, adapter.ts:278-282,334-335).
+    /// Reset to `false` at the top of every `handle_send`.
+    turn_errored: Arc<AtomicBool>,
+    /// PR-3: the strictly-monotonic turn-complete clock's last stamped value for this
+    /// session (`state.lastTurnCompleteAt`, `turn-complete-clock.ts`).
+    last_turn_complete_at: Arc<StdMutex<Option<i64>>>,
+    /// PR-3: the persistent serve-SSE-bridge task started ONCE at materialization
+    /// (`adapter.ts bindServeStream`, called from `materializeOrSend:349`), forwarding
+    /// `session.status`/`session.idle`/`message.*`/`session.error` into
+    /// `freshAgent.session.snapshot` / `freshAgent.session.changed` / `freshAgent.error`
+    /// for the lifetime of the session. `None` until materialized; aborted on kill.
+    serve_bridge: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl OpencodeSession {
+    fn new(placeholder_id: String, cwd: Option<String>, model: Option<String>, effort: Option<String>) -> Self {
+        Self {
+            placeholder_id,
+            real_session_id: None,
+            cwd,
+            model,
+            effort,
+            turn_task: None,
+            turn_aborted: Arc::new(AtomicBool::new(false)),
+            turn_errored: Arc::new(AtomicBool::new(false)),
+            last_turn_complete_at: Arc::new(StdMutex::new(None)),
+            serve_bridge: None,
+        }
+    }
 }
 
 impl FreshOpencodeState {
@@ -134,14 +175,7 @@ impl FreshOpencodeState {
         let effort = normalize_opencode_effort(model.as_deref(), msg.effort.as_deref());
         let placeholder = format!("freshopencode-{request_id}");
 
-        let session = OpencodeSession {
-            placeholder_id: placeholder.clone(),
-            real_session_id: None,
-            cwd: msg.cwd.clone(),
-            model,
-            effort,
-            turn_task: None,
-        };
+        let session = OpencodeSession::new(placeholder.clone(), msg.cwd.clone(), model, effort);
         self.sessions
             .lock()
             .await
@@ -179,6 +213,12 @@ impl FreshOpencodeState {
 
         let mut session = session_arc.lock().await;
 
+        // materializeOrSend:334-335 -- a fresh turn starts un-aborted and un-errored;
+        // `handle_interrupt` flips `turn_aborted` while we are parked on idle, and the
+        // serve-stream bridge flips `turn_errored` if the turn reports an error.
+        session.turn_aborted.store(false, Ordering::SeqCst);
+        session.turn_errored.store(false, Ordering::SeqCst);
+
         // `normalizeOpencodeInput(settings)` (adapter.ts:82-83, materializeOrSend:325-328):
         // when `settings` is present, model/effort are normalized PURELY from it (the
         // reference spreads `{...settings}` — a field settings omits is NOT backfilled
@@ -199,6 +239,13 @@ impl FreshOpencodeState {
         };
 
         let manager = self.fresh_agent.ensure_manager().await;
+
+        // `emitStatus(state, 'running')` (adapter.ts:336) -- BEFORE any session
+        // materialization, stamped with whatever id is currently known (the placeholder
+        // on a session's first send, the durable id thereafter).
+        let busy_session_id =
+            session.real_session_id.clone().unwrap_or_else(|| session.placeholder_id.clone());
+        self.broadcast(&event_frame(&busy_session_id, snapshot_event(&busy_session_id, "running")));
 
         let acked_session_id = if let Some(real_id) = session.real_session_id.clone() {
             // Already materialized: THE continuity fix — reuse it, no new session.
@@ -230,6 +277,15 @@ impl FreshOpencodeState {
                 session_type: SESSION_TYPE.to_string(),
                 session_ref: Some(SessionLocator { provider: PROVIDER.to_string(), session_id: durable_id.clone() }),
             }));
+
+            // PR-3: `bindServeStream(state)` (adapter.ts:349) -- start the persistent
+            // serve-SSE bridge ONCE, right after materialization. A later send never
+            // re-enters this branch (mirrors `if (state.unsubscribeServe ...) return`).
+            session.serve_bridge = Some(self.spawn_serve_bridge(
+                manager.clone(),
+                durable_id.clone(),
+                session.turn_errored.clone(),
+            ));
             durable_id
         };
 
@@ -252,14 +308,39 @@ impl FreshOpencodeState {
             submitted_turn_id: None,
         }));
 
+        let fresh_agent = self.fresh_agent.clone();
+        let turn_aborted = session.turn_aborted.clone();
+        let turn_errored = session.turn_errored.clone();
+        let last_turn_complete_at = session.last_turn_complete_at.clone();
+
         let turn_task = tokio::spawn(async move {
             // `run_turn` (freshell-opencode/serve.rs) prompts + awaits idle against the
-            // REAL opencode serve session, so the reply lands in opencode's own session
-            // state even though PR-3 hasn't bridged the resulting idle/turn-complete
-            // signal onto the WS bus yet (see module docs).
-            let _ = manager
+            // REAL opencode serve session (adapter.ts materializeOrSend:363-368).
+            let result = manager
                 .run_turn(&real_id, &text, model.as_deref(), effort.as_deref(), DEFAULT_TURN_TIMEOUT, route)
                 .await;
+
+            // `emitStatus(state, 'idle')` (adapter.ts:371/384) -- unconditional, whether
+            // the turn succeeded or the promptAsync/idle-wait itself errored.
+            fresh_agent.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
+
+            // adapter.ts:377 -- a positive completion requires the idle-wait to have
+            // actually succeeded AND the turn to have been neither interrupted
+            // (`turn_aborted`, set by `handle_interrupt`) nor errored (`turn_errored`,
+            // set by the serve-stream bridge on an observed `session.error`).
+            if result.is_ok()
+                && !turn_aborted.load(Ordering::SeqCst)
+                && !turn_errored.load(Ordering::SeqCst)
+            {
+                let at = {
+                    let mut guard =
+                        last_turn_complete_at.lock().expect("last_turn_complete_at mutex");
+                    let at = next_monotonic_turn_complete_at(*guard, now_ms());
+                    *guard = Some(at);
+                    at
+                };
+                fresh_agent.broadcast(&event_frame(&real_id, turn_complete_event(&real_id, at)));
+            }
         });
         session.turn_task = Some(turn_task);
     }
@@ -293,6 +374,11 @@ impl FreshOpencodeState {
             if let Some(task) = s.turn_task.take() {
                 task.abort();
             }
+            // PR-3: stop the persistent serve-SSE bridge too (`unsubscribeServe?.()`,
+            // adapter.ts:568) so it doesn't keep broadcasting for a dead session.
+            if let Some(bridge) = s.serve_bridge.take() {
+                bridge.abort();
+            }
         }
 
         // `adapter.ts kill()` is unconditional (`return true` even for an
@@ -306,13 +392,15 @@ impl FreshOpencodeState {
         }));
     }
 
-    // ── freshAgent.interrupt (WS) — cheap best-effort (full bridge is PR-3) ─
+    // ── freshAgent.interrupt (WS) ────────────────────────────────────────
 
-    /// Handle a `freshAgent.interrupt` for opencode: abort the in-flight turn task and
-    /// issue a best-effort `serveManager.abort()` against the real session
-    /// (`adapter.ts interrupt()` / `abortForState`). No status-snapshot broadcast yet —
-    /// bridging the resulting idle status onto the WS bus is PR-3's job (see module
-    /// docs); this is the cheap subset that doesn't require the streaming bridge.
+    /// Handle a `freshAgent.interrupt` for opencode: mark the turn aborted (BEFORE
+    /// aborting, so a racing in-flight completion sees the flag — adapter.ts:521), abort
+    /// the in-flight turn task, and issue a best-effort `serveManager.abort()` against
+    /// the real session (`adapter.ts interrupt()` / `abortForState`). Always broadcasts
+    /// the resulting idle status (`emitStatus(state,'idle')`, adapter.ts:530) — even for
+    /// a not-yet-materialized session (`abortForState` no-ops when there's no
+    /// `realSessionId`, but the reference still emits idle unconditionally).
     pub async fn handle_interrupt(&self, msg: FreshAgentInterrupt) {
         let session_arc = {
             let guard = self.sessions.lock().await;
@@ -323,18 +411,93 @@ impl FreshOpencodeState {
             return;
         };
 
-        let (real_id, route) = {
+        let (real_id, route, turn_aborted) = {
             let mut session = session_arc.lock().await;
+            session.turn_aborted.store(true, Ordering::SeqCst);
             if let Some(task) = session.turn_task.take() {
                 task.abort();
             }
-            (session.real_session_id.clone(), session.cwd.clone())
+            (session.real_session_id.clone(), session.cwd.clone(), session.turn_aborted.clone())
         };
 
-        if let Some(real_id) = real_id {
-            let manager = self.fresh_agent.ensure_manager().await;
-            let _ = manager.abort(&real_id, &route).await;
+        let Some(real_id) = real_id else {
+            // Not yet materialized: `abortForState` is a no-op, but `emitStatus('idle')`
+            // still fires (adapter.ts:530), stamped with whatever id the client sent.
+            self.broadcast(&event_frame(&msg.session_id, snapshot_event(&msg.session_id, "idle")));
+            return;
+        };
+
+        let manager = self.fresh_agent.ensure_manager().await;
+        match manager.abort(&real_id, &route).await {
+            Ok(()) => {
+                self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
+            }
+            Err(_) => {
+                // adapter.ts:525-528 -- the abort never landed, so the turn may still
+                // complete normally; clear the flag so a genuine completion isn't
+                // silently swallowed.
+                turn_aborted.store(false, Ordering::SeqCst);
+            }
         }
+    }
+
+    // ── PR-3: the persistent serve-SSE bridge (adapter.ts `bindServeStream`) ─
+
+    /// Bridge the serve SSE stream for `real_id` into `freshAgent.session.snapshot` /
+    /// `freshAgent.session.changed` / `freshAgent.error` frames for the lifetime of the
+    /// session, and flip `turn_errored` on an observed `session.error` (`state.turnErrored`,
+    /// adapter.ts bindServeStream:278-282). Started ONCE, right after materialization
+    /// (`bindServeStream(state)`, adapter.ts:349); aborted by `handle_kill`.
+    fn spawn_serve_bridge(
+        &self,
+        manager: OpencodeServeManager,
+        real_id: String,
+        turn_errored: Arc<AtomicBool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let fresh_agent = self.fresh_agent.clone();
+        let mut rx = manager.subscribe(&real_id);
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(SessionSignal::Event(parsed)) => {
+                        let Some(mapped) = freshell_opencode::serve_event_to_sdk(&parsed, &real_id)
+                        else {
+                            continue;
+                        };
+                        let inner = match &mapped {
+                            SdkProviderEvent::Snapshot { session_id, status } => {
+                                let status_str = match status {
+                                    SnapshotStatus::Running => "running",
+                                    SnapshotStatus::Idle => "idle",
+                                };
+                                snapshot_event(session_id, status_str)
+                            }
+                            SdkProviderEvent::Changed { session_id, reason } => {
+                                let reason_str = match reason {
+                                    ChangedReason::OpencodeMessage => "opencode-message",
+                                    ChangedReason::OpencodeStatus => "opencode-status",
+                                };
+                                changed_event(session_id, reason_str)
+                            }
+                            SdkProviderEvent::Error { session_id, message } => {
+                                // adapter.ts:278-282 -- a turn error means the in-flight
+                                // turn did not positively complete; consulted by the
+                                // send task's completion gating once idle resolves.
+                                turn_errored.store(true, Ordering::SeqCst);
+                                error_event(session_id, message)
+                            }
+                        };
+                        fresh_agent.broadcast(&event_frame(&real_id, inner));
+                    }
+                    // The sidecar was lost; `run_turn`'s own `await_idle` independently
+                    // surfaces `ServeError::SidecarLost`, which already excludes the
+                    // turn from a positive completion. Nothing further to bridge here.
+                    Ok(SessionSignal::Lost) => {}
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        })
     }
 }
 
@@ -360,6 +523,49 @@ fn now_iso() -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { year + 1 } else { year };
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z")
+}
+
+/// `Date.now()` — epoch milliseconds (the turn-complete clock's `now`). Duplicated from
+/// `codex.rs`'s identical private helper, same rationale as `now_iso` above.
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+// ── PR-3: `freshAgent.event` frame builders (sdk-events.ts + serve-events.ts shapes) ─
+
+/// Wrap `inner` in a `freshAgent.event` envelope (mirrors codex.rs's
+/// `adapter_event_to_frame` / claude.rs's `sdk_line_to_frame`).
+fn event_frame(session_id: &str, inner: Value) -> ServerMessage {
+    ServerMessage::FreshAgentEvent(FreshAgentEvent {
+        event: inner,
+        provider: PROVIDER.to_string(),
+        session_id: session_id.to_string(),
+        session_type: SESSION_TYPE.to_string(),
+    })
+}
+
+/// `{type:'sdk.session.snapshot',...} → freshAgent.session.snapshot` (sdk-events.ts:49-50;
+/// emitted both by `emitStatus` and by `bindServeStream`'s SSE mapping, adapter.ts:301-303).
+fn snapshot_event(session_id: &str, status: &str) -> Value {
+    json!({ "type": "freshAgent.session.snapshot", "sessionId": session_id, "status": status })
+}
+
+/// `sdk.session.changed → freshAgent.session.changed` (sdk-events.ts:51-52; the transcript
+/// / non-lifecycle-status invalidation `bindServeStream` forwards, adapter.ts:296).
+fn changed_event(session_id: &str, reason: &str) -> Value {
+    json!({ "type": "freshAgent.session.changed", "sessionId": session_id, "reason": reason })
+}
+
+/// `sdk.error → freshAgent.error` (sdk-events.ts:75-76; `bindServeStream` forwards a
+/// `session.error` SSE event as this frame IN ADDITION TO flagging `turnErrored`).
+fn error_event(session_id: &str, message: &str) -> Value {
+    json!({ "type": "freshAgent.error", "sessionId": session_id, "message": message })
+}
+
+/// `sdk.turn.complete → freshAgent.turn.complete` (sdk-events.ts:71-72; the status-guarded
+/// positive-completion chime, adapter.ts:377-381).
+fn turn_complete_event(session_id: &str, at: i64) -> Value {
+    json!({ "type": "freshAgent.turn.complete", "sessionId": session_id, "at": at })
 }
 
 #[cfg(test)]
@@ -442,6 +648,66 @@ mod tests {
     impl EventSource for NoopEventSource {
         fn connect(&self, _url: String, _sink: EventSink) -> Box<dyn EventStreamHandle> {
             Box::new(NoopHandle)
+        }
+    }
+
+    /// PR-3: like [`FakeHttp`], but `/session/status` reports the LAST-created session
+    /// id as `busy` for the first `busy_polls` polls, then absent (idle) thereafter —
+    /// driving `OpencodeServeManager::await_idle`'s status-poll fallback to a
+    /// deterministic idle resolution WITHOUT depending on SSE dispatch timing (which
+    /// would otherwise race the manager's own internal `subscribe()` call inside
+    /// `run_turn`). This is a genuinely-idle-eventually fake, not a fast-path stub.
+    struct StatusPollFakeHttp {
+        next_session: AtomicUsize,
+        last_created: StdMutex<Option<String>>,
+        status_polls: AtomicUsize,
+        busy_polls: usize,
+    }
+    impl StatusPollFakeHttp {
+        fn new(busy_polls: usize) -> Self {
+            Self {
+                next_session: AtomicUsize::new(0),
+                last_created: StdMutex::new(None),
+                status_polls: AtomicUsize::new(0),
+                busy_polls,
+            }
+        }
+    }
+    impl ServeHttp for StatusPollFakeHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>>
+        {
+            let is_status = req.url.contains("/session/status");
+            // Precise create-match: exactly `POST /session` (optionally `?directory=...`).
+            // `.contains("/session")` alone (the plain `FakeHttp`'s predicate) also matches
+            // `/session/:id/prompt_async` and `/session/:id/abort` -- fine for `FakeHttp`
+            // (nothing there depends on `run_turn` resolving), but fatal here: misclassifying
+            // `prompt_async` as a create call would mint a SECOND `ses_N` and re-point
+            // `last_created`, so the status-poll busy response would key the wrong session id
+            // and `run_turn` would hang forever waiting for an idle edge that never resolves.
+            let is_create = !is_status
+                && matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && (req.url.ends_with("/session") || req.url.contains("/session?"));
+            let body = if is_create {
+                let n = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
+                let id = format!("ses_{n}");
+                *self.last_created.lock().unwrap() = Some(id.clone());
+                serde_json::to_vec(&json!({ "id": id, "directory": null })).unwrap()
+            } else if is_status {
+                let poll_n = self.status_polls.fetch_add(1, Ordering::SeqCst);
+                let last = self.last_created.lock().unwrap().clone();
+                if poll_n < self.busy_polls {
+                    let id = last.unwrap_or_default();
+                    serde_json::to_vec(&json!({ id: { "type": "busy" } })).unwrap()
+                } else {
+                    b"{}".to_vec()
+                }
+            } else {
+                b"{}".to_vec()
+            };
+            Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) })
         }
     }
 
@@ -638,6 +904,230 @@ mod tests {
         let frame: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(frame["type"], "error");
         assert!(frame["message"].as_str().unwrap().contains("SESSION_NOT_FOUND"));
+    }
+
+    // ── PR-3: serve-stream bridge (status / turn.complete gating) ─────────
+
+    /// Build a [`FreshOpencodeState`] on top of [`state_with_status_poll`], returning it
+    /// alongside a broadcast receiver subscribed BEFORE any handler runs (so nothing —
+    /// including the very first `freshAgent.created` — is missed).
+    async fn state_with_status_poll_and_receiver(
+        busy_polls: usize,
+    ) -> (FreshOpencodeState, tokio::sync::broadcast::Receiver<String>) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner { killed: Arc::new(std::sync::atomic::AtomicBool::new(false)) }),
+            http: Arc::new(StatusPollFakeHttp::new(busy_polls)),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig { idle_poll_interval: Duration::from_millis(15), ..ServeConfig::default() };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager.ensure_started().await.expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        (FreshOpencodeState::new(fresh_agent), rx)
+    }
+
+    #[tokio::test]
+    async fn clean_turn_emits_busy_then_idle_then_one_monotonic_turn_complete() {
+        let (st, mut rx) = state_with_status_poll_and_receiver(1).await;
+
+        st.handle_create(create_msg("req-clean")).await;
+        let placeholder = "freshopencode-req-clean";
+        st.handle_send(send_msg(placeholder, "hello")).await;
+
+        let mut saw_busy = false;
+        let mut idle_count = 0;
+        let mut complete_at: Vec<i64> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else { break };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] != "freshAgent.event" {
+                continue;
+            }
+            match frame["event"]["type"].as_str() {
+                Some("freshAgent.session.snapshot") => match frame["event"]["status"].as_str() {
+                    Some("running") => saw_busy = true,
+                    Some("idle") => idle_count += 1,
+                    _ => {}
+                },
+                Some("freshAgent.turn.complete") => {
+                    complete_at.push(frame["event"]["at"].as_i64().expect("numeric at"));
+                    break; // the turn's terminal frame; stop draining.
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_busy, "expected a running/busy session.snapshot");
+        assert!(idle_count >= 1, "expected at least one idle session.snapshot, got {idle_count}");
+        assert_eq!(complete_at.len(), 1, "expected exactly one turn.complete");
+        assert!(complete_at[0] > 0, "at must be a positive monotonic timestamp");
+    }
+
+    #[tokio::test]
+    async fn interrupted_turn_emits_no_turn_complete() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        // A generous busy-poll count so the natural idle resolution would land well AFTER
+        // our interrupt (proving the interrupt -- not a lucky race -- suppresses the chime).
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner { killed: Arc::new(std::sync::atomic::AtomicBool::new(false)) }),
+            http: Arc::new(StatusPollFakeHttp::new(50)),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig { idle_poll_interval: Duration::from_millis(15), ..ServeConfig::default() };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager.ensure_started().await.expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-int")).await;
+        let placeholder = "freshopencode-req-int";
+        st.handle_send(send_msg(placeholder, "hello")).await;
+
+        // Interrupt promptly, long before the (deliberately slow) natural idle would land.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        st.handle_interrupt(FreshAgentInterrupt {
+            provider: AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        // Drain everything for a budget comfortably past where the natural idle
+        // (50 busy polls * 15ms) would otherwise land, asserting no turn.complete ever
+        // arrives, while an idle snapshot (from handle_interrupt itself) does.
+        let mut saw_idle = false;
+        let mut saw_complete = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else { break };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] != "freshAgent.event" {
+                continue;
+            }
+            match frame["event"]["type"].as_str() {
+                Some("freshAgent.session.snapshot") if frame["event"]["status"] == "idle" => {
+                    saw_idle = true;
+                }
+                Some("freshAgent.turn.complete") => saw_complete = true,
+                _ => {}
+            }
+        }
+
+        assert!(saw_idle, "handle_interrupt must broadcast an idle status");
+        assert!(!saw_complete, "an interrupted turn must never emit turn.complete");
+    }
+
+    #[tokio::test]
+    async fn errored_turn_emits_no_turn_complete_but_forwards_the_error() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner { killed: Arc::new(std::sync::atomic::AtomicBool::new(false)) }),
+            http: Arc::new(StatusPollFakeHttp::new(2)),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig { idle_poll_interval: Duration::from_millis(15), ..ServeConfig::default() };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager.ensure_started().await.expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager.clone()).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-err")).await;
+        let placeholder = "freshopencode-req-err";
+        st.handle_send(send_msg(placeholder, "hello")).await;
+
+        // Dispatch a real `session.error` SSE event through the manager (the same
+        // ingestion point a real serve's EventSource sink uses) well before the
+        // status-poll idle (2 busy polls * 15ms ~= 30-45ms) resolves the turn.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        manager.dispatch_event(freshell_opencode::ParsedServeEvent {
+            kind: "session.error".to_string(),
+            session_id: Some("ses_1".to_string()),
+            properties: {
+                let mut m = serde_json::Map::new();
+                m.insert("error".to_string(), json!({ "message": "boom" }));
+                m
+            },
+            raw: serde_json::Map::new(),
+        });
+
+        let mut saw_error = false;
+        let mut saw_complete = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else { break };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] != "freshAgent.event" {
+                continue;
+            }
+            match frame["event"]["type"].as_str() {
+                Some("freshAgent.error") => {
+                    assert_eq!(frame["event"]["message"], "boom");
+                    saw_error = true;
+                }
+                Some("freshAgent.turn.complete") => saw_complete = true,
+                _ => {}
+            }
+        }
+
+        assert!(saw_error, "the session.error SSE event must be forwarded as freshAgent.error");
+        assert!(!saw_complete, "an errored turn must never emit turn.complete");
+    }
+
+    #[test]
+    fn event_frame_shapes_match_legacy_wire_contract() {
+        let snapshot = serde_json::from_str::<serde_json::Value>(
+            &serde_json::to_string(&event_frame("s-1", snapshot_event("s-1", "running"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot["type"], "freshAgent.event");
+        assert_eq!(snapshot["provider"], "opencode");
+        assert_eq!(snapshot["sessionType"], "freshopencode");
+        assert_eq!(snapshot["sessionId"], "s-1");
+        assert_eq!(snapshot["event"]["type"], "freshAgent.session.snapshot");
+        assert_eq!(snapshot["event"]["sessionId"], "s-1");
+        assert_eq!(snapshot["event"]["status"], "running");
+
+        let changed = serde_json::from_str::<serde_json::Value>(
+            &serde_json::to_string(&event_frame("s-1", changed_event("s-1", "opencode-message"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(changed["event"]["type"], "freshAgent.session.changed");
+        assert_eq!(changed["event"]["reason"], "opencode-message");
+
+        let error = serde_json::from_str::<serde_json::Value>(
+            &serde_json::to_string(&event_frame("s-1", error_event("s-1", "boom"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(error["event"]["type"], "freshAgent.error");
+        assert_eq!(error["event"]["message"], "boom");
+
+        let complete = serde_json::from_str::<serde_json::Value>(
+            &serde_json::to_string(&event_frame("s-1", turn_complete_event("s-1", 42))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(complete["event"]["type"], "freshAgent.turn.complete");
+        assert_eq!(complete["event"]["at"], 42);
     }
 
     #[test]

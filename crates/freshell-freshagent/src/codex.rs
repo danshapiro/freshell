@@ -609,7 +609,20 @@ fn spawn_exit_watcher(
     kill_rx: oneshot::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // `biased` + the REQUESTED-kill arm listed FIRST: a `freshAgent.kill` signals
+        // `kill_tx` right before `start_kill()`s the child, so `child.wait()` can become
+        // ready in the SAME poll as `kill_rx` (the SIGTERM lands and the child exits
+        // essentially immediately). Without `biased`, `tokio::select!` picks a RANDOM
+        // ready branch, so that race could take the `child.wait()` arm and broadcast a
+        // spurious self-heal "exited" status for a kill that was actually requested.
+        // Checking `kill_rx` first every time both are ready eliminates that race.
         tokio::select! {
+            biased;
+            _ = kill_rx => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                reap_owned_codex_sidecars(&ownership_id);
+            }
             _ = child.wait() => {
                 reap_owned_codex_sidecars(&ownership_id);
                 let event = CodexAdapterEvent::Status {
@@ -619,11 +632,6 @@ fn spawn_exit_watcher(
                 if let Some(frame) = adapter_event_to_frame(&event, &thread_id) {
                     let _ = broadcast_tx.send(frame);
                 }
-            }
-            _ = kill_rx => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                reap_owned_codex_sidecars(&ownership_id);
             }
         }
     })
