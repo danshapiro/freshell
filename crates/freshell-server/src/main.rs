@@ -169,6 +169,13 @@ async fn main() -> ExitCode {
     // Cloned (cheap Arc) into the files REST surface too, whose `candidate-dirs`
     // sources the running terminals' cwds for the DirectoryPicker.
     let registry = freshell_terminal::TerminalRegistry::new();
+    // Fix Spec: Session Naming Cluster -- the shared terminal-identity registry
+    // (`freshell_ws::identity`, the port-side closure of
+    // `TerminalMetadataService`'s provider/sessionId association slice). Written
+    // by the WS terminal create/kill/exit paths (`ws_state`, below); read by the
+    // REST rename cascades (`terminals_state`/`sessions::SessionsState`) and the
+    // session-directory live-terminal join (`session_directory_state`).
+    let terminal_identity = freshell_ws::identity::TerminalIdentityRegistry::new();
     // The shared in-memory tabs registry — cloned into both the WS handler
     // (`tabs.sync.*`) and the boot REST surface (`/api/tabs-sync/client-retire`),
     // so the unload beacon and the socket path retire against ONE cross-device view.
@@ -195,6 +202,7 @@ async fn main() -> ExitCode {
     // `terminalsRevision` on the WsHandler that both surfaces stamp.
     let terminals_revision = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let ws_state = WsState {
+        identity: terminal_identity.clone(),
         auth_token: Arc::clone(&auth_token),
         // Shared (not moved) so `GET /api/health` reports the SAME `instanceId`.
         server_instance_id: Arc::clone(&server_instance_id),
@@ -293,6 +301,7 @@ async fn main() -> ExitCode {
         auth_token: Arc::clone(&auth_token),
         settings: settings_store.clone(),
         session_index,
+        identity: terminal_identity.clone(),
     };
 
     let client_dir = Arc::new(resolve_client_dir());
@@ -317,6 +326,7 @@ async fn main() -> ExitCode {
         registry: registry.clone(),
         broadcast_tx: Arc::clone(&broadcast_tx),
         terminals_revision: Arc::clone(&terminals_revision),
+        identity: terminal_identity.clone(),
     };
 
     // The browser-pane HTTP reverse proxy (`/api/proxy/http/{port}/*`): the SPA's
@@ -396,6 +406,10 @@ async fn main() -> ExitCode {
         .merge(sessions::router(sessions::SessionsState {
             auth_token: Arc::clone(&auth_token),
             settings: settings_store.clone(),
+            identity: terminal_identity.clone(),
+            registry: registry.clone(),
+            broadcast_tx: Arc::clone(&broadcast_tx),
+            terminals_revision: Arc::clone(&terminals_revision),
         }))
         .merge(files::router(files_state))
         .merge(terminals::router(terminals_state))

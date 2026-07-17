@@ -20,6 +20,7 @@
 //! The crate emits the frozen [`freshell_protocol`] server-message types so its
 //! wire bytes are contract-locked.
 
+pub mod identity;
 pub mod screenshot;
 pub mod tabs;
 pub mod terminal;
@@ -91,6 +92,15 @@ pub struct WsState {
     /// `client-retire` beacon — shares one cross-device tab view. This is what makes
     /// a closed device's tab disappear from other clients' Tabs UI.
     pub tabs: crate::tabs::TabsRegistry,
+    /// The shared terminal-identity registry (Fix Spec: Session Naming Cluster --
+    /// the port-side closure of `TerminalMetadataService`'s provider/sessionId
+    /// association slice, see [`crate::identity`]). Populated at terminal-create
+    /// time alongside the `terminal.meta.updated` broadcast, retired (not removed)
+    /// on kill/exit so post-exit rename cascades still resolve. Shared into the
+    /// `freshell-server` REST states (`TerminalsState`/`SessionsState`/
+    /// `SessionDirectoryState`) that read it for the rename cascades and the
+    /// session-directory live-terminal join.
+    pub identity: crate::identity::TerminalIdentityRegistry,
     /// The shared UI-screenshot broker (`ws-handler.ts#requestUiScreenshot`). A
     /// connection that advertised `capabilities.uiScreenshotV1` is counted here so
     /// `POST /api/screenshots` knows a capable UI exists, and its inbound
@@ -394,6 +404,7 @@ mod tests {
         let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
         let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         WsState {
+            identity: crate::identity::TerminalIdentityRegistry::new(),
             auth_token: Arc::clone(&auth_token),
             server_instance_id: Arc::new("srv-1111".to_string()),
             boot_id: Arc::new("boot-2222".to_string()),

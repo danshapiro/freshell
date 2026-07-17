@@ -24,6 +24,22 @@ use crate::settings_store::SettingsStore;
 pub struct SessionsState {
     pub auth_token: Arc<String>,
     pub settings: SettingsStore,
+    /// Fix Spec: Session Naming Cluster (SYMPTOM 2a reverse direction) — the
+    /// shared terminal identity registry, read here to cascade a session rename
+    /// to the terminal currently running it (`cascadeSessionRenameToTerminal`,
+    /// `rename-cascade.ts:39-50`). Uses `.list()` (live-only) via
+    /// `find_by_session`, matching `deps.terminalMetadata.list()`
+    /// (`sessions-router.ts:149`) — an already-exited terminal is NOT retitled by
+    /// a session rename (only the forward direction survives exit).
+    pub identity: freshell_ws::identity::TerminalIdentityRegistry,
+    /// The shared terminal registry, so a successful reverse cascade can
+    /// write-through the live title the same way the terminals PATCH route does
+    /// (`deps.registry?.updateTitle(cascadedTerminalId, cleanTitle)`,
+    /// `sessions-router.ts:155`), and the shared broadcast bus + revision counter
+    /// so `terminals.changed` fires (`sessions-router.ts:156`).
+    pub registry: freshell_terminal::TerminalRegistry,
+    pub broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    pub terminals_revision: Arc<std::sync::atomic::AtomicI64>,
 }
 
 /// The sessions sub-router (`PATCH /api/sessions/:id` + `POST .../generate-title`).
@@ -116,7 +132,42 @@ async fn patch_session(
 
     let merged = state.settings.patch_session_override(&key, &patch).await;
     let mut out = merged.as_object().cloned().unwrap_or_default();
-    out.insert("cascadedTerminalId".into(), Value::Null);
+
+    // Cascade: if this session is running in a LIVE terminal, also rename the
+    // terminal (`cascadeSessionRenameToTerminal`, `rename-cascade.ts:39-50`,
+    // driven from `sessions-router.ts:140-161`). `key` is always `provider:id`
+    // (`composite_key` above guarantees the separator), so splitting on the
+    // FIRST `:` recovers `(sessionProvider, sessionId)` exactly like the
+    // original's `parts[0]` / `parts.slice(1).join(':')`.
+    let mut cascaded_terminal_id: Option<String> = None;
+    if let Some(clean_title) = &title {
+        if let Some((session_provider, session_id)) = key.split_once(':') {
+            if let Some(matched) = state.identity.find_by_session(session_provider, session_id) {
+                state
+                    .settings
+                    .patch_terminal_override(
+                        &matched.terminal_id,
+                        &[("titleOverride", Some(Value::from(clean_title.clone())))],
+                    )
+                    .await;
+                state
+                    .registry
+                    .update_title(&matched.terminal_id, clean_title);
+                let revision = state
+                    .terminals_revision
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                let frame =
+                    json!({ "type": "terminals.changed", "revision": revision }).to_string();
+                let _ = state.broadcast_tx.send(frame);
+                cascaded_terminal_id = Some(matched.terminal_id);
+            }
+        }
+    }
+    out.insert(
+        "cascadedTerminalId".into(),
+        cascaded_terminal_id.map(Value::from).unwrap_or(Value::Null),
+    );
     Json(Value::Object(out)).into_response()
 }
 
@@ -254,9 +305,14 @@ mod tests {
     use tower::ServiceExt;
 
     fn state(dir: &std::path::Path) -> super::SessionsState {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
         super::SessionsState {
             auth_token: std::sync::Arc::new("tok".into()),
             settings: crate::settings_store::SettingsStore::load(Some(dir), vec!["claude".into()]),
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            registry: freshell_terminal::TerminalRegistry::new(),
+            broadcast_tx: std::sync::Arc::new(tx),
+            terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }
     }
 
@@ -484,9 +540,14 @@ mod tests {
         let auth_token: std::sync::Arc<String> = std::sync::Arc::new("tok".into());
 
         // Patch title + archived through the sessions router.
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
         let sessions_app = super::router(super::SessionsState {
             auth_token: std::sync::Arc::clone(&auth_token),
             settings: settings.clone(),
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            registry: freshell_terminal::TerminalRegistry::new(),
+            broadcast_tx: std::sync::Arc::new(tx),
+            terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         });
         let patch_resp = sessions_app
             .oneshot(
@@ -519,6 +580,7 @@ mod tests {
                 auth_token: std::sync::Arc::clone(&auth_token),
                 settings,
                 session_index: Some(session_index),
+                identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             });
         let dir_resp = dir_app
             .oneshot(

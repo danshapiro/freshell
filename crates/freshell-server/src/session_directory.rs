@@ -72,6 +72,12 @@ pub struct SessionDirectoryState {
     /// request). `None` → an empty page (no home resolvable), matching the
     /// prior "no home" behavior before the index existed.
     pub session_index: Option<Arc<SessionIndex>>,
+    /// Fix Spec: Session Naming Cluster (SYMPTOM 1) — the shared terminal
+    /// identity registry, joined against the parsed session items by
+    /// [`join_live_terminals`] (`toItems`/`joinRunningState`/
+    /// `buildLiveTerminalSessionItem`, `service.ts:77-151`). `O(terminals)` per
+    /// request, no new I/O — reads the already-in-memory registry snapshot.
+    pub identity: freshell_ws::identity::TerminalIdentityRegistry,
 }
 
 /// One directory item, typed for the sort/filter/cursor derivation. Serialized to
@@ -96,6 +102,23 @@ struct DirItem {
     // Search annotations (set by title-tier search).
     matched_in: Option<String>,
     snippet: Option<String>,
+    /// Fix Spec: Session Naming Cluster (SYMPTOM 1, sidebar join) —
+    /// `SessionDirectoryItem.runningTerminalId` (`shared/read-models.ts:58`): the
+    /// terminal id backing this item when [`Self::is_running`] is `true`. Set by
+    /// [`join_running_state`] (a matched session-file item) or
+    /// [`build_live_terminal_session_item`] (a synthesized live-only item).
+    running_terminal_id: Option<String>,
+    /// `SessionDirectoryItem.liveTerminalOnly` (`shared/read-models.ts:59`): `true`
+    /// only for a synthesized live-terminal item with NO coding-CLI session id yet
+    /// (`buildLiveTerminalSessionItem`, `service.ts:128`, `!meta.sessionId`) —
+    /// never set on a real session-file item.
+    live_terminal_only: bool,
+    /// `SessionDirectoryItem.sessionType` (`shared/read-models.ts:53`): only
+    /// populated on a synthesized live-terminal item (`service.ts:125`,
+    /// `sessionType: meta.provider`) — a real session-file item never sets this
+    /// in this port (the original's parsed items don't set it either, see
+    /// `toItems`/`joinRunningState`, `service.ts:132-151`).
+    session_type: Option<String>,
 }
 
 impl DirItem {
@@ -143,6 +166,15 @@ impl DirItem {
         }
         if let Some(v) = &self.snippet {
             o.insert("snippet".into(), json!(v));
+        }
+        if let Some(v) = &self.running_terminal_id {
+            o.insert("runningTerminalId".into(), json!(v));
+        }
+        if self.live_terminal_only {
+            o.insert("liveTerminalOnly".into(), json!(true));
+        }
+        if let Some(v) = &self.session_type {
+            o.insert("sessionType".into(), json!(v));
         }
         Value::Object(o)
     }
@@ -319,7 +351,14 @@ async fn session_directory(
         None => Vec::new(),
     };
     let items = apply_session_overrides(items, &state.settings.session_overrides());
-    match apply_query(items, &query) {
+    // Fix Spec: Session Naming Cluster (SYMPTOM 1) -- join the LIVE terminal
+    // identity set against the parsed session items (`toItems`, `service.ts:132-151`).
+    // `.list()` (live-only, excludes retired terminals): an exited terminal is not
+    // part of the sidebar's "running" set, matching the original's
+    // `TerminalMetadataService.list()` input to `toItems`.
+    let identities = state.identity.list();
+    let items = join_live_terminals(items, &identities);
+    match apply_query(items, &query, &identities) {
         Ok(page) => Json(page).into_response(),
         // Bad cursor → 400, matching `querySessionDirectory`'s `/cursor/i` → 400.
         Err(msg) => (
@@ -375,6 +414,9 @@ fn dir_item_from_indexed(idx: &IndexedSession) -> DirItem {
         archived: false,
         matched_in: None,
         snippet: None,
+        running_terminal_id: None,
+        live_terminal_only: false,
+        session_type: None,
     }
 }
 
@@ -514,6 +556,9 @@ fn item_from_meta(
         archived: false,
         matched_in: None,
         snippet: None,
+        running_terminal_id: None,
+        live_terminal_only: false,
+        session_type: None,
     }
 }
 
@@ -546,6 +591,308 @@ fn apply_session_overrides(
         .collect()
 }
 
+// ── Sidebar join (Fix Spec: Session Naming Cluster, SYMPTOM 1) ─────────────
+//
+// Ports `toItems`/`joinRunningState`/`buildLiveTerminalSessionItem`/
+// `providerDisplayName` (`session-directory/service.ts:77-151`): fuse the LIVE
+// terminal identity set into the parsed session-file items so a coding-CLI
+// session currently running in a terminal shows `isRunning`/`runningTerminalId`
+// on its (one) sidebar entry, and a terminal with no matching session-file item
+// yet gets exactly ONE synthesized entry instead of being invisible.
+//
+// Deliberately NOT built here (fenced by the fix spec): no filesystem watcher,
+// no cwd-fuzzy join (the join key is `provider:sessionId` ONLY, matching the
+// original), no server-side pane-layout store, no client edits. A freshly
+// created `codex` terminal with no session id yet (identity established only at
+// create time; the real session id arrives later via `terminal.session.bound`,
+// which this port doesn't associate — see `crate::identity`'s module doc)
+// surfaces as a `liveTerminalOnly` item that a subsequent index refresh may
+// duplicate once the session file appears — an EXPECTED, documented residual
+// (pinned by a test below), not a regression.
+
+/// `providerDisplayName` (`service.ts:97-108`).
+fn provider_display_name(provider: &str) -> String {
+    match provider {
+        "claude" => "Claude CLI".to_string(),
+        "codex" => "Codex CLI".to_string(),
+        "opencode" => "OpenCode".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// `joinRunningState` (`service.ts:77-95`): a session-file item whose
+/// `provider:sessionId` matches a LIVE terminal identity gains
+/// `isRunning`/`runningTerminalId`; no match clears both (matching the
+/// original's explicit `isRunning: false` no-match arm).
+fn join_running_state(
+    mut item: DirItem,
+    identities: &[freshell_ws::identity::TerminalIdentity],
+) -> DirItem {
+    let matched = identities.iter().find(|identity| {
+        identity.provider.as_deref() == Some(item.provider.as_str())
+            && identity.session_id.as_deref() == Some(item.session_id.as_str())
+    });
+    match matched {
+        Some(identity) => {
+            item.is_running = true;
+            item.running_terminal_id = Some(identity.terminal_id.clone());
+        }
+        None => {
+            item.is_running = false;
+            item.running_terminal_id = None;
+        }
+    }
+    item
+}
+
+/// `buildLiveTerminalSessionItem` (`service.ts:110-130`): synthesize a sidebar
+/// item for a live terminal identity, for the "no session-file item exists
+/// (yet)" case. `None` when the identity has no coding-CLI `provider` at all
+/// (a plain shell — the original's `if (!meta.provider) return undefined`).
+fn build_live_terminal_session_item(
+    identity: &freshell_ws::identity::TerminalIdentity,
+) -> Option<DirItem> {
+    let provider = identity.provider.clone()?;
+    let session_id = identity
+        .session_id
+        .clone()
+        .unwrap_or_else(|| format!("terminal:{}", identity.terminal_id));
+    let project_path = identity
+        .cwd
+        .clone()
+        .unwrap_or_else(|| format!("terminal:{}", identity.terminal_id));
+    Some(DirItem {
+        session_id,
+        provider: provider.clone(),
+        project_path,
+        title: Some(provider_display_name(&provider)),
+        summary: None,
+        first_user_message: None,
+        last_activity_at: identity.updated_at,
+        created_at: Some(identity.updated_at),
+        cwd: identity.cwd.clone(),
+        is_subagent: false,
+        is_non_interactive: false,
+        is_running: true,
+        archived: false,
+        matched_in: None,
+        snippet: None,
+        running_terminal_id: Some(identity.terminal_id.clone()),
+        live_terminal_only: identity.session_id.is_none(),
+        session_type: Some(provider),
+    })
+}
+
+/// `toItems` (`service.ts:132-151`): join every parsed item against the live
+/// set, then append exactly ONE synthesized item per UNMATCHED live identity
+/// (deduped by `provider:sessionId` — a matched live terminal never also emits
+/// a `liveTerminalOnly` duplicate).
+fn join_live_terminals(
+    items: Vec<DirItem>,
+    identities: &[freshell_ws::identity::TerminalIdentity],
+) -> Vec<DirItem> {
+    let mut items: Vec<DirItem> = items
+        .into_iter()
+        .map(|item| join_running_state(item, identities))
+        .collect();
+    let mut existing_keys: std::collections::HashSet<String> =
+        items.iter().map(DirItem::key).collect();
+
+    for identity in identities {
+        let Some(candidate) = build_live_terminal_session_item(identity) else {
+            continue;
+        };
+        let key = candidate.key();
+        if existing_keys.contains(&key) {
+            continue;
+        }
+        existing_keys.insert(key);
+        items.push(candidate);
+    }
+    items
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::*;
+    use freshell_ws::identity::TerminalIdentityRegistry;
+
+    fn file_item(provider: &str, session_id: &str, last_activity_at: i64) -> DirItem {
+        DirItem {
+            session_id: session_id.to_string(),
+            provider: provider.to_string(),
+            project_path: "/repo".to_string(),
+            title: Some("A real session".to_string()),
+            summary: None,
+            first_user_message: None,
+            last_activity_at,
+            created_at: Some(last_activity_at),
+            cwd: Some("/repo".to_string()),
+            is_subagent: false,
+            is_non_interactive: false,
+            is_running: false,
+            archived: false,
+            matched_in: None,
+            snippet: None,
+            running_terminal_id: None,
+            live_terminal_only: false,
+            session_type: None,
+        }
+    }
+
+    // ── provider_display_name ──
+
+    #[test]
+    fn provider_display_name_matches_known_providers_and_falls_back_to_raw() {
+        assert_eq!(provider_display_name("claude"), "Claude CLI");
+        assert_eq!(provider_display_name("codex"), "Codex CLI");
+        assert_eq!(provider_display_name("opencode"), "OpenCode");
+        assert_eq!(provider_display_name("amplifier"), "amplifier");
+    }
+
+    // ── join_running_state ──
+
+    #[test]
+    fn join_running_state_matches_live_terminal_and_sets_running_fields() {
+        let reg = TerminalIdentityRegistry::new();
+        reg.upsert("term-1", Some("claude"), Some("sess-1"), None, 1000);
+        let item = file_item("claude", "sess-1", 500);
+
+        let joined = join_running_state(item, &reg.list());
+        assert!(joined.is_running);
+        assert_eq!(joined.running_terminal_id.as_deref(), Some("term-1"));
+    }
+
+    #[test]
+    fn join_running_state_no_match_leaves_not_running() {
+        let reg = TerminalIdentityRegistry::new();
+        reg.upsert("term-1", Some("claude"), Some("other-session"), None, 1000);
+        let item = file_item("claude", "sess-1", 500);
+
+        let joined = join_running_state(item, &reg.list());
+        assert!(!joined.is_running);
+        assert_eq!(joined.running_terminal_id, None);
+    }
+
+    // ── build_live_terminal_session_item ──
+
+    #[test]
+    fn build_live_terminal_session_item_none_without_a_provider() {
+        let reg = TerminalIdentityRegistry::new();
+        reg.upsert("term-1", None, None, None, 1000);
+        let identity = reg.list().into_iter().next().unwrap();
+        assert!(build_live_terminal_session_item(&identity).is_none());
+    }
+
+    #[test]
+    fn build_live_terminal_session_item_with_session_id_is_not_live_terminal_only() {
+        let reg = TerminalIdentityRegistry::new();
+        reg.upsert(
+            "term-9",
+            Some("opencode"),
+            Some("sess-77"),
+            Some("/home/dan/project"),
+            2000,
+        );
+        let identity = reg.list().into_iter().next().unwrap();
+        let item = build_live_terminal_session_item(&identity).expect("has provider");
+
+        assert_eq!(item.provider, "opencode");
+        assert_eq!(item.session_id, "sess-77");
+        assert_eq!(item.project_path, "/home/dan/project");
+        assert_eq!(item.title.as_deref(), Some("OpenCode"));
+        assert_eq!(item.session_type.as_deref(), Some("opencode"));
+        assert!(item.is_running);
+        assert_eq!(item.running_terminal_id.as_deref(), Some("term-9"));
+        assert!(!item.live_terminal_only);
+        assert_eq!(item.last_activity_at, 2000);
+    }
+
+    /// A codex terminal established at create time with NO session id yet
+    /// (`buildLiveTerminalSessionItem`, `service.ts:128`, `!meta.sessionId`).
+    #[test]
+    fn build_live_terminal_session_item_without_session_id_is_live_terminal_only() {
+        let reg = TerminalIdentityRegistry::new();
+        reg.upsert("term-5", Some("codex"), None, None, 3000);
+        let identity = reg.list().into_iter().next().unwrap();
+        let item = build_live_terminal_session_item(&identity).expect("has provider");
+
+        assert!(item.live_terminal_only);
+        assert_eq!(item.session_id, "terminal:term-5");
+        assert_eq!(item.project_path, "terminal:term-5");
+        assert_eq!(item.title.as_deref(), Some("Codex CLI"));
+    }
+
+    // ── join_live_terminals (toItems) ──
+
+    /// One session-file item + its matching live terminal -> ONE item, tagged
+    /// running (never a duplicate for a matched terminal).
+    #[test]
+    fn join_live_terminals_matched_session_yields_one_running_item() {
+        let reg = TerminalIdentityRegistry::new();
+        reg.upsert("term-1", Some("claude"), Some("sess-1"), None, 1000);
+        let items = vec![file_item("claude", "sess-1", 500)];
+
+        let joined = join_live_terminals(items, &reg.list());
+        assert_eq!(joined.len(), 1);
+        assert!(joined[0].is_running);
+        assert_eq!(joined[0].running_terminal_id.as_deref(), Some("term-1"));
+    }
+
+    /// A live terminal with NO matching session-file item yet synthesizes
+    /// exactly ONE extra `liveTerminalOnly` item.
+    #[test]
+    fn join_live_terminals_unmatched_terminal_synthesizes_one_live_only_item() {
+        let reg = TerminalIdentityRegistry::new();
+        reg.upsert("term-2", Some("codex"), None, None, 4000);
+
+        let joined = join_live_terminals(Vec::new(), &reg.list());
+        assert_eq!(joined.len(), 1);
+        assert!(joined[0].live_terminal_only);
+        assert_eq!(joined[0].running_terminal_id.as_deref(), Some("term-2"));
+    }
+
+    /// Dedup: a live terminal that MATCHES an existing session-file item must
+    /// never ALSO emit a synthesized `liveTerminalOnly` duplicate for the same
+    /// `provider:sessionId` key.
+    #[test]
+    fn join_live_terminals_matched_terminal_is_never_double_emitted() {
+        let reg = TerminalIdentityRegistry::new();
+        reg.upsert("term-3", Some("claude"), Some("sess-3"), None, 1000);
+        let items = vec![file_item("claude", "sess-3", 500)];
+
+        let joined = join_live_terminals(items, &reg.list());
+        assert_eq!(joined.len(), 1, "no duplicate for a matched terminal");
+    }
+
+    /// An EXPECTED, documented residual (Fix Spec, SYMPTOM 1 caveat): a fresh
+    /// codex terminal identity (no session id, hence keyed `terminal:<id>`) and
+    /// an ALREADY-INDEXED codex session file with its own real session id are
+    /// DIFFERENT join keys -- codex assigns its own session id independently,
+    /// and this port doesn't associate the two after the fact (no
+    /// `terminal.session.bound` wiring, see `crate::identity`'s module doc).
+    /// This produces two sidebar entries until the identity's provisional key
+    /// is superseded by association. Pinned here as CURRENT, ACCEPTED behavior
+    /// -- not a regression to fix in this task.
+    #[test]
+    fn codex_fresh_terminal_and_its_eventual_session_file_are_a_documented_residual_duplicate() {
+        let reg = TerminalIdentityRegistry::new();
+        // The live terminal, no session id yet (identity established at create
+        // time only).
+        reg.upsert("term-codex", Some("codex"), None, None, 5000);
+        // The session file the codex CLI eventually writes, under ITS OWN real
+        // session id -- a different join key than `terminal:term-codex`.
+        let items = vec![file_item("codex", "real-codex-session-id", 4500)];
+
+        let joined = join_live_terminals(items, &reg.list());
+        assert_eq!(
+            joined.len(),
+            2,
+            "documented residual: unassociated codex terminal + its session file don't merge"
+        );
+    }
+}
+
 // ── Cursor (base64url of `{lastActivityAt, key}`) ───────────────────────────
 
 fn encode_cursor(last_activity_at: i64, key: &str) -> String {
@@ -572,7 +919,11 @@ fn decode_cursor(cursor: &str) -> Result<(i64, String), String> {
 /// `querySessionDirectory` (`service.ts:228-298`), title tier: sort, visibility
 /// pre-filter, cursor page, revision. Returns the `SessionDirectoryPage` value, or
 /// an error string when the cursor is invalid (→ 400).
-fn apply_query(mut items: Vec<DirItem>, q: &DirQuery) -> Result<Value, String> {
+fn apply_query(
+    mut items: Vec<DirItem>,
+    q: &DirQuery,
+    identities: &[freshell_ws::identity::TerminalIdentity],
+) -> Result<Value, String> {
     let limit = q
         .limit
         .unwrap_or(MAX_DIRECTORY_PAGE_ITEMS)
@@ -582,10 +933,17 @@ fn apply_query(mut items: Vec<DirItem>, q: &DirQuery) -> Result<Value, String> {
         None => None,
     };
 
-    // revision = max(0, all lastActivityAt) (no terminal meta here).
+    // revision = max(0, all lastActivityAt, all terminal-identity updatedAt)
+    // (`querySessionDirectory`, `service.ts:232-236`). Computed independently of
+    // the joined `items` list (not derived from it) so a LIVE terminal's
+    // identity-only `updated_at` (e.g. a rename that hasn't reached the parsed
+    // session file yet) still bumps the revision even when that terminal is
+    // already matched onto an existing session-file item (whose own
+    // `last_activity_at` may lag behind).
     let revision = items
         .iter()
         .map(|i| i.last_activity_at)
+        .chain(identities.iter().map(|i| i.updated_at))
         .max()
         .unwrap_or(0)
         .max(0);
@@ -814,7 +1172,7 @@ mod tests {
             1,
             "the cwd-less repair fixture is never indexed (R10b)"
         );
-        let page = apply_query(items, &default_query()).unwrap();
+        let page = apply_query(items, &default_query(), &[]).unwrap();
         assert_eq!(page["items"].as_array().unwrap().len(), 0);
         assert_eq!(page["nextCursor"], Value::Null);
         // revision reflects the newest activity even though items are hidden.
@@ -830,7 +1188,7 @@ mod tests {
             include_non_interactive: true,
             ..DirQuery::default()
         };
-        let page = apply_query(items, &q).unwrap();
+        let page = apply_query(items, &q, &[]).unwrap();
         // healthy has no title → still hidden by the empty filter; real-corrupted
         // has a title → shown.
         let arr = page["items"].as_array().unwrap();
@@ -854,7 +1212,7 @@ mod tests {
             include_empty: true,
             ..DirQuery::default()
         };
-        let page = apply_query(items, &q).unwrap();
+        let page = apply_query(items, &q, &[]).unwrap();
         let arr = page["items"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(
@@ -895,7 +1253,7 @@ mod tests {
             include_empty: true,
             ..DirQuery::default()
         };
-        let page = apply_query(items, &q).unwrap();
+        let page = apply_query(items, &q, &[]).unwrap();
         assert_eq!(page["items"].as_array().unwrap().len(), 0);
         assert_eq!(page["revision"], json!(0));
         std::fs::remove_dir_all(&home).ok();
@@ -910,7 +1268,7 @@ mod tests {
             query: Some("session 1".into()),
             ..DirQuery::default()
         };
-        let page = apply_query(items, &q).unwrap();
+        let page = apply_query(items, &q, &[]).unwrap();
         let arr = page["items"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["matchedIn"], json!("title"));
@@ -923,7 +1281,7 @@ mod tests {
             query: Some("zzz-not-present".into()),
             ..DirQuery::default()
         };
-        let page2 = apply_query(items2, &q2).unwrap();
+        let page2 = apply_query(items2, &q2, &[]).unwrap();
         assert_eq!(page2["items"].as_array().unwrap().len(), 0);
         std::fs::remove_dir_all(&home).ok();
     }
@@ -947,13 +1305,16 @@ mod tests {
             archived: false,
             matched_in: None,
             snippet: None,
+            running_terminal_id: None,
+            live_terminal_only: false,
+            session_type: None,
         };
         let items = vec![mk("a", 100), mk("b", 200)];
         let q = DirQuery {
             limit: Some(1),
             ..DirQuery::default()
         };
-        let page = apply_query(items, &q).unwrap();
+        let page = apply_query(items, &q, &[]).unwrap();
         let arr = page["items"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["sessionId"], json!("b")); // newest first
@@ -966,7 +1327,7 @@ mod tests {
             cursor: Some(cursor.to_string()),
             ..DirQuery::default()
         };
-        let page2 = apply_query(items2, &q2).unwrap();
+        let page2 = apply_query(items2, &q2, &[]).unwrap();
         let arr2 = page2["items"].as_array().unwrap();
         assert_eq!(arr2.len(), 1);
         assert_eq!(arr2[0]["sessionId"], json!("a"));
@@ -979,7 +1340,7 @@ mod tests {
             cursor: Some("!!!not-base64!!!".into()),
             ..DirQuery::default()
         };
-        let err = apply_query(Vec::new(), &q).unwrap_err();
+        let err = apply_query(Vec::new(), &q, &[]).unwrap_err();
         assert!(err.to_lowercase().contains("cursor"));
     }
 
@@ -1131,7 +1492,7 @@ mod tests {
             ("cursor", "!!!not-base64!!!"),
         ]))
         .unwrap();
-        let err = apply_query(Vec::new(), &query).unwrap_err();
+        let err = apply_query(Vec::new(), &query, &[]).unwrap_err();
         assert!(err.to_lowercase().contains("cursor"));
     }
 
@@ -1156,6 +1517,9 @@ mod tests {
             archived: false,
             matched_in: None,
             snippet: None,
+            running_terminal_id: None,
+            live_terminal_only: false,
+            session_type: None,
         };
         let items = vec![mk("keep"), mk("gone")];
 
@@ -1195,6 +1559,9 @@ mod tests {
             archived: false,
             matched_in: None,
             snippet: None,
+            running_terminal_id: None,
+            live_terminal_only: false,
+            session_type: None,
         };
         let overlaid = apply_session_overrides(vec![item], &serde_json::Map::new());
         let v = overlaid[0].to_value();
@@ -1313,6 +1680,7 @@ mod tests {
             auth_token: std::sync::Arc::clone(&auth_token),
             settings,
             session_index: Some(session_index),
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         };
         let app = router(state);
         let resp = app
@@ -1355,6 +1723,7 @@ mod tests {
             auth_token: std::sync::Arc::clone(&auth_token),
             settings,
             session_index: None,
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         };
         let app = router(state);
         let resp = app
@@ -1435,6 +1804,7 @@ mod tests {
             auth_token: std::sync::Arc::clone(&auth_token),
             settings: settings.clone(),
             session_index: Some(session_index),
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         };
         let app = router(state);
 
@@ -1538,6 +1908,7 @@ mod tests {
             auth_token: Arc::clone(&auth_token),
             settings,
             session_index: Some(session_index),
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         };
         let app = router(state);
 
@@ -1633,6 +2004,7 @@ mod tests {
             auth_token: Arc::clone(&auth_token),
             settings: settings.clone(),
             session_index: Some(session_index),
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         };
         let app = router(state);
 

@@ -59,6 +59,7 @@ use axum::{
 use base64::Engine;
 use freshell_protocol::TerminalRunStatus;
 use freshell_terminal::TerminalRegistry;
+use freshell_ws::identity::TerminalIdentityRegistry;
 use serde_json::{json, Map, Value};
 
 use crate::boot::{is_authed, unauthorized};
@@ -86,6 +87,14 @@ pub struct TerminalsState {
     /// `WsHandler.terminalsRevision` — the ws-handler-scoped monotonic counter
     /// stamped on each `terminals.changed` broadcast (starts 0, `+1` per send).
     pub terminals_revision: Arc<AtomicI64>,
+    /// Fix Spec: Session Naming Cluster (SYMPTOM 2a) — the shared terminal
+    /// identity registry (`freshell_ws::identity`), read here to cascade a
+    /// terminal-title rename to its coding-CLI session override
+    /// (`cascadeTerminalRenameToSession`, `rename-cascade.ts:23-32`). `get()`
+    /// (not `list()`) so the cascade still resolves on an ALREADY-EXITED
+    /// terminal, matching `terminalMetadata.get?.(terminalId) ??
+    /// .list().find(...)` (`terminals-router.ts:311-312`).
+    pub identity: TerminalIdentityRegistry,
 }
 
 /// The terminals REST sub-router, pre-bound to its state (mergeable into the app).
@@ -972,8 +981,33 @@ async fn patch_terminal(
     if let Some(d) = &description_override {
         state.registry.update_description(&terminal_id, d);
     }
-    // (Rename cascade to a coding-CLI session: no terminal-metadata service in the
-    // Rust server yet — see the module doc.)
+    // Cascade: if this terminal has a coding-CLI session, also rename the session
+    // (`cascadeTerminalRenameToSession`, `rename-cascade.ts:23-32`, driven from
+    // `terminals-router.ts:306-320`). `identity.get()` (NOT `.list()`) so the
+    // cascade still fires for an ALREADY-EXITED terminal (retained/retired
+    // entries preserve provider/sessionId — `terminals-router.ts:311-312`'s
+    // `.get?.(terminalId) ?? .list().find(...)` fallback chain collapses to a
+    // single `get()` here because this port's registry never forgets an entry
+    // outright, only marks it retired).
+    if let Some(t) = &title_override {
+        if let Some(identity) = state.identity.get(&terminal_id) {
+            if let (Some(provider), Some(session_id)) =
+                (identity.provider.as_deref(), identity.session_id.as_deref())
+            {
+                let composite_key = format!("{provider}:{session_id}");
+                state
+                    .settings
+                    .patch_session_override(
+                        &composite_key,
+                        &[
+                            ("titleOverride", Some(Value::String(t.clone()))),
+                            ("titleSource", Some(json!("user"))),
+                        ],
+                    )
+                    .await;
+            }
+        }
+    }
 
     broadcast_terminals_changed(&state);
     Json(next).into_response()
@@ -1024,6 +1058,124 @@ fn broadcast_terminals_changed(state: &TerminalsState) {
     let revision = state.terminals_revision.fetch_add(1, Ordering::SeqCst) + 1;
     let frame = json!({ "type": "terminals.changed", "revision": revision }).to_string();
     let _ = state.broadcast_tx.send(frame);
+}
+
+#[cfg(test)]
+mod cascade_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    fn dir() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "frs-terminals-router-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn state(dir: &std::path::Path) -> TerminalsState {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
+        TerminalsState {
+            auth_token: Arc::new("tok".to_string()),
+            settings: SettingsStore::load(Some(dir), vec!["claude".into()]),
+            registry: TerminalRegistry::new(),
+            broadcast_tx: Arc::new(tx),
+            terminals_revision: Arc::new(AtomicI64::new(0)),
+            identity: TerminalIdentityRegistry::new(),
+        }
+    }
+
+    async fn body_json(resp: axum::response::Response) -> Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn patch_terminal_title(state: TerminalsState, terminal_id: &str, title: &str) -> Value {
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/terminals/{terminal_id}"))
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "titleOverride": title }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        body_json(resp).await
+    }
+
+    /// SYMPTOM 2a (forward direction): renaming a terminal running a coding-CLI
+    /// session cascades the title to that session's override
+    /// (`cascadeTerminalRenameToSession`, `rename-cascade.ts:23-32`).
+    #[tokio::test]
+    async fn rename_cascades_to_associated_live_session() {
+        let dir = dir();
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let state = state(&dir);
+        state
+            .identity
+            .upsert("term-1", Some("claude"), Some("sess-abc"), None, 1000);
+
+        let resp = patch_terminal_title(state.clone(), "term-1", "My Renamed Terminal").await;
+        assert_eq!(resp["titleOverride"], json!("My Renamed Terminal"));
+
+        let overrides = state.settings.session_overrides();
+        let session_override = overrides
+            .get("claude:sess-abc")
+            .expect("session override cascaded");
+        assert_eq!(
+            session_override["titleOverride"],
+            json!("My Renamed Terminal")
+        );
+        assert_eq!(session_override["titleSource"], json!("user"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The forward cascade uses `identity.get()` (not `.list()`), so it still
+    /// fires for a RETIRED (already-exited) terminal — `terminals-router.ts:311`'s
+    /// `.get?.(terminalId) ?? .list().find(...)` fallback, preserved here because
+    /// `retire()` never removes the entry, only marks it retired.
+    #[tokio::test]
+    async fn rename_cascades_even_after_the_terminal_has_exited() {
+        let dir = dir();
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let state = state(&dir);
+        state
+            .identity
+            .upsert("term-2", Some("codex"), Some("sess-xyz"), None, 1000);
+        state.identity.retire("term-2");
+
+        let resp = patch_terminal_title(state.clone(), "term-2", "Post-Exit Rename").await;
+        assert_eq!(resp["titleOverride"], json!("Post-Exit Rename"));
+
+        let overrides = state.settings.session_overrides();
+        let session_override = overrides
+            .get("codex:sess-xyz")
+            .expect("session override cascaded even though the terminal exited");
+        assert_eq!(session_override["titleOverride"], json!("Post-Exit Rename"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A terminal with no coding-CLI identity (plain shell) is a no-op cascade:
+    /// no session override is fabricated.
+    #[tokio::test]
+    async fn rename_of_plain_shell_terminal_does_not_create_a_session_override() {
+        let dir = dir();
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let state = state(&dir);
+        // No identity.upsert() call at all -- unknown to the registry.
+
+        let resp = patch_terminal_title(state.clone(), "term-3", "Shell Renamed").await;
+        assert_eq!(resp["titleOverride"], json!("Shell Renamed"));
+        assert!(state.settings.session_overrides().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[cfg(test)]

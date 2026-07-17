@@ -737,9 +737,15 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         let cleanup_mode = mode.clone();
         let cleanup_cwd = mcp_cwd.clone();
         let registry = state.registry.clone();
+        // Fix Spec: Session Naming Cluster -- retire (not remove) the identity
+        // entry on NATURAL exit too, mirroring `registry.on('terminal.exit', ...)`
+        // -> `terminalMetadata.retire(terminalId)` (`server/index.ts:526-534`), so a
+        // rename cascade still resolves after this terminal's process has exited.
+        let identity = state.identity.clone();
         Some(Box::new(move |exit_code: i64| {
             cleanup_mcp_config(&RealMcpRuntime, &tid, &cleanup_mode, cleanup_cwd.as_deref());
             registry.finish_pty_exit(&tid, exit_code);
+            identity.retire(&tid);
         }))
     };
 
@@ -818,6 +824,18 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         spec.cwd.as_deref(),
         now_ms(),
     ) {
+        // Fix Spec: Session Naming Cluster (SYMPTOM 2/1) -- populate the shared
+        // identity registry alongside the broadcast, the SAME fields, so the
+        // `freshell-server` rename cascades (`terminals.rs`/`sessions.rs`) and the
+        // session-directory live-terminal join (`session_directory.rs`) can find
+        // this terminal's provider/sessionId without a second source of truth.
+        state.identity.upsert(
+            &record.terminal_id,
+            record.provider.as_deref(),
+            record.session_id.as_deref(),
+            record.cwd.as_deref(),
+            record.updated_at,
+        );
         broadcast_terminal_meta_created(state, record);
     }
     sent
@@ -1133,6 +1151,10 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
 /// `INVALID_TERMINAL_ID` error).
 fn kill_and_broadcast(state: &WsState, terminal_id: &str) -> bool {
     if state.registry.kill(terminal_id) {
+        // Fix Spec: Session Naming Cluster -- retire (not remove) on the KILL exit
+        // path too (the natural-exit `on_exit` hook handles the other path); a
+        // kill that never established an identity is a harmless no-op `retire()`.
+        state.identity.retire(terminal_id);
         broadcast_terminals_changed(state);
         return true;
     }
@@ -1497,6 +1519,7 @@ mod terminals_changed_tests {
         let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         let rx = broadcast_tx.subscribe();
         let state = WsState {
+            identity: crate::identity::TerminalIdentityRegistry::new(),
             auth_token: Arc::clone(&auth_token),
             server_instance_id: Arc::new("srv-1111".to_string()),
             boot_id: Arc::new("boot-2222".to_string()),
@@ -1663,6 +1686,7 @@ mod terminal_meta_created_tests {
         let broadcast_tx = std::sync::Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         let rx = broadcast_tx.subscribe();
         let state = WsState {
+            identity: crate::identity::TerminalIdentityRegistry::new(),
             auth_token: std::sync::Arc::clone(&auth_token),
             server_instance_id: std::sync::Arc::new("srv-1111".to_string()),
             boot_id: std::sync::Arc::new("boot-2222".to_string()),

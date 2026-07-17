@@ -55,7 +55,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, patch, post},
     Json, Router,
 };
 use serde_json::{json, Map, Value};
@@ -908,6 +908,7 @@ fn build_opencode_snapshot_json(thread_id: &str, info: &Value, messages: &Value)
 pub fn router(state: FreshAgentState) -> Router {
     Router::new()
         .route("/api/tabs", post(create_tab))
+        .route("/api/panes/{id}", patch(rename_pane))
         .route("/api/panes/{id}/send-keys", post(send_keys))
         .route("/api/panes/{id}/capture", get(capture))
         .with_state(state)
@@ -1058,6 +1059,65 @@ async fn create_tab(
     ok_json(
         json!({ "tabId": tab_id, "paneId": pane_id, "sessionId": placeholder }),
         "fresh-agent pane created",
+    )
+}
+
+// ── PATCH /api/panes/:id (rename pane) ──────────────────────────────────────
+
+/// `MAX_TERMINAL_TITLE_OVERRIDE_LENGTH` (`terminals-router.ts:24`), reused for the
+/// pane-name length bound per `router.ts:1400-1402`.
+const MAX_PANE_NAME_LEN: usize = 500;
+
+/// `parseRequiredName` (`agent-api/router.ts:603-606`): trim; empty/absent -> `None`.
+fn parse_required_name(value: Option<&Value>) -> Option<String> {
+    let trimmed = value.and_then(Value::as_str).unwrap_or("").trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// `PATCH /api/panes/:id` (`router.ts:1396-1427`): renames a pane. Fixes the
+/// user-visible 'not found' this route previously produced by falling through
+/// to the SPA-fallback 404 (the route did not exist).
+///
+/// This port carries no server-side pane layout store (`layoutStore` -- see the
+/// TASK 3 sidebar-join module doc for why that's an explicit non-goal), so
+/// `tabId` is unknowable here: `resolvePaneTarget`/`renamePane`/`tabRenamed`
+/// (`router.ts:1404-1415`) and the `ui.command{pane.rename}` broadcast
+/// (`router.ts:1417-1420`) are not reproduced -- documented deviation, single-client
+/// acceptable. Actual title persistence is Option A (client-driven cascade): the
+/// frozen client's `applyPaneRename` thunk (`src/store/titleSync.ts:30-46`)
+/// separately PATCHes `/api/terminals/:id` or `/api/sessions/:id` right after this
+/// call succeeds, which is what the client has always done for the terminal/
+/// fresh-agent cascade -- this route only needs to validate the name and
+/// acknowledge with the shape `PaneContainer.tsx:311` asserts
+/// (`response.data.paneId === paneId`), so the client can safely apply the
+/// Redux-side rename.
+async fn rename_pane(
+    State(state): State<FreshAgentState>,
+    Path(pane_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !authorized(&headers, &state.auth_token) {
+        return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
+    }
+
+    let Some(name) = parse_required_name(body.get("name")) else {
+        return fail_json(StatusCode::BAD_REQUEST, "name required".to_string());
+    };
+    if name.len() > MAX_PANE_NAME_LEN {
+        return fail_json(
+            StatusCode::BAD_REQUEST,
+            format!("name must be {MAX_PANE_NAME_LEN} characters or fewer"),
+        );
+    }
+
+    ok_json(
+        json!({ "paneId": pane_id, "tabRenamed": false }),
+        "pane renamed",
     )
 }
 
@@ -1747,5 +1807,119 @@ mod tests {
         assert_eq!(items[1]["text"], json!("Ran the command."));
         // Summary joins the (single) text item's text.
         assert_eq!(turn["summary"], json!("Ran the command."));
+    }
+}
+
+// ── PATCH /api/panes/:id (rename pane) ───────────────────────────────────
+
+#[cfg(test)]
+mod rename_pane_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    fn app() -> Router {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        router(FreshAgentState::new(
+            Arc::new("tok".to_string()),
+            Arc::new(tx),
+        ))
+    }
+
+    async fn body_json(resp: Response) -> Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn patch_pane(name: Option<&str>, auth: bool) -> (StatusCode, Value) {
+        let body = match name {
+            Some(n) => json!({ "name": n }).to_string(),
+            None => "{}".to_string(),
+        };
+        let mut req = Request::builder()
+            .method("PATCH")
+            .uri("/api/panes/pane-123")
+            .header("content-type", "application/json");
+        if auth {
+            req = req.header("x-auth-token", "tok");
+        }
+        let resp = app()
+            .oneshot(req.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, body_json(resp).await)
+    }
+
+    /// Highest-severity fix (SYMPTOM 3, fix-spec): a manual pane rename must
+    /// succeed, not fall through to the SPA-fallback 404. Success shape mirrors
+    /// `router.ts:1396-1423`: `ok({paneId, tabRenamed}, 'pane renamed')`. The
+    /// client asserts `data.paneId === paneId` (`PaneContainer.tsx:311`).
+    #[tokio::test]
+    async fn renames_pane_and_returns_paneid_and_tab_renamed_false() {
+        let (status, body) = patch_pane(Some("My New Title"), true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], json!("ok"));
+        assert_eq!(body["data"]["paneId"], json!("pane-123"));
+        assert_eq!(body["data"]["tabRenamed"], json!(false));
+        assert_eq!(body["message"], json!("pane renamed"));
+    }
+
+    /// `parseRequiredName(undefined) -> undefined` -> 400 `'name required'`
+    /// (`router.ts:1398-1399`).
+    #[tokio::test]
+    async fn missing_name_is_400_name_required() {
+        let (status, body) = patch_pane(None, true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["message"], json!("name required"));
+    }
+
+    /// `parseRequiredName` trims and rejects blank-only input the same as absent.
+    #[tokio::test]
+    async fn blank_name_is_400_name_required() {
+        let (status, body) = patch_pane(Some("   "), true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["message"], json!("name required"));
+    }
+
+    /// `MAX_TERMINAL_TITLE_OVERRIDE_LENGTH` (`terminals-router.ts:24`) = 500,
+    /// reused here per the fix spec (`router.ts:1400-1402`).
+    #[tokio::test]
+    async fn name_over_500_chars_is_400_length_message() {
+        let long = "x".repeat(501);
+        let (status, body) = patch_pane(Some(&long), true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["message"],
+            json!("name must be 500 characters or fewer")
+        );
+    }
+
+    #[tokio::test]
+    async fn name_exactly_500_chars_is_ok() {
+        let exact = "y".repeat(500);
+        let (status, _body) = patch_pane(Some(&exact), true).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn missing_auth_is_401() {
+        let (status, body) = patch_pane(Some("Title"), false).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["status"], json!("error"));
+    }
+
+    /// Confirms the route is actually mounted (as opposed to falling through to
+    /// axum's SPA-fallback, which is the exact bug this task fixes): a matched
+    /// route always answers with the `ok`/`error` JSON envelope, never a bare
+    /// 404 with no body.
+    #[tokio::test]
+    async fn route_is_matched_not_fallback_404() {
+        let (status, body) = patch_pane(Some("Title"), true).await;
+        assert_ne!(status, StatusCode::NOT_FOUND);
+        assert!(body.get("status").is_some());
     }
 }

@@ -51,11 +51,11 @@ async fn spawn_server(
 ) -> (String, Arc<tokio::sync::broadcast::Sender<String>>) {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(broadcast_capacity).0);
-    let settings = Arc::new(
-        serde_json::from_value(test_settings_value()).expect("valid settings fixture"),
-    );
+    let settings =
+        Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
 
     let state = WsState {
+        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         auth_token: Arc::clone(&auth_token),
         server_instance_id: Arc::new("srv-test".to_string()),
         boot_id: Arc::new("boot-test".to_string()),
@@ -94,7 +94,8 @@ async fn spawn_server(
     (format!("ws://{addr}/ws", addr = addr), broadcast_tx)
 }
 
-type TestWs = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type TestWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Connect, send `hello`, and read past the 4-message connect handshake
 /// (`ready` / `settings.updated` / `perf.logging` / `terminal.inventory`) so
