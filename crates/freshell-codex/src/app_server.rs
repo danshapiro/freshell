@@ -35,7 +35,27 @@ use crate::protocol::{
 };
 
 /// The reference default request timeout (`DEFAULT_REQUEST_TIMEOUT_MS`, `client.ts:65`).
+/// Applies to every RPC EXCEPT the snapshot-path reads below (`thread/read`, `thread/resume`).
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
+
+/// **DELIBERATE DEVIATION from legacy parity** \u2014 the budget for `thread/read` and
+/// `thread/resume` only.
+///
+/// Legacy (`client.ts:65,141`) uses `DEFAULT_REQUEST_TIMEOUT_MS` (5s) UNIFORMLY for every
+/// RPC, including `readThread` (`adapter.ts:1089,1094` \u2014 `getSnapshot`'s full-thread read).
+/// There is no larger legacy budget to "adopt": grep of `runtime.ts`/`adapter.ts`/`server/index.ts`
+/// confirms no caller ever passes a longer `requestTimeoutMs` for reads specifically.
+///
+/// Proven on real data: `GET /api/fresh-agent/threads/freshcodex/codex/<id>` for a real
+/// ~4,000-raw-item session 500'd with "did not respond to thread/read within 5000ms" on the
+/// first attempt; an immediate retry succeeded (the app-server's internal parse/cache of a
+/// huge thread can itself take single-digit seconds, independent of cold-spawn). At 5s this
+/// is a real, reproducible daily-use failure (the frozen SPA shows "Failed to load session").
+///
+/// A REST snapshot fetch is not latency-sensitive the way `turn/start`/`turn/interrupt` are
+/// (those stay at `DEFAULT_REQUEST_TIMEOUT_MS`, unchanged \u2014 an interactive turn should fail
+/// fast). But it also shouldn't hang forever, so this is capped rather than unbounded: 30s.
+pub const SNAPSHOT_READ_TIMEOUT_MS: u64 = 30_000;
 
 /// A boxed, `Send` future — the object-safe async return used by [`WsTransport`] (keeps it
 /// `dyn`-compatible without an `async-trait` dependency; same pattern as `freshell-opencode`).
@@ -128,7 +148,7 @@ pub struct StartedThread {
 /// **`effort` is forwarded VERBATIM (DEV-0003).** The caller passes the already wire-mapped
 /// value from [`crate::model::to_codex_reasoning_effort`]; the client inserts it unchanged —
 /// it never clamps or remaps `none`/`minimal`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct StartTurnParams {
     pub thread_id: String,
     pub input: Vec<Value>,
@@ -153,6 +173,9 @@ pub struct CodexAppServerClient {
     pending: PendingMap,
     next_id: AtomicI64,
     request_timeout: Duration,
+    /// The wider budget for `thread/read`/`thread/resume` only (see
+    /// [`SNAPSHOT_READ_TIMEOUT_MS`]). Every other RPC stays on `request_timeout`.
+    read_timeout: Duration,
     /// Single-flight initialize cache: `Some(result)` once the handshake completed
     /// (`initializePromise`, `client.ts:126,144-166`).
     init: TokioMutex<Option<Value>>,
@@ -167,19 +190,40 @@ impl Drop for CodexAppServerClient {
 }
 
 impl CodexAppServerClient {
-    /// Wire a client to a transport with the default request timeout. Returns the client plus
-    /// the [`CodexNotification`] stream the background consumer feeds (the adapter's
+    /// Wire a client to a transport with the default request timeout and the
+    /// [`SNAPSHOT_READ_TIMEOUT_MS`] read budget. Returns the client plus the
+    /// [`CodexNotification`] stream the background consumer feeds (the adapter's
     /// lifecycle/turn fan-out). Spawns the background read loop immediately.
     pub fn connect(
         transport: Arc<dyn WsTransport>,
     ) -> (Self, mpsc::UnboundedReceiver<CodexNotification>) {
-        Self::connect_with_timeout(transport, Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS))
+        Self::connect_with_timeouts(
+            transport,
+            Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS),
+            Duration::from_millis(SNAPSHOT_READ_TIMEOUT_MS),
+        )
     }
 
-    /// [`connect`](Self::connect) with an explicit per-request timeout.
+    /// [`connect`](Self::connect) with an explicit per-request timeout; the snapshot-read
+    /// budget still defaults to [`SNAPSHOT_READ_TIMEOUT_MS`] (use
+    /// [`connect_with_timeouts`](Self::connect_with_timeouts) to override both).
     pub fn connect_with_timeout(
         transport: Arc<dyn WsTransport>,
         request_timeout: Duration,
+    ) -> (Self, mpsc::UnboundedReceiver<CodexNotification>) {
+        Self::connect_with_timeouts(
+            transport,
+            request_timeout,
+            Duration::from_millis(SNAPSHOT_READ_TIMEOUT_MS),
+        )
+    }
+
+    /// [`connect`](Self::connect) with explicit overrides for both the general per-request
+    /// timeout and the `thread/read`/`thread/resume`-only read timeout.
+    pub fn connect_with_timeouts(
+        transport: Arc<dyn WsTransport>,
+        request_timeout: Duration,
+        read_timeout: Duration,
     ) -> (Self, mpsc::UnboundedReceiver<CodexNotification>) {
         let pending: PendingMap = Arc::new(StdMutex::new(HashMap::new()));
         let (notify_tx, notify_rx) = mpsc::unbounded_channel();
@@ -189,6 +233,7 @@ impl CodexAppServerClient {
             pending,
             next_id: AtomicI64::new(1),
             request_timeout,
+            read_timeout,
             init: TokioMutex::new(None),
             read_handle,
         };
@@ -210,7 +255,9 @@ impl CodexAppServerClient {
                 "optOutNotificationMethods": ["thread/started"],
             },
         });
-        let result = self.send_request("initialize", params).await?;
+        let result = self
+            .send_request("initialize", params, self.request_timeout)
+            .await?;
         // client.ts:158 — the initialized notification follows a successful initialize.
         self.notify("initialized", None).await?;
         *guard = Some(result.clone());
@@ -273,7 +320,12 @@ impl CodexAppServerClient {
         // (no `experimentalRawEvents` override), only fixing `persistExtendedHistory`.
         wire.insert("persistExtendedHistory".to_string(), json!(true));
 
-        let result = self.request("thread/resume", Value::Object(wire)).await?;
+        // Runs under `read_timeout` (SNAPSHOT_READ_TIMEOUT_MS), not `request_timeout` --
+        // resuming a historical thread to serve a snapshot shares the same cold-load-vs-large-
+        // thread latency risk as `thread/read` (see SNAPSHOT_READ_TIMEOUT_MS's doc comment).
+        let result = self
+            .request_with_timeout("thread/resume", Value::Object(wire), self.read_timeout)
+            .await?;
         let resumed_thread_id = result
             .get("thread")
             .and_then(|t| t.get("id"))
@@ -351,9 +403,12 @@ impl CodexAppServerClient {
         thread_id: &str,
         include_turns: bool,
     ) -> Result<Value, CodexAppServerError> {
-        self.request(
+        // Runs under `read_timeout` (SNAPSHOT_READ_TIMEOUT_MS), not `request_timeout` -- see
+        // SNAPSHOT_READ_TIMEOUT_MS's doc comment for the real-data evidence.
+        self.request_with_timeout(
             "thread/read",
             json!({ "threadId": thread_id, "includeTurns": include_turns }),
+            self.read_timeout,
         )
         .await
     }
@@ -382,21 +437,38 @@ impl CodexAppServerClient {
 
     // ── internals ───────────────────────────────────────────────────────────────────────
 
-    /// Every non-`initialize` request awaits the handshake first (`client.ts:777-778`).
+    /// Every non-`initialize` request awaits the handshake first (`client.ts:777-778`), then
+    /// runs under the default `request_timeout`. See [`Self::request_with_timeout`] for the
+    /// `thread/read`/`thread/resume`-only override.
     async fn request(&self, method: &str, params: Value) -> Result<Value, CodexAppServerError> {
+        self.request_with_timeout(method, params, self.request_timeout)
+            .await
+    }
+
+    /// [`Self::request`] with an explicit per-call timeout override. Used by
+    /// [`Self::read_thread`]/[`Self::resume_thread`] to run under `read_timeout`
+    /// (`SNAPSHOT_READ_TIMEOUT_MS`) instead of the shorter `request_timeout` every other RPC
+    /// (`turn/start`, `turn/interrupt`, etc.) stays on.
+    async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, CodexAppServerError> {
         if method != "initialize" {
             self.initialize().await?;
         }
-        self.send_request(method, params).await
+        self.send_request(method, params, timeout).await
     }
 
     /// The raw request/response round-trip: allocate an integer id, register the pending
     /// oneshot, send `{ id, method, params }`, and await the correlated reply under the
-    /// request timeout (`client.ts:776-803`).
+    /// given request timeout (`client.ts:776-803`).
     async fn send_request(
         &self,
         method: &str,
         params: Value,
+        timeout: Duration,
     ) -> Result<Value, CodexAppServerError> {
         let id = RequestId::Int(self.next_id.fetch_add(1, Ordering::SeqCst));
         let (tx, rx) = oneshot::channel();
@@ -414,7 +486,7 @@ impl CodexAppServerClient {
             });
         }
 
-        match tokio::time::timeout(self.request_timeout, rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(Ok(result))) => Ok(result),
             Ok(Ok(Err(error))) => Err(CodexAppServerError::Rpc {
                 method: method.to_string(),
@@ -428,7 +500,7 @@ impl CodexAppServerClient {
                 self.pending.lock().expect("pending map").remove(&id);
                 Err(CodexAppServerError::Timeout {
                     method: method.to_string(),
-                    timeout_ms: self.request_timeout.as_millis() as u64,
+                    timeout_ms: timeout.as_millis() as u64,
                 })
             }
         }
@@ -812,6 +884,142 @@ mod tests {
         match task.await.unwrap() {
             Err(CodexAppServerError::Closed { method }) => assert_eq!(method, "initialize"),
             other => panic!("expected Closed, got {other:?}"),
+        }
+    }
+
+    // ── snapshot-read timeout budget (thread/read, thread/resume) ──────────────────────
+
+    #[test]
+    fn snapshot_read_timeout_ms_matches_the_documented_30_second_budget() {
+        // Pins the deliberate deviation's value: real-data evidence proved 5s (legacy's
+        // uniform DEFAULT_REQUEST_TIMEOUT_MS, client.ts:65,141) is too tight for a large
+        // thread/read; capped at 30s (a REST fetch shouldn't hang forever).
+        assert_eq!(SNAPSHOT_READ_TIMEOUT_MS, 30_000);
+    }
+
+    #[tokio::test]
+    async fn read_thread_honors_the_longer_read_timeout_not_the_request_timeout() {
+        let (transport, peer) = new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect_with_timeouts(
+            transport,
+            Duration::from_millis(50),
+            Duration::from_millis(400),
+        );
+        let client = Arc::new(client);
+
+        let c = client.clone();
+        let task = tokio::spawn(async move { c.read_thread("thread-1", true).await });
+
+        let (init_id, init_method, _) = peer.expect_request().await;
+        assert_eq!(init_method, "initialize");
+        peer.respond(&init_id, json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "unix", "platformOs": "linux" }));
+        let (_note, _) = peer.expect_notification().await; // initialized
+
+        let (read_id, read_method, _) = peer.expect_request().await;
+        assert_eq!(read_method, "thread/read");
+        // Delay past the SHORT request_timeout (50ms) but well within the LONG
+        // read_timeout (400ms) -- proves read_thread is governed by the latter.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        peer.respond(&read_id, json!({ "thread": { "id": "thread-1" } }));
+
+        match task.await.unwrap() {
+            Ok(value) => assert_eq!(value["thread"]["id"], json!("thread-1")),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_thread_honors_the_longer_read_timeout_not_the_request_timeout() {
+        let (transport, peer) = new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect_with_timeouts(
+            transport,
+            Duration::from_millis(50),
+            Duration::from_millis(400),
+        );
+        let client = Arc::new(client);
+
+        let c = client.clone();
+        let task = tokio::spawn(async move {
+            c.resume_thread("thread-1", StartThreadParams::default())
+                .await
+        });
+
+        let (init_id, init_method, _) = peer.expect_request().await;
+        assert_eq!(init_method, "initialize");
+        peer.respond(&init_id, json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "unix", "platformOs": "linux" }));
+        let (_note, _) = peer.expect_notification().await; // initialized
+
+        let (resume_id, resume_method, _) = peer.expect_request().await;
+        assert_eq!(resume_method, "thread/resume");
+        // Same delay window as the read_thread test above.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        peer.respond(&resume_id, started_thread_result());
+
+        match task.await.unwrap() {
+            Ok(resumed) => assert_eq!(resumed.thread_id, "019810de-1e5f-7db3-9c47-1c2a3b4c5d6e"),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn start_turn_is_unaffected_by_the_longer_read_timeout() {
+        // Scope regression: turn/start (and every non-read RPC) must still be governed by
+        // the SHORT request_timeout, not the read_timeout widened for thread/read + resume.
+        let (transport, peer) = new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect_with_timeouts(
+            transport,
+            Duration::from_millis(50),
+            Duration::from_millis(400),
+        );
+        let client = Arc::new(client);
+
+        let c = client.clone();
+        let task = tokio::spawn(async move { c.start_turn(StartTurnParams::default()).await });
+
+        let (init_id, init_method, _) = peer.expect_request().await;
+        assert_eq!(init_method, "initialize");
+        peer.respond(&init_id, json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "unix", "platformOs": "linux" }));
+        let (_note, _) = peer.expect_notification().await; // initialized
+
+        // Never respond to turn/start -- it must time out at the SHORT request_timeout.
+        let (_turn_id, turn_method, _) = peer.expect_request().await;
+        assert_eq!(turn_method, "turn/start");
+
+        match task.await.unwrap() {
+            Err(CodexAppServerError::Timeout { method, timeout_ms }) => {
+                assert_eq!(method, "turn/start");
+                assert_eq!(timeout_ms, 50);
+            }
+            other => panic!("expected a Timeout at the short request_timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_thread_survives_past_the_production_default_request_timeout() {
+        // Uses the REAL production defaults (connect(), not connect_with_timeouts) to prove
+        // the wiring, not just the plumbing: DEFAULT_REQUEST_TIMEOUT_MS is 5s, so a reply
+        // delayed past 5s but within SNAPSHOT_READ_TIMEOUT_MS (30s) must still succeed.
+        // Bounded real sleep (~5.5s) -- acceptable per the task's own allowance.
+        let (transport, peer) = new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let c = client.clone();
+        let task = tokio::spawn(async move { c.read_thread("thread-big", true).await });
+
+        let (init_id, init_method, _) = peer.expect_request().await;
+        assert_eq!(init_method, "initialize");
+        peer.respond(&init_id, json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "unix", "platformOs": "linux" }));
+        let (_note, _) = peer.expect_notification().await; // initialized
+
+        let (read_id, read_method, _) = peer.expect_request().await;
+        assert_eq!(read_method, "thread/read");
+        tokio::time::sleep(Duration::from_millis(5_500)).await;
+        peer.respond(&read_id, json!({ "thread": { "id": "thread-big" } }));
+
+        match task.await.unwrap() {
+            Ok(value) => assert_eq!(value["thread"]["id"], json!("thread-big")),
+            other => panic!("expected Ok past the 5s default request_timeout, got {other:?}"),
         }
     }
 }
