@@ -1,9 +1,15 @@
 //! `/api/sessions/:sessionId` — session rename/archive/delete overrides and
 //! AI/first-message title generation. Faithful port of the write half of
 //! `server/sessions-router.ts` (`PATCH` :122-165, `POST generate-title` :167-210),
-//! backed by `SettingsStore::patch_session_override`. The terminal-cascade rename
-//! (`cascadeSessionRenameToTerminal`) is out of scope; `cascadedTerminalId` is
-//! always emitted as `null` so the wire shape matches.
+//! backed by `SettingsStore::patch_session_override`. The REVERSE terminal-cascade
+//! rename (`cascadeSessionRenameToTerminal`, `rename-cascade.ts:39-50`) IS
+//! implemented in `patch_session` below: a rename of a session currently running
+//! in a LIVE terminal (`TerminalIdentityRegistry::find_by_session`) rewrites that
+//! terminal's own override, write-throughs the in-memory registry title, and
+//! broadcasts `terminals.changed`, echoing the real terminal id as
+//! `cascadedTerminalId` (`null` only when no live terminal matches). Proven by
+//! `patch_rename_cascades_all_four_effects_to_a_live_terminal` and
+//! `patch_rename_to_a_retired_terminal_identity_does_not_cascade` below.
 
 use std::sync::Arc;
 
@@ -345,6 +351,176 @@ mod tests {
         assert_eq!(v["titleOverride"], serde_json::json!("My Title"));
         assert_eq!(v["titleSource"], serde_json::json!("user"));
         assert_eq!(v["cascadedTerminalId"], serde_json::Value::Null);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Registers a REAL (but throwaway, immediately killable) terminal in the
+    /// shared `TerminalRegistry` so the reverse cascade's registry
+    /// write-through (`registry.update_title`) has an actual entry to mutate.
+    /// `TerminalRegistry::insert_headless` (used by `freshell-terminal`'s own
+    /// unit tests to avoid a real spawn) is private to that crate's test
+    /// module, so this port spawns a minimal `sleep` child instead -- the
+    /// caller is responsible for `registry.kill(terminal_id)` afterward.
+    fn spawn_headless_terminal_for_test(
+        registry: &freshell_terminal::TerminalRegistry,
+        terminal_id: &str,
+    ) {
+        use freshell_platform::spawn::{SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
+        let spec = SpawnSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 5".into()],
+            env_overrides: Default::default(),
+            cwd: None,
+            cols: DEFAULT_COLS,
+            rows: DEFAULT_ROWS,
+        };
+        registry
+            .create(
+                &spec,
+                &std::collections::BTreeMap::new(),
+                terminal_id.to_string(),
+                "stream-test".to_string(),
+                None,
+                None,
+            )
+            .expect("spawn headless test terminal");
+    }
+
+    /// Reviewer finding (Important, commit d5cf534a): the REVERSE rename
+    /// cascade (`cascadeSessionRenameToTerminal`, `rename-cascade.ts:39-50`,
+    /// implemented in `patch_session` above) had ZERO positive-match test
+    /// coverage -- reverting the entire cascade block still left all prior
+    /// tests green, since they only covered the no-match case. This proves
+    /// all FOUR effects a live match must produce: (a) the terminal's OWN
+    /// override is written with the new title, (b) the in-memory registry
+    /// title is updated (write-through, not just the on-disk override), (c) a
+    /// `terminals.changed` broadcast fires, and (d) the response echoes the
+    /// REAL `cascadedTerminalId` (not the always-null placeholder a prior
+    /// version of this router emitted).
+    #[tokio::test]
+    async fn patch_rename_cascades_all_four_effects_to_a_live_terminal() {
+        let dir = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let st = state(&dir);
+
+        // A terminal currently running `claude:sess-live` (the session key
+        // this PATCH targets) -- `find_by_session` needs a LIVE (non-retired)
+        // match, and the registry write-through needs a REAL registered
+        // terminal_id (`update_title` is a no-op against an unknown id).
+        st.identity
+            .upsert("term-live", Some("claude"), Some("sess-live"), None, 1000);
+        spawn_headless_terminal_for_test(&st.registry, "term-live");
+
+        // Subscribe BEFORE the PATCH so the `terminals.changed` send lands in
+        // this receiver's buffer.
+        let mut broadcast_rx = st.broadcast_tx.subscribe();
+
+        let app = super::router(st.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/sessions/sess-live?provider=claude")
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"titleOverride":"Renamed From Session"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+
+        // (d) the REAL cascadedTerminalId, not null.
+        assert_eq!(
+            v["cascadedTerminalId"],
+            serde_json::json!("term-live"),
+            "response must echo the live terminal's id, not null"
+        );
+
+        // (a) the terminal's OWN override was written with the new title.
+        let terminal_overrides = st.settings.terminal_overrides();
+        let term_override = terminal_overrides
+            .get("term-live")
+            .expect("terminal override written by the reverse cascade");
+        assert_eq!(
+            term_override["titleOverride"],
+            serde_json::json!("Renamed From Session")
+        );
+
+        // (b) the in-memory registry title was updated (write-through, not
+        // just the on-disk override).
+        let entry = st
+            .registry
+            .directory()
+            .into_iter()
+            .find(|e| e.terminal_id == "term-live")
+            .expect("terminal present in the registry directory");
+        assert_eq!(entry.title, "Renamed From Session");
+
+        // (c) a `terminals.changed` broadcast fired.
+        let frame = broadcast_rx
+            .try_recv()
+            .expect("terminals.changed broadcast fired");
+        let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(frame["type"], serde_json::json!("terminals.changed"));
+
+        st.registry.kill("term-live");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The reverse cascade's terminal lookup is LIVE-only (`.list()` via
+    /// `find_by_session`, matching `deps.terminalMetadata.list()`,
+    /// `sessions-router.ts:149`): a RETIRED (already-exited) terminal's
+    /// session can still be renamed through this route, but the rename does
+    /// NOT reach back into the exited terminal -- `cascadedTerminalId` stays
+    /// `null`. This pins the live-only semantic against the OPPOSITE
+    /// (terminal -> session) direction's `.get()`-based
+    /// `rename_cascades_even_after_the_terminal_has_exited` test in
+    /// `terminals.rs`, which deliberately DOES still cascade for a retired
+    /// terminal -- the two directions are asymmetric on purpose.
+    #[tokio::test]
+    async fn patch_rename_to_a_retired_terminal_identity_does_not_cascade() {
+        let dir = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let st = state(&dir);
+
+        st.identity.upsert(
+            "term-exited",
+            Some("claude"),
+            Some("sess-exited"),
+            None,
+            1000,
+        );
+        st.identity.retire("term-exited");
+
+        let app = super::router(st.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/sessions/sess-exited?provider=claude")
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"titleOverride":"Renamed After Exit"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+
+        assert_eq!(v["cascadedTerminalId"], serde_json::Value::Null);
+        assert_eq!(
+            v["titleOverride"],
+            serde_json::json!("Renamed After Exit"),
+            "the session override itself still lands -- only the reach-back to the terminal is skipped"
+        );
+        assert!(
+            st.settings.terminal_overrides().is_empty(),
+            "no terminal override should be fabricated for a retired terminal"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

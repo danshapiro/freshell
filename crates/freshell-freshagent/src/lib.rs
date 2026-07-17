@@ -1095,6 +1095,18 @@ fn parse_required_name(value: Option<&Value>) -> Option<String> {
 /// acknowledge with the shape `PaneContainer.tsx:311` asserts
 /// (`response.data.paneId === paneId`), so the client can safely apply the
 /// Redux-side rename.
+///
+/// **Disclosed deviation (Minor, spec review of commit d5cf534a):** the legacy
+/// route resolves `paneId` against a server-side pane registry and answers
+/// `404`/`409` for an unresolvable or already-target-mismatched id
+/// (`resolvePaneTarget`, `agent-api/router.ts:530-541`). This port keeps no
+/// such registry (see the `tabId`-unknowable note above), so `rename_pane`
+/// returns `200` for ANY `pane_id` that passes name validation, whether or not
+/// a pane by that id actually exists. Accepted because the frozen client only
+/// ever calls this with a `paneId` it already holds and asserts solely
+/// `data.paneId === paneId` on the response (`PaneContainer.tsx:311`) -- it
+/// never inspects the status code for a 404/409 branch, so the missing
+/// resolution check is unobservable from the single supported client.
 async fn rename_pane(
     State(state): State<FreshAgentState>,
     Path(pane_id): Path<String>,
