@@ -64,6 +64,35 @@ pub struct SettingsStore {
     /// session-directory read model overlays. std `Mutex` so the sync `persist`
     /// path can snapshot it (same as `terminal_overrides`).
     session_overrides: Arc<std::sync::Mutex<serde_json::Map<String, Value>>>,
+    /// Side-by-side hardening (bake-in with the legacy Node server on the
+    /// SAME real home): top-level keys of `session_overrides` TOUCHED by
+    /// `patch_session_override` THIS PROCESS's lifetime (never cleared --
+    /// "touched this boot" is permanent for the boot's duration, not reset
+    /// per-persist). `persist()`/the freshness reload use this set with
+    /// [`overlay_dirty_keys`] so a key we've never touched always defers to
+    /// whatever a concurrent writer (legacy server, or another Rust
+    /// process) currently has on disk, while a key we HAVE touched always
+    /// reflects our own in-memory value (a key present in this set but
+    /// absent from the in-memory map is a tombstone: explicitly removed).
+    session_overrides_dirty: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// The `terminal_overrides` analog of `session_overrides_dirty`.
+    terminal_overrides_dirty: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Throttled mtime-check state backing the freshness reload
+    /// (`maybe_reload_overrides`) on the override READ path
+    /// (`session_overrides()`/`terminal_overrides()`).
+    overrides_reload_state: Arc<std::sync::Mutex<OverridesReloadState>>,
+}
+
+/// Throttle + change-detection state for [`SettingsStore::maybe_reload_overrides`].
+#[derive(Default)]
+struct OverridesReloadState {
+    /// Monotonic clock (immune to wall-clock adjustments) of the last time
+    /// we actually `stat()`'d `config.json`; `None` means "never checked",
+    /// which always proceeds regardless of the throttle window.
+    last_checked: Option<std::time::Instant>,
+    /// The `config.json` mtime as of the last check; used to skip the
+    /// (more expensive) disk re-read entirely when nothing changed.
+    last_known_mtime: Option<std::time::SystemTime>,
 }
 
 impl SettingsStore {
@@ -164,6 +193,12 @@ impl SettingsStore {
             codex_display_id_secret: Arc::new(codex_display_id_secret),
             terminal_overrides: Arc::new(std::sync::Mutex::new(terminal_overrides)),
             session_overrides: Arc::new(std::sync::Mutex::new(session_overrides)),
+            // Nothing is dirty yet at boot -- every key we just loaded came
+            // straight from disk, so it defers to disk until THIS process
+            // actually patches it.
+            session_overrides_dirty: Arc::new(std::sync::Mutex::new(Default::default())),
+            terminal_overrides_dirty: Arc::new(std::sync::Mutex::new(Default::default())),
+            overrides_reload_state: Arc::new(std::sync::Mutex::new(Default::default())),
         };
         if needs_persist {
             store.persist(&settings);
@@ -241,6 +276,20 @@ impl SettingsStore {
     /// file degrades to `{}` (fresh install, or an already-corrupt file
     /// we're about to overwrite anyway) -- same tolerance as every other
     /// read in this module (`config-store.ts#readConfigFile`).
+    ///
+    /// SIDE-BY-SIDE HARDENING (bake-in with the legacy Node server on the
+    /// SAME real home): this whole read-modify-write is now additionally
+    /// guarded by an advisory [`ConfigLock`] (Rust-vs-Rust only -- see its
+    /// docs), and `sessionOverrides`/`terminalOverrides` are no longer
+    /// overlaid wholesale from memory. Instead [`overlay_dirty_keys`]
+    /// starts from a FRESH disk read and replaces only the keys THIS
+    /// process actually touched this boot, so a concurrent write to any
+    /// other key -- by the legacy server, or another Rust process --
+    /// survives every persist. `settings` itself is still overlaid
+    /// wholesale (unchanged from Batch A): during bake-in, settings edits
+    /// belong to whichever server the user is actively driving, and that
+    /// residual is accepted (see the module-level docs / task report for
+    /// the honest limits of this mechanism).
     fn persist(&self, settings: &ServerSettings) {
         let Some(home) = &self.home else { return };
         let dir = home.join(".freshell");
@@ -248,6 +297,11 @@ impl SettingsStore {
             return;
         }
         let path = dir.join("config.json");
+
+        // Advisory cross-process lock across the ENTIRE read-modify-write
+        // below (sidecar file, never `config.json` itself -- see
+        // `ConfigLock`). Held until the end of this function (RAII drop).
+        let _lock = ConfigLock::acquire(&dir);
 
         let mut doc = std::fs::read_to_string(&path)
             .ok()
@@ -265,24 +319,53 @@ impl SettingsStore {
             "settings".to_string(),
             serde_json::to_value(settings).unwrap_or_else(|_| json!({})),
         );
+
+        // ADOPT-FROM-DISK MERGE (Batch B hardening): fresh disk read,
+        // overlaid with ONLY the keys this process marked dirty. A key
+        // we've never touched this boot always reflects whatever is on
+        // disk RIGHT NOW, not our (possibly stale) boot-time snapshot.
+        let disk_session_overrides = map
+            .get("sessionOverrides")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let merged_session_overrides = {
+            let memory = self
+                .session_overrides
+                .lock()
+                .expect("session overrides lock");
+            let dirty = self
+                .session_overrides_dirty
+                .lock()
+                .expect("session overrides dirty lock");
+            overlay_dirty_keys(disk_session_overrides, &memory, &dirty)
+        };
         map.insert(
             "sessionOverrides".to_string(),
-            Value::Object(
-                self.session_overrides
-                    .lock()
-                    .expect("session overrides lock")
-                    .clone(),
-            ),
+            Value::Object(merged_session_overrides),
         );
+
+        let disk_terminal_overrides = map
+            .get("terminalOverrides")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let merged_terminal_overrides = {
+            let memory = self
+                .terminal_overrides
+                .lock()
+                .expect("terminal overrides lock");
+            let dirty = self
+                .terminal_overrides_dirty
+                .lock()
+                .expect("terminal overrides dirty lock");
+            overlay_dirty_keys(disk_terminal_overrides, &memory, &dirty)
+        };
         map.insert(
             "terminalOverrides".to_string(),
-            Value::Object(
-                self.terminal_overrides
-                    .lock()
-                    .expect("terminal overrides lock")
-                    .clone(),
-            ),
+            Value::Object(merged_terminal_overrides),
         );
+
         // `serverSecrets` is overlaid onto whatever was already there (not
         // replaced wholesale), so a sibling secret this store doesn't know
         // about would survive too.
@@ -311,11 +394,91 @@ impl SettingsStore {
         if std::fs::write(&tmp, &text).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
+        // `_lock` drops here, releasing the flock.
+    }
+
+    /// Cheap mtime-checked freshness reload for the override READ path
+    /// (Batch B hardening): if `config.json`'s mtime changed since we last
+    /// checked, re-read `sessionOverrides`/`terminalOverrides` from disk
+    /// and adopt them into memory under the SAME dirty-key rule `persist()`
+    /// uses ([`overlay_dirty_keys`]) -- so a concurrent rename made by the
+    /// legacy Node server (or another Rust process) shows up here WITHOUT a
+    /// Rust restart, while a key we've touched this boot keeps our own
+    /// value. Throttled to at most once/second (an `Instant`, immune to
+    /// wall-clock adjustments) so a hot polling path (the sidebar) never
+    /// `stat()`s `config.json` on every single call. Read-only otherwise:
+    /// no lock is taken here (a reader either sees the old complete file or
+    /// the new complete file -- `persist()`'s tmp+rename is atomic -- never
+    /// a torn write).
+    fn maybe_reload_overrides(&self) {
+        let Some(home) = &self.home else { return };
+
+        let now = std::time::Instant::now();
+        {
+            let mut state = self
+                .overrides_reload_state
+                .lock()
+                .expect("overrides reload state lock");
+            if let Some(last) = state.last_checked {
+                if now.duration_since(last) < std::time::Duration::from_secs(1) {
+                    return;
+                }
+            }
+            state.last_checked = Some(now);
+        }
+
+        let config_path = home.join(".freshell").join("config.json");
+        let Ok(meta) = std::fs::metadata(&config_path) else {
+            return;
+        };
+        let Ok(mtime) = meta.modified() else {
+            return;
+        };
+
+        let changed = {
+            let mut state = self
+                .overrides_reload_state
+                .lock()
+                .expect("overrides reload state lock");
+            let changed = state.last_known_mtime != Some(mtime);
+            state.last_known_mtime = Some(mtime);
+            changed
+        };
+        if !changed {
+            return;
+        }
+
+        let disk_session = load_session_overrides(Some(home));
+        let mut memory = self
+            .session_overrides
+            .lock()
+            .expect("session overrides lock");
+        let dirty = self
+            .session_overrides_dirty
+            .lock()
+            .expect("session overrides dirty lock");
+        let merged = overlay_dirty_keys(disk_session, &memory, &dirty);
+        *memory = merged;
+        drop(dirty);
+        drop(memory);
+
+        let disk_terminal = load_terminal_overrides(Some(home));
+        let mut memory = self
+            .terminal_overrides
+            .lock()
+            .expect("terminal overrides lock");
+        let dirty = self
+            .terminal_overrides_dirty
+            .lock()
+            .expect("terminal overrides dirty lock");
+        let merged = overlay_dirty_keys(disk_terminal, &memory, &dirty);
+        *memory = merged;
     }
 
     /// A snapshot of `config.terminalOverrides` (the `/api/terminals` directory
     /// reads it to merge titles/descriptions and filter `deleted`).
     pub fn terminal_overrides(&self) -> serde_json::Map<String, Value> {
+        self.maybe_reload_overrides();
         self.terminal_overrides
             .lock()
             .expect("terminal overrides lock")
@@ -360,6 +523,14 @@ impl SettingsStore {
                 }
             }
             all.insert(terminal_id.to_string(), Value::Object(next.clone()));
+            // Side-by-side hardening: this terminal is TOUCHED this boot --
+            // `persist()`/the freshness reload now treat it as ours, always
+            // overlaying (or tombstoning) it over whatever is on disk. See
+            // `session_overrides_dirty` for the full rationale.
+            self.terminal_overrides_dirty
+                .lock()
+                .expect("terminal overrides dirty lock")
+                .insert(terminal_id.to_string());
             next
         };
         // Persist the whole config.json (same atomic tmp+rename write as a
@@ -372,6 +543,7 @@ impl SettingsStore {
     /// A snapshot of `config.sessionOverrides` (the session-directory read model
     /// overlays it; the `/api/sessions` router patches it).
     pub fn session_overrides(&self) -> serde_json::Map<String, Value> {
+        self.maybe_reload_overrides();
         self.session_overrides
             .lock()
             .expect("session overrides lock")
@@ -442,6 +614,17 @@ impl SettingsStore {
             if changed {
                 all.insert(key.to_string(), Value::Object(next.clone()));
             }
+            // Side-by-side hardening: this session key is TOUCHED this
+            // boot -- marked dirty regardless of `changed` (a resolved
+            // no-op still means we've asserted an opinion about this key;
+            // marking it dirty is harmless since no disk write happens
+            // when `!changed`, and it's simplest to reason about "touched
+            // == dirty for the boot's duration"). See
+            // `session_overrides_dirty` for the full rationale.
+            self.session_overrides_dirty
+                .lock()
+                .expect("session overrides dirty lock")
+                .insert(key.to_string());
             (Value::Object(next), changed)
         };
         if changed {
@@ -450,6 +633,116 @@ impl SettingsStore {
         }
         next
     }
+}
+
+/// Advisory cross-process serialization for `persist()`'s read-modify-write
+/// window (bake-in with the legacy Node server on the SAME real home). Held
+/// on a SIDECAR file (`<home>/.freshell/.config.lock`), never `config.json`
+/// itself, so the legacy server's own atomic tmp+rename write is completely
+/// unaffected by whether this lock exists, is held, or is contended.
+///
+/// HONEST LIMIT: the legacy Node server does NOT participate in this lock
+/// at all -- it never even looks at the sidecar file. This only serializes
+/// Rust-vs-Rust (two Rust processes, or two concurrent persists within one
+/// process). It does NOT, by itself, prevent a Rust persist and a legacy
+/// write from interleaving mid-write. What actually prevents Rust from
+/// CLOBBERING a concurrent legacy write is the dirty-key overlay in
+/// `overlay_dirty_keys`: even without this lock, a legacy write to a key
+/// Rust hasn't touched survives, because Rust re-reads disk fresh every
+/// time. This lock's job is narrower: it shrinks the window in which TWO
+/// RUST writers could race each other and lose one's update (see the
+/// `concurrent_persists_across_two_store_instances_serialize_without_lost_updates`
+/// test) -- a real risk once a second Rust process (or a future
+/// multi-instance deployment) exists, even though bake-in's DESCRIBED
+/// scenario is one Rust process alongside the legacy Node server.
+///
+/// Blocking is a short poll loop (`flock(2)` has no native timeout),
+/// bounded to ~2s; on timeout this gives up and logs a warning rather than
+/// risk hanging request handling forever -- a wedged/slow lock holder must
+/// never deadlock the server.
+struct ConfigLock {
+    #[cfg(unix)]
+    _file: std::fs::File,
+}
+
+impl ConfigLock {
+    #[cfg(unix)]
+    fn acquire(dir: &Path) -> Option<Self> {
+        use std::os::unix::io::AsRawFd;
+
+        let path = dir.join(".config.lock");
+        // The lock file's CONTENT is irrelevant (only its existence + flock
+        // state matter), so `truncate(false)` is explicit that we don't
+        // care either way -- avoids clippy's `suspicious_open_options`.
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .ok()?;
+        let fd = file.as_raw_fd();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            // SAFETY: `fd` is a valid, open file descriptor owned by `file`
+            // for the duration of this call; `flock` only mutates kernel
+            // lock state associated with it.
+            let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                return Some(Self { _file: file });
+            }
+            if std::time::Instant::now() >= deadline {
+                eprintln!(
+                    "freshell-server: config lock timed out after 2s ({}); proceeding without it",
+                    path.display()
+                );
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn acquire(_dir: &Path) -> Option<Self> {
+        // No advisory-lock primitive wired up on this platform; `persist()`
+        // proceeds without cross-process serialization (same as a timeout
+        // above) -- the dirty-key overlay is still the primary defense
+        // against clobbering a concurrent writer's untouched keys.
+        None
+    }
+}
+
+/// The canonical per-key merge for the side-by-side override maps: for
+/// keys THIS PROCESS marked `dirty` this boot, our own in-memory value
+/// wins outright (a dirty key ABSENT from `memory` is a tombstone --
+/// explicitly removed, even if `disk` still has a value for it); every
+/// other key defers entirely to `disk` -- e.g. a concurrent legacy-server
+/// edit, or addition, to a key we've never touched.
+///
+/// Used identically in two directions by its two callers: `persist()`
+/// builds what to WRITE (overlay-source = our memory, onto a fresh disk
+/// read), and the freshness reload (`maybe_reload_overrides`) builds what
+/// to ADOPT INTO memory (base = a fresh disk read, dirty keys keep
+/// whatever memory already has) -- both produce the exact same "canonical
+/// view" of the map, just consumed differently.
+fn overlay_dirty_keys(
+    mut disk: serde_json::Map<String, Value>,
+    memory: &serde_json::Map<String, Value>,
+    dirty: &std::collections::HashSet<String>,
+) -> serde_json::Map<String, Value> {
+    for key in dirty {
+        match memory.get(key) {
+            Some(value) => {
+                disk.insert(key.clone(), value.clone());
+            }
+            None => {
+                // Tombstone: we touched this key this boot and it is no
+                // longer present in memory -- it must not resurrect from
+                // disk.
+                disk.remove(key);
+            }
+        }
+    }
+    disk
 }
 
 /// `canUpgradeTitle` (`shared/title-source.ts:50-57`): user always wins; a
@@ -1663,6 +1956,357 @@ mod tests {
         assert_eq!(
             cfg["sessionOverrides"]["claude:abc"]["archived"],
             json!(true)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Batch B: side-by-side operation with the legacy Node server ──
+    //
+    // These tests exercise a bake-in scenario where BOTH the Rust server
+    // and the legacy Node server make automatic writes to the SAME real
+    // `~/.freshell/config.json` (auto-titling sessionOverrides, provider
+    // seeding). An "external writer" below stands in for the legacy
+    // server: a direct `std::fs::write` to `config.json`, bypassing every
+    // Rust API, exactly as a concurrent process would.
+
+    /// EXTERNAL-WRITER SURVIVAL: between Rust's boot-time load and a LATER
+    /// Rust persist (triggered by a patch to a DIFFERENT key), an external
+    /// writer rewrites `config.json` directly: adds a brand-new
+    /// `sessionOverrides` key, changes an EXISTING key Rust has never
+    /// touched this boot, and adds an unrelated unknown top-level key. All
+    /// three must survive the Rust persist, alongside Rust's own patch.
+    /// Pre-hardening `persist()` overlaid `session_overrides.lock().clone()`
+    /// onto the doc WHOLESALE, so the external addition and the external
+    /// edit to the untouched key would both have been silently erased --
+    /// this is the RED case for the whole feature.
+    #[tokio::test]
+    async fn external_writer_edits_survive_a_rust_persist_of_a_different_key() {
+        let dir = std::env::temp_dir().join(format!("frs-sidebyside-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&json!({
+                "version": 1,
+                "settings": {},
+                "sessionOverrides": {
+                    "claude:orig": { "titleOverride": "OrigTitle", "titleSource": "legacy" }
+                },
+                "terminalOverrides": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = store_at(&dir);
+
+        // External writer (the legacy Node server, or another Rust
+        // process) rewrites config.json directly -- Rust never observes
+        // this through its own APIs, only by re-reading disk at persist
+        // time.
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&json!({
+                "version": 1,
+                "settings": {},
+                "sessionOverrides": {
+                    "claude:orig": { "titleOverride": "ExternalRenamed", "titleSource": "legacy" },
+                    "claude:new": { "titleOverride": "NewFromExternal" }
+                },
+                "terminalOverrides": {},
+                "hello": "world"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Rust patches a DIFFERENT key -- triggers a persist.
+        store
+            .patch_session_override("claude:other", &[("archived", Some(json!(true)))])
+            .await;
+
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(freshell.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            cfg["sessionOverrides"]["claude:orig"]["titleOverride"],
+            json!("ExternalRenamed"),
+            "external edit to a key Rust never touched this boot must survive"
+        );
+        assert_eq!(
+            cfg["sessionOverrides"]["claude:new"]["titleOverride"],
+            json!("NewFromExternal"),
+            "a brand-new external key must survive"
+        );
+        assert_eq!(
+            cfg["hello"],
+            json!("world"),
+            "an unknown top-level key must round-trip"
+        );
+        assert_eq!(
+            cfg["sessionOverrides"]["claude:other"]["archived"],
+            json!(true),
+            "Rust's own patch must still land"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// DIRTY-KEY WINS: once Rust has TOUCHED a key this boot, an external
+    /// writer's concurrent edit to that SAME key must NOT survive a later
+    /// Rust persist -- Rust's own value for a key it owns this boot always
+    /// wins (last-user-intent on the Rust side), and the dirty mark
+    /// persists for the WHOLE boot, not just the one persist that first
+    /// set it.
+    #[tokio::test]
+    async fn dirty_key_wins_over_a_concurrent_external_edit_to_the_same_key() {
+        let dir = std::env::temp_dir().join(format!("frs-sidebyside-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = store_at(&dir);
+        let cfg_path = dir.join(".freshell").join("config.json");
+
+        // Rust patches key K -- persists immediately, K is now dirty.
+        store
+            .patch_session_override(
+                "claude:k",
+                &[
+                    ("titleOverride", Some(json!("RustValue"))),
+                    ("titleSource", Some(json!("user"))),
+                ],
+            )
+            .await;
+
+        // External writer changes the SAME key on disk.
+        let mut cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        cfg["sessionOverrides"]["claude:k"]["titleOverride"] = json!("ExternalValue");
+        std::fs::write(&cfg_path, serde_json::to_string(&cfg).unwrap()).unwrap();
+
+        // A persist triggered by patching a DIFFERENT key must still keep
+        // Rust's value for K.
+        store
+            .patch_session_override("claude:other", &[("archived", Some(json!(true)))])
+            .await;
+
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        assert_eq!(
+            cfg["sessionOverrides"]["claude:k"]["titleOverride"],
+            json!("RustValue"),
+            "a dirty key must keep Rust's value even after a concurrent external edit"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TOMBSTONE: a field Rust explicitly REMOVED from a dirty key must
+    /// stay removed, even if disk re-acquires a value for it (an external
+    /// writer re-adding it, or stale content already on disk) --
+    /// `overlay_dirty_keys` REPLACES a dirty key's value wholesale from
+    /// memory; it never merges memory's absence with disk's presence
+    /// field-by-field.
+    #[tokio::test]
+    async fn tombstoned_field_stays_removed_despite_external_reintroduction() {
+        let dir = std::env::temp_dir().join(format!("frs-sidebyside-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = store_at(&dir);
+        let cfg_path = dir.join(".freshell").join("config.json");
+
+        // Seed a field, then remove it -- the key is dirty, and memory's
+        // current value for it has no `summaryOverride`.
+        store
+            .patch_session_override("claude:k", &[("summaryOverride", Some(json!("first")))])
+            .await;
+        store
+            .patch_session_override("claude:k", &[("summaryOverride", None)])
+            .await;
+
+        // External writer re-adds the removed field directly on disk.
+        let mut cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        cfg["sessionOverrides"]["claude:k"]["summaryOverride"] = json!("reintroduced-externally");
+        std::fs::write(&cfg_path, serde_json::to_string(&cfg).unwrap()).unwrap();
+
+        // A persist triggered by a DIFFERENT key must not resurrect it.
+        store
+            .patch_session_override("claude:other", &[("archived", Some(json!(true)))])
+            .await;
+
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        assert!(
+            cfg["sessionOverrides"]["claude:k"]
+                .get("summaryOverride")
+                .is_none(),
+            "a field Rust removed must stay removed, not be resurrected from disk"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// LOCK SERIALIZATION: two independent `SettingsStore` instances (
+    /// standing in for two OS processes -- e.g. a second Rust process, or
+    /// modeling contention with the legacy server's write) pointed at the
+    /// SAME home, persisting concurrently from many threads, must not lose
+    /// updates. Without cross-process serialization, two racing
+    /// read-modify-write cycles can each read the SAME stale disk state
+    /// and each write back a version missing the other's key.
+    #[test]
+    fn concurrent_persists_across_two_store_instances_serialize_without_lost_updates() {
+        let dir = std::env::temp_dir().join(format!("frs-sidebyside-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store_a = store_at(&dir);
+        let store_b = store_at(&dir);
+
+        const N: usize = 20;
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let store_a = store_a.clone();
+            handles.push(std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                rt.block_on(
+                    store_a.patch_session_override(
+                        &format!("a:{i}"),
+                        &[("archived", Some(json!(true)))],
+                    ),
+                );
+            }));
+            let store_b = store_b.clone();
+            handles.push(std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                rt.block_on(
+                    store_b.patch_session_override(
+                        &format!("b:{i}"),
+                        &[("archived", Some(json!(true)))],
+                    ),
+                );
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        let overrides = cfg["sessionOverrides"]
+            .as_object()
+            .expect("sessionOverrides must still be a well-formed object, not corrupted");
+        for i in 0..N {
+            assert!(
+                overrides.contains_key(&format!("a:{i}")),
+                "lost update for a:{i}"
+            );
+            assert!(
+                overrides.contains_key(&format!("b:{i}")),
+                "lost update for b:{i}"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FRESHNESS RELOAD (read path): a rename made externally (standing in
+    /// for the legacy Node server) becomes visible via `session_overrides()`
+    /// WITHOUT a Rust restart, once the mtime-checked reload picks up the
+    /// change. Only ONE call is made to `session_overrides()` here --
+    /// deliberately, so the throttle (which only opens once per second)
+    /// never has a prior baseline to compare against.
+    #[tokio::test]
+    async fn external_rename_becomes_visible_via_session_overrides_without_restart() {
+        let dir = std::env::temp_dir().join(format!("frs-sidebyside-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&json!({
+                "version": 1, "settings": {}, "sessionOverrides": {}, "terminalOverrides": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = store_at(&dir);
+
+        // Give the filesystem a moment so the mtime visibly advances (some
+        // filesystems have coarse timestamp resolution).
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&json!({
+                "version": 1,
+                "settings": {},
+                "sessionOverrides": {
+                    "claude:renamed": { "titleOverride": "Renamed externally" }
+                },
+                "terminalOverrides": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let overrides = store.session_overrides();
+        assert_eq!(
+            overrides["claude:renamed"]["titleOverride"],
+            json!("Renamed externally"),
+            "an external rename must be visible without a Rust restart"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// THROTTLE: the freshness reload's mtime `stat()` is throttled to at
+    /// most once per second -- an external write made between two RAPID
+    /// calls to `session_overrides()` must not appear until the throttle
+    /// window elapses, so a hot polling path (e.g. the sidebar) never stats
+    /// `config.json` on every single call.
+    #[tokio::test]
+    async fn override_reload_is_throttled_to_once_per_second() {
+        let dir = std::env::temp_dir().join(format!("frs-sidebyside-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&json!({
+                "version": 1, "settings": {}, "sessionOverrides": {}, "terminalOverrides": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = store_at(&dir);
+
+        // Establish the throttle baseline (first-ever call always checks).
+        assert!(store.session_overrides().is_empty());
+
+        // External writer adds a key immediately after.
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string(&json!({
+                "version": 1,
+                "settings": {},
+                "sessionOverrides": { "claude:fast": { "titleOverride": "x" } },
+                "terminalOverrides": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Immediate re-check: within the same throttle window, must NOT
+        // see it.
+        assert!(
+            !store.session_overrides().contains_key("claude:fast"),
+            "a reload within the 1s throttle window must not re-stat config.json"
+        );
+
+        // After the window elapses, the SAME store instance does pick it up.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(
+            store.session_overrides().contains_key("claude:fast"),
+            "after the throttle window elapses, the change must become visible"
         );
 
         std::fs::remove_dir_all(&dir).ok();

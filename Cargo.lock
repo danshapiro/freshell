@@ -1335,6 +1335,7 @@ dependencies = [
  "freshell-sessions",
  "freshell-terminal",
  "freshell-ws",
+ "libc",
  "reqwest",
  "rusqlite",
  "serde",

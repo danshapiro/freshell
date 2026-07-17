@@ -62,6 +62,14 @@ dotenvy = "0.15.7"
 # use of SHA-1, just a deterministic per-cwd bucket name.
 sha1 = "0.10"
 
+[target.'cfg(unix)'.dependencies]
+# `flock(2)` for `settings_store.rs`'s advisory cross-process config lock
+# (side-by-side bake-in with the legacy Node server on the same real home).
+# Already resolved in the workspace lock transitively (tokio/reqwest), so
+# this direct dependency adds no new download -- unix-only, matching the
+# lock's own unix-only implementation.
+libc = "0.2"
+
 [dev-dependencies]
 # `ServiceExt::oneshot` for in-process axum router handler tests (`sessions.rs`).
 tower = { version = "0.5", features = ["util"] }
