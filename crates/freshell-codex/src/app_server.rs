@@ -266,6 +266,18 @@ impl CodexAppServerClient {
         Ok(())
     }
 
+    /// `thread/read` (`client.ts readThread`; adapter usage `adapter.ts:1089,1094`) \u2014 fetch the
+    /// full thread record (`{ thread: {\u2026} }`), optionally with its turns embedded
+    /// (`includeTurns`). Returns the raw JSON result verbatim; the fresh-agent REST snapshot
+    /// surface normalizes it (mirrors `getSnapshot`'s `runtime.readThread` call).
+    pub async fn read_thread(&self, thread_id: &str, include_turns: bool) -> Result<Value, CodexAppServerError> {
+        self.request(
+            "thread/read",
+            json!({ "threadId": thread_id, "includeTurns": include_turns }),
+        )
+        .await
+    }
+
     /// Send a notification frame (no response awaited) — `notify`, `client.ts:805-808`.
     pub async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), CodexAppServerError> {
         let frame = build_notification_frame(method, params.as_ref());
@@ -570,6 +582,32 @@ mod tests {
 
             assert_eq!(task.await.unwrap().unwrap(), StartedTurn { turn_id: "turn-1".to_string() });
         }
+    }
+
+    #[tokio::test]
+    async fn read_thread_sends_thread_id_and_include_turns_and_returns_raw_result() {
+        let (transport, peer) = new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let c = client.clone();
+        let task = tokio::spawn(async move { c.read_thread("thread-1", true).await });
+
+        let (init_id, _m, _p) = peer.expect_request().await;
+        peer.respond(&init_id, json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }));
+        let _ = peer.expect_notification().await;
+
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        assert_eq!(params["threadId"], json!("thread-1"));
+        assert_eq!(params["includeTurns"], json!(true));
+        peer.respond(
+            &id,
+            json!({ "thread": { "id": "thread-1", "status": { "type": "idle" }, "turns": [] } }),
+        );
+
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result["thread"]["id"], json!("thread-1"));
     }
 
     #[tokio::test]

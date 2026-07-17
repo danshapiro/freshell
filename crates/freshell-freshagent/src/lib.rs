@@ -39,10 +39,12 @@
 pub mod claude;
 pub mod codex;
 pub mod opencode_ws;
+pub mod snapshot;
 
 pub use claude::FreshClaudeState;
 pub use codex::FreshCodexState;
 pub use opencode_ws::FreshOpencodeState;
+pub use snapshot::SnapshotState;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -56,7 +58,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use freshell_opencode::transport::{
@@ -169,6 +171,232 @@ impl FreshAgentState {
     pub(crate) async fn set_manager_for_test(&self, manager: OpencodeServeManager) {
         *self.opencode.lock().await = Some(manager);
     }
+
+    // ── GET /api/fresh-agent/threads/freshopencode/opencode/:threadId (Batch D PR-5) ──
+
+    /// Build a `FreshAgentSnapshotSchema`-shaped JSON snapshot for an opencode session
+    /// (`adapter.ts getSnapshot`, `adapter.ts:574-592` + `normalizeOpencodeSnapshot`,
+    /// `normalize.ts:357-405`). `thread_id` is treated as the durable `ses_*` id (the id a
+    /// materialized fresh-agent pane's REST/WS surfaces hand the client) -- there is no
+    /// placeholder-session snapshot path here (an un-materialized pane has no opencode
+    /// session to read yet; the client only calls this endpoint after a `sessionRef`/
+    /// `sessionId` exists). Fetches the session's own info (`GET /session/:id`) and its
+    /// message page (`GET /session/:id/message`) through the ONE shared `opencode serve`
+    /// sidecar via [`Self::ensure_manager`].
+    pub async fn get_opencode_snapshot(
+        &self,
+        thread_id: &str,
+        cwd: Option<&str>,
+    ) -> Result<Value, OpencodeSnapshotError> {
+        let manager = self.ensure_manager().await;
+        let route: freshell_opencode::Route = cwd.map(str::to_string);
+
+        let info = match manager.get_session(thread_id, &route).await {
+            Ok(value) if value.is_object() => value,
+            Ok(_) => return Err(OpencodeSnapshotError::NotFound),
+            Err(ServeError::Http { status: 404, .. }) => return Err(OpencodeSnapshotError::NotFound),
+            Err(err) => return Err(OpencodeSnapshotError::Serve(err)),
+        };
+        let messages = manager
+            .list_messages(thread_id, &route)
+            .await
+            .map_err(OpencodeSnapshotError::Serve)?;
+
+        Ok(build_opencode_snapshot_json(thread_id, &info, &messages))
+    }
+}
+
+/// Why [`FreshAgentState::get_opencode_snapshot`] could not produce a snapshot.
+#[derive(Debug)]
+pub enum OpencodeSnapshotError {
+    /// The serve reported no such session (a 404, or a non-object `/session/:id` body).
+    NotFound,
+    /// The serve request itself failed (transport, cold-start, etc.).
+    Serve(ServeError),
+}
+
+impl std::fmt::Display for OpencodeSnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpencodeSnapshotError::NotFound => write!(f, "opencode session not found"),
+            OpencodeSnapshotError::Serve(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+/// `modelFromInfo(info)` (`normalize.ts:30-37`): `providerID/modelID`, falling back to a bare
+/// `modelID`/`model.id` when no provider is present.
+fn opencode_model_from_info(info: &Value) -> Option<String> {
+    let provider_id = info
+        .get("providerID")
+        .and_then(Value::as_str)
+        .or_else(|| info.pointer("/model/providerID").and_then(Value::as_str));
+    let model_id = info
+        .get("modelID")
+        .and_then(Value::as_str)
+        .or_else(|| info.pointer("/model/modelID").and_then(Value::as_str))
+        .or_else(|| info.pointer("/model/id").and_then(Value::as_str));
+    match (provider_id, model_id) {
+        (Some(provider), Some(model)) => Some(format!("{provider}/{model}")),
+        (None, Some(model)) => Some(model.to_string()),
+        _ => None,
+    }
+}
+
+/// `tokenUsage(info)` (`normalize.ts:39-52`).
+fn opencode_token_usage(info: &Value) -> Value {
+    let tokens = info.get("tokens").cloned().unwrap_or_else(|| json!({}));
+    let input = tokens.get("input").and_then(Value::as_f64).unwrap_or(0.0) as i64;
+    let output = tokens.get("output").and_then(Value::as_f64).unwrap_or(0.0) as i64;
+    let cached = tokens.pointer("/cache/read").and_then(Value::as_f64).map(|v| v as i64);
+    let total = tokens
+        .get("total")
+        .and_then(Value::as_f64)
+        .map(|v| v as i64)
+        .unwrap_or(input + output + cached.unwrap_or(0));
+
+    let mut usage = Map::new();
+    usage.insert("inputTokens".to_string(), json!(input));
+    usage.insert("outputTokens".to_string(), json!(output));
+    if let Some(cached) = cached {
+        usage.insert("cachedTokens".to_string(), json!(cached));
+    }
+    usage.insert("totalTokens".to_string(), json!(total));
+    if let Some(reasoning) = tokens.get("reasoning").and_then(Value::as_f64) {
+        usage.insert("contextTokens".to_string(), json!(reasoning as i64));
+    }
+    if let Some(cost) = info.get("cost").and_then(Value::as_f64) {
+        usage.insert("costUsd".to_string(), json!(cost));
+    }
+    Value::Object(usage)
+}
+
+/// `normalizeOpencodeRole(value)` (`normalize.ts:24-28`).
+fn opencode_role(value: Option<&str>) -> Option<&'static str> {
+    match value {
+        Some("user") => Some("user"),
+        Some("assistant") => Some("assistant"),
+        Some("system") => Some("system"),
+        Some("tool") => Some("tool"),
+        _ => None,
+    }
+}
+
+/// A MINIMAL `FreshAgentTurnSchema`-shaped turn from one opencode `{info, parts}` message
+/// (`normalizeOpencodeTurn`, `normalize.ts:324-355`). Only `text`-type parts become visible
+/// `{kind:'text'}` transcript items today; `reasoning`/`tool`/`file`/`patch`/`compaction`
+/// parts are DROPPED rather than mis-rendered (the same honest-subset choice the codex side
+/// makes -- see [`crate::codex`]'s snapshot builder doc comment and the task report).
+/// Returns `None` when the message has no recognizable role AND produced no items --
+/// mirroring the reference's `if (!role && items.length > 0) return null` guard for the
+/// "no role but structural output" case; a role-less, item-less message still degenerates to
+/// an (excluded) empty turn here, which is harmless since it would carry no visible content.
+fn build_opencode_turn_json(message: &Value, ordinal: usize) -> Option<Value> {
+    let info = message.get("info").cloned().unwrap_or_else(|| json!({}));
+    let id = info
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("message-{ordinal}"));
+    let role = opencode_role(info.get("role").and_then(Value::as_str));
+    let parts = message.get("parts").and_then(Value::as_array).cloned().unwrap_or_default();
+
+    let mut items = Vec::new();
+    let mut text_parts: Vec<String> = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        if part.get("type").and_then(Value::as_str) != Some("text") {
+            continue;
+        }
+        let Some(text) = part.get("text").and_then(Value::as_str) else { continue };
+        let part_id = part
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{id}:part-{index}"));
+        items.push(json!({ "id": part_id, "kind": "text", "text": text }));
+        text_parts.push(text.to_string());
+    }
+
+    if role.is_none() && !items.is_empty() {
+        return None;
+    }
+
+    let mut turn = Map::new();
+    turn.insert("id".to_string(), json!(id));
+    turn.insert("turnId".to_string(), json!(id));
+    turn.insert("messageId".to_string(), json!(id));
+    turn.insert("ordinal".to_string(), json!(ordinal));
+    turn.insert("source".to_string(), json!("durable"));
+    if let Some(role) = role {
+        turn.insert("role".to_string(), json!(role));
+    }
+    if let Some(model) = opencode_model_from_info(&info) {
+        turn.insert("model".to_string(), json!(model));
+    }
+    turn.insert("summary".to_string(), json!(text_parts.join("\n\n")));
+    turn.insert("items".to_string(), json!(items));
+    Some(Value::Object(turn))
+}
+
+/// `normalizeOpencodeSnapshot` (`normalize.ts:357-405`): map the session's own info + its
+/// message page into the `FreshAgentSnapshotSchema` shape. `status` always reports `idle`
+/// here -- this REST read has no live busy/idle bit to consult (that lives in the WS
+/// session's in-memory turn task, not the serve's own session record) -- an honest
+/// approximation the task report calls out; the client's WS-driven busy chrome already
+/// covers the live case, this endpoint's job is the committed transcript.
+fn build_opencode_snapshot_json(thread_id: &str, info: &Value, messages: &Value) -> Value {
+    let messages = messages.as_array().cloned().unwrap_or_default();
+    let turns: Vec<Value> = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, message)| build_opencode_turn_json(message, ordinal))
+        .collect();
+    let session_id = info
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(thread_id);
+    let revision = info
+        .pointer("/time/updated")
+        .and_then(Value::as_i64)
+        .unwrap_or(turns.len() as i64);
+    let latest_turn_id = turns.last().and_then(|t| t.get("turnId")).cloned().unwrap_or(Value::Null);
+    let summary = info.get("title").and_then(Value::as_str);
+
+    let mut snapshot = Map::new();
+    snapshot.insert("sessionType".to_string(), json!(SESSION_TYPE));
+    snapshot.insert("provider".to_string(), json!(PROVIDER));
+    snapshot.insert("threadId".to_string(), json!(thread_id));
+    snapshot.insert("sessionId".to_string(), json!(session_id));
+    snapshot.insert("revision".to_string(), json!(revision));
+    snapshot.insert("latestTurnId".to_string(), latest_turn_id);
+    snapshot.insert("status".to_string(), json!("idle"));
+    if let Some(summary) = summary {
+        snapshot.insert("summary".to_string(), json!(summary));
+    }
+    snapshot.insert(
+        "capabilities".to_string(),
+        json!({
+            "send": true,
+            "interrupt": true,
+            "approvals": false,
+            "questions": false,
+            "fork": true,
+            "worktrees": false,
+            "diffs": true,
+            "childThreads": false,
+        }),
+    );
+    snapshot.insert("tokenUsage".to_string(), opencode_token_usage(info));
+    snapshot.insert("pendingApprovals".to_string(), json!([]));
+    snapshot.insert("pendingQuestions".to_string(), json!([]));
+    snapshot.insert("worktrees".to_string(), json!([]));
+    snapshot.insert("diffs".to_string(), json!([]));
+    snapshot.insert("childThreads".to_string(), json!([]));
+    snapshot.insert("turns".to_string(), json!(turns));
+    snapshot.insert("extensions".to_string(), json!({ "opencode": {} }));
+    Value::Object(snapshot)
 }
 
 /// The fresh-agent sub-router, pre-bound to its state.
@@ -581,5 +809,157 @@ mod tests {
     async fn shutdown_is_safe_when_no_serve_started() {
         // No manager was ever created → shutdown is a clean no-op (never panics).
         state().shutdown().await;
+    }
+
+    // ── GET /api/fresh-agent/threads/freshopencode/opencode/:threadId (Batch D PR-5) ──
+
+    use freshell_opencode::{
+        Endpoint, EventSource, EventStreamHandle, PortAllocator, ServeDeps, ServeHttp,
+        ServeHttpRequest, ServeHttpResponse,
+    };
+
+    /// Fakes `GET /session/:id` (session info) and `GET /session/:id/message` (the page)
+    /// with fixed, scripted bodies; anything else (health, etc.) is a benign `{}`.
+    struct FixedSessionHttp {
+        session_body: Value,
+        messages_body: Value,
+    }
+    impl ServeHttp for FixedSessionHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>>
+        {
+            let body = if req.url.contains("/message") {
+                serde_json::to_vec(&self.messages_body).unwrap()
+            } else if req.url.contains("/session/") {
+                serde_json::to_vec(&self.session_body).unwrap()
+            } else {
+                b"{}".to_vec()
+            };
+            Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) })
+        }
+    }
+
+    /// Answers the serve's own `/global/health` probe (so `ensure_started()` succeeds) but
+    /// 404s any `/session/:id` GET (unknown session).
+    struct NotFoundHttp;
+    impl ServeHttp for NotFoundHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                if req.url.contains("/global/health") {
+                    return Ok(ServeHttpResponse::new(200, b"{}".to_vec()));
+                }
+                Ok(ServeHttpResponse::new(404, b"not found".to_vec()))
+            })
+        }
+    }
+
+    struct FakeAllocator;
+    impl PortAllocator for FakeAllocator {
+        fn allocate(&self) -> Result<Endpoint, String> {
+            Ok(Endpoint { hostname: "127.0.0.1".into(), port: 1 })
+        }
+    }
+    struct NoopHandle;
+    impl EventStreamHandle for NoopHandle {}
+    struct NoopEventSource;
+    impl EventSource for NoopEventSource {
+        fn connect(&self, _url: String, _sink: freshell_opencode::serve::EventSink) -> Box<dyn EventStreamHandle> {
+            Box::new(NoopHandle)
+        }
+    }
+    struct NoopSpawner;
+    impl freshell_opencode::ProcessSpawner for NoopSpawner {
+        fn spawn(&self, _req: freshell_opencode::serve::SpawnRequest) -> Result<Box<dyn freshell_opencode::ServeProcess>, String> {
+            struct NoopProcess;
+            impl freshell_opencode::ServeProcess for NoopProcess {
+                fn exited(&self) -> Option<i32> {
+                    None
+                }
+                fn take_fatal_startup_error(&self) -> Option<String> {
+                    None
+                }
+                fn kill(&self) {}
+            }
+            Ok(Box::new(NoopProcess))
+        }
+    }
+
+    async fn state_with_fixed_session_http(session_body: Value, messages_body: Value) -> FreshAgentState {
+        let st = state();
+        let deps = ServeDeps {
+            spawner: Arc::new(NoopSpawner),
+            http: Arc::new(FixedSessionHttp { session_body, messages_body }),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager.ensure_started().await.expect("healthy fake serve starts");
+        st.set_manager_for_test(manager).await;
+        st
+    }
+
+    #[tokio::test]
+    async fn get_opencode_snapshot_returns_a_schema_shaped_snapshot_with_turn_text() {
+        let session_body = json!({
+            "id": "ses_1",
+            "title": "a session",
+            "time": { "created": 1_700_000_000_000i64, "updated": 1_700_000_005_000i64 },
+            "tokens": { "input": 10, "output": 20, "total": 30 },
+        });
+        let messages_body = json!([
+            { "info": { "id": "msg-1", "role": "user" }, "parts": [{ "type": "text", "text": "hi" }] },
+            { "info": { "id": "msg-2", "role": "assistant" }, "parts": [
+                { "type": "step-start" },
+                { "type": "text", "text": "hello from opencode" }
+            ] },
+        ]);
+        let st = state_with_fixed_session_http(session_body, messages_body).await;
+
+        let snapshot = st.get_opencode_snapshot("ses_1", None).await.expect("snapshot builds");
+
+        assert_eq!(snapshot["sessionType"], json!("freshopencode"));
+        assert_eq!(snapshot["provider"], json!("opencode"));
+        assert_eq!(snapshot["threadId"], json!("ses_1"));
+        assert_eq!(snapshot["sessionId"], json!("ses_1"));
+        assert_eq!(snapshot["revision"], json!(1_700_000_005_000i64));
+        assert_eq!(snapshot["status"], json!("idle"));
+        assert_eq!(snapshot["summary"], json!("a session"));
+        assert_eq!(snapshot["tokenUsage"]["inputTokens"], json!(10));
+        assert_eq!(snapshot["tokenUsage"]["outputTokens"], json!(20));
+        assert_eq!(snapshot["tokenUsage"]["totalTokens"], json!(30));
+        assert_eq!(snapshot["pendingApprovals"], json!([]));
+        assert_eq!(snapshot["extensions"]["opencode"], json!({}));
+
+        let turns = snapshot["turns"].as_array().expect("turns array");
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0]["role"], json!("user"));
+        assert_eq!(turns[0]["items"][0]["kind"], json!("text"));
+        assert_eq!(turns[0]["items"][0]["text"], json!("hi"));
+        assert_eq!(turns[1]["role"], json!("assistant"));
+        assert_eq!(turns[1]["summary"], json!("hello from opencode"));
+        assert_eq!(snapshot["latestTurnId"], turns[1]["turnId"]);
+    }
+
+    #[tokio::test]
+    async fn get_opencode_snapshot_of_unknown_session_is_not_found() {
+        let st = state();
+        let deps = ServeDeps {
+            spawner: Arc::new(NoopSpawner),
+            http: Arc::new(NotFoundHttp),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager.ensure_started().await.expect("healthy fake serve starts");
+        st.set_manager_for_test(manager).await;
+
+        let err = st.get_opencode_snapshot("does-not-exist", None).await.expect_err("unknown session");
+        assert!(matches!(err, OpencodeSnapshotError::NotFound));
     }
 }

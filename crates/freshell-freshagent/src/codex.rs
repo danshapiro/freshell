@@ -59,8 +59,8 @@ use freshell_codex::transport::{reap_owned_codex_sidecars, TungsteniteTransport}
 use freshell_codex::{
     mint_ownership_id, normalize_codex_thread_status, normalize_freshcodex_effort,
     normalize_freshcodex_model, to_codex_reasoning_effort, CodexAdapterEvent, CodexAppServerClient,
-    CodexNotification, CodexStatus, CodexSubscription, StartThreadParams, StartTurnParams,
-    CODEX_SIDECAR_OWNERSHIP_ENV,
+    CodexAppServerError, CodexNotification, CodexStatus, CodexSubscription, StartThreadParams,
+    StartTurnParams, CODEX_SIDECAR_OWNERSHIP_ENV,
 };
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCreate, FreshAgentCreated,
@@ -785,6 +785,194 @@ impl FreshCodexState {
             }
         })
     }
+
+    // ── GET /api/fresh-agent/threads/freshcodex/codex/:threadId (Batch D PR-5) ──
+
+    /// Build a `FreshAgentSnapshotSchema`-shaped JSON snapshot for a live codex thread
+    /// (`adapter.ts getSnapshot`, `adapter.ts:1082-1122` + `normalizeCodexThreadSnapshot`,
+    /// `normalize.ts:748-787`). Fetches the raw thread record via `thread/read`
+    /// (`includeTurns:true`), reading the "is a turn active" bit from THIS session's own
+    /// `active_turn` tracker (mirrors legacy's `activeTurnByThread`/`findActiveTurnId`) rather
+    /// than re-deriving it from the raw payload, since it is already the source of truth this
+    /// process trusts for `handle_interrupt`.
+    pub async fn get_snapshot(&self, thread_id: &str) -> Result<Value, CodexSnapshotError> {
+        let (client, active_turn_present) = {
+            let guard = self.sessions.lock().await;
+            let session = guard.get(thread_id).ok_or(CodexSnapshotError::NotFound)?;
+            let client = session.client.clone();
+            let active_turn_present = session.active_turn.lock().expect("active_turn mutex").is_some();
+            (client, active_turn_present)
+        };
+        let raw = client
+            .read_thread(thread_id, true)
+            .await
+            .map_err(CodexSnapshotError::AppServer)?;
+        Ok(build_codex_snapshot_json(thread_id, &raw, active_turn_present))
+    }
+
+    /// Test-only: register a session directly (bypassing the real sidecar spawn
+    /// `handle_create` requires), so [`crate::snapshot`]'s router-level tests can exercise
+    /// `get_snapshot` against a scripted [`freshell_codex::ChannelPeer`] without a real
+    /// `codex app-server` process. Owns a harmless real `sleep` child so the session's
+    /// exit-watcher has a real PID to watch (mirrors `codex::tests::insert_fake_session`).
+    #[cfg(test)]
+    pub(crate) async fn insert_session_for_test(
+        &self,
+        thread_id: &str,
+        client: Arc<CodexAppServerClient>,
+        active_turn: Option<String>,
+    ) {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30");
+        cmd.kill_on_drop(true);
+        let child = cmd.spawn().expect("spawn sleep fixture");
+
+        let consumer = tokio::spawn(async {});
+        let (kill_tx, kill_rx) = oneshot::channel();
+        let exited = Arc::new(AtomicBool::new(false));
+        let watcher = spawn_exit_watcher(
+            child,
+            format!("codex-sidecar-test-snapshot-router-{thread_id}"),
+            thread_id.to_string(),
+            self.broadcast_tx.clone(),
+            kill_rx,
+            exited.clone(),
+        );
+        self.sessions.lock().await.insert(
+            thread_id.to_string(),
+            CodexSession {
+                client,
+                model: "gpt-5.3-codex-spark".to_string(),
+                effort: None,
+                cwd: None,
+                sandbox: None,
+                permission_mode: None,
+                active_turn: Arc::new(StdMutex::new(active_turn)),
+                consumer,
+                kill_tx: Some(kill_tx),
+                watcher,
+                exited,
+            },
+        );
+    }
+}
+
+/// Why [`FreshCodexState::get_snapshot`] could not produce a snapshot.
+#[derive(Debug)]
+pub enum CodexSnapshotError {
+    /// No session is tracked under the given thread id (the REST-surface analogue of the
+    /// WS `FreshAgentLostSessionError` -- there is no crash-recovery path for a cold REST
+    /// GET, unlike `freshAgent.attach`, so an unknown/exited thread is reported honestly).
+    NotFound,
+    /// The live app-server client's `thread/read` call failed.
+    AppServer(CodexAppServerError),
+}
+
+impl std::fmt::Display for CodexSnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CodexSnapshotError::NotFound => write!(f, "codex thread not found"),
+            CodexSnapshotError::AppServer(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+/// `normalizeCodexThreadSnapshot` (`normalize.ts:748-787`): map a raw `thread/read` result
+/// into the `FreshAgentSnapshotSchema` shape. Turn transcript items are a MINIMAL, honest
+/// subset of the reference's rich display-turn normalization (`normalizeCodexDisplayTurns`) --
+/// only `agentMessage` items become `{kind:'text'}` transcript items today; reasoning/
+/// tool_use/tool_result/command items are not yet ported (see the task report). This still
+/// produces a schema-valid snapshot with real turn text, which is the CRITICAL gap this PR
+/// closes (the SPA previously 404'd and rendered no transcript at all).
+fn build_codex_snapshot_json(thread_id: &str, raw: &Value, active_turn_present: bool) -> Value {
+    let thread = raw.get("thread").cloned().unwrap_or_else(|| json!({}));
+    let status = normalize_codex_thread_status(thread.get("status").unwrap_or(&Value::Null));
+    // `isRunning` (`normalize.ts:756`): the reference also treats a `compacting` status as
+    // running, which this client's [`CodexStatus`] does not model; folding in the
+    // independently-tracked in-flight-turn bit keeps `send`/`interrupt`/`fork` correct even
+    // though the enum itself has no `Compacting` variant.
+    let is_running = status == CodexStatus::Running || active_turn_present;
+    let revision = thread.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
+    let summary = thread
+        .get("preview")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let raw_turns = thread.get("turns").and_then(Value::as_array).cloned().unwrap_or_default();
+    let turns: Vec<Value> = raw_turns
+        .iter()
+        .enumerate()
+        .map(|(ordinal, raw_turn)| build_codex_turn_json(raw_turn, ordinal))
+        .collect();
+
+    json!({
+        "sessionType": SESSION_TYPE,
+        "provider": PROVIDER,
+        "threadId": thread_id,
+        "revision": revision,
+        "status": status.as_str(),
+        "summary": summary,
+        "capabilities": {
+            "send": !is_running,
+            "interrupt": is_running,
+            "approvals": false,
+            "questions": false,
+            "fork": !is_running,
+            "worktrees": false,
+            "diffs": false,
+            "childThreads": false,
+        },
+        "tokenUsage": {
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "cachedTokens": 0,
+            "totalTokens": 0,
+        },
+        "pendingApprovals": [],
+        "pendingQuestions": [],
+        "worktrees": [],
+        "diffs": [],
+        "childThreads": [],
+        "turns": turns,
+        "extensions": { "codex": {} },
+    })
+}
+
+/// A MINIMAL `FreshAgentTurnSchema`-shaped turn from one raw codex `turn` record
+/// (`makeThread`/real app-server shape: `{id, status, items:[{type,id,text,\u2026}], \u2026}`). Only
+/// `agentMessage` items become visible `{kind:'text'}` transcript items; every other item
+/// `type` (command, reasoning, tool calls, etc.) is DROPPED today rather than mis-rendered --
+/// an honest, schema-valid subset rather than a silently-wrong one. See the task report for
+/// the follow-up to port the full `normalizeCodexDisplayTurns` item mapping.
+fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Value {
+    let turn_id = raw_turn.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+    let items_raw = raw_turn.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut items = Vec::new();
+    let mut summary_parts: Vec<String> = Vec::new();
+    for (index, item) in items_raw.iter().enumerate() {
+        if item.get("type").and_then(Value::as_str) != Some("agentMessage") {
+            continue;
+        }
+        let Some(text) = item.get("text").and_then(Value::as_str).filter(|t| !t.is_empty()) else {
+            continue;
+        };
+        let item_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{turn_id}:item-{index}"));
+        items.push(json!({ "id": item_id, "kind": "text", "text": text }));
+        summary_parts.push(text.to_string());
+    }
+
+    json!({
+        "id": turn_id,
+        "turnId": turn_id,
+        "ordinal": ordinal,
+        "source": "durable",
+        "summary": summary_parts.join("\n\n"),
+        "items": items,
+    })
 }
 
 /// Watch an owned sidecar child to completion. Two ways out:
@@ -1837,5 +2025,135 @@ mod tests {
                 || outcome["event"]["type"] == "freshAgent.session.snapshot",
             "unexpected first frame: {outcome}"
         );
+    }
+
+    // -- GET /api/fresh-agent/threads/freshcodex/codex/:threadId (Batch D PR-5) --
+
+    #[tokio::test]
+    async fn get_snapshot_of_unknown_thread_is_not_found() {
+        let (st, _rx) = state_with_bus();
+
+        let err = st.get_snapshot("does-not-exist").await.expect_err("unknown thread");
+        assert!(matches!(err, CodexSnapshotError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn get_snapshot_returns_a_schema_shaped_snapshot_with_turn_text() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, _rx) = state_with_bus();
+        insert_fake_session(
+            &st,
+            "thread-1",
+            client,
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-snapshot",
+        )
+        .await;
+
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move { st.get_snapshot("thread-1").await })
+        };
+
+        // `read_thread` gates on the initialize handshake first (this fresh client never
+        // initialized), matching every other RPC this module drives.
+        let (init_id, init_method, _p) = peer.expect_request().await;
+        assert_eq!(init_method, "initialize");
+        peer.respond(
+            &init_id,
+            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+        );
+        let _ = peer.expect_notification().await;
+
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        assert_eq!(params["threadId"], json!("thread-1"));
+        assert_eq!(params["includeTurns"], json!(true));
+        peer.respond(
+            &id,
+            json!({
+                "thread": {
+                    "id": "thread-1",
+                    "preview": "Fixture turn",
+                    "updatedAt": 1770000007,
+                    "status": { "type": "idle" },
+                    "turns": [{
+                        "id": "turn-1",
+                        "status": "completed",
+                        "items": [{
+                            "type": "agentMessage",
+                            "id": "turn-1:item-0",
+                            "text": "hello from codex",
+                        }],
+                    }],
+                }
+            }),
+        );
+
+        let snapshot = driver.await.unwrap().expect("snapshot builds");
+
+        // Required top-level `FreshAgentSnapshotSchema` fields (camelCase, verbatim).
+        assert_eq!(snapshot["sessionType"], json!("freshcodex"));
+        assert_eq!(snapshot["provider"], json!("codex"));
+        assert_eq!(snapshot["threadId"], json!("thread-1"));
+        assert_eq!(snapshot["revision"], json!(1770000007));
+        assert_eq!(snapshot["status"], json!("idle"));
+        assert_eq!(snapshot["capabilities"]["send"], json!(true));
+        assert_eq!(snapshot["capabilities"]["interrupt"], json!(false));
+        assert_eq!(snapshot["tokenUsage"]["inputTokens"], json!(0));
+        assert_eq!(snapshot["pendingApprovals"], json!([]));
+        assert_eq!(snapshot["extensions"]["codex"], json!({}));
+
+        // The turn's transcript text survived the mapping.
+        let turns = snapshot["turns"].as_array().expect("turns array");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0]["id"], json!("turn-1"));
+        assert_eq!(turns[0]["turnId"], json!("turn-1"));
+        assert_eq!(turns[0]["summary"], json!("hello from codex"));
+        assert_eq!(turns[0]["items"][0]["kind"], json!("text"));
+        assert_eq!(turns[0]["items"][0]["text"], json!("hello from codex"));
+    }
+
+    #[tokio::test]
+    async fn get_snapshot_reports_running_capabilities_when_a_turn_is_tracked_active() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, _rx) = state_with_bus();
+        insert_fake_session(
+            &st,
+            "thread-1",
+            client,
+            Arc::new(StdMutex::new(Some("turn-1".to_string()))),
+            spawn_sleeper(),
+            "codex-sidecar-test-snapshot-running",
+        )
+        .await;
+
+        let driver = { let st = st.clone(); tokio::spawn(async move { st.get_snapshot("thread-1").await }) };
+
+        let (init_id, _m, _p) = peer.expect_request().await;
+        peer.respond(
+            &init_id,
+            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+        );
+        let _ = peer.expect_notification().await;
+
+        let (id, _method, _params) = peer.expect_request().await;
+        peer.respond(
+            &id,
+            json!({ "thread": { "id": "thread-1", "status": { "type": "active" }, "turns": [] } }),
+        );
+
+        let snapshot = driver.await.unwrap().expect("snapshot builds");
+        assert_eq!(snapshot["status"], json!("running"));
+        assert_eq!(snapshot["capabilities"]["send"], json!(false));
+        assert_eq!(snapshot["capabilities"]["interrupt"], json!(true));
+        assert_eq!(snapshot["turns"], json!([]));
     }
 }

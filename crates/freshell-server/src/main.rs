@@ -334,9 +334,20 @@ async fn main() -> ExitCode {
     // (or 401, matching the original's auth-first middleware ordering \u2014 R12)
     // for any unmatched `/api/*` (never the HTML shell), mirroring the original ordering.
     let fallback_auth_token = Arc::clone(&auth_token);
+    // The fresh-agent thread-snapshot REST endpoint (Batch D PR-5): `GET
+    // /api/fresh-agent/threads/:sessionType/:provider/:threadId`, the SPA's
+    // `commitSnapshot` read path (`src/lib/api.ts:312` `getFreshAgentThreadSnapshot`).
+    // Shares the already-constructed codex/opencode slices -- no new session state.
+    let snapshot_state = freshell_freshagent::SnapshotState::new(
+        Arc::clone(&auth_token),
+        fresh_codex_state.clone(),
+        fresh_agent_state.clone(),
+    );
+
     let app = freshell_api::router(api_state)
         .merge(freshell_ws::router(ws_state))
         .merge(freshell_freshagent::router(fresh_agent_state.clone()))
+        .merge(freshell_freshagent::snapshot::router(snapshot_state))
         // R1/R2/R3/R4: the ONE `/api/settings` router (GET+PATCH+PUT), backed by
         // the live `settings_store` \u2014 replaces the old split between this boot
         // module's frozen GET and the freshcodex slice's disconnected PATCH.
