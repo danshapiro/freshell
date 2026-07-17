@@ -60,7 +60,8 @@ use freshell_platform::{
 };
 use freshell_protocol::{
     ClientMessage, ErrorCode, ErrorMsg, ServerMessage, Shell, TerminalAttach, TerminalCreate,
-    TerminalCreated, TerminalIdOnly, TerminalKill, TerminalResize,
+    TerminalCreated, TerminalIdOnly, TerminalKill, TerminalMetaRecord, TerminalMetaUpdated,
+    TerminalResize,
 };
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
@@ -754,6 +755,10 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         resume_session_id.clone(),
     );
 
+    // Snapshot the id before it's moved into `created` below -- needed for the
+    // `terminal.meta.updated` create-time slice after the create frame is sent.
+    let terminal_id_for_meta = terminal_id.clone();
+
     let created = ServerMessage::TerminalCreated(TerminalCreated {
         created_at: now_ms(),
         request_id: create.request_id,
@@ -770,7 +775,95 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
     // exists this is unconditional. Live-pinned frame order (exit-orig.json):
     // `terminal.created` then `terminals.changed`.
     broadcast_terminals_changed(state);
+    // DEV-0008 (`port/oracle/DEVIATIONS.md`) create-time slice: when this create
+    // established a session identity, push `terminal.meta.updated` so the SPA's
+    // pane header (`formatPaneRuntimeLabel`, `PaneContainer.tsx`) has cwd/provider/
+    // sessionId to key off of instead of showing nothing. See
+    // `terminal_meta_record_for_create` for exactly what's (and isn't) ported.
+    if let Some(record) = terminal_meta_record_for_create(
+        &terminal_id_for_meta,
+        &mode,
+        resume_session_id.as_deref(),
+        spec.cwd.as_deref(),
+        now_ms(),
+    ) {
+        broadcast_terminal_meta_created(state, record);
+    }
     sent
+}
+
+/// Build the create-time `TerminalMetaRecord` for the port-side closure of
+/// DEV-0008 (`terminal.meta.updated` push subsystem, `port/oracle/DEVIATIONS.md`).
+///
+/// The original's `TerminalMetadataService.seedFromTerminal`
+/// (`terminal-metadata-service.ts:138-146`) runs off the registry's
+/// `'terminal.created'` event (`server/index.ts:516-524`) for every terminal,
+/// deriving `provider`/`sessionId` from `record.resumeSessionId` when the mode
+/// supports resume (`isTerminalProvider`, `terminal-metadata-service.ts:39-41`) --
+/// which is set for a fresh server-preallocated id (e.g. claude) just as much as
+/// for a genuine resume (`terminal-registry.ts:176-195` `TerminalSessionRefSource`;
+/// this fn's `resume_session_id` is the same value, `terminal.rs:507-536`).
+///
+/// Ported here: `terminalId`, `cwd`, `provider`, `sessionId`, `updatedAt` -- the
+/// fields known at create time with zero extra I/O. NOT ported (deferred,
+/// tracked under DEV-0008 as association-time follow-up, `do not build
+/// output-scanning now`):
+/// - git enrichment (`checkoutRoot`/`repoRoot`/`branch`/`isDirty`/`displaySubdir`,
+///   `enrichFromCwd`, `terminal-metadata-service.ts:260-286`) -- requires git
+///   process calls not wired into this crate. The client's
+///   `formatPaneRuntimeLabel` (`format-terminal-title-meta.ts:26`) already falls
+///   back to `safeBasename(meta.cwd)` when `displaySubdir`/`checkoutRoot` are
+///   absent, so sending bare `cwd` is a legacy-compatible degraded label, not a
+///   wire-shape violation.
+/// - session-association enrichment after start (indexer/codex-durability/
+///   opencode-controller sources, `session-association-broadcast.ts`) -- requires
+///   output/event scanning wiring this slice deliberately excludes.
+///
+/// Returns `None` for shell terminals (no provider, matching the original: a
+/// shell's seeded record never carries `provider`/`sessionId`, and this slice
+/// only concerns itself with the resume-identity fields) and for non-shell
+/// creates with no session identity yet at create time (e.g. a fresh `codex`
+/// create with an empty `resumeSessionId` -- identity arrives later via
+/// `terminal.session.bound`, which is the deferred association-time slice).
+fn terminal_meta_record_for_create(
+    terminal_id: &str,
+    mode: &str,
+    resume_session_id: Option<&str>,
+    cwd: Option<&str>,
+    updated_at: i64,
+) -> Option<TerminalMetaRecord> {
+    if mode == "shell" {
+        return None;
+    }
+    let session_id = resume_session_id?;
+    Some(TerminalMetaRecord {
+        terminal_id: terminal_id.to_string(),
+        updated_at,
+        branch: None,
+        checkout_root: None,
+        cwd: cwd.map(str::to_string),
+        display_subdir: None,
+        is_dirty: None,
+        provider: Some(mode.to_string()),
+        repo_root: None,
+        session_id: Some(session_id.to_string()),
+        token_usage: None,
+    })
+}
+
+/// `wsHandler.broadcastTerminalMetaUpdated({upsert, remove: []})`
+/// (`ws-handler.ts:3682-3695`): fan `{type:'terminal.meta.updated', upsert:[record],
+/// remove:[]}` to EVERY connection. Matches the original's plain `this.broadcast(...)`
+/// (`ws-handler.ts:3694`) -- unlike `terminals.changed`, this is NOT
+/// `broadcastAuthenticated`.
+fn broadcast_terminal_meta_created(state: &WsState, record: TerminalMetaRecord) {
+    let msg = ServerMessage::TerminalMetaUpdated(TerminalMetaUpdated {
+        remove: Vec::new(),
+        upsert: vec![record],
+    });
+    if let Ok(frame) = serde_json::to_string(&msg) {
+        let _ = state.broadcast_tx.send(frame);
+    }
 }
 
 /// `wsHandler.broadcastTerminalsChanged()` (`ws-handler.ts:3670-3679`) from the WS
@@ -1320,6 +1413,21 @@ mod cli_create_helper_tests {
         );
     }
 
+    /// DEFECT 5: "clicking a codex session can yield a BLANK pane" is a resume
+    /// (`resumed=true`) create, not a fresh one -- the sub-case the original
+    /// enoent-variants test above didn't cover for a coding-CLI label (only
+    /// covered `resumed=true` for the generic `Shell` label). Confirms the
+    /// resume path gets the same actionable ENOENT message (with the
+    /// "restore" wording and the env-var hint) as a fresh Codex CLI create.
+    #[test]
+    fn wrap_terminal_spawn_error_covers_resumed_codex_enoent() {
+        let enoent = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            wrap_terminal_spawn_error(&enoent, "Codex CLI", "codex", Some("CODEX_CMD"), true),
+            "Could not restore Codex CLI: \"codex\" could not be started because the executable or working directory was not found on the server. Reinstall it or set CODEX_CMD to the correct executable."
+        );
+    }
+
     #[test]
     fn mode_label_shell_and_fallback() {
         assert_eq!(mode_label("shell", None), "Shell");
@@ -1434,5 +1542,175 @@ mod terminals_changed_tests {
             rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
+    }
+}
+
+/// DEV-0008 create-time slice (`port/oracle/DEVIATIONS.md`): `terminal.meta.updated`
+/// pushed on `terminal.create` when a session identity is established at create
+/// time. Tests exercise the pure `terminal_meta_record_for_create` builder and the
+/// `broadcast_terminal_meta_created` wire-shape directly, without spawning a PTY.
+#[cfg(test)]
+mod terminal_meta_created_tests {
+    use super::*;
+
+    /// Plain shells never carry a provider/session identity — the original's
+    /// seeded record for a shell terminal has `provider`/`sessionId` undefined
+    /// (`terminal-metadata-service.ts:39-41` `isTerminalProvider`), and this slice
+    /// only concerns the resume-identity fields, so a shell create emits nothing.
+    #[test]
+    fn shell_mode_emits_no_record_even_with_a_session_id() {
+        assert!(terminal_meta_record_for_create(
+            "term-1",
+            "shell",
+            Some("some-id"),
+            Some("/home/dan/project"),
+            1_000,
+        )
+        .is_none());
+    }
+
+    /// A non-shell create with no session identity yet (e.g. a fresh `codex`
+    /// create with an empty `resumeSessionId`, `terminal.rs:524-527`) has nothing
+    /// to seed at create time — identity arrives later via
+    /// `terminal.session.bound` (deferred association-time slice).
+    #[test]
+    fn non_shell_mode_with_no_session_id_emits_no_record() {
+        assert!(terminal_meta_record_for_create(
+            "term-1",
+            "codex",
+            None,
+            Some("/home/dan/project"),
+            1_000,
+        )
+        .is_none());
+    }
+
+    /// A resume (or server-preallocated fresh id) create carries `cwd`,
+    /// `provider`, `sessionId`, `terminalId`, `updatedAt` — exactly the fields
+    /// `seedFromTerminal` derives with zero extra I/O
+    /// (`terminal-metadata-service.ts:138-146`). Git-enrichment fields stay
+    /// `None` (deferred; see the function doc comment).
+    #[test]
+    fn resume_create_builds_the_expected_record() {
+        let record = terminal_meta_record_for_create(
+            "term-1",
+            "claude",
+            Some("session-abc"),
+            Some("/home/dan/project"),
+            1_000,
+        )
+        .expect("resume create should build a record");
+
+        assert_eq!(record.terminal_id, "term-1");
+        assert_eq!(record.updated_at, 1_000);
+        assert_eq!(record.cwd.as_deref(), Some("/home/dan/project"));
+        assert_eq!(record.provider.as_deref(), Some("claude"));
+        assert_eq!(record.session_id.as_deref(), Some("session-abc"));
+        assert_eq!(record.branch, None);
+        assert_eq!(record.checkout_root, None);
+        assert_eq!(record.display_subdir, None);
+        assert_eq!(record.is_dirty, None);
+        assert_eq!(record.repo_root, None);
+        assert_eq!(record.token_usage, None);
+    }
+
+    /// A create with no `cwd` at all (never happens for a real spawn, but the
+    /// builder shouldn't panic) still emits a record — `cwd` is optional on the
+    /// wire (`TerminalMetaRecord.cwd`, `#[serde(skip_serializing_if =
+    /// "Option::is_none")]`).
+    #[test]
+    fn resume_create_without_cwd_still_builds_a_record() {
+        let record =
+            terminal_meta_record_for_create("term-1", "claude", Some("session-abc"), None, 1_000)
+                .expect("resume create should build a record even without cwd");
+        assert_eq!(record.cwd, None);
+    }
+
+    fn state_with_bus() -> (WsState, tokio::sync::broadcast::Receiver<String>) {
+        let auth_token = std::sync::Arc::new("s3cr3t-token-abcdef".to_string());
+        let broadcast_tx = std::sync::Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
+        let rx = broadcast_tx.subscribe();
+        let state = WsState {
+            auth_token: std::sync::Arc::clone(&auth_token),
+            server_instance_id: std::sync::Arc::new("srv-1111".to_string()),
+            boot_id: std::sync::Arc::new("boot-2222".to_string()),
+            settings: std::sync::Arc::new(
+                serde_json::from_value(serde_json::json!({
+                    "ai": {},
+                    "codingCli": { "enabledProviders": [], "mcpServer": true, "providers": {} },
+                    "editor": { "externalEditor": "auto" },
+                    "extensions": { "disabled": [] },
+                    "freshAgent": { "defaultPlugins": [], "enabled": false, "providers": {} },
+                    "logging": { "debug": false },
+                    "network": { "configured": true, "host": "127.0.0.1" },
+                    "panes": { "defaultNewPane": "ask" },
+                    "safety": { "autoKillIdleMinutes": 15 },
+                    "sidebar": {
+                        "autoGenerateTitles": true,
+                        "excludeFirstChatMustStart": false,
+                        "excludeFirstChatSubstrings": []
+                    },
+                    "terminal": { "scrollback": 10000 }
+                }))
+                .unwrap(),
+            ),
+            broadcast_tx: std::sync::Arc::clone(&broadcast_tx),
+            fresh_codex: freshell_freshagent::FreshCodexState::new(
+                std::sync::Arc::clone(&auth_token),
+                std::sync::Arc::clone(&broadcast_tx),
+                serde_json::json!({ "freshAgent": { "enabled": false } }),
+            ),
+            fresh_claude: freshell_freshagent::FreshClaudeState::new(std::sync::Arc::clone(
+                &broadcast_tx,
+            )),
+            fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+                freshell_freshagent::FreshAgentState::new(
+                    auth_token,
+                    std::sync::Arc::clone(&broadcast_tx),
+                ),
+            ),
+            registry: freshell_terminal::TerminalRegistry::new(),
+            shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
+            tabs: crate::tabs::TabsRegistry::new(),
+            screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
+            terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            cli_commands: std::sync::Arc::new(Vec::new()),
+        };
+        (state, rx)
+    }
+
+    /// `wsHandler.broadcastTerminalMetaUpdated({upsert, remove: []})`
+    /// (`ws-handler.ts:3682-3695`) wire shape: `{type, upsert:[record], remove:[]}`,
+    /// broadcast to every connection (not gated on auth — matches the original's
+    /// plain `this.broadcast(...)`, `ws-handler.ts:3694`).
+    #[test]
+    fn broadcast_emits_legacy_wire_shape() {
+        let (state, mut rx) = state_with_bus();
+        let record = terminal_meta_record_for_create(
+            "term-1",
+            "claude",
+            Some("session-abc"),
+            Some("/home/dan/project"),
+            1_000,
+        )
+        .unwrap();
+
+        broadcast_terminal_meta_created(&state, record);
+
+        let frame: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            frame,
+            serde_json::json!({
+                "type": "terminal.meta.updated",
+                "remove": [],
+                "upsert": [{
+                    "terminalId": "term-1",
+                    "updatedAt": 1_000,
+                    "cwd": "/home/dan/project",
+                    "provider": "claude",
+                    "sessionId": "session-abc",
+                }],
+            })
+        );
     }
 }

@@ -146,6 +146,12 @@ struct TerminalShared {
     /// Highest `seqEnd` produced (drives `attach.ready.headSeq`).
     head_seq: i64,
     status: TerminalRunStatus,
+    /// The exit code from the last `terminal.exit` fan-out (kill or natural exit).
+    /// `None` while `status == Running`. Kept so a client that attaches AFTER the
+    /// terminal already exited (the create-then-instant-exit race) can still be
+    /// told the process is dead instead of silently seeing nothing (DEFECT 5b /
+    /// "blank pane" -- see `attach`'s already-exited synthetic-exit branch).
+    exit_code: Option<i64>,
     created_at: i64,
     last_activity_at: i64,
     /// Current PTY geometry + epoch (`§5.3`): epoch starts 1, +1 only on real change.
@@ -302,6 +308,7 @@ impl TerminalRegistry {
             scanner: BarrierScanner::new(),
             head_seq: 0,
             status: TerminalRunStatus::Running,
+            exit_code: None,
             created_at: now,
             last_activity_at: now,
             cols: spec.cols,
@@ -434,6 +441,25 @@ impl TerminalRegistry {
             }
         }
 
+        // DEFECT 5b ("blank pane" on an instant-exit CLI failure): a terminal
+        // that already exited before this attach (the create-then-instant-exit
+        // race -- e.g. a resumed coding-CLI session whose process dies within
+        // milliseconds) fanned its `terminal.exit` out to zero subscribers
+        // (finish_pty_exit/kill run with nobody attached yet). Without this,
+        // the newly-attached client gets replayed output (if any) and then
+        // silence forever: no error, no exited state, no live output -- a
+        // permanently blank/frozen pane. Synthesize the exit here so a client
+        // attaching to an already-dead terminal is told, exactly once, just
+        // like a client that was already attached when the process died.
+        if s.status == TerminalRunStatus::Exited {
+            let exit = ServerMessage::TerminalExit(TerminalExit {
+                exit_code: s.exit_code.unwrap_or(0),
+                terminal_id: terminal_id.to_string(),
+            });
+            sink(exit);
+            s.subscribers.remove(&conn_id);
+        }
+
         AttachOutcome { found: true }
     }
 
@@ -534,6 +560,7 @@ impl TerminalRegistry {
         {
             let mut s = handle.shared.lock().expect("terminal lock");
             s.status = TerminalRunStatus::Exited;
+            s.exit_code = Some(0);
             let exit = ServerMessage::TerminalExit(TerminalExit {
                 exit_code: 0,
                 terminal_id: terminal_id.to_string(),
@@ -578,6 +605,7 @@ impl TerminalRegistry {
             return false;
         }
         s.status = TerminalRunStatus::Exited;
+        s.exit_code = Some(exit_code);
         s.last_activity_at = now_ms();
         let exit = ServerMessage::TerminalExit(TerminalExit {
             exit_code,
@@ -851,6 +879,7 @@ mod tests {
                 scanner: BarrierScanner::new(),
                 head_seq: 0,
                 status: TerminalRunStatus::Running,
+                exit_code: None,
                 created_at: now,
                 last_activity_at: now,
                 cols: 120,
@@ -1299,5 +1328,32 @@ mod tests {
         reg.feed("T2", frame(1, "y\r\n", "S2"));
         assert!(outputs(&seen1).is_empty());
         assert!(outputs(&seen2).is_empty());
+    }
+    /// Reproduces DEFECT 5b: a terminal that exits (e.g. an instant-exit CLI
+    /// failure) BEFORE any client attaches never gets its `terminal.exit`
+    /// delivered (finish_pty_exit fanned out to zero subscribers). A client
+    /// that attaches afterward currently gets replayed output only -- no
+    /// signal the process is dead -- which renders as a permanently blank/
+    /// frozen pane. Legacy-parity fix: attach() must synthesize `terminal.exit`
+    /// for a terminal that is already `Exited` by the time of attach.
+    #[test]
+    fn attach_to_already_exited_terminal_delivers_synthetic_exit() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        // Simulate the race: the PTY exits with a nonzero code before any
+        // client ever attaches (finish_pty_exit fans out to zero subscribers).
+        assert!(reg.finish_pty_exit("T", 7));
+
+        let (sink, seen) = collector();
+        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false);
+        assert!(outcome.found);
+
+        let exit = seen.lock().unwrap().iter().find_map(|m| match m {
+            ServerMessage::TerminalExit(e) => Some(e.clone()),
+            _ => None,
+        });
+        let exit = exit.expect("attach to an already-exited terminal must deliver terminal.exit");
+        assert_eq!(exit.exit_code, 7);
+        assert_eq!(exit.terminal_id, "T");
     }
 }
