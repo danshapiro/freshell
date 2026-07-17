@@ -17,10 +17,15 @@
 //! | `freshAgent.kill` | remove the session (both its placeholder and durable keys), abort any in-flight turn task, broadcast `freshAgent.killed` — the SHARED `opencode serve` sidecar is NEVER touched (`adapter.ts kill()` has no `serveManager.shutdown()` call) |
 //! | `freshAgent.interrupt` | best-effort: abort the in-flight turn task + issue `serveManager.abort()` against the real session (`adapter.ts interrupt()` / `abortForState`) |
 //!
-//! **Deferred to PR-3:** bridging the serve SSE stream into `freshAgent.event` frames
-//! (status snapshots + the status-guarded `freshAgent.turn.complete` chime). The turn
-//! this module runs on `freshAgent.send` DOES land in the real opencode session (via
-//! [`freshell_opencode::OpencodeServeManager::run_turn`]) — the pane's live-updating
+//! PR-3 bridges the serve SSE stream into `freshAgent.event` frames (status snapshots +
+//! the status-guarded `freshAgent.turn.complete` chime). PR-4 adds `freshAgent.attach`
+//! (reload-rehydrate): a known session re-emits a status snapshot and restarts its
+//! serve-SSE bridge if it died; an unknown session emits the `INVALID_SESSION_ID` shape
+//! the client folds into `markSessionLost` instead of hanging. **Out of scope entirely
+//! for this slice:** `freshAgent.fork` / `freshAgent.compact`.
+//!
+//! The turn this module runs on `freshAgent.send` DOES land in the real opencode session
+//! (via [`freshell_opencode::OpencodeServeManager::run_turn`]) — the pane's live-updating
 //! transcript just isn't wired to the WS bus yet, so nothing streams to the browser
 //! until that turn resolves and a later `freshAgent.attach`/REST read observes it.
 //! **Deferred to PR-4:** `freshAgent.attach`. **Out of scope entirely for this slice:**
@@ -64,8 +69,8 @@ use freshell_opencode::{
     SdkProviderEvent, SessionSignal, SnapshotStatus,
 };
 use freshell_protocol::{
-    ErrorCode, ErrorMsg, FreshAgentCreate, FreshAgentCreated, FreshAgentEvent, FreshAgentInterrupt,
-    FreshAgentKill, FreshAgentKilled, FreshAgentSend, FreshAgentSendAccepted,
+    ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCreate, FreshAgentCreated, FreshAgentEvent,
+    FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentSend, FreshAgentSendAccepted,
     FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
 };
 
@@ -441,6 +446,56 @@ impl FreshOpencodeState {
         }
     }
 
+    // ── freshAgent.attach (reload-rehydrate, PR-4) ──────────────────────────
+
+    /// Handle a `freshAgent.attach` for opencode: emit a session snapshot carrying the
+    /// current status (running/idle from turn-task liveness), and restart the serve-SSE
+    /// bridge if it died (e.g. the shared `opencode serve` sidecar was restarted). An
+    /// unknown session id emits the `INVALID_SESSION_ID` shape the client folds into
+    /// `markSessionLost` (`fresh-agent-ws.ts:326-328`) instead of hanging.
+    pub async fn handle_attach(&self, msg: FreshAgentAttach) {
+        let session_arc = {
+            let guard = self.sessions.lock().await;
+            guard.get(&msg.session_id).cloned()
+        };
+        let Some(session_arc) = session_arc else {
+            self.broadcast(&lost_session_frame(&msg.session_id));
+            return;
+        };
+
+        let (status_session_id, running) = {
+            let mut session = session_arc.lock().await;
+
+            // Ensure the serve-SSE bridge is running (restart it if it died) -- only
+            // meaningful once a durable session exists; a not-yet-materialized session has
+            // never started a bridge (`bindServeStream` only fires from `materializeOrSend`).
+            if let Some(real_id) = session.real_session_id.clone() {
+                let bridge_dead = session
+                    .serve_bridge
+                    .as_ref()
+                    .map(tokio::task::JoinHandle::is_finished)
+                    .unwrap_or(true);
+                if bridge_dead {
+                    let manager = self.fresh_agent.ensure_manager().await;
+                    session.serve_bridge = Some(self.spawn_serve_bridge(
+                        manager,
+                        real_id,
+                        session.turn_errored.clone(),
+                    ));
+                }
+            }
+
+            let status_session_id =
+                session.real_session_id.clone().unwrap_or_else(|| session.placeholder_id.clone());
+            let running =
+                session.turn_task.as_ref().map(|t| !t.is_finished()).unwrap_or(false);
+            (status_session_id, running)
+        };
+
+        let status = if running { "running" } else { "idle" };
+        self.broadcast(&event_frame(&status_session_id, snapshot_event(&status_session_id, status)));
+    }
+
     // ── PR-3: the persistent serve-SSE bridge (adapter.ts `bindServeStream`) ─
 
     /// Bridge the serve SSE stream for `real_id` into `freshAgent.session.snapshot` /
@@ -566,6 +621,22 @@ fn error_event(session_id: &str, message: &str) -> Value {
 /// positive-completion chime, adapter.ts:377-381).
 fn turn_complete_event(session_id: &str, at: i64) -> Value {
     json!({ "type": "freshAgent.turn.complete", "sessionId": session_id, "at": at })
+}
+
+/// The `freshAgent.error{code:'INVALID_SESSION_ID'}` shape (`sdk-events.ts:37`) the client
+/// folds into `markSessionLost` (`fresh-agent-ws.ts:326-328`) instead of hanging on a stale
+/// `freshAgent.attach` for a session this server has never heard of. Duplicated from
+/// `codex.rs`'s identical private helper, same rationale as `now_iso`/`now_ms` above.
+fn lost_session_frame(session_id: &str) -> ServerMessage {
+    event_frame(
+        session_id,
+        json!({
+            "type": "freshAgent.error",
+            "sessionId": session_id,
+            "code": "INVALID_SESSION_ID",
+            "message": format!("opencode session {session_id} not found"),
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -813,6 +884,89 @@ mod tests {
         };
 
         assert_eq!(first_real_id, second_real_id, "second send must reuse the durable session id");
+    }
+
+    fn attach_msg(session_id: &str) -> FreshAgentAttach {
+        FreshAgentAttach {
+            provider: AgentProvider::Opencode,
+            session_id: session_id.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+            resume_session_id: None,
+            session_ref: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_unknown_session_emits_lost_session_error() {
+        let (st, mut rx) = {
+            let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+            let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+            (FreshOpencodeState::new(fresh_agent), rx)
+        };
+
+        st.handle_attach(attach_msg("does-not-exist")).await;
+
+        let frame: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "freshAgent.event");
+        assert_eq!(frame["sessionId"], "does-not-exist");
+        assert_eq!(frame["event"]["type"], "freshAgent.error");
+        assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
+    }
+
+    #[tokio::test]
+    async fn attach_known_materialized_session_emits_idle_snapshot() {
+        // `state_with_status_poll_and_receiver(1)` (the same fixture the working
+        // busy->idle->complete test above uses) resolves the turn genuinely and quickly --
+        // unlike the plain `FakeHttp`-backed `started_manager()`, whose status endpoint
+        // never reports idle and would hang `run_turn` until the real 600s turn timeout.
+        let (st, mut rx) = state_with_status_poll_and_receiver(1).await;
+
+        st.handle_create(create_msg("req-attach")).await;
+        let placeholder = "freshopencode-req-attach";
+        st.handle_send(send_msg(placeholder, "hello")).await;
+        let real_id = {
+            let guard = st.sessions.lock().await;
+            let session_arc = guard.get(placeholder).cloned().expect("session exists");
+            let s = session_arc.lock().await;
+            s.real_session_id.clone().expect("materialized after send")
+        };
+
+        // Wait for the detached turn task to actually finish before attaching, so the
+        // status this test asserts on isn't racing the turn's own completion.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let done = {
+                    let guard = st.sessions.lock().await;
+                    let session_arc = guard.get(&real_id).cloned().expect("session exists");
+                    let s = session_arc.lock().await;
+                    s.turn_task.as_ref().map(|t| t.is_finished()).unwrap_or(true)
+                };
+                if done {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the turn task finishes within the budget");
+
+        st.handle_attach(attach_msg(&real_id)).await;
+
+        // Drain frames until the snapshot this attach call broadcasts (turn.complete /
+        // status frames from the send above may already have landed on the bus first).
+        let snapshot: serde_json::Value = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let raw = rx.recv().await.expect("bus stays open");
+                let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                if frame["event"]["type"] == "freshAgent.session.snapshot" && frame["sessionId"] == real_id {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no snapshot frame observed for {real_id}"));
+        assert_eq!(snapshot["event"]["status"], "idle");
     }
 
     #[tokio::test]
