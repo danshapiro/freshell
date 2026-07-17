@@ -96,6 +96,37 @@ npx playwright test --config test/e2e-browser/playwright.config.ts --project=leg
 Expected: all green except the annotated settings-persistence expected-fail (rust), the known
 multi-client flake (both kinds), restore scenario-3 fixme skips.
 
+## Self-hosting readiness plan (checklist triage, 2026-07-17)
+
+Full 233-item triage for long-term self-hosting (SRE lens; desktop/installer items excluded):
+**3 blockers, ~54 soon-after, ~68 nice-to-have, rest done/out-of-scope.**
+
+**Fact that shapes the plan:** the live legacy server binds `0.0.0.0:3001` (LAN-reachable)
+even though `settings.network.host` says `127.0.0.1` — so if any non-localhost device uses it,
+the security gate is PRE-cutover, not optional.
+
+- **Phase 0 — pre-cutover verification (no new code):**
+  CFG-10 (boot-twice migration losslessness on a real-home clone),
+  SESSION-03 (verify UI delete is SOFT — never removes provider .jsonl),
+  binding decision (loopback-only vs 0.0.0.0 like today).
+- **Phase 1 — security gate (required if 0.0.0.0):** SAFE-01 (auth hardening: reject
+  empty/weak/conflicting token sources), SAFE-03 (WS Origin policy). Then NET-01/02/06/10 for a
+  deliberate expose/retract surface; SAFE-02/04/06, FILE-05/06, BROWSER-04, AGENT-16 before
+  untrusted-LAN trust.
+- **Phase 2 — long-uptime hygiene (first week):** SAFE-11+TERM-22 (graceful shutdown + child
+  reaping for every update restart), TERM-11 (honor autoKillIdleMinutes — SET in the user's real
+  config, currently ignored), TERM-13 (honor terminal.scrollback — currently fixed 8MiB),
+  TERM-09/SAFE-06 (output/frame bounds), DIAG-01/03 (structured logs + rotation + secret
+  redaction — disk-fill protection), CFG-03 (config backup/restore), CFG-07/08+AUTO-15 (stable
+  instance id + durable tab registry for multi-device), SESSION-09 (live sidebar updates),
+  SAFE-08/10 (restore-loop prevention, broadcast-lag resync).
+- **Phase 3 — as-used features:** checkpoints list/restore (AGENT-14), attachments (AGENT-11),
+  fork/compact (AGENT-04/07), orchestration REST/MCP (AUTO-01..14), extensions (EXT-*),
+  browser/file panes (BROWSER-*/FILE-*), search depth (SESSION-07/19).
+- **Cross-cutting — SYNC-00:** this branch predates recent `main` work (#514 amplifier durable
+  session tracking, editor-font-follows-terminal); cutover temporarily trades those away.
+  Schedule a main-reconciliation pass after cutover stabilizes.
+
 ## Cutover plan (gated on explicit user "APPROVED")
 1. Backup real `~/.freshell` (tar + sha256). 2. Stop legacy on :3001 (record pid/cmd for rollback).
 3. Start Rust release binary on :3001 with real HOME + existing AUTH_TOKEN + GOOGLE key
