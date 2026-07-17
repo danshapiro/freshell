@@ -204,11 +204,7 @@ async fn ensure_checkpoint_repo(home: &Path, cwd: &Path) -> Result<PathBuf, Stri
         tokio::fs::create_dir_all(&git_dir)
             .await
             .map_err(|e| format!("failed to create checkpoint dir: {e}"))?;
-        run_git(
-            &["init", "--bare", "-q", &git_dir.to_string_lossy()],
-            None,
-        )
-        .await?;
+        run_git(&["init", "--bare", "-q", &git_dir.to_string_lossy()], None).await?;
     }
     Ok(git_dir)
 }
@@ -568,10 +564,9 @@ mod tests {
         let sha = value["id"].as_str().unwrap().to_string();
 
         let git_dir = checkpoint_git_dir(home_dir.path(), cwd_dir.path());
-        let metadata_raw =
-            tokio::fs::read_to_string(checkpoint_metadata_path(&git_dir))
-                .await
-                .expect("metadata file must be written when requestId is supplied");
+        let metadata_raw = tokio::fs::read_to_string(checkpoint_metadata_path(&git_dir))
+            .await
+            .expect("metadata file must be written when requestId is supplied");
         let metadata: Value = serde_json::from_str(&metadata_raw).unwrap();
         assert_eq!(metadata[&sha]["requestId"], json!("req-123"));
     }
@@ -610,7 +605,10 @@ mod tests {
         while entries.next_entry().await.unwrap().is_some() {
             count += 1;
         }
-        assert_eq!(count, 1, "one shadow repo per distinct cwd, reused across calls");
+        assert_eq!(
+            count, 1,
+            "one shadow repo per distinct cwd, reused across calls"
+        );
     }
 
     #[tokio::test]
