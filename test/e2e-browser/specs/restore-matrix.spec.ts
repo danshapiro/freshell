@@ -185,30 +185,39 @@ test.describe('Restore Matrix', () => {
   })
 
   // -------------------------------------------------------------------
-  // SCENARIO 2 -- FRESH-AGENT RESTORE (reload never mints a new session)
+  // SCENARIO 2 -- FRESH-AGENT RESTORE (reload never abandons the session)
   // -------------------------------------------------------------------
-  // KNOWN LIMITATION (tracked, not silently skipped): this scenario drives a
-  // REAL FreshCodex create through the UI against a real CODEX_CMD-spawned
-  // fake app-server (see `installFakeCodexAppServer`), then asserts that
-  // reload sends `freshAgent.attach` (never a second `freshAgent.create`) --
-  // the exact WS-handler contract DEFECT 2 fixed. The create leg itself was
-  // verified to reach the server (`freshAgent.create` observed on the wire,
-  // gated open via seeded `.freshell/config.json`), and the reload leg
-  // currently still observes a second `freshAgent.create` after reload on
-  // BOTH server kinds identically. Two real bugs were found and fixed while
-  // building this (see `findFreshAgentLeaf` -- the pane lives inside a SPLIT
-  // once created via the picker, so `layout.content` alone is the wrong
-  // read -- and the missing `persist/flushNow` before reload), but a further
-  // root cause remains open: given identical behavior on legacy AND rust,
-  // this reads as this test's synthetic CODEX_CMD session not settling into
-  // a state the client considers resumable within the created window, not a
-  // reintroduction of DEFECT 2 itself (scenario 1's plain-terminal reload,
-  // which exercises the same WS reconnect/rehydrate machinery, passes
-  // cleanly on both projects). Left as `fixme` rather than deleted or faked
-  // green -- next step is to trace the exact `freshAgent.attach` response
-  // server-side for this synthetic session id before re-enabling.
+  // ROOT-CAUSE FINDING (control run against the FROZEN legacy client,
+  // `--project=legacy-chromium`): FreshCodex's real reload-restore contract
+  // is NOT "attach only, never create" -- it is CREATE-WITH-RESUME. The
+  // frozen client's persisted pane state deliberately does not carry a live
+  // `sessionId` across a full page reload (only `sessionRef`/
+  // `resumeSessionId` survive); on reload, `FreshAgentView`'s create-effect
+  // (`!paneContent.sessionId && paneContent.sessionRef`) fires a NEW
+  // `freshAgent.create` carrying `resumeSessionId`/`sessionRef` pointing at
+  // the ORIGINAL durable session. Only once the resulting `freshAgent.created`
+  // response repopulates `sessionId` does the attach-effect fire a
+  // `freshAgent.attach` for the same id. Captured wire sequence on
+  // `legacy-chromium` (debug capture, since removed): `hello` ->
+  // `freshAgent.create` (`resumeSessionId`/`sessionRef` == original session)
+  // -> `freshAgent.attach` (`sessionId` == original session) -- and the UI
+  // evidence (`error-context.md` screenshot from the earlier failing run)
+  // showed the prior transcript ("Fixture turn") rehydrated correctly. This
+  // is a genuinely-working restore path, just not an attach-only one -- so
+  // the original "no freshAgent.create at all after reload" assertion tested
+  // an implementation detail that doesn't match the frozen client's real
+  // contract, not a regression. Confirmed byte-identical on `rust-chromium`
+  // (same 3-message sequence, same resume-target correctness). The scenario
+  // now asserts the CONTRACT that actually matters -- any `freshAgent.create`
+  // sent after reload must target the ORIGINAL session (never mint an
+  // unrelated blank one), the session ends up on the same id, the transcript
+  // rehydrates, and status settles idle -- rather than the implementation
+  // detail of which message type does the resuming. Two real spec bugs found
+  // and fixed while building this (see `findFreshAgentLeaf` -- the pane
+  // lives inside a SPLIT once created via the picker, so `layout.content`
+  // alone is the wrong read -- and the missing `persist/flushNow` before
+  // reload).
   test('FreshCodex reload rehydrates the same session instead of creating a new one', async ({ page, e2eServerKind }) => {
-    test.fixme(true, 'FreshCodex reload still observes a second freshAgent.create; root cause open (see comment above)')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-restore-matrix-codex-'))
     try {
       const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
@@ -322,7 +331,9 @@ test.describe('Restore Matrix', () => {
         // the WS `freshAgent.attach` handler rejected any session id not
         // currently in the sidecar's in-memory map with `INVALID_SESSION_ID`,
         // the client's `markSessionLost` abandoned the durable id, and a
-        // BRAND NEW `freshAgent.create` was sent post-reload. ---
+        // BRAND NEW, UNRELATED `freshAgent.create` was sent post-reload
+        // (no `resumeSessionId`/`sessionRef` tying it back to the original
+        // session -- the data was genuinely lost). ---
         await page.evaluate(() => {
           window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
         })
@@ -332,16 +343,28 @@ test.describe('Restore Matrix', () => {
 
         await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({ timeout: 20_000 })
 
-        // (a) NO new session was minted: no `freshAgent.create` at all after
-        // reload, and an `freshAgent.attach` referencing the ORIGINAL id was
-        // sent instead.
+        // (a) An `freshAgent.attach` referencing the ORIGINAL id was sent.
         await expect.poll(async () => {
           const sent = await harness.getSentWsMessages()
           return sent.some((m: any) => m?.type === 'freshAgent.attach' && m?.sessionId === originalSessionId)
         }, { timeout: 20_000 }).toBe(true)
 
+        // (a2) The frozen client's real restore contract for FreshCodex is
+        // CREATE-WITH-RESUME, not attach-only (see the scenario comment
+        // above for the full wire-sequence evidence): on reload, `sessionId`
+        // does not survive in persisted pane state, so the create-effect
+        // fires again because `sessionRef` does. That is fine -- restore
+        // still holds -- AS LONG AS every such create explicitly targets the
+        // ORIGINAL session via `resumeSessionId`/`sessionRef`. A create with
+        // no resume target (or one pointing somewhere else) would mean the
+        // session was genuinely abandoned -- THAT is DEFECT 2, and must
+        // still fail this test.
         const sentAfterReload = await harness.getSentWsMessages()
-        expect(sentAfterReload.some((m: any) => m?.type === 'freshAgent.create')).toBe(false)
+        const createsAfterReload = sentAfterReload.filter((m: any) => m?.type === 'freshAgent.create')
+        for (const create of createsAfterReload) {
+          const resumeTarget = (create as any).resumeSessionId ?? (create as any).sessionRef?.sessionId
+          expect(resumeTarget).toBe(originalSessionId)
+        }
 
         const rehydratedTabId = await harness.getActiveTabId()
         const rehydratedLayout = await harness.getPaneLayout(rehydratedTabId!)
@@ -384,6 +407,10 @@ test.describe('Restore Matrix', () => {
   // isolated within budget; next step is a bisection between this scenario
   // and session-directory-matrix's server setup to find the exact
   // discrepancy before re-enabling.
+  // Re-confirmed unrelated to scenario 2's finding: reran on legacy-chromium
+  // during the scenario-2 investigation, same `sidebar-session-list` timeout
+  // (30s, "element(s) not found"). A distinct, still-open gap -- not touched
+  // in this pass to keep scope to scenario 2.
   test('opening a seeded historical session from the sidebar gets a real pane title and non-blank content', async ({ page, e2eServerKind }) => {
     test.fixme(true, 'sidebar-session-list does not become visible for this scenario\'s seeded session; root cause open (see comment above)')
     const SESSION_ID = '00000000-0000-4000-8000-0000000c3333'
