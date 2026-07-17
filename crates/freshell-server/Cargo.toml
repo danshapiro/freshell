@@ -60,6 +60,8 @@ dotenvy = "0.15.7"
 [dev-dependencies]
 # `ServiceExt::oneshot` for in-process axum router handler tests (`sessions.rs`).
 tower = { version = "0.5", features = ["util"] }
+# Isolated temp dirs for `session_metadata.rs`'s store round-trip tests.
+tempfile = "3"
 # Batch C: `session_directory.rs` tests build a fixture opencode.db with a
 # writable connection before `OpencodeSource` opens it read-only (same bundled
 # engine `freshell-sessions` uses, unified by cargo).

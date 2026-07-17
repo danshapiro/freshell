@@ -820,24 +820,125 @@ impl FreshCodexState {
     /// `active_turn` tracker (mirrors legacy's `activeTurnByThread`/`findActiveTurnId`) rather
     /// than re-deriving it from the raw payload, since it is already the source of truth this
     /// process trusts for `handle_interrupt`.
-    pub async fn get_snapshot(&self, thread_id: &str) -> Result<Value, CodexSnapshotError> {
-        let (client, active_turn_present) = {
-            let guard = self.sessions.lock().await;
-            let session = guard.get(thread_id).ok_or(CodexSnapshotError::NotFound)?;
-            let client = session.client.clone();
-            let active_turn_present = session
-                .active_turn
-                .lock()
-                .expect("active_turn mutex")
-                .is_some();
-            (client, active_turn_present)
+    pub async fn get_snapshot(
+        &self,
+        thread_id: &str,
+        cwd: Option<&str>,
+    ) -> Result<Value, CodexSnapshotError> {
+        let (client, active_turn_present) = self.snapshot_runtime_for(thread_id, cwd).await?;
+        // `isCodexIncludeTurnsUnavailable` fallback (`adapter.ts:1088-1095,1157-1159`): a
+        // thread with no committed turns yet (freshly created, or resumed before its first
+        // user message) can make the REAL codex app-server reject `includeTurns:true`. THIS
+        // is the root cause of the "open a brand-new freshcodex pane -> 500" rehearsal bug --
+        // this port previously had no fallback at all, so ANY such rejection became an
+        // unconditional 500. Retry once with `includeTurns:false`, matching the reference
+        // exactly (still a valid, if turn-less, snapshot).
+        let raw = match client.read_thread(thread_id, true).await {
+            Ok(raw) => raw,
+            Err(err) if is_codex_include_turns_unavailable(&err) => client
+                .read_thread(thread_id, false)
+                .await
+                .map_err(CodexSnapshotError::AppServer)?,
+            Err(err) => return Err(CodexSnapshotError::AppServer(err)),
         };
-        let raw = client
-            .read_thread(thread_id, true)
-            .await
-            .map_err(CodexSnapshotError::AppServer)?;
         build_codex_snapshot_json(thread_id, &raw, active_turn_present)
             .map_err(CodexSnapshotError::Protocol)
+    }
+
+    /// Resolve the live client + active-turn bit for `thread_id`. If this process already
+    /// tracks the session (created or previously resumed here), reuse it. Otherwise --
+    /// mirroring the reference's `ensureRuntime` (`adapter.ts:762-799`), called
+    /// unconditionally by `getSnapshot` (`adapter.ts:1083-1086`) regardless of whether the
+    /// thread was ever created by THIS process -- spawn a sidecar and `thread/resume` the
+    /// requested id (SAME id, unlike crash-recovery's `ensure_session_alive`, which mints a
+    /// new one), then register it so subsequent reads/sends reuse the same runtime. This is
+    /// what lets a HISTORICAL session (opened from the sidebar, never created/attached in
+    /// this server's lifetime) serve a snapshot at all, instead of an unconditional 404.
+    async fn snapshot_runtime_for(
+        &self,
+        thread_id: &str,
+        cwd: Option<&str>,
+    ) -> Result<(Arc<CodexAppServerClient>, bool), CodexSnapshotError> {
+        {
+            let guard = self.sessions.lock().await;
+            if let Some(session) = guard.get(thread_id) {
+                let active_turn_present = session
+                    .active_turn
+                    .lock()
+                    .expect("active_turn mutex")
+                    .is_some();
+                return Ok((session.client.clone(), active_turn_present));
+            }
+        }
+
+        let (client, notifs, ownership_id, child) = self
+            .spawn_sidecar(cwd)
+            .await
+            .map_err(CodexSnapshotError::Protocol)?;
+
+        let resume_result = client
+            .resume_thread(
+                thread_id,
+                StartThreadParams {
+                    cwd: cwd.map(str::to_string),
+                    model: None,
+                    sandbox: None,
+                    approval_policy: None,
+                },
+            )
+            .await;
+        let resumed = match resume_result {
+            Ok(resumed) => resumed,
+            Err(err) => {
+                client.close().await;
+                let mut child = child;
+                let _ = child.start_kill();
+                reap_owned_codex_sidecars(&ownership_id);
+                if is_codex_thread_not_found(&err) {
+                    return Err(CodexSnapshotError::NotFound);
+                }
+                return Err(CodexSnapshotError::AppServer(err));
+            }
+        };
+
+        let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let exited = Arc::new(AtomicBool::new(false));
+        let consumer = self.spawn_consumer(notifs, thread_id.to_string(), active_turn.clone());
+        let (kill_tx, kill_rx) = oneshot::channel();
+        let watcher = spawn_exit_watcher(
+            child,
+            ownership_id,
+            thread_id.to_string(),
+            self.broadcast_tx.clone(),
+            kill_rx,
+            exited.clone(),
+        );
+        {
+            let mut guard = self.sessions.lock().await;
+            guard.insert(
+                thread_id.to_string(),
+                CodexSession {
+                    client: client.clone(),
+                    // Unknown until a `freshAgent.send` supplies one (matches the
+                    // reference's `settingsByThread` being unpopulated for a thread this
+                    // process has never created/sent to); `handle_send` overwrites these
+                    // via its own `rememberThreadSettings`-equivalent path when it runs.
+                    model: String::new(),
+                    effort: None,
+                    cwd: cwd.map(str::to_string),
+                    sandbox: None,
+                    permission_mode: None,
+                    active_turn: active_turn.clone(),
+                    consumer,
+                    kill_tx: Some(kill_tx),
+                    watcher,
+                    exited,
+                },
+            );
+        }
+        let _ = resumed; // thread id is asserted identical to the request; see resumed.thread_id below
+        let active_turn_present = active_turn.lock().expect("active_turn mutex").is_some();
+        Ok((client, active_turn_present))
     }
 
     /// Test-only: register a session directly (bypassing the real sidecar spawn
@@ -914,6 +1015,29 @@ impl std::fmt::Display for CodexSnapshotError {
             CodexSnapshotError::Protocol(message) => write!(f, "{message}"),
         }
     }
+}
+
+/// `isCodexIncludeTurnsUnavailable` (`adapter.ts:1157-1160`): the real codex app-server
+/// rejects `thread/read{includeTurns:true}` for a thread with no committed turns yet
+/// (freshly created, or resumed before its first user message) with one of these two
+/// message substrings.
+fn is_codex_include_turns_unavailable(err: &CodexAppServerError) -> bool {
+    let message = err.to_string();
+    message.contains("includeTurns is unavailable before first user message")
+        || message.contains("not materialized yet")
+}
+
+/// The reference has no dedicated "is this genuinely a missing thread" check for
+/// `thread/resume` failures -- `ensureRuntime` (`adapter.ts:762-799`) propagates ANY resume
+/// error unwrapped, which `sendFreshAgentError`'s generic fallback turns into a plain 500
+/// (`router.ts:165-166`). This port goes one step further and surfaces a proper 404 when the
+/// app-server's own error text says so, so a garbage/expired thread id (as opposed to a
+/// real spawn/RPC failure) doesn't masquerade as a server error.
+fn is_codex_thread_not_found(err: &CodexAppServerError) -> bool {
+    let message = err.to_string().to_lowercase();
+    message.contains("not found")
+        || message.contains("no such thread")
+        || message.contains("unknown thread")
 }
 
 /// `normalizeCommandStatus(status)` (`normalize.ts:105-113`).
@@ -1824,7 +1948,7 @@ fn now_iso() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use freshell_codex::{CodexStatus, CodexTurnEvent};
 
@@ -2385,7 +2509,7 @@ mod tests {
     /// Serializes every test in this module that mutates the process-global `CODEX_CMD` /
     /// `FAKE_CODEX_APP_SERVER_BEHAVIOR` env vars (`std::env::set_var` is not safe to race
     /// across concurrently-running tests in the same binary).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Point `CODEX_CMD` at the fake app-server and configure its scripted `behavior` (a
     /// `FAKE_CODEX_APP_SERVER_BEHAVIOR` JSON blob \u2014 see the fixture's `loadBehavior()`).
@@ -2614,15 +2738,65 @@ mod tests {
 
     // -- GET /api/fresh-agent/threads/freshcodex/codex/:threadId (Batch D PR-5) --
 
+    /// A thread the process has never seen now goes through ensure-runtime-on-demand
+    /// (`snapshot_runtime_for`) rather than an immediate 404 -- see
+    /// `get_snapshot_ensure_runtime_resumes_a_thread_not_in_the_live_map` for the SUCCESS
+    /// path via a real (fake) app-server subprocess. This test covers what happens when no
+    /// codex binary is reachable at all (`CODEX_CMD` unset, bare test env): the spawn itself
+    /// fails, which is a genuine infra error, not "this specific thread doesn't exist" --
+    /// mirrors the reference (`ensureRuntime` propagates an unwrapped spawn error, which
+    /// `sendFreshAgentError`'s generic fallback turns into a plain 500).
     #[tokio::test]
-    async fn get_snapshot_of_unknown_thread_is_not_found() {
+    async fn get_snapshot_with_no_codex_binary_available_is_an_app_server_error() {
+        // Force a definitely-nonexistent binary rather than relying on `CODEX_CMD` being
+        // unset -- another test in this same process may have left it pointed at the fake
+        // app-server (`ENV_LOCK` only serializes ordering, it doesn't restore the previous
+        // value), so asserting on "absence of an override" is not reliable.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(
+            "CODEX_CMD",
+            "/definitely/not/a/real/codex/binary-xyz-does-not-exist",
+        );
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
         let (st, _rx) = state_with_bus();
 
         let err = st
-            .get_snapshot("does-not-exist")
+            .get_snapshot("does-not-exist", None)
             .await
-            .expect_err("unknown thread");
-        assert!(matches!(err, CodexSnapshotError::NotFound));
+            .expect_err("no codex binary reachable");
+        assert!(
+            matches!(
+                err,
+                CodexSnapshotError::AppServer(_) | CodexSnapshotError::Protocol(_)
+            ),
+            "expected a spawn/RPC-shaped error, got {err:?}"
+        );
+        std::env::remove_var("CODEX_CMD");
+    }
+
+    /// The actual Fix Task #2 deliverable: a thread id this process has NEVER created or
+    /// attached to (a stand-in for a historical session opened from the sidebar) still
+    /// serves a valid snapshot, because `get_snapshot` spawns a real app-server subprocess
+    /// and `thread/resume`s the requested id on demand.
+    #[tokio::test]
+    async fn get_snapshot_ensure_runtime_resumes_a_thread_not_in_the_live_map() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        configure_fake_codex_cmd("{}");
+        let (st, _rx) = state_with_bus();
+
+        let snapshot = st
+            .get_snapshot("historical-thread-1", None)
+            .await
+            .expect("ensure-runtime-on-demand resumes a not-yet-live thread");
+        assert_eq!(snapshot["threadId"], json!("historical-thread-1"));
+        assert_eq!(snapshot["sessionType"], json!("freshcodex"));
+
+        // And it's now registered for reuse -- a second read doesn't need to resume again.
+        let snapshot2 = st
+            .get_snapshot("historical-thread-1", None)
+            .await
+            .expect("second read reuses the now-live session");
+        assert_eq!(snapshot2["threadId"], json!("historical-thread-1"));
     }
 
     #[tokio::test]
@@ -2644,7 +2818,7 @@ mod tests {
 
         let driver = {
             let st = st.clone();
-            tokio::spawn(async move { st.get_snapshot("thread-1").await })
+            tokio::spawn(async move { st.get_snapshot("thread-1", None).await })
         };
 
         // `read_thread` gates on the initialize handshake first (this fresh client never
@@ -2725,7 +2899,7 @@ mod tests {
 
         let driver = {
             let st = st.clone();
-            tokio::spawn(async move { st.get_snapshot("thread-1").await })
+            tokio::spawn(async move { st.get_snapshot("thread-1", None).await })
         };
 
         let (init_id, _m, _p) = peer.expect_request().await;
@@ -2947,7 +3121,7 @@ mod tests {
 
         let driver = {
             let st = st.clone();
-            tokio::spawn(async move { st.get_snapshot("thread-rich").await })
+            tokio::spawn(async move { st.get_snapshot("thread-rich", None).await })
         };
 
         let (init_id, _m, _p) = peer.expect_request().await;

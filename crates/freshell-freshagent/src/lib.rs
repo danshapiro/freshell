@@ -1507,6 +1507,34 @@ mod tests {
         assert_eq!(snapshot["latestTurnId"], turns[1]["turnId"]);
     }
 
+    /// Fix Task #3: a session id this process never created/attached to via any WS/REST
+    /// pane (a stand-in for a HISTORICAL session opened from the sidebar) still serves a
+    /// snapshot -- `get_opencode_snapshot` has no "is this in a live pane map" gate; it
+    /// goes straight to the shared serve manager's `GET /session/:id` + `/message`, which
+    /// opencode's own sqlite-backed store answers for ANY session id it knows about,
+    /// regardless of which process created it or when.
+    #[tokio::test]
+    async fn get_opencode_snapshot_serves_a_session_never_created_by_this_process() {
+        let session_body = json!({
+            "id": "ses_historical",
+            "title": "a session from a previous server lifetime",
+            "time": { "created": 1_700_000_000_000i64, "updated": 1_700_000_005_000i64 },
+        });
+        let messages_body = json!([
+            { "info": { "id": "msg-1", "role": "user" }, "parts": [{ "type": "text", "text": "old message" }] },
+        ]);
+        let st = state_with_fixed_session_http(session_body, messages_body).await;
+
+        // No `handle_create`/`handle_send` ever ran for this id in this test -- there is no
+        // pane, no durable-id map entry, nothing. The snapshot must still build.
+        let snapshot = st
+            .get_opencode_snapshot("ses_historical", None)
+            .await
+            .expect("a historical session (never created by this process) still snapshots");
+        assert_eq!(snapshot["threadId"], json!("ses_historical"));
+        assert_eq!(snapshot["sessionType"], json!("freshopencode"));
+    }
+
     #[tokio::test]
     async fn get_opencode_snapshot_of_unknown_session_is_not_found() {
         let st = state();

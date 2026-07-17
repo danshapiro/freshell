@@ -72,16 +72,28 @@ impl std::fmt::Display for CodexAppServerError {
                 write!(f, "Codex app-server {method} failed: {error}")
             }
             CodexAppServerError::Timeout { method, timeout_ms } => {
-                write!(f, "Codex app-server did not respond to {method} within {timeout_ms}ms.")
+                write!(
+                    f,
+                    "Codex app-server did not respond to {method} within {timeout_ms}ms."
+                )
             }
             CodexAppServerError::Closed { method } => {
-                write!(f, "Codex app-server connection closed before {method} completed.")
+                write!(
+                    f,
+                    "Codex app-server connection closed before {method} completed."
+                )
             }
             CodexAppServerError::Transport { method, message } => {
-                write!(f, "Codex app-server transport failed sending {method}: {message}")
+                write!(
+                    f,
+                    "Codex app-server transport failed sending {method}: {message}"
+                )
             }
             CodexAppServerError::InvalidResponse { method, detail } => {
-                write!(f, "Codex app-server returned an invalid {method} payload: {detail}")
+                write!(
+                    f,
+                    "Codex app-server returned an invalid {method} payload: {detail}"
+                )
             }
         }
     }
@@ -158,7 +170,9 @@ impl CodexAppServerClient {
     /// Wire a client to a transport with the default request timeout. Returns the client plus
     /// the [`CodexNotification`] stream the background consumer feeds (the adapter's
     /// lifecycle/turn fan-out). Spawns the background read loop immediately.
-    pub fn connect(transport: Arc<dyn WsTransport>) -> (Self, mpsc::UnboundedReceiver<CodexNotification>) {
+    pub fn connect(
+        transport: Arc<dyn WsTransport>,
+    ) -> (Self, mpsc::UnboundedReceiver<CodexNotification>) {
         Self::connect_with_timeout(transport, Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS))
     }
 
@@ -204,7 +218,10 @@ impl CodexAppServerClient {
     }
 
     /// `thread/start` (`client.ts:168-186`) — the stable-from-create codex thread.
-    pub async fn start_thread(&self, params: StartThreadParams) -> Result<StartedThread, CodexAppServerError> {
+    pub async fn start_thread(
+        &self,
+        params: StartThreadParams,
+    ) -> Result<StartedThread, CodexAppServerError> {
         let mut wire = Map::new();
         insert_opt_str(&mut wire, "cwd", params.cwd);
         insert_opt_str(&mut wire, "model", params.model);
@@ -225,13 +242,64 @@ impl CodexAppServerClient {
                 detail: "missing thread.id".to_string(),
             })?
             .to_string();
-        let reasoning_effort = result.get("reasoningEffort").and_then(Value::as_str).map(str::to_string);
-        Ok(StartedThread { thread_id, reasoning_effort })
+        let reasoning_effort = result
+            .get("reasoningEffort")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Ok(StartedThread {
+            thread_id,
+            reasoning_effort,
+        })
+    }
+
+    /// `thread/resume` (`client.ts:188-204`) -- resumes an EXISTING thread by id (as opposed
+    /// to `thread/start`'s "mint a new thread"). Used by [`Self::read_thread`]'s callers to
+    /// bring an on-disk-only thread (one this sidecar has never seen) back onto a live
+    /// app-server connection WITHOUT changing its id, mirroring the reference's
+    /// `ensureRuntime` (`adapter.ts:762-799`) -- unlike this crate's own crash-recovery path
+    /// (which mints a NEW thread id on respawn), `thread/resume` preserves the caller's id.
+    pub async fn resume_thread(
+        &self,
+        thread_id: &str,
+        params: StartThreadParams,
+    ) -> Result<StartedThread, CodexAppServerError> {
+        let mut wire = Map::new();
+        wire.insert("threadId".to_string(), json!(thread_id));
+        insert_opt_str(&mut wire, "cwd", params.cwd);
+        insert_opt_str(&mut wire, "model", params.model);
+        insert_opt_str(&mut wire, "sandbox", params.sandbox);
+        insert_opt_str(&mut wire, "approvalPolicy", params.approval_policy);
+        // client.ts:192 -- resume preserves the app-server's default raw-event behavior
+        // (no `experimentalRawEvents` override), only fixing `persistExtendedHistory`.
+        wire.insert("persistExtendedHistory".to_string(), json!(true));
+
+        let result = self.request("thread/resume", Value::Object(wire)).await?;
+        let resumed_thread_id = result
+            .get("thread")
+            .and_then(|t| t.get("id"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| CodexAppServerError::InvalidResponse {
+                method: "thread/resume".to_string(),
+                detail: "missing thread.id".to_string(),
+            })?
+            .to_string();
+        let reasoning_effort = result
+            .get("reasoningEffort")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Ok(StartedThread {
+            thread_id: resumed_thread_id,
+            reasoning_effort,
+        })
     }
 
     /// `turn/start` (`client.ts:424-431`; adapter send `adapter.ts:971-979`). **Forwards
     /// `effort` VERBATIM (DEV-0003)** — the value the caller supplies is inserted unchanged.
-    pub async fn start_turn(&self, params: StartTurnParams) -> Result<StartedTurn, CodexAppServerError> {
+    pub async fn start_turn(
+        &self,
+        params: StartTurnParams,
+    ) -> Result<StartedTurn, CodexAppServerError> {
         let mut wire = Map::new();
         wire.insert("threadId".to_string(), json!(params.thread_id));
         wire.insert("input".to_string(), Value::Array(params.input));
@@ -261,8 +329,16 @@ impl CodexAppServerClient {
     }
 
     /// `turn/interrupt` (`client.ts:433-439`).
-    pub async fn interrupt_turn(&self, thread_id: &str, turn_id: &str) -> Result<(), CodexAppServerError> {
-        self.request("turn/interrupt", json!({ "threadId": thread_id, "turnId": turn_id })).await?;
+    pub async fn interrupt_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<(), CodexAppServerError> {
+        self.request(
+            "turn/interrupt",
+            json!({ "threadId": thread_id, "turnId": turn_id }),
+        )
+        .await?;
         Ok(())
     }
 
@@ -270,7 +346,11 @@ impl CodexAppServerClient {
     /// full thread record (`{ thread: {\u2026} }`), optionally with its turns embedded
     /// (`includeTurns`). Returns the raw JSON result verbatim; the fresh-agent REST snapshot
     /// surface normalizes it (mirrors `getSnapshot`'s `runtime.readThread` call).
-    pub async fn read_thread(&self, thread_id: &str, include_turns: bool) -> Result<Value, CodexAppServerError> {
+    pub async fn read_thread(
+        &self,
+        thread_id: &str,
+        include_turns: bool,
+    ) -> Result<Value, CodexAppServerError> {
         self.request(
             "thread/read",
             json!({ "threadId": thread_id, "includeTurns": include_turns }),
@@ -279,12 +359,19 @@ impl CodexAppServerClient {
     }
 
     /// Send a notification frame (no response awaited) — `notify`, `client.ts:805-808`.
-    pub async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), CodexAppServerError> {
+    pub async fn notify(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<(), CodexAppServerError> {
         let frame = build_notification_frame(method, params.as_ref());
-        self.transport.send(frame).await.map_err(|message| CodexAppServerError::Transport {
-            method: method.to_string(),
-            message,
-        })
+        self.transport
+            .send(frame)
+            .await
+            .map_err(|message| CodexAppServerError::Transport {
+                method: method.to_string(),
+                message,
+            })
     }
 
     /// Close the transport and fail any in-flight requests (`close`, `client.ts:441-470`).
@@ -306,22 +393,37 @@ impl CodexAppServerClient {
     /// The raw request/response round-trip: allocate an integer id, register the pending
     /// oneshot, send `{ id, method, params }`, and await the correlated reply under the
     /// request timeout (`client.ts:776-803`).
-    async fn send_request(&self, method: &str, params: Value) -> Result<Value, CodexAppServerError> {
+    async fn send_request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, CodexAppServerError> {
         let id = RequestId::Int(self.next_id.fetch_add(1, Ordering::SeqCst));
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().expect("pending map").insert(id.clone(), tx);
+        self.pending
+            .lock()
+            .expect("pending map")
+            .insert(id.clone(), tx);
 
         let frame = build_request_frame(&id, method, &params);
         if let Err(message) = self.transport.send(frame).await {
             self.pending.lock().expect("pending map").remove(&id);
-            return Err(CodexAppServerError::Transport { method: method.to_string(), message });
+            return Err(CodexAppServerError::Transport {
+                method: method.to_string(),
+                message,
+            });
         }
 
         match tokio::time::timeout(self.request_timeout, rx).await {
             Ok(Ok(Ok(result))) => Ok(result),
-            Ok(Ok(Err(error))) => Err(CodexAppServerError::Rpc { method: method.to_string(), error }),
+            Ok(Ok(Err(error))) => Err(CodexAppServerError::Rpc {
+                method: method.to_string(),
+                error,
+            }),
             // The sender was dropped without a value → the connection closed.
-            Ok(Err(_)) => Err(CodexAppServerError::Closed { method: method.to_string() }),
+            Ok(Err(_)) => Err(CodexAppServerError::Closed {
+                method: method.to_string(),
+            }),
             Err(_) => {
                 self.pending.lock().expect("pending map").remove(&id);
                 Err(CodexAppServerError::Timeout {
@@ -347,8 +449,12 @@ async fn read_loop(
             break;
         };
         match parse_incoming_frame(&frame) {
-            Some(IncomingMessage::Response { id, result }) => resolve_pending(&pending, &id, Ok(result)),
-            Some(IncomingMessage::RpcError { id, error }) => resolve_pending(&pending, &id, Err(error)),
+            Some(IncomingMessage::Response { id, result }) => {
+                resolve_pending(&pending, &id, Ok(result))
+            }
+            Some(IncomingMessage::RpcError { id, error }) => {
+                resolve_pending(&pending, &id, Err(error))
+            }
             Some(IncomingMessage::Notification { method, params }) => {
                 let notification = classify_notification(&method, params.as_ref());
                 // The consumer being gone is not fatal — matches the reference dropping events
@@ -399,7 +505,9 @@ impl WsTransport for ChannelTransport {
             if self.closed.load(Ordering::SeqCst) {
                 return Err("transport closed".to_string());
             }
-            self.to_server.send(text).map_err(|_| "peer dropped".to_string())
+            self.to_server
+                .send(text)
+                .map_err(|_| "peer dropped".to_string())
         })
     }
 
@@ -433,7 +541,9 @@ impl ChannelPeer {
     pub async fn expect_request(&self) -> (RequestId, String, Value) {
         match self.next_frame().await.expect("client frame") {
             ClientFrame::Request { id, method, params } => (id, method, params),
-            ClientFrame::Notification { method, .. } => panic!("expected a request, got notification {method}"),
+            ClientFrame::Notification { method, .. } => {
+                panic!("expected a request, got notification {method}")
+            }
         }
     }
 
@@ -441,7 +551,9 @@ impl ChannelPeer {
     pub async fn expect_notification(&self) -> (String, Option<Value>) {
         match self.next_frame().await.expect("client frame") {
             ClientFrame::Notification { method, params } => (method, params),
-            ClientFrame::Request { method, .. } => panic!("expected a notification, got request {method}"),
+            ClientFrame::Request { method, .. } => {
+                panic!("expected a notification, got request {method}")
+            }
         }
     }
 
@@ -485,7 +597,10 @@ pub fn new_channel_transport() -> (Arc<ChannelTransport>, ChannelPeer) {
         from_server: TokioMutex::new(from_server),
         closed: AtomicBool::new(false),
     });
-    let peer = ChannelPeer { to_client, from_client: TokioMutex::new(from_client) };
+    let peer = ChannelPeer {
+        to_client,
+        from_client: TokioMutex::new(from_client),
+    };
     (transport, peer)
 }
 
@@ -576,11 +691,20 @@ mod tests {
             // turn/start — assert the effort field is VERBATIM.
             let (turn_id, method, params) = peer.expect_request().await;
             assert_eq!(method, "turn/start");
-            assert_eq!(params["effort"], json!(effort), "effort {effort} must forward verbatim");
+            assert_eq!(
+                params["effort"],
+                json!(effort),
+                "effort {effort} must forward verbatim"
+            );
             assert_eq!(params["threadId"], json!("thread-1"));
             peer.respond(&turn_id, json!({ "turn": { "id": "turn-1" } }));
 
-            assert_eq!(task.await.unwrap().unwrap(), StartedTurn { turn_id: "turn-1".to_string() });
+            assert_eq!(
+                task.await.unwrap().unwrap(),
+                StartedTurn {
+                    turn_id: "turn-1".to_string()
+                }
+            );
         }
     }
 

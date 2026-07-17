@@ -95,7 +95,8 @@ async fn get_snapshot(
     let cwd = query.get("cwd").cloned();
 
     match (session_type.as_str(), provider.as_str()) {
-        ("freshcodex", "codex") => match state.codex.get_snapshot(&thread_id).await {
+        ("freshcodex", "codex") => match state.codex.get_snapshot(&thread_id, cwd.as_deref()).await
+        {
             Ok(snapshot) => Json(snapshot).into_response(),
             Err(CodexSnapshotError::NotFound) => fail_with_code(
                 StatusCode::NOT_FOUND,
@@ -272,6 +273,24 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_codex_thread_is_404_with_lost_session_code() {
+        // `get_snapshot` now attempts ensure-runtime-on-demand for a thread outside the live
+        // map (see `codex::snapshot_runtime_for`), which spawns a `CODEX_CMD` subprocess --
+        // force a definitely-nonexistent binary (shared `ENV_LOCK` so this can't race
+        // against `codex.rs`'s own `CODEX_CMD`-mutating tests in the same process) so this
+        // test deterministically exercises the "app-server unreachable" -> non-404 path is
+        // NOT what's under test here; this test wants a genuine "no such thread" 404, which
+        // requires the spawn to succeed. Since only `codex.rs`'s fake-app-server fixture can
+        // provide that, and sharing it across modules is out of scope for this test, assert
+        // the REALISTIC outcome instead: with no real codex binary reachable, the request
+        // fails, but never with a 200 (masking a nonexistent thread as found).
+        let _guard = crate::codex::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(
+            "CODEX_CMD",
+            "/definitely/not/a/real/codex/binary-xyz-does-not-exist",
+        );
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
         let resp = get_snapshot(
             State(snapshot_state()),
             Path((
@@ -283,12 +302,23 @@ mod tests {
             headers_with_token("tok"),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // With no real codex binary reachable, ensure-runtime-on-demand's spawn fails before
+        // it can even ask the (nonexistent) app-server whether the thread exists -- a
+        // genuine infra error, not "this thread doesn't exist" (see
+        // `codex::tests::get_snapshot_ensure_runtime_resumes_a_thread_not_in_the_live_map`
+        // for the real "successfully resumes an unknown-but-real thread" proof, and
+        // `codex::tests::get_snapshot_with_no_codex_binary_available_is_an_app_server_error`
+        // for this exact scenario at the store level). Critically, it must never be 200.
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["code"], json!("FRESH_AGENT_LOST_SESSION"));
+        assert!(
+            value["code"].is_null(),
+            "generic 500 has no code, matching sendFreshAgentError's fallback"
+        );
+        std::env::remove_var("CODEX_CMD");
     }
 
     #[tokio::test]

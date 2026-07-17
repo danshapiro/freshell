@@ -24,6 +24,7 @@ mod proxy;
 mod screenshots;
 mod serve_client;
 mod session_directory;
+mod session_metadata;
 mod sessions;
 mod settings;
 mod settings_store;
@@ -344,10 +345,26 @@ async fn main() -> ExitCode {
         fresh_agent_state.clone(),
     );
 
+    // `POST /api/session-metadata` (`server/sessions-router.ts:220-244` +
+    // `session-metadata-store.ts`): persists sidebar/fresh-agent `sessionType` tags to
+    // `<home>/.freshell/session-metadata.json`. Same isolated-home directory the settings
+    // store resolves (`settings_store.rs:246`), so a real deployment's existing
+    // `session-metadata.json` is discovered exactly like the legacy server discovers it.
+    let session_metadata_dir = home
+        .as_deref()
+        .map(|h| h.join(".freshell"))
+        .unwrap_or_else(|| PathBuf::from(".freshell"));
+    let session_metadata_store = session_metadata::SessionMetadataStore::new(session_metadata_dir);
+    let session_metadata_state = session_metadata::SessionMetadataApiState {
+        auth_token: Arc::clone(&auth_token),
+        store: session_metadata_store,
+    };
+
     let app = freshell_api::router(api_state)
         .merge(freshell_ws::router(ws_state))
         .merge(freshell_freshagent::router(fresh_agent_state.clone()))
         .merge(freshell_freshagent::snapshot::router(snapshot_state))
+        .merge(session_metadata::router(session_metadata_state))
         // R1/R2/R3/R4: the ONE `/api/settings` router (GET+PATCH+PUT), backed by
         // the live `settings_store` \u2014 replaces the old split between this boot
         // module's frozen GET and the freshcodex slice's disconnected PATCH.
