@@ -169,6 +169,18 @@ async fn main() -> ExitCode {
     // Cloned (cheap Arc) into the files REST surface too, whose `candidate-dirs`
     // sources the running terminals' cwds for the DirectoryPicker.
     let registry = freshell_terminal::TerminalRegistry::new();
+    // TERM-11 fix: honor `settings.safety.autoKillIdleMinutes` at boot (the
+    // Rust registry previously never read it at all, so a config that raised
+    // or lowered it from the default had no effect). See
+    // `freshell_ws::spawn_idle_monitor` for the periodic sweep this feeds.
+    registry.set_auto_kill_idle_minutes(settings.safety.auto_kill_idle_minutes);
+    freshell_ws::spawn_idle_monitor(registry.clone(), std::time::Duration::from_secs(30));
+    // TERM-13 fix: honor `settings.terminal.scrollback` at boot (the Rust
+    // registry previously used a fixed 8MiB replay-log cap for every
+    // terminal, ignoring the configured value entirely).
+    registry.set_scrollback_max_bytes(freshell_terminal::compute_scrollback_max_bytes(
+        settings.terminal.scrollback,
+    ));
     // Fix Spec: Session Naming Cluster -- the shared terminal-identity registry
     // (`freshell_ws::identity`, the port-side closure of
     // `TerminalMetadataService`'s provider/sessionId association slice). Written
@@ -276,7 +288,20 @@ async fn main() -> ExitCode {
     // `ClaudeSource`) and `OpencodeSource` (direct-listed from
     // `opencode.db`) alongside claude. `None` home -> no index -> the prior
     // empty-page behavior.
-    let session_index = home.as_ref().map(|h| {
+    //
+    // FRESHELL_HOME root-alignment fix: provider transcript sources must
+    // resolve against the REAL home, never the (possibly `FRESHELL_HOME`-
+    // overridden) isolated config root `home` above -- see
+    // `session_directory::provider_home` for the full rationale.
+    //
+    // Fourth source: `AmplifierSource` (`crates/freshell-sessions/src/amplifier.rs`,
+    // a faithful port of `server/coding-cli/providers/amplifier.ts`'s
+    // discovery/parse -- file-based, same shape as `ClaudeSource`/`CodexSource`).
+    // `amplifier_home` lives in that module (not `session_directory.rs`, whose
+    // internals are out of scope for this change) but resolves the SAME
+    // `AMPLIFIER_HOME` env / `<home>/.amplifier` default convention
+    // `claude_home`/`codex_home` use, against the same `provider_home()` root.
+    let session_index = session_directory::provider_home().as_ref().map(|h| {
         Arc::new(freshell_sessions::directory_index::SessionIndex::new(vec![
             Arc::new(freshell_sessions::directory_index::ClaudeSource::new(
                 session_directory::claude_home(h),
@@ -286,6 +311,9 @@ async fn main() -> ExitCode {
             )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
             Arc::new(freshell_sessions::directory_index::OpencodeSource::new(
                 freshell_sessions::parse::default_opencode_data_home(),
+            )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
+            Arc::new(freshell_sessions::amplifier::AmplifierSource::new(
+                freshell_sessions::amplifier::amplifier_home(h),
             )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
         ]))
     });
