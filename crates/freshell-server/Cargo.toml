@@ -60,3 +60,7 @@ dotenvy = "0.15.7"
 [dev-dependencies]
 # `ServiceExt::oneshot` for in-process axum router handler tests (`sessions.rs`).
 tower = { version = "0.5", features = ["util"] }
+# Batch C: `session_directory.rs` tests build a fixture opencode.db with a
+# writable connection before `OpencodeSource` opens it read-only (same bundled
+# engine `freshell-sessions` uses, unified by cargo).
+rusqlite = { version = "0.31", features = ["bundled"] }

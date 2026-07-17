@@ -341,6 +341,18 @@ pub(crate) fn claude_home(home: &Path) -> PathBuf {
     }
 }
 
+/// `defaultCodexHome()` (`providers/codex.ts:25-27`): `CODEX_HOME` env else
+/// `<home>/.codex` -- same shape as [`claude_home`]. Batch C:
+/// `freshell_sessions::directory_index::CodexSource` joins `sessions` itself
+/// (mirroring `ClaudeSource` joining `projects`), so callers pass this
+/// resolved codex home, not the sessions dir.
+pub(crate) fn codex_home(home: &Path) -> PathBuf {
+    match std::env::var("CODEX_HOME") {
+        Ok(v) if !v.is_empty() => PathBuf::from(v),
+        _ => home.join(".codex"),
+    }
+}
+
 /// Map a cached [`IndexedSession`] to a request-scoped [`DirItem`]. The
 /// per-request-only fields (`is_running`, `archived`, search annotations)
 /// take their defaults here, exactly as `item_from_meta` did before the
@@ -669,6 +681,17 @@ mod tests {
 
     fn fixtures_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/sessions")
+    }
+
+    /// A fresh, unique temp dir for Batch C's codex/opencode handler tests
+    /// (which need a bare `<home>` to nest `.codex`/`opencode-data` under,
+    /// unlike `claude_home_with`'s claude-specific layout).
+    fn unique_temp_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "freshell-sessdir-batchc-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
     }
 
     /// Build an isolated `<home>/.claude/projects/<project>/` populated with the
@@ -1475,6 +1498,177 @@ mod tests {
             parse_after_first,
             "applying a session override must not re-parse any file"
         );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // -- Batch C: CodexSource + OpencodeSource wired into the same
+    //    `SessionIndex`-backed handler --
+
+    use freshell_sessions::directory_index::{CodexSource, OpencodeSource};
+
+    /// A codex `session_meta` with `payload.source == "exec"` -- a
+    /// non-interactive (`codex exec`) run -- must be HIDDEN by the default
+    /// query (no `includeNonInteractive`), exactly like the claude
+    /// `include_non_interactive_surfaces_titled_session` test proves for
+    /// claude, and must be SURFACED when the flag is set.
+    #[tokio::test]
+    async fn codex_exec_session_hidden_by_default_surfaced_with_flag() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let home = unique_temp_dir();
+        let codex_home = home.join(".codex");
+        let sessions = codex_home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("exec-session.jsonl"),
+            "{\"timestamp\":\"2026-03-01T00:00:00.000Z\",\"type\":\"session_meta\",\
+             \"payload\":{\"id\":\"exec-1\",\"cwd\":\"/p\",\"source\":\"exec\"}}\n",
+        )
+        .unwrap();
+
+        let settings = crate::settings_store::SettingsStore::load(Some(&home), vec!["codex".into()]);
+        let auth_token: Arc<String> = Arc::new("tok".into());
+        let session_index = Arc::new(SessionIndex::new(vec![
+            Arc::new(CodexSource::new(codex_home)) as Arc<dyn SessionSource>
+        ]));
+        let state = SessionDirectoryState {
+            auth_token: Arc::clone(&auth_token),
+            settings,
+            session_index: Some(session_index),
+        };
+        let app = router(state);
+
+        let get_page = |app: Router, query: &str| {
+            let uri = format!("/api/session-directory?priority=visible{query}");
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .header("x-auth-token", "tok")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let resp_default = get_page(app.clone(), "").await;
+        let bytes = axum::body::to_bytes(resp_default.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            page["items"].as_array().unwrap().len(),
+            0,
+            "an exec (non-interactive) codex session must be hidden by default"
+        );
+
+        let resp_flagged = get_page(app, "&includeNonInteractive=1&includeEmpty=1").await;
+        let bytes = axum::body::to_bytes(resp_flagged.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        let items = page["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "includeNonInteractive must surface it");
+        assert_eq!(items[0]["sessionId"], json!("exec-1"));
+        assert_eq!(items[0]["provider"], json!("codex"));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Composite `provider:sessionId` keys (`C.3`/`C.4`) mean session
+    /// overrides apply to codex/opencode sessions through the SAME overlay
+    /// path claude already uses -- no provider-specific override code needed.
+    #[tokio::test]
+    async fn session_override_applies_to_codex_and_opencode_keys() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let home = unique_temp_dir();
+        let codex_home = home.join(".codex");
+        let codex_sessions = codex_home.join("sessions");
+        std::fs::create_dir_all(&codex_sessions).unwrap();
+        std::fs::write(
+            codex_sessions.join("s.jsonl"),
+            "{\"timestamp\":\"2026-03-01T00:00:00.000Z\",\"type\":\"session_meta\",\
+             \"payload\":{\"id\":\"codex-1\",\"cwd\":\"/p\"}}\n",
+        )
+        .unwrap();
+
+        let opencode_home = home.join("opencode-data");
+        std::fs::create_dir_all(&opencode_home).unwrap();
+        {
+            let conn = rusqlite::Connection::open(opencode_home.join("opencode.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+                 CREATE TABLE session (
+                    id TEXT PRIMARY KEY, directory TEXT, title TEXT,
+                    time_created INTEGER, time_updated INTEGER, time_archived INTEGER,
+                    project_id TEXT, parent_id TEXT
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session VALUES ('oc-1','/p','OC',1,2,NULL,NULL,NULL)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let settings =
+            crate::settings_store::SettingsStore::load(Some(&home), vec!["codex".into(), "opencode".into()]);
+        let auth_token: Arc<String> = Arc::new("tok".into());
+        let session_index = Arc::new(SessionIndex::new(vec![
+            Arc::new(CodexSource::new(codex_home)) as Arc<dyn SessionSource>,
+            Arc::new(OpencodeSource::new(opencode_home)) as Arc<dyn SessionSource>,
+        ]));
+        let state = SessionDirectoryState {
+            auth_token: Arc::clone(&auth_token),
+            settings: settings.clone(),
+            session_index: Some(session_index),
+        };
+        let app = router(state);
+
+        settings
+            .patch_session_override("codex:codex-1", &[("titleOverride", Some(json!("Renamed Codex")))])
+            .await;
+        settings
+            .patch_session_override("opencode:oc-1", &[("archived", Some(json!(true)))])
+            .await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible&includeEmpty=1")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        let items = page["items"].as_array().unwrap();
+
+        let codex_item = items
+            .iter()
+            .find(|i| i["sessionId"] == json!("codex-1"))
+            .expect("codex-1 present");
+        assert_eq!(codex_item["title"], json!("Renamed Codex"));
+
+        let opencode_item = items
+            .iter()
+            .find(|i| i["sessionId"] == json!("oc-1"))
+            .expect("oc-1 present");
+        assert_eq!(opencode_item["archived"], json!(true));
 
         std::fs::remove_dir_all(&home).ok();
     }

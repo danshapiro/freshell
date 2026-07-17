@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::meta::ParsedSessionMeta;
-use crate::{parse_session_content, ParseSessionOptions};
+use crate::{parse_codex_session_content, parse_session_content, ParseSessionOptions};
 
 /// Default snapshot freshness window: a request that lands within this window
 /// of the last successful scan reads the cached snapshot; older triggers a
@@ -112,6 +112,32 @@ pub trait SessionSource: Send + Sync {
     /// never re-parsed unless it actually changes. Corruption-tolerant —
     /// never panics.
     fn parse(&self, path: &Path) -> Option<IndexedSession>;
+
+    /// Batch C: direct-listed sources (opencode's single sqlite db, which
+    /// enumerates MANY sessions in ONE query rather than one file per
+    /// session) can't fit the per-file `discover`/`parse` cache — there's no
+    /// stable per-session path to key a [`FileEntry`] by. Instead, a
+    /// direct-listed source returns `Some(token)` here: a cheap-to-compute
+    /// value (e.g. a file mtime) that changes if-and-only-if the underlying
+    /// data might have changed. [`SessionIndex`] calls this every sweep and
+    /// only calls [`Self::direct_list`] (the expensive query) when the token
+    /// differs from the one cached from the last successful listing.
+    ///
+    /// `None` (the default) means "this is a file-based source" —
+    /// `discover`/`parse` are used instead, and this method/`direct_list` are
+    /// never called.
+    fn direct_change_token(&self) -> Option<i64> {
+        None
+    }
+
+    /// The expensive full listing for a direct-listed source, called ONLY
+    /// when [`Self::direct_change_token`] changed since the last successful
+    /// call. `Err` preserves whatever [`SessionIndex`] cached from the last
+    /// successful listing (e.g. a locked/mid-write sqlite db) instead of
+    /// dropping that provider's sessions from the snapshot.
+    fn direct_list(&self) -> Result<Vec<IndexedSession>, String> {
+        Ok(Vec::new())
+    }
 }
 
 /// Claude source: walks `<claude_home>/projects/*/…*.jsonl` (top-level =
@@ -279,6 +305,224 @@ fn item_from_meta(
     }
 }
 
+/// Codex source: recursively walks `<codex_home>/sessions/**/*.jsonl` — codex
+/// nests rollouts under `sessions/YYYY/MM/DD/*.jsonl` (arbitrary depth),
+/// unlike claude's fixed two-level `projects/<project>/*.jsonl` layout. A
+/// faithful lift of `codexProvider.listSessionFiles()`
+/// (`providers/codex.ts:459-462`, `walkJsonlFiles` at :423-436).
+/// `codex_home` is the already-resolved codex home (`CODEX_HOME` env else
+/// `<home>/.codex`, mirroring `defaultCodexHome()` — resolution lives in
+/// `crates/freshell-server/src/session_directory.rs::codex_home`, same
+/// pattern as `claude_home`); this source joins `sessions` itself, same as
+/// `ClaudeSource` joining `projects`.
+pub struct CodexSource {
+    codex_home: PathBuf,
+}
+
+impl CodexSource {
+    pub fn new(codex_home: PathBuf) -> Self {
+        Self { codex_home }
+    }
+
+    /// Convenience: discover + parse every currently-visible file in one
+    /// call, ignoring any incremental cache. Test/perf use only — mirrors
+    /// `ClaudeSource::scan()`.
+    pub fn scan(&self) -> Vec<IndexedSession> {
+        self.discover()
+            .into_iter()
+            .filter_map(|stat| self.parse(&stat.path))
+            .collect()
+    }
+}
+
+impl SessionSource for CodexSource {
+    fn discover(&self) -> Vec<FileStat> {
+        let mut stats = Vec::new();
+        walk_jsonl_recursive(&self.codex_home.join("sessions"), &mut stats);
+        stats
+    }
+
+    fn parse(&self, path: &Path) -> Option<IndexedSession> {
+        parse_codex_file(path)
+    }
+}
+
+/// Recursively stat every `.jsonl` under `dir`, sorted (per directory level)
+/// for determinism — readdir order is filesystem-dependent. Mirrors
+/// `walkJsonlFiles` (`providers/codex.ts:423-436`): unbounded recursion,
+/// corruption-tolerant (an unreadable directory yields fewer entries, never
+/// panics).
+fn walk_jsonl_recursive(dir: &Path, out: &mut Vec<FileStat>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    paths.sort(); // determinism (readdir order is filesystem-dependent)
+    for path in paths {
+        if path.is_dir() {
+            walk_jsonl_recursive(&path, out);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+            if let Some(stat) = stat_file(&path) {
+                out.push(stat);
+            }
+        }
+    }
+}
+
+/// Read + parse one codex rollout file into an [`IndexedSession`].
+/// Corruption-tolerant (the parser never panics); an unreadable file is
+/// skipped (`None`). Enforces the SAME R10b cwd-less exclusion the claude
+/// path does — `session-indexer.ts`'s discovery-time `if (!meta.cwd) continue`
+/// gate (:756, :1124) applies to every provider, not just claude.
+fn parse_codex_file(path: &Path) -> Option<IndexedSession> {
+    let content = String::from_utf8_lossy(&std::fs::read(path).ok()?).into_owned();
+    let meta = parse_codex_session_content(&content);
+    meta.cwd.as_ref()?;
+    let fallback = extract_codex_session_id_from_filename(path);
+    Some(item_from_meta(&meta, "codex", &fallback, false))
+}
+
+/// `extractSessionIdFromFilename` (`providers/codex.ts:417-420`): the
+/// basename minus `.jsonl`, or — if the basename contains one — the embedded
+/// canonical-looking UUID substring (codex rollout filenames look like
+/// `rollout-2026-03-01T00-00-06-<uuid>.jsonl`).
+fn extract_codex_session_id_from_filename(path: &Path) -> String {
+    let base = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    find_uuid_substring(&base).unwrap_or(base)
+}
+
+/// First substring matching
+/// `[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`
+/// — no anchoring, no version/variant nibble constraint (unlike
+/// `is_canonical_claude_session_id`, this mirrors the codex regex exactly).
+fn find_uuid_substring(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let groups = [8usize, 4, 4, 4, 12];
+    'start: for start in 0..bytes.len() {
+        let mut pos = start;
+        for (gi, &len) in groups.iter().enumerate() {
+            if pos + len > bytes.len()
+                || !bytes[pos..pos + len].iter().all(u8::is_ascii_hexdigit)
+            {
+                continue 'start;
+            }
+            pos += len;
+            if gi + 1 < groups.len() {
+                if bytes.get(pos) != Some(&b'-') {
+                    continue 'start;
+                }
+                pos += 1;
+            }
+        }
+        return Some(s[start..pos].to_string());
+    }
+    None
+}
+
+/// OpenCode source: direct-listed from `<data_home>/opencode.db` (one sqlite
+/// query enumerates every root session, unlike the file-per-session
+/// claude/codex layout) — a thin wrapper over [`OpencodeProvider`]
+/// (`crate::parse::opencode`), which is itself the faithful port of
+/// `OpencodeProvider.listSessionsDirect`. Implements the
+/// `direct_change_token`/`direct_list` hooks instead of `discover`/`parse`
+/// (see [`SessionSource`]'s doc comment) — `discover`/`parse` return
+/// empty/`None` and are never called in practice.
+pub struct OpencodeSource {
+    provider: crate::parse::OpencodeProvider,
+}
+
+impl OpencodeSource {
+    pub fn new(data_home: PathBuf) -> Self {
+        Self {
+            provider: crate::parse::OpencodeProvider::new(data_home),
+        }
+    }
+
+    /// Convenience: one-shot listing, ignoring any incremental cache.
+    /// Test/perf use only — mirrors `ClaudeSource::scan()`/`CodexSource::scan()`,
+    /// but goes through `direct_list()` since this source has no per-file
+    /// discover/parse.
+    pub fn scan(&self) -> Vec<IndexedSession> {
+        self.direct_list().unwrap_or_default()
+    }
+}
+
+impl SessionSource for OpencodeSource {
+    fn discover(&self) -> Vec<FileStat> {
+        Vec::new()
+    }
+
+    fn parse(&self, _path: &Path) -> Option<IndexedSession> {
+        None
+    }
+
+    fn direct_change_token(&self) -> Option<i64> {
+        // The WAL wrinkle is load-bearing: sqlite in WAL mode (opencode's
+        // default) can satisfy a write by appending to `opencode.db-wal`
+        // ALONE, leaving `opencode.db`'s own mtime unchanged until the next
+        // checkpoint. Taking the max of both files' mtimes (0 for whichever
+        // doesn't exist) means a WAL-only write still changes the token.
+        let [db, wal] = self.provider.watched_database_paths();
+        let db_mtime = file_mtime_ms(&db).unwrap_or(0);
+        let wal_mtime = file_mtime_ms(&wal).unwrap_or(0);
+        Some(db_mtime.max(wal_mtime))
+    }
+
+    fn direct_list(&self) -> Result<Vec<IndexedSession>, String> {
+        let listing = self
+            .provider
+            .list_sessions(now_ms())
+            .map_err(|e| e.to_string())?;
+        Ok(listing
+            .sessions
+            .into_iter()
+            .map(opencode_session_to_indexed)
+            .collect())
+    }
+}
+
+fn opencode_session_to_indexed(s: crate::parse::OpencodeSession) -> IndexedSession {
+    IndexedSession {
+        session_id: s.session_id,
+        provider: "opencode".to_string(),
+        project_path: s.project_path,
+        title: s.title,
+        // The opencode direct-lister never populates a summary or
+        // first-user-message tier (`listSessionsDirect` doesn't read
+        // `message`/`part` content for these fields) — faithful, not a gap.
+        summary: None,
+        first_user_message: None,
+        last_activity_at: s.last_activity_at,
+        created_at: s.created_at,
+        // `OpencodeSession::cwd` is always present (`list_sessions` already
+        // skips rows without one) — R10b is a structural non-issue here.
+        cwd: Some(s.cwd),
+        is_subagent: s.is_subagent.unwrap_or(false),
+        is_non_interactive: s.is_non_interactive.unwrap_or(false),
+    }
+}
+
+/// `fs::metadata(path).modified()` in milliseconds, `None` on any stat
+/// failure (including "doesn't exist") — used by [`OpencodeSource`]'s change
+/// token, which treats a missing file as mtime `0`.
+fn file_mtime_ms(path: &Path) -> Option<i64> {
+    stat_file(path).map(|s| s.mtime_ms)
+}
+
+/// The injected-clock parameter [`OpencodeProvider::list_sessions`] wants
+/// (mirrors the reference's `Date.now()` fallback for a row with no
+/// `time_updated`).
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// One cached file's parse result, keyed by its absolute path in
 /// [`SessionIndex`]'s `file_cache`. `item: None` caches a file that was
 /// parsed and EXCLUDED (e.g. the R10b cwd-less rule) — so an excluded file is
@@ -317,6 +561,11 @@ pub struct SessionIndex {
     snapshot: StdMutex<Option<CachedSnapshot>>,
     refresh_lock: AsyncMutex<()>,
     file_cache: Arc<StdMutex<HashMap<PathBuf, FileEntry>>>,
+    /// Batch C: the per-source cache for direct-listed sources (opencode),
+    /// keyed by the source's position in `sources` (fixed at construction, so
+    /// an index is a stable, simpler key than source identity). Disjoint from
+    /// `file_cache` -- a direct-listed source never touches it.
+    direct_cache: Arc<StdMutex<HashMap<usize, DirectEntry>>>,
 }
 
 struct CachedSnapshot {
@@ -336,6 +585,7 @@ impl SessionIndex {
             snapshot: StdMutex::new(None),
             refresh_lock: AsyncMutex::new(()),
             file_cache: Arc::new(StdMutex::new(HashMap::new())),
+            direct_cache: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -356,9 +606,11 @@ impl SessionIndex {
         }
         let sources = self.sources.clone(); // Vec<Arc<_>>: refcount bumps only.
         let file_cache = Arc::clone(&self.file_cache);
+        let direct_cache = Arc::clone(&self.direct_cache);
         let items = tokio::task::spawn_blocking(move || {
             let mut cache = file_cache.lock().unwrap();
-            refresh_snapshot(&sources, &mut cache)
+            let mut direct = direct_cache.lock().unwrap();
+            refresh_snapshot(&sources, &mut cache, &mut direct)
         })
         .await
         .unwrap_or_default();
@@ -392,28 +644,70 @@ impl SessionIndex {
     }
 }
 
+/// One cached direct-listed source's last successful listing, keyed by
+/// source index in [`SessionIndex::direct_cache`]. Mirrors [`FileEntry`]'s
+/// role for file-based sources, but keyed by change-token instead of
+/// `(mtime, size)`, and holding a full `Vec` of sessions instead of one.
+struct DirectEntry {
+    token: i64,
+    items: Vec<IndexedSession>,
+}
+
 /// One incremental refresh sweep across all sources:
 ///
-/// 1. `discover()` the current `(path, mtime, size)` set per source — stat
-///    only, no parsing.
-/// 2. Re-`parse()` ONLY a file that's new or whose `mtime`/`size` changed
-///    since the cached [`FileEntry`]; reuse the cached entry (including a
-///    cached EXCLUSION, `item: None`) for everything else.
-/// 3. Prune `cache` entries for paths no longer discovered (deleted files).
-/// 4. Rebuild + re-sort the combined snapshot from the (now up-to-date)
-///    cache — the ONE sort per sweep (not once per request), over
-///    already-parsed data, no disk I/O.
+/// 1. File-based sources: `discover()` the current `(path, mtime, size)` set
+///    — stat only, no parsing. Re-`parse()` ONLY a file that's new or whose
+///    `mtime`/`size` changed since the cached [`FileEntry`]; reuse the cached
+///    entry (including a cached EXCLUSION, `item: None`) for everything
+///    else. Prune `cache` entries for paths no longer discovered (deleted
+///    files).
+/// 2. Direct-listed sources (Batch C: opencode): call
+///    [`SessionSource::direct_change_token`] — cheap, no query. If the token
+///    matches the cached [`DirectEntry`], reuse its `items` unchanged. If it
+///    changed (or there's no cached entry yet), call
+///    [`SessionSource::direct_list`]: `Ok` replaces the cache entry, `Err`
+///    logs once and leaves whatever was cached (never drops that provider's
+///    sessions from the snapshot over a transient read failure).
+/// 3. Rebuild + re-sort the combined snapshot from both caches — the ONE
+///    sort per sweep (not once per request), over already-parsed/listed
+///    data, no disk I/O beyond what steps 1-2 already did.
 ///
 /// A sweep over N unchanged files costs N stats, not N parses — this is what
 /// fixes the "5s problem returns after 1s TTL" regression the FIRST shipped
-/// version of this module had (see the module doc comment).
+/// version of this module had (see the module doc comment). Analogously, a
+/// sweep over an unchanged direct-listed source costs 2 stats (db + db-wal),
+/// not a query.
 fn refresh_snapshot(
     sources: &[Arc<dyn SessionSource>],
     cache: &mut HashMap<PathBuf, FileEntry>,
+    direct_cache: &mut HashMap<usize, DirectEntry>,
 ) -> Vec<IndexedSession> {
     let mut discovered: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
-    for source in sources {
+    for (idx, source) in sources.iter().enumerate() {
+        if let Some(token) = source.direct_change_token() {
+            let unchanged = direct_cache.get(&idx).is_some_and(|e| e.token == token);
+            if !unchanged {
+                match source.direct_list() {
+                    Ok(items) => {
+                        direct_cache.insert(idx, DirectEntry { token, items });
+                    }
+                    Err(err) => {
+                        // Preserve whatever was cached from the last
+                        // successful listing (e.g. a locked/mid-write
+                        // sqlite db) -- never drop this provider's sessions
+                        // from the snapshot over a transient read error.
+                        eprintln!(
+                            "session-directory: direct-listed source #{idx} read error \
+                             (preserving cached sessions): {err}"
+                        );
+                    }
+                }
+            }
+            // Direct-listed sources never touch the per-file cache/discovery.
+            continue;
+        }
+
         for stat in source.discover() {
             let unchanged = cache
                 .get(&stat.path)
@@ -440,6 +734,9 @@ fn refresh_snapshot(
         .values()
         .filter_map(|entry| entry.item.clone())
         .collect();
+    for entry in direct_cache.values() {
+        items.extend(entry.items.iter().cloned());
+    }
     items.sort_by(|a, b| {
         b.last_activity_at
             .cmp(&a.last_activity_at)
@@ -529,15 +826,33 @@ mod tests {
         }
     }
 
-    /// Wraps any `SessionSource`, counting `discover()` and `parse()` calls
-    /// separately. `discover_calls` proves TTL/serialization behavior at the
-    /// sweep level (one discover per refresh); `parse_calls` is the
-    /// incremental-cache guard -- an unchanged (or cached-excluded) file must
-    /// never increment it again after its first sweep.
+    /// Wraps any `SessionSource`, counting `discover()`/`parse()` (file-based)
+    /// and `direct_list()` (direct-listed, Batch C) calls separately.
+    /// `discover_calls` proves TTL/serialization behavior at the sweep level
+    /// (one discover per refresh); `parse_calls` is the incremental-cache
+    /// guard -- an unchanged (or cached-excluded) file must never increment
+    /// it again after its first sweep; `direct_list_calls` is the
+    /// change-token-gating guard for direct-listed sources (opencode) -- an
+    /// unchanged token must never increment it again after the first sweep.
     struct CountingWrapper<S: SessionSource> {
         inner: S,
         discover_calls: Arc<AtomicUsize>,
         parse_calls: Arc<AtomicUsize>,
+        direct_list_calls: Arc<AtomicUsize>,
+    }
+
+    impl<S: SessionSource> CountingWrapper<S> {
+        /// Construct with fresh (zeroed) counters -- the common case, so call
+        /// sites that only care about one counter don't need to spell out
+        /// all three fields.
+        fn new(inner: S) -> Self {
+            Self {
+                inner,
+                discover_calls: Arc::new(AtomicUsize::new(0)),
+                parse_calls: Arc::new(AtomicUsize::new(0)),
+                direct_list_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
     }
 
     impl<S: SessionSource> SessionSource for CountingWrapper<S> {
@@ -549,6 +864,18 @@ mod tests {
         fn parse(&self, path: &Path) -> Option<IndexedSession> {
             self.parse_calls.fetch_add(1, Ordering::SeqCst);
             self.inner.parse(path)
+        }
+
+        fn direct_change_token(&self) -> Option<i64> {
+            // NOT counted: this is the cheap per-sweep check, analogous to
+            // `discover()` for file-based sources -- the gating guard is
+            // `direct_list_calls`, the expensive query.
+            self.inner.direct_change_token()
+        }
+
+        fn direct_list(&self) -> Result<Vec<IndexedSession>, String> {
+            self.direct_list_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.direct_list()
         }
     }
 
@@ -740,9 +1067,8 @@ mod tests {
 
         let parse_calls = Arc::new(AtomicUsize::new(0));
         let source = CountingWrapper {
-            inner: ClaudeSource::new(claude_home.clone()),
-            discover_calls: Arc::new(AtomicUsize::new(0)),
             parse_calls: Arc::clone(&parse_calls),
+            ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
         };
         let index = SessionIndex::with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
 
@@ -800,9 +1126,8 @@ mod tests {
 
         let parse_calls = Arc::new(AtomicUsize::new(0));
         let source = CountingWrapper {
-            inner: ClaudeSource::new(claude_home.clone()),
-            discover_calls: Arc::new(AtomicUsize::new(0)),
             parse_calls: Arc::clone(&parse_calls),
+            ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
         };
         let index = SessionIndex::with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
 
@@ -844,9 +1169,8 @@ mod tests {
 
         let parse_calls = Arc::new(AtomicUsize::new(0));
         let source = CountingWrapper {
-            inner: ClaudeSource::new(claude_home.clone()),
-            discover_calls: Arc::new(AtomicUsize::new(0)),
             parse_calls: Arc::clone(&parse_calls),
+            ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
         };
         let index = SessionIndex::with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
 
@@ -929,9 +1253,8 @@ mod tests {
 
         let parse_calls = Arc::new(AtomicUsize::new(0));
         let source = CountingWrapper {
-            inner: ClaudeSource::new(claude_home.clone()),
-            discover_calls: Arc::new(AtomicUsize::new(0)),
             parse_calls: Arc::clone(&parse_calls),
+            ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
         };
         let index = SessionIndex::with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
 
@@ -993,9 +1316,8 @@ mod tests {
 
         let parse_calls = Arc::new(AtomicUsize::new(0));
         let source = CountingWrapper {
-            inner: ClaudeSource::new(claude_home.clone()),
-            discover_calls: Arc::new(AtomicUsize::new(0)),
             parse_calls: Arc::clone(&parse_calls),
+            ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
         };
         // Short TTL so a `sleep` past it forces a real refresh sweep, exactly
         // like a user browsing more than 1s (the production TTL) apart.
@@ -1043,5 +1365,288 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].session_id, "b7936c10-4935-441c-837c-c1f33cafec2d");
         std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
+    }
+
+    // ── Batch C: CodexSource ─────────────────────────────────────────────
+
+    fn codex_fixture() -> String {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/fixtures/coding-cli/codex/task-events.sanitized.jsonl");
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    /// A `<home>/.codex/sessions/…` layout. `nested` controls whether the
+    /// fixture is placed directly in `sessions/` or several levels deep
+    /// (codex's real `sessions/YYYY/MM/DD/*.jsonl` layout) — proving
+    /// `CodexSource::discover` recurses arbitrarily, unlike claude's
+    /// fixed-depth walk.
+    fn codex_home_with_fixture(label: &str, nested: bool) -> std::path::PathBuf {
+        let home = unique_temp_dir(label);
+        let codex_home = home.join(".codex");
+        let sessions = if nested {
+            codex_home.join("sessions").join("2026").join("03").join("01")
+        } else {
+            codex_home.join("sessions")
+        };
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("rollout-task-events.jsonl"),
+            codex_fixture(),
+        )
+        .unwrap();
+        codex_home
+    }
+
+    #[test]
+    fn codex_source_scans_fixture_and_uses_parsed_session_id() {
+        let codex_home = codex_home_with_fixture("codexsrc-sanity", false);
+        let items = CodexSource::new(codex_home.clone()).scan();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].session_id, "session-activity");
+        assert_eq!(items[0].provider, "codex");
+        assert_eq!(items[0].cwd.as_deref(), Some("/project/codex"));
+        std::fs::remove_dir_all(codex_home.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn codex_source_discovers_nested_yyyy_mm_dd_sessions() {
+        let codex_home = codex_home_with_fixture("codexsrc-nested", true);
+        let items = CodexSource::new(codex_home.clone()).scan();
+        assert_eq!(
+            items.len(),
+            1,
+            "the deeply-nested sessions/2026/03/01/*.jsonl file must be discovered"
+        );
+        std::fs::remove_dir_all(codex_home.parent().unwrap()).ok();
+    }
+
+    /// R10b applies to codex too, not just claude (`session-indexer.ts`'s
+    /// discovery-time `if (!meta.cwd) continue` gates ALL providers).
+    #[test]
+    fn codex_source_skips_cwdless_sessions() {
+        let home = unique_temp_dir("codexsrc-cwdless");
+        let sessions = home.join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // No `cwd` anywhere in this session_meta payload.
+        std::fs::write(
+            sessions.join("no-cwd.jsonl"),
+            "{\"timestamp\":\"2026-03-01T00:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\"}}\n",
+        )
+        .unwrap();
+        let items = CodexSource::new(home.join(".codex")).scan();
+        assert_eq!(items.len(), 0);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// When the parser finds no `session_meta.id`, the session id falls back
+    /// to `extractSessionIdFromFilename`: the embedded UUID substring if the
+    /// basename has one, else the bare basename.
+    #[test]
+    fn codex_source_fallback_session_id_uses_embedded_uuid_in_filename() {
+        let home = unique_temp_dir("codexsrc-fallback-id");
+        let sessions = home.join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // session_meta has no `id`, so the filename's embedded UUID wins.
+        std::fs::write(
+            sessions.join("rollout-2026-03-01T00-00-06-b7936c10-4935-441c-837c-c1f33cafec2d.jsonl"),
+            "{\"timestamp\":\"2026-03-01T00:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/p\"}}\n",
+        )
+        .unwrap();
+        let items = CodexSource::new(home.join(".codex")).scan();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].session_id, "b7936c10-4935-441c-837c-c1f33cafec2d");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn find_uuid_substring_extracts_embedded_uuid_or_none() {
+        assert_eq!(
+            find_uuid_substring("rollout-2026-03-01T00-00-06-b7936c10-4935-441c-837c-c1f33cafec2d"),
+            Some("b7936c10-4935-441c-837c-c1f33cafec2d".to_string())
+        );
+        assert_eq!(find_uuid_substring("plain-basename-no-uuid"), None);
+    }
+
+    // ── Batch C: OpencodeSource ──────────────────────────────────────────
+
+    /// A writable sqlite db at `<data_home>/opencode.db`, seeded with the
+    /// same schema/shape `tests/opencode_sqlite.rs` uses.
+    fn opencode_data_home_with_sessions(
+        label: &str,
+        rows: &[(&str, &str, &str, i64, i64)], // (id, cwd, title, created, updated)
+    ) -> std::path::PathBuf {
+        let data_home = unique_temp_dir(label);
+        std::fs::create_dir_all(&data_home).unwrap();
+        let db = data_home.join("opencode.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+             CREATE TABLE session (
+                id TEXT PRIMARY KEY, directory TEXT, title TEXT,
+                time_created INTEGER, time_updated INTEGER, time_archived INTEGER,
+                project_id TEXT, parent_id TEXT
+             );",
+        )
+        .unwrap();
+        for (id, cwd, title, created, updated) in rows {
+            conn.execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL)",
+                rusqlite::params![id, cwd, title, created, updated],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        data_home
+    }
+
+    #[test]
+    fn opencode_source_direct_lists_and_maps_fields() {
+        let data_home = opencode_data_home_with_sessions(
+            "opencodesrc-basic",
+            &[("ses_a", "/repo/a", "Session A", 1000, 5000)],
+        );
+        let items = OpencodeSource::new(data_home.clone()).scan();
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.session_id, "ses_a");
+        assert_eq!(item.provider, "opencode");
+        assert_eq!(item.project_path, "/repo/a"); // no project row -> falls back to cwd
+        assert_eq!(item.cwd.as_deref(), Some("/repo/a"));
+        assert_eq!(item.title.as_deref(), Some("Session A"));
+        assert_eq!(item.created_at, Some(1000));
+        assert_eq!(item.last_activity_at, 5000);
+        assert_eq!(item.summary, None);
+        assert_eq!(item.first_user_message, None);
+        assert!(!item.is_subagent);
+        assert!(!item.is_non_interactive);
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    #[test]
+    fn opencode_source_missing_db_scans_empty_without_panicking() {
+        let data_home = unique_temp_dir("opencodesrc-missing");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let items = OpencodeSource::new(data_home.clone()).scan();
+        assert_eq!(items.len(), 0);
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    /// The change-token-gating contract: an unchanged db (and db-wal) must
+    /// not trigger a re-query; touching `opencode.db-wal` (the WAL wrinkle —
+    /// a write may touch ONLY the wal file, never the main db) must.
+    #[tokio::test]
+    async fn opencode_change_token_gating_unchanged_no_requery_wal_touch_requeries() {
+        let data_home = opencode_data_home_with_sessions(
+            "opencodesrc-gating",
+            &[("ses_a", "/repo/a", "Session A", 1000, 5000)],
+        );
+        let source = CountingWrapper::new(OpencodeSource::new(data_home.clone()));
+        let direct_list_calls = Arc::clone(&source.direct_list_calls);
+        let index = SessionIndex::with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
+
+        let snap = index.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(direct_list_calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::sleep(Duration::from_millis(30)).await; // past TTL, db untouched
+        let snap2 = index.snapshot().await;
+        assert_eq!(snap2.len(), 1);
+        assert_eq!(
+            direct_list_calls.load(Ordering::SeqCst),
+            1,
+            "an unchanged db (and db-wal) must not trigger a re-query"
+        );
+
+        // Touch ONLY the -wal file (the load-bearing WAL wrinkle): a write
+        // that never touches the main db's own mtime.
+        let wal = data_home.join("opencode.db-wal");
+        std::fs::write(&wal, b"wal-bytes-changed").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await; // past TTL
+
+        let snap3 = index.snapshot().await;
+        assert_eq!(snap3.len(), 1);
+        assert_eq!(
+            direct_list_calls.load(Ordering::SeqCst),
+            2,
+            "a wal-only mtime change must trigger exactly one more query"
+        );
+
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    /// A read error (e.g. a locked/corrupted db) must preserve whatever was
+    /// cached from the last successful listing -- never drop opencode
+    /// history over a transient failure.
+    #[tokio::test]
+    async fn opencode_read_error_preserves_previously_cached_sessions() {
+        let data_home = opencode_data_home_with_sessions(
+            "opencodesrc-readerror",
+            &[("ses_a", "/repo/a", "Session A", 1000, 5000)],
+        );
+        let db = data_home.join("opencode.db");
+        let source = OpencodeSource::new(data_home.clone());
+        let index = SessionIndex::with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
+
+        let snap = index.snapshot().await;
+        assert_eq!(snap.len(), 1, "sanity: the good db is listed successfully");
+
+        // RED-demo proof this guard is load-bearing: verified by temporarily
+        // making `direct_list` always return `Err` regardless of the
+        // underlying provider (see PR description) -- the assertion below
+        // failed (`snap2.len() == 0`) before the preserve-on-error handling
+        // existed, confirming this test catches a real regression.
+        //
+        // Corrupt the db file (garbage, non-sqlite bytes) -- changes its
+        // mtime/size, so the change-token gate WILL attempt a re-query, and
+        // that re-query WILL fail.
+        std::fs::write(&db, b"not a sqlite database, deliberately corrupted").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await; // past TTL
+
+        let snap2 = index.snapshot().await;
+        assert_eq!(
+            snap2.len(),
+            1,
+            "a read error on the corrupted db must preserve the previously cached session"
+        );
+        assert_eq!(snap2[0].session_id, "ses_a");
+
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    // ── Batch C: cross-provider merge/sort ───────────────────────────────
+
+    /// Three providers merged from three separate sources sort correctly as
+    /// one snapshot, and a `lastActivityAt` tie breaks by the
+    /// provider-qualified `key()` (`provider:sessionId`) DESC, exactly like
+    /// the single-provider B-T2 test -- proving the tie-break is genuinely
+    /// cross-provider, not just cross-session-id-within-one-provider.
+    #[tokio::test]
+    async fn three_provider_snapshot_merges_and_tie_breaks_by_qualified_key() {
+        let claude = CountingSource {
+            calls: Arc::new(AtomicUsize::new(0)),
+            items: vec![mk("z", "claude", 300)],
+        };
+        let codex = CountingSource {
+            calls: Arc::new(AtomicUsize::new(0)),
+            items: vec![mk("z", "codex", 300), mk("a", "codex", 100)],
+        };
+        let opencode = CountingSource {
+            calls: Arc::new(AtomicUsize::new(0)),
+            items: vec![mk("z", "opencode", 300)],
+        };
+        let index = SessionIndex::new(vec![
+            Arc::new(claude),
+            Arc::new(codex),
+            Arc::new(opencode),
+        ]);
+        let snap = index.snapshot().await;
+        let keys: Vec<String> = snap.iter().map(|s| s.key()).collect();
+        // All three "z" sessions tie on lastActivityAt=300 -> key() DESC:
+        // "opencode:z" > "codex:z" > "claude:z" (lexicographic). "codex:a"
+        // (lastActivityAt=100) sorts last.
+        assert_eq!(
+            keys,
+            vec!["opencode:z", "codex:z", "claude:z", "codex:a"]
+        );
     }
 }

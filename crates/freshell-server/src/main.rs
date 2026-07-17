@@ -261,12 +261,20 @@ async fn main() -> ExitCode {
     //
     // Batch B: `session_directory` no longer re-walks + re-parses every
     // transcript on every request -- it reads a cached, TTL-refreshed
-    // `SessionIndex` (claude only; codex/opencode sources are additive,
-    // Batch C). `None` home -> no index -> the prior empty-page behavior.
+    // `SessionIndex`. Batch C adds `CodexSource` (file-based, same shape as
+    // `ClaudeSource`) and `OpencodeSource` (direct-listed from
+    // `opencode.db`) alongside claude. `None` home -> no index -> the prior
+    // empty-page behavior.
     let session_index = home.as_ref().map(|h| {
         Arc::new(freshell_sessions::directory_index::SessionIndex::new(vec![
             Arc::new(freshell_sessions::directory_index::ClaudeSource::new(
                 session_directory::claude_home(h),
+            )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
+            Arc::new(freshell_sessions::directory_index::CodexSource::new(
+                session_directory::codex_home(h),
+            )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
+            Arc::new(freshell_sessions::directory_index::OpencodeSource::new(
+                freshell_sessions::parse::default_opencode_data_home(),
             )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
         ]))
     });

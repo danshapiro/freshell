@@ -1334,6 +1334,7 @@ dependencies = [
  "freshell-terminal",
  "freshell-ws",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",
