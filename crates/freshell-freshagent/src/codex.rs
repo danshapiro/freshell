@@ -46,21 +46,21 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
-    Json, Router,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::patch,
+    Json, Router,
 };
-use serde_json::{Map, Value, json};
-use tokio::sync::{Mutex as TokioMutex, oneshot};
+use serde_json::{json, Map, Value};
+use tokio::sync::{oneshot, Mutex as TokioMutex};
 
-use freshell_codex::transport::{TungsteniteTransport, reap_owned_codex_sidecars};
+use freshell_codex::transport::{reap_owned_codex_sidecars, TungsteniteTransport};
 use freshell_codex::{
-    CODEX_SIDECAR_OWNERSHIP_ENV, CodexAdapterEvent, CodexAppServerClient, CodexAppServerError,
-    CodexNotification, CodexStatus, CodexSubscription, StartThreadParams, StartTurnParams,
     mint_ownership_id, normalize_codex_thread_status, normalize_freshcodex_effort,
-    normalize_freshcodex_model, to_codex_reasoning_effort,
+    normalize_freshcodex_model, to_codex_reasoning_effort, CodexAdapterEvent, CodexAppServerClient,
+    CodexAppServerError, CodexNotification, CodexStatus, CodexSubscription, StartThreadParams,
+    StartTurnParams, CODEX_SIDECAR_OWNERSHIP_ENV,
 };
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCreate, FreshAgentCreateFailed,

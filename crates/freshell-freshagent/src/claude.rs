@@ -182,7 +182,12 @@ impl FreshClaudeState {
 
         self.sessions.lock().await.insert(
             created.clone(),
-            ClaudeSession { stdin, child, ownership_id, consumer },
+            ClaudeSession {
+                stdin,
+                child,
+                ownership_id,
+                consumer,
+            },
         );
 
         // Broadcast freshAgent.created (ws-handler.ts:3378). NO sessionRef for claude
@@ -198,12 +203,14 @@ impl FreshClaudeState {
     }
 
     fn fail_create(&self, request_id: &str, code: &str, message: &str) {
-        self.broadcast(&ServerMessage::FreshAgentCreateFailed(FreshAgentCreateFailed {
-            code: code.to_string(),
-            message: message.to_string(),
-            request_id: request_id.to_string(),
-            retryable: None,
-        }));
+        self.broadcast(&ServerMessage::FreshAgentCreateFailed(
+            FreshAgentCreateFailed {
+                code: code.to_string(),
+                message: message.to_string(),
+                request_id: request_id.to_string(),
+                retryable: None,
+            },
+        ));
     }
 
     // ── freshAgent.send (WS) ─────────────────────────────────────────────────────────
@@ -231,14 +238,16 @@ impl FreshClaudeState {
         }
         drop(guard);
 
-        self.broadcast(&ServerMessage::FreshAgentSendAccepted(FreshAgentSendAccepted {
-            provider: PROVIDER.to_string(),
-            request_id: request_id.unwrap_or_default(),
-            session_id,
-            session_type: session_type.to_string(),
-            cwd: msg.cwd,
-            submitted_turn_id: None,
-        }));
+        self.broadcast(&ServerMessage::FreshAgentSendAccepted(
+            FreshAgentSendAccepted {
+                provider: PROVIDER.to_string(),
+                request_id: request_id.unwrap_or_default(),
+                session_id,
+                session_type: session_type.to_string(),
+                cwd: msg.cwd,
+                submitted_turn_id: None,
+            },
+        ));
     }
 
     fn send_error(&self, request_id: &Option<String>, code: &str, message: &str) {
@@ -350,7 +359,10 @@ fn session_type_str(session_type: SessionType) -> &'static str {
 async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), String> {
     let entry = sidecar_entry_path();
     if !entry.exists() {
-        return Err(format!("claude sidecar entry not found at {}", entry.display()));
+        return Err(format!(
+            "claude sidecar entry not found at {}",
+            entry.display()
+        ));
     }
     let node = std::env::var("FRESHELL_CLAUDE_NODE").unwrap_or_else(|_| "node".to_string());
     let ownership_id = mint_ownership_id();
@@ -362,12 +374,17 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
     // (the SDK's clean-env passes FRESHELL_CLAUDE_SIDECAR_ID through — it strips only
     // CLAUDECODE + ANTHROPIC_API_KEY).
     cmd.env(CLAUDE_SIDECAR_OWNERSHIP_ENV, &ownership_id);
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("claude sidecar spawn failed ({node} {}): {e}", entry.display()))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        format!(
+            "claude sidecar spawn failed ({node} {}): {e}",
+            entry.display()
+        )
+    })?;
     let stdin = child.stdin.take().ok_or("sidecar stdin unavailable")?;
     let stdout = child.stdout.take().ok_or("sidecar stdout unavailable")?;
     // Drain stderr so verbose SDK/CLI logs can never fill the pipe and stall the sidecar.
@@ -448,7 +465,10 @@ fn sidecar_entry_path() -> PathBuf {
 async fn write_line(stdin: &mut ChildStdin, value: &Value) -> Result<(), String> {
     let mut line = serde_json::to_string(value).map_err(|e| e.to_string())?;
     line.push('\n');
-    stdin.write_all(line.as_bytes()).await.map_err(|e| e.to_string())?;
+    stdin
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
     stdin.flush().await.map_err(|e| e.to_string())
 }
 
@@ -497,11 +517,15 @@ fn reap_owned_claude_sidecars(ownership_id: &str) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Ok(pid) = name.parse::<i32>() else { continue };
+        let Ok(pid) = name.parse::<i32>() else {
+            continue;
+        };
         let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
             continue;
         };
-        let carries_tag = environ.split(|&b| b == 0).any(|var| var == needle.as_bytes());
+        let carries_tag = environ
+            .split(|&b| b == 0)
+            .any(|var| var == needle.as_bytes());
         if carries_tag {
             unsafe {
                 libc::kill(pid, libc::SIGTERM);
@@ -519,7 +543,9 @@ fn reap_owned_claude_sidecars(_ownership_id: &str) {
 
 /// ISO-8601 / RFC-3339 millis-Z timestamp (`new Date().toISOString()`) for error frames.
 fn now_iso() -> String {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = now.as_secs();
     let millis = now.subsec_millis();
     let days = (secs / 86_400) as i64;
@@ -549,12 +575,24 @@ mod tests {
 
     #[test]
     fn normalize_maps_the_known_sdk_set_and_ignores_others() {
-        assert_eq!(normalize_sdk_type("sdk.session.init"), Some("freshAgent.session.init"));
-        assert_eq!(normalize_sdk_type("sdk.assistant"), Some("freshAgent.assistant"));
+        assert_eq!(
+            normalize_sdk_type("sdk.session.init"),
+            Some("freshAgent.session.init")
+        );
+        assert_eq!(
+            normalize_sdk_type("sdk.assistant"),
+            Some("freshAgent.assistant")
+        );
         assert_eq!(normalize_sdk_type("sdk.stream"), Some("freshAgent.stream"));
         assert_eq!(normalize_sdk_type("sdk.result"), Some("freshAgent.result"));
-        assert_eq!(normalize_sdk_type("sdk.turn.complete"), Some("freshAgent.turn.complete"));
-        assert_eq!(normalize_sdk_type("sdk.turn.waiting"), Some("freshAgent.turn.waiting"));
+        assert_eq!(
+            normalize_sdk_type("sdk.turn.complete"),
+            Some("freshAgent.turn.complete")
+        );
+        assert_eq!(
+            normalize_sdk_type("sdk.turn.waiting"),
+            Some("freshAgent.turn.waiting")
+        );
         // Control + unknown types are NOT surfaced as fresh-agent events.
         assert_eq!(normalize_sdk_type("created"), None);
         assert_eq!(normalize_sdk_type("create.failed"), None);
@@ -579,7 +617,10 @@ mod tests {
         assert_eq!(wire["sessionType"], "freshclaude");
         assert_eq!(wire["sessionId"], "nano_placeholder_1234567");
         assert_eq!(wire["event"]["type"], "freshAgent.session.init");
-        assert_eq!(wire["event"]["cliSessionId"], "0199abcd-1234-7abc-8def-0123456789ab");
+        assert_eq!(
+            wire["event"]["cliSessionId"],
+            "0199abcd-1234-7abc-8def-0123456789ab"
+        );
         assert_eq!(wire["event"]["model"], "haiku");
     }
 
@@ -597,8 +638,18 @@ mod tests {
     #[test]
     fn control_lines_are_not_forwarded_as_events() {
         // `created` / `create.failed` are handled in the create flow, never as events.
-        assert!(sdk_line_to_frame(&json!({ "type": "created", "sessionId": "x" }), "x", "freshclaude").is_none());
-        assert!(sdk_line_to_frame(&json!({ "type": "create.failed", "message": "boom" }), "x", "freshclaude").is_none());
+        assert!(sdk_line_to_frame(
+            &json!({ "type": "created", "sessionId": "x" }),
+            "x",
+            "freshclaude"
+        )
+        .is_none());
+        assert!(sdk_line_to_frame(
+            &json!({ "type": "create.failed", "message": "boom" }),
+            "x",
+            "freshclaude"
+        )
+        .is_none());
     }
 
     #[test]
@@ -618,14 +669,25 @@ mod tests {
             .filter_map(|l| sdk_line_to_frame(l, "s", "freshclaude"))
             .map(|f| serde_json::from_str(&f).unwrap())
             .collect();
-        let inner_types: Vec<&str> = frames.iter().map(|f| f["event"]["type"].as_str().unwrap()).collect();
+        let inner_types: Vec<&str> = frames
+            .iter()
+            .map(|f| f["event"]["type"].as_str().unwrap())
+            .collect();
         assert!(
             !inner_types.contains(&"freshAgent.turn.complete"),
             "a death-truncated stream must never yield a completion chime, got {inner_types:?}"
         );
         // And a subsequent success stream DOES complete — the edge is real, not disabled.
-        let ok = sdk_line_to_frame(&json!({ "type": "sdk.turn.complete", "sessionId": "s", "at": 1 }), "s", "freshclaude").unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&ok).unwrap()["event"]["type"], "freshAgent.turn.complete");
+        let ok = sdk_line_to_frame(
+            &json!({ "type": "sdk.turn.complete", "sessionId": "s", "at": 1 }),
+            "s",
+            "freshclaude",
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&ok).unwrap()["event"]["type"],
+            "freshAgent.turn.complete"
+        );
     }
 
     #[test]
@@ -646,7 +708,11 @@ mod tests {
     fn sidecar_entry_resolves_to_the_vendored_package() {
         // The compile-time path points at the vendored Node package beside this crate.
         let entry = sidecar_entry_path();
-        assert!(entry.ends_with("freshell-claude-sidecar/index.mjs"), "{}", entry.display());
+        assert!(
+            entry.ends_with("freshell-claude-sidecar/index.mjs"),
+            "{}",
+            entry.display()
+        );
     }
 
     #[tokio::test]

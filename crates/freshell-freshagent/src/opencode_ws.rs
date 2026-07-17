@@ -129,7 +129,12 @@ struct OpencodeSession {
 }
 
 impl OpencodeSession {
-    fn new(placeholder_id: String, cwd: Option<String>, model: Option<String>, effort: Option<String>) -> Self {
+    fn new(
+        placeholder_id: String,
+        cwd: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Self {
         Self {
             placeholder_id,
             real_session_id: None,
@@ -149,7 +154,10 @@ impl FreshOpencodeState {
     /// Build the state around an existing [`FreshAgentState`] (REUSED, not duplicated),
     /// so this slice and the REST tabs slice share exactly one `opencode serve` sidecar.
     pub fn new(fresh_agent: FreshAgentState) -> Self {
-        Self { fresh_agent, sessions: Arc::new(TokioMutex::new(HashMap::new())) }
+        Self {
+            fresh_agent,
+            sessions: Arc::new(TokioMutex::new(HashMap::new())),
+        }
     }
 
     fn broadcast(&self, msg: &ServerMessage) {
@@ -192,7 +200,10 @@ impl FreshOpencodeState {
             runtime_provider: PROVIDER.to_string(),
             session_id: placeholder.clone(),
             session_type: SESSION_TYPE.to_string(),
-            session_ref: Some(SessionLocator { provider: PROVIDER.to_string(), session_id: placeholder }),
+            session_ref: Some(SessionLocator {
+                provider: PROVIDER.to_string(),
+                session_id: placeholder,
+            }),
         }));
     }
 
@@ -212,7 +223,11 @@ impl FreshOpencodeState {
             guard.get(&session_id).cloned()
         };
         let Some(session_arc) = session_arc else {
-            self.send_error(&request_id, "SESSION_NOT_FOUND", "opencode session not found");
+            self.send_error(
+                &request_id,
+                "SESSION_NOT_FOUND",
+                "opencode session not found",
+            );
             return;
         };
 
@@ -248,9 +263,14 @@ impl FreshOpencodeState {
         // `emitStatus(state, 'running')` (adapter.ts:336) -- BEFORE any session
         // materialization, stamped with whatever id is currently known (the placeholder
         // on a session's first send, the durable id thereafter).
-        let busy_session_id =
-            session.real_session_id.clone().unwrap_or_else(|| session.placeholder_id.clone());
-        self.broadcast(&event_frame(&busy_session_id, snapshot_event(&busy_session_id, "running")));
+        let busy_session_id = session
+            .real_session_id
+            .clone()
+            .unwrap_or_else(|| session.placeholder_id.clone());
+        self.broadcast(&event_frame(
+            &busy_session_id,
+            snapshot_event(&busy_session_id, "running"),
+        ));
 
         let acked_session_id = if let Some(real_id) = session.real_session_id.clone() {
             // Already materialized: THE continuity fix — reuse it, no new session.
@@ -259,7 +279,11 @@ impl FreshOpencodeState {
             let created = match manager.create_session(None, None, cwd.as_deref()).await {
                 Ok(created) => created,
                 Err(err) => {
-                    self.send_error(&request_id, "OPENCODE_SESSION_CREATE_FAILED", &err.to_string());
+                    self.send_error(
+                        &request_id,
+                        "OPENCODE_SESSION_CREATE_FAILED",
+                        &err.to_string(),
+                    );
                     return;
                 }
             };
@@ -271,17 +295,25 @@ impl FreshOpencodeState {
                 session.cwd = Some(cwd);
             }
 
-            self.sessions.lock().await.insert(durable_id.clone(), session_arc.clone());
+            self.sessions
+                .lock()
+                .await
+                .insert(durable_id.clone(), session_arc.clone());
 
             // `freshAgent.session.materialized` (ws-handler.ts:3477-3484): placeholder ->
             // durable, emitted EXACTLY ONCE (a later send never re-enters this branch).
-            self.broadcast(&ServerMessage::FreshAgentSessionMaterialized(FreshAgentSessionMaterialized {
-                previous_session_id: session.placeholder_id.clone(),
-                provider: PROVIDER.to_string(),
-                session_id: durable_id.clone(),
-                session_type: SESSION_TYPE.to_string(),
-                session_ref: Some(SessionLocator { provider: PROVIDER.to_string(), session_id: durable_id.clone() }),
-            }));
+            self.broadcast(&ServerMessage::FreshAgentSessionMaterialized(
+                FreshAgentSessionMaterialized {
+                    previous_session_id: session.placeholder_id.clone(),
+                    provider: PROVIDER.to_string(),
+                    session_id: durable_id.clone(),
+                    session_type: SESSION_TYPE.to_string(),
+                    session_ref: Some(SessionLocator {
+                        provider: PROVIDER.to_string(),
+                        session_id: durable_id.clone(),
+                    }),
+                },
+            ));
 
             // PR-3: `bindServeStream(state)` (adapter.ts:349) -- start the persistent
             // serve-SSE bridge ONCE, right after materialization. A later send never
@@ -304,14 +336,16 @@ impl FreshOpencodeState {
         // mirroring the codex slice's ack timing. The turn itself runs in a detached
         // task below so `freshAgent.kill` can target it independently of this handler's
         // own (already-detached, per terminal.rs dispatch) task.
-        self.broadcast(&ServerMessage::FreshAgentSendAccepted(FreshAgentSendAccepted {
-            provider: PROVIDER.to_string(),
-            request_id: request_id.unwrap_or_default(),
-            session_id: acked_session_id,
-            session_type: SESSION_TYPE.to_string(),
-            cwd: route.clone(),
-            submitted_turn_id: None,
-        }));
+        self.broadcast(&ServerMessage::FreshAgentSendAccepted(
+            FreshAgentSendAccepted {
+                provider: PROVIDER.to_string(),
+                request_id: request_id.unwrap_or_default(),
+                session_id: acked_session_id,
+                session_type: SESSION_TYPE.to_string(),
+                cwd: route.clone(),
+                submitted_turn_id: None,
+            },
+        ));
 
         let fresh_agent = self.fresh_agent.clone();
         let turn_aborted = session.turn_aborted.clone();
@@ -322,7 +356,14 @@ impl FreshOpencodeState {
             // `run_turn` (freshell-opencode/serve.rs) prompts + awaits idle against the
             // REAL opencode serve session (adapter.ts materializeOrSend:363-368).
             let result = manager
-                .run_turn(&real_id, &text, model.as_deref(), effort.as_deref(), DEFAULT_TURN_TIMEOUT, route)
+                .run_turn(
+                    &real_id,
+                    &text,
+                    model.as_deref(),
+                    effort.as_deref(),
+                    DEFAULT_TURN_TIMEOUT,
+                    route,
+                )
                 .await;
 
             // `emitStatus(state, 'idle')` (adapter.ts:371/384) -- unconditional, whether
@@ -338,8 +379,9 @@ impl FreshOpencodeState {
                 && !turn_errored.load(Ordering::SeqCst)
             {
                 let at = {
-                    let mut guard =
-                        last_turn_complete_at.lock().expect("last_turn_complete_at mutex");
+                    let mut guard = last_turn_complete_at
+                        .lock()
+                        .expect("last_turn_complete_at mutex");
                     let at = next_monotonic_turn_complete_at(*guard, now_ms());
                     *guard = Some(at);
                     at
@@ -422,13 +464,20 @@ impl FreshOpencodeState {
             if let Some(task) = session.turn_task.take() {
                 task.abort();
             }
-            (session.real_session_id.clone(), session.cwd.clone(), session.turn_aborted.clone())
+            (
+                session.real_session_id.clone(),
+                session.cwd.clone(),
+                session.turn_aborted.clone(),
+            )
         };
 
         let Some(real_id) = real_id else {
             // Not yet materialized: `abortForState` is a no-op, but `emitStatus('idle')`
             // still fires (adapter.ts:530), stamped with whatever id the client sent.
-            self.broadcast(&event_frame(&msg.session_id, snapshot_event(&msg.session_id, "idle")));
+            self.broadcast(&event_frame(
+                &msg.session_id,
+                snapshot_event(&msg.session_id, "idle"),
+            ));
             return;
         };
 
@@ -485,15 +534,23 @@ impl FreshOpencodeState {
                 }
             }
 
-            let status_session_id =
-                session.real_session_id.clone().unwrap_or_else(|| session.placeholder_id.clone());
-            let running =
-                session.turn_task.as_ref().map(|t| !t.is_finished()).unwrap_or(false);
+            let status_session_id = session
+                .real_session_id
+                .clone()
+                .unwrap_or_else(|| session.placeholder_id.clone());
+            let running = session
+                .turn_task
+                .as_ref()
+                .map(|t| !t.is_finished())
+                .unwrap_or(false);
             (status_session_id, running)
         };
 
         let status = if running { "running" } else { "idle" };
-        self.broadcast(&event_frame(&status_session_id, snapshot_event(&status_session_id, status)));
+        self.broadcast(&event_frame(
+            &status_session_id,
+            snapshot_event(&status_session_id, status),
+        ));
     }
 
     // ── PR-3: the persistent serve-SSE bridge (adapter.ts `bindServeStream`) ─
@@ -534,7 +591,10 @@ impl FreshOpencodeState {
                                 };
                                 changed_event(session_id, reason_str)
                             }
-                            SdkProviderEvent::Error { session_id, message } => {
+                            SdkProviderEvent::Error {
+                                session_id,
+                                message,
+                            } => {
                                 // adapter.ts:278-282 -- a turn error means the in-flight
                                 // turn did not positively complete; consulted by the
                                 // send task's completion gating once idle resolves.
@@ -561,7 +621,9 @@ impl FreshOpencodeState {
 /// this crate has no shared "misc formatting" home yet — see `IMPLEMENTATION_PHILOSOPHY.md`
 /// on not centralizing a one-off for a two-site duplication.
 fn now_iso() -> String {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = now.as_secs();
     let millis = now.subsec_millis();
     let days = (secs / 86_400) as i64;
@@ -583,7 +645,10 @@ fn now_iso() -> String {
 /// `Date.now()` — epoch milliseconds (the turn-complete clock's `now`). Duplicated from
 /// `codex.rs`'s identical private helper, same rationale as `now_iso` above.
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 // ── PR-3: `freshAgent.event` frame builders (sdk-events.ts + serve-events.ts shapes) ─
@@ -663,8 +728,9 @@ mod tests {
         fn request<'a>(
             &'a self,
             req: ServeHttpRequest,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        > {
             let is_create = req.url.contains("/session")
                 && !req.url.contains("/message")
                 && !req.url.contains("/abort")
@@ -683,7 +749,10 @@ mod tests {
     struct FakeAllocator;
     impl PortAllocator for FakeAllocator {
         fn allocate(&self) -> Result<Endpoint, String> {
-            Ok(Endpoint { hostname: "127.0.0.1".into(), port: 1 })
+            Ok(Endpoint {
+                hostname: "127.0.0.1".into(),
+                port: 1,
+            })
         }
     }
 
@@ -709,7 +778,9 @@ mod tests {
     }
     impl ProcessSpawner for TrackedSpawner {
         fn spawn(&self, _req: SpawnRequest) -> Result<Box<dyn ServeProcess>, String> {
-            Ok(Box::new(TrackedProcess { killed: self.killed.clone() }))
+            Ok(Box::new(TrackedProcess {
+                killed: self.killed.clone(),
+            }))
         }
     }
 
@@ -748,8 +819,9 @@ mod tests {
         fn request<'a>(
             &'a self,
             req: ServeHttpRequest,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        > {
             let is_status = req.url.contains("/session/status");
             // Precise create-match: exactly `POST /session` (optionally `?directory=...`).
             // `.contains("/session")` alone (the plain `FakeHttp`'s predicate) also matches
@@ -787,14 +859,23 @@ mod tests {
     async fn started_manager() -> (OpencodeServeManager, Arc<std::sync::atomic::AtomicBool>) {
         let killed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let deps = ServeDeps {
-            spawner: Arc::new(TrackedSpawner { killed: killed.clone() }),
-            http: Arc::new(FakeHttp { next_session: AtomicUsize::new(0) }),
+            spawner: Arc::new(TrackedSpawner {
+                killed: killed.clone(),
+            }),
+            http: Arc::new(FakeHttp {
+                next_session: AtomicUsize::new(0),
+            }),
             ports: Arc::new(FakeAllocator),
             events: Arc::new(NoopEventSource),
         };
-        let config = ServeConfig { idle_poll_interval: Duration::from_millis(20), ..ServeConfig::default() };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(20),
+            ..ServeConfig::default()
+        };
         let mgr = OpencodeServeManager::new(deps, config);
-        mgr.ensure_started().await.expect("healthy fake serve starts");
+        mgr.ensure_started()
+            .await
+            .expect("healthy fake serve starts");
         (mgr, killed)
     }
 
@@ -867,11 +948,16 @@ mod tests {
         st.handle_send(send_msg(placeholder, "first turn")).await;
         let session_arc = {
             let guard = st.sessions.lock().await;
-            guard.get(placeholder).cloned().expect("session exists after create")
+            guard
+                .get(placeholder)
+                .cloned()
+                .expect("session exists after create")
         };
         let first_real_id = {
             let s = session_arc.lock().await;
-            s.real_session_id.clone().expect("materialized after first send")
+            s.real_session_id
+                .clone()
+                .expect("materialized after first send")
         };
 
         // Second send addressed by the PLACEHOLDER id again (the client hasn't yet
@@ -883,7 +969,10 @@ mod tests {
             s.real_session_id.clone().expect("still materialized")
         };
 
-        assert_eq!(first_real_id, second_real_id, "second send must reuse the durable session id");
+        assert_eq!(
+            first_real_id, second_real_id,
+            "second send must reuse the durable session id"
+        );
     }
 
     fn attach_msg(session_id: &str) -> FreshAgentAttach {
@@ -940,7 +1029,10 @@ mod tests {
                     let guard = st.sessions.lock().await;
                     let session_arc = guard.get(&real_id).cloned().expect("session exists");
                     let s = session_arc.lock().await;
-                    s.turn_task.as_ref().map(|t| t.is_finished()).unwrap_or(true)
+                    s.turn_task
+                        .as_ref()
+                        .map(|t| t.is_finished())
+                        .unwrap_or(true)
                 };
                 if done {
                     break;
@@ -955,17 +1047,20 @@ mod tests {
 
         // Drain frames until the snapshot this attach call broadcasts (turn.complete /
         // status frames from the send above may already have landed on the bus first).
-        let snapshot: serde_json::Value = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let raw = rx.recv().await.expect("bus stays open");
-                let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
-                if frame["event"]["type"] == "freshAgent.session.snapshot" && frame["sessionId"] == real_id {
-                    return frame;
+        let snapshot: serde_json::Value =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let raw = rx.recv().await.expect("bus stays open");
+                    let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                    if frame["event"]["type"] == "freshAgent.session.snapshot"
+                        && frame["sessionId"] == real_id
+                    {
+                        return frame;
+                    }
                 }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("no snapshot frame observed for {real_id}"));
+            })
+            .await
+            .unwrap_or_else(|_| panic!("no snapshot frame observed for {real_id}"));
         assert_eq!(snapshot["event"]["status"], "idle");
     }
 
@@ -994,7 +1089,10 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(materialized_count, 1, "materialized must be emitted exactly once");
+        assert_eq!(
+            materialized_count, 1,
+            "materialized must be emitted exactly once"
+        );
         assert_eq!(send_accepted_count, 2, "both sends are still accepted");
     }
 
@@ -1057,7 +1155,10 @@ mod tests {
 
         let frame: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(frame["type"], "error");
-        assert!(frame["message"].as_str().unwrap().contains("SESSION_NOT_FOUND"));
+        assert!(frame["message"]
+            .as_str()
+            .unwrap()
+            .contains("SESSION_NOT_FOUND"));
     }
 
     // ── PR-3: serve-stream bridge (status / turn.complete gating) ─────────
@@ -1071,14 +1172,22 @@ mod tests {
         let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
         let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
         let deps = ServeDeps {
-            spawner: Arc::new(TrackedSpawner { killed: Arc::new(std::sync::atomic::AtomicBool::new(false)) }),
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
             http: Arc::new(StatusPollFakeHttp::new(busy_polls)),
             ports: Arc::new(FakeAllocator),
             events: Arc::new(NoopEventSource),
         };
-        let config = ServeConfig { idle_poll_interval: Duration::from_millis(15), ..ServeConfig::default() };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
         let manager = OpencodeServeManager::new(deps, config);
-        manager.ensure_started().await.expect("healthy fake serve starts");
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
         fresh_agent.set_manager_for_test(manager).await;
         (FreshOpencodeState::new(fresh_agent), rx)
     }
@@ -1100,7 +1209,9 @@ mod tests {
             if remaining.is_zero() {
                 break;
             }
-            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else { break };
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
             let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
             if frame["type"] != "freshAgent.event" {
                 continue;
@@ -1120,9 +1231,15 @@ mod tests {
         }
 
         assert!(saw_busy, "expected a running/busy session.snapshot");
-        assert!(idle_count >= 1, "expected at least one idle session.snapshot, got {idle_count}");
+        assert!(
+            idle_count >= 1,
+            "expected at least one idle session.snapshot, got {idle_count}"
+        );
         assert_eq!(complete_at.len(), 1, "expected exactly one turn.complete");
-        assert!(complete_at[0] > 0, "at must be a positive monotonic timestamp");
+        assert!(
+            complete_at[0] > 0,
+            "at must be a positive monotonic timestamp"
+        );
     }
 
     #[tokio::test]
@@ -1132,14 +1249,22 @@ mod tests {
         // A generous busy-poll count so the natural idle resolution would land well AFTER
         // our interrupt (proving the interrupt -- not a lucky race -- suppresses the chime).
         let deps = ServeDeps {
-            spawner: Arc::new(TrackedSpawner { killed: Arc::new(std::sync::atomic::AtomicBool::new(false)) }),
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
             http: Arc::new(StatusPollFakeHttp::new(50)),
             ports: Arc::new(FakeAllocator),
             events: Arc::new(NoopEventSource),
         };
-        let config = ServeConfig { idle_poll_interval: Duration::from_millis(15), ..ServeConfig::default() };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
         let manager = OpencodeServeManager::new(deps, config);
-        manager.ensure_started().await.expect("healthy fake serve starts");
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
         fresh_agent.set_manager_for_test(manager).await;
         let st = FreshOpencodeState::new(fresh_agent);
 
@@ -1168,7 +1293,9 @@ mod tests {
             if remaining.is_zero() {
                 break;
             }
-            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else { break };
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
             let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
             if frame["type"] != "freshAgent.event" {
                 continue;
@@ -1183,7 +1310,10 @@ mod tests {
         }
 
         assert!(saw_idle, "handle_interrupt must broadcast an idle status");
-        assert!(!saw_complete, "an interrupted turn must never emit turn.complete");
+        assert!(
+            !saw_complete,
+            "an interrupted turn must never emit turn.complete"
+        );
     }
 
     #[tokio::test]
@@ -1191,14 +1321,22 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
         let deps = ServeDeps {
-            spawner: Arc::new(TrackedSpawner { killed: Arc::new(std::sync::atomic::AtomicBool::new(false)) }),
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
             http: Arc::new(StatusPollFakeHttp::new(2)),
             ports: Arc::new(FakeAllocator),
             events: Arc::new(NoopEventSource),
         };
-        let config = ServeConfig { idle_poll_interval: Duration::from_millis(15), ..ServeConfig::default() };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
         let manager = OpencodeServeManager::new(deps, config);
-        manager.ensure_started().await.expect("healthy fake serve starts");
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
         fresh_agent.set_manager_for_test(manager.clone()).await;
         let st = FreshOpencodeState::new(fresh_agent);
 
@@ -1229,7 +1367,9 @@ mod tests {
             if remaining.is_zero() {
                 break;
             }
-            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else { break };
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
             let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
             if frame["type"] != "freshAgent.event" {
                 continue;
@@ -1244,8 +1384,14 @@ mod tests {
             }
         }
 
-        assert!(saw_error, "the session.error SSE event must be forwarded as freshAgent.error");
-        assert!(!saw_complete, "an errored turn must never emit turn.complete");
+        assert!(
+            saw_error,
+            "the session.error SSE event must be forwarded as freshAgent.error"
+        );
+        assert!(
+            !saw_complete,
+            "an errored turn must never emit turn.complete"
+        );
     }
 
     #[test]
@@ -1263,7 +1409,11 @@ mod tests {
         assert_eq!(snapshot["event"]["status"], "running");
 
         let changed = serde_json::from_str::<serde_json::Value>(
-            &serde_json::to_string(&event_frame("s-1", changed_event("s-1", "opencode-message"))).unwrap(),
+            &serde_json::to_string(&event_frame(
+                "s-1",
+                changed_event("s-1", "opencode-message"),
+            ))
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(changed["event"]["type"], "freshAgent.session.changed");

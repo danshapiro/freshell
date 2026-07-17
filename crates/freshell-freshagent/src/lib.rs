@@ -52,21 +52,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::{
-    Json, Router,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
+    Json, Router,
 };
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use freshell_opencode::transport::{
     LoopbackPortAllocator, ReqwestEventSource, ReqwestServeHttp, TokioProcessSpawner,
 };
 use freshell_opencode::{
-    OpencodeServeManager, ServeConfig, ServeDeps, ServeError, normalize_opencode_effort,
-    normalize_opencode_model,
+    normalize_opencode_effort, normalize_opencode_model, OpencodeServeManager, ServeConfig,
+    ServeDeps, ServeError,
 };
 use freshell_protocol::{
     FreshAgentSessionMaterialized, ServerMessage, SessionLocator, SessionsChanged, UiCommand,
