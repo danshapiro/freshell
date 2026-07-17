@@ -149,6 +149,17 @@ async fn main() -> ExitCode {
     // create gate is the SHARED settings.freshAgent.enabled flag (owned by fresh_codex).
     let fresh_claude_state = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
 
+    // The fresh-agent REST surface (opencode slice): shares the auth token + the
+    // broadcast bus so its create/send broadcasts reach every WS client. Constructed
+    // here (before `ws_state`) so the WS freshopencode slice below can wrap the SAME
+    // instance -- one `opencode serve` sidecar shared by both surfaces (Batch D PR-2).
+    let fresh_agent_state =
+        FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx));
+    // The freshopencode WS fresh-agent slice: the post-handshake loop dispatches
+    // `freshAgent.create`/`send`/`kill`/`interrupt` (opencode) here.
+    let fresh_opencode_state =
+        freshell_freshagent::FreshOpencodeState::new(fresh_agent_state.clone());
+
     // The shared, connection-independent terminal registry: terminals are owned by
     // `terminalId` here (not by the socket that created them), so a second/reconnected
     // socket re-attaches to a running PTY and replays its scrollback. This is what
@@ -190,6 +201,7 @@ async fn main() -> ExitCode {
         broadcast_tx: Arc::clone(&broadcast_tx),
         fresh_codex: fresh_codex_state.clone(),
         fresh_claude: fresh_claude_state.clone(),
+        fresh_opencode: fresh_opencode_state.clone(),
         registry: registry.clone(),
         tabs: tabs.clone(),
         screenshots: screenshots.clone(),
@@ -207,11 +219,6 @@ async fn main() -> ExitCode {
         instance_id: Arc::clone(&server_instance_id),
         started_at: Arc::clone(&started_at),
     };
-    // The fresh-agent REST surface (opencode slice): shares the auth token + the
-    // broadcast bus so its create/send broadcasts reach every WS client.
-    let fresh_agent_state =
-        FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx));
-
     // Detect which coding-CLI agents are on PATH (so the PanePicker surfaces the real
     // claude/codex/opencode agents, was `{}`) and serialize the client registry for
     // `GET /api/extensions`, reusing the `extension_registry` scanned above.

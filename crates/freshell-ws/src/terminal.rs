@@ -263,6 +263,11 @@ async fn handle_client_text(
                         let fresh_claude = state.fresh_claude.clone();
                         tokio::spawn(async move { fresh_claude.handle_create(create).await });
                     }
+                    // Batch D PR-2: freshopencode joins the codex/claude WS create path.
+                    Some(freshell_protocol::AgentProvider::Opencode) => {
+                        let fresh_opencode = state.fresh_opencode.clone();
+                        tokio::spawn(async move { fresh_opencode.handle_create(create).await });
+                    }
                     _ => {}
                 }
             }
@@ -278,19 +283,28 @@ async fn handle_client_text(
                     let fresh_claude = state.fresh_claude.clone();
                     tokio::spawn(async move { fresh_claude.handle_send(send).await });
                 }
-                _ => {}
+                // Batch D PR-2: materialize-or-send (the continuity fix) runs here.
+                freshell_protocol::AgentProvider::Opencode => {
+                    let fresh_opencode = state.fresh_opencode.clone();
+                    tokio::spawn(async move { fresh_opencode.handle_send(send).await });
+                }
             }
             true
         }
-        // `freshAgent.interrupt` / `freshAgent.kill`: PR-1 wires ONLY the codex provider
-        // (`is_codex_provider`) to `FreshCodexState::handle_interrupt`/`handle_kill`. Claude
-        // and opencode keep the prior swallow behavior (their handlers land in a later PR).
-        // Detached tasks, same pattern as `FreshAgentCreate`/`FreshAgentSend` above, so a cold
-        // interrupt/kill RPC never blocks this connection's select loop.
+        // `freshAgent.interrupt` / `freshAgent.kill`: PR-1 wired the codex provider
+        // (`is_codex_provider`) to `FreshCodexState::handle_interrupt`/`handle_kill`. Batch D
+        // PR-2 adds opencode's kill (full removal, shared-sidecar-safe) and a cheap
+        // best-effort interrupt (abort the in-flight turn task; the full status-guarded
+        // bridge is PR-3). Claude keeps the prior swallow behavior. Detached tasks, same
+        // pattern as `FreshAgentCreate`/`FreshAgentSend` above, so a cold interrupt/kill RPC
+        // never blocks this connection's select loop.
         ClientMessage::FreshAgentInterrupt(interrupt) => {
             if is_codex_provider(interrupt.provider) {
                 let fresh_codex = state.fresh_codex.clone();
                 tokio::spawn(async move { fresh_codex.handle_interrupt(interrupt).await });
+            } else if interrupt.provider == freshell_protocol::AgentProvider::Opencode {
+                let fresh_opencode = state.fresh_opencode.clone();
+                tokio::spawn(async move { fresh_opencode.handle_interrupt(interrupt).await });
             }
             true
         }
@@ -298,6 +312,9 @@ async fn handle_client_text(
             if is_codex_provider(kill.provider) {
                 let fresh_codex = state.fresh_codex.clone();
                 tokio::spawn(async move { fresh_codex.handle_kill(kill).await });
+            } else if kill.provider == freshell_protocol::AgentProvider::Opencode {
+                let fresh_opencode = state.fresh_opencode.clone();
+                tokio::spawn(async move { fresh_opencode.handle_kill(kill).await });
             }
             true
         }
@@ -1313,11 +1330,14 @@ mod terminals_changed_tests {
             ),
             broadcast_tx: Arc::clone(&broadcast_tx),
             fresh_codex: freshell_freshagent::FreshCodexState::new(
-                auth_token,
+                Arc::clone(&auth_token),
                 Arc::clone(&broadcast_tx),
                 serde_json::json!({ "freshAgent": { "enabled": false } }),
             ),
             fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+            fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+                freshell_freshagent::FreshAgentState::new(auth_token, Arc::clone(&broadcast_tx)),
+            ),
             registry: freshell_terminal::TerminalRegistry::new(),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             tabs: crate::tabs::TabsRegistry::new(),

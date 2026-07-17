@@ -72,6 +72,12 @@ pub struct WsState {
     /// (session.init + stream + assistant + result + the success-guarded turn.complete edge).
     /// Gated by the SHARED `settings.freshAgent.enabled` flag (owned by `fresh_codex`).
     pub fresh_claude: freshell_freshagent::FreshClaudeState,
+    /// The freshopencode WS fresh-agent slice (Batch D PR-2): the post-handshake loop
+    /// dispatches `freshAgent.create` / `freshAgent.send` / `freshAgent.kill` /
+    /// `freshAgent.interrupt` (opencode) here. Wraps the SAME `FreshAgentState` the REST
+    /// `/api/tabs` + `/api/panes/:id/send-keys` surface uses, so both share exactly ONE
+    /// `opencode serve` sidecar. Streaming (`freshAgent.event`) is PR-3.
+    pub fresh_opencode: freshell_freshagent::FreshOpencodeState,
     /// The shared, connection-independent terminal registry (the port of
     /// `server/terminal-registry.ts` plus the broker fan-out). Terminals are owned here
     /// by `terminalId`, NOT by the connection that created them, so a second/reconnected
@@ -373,11 +379,14 @@ mod tests {
             settings: Arc::new(test_settings()),
             broadcast_tx: Arc::clone(&broadcast_tx),
             fresh_codex: freshell_freshagent::FreshCodexState::new(
-                auth_token,
+                Arc::clone(&auth_token),
                 Arc::clone(&broadcast_tx),
                 serde_json::json!({ "freshAgent": { "enabled": false } }),
             ),
             fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+            fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+                freshell_freshagent::FreshAgentState::new(auth_token, Arc::clone(&broadcast_tx)),
+            ),
             registry: freshell_terminal::TerminalRegistry::new(),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             tabs: crate::tabs::TabsRegistry::new(),

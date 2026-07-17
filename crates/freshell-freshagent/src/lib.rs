@@ -38,9 +38,11 @@
 
 pub mod claude;
 pub mod codex;
+pub mod opencode_ws;
 
 pub use claude::FreshClaudeState;
 pub use codex::FreshCodexState;
+pub use opencode_ws::FreshOpencodeState;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -127,7 +129,10 @@ impl FreshAgentState {
         }
     }
 
-    fn broadcast(&self, msg: &ServerMessage) {
+    /// Shared with [`opencode_ws::FreshOpencodeState`] (same crate root), which pushes
+    /// `freshAgent.created` / `freshAgent.send.accepted` / `freshAgent.session.materialized`
+    /// / `freshAgent.killed` onto the SAME bus this REST slice uses.
+    pub(crate) fn broadcast(&self, msg: &ServerMessage) {
         if let Ok(frame) = serde_json::to_string(msg) {
             // A send with no live receivers is fine (returns Err) — the capture socket
             // subscribed before the handshake, so it will observe every broadcast.
@@ -137,7 +142,11 @@ impl FreshAgentState {
 
     /// Get-or-create the single serve client. `ServeConfig::default()` reads `OPENCODE_CMD`
     /// (unset in the cold-start path → the real `opencode` binary). Cheap `Arc` clone.
-    async fn ensure_manager(&self) -> OpencodeServeManager {
+    ///
+    /// `pub(crate)` so [`opencode_ws::FreshOpencodeState`] reuses THIS ONE manager cell
+    /// instead of constructing its own — the "never spawn a second `opencode serve`
+    /// sidecar" invariant PR-2 depends on.
+    pub(crate) async fn ensure_manager(&self) -> OpencodeServeManager {
         let mut guard = self.opencode.lock().await;
         if let Some(manager) = guard.as_ref() {
             return manager.clone();
@@ -151,6 +160,14 @@ impl FreshAgentState {
         let manager = OpencodeServeManager::new(deps, ServeConfig::default());
         *guard = Some(manager.clone());
         manager
+    }
+
+    /// Test-only: seed the manager cell with a fake-backed [`OpencodeServeManager`] so
+    /// [`opencode_ws`]'s unit tests can drive `ensure_manager()` deterministically, with
+    /// NO real `opencode` process spawned.
+    #[cfg(test)]
+    pub(crate) async fn set_manager_for_test(&self, manager: OpencodeServeManager) {
+        *self.opencode.lock().await = Some(manager);
     }
 }
 
@@ -327,38 +344,54 @@ async fn send_keys(
     let manager = state.ensure_manager().await;
     let route = pane.cwd.clone();
 
-    // COLD-START + create the durable session. `create_session` runs `ensure_started`
-    // (spawn serve → bounded health wait — the DEV-0001 fix, NO warm-proxy) then
-    // `POST /session`. Success here IS the cold-start-clean fingerprint.
-    let created = match manager.create_session(None, None, pane.cwd.as_deref()).await {
-        Ok(created) => created,
-        Err(err) => return fail_json(serve_error_status(&err), err.to_string()),
+    // AGENT-08 continuity fix: create the durable session ONLY the FIRST time this pane
+    // sends (mirrors `adapter.ts materializeOrSend:349` — `if (!state.realSessionId)`).
+    // Before this fix, every call unconditionally ran `create_session`, so a second
+    // `send-keys` on the same pane silently started a BRAND NEW opencode session instead
+    // of continuing the first — the exact context-loss bug the WS `handle_send`
+    // continuity regression test (`opencode_ws.rs`) guards against on the WS path.
+    let durable_id = if let Some(durable_id) = pane.durable_id.clone() {
+        durable_id
+    } else {
+        // COLD-START + create the durable session. `create_session` runs `ensure_started`
+        // (spawn serve → bounded health wait — the DEV-0001 fix, NO warm-proxy) then
+        // `POST /session`. Success here IS the cold-start-clean fingerprint.
+        let created = match manager.create_session(None, None, pane.cwd.as_deref()).await {
+            Ok(created) => created,
+            Err(err) => return fail_json(serve_error_status(&err), err.to_string()),
+        };
+        let durable_id = created.id;
+
+        // Persist the durable id back onto the pane (so /capture and the next
+        // `send-keys` on this pane can reuse it instead of re-materializing).
+        if let Some(entry) = state.panes.lock().expect("panes mutex").get_mut(&pane_id) {
+            entry.durable_id = Some(durable_id.clone());
+        }
+
+        let session_ref = SessionLocator {
+            provider: PROVIDER.to_string(),
+            session_id: durable_id.clone(),
+        };
+
+        // Broadcast the placeholder→durable materialization (router.ts:1734, broadcast to
+        // ALL) — emitted EXACTLY ONCE per pane, only on the send that actually materializes.
+        state.broadcast(&ServerMessage::FreshAgentSessionMaterialized(FreshAgentSessionMaterialized {
+            previous_session_id: pane.placeholder_id.clone(),
+            provider: PROVIDER.to_string(),
+            session_id: durable_id.clone(),
+            session_type: SESSION_TYPE.to_string(),
+            session_ref: Some(session_ref.clone()),
+        }));
+
+        // A durable session was persisted → sessions.changed (the original's
+        // session-indexer watcher fires this on the isolated opencode.db write; we
+        // surface it directly). Also once-only: subsequent turns on an already-durable
+        // session don't create a new session-directory entry.
+        let revision = state.sessions_revision.fetch_add(1, Ordering::SeqCst) + 1;
+        state.broadcast(&ServerMessage::SessionsChanged(SessionsChanged { revision }));
+
+        durable_id
     };
-    let durable_id = created.id;
-
-    // Persist the durable id back onto the pane (so /capture can read it).
-    if let Some(entry) = state.panes.lock().expect("panes mutex").get_mut(&pane_id) {
-        entry.durable_id = Some(durable_id.clone());
-    }
-
-    let session_ref = SessionLocator {
-        provider: PROVIDER.to_string(),
-        session_id: durable_id.clone(),
-    };
-
-    // Broadcast the placeholder→durable materialization (router.ts:1734, broadcast to ALL).
-    state.broadcast(&ServerMessage::FreshAgentSessionMaterialized(FreshAgentSessionMaterialized {
-        previous_session_id: pane.placeholder_id.clone(),
-        provider: PROVIDER.to_string(),
-        session_id: durable_id.clone(),
-        session_type: SESSION_TYPE.to_string(),
-        session_ref: Some(session_ref.clone()),
-    }));
-
-    // A durable session was persisted → sessions.changed (the original's session-indexer
-    // watcher fires this on the isolated opencode.db write; we surface it directly).
-    let revision = state.sessions_revision.fetch_add(1, Ordering::SeqCst) + 1;
-    state.broadcast(&ServerMessage::SessionsChanged(SessionsChanged { revision }));
 
     // Drive the turn: normalize model/effort (adapter.ts:80-83), send, block on the IDLE
     // edge (session.idle / session.status{idle}) surfaced by run_turn.
