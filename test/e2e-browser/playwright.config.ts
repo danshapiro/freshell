@@ -23,6 +23,11 @@ const MATRIX_SPECS = [
   /browser-pane\.spec\.ts$/,
   /multi-client\.spec\.ts$/,
   /session-directory-matrix\.spec\.ts$/,
+  // Bulletproof-restore acceptance suite: terminal reload/restart, FreshCodex
+  // reload (no new session minted), historical session open (pane title +
+  // non-blank content), and mid-life exit surfacing. Restore is a core
+  // feature, so this runs against both server kinds on every matrix pass.
+  /restore-matrix\.spec\.ts$/,
 ]
 
 export default defineConfig({
