@@ -633,3 +633,130 @@ fn g_x0_codex_shipped_deviation_shape_dev_0006() {
     );
     assert!(launch.env.is_empty());
 }
+
+// ===========================================================================
+// Batch E — Amplifier terminal mode. `extensions/amplifier/freshell.json`
+// (legacy commit 5aca24c0 "feat: add Amplifier as a freshell CLI agent" —
+// content ported by value; NOT reachable from this branch's frozen ancestry,
+// see `amplifier_manifest_matches_legacy_cli_block` below) is a plain
+// extension-manifest CLI, same shape as gemini/kimi: no model/sandbox/
+// permissionMode support, so it gets the same generic resolver treatment —
+// `provider_args`/`settings_args` stay empty and only `base_env` +
+// `resume_args` + the `envVar` override apply.
+fn amplifier_spec() -> CliCommandSpec {
+    let mut base_env = BTreeMap::new();
+    base_env.insert("PROMPT_TOOLKIT_NO_CPR".to_string(), "1".to_string());
+    CliCommandSpec {
+        name: "amplifier".into(),
+        label: "Amplifier".into(),
+        env_var: Some("AMPLIFIER_CMD".into()),
+        default_cmd: "amplifier".into(),
+        resume_args: Some(s(&["resume", "{{sessionId}}"])),
+        base_env,
+        ..Default::default()
+    }
+}
+
+fn amplifier_inputs<'a>(resume_session_id: Option<&'a str>) -> CliLaunchInputs<'a> {
+    CliLaunchInputs {
+        mode: "amplifier",
+        target: ProviderTarget::Unix,
+        resume_session_id,
+        launch_intent: LaunchIntent::Resume,
+        permission_mode: None,
+        model: None,
+        sandbox: None,
+        codex_remote_ws_url: None,
+        opencode_server: None,
+        mcp_injection: McpInjection::default(),
+    }
+}
+
+/// G-A1 — amplifier, fresh launch (no resume id): base command, no args
+/// (no notification/provider_args special-case, matching gemini/kimi), the
+/// manifest's `PROMPT_TOOLKIT_NO_CPR` env carried through, manifest label.
+#[test]
+fn g_a1_amplifier_fresh_launch_matches_manifest() {
+    let mut all_specs = specs();
+    all_specs.push(amplifier_spec());
+    let launch = resolve_coding_cli_command(&all_specs, &amplifier_inputs(None), &env_of(&[]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(launch.command, "amplifier");
+    assert!(launch.args.is_empty());
+    assert_eq!(
+        launch.env.get("PROMPT_TOOLKIT_NO_CPR").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(launch.label, "Amplifier");
+}
+
+/// G-A2 — amplifier resume: `["resume", "<sessionId>"]` from the manifest's
+/// `resumeArgs` template (first-occurrence substitution, rev 2.1 pin).
+#[test]
+fn g_a2_amplifier_resume_appends_resume_args() {
+    let mut all_specs = specs();
+    all_specs.push(amplifier_spec());
+    let launch = resolve_coding_cli_command(
+        &all_specs,
+        &amplifier_inputs(Some("sess-123")),
+        &env_of(&[]),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        launch.args,
+        vec!["resume".to_string(), "sess-123".to_string()]
+    );
+}
+
+/// G-A3 — `AMPLIFIER_CMD` env override wins over the manifest's default
+/// command (`spec.envVar && env[...] || spec.defaultCommand`).
+#[test]
+fn g_a3_amplifier_env_var_override() {
+    let mut all_specs = specs();
+    all_specs.push(amplifier_spec());
+    let launch = resolve_coding_cli_command(
+        &all_specs,
+        &amplifier_inputs(None),
+        &env_of(&[("AMPLIFIER_CMD", "/custom/amplifier")]),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(launch.command, "/custom/amplifier");
+}
+
+/// The amplifier extension manifest (`extensions/amplifier/freshell.json`) is
+/// the single source of truth for its launch behavior — this crate never
+/// hardcodes a `CliCommandSpec` for it; `freshell-server`'s
+/// `ExtensionRegistry::cli_command_specs()` (`crates/freshell-server/src/
+/// extensions.rs:246-267`) compiles the manifest's `cli` block into exactly
+/// the [`amplifier_spec`] shape above (mirroring `server/index.ts:231-255`
+/// for every other shipped CLI). Before this manifest file existed, this test
+/// failed on the missing-file `read_to_string` error (verified RED: `find
+/// extensions -iname '*amplifier*'` returned nothing in this branch prior to
+/// this commit — the manifest content itself is from legacy commit 5aca24c0
+/// "feat: add Amplifier as a freshell CLI agent" on `origin/main`, which is
+/// NOT reachable from this branch's frozen ancestry). Pins the manifest
+/// against silent drift now that it exists.
+#[test]
+fn amplifier_manifest_matches_legacy_cli_block() {
+    let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../extensions/amplifier/freshell.json");
+    let raw = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|e| panic!("missing amplifier manifest at {manifest_path:?}: {e}"));
+    let json: serde_json::Value = serde_json::from_str(&raw).expect("manifest must be valid JSON");
+    assert_eq!(json["name"], "amplifier");
+    assert_eq!(json["category"], "cli");
+    let cli = &json["cli"];
+    assert_eq!(cli["command"], "amplifier");
+    assert_eq!(cli["envVar"], "AMPLIFIER_CMD");
+    assert_eq!(
+        cli["resumeArgs"],
+        serde_json::json!(["resume", "{{sessionId}}"])
+    );
+    assert_eq!(
+        cli["env"],
+        serde_json::json!({ "PROMPT_TOOLKIT_NO_CPR": "1" })
+    );
+}

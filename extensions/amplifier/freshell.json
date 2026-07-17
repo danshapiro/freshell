@@ -1,0 +1,17 @@
+{
+  "name": "amplifier",
+  "version": "1.0.0",
+  "label": "Amplifier",
+  "description": "Microsoft's Amplifier CLI agent",
+  "category": "cli",
+  "cli": {
+    "command": "amplifier",
+    "envVar": "AMPLIFIER_CMD",
+    "resumeArgs": ["resume", "{{sessionId}}"],
+    "env": { "PROMPT_TOOLKIT_NO_CPR": "1" }
+  },
+  "picker": {
+    "shortcut": "A",
+    "group": "agents"
+  }
+}

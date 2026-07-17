@@ -1313,6 +1313,27 @@ mod cli_create_helper_tests {
         assert_eq!(mode_label("shell", None), "Shell");
         assert_eq!(mode_label("kimi", None), "Kimi");
     }
+
+    /// Batch E — amplifier joins the generic `cli_commands`-driven mode
+    /// registry (`handle_create`'s `cli_spec_known` check, `terminal.rs:475`)
+    /// exactly like gemini/kimi: no dedicated branch, just a registered spec.
+    /// Once `extensions/amplifier/freshell.json` is discovered (see
+    /// `freshell-platform`'s `amplifier_manifest_matches_legacy_cli_block` +
+    /// `g_a1`-`g_a3` goldens for the resolved argv/env), the label falls
+    /// through to the spec's `label` field like every other registered CLI.
+    #[test]
+    fn mode_label_amplifier_uses_manifest_label() {
+        let launch = freshell_platform::CliLaunch {
+            command: "amplifier".to_string(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            label: "Amplifier".to_string(),
+        };
+        assert_eq!(mode_label("amplifier", Some(&launch)), "Amplifier");
+        // Unregistered fallback (spec absent) still capitalizes the raw mode,
+        // unchanged by amplifier's addition.
+        assert_eq!(mode_label("amplifier", None), "Amplifier");
+    }
 }
 
 #[cfg(test)]
