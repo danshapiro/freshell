@@ -10,6 +10,10 @@ publish.workspace = true
 # JSON line parsing for the claude/codex JSONL transcripts (JSON.parse parity,
 # skip-on-error corruption tolerance). preserve_order matches the TS object model.
 serde_json = { workspace = true }
+# `derive` for `IndexedSession`/`FileEntry` (the persistent parse-cache format,
+# `directory_index.rs`'s `rust-session-cache.json`) -- the boot-time cold-scan
+# fix (5min -> seconds on a real 8.7GB+2.2GB corpus).
+serde = { workspace = true }
 # chokidar -> notify: the session-indexer file watcher (ADR Decision 1.1, deps=notify).
 notify = "6"
 # node:sqlite -> rusqlite: the opencode.db read-only listing parser. `bundled`

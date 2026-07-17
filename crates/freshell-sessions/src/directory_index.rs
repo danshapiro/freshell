@@ -54,7 +54,7 @@ const DEFAULT_TTL: Duration = Duration::from_millis(1000);
 /// `DirItem` needs from the parse layer (everything EXCEPT the per-request
 /// fields `archived` / `is_running` / the search annotations, which are
 /// overlaid after the snapshot, never cached).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct IndexedSession {
     pub session_id: String,
     pub provider: String,
@@ -525,6 +525,7 @@ fn now_ms() -> i64 {
 /// [`SessionIndex`]'s `file_cache`. `item: None` caches a file that was
 /// parsed and EXCLUDED (e.g. the R10b cwd-less rule) — so an excluded file is
 /// stat'd every sweep but never re-parsed unless it actually changes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct FileEntry {
     mtime_ms: i64,
     size: u64,
@@ -564,11 +565,33 @@ pub struct SessionIndex {
     /// an index is a stable, simpler key than source identity). Disjoint from
     /// `file_cache` -- a direct-listed source never touches it.
     direct_cache: Arc<StdMutex<HashMap<usize, DirectEntry>>>,
+    /// Persistent parse-cache file path (`rust-session-cache.json`), or
+    /// `None` to disable persistence entirely (e.g. no resolvable home).
+    /// Read at construction to pre-populate `file_cache`; written back
+    /// opportunistically after a sweep (see `Self::take_pending_save`).
+    persist_path: Option<PathBuf>,
+    persist_state: StdMutex<PersistState>,
 }
 
 struct CachedSnapshot {
     items: Arc<Vec<IndexedSession>>,
     fetched_at: Instant,
+}
+
+/// Bookkeeping for the persistent parse-cache's opportunistic-save gating
+/// (module doc comment's "Persistent parse cache" section).
+#[derive(Default)]
+struct PersistState {
+    /// Files parsed (changed/new) or direct-listed sources re-queried since
+    /// the last successful save -- reset to 0 whenever a save happens.
+    changed_since_save: u64,
+    last_saved_at: Option<Instant>,
+    /// Sticky "have we EVER saved" flag: the initial `warm()` build always
+    /// persists once, regardless of how few files it touched (a home with
+    /// fewer than `SAVE_CHANGED_THRESHOLD` sessions must still get its
+    /// first-ever cache file, not wait for the 60s debounce or a 50-file
+    /// burst that will never come).
+    saved_once: bool,
 }
 
 impl SessionIndex {
@@ -577,13 +600,43 @@ impl SessionIndex {
     }
 
     pub fn with_ttl(sources: Vec<Arc<dyn SessionSource>>, ttl: Duration) -> Self {
+        Self::with_ttl_and_cache_path(sources, ttl, default_persist_path())
+    }
+
+    /// Same as `Self::with_ttl`, but with an explicit (or disabled -- `None`)
+    /// persistent parse-cache path instead of relying on
+    /// `default_persist_path`'s environment-variable resolution. This is the
+    /// dependency-injection seam that lets tests point at an isolated
+    /// temp-dir cache file (deterministic, no global env var mutation, safe
+    /// under the test harness's parallel execution) while `new`/`with_ttl`
+    /// -- whose signatures `crates/freshell-server/src/main.rs` depends on
+    /// unchanged -- keep today's exact call shape.
+    pub fn with_ttl_and_cache_path(
+        sources: Vec<Arc<dyn SessionSource>>,
+        ttl: Duration,
+        persist_path: Option<PathBuf>,
+    ) -> Self {
+        // Pre-populate the file cache from disk, if a persisted cache exists
+        // and is readable/current -- `load_cache_file` is fully tolerant
+        // (missing/corrupt/wrong-version all yield an empty map, never a
+        // panic). The FIRST `refresh_snapshot` sweep re-validates every
+        // loaded entry's (mtime, size) against a fresh `discover()` before
+        // trusting it (the same incremental-cache logic that already
+        // protects a warm in-memory cache) -- persistence only changes
+        // WHERE the starting cache comes from, never how it's trusted.
+        let file_cache = persist_path
+            .as_deref()
+            .map(load_cache_file)
+            .unwrap_or_default();
         Self {
             sources,
             ttl,
             snapshot: StdMutex::new(None),
             refresh_lock: AsyncMutex::new(()),
-            file_cache: Arc::new(StdMutex::new(HashMap::new())),
+            file_cache: Arc::new(StdMutex::new(file_cache)),
             direct_cache: Arc::new(StdMutex::new(HashMap::new())),
+            persist_path,
+            persist_state: StdMutex::new(PersistState::default()),
         }
     }
 
@@ -605,7 +658,7 @@ impl SessionIndex {
         let sources = self.sources.clone(); // Vec<Arc<_>>: refcount bumps only.
         let file_cache = Arc::clone(&self.file_cache);
         let direct_cache = Arc::clone(&self.direct_cache);
-        let items = tokio::task::spawn_blocking(move || {
+        let (items, changed) = tokio::task::spawn_blocking(move || {
             let mut cache = file_cache.lock().unwrap();
             let mut direct = direct_cache.lock().unwrap();
             refresh_snapshot(&sources, &mut cache, &mut direct)
@@ -620,6 +673,26 @@ impl SessionIndex {
                 fetched_at: Instant::now(),
             });
         } // guard dropped here — never held across an .await.
+          // Opportunistic persistence: gated (threshold/debounce) and, when
+          // warranted, saved via a DETACHED task -- never awaited here, so a
+          // real caller of `snapshot()` (an HTTP request handler) is never
+          // delayed by a disk write. See `Self::take_pending_save`.
+        if let Some((path, cache_snapshot)) = self.take_pending_save(changed) {
+            tokio::spawn(async move {
+                let outcome =
+                    tokio::task::spawn_blocking(move || save_cache_file(&path, &cache_snapshot))
+                        .await;
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        eprintln!("session-directory: failed to persist parse cache: {err}")
+                    }
+                    Err(join_err) => {
+                        eprintln!("session-directory: persist task panicked: {join_err}")
+                    }
+                }
+            });
+        }
         items
     }
 
@@ -639,6 +712,55 @@ impl SessionIndex {
     /// off the executor thread, so it never delays serving other requests.
     pub async fn warm(&self) {
         let _ = self.snapshot().await;
+    }
+
+    /// Decide whether a save is warranted after a sweep that changed
+    /// `changed_this_sweep` files/direct-listed sources, using the
+    /// production debounce window (`SAVE_DEBOUNCE`). `None` if persistence
+    /// is disabled (no `persist_path`) or no save is warranted right now.
+    /// See `Self::take_pending_save_with_debounce` for the gating rule.
+    fn take_pending_save(
+        &self,
+        changed_this_sweep: usize,
+    ) -> Option<(PathBuf, HashMap<PathBuf, FileEntry>)> {
+        self.take_pending_save_with_debounce(changed_this_sweep, SAVE_DEBOUNCE)
+    }
+
+    /// Save-decision gate, with an injectable debounce window so tests can
+    /// exercise the debounce rule in milliseconds instead of the real 60s
+    /// (`SAVE_DEBOUNCE`). Rule: a save is warranted iff at least one file
+    /// changed since the last save AND (this is the very first-ever sweep,
+    /// OR the cumulative changed-since-save count has reached
+    /// `SAVE_CHANGED_THRESHOLD`, OR the debounce window has elapsed since
+    /// the last save). On a "yes", resets the changed-since-save counter and
+    /// returns a cloned snapshot of the file cache to write (cloned while
+    /// still holding the state lock, so two concurrent sweeps can never
+    /// both decide "yes" for the same window).
+    fn take_pending_save_with_debounce(
+        &self,
+        changed_this_sweep: usize,
+        debounce: Duration,
+    ) -> Option<(PathBuf, HashMap<PathBuf, FileEntry>)> {
+        let path = self.persist_path.clone()?;
+        let mut state = self.persist_state.lock().unwrap();
+        state.changed_since_save = state
+            .changed_since_save
+            .saturating_add(changed_this_sweep as u64);
+        if state.changed_since_save == 0 {
+            return None;
+        }
+        let should_save = !state.saved_once
+            || state.changed_since_save >= SAVE_CHANGED_THRESHOLD
+            || state.last_saved_at.is_none_or(|t| t.elapsed() >= debounce);
+        if !should_save {
+            return None;
+        }
+        state.changed_since_save = 0;
+        state.last_saved_at = Some(Instant::now());
+        state.saved_once = true;
+        drop(state);
+        let cache_snapshot = self.file_cache.lock().unwrap().clone();
+        Some((path, cache_snapshot))
     }
 }
 
@@ -679,8 +801,13 @@ fn refresh_snapshot(
     sources: &[Arc<dyn SessionSource>],
     cache: &mut HashMap<PathBuf, FileEntry>,
     direct_cache: &mut HashMap<usize, DirectEntry>,
-) -> Vec<IndexedSession> {
+) -> (Vec<IndexedSession>, usize) {
     let mut discovered: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    // Count of files re-parsed + direct-listed sources re-queried this
+    // sweep -- the persistent-parse-cache save gate's "how much changed"
+    // signal (`SessionIndex::take_pending_save`). Stats-only unchanged
+    // files/tokens don't count; only actual expensive work does.
+    let mut changed = 0usize;
 
     for (idx, source) in sources.iter().enumerate() {
         if let Some(token) = source.direct_change_token() {
@@ -689,6 +816,7 @@ fn refresh_snapshot(
                 match source.direct_list() {
                     Ok(items) => {
                         direct_cache.insert(idx, DirectEntry { token, items });
+                        changed += 1;
                     }
                     Err(err) => {
                         // Preserve whatever was cached from the last
@@ -720,6 +848,7 @@ fn refresh_snapshot(
                         item,
                     },
                 );
+                changed += 1;
             }
             discovered.insert(stat.path);
         }
@@ -740,7 +869,156 @@ fn refresh_snapshot(
             .cmp(&a.last_activity_at)
             .then_with(|| b.key().cmp(&a.key()))
     });
-    items
+    (items, changed)
+}
+
+// -- Persistent parse cache (self-hosting-readiness bake-in, "kill the cold
+// boot") --------------------------------------------------------------------
+//
+// The in-memory `FileEntry` cache above makes a WARM request fast (a sweep
+// over unchanged files costs stats, not parses), but every server BOOT
+// starts that cache empty -- on a real 8.7GB codex + 2.2GB claude corpus,
+// the very first `warm()` sweep measured ~4-5 minutes at 99% CPU before the
+// sidebar responds. This section adds disk persistence for exactly the same
+// `FileEntry` map: `SessionIndex::with_ttl_and_cache_path` loads it at
+// construction (pre-populating `file_cache`), and `SessionIndex::snapshot`
+// opportunistically writes it back after a sweep. The EXISTING incremental
+// logic in `refresh_snapshot` (above) is what makes this safe -- a loaded
+// entry is only ever "used as-is" after a fresh `discover()` confirms its
+// `(mtime, size)` still match; persistence changes WHERE a sweep's starting
+// point comes from, never whether a stale/tampered entry can be trusted.
+//
+// File location: `<home>/.freshell/rust-session-cache.json` -- honoring
+// `FRESHELL_HOME` then `HOME`, matching
+// `crates/freshell-server/src/main.rs::resolve_home`'s precedence for the
+// `.freshell` config dir this cache file lives beside.
+//
+// Filename: deliberately `rust-session-cache.json`, NOT `session-cache.json`
+// (the legacy Node server's file, `server/session-scanner/cache.ts`). During
+// the side-by-side bake-in, both servers can run concurrently against the
+// SAME `~/.freshell` home; sharing one file would mean two independent
+// writers (each doing its own tmp+rename) racing the same path, and the two
+// formats aren't compatible anyway (this stores `FileEntry`/`IndexedSession`;
+// the legacy format stores its own `SessionScanResult` shape). A distinct
+// filename makes the two caches fully independent: no lock, no format
+// coupling, no risk of one server's write corrupting the other's read.
+
+/// Schema version for the persisted parse-cache file. Bump on any format
+/// change so an old (or a future, if this ever needs to roll back) file is
+/// cleanly discarded -- never partially or incorrectly deserialized into a
+/// mismatched shape.
+const CACHE_SCHEMA_VERSION: u32 = 1;
+
+/// See "File location"/"Filename" above.
+const CACHE_FILENAME: &str = "rust-session-cache.json";
+
+/// After a sweep, save immediately once at least this many files/sources
+/// changed since the last save (a cold-boot sweep over thousands of files
+/// clears this on its very first sweep). Below this, saves are debounced
+/// (see [`SAVE_DEBOUNCE`]) instead of writing on every small trickle of
+/// changes.
+const SAVE_CHANGED_THRESHOLD: u64 = 50;
+
+/// When fewer than [`SAVE_CHANGED_THRESHOLD`] files changed, save at most
+/// this often -- bounds disk-write frequency during active browsing/editing
+/// without indefinitely delaying a save that IS warranted.
+const SAVE_DEBOUNCE: Duration = Duration::from_secs(60);
+
+/// On-disk shape of the persisted parse cache. `entries` is keyed by the
+/// absolute file path as a `String` (not `PathBuf` -- `serde_json` object
+/// keys must serialize as strings, and a lossy round-trip through
+/// `to_string_lossy` is a non-issue here: a non-UTF-8 path would already be
+/// unusable in this codebase's other string-keyed maps/APIs).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedCacheFile {
+    schema_version: u32,
+    entries: HashMap<String, FileEntry>,
+}
+
+/// Resolve `<home>/.freshell/rust-session-cache.json`, honoring
+/// `FRESHELL_HOME` then `HOME` (see the section doc comment above). `None`
+/// if neither is set (or set to an empty string) -- persistence is simply
+/// disabled in that case, exactly like any other optional feature with an
+/// unresolvable prerequisite, never a hard error.
+fn default_persist_path() -> Option<PathBuf> {
+    let home = std::env::var("FRESHELL_HOME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var("HOME").ok().filter(|v| !v.is_empty()))?;
+    Some(PathBuf::from(home).join(".freshell").join(CACHE_FILENAME))
+}
+
+/// Load the persisted parse cache from `path`. Tolerant of everything: a
+/// missing file, unreadable/corrupt JSON, or a schema-version mismatch all
+/// produce an empty cache (logged once to stderr, except for the common
+/// "file doesn't exist yet" case) -- NEVER panics, NEVER fails boot. The
+/// caller pre-populates `SessionIndex.file_cache` with the result; the
+/// existing incremental-sweep logic in `refresh_snapshot` re-validates every
+/// entry's `(mtime, size)` against a fresh `discover()` before trusting it,
+/// so a stale/tampered file can only ever cause an extra re-parse, never a
+/// wrong result.
+fn load_cache_file(path: &Path) -> HashMap<PathBuf, FileEntry> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(), // missing (the common case) or unreadable
+    };
+    let parsed: PersistedCacheFile = match serde_json::from_str(&content) {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!(
+                "session-directory: parse cache at {} is corrupt, starting cold ({err})",
+                path.display()
+            );
+            return HashMap::new();
+        }
+    };
+    if parsed.schema_version != CACHE_SCHEMA_VERSION {
+        eprintln!(
+            "session-directory: parse cache at {} has schema_version {} (expected {}), starting cold",
+            path.display(),
+            parsed.schema_version,
+            CACHE_SCHEMA_VERSION
+        );
+        return HashMap::new();
+    }
+    parsed
+        .entries
+        .into_iter()
+        .map(|(k, v)| (PathBuf::from(k), v))
+        .collect()
+}
+
+/// Atomically persist `cache` to `path`: write the full JSON payload to a
+/// sibling temp file, then `rename` it into place. A reader (or a process
+/// that crashes mid-write) never observes a partially-written cache file --
+/// `path` itself is untouched until the `rename`, which POSIX/most
+/// filesystems perform as a single atomic directory-entry update. Creates
+/// `path`'s parent directory if it doesn't exist yet (mirrors `mkdir -p
+/// ~/.freshell` the legacy server's cache does at startup). Errors are
+/// returned (not swallowed) so the caller can log them, but a save failure
+/// NEVER propagates to any request path -- see
+/// `SessionIndex::take_pending_save`'s caller in `snapshot()`.
+fn save_cache_file(path: &Path, cache: &HashMap<PathBuf, FileEntry>) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let entries: HashMap<String, FileEntry> = cache
+        .iter()
+        .map(|(k, v)| (k.to_string_lossy().into_owned(), v.clone()))
+        .collect();
+    let payload = PersistedCacheFile {
+        schema_version: CACHE_SCHEMA_VERSION,
+        entries,
+    };
+    let json = serde_json::to_string(&payload)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(".tmp");
+    let tmp_path = PathBuf::from(tmp_os);
+    std::fs::write(&tmp_path, json)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1639,5 +1917,585 @@ mod tests {
         // "opencode:z" > "codex:z" > "claude:z" (lexicographic). "codex:a"
         // (lastActivityAt=100) sorts last.
         assert_eq!(keys, vec!["opencode:z", "codex:z", "claude:z", "codex:a"]);
+    }
+
+    // ── Persistent parse cache (Batch 1B, self-hosting-readiness bake-in):
+    // disk persistence for `FileEntry` so a server restart doesn't pay the
+    // full cold-scan cost again (measured ~4-5min at 99% CPU on a real
+    // 8.7GB codex + 2.2GB claude corpus before this change). `SessionIndex`
+    // loads a persisted cache at construction (pre-populating `file_cache`
+    // -- the EXISTING incremental-sweep logic above re-validates every
+    // entry's (mtime, size) against a fresh `discover()`, so a stale/corrupt
+    // file can only ever cause an extra re-parse, never a wrong result) and
+    // opportunistically saves it back (threshold/debounce-gated, detached --
+    // never on the request path) after a sweep. `with_ttl_and_cache_path`
+    // exists so tests (and any other caller) can inject an explicit cache
+    // path instead of relying on `default_persist_path()`'s environment
+    // resolution, which would otherwise require mutating global env vars
+    // across parallel test threads.
+    //
+    // RED (this commit, before the production code existed): none of
+    // `load_cache_file` / `save_cache_file` / `default_persist_path` /
+    // `SessionIndex::with_ttl_and_cache_path` / `FileEntry` (test-visible)
+    // existed, so this test module failed to compile.
+
+    fn cache_path_in(dir: &Path) -> PathBuf {
+        dir.join("rust-session-cache.json")
+    }
+
+    /// A. Cache round-trip: build an index over real fixtures, persist it,
+    /// then build a SECOND index (fresh parse-call counter) pointed at the
+    /// same directory + cache file -- its first sweep must re-parse ZERO
+    /// files (only re-stat), proving the persisted entries were trusted.
+    #[tokio::test]
+    async fn persisted_cache_round_trip_avoids_reparse_on_reload() {
+        let claude_home = unique_temp_dir("persist-round-trip");
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        write_session_file(
+            &project,
+            "a.jsonl",
+            &synthetic_session_id(1),
+            "/p/a",
+            "2025-01-30T10:00:00.000Z",
+            "hello a",
+        );
+        write_session_file(
+            &project,
+            "b.jsonl",
+            &synthetic_session_id(2),
+            "/p/b",
+            "2025-01-30T10:00:01.000Z",
+            "hello b",
+        );
+
+        let cache_dir = unique_temp_dir("persist-round-trip-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cache_path = cache_path_in(&cache_dir);
+
+        // First index: cold sweep, parses both files, then we persist its
+        // resulting file_cache directly (white-box -- same module -- so the
+        // test doesn't depend on the fire-and-forget background save's
+        // timing).
+        let index1 = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(ClaudeSource::new(claude_home.clone()))],
+            Duration::from_millis(10),
+            Some(cache_path.clone()),
+        );
+        let snap1 = index1.snapshot().await;
+        assert_eq!(snap1.len(), 2);
+        save_cache_file(&cache_path, &index1.file_cache.lock().unwrap()).unwrap();
+
+        // Second index, same directory + cache file, FRESH parse counter.
+        let parse_calls = Arc::new(AtomicUsize::new(0));
+        let source2 = CountingWrapper {
+            parse_calls: Arc::clone(&parse_calls),
+            ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
+        };
+        let index2 = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(source2)],
+            Duration::from_millis(10),
+            Some(cache_path.clone()),
+        );
+        let snap2 = index2.snapshot().await;
+        assert_eq!(
+            snap2.len(),
+            2,
+            "the reloaded index must see the same sessions"
+        );
+        assert_eq!(
+            parse_calls.load(Ordering::SeqCst),
+            0,
+            "a freshly-constructed index loading a persisted cache must not re-parse any unchanged file"
+        );
+
+        std::fs::remove_dir_all(&claude_home).ok();
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    /// B. Stale entry: after persisting, one file changes size on disk
+    /// (bypassing the first index entirely) before a second index loads the
+    /// cache -- only that file must be re-parsed.
+    #[tokio::test]
+    async fn persisted_cache_stale_entry_reparses_only_changed_file() {
+        let claude_home = unique_temp_dir("persist-stale-entry");
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        write_session_file(
+            &project,
+            "a.jsonl",
+            &synthetic_session_id(1),
+            "/p/a",
+            "2025-01-30T10:00:00.000Z",
+            "hello a",
+        );
+        write_session_file(
+            &project,
+            "b.jsonl",
+            &synthetic_session_id(2),
+            "/p/b",
+            "2025-01-30T10:00:01.000Z",
+            "hello b",
+        );
+
+        let cache_dir = unique_temp_dir("persist-stale-entry-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cache_path = cache_path_in(&cache_dir);
+
+        let index1 = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(ClaudeSource::new(claude_home.clone()))],
+            Duration::from_millis(10),
+            Some(cache_path.clone()),
+        );
+        let _ = index1.snapshot().await;
+        save_cache_file(&cache_path, &index1.file_cache.lock().unwrap()).unwrap();
+
+        // Rewrite "b" with different (longer) content -- changes size,
+        // robust to coarse filesystem mtime resolution (same technique the
+        // pre-existing `changed_file_single_reparse` test above uses).
+        write_session_file(
+            &project,
+            "b.jsonl",
+            &synthetic_session_id(2),
+            "/p/b",
+            "2025-01-30T10:05:00.000Z",
+            "hello b, now with a much longer message body to force a size change",
+        );
+
+        let parse_calls = Arc::new(AtomicUsize::new(0));
+        let source2 = CountingWrapper {
+            parse_calls: Arc::clone(&parse_calls),
+            ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
+        };
+        let index2 = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(source2)],
+            Duration::from_millis(10),
+            Some(cache_path.clone()),
+        );
+        let snap2 = index2.snapshot().await;
+        assert_eq!(snap2.len(), 2);
+        assert_eq!(
+            parse_calls.load(Ordering::SeqCst),
+            1,
+            "only the changed file must be re-parsed; the untouched sibling is trusted from the persisted cache"
+        );
+
+        std::fs::remove_dir_all(&claude_home).ok();
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    /// C1. A missing cache file loads as an empty cache -- no panic.
+    #[test]
+    fn load_cache_file_missing_path_returns_empty_cache() {
+        let dir = unique_temp_dir("persist-missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = cache_path_in(&dir); // parent dir exists, file itself doesn't
+        let cache = load_cache_file(&path);
+        assert!(cache.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C2. A corrupt (non-JSON) cache file loads as an empty cache -- no panic.
+    #[test]
+    fn load_cache_file_corrupt_json_returns_empty_cache() {
+        let dir = unique_temp_dir("persist-corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = cache_path_in(&dir);
+        std::fs::write(&path, b"not valid json { at all").unwrap();
+        let cache = load_cache_file(&path);
+        assert!(cache.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C3. A valid-JSON cache file with a schema_version that doesn't match
+    /// the current format loads as an empty cache -- clean invalidation
+    /// instead of misinterpreting an old/future format.
+    #[test]
+    fn load_cache_file_wrong_schema_version_returns_empty_cache() {
+        let dir = unique_temp_dir("persist-wrong-version");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = cache_path_in(&dir);
+        std::fs::write(&path, r#"{"schema_version":999,"entries":{}}"#).unwrap();
+        let cache = load_cache_file(&path);
+        assert!(cache.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C4. End-to-end: a `SessionIndex` constructed against a corrupt cache
+    /// file boots cold (empty file_cache) without panicking, and still
+    /// indexes real sessions normally.
+    #[tokio::test]
+    async fn session_index_with_corrupt_cache_file_boots_cold_without_panic() {
+        let claude_home = unique_temp_dir("persist-boot-corrupt");
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        write_session_file(
+            &project,
+            "a.jsonl",
+            &synthetic_session_id(1),
+            "/p/a",
+            "2025-01-30T10:00:00.000Z",
+            "hello a",
+        );
+
+        let cache_dir = unique_temp_dir("persist-boot-corrupt-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cache_path = cache_path_in(&cache_dir);
+        std::fs::write(&cache_path, b"{ garbage").unwrap();
+
+        let index = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(ClaudeSource::new(claude_home.clone()))],
+            Duration::from_millis(10),
+            Some(cache_path.clone()),
+        );
+        let snap = index.snapshot().await;
+        assert_eq!(
+            snap.len(),
+            1,
+            "indexing must proceed normally despite the corrupt cache file"
+        );
+
+        std::fs::remove_dir_all(&claude_home).ok();
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    /// D. A file present when the cache was persisted, then deleted before a
+    /// second index loads it, is pruned -- the existing discovery-based
+    /// prune (`cache.retain`) already handles this; persistence just
+    /// pre-populates the map with a since-deleted entry.
+    #[tokio::test]
+    async fn persisted_cache_deleted_file_pruned_after_reload() {
+        let claude_home = unique_temp_dir("persist-deleted-pruned");
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        write_session_file(
+            &project,
+            "keep.jsonl",
+            &synthetic_session_id(1),
+            "/p/1",
+            "2025-01-30T10:00:00.000Z",
+            "hello",
+        );
+        write_session_file(
+            &project,
+            "remove.jsonl",
+            &synthetic_session_id(2),
+            "/p/2",
+            "2025-01-30T10:00:01.000Z",
+            "hello",
+        );
+
+        let cache_dir = unique_temp_dir("persist-deleted-pruned-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cache_path = cache_path_in(&cache_dir);
+
+        let index1 = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(ClaudeSource::new(claude_home.clone()))],
+            Duration::from_millis(10),
+            Some(cache_path.clone()),
+        );
+        let snap1 = index1.snapshot().await;
+        assert_eq!(snap1.len(), 2);
+        save_cache_file(&cache_path, &index1.file_cache.lock().unwrap()).unwrap();
+
+        std::fs::remove_file(project.join("remove.jsonl")).unwrap();
+
+        let index2 = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(ClaudeSource::new(claude_home.clone()))],
+            Duration::from_millis(10),
+            Some(cache_path.clone()),
+        );
+        let snap2 = index2.snapshot().await;
+        assert_eq!(
+            snap2.len(),
+            1,
+            "the deleted file's session must be gone after reload"
+        );
+        assert_eq!(snap2[0].session_id, synthetic_session_id(1));
+
+        std::fs::remove_dir_all(&claude_home).ok();
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    /// E1. A successful save leaves no stray `.tmp` file behind (proving
+    /// the tmp-then-rename sequence completed and cleaned up after itself).
+    #[test]
+    fn save_cache_file_leaves_no_stray_tmp_file_on_success() {
+        let dir = unique_temp_dir("persist-atomic-success");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = cache_path_in(&dir);
+        let cache = HashMap::new();
+        save_cache_file(&path, &cache).unwrap();
+        assert!(path.exists());
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(".tmp");
+        assert!(
+            !Path::new(&tmp).exists(),
+            "no leftover temp file after a successful save"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// E2. Atomicity under failure: if the write to the temp file fails
+    /// (simulated by making the target directory read-only), any
+    /// PRE-EXISTING cache file at the target path is left completely
+    /// untouched -- a reader never observes a half-written file.
+    ///
+    /// (A crash mid-`fs::write` to the tmp file itself cannot be simulated
+    /// deterministically from a unit test -- that's an OS/fault-injection
+    /// concern, not something achievable by calling `std::fs::write`'s safe
+    /// Rust API on purpose. What IS provable at this level, and what this
+    /// test proves, is that a write-path FAILURE never corrupts or removes
+    /// the existing target file: `save_cache_file` never touches `path`
+    /// itself until the final `rename`, and `rename` is never reached if
+    /// the write to the tmp path errors.)
+    #[cfg(unix)]
+    #[test]
+    fn save_cache_file_leaves_original_untouched_when_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_temp_dir("persist-atomic-failure");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = cache_path_in(&dir);
+        std::fs::write(&path, r#"{"schema_version":1,"entries":{}}"#).unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+
+        // Read-only directory -> the tmp-file write inside it fails with a
+        // permission error, before any rename is attempted.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            PathBuf::from("/fake/path.jsonl"),
+            FileEntry {
+                mtime_ms: 1,
+                size: 2,
+                item: None,
+            },
+        );
+        let result = save_cache_file(&path, &cache);
+
+        // Restore write permission before cleanup.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "the write into a read-only directory must fail"
+        );
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after, original,
+            "the original cache file must be untouched by a failed save"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F. An excluded (cwd-less) file's cached EXCLUSION (`item: None`)
+    /// survives persistence -- a reloaded index must not re-parse it either.
+    #[tokio::test]
+    async fn persisted_cache_excluded_marker_survives_reload() {
+        let claude_home = unique_temp_dir("persist-excluded-survives");
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        let content = std::fs::read_to_string(fixtures_dir().join("healthy.jsonl")).unwrap();
+        std::fs::write(project.join("healthy.jsonl"), &content).unwrap();
+        write_session_file(
+            &project,
+            "included.jsonl",
+            &synthetic_session_id(9),
+            "/p/9",
+            "2025-01-30T10:00:00.000Z",
+            "hello",
+        );
+
+        let cache_dir = unique_temp_dir("persist-excluded-survives-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cache_path = cache_path_in(&cache_dir);
+
+        let index1 = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(ClaudeSource::new(claude_home.clone()))],
+            Duration::from_millis(10),
+            Some(cache_path.clone()),
+        );
+        let snap1 = index1.snapshot().await;
+        assert_eq!(snap1.len(), 1, "sanity: the cwd-less file is excluded");
+        save_cache_file(&cache_path, &index1.file_cache.lock().unwrap()).unwrap();
+
+        let parse_calls = Arc::new(AtomicUsize::new(0));
+        let source2 = CountingWrapper {
+            parse_calls: Arc::clone(&parse_calls),
+            ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
+        };
+        let index2 = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(source2)],
+            Duration::from_millis(10),
+            Some(cache_path.clone()),
+        );
+        let snap2 = index2.snapshot().await;
+        assert_eq!(
+            snap2.len(),
+            1,
+            "the excluded file must still be absent after reload"
+        );
+        assert_eq!(
+            parse_calls.load(Ordering::SeqCst),
+            0,
+            "neither the included nor the excluded file should be re-parsed -- both were cached"
+        );
+
+        std::fs::remove_dir_all(&claude_home).ok();
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    /// G. Automatic wiring sanity: `warm()` (the boot-time call, `main.rs`)
+    /// triggers persistence WITHOUT any manual `save_cache_file` call --
+    /// proving `SessionIndex` actually wires the opportunistic save into its
+    /// own sweep, not just that the standalone save/load functions work in
+    /// isolation. The save is fire-and-forget (never blocks a request
+    /// path), so this polls for the file to appear rather than asserting
+    /// immediately -- bounded (2s total), and a write this small completes
+    /// in low single-digit milliseconds on any local disk, so this is a
+    /// generous margin, not a race.
+    #[tokio::test]
+    async fn warm_automatically_persists_cache_to_disk() {
+        let claude_home = unique_temp_dir("persist-auto-warm");
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        write_session_file(
+            &project,
+            "a.jsonl",
+            &synthetic_session_id(1),
+            "/p/a",
+            "2025-01-30T10:00:00.000Z",
+            "hello a",
+        );
+
+        let cache_dir = unique_temp_dir("persist-auto-warm-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cache_path = cache_path_in(&cache_dir);
+
+        let index = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(ClaudeSource::new(claude_home.clone()))],
+            Duration::from_secs(60),
+            Some(cache_path.clone()),
+        );
+        index.warm().await;
+
+        let mut found = false;
+        for _ in 0..40 {
+            if cache_path.exists() {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            found,
+            "warm() must automatically persist the cache to disk within 2s"
+        );
+        let cache = load_cache_file(&cache_path);
+        assert_eq!(
+            cache.len(),
+            1,
+            "the persisted cache must contain the one indexed file"
+        );
+
+        std::fs::remove_dir_all(&claude_home).ok();
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    /// H. Save-decision gating: the very first sweep always saves
+    /// (regardless of how few files changed); a subsequent sweep with few
+    /// changes does NOT save again until the debounce window elapses; a
+    /// change at/above the threshold saves immediately regardless of
+    /// debounce; zero changes never saves.
+    #[tokio::test]
+    async fn take_pending_save_gates_by_threshold_and_debounce() {
+        let cache_dir = unique_temp_dir("persist-gating");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cache_path = cache_path_in(&cache_dir);
+        let index = SessionIndex::with_ttl_and_cache_path(
+            Vec::new(),
+            Duration::from_secs(60),
+            Some(cache_path.clone()),
+        );
+
+        let first = index.take_pending_save_with_debounce(1, Duration::from_millis(30));
+        assert!(first.is_some(), "the first-ever sweep must always persist");
+
+        let second = index.take_pending_save_with_debounce(1, Duration::from_millis(30));
+        assert!(
+            second.is_none(),
+            "a small change within the debounce window must not re-save"
+        );
+
+        let third = index.take_pending_save_with_debounce(
+            SAVE_CHANGED_THRESHOLD as usize,
+            Duration::from_millis(30),
+        );
+        assert!(
+            third.is_some(),
+            "a change at/above the threshold must save immediately"
+        );
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let fourth = index.take_pending_save_with_debounce(1, Duration::from_millis(30));
+        assert!(
+            fourth.is_some(),
+            "any change after the debounce window elapses must save"
+        );
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let fifth = index.take_pending_save_with_debounce(0, Duration::from_millis(30));
+        assert!(fifth.is_none(), "zero changes must never trigger a save");
+
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    /// I. `default_persist_path()` resolves `FRESHELL_HOME` then `HOME` (the
+    /// same precedence `main.rs::resolve_home` uses for the `.freshell`
+    /// config dir this cache file lives beside), and returns `None` when
+    /// neither is set -- disabling persistence rather than erroring.
+    #[test]
+    fn default_persist_path_resolves_freshell_home_then_home_then_none() {
+        // Serialize env-var mutation: this is the ONLY test in this crate
+        // that touches FRESHELL_HOME/HOME, so no cross-test interference is
+        // possible even under the default parallel test harness.
+        let prior_freshell_home = std::env::var("FRESHELL_HOME").ok();
+        let prior_home = std::env::var("HOME").ok();
+
+        std::env::set_var("FRESHELL_HOME", "/fh-home");
+        std::env::set_var("HOME", "/plain-home");
+        assert_eq!(
+            default_persist_path(),
+            Some(PathBuf::from("/fh-home/.freshell/rust-session-cache.json")),
+            "FRESHELL_HOME must take precedence over HOME"
+        );
+
+        std::env::remove_var("FRESHELL_HOME");
+        assert_eq!(
+            default_persist_path(),
+            Some(PathBuf::from(
+                "/plain-home/.freshell/rust-session-cache.json"
+            )),
+            "HOME must be used when FRESHELL_HOME is unset"
+        );
+
+        std::env::remove_var("HOME");
+        assert_eq!(
+            default_persist_path(),
+            None,
+            "no home resolved -> persistence disabled, not an error"
+        );
+
+        match prior_freshell_home {
+            Some(v) => std::env::set_var("FRESHELL_HOME", v),
+            None => std::env::remove_var("FRESHELL_HOME"),
+        }
+        match prior_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
     }
 }

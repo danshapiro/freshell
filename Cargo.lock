@@ -1353,6 +1353,7 @@ version = "0.1.0"
 dependencies = [
  "notify",
  "rusqlite",
+ "serde",
  "serde_json",
  "tokio",
 ]
