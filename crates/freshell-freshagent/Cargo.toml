@@ -40,6 +40,13 @@ freshell-codex = { path = "../freshell-codex", features = ["real-transport"] }
 # The REST router + JSON extraction.
 axum = "0.8"
 serde_json = { workspace = true }
+# `<think>`/`<thinking>` balanced-tag segmentation for opencode assistant text
+# (`itemsFromAssistantTextPart`/`normalizeBalancedThinkTags`, normalize.ts:100-189) needs a
+# backreference (`<(thinking|think)...>...</\1>`) to match only same-name open/close pairs --
+# the `regex` crate cannot express that (no backreference support, by design, for linear-time
+# guarantees). `fancy-regex` is already resolved in the workspace lockfile (a transitive dep of
+# `jsonschema`), so this adds no new dependency to the build graph, only a direct one.
+fancy-regex = "0.18"
 # The shared broadcast bus (String frames), the create/turn async orchestration, the codex
 # app-server sidecar spawn (`process`), and its stdio drain (`io-util`).
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "process", "io-util"] }

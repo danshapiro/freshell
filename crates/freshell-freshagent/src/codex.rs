@@ -46,21 +46,21 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
+    Json, Router,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::patch,
-    Json, Router,
 };
-use serde_json::{json, Map, Value};
-use tokio::sync::{oneshot, Mutex as TokioMutex};
+use serde_json::{Map, Value, json};
+use tokio::sync::{Mutex as TokioMutex, oneshot};
 
-use freshell_codex::transport::{reap_owned_codex_sidecars, TungsteniteTransport};
+use freshell_codex::transport::{TungsteniteTransport, reap_owned_codex_sidecars};
 use freshell_codex::{
+    CODEX_SIDECAR_OWNERSHIP_ENV, CodexAdapterEvent, CodexAppServerClient, CodexAppServerError,
+    CodexNotification, CodexStatus, CodexSubscription, StartThreadParams, StartTurnParams,
     mint_ownership_id, normalize_codex_thread_status, normalize_freshcodex_effort,
-    normalize_freshcodex_model, to_codex_reasoning_effort, CodexAdapterEvent, CodexAppServerClient,
-    CodexAppServerError, CodexNotification, CodexStatus, CodexSubscription, StartThreadParams,
-    StartTurnParams, CODEX_SIDECAR_OWNERSHIP_ENV,
+    normalize_freshcodex_model, to_codex_reasoning_effort,
 };
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCreate, FreshAgentCreateFailed,
@@ -1140,6 +1140,29 @@ fn map_codex_item(item_id: &str, item: &Value, item_type: &str) -> Result<Vec<Va
     }
 }
 
+/// `classifyCodexItemRole(item)` (`normalize.ts:475-501`): every `CodexThreadItemTypeSchema`
+/// variant maps to exactly one display role. This is called only AFTER [`map_codex_item`] has
+/// already validated `item_type` against the same variant set (returning `Err` for anything
+/// else), so the catch-all arm below is unreachable in practice -- it exists only so this is a
+/// total function, matching the reference's `assertNever` default case in spirit (a compile-time
+/// safety net, not a runtime path).
+fn classify_codex_item_role(item_type: &str) -> &'static str {
+    match item_type {
+        "userMessage" => "user",
+        "agentMessage" | "plan" | "reasoning" => "assistant",
+        "commandExecution"
+        | "fileChange"
+        | "mcpToolCall"
+        | "dynamicToolCall"
+        | "collabAgentToolCall"
+        | "webSearch"
+        | "imageView"
+        | "imageGeneration" => "tool",
+        "hookPrompt" | "enteredReviewMode" | "exitedReviewMode" | "contextCompaction" => "system",
+        _ => "assistant",
+    }
+}
+
 /// `readCodexTurnError(rawTurn)` (`normalize.ts:509-519`).
 fn read_codex_turn_error(raw_turn: &Value) -> Option<String> {
     let error = raw_turn.get("error")?;
@@ -1277,11 +1300,22 @@ fn build_codex_snapshot_json(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // `normalizeRawTurns` (`adapter.ts:491-502`): flatMap every raw turn's SPLIT display rows
+    // into one flat list, THEN renumber `ordinal` sequentially across the WHOLE flattened list
+    // (`.map((turn, index) => ({...turn, ordinal: index}))`, `adapter.ts:499-501`) -- ordinal is
+    // NOT per-raw-turn, it is the display row's position in the final transcript.
     let turns: Vec<Value> = raw_turns
         .iter()
+        .map(|raw_turn| build_codex_turn_json(raw_turn, 0))
+        .collect::<Result<Vec<Vec<Value>>, String>>()?
+        .into_iter()
+        .flatten()
         .enumerate()
-        .map(|(ordinal, raw_turn)| build_codex_turn_json(raw_turn, ordinal))
-        .collect::<Result<_, _>>()?;
+        .map(|(ordinal, mut turn)| {
+            turn["ordinal"] = json!(ordinal);
+            turn
+        })
+        .collect();
 
     Ok(json!({
         "sessionType": SESSION_TYPE,
@@ -1316,23 +1350,46 @@ fn build_codex_snapshot_json(
     }))
 }
 
-/// A `FreshAgentTurnSchema`-shaped turn from one raw codex `turn` record (`makeThread`/real
-/// app-server shape: `{id, status, error?, items:[{type,id,...}], ...}`). Every item in `items`
-/// is mapped via [`map_codex_item`] (the full `normalizeCodexItem` switch,
-/// `normalize.ts:238-473`); a turn-level `error` (`normalize.ts:509-519,640-641`) appends a
-/// synthetic `{kind:'text', text:'Codex turn failed: ...'}` item.
+/// One raw codex turn's items, grouped into contiguous same-role rows -- the intermediate
+/// shape `normalizeCodexDisplayTurns`' internal `pendingRows` builds before `buildDisplayTurn`
+/// (`normalize.ts:615-632`).
+struct CodexPendingRow {
+    role: &'static str,
+    items: Vec<Value>,
+}
+
+/// `normalizeCodexDisplayTurns` (`normalize.ts:600-684`), restricted to this committed-turns
+/// REST READ path (`getSnapshot`, `adapter.ts:1082-1122`): SPLIT one raw codex `turn` record
+/// (`makeThread`/real app-server shape: `{id, status, error?, items:[{type,id,...}], ...}`)
+/// into MULTIPLE `FreshAgentTurnSchema`-shaped display turns, one per maximal run of
+/// contiguous-same-role raw items (`classifyCodexItemRole`, `normalize.ts:475-501` --
+/// ported as [`classify_codex_item_role`]). Every raw item is mapped via [`map_codex_item`]
+/// (the full `normalizeCodexItem` switch, `normalize.ts:238-473`) BEFORE being folded into its
+/// row, so an unrecognized item type still fails the whole turn exactly as before.
 ///
-/// STRUCTURAL SIMPLIFICATION (documented, not silent): the reference SPLITS one raw turn's
-/// items into MULTIPLE display turns grouped by contiguous same-role rows, each with its own
-/// HMAC-derived `turnId` (`normalizeCodexDisplayTurns`, `normalize.ts:600-684`) -- machinery
-/// built for the LIVE optimistic-update path (`requestId` aliasing for in-flight sends,
-/// `empty-response`/`submitted-input` synthetic rows). This is a committed-turns REST READ, not
-/// a live drive path, so this port keeps the ORIGINAL one-raw-turn-to-one-output-turn shape
-/// established by PR-5 (`turnId` = the raw turn's own `id`) and focuses fidelity on ITEM KIND
-/// coverage within that turn, which is what actually determines whether the transcript renders
-/// tool calls/reasoning/file changes. The `empty-response`/`submitted-input` synthetic rows are
-/// NOT ported (no live-turn optimistic-update concept exists on this read-only path).
-fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Value, String> {
+/// A turn-level `error` (`normalize.ts:509-519,640-641`) or a completed turn whose only items
+/// are `user`-role with no `assistant` output (`normalize.ts:642-652`) each APPEND A NEW
+/// synthetic row (role `assistant`, matching `createSyntheticPendingRow`'s hardcoded role,
+/// `normalize.ts:521-533`) rather than an item tacked onto the last row -- this is the
+/// reference's actual shape, not a simplification of it.
+///
+/// `turnId`/`id` semantics (documented divergence, not a silent one): the reference derives an
+/// HMAC-SHA256 `turnId` per row (`createCodexDisplayId`, `normalize.ts:574-593`) keyed by a
+/// per-server-instance secret (`displayIdSecret`, sourced from `configStore` in
+/// `server/index.ts:322-326` -- freshell-server's config store, outside this crate's ownership
+/// boundary). This port does not carry that secret and does not need to: the only consumer of
+/// a Fresh-Agent `turnId`'s STABILITY is client-side checkpoint matching
+/// (`fresh-agent-checkpoints.ts`), which already falls back to label+ordinal matching whenever
+/// a direct `turnId`/`requestId` match fails -- and a REST-read turn's `requestId` is ALWAYS
+/// absent in both ports (`stripCodexDisplayMetadata` strips it in the reference; this port
+/// never adds it). There is also no `getTurnBody`/rewind-by-`turnId` RPC on this crate's
+/// surface that would need to recompute and match this id later. Given that, this port keeps
+/// PR-5's `turnId == raw provider turn id` for the common case (a raw turn that produces
+/// exactly ONE display row, e.g. a straightforward `agentMessage`), and disambiguates a
+/// SPLIT raw turn's extra rows with `"{raw_turn_id}:row-{index}"`. Both schemes are stable
+/// (same raw turn shape -> same ids on repeated reads) and unique per row, which is everything
+/// a `.strict()`-schema, non-cryptographic display id needs to be.
+fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>, String> {
     let turn_id = raw_turn
         .get("id")
         .and_then(Value::as_str)
@@ -1343,7 +1400,11 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Value, Stri
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let mut items = Vec::new();
+
+    let mut rows: Vec<CodexPendingRow> = Vec::new();
+    let mut has_assistant_output = false;
+    let mut has_user_output = false;
+    let mut all_items_are_user = true;
     for (index, item) in items_raw.iter().enumerate() {
         let item_type = item
             .get("type")
@@ -1354,24 +1415,77 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Value, Stri
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| format!("{turn_id}:item-{index}"));
-        items.extend(map_codex_item(&item_id, item, item_type)?);
-    }
-    if let Some(turn_error) = read_codex_turn_error(raw_turn) {
-        items.push(json!({
-            "id": format!("{turn_id}:turn-error"),
-            "kind": "text",
-            "text": format!("Codex turn failed: {turn_error}"),
-        }));
+        let mapped = map_codex_item(&item_id, item, item_type)?;
+        let role = classify_codex_item_role(item_type);
+        match role {
+            "assistant" => has_assistant_output = true,
+            "user" => has_user_output = true,
+            _ => {}
+        }
+        if role != "user" {
+            all_items_are_user = false;
+        }
+        match rows.last_mut() {
+            Some(row) if row.role == role => row.items.extend(mapped),
+            _ => rows.push(CodexPendingRow {
+                role,
+                items: mapped,
+            }),
+        }
     }
 
-    Ok(json!({
-        "id": turn_id,
-        "turnId": turn_id,
-        "ordinal": ordinal,
-        "source": "durable",
-        "summary": summarize_codex_items(&items),
-        "items": items,
-    }))
+    // `readCodexTurnError`/the turn-error branch (`normalize.ts:509-519,640-641`).
+    if let Some(turn_error) = read_codex_turn_error(raw_turn) {
+        rows.push(CodexPendingRow {
+            role: "assistant",
+            items: vec![json!({
+                "id": format!("{turn_id}:turn-error"),
+                "kind": "text",
+                "text": format!("Codex turn failed: {turn_error}"),
+            })],
+        });
+    } else if raw_turn.get("status").and_then(Value::as_str) == Some("completed")
+        && has_user_output
+        && all_items_are_user
+        && !has_assistant_output
+    {
+        // The "empty-response" synthetic row (`normalize.ts:642-652`): a completed turn that
+        // recorded only user-role items and no assistant output at all.
+        rows.push(CodexPendingRow {
+            role: "assistant",
+            items: vec![json!({
+                "id": format!("{turn_id}:empty-response"),
+                "kind": "text",
+                "text": "Codex completed this turn without recording an assistant response.",
+            })],
+        });
+    }
+
+    let row_count = rows.len();
+    let turns = rows
+        .into_iter()
+        .enumerate()
+        .map(|(row_index, row)| {
+            // Single-row turns keep the raw provider turn id verbatim (PR-5 precedent);
+            // split turns disambiguate each extra row -- see the turnId doc comment above.
+            let row_turn_id = if row_count <= 1 {
+                turn_id.clone()
+            } else {
+                format!("{turn_id}:row-{row_index}")
+            };
+            json!({
+                "id": row_turn_id,
+                "turnId": row_turn_id,
+                "ordinal": ordinal,
+                "source": "durable",
+                "role": row.role,
+                "summary": summarize_codex_items(&row.items),
+                "items": row.items,
+            })
+        })
+        .collect();
+
+    Ok(turns)
 }
 
 /// Watch an owned sidecar child to completion. Two ways out:
@@ -2774,21 +2888,30 @@ mod tests {
 
     #[test]
     fn build_codex_turn_json_appends_synthetic_text_item_for_turn_error() {
+        // CHANGED (was: item appended into the existing turn's `items`): the reference always
+        // gives a turn-level error its OWN synthetic display row with `role: 'assistant'`
+        // (`createSyntheticPendingRow`, `normalize.ts:521-533`) -- it is never folded into an
+        // existing row's item list. With no other items in this raw turn, that means exactly
+        // ONE output turn, whose items are just the synthetic error text.
         let raw_turn = json!({
             "id": "turn-err",
             "error": { "message": "sandbox denied" },
             "items": [],
         });
-        let turn = build_codex_turn_json(&raw_turn, 0).expect("turn builds");
-        assert_eq!(turn["items"][0]["kind"], json!("text"));
+        let turns = build_codex_turn_json(&raw_turn, 0).expect("turn builds");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0]["role"], json!("assistant"));
+        assert_eq!(turns[0]["items"][0]["kind"], json!("text"));
         assert_eq!(
-            turn["items"][0]["text"],
+            turns[0]["items"][0]["text"],
             json!("Codex turn failed: sandbox denied")
         );
     }
 
     #[test]
     fn build_codex_turn_json_propagates_unrecognized_item_type_as_error() {
+        // Return type changed from a single `Value` to `Vec<Value>` (turn-splitting), but an
+        // unrecognized item type must still error the WHOLE raw turn immediately, unchanged.
         let raw_turn =
             json!({ "id": "turn-bad", "items": [{ "type": "notAKnownType", "id": "x" }] });
         let err = build_codex_turn_json(&raw_turn, 0)
@@ -2854,17 +2977,167 @@ mod tests {
             }),
         );
 
+        // CHANGED (was: one turn with all 3 items): `reasoning` classifies as `assistant`
+        // (`classifyCodexItemRole`, `normalize.ts:480-483`) while `commandExecution`/
+        // `fileChange` both classify as `tool` (`normalize.ts:484-492`) -- a role change mid-turn
+        // SPLITS the raw turn into two display rows (`normalizeCodexDisplayTurns`,
+        // `normalize.ts:615-632`), each with its own `role`. This is the exact behavior the
+        // Critical review finding required: role present on every turn, contiguous same-role
+        // items grouped into their own turn.
         let snapshot = driver.await.unwrap().expect("snapshot builds");
-        let items = snapshot["turns"][0]["items"]
-            .as_array()
-            .expect("items array");
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0]["kind"], json!("reasoning"));
-        assert_eq!(items[1]["kind"], json!("command"));
-        assert_eq!(items[1]["command"], json!("cat a.txt"));
-        assert_eq!(items[2]["kind"], json!("file_change"));
-        assert_eq!(items[2]["changes"], json!([{ "path": "a.txt" }]));
-        // Turn summary is the FIRST item's projection (reasoning), not a join of all three.
-        assert_eq!(snapshot["turns"][0]["summary"], json!("Checking the file"));
+        let turns = snapshot["turns"].as_array().expect("turns array");
+        assert_eq!(turns.len(), 2);
+
+        assert_eq!(turns[0]["role"], json!("assistant"));
+        assert_eq!(turns[0]["ordinal"], json!(0));
+        let assistant_items = turns[0]["items"].as_array().expect("items array");
+        assert_eq!(assistant_items.len(), 1);
+        assert_eq!(assistant_items[0]["kind"], json!("reasoning"));
+        // Turn summary is that row's own (only) item's projection.
+        assert_eq!(turns[0]["summary"], json!("Checking the file"));
+
+        assert_eq!(turns[1]["role"], json!("tool"));
+        assert_eq!(turns[1]["ordinal"], json!(1));
+        let tool_items = turns[1]["items"].as_array().expect("items array");
+        assert_eq!(tool_items.len(), 2);
+        assert_eq!(tool_items[0]["kind"], json!("command"));
+        assert_eq!(tool_items[0]["command"], json!("cat a.txt"));
+        assert_eq!(tool_items[1]["kind"], json!("file_change"));
+        assert_eq!(tool_items[1]["changes"], json!([{ "path": "a.txt" }]));
+
+        // Both rows came from the SAME raw turn ("turn-1"), which splits into 2 -- so neither
+        // keeps the raw id verbatim; each gets a disambiguated `"{raw_id}:row-{index}"` id.
+        assert_eq!(turns[0]["id"], json!("turn-1:row-0"));
+        assert_eq!(turns[0]["turnId"], json!("turn-1:row-0"));
+        assert_eq!(turns[1]["id"], json!("turn-1:row-1"));
+        assert_eq!(turns[1]["turnId"], json!("turn-1:row-1"));
+    }
+
+    // -- Fix task: role field + per-role turn splitting for the codex snapshot endpoint --
+
+    #[test]
+    fn build_codex_turn_json_splits_a_raw_turn_with_user_and_assistant_items_into_two_turns() {
+        let raw_turn = json!({
+            "id": "turn-mixed",
+            "status": "completed",
+            "items": [
+                { "type": "userMessage", "id": "u-1", "content": [{ "type": "text", "text": "please check the file" }] },
+                { "type": "agentMessage", "id": "a-1", "text": "Sure, checking now." },
+            ],
+        });
+        let turns = build_codex_turn_json(&raw_turn, 0).expect("turn builds");
+
+        assert_eq!(
+            turns.len(),
+            2,
+            "one user row + one assistant row: {turns:?}"
+        );
+
+        assert_eq!(turns[0]["role"], json!("user"));
+        let user_items = turns[0]["items"].as_array().expect("items array");
+        assert_eq!(user_items.len(), 1);
+        assert_eq!(user_items[0]["kind"], json!("text"));
+        assert_eq!(user_items[0]["text"], json!("please check the file"));
+
+        assert_eq!(turns[1]["role"], json!("assistant"));
+        let assistant_items = turns[1]["items"].as_array().expect("items array");
+        assert_eq!(assistant_items.len(), 1);
+        assert_eq!(assistant_items[0]["kind"], json!("text"));
+        assert_eq!(assistant_items[0]["text"], json!("Sure, checking now."));
+
+        // Every emitted turn carries a `.strict()`-schema-valid `role`.
+        for turn in &turns {
+            assert!(
+                turn.get("role").and_then(Value::as_str).is_some(),
+                "every emitted turn must carry a role: {turn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_codex_turn_json_keeps_a_single_role_raw_turn_as_one_turn_with_role_set() {
+        let raw_turn = json!({
+            "id": "turn-single",
+            "items": [
+                { "type": "agentMessage", "id": "a-1", "text": "hello from codex" },
+            ],
+        });
+        let turns = build_codex_turn_json(&raw_turn, 0).expect("turn builds");
+
+        assert_eq!(turns.len(), 1, "single role -> single turn: {turns:?}");
+        assert_eq!(turns[0]["role"], json!("assistant"));
+        assert_eq!(turns[0]["items"][0]["text"], json!("hello from codex"));
+    }
+
+    #[test]
+    fn build_codex_turn_json_role_is_present_on_every_emitted_turn_including_tool_rows() {
+        let raw_turn = json!({
+            "id": "turn-tool-only",
+            "items": [
+                { "type": "commandExecution", "id": "c-1", "command": "pwd", "status": "completed" },
+            ],
+        });
+        let turns = build_codex_turn_json(&raw_turn, 0).expect("turn builds");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0]["role"], json!("tool"));
+    }
+
+    #[test]
+    fn build_codex_turn_json_turn_id_semantics_single_row_keeps_raw_id_multi_row_disambiguates() {
+        // Pinning the documented turnId scheme (see the doc comment on `build_codex_turn_json`):
+        // the reference's HMAC-derived turnId (`createCodexDisplayId`, `normalize.ts:574-593`)
+        // requires a per-server-instance secret this crate does not own (`configStore` in
+        // `server/index.ts:322-326`). This port's non-cryptographic, deterministic substitute:
+        // a raw turn producing exactly one display row keeps `turnId == raw turn id` (PR-5
+        // precedent, unchanged for the common case); a raw turn that SPLITS into multiple rows
+        // disambiguates each extra row as `"{raw_turn_id}:row-{index}"`.
+        let single_row_turn = json!({
+            "id": "turn-single-id",
+            "items": [{ "type": "agentMessage", "id": "a-1", "text": "hi" }],
+        });
+        let turns = build_codex_turn_json(&single_row_turn, 0).expect("turn builds");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0]["id"], json!("turn-single-id"));
+        assert_eq!(turns[0]["turnId"], json!("turn-single-id"));
+
+        let multi_row_turn = json!({
+            "id": "turn-multi-id",
+            "items": [
+                { "type": "userMessage", "id": "u-1", "content": [{ "type": "text", "text": "hi" }] },
+                { "type": "agentMessage", "id": "a-1", "text": "hello" },
+            ],
+        });
+        let turns = build_codex_turn_json(&multi_row_turn, 0).expect("turn builds");
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0]["id"], json!("turn-multi-id:row-0"));
+        assert_eq!(turns[0]["turnId"], json!("turn-multi-id:row-0"));
+        assert_eq!(turns[1]["id"], json!("turn-multi-id:row-1"));
+        assert_eq!(turns[1]["turnId"], json!("turn-multi-id:row-1"));
+    }
+
+    #[test]
+    fn build_codex_turn_json_empty_response_synthetic_row_also_carries_assistant_role() {
+        // A completed turn with ONLY user-role items and no assistant output gets a synthetic
+        // "empty-response" row appended (`normalize.ts:642-652`) -- also role `assistant`,
+        // matching `createSyntheticPendingRow`'s hardcoded role.
+        let raw_turn = json!({
+            "id": "turn-empty-response",
+            "status": "completed",
+            "items": [
+                { "type": "userMessage", "id": "u-1", "content": [{ "type": "text", "text": "hi" }] },
+            ],
+        });
+        let turns = build_codex_turn_json(&raw_turn, 0).expect("turn builds");
+        assert_eq!(
+            turns.len(),
+            2,
+            "user row + synthetic empty-response row: {turns:?}"
+        );
+        assert_eq!(turns[0]["role"], json!("user"));
+        assert_eq!(turns[1]["role"], json!("assistant"));
+        assert_eq!(
+            turns[1]["items"][0]["text"],
+            json!("Codex completed this turn without recording an assistant response.")
+        );
     }
 }

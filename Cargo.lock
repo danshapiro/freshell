@@ -1282,6 +1282,7 @@ name = "freshell-freshagent"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "fancy-regex",
  "freshell-codex",
  "freshell-opencode",
  "freshell-protocol",

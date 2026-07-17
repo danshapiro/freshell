@@ -52,21 +52,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::{
+    Json, Router,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use freshell_opencode::transport::{
     LoopbackPortAllocator, ReqwestEventSource, ReqwestServeHttp, TokioProcessSpawner,
 };
 use freshell_opencode::{
-    normalize_opencode_effort, normalize_opencode_model, OpencodeServeManager, ServeConfig,
-    ServeDeps, ServeError,
+    OpencodeServeManager, ServeConfig, ServeDeps, ServeError, normalize_opencode_effort,
+    normalize_opencode_model,
 };
 use freshell_protocol::{
     FreshAgentSessionMaterialized, ServerMessage, SessionLocator, SessionsChanged, UiCommand,
@@ -195,7 +195,7 @@ impl FreshAgentState {
             Ok(value) if value.is_object() => value,
             Ok(_) => return Err(OpencodeSnapshotError::NotFound),
             Err(ServeError::Http { status: 404, .. }) => {
-                return Err(OpencodeSnapshotError::NotFound)
+                return Err(OpencodeSnapshotError::NotFound);
             }
             Err(err) => return Err(OpencodeSnapshotError::Serve(err)),
         };
@@ -349,19 +349,258 @@ fn opencode_strip_run_argument_quoting(text: &str) -> String {
     }
 }
 
-/// `itemFromPart(part, fallbackId, role)` (`normalize.ts:191-238`), covering `text`,
-/// `reasoning`, `tool`, `file`, `patch`, and `compaction` part types -- the full set the task
-/// scope calls for. Structural parts (`step-start`/`step-finish`) and any other unrecognized
-/// part `type` fall through to the reference's `return []` default (`normalize.ts:237`), same
-/// as an unrecognized type here.
+/// One text segment produced by [`opencode_normalize_balanced_think_tags`]/
+/// [`opencode_items_from_assistant_text_part`] -- the Rust analog of `NormalizedTextSegment`
+/// (`normalize.ts:100-103`).
+struct OpencodeTextSegment {
+    kind: &'static str,
+    text: String,
+}
+
+/// `THINK_TAG_PATTERN` (`normalize.ts:105`): matches any open OR close `<think>`/`<thinking>`
+/// tag (optionally carrying attributes), case-insensitively. Used both to detect leakage
+/// (`hasThinkTag`) and to strip stray markers (`stripThinkTagMarkers`).
+fn opencode_think_tag_pattern() -> &'static fancy_regex::Regex {
+    static RE: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        fancy_regex::Regex::new(r"(?i)</?thinking\b[^>]*>|</?think\b[^>]*>")
+            .expect("static think-tag pattern is valid")
+    })
+}
+
+/// `BALANCED_THINK_TAG_PATTERN` (`normalize.ts:106`): a `<thinking>...</thinking>` or
+/// `<think>...</think>` pair -- the backreference (`</\1>`) is why this needs `fancy-regex`
+/// rather than the (backreference-free) `regex` crate: it must NOT match a `<thinking>` open
+/// tag against a `</think>` close tag or vice versa.
+fn opencode_balanced_think_tag_pattern() -> &'static fancy_regex::Regex {
+    static RE: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        fancy_regex::Regex::new(r"(?is)<(thinking|think)\b[^>]*>(.*?)</\1>")
+            .expect("static balanced think-tag pattern is valid")
+    })
+}
+
+/// `LEADING_THINK_CLOSER_PATTERN` (`normalize.ts:107`): one or more stray CLOSING tags at the
+/// very start of the text, with only whitespace between/after them.
+fn opencode_leading_think_closer_pattern() -> &'static fancy_regex::Regex {
+    static RE: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        fancy_regex::Regex::new(r"(?i)^\s*(?:(?:</thinking>|</think>)\s*)+")
+            .expect("static leading-closer pattern is valid")
+    })
+}
+
+/// `THINK_OPEN_TAG_PATTERN` (`normalize.ts:108`): the first open tag, unbalanced (no matching
+/// close survives the balanced pass).
+fn opencode_think_open_tag_pattern() -> &'static fancy_regex::Regex {
+    static RE: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        fancy_regex::Regex::new(r"(?i)<(thinking|think)\b[^>]*>")
+            .expect("static open-tag pattern is valid")
+    })
+}
+
+/// `THINK_CLOSE_TAG_PATTERN` (`normalize.ts:109`): the first close tag, unbalanced.
+fn opencode_think_close_tag_pattern() -> &'static fancy_regex::Regex {
+    static RE: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        fancy_regex::Regex::new(r"(?i)</(?:thinking|think)>")
+            .expect("static close-tag pattern is valid")
+    })
+}
+
+/// `hasThinkTag(text)` (`normalize.ts:112-115`).
+fn opencode_has_think_tag(text: &str) -> bool {
+    opencode_think_tag_pattern().is_match(text).unwrap_or(false)
+}
+
+/// `stripThinkTagMarkers(text)` (`normalize.ts:117-120`).
+fn opencode_strip_think_tag_markers(text: &str) -> String {
+    opencode_think_tag_pattern()
+        .replace_all(text, "")
+        .into_owned()
+}
+
+/// `normalizeBalancedThinkTags(text)` (`normalize.ts:122-140`): split `text` into alternating
+/// `text`/`thinking` segments around every BALANCED `<thinking>...</thinking>`/
+/// `<think>...</think>` pair. Returns `None` when there is no balanced pair at all (mirrors the
+/// reference's `null` return, `normalize.ts:135`), signaling the caller to fall through to the
+/// unbalanced-tag heuristics.
+fn opencode_normalize_balanced_think_tags(text: &str) -> Option<Vec<OpencodeTextSegment>> {
+    let re = opencode_balanced_think_tag_pattern();
+    let mut segments = Vec::new();
+    let mut cursor = 0usize;
+    let mut matched = false;
+    for cap in re.captures_iter(text) {
+        let Ok(cap) = cap else { continue };
+        let m = cap.get(0).expect("group 0 always matches");
+        matched = true;
+        if m.start() > cursor {
+            segments.push(OpencodeTextSegment {
+                kind: "text",
+                text: opencode_strip_think_tag_markers(&text[cursor..m.start()]),
+            });
+        }
+        let inner = cap
+            .get(2)
+            .map(|g| g.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        segments.push(OpencodeTextSegment {
+            kind: "thinking",
+            text: inner,
+        });
+        cursor = m.end();
+    }
+    if !matched {
+        return None;
+    }
+    if cursor < text.len() {
+        segments.push(OpencodeTextSegment {
+            kind: "text",
+            text: opencode_strip_think_tag_markers(&text[cursor..]),
+        });
+    }
+    Some(segments)
+}
+
+/// `segmentsToItems(id, segments)` (`normalize.ts:142-150`): drop empty segments; a single
+/// surviving segment keeps the plain `id`, multiple surviving segments each get a
+/// `"{id}:{kind}-{index}"` id (index over the FILTERED list, matching the reference).
+fn opencode_segments_to_items(id: &str, segments: Vec<OpencodeTextSegment>) -> Vec<Value> {
+    let visible: Vec<OpencodeTextSegment> = segments
+        .into_iter()
+        .filter(|s| !s.text.is_empty())
+        .collect();
+    if visible.is_empty() {
+        return vec![];
+    }
+    if visible.len() == 1 {
+        let seg = &visible[0];
+        return vec![json!({ "id": id, "kind": seg.kind, "text": seg.text })];
+    }
+    visible
+        .iter()
+        .enumerate()
+        .map(|(index, seg)| json!({ "id": format!("{id}:{}-{index}", seg.kind), "kind": seg.kind, "text": seg.text }))
+        .collect()
+}
+
+/// `itemsFromAssistantTextPart(text, id, leadingCloserIsThinking)` (`normalize.ts:155-189`):
+/// OpenCode/Kimi can leak internal `<think>`/`<thinking>` reasoning markup into assistant text
+/// parts. This normalizes that leakage into separate `{kind:'thinking'}` items rather than
+/// rendering the raw tags as visible text, in priority order: no tags at all (passthrough) ->
+/// balanced pair(s) (segmented) -> an unbalanced LEADING closer (the `followedByTool` caller
+/// hint decides whether the orphaned content itself reads as `thinking` or `text`) -> an
+/// unbalanced OPEN tag only (text-before / thinking-after) -> an unbalanced CLOSE tag only
+/// (thinking-before / text-after) -> markers stripped with nothing else salvageable.
+fn opencode_items_from_assistant_text_part(
+    text: &str,
+    id: &str,
+    leading_closer_is_thinking: bool,
+) -> Vec<Value> {
+    if !opencode_has_think_tag(text) {
+        return vec![json!({ "id": id, "kind": "text", "text": text })];
+    }
+
+    if let Some(segments) = opencode_normalize_balanced_think_tags(text) {
+        return opencode_segments_to_items(id, segments);
+    }
+
+    let without_markers = opencode_strip_think_tag_markers(text);
+    if opencode_leading_think_closer_pattern()
+        .is_match(text)
+        .unwrap_or(false)
+    {
+        let normalized = without_markers.trim().to_string();
+        if normalized.is_empty() {
+            return vec![];
+        }
+        let kind = if leading_closer_is_thinking {
+            "thinking"
+        } else {
+            "text"
+        };
+        return vec![json!({ "id": id, "kind": kind, "text": normalized })];
+    }
+
+    if let Ok(Some(open_match)) = opencode_think_open_tag_pattern().find(text) {
+        return opencode_segments_to_items(
+            id,
+            vec![
+                OpencodeTextSegment {
+                    kind: "text",
+                    text: opencode_strip_think_tag_markers(&text[..open_match.start()]),
+                },
+                OpencodeTextSegment {
+                    kind: "thinking",
+                    text: opencode_strip_think_tag_markers(&text[open_match.end()..])
+                        .trim()
+                        .to_string(),
+                },
+            ],
+        );
+    }
+
+    if let Ok(Some(close_match)) = opencode_think_close_tag_pattern().find(text) {
+        return opencode_segments_to_items(
+            id,
+            vec![
+                OpencodeTextSegment {
+                    kind: "thinking",
+                    text: opencode_strip_think_tag_markers(&text[..close_match.start()])
+                        .trim()
+                        .to_string(),
+                },
+                OpencodeTextSegment {
+                    kind: "text",
+                    text: opencode_strip_think_tag_markers(&text[close_match.end()..]),
+                },
+            ],
+        );
+    }
+
+    if !without_markers.is_empty() {
+        vec![json!({ "id": id, "kind": "text", "text": without_markers })]
+    } else {
+        vec![]
+    }
+}
+
+/// `computeToolAfterByPartIndex(parts)` (`normalize.ts:240-248`): for each part index, is there
+/// a `tool`-type part strictly AFTER it in the same message? Feeds
+/// [`opencode_items_from_assistant_text_part`]'s `leading_closer_is_thinking` hint -- an
+/// orphaned leading `</think>` closer immediately before a tool call reads as leaked reasoning,
+/// not user-facing prose.
+fn opencode_compute_tool_after_by_part_index(parts: &[Value]) -> Vec<bool> {
+    let mut tool_after = vec![false; parts.len()];
+    let mut has_tool_after = false;
+    for index in (0..parts.len()).rev() {
+        tool_after[index] = has_tool_after;
+        if parts[index].get("type").and_then(Value::as_str) == Some("tool") {
+            has_tool_after = true;
+        }
+    }
+    tool_after
+}
+
+/// `itemFromPart(part, fallbackId, role, followedByTool)` (`normalize.ts:191-238`), covering
+/// `text`, `reasoning`, `tool`, `file`, `patch`, and `compaction` part types -- the full set the
+/// task scope calls for. Structural parts (`step-start`/`step-finish`) and any other
+/// unrecognized part `type` fall through to the reference's `return []` default
+/// (`normalize.ts:237`), same as an unrecognized type here.
 ///
-/// NOT ported (documented, not silent): the reference's assistant-text think-tag segmentation
-/// (`itemsFromAssistantTextPart`/`normalizeBalancedThinkTags`, `normalize.ts:100-189`), which
-/// splits OpenCode/Kimi's leaked `<think>...</think>` markup into separate `{kind:'thinking'}`
-/// items. That is a provider-specific text-leakage workaround, not core tool/reasoning/
-/// file-change rendering -- text parts are passed through as plain `{kind:'text'}` here. The
-/// `followedByTool` parameter that only feeds that segmentation is dropped accordingly.
-fn opencode_item_from_part(part: &Value, fallback_id: &str, role: Option<&str>) -> Vec<Value> {
+/// Non-`user` text parts are routed through [`opencode_items_from_assistant_text_part`] (the
+/// `<think>`/`<thinking>` leakage segmentation) rather than passed through as plain
+/// `{kind:'text'}` -- this is the fix for the PR-6 review's "Important" finding: think-tag
+/// leakage must become `{kind:'thinking'}` items, matching the reference exactly.
+fn opencode_item_from_part(
+    part: &Value,
+    fallback_id: &str,
+    role: Option<&str>,
+    followed_by_tool: bool,
+) -> Vec<Value> {
     let id = part
         .get("id")
         .and_then(Value::as_str)
@@ -370,12 +609,12 @@ fn opencode_item_from_part(part: &Value, fallback_id: &str, role: Option<&str>) 
     match part.get("type").and_then(Value::as_str) {
         Some("text") => {
             let raw_text = part.get("text").and_then(Value::as_str).unwrap_or("");
-            let text = if role == Some("user") {
-                opencode_strip_run_argument_quoting(raw_text)
+            if role == Some("user") {
+                let text = opencode_strip_run_argument_quoting(raw_text);
+                vec![json!({ "id": id, "kind": "text", "text": text })]
             } else {
-                raw_text.to_string()
-            };
-            vec![json!({ "id": id, "kind": "text", "text": text })]
+                opencode_items_from_assistant_text_part(raw_text, id, followed_by_tool)
+            }
         }
         Some("reasoning") => {
             let text = part
@@ -442,21 +681,68 @@ fn opencode_item_from_part(part: &Value, fallback_id: &str, role: Option<&str>) 
 }
 
 /// `textSummaryFromItems` + `normalizeOpencodeTurn`'s summary fallback (`normalize.ts:250-269,341-342`):
-/// join every `{kind:'text'}` item's text with `"\n\n"`, falling back to the first `reasoning`
-/// item's `summary[0]` when there is no text at all. The reference additionally groups
-/// consecutive text items sharing a `:text-N`/`:thinking-N`-suffixed source id (an artifact of
-/// the think-tag segmentation this port doesn't perform, see [`opencode_item_from_part`]) --
-/// since that segmentation never produces such ids here, every text item already has a
-/// distinct source id, so grouping degenerates exactly to "join every text item," which is
-/// what this does directly.
+/// `SYNTHETIC_TEXT_SEGMENT_ID_SUFFIX_PATTERN` (`normalize.ts:110`): strips a trailing
+/// `:text-N`/`:thinking-N` suffix that [`opencode_segments_to_items`] adds when a single part
+/// splits into multiple segments, recovering that shared segment's original source id.
+fn opencode_strip_synthetic_text_segment_suffix(id: &str) -> String {
+    let Some(colon) = id.rfind(':') else {
+        return id.to_string();
+    };
+    let suffix = &id[colon + 1..];
+    let digits = suffix
+        .strip_prefix("text-")
+        .or_else(|| suffix.strip_prefix("thinking-"));
+    match digits {
+        Some(d) if !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()) => {
+            id[..colon].to_string()
+        }
+        _ => id.to_string(),
+    }
+}
+
+/// `textSummaryFromItems` + `normalizeOpencodeTurn`'s summary fallback (`normalize.ts:250-269,341-342`):
+/// join every `{kind:'text'}` item's text, GROUPING consecutive items that share the same
+/// source id (post `:text-N`/`:thinking-N`-suffix-stripping) by direct concatenation --
+/// separate source ids join with `"\n\n"`. This grouping is what makes think-tag segmentation
+/// safe: when one assistant text part splits into `[text, thinking, text]`, the two `text`
+/// halves share the ORIGINAL part's source id and must read as one continuous excerpt, not two
+/// paragraphs separated by a blank line they never had. Falls back to the first `reasoning`
+/// item's `summary[0]` when there is no `text`-kind item at all.
 fn opencode_turn_summary(items: &[Value]) -> String {
-    let text_parts: Vec<String> = items
+    let text_items: Vec<(&str, &str)> = items
         .iter()
         .filter(|item| item.get("kind").and_then(Value::as_str) == Some("text"))
-        .filter_map(|item| item.get("text").and_then(Value::as_str).map(str::to_string))
+        .filter_map(|item| {
+            let id = item.get("id").and_then(Value::as_str)?;
+            let text = item.get("text").and_then(Value::as_str)?;
+            Some((id, text))
+        })
         .collect();
-    if !text_parts.is_empty() {
-        return text_parts.join("\n\n");
+    if !text_items.is_empty() {
+        let mut groups: Vec<String> = Vec::new();
+        let mut current_source: Option<String> = None;
+        let mut current_text = String::new();
+        for (id, text) in text_items {
+            let source_id = opencode_strip_synthetic_text_segment_suffix(id);
+            match &current_source {
+                Some(cs) if *cs == source_id => current_text.push_str(text),
+                None => {
+                    current_source = Some(source_id);
+                    current_text.push_str(text);
+                }
+                _ => {
+                    if !current_text.is_empty() {
+                        groups.push(std::mem::take(&mut current_text));
+                    }
+                    current_source = Some(source_id);
+                    current_text.push_str(text);
+                }
+            }
+        }
+        if !current_text.is_empty() {
+            groups.push(current_text);
+        }
+        return groups.join("\n\n");
     }
     items
         .iter()
@@ -489,11 +775,16 @@ fn build_opencode_turn_json(message: &Value, ordinal: usize) -> Option<Value> {
         .cloned()
         .unwrap_or_default();
 
+    let tool_after_by_part_index = opencode_compute_tool_after_by_part_index(&parts);
     let items: Vec<Value> = parts
         .iter()
         .enumerate()
         .flat_map(|(index, part)| {
-            opencode_item_from_part(part, &format!("{id}:part-{index}"), role)
+            let followed_by_tool = tool_after_by_part_index
+                .get(index)
+                .copied()
+                .unwrap_or(false);
+            opencode_item_from_part(part, &format!("{id}:part-{index}"), role, followed_by_tool)
         })
         .collect();
 
@@ -1247,7 +1538,7 @@ mod tests {
             "type": "tool", "id": "part-1", "tool": "bash",
             "state": { "status": "completed", "input": { "command": "ls" }, "output": "a.txt\n" },
         });
-        let items = opencode_item_from_part(&part, "fallback", Some("assistant"));
+        let items = opencode_item_from_part(&part, "fallback", Some("assistant"), false);
         assert_eq!(
             items[0],
             json!({
@@ -1260,7 +1551,7 @@ mod tests {
     #[test]
     fn opencode_item_from_part_running_tool_has_no_content_items_or_success() {
         let part = json!({ "type": "tool", "id": "part-2", "tool": "bash", "state": { "status": "running", "input": {} } });
-        let items = opencode_item_from_part(&part, "fallback", Some("assistant"));
+        let items = opencode_item_from_part(&part, "fallback", Some("assistant"), false);
         assert_eq!(items[0]["status"], json!("running"));
         assert_eq!(items[0]["contentItems"], Value::Null);
         assert_eq!(items[0]["success"], Value::Null);
@@ -1269,7 +1560,7 @@ mod tests {
     #[test]
     fn opencode_item_from_part_patch_renders_file_change_kind_with_exact_schema_keys() {
         let part = json!({ "type": "patch", "id": "part-3", "files": ["src/main.rs"] });
-        let items = opencode_item_from_part(&part, "fallback", Some("assistant"));
+        let items = opencode_item_from_part(&part, "fallback", Some("assistant"), false);
         assert_eq!(
             items[0],
             json!({
@@ -1282,7 +1573,7 @@ mod tests {
     #[test]
     fn opencode_item_from_part_reasoning_renders_reasoning_kind() {
         let part = json!({ "type": "reasoning", "id": "part-4", "text": "considering options" });
-        let items = opencode_item_from_part(&part, "fallback", Some("assistant"));
+        let items = opencode_item_from_part(&part, "fallback", Some("assistant"), false);
         assert_eq!(
             items[0],
             json!({
@@ -1296,8 +1587,86 @@ mod tests {
     fn opencode_item_from_part_structural_step_start_is_skipped_matching_reference_default() {
         let part = json!({ "type": "step-start", "id": "part-5" });
         assert_eq!(
-            opencode_item_from_part(&part, "fallback", Some("assistant")),
+            opencode_item_from_part(&part, "fallback", Some("assistant"), false),
             Vec::<Value>::new()
+        );
+    }
+
+    // -- Fix task: opencode <think>/<thinking> leakage segmentation --
+
+    #[test]
+    fn opencode_item_from_part_balanced_think_tag_splits_into_thinking_and_text_items() {
+        let part = json!({
+            "type": "text", "id": "part-6",
+            "text": "Before.<thinking>reasoning here</thinking>After.",
+        });
+        let items = opencode_item_from_part(&part, "fallback", Some("assistant"), false);
+        // Text-before + thinking + text-after: 3 segments around the one balanced pair.
+        assert_eq!(
+            items.len(),
+            3,
+            "text-before + thinking + text-after: {items:?}"
+        );
+        assert_eq!(items[0]["kind"], json!("text"));
+        assert_eq!(items[0]["text"], json!("Before."));
+        assert_eq!(items[1]["kind"], json!("thinking"));
+        assert_eq!(items[1]["text"], json!("reasoning here"));
+        assert_eq!(items[2]["kind"], json!("text"));
+        assert_eq!(items[2]["text"], json!("After."));
+        // Multi-segment ids are suffixed by kind + index (over the visible/filtered list).
+        assert_eq!(items[0]["id"], json!("part-6:text-0"));
+        assert_eq!(items[1]["id"], json!("part-6:thinking-1"));
+        assert_eq!(items[2]["id"], json!("part-6:text-2"));
+    }
+
+    #[test]
+    fn opencode_item_from_part_balanced_think_short_tag_alias_also_segments() {
+        // `<think>`/`</think>` is an accepted alias for `<thinking>`/`</thinking>`
+        // (`THINK_OPEN_TAG_PATTERN`/`BALANCED_THINK_TAG_PATTERN`, normalize.ts:106-108).
+        let part =
+            json!({ "type": "text", "id": "part-7", "text": "<think>quiet plan</think>Ready." });
+        let items = opencode_item_from_part(&part, "fallback", Some("assistant"), false);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["kind"], json!("thinking"));
+        assert_eq!(items[0]["text"], json!("quiet plan"));
+        assert_eq!(items[1]["kind"], json!("text"));
+        assert_eq!(items[1]["text"], json!("Ready."));
+    }
+
+    #[test]
+    fn opencode_item_from_part_text_without_any_think_tag_is_unchanged() {
+        let part = json!({ "type": "text", "id": "part-8", "text": "Ran the command." });
+        let items = opencode_item_from_part(&part, "fallback", Some("assistant"), false);
+        assert_eq!(
+            items,
+            vec![json!({ "id": "part-8", "kind": "text", "text": "Ran the command." })]
+        );
+    }
+
+    #[test]
+    fn opencode_item_from_part_unbalanced_open_tag_only_splits_text_before_and_thinking_after() {
+        // No closing tag at all -- an unbalanced OPEN-only leak. Everything after the open tag
+        // is orphaned reasoning content; everything before is ordinary text.
+        let part = json!({ "type": "text", "id": "part-9", "text": "Plan:<thinking>still going" });
+        let items = opencode_item_from_part(&part, "fallback", Some("assistant"), false);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["kind"], json!("text"));
+        assert_eq!(items[0]["text"], json!("Plan:"));
+        assert_eq!(items[1]["kind"], json!("thinking"));
+        assert_eq!(items[1]["text"], json!("still going"));
+    }
+
+    #[test]
+    fn opencode_item_from_part_user_text_is_never_segmented_even_with_think_tags() {
+        // Segmentation is an assistant-text-leakage workaround; user-authored text passes
+        // through the run-argument-quote-stripping path only, tags and all.
+        let part = json!({ "type": "text", "id": "part-10", "text": "<thinking>not reasoning</thinking>" });
+        let items = opencode_item_from_part(&part, "fallback", Some("user"), false);
+        assert_eq!(
+            items,
+            vec![
+                json!({ "id": "part-10", "kind": "text", "text": "<thinking>not reasoning</thinking>" })
+            ]
         );
     }
 
