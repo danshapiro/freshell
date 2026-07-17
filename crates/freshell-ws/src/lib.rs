@@ -113,6 +113,17 @@ pub struct WsState {
     /// 2026-07-13: the original's client observes {code:4009, reason:'Server
     /// shutting down'}; the port previously died with an abnormal 1006.
     pub shutdown: Arc<tokio::sync::Notify>,
+    /// WS protocol-level keepalive ping interval, milliseconds (`ws-handler.ts:224`
+    /// `pingIntervalMs: Number(process.env.PING_INTERVAL_MS || 30_000)`). Every
+    /// `/ws` connection's serve loop (`terminal::run`) pings on this cadence and
+    /// terminates the socket if no pong arrived since the previous tick (mirrors
+    /// `ws.isAlive` / `ws.terminate()`, `ws-handler.ts:745-755`). Without this, an
+    /// idle connection carries zero traffic and a silent intermediary (NAT/proxy/
+    /// dead network path) can black-hole it — the client's `readyState` stays
+    /// `OPEN` while every broadcast frame the server sends is lost. A small value
+    /// here (e.g. in tests) makes the keepalive cadence observable without a real
+    /// 30s wait.
+    pub ping_interval_ms: u64,
 }
 
 /// The `/ws` sub-router, pre-bound to its state (mergeable into the server app).
@@ -403,6 +414,7 @@ mod tests {
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
+            ping_interval_ms: 30_000,
         }
     }
 

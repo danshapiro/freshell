@@ -128,6 +128,24 @@ pub async fn run(
     // bus can never busy-loop). The bus outlives every connection in practice.
     let mut bus_open = true;
 
+    // WS protocol-level keepalive (legacy parity: `ws-handler.ts:745-755`). The
+    // original starts a `setInterval` per connection that `ws.ping()`s on every
+    // tick and `ws.terminate()`s the socket if no pong arrived since the
+    // previous tick (`ws.isAlive`, cleared on tick / set on `ws.on('pong')`).
+    // Without this, an idle `/ws` connection carries ZERO traffic: a silent
+    // intermediary (NAT/proxy/dead network path) can black-hole it while the
+    // browser's `readyState` stays `OPEN` and every broadcast the server sends
+    // is lost. `axum`'s `WebSocketUpgrade` sends no automatic pings of its own
+    // (that's application policy, not a transport default) — this ticker is
+    // the only source of periodic traffic on an otherwise-quiet socket.
+    let ping_interval = std::time::Duration::from_millis(state.ping_interval_ms.max(1));
+    let mut ping_ticker = tokio::time::interval(ping_interval);
+    // `setInterval` never fires at t=0; consume the immediate first tick so the
+    // real cadence starts one full interval out, matching the original.
+    ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping_ticker.tick().await;
+    let mut pong_since_last_ping = true;
+
     loop {
         tokio::select! {
             // Graceful shutdown (`ws-handler.ts:3843`): close 4009 "Server shutting
@@ -138,6 +156,16 @@ pub async fn run(
                     .send(Message::Close(Some(CloseFrame { code: 4009, reason: "Server shutting down".into() })))
                     .await;
                 break;
+            }
+            _ = ping_ticker.tick() => {
+                if !pong_since_last_ping {
+                    // No pong since the previous tick: legacy's `ws.terminate()`.
+                    break;
+                }
+                pong_since_last_ping = false;
+                if ws_tx.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
             }
             inbound = ws_rx.next() => {
                 match inbound {
@@ -157,7 +185,10 @@ pub async fn run(
                     }
                     // Client closed, socket error, or stream ended: tear down.
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
-                    // Binary / ping / pong: ignored (ping/pong handled by the transport).
+                    // A pong answers our keepalive ping (`ws.on('pong')`, ws-handler.ts:1149-1150).
+                    Some(Ok(Message::Pong(_))) => { pong_since_last_ping = true; }
+                    // Binary / inbound ping: ignored (an inbound ping's pong reply is
+                    // handled automatically by the underlying transport).
                     _ => {}
                 }
             }
@@ -1505,6 +1536,7 @@ mod terminals_changed_tests {
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
+            ping_interval_ms: 30_000,
         };
         (state, rx)
     }
@@ -1675,6 +1707,7 @@ mod terminal_meta_created_tests {
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: std::sync::Arc::new(Vec::new()),
+            ping_interval_ms: 30_000,
         };
         (state, rx)
     }

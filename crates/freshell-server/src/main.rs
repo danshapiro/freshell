@@ -209,6 +209,7 @@ async fn main() -> ExitCode {
         terminals_revision: Arc::clone(&terminals_revision),
         cli_commands: Arc::clone(&cli_commands),
         shutdown: Arc::clone(&shutdown_notify),
+        ping_interval_ms: resolve_ping_interval_ms(),
     };
     let api_state = ApiState {
         auth_token: Arc::clone(&auth_token),
@@ -496,6 +497,15 @@ fn resolve_port() -> u16 {
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(3001)
+}
+
+/// Resolve the WS keepalive ping interval, milliseconds. Mirrors
+/// `ws-handler.ts:224`: `Number(process.env.PING_INTERVAL_MS || 30_000)`.
+fn resolve_ping_interval_ms() -> u64 {
+    std::env::var("PING_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(30_000)
 }
 
 /// Resolve the bind host, faithfully to `server/get-network-host.ts`:
