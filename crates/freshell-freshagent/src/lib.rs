@@ -76,6 +76,12 @@ use freshell_protocol::{
 const SESSION_TYPE: &str = "freshopencode";
 /// The runtime provider (`AGENT_SESSION_TYPES.opencode.provider`).
 const PROVIDER: &str = "opencode";
+/// `makePlaceholderSessionId(requestId)`'s prefix (`adapter.ts:75`, mirrored by
+/// `create_tab` above and `opencode_ws::handle_create`): this port's ONE placeholder-id
+/// format, `format!("freshopencode-{request_id}")`. By construction, an id with this shape
+/// is never a real opencode `serve` session id (those are `ses_*`) -- see
+/// [`FreshAgentState::get_opencode_snapshot`]'s Fix Task #3 short-circuit.
+const OPENCODE_PLACEHOLDER_PREFIX: &str = "freshopencode-";
 /// Fallback turn idle budget when `send-keys` carries no `timeout` (matches the harness's
 /// generous Kimi budget; the request always supplies one in the oracle path).
 const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(180);
@@ -188,6 +194,31 @@ impl FreshAgentState {
         thread_id: &str,
         cwd: Option<&str>,
     ) -> Result<Value, OpencodeSnapshotError> {
+        // Fix Task #3 (defect 3): a `freshopencode-*` placeholder id (minted by
+        // `create_tab` above and by `opencode_ws::handle_create`, BEFORE the pane's first
+        // `send-keys`/`freshAgent.send` materializes a real `ses_*` opencode session) is,
+        // by construction, never a live `opencode serve` session -- serve genuinely has no
+        // such id and 500s, so the pane shows "Failed to load session" and is unusable
+        // forever (there is no send-independent way to materialize it). Legacy
+        // (`adapter.ts getSnapshot`, `adapter.ts:574-581`) guards this BEFORE ever touching
+        // serve: `if (liveState && !liveState.realSessionId) return
+        // normalizeOpencodeSnapshot({...no exported})` -- a schema-valid, EMPTY snapshot.
+        // This port has no single in-memory map spanning both the REST `panes` map (this
+        // struct) and the WS `opencode_ws::FreshOpencodeState::sessions` map, so mirror the
+        // safe, general form of that guard: this port's ONE placeholder-id shape is
+        // sufficient on its own (no `ses_*` id is ever the empty string prefixed this way),
+        // so short-circuit on it directly, reusing [`build_opencode_snapshot_json`] with an
+        // empty info/message page -- WITHOUT ever calling [`Self::ensure_manager`]/serve. A
+        // `ses_*` (or any other) id serve genuinely doesn't know about still falls through
+        // below and surfaces as a real `OpencodeSnapshotError::NotFound` (404).
+        if thread_id.starts_with(OPENCODE_PLACEHOLDER_PREFIX) {
+            return Ok(build_opencode_snapshot_json(
+                thread_id,
+                &json!({}),
+                &json!([]),
+            ));
+        }
+
         let manager = self.ensure_manager().await;
         let route: freshell_opencode::Route = cwd.map(str::to_string);
 

@@ -128,6 +128,18 @@ struct OpencodeSession {
     serve_bridge: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Why [`FreshOpencodeState::resume_durable_session`] could not produce a live session for
+/// a `freshAgent.attach` id not tracked in [`FreshOpencodeState::sessions`].
+enum ResumeOpencodeError {
+    /// The shared `opencode serve` sidecar genuinely has no record of this id (a 404, or
+    /// a non-object `/session/:id` body) -- a real lost session.
+    NotFound,
+    /// The manager/transport call itself failed (sidecar unreachable, cold-start failure,
+    /// timeout, ...) -- NOT evidence the session is gone; safe to retry, never mapped to
+    /// `INVALID_SESSION_ID`.
+    Manager(freshell_opencode::ServeError),
+}
+
 impl OpencodeSession {
     fn new(
         placeholder_id: String,
@@ -499,17 +511,39 @@ impl FreshOpencodeState {
 
     /// Handle a `freshAgent.attach` for opencode: emit a session snapshot carrying the
     /// current status (running/idle from turn-task liveness), and restart the serve-SSE
-    /// bridge if it died (e.g. the shared `opencode serve` sidecar was restarted). An
-    /// unknown session id emits the `INVALID_SESSION_ID` shape the client folds into
-    /// `markSessionLost` (`fresh-agent-ws.ts:326-328`) instead of hanging.
+    /// bridge if it died (e.g. the shared `opencode serve` sidecar was restarted).
+    ///
+    /// A session id NOT tracked locally (e.g. a page reload re-attaching after a server
+    /// restart, when this process's WS session map is empty but the shared `opencode
+    /// serve` sidecar still remembers the durable session) is looked up against the
+    /// serve manager (THE FIX -- [`Self::resume_durable_session`]) before being declared
+    /// lost: if serve still knows about it, it's registered locally (bridge spawned) and
+    /// rehydrated with a real snapshot. Only a session serve GENUINELY has no record of
+    /// emits the `INVALID_SESSION_ID` shape the client folds into `markSessionLost`
+    /// (`fresh-agent-ws.ts:326-328`); a manager/transport failure degrades to a
+    /// `freshAgent.error` frame instead (never panics, never tears down the shared
+    /// sidecar, never mis-declares a possibly-live session lost).
     pub async fn handle_attach(&self, msg: FreshAgentAttach) {
         let session_arc = {
             let guard = self.sessions.lock().await;
             guard.get(&msg.session_id).cloned()
         };
-        let Some(session_arc) = session_arc else {
-            self.broadcast(&lost_session_frame(&msg.session_id));
-            return;
+        let session_arc = match session_arc {
+            Some(session_arc) => session_arc,
+            None => match self
+                .resume_durable_session(&msg.session_id, msg.cwd.as_deref())
+                .await
+            {
+                Ok(session_arc) => session_arc,
+                Err(ResumeOpencodeError::NotFound) => {
+                    self.broadcast(&lost_session_frame(&msg.session_id));
+                    return;
+                }
+                Err(ResumeOpencodeError::Manager(err)) => {
+                    self.send_error(&None, "OPENCODE_ATTACH_RESUME_FAILED", &err.to_string());
+                    return;
+                }
+            },
         };
 
         let (status_session_id, running) = {
@@ -551,6 +585,49 @@ impl FreshOpencodeState {
             &status_session_id,
             snapshot_event(&status_session_id, status),
         ));
+    }
+
+    /// Look up `session_id` against the shared `opencode serve` sidecar (`GET
+    /// /session/:id`) and, if it's still there, register a local session row for it
+    /// (`real_session_id = Some(session_id)`, a fresh serve-SSE bridge) so a
+    /// `freshAgent.attach` for a session this process's WS map never heard of -- e.g. a
+    /// page reload after a server restart -- can rehydrate instead of being declared lost.
+    /// There is no separate placeholder id here: attach only ever resumes an ALREADY
+    /// durable `ses_*` id, so the placeholder and real id are the same value.
+    async fn resume_durable_session(
+        &self,
+        session_id: &str,
+        cwd: Option<&str>,
+    ) -> Result<Arc<TokioMutex<OpencodeSession>>, ResumeOpencodeError> {
+        let manager = self.fresh_agent.ensure_manager().await;
+        let route: freshell_opencode::Route = cwd.map(str::to_string);
+
+        let info = match manager.get_session(session_id, &route).await {
+            Ok(value) if value.is_object() => value,
+            Ok(_) => return Err(ResumeOpencodeError::NotFound),
+            Err(freshell_opencode::ServeError::Http { status: 404, .. }) => {
+                return Err(ResumeOpencodeError::NotFound);
+            }
+            Err(err) => return Err(ResumeOpencodeError::Manager(err)),
+        };
+        let _ = info;
+
+        let mut session =
+            OpencodeSession::new(session_id.to_string(), cwd.map(str::to_string), None, None);
+        session.real_session_id = Some(session_id.to_string());
+        session.serve_bridge = Some(self.spawn_serve_bridge(
+            manager,
+            session_id.to_string(),
+            session.turn_errored.clone(),
+        ));
+        let session_arc = Arc::new(TokioMutex::new(session));
+
+        self.sessions
+            .lock()
+            .await
+            .insert(session_id.to_string(), session_arc.clone());
+
+        Ok(session_arc)
     }
 
     // ── PR-3: the persistent serve-SSE bridge (adapter.ts `bindServeStream`) ─
@@ -854,6 +931,85 @@ mod tests {
         }
     }
 
+    /// Fix Task #3 (defect 3): mimics a REAL `opencode serve` more faithfully than
+    /// [`FakeHttp`] for the placeholder-snapshot regression below -- `POST /session`
+    /// mints a fresh `ses_N` id and REMEMBERS it; a `GET /session/:id` (or its
+    /// `/message` page) for any id NOT in that set 404s, exactly like the real serve
+    /// genuinely never having heard of a `freshopencode-*` placeholder id. This is what
+    /// lets the test prove the bug (a pre-fix `get_opencode_snapshot` call for a live
+    /// placeholder id reaches this fake and comes back 404/500-shaped, not a silently
+    /// benign `{}`) as well as the fix (post-fix, the placeholder id never reaches this
+    /// fake at all) and the materialized-turns follow-up (the real `ses_N` id DOES
+    /// resolve, with a scripted message page).
+    struct RealisticServeHttp {
+        created: StdMutex<std::collections::HashSet<String>>,
+        next_session: AtomicUsize,
+    }
+    impl RealisticServeHttp {
+        fn new() -> Self {
+            Self {
+                created: StdMutex::new(std::collections::HashSet::new()),
+                next_session: AtomicUsize::new(0),
+            }
+        }
+    }
+    impl ServeHttp for RealisticServeHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        > {
+            let is_create = matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && (req.url.ends_with("/session") || req.url.contains("/session?"));
+            if is_create {
+                let n = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
+                let id = format!("ses_{n}");
+                self.created.lock().unwrap().insert(id.clone());
+                let body = serde_json::to_vec(
+                    &json!({ "id": id, "title": "materialized session", "time": { "updated": 5 } }),
+                )
+                .unwrap();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+            }
+            if req.url.contains("/global/health") || req.url.contains("/session/status") {
+                // `/global/health` (serve health probe) and the GLOBAL `/session/status`
+                // busy-map poll (no id in the path, unlike `/session/:id`) both always
+                // report "nothing busy" -- `run_turn`'s status-poll idle-fallback resolves
+                // immediately without depending on SSE dispatch (this fake's `EventSource`
+                // is a no-op), and it runs in `handle_send`'s DETACHED turn task, never
+                // awaited by this test, so its outcome doesn't gate the assertions below.
+                return Box::pin(async move { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) });
+            }
+            // `GET /session/:id/message` and `GET /session/:id` both contain
+            // `/session/<id>`; extract the id segment to check against `created`.
+            let id = req
+                .url
+                .split("/session/")
+                .nth(1)
+                .and_then(|rest| rest.split(['/', '?']).next())
+                .unwrap_or("")
+                .to_string();
+            if !req.url.contains("/session/") || !self.created.lock().unwrap().contains(&id) {
+                return Box::pin(
+                    async move { Ok(ServeHttpResponse::new(404, b"not found".to_vec())) },
+                );
+            }
+            let body = if req.url.contains("/message") {
+                serde_json::to_vec(&json!([
+                    { "info": { "id": "m1", "role": "user" }, "parts": [{ "type": "text", "text": "hello" }] },
+                ]))
+                .unwrap()
+            } else {
+                serde_json::to_vec(
+                    &json!({ "id": id, "title": "materialized session", "time": { "updated": 5 } }),
+                )
+                .unwrap()
+            };
+            Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) })
+        }
+    }
+
     /// A started (healthy-fake-backed) manager + a flag proving whether its owned
     /// sidecar was ever killed.
     async fn started_manager() -> (OpencodeServeManager, Arc<std::sync::atomic::AtomicBool>) {
@@ -939,6 +1095,126 @@ mod tests {
         assert_eq!(frame["sessionType"], "freshopencode");
     }
 
+    /// Fix Task #3 (defect 3): `GET /api/fresh-agent/threads/freshopencode/opencode/<id>`
+    /// for a `freshopencode-*` placeholder id -- created via `handle_create`, BEFORE any
+    /// `handle_send` materializes it into a real `ses_*` session -- must build a
+    /// schema-valid, EMPTY snapshot, never reach the serve manager, and never 500/404.
+    /// Once materialized, the SAME flow (now addressed by the durable `ses_*` id) must
+    /// return the session's real turns.
+    #[tokio::test]
+    async fn get_opencode_snapshot_of_live_placeholder_before_first_send_is_empty_then_real_after_materialization(
+    ) {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(RealisticServeHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-t3")).await;
+        let placeholder = "freshopencode-req-t3";
+
+        // BEFORE the fix, this call falls straight through to
+        // `manager.get_session(placeholder, ..)` -- which `RealisticServeHttp` (mimicking
+        // the REAL serve genuinely never having heard of this synthetic id) 404s, exactly
+        // reproducing the reported "Failed to load session" defect. AFTER the fix, the
+        // placeholder-shaped id short-circuits before ever touching the manager.
+        let snapshot = st
+            .fresh_agent
+            .get_opencode_snapshot(placeholder, None)
+            .await
+            .expect("a live, not-yet-materialized placeholder must not 404/500");
+
+        assert_eq!(snapshot["sessionType"], json!("freshopencode"));
+        assert_eq!(snapshot["provider"], json!("opencode"));
+        assert_eq!(snapshot["threadId"], json!(placeholder));
+        assert_eq!(snapshot["sessionId"], json!(placeholder));
+        assert_eq!(snapshot["status"], json!("idle"));
+        assert_eq!(snapshot["revision"], json!(0));
+        assert_eq!(snapshot["latestTurnId"], Value::Null);
+        assert_eq!(snapshot["turns"], json!([]));
+        assert_eq!(snapshot["pendingApprovals"], json!([]));
+        assert_eq!(snapshot["pendingQuestions"], json!([]));
+        assert_eq!(snapshot["worktrees"], json!([]));
+        assert_eq!(snapshot["diffs"], json!([]));
+        assert_eq!(snapshot["childThreads"], json!([]));
+        assert_eq!(snapshot["capabilities"]["send"], json!(true));
+        assert_eq!(snapshot["capabilities"]["interrupt"], json!(true));
+        assert_eq!(
+            snapshot.get("summary"),
+            None,
+            "no title yet -- omitted like `normalizeOpencodeSnapshot`'s undefined `summary`"
+        );
+
+        // Now materialize (first `handle_send`) and confirm the SAME flow, addressed by
+        // the new durable id, returns the session's real turns instead of the empty shape.
+        st.handle_send(send_msg(placeholder, "hello")).await;
+        let durable_id = {
+            let guard = st.sessions.lock().await;
+            let session_arc = guard.get(placeholder).cloned().expect("session exists");
+            let s = session_arc.lock().await;
+            s.real_session_id.clone().expect("materialized after send")
+        };
+        assert!(durable_id.starts_with("ses_"));
+
+        let materialized_snapshot = st
+            .fresh_agent
+            .get_opencode_snapshot(&durable_id, None)
+            .await
+            .expect("materialized session snapshot builds");
+        assert_eq!(materialized_snapshot["threadId"], json!(durable_id));
+        assert_eq!(
+            materialized_snapshot["summary"],
+            json!("materialized session")
+        );
+        let turns = materialized_snapshot["turns"]
+            .as_array()
+            .expect("turns array");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0]["role"], json!("user"));
+        assert_eq!(turns[0]["items"][0]["text"], json!("hello"));
+    }
+
+    /// Fix Task #3: a `ses_*` id the shared serve genuinely doesn't know about (NOT a
+    /// `freshopencode-*` placeholder) must still 404 -- the placeholder short-circuit must
+    /// not swallow real "lost session" cases.
+    #[tokio::test]
+    async fn get_opencode_snapshot_of_unknown_ses_id_is_still_not_found() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(RealisticServeHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+
+        let err = fresh_agent
+            .get_opencode_snapshot("ses_never_created", None)
+            .await
+            .expect_err("unknown ses_* id");
+        assert!(matches!(err, crate::OpencodeSnapshotError::NotFound));
+    }
+
     #[tokio::test]
     async fn second_send_reuses_the_same_durable_session_id() {
         let (st, _killed) = state().await;
@@ -986,13 +1262,28 @@ mod tests {
         }
     }
 
+    /// Decision-table row: NOT tracked locally + serve genuinely has no record of the id
+    /// (a real 404) -> `lost_session_frame` (`INVALID_SESSION_ID`) is still correct.
     #[tokio::test]
-    async fn attach_unknown_session_emits_lost_session_error() {
-        let (st, mut rx) = {
-            let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
-            let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
-            (FreshOpencodeState::new(fresh_agent), rx)
+    async fn attach_unknown_session_with_genuinely_missing_serve_session_emits_lost_session_error()
+    {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(RealisticServeHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
         };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
 
         st.handle_attach(attach_msg("does-not-exist")).await;
 
@@ -1001,6 +1292,120 @@ mod tests {
         assert_eq!(frame["sessionId"], "does-not-exist");
         assert_eq!(frame["event"]["type"], "freshAgent.error");
         assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
+    }
+
+    /// THE FIX (defect 2, opencode half): a durable `ses_*` session the shared `opencode
+    /// serve` sidecar still knows about, but which this process's WS session map has
+    /// never heard of (e.g. a page reload after a server restart), must be resumed and
+    /// registered instead of declared lost.
+    #[tokio::test]
+    async fn attach_unknown_session_resumes_a_durable_serve_session_not_in_the_local_map() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(RealisticServeHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+
+        // Seed a durable session directly through the manager -- simulating a session
+        // that exists in opencode serve's own store but was never created/attached
+        // through this process's WS session map.
+        let created = manager
+            .create_session(None, None, None)
+            .await
+            .expect("create_session");
+        let durable_id = created.id.clone();
+
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        assert!(
+            !st.sessions.lock().await.contains_key(&durable_id),
+            "not tracked locally yet"
+        );
+
+        st.handle_attach(attach_msg(&durable_id)).await;
+
+        let frame: serde_json::Value =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let raw = rx.recv().await.expect("bus stays open");
+                    let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                    if frame["type"] == "freshAgent.event" {
+                        return frame;
+                    }
+                }
+            })
+            .await
+            .expect("attach resumes within the budget");
+
+        assert_eq!(frame["sessionId"], durable_id);
+        assert_eq!(frame["event"]["type"], "freshAgent.session.snapshot");
+        assert_eq!(frame["event"]["status"], "idle");
+        assert_ne!(
+            frame["event"]["code"], "INVALID_SESSION_ID",
+            "a durable serve session must never be declared lost"
+        );
+
+        let session_arc = st
+            .sessions
+            .lock()
+            .await
+            .get(&durable_id)
+            .cloned()
+            .expect("registered for reuse");
+        let real_id = session_arc.lock().await.real_session_id.clone();
+        assert_eq!(real_id.as_deref(), Some(durable_id.as_str()));
+    }
+
+    /// A `ProcessSpawner` that always fails, so `ensure_manager`/`get_session` surfaces a
+    /// genuine manager/transport failure rather than a 404.
+    struct FailingSpawner;
+    impl ProcessSpawner for FailingSpawner {
+        fn spawn(&self, _req: SpawnRequest) -> Result<Box<dyn ServeProcess>, String> {
+            Err("boom: no opencode binary reachable".to_string())
+        }
+    }
+
+    /// Decision-table row: NOT tracked locally + the manager/transport call itself fails
+    /// (not a 404) -> a `OPENCODE_ATTACH_RESUME_FAILED` error frame, NEVER
+    /// `INVALID_SESSION_ID` -- a transient infra hiccup must not cause the client to
+    /// abandon an otherwise-healthy durable session via `markSessionLost`.
+    #[tokio::test]
+    async fn attach_unknown_session_with_transient_manager_failure_emits_resume_failed_error() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let deps = ServeDeps {
+            spawner: Arc::new(FailingSpawner),
+            http: Arc::new(RealisticServeHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        // Deliberately do NOT call `ensure_started()` -- the resume path itself must
+        // trigger the (failing) cold-start via `get_session`.
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_attach(attach_msg("ses_some_durable_id")).await;
+
+        let frame: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "error");
+        assert!(
+            frame["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("OPENCODE_ATTACH_RESUME_FAILED:"),
+            "{frame}"
+        );
     }
 
     #[tokio::test]
