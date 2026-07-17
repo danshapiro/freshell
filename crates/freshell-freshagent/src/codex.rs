@@ -63,10 +63,9 @@ use freshell_codex::{
     StartTurnParams, CODEX_SIDECAR_OWNERSHIP_ENV,
 };
 use freshell_protocol::{
-    ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCreate, FreshAgentCreated,
-    FreshAgentCreateFailed, FreshAgentEvent, FreshAgentInterrupt, FreshAgentKill,
-    FreshAgentKilled, FreshAgentSend, FreshAgentSessionMaterialized, ServerMessage,
-    SessionLocator,
+    ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCreate, FreshAgentCreateFailed,
+    FreshAgentCreated, FreshAgentEvent, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled,
+    FreshAgentSend, FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
 };
 
 /// The codex fresh-agent `sessionType` (`AGENT_SESSION_TYPES.codex`).
@@ -326,12 +325,14 @@ impl FreshCodexState {
     }
 
     fn fail_create(&self, request_id: &str, code: &str, message: &str) {
-        self.broadcast(&ServerMessage::FreshAgentCreateFailed(FreshAgentCreateFailed {
-            code: code.to_string(),
-            message: message.to_string(),
-            request_id: request_id.to_string(),
-            retryable: None,
-        }));
+        self.broadcast(&ServerMessage::FreshAgentCreateFailed(
+            FreshAgentCreateFailed {
+                code: code.to_string(),
+                message: message.to_string(),
+                request_id: request_id.to_string(),
+                retryable: None,
+            },
+        ));
     }
 
     // ── freshAgent.send (WS) ─────────────────────────────────────────────────
@@ -463,7 +464,9 @@ impl FreshCodexState {
 
         let looked_up = {
             let guard = self.sessions.lock().await;
-            guard.get(&session_id).map(|s| (s.client.clone(), s.active_turn.clone()))
+            guard
+                .get(&session_id)
+                .map(|s| (s.client.clone(), s.active_turn.clone()))
         };
         let Some((client, active_turn)) = looked_up else {
             self.send_error(&None, "SESSION_NOT_FOUND", "codex session not found");
@@ -555,8 +558,16 @@ impl FreshCodexState {
                 .map(|s| s.active_turn.lock().expect("active_turn mutex").is_some())
                 .unwrap_or(false)
         };
-        let status = if running { CodexStatus::Running } else { CodexStatus::Idle };
-        let event = CodexAdapterEvent::StatusSnapshot { session_id: session_id.clone(), status, revision: None };
+        let status = if running {
+            CodexStatus::Running
+        } else {
+            CodexStatus::Idle
+        };
+        let event = CodexAdapterEvent::StatusSnapshot {
+            session_id: session_id.clone(),
+            status,
+            revision: None,
+        };
         if let Some(frame) = adapter_event_to_frame(&event, &session_id) {
             let _ = self.broadcast_tx.send(frame);
         }
@@ -572,7 +583,10 @@ impl FreshCodexState {
     /// already uses (`FreshAgentSessionMaterialized`), just triggered by crash-recovery
     /// instead of first-turn creation. Callers (`handle_send`/`handle_attach`) must use the
     /// returned id for anything session-scoped afterward.
-    async fn ensure_session_alive(&self, session_id: &str) -> Result<EnsureAliveOutcome, EnsureAliveError> {
+    async fn ensure_session_alive(
+        &self,
+        session_id: &str,
+    ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
         let (cwd, model, effort, sandbox, permission_mode) = {
             let guard = self.sessions.lock().await;
             let session = guard.get(session_id).ok_or(EnsureAliveError::NotFound)?;
@@ -646,15 +660,22 @@ impl FreshCodexState {
             );
         }
 
-        self.broadcast(&ServerMessage::FreshAgentSessionMaterialized(FreshAgentSessionMaterialized {
-            previous_session_id: session_id.to_string(),
-            provider: PROVIDER.to_string(),
-            session_id: new_thread_id.clone(),
-            session_type: SESSION_TYPE.to_string(),
-            session_ref: Some(SessionLocator { provider: PROVIDER.to_string(), session_id: new_thread_id.clone() }),
-        }));
+        self.broadcast(&ServerMessage::FreshAgentSessionMaterialized(
+            FreshAgentSessionMaterialized {
+                previous_session_id: session_id.to_string(),
+                provider: PROVIDER.to_string(),
+                session_id: new_thread_id.clone(),
+                session_type: SESSION_TYPE.to_string(),
+                session_ref: Some(SessionLocator {
+                    provider: PROVIDER.to_string(),
+                    session_id: new_thread_id.clone(),
+                }),
+            },
+        ));
 
-        Ok(EnsureAliveOutcome::Respawned { new_session_id: new_thread_id })
+        Ok(EnsureAliveOutcome::Respawned {
+            new_session_id: new_thread_id,
+        })
     }
 
     // ── codex app-server sidecar spawn ───────────────────────────────────────
@@ -702,7 +723,9 @@ impl FreshCodexState {
         // Inherit the parent env (HOME=<isolated>, CODEX_HOME unset → <HOME>/.codex) and
         // layer the ownership tag so the /proc reaper can find exactly our sidecar.
         cmd.env(CODEX_SIDECAR_OWNERSHIP_ENV, &ownership_id);
-        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
         let mut child = cmd
@@ -724,7 +747,9 @@ impl FreshCodexState {
                 Ok(transport) => break Arc::new(transport),
                 Err(err) => {
                     if let Ok(Some(status)) = child.try_wait() {
-                        return Err(format!("codex app-server exited before listening: {status}"));
+                        return Err(format!(
+                            "codex app-server exited before listening: {status}"
+                        ));
                     }
                     if Instant::now() >= deadline {
                         let _ = child.start_kill();
@@ -800,14 +825,19 @@ impl FreshCodexState {
             let guard = self.sessions.lock().await;
             let session = guard.get(thread_id).ok_or(CodexSnapshotError::NotFound)?;
             let client = session.client.clone();
-            let active_turn_present = session.active_turn.lock().expect("active_turn mutex").is_some();
+            let active_turn_present = session
+                .active_turn
+                .lock()
+                .expect("active_turn mutex")
+                .is_some();
             (client, active_turn_present)
         };
         let raw = client
             .read_thread(thread_id, true)
             .await
             .map_err(CodexSnapshotError::AppServer)?;
-        Ok(build_codex_snapshot_json(thread_id, &raw, active_turn_present))
+        build_codex_snapshot_json(thread_id, &raw, active_turn_present)
+            .map_err(CodexSnapshotError::Protocol)
     }
 
     /// Test-only: register a session directly (bypassing the real sidecar spawn
@@ -866,6 +896,14 @@ pub enum CodexSnapshotError {
     NotFound,
     /// The live app-server client's `thread/read` call failed.
     AppServer(CodexAppServerError),
+    /// A raw thread item's `type` was not one of `CodexThreadItemTypeSchema`'s known variants
+    /// (`protocol.ts:113-129`) -- mirrors `readCodexThreadItemType`/`assertNever` both
+    /// throwing `Unsupported Codex thread item type: ${value}` (`normalize.ts:141-147,123-125`),
+    /// which `router.ts`'s catch-all turns into a bare 500 (`router.ts:165-166`). Every
+    /// variant the real app-server currently emits IS mapped below, so this is a forward-compat
+    /// guard against a future app-server item type this build doesn't know about yet, not a
+    /// path exercised by ordinary transcripts.
+    Protocol(String),
 }
 
 impl std::fmt::Display for CodexSnapshotError {
@@ -873,18 +911,354 @@ impl std::fmt::Display for CodexSnapshotError {
         match self {
             CodexSnapshotError::NotFound => write!(f, "codex thread not found"),
             CodexSnapshotError::AppServer(err) => write!(f, "{err}"),
+            CodexSnapshotError::Protocol(message) => write!(f, "{message}"),
         }
     }
 }
 
+/// `normalizeCommandStatus(status)` (`normalize.ts:105-113`).
+fn codex_normalize_command_status(status: Option<&str>) -> &'static str {
+    match status {
+        Some("inProgress") => "running",
+        Some("declined") => "declined",
+        Some("failed") => "failed",
+        _ => "completed",
+    }
+}
+
+/// `normalizeToolStatus(status)` (`normalize.ts:115-121`).
+fn codex_normalize_tool_status(status: Option<&str>) -> &'static str {
+    match status {
+        Some("inProgress") => "running",
+        Some("failed") => "failed",
+        _ => "completed",
+    }
+}
+
+/// `stringArray(value)` (`normalize.ts:158-166`).
+fn codex_string_array(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        Some(Value::String(s)) => vec![s.clone()],
+        _ => vec![],
+    }
+}
+
+/// `String(value ?? '')` (used by several `normalizeCodexItem` arms, e.g. `normalize.ts:374,376,419,421,434,446`).
+fn codex_to_string(value: Option<&Value>) -> String {
+    match value {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// `readUserMessageTextParts(item)` (`normalize.ts:209-236`): a `userMessage` item's
+/// `content` array becomes one text part per entry (`text`/`input_text` parts keep their
+/// text; anything else becomes a `[type]` placeholder), falling back to `item.text`,
+/// `item.summary`, then a single empty part.
+fn codex_user_message_text_parts(item: &Value) -> Vec<(usize, String)> {
+    if let Some(content) = item.get("content").and_then(Value::as_array) {
+        if !content.is_empty() {
+            return content
+                .iter()
+                .enumerate()
+                .map(|(part_index, part)| {
+                    let part_type = part.get("type").and_then(Value::as_str);
+                    let text = if part_type == Some("text") || part_type == Some("input_text") {
+                        part.get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string()
+                    } else {
+                        format!("[{}]", part_type.unwrap_or("input"))
+                    };
+                    (part_index, text)
+                })
+                .collect();
+        }
+    }
+    if let Some(text) = item.get("text").and_then(Value::as_str) {
+        return vec![(0, text.to_string())];
+    }
+    if let Some(summary) = item.get("summary").and_then(Value::as_str) {
+        return vec![(0, summary.to_string())];
+    }
+    vec![(0, String::new())]
+}
+
+/// `normalizeCodexItem` (`normalize.ts:238-473`): map ONE raw codex thread item into its
+/// `FreshAgentTranscriptItemSchema`-shaped item(s). Every `CodexThreadItemTypeSchema` variant
+/// (`protocol.ts:113-129`) is covered; an item `type` outside that set is `Err` (mirrors
+/// `readCodexThreadItemType`'s zod-parse throw + `assertNever`'s default-case throw,
+/// `normalize.ts:141-147,123-125` -- see [`CodexSnapshotError::Protocol`]).
+///
+/// Unlike the reference, a missing `item.id` does NOT throw (`readCodexItemId`,
+/// `normalize.ts:149-156`) -- the caller ([`build_codex_turn_json`]) already falls back to a
+/// synthetic `{turnId}:item-{index}` id, matching this module's existing tolerant-read
+/// convention elsewhere (documented divergence, not a silent one).
+fn map_codex_item(item_id: &str, item: &Value, item_type: &str) -> Result<Vec<Value>, String> {
+    match item_type {
+        "userMessage" => Ok(codex_user_message_text_parts(item)
+            .into_iter()
+            .map(|(part_index, text)| {
+                json!({ "id": format!("{item_id}:part:{part_index}"), "kind": "text", "text": text })
+            })
+            .collect()),
+        "agentMessage" | "plan" => {
+            let text = item
+                .get("text")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("summary").and_then(Value::as_str))
+                .unwrap_or("");
+            Ok(vec![json!({ "id": item_id, "kind": "text", "text": text })])
+        }
+        "reasoning" => {
+            let summary = codex_string_array(item.get("summary"));
+            let content = codex_string_array(item.get("content"));
+            let text = if !summary.is_empty() { summary.join("\n") } else { content.join("\n") };
+            Ok(vec![json!({
+                "id": item_id, "kind": "reasoning", "summary": summary, "content": content, "text": text,
+            })])
+        }
+        "commandExecution" => {
+            let mut value = json!({
+                "id": item_id,
+                "kind": "command",
+                "command": item.get("command").and_then(Value::as_str).unwrap_or(""),
+                "status": codex_normalize_command_status(item.get("status").and_then(Value::as_str)),
+                "output": item.get("aggregatedOutput").and_then(Value::as_str),
+                "exitCode": item.get("exitCode").and_then(Value::as_i64),
+                "extensions": { "codex": item },
+            });
+            // `cwd` is optional-not-nullable in the schema -- omit the key entirely rather
+            // than emit `null` (`normalize.ts:312`).
+            if let Some(cwd) = item.get("cwd").and_then(Value::as_str) {
+                value["cwd"] = json!(cwd);
+            }
+            Ok(vec![value])
+        }
+        "fileChange" => {
+            let changes: Vec<Value> = item
+                .get("changes")
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter(|change| change.is_object()).cloned().collect())
+                .unwrap_or_default();
+            Ok(vec![json!({
+                "id": item_id,
+                "kind": "file_change",
+                "status": codex_normalize_command_status(item.get("status").and_then(Value::as_str)),
+                "changes": changes,
+                "extensions": { "codex": item },
+            })])
+        }
+        "mcpToolCall" => Ok(vec![json!({
+            "id": item_id,
+            "kind": "mcp_tool",
+            "server": item.get("server").and_then(Value::as_str).unwrap_or(""),
+            "tool": item.get("tool").and_then(Value::as_str).unwrap_or(""),
+            "status": codex_normalize_tool_status(item.get("status").and_then(Value::as_str)),
+            "arguments": item.get("arguments").cloned().unwrap_or(Value::Null),
+            "result": item.get("result").cloned().unwrap_or(Value::Null),
+            "error": item.get("error").cloned().unwrap_or(Value::Null),
+        })]),
+        "dynamicToolCall" => Ok(vec![json!({
+            "id": item_id,
+            "kind": "dynamic_tool",
+            "namespace": item.get("namespace").and_then(Value::as_str),
+            "tool": item.get("tool").and_then(Value::as_str).unwrap_or(""),
+            "status": codex_normalize_tool_status(item.get("status").and_then(Value::as_str)),
+            "arguments": item.get("arguments").cloned().unwrap_or(Value::Null),
+            "contentItems": item.get("contentItems").and_then(Value::as_array),
+            "success": item.get("success").and_then(Value::as_bool),
+        })]),
+        "collabAgentToolCall" => {
+            let receiver_thread_ids: Vec<String> = item
+                .get("receiverThreadIds")
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            let agents_states = item
+                .get("agentsStates")
+                .filter(|v| v.is_object())
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            Ok(vec![json!({
+                "id": item_id,
+                "kind": "collab_agent",
+                "tool": codex_to_string(item.get("tool")),
+                "status": codex_normalize_tool_status(item.get("status").and_then(Value::as_str)),
+                "senderThreadId": codex_to_string(item.get("senderThreadId")),
+                "receiverThreadIds": receiver_thread_ids,
+                "prompt": item.get("prompt").and_then(Value::as_str),
+                "model": item.get("model").and_then(Value::as_str),
+                "reasoningEffort": item.get("reasoningEffort").and_then(Value::as_str),
+                "agentsStates": agents_states,
+            })])
+        }
+        "webSearch" => Ok(vec![json!({
+            "id": item_id,
+            "kind": "web_search",
+            "query": item.get("query").and_then(Value::as_str).unwrap_or(""),
+            "action": item.get("action").cloned().unwrap_or(Value::Null),
+        })]),
+        "imageView" => Ok(vec![json!({
+            "id": item_id,
+            "kind": "image_view",
+            "path": item.get("path").and_then(Value::as_str).unwrap_or(""),
+        })]),
+        "imageGeneration" => {
+            let mut value = json!({
+                "id": item_id,
+                "kind": "image_generation",
+                "status": codex_to_string(item.get("status")),
+                "revisedPrompt": item.get("revisedPrompt").and_then(Value::as_str),
+                "result": codex_to_string(item.get("result")),
+            });
+            // `savedPath` is optional-not-nullable -- omit rather than emit `null`
+            // (`normalize.ts:422`).
+            if let Some(saved_path) = item.get("savedPath").and_then(Value::as_str) {
+                value["savedPath"] = json!(saved_path);
+            }
+            Ok(vec![value])
+        }
+        "enteredReviewMode" => Ok(vec![json!({
+            "id": item_id, "kind": "review_mode", "event": "entered", "review": codex_to_string(item.get("review")),
+        })]),
+        "exitedReviewMode" => Ok(vec![json!({
+            "id": item_id, "kind": "review_mode", "event": "exited", "review": codex_to_string(item.get("review")),
+        })]),
+        "contextCompaction" => Ok(vec![json!({ "id": item_id, "kind": "context_compaction" })]),
+        "hookPrompt" => {
+            let text = item.get("text").and_then(Value::as_str).unwrap_or("Hook prompt");
+            Ok(vec![json!({ "id": item_id, "kind": "text", "text": text })])
+        }
+        other => Err(format!("Unsupported Codex thread item type: {other}")),
+    }
+}
+
+/// `readCodexTurnError(rawTurn)` (`normalize.ts:509-519`).
+fn read_codex_turn_error(raw_turn: &Value) -> Option<String> {
+    let error = raw_turn.get("error")?;
+    if error.is_null() {
+        return None;
+    }
+    if let Some(s) = error.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(obj) = error.as_object() {
+        if let Some(message) = obj.get("message").and_then(Value::as_str) {
+            return Some(message.to_string());
+        }
+        if let Some(message) = obj.get("error").and_then(Value::as_str) {
+            return Some(message.to_string());
+        }
+    }
+    Some(error.to_string())
+}
+
+/// `summarizeFreshAgentItems(items)` (`normalize.ts:168-207`): the turn's `summary` string is
+/// the FIRST item's kind-specific preview text (NOT a concatenation of every item) -- e.g. a
+/// turn with a `reasoning` item followed by a `command` item summarizes from the reasoning
+/// alone. `.slice(0,140)` is approximated with a 140-`char` (not UTF-16 code unit) cap, an
+/// acceptable divergence for non-BMP text.
+fn summarize_codex_items(items: &[Value]) -> String {
+    fn truncate140(text: &str) -> String {
+        text.chars().take(140).collect()
+    }
+    for item in items {
+        let kind = item.get("kind").and_then(Value::as_str).unwrap_or("");
+        let text = match kind {
+            "text" | "thinking" => item.get("text").and_then(Value::as_str).map(truncate140),
+            "reasoning" => {
+                let direct = item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty());
+                let text = direct.map(str::to_string).unwrap_or_else(|| {
+                    let summary_joined = item
+                        .get("summary")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default();
+                    if !summary_joined.is_empty() {
+                        summary_joined
+                    } else {
+                        item.get("content")
+                            .and_then(Value::as_array)
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(Value::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .unwrap_or_default()
+                    }
+                });
+                Some(truncate140(&text))
+            }
+            "command" => item.get("command").and_then(Value::as_str).map(truncate140),
+            "file_change" => Some("File change".to_string()),
+            "mcp_tool" => {
+                let server = item.get("server").and_then(Value::as_str).unwrap_or("");
+                let tool = item.get("tool").and_then(Value::as_str).unwrap_or("");
+                Some(truncate140(&format!("{server}:{tool}")))
+            }
+            "dynamic_tool" | "collab_agent" => {
+                item.get("tool").and_then(Value::as_str).map(truncate140)
+            }
+            "web_search" => item.get("query").and_then(Value::as_str).map(truncate140),
+            "image_view" => item.get("path").and_then(Value::as_str).map(truncate140),
+            "image_generation" => item.get("result").and_then(Value::as_str).map(truncate140),
+            "review_mode" => {
+                let event = item.get("event").and_then(Value::as_str).unwrap_or("");
+                Some(truncate140(&format!("{event} review mode")))
+            }
+            "context_compaction" => Some("Context compacted".to_string()),
+            "tool_use" => item.get("name").and_then(Value::as_str).map(truncate140),
+            "tool_result" => {
+                let is_error = item
+                    .get("isError")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                Some(if is_error {
+                    "Tool error".to_string()
+                } else {
+                    "Tool result".to_string()
+                })
+            }
+            _ => None,
+        };
+        if let Some(text) = text {
+            return text;
+        }
+    }
+    String::new()
+}
+
 /// `normalizeCodexThreadSnapshot` (`normalize.ts:748-787`): map a raw `thread/read` result
-/// into the `FreshAgentSnapshotSchema` shape. Turn transcript items are a MINIMAL, honest
-/// subset of the reference's rich display-turn normalization (`normalizeCodexDisplayTurns`) --
-/// only `agentMessage` items become `{kind:'text'}` transcript items today; reasoning/
-/// tool_use/tool_result/command items are not yet ported (see the task report). This still
-/// produces a schema-valid snapshot with real turn text, which is the CRITICAL gap this PR
-/// closes (the SPA previously 404'd and rendered no transcript at all).
-fn build_codex_snapshot_json(thread_id: &str, raw: &Value, active_turn_present: bool) -> Value {
+/// into the `FreshAgentSnapshotSchema` shape.
+///
+/// `tokenUsage` is always the zero-fallback (`normalize.ts:774-779`'s `?? {...zeros}` branch):
+/// `CodexThreadReadResultSchema` (`protocol.ts:258-259`) is `{ thread: CodexThreadSchema }`, and
+/// neither `CodexThreadSchema` (`protocol.ts:148-167`) nor anywhere else in the codex app-server
+/// RPC surface exposes a `tokenUsage` field -- confirmed by inspection of the full protocol
+/// schema, not by omission. The reference's `rawSnapshot.tokenUsage` is therefore ALWAYS
+/// `undefined` on this path too; this is not a Rust-side gap, it is the reference's own honest
+/// zero, faithfully reproduced.
+fn build_codex_snapshot_json(
+    thread_id: &str,
+    raw: &Value,
+    active_turn_present: bool,
+) -> Result<Value, String> {
     let thread = raw.get("thread").cloned().unwrap_or_else(|| json!({}));
     let status = normalize_codex_thread_status(thread.get("status").unwrap_or(&Value::Null));
     // `isRunning` (`normalize.ts:756`): the reference also treats a `compacting` status as
@@ -898,14 +1272,18 @@ fn build_codex_snapshot_json(thread_id: &str, raw: &Value, active_turn_present: 
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let raw_turns = thread.get("turns").and_then(Value::as_array).cloned().unwrap_or_default();
+    let raw_turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let turns: Vec<Value> = raw_turns
         .iter()
         .enumerate()
         .map(|(ordinal, raw_turn)| build_codex_turn_json(raw_turn, ordinal))
-        .collect();
+        .collect::<Result<_, _>>()?;
 
-    json!({
+    Ok(json!({
         "sessionType": SESSION_TYPE,
         "provider": PROVIDER,
         "threadId": thread_id,
@@ -935,44 +1313,65 @@ fn build_codex_snapshot_json(thread_id: &str, raw: &Value, active_turn_present: 
         "childThreads": [],
         "turns": turns,
         "extensions": { "codex": {} },
-    })
+    }))
 }
 
-/// A MINIMAL `FreshAgentTurnSchema`-shaped turn from one raw codex `turn` record
-/// (`makeThread`/real app-server shape: `{id, status, items:[{type,id,text,\u2026}], \u2026}`). Only
-/// `agentMessage` items become visible `{kind:'text'}` transcript items; every other item
-/// `type` (command, reasoning, tool calls, etc.) is DROPPED today rather than mis-rendered --
-/// an honest, schema-valid subset rather than a silently-wrong one. See the task report for
-/// the follow-up to port the full `normalizeCodexDisplayTurns` item mapping.
-fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Value {
-    let turn_id = raw_turn.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-    let items_raw = raw_turn.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
+/// A `FreshAgentTurnSchema`-shaped turn from one raw codex `turn` record (`makeThread`/real
+/// app-server shape: `{id, status, error?, items:[{type,id,...}], ...}`). Every item in `items`
+/// is mapped via [`map_codex_item`] (the full `normalizeCodexItem` switch,
+/// `normalize.ts:238-473`); a turn-level `error` (`normalize.ts:509-519,640-641`) appends a
+/// synthetic `{kind:'text', text:'Codex turn failed: ...'}` item.
+///
+/// STRUCTURAL SIMPLIFICATION (documented, not silent): the reference SPLITS one raw turn's
+/// items into MULTIPLE display turns grouped by contiguous same-role rows, each with its own
+/// HMAC-derived `turnId` (`normalizeCodexDisplayTurns`, `normalize.ts:600-684`) -- machinery
+/// built for the LIVE optimistic-update path (`requestId` aliasing for in-flight sends,
+/// `empty-response`/`submitted-input` synthetic rows). This is a committed-turns REST READ, not
+/// a live drive path, so this port keeps the ORIGINAL one-raw-turn-to-one-output-turn shape
+/// established by PR-5 (`turnId` = the raw turn's own `id`) and focuses fidelity on ITEM KIND
+/// coverage within that turn, which is what actually determines whether the transcript renders
+/// tool calls/reasoning/file changes. The `empty-response`/`submitted-input` synthetic rows are
+/// NOT ported (no live-turn optimistic-update concept exists on this read-only path).
+fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Value, String> {
+    let turn_id = raw_turn
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let items_raw = raw_turn
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let mut items = Vec::new();
-    let mut summary_parts: Vec<String> = Vec::new();
     for (index, item) in items_raw.iter().enumerate() {
-        if item.get("type").and_then(Value::as_str) != Some("agentMessage") {
-            continue;
-        }
-        let Some(text) = item.get("text").and_then(Value::as_str).filter(|t| !t.is_empty()) else {
-            continue;
-        };
+        let item_type = item
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("undefined");
         let item_id = item
             .get("id")
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| format!("{turn_id}:item-{index}"));
-        items.push(json!({ "id": item_id, "kind": "text", "text": text }));
-        summary_parts.push(text.to_string());
+        items.extend(map_codex_item(&item_id, item, item_type)?);
+    }
+    if let Some(turn_error) = read_codex_turn_error(raw_turn) {
+        items.push(json!({
+            "id": format!("{turn_id}:turn-error"),
+            "kind": "text",
+            "text": format!("Codex turn failed: {turn_error}"),
+        }));
     }
 
-    json!({
+    Ok(json!({
         "id": turn_id,
         "turnId": turn_id,
         "ordinal": ordinal,
         "source": "durable",
-        "summary": summary_parts.join("\n\n"),
+        "summary": summarize_codex_items(&items),
         "items": items,
-    })
+    }))
 }
 
 /// Watch an owned sidecar child to completion. Two ways out:
@@ -1086,7 +1485,10 @@ fn reduce_notification(
             if thread_id == subscription.session_id() {
                 clear_active_turn(active_turn);
             }
-            subscription.on_thread_closed(&thread_id).into_iter().collect()
+            subscription
+                .on_thread_closed(&thread_id)
+                .into_iter()
+                .collect()
         }
         CodexNotification::FsChanged { .. } | CodexNotification::Other { .. } => Vec::new(),
     }
@@ -1096,7 +1498,11 @@ fn reduce_notification(
 /// `sdk.*` → `freshAgent.*`). Returns the pre-serialized JSON, or `None` on a serialize error.
 fn adapter_event_to_frame(event: &CodexAdapterEvent, thread_id: &str) -> Option<String> {
     let inner = match event {
-        CodexAdapterEvent::StatusSnapshot { session_id, status, revision } => {
+        CodexAdapterEvent::StatusSnapshot {
+            session_id,
+            status,
+            revision,
+        } => {
             let mut map = Map::new();
             map.insert("type".into(), json!("freshAgent.session.snapshot"));
             map.insert("sessionId".into(), json!(session_id));
@@ -1157,7 +1563,11 @@ async fn patch_settings(
     Json(patch_body): Json<Value>,
 ) -> Response {
     if !authorized(&headers, &state.auth_token) {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" }))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "unauthorized" })),
+        )
+            .into_response();
     }
     let merged = {
         let mut guard = state.settings.lock().await;
@@ -1191,7 +1601,10 @@ fn deep_merge(target: &mut Value, patch: &Value) {
     match (target, patch) {
         (Value::Object(target_map), Value::Object(patch_map)) => {
             for (key, patch_value) in patch_map {
-                deep_merge(target_map.entry(key.clone()).or_insert(Value::Null), patch_value);
+                deep_merge(
+                    target_map.entry(key.clone()).or_insert(Value::Null),
+                    patch_value,
+                );
             }
         }
         (target_slot, patch_value) => {
@@ -1274,7 +1687,9 @@ fn now_ms() -> i64 {
 /// ISO-8601 / RFC-3339 millis-Z timestamp (matches `new Date().toISOString()`) for error frames.
 fn now_iso() -> String {
     // Reuse the same shape freshell-ws uses; a tiny local formatter avoids a chrono dep here.
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = now.as_secs();
     let millis = now.subsec_millis();
     // days since epoch → civil date (Howard Hinnant's algorithm).
@@ -1291,9 +1706,7 @@ fn now_iso() -> String {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { year + 1 } else { year };
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z")
 }
 
 #[cfg(test)]
@@ -1324,17 +1737,32 @@ mod tests {
 
     #[test]
     fn sandbox_and_approval_wire_shapes_match_reference() {
-        assert_eq!(sandbox_wire_value(freshell_protocol::Sandbox::ReadOnly), "read-only");
-        assert_eq!(sandbox_policy_value("read-only"), json!({ "type": "readOnly" }));
-        assert_eq!(sandbox_policy_value("workspace-write"), json!({ "type": "workspaceWrite" }));
-        assert_eq!(sandbox_policy_value("danger-full-access"), json!({ "type": "dangerFullAccess" }));
+        assert_eq!(
+            sandbox_wire_value(freshell_protocol::Sandbox::ReadOnly),
+            "read-only"
+        );
+        assert_eq!(
+            sandbox_policy_value("read-only"),
+            json!({ "type": "readOnly" })
+        );
+        assert_eq!(
+            sandbox_policy_value("workspace-write"),
+            json!({ "type": "workspaceWrite" })
+        );
+        assert_eq!(
+            sandbox_policy_value("danger-full-access"),
+            json!({ "type": "dangerFullAccess" })
+        );
     }
 
     #[test]
     fn turn_complete_event_frames_carry_the_inner_type() {
         // The status-guarded chime → freshAgent.event { event.type: freshAgent.turn.complete }.
         let frame = adapter_event_to_frame(
-            &CodexAdapterEvent::TurnComplete { session_id: "t-1".into(), at: 42 },
+            &CodexAdapterEvent::TurnComplete {
+                session_id: "t-1".into(),
+                at: 42,
+            },
             "t-1",
         )
         .unwrap();
@@ -1382,15 +1810,26 @@ mod tests {
         let inner_types: Vec<String> = events
             .iter()
             .filter_map(|e| adapter_event_to_frame(e, "t-1"))
-            .map(|f| serde_json::from_str::<Value>(&f).unwrap()["event"]["type"].as_str().unwrap().to_string())
+            .map(|f| {
+                serde_json::from_str::<Value>(&f).unwrap()["event"]["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
             .collect();
-        assert_eq!(inner_types, vec!["freshAgent.session.snapshot", "freshAgent.turn.complete"]);
+        assert_eq!(
+            inner_types,
+            vec!["freshAgent.session.snapshot", "freshAgent.turn.complete"]
+        );
     }
 
     #[test]
     fn deep_merge_replaces_scalars_and_merges_objects() {
         let mut target = json!({ "freshAgent": { "enabled": false, "keep": 1 }, "other": true });
-        deep_merge(&mut target, &json!({ "freshAgent": { "enabled": true, "defaultPlugins": [] } }));
+        deep_merge(
+            &mut target,
+            &json!({ "freshAgent": { "enabled": true, "defaultPlugins": [] } }),
+        );
         assert_eq!(target["freshAgent"]["enabled"], true);
         assert_eq!(target["freshAgent"]["keep"], 1);
         assert_eq!(target["freshAgent"]["defaultPlugins"], json!([]));
@@ -1646,7 +2085,10 @@ mod tests {
         assert_eq!(frame["provider"], "codex");
         assert_eq!(frame["success"], true);
 
-        assert!(!st.sessions.lock().await.contains_key("thread-1"), "session removed");
+        assert!(
+            !st.sessions.lock().await.contains_key("thread-1"),
+            "session removed"
+        );
     }
 
     #[tokio::test]
@@ -1710,7 +2152,10 @@ mod tests {
 
         // No accompanying chime, and the session STAYS mapped (adapter.ts:937-944 invariant
         // -- PR-1 leaves the actual lazy-restart-on-next-send unimplemented; see report).
-        assert!(rx.try_recv().is_err(), "no turn.complete chime alongside the exit status");
+        assert!(
+            rx.try_recv().is_err(),
+            "no turn.complete chime alongside the exit status"
+        );
         assert!(
             st.sessions.lock().await.contains_key("thread-1"),
             "the session stays mapped after an unrequested exit"
@@ -1839,7 +2284,10 @@ mod tests {
     /// the decoupled `insert_fake_session` fixture), so a subsequent crash + respawn
     /// genuinely exercises [`FreshCodexState::spawn_sidecar`] end-to-end. Returns the thread
     /// id and drains the `freshAgent.created` frame.
-    async fn create_real_fake_session(st: &FreshCodexState, rx: &mut tokio::sync::broadcast::Receiver<String>) -> String {
+    async fn create_real_fake_session(
+        st: &FreshCodexState,
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+    ) -> String {
         st.handle_create(FreshAgentCreate {
             request_id: "req-1".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -1860,14 +2308,19 @@ mod tests {
         let created: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
-                if frame["type"] == "freshAgent.created" || frame["type"] == "freshAgent.create.failed" {
+                if frame["type"] == "freshAgent.created"
+                    || frame["type"] == "freshAgent.create.failed"
+                {
                     return frame;
                 }
             }
         })
         .await
         .expect("the fake app-server responds within the budget");
-        assert_eq!(created["type"], "freshAgent.created", "fixture create failed: {created}");
+        assert_eq!(
+            created["type"], "freshAgent.created",
+            "fixture create failed: {created}"
+        );
         created["sessionId"].as_str().unwrap().to_string()
     }
 
@@ -1883,7 +2336,10 @@ mod tests {
             loop {
                 let exited = {
                     let guard = st.sessions.lock().await;
-                    guard.get(session_id).map(|s| s.exited.load(Ordering::SeqCst)).unwrap_or(false)
+                    guard
+                        .get(session_id)
+                        .map(|s| s.exited.load(Ordering::SeqCst))
+                        .unwrap_or(false)
                 };
                 if exited {
                     break;
@@ -1897,7 +2353,9 @@ mod tests {
         let exited_frame: Value = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
-                if frame["event"]["type"] == "freshAgent.status" && frame["event"]["status"] == "exited" {
+                if frame["event"]["type"] == "freshAgent.status"
+                    && frame["event"]["status"] == "exited"
+                {
                     return frame;
                 }
             }
@@ -1950,7 +2408,10 @@ mod tests {
         let materialized: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
-                assert_ne!(frame["type"], "error", "no user-facing error frame: {frame}");
+                assert_ne!(
+                    frame["type"], "error",
+                    "no user-facing error frame: {frame}"
+                );
                 if frame["type"] == "freshAgent.session.materialized" {
                     return frame;
                 }
@@ -1966,7 +2427,10 @@ mod tests {
         let accepted: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
-                assert_ne!(frame["type"], "error", "no user-facing error frame: {frame}");
+                assert_ne!(
+                    frame["type"], "error",
+                    "no user-facing error frame: {frame}"
+                );
                 if frame["type"] == "freshAgent.send.accepted" {
                     return frame;
                 }
@@ -2008,14 +2472,21 @@ mod tests {
         let outcome: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
-                assert_ne!(frame["type"], "error", "attach recovers or reports honestly, never hangs silently: {frame}");
-                if frame["type"] == "freshAgent.session.materialized" || frame["type"] == "freshAgent.event" {
+                assert_ne!(
+                    frame["type"], "error",
+                    "attach recovers or reports honestly, never hangs silently: {frame}"
+                );
+                if frame["type"] == "freshAgent.session.materialized"
+                    || frame["type"] == "freshAgent.event"
+                {
                     return frame;
                 }
             }
         })
         .await
-        .expect("attach either recovers (materialized+snapshot) or reports honestly, within the budget");
+        .expect(
+            "attach either recovers (materialized+snapshot) or reports honestly, within the budget",
+        );
 
         // Recovery succeeded: materialized under a new id (asserted generously here since
         // frame order between the materialize broadcast and the snapshot broadcast is not
@@ -2033,7 +2504,10 @@ mod tests {
     async fn get_snapshot_of_unknown_thread_is_not_found() {
         let (st, _rx) = state_with_bus();
 
-        let err = st.get_snapshot("does-not-exist").await.expect_err("unknown thread");
+        let err = st
+            .get_snapshot("does-not-exist")
+            .await
+            .expect_err("unknown thread");
         assert!(matches!(err, CodexSnapshotError::NotFound));
     }
 
@@ -2135,7 +2609,10 @@ mod tests {
         )
         .await;
 
-        let driver = { let st = st.clone(); tokio::spawn(async move { st.get_snapshot("thread-1").await }) };
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move { st.get_snapshot("thread-1").await })
+        };
 
         let (init_id, _m, _p) = peer.expect_request().await;
         peer.respond(
@@ -2155,5 +2632,239 @@ mod tests {
         assert_eq!(snapshot["capabilities"]["send"], json!(false));
         assert_eq!(snapshot["capabilities"]["interrupt"], json!(true));
         assert_eq!(snapshot["turns"], json!([]));
+    }
+
+    // -- Batch D PR-6: rich transcript items for the codex snapshot endpoint --
+
+    #[test]
+    fn map_codex_item_command_execution_renders_command_kind_with_exact_schema_keys() {
+        let item = json!({
+            "type": "commandExecution",
+            "id": "item-1",
+            "command": "ls -la",
+            "cwd": "/repo",
+            "status": "inProgress",
+            "aggregatedOutput": "total 0\n",
+            "exitCode": null,
+        });
+        let mapped =
+            map_codex_item("item-1", &item, "commandExecution").expect("commandExecution maps");
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(
+            mapped[0],
+            json!({
+                "id": "item-1",
+                "kind": "command",
+                "command": "ls -la",
+                "cwd": "/repo",
+                "status": "running",
+                "output": "total 0\n",
+                "exitCode": null,
+                "extensions": { "codex": item },
+            })
+        );
+    }
+
+    #[test]
+    fn map_codex_item_command_execution_omits_cwd_key_when_absent() {
+        let item = json!({ "type": "commandExecution", "id": "item-1", "command": "pwd", "status": "completed" });
+        let mapped = map_codex_item("item-1", &item, "commandExecution").expect("maps");
+        let obj = mapped[0].as_object().expect("object");
+        assert!(
+            !obj.contains_key("cwd"),
+            "cwd must be OMITTED (not null) when the raw item has none: {obj:?}"
+        );
+    }
+
+    #[test]
+    fn map_codex_item_reasoning_renders_reasoning_kind_with_exact_schema_keys() {
+        let item = json!({ "type": "reasoning", "id": "item-2", "summary": ["Plan: read the file first"], "content": [] });
+        let mapped = map_codex_item("item-2", &item, "reasoning").expect("reasoning maps");
+        assert_eq!(
+            mapped[0],
+            json!({
+                "id": "item-2",
+                "kind": "reasoning",
+                "summary": ["Plan: read the file first"],
+                "content": [],
+                "text": "Plan: read the file first",
+            })
+        );
+    }
+
+    #[test]
+    fn map_codex_item_file_change_renders_file_change_kind_with_exact_schema_keys() {
+        let item = json!({
+            "type": "fileChange",
+            "id": "item-3",
+            "status": "completed",
+            "changes": [{ "path": "src/main.rs", "kind": "update" }],
+        });
+        let mapped = map_codex_item("item-3", &item, "fileChange").expect("fileChange maps");
+        assert_eq!(
+            mapped[0],
+            json!({
+                "id": "item-3",
+                "kind": "file_change",
+                "status": "completed",
+                "changes": [{ "path": "src/main.rs", "kind": "update" }],
+                "extensions": { "codex": item },
+            })
+        );
+    }
+
+    #[test]
+    fn map_codex_item_mcp_tool_call_renders_mcp_tool_kind_with_exact_schema_keys() {
+        let item = json!({
+            "type": "mcpToolCall", "id": "item-4", "server": "fs", "tool": "read_file",
+            "status": "completed", "arguments": { "path": "a.txt" }, "result": "contents", "error": null,
+        });
+        let mapped = map_codex_item("item-4", &item, "mcpToolCall").expect("mcpToolCall maps");
+        assert_eq!(
+            mapped[0],
+            json!({
+                "id": "item-4", "kind": "mcp_tool", "server": "fs", "tool": "read_file", "status": "completed",
+                "arguments": { "path": "a.txt" }, "result": "contents", "error": null,
+            })
+        );
+    }
+
+    #[test]
+    fn map_codex_item_dynamic_tool_call_renders_dynamic_tool_kind_with_exact_schema_keys() {
+        let item = json!({
+            "type": "dynamicToolCall", "id": "item-5", "tool": "bash", "status": "inProgress",
+            "arguments": { "command": "ls" },
+        });
+        let mapped =
+            map_codex_item("item-5", &item, "dynamicToolCall").expect("dynamicToolCall maps");
+        assert_eq!(
+            mapped[0],
+            json!({
+                "id": "item-5", "kind": "dynamic_tool", "namespace": null, "tool": "bash", "status": "running",
+                "arguments": { "command": "ls" }, "contentItems": null, "success": null,
+            })
+        );
+    }
+
+    #[test]
+    fn map_codex_item_user_message_splits_content_parts_into_text_items() {
+        let item = json!({
+            "type": "userMessage", "id": "item-6",
+            "content": [{ "type": "text", "text": "hello" }, { "type": "image" }],
+        });
+        let mapped = map_codex_item("item-6", &item, "userMessage").expect("userMessage maps");
+        assert_eq!(mapped.len(), 2);
+        assert_eq!(
+            mapped[0],
+            json!({ "id": "item-6:part:0", "kind": "text", "text": "hello" })
+        );
+        assert_eq!(
+            mapped[1],
+            json!({ "id": "item-6:part:1", "kind": "text", "text": "[image]" })
+        );
+    }
+
+    #[test]
+    fn map_codex_item_unrecognized_type_is_a_protocol_error_matching_reference_message() {
+        let item = json!({ "type": "somethingNew", "id": "item-7" });
+        let err =
+            map_codex_item("item-7", &item, "somethingNew").expect_err("unrecognized type errors");
+        assert_eq!(err, "Unsupported Codex thread item type: somethingNew");
+    }
+
+    #[test]
+    fn build_codex_turn_json_appends_synthetic_text_item_for_turn_error() {
+        let raw_turn = json!({
+            "id": "turn-err",
+            "error": { "message": "sandbox denied" },
+            "items": [],
+        });
+        let turn = build_codex_turn_json(&raw_turn, 0).expect("turn builds");
+        assert_eq!(turn["items"][0]["kind"], json!("text"));
+        assert_eq!(
+            turn["items"][0]["text"],
+            json!("Codex turn failed: sandbox denied")
+        );
+    }
+
+    #[test]
+    fn build_codex_turn_json_propagates_unrecognized_item_type_as_error() {
+        let raw_turn =
+            json!({ "id": "turn-bad", "items": [{ "type": "notAKnownType", "id": "x" }] });
+        let err = build_codex_turn_json(&raw_turn, 0)
+            .expect_err("unrecognized item type errors the whole turn");
+        assert_eq!(err, "Unsupported Codex thread item type: notAKnownType");
+    }
+
+    #[test]
+    fn summarize_codex_items_uses_first_items_kind_specific_text_not_a_join() {
+        let items = vec![
+            json!({ "id": "a", "kind": "reasoning", "summary": ["thinking hard"], "content": [], "text": "thinking hard" }),
+            json!({ "id": "b", "kind": "command", "command": "ls", "status": "completed", "output": null, "exitCode": null, "extensions": {} }),
+        ];
+        assert_eq!(summarize_codex_items(&items), "thinking hard");
+    }
+
+    #[tokio::test]
+    async fn get_snapshot_renders_tool_reasoning_and_file_change_items_end_to_end() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, _rx) = state_with_bus();
+        insert_fake_session(
+            &st,
+            "thread-rich",
+            client,
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-snapshot-rich",
+        )
+        .await;
+
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move { st.get_snapshot("thread-rich").await })
+        };
+
+        let (init_id, _m, _p) = peer.expect_request().await;
+        peer.respond(
+            &init_id,
+            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+        );
+        let _ = peer.expect_notification().await;
+
+        let (id, _method, _params) = peer.expect_request().await;
+        peer.respond(
+            &id,
+            json!({
+                "thread": {
+                    "id": "thread-rich",
+                    "status": { "type": "idle" },
+                    "turns": [{
+                        "id": "turn-1",
+                        "status": "completed",
+                        "items": [
+                            { "type": "reasoning", "id": "r-1", "summary": ["Checking the file"], "content": [] },
+                            { "type": "commandExecution", "id": "c-1", "command": "cat a.txt", "status": "completed", "aggregatedOutput": "hi\n", "exitCode": 0 },
+                            { "type": "fileChange", "id": "f-1", "status": "completed", "changes": [{ "path": "a.txt" }] },
+                        ],
+                    }],
+                }
+            }),
+        );
+
+        let snapshot = driver.await.unwrap().expect("snapshot builds");
+        let items = snapshot["turns"][0]["items"]
+            .as_array()
+            .expect("items array");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["kind"], json!("reasoning"));
+        assert_eq!(items[1]["kind"], json!("command"));
+        assert_eq!(items[1]["command"], json!("cat a.txt"));
+        assert_eq!(items[2]["kind"], json!("file_change"));
+        assert_eq!(items[2]["changes"], json!([{ "path": "a.txt" }]));
+        // Turn summary is the FIRST item's projection (reasoning), not a join of all three.
+        assert_eq!(snapshot["turns"][0]["summary"], json!("Checking the file"));
     }
 }

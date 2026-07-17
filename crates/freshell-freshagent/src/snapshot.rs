@@ -65,7 +65,11 @@ pub struct SnapshotState {
 
 impl SnapshotState {
     pub fn new(auth_token: Arc<String>, codex: FreshCodexState, opencode: FreshAgentState) -> Self {
-        Self { auth_token, codex, opencode }
+        Self {
+            auth_token,
+            codex,
+            opencode,
+        }
     }
 }
 
@@ -98,21 +102,36 @@ async fn get_snapshot(
                 format!("codex thread {thread_id} not found"),
                 "FRESH_AGENT_LOST_SESSION",
             ),
-            Err(CodexSnapshotError::AppServer(err)) => fail(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+            Err(CodexSnapshotError::AppServer(err)) => {
+                fail(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+            }
+            // Mirrors `router.ts`'s generic catch-all 500 (`router.ts:165-166`) for an
+            // unrecognized codex thread-item `type` (see `CodexSnapshotError::Protocol`).
+            Err(CodexSnapshotError::Protocol(message)) => {
+                fail(StatusCode::INTERNAL_SERVER_ERROR, message)
+            }
         },
         ("freshopencode", "opencode") => {
-            match state.opencode.get_opencode_snapshot(&thread_id, cwd.as_deref()).await {
+            match state
+                .opencode
+                .get_opencode_snapshot(&thread_id, cwd.as_deref())
+                .await
+            {
                 Ok(snapshot) => Json(snapshot).into_response(),
                 Err(OpencodeSnapshotError::NotFound) => fail_with_code(
                     StatusCode::NOT_FOUND,
                     format!("opencode session {thread_id} not found"),
                     "FRESH_AGENT_LOST_SESSION",
                 ),
-                Err(OpencodeSnapshotError::Serve(err)) => fail(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+                Err(OpencodeSnapshotError::Serve(err)) => {
+                    fail(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                }
             }
         }
         (session_type_value, provider_value) => {
-            if !VALID_SESSION_TYPES.contains(&session_type_value) || !VALID_PROVIDERS.contains(&provider_value) {
+            if !VALID_SESSION_TYPES.contains(&session_type_value)
+                || !VALID_PROVIDERS.contains(&provider_value)
+            {
                 return fail(StatusCode::BAD_REQUEST, "Invalid request".to_string());
             }
             // A structurally valid locator this port has no adapter registered for
@@ -158,8 +177,9 @@ mod tests {
     use super::*;
     use freshell_codex::CodexAppServerClient;
     use freshell_opencode::{
-        Endpoint, EventSource, EventStreamHandle, OpencodeServeManager, PortAllocator, ProcessSpawner,
-        ServeConfig, ServeDeps, ServeHttp, ServeHttpRequest, ServeHttpResponse, ServeProcess, SpawnRequest,
+        Endpoint, EventSource, EventStreamHandle, OpencodeServeManager, PortAllocator,
+        ProcessSpawner, ServeConfig, ServeDeps, ServeHttp, ServeHttpRequest, ServeHttpResponse,
+        ServeProcess, SpawnRequest,
     };
 
     #[test]
@@ -201,7 +221,11 @@ mod tests {
     async fn missing_auth_header_is_401() {
         let resp = get_snapshot(
             State(snapshot_state()),
-            Path(("freshcodex".to_string(), "codex".to_string(), "thread-1".to_string())),
+            Path((
+                "freshcodex".to_string(),
+                "codex".to_string(),
+                "thread-1".to_string(),
+            )),
             Query(HashMap::new()),
             HeaderMap::new(),
         )
@@ -213,7 +237,11 @@ mod tests {
     async fn unknown_session_type_is_400() {
         let resp = get_snapshot(
             State(snapshot_state()),
-            Path(("bogus".to_string(), "codex".to_string(), "thread-1".to_string())),
+            Path((
+                "bogus".to_string(),
+                "codex".to_string(),
+                "thread-1".to_string(),
+            )),
             Query(HashMap::new()),
             headers_with_token("tok"),
         )
@@ -225,13 +253,19 @@ mod tests {
     async fn valid_but_unregistered_locator_is_503_with_code() {
         let resp = get_snapshot(
             State(snapshot_state()),
-            Path(("freshclaude".to_string(), "claude".to_string(), "thread-1".to_string())),
+            Path((
+                "freshclaude".to_string(),
+                "claude".to_string(),
+                "thread-1".to_string(),
+            )),
             Query(HashMap::new()),
             headers_with_token("tok"),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["code"], json!("FRESH_AGENT_RUNTIME_UNAVAILABLE"));
     }
@@ -240,13 +274,19 @@ mod tests {
     async fn unknown_codex_thread_is_404_with_lost_session_code() {
         let resp = get_snapshot(
             State(snapshot_state()),
-            Path(("freshcodex".to_string(), "codex".to_string(), "does-not-exist".to_string())),
+            Path((
+                "freshcodex".to_string(),
+                "codex".to_string(),
+                "does-not-exist".to_string(),
+            )),
             Query(HashMap::new()),
             headers_with_token("tok"),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["code"], json!("FRESH_AGENT_LOST_SESSION"));
     }
@@ -258,13 +298,19 @@ mod tests {
         let client = Arc::new(client);
 
         let codex = codex_state();
-        codex.insert_session_for_test("thread-1", client, None).await;
+        codex
+            .insert_session_for_test("thread-1", client, None)
+            .await;
         let state = SnapshotState::new(Arc::new("tok".to_string()), codex, opencode_state());
 
         let driver = tokio::spawn(async move {
             get_snapshot(
                 State(state),
-                Path(("freshcodex".to_string(), "codex".to_string(), "thread-1".to_string())),
+                Path((
+                    "freshcodex".to_string(),
+                    "codex".to_string(),
+                    "thread-1".to_string(),
+                )),
                 Query(HashMap::new()),
                 headers_with_token("tok"),
             )
@@ -286,12 +332,17 @@ mod tests {
 
         let resp = driver.await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["sessionType"], json!("freshcodex"));
         assert_eq!(value["provider"], json!("codex"));
         assert_eq!(value["threadId"], json!("thread-1"));
-        assert!(value.get("session_type").is_none(), "must be camelCase, not snake_case");
+        assert!(
+            value.get("session_type").is_none(),
+            "must be camelCase, not snake_case"
+        );
     }
 
     // -- opencode success fakes --
@@ -304,8 +355,9 @@ mod tests {
         fn request<'a>(
             &'a self,
             req: ServeHttpRequest,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        > {
             let body = if req.url.contains("/message") {
                 serde_json::to_vec(&self.messages_body).unwrap()
             } else if req.url.contains("/session/") {
@@ -319,14 +371,21 @@ mod tests {
     struct FakeAllocator;
     impl PortAllocator for FakeAllocator {
         fn allocate(&self) -> Result<Endpoint, String> {
-            Ok(Endpoint { hostname: "127.0.0.1".into(), port: 1 })
+            Ok(Endpoint {
+                hostname: "127.0.0.1".into(),
+                port: 1,
+            })
         }
     }
     struct NoopHandle;
     impl EventStreamHandle for NoopHandle {}
     struct NoopEventSource;
     impl EventSource for NoopEventSource {
-        fn connect(&self, _url: String, _sink: freshell_opencode::serve::EventSink) -> Box<dyn EventStreamHandle> {
+        fn connect(
+            &self,
+            _url: String,
+            _sink: freshell_opencode::serve::EventSink,
+        ) -> Box<dyn EventStreamHandle> {
             Box::new(NoopHandle)
         }
     }
@@ -362,20 +421,29 @@ mod tests {
             events: Arc::new(NoopEventSource),
         };
         let manager = OpencodeServeManager::new(deps, ServeConfig::default());
-        manager.ensure_started().await.expect("healthy fake serve starts");
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
         opencode.set_manager_for_test(manager).await;
 
         let state = SnapshotState::new(Arc::new("tok".to_string()), codex_state(), opencode);
         let resp = get_snapshot(
             State(state),
-            Path(("freshopencode".to_string(), "opencode".to_string(), "ses_1".to_string())),
+            Path((
+                "freshopencode".to_string(),
+                "opencode".to_string(),
+                "ses_1".to_string(),
+            )),
             Query(HashMap::new()),
             headers_with_token("tok"),
         )
         .await;
 
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["sessionType"], json!("freshopencode"));
         assert_eq!(value["provider"], json!("opencode"));

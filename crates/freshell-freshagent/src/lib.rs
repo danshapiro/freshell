@@ -194,7 +194,9 @@ impl FreshAgentState {
         let info = match manager.get_session(thread_id, &route).await {
             Ok(value) if value.is_object() => value,
             Ok(_) => return Err(OpencodeSnapshotError::NotFound),
-            Err(ServeError::Http { status: 404, .. }) => return Err(OpencodeSnapshotError::NotFound),
+            Err(ServeError::Http { status: 404, .. }) => {
+                return Err(OpencodeSnapshotError::NotFound)
+            }
             Err(err) => return Err(OpencodeSnapshotError::Serve(err)),
         };
         let messages = manager
@@ -248,7 +250,10 @@ fn opencode_token_usage(info: &Value) -> Value {
     let tokens = info.get("tokens").cloned().unwrap_or_else(|| json!({}));
     let input = tokens.get("input").and_then(Value::as_f64).unwrap_or(0.0) as i64;
     let output = tokens.get("output").and_then(Value::as_f64).unwrap_or(0.0) as i64;
-    let cached = tokens.pointer("/cache/read").and_then(Value::as_f64).map(|v| v as i64);
+    let cached = tokens
+        .pointer("/cache/read")
+        .and_then(Value::as_f64)
+        .map(|v| v as i64);
     let total = tokens
         .get("total")
         .and_then(Value::as_f64)
@@ -282,15 +287,193 @@ fn opencode_role(value: Option<&str>) -> Option<&'static str> {
     }
 }
 
-/// A MINIMAL `FreshAgentTurnSchema`-shaped turn from one opencode `{info, parts}` message
-/// (`normalizeOpencodeTurn`, `normalize.ts:324-355`). Only `text`-type parts become visible
-/// `{kind:'text'}` transcript items today; `reasoning`/`tool`/`file`/`patch`/`compaction`
-/// parts are DROPPED rather than mis-rendered (the same honest-subset choice the codex side
-/// makes -- see [`crate::codex`]'s snapshot builder doc comment and the task report).
-/// Returns `None` when the message has no recognizable role AND produced no items --
-/// mirroring the reference's `if (!role && items.length > 0) return null` guard for the
-/// "no role but structural output" case; a role-less, item-less message still degenerates to
-/// an (excluded) empty turn here, which is harmless since it would carry no visible content.
+/// `fileAttachmentTarget(part)` (`normalize.ts:54-59`).
+fn opencode_file_attachment_target(part: &Value) -> String {
+    for key in ["filename", "name", "url", "path"] {
+        if let Some(v) = part.get(key).and_then(Value::as_str) {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    "unknown file".to_string()
+}
+
+/// `normalizePatchChange(value)` (`normalize.ts:61-75`).
+fn opencode_normalize_patch_change(value: &Value) -> Option<Value> {
+    if let Some(s) = value.as_str() {
+        return if s.is_empty() {
+            None
+        } else {
+            Some(json!({ "path": s }))
+        };
+    }
+    if let Some(obj) = value.as_object() {
+        let mut change = obj.clone();
+        let has_string_path = change.get("path").map(|v| v.is_string()).unwrap_or(false);
+        if !has_string_path {
+            let path = obj
+                .get("file")
+                .and_then(Value::as_str)
+                .or_else(|| obj.get("name").and_then(Value::as_str));
+            if let Some(path) = path {
+                change.insert("path".to_string(), json!(path));
+            }
+        }
+        return Some(Value::Object(change));
+    }
+    None
+}
+
+/// `normalizePatchChanges(files)` (`normalize.ts:77-86`).
+fn opencode_normalize_patch_changes(files: Option<&Value>) -> Vec<Value> {
+    let values: Vec<Value> = match files {
+        Some(Value::Array(arr)) => arr.clone(),
+        Some(v @ Value::String(_)) => vec![v.clone()],
+        Some(v @ Value::Object(_)) => vec![v.clone()],
+        _ => vec![],
+    };
+    values
+        .iter()
+        .filter_map(opencode_normalize_patch_change)
+        .collect()
+}
+
+/// `stripOpencodeRunArgumentQuoting(text)` (`normalize.ts:95-98`).
+fn opencode_strip_run_argument_quoting(text: &str) -> String {
+    if text.len() >= 2 && text.starts_with('"') && text.ends_with('"') {
+        text[1..text.len() - 1].to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+/// `itemFromPart(part, fallbackId, role)` (`normalize.ts:191-238`), covering `text`,
+/// `reasoning`, `tool`, `file`, `patch`, and `compaction` part types -- the full set the task
+/// scope calls for. Structural parts (`step-start`/`step-finish`) and any other unrecognized
+/// part `type` fall through to the reference's `return []` default (`normalize.ts:237`), same
+/// as an unrecognized type here.
+///
+/// NOT ported (documented, not silent): the reference's assistant-text think-tag segmentation
+/// (`itemsFromAssistantTextPart`/`normalizeBalancedThinkTags`, `normalize.ts:100-189`), which
+/// splits OpenCode/Kimi's leaked `<think>...</think>` markup into separate `{kind:'thinking'}`
+/// items. That is a provider-specific text-leakage workaround, not core tool/reasoning/
+/// file-change rendering -- text parts are passed through as plain `{kind:'text'}` here. The
+/// `followedByTool` parameter that only feeds that segmentation is dropped accordingly.
+fn opencode_item_from_part(part: &Value, fallback_id: &str, role: Option<&str>) -> Vec<Value> {
+    let id = part
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(fallback_id);
+    match part.get("type").and_then(Value::as_str) {
+        Some("text") => {
+            let raw_text = part.get("text").and_then(Value::as_str).unwrap_or("");
+            let text = if role == Some("user") {
+                opencode_strip_run_argument_quoting(raw_text)
+            } else {
+                raw_text.to_string()
+            };
+            vec![json!({ "id": id, "kind": "text", "text": text })]
+        }
+        Some("reasoning") => {
+            let text = part
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let segment = if text.is_empty() {
+                vec![]
+            } else {
+                vec![text.clone()]
+            };
+            vec![
+                json!({ "id": id, "kind": "reasoning", "summary": segment.clone(), "content": segment, "text": text }),
+            ]
+        }
+        Some("tool") => {
+            let state = part
+                .get("state")
+                .filter(|v| v.is_object())
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let status = match state.get("status").and_then(Value::as_str) {
+                Some("completed") => "completed",
+                Some("error") => "failed",
+                _ => "running",
+            };
+            let arguments = state.get("input").cloned().unwrap_or_else(|| json!({}));
+            let content_items = state
+                .get("output")
+                .and_then(Value::as_str)
+                .map(|s| json!([s]));
+            let success = if status == "completed" {
+                Some(true)
+            } else {
+                None
+            };
+            vec![json!({
+                "id": id,
+                "kind": "dynamic_tool",
+                "namespace": "opencode",
+                "tool": part.get("tool").and_then(Value::as_str).unwrap_or("tool"),
+                "status": status,
+                "arguments": arguments,
+                "contentItems": content_items,
+                "success": success,
+            })]
+        }
+        Some("file") => vec![json!({
+            "id": id,
+            "kind": "text",
+            "text": format!("Attached file: {}", opencode_file_attachment_target(part)),
+        })],
+        Some("patch") => vec![json!({
+            "id": id,
+            "kind": "file_change",
+            "status": "completed",
+            "changes": opencode_normalize_patch_changes(part.get("files")),
+            "extensions": { "opencode": part },
+        })],
+        Some("compaction") => vec![json!({ "id": id, "kind": "context_compaction" })],
+        _ => vec![],
+    }
+}
+
+/// `textSummaryFromItems` + `normalizeOpencodeTurn`'s summary fallback (`normalize.ts:250-269,341-342`):
+/// join every `{kind:'text'}` item's text with `"\n\n"`, falling back to the first `reasoning`
+/// item's `summary[0]` when there is no text at all. The reference additionally groups
+/// consecutive text items sharing a `:text-N`/`:thinking-N`-suffixed source id (an artifact of
+/// the think-tag segmentation this port doesn't perform, see [`opencode_item_from_part`]) --
+/// since that segmentation never produces such ids here, every text item already has a
+/// distinct source id, so grouping degenerates exactly to "join every text item," which is
+/// what this does directly.
+fn opencode_turn_summary(items: &[Value]) -> String {
+    let text_parts: Vec<String> = items
+        .iter()
+        .filter(|item| item.get("kind").and_then(Value::as_str) == Some("text"))
+        .filter_map(|item| item.get("text").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    if !text_parts.is_empty() {
+        return text_parts.join("\n\n");
+    }
+    items
+        .iter()
+        .find(|item| item.get("kind").and_then(Value::as_str) == Some("reasoning"))
+        .and_then(|item| item.get("summary").and_then(Value::as_array))
+        .and_then(|arr| arr.first())
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A `FreshAgentTurnSchema`-shaped turn from one opencode `{info, parts}` message
+/// (`normalizeOpencodeTurn`, `normalize.ts:324-355`). Every part is mapped via
+/// [`opencode_item_from_part`] (`itemFromPart`, `normalize.ts:191-238`) -- `text`, `reasoning`,
+/// `tool`, `file`, and `patch` parts all become visible transcript items today; only
+/// structural (`step-start`/`step-finish`) and truly unrecognized part types are dropped,
+/// matching the reference's own `return []` default.
 fn build_opencode_turn_json(message: &Value, ordinal: usize) -> Option<Value> {
     let info = message.get("info").cloned().unwrap_or_else(|| json!({}));
     let id = info
@@ -300,23 +483,19 @@ fn build_opencode_turn_json(message: &Value, ordinal: usize) -> Option<Value> {
         .map(str::to_string)
         .unwrap_or_else(|| format!("message-{ordinal}"));
     let role = opencode_role(info.get("role").and_then(Value::as_str));
-    let parts = message.get("parts").and_then(Value::as_array).cloned().unwrap_or_default();
+    let parts = message
+        .get("parts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
 
-    let mut items = Vec::new();
-    let mut text_parts: Vec<String> = Vec::new();
-    for (index, part) in parts.iter().enumerate() {
-        if part.get("type").and_then(Value::as_str) != Some("text") {
-            continue;
-        }
-        let Some(text) = part.get("text").and_then(Value::as_str) else { continue };
-        let part_id = part
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("{id}:part-{index}"));
-        items.push(json!({ "id": part_id, "kind": "text", "text": text }));
-        text_parts.push(text.to_string());
-    }
+    let items: Vec<Value> = parts
+        .iter()
+        .enumerate()
+        .flat_map(|(index, part)| {
+            opencode_item_from_part(part, &format!("{id}:part-{index}"), role)
+        })
+        .collect();
 
     if role.is_none() && !items.is_empty() {
         return None;
@@ -334,7 +513,7 @@ fn build_opencode_turn_json(message: &Value, ordinal: usize) -> Option<Value> {
     if let Some(model) = opencode_model_from_info(&info) {
         turn.insert("model".to_string(), json!(model));
     }
-    turn.insert("summary".to_string(), json!(text_parts.join("\n\n")));
+    turn.insert("summary".to_string(), json!(opencode_turn_summary(&items)));
     turn.insert("items".to_string(), json!(items));
     Some(Value::Object(turn))
 }
@@ -361,7 +540,11 @@ fn build_opencode_snapshot_json(thread_id: &str, info: &Value, messages: &Value)
         .pointer("/time/updated")
         .and_then(Value::as_i64)
         .unwrap_or(turns.len() as i64);
-    let latest_turn_id = turns.last().and_then(|t| t.get("turnId")).cloned().unwrap_or(Value::Null);
+    let latest_turn_id = turns
+        .last()
+        .and_then(|t| t.get("turnId"))
+        .cloned()
+        .unwrap_or(Value::Null);
     let summary = info.get("title").and_then(Value::as_str);
 
     let mut snapshot = Map::new();
@@ -433,17 +616,29 @@ fn authorized(headers: &HeaderMap, token: &str) -> bool {
 
 /// `ok(data, message)` → `{status:'ok', data, message}` at HTTP 200.
 fn ok_json(data: Value, message: &str) -> Response {
-    (StatusCode::OK, Json(json!({ "status": "ok", "data": data, "message": message }))).into_response()
+    (
+        StatusCode::OK,
+        Json(json!({ "status": "ok", "data": data, "message": message })),
+    )
+        .into_response()
 }
 
 /// `approx(data, message)` → `{status:'approx', …}` (turn did not reach idle by deadline).
 fn approx_json(data: Value, message: &str) -> Response {
-    (StatusCode::OK, Json(json!({ "status": "approx", "data": data, "message": message }))).into_response()
+    (
+        StatusCode::OK,
+        Json(json!({ "status": "approx", "data": data, "message": message })),
+    )
+        .into_response()
 }
 
 /// `fail(message)` → `{status:'error', message}` at `status`.
 fn fail_json(status: StatusCode, message: String) -> Response {
-    (status, Json(json!({ "status": "error", "message": message }))).into_response()
+    (
+        status,
+        Json(json!({ "status": "error", "message": message })),
+    )
+        .into_response()
 }
 
 /// The error status the original maps serve failures to (`agentRouteErrorStatus`): a
@@ -473,12 +668,21 @@ async fn create_tab(
     // This surface is the opencode T2 slice; other agents are deferred (400, matching
     // the original's `unknown agent` rejection for anything without a mapping here).
     if agent != "opencode" {
-        return fail_json(StatusCode::BAD_REQUEST, format!("unknown agent \"{agent}\""));
+        return fail_json(
+            StatusCode::BAD_REQUEST,
+            format!("unknown agent \"{agent}\""),
+        );
     }
 
     let cwd = body.get("cwd").and_then(Value::as_str).map(str::to_string);
-    let model = body.get("model").and_then(Value::as_str).map(str::to_string);
-    let effort = body.get("effort").and_then(Value::as_str).map(str::to_string);
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let effort = body
+        .get("effort")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let name = body.get("name").and_then(Value::as_str).map(str::to_string);
 
     let tab_id = Uuid::new_v4().to_string();
@@ -558,7 +762,13 @@ async fn send_keys(
         return fail_json(StatusCode::BAD_REQUEST, "text is required".to_string());
     }
 
-    let pane = match state.panes.lock().expect("panes mutex").get(&pane_id).cloned() {
+    let pane = match state
+        .panes
+        .lock()
+        .expect("panes mutex")
+        .get(&pane_id)
+        .cloned()
+    {
         Some(pane) => pane,
         None => return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string()),
     };
@@ -584,7 +794,10 @@ async fn send_keys(
         // COLD-START + create the durable session. `create_session` runs `ensure_started`
         // (spawn serve → bounded health wait — the DEV-0001 fix, NO warm-proxy) then
         // `POST /session`. Success here IS the cold-start-clean fingerprint.
-        let created = match manager.create_session(None, None, pane.cwd.as_deref()).await {
+        let created = match manager
+            .create_session(None, None, pane.cwd.as_deref())
+            .await
+        {
             Ok(created) => created,
             Err(err) => return fail_json(serve_error_status(&err), err.to_string()),
         };
@@ -603,20 +816,24 @@ async fn send_keys(
 
         // Broadcast the placeholder→durable materialization (router.ts:1734, broadcast to
         // ALL) — emitted EXACTLY ONCE per pane, only on the send that actually materializes.
-        state.broadcast(&ServerMessage::FreshAgentSessionMaterialized(FreshAgentSessionMaterialized {
-            previous_session_id: pane.placeholder_id.clone(),
-            provider: PROVIDER.to_string(),
-            session_id: durable_id.clone(),
-            session_type: SESSION_TYPE.to_string(),
-            session_ref: Some(session_ref.clone()),
-        }));
+        state.broadcast(&ServerMessage::FreshAgentSessionMaterialized(
+            FreshAgentSessionMaterialized {
+                previous_session_id: pane.placeholder_id.clone(),
+                provider: PROVIDER.to_string(),
+                session_id: durable_id.clone(),
+                session_type: SESSION_TYPE.to_string(),
+                session_ref: Some(session_ref.clone()),
+            },
+        ));
 
         // A durable session was persisted → sessions.changed (the original's
         // session-indexer watcher fires this on the isolated opencode.db write; we
         // surface it directly). Also once-only: subsequent turns on an already-durable
         // session don't create a new session-directory entry.
         let revision = state.sessions_revision.fetch_add(1, Ordering::SeqCst) + 1;
-        state.broadcast(&ServerMessage::SessionsChanged(SessionsChanged { revision }));
+        state.broadcast(&ServerMessage::SessionsChanged(SessionsChanged {
+            revision,
+        }));
 
         durable_id
     };
@@ -628,7 +845,14 @@ async fn send_keys(
     let submitted_turn_id = Uuid::new_v4().to_string();
 
     match manager
-        .run_turn(&durable_id, &text, model.as_deref(), effort.as_deref(), turn_timeout, route)
+        .run_turn(
+            &durable_id,
+            &text,
+            model.as_deref(),
+            effort.as_deref(),
+            turn_timeout,
+            route,
+        )
         .await
     {
         Ok(()) => ok_json(
@@ -659,8 +883,16 @@ async fn send_keys(
 /// A `timeout` value in seconds (number or numeric string), clamped ≥ 0.
 fn value_as_secs(value: &Value) -> Option<u64> {
     match value {
-        Value::Number(n) => n.as_f64().filter(|f| f.is_finite() && *f >= 0.0).map(|f| f as u64),
-        Value::String(s) => s.trim().parse::<f64>().ok().filter(|f| f.is_finite() && *f >= 0.0).map(|f| f as u64),
+        Value::Number(n) => n
+            .as_f64()
+            .filter(|f| f.is_finite() && *f >= 0.0)
+            .map(|f| f as u64),
+        Value::String(s) => s
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite() && *f >= 0.0)
+            .map(|f| f as u64),
         _ => None,
     }
 }
@@ -676,7 +908,13 @@ async fn capture(
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
 
-    let pane = match state.panes.lock().expect("panes mutex").get(&pane_id).cloned() {
+    let pane = match state
+        .panes
+        .lock()
+        .expect("panes mutex")
+        .get(&pane_id)
+        .cloned()
+    {
         Some(pane) => pane,
         None => return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string()),
     };
@@ -697,7 +935,12 @@ async fn capture(
 }
 
 fn text_plain(body: String) -> Response {
-    (StatusCode::OK, [("content-type", "text/plain; charset=utf-8")], body).into_response()
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; charset=utf-8")],
+        body,
+    )
+        .into_response()
 }
 
 /// Render an opencode message page to plain text: collect every `{type:'text', text}`
@@ -796,7 +1039,10 @@ mod tests {
             provider: PROVIDER.to_string(),
             session_id: "ses_123".to_string(),
             session_type: SESSION_TYPE.to_string(),
-            session_ref: Some(SessionLocator { provider: PROVIDER.to_string(), session_id: "ses_123".to_string() }),
+            session_ref: Some(SessionLocator {
+                provider: PROVIDER.to_string(),
+                session_id: "ses_123".to_string(),
+            }),
         });
         let wire: Value = serde_json::to_value(&msg).unwrap();
         assert_eq!(wire["type"], "freshAgent.session.materialized");
@@ -828,8 +1074,9 @@ mod tests {
         fn request<'a>(
             &'a self,
             req: ServeHttpRequest,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        > {
             let body = if req.url.contains("/message") {
                 serde_json::to_vec(&self.messages_body).unwrap()
             } else if req.url.contains("/session/") {
@@ -848,8 +1095,9 @@ mod tests {
         fn request<'a>(
             &'a self,
             req: ServeHttpRequest,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        > {
             Box::pin(async move {
                 if req.url.contains("/global/health") {
                     return Ok(ServeHttpResponse::new(200, b"{}".to_vec()));
@@ -862,20 +1110,30 @@ mod tests {
     struct FakeAllocator;
     impl PortAllocator for FakeAllocator {
         fn allocate(&self) -> Result<Endpoint, String> {
-            Ok(Endpoint { hostname: "127.0.0.1".into(), port: 1 })
+            Ok(Endpoint {
+                hostname: "127.0.0.1".into(),
+                port: 1,
+            })
         }
     }
     struct NoopHandle;
     impl EventStreamHandle for NoopHandle {}
     struct NoopEventSource;
     impl EventSource for NoopEventSource {
-        fn connect(&self, _url: String, _sink: freshell_opencode::serve::EventSink) -> Box<dyn EventStreamHandle> {
+        fn connect(
+            &self,
+            _url: String,
+            _sink: freshell_opencode::serve::EventSink,
+        ) -> Box<dyn EventStreamHandle> {
             Box::new(NoopHandle)
         }
     }
     struct NoopSpawner;
     impl freshell_opencode::ProcessSpawner for NoopSpawner {
-        fn spawn(&self, _req: freshell_opencode::serve::SpawnRequest) -> Result<Box<dyn freshell_opencode::ServeProcess>, String> {
+        fn spawn(
+            &self,
+            _req: freshell_opencode::serve::SpawnRequest,
+        ) -> Result<Box<dyn freshell_opencode::ServeProcess>, String> {
             struct NoopProcess;
             impl freshell_opencode::ServeProcess for NoopProcess {
                 fn exited(&self) -> Option<i32> {
@@ -890,16 +1148,25 @@ mod tests {
         }
     }
 
-    async fn state_with_fixed_session_http(session_body: Value, messages_body: Value) -> FreshAgentState {
+    async fn state_with_fixed_session_http(
+        session_body: Value,
+        messages_body: Value,
+    ) -> FreshAgentState {
         let st = state();
         let deps = ServeDeps {
             spawner: Arc::new(NoopSpawner),
-            http: Arc::new(FixedSessionHttp { session_body, messages_body }),
+            http: Arc::new(FixedSessionHttp {
+                session_body,
+                messages_body,
+            }),
             ports: Arc::new(FakeAllocator),
             events: Arc::new(NoopEventSource),
         };
         let manager = OpencodeServeManager::new(deps, ServeConfig::default());
-        manager.ensure_started().await.expect("healthy fake serve starts");
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
         st.set_manager_for_test(manager).await;
         st
     }
@@ -921,7 +1188,10 @@ mod tests {
         ]);
         let st = state_with_fixed_session_http(session_body, messages_body).await;
 
-        let snapshot = st.get_opencode_snapshot("ses_1", None).await.expect("snapshot builds");
+        let snapshot = st
+            .get_opencode_snapshot("ses_1", None)
+            .await
+            .expect("snapshot builds");
 
         assert_eq!(snapshot["sessionType"], json!("freshopencode"));
         assert_eq!(snapshot["provider"], json!("opencode"));
@@ -956,10 +1226,98 @@ mod tests {
             events: Arc::new(NoopEventSource),
         };
         let manager = OpencodeServeManager::new(deps, ServeConfig::default());
-        manager.ensure_started().await.expect("healthy fake serve starts");
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
         st.set_manager_for_test(manager).await;
 
-        let err = st.get_opencode_snapshot("does-not-exist", None).await.expect_err("unknown session");
+        let err = st
+            .get_opencode_snapshot("does-not-exist", None)
+            .await
+            .expect_err("unknown session");
         assert!(matches!(err, OpencodeSnapshotError::NotFound));
+    }
+
+    // -- Batch D PR-6: rich transcript items for the opencode snapshot endpoint --
+
+    #[test]
+    fn opencode_item_from_part_tool_part_renders_dynamic_tool_kind_with_exact_schema_keys() {
+        let part = json!({
+            "type": "tool", "id": "part-1", "tool": "bash",
+            "state": { "status": "completed", "input": { "command": "ls" }, "output": "a.txt\n" },
+        });
+        let items = opencode_item_from_part(&part, "fallback", Some("assistant"));
+        assert_eq!(
+            items[0],
+            json!({
+                "id": "part-1", "kind": "dynamic_tool", "namespace": "opencode", "tool": "bash",
+                "status": "completed", "arguments": { "command": "ls" }, "contentItems": ["a.txt\n"], "success": true,
+            })
+        );
+    }
+
+    #[test]
+    fn opencode_item_from_part_running_tool_has_no_content_items_or_success() {
+        let part = json!({ "type": "tool", "id": "part-2", "tool": "bash", "state": { "status": "running", "input": {} } });
+        let items = opencode_item_from_part(&part, "fallback", Some("assistant"));
+        assert_eq!(items[0]["status"], json!("running"));
+        assert_eq!(items[0]["contentItems"], Value::Null);
+        assert_eq!(items[0]["success"], Value::Null);
+    }
+
+    #[test]
+    fn opencode_item_from_part_patch_renders_file_change_kind_with_exact_schema_keys() {
+        let part = json!({ "type": "patch", "id": "part-3", "files": ["src/main.rs"] });
+        let items = opencode_item_from_part(&part, "fallback", Some("assistant"));
+        assert_eq!(
+            items[0],
+            json!({
+                "id": "part-3", "kind": "file_change", "status": "completed",
+                "changes": [{ "path": "src/main.rs" }], "extensions": { "opencode": part },
+            })
+        );
+    }
+
+    #[test]
+    fn opencode_item_from_part_reasoning_renders_reasoning_kind() {
+        let part = json!({ "type": "reasoning", "id": "part-4", "text": "considering options" });
+        let items = opencode_item_from_part(&part, "fallback", Some("assistant"));
+        assert_eq!(
+            items[0],
+            json!({
+                "id": "part-4", "kind": "reasoning",
+                "summary": ["considering options"], "content": ["considering options"], "text": "considering options",
+            })
+        );
+    }
+
+    #[test]
+    fn opencode_item_from_part_structural_step_start_is_skipped_matching_reference_default() {
+        let part = json!({ "type": "step-start", "id": "part-5" });
+        assert_eq!(
+            opencode_item_from_part(&part, "fallback", Some("assistant")),
+            Vec::<Value>::new()
+        );
+    }
+
+    #[test]
+    fn build_opencode_turn_json_renders_both_tool_and_text_parts_in_one_message() {
+        let message = json!({
+            "info": { "id": "msg-1", "role": "assistant" },
+            "parts": [
+                { "type": "tool", "id": "t-1", "tool": "bash", "state": { "status": "completed", "input": {}, "output": "done" } },
+                { "type": "text", "id": "x-1", "text": "Ran the command." },
+            ],
+        });
+        let turn = build_opencode_turn_json(&message, 0).expect("turn builds");
+        let items = turn["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["kind"], json!("dynamic_tool"));
+        assert_eq!(items[0]["tool"], json!("bash"));
+        assert_eq!(items[1]["kind"], json!("text"));
+        assert_eq!(items[1]["text"], json!("Ran the command."));
+        // Summary joins the (single) text item's text.
+        assert_eq!(turn["summary"], json!("Ran the command."));
     }
 }
