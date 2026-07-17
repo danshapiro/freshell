@@ -59,6 +59,22 @@ d5cf534a naming cluster: PATCH /api/panes/:id, rename cascades, sidebar live-ter
 7. Frozen-legacy finding: legacy-at-base **cannot run FreshCodex with codex-cli 0.144.5** at all —
    Rust exceeds the frozen baseline for fresh-agent; recorded as deliberate deviations.
 
+## Relationship to the 233-item parity checklist
+
+The full acceptance checklist lives at
+`docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md` — **233 items, 2 formally
+checked (HARNESS-01, HARNESS-02), 231 unchecked** as of this snapshot. Its bar is strict:
+an item is checked only when its *stated* acceptance evidence (generally an isolated-home
+Playwright test driving the real binary) has actually passed — implementation alone does not count.
+
+The transition campaign above implemented substantial behavior behind many unchecked items
+(config/CFG, session-directory/SESSION, fresh-agent/AGENT, terminal/TERM, WS lanes) and landed
+reusable evidence machinery (the legacy/rust matrix, restore suite, wire-shape differential).
+A reconciliation pass — mapping campaign evidence onto checklist IDs and checking off what now
+genuinely qualifies — has NOT been done and is the natural next campaign task after cutover.
+Do not infer checklist completion from the campaign log; the checklist is the source of truth
+for what is *proven*, this doc for what is *built and working for the daily-driver goal*.
+
 ## Environments (as of this doc)
 - **Live daily driver (do NOT touch):** legacy Node on `:3001` (pid 3381928, HOME=/home/dan).
 - **Staging (Rust, real-data clone):** `http://localhost:17874/?token=<see /home/dan/freshell-qa/token.txt>`
