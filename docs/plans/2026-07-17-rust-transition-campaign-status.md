@@ -127,6 +127,29 @@ the security gate is PRE-cutover, not optional.
   session tracking, editor-font-follows-terminal); cutover temporarily trades those away.
   Schedule a main-reconciliation pass after cutover stabilizes.
 
+## Side-by-side bake-in (ACTIVE since 2026-07-17 ~15:00)
+
+Rust runs against the REAL home alongside legacy: **http://localhost:3002** (same AUTH_TOKEN as
+:3001; bind 127.0.0.1; pid file /tmp/freshell-bakein-3002.pid; log /tmp/freshell-bakein-3002.log).
+Pre-flight completed: state backup (freshell-qa/backups/freshell-state-20260717-141613.tar.gz),
+CFG-10 boot-twice on a real-config clone = byte-identical, SESSION-03 delete confirmed soft
+(override flag only), config-writer hardening landed (flock sidecar + dirty-key adopt-from-disk
+merge + mtime freshness reload, commit 9c346fc6) so Rust cannot clobber concurrent legacy writes
+and legacy renames appear on Rust within ~1s.
+
+**Discipline rules:** user-writes (renames/settings/archives) on ONE server at a time; never drive
+the SAME agent conversation from both; terminals/layouts are per-server (different origins).
+
+**Bake-in caveats discovered at launch:**
+1. Cold boot on the real corpus takes ~4–5 min of CPU (parses 8.7GB codex jsonl once) before the
+   sidebar responds; fast afterwards. Legacy avoids this with its persistent session-cache.json.
+   FOLLOW-UP: persistent parse cache for the Rust index.
+2. Env quirk: setting FRESHELL_HOME re-roots the PROVIDER sources too (claude/codex under
+   $FRESHELL_HOME instead of $HOME) — legacy derives provider dirs from os.homedir(). Launch the
+   bake-in WITHOUT FRESHELL_HOME. FOLLOW-UP: align home-root resolution with legacy.
+3. Legacy on :3001 is now CURRENT MAIN (incl. #514 amplifier session indexing) — amplifier
+   sessions appear in the legacy sidebar but NOT on :3002 (Rust doesn't index amplifier yet).
+
 ## Cutover plan (gated on explicit user "APPROVED")
 1. Backup real `~/.freshell` (tar + sha256). 2. Stop legacy on :3001 (record pid/cmd for rollback).
 3. Start Rust release binary on :3001 with real HOME + existing AUTH_TOKEN + GOOGLE key
