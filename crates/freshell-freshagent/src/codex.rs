@@ -567,7 +567,7 @@ impl FreshCodexState {
     ///
     /// | State | Action |
     /// |---|---|
-    /// | tracked, sidecar alive | re-emit a status snapshot (unchanged) |
+    /// | tracked, sidecar alive | no-op -- NO frame (wire-shape parity, see below) |
     /// | tracked, sidecar exited | crash-recovery respawn ([`Self::ensure_session_alive`]) |
     /// | NOT tracked, thread resumes | register it (THE FIX) + emit an idle snapshot |
     /// | NOT tracked, thread genuinely missing | `lost_session_frame` (`INVALID_SESSION_ID`) |
@@ -581,25 +581,44 @@ impl FreshCodexState {
     /// client folds into `markSessionLost` and abandons the durable session entirely
     /// (`fresh-agent-ws.ts:326-328`). Mirroring [`Self::snapshot_runtime_for`]'s
     /// ensure-runtime-on-demand behavior here is what makes restore actually restore.
+    ///
+    /// WIRE-SHAPE PARITY (fresh-agent differential capture,
+    /// `test/unit/port/oracle/freshagent-wireshape-differential.test.ts`): the tracked +
+    /// sidecar-alive branch used to UNCONDITIONALLY re-emit a `freshAgent.session.snapshot`
+    /// on every attach, even when nothing changed. The reference's `attach()`
+    /// (`server/fresh-agent/adapters/codex/adapter.ts:871-874`) is a pure no-op for this
+    /// case -- it only remembers thread settings and returns the locator; it never pushes an
+    /// event. Its `subscribe()` (`adapter.ts:875-946`) likewise never proactively pushes a
+    /// CURRENT snapshot on (re-)subscription -- it only reacts to FUTURE thread-lifecycle /
+    /// turn-completed notifications. The differential capture proved this: driving the
+    /// identical `create -> send -> attach` sequence against both servers produced
+    /// byte-identical frames through the turn-complete chime, then the Rust port alone
+    /// emitted one EXTRA `freshAgent.event{event.type:'freshAgent.session.snapshot'}` frame
+    /// after `attach` that the original never sends. Removed to match: the respawn (crash
+    /// recovery) and not-tracked-resume branches below are UNCHANGED and still emit their
+    /// snapshot, because those represent genuinely new state the client has never observed
+    /// (a new thread id, or a session this connection is only now discovering) -- not an
+    /// unconditional repeat of already-known state.
     pub async fn handle_attach(&self, msg: FreshAgentAttach) {
         let tracked = self.sessions.lock().await.contains_key(&msg.session_id);
 
-        let (session_id, active_turn_present) = if tracked {
-            let resolved_id = match self.ensure_session_alive(&msg.session_id).await {
-                Ok(EnsureAliveOutcome::AlreadyRunning) => msg.session_id.clone(),
-                Ok(EnsureAliveOutcome::Respawned { new_session_id }) => new_session_id,
-                Err(EnsureAliveError::NotFound) => {
-                    // Raced away between the `tracked` check and here (e.g. a concurrent
-                    // kill) -- fall back to the same "not tracked" handling a plain miss
-                    // would get.
-                    self.broadcast(&lost_session_frame(&msg.session_id));
-                    return;
-                }
-                Err(EnsureAliveError::RespawnFailed(err)) => {
-                    self.send_error(&None, "CODEX_ATTACH_RESPAWN_FAILED", &err);
-                    return;
-                }
-            };
+        let (session_id, active_turn_present, should_emit_snapshot) = if tracked {
+            let (resolved_id, should_emit_snapshot) =
+                match self.ensure_session_alive(&msg.session_id).await {
+                    Ok(EnsureAliveOutcome::AlreadyRunning) => (msg.session_id.clone(), false),
+                    Ok(EnsureAliveOutcome::Respawned { new_session_id }) => (new_session_id, true),
+                    Err(EnsureAliveError::NotFound) => {
+                        // Raced away between the `tracked` check and here (e.g. a concurrent
+                        // kill) -- fall back to the same "not tracked" handling a plain miss
+                        // would get.
+                        self.broadcast(&lost_session_frame(&msg.session_id));
+                        return;
+                    }
+                    Err(EnsureAliveError::RespawnFailed(err)) => {
+                        self.send_error(&None, "CODEX_ATTACH_RESPAWN_FAILED", &err);
+                        return;
+                    }
+                };
             let active_turn_present = {
                 let guard = self.sessions.lock().await;
                 guard
@@ -607,7 +626,7 @@ impl FreshCodexState {
                     .map(|s| s.active_turn.lock().expect("active_turn mutex").is_some())
                     .unwrap_or(false)
             };
-            (resolved_id, active_turn_present)
+            (resolved_id, active_turn_present, should_emit_snapshot)
         } else {
             match self
                 .ensure_session_resumable(&msg.session_id, msg.cwd.as_deref())
@@ -619,7 +638,7 @@ impl FreshCodexState {
                         .lock()
                         .expect("active_turn mutex")
                         .is_some();
-                    (msg.session_id.clone(), active_turn_present)
+                    (msg.session_id.clone(), active_turn_present, true)
                 }
                 Err(ResumeSessionError::NotFound) => {
                     self.broadcast(&lost_session_frame(&msg.session_id));
@@ -631,6 +650,10 @@ impl FreshCodexState {
                 }
             }
         };
+
+        if !should_emit_snapshot {
+            return;
+        }
 
         let status = if active_turn_present {
             CodexStatus::Running
@@ -2744,70 +2767,50 @@ pub(crate) mod tests {
         std::fs::remove_file(&log_path).ok();
     }
 
+    /// WIRE-SHAPE PARITY: attaching to a tracked, still-alive session (no crash, no
+    /// respawn) must be a pure no-op on the wire -- NO frame at all -- matching the
+    /// reference's `attach()` (`adapter.ts:871-874`), which only remembers thread settings
+    /// and never pushes an event. This replaces the two former tests
+    /// (`handle_attach_known_session_emits_{running,idle}_snapshot_when_*`), which asserted
+    /// the OLD, over-eager behavior the fresh-agent wire-shape differential capture
+    /// (`test/unit/port/oracle/freshagent-wireshape-differential.test.ts`) proved diverges
+    /// from the original: the differential showed an identical `create -> send ->
+    /// turn-complete` sequence on both servers, then the Rust port ALONE emitted one extra
+    /// `freshAgent.event{event.type:'freshAgent.session.snapshot'}` frame after `attach`.
     #[tokio::test]
-    async fn handle_attach_known_session_emits_running_snapshot_when_turn_active() {
-        let (transport, _peer) = freshell_codex::new_channel_transport();
-        let (client, _notifs) = CodexAppServerClient::connect(transport);
-        let client = Arc::new(client);
+    async fn handle_attach_known_alive_session_emits_no_frame_regardless_of_turn_state() {
+        for active_turn in [Some("turn-1".to_string()), None] {
+            let (transport, _peer) = freshell_codex::new_channel_transport();
+            let (client, _notifs) = CodexAppServerClient::connect(transport);
+            let client = Arc::new(client);
 
-        let (st, mut rx) = state_with_bus();
-        insert_fake_session(
-            &st,
-            "thread-1",
-            client,
-            Arc::new(StdMutex::new(Some("turn-1".to_string()))),
-            spawn_sleeper(),
-            "codex-sidecar-test-attach-running",
-        )
-        .await;
+            let (st, mut rx) = state_with_bus();
+            insert_fake_session(
+                &st,
+                "thread-1",
+                client,
+                Arc::new(StdMutex::new(active_turn)),
+                spawn_sleeper(),
+                "codex-sidecar-test-attach-no-frame",
+            )
+            .await;
 
-        st.handle_attach(FreshAgentAttach {
-            provider: freshell_protocol::AgentProvider::Codex,
-            session_id: "thread-1".to_string(),
-            session_type: freshell_protocol::SessionType::Freshcodex,
-            cwd: None,
-            resume_session_id: None,
-            session_ref: None,
-        })
-        .await;
+            st.handle_attach(FreshAgentAttach {
+                provider: freshell_protocol::AgentProvider::Codex,
+                session_id: "thread-1".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                cwd: None,
+                resume_session_id: None,
+                session_ref: None,
+            })
+            .await;
 
-        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(frame["type"], "freshAgent.event");
-        assert_eq!(frame["sessionId"], "thread-1");
-        assert_eq!(frame["event"]["type"], "freshAgent.session.snapshot");
-        assert_eq!(frame["event"]["status"], "running");
-    }
-
-    #[tokio::test]
-    async fn handle_attach_known_session_emits_idle_snapshot_when_no_active_turn() {
-        let (transport, _peer) = freshell_codex::new_channel_transport();
-        let (client, _notifs) = CodexAppServerClient::connect(transport);
-        let client = Arc::new(client);
-
-        let (st, mut rx) = state_with_bus();
-        insert_fake_session(
-            &st,
-            "thread-1",
-            client,
-            Arc::new(StdMutex::new(None)),
-            spawn_sleeper(),
-            "codex-sidecar-test-attach-idle",
-        )
-        .await;
-
-        st.handle_attach(FreshAgentAttach {
-            provider: freshell_protocol::AgentProvider::Codex,
-            session_id: "thread-1".to_string(),
-            session_type: freshell_protocol::SessionType::Freshcodex,
-            cwd: None,
-            resume_session_id: None,
-            session_ref: None,
-        })
-        .await;
-
-        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(frame["event"]["type"], "freshAgent.session.snapshot");
-        assert_eq!(frame["event"]["status"], "idle");
+            assert!(
+                rx.try_recv().is_err(),
+                "attach to a tracked, alive session must broadcast nothing (byte-parity with \
+                 the reference's no-op attach()), regardless of whether a turn is active"
+            );
+        }
     }
 
     // -- lazy restart after crash (PR-4) --
