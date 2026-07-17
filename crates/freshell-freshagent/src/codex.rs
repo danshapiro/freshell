@@ -997,13 +997,15 @@ pub enum CodexSnapshotError {
     NotFound,
     /// The live app-server client's `thread/read` call failed.
     AppServer(CodexAppServerError),
-    /// A raw thread item's `type` was not one of `CodexThreadItemTypeSchema`'s known variants
-    /// (`protocol.ts:113-129`) -- mirrors `readCodexThreadItemType`/`assertNever` both
-    /// throwing `Unsupported Codex thread item type: ${value}` (`normalize.ts:141-147,123-125`),
-    /// which `router.ts`'s catch-all turns into a bare 500 (`router.ts:165-166`). Every
-    /// variant the real app-server currently emits IS mapped below, so this is a forward-compat
-    /// guard against a future app-server item type this build doesn't know about yet, not a
-    /// path exercised by ordinary transcripts.
+    /// A non-item-type protocol failure while building the snapshot (currently: sidecar spawn
+    /// failure from [`FreshCodexState::snapshot_runtime_for`]). NOTE: an unrecognized raw thread
+    /// item `type` (e.g. the real codex CLI's `subAgentActivity`, unknown to both the frozen
+    /// legacy protocol and current `origin/main`) no longer produces this variant -- see the
+    /// DELIBERATE DEVIATION doc on [`map_codex_item`]. The reference's `readCodexThreadItemType`/
+    /// `assertNever` throw `Unsupported Codex thread item type: ${value}`
+    /// (`normalize.ts:141-147,123-125`), which `router.ts`'s catch-all turns into a bare 500 for
+    /// the whole thread (`router.ts:165-166`); this port instead skips the single unrecognized
+    /// item and keeps rendering everything else.
     Protocol(String),
 }
 
@@ -1116,9 +1118,22 @@ fn codex_user_message_text_parts(item: &Value) -> Vec<(usize, String)> {
 
 /// `normalizeCodexItem` (`normalize.ts:238-473`): map ONE raw codex thread item into its
 /// `FreshAgentTranscriptItemSchema`-shaped item(s). Every `CodexThreadItemTypeSchema` variant
-/// (`protocol.ts:113-129`) is covered; an item `type` outside that set is `Err` (mirrors
-/// `readCodexThreadItemType`'s zod-parse throw + `assertNever`'s default-case throw,
-/// `normalize.ts:141-147,123-125` -- see [`CodexSnapshotError::Protocol`]).
+/// (`protocol.ts:113-129`) is covered.
+///
+/// DELIBERATE DEVIATION from legacy for an unrecognized `type`: the reference's
+/// `readCodexThreadItemType`/`assertNever` both throw `Unsupported Codex thread item type:
+/// ${value}` (`normalize.ts:141-147,123-125`), which `router.ts`'s catch-all turns into a bare
+/// 500 for the ENTIRE thread (`router.ts:165-166`) -- legacy would 500 here too, so this is not
+/// a port regression, but it is a real bug either way. The real codex CLI (observed: 0.144.5)
+/// emits `subAgentActivity`, an item type absent from BOTH the frozen legacy protocol
+/// (`protocol.ts:113-129`, 16 variants) and current `origin/main`. Hard-failing an entire
+/// historical thread over one item type neither codebase has caught up to yet makes the
+/// snapshot endpoint unusable for real transcripts -- proven against real staging data (a
+/// genuinely readable thread 500'd solely because of one `subAgentActivity` item). So an
+/// unrecognized item type returns `Ok(vec![])` (the item is silently omitted; every other item
+/// in the thread still renders) instead of `Err`. This mirrors the opencode side's existing
+/// precedent: an unrecognized opencode part also degrades to `[]`, not a hard error (see
+/// `opencode_item_from_part`).
 ///
 /// Unlike the reference, a missing `item.id` does NOT throw (`readCodexItemId`,
 /// `normalize.ts:149-156`) -- the caller ([`build_codex_turn_json`]) already falls back to a
@@ -1260,16 +1275,19 @@ fn map_codex_item(item_id: &str, item: &Value, item_type: &str) -> Result<Vec<Va
             let text = item.get("text").and_then(Value::as_str).unwrap_or("Hook prompt");
             Ok(vec![json!({ "id": item_id, "kind": "text", "text": text })])
         }
-        other => Err(format!("Unsupported Codex thread item type: {other}")),
+        // DELIBERATE DEVIATION: unrecognized item type -> skip, don't error the whole thread.
+        // See the doc comment above for the full rationale (real codex 0.144.5's
+        // `subAgentActivity`, unknown to both frozen legacy and current `origin/main`).
+        _ => Ok(vec![]),
     }
 }
 
 /// `classifyCodexItemRole(item)` (`normalize.ts:475-501`): every `CodexThreadItemTypeSchema`
-/// variant maps to exactly one display role. This is called only AFTER [`map_codex_item`] has
-/// already validated `item_type` against the same variant set (returning `Err` for anything
-/// else), so the catch-all arm below is unreachable in practice -- it exists only so this is a
-/// total function, matching the reference's `assertNever` default case in spirit (a compile-time
-/// safety net, not a runtime path).
+/// variant maps to exactly one display role. The caller ([`build_codex_turn_json`]) only reaches
+/// this for an `item_type` that [`map_codex_item`] mapped to a NON-empty item list -- i.e. one of
+/// the known variants below -- so the catch-all arm is unreachable in practice -- it exists only
+/// so this is a total function, matching the reference's `assertNever` default case in spirit (a
+/// compile-time safety net, not a runtime path).
 fn classify_codex_item_role(item_type: &str) -> &'static str {
     match item_type {
         "userMessage" => "user",
@@ -1488,8 +1506,11 @@ struct CodexPendingRow {
 /// into MULTIPLE `FreshAgentTurnSchema`-shaped display turns, one per maximal run of
 /// contiguous-same-role raw items (`classifyCodexItemRole`, `normalize.ts:475-501` --
 /// ported as [`classify_codex_item_role`]). Every raw item is mapped via [`map_codex_item`]
-/// (the full `normalizeCodexItem` switch, `normalize.ts:238-473`) BEFORE being folded into its
-/// row, so an unrecognized item type still fails the whole turn exactly as before.
+/// (the full `normalizeCodexItem` switch, `normalize.ts:238-473`) before being folded into its
+/// row. DELIBERATE DEVIATION: an unrecognized item type no longer fails the turn -- per
+/// [`map_codex_item`]'s doc comment, it maps to an empty item list, and this loop skips it
+/// entirely (no role/row bookkeeping touched) so it can never manufacture a spurious empty
+/// display row. Every other item in the turn still renders normally.
 ///
 /// A turn-level `error` (`normalize.ts:509-519,640-641`) or a completed turn whose only items
 /// are `user`-role with no `assistant` output (`normalize.ts:642-652`) each APPEND A NEW
@@ -3053,11 +3074,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn map_codex_item_unrecognized_type_is_a_protocol_error_matching_reference_message() {
-        let item = json!({ "type": "somethingNew", "id": "item-7" });
-        let err =
-            map_codex_item("item-7", &item, "somethingNew").expect_err("unrecognized type errors");
-        assert_eq!(err, "Unsupported Codex thread item type: somethingNew");
+    fn map_codex_item_unrecognized_type_is_gracefully_skipped_not_an_error() {
+        // CHANGED (was: `Err("Unsupported Codex thread item type: ...")`, matching legacy's
+        // assertNever->500). The real codex CLI (0.144.5) emits `subAgentActivity`, unknown to
+        // both frozen legacy and current `origin/main` -- hard-failing the whole thread over one
+        // unrecognized item type made real historical threads unreadable. An unrecognized item
+        // type now maps to an empty item list (the item is omitted; everything else renders).
+        let item = json!({ "type": "subAgentActivity", "id": "item-7" });
+        let mapped =
+            map_codex_item("item-7", &item, "subAgentActivity").expect("unrecognized type is Ok");
+        assert_eq!(mapped, Vec::<Value>::new());
+
+        // Any other unrecognized type is handled the same way -- not special-cased on the name.
+        let other_item = json!({ "type": "somethingNew", "id": "item-8" });
+        let other_mapped =
+            map_codex_item("item-8", &other_item, "somethingNew").expect("unrecognized type is Ok");
+        assert_eq!(other_mapped, Vec::<Value>::new());
     }
 
     #[test]
@@ -3083,14 +3115,93 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn build_codex_turn_json_propagates_unrecognized_item_type_as_error() {
-        // Return type changed from a single `Value` to `Vec<Value>` (turn-splitting), but an
-        // unrecognized item type must still error the WHOLE raw turn immediately, unchanged.
-        let raw_turn =
-            json!({ "id": "turn-bad", "items": [{ "type": "notAKnownType", "id": "x" }] });
-        let err = build_codex_turn_json(&raw_turn, 0)
-            .expect_err("unrecognized item type errors the whole turn");
-        assert_eq!(err, "Unsupported Codex thread item type: notAKnownType");
+    fn build_codex_turn_json_skips_unrecognized_item_type_without_erroring_the_turn() {
+        // CHANGED (was: an unrecognized item type errored the whole raw turn immediately).
+        // Reproduces the real-world 500: `GET /api/fresh-agent/threads/freshcodex/codex/<id>`
+        // returned "Unsupported Codex thread item type: subAgentActivity" for a real codex
+        // 0.144.5 thread. A single unknown item must not make an otherwise-readable thread
+        // unreadable: the known items around it still render, and building the turn succeeds.
+        let raw_turn = json!({
+            "id": "turn-mixed-unknown",
+            "status": "completed",
+            "items": [
+                { "type": "agentMessage", "id": "known-1", "text": "known text item" },
+                { "type": "subAgentActivity", "id": "unknown-1", "detail": "sub-agent ran" },
+                { "type": "reasoning", "id": "known-2", "summary": ["known reasoning item"], "content": [] },
+            ],
+        });
+
+        let turns =
+            build_codex_turn_json(&raw_turn, 0).expect("unknown item type must not error the turn");
+
+        // `agentMessage` and `reasoning` both classify as role `assistant`
+        // (`classify_codex_item_role`), and the skipped unknown item never touches row
+        // bookkeeping -- so all three raw items collapse into ONE contiguous-role row
+        // containing exactly the two KNOWN items, role/split behavior unaffected.
+        assert_eq!(
+            turns.len(),
+            1,
+            "one assistant row, unknown item contributes nothing: {turns:?}"
+        );
+        assert_eq!(turns[0]["role"], json!("assistant"));
+        let items = turns[0]["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 2, "only the two known items render: {items:?}");
+        assert_eq!(items[0]["kind"], json!("text"));
+        assert_eq!(items[0]["text"], json!("known text item"));
+        assert_eq!(items[1]["kind"], json!("reasoning"));
+        assert_eq!(items[1]["text"], json!("known reasoning item"));
+    }
+
+    #[test]
+    fn build_codex_turn_json_unknown_item_type_does_not_perturb_role_splitting() {
+        // The unknown item sits BETWEEN a user item and an assistant item -- proving the skip
+        // touches no role/row bookkeeping (it must not appear as its own row, and must not
+        // prevent the user/assistant split that would otherwise occur).
+        let raw_turn = json!({
+            "id": "turn-unknown-between-roles",
+            "status": "completed",
+            "items": [
+                { "type": "userMessage", "id": "u-1", "content": [{ "type": "text", "text": "please check" }] },
+                { "type": "subAgentActivity", "id": "unknown-1" },
+                { "type": "agentMessage", "id": "a-1", "text": "checking now" },
+            ],
+        });
+
+        let turns = build_codex_turn_json(&raw_turn, 0).expect("unknown item type must not error");
+
+        assert_eq!(
+            turns.len(),
+            2,
+            "user row + assistant row, unknown item is invisible: {turns:?}"
+        );
+        assert_eq!(turns[0]["role"], json!("user"));
+        assert_eq!(turns[0]["items"].as_array().expect("items").len(), 1);
+        assert_eq!(turns[1]["role"], json!("assistant"));
+        assert_eq!(turns[1]["items"].as_array().expect("items").len(), 1);
+    }
+
+    // Genuinely malformed items (missing `id`/`type`) are NOT a distinct error path: a missing
+    // `type` already falls back to the sentinel `"undefined"` (`build_codex_turn_json`'s
+    // `item_type` read above) and a missing `id` already falls back to a synthetic
+    // `{turnId}:item-{index}` (this function's own tolerant-read convention, documented on
+    // [`map_codex_item`]). Both therefore flow through the exact same "unrecognized type ->
+    // skip" path exercised above -- there is no separate malformed-item error behavior in this
+    // module to preserve.
+    #[test]
+    fn build_codex_turn_json_item_missing_type_field_is_skipped_like_any_unrecognized_type() {
+        let raw_turn = json!({
+            "id": "turn-missing-type",
+            "status": "completed",
+            "items": [
+                { "id": "no-type-1" },
+                { "type": "agentMessage", "id": "known-1", "text": "still renders" },
+            ],
+        });
+        let turns = build_codex_turn_json(&raw_turn, 0).expect("missing type must not error");
+        assert_eq!(turns.len(), 1);
+        let items = turns[0]["items"].as_array().expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["text"], json!("still renders"));
     }
 
     #[test]
