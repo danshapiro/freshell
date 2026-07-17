@@ -104,7 +104,9 @@ pub fn run_opencode_listing_query(
     conn: &Connection,
     marker_pattern: &str,
 ) -> rusqlite::Result<OpencodeListingResult> {
-    conn.busy_timeout(std::time::Duration::from_millis(OPENCODE_DB_BUSY_TIMEOUT_MS))?;
+    conn.busy_timeout(std::time::Duration::from_millis(
+        OPENCODE_DB_BUSY_TIMEOUT_MS,
+    ))?;
 
     // PRAGMA table_info(session) -> hasParentId
     let has_parent_id = {
@@ -118,7 +120,11 @@ pub fn run_opencode_listing_query(
         }
         found
     };
-    let root_filter = if has_parent_id { "AND s.parent_id IS NULL" } else { "" };
+    let root_filter = if has_parent_id {
+        "AND s.parent_id IS NULL"
+    } else {
+        ""
+    };
 
     // Which optional tables exist (the marker can live in part.data and/or message.data).
     let table_names: std::collections::HashSet<String> = {
@@ -134,11 +140,13 @@ pub fn run_opencode_listing_query(
     let mut marker_clauses: Vec<&str> = Vec::new();
     let mut marker_params: Vec<String> = Vec::new();
     if table_names.contains("part") {
-        marker_clauses.push("EXISTS (SELECT 1 FROM part pa WHERE pa.session_id = s.id AND pa.data LIKE ?)");
+        marker_clauses
+            .push("EXISTS (SELECT 1 FROM part pa WHERE pa.session_id = s.id AND pa.data LIKE ?)");
         marker_params.push(marker_pattern.to_string());
     }
     if table_names.contains("message") {
-        marker_clauses.push("EXISTS (SELECT 1 FROM message m WHERE m.session_id = s.id AND m.data LIKE ?)");
+        marker_clauses
+            .push("EXISTS (SELECT 1 FROM message m WHERE m.session_id = s.id AND m.data LIKE ?)");
         marker_params.push(marker_pattern.to_string());
     }
     let marker_expr = if marker_clauses.is_empty() {
@@ -164,8 +172,10 @@ pub fn run_opencode_listing_query(
     );
 
     let mut stmt = conn.prepare(&sql)?;
-    let param_refs: Vec<&dyn rusqlite::ToSql> =
-        marker_params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+    let param_refs: Vec<&dyn rusqlite::ToSql> = marker_params
+        .iter()
+        .map(|p| p as &dyn rusqlite::ToSql)
+        .collect();
     let rows_iter = stmt.query_map(param_refs.as_slice(), |row| {
         Ok(OpencodeSessionRow {
             session_id: match row.get::<_, SqlValue>(0)? {
@@ -199,7 +209,9 @@ pub struct OpencodeProvider {
 
 impl OpencodeProvider {
     pub fn new(home_dir: impl Into<PathBuf>) -> Self {
-        Self { home_dir: home_dir.into() }
+        Self {
+            home_dir: home_dir.into(),
+        }
     }
 
     /// `getDatabasePath` — `<homeDir>/opencode.db`.
@@ -238,7 +250,10 @@ impl OpencodeProvider {
 
         if !db_path.exists() {
             degrade.push(OpencodeDegrade::MissingDb);
-            return Ok(OpencodeListing { sessions: Vec::new(), degrade });
+            return Ok(OpencodeListing {
+                sessions: Vec::new(),
+                degrade,
+            });
         }
 
         let conn = Connection::open_with_flags(

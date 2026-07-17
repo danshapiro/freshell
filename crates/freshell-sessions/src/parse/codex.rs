@@ -7,14 +7,18 @@
 use serde_json::Value;
 
 use crate::meta::{CodexTaskEventSnapshot, ParsedSessionMeta, TokenSummary};
-use crate::text::{extract_title_from_message, extract_user_authored_text, looks_like_path, normalize_first_user_message};
+use crate::text::{
+    extract_title_from_message, extract_user_authored_text, looks_like_path,
+    normalize_first_user_message,
+};
 use crate::time::{parse_timestamp_ms, to_finite_number};
 
 const CODEX_MAX_PLAUSIBLE_CONTEXT_TOKENS_WITHOUT_WINDOW: i64 = 5_000_000;
 const CODEX_AUTO_COMPACT_DEFAULT_PERCENT: f64 = 90.0;
 const CODEX_EFFECTIVE_CONTEXT_WINDOW_DEFAULT_PERCENT: f64 = 95.0;
 
-const SEMANTIC_CODEX_RESPONSE_TYPES: &[&str] = &["message", "function_call", "function_call_output"];
+const SEMANTIC_CODEX_RESPONSE_TYPES: &[&str] =
+    &["message", "function_call", "function_call_output"];
 const SEMANTIC_CODEX_EVENT_TYPES: &[&str] = &[
     "agent_message",
     "agent_reasoning",
@@ -30,7 +34,11 @@ fn extract_text_content(items: Option<&Value>) -> String {
     };
     items
         .iter()
-        .filter_map(|item| item.get("text").and_then(Value::as_str).filter(|s| !s.is_empty()))
+        .filter_map(|item| {
+            item.get("text")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -85,7 +93,8 @@ fn derive_codex_compact_threshold_tokens(
         return None;
     }
     Some(
-        (window as f64 * (CODEX_AUTO_COMPACT_DEFAULT_PERCENT / CODEX_EFFECTIVE_CONTEXT_WINDOW_DEFAULT_PERCENT))
+        (window as f64
+            * (CODEX_AUTO_COMPACT_DEFAULT_PERCENT / CODEX_EFFECTIVE_CONTEXT_WINDOW_DEFAULT_PERCENT))
             .round() as i64,
     )
 }
@@ -322,17 +331,26 @@ pub fn parse_codex_session_content(content: &str) -> ParsedSessionMeta {
                 }
             }
             if is_dirty.is_none() {
-                if let Some(d) = payload.get("git").and_then(|g| g.get("dirty")).and_then(Value::as_bool) {
+                if let Some(d) = payload
+                    .get("git")
+                    .and_then(|g| g.get("dirty"))
+                    .and_then(Value::as_bool)
+                {
                     is_dirty = Some(d);
                 }
             }
             if is_dirty.is_none() {
-                if let Some(d) = payload.get("git").and_then(|g| g.get("isDirty")).and_then(Value::as_bool) {
+                if let Some(d) = payload
+                    .get("git")
+                    .and_then(|g| g.get("isDirty"))
+                    .and_then(Value::as_bool)
+                {
                     is_dirty = Some(d);
                 }
             }
             if is_subagent.is_none()
-                && (is_codex_subagent_source(payload.get("source")) || has_codex_forked_from_session(payload))
+                && (is_codex_subagent_source(payload.get("source"))
+                    || has_codex_forked_from_session(payload))
             {
                 is_subagent = Some(true);
             }
@@ -347,7 +365,11 @@ pub fn parse_codex_session_content(content: &str) -> ParsedSessionMeta {
                 .and_then(|p| p.get("cwd"))
                 .and_then(Value::as_str)
                 .or_else(|| obj.get("cwd").and_then(Value::as_str))
-                .or_else(|| obj.get("context").and_then(|c| c.get("cwd")).and_then(Value::as_str));
+                .or_else(|| {
+                    obj.get("context")
+                        .and_then(|c| c.get("cwd"))
+                        .and_then(Value::as_str)
+                });
             if let Some(p) = possible {
                 if looks_like_path(p) {
                     cwd = Some(p.to_string());
@@ -355,10 +377,19 @@ pub fn parse_codex_session_content(content: &str) -> ParsedSessionMeta {
             }
         }
 
-        let payload_type = obj.get("payload").and_then(|p| p.get("type")).and_then(Value::as_str);
-        let payload_role = obj.get("payload").and_then(|p| p.get("role")).and_then(Value::as_str);
+        let payload_type = obj
+            .get("payload")
+            .and_then(|p| p.get("type"))
+            .and_then(Value::as_str);
+        let payload_role = obj
+            .get("payload")
+            .and_then(|p| p.get("role"))
+            .and_then(Value::as_str);
 
-        if ty == Some("response_item") && payload_type == Some("message") && payload_role == Some("user") {
+        if ty == Some("response_item")
+            && payload_type == Some("message")
+            && payload_role == Some("user")
+        {
             let text = extract_text_content(obj.get("payload").and_then(|p| p.get("content")));
             let user_text = extract_user_authored_text(&text);
             if first_user_message.is_none() {
@@ -412,7 +443,11 @@ pub fn parse_codex_session_content(content: &str) -> ParsedSessionMeta {
         }
 
         if cwd.is_none() && ty == Some("turn_context") {
-            if let Some(ctx_cwd) = obj.get("payload").and_then(|p| p.get("cwd")).and_then(Value::as_str) {
+            if let Some(ctx_cwd) = obj
+                .get("payload")
+                .and_then(|p| p.get("cwd"))
+                .and_then(Value::as_str)
+            {
                 if looks_like_path(ctx_cwd) {
                     cwd = Some(ctx_cwd.to_string());
                 }

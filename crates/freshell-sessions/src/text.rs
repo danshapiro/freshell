@@ -169,8 +169,7 @@ pub fn is_system_context(text: &str) -> bool {
 
     // /^Base directory for this skill:\s+/i
     if starts_with_ci(trimmed, "base directory for this skill:")
-        && trimmed["base directory for this skill:".len()..]
-            .starts_with(char::is_whitespace)
+        && trimmed["base directory for this skill:".len()..].starts_with(char::is_whitespace)
     {
         return true;
     }
@@ -271,7 +270,11 @@ fn is_digit_comma_ws(s: &str) -> bool {
     }
     // ',' then a whitespace char
     b.get(i) == Some(&b',')
-        && s[i + 1..].chars().next().map(|c| c.is_whitespace()).unwrap_or(false)
+        && s[i + 1..]
+            .chars()
+            .next()
+            .map(|c| c.is_whitespace())
+            .unwrap_or(false)
 }
 
 /// `server/coding-cli/utils.ts` `extractFromIdeContext`.
@@ -446,7 +449,9 @@ fn match_xml_open(s: &str) -> Option<(String, usize)> {
     let tag_start = i;
     i += 1;
     // [\w-]*  (word char or '-')
-    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'-') {
+    while i < bytes.len()
+        && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'-')
+    {
         i += 1;
     }
     let tag = s[tag_start..i].to_string();
@@ -537,7 +542,10 @@ mod char_boundary_tests {
         // Real removal still works, and surrounding multibyte survives intact.
         assert_eq!(strip_image_tags("a<image src=\"x\">b"), "ab");
         assert_eq!(strip_image_tags("</IMAGE>→"), "→");
-        assert_eq!(strip_image_tags("see → <image foo> then → done"), "see →  then → done");
+        assert_eq!(
+            strip_image_tags("see → <image foo> then → done"),
+            "see →  then → done"
+        );
     }
 
     // Broad guard: the whole text-normalization path must never panic on multibyte,

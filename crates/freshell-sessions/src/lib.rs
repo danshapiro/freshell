@@ -36,15 +36,23 @@ mod tests {
     #[test]
     fn canonical_claude_session_id_matches_reference_regex() {
         // Real UUID from the real-corrupted fixture.
-        assert!(is_canonical_claude_session_id("b7936c10-4935-441c-837c-c1f33cafec2d"));
-        assert!(is_canonical_claude_session_id("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(is_canonical_claude_session_id(
+            "b7936c10-4935-441c-837c-c1f33cafec2d"
+        ));
+        assert!(is_canonical_claude_session_id(
+            "550e8400-e29b-41d4-a716-446655440000"
+        ));
         // Fixture "session ids" that are NOT canonical (why healthy.jsonl has no sessionId).
         assert!(!is_canonical_claude_session_id("healthy-session-id"));
         assert!(!is_canonical_claude_session_id("malformed-id"));
         assert!(!is_canonical_claude_session_id("not-a-uuid"));
         // Wrong version / variant nibble.
-        assert!(!is_canonical_claude_session_id("550e8400-e29b-61d4-a716-446655440000"));
-        assert!(!is_canonical_claude_session_id("550e8400-e29b-41d4-c716-446655440000"));
+        assert!(!is_canonical_claude_session_id(
+            "550e8400-e29b-61d4-a716-446655440000"
+        ));
+        assert!(!is_canonical_claude_session_id(
+            "550e8400-e29b-41d4-c716-446655440000"
+        ));
     }
 
     #[test]
@@ -59,25 +67,41 @@ mod tests {
 
     #[test]
     fn title_extraction_collapses_and_truncates() {
-        assert_eq!(extract_title_from_message("  Multiple   spaces   here  ", 200), "Multiple spaces here");
-        assert_eq!(extract_title_from_message(&"A".repeat(250), 200), "A".repeat(200));
+        assert_eq!(
+            extract_title_from_message("  Multiple   spaces   here  ", 200),
+            "Multiple spaces here"
+        );
+        assert_eq!(
+            extract_title_from_message(&"A".repeat(250), 200),
+            "A".repeat(200)
+        );
         // Multi-line uses the first non-empty line.
-        assert_eq!(extract_title_from_message("\n\nFirst line\nSecond", 200), "First line");
+        assert_eq!(
+            extract_title_from_message("\n\nFirst line\nSecond", 200),
+            "First line"
+        );
     }
 
     #[test]
     fn system_context_is_skipped_for_authored_text() {
         // Matches the reference claude-provider tests.
-        assert_eq!(extract_user_authored_text("Fix the login bug").as_deref(), Some("Fix the login bug"));
+        assert_eq!(
+            extract_user_authored_text("Fix the login bug").as_deref(),
+            Some("Fix the login bug")
+        );
         assert_eq!(
             extract_user_authored_text("[SUGGESTION MODE: suggest...] FIRST: look").as_deref(),
             None
         );
         assert_eq!(
-            extract_user_authored_text("<environment_context>\nctx\n</environment_context>").as_deref(),
+            extract_user_authored_text("<environment_context>\nctx\n</environment_context>")
+                .as_deref(),
             None
         );
-        assert_eq!(extract_user_authored_text("# AGENTS.md instructions\n\nrules").as_deref(), None);
+        assert_eq!(
+            extract_user_authored_text("# AGENTS.md instructions\n\nrules").as_deref(),
+            None
+        );
     }
 
     #[test]
@@ -92,11 +116,23 @@ mod tests {
     #[test]
     fn timestamps_match_date_parse_for_fixture_values() {
         // Cross-checks against the reference ground truth captured from parseSessionContent.
-        assert_eq!(parse_timestamp_ms(&json!("2025-01-30T10:00:00.000Z")), Some(1_738_231_200_000));
-        assert_eq!(parse_timestamp_ms(&json!("2026-01-30T06:15:56.713Z")), Some(1_769_753_756_713));
-        assert_eq!(parse_timestamp_ms(&json!("2026-03-01T00:00:06.000Z")), Some(1_772_323_206_000));
+        assert_eq!(
+            parse_timestamp_ms(&json!("2025-01-30T10:00:00.000Z")),
+            Some(1_738_231_200_000)
+        );
+        assert_eq!(
+            parse_timestamp_ms(&json!("2026-01-30T06:15:56.713Z")),
+            Some(1_769_753_756_713)
+        );
+        assert_eq!(
+            parse_timestamp_ms(&json!("2026-03-01T00:00:06.000Z")),
+            Some(1_772_323_206_000)
+        );
         // Numeric passthrough + non-finite rejection.
-        assert_eq!(parse_timestamp_ms(&json!(1_738_231_200_000i64)), Some(1_738_231_200_000));
+        assert_eq!(
+            parse_timestamp_ms(&json!(1_738_231_200_000i64)),
+            Some(1_738_231_200_000)
+        );
         assert_eq!(parse_timestamp_ms(&json!("not a date")), None);
     }
 }

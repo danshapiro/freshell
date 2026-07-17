@@ -131,7 +131,10 @@ fn is_claude_semantic_record(obj: &Value) -> bool {
         return true;
     }
     let role = obj.get("role").and_then(Value::as_str);
-    let msg_role = obj.get("message").and_then(|m| m.get("role")).and_then(Value::as_str);
+    let msg_role = obj
+        .get("message")
+        .and_then(|m| m.get("role"))
+        .and_then(Value::as_str);
     if ty == Some("user") || role == Some("user") || msg_role == Some("user") {
         return true;
     }
@@ -155,7 +158,10 @@ fn resolve_claude_semantic_timestamp_ms(
     }
     if obj.get("type").and_then(Value::as_str) == Some("result") {
         let base_at = last_activity_at.or(created_at)?;
-        let duration_ms = obj.get("duration_ms").and_then(to_finite_number).unwrap_or(1.0);
+        let duration_ms = obj
+            .get("duration_ms")
+            .and_then(to_finite_number)
+            .unwrap_or(1.0);
         return Some(base_at + (duration_ms.round() as i64).max(1));
     }
     None
@@ -179,7 +185,10 @@ fn extract_user_content_text(content: &Value) -> Option<String> {
                 Some(text_parts.join("\n"))
             }
         }
-        Value::Object(_) => content.get("text").and_then(Value::as_str).map(str::to_string),
+        Value::Object(_) => content
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         _ => None,
     }
 }
@@ -192,7 +201,12 @@ fn extract_user_message_text(obj: &Value) -> Option<String> {
             }
         }
     }
-    if obj.get("message").and_then(|m| m.get("role")).and_then(Value::as_str) == Some("user") {
+    if obj
+        .get("message")
+        .and_then(|m| m.get("role"))
+        .and_then(Value::as_str)
+        == Some("user")
+    {
         return obj
             .get("message")
             .and_then(|m| m.get("content"))
@@ -208,7 +222,11 @@ fn assistant_usage_dedup_key(obj: &Value, line: &str) -> String {
             return format!("uuid:{uuid}");
         }
     }
-    if let Some(id) = obj.get("message").and_then(|m| m.get("id")).and_then(Value::as_str) {
+    if let Some(id) = obj
+        .get("message")
+        .and_then(|m| m.get("id"))
+        .and_then(Value::as_str)
+    {
         let id = id.trim();
         if !id.is_empty() {
             return format!("message:{id}");
@@ -257,7 +275,9 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
         };
 
         if is_claude_semantic_record(&obj) {
-            if let Some(at) = resolve_claude_semantic_timestamp_ms(&obj, created_at, last_activity_at) {
+            if let Some(at) =
+                resolve_claude_semantic_timestamp_ms(&obj, created_at, last_activity_at)
+            {
                 created_at = Some(created_at.map_or(at, |c| c.min(at)));
                 last_activity_at = Some(last_activity_at.map_or(at, |l| l.max(at)));
             }
@@ -283,9 +303,12 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
         }
 
         if model.is_none() {
-            for cand in [obj.get("model"), obj.get("message").and_then(|m| m.get("model"))]
-                .into_iter()
-                .flatten()
+            for cand in [
+                obj.get("model"),
+                obj.get("message").and_then(|m| m.get("model")),
+            ]
+            .into_iter()
+            .flatten()
             {
                 if let Some(s) = as_trimmed_nonempty(cand) {
                     model = Some(s.to_string());
@@ -364,8 +387,12 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
         if git_branch.is_none() {
             let candidates = [
                 obj.get("git").and_then(|g| g.get("branch")),
-                obj.get("payload").and_then(|p| p.get("git")).and_then(|g| g.get("branch")),
-                obj.get("message").and_then(|m| m.get("git")).and_then(|g| g.get("branch")),
+                obj.get("payload")
+                    .and_then(|p| p.get("git"))
+                    .and_then(|g| g.get("branch")),
+                obj.get("message")
+                    .and_then(|m| m.get("git"))
+                    .and_then(|g| g.get("branch")),
             ];
             for cand in candidates.into_iter().flatten() {
                 if let Some(s) = as_trimmed_nonempty(cand) {
@@ -379,10 +406,18 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
             let candidates = [
                 obj.get("git").and_then(|g| g.get("dirty")),
                 obj.get("git").and_then(|g| g.get("isDirty")),
-                obj.get("payload").and_then(|p| p.get("git")).and_then(|g| g.get("dirty")),
-                obj.get("payload").and_then(|p| p.get("git")).and_then(|g| g.get("isDirty")),
-                obj.get("message").and_then(|m| m.get("git")).and_then(|g| g.get("dirty")),
-                obj.get("message").and_then(|m| m.get("git")).and_then(|g| g.get("isDirty")),
+                obj.get("payload")
+                    .and_then(|p| p.get("git"))
+                    .and_then(|g| g.get("dirty")),
+                obj.get("payload")
+                    .and_then(|p| p.get("git"))
+                    .and_then(|g| g.get("isDirty")),
+                obj.get("message")
+                    .and_then(|m| m.get("git"))
+                    .and_then(|g| g.get("dirty")),
+                obj.get("message")
+                    .and_then(|m| m.get("git"))
+                    .and_then(|g| g.get("isDirty")),
             ];
             for cand in candidates.into_iter().flatten() {
                 if let Some(b) = cand.as_bool() {
@@ -394,15 +429,25 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
 
         let is_assistant_entry = obj.get("type").and_then(Value::as_str) == Some("assistant")
             || obj.get("role").and_then(Value::as_str) == Some("assistant")
-            || obj.get("message").and_then(|m| m.get("role")).and_then(Value::as_str) == Some("assistant");
+            || obj
+                .get("message")
+                .and_then(|m| m.get("role"))
+                .and_then(Value::as_str)
+                == Some("assistant");
 
         let usage = obj.get("message").and_then(|m| m.get("usage"));
         if is_assistant_entry {
             if let Some(usage) = usage.filter(|u| u.is_object()) {
                 let dedup_key = assistant_usage_dedup_key(&obj, line);
                 if usage_seen.insert(dedup_key) {
-                    let input = usage.get("input_tokens").and_then(to_finite_number).unwrap_or(0.0);
-                    let output = usage.get("output_tokens").and_then(to_finite_number).unwrap_or(0.0);
+                    let input = usage
+                        .get("input_tokens")
+                        .and_then(to_finite_number)
+                        .unwrap_or(0.0);
+                    let output = usage
+                        .get("output_tokens")
+                        .and_then(to_finite_number)
+                        .unwrap_or(0.0);
                     let cache_read = usage
                         .get("cache_read_input_tokens")
                         .and_then(to_finite_number)
@@ -421,7 +466,11 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
         }
     }
 
-    let is_non_interactive = if user_message_count <= 1 { Some(true) } else { None };
+    let is_non_interactive = if user_message_count <= 1 {
+        Some(true)
+    } else {
+        None
+    };
 
     if session_id.is_none() {
         if let Some(fallback) = &options.fallback_session_id {
@@ -447,7 +496,10 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
             context_tokens: Some(context_tokens),
             model_context_window: Some(model_context_window),
             compact_threshold_tokens: Some(compact_threshold_tokens),
-            compact_percent: Some(normalize_compact_percent(context_tokens, compact_threshold_tokens)),
+            compact_percent: Some(normalize_compact_percent(
+                context_tokens,
+                compact_threshold_tokens,
+            )),
         }
     });
 

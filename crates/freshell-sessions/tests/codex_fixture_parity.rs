@@ -49,7 +49,8 @@ fn task_events_stream_matches_reference() {
 #[test]
 fn corrupt_and_empty_codex_streams_never_panic() {
     // Corruption tolerance: garbage lines are skipped, empty input yields empty meta.
-    let corrupt = "not json\n{\"type\":\"session_meta\",\"payload\":{\"id\":\"s\",\"cwd\":\"/x\"}}\n{oops";
+    let corrupt =
+        "not json\n{\"type\":\"session_meta\",\"payload\":{\"id\":\"s\",\"cwd\":\"/x\"}}\n{oops";
     let meta = parse_codex_session_content(corrupt);
     assert_eq!(meta.session_id.as_deref(), Some("s"));
     assert_eq!(meta.cwd.as_deref(), Some("/x"));

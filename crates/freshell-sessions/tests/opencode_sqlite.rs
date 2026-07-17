@@ -31,8 +31,10 @@ impl TmpDir {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("freshell-sessions-oc-{}-{n}-{nanos}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "freshell-sessions-oc-{}-{n}-{nanos}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         TmpDir(dir)
     }
@@ -75,7 +77,8 @@ fn full_schema_lists_root_sessions_with_marker_and_ordering() {
     {
         let conn = Connection::open(&db).unwrap();
         create_full_schema(&conn);
-        conn.execute("INSERT INTO project VALUES ('proj1', '/repo/worktree')", []).unwrap();
+        conn.execute("INSERT INTO project VALUES ('proj1', '/repo/worktree')", [])
+            .unwrap();
         // root1: newest, marked 3-views via part.data, has a project worktree
         conn.execute(
             "INSERT INTO session VALUES ('ses_root1','/repo/cwd1','Root 1',1000,3000,NULL,'proj1',NULL)",
@@ -116,8 +119,16 @@ fn full_schema_lists_root_sessions_with_marker_and_ordering() {
     let provider = OpencodeProvider::new(dir.to_path_buf());
     let listing = provider.list_sessions(42).expect("read ok");
 
-    assert!(listing.degrade.is_empty(), "no degrade for a healthy non-empty db: {:?}", listing.degrade);
-    let ids: Vec<&str> = listing.sessions.iter().map(|s| s.session_id.as_str()).collect();
+    assert!(
+        listing.degrade.is_empty(),
+        "no degrade for a healthy non-empty db: {:?}",
+        listing.degrade
+    );
+    let ids: Vec<&str> = listing
+        .sessions
+        .iter()
+        .map(|s| s.session_id.as_str())
+        .collect();
     // root1 (updated 3000) before root2 (2000); child/archived/nocwd all excluded.
     assert_eq!(ids, vec!["ses_root1", "ses_root2"]);
 
@@ -131,7 +142,10 @@ fn full_schema_lists_root_sessions_with_marker_and_ordering() {
     assert_eq!(root1.is_non_interactive, Some(true));
 
     let root2 = &listing.sessions[1];
-    assert_eq!(root2.project_path, "/repo/cwd2", "no worktree -> fall back to cwd");
+    assert_eq!(
+        root2.project_path, "/repo/cwd2",
+        "no worktree -> fall back to cwd"
+    );
     assert_eq!(root2.is_subagent, None, "unmarked session");
     assert_eq!(root2.is_non_interactive, None);
 }
@@ -151,15 +165,29 @@ fn missing_parent_id_column_degrades_and_treats_all_as_roots() {
              );",
         )
         .unwrap();
-        conn.execute("INSERT INTO session VALUES ('s1','/a','A',1,10,NULL,NULL)", []).unwrap();
-        conn.execute("INSERT INTO session VALUES ('s2','/b','B',1,20,NULL,NULL)", []).unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES ('s1','/a','A',1,10,NULL,NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES ('s2','/b','B',1,20,NULL,NULL)",
+            [],
+        )
+        .unwrap();
     }
 
     let provider = OpencodeProvider::new(dir.to_path_buf());
     let listing = provider.list_sessions(0).expect("read ok");
-    assert!(listing.degrade.contains(&OpencodeDegrade::SchemaMissingParentId));
+    assert!(listing
+        .degrade
+        .contains(&OpencodeDegrade::SchemaMissingParentId));
     // Both flat sessions are returned as roots, ordered by time_updated DESC.
-    let ids: Vec<&str> = listing.sessions.iter().map(|s| s.session_id.as_str()).collect();
+    let ids: Vec<&str> = listing
+        .sessions
+        .iter()
+        .map(|s| s.session_id.as_str())
+        .collect();
     assert_eq!(ids, vec!["s2", "s1"]);
 }
 
@@ -179,12 +207,17 @@ fn neither_part_nor_message_table_degrades_to_unmarked_no_crash() {
              );",
         )
         .unwrap();
-        conn.execute("INSERT INTO session VALUES ('s1','/a','A',1,10,NULL,NULL,NULL)", []).unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES ('s1','/a','A',1,10,NULL,NULL,NULL)",
+            [],
+        )
+        .unwrap();
     }
 
     // The listing query must NOT throw "no such table: part" — the marker expr degrades to 0.
     let conn = Connection::open(&db).unwrap();
-    let result = run_opencode_listing_query(&conn, THREE_VIEWS_MARKER_SQL_PATTERN).expect("query ok");
+    let result =
+        run_opencode_listing_query(&conn, THREE_VIEWS_MARKER_SQL_PATTERN).expect("query ok");
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0].has_three_views_marker, Some(0));
 }
@@ -215,7 +248,9 @@ fn empty_db_reports_empty_degrade() {
 fn missing_db_file_reports_missing_degrade_without_error() {
     let dir = TmpDir::new(); // no opencode.db created
     let provider = OpencodeProvider::new(dir.to_path_buf());
-    let listing = provider.list_sessions(0).expect("missing db is Ok(empty), not Err");
+    let listing = provider
+        .list_sessions(0)
+        .expect("missing db is Ok(empty), not Err");
     assert!(listing.sessions.is_empty());
     assert_eq!(listing.degrade, vec![OpencodeDegrade::MissingDb]);
 }
@@ -223,8 +258,17 @@ fn missing_db_file_reports_missing_degrade_without_error() {
 #[test]
 fn provider_path_derivations_match_reference() {
     let provider = OpencodeProvider::new(PathBuf::from("/home/u/.local/share/opencode"));
-    assert_eq!(provider.database_path(), PathBuf::from("/home/u/.local/share/opencode/opencode.db"));
+    assert_eq!(
+        provider.database_path(),
+        PathBuf::from("/home/u/.local/share/opencode/opencode.db")
+    );
     // watch-base = dirname(homeDir) = ~/.local/share
-    assert_eq!(provider.session_watch_bases(), vec![PathBuf::from("/home/u/.local/share")]);
-    assert_eq!(provider.session_roots(), vec![PathBuf::from("/home/u/.local/share/opencode/opencode.db")]);
+    assert_eq!(
+        provider.session_watch_bases(),
+        vec![PathBuf::from("/home/u/.local/share")]
+    );
+    assert_eq!(
+        provider.session_roots(),
+        vec![PathBuf::from("/home/u/.local/share/opencode/opencode.db")]
+    );
 }

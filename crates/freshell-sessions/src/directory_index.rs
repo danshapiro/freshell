@@ -405,9 +405,7 @@ fn find_uuid_substring(s: &str) -> Option<String> {
     'start: for start in 0..bytes.len() {
         let mut pos = start;
         for (gi, &len) in groups.iter().enumerate() {
-            if pos + len > bytes.len()
-                || !bytes[pos..pos + len].iter().all(u8::is_ascii_hexdigit)
-            {
+            if pos + len > bytes.len() || !bytes[pos..pos + len].iter().all(u8::is_ascii_hexdigit) {
                 continue 'start;
             }
             pos += len;
@@ -1384,16 +1382,16 @@ mod tests {
         let home = unique_temp_dir(label);
         let codex_home = home.join(".codex");
         let sessions = if nested {
-            codex_home.join("sessions").join("2026").join("03").join("01")
+            codex_home
+                .join("sessions")
+                .join("2026")
+                .join("03")
+                .join("01")
         } else {
             codex_home.join("sessions")
         };
         std::fs::create_dir_all(&sessions).unwrap();
-        std::fs::write(
-            sessions.join("rollout-task-events.jsonl"),
-            codex_fixture(),
-        )
-        .unwrap();
+        std::fs::write(sessions.join("rollout-task-events.jsonl"), codex_fixture()).unwrap();
         codex_home
     }
 
@@ -1634,19 +1632,12 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
             items: vec![mk("z", "opencode", 300)],
         };
-        let index = SessionIndex::new(vec![
-            Arc::new(claude),
-            Arc::new(codex),
-            Arc::new(opencode),
-        ]);
+        let index = SessionIndex::new(vec![Arc::new(claude), Arc::new(codex), Arc::new(opencode)]);
         let snap = index.snapshot().await;
         let keys: Vec<String> = snap.iter().map(|s| s.key()).collect();
         // All three "z" sessions tie on lastActivityAt=300 -> key() DESC:
         // "opencode:z" > "codex:z" > "claude:z" (lexicographic). "codex:a"
         // (lastActivityAt=100) sorts last.
-        assert_eq!(
-            keys,
-            vec!["opencode:z", "codex:z", "claude:z", "codex:a"]
-        );
+        assert_eq!(keys, vec!["opencode:z", "codex:z", "claude:z", "codex:a"]);
     }
 }

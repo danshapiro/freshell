@@ -48,22 +48,34 @@ fn clock_only(created: i64, last: i64, message_count: i64) -> ParsedSessionMeta 
 #[test]
 fn healthy_parses_all_six_lines_no_uuid_session_id() {
     // "healthy-session-id" is not a canonical UUID -> session_id stays None.
-    assert_eq!(parse_fixture("healthy.jsonl"), clock_only(1_738_231_200_000, 1_738_231_205_000, 6));
+    assert_eq!(
+        parse_fixture("healthy.jsonl"),
+        clock_only(1_738_231_200_000, 1_738_231_205_000, 6)
+    );
 }
 
 #[test]
 fn corrupted_shallow_tolerates_orphaned_progress_record() {
-    assert_eq!(parse_fixture("corrupted-shallow.jsonl"), clock_only(1_738_231_200_000, 1_738_231_206_000, 8));
+    assert_eq!(
+        parse_fixture("corrupted-shallow.jsonl"),
+        clock_only(1_738_231_200_000, 1_738_231_206_000, 8)
+    );
 }
 
 #[test]
 fn corrupted_deep_tolerates_deep_orphan_chain() {
-    assert_eq!(parse_fixture("corrupted-deep.jsonl"), clock_only(1_738_231_200_000, 1_738_231_220_000, 21));
+    assert_eq!(
+        parse_fixture("corrupted-deep.jsonl"),
+        clock_only(1_738_231_200_000, 1_738_231_220_000, 21)
+    );
 }
 
 #[test]
 fn corrupted_multiple_tolerates_multiple_orphans() {
-    assert_eq!(parse_fixture("corrupted-multiple.jsonl"), clock_only(1_738_231_200_000, 1_738_231_211_000, 12));
+    assert_eq!(
+        parse_fixture("corrupted-multiple.jsonl"),
+        clock_only(1_738_231_200_000, 1_738_231_211_000, 12)
+    );
 }
 
 #[test]
@@ -71,14 +83,21 @@ fn malformed_skips_two_bad_lines_but_counts_all_six() {
     // Lines "this is not valid json" and "{\"incomplete json" are skipped by JSON.parse,
     // but still counted (non-empty). Session id from the valid init line is "malformed-id"
     // — not a UUID — so session_id is None.
-    assert_eq!(parse_fixture("malformed.jsonl"), clock_only(1_738_231_200_000, 1_738_231_203_000, 6));
+    assert_eq!(
+        parse_fixture("malformed.jsonl"),
+        clock_only(1_738_231_200_000, 1_738_231_203_000, 6)
+    );
 }
 
 #[test]
 fn no_uuid_yields_no_session_id() {
     assert_eq!(
         parse_fixture("no-uuid.jsonl"),
-        ParsedSessionMeta { message_count: 2, is_non_interactive: Some(true), ..Default::default() }
+        ParsedSessionMeta {
+            message_count: 2,
+            is_non_interactive: Some(true),
+            ..Default::default()
+        }
     );
 }
 
@@ -86,7 +105,11 @@ fn no_uuid_yields_no_session_id() {
 fn empty_yields_empty_meta() {
     assert_eq!(
         parse_fixture("empty.jsonl"),
-        ParsedSessionMeta { message_count: 0, is_non_interactive: Some(true), ..Default::default() }
+        ParsedSessionMeta {
+            message_count: 0,
+            is_non_interactive: Some(true),
+            ..Default::default()
+        }
     );
 }
 

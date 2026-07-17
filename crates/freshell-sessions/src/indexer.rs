@@ -74,13 +74,20 @@ pub enum FsEvent {
 /// Structured indexer log for assertions (in production these map to `logger.*` lines).
 #[derive(Debug, Clone, PartialEq)]
 pub enum IndexerEvent {
-    Reconfigured { key: String },
+    Reconfigured {
+        key: String,
+    },
     RootAppeared(PathBuf),
     RootRemoved(PathBuf),
     RescanScheduled,
-    RescanRan { discovered: usize },
+    RescanRan {
+        discovered: usize,
+    },
     /// A watcher failed to arm during reconfigure — logged + degrade (DEV-0002 fix path).
-    WatchArmFailedDegraded { label: &'static str, error: String },
+    WatchArmFailedDegraded {
+        label: &'static str,
+        error: String,
+    },
     /// A watch-backend error was surfaced — logged + degrade (DEV-0002 fix path).
     WatchErrorDegraded(String),
 }
@@ -159,7 +166,17 @@ impl Indexer {
         let mut parts: Vec<String> = self
             .providers
             .iter()
-            .map(|p| format!("{}:{}", p.name, if self.provider_has_existing_root(p) { 1 } else { 0 }))
+            .map(|p| {
+                format!(
+                    "{}:{}",
+                    p.name,
+                    if self.provider_has_existing_root(p) {
+                        1
+                    } else {
+                        0
+                    }
+                )
+            })
             .collect();
         parts.sort();
         parts.join(",")
@@ -203,8 +220,10 @@ impl Indexer {
             };
             for root in &spec.session_roots {
                 // matchingBases: bases containing root, longest first.
-                let mut matching: Vec<&PathBuf> =
-                    bases.iter().filter(|base| is_path_within(base, root)).collect();
+                let mut matching: Vec<&PathBuf> = bases
+                    .iter()
+                    .filter(|base| is_path_within(base, root))
+                    .collect();
                 matching.sort_by_key(|b| std::cmp::Reverse(path_len(b)));
                 let mut ancestor: Option<PathBuf> = None;
                 for base in matching {
@@ -233,14 +252,19 @@ impl Indexer {
     fn degrade_on_arm_failure(&mut self, label: &'static str, e: WatchError) {
         // DEV-0002 fix: log + degrade (schedule rescan) + stay alive. Never propagate a
         // panic/abort out of reconfigure.
-        self.events.push(IndexerEvent::WatchArmFailedDegraded { label, error: e.0 });
+        self.events
+            .push(IndexerEvent::WatchArmFailedDegraded { label, error: e.0 });
         self.needs_full_scan = true;
         self.schedule_rescan();
     }
 
     /// `findNearestExistingAncestorWithin` — walk up from `target` to `floor`, returning
     /// the first existing directory (inclusive), else `None`.
-    fn find_nearest_existing_ancestor_within(&self, target: &Path, floor: &Path) -> Option<PathBuf> {
+    fn find_nearest_existing_ancestor_within(
+        &self,
+        target: &Path,
+        floor: &Path,
+    ) -> Option<PathBuf> {
         if !is_path_within(floor, target) {
             return None;
         }
@@ -262,9 +286,10 @@ impl Indexer {
     /// `affectsWatchedRoot(entryPath)` — true when the path IS a session root or an
     /// ancestor of one (i.e. its creation/removal changes root existence).
     fn affects_watched_root(&self, path: &Path) -> bool {
-        self.providers.iter().flat_map(|p| &p.session_roots).any(|root| {
-            root == path || root.starts_with(path)
-        })
+        self.providers
+            .iter()
+            .flat_map(|p| &p.session_roots)
+            .any(|root| root == path || root.starts_with(path))
     }
 
     /// Feed a filesystem event. Root-affecting create/remove reconfigures + full-rescans;
@@ -325,7 +350,9 @@ impl Indexer {
             }
         }
         self.discovered = discovered;
-        self.events.push(IndexerEvent::RescanRan { discovered: self.discovered.len() });
+        self.events.push(IndexerEvent::RescanRan {
+            discovered: self.discovered.len(),
+        });
         self.discovered.len()
     }
 
@@ -388,7 +415,10 @@ pub fn codex_provider_spec(home: &Path) -> ProviderSpec {
 /// OpenCode: root `<dataHome>/opencode.db`, watch-base `dirname(dataHome)`.
 pub fn opencode_provider_spec(data_home: &Path) -> ProviderSpec {
     let db = data_home.join("opencode.db");
-    let base = data_home.parent().map(Path::to_path_buf).unwrap_or_else(|| data_home.to_path_buf());
+    let base = data_home
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| data_home.to_path_buf());
     ProviderSpec {
         name: "opencode".to_string(),
         session_roots: vec![db],
@@ -457,7 +487,10 @@ impl NotifyWatcherFactory {
 
 impl WatcherFactory for NotifyWatcherFactory {
     fn create(&self, _label: &'static str) -> Box<dyn Watcher> {
-        Box::new(NotifyWatcher { tx: self.tx.clone(), inner: None })
+        Box::new(NotifyWatcher {
+            tx: self.tx.clone(),
+            inner: None,
+        })
     }
 }
 
@@ -471,8 +504,8 @@ impl Watcher for NotifyWatcher {
     fn watch(&mut self, paths: &[PathBuf], recursive: bool) -> Result<(), WatchError> {
         use notify::{RecursiveMode, Watcher as _};
         let tx = self.tx.clone();
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            match res {
+        let mut watcher =
+            notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
                 Ok(event) => {
                     for path in event.paths {
                         let mapped = match event.kind {
@@ -486,13 +519,18 @@ impl Watcher for NotifyWatcher {
                 Err(err) => {
                     let _ = tx.send(FsEvent::Error(err.to_string()));
                 }
-            }
-        })
-        .map_err(|e| WatchError(e.to_string()))?;
+            })
+            .map_err(|e| WatchError(e.to_string()))?;
 
-        let mode = if recursive { RecursiveMode::Recursive } else { RecursiveMode::NonRecursive };
+        let mode = if recursive {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        };
         for path in paths {
-            watcher.watch(path, mode).map_err(|e| WatchError(e.to_string()))?;
+            watcher
+                .watch(path, mode)
+                .map_err(|e| WatchError(e.to_string()))?;
         }
         self.inner = Some(watcher);
         Ok(())
