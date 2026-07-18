@@ -31,6 +31,24 @@ Seventeen commits landed, each TDD'd, adversarially reviewed, and gate-verified:
   attribution notes in commit bodies); sandbox cargo-target volume can serve stale rlibs after
   big rebases (`docker volume rm freshell-sandbox-cargo-target` clears; noted in gate report).
 
+## Morning wave 8 (2026-07-18, post-incident)
+
+- **17874 incident**: overnight staging restarts blanked the user's 6 live tabs. Root-caused to
+  three CLIENT defects (claude-only lost-recovery guard; restore_unavailable persisting blank
+  replacements; one-shot restore) — fixed on MAIN branch `restore-resilience` (c8ab9e9c, reviewed
+  APPROVED ready-for-PR, awaiting user PR approval). User sessions recovered via rollout copies +
+  codex resume commands. Rule extended: NO restart of ANY server without user approval.
+- Landed on the port branch: SESSION-07 search tiers + pagination (bb29e9db), TERM-09/SAFE-06
+  bounded output + frame limits (15b48427), CFG-07 persistent instanceId + DIAG-05 debug/perf/
+  server-info (a2d23d4d), SAFE-08 diagnostics arm + SAFE-10 lag resync-close (61dc23e7),
+  wave-8 specs doc (348b0ace), diag01 deflake (c62385ab).
+- Checklist: PARTIAL/MISSING annotations added for SESSION-07, TERM-09, SAFE-06.
+- Frozen-paths / bisectability record addition: bb29e9db does not build standalone (absorbed
+  15b48427's main.rs wiring via the shared index — third occurrence). Mitigation now standing:
+  agents MUST commit with explicit pathspecs (git commit -- <files>).
+- :3002 now binds 0.0.0.0 (WSL localhost-relay failure workaround; same posture as legacy,
+  protected by SAFE-01/03). Runs c62385ab binary; wave-8 commits await next approved restart.
+
 # (previous snapshot below, 2026-07-17 morning)
 
 **Goal:** seamless daily-driver switch to the Rust server, used from Chrome on Windows,
