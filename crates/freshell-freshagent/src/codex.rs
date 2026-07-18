@@ -2388,7 +2388,7 @@ pub(crate) mod tests {
     // ── DIAG-01 lifecycle tracing events (capturing test facility) ────────
     mod tracing_capture {
         use std::collections::BTreeMap;
-        use std::sync::{Arc, Mutex};
+        use std::sync::{Arc, Mutex, OnceLock};
         use tracing::field::{Field, Visit};
         use tracing::{Event, Subscriber};
         use tracing_subscriber::layer::{Context, SubscriberExt};
@@ -2458,6 +2458,13 @@ pub(crate) mod tests {
         /// Thread-local capturing subscriber. Callers MUST use a CURRENT-THREAD
         /// `#[tokio::test]` (not `flavor = "multi_thread"`) so every task this
         /// crate's async fns spawn is polled on the SAME OS thread and observed.
+        ///
+        /// NOTE: unused by any test today (superseded by [`capture_by_session`] below
+        /// for exactly the reason its own doc comment warns about -- DIAG-01's crash
+        /// detection fires from a task tokio may poll on a different OS thread under
+        /// parallel `cargo test`). Kept as a smaller building block (`CaptureLayer`,
+        /// `FieldVisitor`) other single-threaded-only tests could still reach for.
+        #[allow(dead_code)]
         pub fn capture() -> (
             Arc<Mutex<Vec<CapturedEvent>>>,
             tracing::subscriber::DefaultGuard,
@@ -2469,6 +2476,119 @@ pub(crate) mod tests {
             let subscriber = tracing_subscriber::registry().with(layer);
             let guard = tracing::subscriber::set_default(subscriber);
             (events, guard)
+        }
+
+        /// Global (process-wide) capturing layer.
+        ///
+        /// `capture()` above is thread-local (`tracing::subscriber::set_default`): it only
+        /// observes events emitted ON THE THREAD that installed it. DIAG-01's crash/self-heal
+        /// event (`freshagent.session.crash_detected`) fires from `spawn_exit_watcher`'s
+        /// spawned tokio task. Under a plain `#[tokio::test]` (current-thread flavor) that
+        /// task is normally polled on the same OS thread as the test body -- but empirically
+        /// (see the flaky-test investigation this fixes) it is NOT reliably so under
+        /// `cargo test`'s default PARALLEL execution, where many other tests' OS threads,
+        /// tokio runtimes and process reaping are churning concurrently; the exact scheduling
+        /// that keeps everything thread-local under `--test-threads=1` is not a guarantee this
+        /// test can depend on. A `set_global_default` subscriber -- installed exactly ONCE for
+        /// the whole test binary via `OnceLock::get_or_init` (first caller wins, and
+        /// `get_or_init` itself is the synchronization: only one caller ever runs the init
+        /// closure even if several tests reach it concurrently) -- observes every event from
+        /// every thread in the process, regardless of which one emits it, which is what makes
+        /// capture deterministic here.
+        ///
+        /// Every event (from every concurrently-running test, in this binary) lands in one
+        /// shared, append-only `Vec`. Reads filter that vec down to what a given test cares
+        /// about, two ways (see `GlobalCapture` below):
+        ///   - by `session_id` field (exact match) for events that carry one -- airtight
+        ///     regardless of what else is running concurrently, since DIAG-01's fixture pins
+        ///     a session id literal unique in this codebase.
+        ///   - by arrival order (`since` an index snapshot) for the one DIAG-01 event that
+        ///     carries no `session_id` (`freshagent.sidecar.spawned`, which only has `pid`) --
+        ///     narrower than "ever in the process" though not perfectly attributable absent a
+        ///     session-tagged field the production event doesn't carry.
+        struct GlobalCaptureLayer {
+            events: Arc<Mutex<Vec<CapturedEvent>>>,
+        }
+
+        impl<S: Subscriber> Layer<S> for GlobalCaptureLayer {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                let mut visitor = FieldVisitor::default();
+                event.record(&mut visitor);
+                self.events
+                    .lock()
+                    .expect("capture lock")
+                    .push(CapturedEvent {
+                        message: visitor.message,
+                        fields: visitor.fields,
+                    });
+            }
+        }
+
+        static GLOBAL_EVENTS: OnceLock<Arc<Mutex<Vec<CapturedEvent>>>> = OnceLock::new();
+
+        /// Scope a capture to `session_id`. Installs the global subscriber on the first call
+        /// across the whole test binary (harmless, cheap no-op on every subsequent call --
+        /// `get_or_init` never re-runs the closure) and returns a handle that reads back
+        /// events for that session id, plus everything captured from this point forward.
+        pub fn capture_by_session(session_id: &str) -> GlobalCapture {
+            let events = GLOBAL_EVENTS
+                .get_or_init(|| {
+                    let events = Arc::new(Mutex::new(Vec::new()));
+                    let layer = GlobalCaptureLayer {
+                        events: Arc::clone(&events),
+                    };
+                    let subscriber = tracing_subscriber::registry().with(layer);
+                    // This crate's test suite installs no other global default (verified: no
+                    // `set_global_default`/`tracing_subscriber::fmt().init()` elsewhere in this
+                    // binary), so this is guaranteed to be the first and only installer --
+                    // `.expect()` turns any future regression (a second global-default
+                    // installer added elsewhere) into an immediate, diagnosable panic instead
+                    // of a silently-empty capture.
+                    tracing::subscriber::set_global_default(subscriber)
+                        .expect("DIAG-01 test binary installs exactly one global subscriber");
+                    events
+                })
+                .clone();
+            let start_index = events.lock().expect("capture lock").len();
+            GlobalCapture {
+                events,
+                session_id: session_id.to_string(),
+                start_index,
+            }
+        }
+
+        pub struct GlobalCapture {
+            events: Arc<Mutex<Vec<CapturedEvent>>>,
+            session_id: String,
+            start_index: usize,
+        }
+
+        impl GlobalCapture {
+            /// Every event (from any point in the process's lifetime) tagged with this
+            /// handle's `session_id`. Exact-match filtering makes this safe under concurrency:
+            /// no other test in this codebase uses the same session id literal.
+            pub fn events(&self) -> Vec<CapturedEvent> {
+                self.events
+                    .lock()
+                    .expect("capture lock")
+                    .iter()
+                    .filter(|e| e.fields.get("session_id").map(String::as_str) == Some(self.session_id.as_str()))
+                    .cloned()
+                    .collect()
+            }
+
+            /// Events with NO `session_id` field, captured since this handle was created.
+            /// For events the production code doesn't tag (e.g. `freshagent.sidecar.spawned`).
+            pub fn untagged_events_since_start(&self) -> Vec<CapturedEvent> {
+                self.events
+                    .lock()
+                    .expect("capture lock")
+                    .iter()
+                    .skip(self.start_index)
+                    .filter(|e| !e.fields.contains_key("session_id"))
+                    .cloned()
+                    .collect()
+            }
         }
     }
 
@@ -2487,7 +2607,12 @@ pub(crate) mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn diag01_freshagent_events_fire_on_create_and_crash_detection() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (events, _capture_guard) = tracing_capture::capture();
+        // The fixture below pins the durable thread id to this exact literal, so it's known
+        // up front -- see `capture_by_session`'s doc comment for why this must be a
+        // process-wide (not thread-local) capture: `freshagent.session.crash_detected` fires
+        // from `spawn_exit_watcher`'s spawned task, which parallel `cargo test` does not
+        // guarantee lands on this test's own OS thread.
+        let capture = tracing_capture::capture_by_session("thread-diag01");
 
         configure_fake_codex_cmd(
             r#"{"threadStartThreadId":"thread-diag01","exitProcessAfterMethodsOnce":["thread/start"]}"#,
@@ -2499,7 +2624,7 @@ pub(crate) mod tests {
         std::env::remove_var("CODEX_CMD");
         std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
 
-        let captured = events.lock().unwrap();
+        let captured = capture.events();
 
         let created = captured
             .iter()
@@ -2524,7 +2649,8 @@ pub(crate) mod tests {
             Some(thread_id.as_str())
         );
 
-        let spawned = captured
+        let spawned = capture
+            .untagged_events_since_start()
             .iter()
             .filter(|e| e.message == "freshagent.sidecar.spawned")
             .count();
