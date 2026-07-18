@@ -17,6 +17,11 @@ freshell-protocol = { path = "../freshell-protocol" }
 serde_json = { workspace = true }
 # Real pseudo-terminal spawn/read/write/resize/kill (node-pty's role).
 portable-pty = "0.8"
+# DIAG-01 lifecycle events (terminal created/exited/killed, idle-reap sweep):
+# flows to the global `tracing` subscriber `freshell-server` installs
+# (`crates/freshell-server/src/logging.rs`) -- this crate stays tokio-free
+# (see module docs) and only emits events, never installs its own subscriber.
+tracing = "0.1"
 
 [target.'cfg(unix)'.dependencies]
 # SAFE-11/TERM-22: `PtyTerminal::kill` additionally SIGKILLs the whole process
@@ -29,3 +34,7 @@ libc = "0.2"
 [dev-dependencies]
 # The T1 fidelity test asserts sha256-equality with the committed goldens.
 sha2 = "0.10"
+# DIAG-01 test facility: a capturing `Layer` + `tracing::subscriber::set_default`
+# to assert lifecycle events fire, without depending on the global subscriber
+# `freshell-server` owns.
+tracing-subscriber = "0.3"

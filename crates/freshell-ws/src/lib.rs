@@ -308,13 +308,21 @@ async fn handle_socket(
     // a rejected connection observes zero session state (no ready/settings/
     // terminal.inventory) — just an error frame + close. See [`crate::origin`]
     // for why this is deliberate hardening beyond the (advisory-only) original.
-    if crate::origin::evaluate_origin(origin.as_deref(), host.as_deref(), &state.allowed_origins)
-        == crate::origin::OriginDecision::Rejected
-    {
+    let origin_decision =
+        crate::origin::evaluate_origin(origin.as_deref(), host.as_deref(), &state.allowed_origins);
+    if origin_decision == crate::origin::OriginDecision::Rejected {
         let _ = send_error(&mut socket, ErrorCode::Unauthorized, "Origin not allowed").await;
         let _ = close_with(&mut socket, CLOSE_ORIGIN_REJECTED, "Origin not allowed").await;
         return;
     }
+    // DIAG-01: the origin allowed-kind for the `ws.connection.established`
+    // event `terminal::run` emits once this connection is authenticated
+    // (Rejected already returned above, so only these two remain).
+    let origin_kind = match origin_decision {
+        crate::origin::OriginDecision::NoOrigin => "no_origin",
+        crate::origin::OriginDecision::Allowed => "allowed",
+        crate::origin::OriginDecision::Rejected => unreachable!("handled above"),
+    };
 
     // Read the first client frame (the hello), skipping any control frames.
     let first = loop {
@@ -342,11 +350,15 @@ async fn handle_socket(
     match evaluate_hello(&value, &state.auth_token) {
         HelloOutcome::Accept => {}
         HelloOutcome::NotHello => {
+            // DIAG-01: `reason` only -- a `NotHello` frame couldn't have
+            // carried a valid token anyway, but we never touch the field.
+            tracing::warn!(reason = "not_hello", "ws.hello.rejected");
             let _ = send_error(&mut socket, ErrorCode::NotAuthenticated, "Send hello first").await;
             let _ = close_with(&mut socket, CLOSE_NOT_AUTHENTICATED, "Invalid token").await;
             return;
         }
         HelloOutcome::ProtocolMismatch => {
+            tracing::warn!(reason = "protocol_mismatch", "ws.hello.rejected");
             let msg =
                 format!("Expected protocol version {WS_PROTOCOL_VERSION}. Please reload the page.");
             let _ = send_error(&mut socket, ErrorCode::ProtocolMismatch, &msg).await;
@@ -362,6 +374,10 @@ async fn handle_socket(
             return;
         }
         HelloOutcome::BadToken => {
+            // DIAG-01: `reason` only -- covers both a wrong AND a missing
+            // token (both evaluate to `BadToken`); the presented value is
+            // NEVER logged, whether it was right, wrong, or absent.
+            tracing::warn!(reason = "bad_token", "ws.hello.rejected");
             let _ = send_error(&mut socket, ErrorCode::NotAuthenticated, "Invalid token").await;
             // S3: covers both a wrong AND a missing token (both evaluate to
             // `BadToken`) \u2014 the original closes 4001 "Invalid token" in both cases.
@@ -406,7 +422,14 @@ async fn handle_socket(
 
     // Handshake done: serve the terminal.* shell path (and fan out broadcast-bus
     // frames) until the client closes.
-    terminal::run(socket, &state, bcast_rx, terminal_output_batch_v1).await;
+    terminal::run(
+        socket,
+        &state,
+        bcast_rx,
+        terminal_output_batch_v1,
+        origin_kind,
+    )
+    .await;
 
     if ui_screenshot_v1 {
         state.screenshots.remove_capable_client();

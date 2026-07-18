@@ -106,12 +106,23 @@ pub async fn run(
     state: &WsState,
     mut bcast_rx: tokio::sync::broadcast::Receiver<String>,
     terminal_output_batch_v1: bool,
+    origin_kind: &'static str,
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     // Identify this connection so the registry can key its terminal subscriptions
     // (and sweep them on close).
     let conn_id = state.registry.new_connection_id();
+
+    // DIAG-01: this connection is now fully authenticated (the handshake was
+    // already written by the caller) -- lifecycle event with process/
+    // connection ownership context (`connection_id`) plus the Origin policy
+    // outcome (`origin_kind`, see `crate::origin`).
+    tracing::info!(
+        connection_id = conn_id,
+        origin_kind = origin_kind,
+        "ws.connection.established"
+    );
 
     // This connection's single outbound channel. The registry delivers this
     // connection's attach.ready / replay / live-output / exit frames here (via the
@@ -146,6 +157,16 @@ pub async fn run(
     ping_ticker.tick().await;
     let mut pong_since_last_ping = true;
 
+    // DIAG-01: the reason (and, when the peer supplied one, the WS close
+    // code) this connection's loop broke -- captured at each `break` site,
+    // then logged ONCE at teardown (`ws.connection.closed`) rather than
+    // spraying a log line per select-arm. The initial value is a safe
+    // fallback the borrow checker requires (every `break` arm below
+    // overwrites it before the loop can exit), hence the lint allow.
+    #[allow(unused_assignments)]
+    let mut close_reason: &'static str = "stream_ended";
+    let mut close_code: Option<u16> = None;
+
     loop {
         tokio::select! {
             // Graceful shutdown (`ws-handler.ts:3843`): close 4009 "Server shutting
@@ -155,15 +176,20 @@ pub async fn run(
                 let _ = ws_tx
                     .send(Message::Close(Some(CloseFrame { code: 4009, reason: "Server shutting down".into() })))
                     .await;
+                close_reason = "server_shutdown";
+                close_code = Some(4009);
                 break;
             }
             _ = ping_ticker.tick() => {
                 if !pong_since_last_ping {
                     // No pong since the previous tick: legacy's `ws.terminate()`.
+                    tracing::warn!(connection_id = conn_id, missed = 1u32, "ws.keepalive.terminated");
+                    close_reason = "keepalive_timeout";
                     break;
                 }
                 pong_since_last_ping = false;
                 if ws_tx.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    close_reason = "send_error";
                     break;
                 }
             }
@@ -180,11 +206,26 @@ pub async fn run(
                         )
                         .await
                         {
+                            close_reason = "send_error";
                             break;
                         }
                     }
-                    // Client closed, socket error, or stream ended: tear down.
-                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    // Client closed the socket, optionally carrying a close code.
+                    Some(Ok(Message::Close(frame))) => {
+                        if let Some(f) = frame {
+                            close_code = Some(f.code);
+                        }
+                        close_reason = "client_closed";
+                        break;
+                    }
+                    Some(Err(_)) => {
+                        close_reason = "socket_error";
+                        break;
+                    }
+                    None => {
+                        close_reason = "stream_ended";
+                        break;
+                    }
                     // A pong answers our keepalive ping (`ws.on('pong')`, ws-handler.ts:1149-1150).
                     Some(Ok(Message::Pong(_))) => { pong_since_last_ping = true; }
                     // Binary / inbound ping: ignored (an inbound ping's pong reply is
@@ -196,6 +237,7 @@ pub async fn run(
                 if let Some(out) = maybe_out {
                     // A terminal frame destined for THIS connection (registry fan-out).
                     if !send(&mut ws_tx, &out).await {
+                        close_reason = "send_error";
                         break;
                     }
                 }
@@ -205,6 +247,7 @@ pub async fn run(
                     // A pre-serialized server→client frame — forward it verbatim.
                     Ok(json) => {
                         if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                            close_reason = "send_error";
                             break;
                         }
                     }
@@ -218,6 +261,22 @@ pub async fn run(
                 }
             }
         }
+    }
+
+    // DIAG-01: one summary lifecycle event per connection teardown, whatever
+    // the actual reason -- see `close_reason`/`close_code` above.
+    match close_code {
+        Some(code) => tracing::info!(
+            connection_id = conn_id,
+            reason = close_reason,
+            code = code,
+            "ws.connection.closed"
+        ),
+        None => tracing::info!(
+            connection_id = conn_id,
+            reason = close_reason,
+            "ws.connection.closed"
+        ),
     }
 
     // Teardown: drop this connection's subscriptions. Terminals KEEP RUNNING as

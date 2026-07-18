@@ -52,8 +52,17 @@ uuid = { version = "1", features = ["v4"] }
 # (freshell-opencode/src/transport.rs). real-transport is already enabled
 # transitively via freshell-freshagent.
 freshell-opencode = { path = "../freshell-opencode", features = ["real-transport"] }
+# DIAG-01 lifecycle events (connection established/closed, hello rejected,
+# keepalive termination): flow to the global `tracing` subscriber
+# `freshell-server` installs (`crates/freshell-server/src/logging.rs`) --
+# this crate only emits events, it never installs its own subscriber.
+tracing = "0.1"
 
 [dev-dependencies]
+# DIAG-01 test facility: a capturing `Layer` + `tracing::subscriber::set_default`
+# to assert lifecycle events fire, without depending on the global subscriber
+# `freshell-server` owns.
+tracing-subscriber = "0.3"
 # Real socket integration tests for the WS keepalive contract (ping/pong cadence,
 # broadcast-flood survival): a real axum server on an ephemeral loopback port +
 # a real WS client. `net`/`rt-multi-thread` let the test binary bind a listener

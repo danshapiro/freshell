@@ -281,6 +281,14 @@ impl PtyTerminal {
         &self.terminal_id
     }
 
+    /// The pty child's OS pid (unix only; `None` on windows or after
+    /// [`mark_naturally_exited`](Self::mark_naturally_exited) drops the
+    /// cached value). DIAG-01: surfaced in the registry's `terminal.created`
+    /// lifecycle event for process-ownership context.
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
     pub fn stream_id(&self) -> &str {
         &self.stream_id
     }

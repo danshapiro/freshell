@@ -112,8 +112,7 @@ async fn connect_and_complete_handshake(url: &str) -> TestWs {
             "token": AUTH_TOKEN,
             "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
         })
-        .to_string()
-        .into(),
+        .to_string(),
     ))
     .await
     .expect("send hello");

@@ -439,7 +439,13 @@ impl TerminalRegistry {
         // caller (log line, test) depends on kill ORDER across multiple victims.
         candidates.sort();
         for id in &candidates {
-            self.kill(id);
+            self.kill_internal(id, "idle");
+        }
+        // DIAG-01: a single summary event per sweep -- only when it actually
+        // killed something (a no-op sweep, the common case on a 30s cadence,
+        // would otherwise spam the log every tick).
+        if !candidates.is_empty() {
+            tracing::info!(count = candidates.len(), "terminal.idle_reap");
         }
         candidates
     }
@@ -503,15 +509,29 @@ impl TerminalRegistry {
             on_exit,
         )?;
 
+        // DIAG-01: terminal lifecycle event -- captured BEFORE `pty` is moved
+        // into the registry, from the just-spawned PTY (so `pid` reflects
+        // the real child, not a stale/absent value).
+        let pid = pty.pid();
+
         let mut inner = self.inner.lock().expect("registry lock");
         inner.terminals.insert(
-            terminal_id,
+            terminal_id.clone(),
             TerminalHandle {
                 shared,
                 pty: Some(pty),
             },
         );
         inner.revision += 1;
+        drop(inner);
+
+        tracing::info!(
+            terminal_id = %terminal_id,
+            mode = "shell",
+            cwd = %spec.cwd.as_deref().unwrap_or(""),
+            pid = pid.unwrap_or(0),
+            "terminal.created"
+        );
         Ok(())
     }
 
@@ -708,7 +728,19 @@ impl TerminalRegistry {
     /// `registry.kill()` (`terminal-registry.ts:3997-4033`): remove the terminal, send
     /// `terminal.exit{exitCode:0}` to every attached connection, and SIGKILL+reap the
     /// PTY. Bumps the inventory revision. Returns whether the terminal existed.
+    ///
+    /// DIAG-01: this is the "api"-initiated kill path (a client's explicit
+    /// `terminal.kill`); see [`Self::kill_internal`] for the `by`-tagged
+    /// event other callers (idle-reap, shutdown) use.
     pub fn kill(&self, terminal_id: &str) -> bool {
+        self.kill_internal(terminal_id, "api")
+    }
+
+    /// Shared kill implementation. `by` distinguishes the caller for the
+    /// `terminal.killed` DIAG-01 event (`"api"` | `"idle"` | `"shutdown"`)
+    /// without adding a public parameter to [`Self::kill`] (preserving that
+    /// method's existing signature for `freshell-ws` and any other caller).
+    fn kill_internal(&self, terminal_id: &str, by: &'static str) -> bool {
         let handle = {
             let mut inner = self.inner.lock().expect("registry lock");
             match inner.terminals.remove(terminal_id) {
@@ -757,6 +789,7 @@ impl TerminalRegistry {
                 pty.kill();
             }
         }
+        tracing::info!(terminal_id = %terminal_id, by = by, "terminal.killed");
         true
     }
 
@@ -779,7 +812,9 @@ impl TerminalRegistry {
             let inner = self.inner.lock().expect("registry lock");
             inner.terminals.keys().cloned().collect()
         };
-        ids.iter().filter(|id| self.kill(id)).count()
+        ids.iter()
+            .filter(|id| self.kill_internal(id, "shutdown"))
+            .count()
     }
 
     /// `finishTerminalPtyExit` (`terminal-registry.ts:1479-1510`), non-codex core —
@@ -835,6 +870,8 @@ impl TerminalRegistry {
             (sub.sink)(exit.clone());
         }
         s.subscribers.clear();
+        drop(s);
+        tracing::info!(terminal_id = %terminal_id, exit_code = exit_code, "terminal.exited");
         true
     }
 
@@ -1068,6 +1105,243 @@ fn deliver_batches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── DIAG-01 lifecycle tracing events ─────────────────────────────────
+    //
+    // A minimal capturing `tracing_subscriber::Layer` (dev-dependency only)
+    // that records every event's message + string-rendered fields, installed
+    // as the THREAD's default subscriber (`tracing::subscriber::set_default`,
+    // scoped to the returned guard) rather than the process-global one --
+    // `freshell-server`'s `logging::init` owns that (frozen, out of scope
+    // here). This proves the lifecycle events fire with the documented
+    // fields; the JSONL formatting itself is `freshell-server`'s concern.
+    mod tracing_capture {
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::span::Attributes;
+        use tracing::{Event, Id, Subscriber};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::Layer;
+
+        #[derive(Debug, Clone, Default)]
+        pub struct CapturedEvent {
+            pub message: String,
+            pub fields: BTreeMap<String, String>,
+        }
+
+        #[derive(Default)]
+        struct FieldVisitor {
+            message: String,
+            fields: BTreeMap<String, String>,
+        }
+
+        impl Visit for FieldVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                let rendered = format!("{value:?}");
+                if field.name() == "message" {
+                    self.message = rendered;
+                } else {
+                    self.fields.insert(field.name().to_string(), rendered);
+                }
+            }
+
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "message" {
+                    self.message = value.to_string();
+                } else {
+                    self.fields
+                        .insert(field.name().to_string(), value.to_string());
+                }
+            }
+
+            fn record_i64(&mut self, field: &Field, value: i64) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+        }
+
+        struct CaptureLayer {
+            events: Arc<Mutex<Vec<CapturedEvent>>>,
+        }
+
+        impl<S> Layer<S> for CaptureLayer
+        where
+            S: Subscriber,
+        {
+            fn on_new_span(&self, _attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {}
+
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                let mut visitor = FieldVisitor::default();
+                event.record(&mut visitor);
+                self.events
+                    .lock()
+                    .expect("capture lock")
+                    .push(CapturedEvent {
+                        message: visitor.message,
+                        fields: visitor.fields,
+                    });
+            }
+        }
+
+        /// Install a thread-local capturing subscriber for the life of the
+        /// returned guard. `#[test]` functions run synchronously on their own
+        /// test-harness thread, so this reliably observes every `tracing`
+        /// event emitted by (synchronous) registry calls made while the
+        /// guard is held.
+        pub fn capture() -> (
+            Arc<Mutex<Vec<CapturedEvent>>>,
+            tracing::subscriber::DefaultGuard,
+        ) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let layer = CaptureLayer {
+                events: Arc::clone(&events),
+            };
+            let subscriber = tracing_subscriber::registry().with(layer);
+            let guard = tracing::subscriber::set_default(subscriber);
+            (events, guard)
+        }
+    }
+
+    /// **RED before implementation**: `TerminalRegistry::create` must emit a
+    /// `terminal.created` tracing event (fields: `terminal_id`, `mode`, `cwd`,
+    /// `pid`) -- DIAG-01's terminal lifecycle slice.
+    #[test]
+    fn create_emits_terminal_created_event_with_expected_fields() {
+        let (events, _guard) = tracing_capture::capture();
+        let reg = TerminalRegistry::new();
+        let spec = SpawnSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            env_overrides: std::collections::BTreeMap::new(),
+            cwd: Some("/tmp".into()),
+            cols: 80,
+            rows: 24,
+        };
+        let env = std::collections::BTreeMap::new();
+        reg.create(
+            &spec,
+            &env,
+            "T-diag-created".to_string(),
+            "S-diag-created".to_string(),
+            None,
+            None,
+        )
+        .expect("spawn /bin/sh -c 'sleep 30'");
+
+        let captured = events.lock().unwrap();
+        let created = captured
+            .iter()
+            .find(|e| e.message == "terminal.created")
+            .expect("expected a terminal.created tracing event");
+        assert_eq!(
+            created.fields.get("terminal_id").map(String::as_str),
+            Some("T-diag-created")
+        );
+        assert_eq!(
+            created.fields.get("mode").map(String::as_str),
+            Some("shell")
+        );
+        assert_eq!(created.fields.get("cwd").map(String::as_str), Some("/tmp"));
+        assert!(
+            created.fields.contains_key("pid"),
+            "terminal.created must carry the spawned PTY's pid"
+        );
+
+        drop(captured);
+        reg.kill("T-diag-created");
+    }
+
+    /// **RED before implementation**: `TerminalRegistry::finish_pty_exit`
+    /// (the NATURAL-exit path) must emit a `terminal.exited` event (fields:
+    /// `terminal_id`, `exit_code`).
+    #[test]
+    fn finish_pty_exit_emits_terminal_exited_event_with_exit_code() {
+        let (events, _guard) = tracing_capture::capture();
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T-diag-exit", "S-diag-exit");
+
+        assert!(reg.finish_pty_exit("T-diag-exit", 3));
+
+        let captured = events.lock().unwrap();
+        let exited = captured
+            .iter()
+            .find(|e| e.message == "terminal.exited")
+            .expect("expected a terminal.exited tracing event");
+        assert_eq!(
+            exited.fields.get("terminal_id").map(String::as_str),
+            Some("T-diag-exit")
+        );
+        assert_eq!(
+            exited.fields.get("exit_code").map(String::as_str),
+            Some("3")
+        );
+    }
+
+    /// **RED before implementation**: `TerminalRegistry::kill` must emit a
+    /// `terminal.killed` event (fields: `terminal_id`, `by`), and the
+    /// idle-reaper sweep must ADDITIONALLY emit a summary `terminal.idle_reap`
+    /// event (field: `count`) -- but only when it actually killed something.
+    #[test]
+    fn enforce_idle_kills_emits_killed_by_idle_and_a_sweep_summary_event() {
+        let (events, _guard) = tracing_capture::capture();
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T-diag-idle", "S-diag-idle");
+        reg.set_auto_kill_idle_minutes(5);
+        reg.backdate_last_activity("T-diag-idle", now_ms() - 6 * 60_000);
+
+        let killed = reg.enforce_idle_kills();
+        assert_eq!(killed, vec!["T-diag-idle".to_string()]);
+
+        let captured = events.lock().unwrap();
+        let killed_evt = captured
+            .iter()
+            .find(|e| {
+                e.message == "terminal.killed"
+                    && e.fields.get("terminal_id").map(String::as_str) == Some("T-diag-idle")
+            })
+            .expect("expected a terminal.killed tracing event for the idle victim");
+        assert_eq!(
+            killed_evt.fields.get("by").map(String::as_str),
+            Some("idle")
+        );
+
+        let sweep = captured
+            .iter()
+            .find(|e| e.message == "terminal.idle_reap")
+            .expect("expected a terminal.idle_reap sweep-summary event");
+        assert_eq!(sweep.fields.get("count").map(String::as_str), Some("1"));
+    }
+
+    /// A sweep that kills nothing must NOT emit the summary event (the task
+    /// spec: "idle-reap sweep (count killed, only when >0)").
+    #[test]
+    fn enforce_idle_kills_emits_no_sweep_event_when_nothing_was_killed() {
+        let (events, _guard) = tracing_capture::capture();
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T-diag-fresh", "S-diag-fresh");
+        reg.set_auto_kill_idle_minutes(5);
+        // Freshly created -- not idle long enough to be a candidate.
+
+        let killed = reg.enforce_idle_kills();
+        assert!(killed.is_empty());
+
+        let captured = events.lock().unwrap();
+        assert!(
+            !captured.iter().any(|e| e.message == "terminal.idle_reap"),
+            "a no-op sweep must not emit terminal.idle_reap"
+        );
+    }
     use std::sync::Mutex as StdMutex;
 
     /// A `FrameSink` that records every delivered message for assertions.

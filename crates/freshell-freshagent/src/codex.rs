@@ -345,7 +345,7 @@ impl FreshCodexState {
                 client,
                 model,
                 effort,
-                cwd,
+                cwd: cwd.clone(),
                 sandbox,
                 permission_mode,
                 active_turn,
@@ -354,6 +354,15 @@ impl FreshCodexState {
                 watcher,
                 exited,
             },
+        );
+
+        // DIAG-01: fresh-agent session lifecycle -- provider/session_id/cwd,
+        // never the turn text/prompt content.
+        tracing::info!(
+            provider = PROVIDER,
+            session_id = %thread_id,
+            cwd = %cwd.as_deref().unwrap_or(""),
+            "freshagent.session.created"
         );
 
         // Broadcast freshAgent.created (ws-handler.ts:3378). sessionId == durable (UUID).
@@ -471,6 +480,14 @@ impl FreshCodexState {
                 return;
             }
         };
+
+        // DIAG-01: the turn was accepted by the sidecar -- session_id + turn
+        // id only, never the submitted text/prompt.
+        tracing::info!(
+            session_id = %session_id,
+            turn = %submitted_turn_id,
+            "freshagent.send.accepted"
+        );
 
         // Broadcast freshAgent.send.accepted (ws-handler.ts:3487). turnAccepted edge.
         self.broadcast(&ServerMessage::FreshAgentSendAccepted(
@@ -889,6 +906,10 @@ impl FreshCodexState {
             );
         }
 
+        // DIAG-01: crash recovery took the resume-first path -- the durable
+        // session_id is unchanged, conversation memory survives.
+        tracing::info!(session_id = %session_id, "freshagent.crash_recovery.resumed_same_thread");
+
         Ok(EnsureAliveOutcome::Recovered)
     }
 
@@ -967,6 +988,16 @@ impl FreshCodexState {
                 },
             );
         }
+
+        // DIAG-01: crash recovery had to mint a fresh thread -- the durable
+        // identity MOVED (old_session_id -> new_thread_id); conversation
+        // memory for the old thread is lost. `warn`, unlike the resume-first
+        // path, because this is the degraded fallback.
+        tracing::warn!(
+            old_session_id = %old_session_id,
+            new_session_id = %new_thread_id,
+            "freshagent.crash_recovery.minted_new"
+        );
 
         self.broadcast(&ServerMessage::FreshAgentSessionMaterialized(
             FreshAgentSessionMaterialized {
@@ -1089,6 +1120,7 @@ impl FreshCodexState {
             }
         }
 
+        tracing::info!(pid = child.id().unwrap_or(0), "freshagent.sidecar.spawned");
         Ok((client, notifs, ownership_id, child))
     }
 
@@ -1110,6 +1142,11 @@ impl FreshCodexState {
             while let Some(notification) = notifs.recv().await {
                 let events = reduce_notification(&mut subscription, notification, &active_turn);
                 for event in events {
+                    // DIAG-01: the positive turn-complete chime only -- session_id
+                    // alone, never the turn's text/response content.
+                    if let CodexAdapterEvent::TurnComplete { session_id, .. } = &event {
+                        tracing::info!(session_id = %session_id, "freshagent.turn.complete");
+                    }
                     let frame = adapter_event_to_frame(&event, &thread_id);
                     if let Some(frame) = frame {
                         let _ = broadcast_tx.send(frame);
@@ -2033,9 +2070,15 @@ fn spawn_exit_watcher(
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 reap_owned_codex_sidecars(&ownership_id);
+                tracing::info!(session_id = %thread_id, "freshagent.sidecar.reaped");
             }
             _ = child.wait() => {
                 reap_owned_codex_sidecars(&ownership_id);
+                tracing::info!(session_id = %thread_id, "freshagent.sidecar.reaped");
+                // DIAG-01: an UNREQUESTED exit -- the crash/disconnect self-heal
+                // edge (`kill_rx` firing instead would mean a requested kill,
+                // handled in the sibling arm above with no event here).
+                tracing::warn!(session_id = %thread_id, "freshagent.session.crash_detected");
                 // PR-4: flip the lazy-restart flag BEFORE broadcasting, so a client that
                 // reacts to the `exited` status by immediately sending/attaching never
                 // races ahead of `ensure_session_alive` observing a stale `false`.
@@ -2341,6 +2384,155 @@ fn now_iso() -> String {
 pub(crate) mod tests {
     use super::*;
     use freshell_codex::{CodexStatus, CodexTurnEvent};
+
+    // ── DIAG-01 lifecycle tracing events (capturing test facility) ────────
+    mod tracing_capture {
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Subscriber};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::Layer;
+
+        #[derive(Debug, Clone, Default)]
+        pub struct CapturedEvent {
+            pub message: String,
+            pub fields: BTreeMap<String, String>,
+        }
+
+        #[derive(Default)]
+        struct FieldVisitor {
+            message: String,
+            fields: BTreeMap<String, String>,
+        }
+
+        impl Visit for FieldVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                let rendered = format!("{value:?}");
+                if field.name() == "message" {
+                    self.message = rendered;
+                } else {
+                    self.fields.insert(field.name().to_string(), rendered);
+                }
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "message" {
+                    self.message = value.to_string();
+                } else {
+                    self.fields
+                        .insert(field.name().to_string(), value.to_string());
+                }
+            }
+            fn record_i64(&mut self, field: &Field, value: i64) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+        }
+
+        struct CaptureLayer {
+            events: Arc<Mutex<Vec<CapturedEvent>>>,
+        }
+
+        impl<S: Subscriber> Layer<S> for CaptureLayer {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                let mut visitor = FieldVisitor::default();
+                event.record(&mut visitor);
+                self.events
+                    .lock()
+                    .expect("capture lock")
+                    .push(CapturedEvent {
+                        message: visitor.message,
+                        fields: visitor.fields,
+                    });
+            }
+        }
+
+        /// Thread-local capturing subscriber. Callers MUST use a CURRENT-THREAD
+        /// `#[tokio::test]` (not `flavor = "multi_thread"`) so every task this
+        /// crate's async fns spawn is polled on the SAME OS thread and observed.
+        pub fn capture() -> (
+            Arc<Mutex<Vec<CapturedEvent>>>,
+            tracing::subscriber::DefaultGuard,
+        ) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let layer = CaptureLayer {
+                events: Arc::clone(&events),
+            };
+            let subscriber = tracing_subscriber::registry().with(layer);
+            let guard = tracing::subscriber::set_default(subscriber);
+            (events, guard)
+        }
+    }
+
+    /// **DIAG-01**: `handle_create` must emit `freshagent.session.created`
+    /// (fields: `provider`, `session_id`, `cwd`), and an UNREQUESTED sidecar
+    /// crash must emit `freshagent.session.crash_detected` (field:
+    /// `session_id`) -- exercised through the SAME real fake-app-server
+    /// "scripted peer" fixture (`test/fixtures/coding-cli/codex-app-server/
+    /// fake-app-server.mjs`) the crash-recovery tests above use, so this
+    /// proves the events fire on a genuine subprocess lifecycle, not a mock.
+    #[tokio::test]
+    // Intentional: `_guard` is held across every `.await` in this test BY DESIGN
+    // (same convention as the crash-recovery tests above), serializing against
+    // every other test in this module that mutates the process-global
+    // `CODEX_CMD`/`FAKE_CODEX_APP_SERVER_BEHAVIOR` env vars.
+    #[allow(clippy::await_holding_lock)]
+    async fn diag01_freshagent_events_fire_on_create_and_crash_detection() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (events, _capture_guard) = tracing_capture::capture();
+
+        configure_fake_codex_cmd(
+            r#"{"threadStartThreadId":"thread-diag01","exitProcessAfterMethodsOnce":["thread/start"]}"#,
+        );
+        let (st, mut rx) = state_with_bus();
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+
+        std::env::remove_var("CODEX_CMD");
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
+
+        let captured = events.lock().unwrap();
+
+        let created = captured
+            .iter()
+            .find(|e| e.message == "freshagent.session.created")
+            .expect("expected a freshagent.session.created tracing event");
+        assert_eq!(
+            created.fields.get("provider").map(String::as_str),
+            Some("codex")
+        );
+        assert_eq!(
+            created.fields.get("session_id").map(String::as_str),
+            Some(thread_id.as_str())
+        );
+        assert!(created.fields.contains_key("cwd"));
+
+        let crash = captured
+            .iter()
+            .find(|e| e.message == "freshagent.session.crash_detected")
+            .expect("expected a freshagent.session.crash_detected tracing event");
+        assert_eq!(
+            crash.fields.get("session_id").map(String::as_str),
+            Some(thread_id.as_str())
+        );
+
+        let spawned = captured
+            .iter()
+            .filter(|e| e.message == "freshagent.sidecar.spawned")
+            .count();
+        assert!(
+            spawned >= 1,
+            "expected at least one freshagent.sidecar.spawned event"
+        );
+    }
 
     fn state() -> FreshCodexState {
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);

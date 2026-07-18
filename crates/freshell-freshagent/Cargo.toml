@@ -52,6 +52,11 @@ fancy-regex = "0.18"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "process", "io-util"] }
 # paneId / tabId / placeholder-suffix / submittedTurnId + claude-sidecar ownership-id minting.
 uuid = { version = "1", features = ["v4"] }
+# DIAG-01 lifecycle events (session created/send accepted/turn complete/crash
+# detected/crash recovery/sidecar spawn+reap): flows to the global `tracing`
+# subscriber `freshell-server` installs (`crates/freshell-server/src/logging.rs`)
+# -- this crate only emits events, it never installs its own subscriber.
+tracing = "0.1"
 
 # Linux /proc ownership reaper for the claude Node sidecar + its `claude` CLI grandchild
 # (SIGTERM anything carrying our FRESHELL_CLAUDE_SIDECAR_ID tag) — the claude analog of the
@@ -63,3 +68,7 @@ libc = "0.2"
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tower = { version = "0.5", features = ["util"] }
+# DIAG-01 test facility: a capturing `Layer` + `tracing::subscriber::set_default`
+# to assert lifecycle events fire, without depending on the global subscriber
+# `freshell-server` owns.
+tracing-subscriber = "0.3"
