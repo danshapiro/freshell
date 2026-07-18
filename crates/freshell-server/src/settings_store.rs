@@ -142,6 +142,16 @@ impl SettingsStore {
     /// allowlist is fixed at boot to the discovered set (`validCliProviders:
     /// allCliNames`, `server/index.ts:585`).
     pub fn load(home: Option<&Path>, discovered_cli_names: Vec<String>) -> Self {
+        // CFG-03: conservative backup restore, BEFORE any of the tolerant
+        // per-field readers below (`load_full_settings`,
+        // `load_terminal_overrides`, `load_session_overrides`,
+        // `load_or_mint_codex_display_id_secret`) each independently
+        // re-read `config.json` -- so a restore rewrites the actual file
+        // once, and every one of them sees the SAME recovered document.
+        // See `maybe_restore_config_from_backup` for the full policy.
+        if let Some(home) = home {
+            maybe_restore_config_from_backup(home);
+        }
         let mut settings = load_full_settings(home);
 
         // (1) Legacy default-enabled migration (`settings-migrate.ts:17-49`).
@@ -414,8 +424,17 @@ impl SettingsStore {
             return;
         };
         let tmp = dir.join(format!("config.json.tmp-{}", std::process::id()));
-        if std::fs::write(&tmp, &text).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+        let persisted_ok =
+            std::fs::write(&tmp, &text).is_ok() && std::fs::rename(&tmp, &path).is_ok();
+
+        // CFG-03 (backup + conservative auto-restore): refresh the backup
+        // ONLY after a SUCCESSFUL primary persist, and do it atomically
+        // (tmp+rename via `atomic_write`) -- unlike the original's plain,
+        // non-atomic `copyFile(configPath(), backupPath())`
+        // (`config-store.ts:427`), which can leave a torn/partial backup if
+        // the process dies mid-copy. Covered by the SAME `_lock` above.
+        if persisted_ok {
+            atomic_write(&backup_path(&dir), &text);
         }
         // `_lock` drops here, releasing the flock.
     }
@@ -731,6 +750,237 @@ impl ConfigLock {
         // above) -- the dirty-key overlay is still the primary defense
         // against clobbering a concurrent writer's untouched keys.
         None
+    }
+}
+
+/// `<home>/.freshell/config.backup.json` -- SAME filename the original uses
+/// (`config-store.ts:86-88`'s `backupPath()`), so a human (or a future
+/// restore UI, `configFallback.backupExists` / `backupExists()`) finds it in
+/// the expected place regardless of which server wrote it.
+fn backup_path(dir: &Path) -> PathBuf {
+    dir.join("config.backup.json")
+}
+
+/// Atomic tmp+rename write shared by [`SettingsStore::persist`]'s backup
+/// refresh and [`maybe_restore_config_from_backup`]'s primary restore. Same
+/// tmp-then-rename shape `persist()` already uses for `config.json` itself,
+/// but the tmp name additionally carries a random UUID (not just the
+/// process id): unlike `persist()`'s single call site (already serialized
+/// by its own held `ConfigLock` for its whole body), this helper is called
+/// from two DIFFERENT functions that each acquire and release their OWN
+/// `ConfigLock` instance sequentially, so a crashed prior attempt's
+/// leftover `*.tmp-<pid>` could otherwise collide with a same-pid retry.
+fn atomic_write(path: &Path, text: &str) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let tmp = parent.join(format!(
+        "{name}.tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    if std::fs::write(&tmp, text).is_err() {
+        return false;
+    }
+    if std::fs::rename(&tmp, path).is_ok() {
+        true
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+        false
+    }
+}
+
+/// CFG-03 file-health classification, deliberately coarse: this module's
+/// restore policy is CONSERVATIVE (auto-restore ONLY on a broken read,
+/// NEVER on a semantic surprise), so beyond "does this parse as JSON at
+/// all" there is nothing else for it to know. A parseable file of ANY
+/// shape -- missing keys, wrong types, a bake-in-partner legacy write that
+/// looks unusual -- is [`Ok`](ConfigFileHealth::Ok) and is never touched by
+/// [`maybe_restore_config_from_backup`]; per-field tolerance for a
+/// surprising-but-parseable shape is `load_full_settings`/
+/// `load_terminal_overrides`/`load_session_overrides`'s job, unchanged by
+/// this policy.
+enum ConfigFileHealth {
+    /// No file at all -- the original's silent, unlogged `ENOENT` fallback
+    /// (`config-store.ts#readConfigFile`). Nothing on disk to preserve.
+    Missing,
+    /// A file exists but its bytes could not be decoded as UTF-8 or parsed
+    /// as JSON. Real corruption -- the restore policy's trigger condition.
+    Corrupt,
+    /// Valid JSON, any shape.
+    Ok,
+}
+
+fn config_file_health(path: &Path) -> ConfigFileHealth {
+    if std::fs::metadata(path).is_err() {
+        return ConfigFileHealth::Missing;
+    }
+    match std::fs::read_to_string(path) {
+        // Exists (the `metadata` check above proved that) but could not be
+        // read as UTF-8 text (or some other transient IO error) -- treated
+        // as corrupt-equivalent, matching the original's `READ_ERROR`
+        // fallback-with-warning path (`config-store.ts:227-231`).
+        Err(_) => ConfigFileHealth::Corrupt,
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(_) => ConfigFileHealth::Ok,
+            Err(_) => ConfigFileHealth::Corrupt,
+        },
+    }
+}
+
+/// CFG-03 -- backup + conservative auto-restore. Called ONCE at the very
+/// top of [`SettingsStore::load`], BEFORE `load_full_settings`/
+/// `load_terminal_overrides`/`load_session_overrides`/
+/// `load_or_mint_codex_display_id_secret` each independently re-read
+/// `config.json` from disk -- so when a restore happens, it rewrites the
+/// ACTUAL file on disk and every one of those readers transparently sees
+/// the SAME recovered document this boot, not just an in-memory patch only
+/// one of them would observe.
+///
+/// THE ORIGINAL'S GAP THIS CLOSES (`config-store.ts:317-398`): on ANY read
+/// failure -- parse, version, OR read error, not just a missing file --
+/// the original's `loadInternal` falls through to its "no existing config"
+/// branch and calls `saveInternal(defaultsOnlyConfig)` UNCONDITIONALLY.
+/// That immediately overwrites `config.json` with bare defaults AND, via
+/// `saveInternal`'s own unconditional `copyFile(configPath(), backupPath())`
+/// (`config-store.ts:423-430`), OVERWRITES THE LAST-GOOD BACKUP with those
+/// same bare defaults -- before a human ever has a chance to act on the
+/// warning log's suggested manual `mv config.backup.json config.json`
+/// recovery command. By the time anyone could run it, the backup it
+/// depends on is already gone. This is precisely the "a corrupted config
+/// costs the user their N renames" failure CFG-03 exists to close, and
+/// mirrors this task's outer acceptance test one-for-one.
+///
+/// THE FIX -- a deliberate, documented safety improvement beyond the
+/// original (the CFG-03 checklist item's own parenthetical permits exactly
+/// this: "Automatic backup restoration is a deliberate safety improvement
+/// only if separately documented and tested"):
+///
+/// * restore ONLY when the primary is [`ConfigFileHealth::Missing`] or
+///   [`ConfigFileHealth::Corrupt`] -- a primary that parses, of ANY shape,
+///   is NEVER touched (side-by-side hazard: the legacy Node server
+///   co-writes this same file during bake-in; a stale backup must never
+///   clobber a newer valid legacy write, so "parses" is the ENTIRE bar);
+/// * restore ONLY when the backup itself is [`ConfigFileHealth::Ok`] --
+///   restoring from an equally-broken backup would just trade one
+///   corruption for another;
+/// * a missing primary with NO backup at all is the ordinary fresh-install
+///   path (matches the original's silent `ENOENT` handling) -- not logged,
+///   not treated as an incident;
+/// * whatever corrupt CONTENT actually exists on disk (primary and/or
+///   backup) is preserved byte-for-byte, via a raw [`std::fs::copy`] (not a
+///   re-encode through the string this function may have read -- so even
+///   invalid-UTF-8 corruption is preserved exactly), in a
+///   `<name>.corrupt-<nanos>` sibling file BEFORE anything is overwritten;
+/// * every non-trivial outcome is screamed to stderr. This module has no
+///   `tracing` dependency today (`Cargo.toml` is outside this task's
+///   file-ownership scope -- see the task report's honest note), so
+///   `eprintln!` is the deliberate, guaranteed channel, not an oversight;
+/// * when BOTH primary and backup are corrupt, this function does NOT
+///   invent a rewrite of its own -- it only preserves forensic copies of
+///   both and screams. The EXISTING seed-migration path a few lines below
+///   in [`SettingsStore::load`] (`read_persisted_known_providers` reading
+///   `None` from an unparseable primary => `needs_persist = true` =>
+///   `persist(&settings)`) already performs the original's "start fresh"
+///   write on our behalf, and -- via this same change's backup refresh in
+///   `persist()` -- refreshes the backup from that fresh write too. So
+///   "both corrupt" still ends exactly where the original ends up (fresh
+///   defaults on disk), it just never destroys forensic evidence en route.
+///
+/// Guarded by the SAME advisory [`ConfigLock`] sidecar `persist()` uses (a
+/// fresh acquire-then-release, not nested with any later `persist()` call
+/// in the same `load()` -- so this cannot deadlock a subsequent persist);
+/// the honest cross-process limit documented on [`ConfigLock`] (Rust-vs-
+/// Rust only) applies here identically.
+fn maybe_restore_config_from_backup(home: &Path) {
+    let dir = home.join(".freshell");
+    let primary = dir.join("config.json");
+    let backup = backup_path(&dir);
+
+    let _lock = ConfigLock::acquire(&dir);
+
+    let primary_health = config_file_health(&primary);
+    if matches!(primary_health, ConfigFileHealth::Ok) {
+        return; // Parseable, however surprising -- NEVER restore over it.
+    }
+    let backup_health = config_file_health(&backup);
+    if matches!(primary_health, ConfigFileHealth::Missing)
+        && matches!(backup_health, ConfigFileHealth::Missing)
+    {
+        return; // Ordinary fresh install: nothing to act on, nothing to log.
+    }
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+
+    let mut primary_forensic: Option<PathBuf> = None;
+    if matches!(primary_health, ConfigFileHealth::Corrupt) {
+        let dest = dir.join(format!("config.json.corrupt-{nanos}"));
+        if std::fs::copy(&primary, &dest).is_ok() {
+            primary_forensic = Some(dest);
+        }
+    }
+
+    match backup_health {
+        ConfigFileHealth::Ok => {
+            let Ok(backup_text) = std::fs::read_to_string(&backup) else {
+                // Vanished between the health check and now -- nothing
+                // safe to restore from; leave the corrupt primary (and its
+                // just-taken forensic copy) as the tolerant defaults path
+                // handles it from here.
+                return;
+            };
+            let restored = atomic_write(&primary, &backup_text);
+            eprintln!(
+                "freshell-server: CFG-03 config.json was {} -- {} from config.backup.json{}",
+                if matches!(primary_health, ConfigFileHealth::Missing) {
+                    "MISSING"
+                } else {
+                    "CORRUPT"
+                },
+                if restored {
+                    "auto-restored"
+                } else {
+                    "auto-restore FAILED"
+                },
+                primary_forensic
+                    .as_ref()
+                    .map(|p| format!("; corrupt original preserved at {}", p.display()))
+                    .unwrap_or_default(),
+            );
+        }
+        ConfigFileHealth::Corrupt => {
+            let backup_dest = dir.join(format!("config.backup.json.corrupt-{nanos}"));
+            let backup_forensic = std::fs::copy(&backup, &backup_dest).is_ok();
+            eprintln!(
+                "freshell-server: CFG-03 BOTH config.json and config.backup.json are unreadable/corrupt -- starting fresh with defaults (forensic copies preserved: primary={}, backup={})",
+                primary_forensic
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                if backup_forensic {
+                    backup_dest.display().to_string()
+                } else {
+                    "n/a".to_string()
+                },
+            );
+        }
+        ConfigFileHealth::Missing => {
+            // Only reachable with a CORRUPT primary (Missing+Missing already
+            // returned above) and a backup that never existed at all.
+            eprintln!(
+                "freshell-server: CFG-03 config.json is corrupt and no backup exists -- starting fresh with defaults{}",
+                primary_forensic
+                    .as_ref()
+                    .map(|p| format!(" (corrupt original preserved at {})", p.display()))
+                    .unwrap_or_default(),
+            );
+        }
     }
 }
 
@@ -2377,6 +2627,381 @@ mod tests {
             "after the throttle window elapses, the change must become visible"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ================================================================
+    // CFG-03: config.backup.json + conservative restore-on-corruption
+    // ================================================================
+    //
+    // Legacy gap this closes (`server/config-store.ts:317-398,423-430`): on
+    // ANY read failure (parse/version/read error -- not just a missing
+    // file), the original's `loadInternal` falls straight to its "no
+    // existing config" branch and calls `saveInternal(defaultsOnlyConfig)`
+    // UNCONDITIONALLY -- which immediately overwrites `config.json` with
+    // bare defaults AND, via `saveInternal`'s own unconditional
+    // `copyFile(configPath(), backupPath())`, overwrites the LAST-GOOD
+    // BACKUP with those same bare defaults, before a human ever gets a
+    // chance to run the warning log's suggested manual
+    // `mv config.backup.json config.json` recovery. This is the "a
+    // corrupted config costs the user their N renames" failure CFG-03
+    // exists to close. Proven RED against a version of this file with NO
+    // backup mechanism at all (see the task report for the exact
+    // stash/diff evidence) before the `persist()`/`load()`/
+    // `maybe_restore_config_from_backup` changes above were added.
+
+    /// THE OUTER ACCEPTANCE TEST, written first. Seeds a realistic config
+    /// (a settings patch, a terminal override, a session override, PLUS a
+    /// top-level key this store never manages at all -- `completedMigrations`
+    /// -- so unmanaged/unknown-key survival is proven, not just the keys
+    /// this module happens to know about), persists it (so a backup now
+    /// exists), truncates the primary mid-file (a realistic
+    /// crash-during-write corruption), then constructs a BRAND NEW store
+    /// over the SAME home and asserts: load succeeds, the recovered file is
+    /// value-identical to the last known-good state (byte-identical for the
+    /// unmanaged key specifically), the corrupt original is preserved
+    /// forensically with its ACTUAL corrupt bytes, and the restored store's
+    /// NEXT persist still round-trips normally (proving it is not wedged --
+    /// also the "no deadlock with the existing lock" evidence: this awaits
+    /// to completion rather than hanging).
+    #[tokio::test]
+    async fn corrupted_primary_restores_from_backup_preserving_every_last_good_value() {
+        let dir = std::env::temp_dir().join(format!("frs-cfg03-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        let config_path = freshell.join("config.json");
+        let backup_path = freshell.join("config.backup.json");
+
+        // Seed a config containing a key this store NEVER manages (only
+        // copy-forwarded by `persist()`'s adopt-from-disk merge), so its
+        // survival proves the restore is a real byte-level recovery, not
+        // just "the fields this module happens to reconstruct."
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "settings": {},
+                "sessionOverrides": {},
+                "terminalOverrides": {},
+                "completedMigrations": ["legacy-theme-seed", "provider-rename-2026"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = store_at(&dir);
+
+        // A realistic last-good state: independent settings/terminal/session
+        // writes, all landing in the same config.json.
+        store
+            .patch(&json!({ "safety": { "autoKillIdleMinutes": 42 } }))
+            .await
+            .unwrap();
+        store
+            .patch_terminal_override("term-1", &[("titleOverride", Some(json!("My Terminal")))])
+            .await;
+        store
+            .patch_session_override("claude:abc", &[("archived", Some(json!(true)))])
+            .await;
+
+        assert!(
+            backup_path.exists(),
+            "a backup must exist after a successful persist"
+        );
+        let last_good_bytes = std::fs::read(&config_path).unwrap();
+        let last_good: Value = serde_json::from_slice(&last_good_bytes).unwrap();
+        assert_eq!(
+            last_good["completedMigrations"],
+            json!(["legacy-theme-seed", "provider-rename-2026"]),
+            "sanity: the unmanaged key really is present in the last-good state"
+        );
+
+        // Simulate a crash-during-write: truncate the primary mid-file.
+        let corrupted = last_good_bytes[..last_good_bytes.len() / 2].to_vec();
+        std::fs::write(&config_path, &corrupted).unwrap();
+        assert!(
+            serde_json::from_slice::<Value>(&std::fs::read(&config_path).unwrap()).is_err(),
+            "sanity: the truncated file really does fail to parse"
+        );
+
+        // A brand-new store over the SAME home: this is where the
+        // restore-on-load policy runs.
+        let restored_store = store_at(&dir);
+
+        // The file itself is recovered to the last known-good state.
+        let restored_bytes = std::fs::read(&config_path).unwrap();
+        let restored: Value = serde_json::from_slice(&restored_bytes).unwrap();
+        assert_eq!(
+            restored, last_good,
+            "restored config.json must match the last known-good state exactly"
+        );
+        assert_eq!(
+            restored_bytes, last_good_bytes,
+            "the restore must be byte-identical (it copies the backup's exact bytes), \
+             proving unmanaged keys survive at the byte level, not just semantically"
+        );
+
+        // In-memory state agrees too -- every writer's contribution intact.
+        let settings = restored_store.get().await;
+        assert_eq!(settings.safety.auto_kill_idle_minutes, 42);
+        assert_eq!(
+            restored_store.terminal_overrides()["term-1"]["titleOverride"],
+            json!("My Terminal")
+        );
+        assert_eq!(
+            restored_store.session_overrides()["claude:abc"]["archived"],
+            json!(true)
+        );
+
+        // The corrupt original was preserved forensically, not discarded.
+        let corrupt_forensics: Vec<_> = std::fs::read_dir(&freshell)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("config.json.corrupt-"))
+            .collect();
+        assert_eq!(
+            corrupt_forensics.len(),
+            1,
+            "exactly one forensic copy of the corrupt primary must be preserved, found: {corrupt_forensics:?}"
+        );
+        let forensic_bytes = std::fs::read(freshell.join(&corrupt_forensics[0])).unwrap();
+        assert_eq!(
+            forensic_bytes, corrupted,
+            "the forensic copy must preserve the ACTUAL corrupt bytes, not something else"
+        );
+
+        // Not wedged: the restored store's NEXT persist still round-trips,
+        // and completes at all (no lock deadlock left over from the
+        // restore step's own acquire/release).
+        let merged = restored_store
+            .patch(&json!({ "safety": { "autoKillIdleMinutes": 7 } }))
+            .await
+            .unwrap();
+        assert_eq!(merged.safety.auto_kill_idle_minutes, 7);
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(cfg["settings"]["safety"]["autoKillIdleMinutes"], 7);
+        assert_eq!(
+            cfg["completedMigrations"],
+            json!(["legacy-theme-seed", "provider-rename-2026"]),
+            "the unmanaged key must still round-trip on the FOLLOWING persist too"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// SIDE-BY-SIDE HAZARD: a primary that PARSES -- even with a shape that
+    /// looks stale/surprising next to a newer backup -- must NEVER be
+    /// restored over. This is what protects a concurrent legacy-server
+    /// write from being clobbered by an auto-restore during bake-in.
+    #[tokio::test]
+    async fn parseable_but_surprising_primary_is_never_restored_over() {
+        let dir = std::env::temp_dir().join(format!("frs-cfg03-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        let config_path = freshell.join("config.json");
+        let backup_path = freshell.join("config.backup.json");
+
+        // A valid (older-looking) backup...
+        std::fs::write(
+            &backup_path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "settings": { "safety": { "autoKillIdleMinutes": 999 } },
+                "sessionOverrides": {},
+                "terminalOverrides": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // ...and a primary that is perfectly parseable JSON, but "surprising"
+        // (a value nothing in this test ever wrote, standing in for a
+        // concurrent legacy-server write during bake-in). `knownProviders`
+        // is pre-seeded to match `store_at`'s discovered set so the
+        // UNRELATED known-providers migration in `SettingsStore::load`
+        // never fires here -- this test isolates the CFG-03 restore
+        // policy specifically, not the pre-existing seed migration.
+        let surprising = json!({
+            "version": 1,
+            "settings": {
+                "safety": { "autoKillIdleMinutes": 5 },
+                "codingCli": { "knownProviders": ["claude", "codex"] }
+            },
+            "sessionOverrides": {},
+            "terminalOverrides": {},
+            "aFieldTheBackupKnowsNothingAbout": "legacy wrote this just now"
+        });
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&surprising).unwrap(),
+        )
+        .unwrap();
+        let primary_bytes_before = std::fs::read(&config_path).unwrap();
+
+        let store = store_at(&dir);
+        let settings = store.get().await;
+        assert_eq!(
+            settings.safety.auto_kill_idle_minutes, 5,
+            "the parseable primary's own value must be used, never the backup's"
+        );
+
+        let primary_bytes_after = std::fs::read(&config_path).unwrap();
+        assert_eq!(
+            primary_bytes_after, primary_bytes_before,
+            "a parseable primary must be byte-for-byte untouched by the restore policy"
+        );
+
+        let corrupt_forensics = std::fs::read_dir(&freshell)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("config.json.corrupt-")
+            });
+        assert!(
+            !corrupt_forensics,
+            "no forensic copy should ever be created for a primary that was never touched"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FAIL-SAFE: when BOTH primary and backup are corrupt, the store must
+    /// start fresh with defaults (matching the original's ultimate
+    /// fallback) WITHOUT losing either corrupt file -- both are preserved
+    /// forensically before anything is overwritten.
+    #[tokio::test]
+    async fn both_primary_and_backup_corrupt_starts_fresh_but_preserves_both_forensic_copies() {
+        let dir = std::env::temp_dir().join(format!("frs-cfg03-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        let config_path = freshell.join("config.json");
+        let backup_path = freshell.join("config.backup.json");
+
+        std::fs::write(&config_path, b"{ this is not valid json at all").unwrap();
+        std::fs::write(&backup_path, b"{ neither is this backup, oops").unwrap();
+
+        let store = store_at(&dir);
+
+        // Fresh defaults in memory (only `knownProviders` seeded from
+        // discovery -- the original migration this store already runs).
+        let settings = store.get().await;
+        assert_eq!(
+            settings.coding_cli.known_providers,
+            Some(vec!["claude".to_string(), "codex".to_string()])
+        );
+
+        let entries: Vec<_> = std::fs::read_dir(&freshell)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            entries
+                .iter()
+                .any(|n| n.starts_with("config.json.corrupt-")),
+            "the corrupt PRIMARY must be preserved forensically, found: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|n| n.starts_with("config.backup.json.corrupt-")),
+            "the corrupt BACKUP must ALSO be preserved forensically, found: {entries:?}"
+        );
+
+        // "Start fresh" (like the original): a valid config.json now exists.
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            cfg["settings"]["codingCli"]["knownProviders"],
+            json!(["claude", "codex"])
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ATOMICITY: the backup refresh after a successful persist is a
+    /// tmp+rename write, never a partial in-place write -- no leftover tmp
+    /// file, and the backup is always fully valid JSON immediately after.
+    #[tokio::test]
+    async fn backup_write_is_atomic_tmp_plus_rename_with_no_leftovers() {
+        let dir = std::env::temp_dir().join(format!("frs-cfg03-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let freshell = dir.join(".freshell");
+        let store = store_at(&dir);
+
+        store
+            .patch(&json!({ "safety": { "autoKillIdleMinutes": 11 } }))
+            .await
+            .unwrap();
+
+        let backup_text = std::fs::read_to_string(freshell.join("config.backup.json")).unwrap();
+        let backup_json: Value = serde_json::from_str(&backup_text)
+            .expect("backup must always be complete, valid JSON right after a persist");
+        assert_eq!(backup_json["settings"]["safety"]["autoKillIdleMinutes"], 11);
+
+        let leftover_tmp = std::fs::read_dir(&freshell)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp-"));
+        assert!(
+            !leftover_tmp,
+            "no tmp file should survive a successful atomic backup write"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// NEGATIVE CASE: a persist that never actually reaches disk (primary
+    /// write fails) must NOT refresh the backup -- "refresh the backup"
+    /// means "after a SUCCESSFUL persist," not "whenever persist is
+    /// attempted." Makes `.freshell` read-only so the tmp-file write inside
+    /// `persist()` fails, then asserts the pre-existing backup is
+    /// byte-for-byte unchanged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backup_is_not_refreshed_when_the_primary_persist_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("frs-cfg03-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        let store = store_at(&dir);
+
+        // Establish a known-good backup first, while the directory is still
+        // writable.
+        store
+            .patch(&json!({ "safety": { "autoKillIdleMinutes": 3 } }))
+            .await
+            .unwrap();
+        let backup_before = std::fs::read(freshell.join("config.backup.json")).unwrap();
+
+        // Make `.freshell` read+execute only: `persist()`'s tmp-file write
+        // (which must CREATE a new file in this directory) fails, so the
+        // primary write itself never succeeds.
+        let original_perms = std::fs::metadata(&freshell).unwrap().permissions();
+        std::fs::set_permissions(&freshell, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let merged = store
+            .patch(&json!({ "safety": { "autoKillIdleMinutes": 99 } }))
+            .await
+            .unwrap();
+        // The in-memory tree still updates (persist failure is silent/best-
+        // effort, matching this module's existing tolerant-write policy).
+        assert_eq!(merged.safety.auto_kill_idle_minutes, 99);
+
+        let backup_after = std::fs::read(freshell.join("config.backup.json")).unwrap();
+        assert_eq!(
+            backup_after, backup_before,
+            "the backup must be untouched when the primary persist itself failed"
+        );
+
+        // Restore permissions so cleanup (and any other test running
+        // concurrently against a colliding tmp dir name) can proceed.
+        std::fs::set_permissions(&freshell, original_perms).unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 }
