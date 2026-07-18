@@ -2,6 +2,7 @@ import '@testing-library/jest-dom/vitest'
 import { afterEach, beforeEach, vi } from 'vitest'
 import { enableMapSet } from 'immer'
 import { resetWsClientForTests } from '@/lib/ws-client'
+import { installConsoleTraps } from './console-trap'
 
 enableMapSet()
 
@@ -98,72 +99,17 @@ beforeEach(() => {
 })
 // ── end matchMedia polyfill ─────────────────────────────────────────
 
-// A test that deliberately exercises an error/warning path must capture that
-// output (spy on the console method and assert on it) rather than let it leak.
-// Any console.error or console.warn a test does not capture fails that test —
-// unexpected console noise is a bug. A test that legitimately cannot spy can
-// opt out for a single test by setting __ALLOW_CONSOLE_ERROR__ /
-// __ALLOW_CONSOLE_WARN__ to true; the flag resets after each test.
-type ConsoleTrap = {
-  method: 'error' | 'warn'
-  allowFlag: '__ALLOW_CONSOLE_ERROR__' | '__ALLOW_CONSOLE_WARN__'
-  spy: ReturnType<typeof vi.spyOn> | null
-  calls: Array<{ args: unknown[]; stack?: string }>
-  hasCapturedStack: boolean
-}
-
-const consoleTraps: ConsoleTrap[] = [
-  { method: 'error', allowFlag: '__ALLOW_CONSOLE_ERROR__', spy: null, calls: [], hasCapturedStack: false },
-  { method: 'warn', allowFlag: '__ALLOW_CONSOLE_WARN__', spy: null, calls: [], hasCapturedStack: false },
-]
+let installedConsoleTraps: ReturnType<typeof installConsoleTraps> | null = null
 
 beforeEach(() => {
-  for (const trap of consoleTraps) {
-    trap.calls = []
-    trap.hasCapturedStack = false
-    const impl = (...args: unknown[]) => {
-      // Capturing stacks for every call can be expensive; keep the first one for debugging.
-      let stack: string | undefined
-      if (!trap.hasCapturedStack) {
-        trap.hasCapturedStack = true
-        const err = new Error(`console.${trap.method} captured`)
-        // Exclude this helper from the captured stack for better signal.
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        ;(Error as any).captureStackTrace?.(err, impl)
-        stack = err.stack
-      }
-      trap.calls.push({ args, stack })
-    }
-    trap.spy = vi.spyOn(console, trap.method).mockImplementation(impl)
-  }
+  installedConsoleTraps = installConsoleTraps()
 })
 
 afterEach(() => {
   resetWsClientForTests()
 
-  const failures: string[] = []
-  for (const trap of consoleTraps) {
-    trap.spy?.mockRestore()
-    trap.spy = null
-
-    const allow = (globalThis as any)[trap.allowFlag] === true
-    ;(globalThis as any)[trap.allowFlag] = false
-
-    // Redux Toolkit's dev-only invariant middleware warns when a check exceeds a
-    // wall-clock threshold ("<name> took <n>ms, which is more than the warning
-    // threshold..."). That is machine-load-dependent perf noise, not app output,
-    // and would flake the suite on any store-dispatching test. Ignore it.
-    const relevant = trap.calls.filter(
-      (call) => !/ took \d+ms, which is more than the warning threshold/.test(call.args.map(String).join(' ')),
-    )
-
-    if (!allow && relevant.length > 0) {
-      const first = relevant[0]
-      const rendered = first?.args?.map(String).join(' ') ?? ''
-      const stack = first?.stack ? `\n${first.stack}` : ''
-      failures.push(`Unexpected console.${trap.method}: ${rendered}${stack}`)
-    }
-  }
+  const failures = installedConsoleTraps?.collectFailures() ?? []
+  installedConsoleTraps = null
 
   if (failures.length > 0) {
     throw new Error(failures.join('\n'))
