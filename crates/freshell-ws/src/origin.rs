@@ -101,7 +101,11 @@ pub enum OriginDecision {
 /// Evaluate the Origin policy for a `/ws` upgrade request. `host` is the
 /// request's own `Host` header (enables the same-origin check); `allowed` is
 /// the list resolved by [`resolve_allowed_origins`].
-pub fn evaluate_origin(origin: Option<&str>, host: Option<&str>, allowed: &[String]) -> OriginDecision {
+pub fn evaluate_origin(
+    origin: Option<&str>,
+    host: Option<&str>,
+    allowed: &[String],
+) -> OriginDecision {
     let Some(origin) = origin else {
         return OriginDecision::NoOrigin;
     };
@@ -143,14 +147,20 @@ mod tests {
 
     #[test]
     fn resolve_allowed_origins_falls_back_to_defaults_when_env_unset() {
-        assert_eq!(resolve_allowed_origins(None, None), default_allowed_origins());
+        assert_eq!(
+            resolve_allowed_origins(None, None),
+            default_allowed_origins()
+        );
     }
 
     #[test]
     fn resolve_allowed_origins_falls_back_to_defaults_when_env_empty() {
         // Legacy: `if (env) ...` — an empty string is JS-falsy, so it falls
         // through to the default list exactly like an unset var.
-        assert_eq!(resolve_allowed_origins(Some(""), None), default_allowed_origins());
+        assert_eq!(
+            resolve_allowed_origins(Some(""), None),
+            default_allowed_origins()
+        );
     }
 
     #[test]
@@ -179,7 +189,11 @@ mod tests {
     #[test]
     fn null_origin_is_rejected() {
         assert_eq!(
-            evaluate_origin(Some("null"), Some("127.0.0.1:3001"), &default_allowed_origins()),
+            evaluate_origin(
+                Some("null"),
+                Some("127.0.0.1:3001"),
+                &default_allowed_origins()
+            ),
             OriginDecision::Rejected
         );
     }
@@ -188,7 +202,11 @@ mod tests {
     fn same_origin_via_host_header_is_allowed() {
         let allowed = vec![]; // deliberately empty allow-list: same-origin must not depend on it
         assert_eq!(
-            evaluate_origin(Some("http://192.168.1.50:3002"), Some("192.168.1.50:3002"), &allowed),
+            evaluate_origin(
+                Some("http://192.168.1.50:3002"),
+                Some("192.168.1.50:3002"),
+                &allowed
+            ),
             OriginDecision::Allowed
         );
     }
@@ -197,7 +215,11 @@ mod tests {
     fn configured_allow_listed_origin_is_allowed() {
         let allowed = default_allowed_origins();
         assert_eq!(
-            evaluate_origin(Some("http://localhost:3002"), Some("127.0.0.1:3002"), &allowed),
+            evaluate_origin(
+                Some("http://localhost:3002"),
+                Some("127.0.0.1:3002"),
+                &allowed
+            ),
             OriginDecision::Allowed
         );
     }
@@ -220,7 +242,11 @@ mod tests {
     #[test]
     fn malformed_origin_is_rejected() {
         assert_eq!(
-            evaluate_origin(Some("not-a-url"), Some("127.0.0.1:3002"), &default_allowed_origins()),
+            evaluate_origin(
+                Some("not-a-url"),
+                Some("127.0.0.1:3002"),
+                &default_allowed_origins()
+            ),
             OriginDecision::Rejected
         );
     }

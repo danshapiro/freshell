@@ -10,10 +10,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use tokio::net::TcpListener;
-use tokio_tungstenite::tungstenite::{
-    handshake::client::generate_key,
-    http::Request,
-};
+use tokio_tungstenite::tungstenite::{handshake::client::generate_key, http::Request};
 
 use freshell_ws::WsState;
 
@@ -141,7 +138,12 @@ async fn connect_with_origin(url: &str, addr: &str, origin: Option<&str>) -> boo
         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(frame)))) => {
             let rejected_for_origin = frame
                 .as_ref()
-                .map(|f| f.code == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::from(4011))
+                .map(|f| {
+                    f.code
+                        == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::from(
+                            4011,
+                        )
+                })
                 .unwrap_or(false);
             !rejected_for_origin
         }

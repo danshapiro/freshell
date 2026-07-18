@@ -824,7 +824,9 @@ mod tests {
 
     #[test]
     fn rejects_default_weak_tokens_case_insensitive() {
-        for weak in ["changeme", "CHANGEME", "ChangeMe", "default", "password", "TOKEN"] {
+        for weak in [
+            "changeme", "CHANGEME", "ChangeMe", "default", "password", "TOKEN",
+        ] {
             assert!(
                 validate_auth_token(weak).is_err(),
                 "expected {weak:?} to be rejected as a weak/default token"
