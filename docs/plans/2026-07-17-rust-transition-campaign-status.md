@@ -1,4 +1,37 @@
-# Rust Transition Campaign — Status (2026-07-17 morning)
+# Rust Transition Campaign — Status (updated 2026-07-18 ~04:00, overnight run)
+
+## Overnight run 2026-07-17→18 (waves 1–6, all pushed through 7905f102)
+
+Seventeen commits landed, each TDD'd, adversarially reviewed, and gate-verified:
+- **Codex-first headline:** found + fixed a REAL parity defect — Rust codex snapshots wedged
+  `capabilities.send:false` after a turn (composer permanently disabled in the browser);
+  root cause a stale in-memory `active_turn` OR'd into `is_running` (94a3ca94). Also: codex
+  crash-recovery now RESUMES the same thread (memory preserved) instead of minting a new one.
+- Structured JSONL logging + rotation + writer-level redaction (d5a526d3, beyond legacy — legacy
+  has NO redaction); config backup + conservative auto-restore (41b04143 — legacy's own corrupt-boot
+  path destroys its backup; ours doesn't); graceful shutdown + child reaping w/ 5s watchdog +
+  stale-pid group-kill hardening (edf1e93d, a8d43d9d — sandbox-proven zero orphans);
+  SESSION-09 live sidebar (sessions.changed sweep + write-site broadcasts, unified revision counter:
+  0db588c4, b068d28b, 0855e27f, 7905f102); checkpoints list/restore/metadata (96e354ea — restore
+  file-safety pinned: never deletes post-checkpoint files); narrow live settings reload
+  (f766ad6c — idle-kill + scrollback apply without restart, Playwright-proven both kinds);
+  restore-matrix scenario 3 fixed + SYNC-05 quiet-restart spec (8fd9233a — green both kinds);
+  matrix conversions TERM-02/AGENT-02/TERM-18/SESSION-01/AGENT-08 (33f7b015, d4b8630a).
+- **Checklist:** reconciliation doc (2026-07-18-checklist-reconciliation.md: 93 PARTIAL / 72
+  no-evidence / 66 host-limited) + evidence-cited checkbox updates: now **4/233 checked**
+  (TERM-02, TERM-18 new) + 14 items annotated PARTIAL with exact missing clauses.
+- **Final gates at 7905f102: ALL PASS** — 889+145 cargo tests, oracle 99/99 (deep-equal true),
+  Playwright matrix 79 passed / 2 failed (= the pre-existing multi-client flake, both kinds,
+  deterministic on retry), sandbox shutdown acceptance green.
+- **Staging (17874) redeployed + verified:** cold boot built the 22.5MB parse cache in 100s;
+  **restart-to-sidebar now 2s** (was ~5min); checkpoints + structured logs live.
+- **NOT done: :3002 bake-in still runs the 2026-07-17 binary** — restart needs user approval
+  (live sessions). One command deploys everything above to it.
+- Known debris: three shared-index commit-absorption incidents (all disclosed, content verified,
+  attribution notes in commit bodies); sandbox cargo-target volume can serve stale rlibs after
+  big rebases (`docker volume rm freshell-sandbox-cargo-target` clears; noted in gate report).
+
+# (previous snapshot below, 2026-07-17 morning)
 
 **Goal:** seamless daily-driver switch to the Rust server, used from Chrome on Windows,
 with all settings and state carried over. The user's declared core requirement: **restore
