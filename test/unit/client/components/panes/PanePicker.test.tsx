@@ -354,6 +354,8 @@ describe('PanePicker', () => {
     })
 
     it('retries loading the extension registry after the connection reaches ready', async () => {
+      // The first (pre-ready) load rejects and is logged before the ready-triggered retry.
+      vi.spyOn(console, 'warn').mockImplementation(() => {})
       mockApiGet
         .mockRejectedValueOnce({ status: 503, message: 'Service Unavailable' })
         .mockResolvedValueOnce([
