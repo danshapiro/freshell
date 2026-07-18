@@ -455,6 +455,12 @@ async fn main() -> ExitCode {
     let session_metadata_state = session_metadata::SessionMetadataApiState {
         auth_token: Arc::clone(&auth_token),
         store: session_metadata_store,
+        // W5 fix-forward: the SAME shared `sessions.changed` bus + revision
+        // counter minted above (and already wired into
+        // `ws_state`/`fresh_agent_state`/`sessions::SessionsState`) so a
+        // metadata tag change broadcasts on the ONE unified sequence.
+        broadcast_tx: Arc::clone(&broadcast_tx),
+        sessions_revision: Arc::clone(&sessions_revision),
     };
 
     // `POST /api/fresh-agent/checkpoints` (`fresh-agent-extras-router.ts:346-368`):

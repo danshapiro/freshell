@@ -956,18 +956,29 @@ fn broadcast_terminals_changed(state: &WsState) {
 /// `freshell_sessions::directory_index` module docs), so a plain interval
 /// sweep is what detects "did anything change" and invokes this.
 ///
-/// NOTE: `freshell-freshagent` also emits a `sessions.changed` frame (on a
-/// fresh-agent turn's placeholder-\u2192durable session materialization) using
-/// its OWN internal `sessions_revision` counter, entirely independent of
-/// `WsState::sessions_revision`. The two counters are NOT unified in this
-/// slice. Because the client's dedupe is "accept only if revision increases",
-/// two independently-incrementing producers of the same message type can, in
-/// rare interleavings, cause a real change from one producer to be masked by
-/// a lower-or-equal revision number from the other (the client already
-/// advanced its watermark past that value from the first producer's frame).
-/// This is a known architectural gap flagged for follow-up reconciliation
-/// (e.g. sharing ONE counter across both producers), not fixed here because
-/// `freshell-freshagent` is owned by a different concurrent workstream.
+/// UNIFIED counter (commit b068d28b): `freshell-freshagent` no longer keeps
+/// its own independent `sessions_revision` -- `FreshAgentState` is
+/// constructed via `FreshAgentState::with_shared_sessions_revision`, handed
+/// this SAME `Arc<AtomicI64>` that backs `WsState::sessions_revision`, so a
+/// fresh-agent turn's placeholder-\u2192durable session materialization stamps
+/// the identical monotonic sequence this function does. There are three
+/// producers sharing the one counter: this crate's periodic session-directory
+/// sweep task (`spawn_sessions_sweep`, `main.rs`, invoking this function),
+/// `freshell-freshagent`'s materialize path, and `sessions.rs`'s override
+/// (rename/archive/delete) PATCH route -- all three `fetch_add` the SAME
+/// `Arc` minted once in `main.rs` and cloned into each state struct, so the
+/// client's "accept only if revision increases" dedupe (`src/App.tsx:924-932`)
+/// can no longer have one producer's frame mask another's.
+///
+/// Remaining accepted gap: the counter is `Arc<AtomicI64>`, not a
+/// transactionally-ordered log, so two producers racing to `fetch_add` at
+/// the same instant can still interleave their broadcast sends in a
+/// different order than their revision numbers were minted in (i.e. the
+/// WS frame carrying the lower revision number could theoretically arrive
+/// at a client after the frame carrying the higher one). This is a
+/// send-ordering nuance of the broadcast channel, not a revision-collision
+/// bug -- the counter itself is correctly monotonic and shared -- and is not
+/// addressed here.
 pub fn broadcast_sessions_changed(state: &WsState) {
     let revision = state
         .sessions_revision

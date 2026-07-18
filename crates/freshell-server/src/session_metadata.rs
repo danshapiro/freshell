@@ -281,6 +281,21 @@ fn should_apply_session_type_metadata(
 pub struct SessionMetadataApiState {
     pub auth_token: Arc<String>,
     pub store: SessionMetadataStore,
+    /// W5 fix-forward (mirroring `sessions::SessionsState`'s GAP-1 fix): the
+    /// shared broadcast bus + monotonic `sessions.changed` revision counter --
+    /// the SAME `Arc`s as `WsState`/`FreshAgentState`/`SessionsState`, unified
+    /// in commit b068d28b -- so a metadata write that actually changes the
+    /// persisted `sessionType` broadcasts directly, instead of waiting on the
+    /// periodic session-directory sweep (which is structurally blind to
+    /// metadata-only changes: `IndexedSession` carries no `sessionType`
+    /// field). Legacy parity: `POST /api/session-metadata`
+    /// (`sessions-router.ts:220-244`) triggers `codingCliIndexer.refresh()` on
+    /// a successful write, and `SessionsSyncService`'s differ
+    /// (`projection.ts:32-49`) treats `sessionType` as part of the comparable
+    /// snapshot, so a tag change there fans out `sessions.changed` (indirectly,
+    /// via the refresh) in the reference.
+    pub broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    pub sessions_revision: Arc<std::sync::atomic::AtomicI64>,
 }
 
 /// The `/api/session-metadata` sub-router.
@@ -318,7 +333,27 @@ async fn post_session_metadata(
                 )
                 .await
             {
-                Ok(changed) => Json(json!({ "ok": true, "changed": changed })).into_response(),
+                Ok(changed) => {
+                    // W5 fix-forward: broadcast `sessions.changed` directly for a
+                    // metadata write that actually changed the persisted `sessionType`
+                    // (mirroring `sessions::patch_session`'s GAP-1 fix). Guarded on
+                    // `changed` -- the store's own no-op comparison (semantic `Map`
+                    // equality, see `SessionMetadataStore::set`'s doc comment) is the
+                    // same gate the periodic session-directory sweep would otherwise
+                    // never trip for a metadata-only change (`IndexedSession` carries
+                    // no `sessionType` field, so the sweep's `(count, max
+                    // lastActivityAt)` signature can't detect this).
+                    if changed {
+                        let revision = state
+                            .sessions_revision
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                            + 1;
+                        let frame =
+                            json!({ "type": "sessions.changed", "revision": revision }).to_string();
+                        let _ = state.broadcast_tx.send(frame);
+                    }
+                    Json(json!({ "ok": true, "changed": changed })).into_response()
+                }
                 Err(err) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({ "error": err.to_string() })),
@@ -397,9 +432,12 @@ mod tests {
     }
 
     fn state(store: SessionMetadataStore) -> SessionMetadataApiState {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
         SessionMetadataApiState {
             auth_token: Arc::new("tok".to_string()),
             store,
+            broadcast_tx: Arc::new(tx),
+            sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }
     }
 
@@ -728,5 +766,91 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// W5 fix-forward (mirroring `sessions.rs`'s
+    /// `patch_rename_broadcasts_sessions_changed_with_increased_revision`):
+    /// legacy indirectly broadcasts `sessions.changed` on a session-metadata
+    /// tag change (`codingCliIndexer.refresh()` -> `SessionsSyncService`'s
+    /// differ, which treats `sessionType` as part of the comparable
+    /// projection, `projection.ts:32-49`). Proves a metadata write that
+    /// actually changes the persisted tag produces exactly one
+    /// `sessions.changed` frame with a positive revision.
+    #[tokio::test]
+    async fn metadata_change_broadcasts_sessions_changed_with_increased_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state(SessionMetadataStore::new(dir.path()));
+
+        // Subscribe BEFORE the POST so the `sessions.changed` send lands in
+        // this receiver's buffer.
+        let mut broadcast_rx = st.broadcast_tx.subscribe();
+
+        let resp = post_session_metadata(
+            State(st.clone()),
+            headers_with_token("tok"),
+            Json(valid_body()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let frame = broadcast_rx
+            .try_recv()
+            .expect("sessions.changed broadcast fired for the metadata write");
+        let frame: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(frame["type"], json!("sessions.changed"));
+        let revision = frame["revision"].as_i64().expect("revision is a number");
+        assert!(revision > 0, "revision must be a positive counter value");
+
+        // Exactly one frame -- no duplicate/extra broadcast for a single
+        // changing write.
+        assert!(
+            broadcast_rx.try_recv().is_err(),
+            "exactly one broadcast frame expected for a single metadata change"
+        );
+    }
+
+    /// Companion to the broadcast test above: a second, IDENTICAL POST is a
+    /// no-op per the store's own change-detection gate (`changed: false`,
+    /// proven separately by `second_identical_post_reports_changed_false`)
+    /// and must NOT produce a second `sessions.changed` frame -- broadcasting
+    /// on a write that persisted nothing would be a spurious client refetch.
+    #[tokio::test]
+    async fn metadata_no_op_write_does_not_broadcast_a_second_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state(SessionMetadataStore::new(dir.path()));
+        let mut broadcast_rx = st.broadcast_tx.subscribe();
+
+        // First write actually changes the tag -- must broadcast exactly once.
+        let _ = post_session_metadata(
+            State(st.clone()),
+            headers_with_token("tok"),
+            Json(valid_body()),
+        )
+        .await;
+        broadcast_rx
+            .try_recv()
+            .expect("sessions.changed broadcast fired for the first (changing) write");
+
+        // Second, IDENTICAL write is a no-op -- must NOT produce a second
+        // broadcast frame.
+        let resp = post_session_metadata(
+            State(st.clone()),
+            headers_with_token("tok"),
+            Json(valid_body()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["changed"], json!(false));
+
+        assert!(
+            broadcast_rx.try_recv().is_err(),
+            "no broadcast expected for a no-op metadata write"
+        );
     }
 }

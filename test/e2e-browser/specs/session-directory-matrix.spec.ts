@@ -247,11 +247,17 @@ const test = base.extend({
           // ("feat(amplifier): durable session tracking via events.jsonl"),
           // where `server/coding-cli/providers/amplifier.ts` was introduced
           // -- verified via `git log --oneline HEAD..origin/main --
-          // server/coding-cli/providers/amplifier.ts` (49 commits behind) and
-          // by grepping for zero "amplifier" occurrences anywhere under
-          // `server/`, `shared/`, or the built `dist/server/index.js` in this
-          // checkout. So legacy has NO Amplifier provider registered at all
-          // in this branch -- not a home-layout mismatch to align, an
+          // server/coding-cli/providers/amplifier.ts` (6 commits touch that
+          // path; the unfiltered `git log --oneline HEAD..origin/main`,
+          // with no path filter, is 49 -- that broader count is NOT specific
+          // to this file and should not be quoted as if it were) and by
+          // grepping for zero "amplifier" occurrences under `server/` or
+          // `shared/` in this checkout (`dist/server/index.js` is a
+          // gitignored build artifact, absent in a fresh checkout/worktree
+          // until a build is run, so it is NOT part of this verification --
+          // only present here because this worktree happens to have been
+          // built already). So legacy has NO Amplifier provider registered
+          // at all in this branch -- not a home-layout mismatch to align, an
           // absent feature. The seed below is still written unconditionally
           // (same as every other provider seed in this hook) so a future
           // merge of that upstream commit into this branch picks it up for
@@ -332,19 +338,25 @@ test.describe('Session Directory Matrix', () => {
     // tracking via events.jsonl"), which is where
     // `server/coding-cli/providers/amplifier.ts` was introduced --
     // verified via `git log --oneline HEAD..origin/main --
-    // server/coding-cli/providers/amplifier.ts` (49 commits behind at time
-    // of writing) and by grepping for zero "amplifier" occurrences under
-    // `server/`, `shared/`, or the built `dist/server/index.js` used by the
-    // `legacy-chromium` project's `TestServer`. So on `legacy-chromium` the
-    // legacy indexer has NO Amplifier provider registered at all and will
-    // never surface this seed -- that is not a home-layout mismatch to
-    // align (legacy and Rust already agree `~/.amplifier` is the right
-    // home; see `amplifier_home()` in `amplifier.rs` vs
-    // `defaultAmplifierHome()` referenced in its doc comment), it is an
-    // absent feature on this branch, outside this task's frozen `server/`
-    // ownership. A follow-up merge of that upstream commit into this
-    // branch (or a Codex-driven port pass) would close the gap; flagging
-    // it here rather than silently asserting only what happens to pass.
+    // server/coding-cli/providers/amplifier.ts` (6 commits touch that path,
+    // at time of writing; the unfiltered `git log --oneline
+    // HEAD..origin/main`, with no path filter, is 49 -- that broader count
+    // is NOT specific to this file) and by grepping for zero "amplifier"
+    // occurrences under `server/` or `shared/` in this checkout
+    // (`dist/server/index.js`, which the `legacy-chromium` project's
+    // `TestServer` runs, is a gitignored build artifact -- absent in a
+    // fresh checkout/worktree until a build is run, so it's confirmatory
+    // only for an already-built checkout, not a standalone proof). So on
+    // `legacy-chromium` the legacy indexer has NO Amplifier provider
+    // registered at all and will never surface this seed -- that is not a
+    // home-layout mismatch to align (legacy and Rust already agree
+    // `~/.amplifier` is the right home; see `amplifier_home()` in
+    // `amplifier.rs` vs `defaultAmplifierHome()` referenced in its doc
+    // comment), it is an absent feature on this branch, outside this task's
+    // frozen `server/` ownership. A follow-up merge of that upstream commit
+    // into this branch (or a Codex-driven port pass) would close the gap;
+    // flagging it here rather than silently asserting only what happens to
+    // pass.
     if (e2eServerKind === 'rust') {
       await expect(page.getByText(/harness-02 matrix epsilon/i)).toBeVisible({ timeout: 15_000 })
     }
