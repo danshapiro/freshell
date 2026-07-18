@@ -217,6 +217,24 @@ function getCanonicalPaneResumeSessionId(pane: FreshAgentPaneContent): string | 
   return undefined
 }
 
+// Codex fresh-agent threads don't have a UUID-format validator the way Claude
+// does (isValidClaudeSessionId), so this mirrors getCanonicalPaneResumeSessionId's
+// fallback chain (sessionRef -> resumeSessionId -> sessionId) without that
+// claude-specific format check. Used only to let a lost codex session attempt
+// a bounded resume instead of being permanently abandoned (see triggerRecovery).
+function getCanonicalCodexResumeSessionId(pane: FreshAgentPaneContent): string | undefined {
+  if (pane.sessionRef?.provider === 'codex' && pane.sessionRef.sessionId) {
+    return pane.sessionRef.sessionId
+  }
+  if (pane.provider === 'codex' && pane.resumeSessionId) {
+    return pane.resumeSessionId
+  }
+  if (pane.provider === 'codex' && pane.sessionId) {
+    return pane.sessionId
+  }
+  return undefined
+}
+
 function isFreshOpencodePlaceholderId(pane: FreshAgentPaneContent, sessionId: string | undefined): boolean {
   return pane.provider === 'opencode'
     && pane.sessionType === 'freshopencode'
@@ -1001,15 +1019,23 @@ export function FreshAgentView({
       restoreTimeoutRef.current = null
     }
     const nextRequestId = nanoid()
-    const canonicalResumeSessionId = getCanonicalDurableSessionId(claudeSession)
-      ?? getCanonicalPaneResumeSessionId(paneContentRef.current)
+    const current = paneContentRef.current
+    // Codex threads don't carry Claude's UUID-format durable identity, so they
+    // resolve their canonical resume id through the codex-specific helper
+    // instead of getCanonicalDurableSessionId/getCanonicalPaneResumeSessionId
+    // (both of which gate on isValidClaudeSessionId).
+    const canonicalResumeSessionId = current.provider === 'codex'
+      ? getCanonicalCodexResumeSessionId(current)
+      : getCanonicalDurableSessionId(claudeSession) ?? getCanonicalPaneResumeSessionId(current)
     if (!canonicalResumeSessionId) {
-      const hadLegacyRestoreTarget = Boolean(getPreferredResumeSessionId(claudeSession) || paneContentRef.current.resumeSessionId)
+      const hadLegacyRestoreTarget = current.provider === 'codex'
+        ? Boolean(current.resumeSessionId)
+        : Boolean(getPreferredResumeSessionId(claudeSession) || current.resumeSessionId)
       dispatch(updatePaneContent({
         tabId,
         paneId,
         content: {
-          ...paneContentRef.current,
+          ...current,
           sessionId: undefined,
           resumeSessionId: undefined,
           sessionRef: undefined,
@@ -1026,10 +1052,10 @@ export function FreshAgentView({
       tabId,
       paneId,
       content: {
-        ...paneContentRef.current,
+        ...current,
         sessionId: undefined,
         resumeSessionId: canonicalResumeSessionId,
-        sessionRef: { provider: 'claude', sessionId: canonicalResumeSessionId },
+        sessionRef: { provider: current.provider, sessionId: canonicalResumeSessionId },
         restoreError: undefined,
         createRequestId: nextRequestId,
         status: 'creating',
@@ -1252,7 +1278,12 @@ export function FreshAgentView({
 
   useEffect(() => {
     if (!snapshotThreadId) return
-    if (paneContent.provider === 'claude' && claudeSession?.lost) return
+    // agentSession is the provider-agnostic session-meta selector (see above);
+    // for claude it's the same entry as claudeSession, so this also covers
+    // claude's existing behavior. Skip the snapshot fetch while a resumable
+    // provider is lost -- fetching against a dead thread id is a guaranteed
+    // 404 and triggerRecovery (below) is what should react to `.lost`.
+    if ((paneContent.provider === 'claude' || paneContent.provider === 'codex') && agentSession?.lost) return
     const controller = new AbortController()
     setLoadError(null)
     const sessionId = snapshotThreadId
@@ -1420,7 +1451,9 @@ export function FreshAgentView({
     // the same session. Current values for non-identity fields are read live via
     // paneContentRef.current inside the effect.
   }, [
-    claudeSession?.lost,
+    agentSession?.lost,
+    claudeSession,
+    isRestoring,
     dispatch,
     paneContent.provider,
     paneContent.createRequestId,
@@ -1429,6 +1462,7 @@ export function FreshAgentView({
     paneId,
     commitSnapshot,
     migratePendingAutoTitle,
+    setLocalEcho,
     snapshotThreadId,
     snapshotRefreshNonce,
     tabId,
@@ -1481,18 +1515,34 @@ export function FreshAgentView({
     tabId,
   ])
 
+  // This is the actual .lost-state recovery/retry reaction. It was originally
+  // claude-only (guarded on paneContent.provider === 'claude'), which meant a
+  // codex fresh-agent pane that received a lost-session frame (markSessionLost
+  // via INVALID_SESSION_ID -- see fresh-agent-ws.ts, which dispatches it for
+  // ANY provider, not just claude) permanently sat abandoned: nothing ever
+  // called triggerRecovery for it. Codex's server-side resume machinery
+  // supports re-attach, so it's extended here. agentSession is the
+  // provider-agnostic session selector (identical to claudeSession for
+  // claude), so this reuses the exact same bounded shape: give up (handled
+  // inside triggerRecovery) when no canonical resume id can be resolved,
+  // otherwise attempt exactly once per `.lost` transition -- the effect only
+  // re-fires when these dependencies change, so it does not loop.
+  // Opencode is deliberately NOT included: it already has its own dedicated
+  // lost-thread recovery path (isLostFreshOpencodeThreadError, handled
+  // elsewhere in this file) that predates this effect and must not be
+  // double-driven.
   useEffect(() => {
-    if (paneContent.provider !== 'claude') return
-    if (!paneContent.sessionId || !claudeSession?.lost) return
+    if (paneContent.provider !== 'claude' && paneContent.provider !== 'codex') return
+    if (!paneContent.sessionId || !agentSession?.lost) return
     const shouldDeferUntilVisibleRestore = Boolean(
-      claudeSession.latestTurnId !== undefined && claudeSession.historyLoaded === true
+      agentSession.latestTurnId !== undefined && agentSession.historyLoaded === true
     )
     if (shouldDeferUntilVisibleRestore) {
       const sessionIdForRecovery = paneContent.sessionId
       restoreTimeoutRef.current = window.setTimeout(() => {
         restoreTimeoutRef.current = null
         if (paneContentRef.current.sessionId !== sessionIdForRecovery) return
-        if (!claudeSession?.lost) return
+        if (!agentSession?.lost) return
         triggerRecovery()
       }, 0)
       return () => {
@@ -1504,9 +1554,9 @@ export function FreshAgentView({
     }
     triggerRecovery()
   }, [
-    claudeSession?.historyLoaded,
-    claudeSession?.latestTurnId,
-    claudeSession?.lost,
+    agentSession?.historyLoaded,
+    agentSession?.latestTurnId,
+    agentSession?.lost,
     paneContent.provider,
     paneContent.sessionId,
     triggerRecovery,

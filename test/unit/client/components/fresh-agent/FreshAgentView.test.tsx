@@ -4,7 +4,7 @@ import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from '@/store/settingsSlice'
-import freshAgentReducer, { sessionInit, setSessionStatus } from '@/store/freshAgentSlice'
+import freshAgentReducer, { sessionInit, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
@@ -4764,6 +4764,63 @@ describe('FreshAgentView', () => {
       type: 'freshAgent.kill',
       sessionId: 'thread-1',
     }))
+  })
+
+  it('attempts a bounded resume for a codex pane whose session was marked lost (INVALID_SESSION_ID)', async () => {
+    // Regression test for the claude-only .lost recovery bug: markSessionLost
+    // is dispatched generically for any provider (fresh-agent-ws.ts reacts to
+    // INVALID_SESSION_ID regardless of provider), but only claude's
+    // triggerRecovery effect ever reacted to it. A codex pane used to sit
+    // permanently abandoned.
+    const store = createStore()
+    store.dispatch(sessionInit({
+      sessionId: 'codex-thread-lost',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      model: 'gpt-5.5',
+    }))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-codex-lost',
+        sessionId: 'codex-thread-lost',
+        sessionRef: { provider: 'codex', sessionId: 'codex-thread-lost' },
+        status: 'connected',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled()
+    })
+
+    act(() => {
+      store.dispatch(markSessionLost({
+        sessionId: 'codex-thread-lost',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+      }))
+    })
+
+    // A bounded resume attempt: the pane re-requests session creation using
+    // its canonical resumable session id, rather than sitting abandoned.
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts['tab-1']
+      if (!layout || layout.type !== 'leaf' || layout.content.kind !== 'fresh-agent') {
+        throw new Error('Expected fresh-agent leaf')
+      }
+      expect(layout.content.status).toBe('creating')
+      expect(layout.content.resumeSessionId).toBe('codex-thread-lost')
+    })
   })
 
   it('keeps an established freshclaude pane interactive after remount when snapshot loading is unavailable', async () => {

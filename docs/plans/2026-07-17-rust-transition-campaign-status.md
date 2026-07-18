@@ -273,6 +273,9 @@ fix exists. This is the FIRST and only intentional divergence from the frozen `s
 `server/` and `shared/` remain byte-frozen. The client bundle (dist/client) must be rebuilt for
 the icon to ship. Oracle equivalence is unaffected (server-side only).
 
+src/ deviation grown to 3 files — restore fixes cherry-picked from main 5c56ecc3 (#516) so the
+port client carries them before reconciliation; adaptations listed in commit <sha>.
+
 2026-07-17 (commits `64083989`, `8888df30` — non-bisectable span, harmless at HEAD): these two
 Batch 1 commits do not build standalone in isolation. `64083989` ("add Amplifier as a fourth
 session-directory source") absorbed a concurrent agent's `main.rs` wiring change (the
