@@ -77,6 +77,12 @@ const PROVIDER: &str = "codex";
 const CODEX_MANAGED_CONFIG_ARGS: &[&str] = &["-c", "features.apps=false"];
 /// Cold-boot budget for the sidecar's WS listener + `initialize` handshake.
 const SIDECAR_START_BUDGET: Duration = Duration::from_secs(45);
+/// Default TTL for the [`FreshCodexState::dead_threads`] negative cache (CODEX-FIRST
+/// triage Finding 2). Long enough to absorb a burst of retries from a client with no
+/// backoff (the empirically-observed storm), short enough that a thread this process was
+/// wrong about -- or that genuinely becomes resumable again -- is not stuck unresumable for
+/// long.
+const DEAD_THREAD_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Shared, cheaply-cloneable freshcodex WS state (mergeable into the server app + WsState).
 #[derive(Clone)]
@@ -105,6 +111,23 @@ pub struct FreshCodexState {
     /// worse than `sessions` itself never shrinking for thread ids this process has ever
     /// touched).
     resuming: Arc<TokioMutex<HashMap<String, Arc<TokioMutex<()>>>>>,
+    /// FIX (CODEX-FIRST triage Finding 2, sidecar spawn storm): a negative cache of thread
+    /// ids this process has recently confirmed genuinely gone (`is_codex_thread_not_found`
+    /// on a `thread/resume` attempt), mapped to the `Instant` the entry expires. Consulted
+    /// BEFORE spawning a sidecar in every resume attempt ([`Self::ensure_session_resumable`],
+    /// [`Self::ensure_session_alive`], and [`Self::handle_create_resume`]) -- without it, a
+    /// client retrying `freshAgent.attach`/`freshAgent.create{resumeSessionId}` against a
+    /// permanently-dead thread with no backoff spawns (and immediately kills) a real `codex
+    /// app-server` subprocess on every single attempt (empirically measured: ~3 spawn/kill
+    /// cycles per second, no damping). Bounded: entries expire after [`Self::dead_thread_ttl`]
+    /// and are removed lazily on read, or explicitly on any later successful resume/create
+    /// for that id -- so a thread this process was wrong about (or that became resumable
+    /// again) is never stuck permanently unresumable.
+    dead_threads: Arc<TokioMutex<HashMap<String, Instant>>>,
+    /// TTL for [`Self::dead_threads`] entries. A plain field (not shared state) so tests can
+    /// shrink it directly (private-field access from the `tests` submodule, same convention
+    /// [`CodexSession`]'s test constructors already rely on) without needing a fake clock.
+    dead_thread_ttl: Duration,
 }
 
 /// One live freshcodex session: the app-server client, its owned sidecar, and the
@@ -218,6 +241,8 @@ impl FreshCodexState {
             settings: Arc::new(TokioMutex::new(settings)),
             auth_token,
             resuming: Arc::new(TokioMutex::new(HashMap::new())),
+            dead_threads: Arc::new(TokioMutex::new(HashMap::new())),
+            dead_thread_ttl: DEAD_THREAD_CACHE_TTL,
         }
     }
 
@@ -288,6 +313,30 @@ impl FreshCodexState {
             return;
         }
 
+        // FIX (CODEX-FIRST triage Finding 1): a `freshAgent.create` carrying
+        // `resumeSessionId` must RESUME the existing thread -- mirroring the reference's
+        // resume-first create path (`FreshAgentRuntimeManager.create`, `runtime-manager.ts:
+        // 103-112`'s `usedResume` branch, which dispatches to the codex adapter's `resume()`,
+        // `adapter.ts:843-869`, instead of `create()`) -- rather than unconditionally
+        // minting a brand-new thread. Before this fix, `msg.resume_session_id` was never
+        // read here at all: the client's lost-session recovery (which resends `create` with
+        // `resumeSessionId` set, `FreshAgentView.tsx`'s `triggerRecovery`) silently produced
+        // an EMPTY new conversation under a brand-new id -- connected, no error, just quiet
+        // data loss.
+        if let Some(resume_session_id) = msg.resume_session_id.clone() {
+            self.handle_create_resume(
+                request_id,
+                resume_session_id,
+                cwd,
+                model,
+                effort,
+                sandbox,
+                permission_mode,
+            )
+            .await;
+            return;
+        }
+
         // Spawn + initialize the app-server sidecar.
         let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
             Ok(parts) => parts,
@@ -318,7 +367,143 @@ impl FreshCodexState {
             }
         };
 
-        // Legacy `activeTurnByThread` mirror for THIS session (adapter.ts:295) \u2014 set on
+        self.finish_create(
+            request_id,
+            thread_id,
+            client,
+            notifs,
+            ownership_id,
+            child,
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+        )
+        .await;
+    }
+
+    /// The resume branch of `handle_create` (FINDING 1 -- CODEX-FIRST triage): spawn a
+    /// sidecar and `thread/resume` the CALLER-SUPPLIED id (never minting a new one),
+    /// registering the session under that SAME id on success. Mirrors the reference's
+    /// `resume()` (`adapter.ts:843-869`): one resume attempt with the settings this create
+    /// carried, no retry-without-settings (that fallback is exclusive to crash recovery,
+    /// `ensure_session_alive` -- an unrelated feature this create path does not have in the
+    /// reference either).
+    ///
+    /// On a genuine `threadNotFound` (`is_codex_thread_not_found`), mirrors the reference's
+    /// fallback exactly: `FreshAgentRuntimeManager.create` (`runtime-manager.ts:103-112`)
+    /// propagates ANY `resume()` failure unwrapped -- there is no mint-new fallback inside
+    /// `create`, that behavior is exclusive to crash recovery -- and `ws-handler.ts:3388-3405`'s
+    /// generic catch turns it into a `freshAgent.create.failed`. The thrown JS error's
+    /// `.code` is the app-server's numeric JSON-RPC code (`CodexAppServerRpcError`,
+    /// `client.ts:68-78`), never a string, so `ws-handler.ts:3395-3397`'s
+    /// `typeof error.code === 'string'` guard never matches it -- the code is ALWAYS the
+    /// generic `FRESH_AGENT_CREATE_FAILED` fallback, never a distinguishing not-found code.
+    /// So: an error to the client, never a silently-minted fresh thread, and never a
+    /// `lost_session_frame` (that shape is exclusive to `freshAgent.attach`). This is also
+    /// the case `is_known_dead_thread` (Finding 2) short-circuits: a thread already
+    /// confirmed gone within its TTL window fails the SAME way, without spawning a sidecar
+    /// to re-prove it.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_create_resume(
+        &self,
+        request_id: String,
+        resume_session_id: String,
+        cwd: Option<String>,
+        model: String,
+        effort: Option<String>,
+        sandbox: Option<String>,
+        permission_mode: Option<String>,
+    ) {
+        if self.is_known_dead_thread(&resume_session_id).await {
+            self.fail_create(
+                &request_id,
+                "FRESH_AGENT_CREATE_FAILED",
+                &format!("codex thread {resume_session_id} not found"),
+            );
+            return;
+        }
+
+        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await
+        {
+            Ok(parts) => parts,
+            Err(err) => {
+                self.fail_create(&request_id, "CODEX_APP_SERVER_START_FAILED", &err);
+                return;
+            }
+        };
+
+        let resume_result = client
+            .resume_thread(
+                &resume_session_id,
+                StartThreadParams {
+                    cwd: cwd.clone(),
+                    model: Some(model.clone()),
+                    sandbox: sandbox.clone(),
+                    approval_policy: permission_mode.clone(),
+                },
+            )
+            .await;
+        let started = match resume_result {
+            Ok(started) => started,
+            Err(err) => {
+                client.close().await;
+                let mut child = child;
+                let _ = child.start_kill();
+                reap_owned_codex_sidecars(&ownership_id);
+                if is_codex_thread_not_found(&err) {
+                    self.mark_thread_dead(&resume_session_id).await;
+                }
+                self.fail_create(&request_id, "FRESH_AGENT_CREATE_FAILED", &err.to_string());
+                return;
+            }
+        };
+        debug_assert_eq!(
+            started.thread_id, resume_session_id,
+            "thread/resume must preserve the requested id"
+        );
+        let thread_id = resume_session_id;
+        self.clear_dead_thread(&thread_id).await;
+
+        self.finish_create(
+            request_id,
+            thread_id,
+            client,
+            notifs,
+            ownership_id,
+            child,
+            model,
+            effort,
+            cwd,
+            sandbox,
+            permission_mode,
+        )
+        .await;
+    }
+
+    /// Shared tail of `handle_create` and `handle_create_resume`: register the session
+    /// (notification consumer, exit-watcher, `sessions` map insert) and broadcast
+    /// `freshAgent.created` (ws-handler.ts:3378). `thread_id` is either a freshly-minted
+    /// `thread/start` id or a caller-supplied `thread/resume` id preserved verbatim -- this
+    /// tail treats them identically, since from here on both are just "a live codex thread
+    /// this process now owns runtime state for."
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_create(
+        &self,
+        request_id: String,
+        thread_id: String,
+        client: Arc<CodexAppServerClient>,
+        notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
+        ownership_id: String,
+        child: tokio::process::Child,
+        model: String,
+        effort: Option<String>,
+        cwd: Option<String>,
+        sandbox: Option<String>,
+        permission_mode: Option<String>,
+    ) {
+        // Legacy `activeTurnByThread` mirror for THIS session (adapter.ts:295) -- set on
         // `handle_send`, read/cleared by `handle_interrupt`, cleared by the consumer below.
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
 
@@ -332,7 +517,7 @@ impl FreshCodexState {
         let exited = Arc::new(AtomicBool::new(false));
         let watcher = spawn_exit_watcher(
             child,
-            ownership_id.clone(),
+            ownership_id,
             thread_id.clone(),
             self.broadcast_tx.clone(),
             kill_rx,
@@ -789,6 +974,23 @@ impl FreshCodexState {
             }
         }
 
+        // FIX (CODEX-FIRST triage Finding 2): this exact thread id was already confirmed
+        // genuinely gone within its negative-cache TTL window -- skip the doomed resume
+        // attempt (and the sidecar it would burn to re-prove it) and go straight to the
+        // mint-new-thread fallback, which needs a fresh sidecar of its own regardless.
+        if self.is_known_dead_thread(session_id).await {
+            return self
+                .respawn_as_new_thread_after_crash(
+                    session_id,
+                    cwd,
+                    model,
+                    effort,
+                    sandbox,
+                    permission_mode,
+                )
+                .await;
+        }
+
         let (client, notifs, ownership_id, child) = self
             .spawn_sidecar(cwd.as_deref())
             .await
@@ -843,6 +1045,10 @@ impl FreshCodexState {
                 let mut dead_child = child;
                 let _ = dead_child.start_kill();
                 reap_owned_codex_sidecars(&ownership_id);
+                // FIX (CODEX-FIRST triage Finding 2): remember this id as genuinely gone so
+                // a later attach/create against it fails fast instead of repeating this same
+                // spawn-resume-fail cycle.
+                self.mark_thread_dead(session_id).await;
                 return self
                     .respawn_as_new_thread_after_crash(
                         session_id,
@@ -905,6 +1111,10 @@ impl FreshCodexState {
                 },
             );
         }
+
+        // FIX (CODEX-FIRST triage Finding 2): the app-server just proved this id alive again
+        // -- clear any stale "recently gone" marking so it doesn't linger.
+        self.clear_dead_thread(session_id).await;
 
         // DIAG-01: crash recovery took the resume-first path -- the durable
         // session_id is unchanged, conversation memory survives.
@@ -1217,6 +1427,43 @@ impl FreshCodexState {
         }
     }
 
+    // -- dead-thread negative cache (CODEX-FIRST triage Finding 2) --
+
+    /// Fast, side-effect-mostly-free check: is `thread_id` currently within its negative-cache
+    /// TTL window (a thread this process recently confirmed genuinely gone)? Lazily evicts an
+    /// expired entry it happens to observe on read, so the map only ever holds entries that
+    /// still matter (bounded memory without a separate sweep task).
+    async fn is_known_dead_thread(&self, thread_id: &str) -> bool {
+        let mut guard = self.dead_threads.lock().await;
+        match guard.get(thread_id) {
+            Some(expires_at) if Instant::now() < *expires_at => true,
+            Some(_) => {
+                guard.remove(thread_id);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Record that `thread_id` was just confirmed genuinely gone (`is_codex_thread_not_found`
+    /// on a real `thread/resume` attempt), so the next attempt within [`Self::dead_thread_ttl`]
+    /// fails fast instead of spawning a sidecar only to re-prove what this process already
+    /// knows.
+    async fn mark_thread_dead(&self, thread_id: &str) {
+        let expires_at = Instant::now() + self.dead_thread_ttl;
+        self.dead_threads
+            .lock()
+            .await
+            .insert(thread_id.to_string(), expires_at);
+    }
+
+    /// Clear a negative-cache entry after a successful resume/create for `thread_id` -- the
+    /// app-server just proved it alive again, so no stale "recently gone" marking may linger
+    /// for this id.
+    async fn clear_dead_thread(&self, thread_id: &str) {
+        self.dead_threads.lock().await.remove(thread_id);
+    }
+
     /// Resolve the live client + active-turn bit for `thread_id`. If this process already
     /// tracks the session (created or previously resumed here), reuse it. Otherwise spawn a
     /// sidecar and `thread/resume` the requested id (SAME id, unlike crash-recovery's
@@ -1229,6 +1476,12 @@ impl FreshCodexState {
     /// sidecars for one logical session. The double-checked-lock pattern below (check
     /// `sessions`, acquire the per-thread lock, re-check `sessions`) ensures at most one
     /// resume RPC (and one spawned sidecar) is ever in flight per thread id at a time.
+    ///
+    /// FIX (CODEX-FIRST triage Finding 2): also checked (before AND after acquiring the
+    /// per-thread lock) against [`Self::dead_threads`] -- a thread already confirmed gone
+    /// within its TTL window fails fast with the SAME [`ResumeSessionError::NotFound`] a
+    /// fresh not-found produces, without spawning a sidecar to re-prove it. This is what
+    /// bounds the spawn storm from a client retrying `freshAgent.attach` with no backoff.
     async fn ensure_session_resumable(
         &self,
         thread_id: &str,
@@ -1236,6 +1489,9 @@ impl FreshCodexState {
     ) -> Result<ResumedCodexSession, ResumeSessionError> {
         if let Some(resumed) = self.live_resumed_session(thread_id).await {
             return Ok(resumed);
+        }
+        if self.is_known_dead_thread(thread_id).await {
+            return Err(ResumeSessionError::NotFound);
         }
 
         let per_thread_lock = {
@@ -1275,10 +1531,18 @@ impl FreshCodexState {
             let _ = child.start_kill();
             reap_owned_codex_sidecars(&ownership_id);
             if is_codex_thread_not_found(&err) {
+                // FIX (CODEX-FIRST triage Finding 2): remember this id as genuinely gone so
+                // a later attach/snapshot-read against it fails fast instead of repeating
+                // this same spawn-resume-fail cycle.
+                self.mark_thread_dead(thread_id).await;
                 return Err(ResumeSessionError::NotFound);
             }
             return Err(ResumeSessionError::Transient(err.to_string()));
         }
+
+        // FIX (CODEX-FIRST triage Finding 2): the app-server just proved this id alive --
+        // clear any stale "recently gone" marking so it doesn't linger.
+        self.clear_dead_thread(thread_id).await;
 
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
@@ -3485,6 +3749,304 @@ pub(crate) mod tests {
                  the reference's no-op attach()), regardless of whether a turn is active"
             );
         }
+    }
+
+    // -- freshAgent.create resume (CODEX-FIRST triage Finding 1) --
+
+    /// FINDING 1 (CODEX-FIRST triage): `freshAgent.create` carrying `resumeSessionId` must
+    /// RESUME the existing thread (mirroring the reference's resume-first create path,
+    /// `runtime-manager.ts:103-112` -> `adapter.ts:843-869`), never mint a brand-new one.
+    /// The fake app-server's `thread/start` is configured to return an OBVIOUSLY WRONG id
+    /// (`thread-should-never-be-minted`) so a passing assertion on the requested resume id
+    /// proves `thread/resume` was used, not `thread/start`.
+    #[tokio::test]
+    async fn handle_create_with_resume_session_id_resumes_the_same_thread() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-should-never-be-minted"}"#);
+        let (st, mut rx) = state_with_bus();
+
+        st.handle_create(FreshAgentCreate {
+            request_id: "req-resume-1".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            provider: Some(freshell_protocol::AgentProvider::Codex),
+            cwd: None,
+            legacy_restore_context: None,
+            resume_session_id: Some("thread-existing-durable".to_string()),
+            session_ref: None,
+            model: None,
+            model_selection: None,
+            permission_mode: None,
+            sandbox: None,
+            effort: None,
+            plugins: None,
+        })
+        .await;
+
+        let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.created" || frame["type"] == "freshAgent.create.failed" {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the fake app-server responds within the budget");
+
+        assert_eq!(
+            frame["type"], "freshAgent.created",
+            "resuming an existing thread must succeed: {frame}"
+        );
+        assert_eq!(
+            frame["sessionId"], "thread-existing-durable",
+            "create-with-resume must preserve the CALLER's thread id, never mint a new one \
+             (thread/start would have returned thread-should-never-be-minted): {frame}"
+        );
+        assert!(
+            st.sessions
+                .lock()
+                .await
+                .contains_key("thread-existing-durable"),
+            "the resumed thread must be registered under its ORIGINAL id"
+        );
+    }
+
+    /// FINDING 1 (CODEX-FIRST triage): when the caller-supplied `resumeSessionId` is
+    /// genuinely gone (`thread/resume` reports "not found"), the legacy reference has NO
+    /// mint-new fallback inside `freshAgent.create`'s resume branch -- `runtime-manager.ts:
+    /// 103-112` propagates the adapter's `resume()` failure unwrapped, and
+    /// `ws-handler.ts:3388-3405`'s generic catch turns it into `freshAgent.create.failed`
+    /// with the generic `FRESH_AGENT_CREATE_FAILED` code (the RPC error's numeric `.code`
+    /// never satisfies the `typeof error.code === 'string'` guard). This port mirrors that:
+    /// an error to the client, never a silently-minted fresh thread, and never a
+    /// `lost_session_frame` (that shape is exclusive to `freshAgent.attach`).
+    #[tokio::test]
+    async fn handle_create_with_resume_on_genuinely_missing_thread_emits_create_failed() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/resume": {
+                        "error": { "code": -32001, "message": "Thread not found" }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+
+        st.handle_create(FreshAgentCreate {
+            request_id: "req-resume-2".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            provider: Some(freshell_protocol::AgentProvider::Codex),
+            cwd: None,
+            legacy_restore_context: None,
+            resume_session_id: Some("thread-truly-gone".to_string()),
+            session_ref: None,
+            model: None,
+            model_selection: None,
+            permission_mode: None,
+            sandbox: None,
+            effort: None,
+            plugins: None,
+        })
+        .await;
+
+        let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.created" || frame["type"] == "freshAgent.create.failed" {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the fake app-server responds within the budget");
+
+        assert_eq!(
+            frame["type"], "freshAgent.create.failed",
+            "a genuinely-missing resume target must fail create, never silently mint a \
+             fresh session: {frame}"
+        );
+        assert_eq!(frame["requestId"], "req-resume-2");
+        assert_eq!(
+            frame["code"], "FRESH_AGENT_CREATE_FAILED",
+            "legacy's generic ws-handler.ts:3395-3397 fallback code (the RPC error's numeric \
+             .code never satisfies the `typeof === 'string'` guard): {frame}"
+        );
+        assert!(
+            !st.sessions.lock().await.contains_key("thread-truly-gone"),
+            "no session may be registered for a resume target that was never actually created"
+        );
+    }
+
+    // -- dead-thread negative cache (CODEX-FIRST triage Finding 2) --
+
+    /// Unit-level: [`FreshCodexState::mark_thread_dead`]/[`FreshCodexState::is_known_dead_thread`]/
+    /// [`FreshCodexState::clear_dead_thread`] in isolation, no sidecar involved.
+    #[tokio::test]
+    async fn dead_thread_cache_marks_checks_and_clears() {
+        let (st, _rx) = state_with_bus();
+
+        assert!(
+            !st.is_known_dead_thread("cache-unit-t1").await,
+            "a thread never marked dead must not be reported dead"
+        );
+
+        st.mark_thread_dead("cache-unit-t1").await;
+        assert!(
+            st.is_known_dead_thread("cache-unit-t1").await,
+            "a freshly-marked thread must be reported dead within its TTL"
+        );
+
+        st.clear_dead_thread("cache-unit-t1").await;
+        assert!(
+            !st.is_known_dead_thread("cache-unit-t1").await,
+            "an explicit clear (a successful resume/create) must remove the entry \
+             immediately, not wait for its TTL to elapse"
+        );
+    }
+
+    /// Unit-level: an entry stops being reported dead once its TTL elapses.
+    #[tokio::test]
+    async fn dead_thread_cache_entry_expires_after_its_ttl() {
+        let (mut st, _rx) = state_with_bus();
+        st.dead_thread_ttl = std::time::Duration::from_millis(20);
+
+        st.mark_thread_dead("cache-unit-t2").await;
+        assert!(st.is_known_dead_thread("cache-unit-t2").await);
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            !st.is_known_dead_thread("cache-unit-t2").await,
+            "an entry must stop being reported dead once its TTL has elapsed"
+        );
+    }
+
+    /// FINDING 2 (CODEX-FIRST triage, empirically proven ~3 spawn/kill cycles PER SECOND): a
+    /// client retrying `freshAgent.attach` against a permanently-dead thread id (no
+    /// client-side backoff) must NOT spawn a fresh `codex app-server` sidecar on every
+    /// attempt -- `ensure_session_resumable` fails fast against the negative cache after the
+    /// FIRST resume genuinely proves the thread gone, so N sequential attempts spawn AT MOST
+    /// once.
+    #[tokio::test]
+    async fn handle_attach_repeated_dead_thread_spawns_sidecar_at_most_once() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/resume": {
+                        "error": { "code": -32001, "message": "Thread not found" }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+        let capture = tracing_capture::capture_by_session("finding-2-storm-marker-unused");
+
+        for attempt in 0..5 {
+            st.handle_attach(attach_msg("thread-permanently-dead")).await;
+
+            let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    let raw = rx.recv().await.expect("bus stays open");
+                    let frame: Value = serde_json::from_str(&raw).unwrap();
+                    if frame["type"] == "freshAgent.event" {
+                        return frame;
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("attempt {attempt} resolves within the budget"));
+            assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
+        }
+
+        let spawn_count = capture
+            .untagged_events_since_start()
+            .into_iter()
+            .filter(|e| e.message == "freshagent.sidecar.spawned")
+            .count();
+        assert_eq!(
+            spawn_count, 1,
+            "5 sequential attaches against a permanently-dead thread must spawn the codex \
+             app-server sidecar exactly once, not once per attempt (the storm this fix bounds)"
+        );
+    }
+
+    /// FINDING 2 (CODEX-FIRST triage): the negative cache must not be permanent -- once its
+    /// TTL elapses, a later attach against the SAME (now-resumable) thread id must genuinely
+    /// retry: a second sidecar spawn, a real `thread/resume`, and success.
+    #[tokio::test]
+    async fn handle_attach_dead_thread_retries_genuinely_after_cache_ttl_expires() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/resume": {
+                        "error": { "code": -32001, "message": "Thread not found" }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let (mut st, mut rx) = state_with_bus();
+        st.dead_thread_ttl = std::time::Duration::from_millis(50);
+        let capture = tracing_capture::capture_by_session("finding-2-expiry-marker-unused");
+
+        st.handle_attach(attach_msg("thread-temporarily-dead")).await;
+        let first: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let raw = rx.recv().await.expect("bus stays open");
+                let frame: Value = serde_json::from_str(&raw).unwrap();
+                if frame["type"] == "freshAgent.event" {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("first attach resolves within the budget");
+        assert_eq!(first["event"]["code"], "INVALID_SESSION_ID");
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Now the thread is genuinely resumable.
+        configure_fake_codex_cmd("{}");
+
+        st.handle_attach(attach_msg("thread-temporarily-dead")).await;
+        let second: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let raw = rx.recv().await.expect("bus stays open");
+                let frame: Value = serde_json::from_str(&raw).unwrap();
+                if frame["type"] == "freshAgent.event" {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("second attach resolves within the budget");
+        assert_eq!(
+            second["event"]["type"], "freshAgent.session.snapshot",
+            "after the negative-cache TTL elapses, a retry must genuinely resume: {second}"
+        );
+        assert!(
+            st.sessions
+                .lock()
+                .await
+                .contains_key("thread-temporarily-dead"),
+            "the retried resume must register the session for reuse"
+        );
+
+        let spawn_count = capture
+            .untagged_events_since_start()
+            .into_iter()
+            .filter(|e| e.message == "freshagent.sidecar.spawned")
+            .count();
+        assert_eq!(
+            spawn_count, 2,
+            "expiry must allow a genuine SECOND spawn attempt (not permanently blocked): \
+             {spawn_count}"
+        );
     }
 
     // -- lazy restart after crash (PR-4) --
