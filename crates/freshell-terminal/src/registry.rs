@@ -1391,7 +1391,15 @@ mod tests {
         /// Register a headless terminal (no PTY) so the stream logic can be driven
         /// deterministically by [`feed`](Self::feed) instead of real child output.
         fn insert_headless(&self, terminal_id: &str, stream_id: &str) {
-            let now = now_ms();
+            self.insert_headless_at(terminal_id, stream_id, now_ms());
+        }
+
+        /// Same as [`insert_headless`](Self::insert_headless), but with an
+        /// explicit `created_at` instead of the wall clock. Needed by tests that
+        /// must pin two terminals to the SAME timestamp (e.g. exercising
+        /// `inventory()`'s tie-break) without racing real `now_ms()` resolution
+        /// under load -- see `inventory_lists_running_terminals_sorted_and_reflects_revision`.
+        fn insert_headless_at(&self, terminal_id: &str, stream_id: &str, created_at: i64) {
             let shared = Arc::new(Mutex::new(TerminalShared {
                 terminal_id: terminal_id.to_string(),
                 stream_id: stream_id.to_string(),
@@ -1402,8 +1410,8 @@ mod tests {
                 head_seq: 0,
                 status: TerminalRunStatus::Running,
                 exit_code: None,
-                created_at: now,
-                last_activity_at: now,
+                created_at,
+                last_activity_at: created_at,
                 cols: 120,
                 rows: 30,
                 geometry_epoch: 1,
@@ -1891,15 +1899,24 @@ mod tests {
     fn inventory_lists_running_terminals_sorted_and_reflects_revision() {
         let reg = TerminalRegistry::new();
         assert!(reg.inventory().is_empty());
-        reg.insert_headless("T-b", "S1");
-        reg.insert_headless("T-a", "S2");
+        // Pin both terminals to the SAME created_at instead of relying on two
+        // back-to-back now_ms() calls happening to land in the same millisecond:
+        // under parallel/loaded test execution the wall clock can tick between
+        // the two inserts, which would make this a real (not tied) createdAt
+        // ordering and flake the fixed expectation below. Forcing an exact tie
+        // here is what actually exercises the tie-break this test documents.
+        reg.insert_headless_at("T-b", "S1", 1_000);
+        reg.insert_headless_at("T-a", "S2", 1_000);
         let inv = reg.inventory();
         assert_eq!(inv.len(), 2);
         for t in &inv {
             assert_eq!(t.status, TerminalRunStatus::Running);
             assert_eq!(t.mode, "shell");
         }
-        // created_at ties broken by terminalId → deterministic order.
+        // created_at ties broken by terminalId → deterministic order. Necessary
+        // because (unlike the legacy JS Map, whose iteration preserves insertion
+        // order) Rust's HashMap iteration order is arbitrary, so without a total
+        // tiebreak a same-timestamp tie would sort non-deterministically per run.
         assert_eq!(inv[0].terminal_id, "T-a");
         assert_eq!(inv[1].terminal_id, "T-b");
 
