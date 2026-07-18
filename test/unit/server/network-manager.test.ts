@@ -11,6 +11,7 @@ import {
 import { detectLanIps, detectLanIpsAsync } from '../../../server/bootstrap.js'
 import { detectFirewall, firewallCommands } from '../../../server/firewall.js'
 import { computeWslPortForwardingPlanAsync } from '../../../server/wsl-port-forward.js'
+import { consumeCapturedLogRecords } from '../../../server/test-log-capture.js'
 
 // Mock external dependencies
 vi.mock('../../../server/bootstrap.js', () => ({
@@ -366,6 +367,12 @@ describe('NetworkManager', () => {
         configured: true,
       },
     })
+
+    // Let the scheduled rebind finish so its async server close/relisten cannot
+    // race afterEach teardown and emit a spurious close error into a later test.
+    await vi.waitFor(() => {
+      expect((manager as any).rebindInFlight).toBe(false)
+    })
   })
 
   it('does not schedule rebind when host unchanged', async () => {
@@ -696,6 +703,10 @@ describe('NetworkManager', () => {
     expect(mockWsHandler.prepareForRebind).toHaveBeenCalledOnce()
     // CRITICAL: resumeAfterRebind must still be called (via finally block)
     expect(mockWsHandler.resumeAfterRebind).toHaveBeenCalledOnce()
+    expect(
+      consumeCapturedLogRecords((r) => r.msg === 'Failed to close server for rebind'),
+    ).toHaveLength(1)
+    expect(consumeCapturedLogRecords((r) => r.msg === 'Hot rebind failed')).toHaveLength(1)
 
     // Restore
     server.close = originalClose
