@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import fsp from 'fs/promises'
 import path from 'path'
 import os from 'os'
+import { consumeCapturedLogRecords } from '../../../server/test-log-capture.js'
 
 // Use vi.hoisted to ensure mockState is available before vi.mock runs
 // vitest hoists vi.mock calls to the top, so we need vi.hoisted for dependencies
@@ -392,6 +393,7 @@ describe('ConfigStore', () => {
       expect(config.version).toBe(1)
       expect(config.settings).toEqual(defaultSettings)
       expect(store.getLastReadError()).toBe('VERSION_MISMATCH')
+      expect(consumeCapturedLogRecords((r) => r.msg === 'Config file version mismatch; falling back to defaults')).toHaveLength(1)
     })
 
     it('returns defaults for malformed JSON', async () => {
@@ -404,6 +406,7 @@ describe('ConfigStore', () => {
       expect(config.version).toBe(1)
       expect(config.settings).toEqual(defaultSettings)
       expect(store.getLastReadError()).toBe('PARSE_ERROR')
+      expect(consumeCapturedLogRecords((r) => r.msg === 'Config file parse failed; falling back to defaults')).toHaveLength(1)
     })
 
     it('uses cached value on subsequent calls', async () => {
