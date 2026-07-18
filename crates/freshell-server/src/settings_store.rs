@@ -1624,7 +1624,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         assert_eq!(state.registry.auto_kill_idle_minutes(), 7);
-        assert_eq!(state.registry.scrollback_max_bytes(), scrollback_after_first_patch);
+        assert_eq!(
+            state.registry.scrollback_max_bytes(),
+            scrollback_after_first_patch
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
