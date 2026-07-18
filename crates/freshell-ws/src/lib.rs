@@ -21,6 +21,7 @@
 //! wire bytes are contract-locked.
 
 pub mod identity;
+pub mod origin;
 pub mod screenshot;
 pub mod tabs;
 pub mod terminal;
@@ -134,6 +135,11 @@ pub struct WsState {
     /// here (e.g. in tests) makes the keepalive cadence observable without a real
     /// 30s wait.
     pub ping_interval_ms: u64,
+    /// SAFE-03 WS Origin policy allow-list (resolved once at boot from
+    /// `ALLOWED_ORIGINS`/`EXTRA_ALLOWED_ORIGINS`, see [`crate::origin`]). A
+    /// connection whose `Origin` is present but neither same-origin (Host
+    /// match) nor on this list is rejected before any session state is sent.
+    pub allowed_origins: Arc<Vec<String>>,
 }
 
 /// The `/ws` sub-router, pre-bound to its state (mergeable into the server app).
@@ -143,8 +149,20 @@ pub fn router(state: WsState) -> Router {
         .with_state(state)
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<WsState>) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    headers: axum::http::HeaderMap,
+    State(state): State<WsState>,
+) -> Response {
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    ws.on_upgrade(move |socket| handle_socket(socket, state, origin, host))
 }
 
 /// Constant-time byte-slice equality. Mirrors `auth.ts#timingSafeCompare`:
@@ -266,7 +284,24 @@ pub fn evaluate_hello(value: &serde_json::Value, expected_token: &str) -> HelloO
     HelloOutcome::Accept
 }
 
-async fn handle_socket(mut socket: WebSocket, state: WsState) {
+async fn handle_socket(
+    mut socket: WebSocket,
+    state: WsState,
+    origin: Option<String>,
+    host: Option<String>,
+) {
+    // SAFE-03 Origin policy: evaluated BEFORE the first frame is even read, so
+    // a rejected connection observes zero session state (no ready/settings/
+    // terminal.inventory) — just an error frame + close. See [`crate::origin`]
+    // for why this is deliberate hardening beyond the (advisory-only) original.
+    if crate::origin::evaluate_origin(origin.as_deref(), host.as_deref(), &state.allowed_origins)
+        == crate::origin::OriginDecision::Rejected
+    {
+        let _ = send_error(&mut socket, ErrorCode::Unauthorized, "Origin not allowed").await;
+        let _ = close_with(&mut socket, CLOSE_ORIGIN_REJECTED, "Origin not allowed").await;
+        return;
+    }
+
     // Read the first client frame (the hello), skipping any control frames.
     let first = loop {
         match socket.recv().await {
@@ -370,6 +405,11 @@ async fn handle_socket(mut socket: WebSocket, state: WsState) {
 /// connection, which a client observes as an abnormal `1006` closure.
 const CLOSE_NOT_AUTHENTICATED: u16 = 4001;
 const CLOSE_PROTOCOL_MISMATCH: u16 = 4010;
+/// SAFE-03: a NEW code (4011) -- the original has no Origin-rejection close
+/// code at all (its Origin handling never rejects, see [`crate::origin`]), so
+/// this doesn't collide with any of `server/ws-handler.ts`'s `CLOSE_CODES`
+/// (4001/4002/4003/4008/4009/4010).
+const CLOSE_ORIGIN_REJECTED: u16 = 4011;
 
 /// Send a WS close frame with the given code/reason, best-effort (the socket
 /// may already be gone).
@@ -464,6 +504,7 @@ mod tests {
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
             ping_interval_ms: 30_000,
+            allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
         }
     }
 

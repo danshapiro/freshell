@@ -75,8 +75,14 @@ async fn main() -> ExitCode {
 
     // AUTH_TOKEN is mandatory — refuse to start without it (matches the original).
     let auth_token = match std::env::var("AUTH_TOKEN") {
-        Ok(token) if !token.is_empty() => Arc::new(token),
-        _ => {
+        Ok(token) => match validate_auth_token(&token) {
+            Ok(()) => Arc::new(token),
+            Err(reason) => {
+                eprintln!("{reason}");
+                return ExitCode::FAILURE;
+            }
+        },
+        Err(_) => {
             eprintln!("AUTH_TOKEN is required. Refusing to start without authentication.");
             return ExitCode::FAILURE;
         }
@@ -231,6 +237,7 @@ async fn main() -> ExitCode {
         cli_commands: Arc::clone(&cli_commands),
         shutdown: Arc::clone(&shutdown_notify),
         ping_interval_ms: resolve_ping_interval_ms(),
+        allowed_origins: Arc::new(resolve_allowed_origins()),
     };
     let api_state = ApiState {
         auth_token: Arc::clone(&auth_token),
@@ -546,6 +553,34 @@ async fn ensure_json_charset(mut response: axum::response::Response) -> axum::re
     response
 }
 
+/// Default/weak `AUTH_TOKEN` values the original refuses to start with
+/// (`server/auth.ts` `DEFAULT_BAD_TOKENS`, exact set, case-insensitive).
+const DEFAULT_BAD_TOKENS: [&str; 4] = ["changeme", "default", "password", "token"];
+
+/// SAFE-01 startup hardening (mirrors `server/auth.ts#validateStartupSecurity`,
+/// called from the `AUTH_TOKEN` env read above). Checked in the original's
+/// order — empty, then too short, then default/weak — with one deliberate
+/// addition: a whitespace-only token is rejected even if it is >= 16
+/// characters. The original's own check (`!token`) is JS-falsy-only, so
+/// `"                "` (16 spaces) would pass it; a whitespace secret is
+/// never an effective one, so this crate closes that gap rather than port it.
+fn validate_auth_token(token: &str) -> Result<(), String> {
+    if token.trim().is_empty() {
+        return Err(
+            "AUTH_TOKEN is required. Refusing to start without authentication.".to_string(),
+        );
+    }
+    if token.len() < 16 {
+        return Err("AUTH_TOKEN is too short. Use at least 16 characters.".to_string());
+    }
+    if DEFAULT_BAD_TOKENS.contains(&token.to_lowercase().as_str()) {
+        return Err(
+            "AUTH_TOKEN appears to be a default/weak value. Refusing to start.".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Resolve the port to bind. Mirrors `server/index.ts`: `PORT` env or 3001.
 fn resolve_port() -> u16 {
     std::env::var("PORT")
@@ -561,6 +596,17 @@ fn resolve_ping_interval_ms() -> u64 {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(30_000)
+}
+
+/// SAFE-03: resolve the WS Origin allow-list from process env, mirroring
+/// `server/auth.ts#parseAllowedOrigins` (`ALLOWED_ORIGINS`) plus
+/// `server/network-manager.ts`'s user-facing `EXTRA_ALLOWED_ORIGINS` knob
+/// (see [`freshell_ws::origin`]).
+fn resolve_allowed_origins() -> Vec<String> {
+    freshell_ws::origin::resolve_allowed_origins(
+        std::env::var("ALLOWED_ORIGINS").ok().as_deref(),
+        std::env::var("EXTRA_ALLOWED_ORIGINS").ok().as_deref(),
+    )
 }
 
 /// Resolve the bind host, faithfully to `server/get-network-host.ts`:
@@ -751,6 +797,44 @@ mod tests {
 
         std::env::remove_var("FRESHELL_TASK7_TEST_VAR_SET");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // SAFE-01: startup token hardening (`server/auth.ts#validateStartupSecurity`).
+    // Order mirrors legacy: empty/whitespace -> too short (<16) -> default/weak
+    // value (case-insensitive exact match). Whitespace-only is beyond-legacy
+    // hardening (the original's `!token` check is JS-falsy-only, so a
+    // whitespace string of length >= 16 would pass it; we reject it here
+    // because a whitespace token is never a deliberate, effective secret).
+
+    #[test]
+    fn rejects_empty_token() {
+        assert!(validate_auth_token("").is_err());
+    }
+
+    #[test]
+    fn rejects_whitespace_only_token() {
+        // 20 spaces: long enough to pass the length check, still rejected.
+        assert!(validate_auth_token("                    ").is_err());
+    }
+
+    #[test]
+    fn rejects_token_shorter_than_16_chars() {
+        assert!(validate_auth_token("short123").is_err());
+    }
+
+    #[test]
+    fn rejects_default_weak_tokens_case_insensitive() {
+        for weak in ["changeme", "CHANGEME", "ChangeMe", "default", "password", "TOKEN"] {
+            assert!(
+                validate_auth_token(weak).is_err(),
+                "expected {weak:?} to be rejected as a weak/default token"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_strong_token() {
+        assert!(validate_auth_token("s3cr3t-token-abcdef").is_ok());
     }
 
     #[test]

@@ -81,6 +81,15 @@ pub struct SettingsStore {
     /// (`maybe_reload_overrides`) on the override READ path
     /// (`session_overrides()`/`terminal_overrides()`).
     overrides_reload_state: Arc<std::sync::Mutex<OverridesReloadState>>,
+    /// The freshness-reload throttle window (production default: 1 second,
+    /// set in [`SettingsStore::load`]). Injectable via the `#[cfg(test)]`
+    /// [`SettingsStore::with_reload_throttle_window`] builder so tests can
+    /// prove the SAME throttle logic against a much smaller, test-scaled
+    /// window instead of racing the real 1-second wall-clock boundary under
+    /// parallel test-suite CPU contention (see `override_reload_is_throttled`
+    /// below). Compiled out of release builds -- there is no production path
+    /// that ever sets anything other than the 1-second default.
+    reload_throttle_window: std::time::Duration,
 }
 
 /// Throttle + change-detection state for [`SettingsStore::maybe_reload_overrides`].
@@ -96,6 +105,19 @@ struct OverridesReloadState {
 }
 
 impl SettingsStore {
+    /// Test-only override for the freshness-reload throttle window (default:
+    /// 1 real second, set by [`SettingsStore::load`]). `#[cfg(test)]`-gated,
+    /// so it compiles out of every release build entirely -- this is not a
+    /// production entry point, just dependency injection for a deterministic
+    /// test (see `override_reload_is_throttled_to_a_configurable_window`
+    /// below), which needs a MUCH smaller window than 1 real second to stay
+    /// immune to scheduling jitter under a parallel test-suite run.
+    #[cfg(test)]
+    fn with_reload_throttle_window(mut self, window: std::time::Duration) -> Self {
+        self.reload_throttle_window = window;
+        self
+    }
+
     /// Load the full persisted settings tree (defaults deep-merged with
     /// `<home>/.freshell/config.json`'s `settings` object \u2014 mirrors
     /// `mergeServerSettings(defaults, persisted)`), then run the ORIGINAL's
@@ -199,6 +221,7 @@ impl SettingsStore {
             session_overrides_dirty: Arc::new(std::sync::Mutex::new(Default::default())),
             terminal_overrides_dirty: Arc::new(std::sync::Mutex::new(Default::default())),
             overrides_reload_state: Arc::new(std::sync::Mutex::new(Default::default())),
+            reload_throttle_window: std::time::Duration::from_secs(1),
         };
         if needs_persist {
             store.persist(&settings);
@@ -420,7 +443,7 @@ impl SettingsStore {
                 .lock()
                 .expect("overrides reload state lock");
             if let Some(last) = state.last_checked {
-                if now.duration_since(last) < std::time::Duration::from_secs(1) {
+                if now.duration_since(last) < self.reload_throttle_window {
                     return;
                 }
             }
@@ -2259,13 +2282,49 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// THROTTLE: the freshness reload's mtime `stat()` is throttled to at
-    /// most once per second -- an external write made between two RAPID
+    /// Pure boundary check for the freshness-reload throttle predicate
+    /// (extracted from `maybe_reload_overrides`): fully deterministic,
+    /// synthetic `Instant`s, zero real elapsed time, zero flake risk. Locks
+    /// in the exact `duration_since(last) < window` comparison independent
+    /// of the wall-clock/scheduling-sensitive integration test below.
+    #[test]
+    fn reload_throttle_boundary_is_exclusive_of_the_window() {
+        let window = std::time::Duration::from_millis(100);
+        let last = std::time::Instant::now();
+
+        // Just under the window: still throttled (must NOT check).
+        let almost = last + std::time::Duration::from_millis(99);
+        assert!(almost.duration_since(last) < window);
+
+        // Exactly at / just past the window: no longer throttled.
+        let past = last + std::time::Duration::from_millis(101);
+        assert!(past.duration_since(last) >= window);
+    }
+
+    /// THROTTLE (SAFE-01 bonus deflake): the freshness reload's mtime
+    /// `stat()` is throttled -- an external write made between two RAPID
     /// calls to `session_overrides()` must not appear until the throttle
     /// window elapses, so a hot polling path (e.g. the sidebar) never stats
     /// `config.json` on every single call.
+    ///
+    /// Deflake note: this used to hardcode the PRODUCTION 1-second window and
+    /// sleep 1100ms real time. Under a parallel `cargo test` run (heavy CPU
+    /// contention across many test threads), the gap between "establish
+    /// baseline" and "immediate re-check" -- separated only by one
+    /// `fs::write` -- could occasionally be scheduled far enough apart to
+    /// exceed a full real second, making the "must NOT see it yet" assertion
+    /// flake. Fixed by injecting a much smaller window (100ms) via
+    /// [`SettingsStore::with_reload_throttle_window`] (`#[cfg(test)]`-gated,
+    /// never compiled into release builds) and widening the post-window
+    /// sleep to 5x the window (500ms) -- the SAME throttle logic, proven at a
+    /// scale where routine test-suite scheduling jitter (single-digit-to-
+    /// low-double-digit milliseconds) cannot cross either boundary. What it
+    /// proves is unchanged: an immediate re-check inside the window sees the
+    /// stale value; the SAME store instance picks up the change once the
+    /// window elapses.
     #[tokio::test]
-    async fn override_reload_is_throttled_to_once_per_second() {
+    async fn override_reload_is_throttled_to_a_configurable_window() {
+        let window = std::time::Duration::from_millis(100);
         let dir = std::env::temp_dir().join(format!("frs-sidebyside-{}", uuid_like()));
         let freshell = dir.join(".freshell");
         std::fs::create_dir_all(&freshell).unwrap();
@@ -2277,10 +2336,18 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let store = store_at(&dir);
+        let store = store_at(&dir).with_reload_throttle_window(window);
 
         // Establish the throttle baseline (first-ever call always checks).
         assert!(store.session_overrides().is_empty());
+
+        // A small real gap before the external write: `store_at` itself may
+        // persist once (the `knownProviders` seed migration), and the mtime
+        // change-detection below compares raw filesystem mtimes -- two
+        // writes close enough together can otherwise land on the identical
+        // timestamp tick and be indistinguishable as "changed". This gap is
+        // still far inside the throttle window (`window` = 100ms).
+        std::thread::sleep(std::time::Duration::from_millis(20));
 
         // External writer adds a key immediately after.
         std::fs::write(
@@ -2299,11 +2366,12 @@ mod tests {
         // see it.
         assert!(
             !store.session_overrides().contains_key("claude:fast"),
-            "a reload within the 1s throttle window must not re-stat config.json"
+            "a reload within the throttle window must not re-stat config.json"
         );
 
-        // After the window elapses, the SAME store instance does pick it up.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // After the window elapses (5x margin), the SAME store instance does
+        // pick it up.
+        std::thread::sleep(window * 5);
         assert!(
             store.session_overrides().contains_key("claude:fast"),
             "after the throttle window elapses, the change must become visible"

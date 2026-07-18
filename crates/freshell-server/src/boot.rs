@@ -459,27 +459,41 @@ async fn tabs_sync_client_retire(
 ///
 /// `pub(crate)` so the additive `files` REST surface shares the identical gate
 /// (mirrors the single `server/auth.ts#httpAuthMiddleware` in the original).
+///
+/// SAFE-01 precedence fix: the original resolves the credential with
+/// `provided = headerToken || cookieToken` (`server/auth.ts:41`) — a JS `||`,
+/// which is a VALUE fallback, not an "accept either" gate. A present,
+/// non-empty header wins UNCONDITIONALLY: if it's wrong, the request is
+/// rejected even when a correct cookie is also attached (the cookie is never
+/// even read in that case). Only an absent/empty header falls through to the
+/// cookie. The previous port instead tried the header, and on failure tried
+/// the cookie too — an "either succeeds" OR-gate that accepts a
+/// wrong-header/right-cookie combination the original would reject. That
+/// divergence matters once request paths compose the two on purpose (e.g. a
+/// stale cached header alongside a live cookie); mirroring the original's
+/// deterministic precedence removes the ambiguity.
 pub(crate) fn is_authed(headers: &HeaderMap, token: &str) -> bool {
-    if let Some(header_token) = headers
+    let header_token = headers
         .get("x-auth-token")
         .and_then(|value| value.to_str().ok())
-    {
-        if freshell_api::constant_time_eq(header_token.as_bytes(), token.as_bytes()) {
-            return true;
-        }
-    }
-    if let Some(cookie_header) = headers
+        .filter(|value| !value.is_empty());
+
+    let cookie_token = headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
-    {
-        if let Some(raw) = cookie_value(cookie_header, "freshell-auth") {
-            let decoded = percent_decode(&raw);
-            if freshell_api::constant_time_eq(decoded.as_bytes(), token.as_bytes()) {
-                return true;
-            }
-        }
+        .and_then(|cookie_header| cookie_value(cookie_header, "freshell-auth"))
+        .map(|raw| percent_decode(&raw))
+        .filter(|value| !value.is_empty());
+
+    let provided = match header_token {
+        Some(header_token) => Some(header_token.to_string()),
+        None => cookie_token,
+    };
+
+    match provided {
+        Some(provided) => freshell_api::constant_time_eq(provided.as_bytes(), token.as_bytes()),
+        None => false,
     }
-    false
 }
 
 /// `401 { "error": "Unauthorized" }` — byte-shape-equal to the original's reject.
@@ -559,6 +573,39 @@ mod tests {
         // encodeURIComponent('a b/c') === 'a%20b%2Fc'
         let h = headers_with("cookie", "other=1; freshell-auth=a%20b%2Fc; z=2");
         assert!(is_authed(&h, "a b/c"));
+    }
+
+    // SAFE-01: conflicting-source precedence. `server/auth.ts:41` resolves
+    // `provided = headerToken || cookieToken` -- a JS value-fallback, not an
+    // "accept either" gate. A present, non-empty header wins UNCONDITIONALLY:
+    // wrong header + correct cookie must still be REJECTED (the cookie is
+    // never even consulted once a header is present).
+    #[test]
+    fn wrong_header_rejects_even_with_correct_cookie_present() {
+        let mut h = headers_with("x-auth-token", "WRONG");
+        h.insert(
+            header::COOKIE,
+            HeaderValue::from_static("freshell-auth=s3cr3t-token-abcdef"),
+        );
+        assert!(!is_authed(&h, "s3cr3t-token-abcdef"));
+    }
+
+    #[test]
+    fn falls_back_to_cookie_only_when_header_absent() {
+        let h = headers_with("cookie", "freshell-auth=s3cr3t-token-abcdef");
+        assert!(is_authed(&h, "s3cr3t-token-abcdef"));
+    }
+
+    #[test]
+    fn empty_header_value_falls_back_to_cookie() {
+        // Legacy: `('' as string|undefined) || undefined` treats an empty
+        // header value as ABSENT, so the cookie is still consulted.
+        let mut h = headers_with("x-auth-token", "");
+        h.insert(
+            header::COOKIE,
+            HeaderValue::from_static("freshell-auth=s3cr3t-token-abcdef"),
+        );
+        assert!(is_authed(&h, "s3cr3t-token-abcdef"));
     }
 
     #[test]

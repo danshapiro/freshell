@@ -1560,6 +1560,7 @@ mod terminals_changed_tests {
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
             ping_interval_ms: 30_000,
+            allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
         };
         (state, rx)
     }
@@ -1732,6 +1733,7 @@ mod terminal_meta_created_tests {
             terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: std::sync::Arc::new(Vec::new()),
             ping_interval_ms: 30_000,
+            allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
         };
         (state, rx)
     }

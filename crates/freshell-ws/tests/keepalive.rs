@@ -80,6 +80,7 @@ async fn spawn_server(
         cli_commands: Arc::new(Vec::new()),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         ping_interval_ms,
+        allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
     };
 
     let router = freshell_ws::router(state);
