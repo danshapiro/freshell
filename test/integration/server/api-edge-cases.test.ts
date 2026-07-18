@@ -5,6 +5,7 @@ import request from 'supertest'
 import fsp from 'fs/promises'
 import path from 'path'
 import os from 'os'
+import { consumeCapturedLogRecords } from '../../../server/test-log-capture.js'
 
 // Use vi.hoisted to ensure mockState is available before vi.mock runs
 const mockState = vi.hoisted(() => ({
@@ -1132,6 +1133,7 @@ describe('API Edge Cases - Security Testing', () => {
 
       // Should fall back to defaults
       expect(settings).toEqual(defaultSettings)
+      expect(consumeCapturedLogRecords((r) => r.msg === 'Config file parse failed; falling back to defaults')).toHaveLength(1)
     })
 
     it('recovers from config with wrong version', async () => {
@@ -1146,6 +1148,7 @@ describe('API Edge Cases - Security Testing', () => {
       const settings = await newStore.getSettings()
 
       expect(settings).toEqual(defaultSettings)
+      expect(consumeCapturedLogRecords((r) => r.msg === 'Config file version mismatch; falling back to defaults')).toHaveLength(1)
     })
 
     it('handles missing .freshell directory', async () => {
