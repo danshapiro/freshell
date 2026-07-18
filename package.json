@@ -76,7 +76,8 @@
     "perf:audit:gate": "tsx scripts/assert-visible-first-audit-gate.ts",
     "contract:generate": "tsx port/contract/generate-ws-contract.ts",
     "test:oracle": "vitest run --config config/vitest/vitest.oracle.config.ts",
-    "test:oracle:t2": "vitest run --config config/vitest/vitest.oracle-t2.config.ts"
+    "test:oracle:t2": "vitest run --config config/vitest/vitest.oracle-t2.config.ts",
+    "test:sandbox": "bash scripts/sandbox-test.sh"
   },
   "dependencies": {
     "@ai-sdk/google": "^3.0.29",

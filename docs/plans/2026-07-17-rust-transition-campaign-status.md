@@ -188,6 +188,12 @@ the SAME agent conversation from both; terminals/layouts are per-server (differe
    - Prefer mechanism over instruction: put these guards in shared harness helpers (kill_tree
      that refuses unrecorded PIDs; sandbox-path assertions) so the safe path is the easy path.
    - Reviewers explicitly audit destructive tests for blast radius as a named review item.
+   - **Required home for these suites**: process-kill, config-corruption, and restart-storm
+     suites run inside the disposable containerized test sandbox (`docker/sandbox/**`,
+     `scripts/sandbox-test.sh` / `npm run test:sandbox`) — see
+     `docs/development/test-sandbox.md`. The sandbox is a hard wall (own PID/network/FS
+     namespaces, `--rm`, no real-data mounts by default) in addition to, not instead of, the
+     in-code guard-rails above.
 4. **Independent adversarial review.** Every commit reviewed at a pinned SHA in an isolated
    worktree; reviewer re-reads legacy sources itself, re-runs tests, and reverts implementations
    to prove tests bite (caught the untested reverse cascade and the chars-vs-bytes scrollback

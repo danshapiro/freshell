@@ -32,6 +32,10 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - Use `npm run test:vitest -- ...` for a repo-owned direct Vitest path. Raw `npx vitest` is not a coordinated workflow.
 - `test:unit` is the exact default-config `test/unit` workload, `test:integration` is the exact server-config `test/server` workload, and `test:server` stays watch-capable unless you pass an explicit broad `--run`.
 
+## Destructive Test Sandbox
+- Process-kill, config-corruption, and restart-storm suites run inside a disposable Docker sandbox, never directly on host: `scripts/sandbox-test.sh "<command>"` (or `npm run test:sandbox -- "<command>"`).
+- See `docs/development/test-sandbox.md` for the safety guarantees, the `--corpus` read-only real-data flag, and cache-volume management.
+
 ## Kata
 - `.kata.toml` is committed project configuration. Always commit it after modifying it.
 
