@@ -382,9 +382,11 @@ impl TerminalRegistry {
     /// NOTE (documented scope limit): legacy's `setSettings` ALSO resizes every
     /// ALREADY-CREATED terminal's buffer in place (`t.buffer.setMaxChars(...)`
     /// loop). This port only applies the cap to terminals created AFTER this
-    /// call, matching the task's "respected at create" acceptance bar; live
-    /// resize of existing terminals is deferred (no live `PATCH /api/settings`
-    /// -> registry wiring exists yet at all -- see `enforce_idle_kills`'同 note).
+    /// call, matching the task's "respected at create" acceptance bar. Live
+    /// `PATCH /api/settings` -> registry wiring DOES exist (commit f766ad6c:
+    /// `apply_live_registry_settings`), so the setting applies without restart
+    /// to newly-created terminals; in-place resize of already-open terminals
+    /// remains deferred.
     pub fn set_scrollback_max_bytes(&self, max_bytes: i64) {
         self.scrollback_max_bytes
             .store(max_bytes, Ordering::Relaxed);
