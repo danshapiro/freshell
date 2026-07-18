@@ -194,27 +194,22 @@ test.describe('Amplifier Restore (Rust only)', () => {
         const harness = await bootAndConnect(page, info)
         await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
 
-        // `availableClis` is populated by the SERVER's `which amplifier`
+        // `availableClis` is populated by the SERVER's `which`/`where.exe`
         // probe (`crates/freshell-server/src/extensions.rs`'s
-        // `detect_available_clis`), but that probe's spec derivation maps
-        // 1:1 to the historical fixed CLI set (claude/codex/opencode/
-        // gemini/kimi, per that module's own doc comment) and never
-        // considers newer extension-provided CLIs like amplifier -- so the
-        // picker would never show it regardless of `AMPLIFIER_CMD`/PATH.
-        // Declare availability directly via the SAME real Redux action
-        // `restore-matrix.spec.ts`'s FreshCodex scenarios use for exactly
-        // this class of e2e-sandbox gap (there for codex/claude), merged
-        // with whatever the server already detected so this doesn't
-        // clobber real detections of other providers.
-        await page.evaluate(() => {
-          const harnessGlobal = (window as any).__FRESHELL_TEST_HARNESS__
-          const current = harnessGlobal?.getState()?.connection?.availableClis ?? {}
-          harnessGlobal?.dispatch({
-            type: 'connection/setAvailableClis',
-            payload: { ...current, amplifier: true },
-          })
-        })
-
+        // `detect_available_clis_live`), whose spec list is derived from
+        // GENUINELY DISCOVERED CLI extension manifests
+        // (`ExtensionRegistry::cli_detection_specs`) -- NOT the module's
+        // `DEFAULT_CLI_DETECTION_SPECS` constant, which that module's own
+        // doc comment says is dead reference-parity code never consulted
+        // on the real boot path. `extensions/amplifier/freshell.json` is a
+        // real `category: "cli"` manifest (`command: "amplifier"`,
+        // `envVar: "AMPLIFIER_CMD"`), the `RustServer` fixture spawns with
+        // `cwd: PROJECT_ROOT` (`test/e2e-browser/helpers/rust-server.ts`),
+        // exactly where `resolve_extension_dirs`'s cwd-relative
+        // `extensions/` scan looks -- so the server's live boot-time
+        // detection already discovers and probes amplifier via the
+        // `AMPLIFIER_CMD` override this test sets, with no client-side
+        // Redux workaround needed.
         const tabId = await harness.getActiveTabId()
         expect(tabId).toBeTruthy()
 

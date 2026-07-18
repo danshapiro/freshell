@@ -73,11 +73,37 @@ pub(crate) fn note_possible_submit(state: &WsState, terminal_id: &str, data: &st
 /// resolved this tick. Intended to be called periodically (the sweep-timer
 /// pattern already used by `spawn_sessions_sweep`,
 /// `crates/freshell-server/src/main.rs`).
-pub(crate) fn drain_and_associate(state: &WsState) {
+///
+/// `AmplifierLocator::tick` is synchronous `std::fs` I/O (a `projects/`
+/// directory walk plus bounded `events.jsonl` probe reads) whenever at
+/// least one terminal is armed -- see its doc comment for the idle
+/// short-circuit that makes it a zero-I/O no-op otherwise. Either way, this
+/// runs the tick inside `tokio::task::spawn_blocking` rather than directly
+/// on this async task's worker thread, mirroring `SessionIndex::snapshot`'s
+/// identical wrapping for the analogous `spawn_sessions_sweep` poll
+/// (`crates/freshell-server/src/main.rs`) -- a blocking filesystem call has
+/// no business running straight on a tokio executor thread.
+pub(crate) async fn drain_and_associate(state: &WsState) {
     let Some(locator) = &state.amplifier_locator else {
         return;
     };
-    for located in locator.tick(now_ms()) {
+    let locator = std::sync::Arc::clone(locator);
+    let now = now_ms();
+    let located = match tokio::task::spawn_blocking(move || locator.tick(now)).await {
+        Ok(located) => located,
+        Err(join_error) => {
+            // The blocking closure only calls `AmplifierLocator::tick`,
+            // which does not itself panic in normal operation; a panic
+            // here would be a genuine bug, not a routine condition to
+            // silently swallow.
+            tracing::warn!(
+                error = %join_error,
+                "amplifier_locator_tick_panicked: sweep tick task panicked, skipping this cycle"
+            );
+            return;
+        }
+    };
+    for located in located {
         let Some(entry) = state
             .registry
             .directory()
@@ -183,7 +209,7 @@ pub fn spawn_amplifier_locator_sweep(state: WsState, interval: std::time::Durati
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            drain_and_associate(&state);
+            drain_and_associate(&state).await;
         }
     });
 }
@@ -324,8 +350,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    #[test]
-    fn drain_and_associate_binds_identity_and_broadcasts_on_location() {
+    #[tokio::test]
+    async fn drain_and_associate_binds_identity_and_broadcasts_on_location() {
         let home = unique_temp_dir("drain-associate");
         let (state, mut rx) = state_with_locator(home.clone());
 
@@ -375,9 +401,9 @@ mod tests {
 
         // Drain repeatedly until the locator's correlation window (2000ms)
         // has definitely closed relative to wall-clock `now_ms()`.
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         for _ in 0..30 {
-            drain_and_associate(&state);
+            drain_and_associate(&state).await;
             if state
                 .identity
                 .get("t1")
@@ -386,7 +412,7 @@ mod tests {
             {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
 
         let identity = state.identity.get("t1").expect("identity seeded");

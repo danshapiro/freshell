@@ -41,6 +41,32 @@
 //! existing convention in `amplifier.rs`) and every entry point takes an
 //! explicit `now_ms` so tests drive the correlation windows deterministically
 //! without real sleeps.
+//!
+//! ## Idle short-circuit (armed-only watching)
+//!
+//! The reference only watches while `>= 1` armed terminal exists (its module
+//! doc). This port matches that: [`AmplifierLocator::tick`] performs
+//! **zero** filesystem I/O -- no `projects/` walk, no probe reads -- whenever
+//! zero terminals are armed, rather than sweeping unconditionally forever.
+//! There is nothing a tick could resolve with no armed terminal to
+//! correlate against, so the early return is pure cost avoidance, not a
+//! semantic change.
+//!
+//! This creates one hazard: while idle, `known_dirs` (the "already seen,
+//! never re-probe" baseline) stops advancing, so it can miss a directory
+//! that appears during the idle window. [`AmplifierLocator::arm`] closes
+//! this on the idle\u2192armed transition (armed count `0 -> 1`) by re-baselining
+//! `known_dirs` from a **fresh** disk read taken at that exact moment --
+//! see `arm`'s doc comment for why this is belt-and-suspenders (binding
+//! correctness never depended on `known_dirs` freshness in the first place;
+//! the refresh's payoff is avoiding wasted probes of a potentially large
+//! accumulated-while-idle set).
+//!
+//! The caller (`freshell_ws::amplifier_association::drain_and_associate`)
+//! runs this synchronous, `std::fs`-touching `tick()` inside
+//! `tokio::task::spawn_blocking` rather than directly on an async worker
+//! thread -- mirroring `SessionIndex::snapshot`'s identical wrapping for the
+//! analogous `spawn_sessions_sweep` poll (`crates/freshell-server/src/main.rs`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -127,6 +153,12 @@ pub struct AmplifierLocator {
     pre_epsilon_ms: i64,
     probe_timeout_ms: i64,
     inner: Mutex<Inner>,
+    /// Counts every call to `snapshot_session_dirs` -- the locator's one and
+    /// only filesystem-touching primitive. Test/diagnostic hook (mirrors
+    /// `armed_count`'s existing convention below): lets a test assert the
+    /// idle short-circuit in [`AmplifierLocator::tick`] performs literally
+    /// zero further disk I/O while no terminal is armed.
+    fs_scan_count: std::sync::atomic::AtomicU64,
 }
 
 impl AmplifierLocator {
@@ -159,6 +191,7 @@ impl AmplifierLocator {
             pre_epsilon_ms,
             probe_timeout_ms: window_ms * 2,
             inner: Mutex::new(Inner::default()),
+            fs_scan_count: std::sync::atomic::AtomicU64::new(0),
         };
         let known_dirs = locator.snapshot_session_dirs();
         locator.lock().known_dirs = known_dirs;
@@ -175,6 +208,14 @@ impl AmplifierLocator {
     /// How many terminals are currently armed (test/diagnostic hook).
     pub fn armed_count(&self) -> usize {
         self.lock().armed.len()
+    }
+
+    /// How many times `snapshot_session_dirs` has run so far (test/
+    /// diagnostic hook, mirrors `armed_count` above). Proves the idle
+    /// short-circuit in [`AmplifierLocator::tick`] performs zero further
+    /// filesystem scans while no terminal is armed.
+    pub fn fs_scan_count(&self) -> u64 {
+        self.fs_scan_count.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Arm a terminal for Enter↔dir correlation. Only fresh amplifier panes
@@ -206,6 +247,28 @@ impl AmplifierLocator {
             return false;
         }
         let snapshot = self.snapshot_session_dirs();
+        if inner.armed.is_empty() {
+            // Idle->armed transition (armed count 0 -> 1): `tick()`
+            // short-circuits with ZERO filesystem I/O while no terminal is
+            // armed (module doc), so `known_dirs` may be stale -- missing
+            // any directory that appeared during that idle window.
+            // Re-baseline it now from THIS SAME fresh disk read (`extend`,
+            // never shrink -- `known_dirs` is documented above to only
+            // grow) so those dirs are treated as pre-existing rather than
+            // spuriously surfacing as "new" discoveries (with a
+            // probe-worthy but fabricated `appeared_at_ms` of "now") the
+            // moment polling resumes on the next tick.
+            //
+            // Belt-and-suspenders, not the sole guard: even without this,
+            // no such dir could ever WRONGLY bind to a terminal, because
+            // `snapshot` above -- taken fresh, right here, independent of
+            // `known_dirs` -- already excludes every dir that exists at
+            // arm time via `armed.snapshot` below, exactly as every arm()
+            // always has. The refresh's real payoff is avoiding wasted
+            // probes (bounded `events.jsonl` reads) of a potentially large
+            // accumulated-while-idle set.
+            inner.known_dirs.extend(snapshot.iter().cloned());
+        }
         inner.armed.insert(
             terminal_id.to_string(),
             Armed {
@@ -249,6 +312,18 @@ impl AmplifierLocator {
     /// [`Located`] association resolved this tick (drains — never re-emitted).
     pub fn tick(&self, now_ms: i64) -> Vec<Located> {
         let mut inner = self.lock();
+        if inner.armed.is_empty() {
+            // Idle short-circuit (module doc): zero armed terminals means
+            // zero possible windows to resolve, so there is nothing this
+            // poll could do. Skip ALL filesystem I/O entirely rather than
+            // sweeping `projects/` unconditionally forever -- #514's
+            // reference only watches while >= 1 armed terminal exists.
+            // Safe: `arm()` always re-baselines `known_dirs` from a FRESH
+            // disk read on the idle->armed transition (see its doc
+            // comment), so resuming full scans on the very next armed
+            // tick can never miss anything.
+            return Vec::new();
+        }
         self.scan_new_dirs(&mut inner, now_ms);
         self.probe_pending(&mut inner, now_ms);
         self.prune_discoveries(&mut inner, now_ms);
@@ -266,6 +341,8 @@ impl AmplifierLocator {
     /// (`amplifier-session-locator.ts:331-361`). Tolerates a missing
     /// `projects/` dir entirely (lazily created by amplifier itself).
     fn snapshot_session_dirs(&self) -> HashSet<PathBuf> {
+        self.fs_scan_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut out = HashSet::new();
         let Ok(slugs) = std::fs::read_dir(&self.projects_dir) else {
             return out;
@@ -892,6 +969,79 @@ mod tests {
 
         assert!(located.is_empty());
         assert_eq!(locator.armed_count(), 0);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // -- idle short-circuit: tick() while unarmed performs ZERO filesystem
+    // scans (the "always-on FS-walk tax" fix). --
+
+    #[test]
+    fn tick_while_unarmed_performs_zero_filesystem_scans() {
+        let home = unique_temp_dir("idle-no-scan");
+        let locator = AmplifierLocator::new(home.clone());
+        // Construction already performed exactly one scan (seeding
+        // `known_dirs`, `with_config`'s doc comment) -- capture that as the
+        // baseline rather than assuming zero.
+        let baseline = locator.fs_scan_count();
+
+        // No terminal armed at any point below: every one of these ticks
+        // must be a pure no-op, performing NO further scan whatsoever.
+        for i in 0..5 {
+            let located = locator.tick(i * 1_000);
+            assert!(located.is_empty());
+        }
+
+        assert_eq!(
+            locator.fs_scan_count(),
+            baseline,
+            "tick() must not touch the filesystem while zero terminals are armed"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // -- arm-after-idle: a dir created while unarmed is NEVER a candidate
+    // for a terminal that arms afterward; a dir created strictly AFTER
+    // arming still resolves normally. Also proves the idle short-circuit
+    // doesn't silently break the known_dirs baseline. --
+
+    #[test]
+    fn dir_created_while_idle_never_binds_but_post_arm_dir_still_locates() {
+        let home = unique_temp_dir("idle-then-arm");
+        let locator = AmplifierLocator::new(home.clone());
+
+        // Idle period: zero terminals armed. tick() here is the
+        // idle-short-circuit no-op proven above -- included to make
+        // explicit that a leftover/foreign session dir appearing during
+        // this window must never surface for whichever terminal arms next.
+        assert!(locator.tick(0).is_empty());
+        let idle_lines = fresh_session_lines("/proj");
+        let idle_lines_ref: Vec<&str> = idle_lines.iter().map(String::as_str).collect();
+        write_events(&home, "proj", "sess-idle-leftover", &idle_lines_ref);
+        assert!(locator.tick(50).is_empty()); // still unarmed -- still a no-op
+
+        // Idle->armed transition at t=1_000: arm()'s own fresh disk read
+        // captures "sess-idle-leftover" as pre-existing (armed.snapshot),
+        // and the known_dirs baseline refresh (arm()'s doc comment) means
+        // the very next tick doesn't even re-admit it as a spurious
+        // "new" discovery.
+        assert!(locator.arm("t1", "amplifier", true, None, Some("/proj"), 1_000));
+
+        // A genuinely NEW dir, created strictly AFTER arming -- this is
+        // t1's real (lazily-created) session and must still resolve.
+        assert!(locator.note_submit("t1", 1_100));
+        let post_arm_lines = fresh_session_lines("/proj");
+        let post_arm_lines_ref: Vec<&str> = post_arm_lines.iter().map(String::as_str).collect();
+        write_events(&home, "proj", "sess-post-arm", &post_arm_lines_ref);
+
+        locator.tick(1_200); // admit + confirm the post-arm dir
+        let located = locator.tick(1_100 + AMPLIFIER_DIR_APPEAR_WINDOW_MS + 1);
+
+        assert_eq!(
+            located.len(),
+            1,
+            "exactly the post-arm dir must resolve, never the idle-leftover one"
+        );
+        assert_eq!(located[0].session_id, "sess-post-arm");
         let _ = std::fs::remove_dir_all(&home);
     }
 }
