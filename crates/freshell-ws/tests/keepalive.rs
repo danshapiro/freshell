@@ -168,50 +168,74 @@ async fn idle_connection_receives_periodic_pings_and_survives_multiple_cycles() 
     );
 }
 
-/// **Regression lock-in**: a slow broadcast consumer that falls behind past
-/// the channel's capacity (`RecvError::Lagged`) must NOT have its connection
-/// killed — `terminal.rs`'s `Err(RecvError::Lagged(_)) => {}` arm already
-/// skips the gap and keeps serving (unlike a naive `?`/`break` on any `Err`).
-/// This was verified RED by temporarily changing that arm to `=> break` and
-/// re-running: the test failed (no marker frame received, stream ended
-/// early) for the right reason; reverting restored green.
+/// **SAFE-10**: a slow broadcast consumer that falls behind past the
+/// channel's capacity (`RecvError::Lagged`) must NOT be left silently stale
+/// (the pre-SAFE-10 `Err(RecvError::Lagged(_)) => {}` arm skipped the gap
+/// and kept serving with NO signal that frames were dropped, so the
+/// client's UI would go permanently stale — ghost terminals, stuck busy
+/// indicators, missed `settings.updated`, etc.). Legacy parity
+/// (`server/ws-handler.ts:1562-1568`/`:1680-1710`): a slow consumer is
+/// detected and the socket is closed with `CLOSE_CODES.BACKPRESSURE` (4008,
+/// reason `"Backpressure"`), forcing the client to reconnect and run the
+/// full handshake resync (`ready` + `settings.updated` + inventory). The
+/// tokio broadcast model has no per-socket `bufferedAmount` equivalent (it
+/// drops rather than buffers), so this translates the *intent* (recover,
+/// don't go stale) via the same close code, not the buffered-bytes
+/// mechanism — see `terminal.rs`'s `Err(RecvError::Lagged(dropped))` arm.
+///
+/// Was RED before the fix: the pre-fix `Err(RecvError::Lagged(_)) => {}`
+/// arm never closes, so this test timed out waiting for a close frame and
+/// instead observed the (stale) post-flood marker delivered as an ordinary
+/// text frame, proving the old silent-skip behavior.
 #[tokio::test]
-async fn slow_broadcast_consumer_survives_lagged_frames_and_keeps_serving() {
+async fn slow_broadcast_consumer_lag_closes_with_backpressure_code_for_resync() {
     // A tiny channel capacity so a small flood guarantees a `Lagged` gap for a
     // consumer that hasn't drained yet.
     let broadcast_capacity = 4;
     let (url, broadcast_tx) = spawn_server(30_000, broadcast_capacity).await;
     let mut ws = connect_and_complete_handshake(&url).await;
 
-    // Flood well past capacity while the client isn't reading yet.
+    // Flood well past capacity while the client isn't reading yet — the
+    // connection's very first `bcast_rx.recv()` observes `Lagged`.
     for i in 0..(broadcast_capacity * 5) {
         let _ = broadcast_tx.send(format!(r#"{{"type":"flood","seq":{i}}}"#));
     }
-    // A distinguishable marker sent after the flood — proves frames delivered
-    // AFTER the lag are still reaching the client (the loop kept serving).
+    // A distinguishable marker sent after the flood — must NOT reach the
+    // client as an ordinary text frame; the connection should already be
+    // closing by the time this would have been delivered.
     let _ = broadcast_tx.send(r#"{"type":"marker","id":"post-flood"}"#.to_string());
 
-    let mut saw_marker = false;
+    let mut close_code = None;
+    let mut saw_marker_as_text = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(2), ws.next()).await {
+            Ok(Some(Ok(WsMessage::Close(frame)))) => {
+                close_code = frame.map(|f| f.code);
+                break;
+            }
             Ok(Some(Ok(WsMessage::Text(text)))) => {
                 if text.contains("post-flood") {
-                    saw_marker = true;
-                    break;
+                    saw_marker_as_text = true;
                 }
             }
             Ok(Some(Ok(_))) => {}
-            Ok(Some(Err(err))) => panic!("unexpected ws error (connection likely killed): {err}"),
-            Ok(None) => panic!("connection closed unexpectedly after a broadcast flood"),
+            Ok(Some(Err(_))) => break, // an abrupt close also reads as a stream error; fine either way
+            Ok(None) => break,
             Err(_) => break,
         }
     }
 
+    assert_eq!(
+        close_code,
+        Some(tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::from(4008)),
+        "a broadcast-lagged connection must close with the backpressure code (4008) so the \
+         client reconnects and resyncs, matching legacy's CLOSE_CODES.BACKPRESSURE"
+    );
     assert!(
-        saw_marker,
-        "connection should survive a broadcast flood past channel capacity and keep \
-         delivering post-flood frames (Lagged must skip-and-continue, not kill the socket)"
+        !saw_marker_as_text,
+        "a lagged connection must not keep silently serving stale post-lag frames as if \
+         nothing happened"
     );
 }
 

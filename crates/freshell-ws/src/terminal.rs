@@ -318,9 +318,43 @@ pub async fn run(
                             break;
                         }
                     }
-                    // Slow consumer dropped some frames: the broadcast set is tiny and
-                    // paced, so this is not expected; skip the gap and keep serving.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    // SAFE-10: this connection missed `dropped` broadcast frames
+                    // (settings.updated / terminal lifecycle / activity /
+                    // association / fresh-agent materialization / extensions /
+                    // tabs, ...) and would otherwise be permanently stale -- no
+                    // resync, no reconnect, no signal. Legacy never leaves a
+                    // slow consumer silently stale either: `ws-handler.ts`'s
+                    // `send()` (:1562-1568) applies `waitForBufferedAmountBelow`
+                    // (:1680-1710) and closes with `CLOSE_CODES.BACKPRESSURE`
+                    // (4008, reason "Backpressure") once a socket can't keep up,
+                    // forcing a reconnect that re-runs the full handshake resync
+                    // (ready + settings.updated + inventory). The tokio broadcast
+                    // model has no per-socket `bufferedAmount` to poll (it drops
+                    // rather than buffers), so this translates the *intent*
+                    // (recover, don't go stale) onto the SAME close code rather
+                    // than the buffered-bytes mechanism. Reusing 4008 here
+                    // (instead of inventing a new number) is deliberate: it is
+                    // legacy's own generic backpressure code, and this crate
+                    // already reuses it for TERM-09's catastrophic-backpressure
+                    // close just above -- both are the same family of "this
+                    // socket cannot keep up" close, distinguished by `reason`.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
+                        tracing::warn!(
+                            connection_id = conn_id,
+                            dropped = dropped,
+                            "ws.broadcast.lagged.close"
+                        );
+                        use axum::extract::ws::CloseFrame;
+                        let _ = ws_tx
+                            .send(Message::Close(Some(CloseFrame {
+                                code: 4008,
+                                reason: "Backpressure".into(),
+                            })))
+                            .await;
+                        close_reason = "broadcast_lagged";
+                        close_code = Some(4008);
+                        break;
+                    }
                     // Sender gone (server shutting down): stop polling the bus.
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         bus_open = false;
@@ -388,6 +422,34 @@ async fn handle_client_text(
         return true;
     };
     match message {
+        // SAFE-08: structured restore-diagnostic record, parity with
+        // server/ws-handler.ts:1901-1915's `client_restore_unavailable`
+        // session-lifecycle event. Server-side this is a PURE diagnostic --
+        // no reply, no state mutation (legacy `return`s immediately,
+        // `ws-handler.ts:1914`). The repair itself is entirely client-driven:
+        // a fresh `terminal.create { recoveryIntent:
+        // 'fresh_after_restore_unavailable' }` (TerminalView.tsx:4100-4112),
+        // deduped by the client's own createRequestId -- already handled by
+        // the existing `handle_create` path (`recovery_intent` is a plain
+        // passthrough field on `TerminalCreate`). Mirrors legacy's own
+        // `if (m.event === 'restore_unavailable')` guard so an unrecognized
+        // future `event` value is tolerated (accept-and-strip) rather than
+        // logged as a diagnostic it isn't.
+        ClientMessage::ClientDiagnostic(diag) if diag.event == "restore_unavailable" => {
+            tracing::info!(
+                event = "client_restore_unavailable",
+                connection_id = conn_id,
+                terminal_id = %diag.terminal_id,
+                tab_id = %diag.tab_id,
+                pane_id = %diag.pane_id,
+                mode = %diag.mode,
+                reason = %diag.reason,
+                has_session_ref = diag.has_session_ref,
+                "ws.restore.unavailable"
+            );
+            true
+        }
+        ClientMessage::ClientDiagnostic(_) => true,
         ClientMessage::TerminalCreate(create) => handle_create(create, ws_tx, state).await,
         ClientMessage::TerminalAttach(attach) => {
             handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1);
