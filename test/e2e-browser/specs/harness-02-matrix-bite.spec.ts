@@ -59,9 +59,14 @@ async function fetchHealthInstanceId(baseUrl: string): Promise<string> {
   return body.instanceId as string
 }
 
-/** `GET /api/server-info` -- the DIAG-05 route this bite's discriminator now keys on. */
-async function fetchServerInfo(baseUrl: string): Promise<{ runtime?: unknown; nodeVersion?: unknown }> {
-  const res = await fetch(`${baseUrl}/api/server-info`)
+/** `GET /api/server-info` -- the authenticated DIAG-05 discriminator route. */
+async function fetchServerInfo(
+  baseUrl: string,
+  token: string,
+): Promise<{ runtime?: unknown; nodeVersion?: unknown }> {
+  const res = await fetch(`${baseUrl}/api/server-info`, {
+    headers: { 'x-auth-token': token },
+  })
   expect(res.ok).toBe(true)
   return (await res.json()) as { runtime?: unknown; nodeVersion?: unknown }
 }
@@ -95,6 +100,7 @@ test.describe('HARNESS-02: Node/Rust matrix mutation negative-proof', () => {
     const instanceIdBeforeRestart = await fetchHealthInstanceId(serverInfo.baseUrl)
     const instanceIdBeforeRestartAgain = await fetchHealthInstanceId(serverInfo.baseUrl)
     expect(instanceIdBeforeRestartAgain).toBe(instanceIdBeforeRestart)
+    const runtimeInfoBeforeRestart = await fetchServerInfo(serverInfo.baseUrl, serverInfo.token)
 
     // --- (2) restart the SAME owned server (same home/port/token) ---
     if (!testServer.restart) {
@@ -127,9 +133,8 @@ test.describe('HARNESS-02: Node/Rust matrix mutation negative-proof', () => {
     // while the Rust binary always reports `runtime: "rust"` and never
     // `nodeVersion` -- a property of the binary itself, unaffected by
     // whether CFG-07 makes `instanceId` stable on both sides.
-    const infoBeforeRestart = await fetchServerInfo(serverInfo.baseUrl)
-    const infoAfterRestart = await fetchServerInfo(restartedInfo.baseUrl)
-    for (const info of [infoBeforeRestart, infoAfterRestart]) {
+    const runtimeInfoAfterRestart = await fetchServerInfo(restartedInfo.baseUrl, restartedInfo.token)
+    for (const info of [runtimeInfoBeforeRestart, runtimeInfoAfterRestart]) {
       if (e2eServerKind === 'rust') {
         expect(info.runtime).toBe('rust')
         expect(info.nodeVersion).toBeUndefined()
