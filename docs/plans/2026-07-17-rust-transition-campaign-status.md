@@ -150,6 +150,32 @@ the SAME agent conversation from both; terminals/layouts are per-server (differe
 3. Legacy on :3001 is now CURRENT MAIN (incl. #514 amplifier session indexing) — amplifier
    sessions appear in the legacy sidebar but NOT on :3002 (Rust doesn't index amplifier yet).
 
+## Standing wave process (how every wave runs)
+
+1. **Scope + dependency slice.** 3–5 items per wave from the readiness tiers; split into
+   parallel-safe tasks with EXPLICIT file ownership (disjoint crates/files per agent). Anything
+   sharing a file — especially main.rs wiring — goes in one task or sequential slots (lesson:
+   the 64083989/8888df30 non-bisectable span came from shared-worktree wiring absorption).
+2. **Investigate before building.** Non-obvious items get a read-only code-intel pass first,
+   producing an implementer-ready spec with legacy/origin-main file:line citations (this caught
+   "amplifier lists via metadata.json, not events.jsonl" before we built the wrong thing).
+3. **Parallel TDD implementation.** 2–3 implementers at once. Each must: cite its parity source
+   (frozen server/ or origin/main, stated per task), prove RED before GREEN, run focused crate
+   tests + fmt/clippy, keep frozen paths clean, and do a REAL-DATA acceptance check against the
+   staging clone or a throwaway home (caught the all-opencode bug and the 5-min cold boot).
+4. **Independent adversarial review.** Every commit reviewed at a pinned SHA in an isolated
+   worktree; reviewer re-reads legacy sources itself, re-runs tests, and reverts implementations
+   to prove tests bite (caught the untested reverse cascade and the chars-vs-bytes scrollback
+   bug). Importants are fixed or explicitly adjudicated with the user before "done".
+5. **Full gate run** by a separate fix-nothing ops agent: workspace tests + full oracle +
+   wire-shape differential + Playwright matrix vs the expected profile.
+6. **Deploy + record.** Rebuild; restart :3002 only in a user-approved window (live sessions);
+   verify against real data; update THIS doc (deviations, follow-ups, checklist movement);
+   push after every wave.
+
+Cross-cutting rules: codex-first triage (below); data-safety verified on clones before real
+state; honest gaps stay visible (fixme-with-trail, N/A-with-reason — never silent skips).
+
 ## Standing priority directive (user, 2026-07-17)
 
 **Codex CLI issues come first.** Codex is the user's default agent for the transition — drive
