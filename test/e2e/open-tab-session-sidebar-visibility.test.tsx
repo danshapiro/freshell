@@ -109,16 +109,20 @@ vi.mock('@/lib/ws-client', () => ({
   }),
 }))
 
-vi.mock('@/lib/api', () => ({
-  api: {
-    get: (url: string) => apiGet(url),
-    patch: vi.fn().mockResolvedValue({}),
-    post: vi.fn().mockResolvedValue({}),
-  },
-  fetchSidebarSessionsSnapshot: (options?: unknown) => fetchSidebarSessionsSnapshot(options),
-  searchSessions: (...args: any[]) => searchSessions(...args),
-  isApiUnauthorizedError: (err: any) => !!err && typeof err === 'object' && err.status === 401,
-}))
+vi.mock('@/lib/api', async (importActual) => {
+  const actual = await importActual<typeof import('@/lib/api')>()
+  return {
+    ...actual,
+    api: {
+      get: (url: string) => apiGet(url),
+      patch: vi.fn().mockResolvedValue({}),
+      post: vi.fn().mockResolvedValue({}),
+    },
+    fetchSidebarSessionsSnapshot: (options?: unknown) => fetchSidebarSessionsSnapshot(options),
+    searchSessions: (...args: any[]) => searchSessions(...args),
+    isApiUnauthorizedError: (err: any) => !!err && typeof err === 'object' && err.status === 401,
+  }
+})
 
 function broadcastWs(msg: any) {
   for (const handler of Array.from(wsHandlers)) {
@@ -445,35 +449,43 @@ describe('open tab session sidebar visibility (e2e)', () => {
 
     const store = createStore()
 
-    render(
-      <Provider store={store}>
-        <App />
-      </Provider>,
-    )
+    // The first bootstrap and sidebar loads fail transiently; the app logs the
+    // contained failure and recovers on the websocket `ready` refetch.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      render(
+        <Provider store={store}>
+          <App />
+        </Provider>,
+      )
 
-    await waitFor(() => {
-      expect(apiGet).toHaveBeenCalledWith('/api/bootstrap')
-    })
-
-    act(() => {
-      wsMocks.isReady = true
-      wsMocks.serverInstanceId = 'srv-recovered'
-      broadcastWs({
-        type: 'ready',
-        timestamp: new Date().toISOString(),
-        serverInstanceId: 'srv-recovered',
+      await waitFor(() => {
+        expect(apiGet).toHaveBeenCalledWith('/api/bootstrap')
       })
-    })
 
-    await waitFor(() => {
-      expect(store.getState().connection.availableClis).toEqual({ claude: true, codex: true })
-      expect(store.getState().settings.settings.sidebar.excludeFirstChatSubstrings).toEqual(['__AUTO__'])
-      expect(screen.queryByText('Hidden Auto Session')).not.toBeInTheDocument()
-      expect(screen.getAllByText('Visible Manual Session').length).toBeGreaterThan(0)
-    })
+      act(() => {
+        wsMocks.isReady = true
+        wsMocks.serverInstanceId = 'srv-recovered'
+        broadcastWs({
+          type: 'ready',
+          timestamp: new Date().toISOString(),
+          serverInstanceId: 'srv-recovered',
+        })
+      })
 
-    expect(bootstrapCalls).toBe(2)
-    expect(sidebarCalls).toBe(2)
+      await waitFor(() => {
+        expect(store.getState().connection.availableClis).toEqual({ claude: true, codex: true })
+        expect(store.getState().settings.settings.sidebar.excludeFirstChatSubstrings).toEqual(['__AUTO__'])
+        expect(screen.queryByText('Hidden Auto Session')).not.toBeInTheDocument()
+        expect(screen.getAllByText('Visible Manual Session').length).toBeGreaterThan(0)
+      })
+
+      expect(bootstrapCalls).toBe(2)
+      expect(sidebarCalls).toBe(2)
+      expect(warnSpy).toHaveBeenCalledWith('[App]', 'Failed to load bootstrap data', expect.anything())
+    } finally {
+      warnSpy.mockRestore()
+    }
   })
 
   it('ignores legacy sessions.updated websocket pushes because the sidebar window is HTTP-owned', async () => {
