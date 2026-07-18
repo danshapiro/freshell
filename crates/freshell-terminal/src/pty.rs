@@ -334,6 +334,13 @@ impl PtyTerminal {
         let _ = self.killer.kill();
         #[cfg(unix)]
         if let Some(pid) = self.pid {
+            // SAFE-11/TERM-22 stale-pid hardening: record the pid this
+            // instance is ABOUT to group-signal (test-only observability
+            // seam -- see `take_group_kill_log`) before actually sending it,
+            // so a test can assert this branch was (or wasn't) reached
+            // without having to inspect real process state.
+            #[cfg(test)]
+            record_group_kill(pid);
             // SAFETY: `libc::kill` with a negative pid signals the whole
             // process group rooted at that pid; a process's own group is
             // always safe to signal (we only ever signal a group WE
@@ -344,6 +351,55 @@ impl PtyTerminal {
             }
         }
     }
+
+    /// SAFE-11/TERM-22 (stale-pid group-kill hardening): mark this
+    /// `PtyTerminal` as already reaped and invalidate its cached OS pid,
+    /// WITHOUT touching the killer or joining any thread. Called from
+    /// `TerminalRegistry::finish_pty_exit` the moment a child exits
+    /// NATURALLY -- which runs from inside this very instance's reader
+    /// thread (see that function's doc comment), so joining
+    /// `reader_thread`/`waiter_thread` here would deadlock. Idempotent.
+    ///
+    /// Why this exists: a terminal that exits naturally is RETAINED in the
+    /// registry (not removed), so its `PtyTerminal` can still be reached by
+    /// a LATER, unrelated `kill()` (e.g. `TerminalRegistry::kill_all`'s
+    /// shutdown sweep, which walks every tracked id, including
+    /// retained-exited ones). Between this natural exit and that later
+    /// call, the OS is free to recycle this struct's cached `pid` to a
+    /// completely unrelated process (and process group) leader. Without
+    /// this guard, `kill()` would still attempt
+    /// `libc::kill(-pid, SIGKILL)` against that now-stale, recycled pid --
+    /// SIGKILLing an innocent process group. Setting `reaped = true` makes
+    /// `kill()` a guaranteed no-op (its very first line); clearing `pid` is
+    /// a second, independent guard against the same class of bug even if
+    /// that check were ever removed or bypassed.
+    pub(crate) fn mark_naturally_exited(&mut self) {
+        self.reaped = true;
+        self.pid = None;
+    }
+}
+
+// SAFE-11/TERM-22 test-only signal-recording seam: records every pid this
+// process ACTUALLY attempted to group-kill via `PtyTerminal::kill`, so tests
+// can assert a group-kill was (positive control) or was NOT (the stale-pid
+// regression this hardens against) attempted, without needing to inspect
+// real OS process state. Thread-local so parallel `cargo test` runs (each
+// test gets its own thread by default) never interfere with each other.
+#[cfg(test)]
+thread_local! {
+    static GROUP_KILL_LOG: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_group_kill(pid: u32) {
+    GROUP_KILL_LOG.with(|log| log.borrow_mut().push(pid));
+}
+
+/// Drain and return every pid recorded by [`record_group_kill`] on the
+/// CURRENT thread so far (test-only).
+#[cfg(test)]
+pub(crate) fn take_group_kill_log() -> Vec<u32> {
+    GROUP_KILL_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
 }
 
 impl Drop for PtyTerminal {

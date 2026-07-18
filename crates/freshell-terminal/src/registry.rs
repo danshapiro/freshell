@@ -722,8 +722,9 @@ impl TerminalRegistry {
         let Some(mut handle) = handle else {
             return false;
         };
-        {
+        let was_running = {
             let mut s = handle.shared.lock().expect("terminal lock");
+            let was_running = s.status == TerminalRunStatus::Running;
             s.status = TerminalRunStatus::Exited;
             s.exit_code = Some(0);
             let exit = ServerMessage::TerminalExit(TerminalExit {
@@ -734,9 +735,27 @@ impl TerminalRegistry {
                 (sub.sink)(exit.clone());
             }
             s.subscribers.clear();
-        }
-        if let Some(mut pty) = handle.pty.take() {
-            pty.kill();
+            was_running
+        };
+        // SAFE-11/TERM-22 (stale-pid group-kill hardening, second independent
+        // layer): only ever call `pty.kill()` when the registry itself still
+        // believed this terminal was Running. A terminal already marked
+        // `Exited` (via `finish_pty_exit` -- RETAINED in the inventory, see
+        // that function's doc comment) reaches this same `kill()` whenever a
+        // later, unrelated sweep (`kill_all`'s shutdown sweep walks EVERY
+        // tracked id, including retained-exited ones) names it. Its
+        // `PtyTerminal`'s cached OS pid may since have been recycled by the
+        // kernel to a completely unrelated process group; blindly calling
+        // `pty.kill()` here would attempt to SIGKILL that unrelated group.
+        // (The `PtyTerminal` itself is independently hardened too --
+        // `mark_naturally_exited` marks it reaped + drops the cached pid at
+        // natural-exit time -- but this check means the registry never even
+        // ATTEMPTS the call for a non-Running terminal, regardless of the
+        // `PtyTerminal`'s own state.)
+        if was_running {
+            if let Some(mut pty) = handle.pty.take() {
+                pty.kill();
+            }
         }
         true
     }
@@ -781,9 +800,23 @@ impl TerminalRegistry {
     /// the very reader thread this runs on.
     pub fn finish_pty_exit(&self, terminal_id: &str, exit_code: i64) -> bool {
         let shared = {
-            let inner = self.inner.lock().expect("registry lock");
-            match inner.terminals.get(terminal_id) {
-                Some(handle) => Arc::clone(&handle.shared),
+            let mut inner = self.inner.lock().expect("registry lock");
+            match inner.terminals.get_mut(terminal_id) {
+                Some(handle) => {
+                    // SAFE-11/TERM-22 (stale-pid group-kill hardening): mark
+                    // the underlying PtyTerminal reaped + drop its cached pid
+                    // NOW, at the moment of natural exit, rather than leaving
+                    // it live in the (retained) record for a later, unrelated
+                    // `kill()`/`kill_all()` to potentially re-signal against a
+                    // since-recycled pid. Safe to call from here: it neither
+                    // blocks nor joins any thread (see its own doc comment),
+                    // which matters because natural exit runs THIS callback
+                    // from inside the PtyTerminal's own reader thread.
+                    if let Some(pty) = handle.pty.as_mut() {
+                        pty.mark_naturally_exited();
+                    }
+                    Arc::clone(&handle.shared)
+                }
                 None => return false, // killed (kill removes the record) or unknown
             }
         };
@@ -1444,6 +1477,117 @@ mod tests {
         }
         // Idempotent / empty-registry-safe: a second call finds nothing left to kill.
         assert_eq!(reg.kill_all(), 0);
+    }
+
+    /// SAFE-11/TERM-22 stale-pid group-kill hardening (reviewer "Important"
+    /// finding on `edf1e93d`): a terminal that exits NATURALLY is RETAINED in
+    /// the registry (`finish_pty_exit` never removes the record -- see its
+    /// doc comment), so a LATER, unrelated `kill_all()` sweep (e.g. server
+    /// shutdown) still walks it. Its `PtyTerminal`'s cached OS pid may, by
+    /// the time that sweep runs, have been recycled by the kernel to a
+    /// completely unrelated process (and process group) leader.
+    /// `kill_all`/`kill` must never re-attempt the group-kill signal
+    /// (`libc::kill(-pid, SIGKILL)`) against a terminal the registry doesn't
+    /// believe is still Running -- proven here via the pty.rs test-only
+    /// signal-recording seam, not just by checking the terminal "looks" dead.
+    #[test]
+    fn kill_all_never_group_signals_a_terminal_that_already_exited_naturally() {
+        let reg = TerminalRegistry::new();
+        let reg_for_exit = reg.clone();
+        let spec = SpawnSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "exit 0".into()],
+            env_overrides: std::collections::BTreeMap::new(),
+            cwd: None,
+            cols: 80,
+            rows: 24,
+        };
+        let env = std::collections::BTreeMap::new();
+        let terminal_id = "T-natural-exit".to_string();
+        let on_exit_id = terminal_id.clone();
+        reg.create(
+            &spec,
+            &env,
+            terminal_id.clone(),
+            "S".to_string(),
+            None,
+            Some(Box::new(move |code| {
+                // Mirrors the production wiring (`freshell-ws`'s on_exit hook):
+                // the reader thread calls `finish_pty_exit` on natural exit.
+                reg_for_exit.finish_pty_exit(&on_exit_id, code);
+            })),
+        )
+        .expect("spawn /bin/sh -c 'exit 0'");
+
+        // Wait for the natural exit to be observed (bounded poll; the child
+        // exits near-instantly, so this deadline is generous headroom, not a
+        // real-time dependency). NOTE: `is_running` only checks the record's
+        // presence in the map -- a naturally-exited terminal is RETAINED
+        // (still present), so it never goes false here; the actual signal is
+        // the record's `status` flipping to `Exited` (`finish_pty_exit`).
+        let exited = |reg: &TerminalRegistry| {
+            reg.inventory()
+                .iter()
+                .any(|t| t.terminal_id == terminal_id && t.status == TerminalRunStatus::Exited)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !exited(&reg) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            exited(&reg),
+            "the spawned child must exit naturally within the deadline"
+        );
+
+        // Discard anything recorded incidentally before the operation under test.
+        let _ = crate::pty::take_group_kill_log();
+
+        let killed = reg.kill_all();
+        assert_eq!(killed, 1, "the retained-exited terminal is still reaped");
+
+        assert!(
+            crate::pty::take_group_kill_log().is_empty(),
+            "kill_all must NOT attempt a group-kill signal against a terminal \
+             that already exited naturally -- its cached pid may have been \
+             recycled to an unrelated process group"
+        );
+    }
+
+    /// Positive control for the test above: a terminal that IS still Running
+    /// when `kill()` is called must still be group-signaled (the SAFE-11 fix
+    /// from `edf1e93d` this hardening must not silently disable).
+    #[test]
+    fn kill_group_signals_a_still_running_terminal() {
+        let reg = TerminalRegistry::new();
+        let spec = SpawnSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            env_overrides: std::collections::BTreeMap::new(),
+            cwd: None,
+            cols: 80,
+            rows: 24,
+        };
+        let env = std::collections::BTreeMap::new();
+        let terminal_id = "T-running".to_string();
+        reg.create(
+            &spec,
+            &env,
+            terminal_id.clone(),
+            "S".to_string(),
+            None,
+            None,
+        )
+        .expect("spawn /bin/sh -c 'sleep 30'");
+        assert!(reg.is_running(&terminal_id));
+
+        let _ = crate::pty::take_group_kill_log();
+        assert!(reg.kill(&terminal_id));
+
+        assert_eq!(
+            crate::pty::take_group_kill_log().len(),
+            1,
+            "kill() on a still-Running terminal must group-signal its PTY exactly once"
+        );
     }
 
     #[test]
