@@ -149,8 +149,20 @@ struct CodexSession {
 enum EnsureAliveOutcome {
     /// The session's sidecar was already alive; no respawn was needed.
     AlreadyRunning,
-    /// The sidecar had crashed; a fresh sidecar + thread were spawned and the session was
-    /// materialized under `new_session_id`.
+    /// The sidecar had crashed; recovery respawned a fresh sidecar and `thread/resume`d
+    /// the ORIGINAL thread id (matching `adapter.ts`'s `ensureRuntime`, `adapter.ts:762-799`
+    /// -- this client's crash recovery has a real resume RPC now; see
+    /// [`FreshCodexState::ensure_session_alive`]'s doc comment). The session's durable
+    /// identity is unchanged -- no `freshAgent.session.materialized` broadcast -- but the
+    /// sidecar/turn state is new to this connection, so callers treat it like fresh state
+    /// (e.g. `handle_attach` still emits a snapshot).
+    Recovered,
+    /// The sidecar had crashed AND the app-server no longer has the thread (a genuine
+    /// `threadNotFound` on resume, e.g. the on-disk rollout was deleted) -- recovery fell
+    /// back to minting a brand-new thread on a fresh sidecar, and the session was
+    /// materialized under `new_session_id`. Conversation memory for the old thread is
+    /// lost; see [`FreshCodexState::ensure_session_alive`]'s doc comment for the client
+    /// notification story.
     Respawned { new_session_id: String },
 }
 
@@ -386,6 +398,9 @@ impl FreshCodexState {
 
         match self.ensure_session_alive(&session_id).await {
             Ok(EnsureAliveOutcome::AlreadyRunning) => {}
+            // FIX-2: a resume-recovered session keeps its ORIGINAL id -- nothing for
+            // `handle_send` to update, same as the already-running case.
+            Ok(EnsureAliveOutcome::Recovered) => {}
             Ok(EnsureAliveOutcome::Respawned { new_session_id }) => {
                 session_id = new_session_id;
             }
@@ -606,6 +621,13 @@ impl FreshCodexState {
             let (resolved_id, should_emit_snapshot) =
                 match self.ensure_session_alive(&msg.session_id).await {
                     Ok(EnsureAliveOutcome::AlreadyRunning) => (msg.session_id.clone(), false),
+                    // FIX-2: a resume-recovered session keeps its ORIGINAL id, but the
+                    // sidecar/turn state is new to this connection (memory MAY have moved,
+                    // an in-flight turn is gone, etc) -- unlike the plain-tracked-and-alive
+                    // no-op case above, this genuinely-new state DOES warrant a fresh
+                    // snapshot, same as the not-tracked-resume and mint-new-respawn
+                    // branches below.
+                    Ok(EnsureAliveOutcome::Recovered) => (msg.session_id.clone(), true),
                     Ok(EnsureAliveOutcome::Respawned { new_session_id }) => (new_session_id, true),
                     Err(EnsureAliveError::NotFound) => {
                         // Raced away between the `tracked` check and here (e.g. a concurrent
@@ -673,13 +695,38 @@ impl FreshCodexState {
     // ── lazy restart after crash (PR-4, adapter.ts:935-946 ensureRuntime invariant) ─
 
     /// Ensure `session_id`'s sidecar is alive, transparently respawning it if the
-    /// exit-watcher flipped [`CodexSession::exited`] (a crash/disconnect). This client has
-    /// no `thread/resume` RPC, so recovery cannot continue the SAME codex thread; instead it
-    /// mints a fresh thread on a fresh sidecar and MATERIALIZES the session under the new
-    /// thread id -- the same placeholder\u2192durable identity-move pattern the opencode slice
-    /// already uses (`FreshAgentSessionMaterialized`), just triggered by crash-recovery
-    /// instead of first-turn creation. Callers (`handle_send`/`handle_attach`) must use the
-    /// returned id for anything session-scoped afterward.
+    /// exit-watcher flipped [`CodexSession::exited`] (a crash/disconnect).
+    ///
+    /// FIX-2 (codex-first triage): this client DOES have a `thread/resume` RPC
+    /// ([`CodexAppServerClient::resume_thread`], added for [`Self::ensure_session_resumable`]'s
+    /// historical-thread path) -- the doc comment that used to live here claiming otherwise
+    /// was stale. Recovery is resume-first now, matching the reference's `ensureRuntime`
+    /// (`adapter.ts:762-802`, via `toCodexResumeInput`, `adapter.ts:151-162`): respawn a fresh
+    /// sidecar, then `thread/resume` the ORIGINAL `session_id` (passing this session's stored
+    /// `cwd`/`model`/`sandbox`/`permissionMode`, mirroring `toCodexResumeInput`'s "forward
+    /// what we have"), and re-register the recovered runtime under the SAME id -- no
+    /// `freshAgent.session.materialized` broadcast, because the durable identity never
+    /// changed and conversation memory survives (this is the actual crash-recovery bug fix:
+    /// the OLD mint-new path silently discarded the model's memory of the conversation).
+    ///
+    /// If the app-server rejects the resume WITH those settings for any reason other than a
+    /// genuine "thread not found" (a stale/invalid model or sandbox value, say), one retry is
+    /// made with NO settings at all -- `handle_send`'s own "re-normalize on send" already
+    /// re-applies the real settings on the next turn, so a resume succeeding with defaults is
+    /// strictly better than failing over a value we can't currently validate.
+    ///
+    /// Only a genuine `threadNotFound` on resume ([`is_codex_thread_not_found`]) falls back to
+    /// the ORIGINAL mint-new-thread behavior ([`Self::respawn_as_new_thread_after_crash`]):
+    /// there is truly no thread left to resume, so a fresh one is minted and materialized
+    /// under a new id, same as before -- conversation memory for the old thread is genuinely
+    /// lost in that (rare) case.
+    ///
+    /// Single-flighted per session id via [`Self::resuming`] (the SAME per-thread-id lock map
+    /// [`Self::ensure_session_resumable`] uses): a `freshAgent.send` and a `freshAgent.attach`
+    /// racing on the SAME crashed session must respawn exactly once, not twice. Callers
+    /// (`handle_send`/`handle_attach`) only need the returned id for anything session-scoped
+    /// afterward when the outcome is [`EnsureAliveOutcome::Respawned`] -- for
+    /// [`EnsureAliveOutcome::Recovered`], `session_id` is unchanged.
     async fn ensure_session_alive(
         &self,
         session_id: &str,
@@ -699,6 +746,170 @@ impl FreshCodexState {
             )
         };
 
+        // Single-flight: acquire (and possibly create) this session id's per-thread lock,
+        // shared with `ensure_session_resumable`'s map so a concurrent historical-thread
+        // resume and a crash recovery for the SAME id can't race either.
+        let per_thread_lock = {
+            let mut guard = self.resuming.lock().await;
+            guard
+                .entry(session_id.to_string())
+                .or_insert_with(|| Arc::new(TokioMutex::new(())))
+                .clone()
+        };
+        let _permit = per_thread_lock.lock().await;
+
+        // Double-checked: a concurrent caller (e.g. a racing `freshAgent.send` and
+        // `freshAgent.attach` for the same session) may have already completed recovery
+        // while this call waited for the per-thread lock above.
+        {
+            let guard = self.sessions.lock().await;
+            match guard.get(session_id) {
+                Some(session) if !session.exited.load(Ordering::SeqCst) => {
+                    return Ok(EnsureAliveOutcome::AlreadyRunning);
+                }
+                Some(_) => {}
+                None => return Err(EnsureAliveError::NotFound),
+            }
+        }
+
+        let (client, notifs, ownership_id, child) = self
+            .spawn_sidecar(cwd.as_deref())
+            .await
+            .map_err(EnsureAliveError::RespawnFailed)?;
+
+        // `toCodexResumeInput` (adapter.ts:151-162): forward only settings this process
+        // actually has recorded for the thread. An empty `model` means `handle_send` never
+        // ran for this session (mirrors `ensure_session_resumable`'s "unknown until a
+        // freshAgent.send supplies one" convention, and `CodexSession::model`'s doc comment)
+        // -- omit it (`None`) rather than resuming with an empty string.
+        let resume_model = (!model.is_empty()).then(|| model.clone());
+        let first_attempt = client
+            .resume_thread(
+                session_id,
+                StartThreadParams {
+                    cwd: cwd.clone(),
+                    model: resume_model,
+                    sandbox: sandbox.clone(),
+                    approval_policy: permission_mode.clone(),
+                },
+            )
+            .await;
+
+        let resume_result = match first_attempt {
+            Ok(started) => Ok(started),
+            Err(err) if is_codex_thread_not_found(&err) => Err(err),
+            // Not a "thread not found" -- retry once with no settings at all in case the
+            // app-server rejected one of them; `handle_send` re-applies the real settings
+            // on the next turn regardless.
+            Err(_) => {
+                client
+                    .resume_thread(
+                        session_id,
+                        StartThreadParams {
+                            cwd: cwd.clone(),
+                            model: None,
+                            sandbox: None,
+                            approval_policy: None,
+                        },
+                    )
+                    .await
+            }
+        };
+
+        let started = match resume_result {
+            Ok(started) => started,
+            Err(err) if is_codex_thread_not_found(&err) => {
+                // Genuine "thread not found": this sidecar/socket already burned its resume
+                // attempt(s) against a thread the app-server has truly forgotten -- close it
+                // and fall back to the ORIGINAL mint-new-thread recovery on a fresh sidecar.
+                client.close().await;
+                let mut dead_child = child;
+                let _ = dead_child.start_kill();
+                reap_owned_codex_sidecars(&ownership_id);
+                return self
+                    .respawn_as_new_thread_after_crash(
+                        session_id,
+                        cwd,
+                        model,
+                        effort,
+                        sandbox,
+                        permission_mode,
+                    )
+                    .await;
+            }
+            Err(err) => {
+                client.close().await;
+                let mut child = child;
+                let _ = child.start_kill();
+                reap_owned_codex_sidecars(&ownership_id);
+                return Err(EnsureAliveError::RespawnFailed(err.to_string()));
+            }
+        };
+        debug_assert_eq!(
+            started.thread_id, session_id,
+            "thread/resume must preserve the requested id"
+        );
+
+        let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let exited = Arc::new(AtomicBool::new(false));
+        let consumer = self.spawn_consumer(notifs, session_id.to_string(), active_turn.clone());
+        let (kill_tx, kill_rx) = oneshot::channel();
+        let watcher = spawn_exit_watcher(
+            child,
+            ownership_id,
+            session_id.to_string(),
+            self.broadcast_tx.clone(),
+            kill_rx,
+            exited.clone(),
+        );
+
+        // `HashMap::insert` on an existing key overwrites in place, dropping the old (dead
+        // sidecar's) entry -- same convention `respawn_as_new_thread_after_crash` and
+        // `ensure_session_resumable` both already rely on; its `consumer`/`watcher`
+        // `JoinHandle`s are not aborted, they simply run to completion on their own (the old
+        // notification stream is closed, and the old watcher already fired the self-heal
+        // broadcast that got us here).
+        {
+            let mut guard = self.sessions.lock().await;
+            guard.insert(
+                session_id.to_string(),
+                CodexSession {
+                    client,
+                    model,
+                    effort,
+                    cwd,
+                    sandbox,
+                    permission_mode,
+                    active_turn,
+                    consumer,
+                    kill_tx: Some(kill_tx),
+                    watcher,
+                    exited,
+                },
+            );
+        }
+
+        Ok(EnsureAliveOutcome::Recovered)
+    }
+
+    /// The ORIGINAL crash-recovery fallback (kept verbatim in behavior, just extracted so
+    /// [`Self::ensure_session_alive`]'s resume-first path can fall back to it): mint a fresh
+    /// thread on a fresh sidecar and MATERIALIZE the session under the new thread id -- the
+    /// same placeholder\u2192durable identity-move pattern the opencode slice already uses
+    /// (`FreshAgentSessionMaterialized`). Reached only when [`is_codex_thread_not_found`]
+    /// proves the app-server has genuinely forgotten `old_session_id`'s thread; conversation
+    /// memory for it is lost. Callers must use the returned `new_session_id` for anything
+    /// session-scoped afterward.
+    #[allow(clippy::too_many_arguments)]
+    async fn respawn_as_new_thread_after_crash(
+        &self,
+        old_session_id: &str,
+        cwd: Option<String>,
+        model: String,
+        effort: Option<String>,
+        sandbox: Option<String>,
+        permission_mode: Option<String>,
+    ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
         let (client, notifs, ownership_id, child) = self
             .spawn_sidecar(cwd.as_deref())
             .await
@@ -738,7 +949,7 @@ impl FreshCodexState {
 
         {
             let mut guard = self.sessions.lock().await;
-            guard.remove(session_id);
+            guard.remove(old_session_id);
             guard.insert(
                 new_thread_id.clone(),
                 CodexSession {
@@ -759,7 +970,7 @@ impl FreshCodexState {
 
         self.broadcast(&ServerMessage::FreshAgentSessionMaterialized(
             FreshAgentSessionMaterialized {
-                previous_session_id: session_id.to_string(),
+                previous_session_id: old_session_id.to_string(),
                 provider: PROVIDER.to_string(),
                 session_id: new_thread_id.clone(),
                 session_type: SESSION_TYPE.to_string(),
@@ -1565,15 +1776,30 @@ fn summarize_codex_items(items: &[Value]) -> String {
 fn build_codex_snapshot_json(
     thread_id: &str,
     raw: &Value,
-    active_turn_present: bool,
+    _active_turn_present: bool,
 ) -> Result<Value, String> {
     let thread = raw.get("thread").cloned().unwrap_or_else(|| json!({}));
     let status = normalize_codex_thread_status(thread.get("status").unwrap_or(&Value::Null));
-    // `isRunning` (`normalize.ts:756`): the reference also treats a `compacting` status as
-    // running, which this client's [`CodexStatus`] does not model; folding in the
-    // independently-tracked in-flight-turn bit keeps `send`/`interrupt`/`fork` correct even
-    // though the enum itself has no `Compacting` variant.
-    let is_running = status == CodexStatus::Running || active_turn_present;
+    // `isRunning` (`normalize.ts:756`): PURELY the freshly-read thread status --
+    // `status === 'running' || status === 'compacting'` -- and NOTHING else. The reference
+    // has no independently-tracked in-flight-turn fallback here.
+    //
+    // FIX-1 (codex-first triage, `test/e2e-browser/specs/restore-matrix.spec.ts`'s
+    // `test.fail` annotation): this used to also OR in `active_turn_present` (this
+    // process's own `active_turn` bookkeeping, kept for `freshAgent.interrupt` targeting)
+    // as a workaround for [`CodexStatus`] having no `Compacting` variant. That was a
+    // correctness regression: `active_turn_present` is server-local, in-memory state that
+    // can lag the app-server's actual thread status for reasons having nothing to do with
+    // whether a turn is genuinely still running (a missed/reordered notification, a
+    // resumed session inheriting stale bookkeeping, etc). Any such lag permanently wedged
+    // `capabilities.send: false` even after the app-server itself reported `idle` --
+    // exactly the observed regression: the FreshCodex composer never re-enabled after the
+    // first live turn completed. `active_turn_present` is intentionally UNUSED here now
+    // (retained as a parameter -- see doc comment on the caller,
+    // [`FreshCodexState::get_snapshot`] -- for callers that still need the value for other
+    // purposes); a snapshot is sendable whenever the freshly-read status says so, full
+    // stop, matching the legacy adapter exactly.
+    let is_running = status == CodexStatus::Running;
     let revision = thread.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
     let summary = thread
         .get("preview")
@@ -2341,6 +2567,136 @@ pub(crate) mod tests {
         cmd.spawn().expect("spawn sleep fixture")
     }
 
+    /// Like [`insert_fake_session`], but wires the REAL notification-consumer
+    /// ([`FreshCodexState::spawn_consumer`]) instead of a no-op, so a scripted
+    /// `turn/completed` notification pushed via the paired
+    /// [`freshell_codex::ChannelPeer`] actually flows through [`reduce_notification`]
+    /// and clears `active_turn` -- exercising the exact production path `get_snapshot`
+    /// (REST) relies on for `capabilities.send`.
+    async fn insert_fake_session_with_real_consumer(
+        state: &FreshCodexState,
+        thread_id: &str,
+        client: Arc<CodexAppServerClient>,
+        active_turn: Arc<StdMutex<Option<String>>>,
+        notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
+        child: tokio::process::Child,
+        ownership_id: &str,
+    ) -> tokio::sync::broadcast::Receiver<String> {
+        let consumer = state.spawn_consumer(notifs, thread_id.to_string(), active_turn.clone());
+        let (kill_tx, kill_rx) = oneshot::channel();
+        let exited = Arc::new(AtomicBool::new(false));
+        let watcher = spawn_exit_watcher(
+            child,
+            ownership_id.to_string(),
+            thread_id.to_string(),
+            state.broadcast_tx.clone(),
+            kill_rx,
+            exited.clone(),
+        );
+        state.sessions.lock().await.insert(
+            thread_id.to_string(),
+            CodexSession {
+                client,
+                model: "gpt-5.3-codex-spark".to_string(),
+                effort: None,
+                cwd: None,
+                sandbox: None,
+                permission_mode: None,
+                active_turn,
+                consumer,
+                kill_tx: Some(kill_tx),
+                watcher,
+                exited,
+            },
+        );
+        state.broadcast_tx.subscribe()
+    }
+
+    /// FIX-1 (codex-first triage): after a turn genuinely completes through the REAL
+    /// notification-consumer path (not a hand-set mutex), a subsequent `get_snapshot`
+    /// must report `capabilities.send: true` -- matching the legacy adapter
+    /// (`normalizeCodexThreadSnapshot`, `normalize.ts:756,765`), which computes
+    /// `send`/`interrupt`/`fork` PURELY from the freshly-read thread status, never
+    /// from an independently-tracked in-flight-turn bit. Reproduces the E2E-observed
+    /// regression documented in `test/e2e-browser/specs/restore-matrix.spec.ts`'s
+    /// `test.fail` comment: the FreshCodex composer stays permanently disabled after
+    /// the first live turn completes.
+    #[tokio::test]
+    async fn get_snapshot_reports_sendable_after_a_turn_completes_via_the_real_notification_stream()
+    {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, mut rx) = state_with_bus();
+        let active_turn = Arc::new(StdMutex::new(Some("turn-1".to_string())));
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-1",
+            client,
+            active_turn.clone(),
+            notifs,
+            spawn_sleeper(),
+            "codex-sidecar-test-turn-complete-capabilities",
+        )
+        .await;
+
+        // The real app-server pushes `turn/completed` for the tracked thread -- exactly
+        // what `handle_send`'s consumer (`spawn_consumer` -> `reduce_notification`)
+        // observes in production.
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-1", "turnId": "turn-1", "status": "completed" }),
+        );
+
+        // Deterministic sync: the consumer clears `active_turn` BEFORE it broadcasts the
+        // resulting frames, so waiting for the idle snapshot frame here proves the clear
+        // has already happened by the time `get_snapshot` is called below.
+        let frame = rx.recv().await.expect("idle snapshot frame");
+        let wire: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(wire["event"]["type"], "freshAgent.session.snapshot");
+
+        assert!(
+            active_turn.lock().expect("active_turn mutex").is_none(),
+            "active_turn must be cleared by the real notification consumer"
+        );
+
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move { st.get_snapshot("thread-1", None).await })
+        };
+
+        let (init_id, init_method, _p) = peer.expect_request().await;
+        assert_eq!(init_method, "initialize");
+        peer.respond(
+            &init_id,
+            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+        );
+        let _ = peer.expect_notification().await;
+
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        peer.respond(
+            &id,
+            json!({
+                "thread": {
+                    "id": "thread-1",
+                    "status": { "type": "idle" },
+                    "turns": [],
+                }
+            }),
+        );
+
+        let snapshot = driver.await.unwrap().expect("snapshot builds");
+        assert_eq!(snapshot["status"], json!("idle"));
+        assert_eq!(
+            snapshot["capabilities"]["send"],
+            json!(true),
+            "composer must be sendable once the real notification stream has cleared the active turn"
+        );
+        assert_eq!(snapshot["capabilities"]["interrupt"], json!(false));
+    }
+
     #[tokio::test]
     async fn handle_interrupt_issues_rpc_for_tracked_turn_and_clears_it() {
         let (transport, peer) = freshell_codex::new_channel_transport();
@@ -2927,31 +3283,34 @@ pub(crate) mod tests {
         assert_eq!(exited_frame["sessionId"], session_id);
     }
 
+    /// FIX-2 (codex-first triage): crash recovery is resume-first now. The crashed
+    /// sidecar respawns, `thread/resume`s the ORIGINAL thread id, and the turn completes
+    /// under that SAME id -- no `freshAgent.session.materialized` broadcast (the durable
+    /// identity never changed), unlike the old mint-new-thread behavior this test used to
+    /// pin (see the removed `assert_ne!(new_thread_id, thread_id, ...)` this replaces).
     #[tokio::test(flavor = "multi_thread")]
     // Intentional: `_guard` is held across every `.await` in this test BY DESIGN, so it
     // serializes against `attach_after_unrequested_crash_recovers_and_emits_a_snapshot`
     // (the other test mutating the process-global `CODEX_CMD`/`FAKE_CODEX_APP_SERVER_BEHAVIOR`
     // env vars) for the test's ENTIRE duration, not just around individual calls.
     #[allow(clippy::await_holding_lock)]
-    async fn send_after_unrequested_crash_lazily_respawns_and_completes_with_no_error_frame() {
+    async fn send_after_unrequested_crash_resumes_the_same_thread_id_and_completes_with_no_error_frame(
+    ) {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (st, mut rx) = state_with_bus();
 
         // The FIRST spawn crashes deterministically right after `thread/start` responds
         // (the fixture's `exitProcessAfterMethodsOnce`) -- a real, observable "the child
-        // process exited on its own" crash, not a simulated flag flip. A distinct
-        // `threadStartThreadId` (vs the respawn's below) proves the respawned session is a
-        // genuinely NEW thread, not a coincidental id collision from the fixture's shared
-        // "thread-new-1" default.
+        // process exited on its own" crash, not a simulated flag flip.
         configure_fake_codex_cmd(
             r#"{"threadStartThreadId":"thread-original","exitProcessAfterMethodsOnce":["thread/start"]}"#,
         );
         let thread_id = create_real_fake_session(&st, &mut rx).await;
         wait_for_self_heal(&st, &mut rx, &thread_id).await;
 
-        // The respawned sidecar must NOT immediately crash again, and mints a DIFFERENT
-        // thread id than the original.
-        configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-respawned"}"#);
+        // The respawned sidecar must NOT immediately crash again; `thread/resume` on this
+        // fixture always succeeds (echoing back whatever thread id it's asked to resume).
+        configure_fake_codex_cmd("{}");
 
         st.handle_send(FreshAgentSend {
             request_id: Some("req-2".to_string()),
@@ -2965,8 +3324,78 @@ pub(crate) mod tests {
         })
         .await;
 
-        // A NEW fake-app-server child was spawned, materialized under a new thread id, and
-        // the turn was accepted -- with NO user-facing error frame along the way.
+        // The turn was accepted under the SAME id, with NO user-facing error frame and NO
+        // `freshAgent.session.materialized` broadcast along the way (recovery preserved
+        // the durable identity -- conversation memory for this thread is intact).
+        let accepted: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                assert_ne!(
+                    frame["type"], "error",
+                    "no user-facing error frame: {frame}"
+                );
+                assert_ne!(
+                    frame["type"], "freshAgent.session.materialized",
+                    "resume-first recovery must not materialize a new durable identity: {frame}"
+                );
+                if frame["type"] == "freshAgent.send.accepted" {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("send.accepted arrives within the budget -- the turn actually ran");
+        assert_eq!(
+            accepted["sessionId"], thread_id,
+            "recovery must resume the SAME thread id, not mint a new one"
+        );
+
+        // The SAME id is (still) live -- no key change in the session map.
+        let guard = st.sessions.lock().await;
+        assert!(guard.contains_key(&thread_id));
+    }
+
+    /// FIX-2: when the app-server genuinely no longer has the thread (`thread/resume`
+    /// fails with a "not found"-shaped error), recovery falls back to the ORIGINAL
+    /// mint-new-thread behavior -- a `freshAgent.session.materialized` broadcast under a
+    /// brand-new id, conversation memory for the old thread genuinely lost.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn send_after_crash_falls_back_to_mint_new_thread_when_resume_reports_not_found() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (st, mut rx) = state_with_bus();
+
+        configure_fake_codex_cmd(
+            r#"{"threadStartThreadId":"thread-original","exitProcessAfterMethodsOnce":["thread/start"]}"#,
+        );
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+
+        // The respawned sidecar's `thread/resume` reports the thread as genuinely gone.
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "thread-respawned",
+                "overrides": {
+                    "thread/resume": {
+                        "error": { "code": -32001, "message": "Thread not found" }
+                    }
+                }
+            })
+            .to_string(),
+        );
+
+        st.handle_send(FreshAgentSend {
+            request_id: Some("req-2".to_string()),
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread_id.clone(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            text: "hello again".to_string(),
+            images: None,
+            cwd: None,
+            settings: None,
+        })
+        .await;
+
         let materialized: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
@@ -2984,15 +3413,14 @@ pub(crate) mod tests {
 
         assert_eq!(materialized["previousSessionId"], thread_id);
         let new_thread_id = materialized["sessionId"].as_str().unwrap().to_string();
-        assert_ne!(new_thread_id, thread_id, "respawn mints a fresh thread id");
+        assert_ne!(
+            new_thread_id, thread_id,
+            "a genuine thread-not-found on resume still mints a fresh thread id"
+        );
 
         let accepted: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
-                assert_ne!(
-                    frame["type"], "error",
-                    "no user-facing error frame: {frame}"
-                );
                 if frame["type"] == "freshAgent.send.accepted" {
                     return frame;
                 }
@@ -3002,10 +3430,207 @@ pub(crate) mod tests {
         .expect("send.accepted arrives within the budget -- the turn actually ran");
         assert_eq!(accepted["sessionId"], new_thread_id);
 
-        // The old id is gone; the new one is live.
         let guard = st.sessions.lock().await;
         assert!(!guard.contains_key(&thread_id));
         assert!(guard.contains_key(&new_thread_id));
+    }
+
+    /// FIX-2: a resume failure that is NOT "thread not found" (a transient RPC error) must
+    /// NOT silently mint a new thread -- it reports `CODEX_RESPAWN_FAILED` and leaves the
+    /// session mapped under its OLD id, still marked exited, for a future retry (mirroring
+    /// the pre-existing `RespawnFailed` contract for a `thread/start` failure).
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn send_after_crash_with_transient_resume_failure_reports_respawn_failed_and_stays_exited(
+    ) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (st, mut rx) = state_with_bus();
+
+        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+
+        // A transient failure (NOT a "not found"-shaped message) on EVERY `thread/resume`
+        // attempt -- the first (with settings) AND the retry (with settings dropped).
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/resume": {
+                        "error": { "code": -32000, "message": "internal error: sidecar unreachable" }
+                    }
+                }
+            })
+            .to_string(),
+        );
+
+        st.handle_send(FreshAgentSend {
+            request_id: Some("req-2".to_string()),
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread_id.clone(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            text: "hello again".to_string(),
+            images: None,
+            cwd: None,
+            settings: None,
+        })
+        .await;
+
+        let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "error" {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("an error frame arrives within the budget");
+        assert!(
+            frame["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("CODEX_RESPAWN_FAILED:"),
+            "{frame}"
+        );
+
+        // Still mapped under the OLD id, still exited -- ripe for a future retry.
+        let guard = st.sessions.lock().await;
+        let session = guard.get(&thread_id).expect("session stays mapped");
+        assert!(session.exited.load(Ordering::SeqCst));
+    }
+
+    /// FIX-2: `freshAgent.attach` recovering a crashed session emits its fresh snapshot
+    /// under the SAME thread id (resume-first), not a new one.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn attach_after_unrequested_crash_resumes_and_emits_a_snapshot_with_the_same_id() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (st, mut rx) = state_with_bus();
+
+        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+
+        configure_fake_codex_cmd("{}");
+        st.handle_attach(FreshAgentAttach {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread_id.clone(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+            resume_session_id: None,
+            session_ref: None,
+        })
+        .await;
+
+        let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                assert_ne!(
+                    frame["type"], "error",
+                    "attach recovers or reports honestly, never hangs silently: {frame}"
+                );
+                assert_ne!(
+                    frame["type"], "freshAgent.session.materialized",
+                    "resume-first recovery must not materialize a new durable identity: {frame}"
+                );
+                if frame["type"] == "freshAgent.event" {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("attach recovers within the budget");
+
+        assert_eq!(frame["event"]["type"], "freshAgent.session.snapshot");
+        assert_eq!(
+            frame["sessionId"], thread_id,
+            "the post-recovery snapshot must carry the SAME thread id"
+        );
+    }
+
+    /// FIX-2: a `freshAgent.send` and a `freshAgent.attach` racing on the SAME crashed
+    /// session must recover it exactly once -- one spawned sidecar, one `thread/resume`
+    /// RPC -- never two independent respawns.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn concurrent_send_and_attach_single_flight_recovery_for_the_same_crashed_session() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (st, mut rx) = state_with_bus();
+
+        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+
+        // A small delay on `thread/resume` widens the race window between the two
+        // concurrent recovery attempts below.
+        configure_fake_codex_cmd(
+            &json!({ "delayMethodsMs": { "thread/resume": 200 } }).to_string(),
+        );
+
+        let st_send = st.clone();
+        let send_thread_id = thread_id.clone();
+        let send_task = tokio::spawn(async move {
+            st_send
+                .handle_send(FreshAgentSend {
+                    request_id: Some("req-race-send".to_string()),
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: send_thread_id,
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    text: "racing send".to_string(),
+                    images: None,
+                    cwd: None,
+                    settings: None,
+                })
+                .await;
+        });
+
+        let st_attach = st.clone();
+        let attach_thread_id = thread_id.clone();
+        let attach_task = tokio::spawn(async move {
+            st_attach
+                .handle_attach(FreshAgentAttach {
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: attach_thread_id,
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    cwd: None,
+                    resume_session_id: None,
+                    session_ref: None,
+                })
+                .await;
+        });
+
+        let (send_res, attach_res) = tokio::join!(send_task, attach_task);
+        send_res.expect("send task doesn't panic");
+        attach_res.expect("attach task doesn't panic");
+
+        // Exactly one recovered session is live under the original id -- if two
+        // concurrent respawns had raced past the single-flight guard, this thread id
+        // would have been resumed twice (two sidecars), and the fixture's per-process
+        // `activeThreadIds` bookkeeping / a duplicate resume would surface as an error
+        // frame on the bus. Assert none arrived, and the session is alive.
+        let mut saw_send_accepted = false;
+        let timeout = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                assert_ne!(
+                    frame["type"], "error",
+                    "no user-facing error frame from either racing caller: {frame}"
+                );
+                if frame["type"] == "freshAgent.send.accepted" {
+                    saw_send_accepted = true;
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(timeout.is_ok(), "send.accepted arrives within the budget");
+        assert!(saw_send_accepted);
+
+        let guard = st.sessions.lock().await;
+        assert!(
+            guard.contains_key(&thread_id),
+            "the single recovered session is live under the original id"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3244,6 +3869,70 @@ pub(crate) mod tests {
         assert_eq!(snapshot["capabilities"]["send"], json!(false));
         assert_eq!(snapshot["capabilities"]["interrupt"], json!(true));
         assert_eq!(snapshot["turns"], json!([]));
+    }
+
+    /// FIX-1 (codex-first triage): the freshly-read thread status is the reference's ONLY
+    /// input to `isRunning`/`capabilities.send` (`normalizeCodexThreadSnapshot`,
+    /// `normalize.ts:756,765` -- `isRunning = status === 'running' || status === 'compacting'`,
+    /// nothing else). This process's independently-tracked `active_turn` bit is legitimate
+    /// for targeting `freshAgent.interrupt` (`adapter.ts:1009`), but it is IN-MEMORY,
+    /// server-local state that can lag the app-server's actual thread status for reasons
+    /// having nothing to do with whether a turn is really still running (a missed/reordered
+    /// notification, a resumed session inheriting stale bookkeeping, etc). Folding it into
+    /// `is_running` (as a `Compacting`-status workaround) means ANY such lag permanently
+    /// wedges the composer read-only even after the app-server itself reports `idle` --
+    /// exactly the regression `test/e2e-browser/specs/restore-matrix.spec.ts`'s `test.fail`
+    /// annotation documents: the FreshCodex composer never re-enables after the first live
+    /// turn completes. A snapshot must be sendable whenever the app-server says `idle`,
+    /// full stop -- matching the legacy adapter, which has no such fallback to begin with.
+    #[tokio::test]
+    async fn get_snapshot_is_sendable_once_thread_status_is_idle_even_if_active_turn_is_stale() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, _rx) = state_with_bus();
+        insert_fake_session(
+            &st,
+            "thread-1",
+            client,
+            // A stale in-memory active-turn bit: the app-server has already moved this
+            // thread to idle (below), but this process's own bookkeeping hasn't (or
+            // can't, for reasons unrelated to the thread's real state) caught up.
+            Arc::new(StdMutex::new(Some("turn-1".to_string()))),
+            spawn_sleeper(),
+            "codex-sidecar-test-snapshot-stale-active-turn",
+        )
+        .await;
+
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move { st.get_snapshot("thread-1", None).await })
+        };
+
+        let (init_id, _m, _p) = peer.expect_request().await;
+        peer.respond(
+            &init_id,
+            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+        );
+        let _ = peer.expect_notification().await;
+
+        let (id, _method, _params) = peer.expect_request().await;
+        peer.respond(
+            &id,
+            json!({ "thread": { "id": "thread-1", "status": { "type": "idle" }, "turns": [] } }),
+        );
+
+        let snapshot = driver.await.unwrap().expect("snapshot builds");
+        assert_eq!(snapshot["status"], json!("idle"));
+        assert_eq!(
+            snapshot["capabilities"]["send"],
+            json!(true),
+            "a freshly-read idle thread status must be sendable regardless of stale \
+             in-memory active-turn bookkeeping, matching the legacy adapter's pure \
+             status-based capabilities computation"
+        );
+        assert_eq!(snapshot["capabilities"]["interrupt"], json!(false));
     }
 
     // -- Batch D PR-6: rich transcript items for the codex snapshot endpoint --

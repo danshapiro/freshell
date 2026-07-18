@@ -705,26 +705,17 @@ test.describe('Restore Matrix', () => {
   // durable session (never a fresh one) is targeted post-restart via every
   // `freshAgent.create`/`freshAgent.attach` sent, and the resumed pane
   // renders real non-blank content rather than a blank/broken pane.
-  // RUST DEFECT (codex-first triage, found while authoring this spec):
-  // on `rust-chromium`, after the FIRST live codex turn completes, the
-  // composer stays permanently disabled ("Read-only session" placeholder,
-  // Send button disabled) instead of returning to a sendable idle state --
-  // blocking every subsequent turn on the same pane. Confirmed via
-  // `test-results/.../error-context.md`'s accessibility snapshot after
-  // turn 1: `textbox "Chat message input" [disabled]` with placeholder
-  // "Read-only session". This traces to `FreshAgentView.tsx`'s `canSend`
-  // gate (`snapshot?.capabilities?.send === true` for non-Claude
-  // providers) -- the Rust codex snapshot endpoint is not reporting
-  // `capabilities.send: true` once a turn completes, unlike the legacy
-  // Node server (confirmed green on `legacy-chromium`). This is a genuine
-  // parity gap in `crates/freshell-freshagent/src/codex.rs` (out of scope
-  // for this pass, which owns only `test/e2e-browser/**`), not a flaw in
-  // this spec -- RED-demoed by removing this annotation and re-running
-  // against `rust-chromium` (times out waiting for a second sendable turn).
-  test.fail(
-    ({ e2eServerKind }) => e2eServerKind === 'rust',
-    'Rust codex snapshot does not report capabilities.send=true after a turn completes -- composer stays disabled for a second live turn (see comment above)',
-  )
+  // FIXED (codex-first triage): `crates/freshell-freshagent/src/codex.rs`'s
+  // `build_codex_snapshot_json` used to fold an independently-tracked,
+  // server-local `active_turn_present` bit into `capabilities.send`'s
+  // `isRunning` computation (a workaround for `CodexStatus` having no
+  // `Compacting` variant). That bit could lag the app-server's actual
+  // freshly-read thread status, permanently wedging the composer read-only
+  // after the first live turn completed. Fixed to compute `is_running`
+  // PURELY from the freshly-read thread status, matching the legacy
+  // adapter's `normalizeCodexThreadSnapshot` exactly (see
+  // `get_snapshot_is_sendable_once_thread_status_is_idle_even_if_active_turn_is_stale`
+  // in `codex.rs` for the regression test).
   test('FreshCodex targets the same durable thread with no duplicate conversation after a full server restart', async ({ page, e2eServerKind }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-restore-matrix-codex-restart-'))
     try {
