@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach, vi, beforeEach } from 'vitest'
 import * as net from 'net'
 import { PortForwardManager } from '../../../server/port-forward.js'
 import { createRequesterIdentity } from '../../../server/request-ip.js'
+import { consumeCapturedLogRecords } from '../../../server/test-log-capture.js'
 
 // Helper: create a TCP server on localhost that echoes data back
 function createEchoServer(): Promise<{ server: net.Server; port: number }> {
@@ -379,6 +380,9 @@ describe('PortForwardManager', () => {
 
       const { reasons } = await captureUnhandledRejections(async () => manager.closeAll())
       expect(reasons).toEqual([])
+      expect(
+        consumeCapturedLogRecords((r) => r.msg === 'Port forward close failed'),
+      ).toHaveLength(1)
     })
   })
 
@@ -443,6 +447,9 @@ describe('PortForwardManager', () => {
         })
 
         expect(reasons).toEqual([])
+        expect(
+          consumeCapturedLogRecords((r) => r.msg === 'Port forward close failed'),
+        ).toHaveLength(1)
 
         await shortManager.closeAll()
       } finally {
