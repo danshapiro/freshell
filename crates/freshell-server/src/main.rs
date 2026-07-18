@@ -23,6 +23,7 @@ mod files;
 mod logging;
 mod network;
 mod proxy;
+mod rate_limit;
 mod screenshots;
 mod serve_client;
 mod session_directory;
@@ -474,6 +475,15 @@ async fn main() -> ExitCode {
         home: Arc::new(home.clone().unwrap_or_else(|| PathBuf::from("."))),
     };
 
+    // SAFE-02: the global authenticated API rate limiter (checklist:
+    // `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md:539`).
+    // ONE process-wide token bucket, wired below as the outermost-but-one
+    // layer (see `rate_limit`'s module doc comment for the full legacy-parity
+    // derivation of these defaults and the deliberate global-vs-per-IP scope
+    // decision).
+    let rate_limiter =
+        rate_limit::RateLimiter::new_system(rate_limit::RateLimitConfig::default_api());
+
     let app = freshell_api::router(api_state)
         .merge(freshell_ws::router(ws_state))
         .merge(freshell_freshagent::router(fresh_agent_state.clone()))
@@ -531,6 +541,18 @@ async fn main() -> ExitCode {
         // the original's exact charset suffix, globally, so no individual handler
         // has to remember it.
         .layer(axum::middleware::map_response(ensure_json_charset))
+        // SAFE-02: the global authenticated API rate limit. Sits ABOVE (outside)
+        // `ensure_json_charset` -- a rejection here short-circuits before that
+        // inner layer runs, so `rate_limit::rate_limited_response` sets its own
+        // `application/json; charset=utf-8` content-type directly rather than
+        // depending on it. `rate_limit::enforce` itself exempts `/api/health`
+        // and everything outside the `/api` prefix (the `/ws` upgrade, the
+        // retained SPA's static assets) -- see that module's doc comment for
+        // the full legacy-parity derivation (`server/index.ts:161-170`).
+        .layer(axum::middleware::from_fn(move |req, next| {
+            let rate_limiter = Arc::clone(&rate_limiter);
+            async move { rate_limit::enforce(rate_limiter, req, next).await }
+        }))
         // DIAG-01: the outermost layer, so it wraps every route INCLUDING the
         // fallback (unmatched-path 404/401, the retained SPA, and the `/ws`
         // upgrade) -- one `http_request` JSONL event per response, carrying a
