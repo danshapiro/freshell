@@ -120,11 +120,15 @@ describe('terminal-cursor', () => {
   })
 
   it('remains resilient when stored payload is malformed', () => {
+    // The malformed payload is expected to warn; capture it here.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     localStorage.setItem(TERMINAL_CURSOR_STORAGE_KEY, '{not valid json')
     __resetTerminalCursorCacheForTests()
 
     expect(loadTerminalCursor('term-bad')).toBe(0)
     expect(getCursorMapSize()).toBe(0)
+    expect(warnSpy).toHaveBeenCalled()
+    warnSpy.mockRestore()
   })
 
   it('treats legacy persisted cursor records as incompatible by default', () => {
