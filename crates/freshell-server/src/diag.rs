@@ -115,7 +115,7 @@ async fn debug_body(state: &DiagState) -> Value {
     let settings_value = serde_json::to_value(&settings).unwrap_or_else(|_| json!({}));
     let redacted_settings = redact_settings(&settings_value);
 
-    let (record_count, device_count) = tabs_registry_counts(&state.tabs);
+    let (record_count, device_count) = state.tabs.diagnostic_counts();
 
     let sessions_projects = match &state.session_index {
         Some(index) => distinct_project_paths(&index.snapshot().await),
@@ -135,23 +135,6 @@ async fn debug_body(state: &DiagState) -> Value {
         "terminals": state.registry.inventory(),
         "time": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     })
-}
-
-/// Aggregate `(recordCount, deviceCount)` across ALL devices/clients, using
-/// ONLY [`freshell_ws::tabs::TabsRegistry`]'s EXISTING public `query` API --
-/// no changes to that (frozen, concurrently-owned) crate. Passing a
-/// device/client id that can never match a real record (`""`) means every
-/// winning OPEN record is classified as `remoteOpen` (never `localOpen`/
-/// `sameDeviceOpen`, both of which require `record_device == device_id`), and
-/// the `closed`/`devices` lists are returned in full, untouched by the
-/// filter. `recordCount` is therefore `remoteOpen + closed` (every winning
-/// tabKey, open or closed); `deviceCount` is the full device list length.
-fn tabs_registry_counts(tabs: &freshell_ws::tabs::TabsRegistry) -> (usize, usize) {
-    let snapshot = tabs.query("", "");
-    let open = snapshot["remoteOpen"].as_array().map(Vec::len).unwrap_or(0);
-    let closed = snapshot["closed"].as_array().map(Vec::len).unwrap_or(0);
-    let devices = snapshot["devices"].as_array().map(Vec::len).unwrap_or(0);
-    (open + closed, devices)
 }
 
 /// Distinct, sorted project paths across the indexed session corpus (`GET
@@ -427,6 +410,83 @@ mod tests {
             body["settings"]["ai"]["geminiApiKey"],
             json!("[redacted]"),
             "the redacted field must be present as the sentinel, not merely absent"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn debug_body_tabs_registry_recordcount_and_devicecount_reflect_raw_legacy_semantics() {
+        // DEFECT 1 + DEFECT 2 route-level regression: two devices each push
+        // an open snapshot containing the SAME tabKey (the ordinary
+        // "same tab open on two devices" case). Legacy's `recordCount`
+        // (`tabsRegistryStore.count()`, server/tabs-registry/store.ts:1306-1309)
+        // is the RAW undeduplicated sum across client snapshots, so it must
+        // be 2 here -- NOT 1, which is what a winner-per-tabKey dedup (the
+        // OLD, defective `tabs_registry_counts` built on `query()`) would
+        // report. Both devices are freshly pushed (well within the 7-day
+        // display TTL, server/tabs-registry/store.ts:1298-1304), so
+        // `deviceCount` must be 2.
+        let dir = unique_temp_dir("debug-tabsregistry");
+        let state = sample_state(&dir);
+
+        state
+            .tabs
+            .replace_client_snapshot(
+                "srv-1",
+                "device-a",
+                "Device A",
+                "client-a1",
+                1,
+                vec![json!({
+                    "tabKey": "shared-tab",
+                    "tabId": "shared-tab",
+                    "tabName": "from A",
+                    "status": "open",
+                    "revision": 1,
+                    "updatedAt": 100,
+                    "createdAt": 100,
+                    "paneCount": 1,
+                    "titleSetByUser": true,
+                    "panes": [],
+                })],
+            )
+            .expect("push accepted");
+        state
+            .tabs
+            .replace_client_snapshot(
+                "srv-1",
+                "device-b",
+                "Device B",
+                "client-b1",
+                1,
+                vec![json!({
+                    "tabKey": "shared-tab",
+                    "tabId": "shared-tab",
+                    "tabName": "from B",
+                    "status": "open",
+                    "revision": 1,
+                    "updatedAt": 200,
+                    "createdAt": 200,
+                    "paneCount": 1,
+                    "titleSetByUser": true,
+                    "panes": [],
+                })],
+            )
+            .expect("push accepted");
+
+        let body = debug_body(&state).await;
+
+        assert_eq!(
+            body["tabsRegistry"]["recordCount"],
+            json!(2),
+            "recordCount must be the raw sum across both clients' snapshots (1 + 1), \
+             not the deduped winner-per-tabKey count of 1"
+        );
+        assert_eq!(
+            body["tabsRegistry"]["deviceCount"],
+            json!(2),
+            "both freshly-pushed devices are within the display TTL"
         );
 
         std::fs::remove_dir_all(&dir).ok();

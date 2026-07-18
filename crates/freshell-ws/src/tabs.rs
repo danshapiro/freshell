@@ -31,6 +31,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+/// `DAY_MS` (store.ts:9): milliseconds in a day. Used only by
+/// [`TabsRegistry::diagnostic_counts`]'s device-display TTL cutoff below.
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// `DEFAULT_DEVICE_DISPLAY_TTL_DAYS` (store.ts:13). Legacy's schema pins
+/// `deviceDisplayTtlDays` to a `z.literal(DEFAULT_DEVICE_DISPLAY_TTL_DAYS)`
+/// (store.ts:221) -- it is not actually settings-configurable in practice,
+/// it IS this constant. This in-memory port has no persisted `settings`
+/// manifest object at all (see the module doc comment above: "no on-disk
+/// manifest ... no TTL expiry within a process's lifetime" refers to
+/// *retention/compaction*, not display filtering), so there is no existing
+/// settings plumbing to reuse for this value. Mirroring the legacy constant
+/// directly is therefore the correct, complete port of the value legacy
+/// always resolves to in practice.
+const DEVICE_DISPLAY_TTL_DAYS: i64 = 7;
+
 /// One client's stored open snapshot (`ClientOpenSnapshot`, store.ts:75).
 #[derive(Clone)]
 struct ClientOpenSnapshot {
@@ -321,6 +337,46 @@ impl TabsRegistry {
             "devices": devices,
         })
     }
+
+    /// `(recordCount, deviceCount)` for `GET /api/debug`'s `tabsRegistry`
+    /// field (legacy `debug-router.ts`: `tabsRegistryStore.count()` /
+    /// `tabsRegistryStore.listDevices().length`). Deliberately ADDITIVE and
+    /// DISTINCT from [`Self::query`]'s winner-per-tabKey merge -- `query()`'s
+    /// wire semantics are frozen/concurrently-owned and unchanged by this
+    /// method:
+    ///
+    /// - `recordCount` mirrors `TabsRegistryStore.count()`
+    ///   (server/tabs-registry/store.ts:1306-1309) EXACTLY: the RAW,
+    ///   undeduplicated sum of `records.length` across every client's stored
+    ///   open snapshot, PLUS the (already tabKey-deduped-by-construction)
+    ///   closed-tombstone count. This is intentionally NOT the same as
+    ///   `query()`'s `remoteOpen.len() + closed.len()`, which collapses a
+    ///   tab open on multiple devices/clients down to a single winner --
+    ///   legacy's `count()` does not perform that collapse for open records.
+    /// - `deviceCount` mirrors `TabsRegistryStore.listDevices().length`
+    ///   (server/tabs-registry/store.ts:1298-1304): only devices seen within
+    ///   the last [`DEVICE_DISPLAY_TTL_DAYS`] days count (`lastSeenAt >= now
+    ///   - ttlDays * DAY_MS`), matching legacy's `deviceCutoff`
+    ///   (store.ts:1300). `query()`'s `devices` list has no such filter.
+    pub fn diagnostic_counts(&self) -> (usize, usize) {
+        let state = self.inner.lock().expect("tabs registry lock");
+
+        let record_count = state
+            .open_snapshots
+            .values()
+            .map(|snapshot| snapshot.records.len())
+            .sum::<usize>()
+            + state.closed_by_tab_key.len();
+
+        let cutoff = now_ms() - DEVICE_DISPLAY_TTL_DAYS * DAY_MS;
+        let device_count = state
+            .devices
+            .values()
+            .filter(|device| device.last_seen_at >= cutoff)
+            .count();
+
+        (record_count, device_count)
+    }
 }
 
 // ── Record field accessors + ordering (store.ts:341-365) ─────────────────────
@@ -552,6 +608,133 @@ mod tests {
         assert_eq!(
             envelope_records(&json!({ "type": "tabs.sync.push" })).len(),
             0
+        );
+    }
+
+    // ---- diagnostic_counts (DEFECT 1 + DEFECT 2 regression coverage) ----
+
+    fn closed_record(tab_key: &str, tab_name: &str, updated_at: i64, closed_at: i64) -> Value {
+        json!({
+            "tabKey": tab_key,
+            "tabId": tab_key,
+            "tabName": tab_name,
+            "status": "closed",
+            "revision": 1,
+            "updatedAt": updated_at,
+            "closedAt": closed_at,
+            "createdAt": updated_at,
+            "paneCount": 1,
+            "titleSetByUser": true,
+            "panes": [],
+        })
+    }
+
+    #[test]
+    fn diagnostic_counts_recordcount_is_raw_undeduplicated_sum_like_legacy_count() {
+        // Legacy `TabsRegistryStore.count()` (server/tabs-registry/store.ts:1306-1309)
+        // is `sum(records.length across EVERY client's stored open snapshot)
+        // + closedByTabKey.length` -- it does NOT dedup by tabKey across
+        // clients/devices the way `query()`'s winner-per-tabKey merge does.
+        let reg = TabsRegistry::new();
+
+        // Device A, client a1: two open records ("t1", "t2").
+        reg.replace_client_snapshot(
+            "srv-1",
+            "device-a",
+            "Device A",
+            "client-a1",
+            1,
+            vec![open_record("t1", "from A", 100), open_record("t2", "solo", 100)],
+        )
+        .expect("push accepted");
+
+        // Device B, client b1: one open record with the SAME tabKey "t1"
+        // (the normal multi-device case: the same logical tab open on two
+        // devices) plus one closed record.
+        reg.replace_client_snapshot(
+            "srv-1",
+            "device-b",
+            "Device B",
+            "client-b1",
+            1,
+            vec![
+                open_record("t1", "from B", 200),
+                closed_record("closed-1", "was open", 50, 60),
+            ],
+        )
+        .expect("push accepted");
+
+        // Hand-computed expected, per legacy's raw-sum arithmetic:
+        //   openSnapshotsByClient: { a1: [t1, t2] (len 2), b1: [t1] (len 1) }
+        //     -> sum = 2 + 1 = 3
+        //   closedByTabKey: { closed-1 } -> len = 1
+        //   expected recordCount = 3 + 1 = 4
+        let (record_count, _device_count) = reg.diagnostic_counts();
+        assert_eq!(
+            record_count, 4,
+            "recordCount must be the raw undeduplicated sum (legacy store.ts:1306-1309), \
+             not query()'s winner-per-tabKey count"
+        );
+
+        // Prove the two APIs genuinely diverge: query()'s dedup collapses
+        // the shared "t1" tabKey down to a single winner, undercounting by
+        // exactly the 1 duplicate record relative to the raw sum above.
+        let queried = reg.query("", "");
+        let via_query = queried["remoteOpen"].as_array().unwrap().len()
+            + queried["closed"].as_array().unwrap().len();
+        assert_eq!(
+            via_query, 3,
+            "query() dedups the shared 't1' tabKey down to one winner (t1, t2, closed-1 = 3), \
+             undercounting relative to the raw sum of 4"
+        );
+    }
+
+    #[test]
+    fn diagnostic_counts_devicecount_excludes_devices_past_the_display_ttl_like_legacy_list_devices()
+    {
+        // Legacy `listDevices()` (server/tabs-registry/store.ts:1298-1304)
+        // filters by `deviceDisplayTtlDays` BEFORE counting: `cutoff = now -
+        // deviceDisplayTtlDays * DAY_MS`, `lastSeenAt >= cutoff` survives.
+        // The TTL value itself is `DEFAULT_DEVICE_DISPLAY_TTL_DAYS = 7`
+        // (store.ts:13), and the schema pins `deviceDisplayTtlDays` to a
+        // `z.literal(DEFAULT_DEVICE_DISPLAY_TTL_DAYS)` (store.ts:221) -- it
+        // is not actually settings-configurable, so mirroring the constant
+        // directly (see `DEVICE_DISPLAY_TTL_DAYS` above) is a complete port.
+        let reg = TabsRegistry::new();
+
+        // A "fresh" device via the real push path (lastSeenAt = now).
+        reg.replace_client_snapshot(
+            "srv-1",
+            "device-fresh",
+            "Fresh Device",
+            "client-1",
+            1,
+            vec![open_record("t-fresh", "fresh tab", 1)],
+        )
+        .expect("push accepted");
+
+        // A "stale" device, seeded directly via the private `inner`/`State`
+        // fields (same-file access from the child `tests` module -- there
+        // is no public API to backdate `lastSeenAt`, and waiting 7 real
+        // days in a test is not an option).
+        {
+            let mut state = reg.inner.lock().expect("tabs registry lock");
+            let eight_days_ago = now_ms() - 8 * DAY_MS;
+            state.devices.insert(
+                "device-stale".to_string(),
+                DeviceEntry {
+                    device_id: "device-stale".to_string(),
+                    device_label: "Stale Device".to_string(),
+                    last_seen_at: eight_days_ago,
+                },
+            );
+        }
+
+        let (_record_count, device_count) = reg.diagnostic_counts();
+        assert_eq!(
+            device_count, 1,
+            "the device last seen 8 days ago must be excluded by the {DEVICE_DISPLAY_TTL_DAYS}-day TTL, \
+             leaving only the fresh device"
         );
     }
 }
