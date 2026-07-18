@@ -78,10 +78,13 @@ describe('openExternalUrl', () => {
   })
 
   it('ignores non-string URLs', () => {
+    const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     vi.stubGlobal('freshellDesktop', undefined)
 
     openExternalUrl(undefined as unknown as string)
 
     expect(windowOpenSpy).not.toHaveBeenCalled()
+    expect(consoleWarnSpy).toHaveBeenCalled()
+    consoleWarnSpy.mockRestore()
   })
 })
