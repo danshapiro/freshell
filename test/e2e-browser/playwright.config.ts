@@ -32,6 +32,10 @@ const MATRIX_SPECS = [
   // of the TERM-22/SAFE-11/TAURI-30 implementation wave). See
   // restore-sync05.spec.ts for the full acceptance-text mirror.
   /restore-sync05\.spec\.ts$/,
+  // AGENT-08 -- OpenCode continuity via REST (`/api/tabs` +
+  // `/api/panes/:id/send-keys`): one durable id across repeat sends, a
+  // different id per pane. See agent-continuity-matrix.spec.ts.
+  /agent-continuity-matrix\.spec\.ts$/,
 ]
 
 export default defineConfig({
