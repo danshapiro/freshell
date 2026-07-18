@@ -28,6 +28,10 @@ const MATRIX_SPECS = [
   // non-blank content), and mid-life exit surfacing. Restore is a core
   // feature, so this runs against both server kinds on every matrix pass.
   /restore-matrix\.spec\.ts$/,
+  // SYNC-05 -- expected-restart quiet-reconnect outer spec (authored ahead
+  // of the TERM-22/SAFE-11/TAURI-30 implementation wave). See
+  // restore-sync05.spec.ts for the full acceptance-text mirror.
+  /restore-sync05\.spec\.ts$/,
 ]
 
 export default defineConfig({

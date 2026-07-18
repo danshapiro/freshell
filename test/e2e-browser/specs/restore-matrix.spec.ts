@@ -74,6 +74,41 @@ process.exit(result.status ?? 1)
   return dest
 }
 
+/**
+ * Write a minimal, deterministic fake `claude` CLI executable (into a
+ * throwaway directory) for SCENARIO 3's `CLAUDE_CMD` override. Unlike
+ * FreshCodex's fake app-server (a headless JSON-RPC sidecar the real
+ * fresh-agent runtime talks to over stdio), resuming a historical Claude
+ * session from the sidebar spawns `claude` as a plain interactive TERMINAL
+ * program (`server/terminal-registry.ts`'s `claude` provider entry, PTY-
+ * attached) -- whatever it writes to stdout lands directly in the pane's
+ * xterm buffer. So the fake here is intentionally trivial: it ignores argv
+ * (including the real `--resume <sessionId>` flag the registry passes) and
+ * just prints deterministic text, satisfying this scenario's "content is
+ * never silently blank" requirement with genuine CLI output rather than a
+ * status notice. `server/terminal-registry.ts`'s `CLAUDE_CMD` env var
+ * override (`resolveClaudeCommand()`) accepts a bare executable path, same
+ * as `CODEX_CMD` -- see `installFakeCodexAppServer` above for why a `+x`
+ * wrapper (not a content copy) is used to install it.
+ */
+async function installFakeClaudeCli(destDir: string): Promise<string> {
+  await fs.mkdir(destDir, { recursive: true })
+  const dest = path.join(destDir, 'fake-claude-cli.mjs')
+  // Prints deterministic output then stays alive (like the real interactive
+  // `claude` TUI would) rather than exiting -- keeps the pane's terminal
+  // status 'running' with genuine buffer content, instead of racing this
+  // scenario's assertions against 'exited'-state UI (a different, already
+  // covered concern -- see SCENARIO 4 below). The test's `server.stop()`
+  // tears the process down; nothing needs to shut it down cleanly itself.
+  const script = `#!/usr/bin/env node
+process.stdout.write('restore-matrix historical session resumed output\\r\\n')
+process.stdin.resume()
+`
+  await fs.writeFile(dest, script, 'utf8')
+  await fs.chmod(dest, 0o755)
+  return dest
+}
+
 async function selectShellIfPickerShowing(page: import('@playwright/test').Page): Promise<void> {
   await page.waitForTimeout(500)
   const xtermVisible = await page.locator('.xterm').first().isVisible().catch(() => false)
@@ -396,32 +431,52 @@ test.describe('Restore Matrix', () => {
   // -------------------------------------------------------------------
   // SCENARIO 3 -- HISTORICAL SESSION OPEN (sidebar -> tab, real pane title)
   // -------------------------------------------------------------------
-  // KNOWN LIMITATION (tracked, not silently skipped): `sidebar-session-list`
-  // does not become visible within a generous timeout when a session is
-  // seeded via `setupHome` writing directly into `.claude/projects/...`
-  // before boot, on BOTH server kinds identically. The identical JSONL shape
-  // (system/init, user, assistant, summary lines) IS proven to work via
-  // `session-directory-matrix.spec.ts` (already in MATRIX_SPECS, currently
-  // green) -- the difference is this scenario's server construction (custom
-  // `setupHome` closure inline here) versus that spec's. Root cause not
-  // isolated within budget; next step is a bisection between this scenario
-  // and session-directory-matrix's server setup to find the exact
-  // discrepancy before re-enabling.
-  // Re-confirmed unrelated to scenario 2's finding: reran on legacy-chromium
-  // during the scenario-2 investigation, same `sidebar-session-list` timeout
-  // (30s, "element(s) not found"). A distinct, still-open gap -- not touched
-  // in this pass to keep scope to scenario 2.
+  // ROOT-CAUSE FINDING (spec bug, not a product defect -- confirmed via the
+  // FROZEN server's own filtering logic, identical on both server kinds):
+  // `server/coding-cli/providers/claude.ts`'s `parseClaudeSession` marks a
+  // session `isNonInteractive: true` whenever `userMessageCount <= 1`
+  // (single request/reply pair = "headless dispatch or abandoned session",
+  // per that file's own comment). `server/session-directory/service.ts`
+  // then filters `isNonInteractive` sessions OUT of any `/session-directory`
+  // query unless the caller passes `includeNonInteractive: true` --
+  // `src/store/sessionsThunks.ts`'s default sidebar fetch does not (it only
+  // sets that flag from `sidebarSettings?.showNoninteractiveSessions`, unset
+  // by default). This scenario's seed JSONL had exactly ONE user/assistant
+  // turn, so the seeded session was silently excluded from the sidebar's
+  // result set -- zero items renders the "No sessions yet" empty state
+  // (no `sidebar-session-list` testid), which is exactly the observed
+  // symptom ("element(s) not found" after 30s). `session-directory-matrix.spec.ts`
+  // seeds TWO user/assistant turns per session via its `buildSessionJsonl`
+  // helper, which is why its otherwise-identical JSONL shape is discovered
+  // and rendered. Fix: seed two turns here too (matching that helper's
+  // shape) so the session is genuinely interactive and passes the server's
+  // own (correct, intentional) filter -- no server/client code changed.
   test('opening a seeded historical session from the sidebar gets a real pane title and non-blank content', async ({ page, e2eServerKind }) => {
-    test.fixme(true, 'sidebar-session-list does not become visible for this scenario\'s seeded session; root cause open (see comment above)')
     const SESSION_ID = '00000000-0000-4000-8000-0000000c3333'
     const SESSION_TITLE = 'restore-matrix historical session'
+
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-restore-matrix-claude-'))
+    const fakeClaudePath = await installFakeClaudeCli(path.join(sharedRoot, 'bin'))
 
     const server = await createE2eServerHandle(process.env, {
       kind: e2eServerKind,
       construct: {
+        // Resuming this seeded session spawns the terminal-mode `claude`
+        // provider (`server/terminal-registry.ts`'s `CLAUDE_CMD` override),
+        // which is a real, PTY-attached interactive program -- not a fake
+        // JSON-RPC sidecar. Without a `claude` binary on PATH, the isolated
+        // test HOME has nothing for the real command to spawn. Point it at
+        // the deterministic fake above so this scenario's "content is never
+        // silently blank" requirement is proven with genuine CLI output.
+        env: { CLAUDE_CMD: fakeClaudePath },
         setupHome: async (homeDir) => {
           const projectDir = path.join(homeDir, '.claude', 'projects', 'restore-matrix-project')
           await fs.mkdir(projectDir, { recursive: true })
+          // The seeded JSONL's `cwd` must exist on disk: resuming this
+          // session spawns a REAL PTY-attached process there (see the
+          // `CLAUDE_CMD` override above), and a real Claude session's `cwd`
+          // is always a real directory in production.
+          await fs.mkdir('/tmp/freshell-restore-matrix/project', { recursive: true })
           const lines: string[] = [
             JSON.stringify({
               type: 'system',
@@ -459,10 +514,41 @@ test.describe('Restore Matrix', () => {
               uuid: `${SESSION_ID}-assistant-1`,
               timestamp: '2026-07-16T08:00:02.000Z',
             }),
+            // Second user/assistant turn: a session with only ONE turn is
+            // classified `isNonInteractive` server-side (see root-cause
+            // comment above) and silently excluded from the sidebar's
+            // default query -- two turns makes this genuinely interactive.
+            JSON.stringify({
+              parentUuid: `${SESSION_ID}-assistant-1`,
+              cwd: '/tmp/freshell-restore-matrix/project',
+              sessionId: SESSION_ID,
+              version: '2.1.23',
+              gitBranch: 'main',
+              type: 'user',
+              message: { role: 'user', content: `${SESSION_TITLE} request 2` },
+              uuid: `${SESSION_ID}-user-2`,
+              timestamp: '2026-07-16T08:00:03.000Z',
+            }),
+            JSON.stringify({
+              parentUuid: `${SESSION_ID}-user-2`,
+              cwd: '/tmp/freshell-restore-matrix/project',
+              sessionId: SESSION_ID,
+              version: '2.1.23',
+              gitBranch: 'main',
+              type: 'assistant',
+              message: {
+                role: 'assistant',
+                model: 'claude-opus-4-6-20260301',
+                content: [{ type: 'text', text: `${SESSION_TITLE} reply 2` }],
+                usage: { input_tokens: 100, output_tokens: 40, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+              },
+              uuid: `${SESSION_ID}-assistant-2`,
+              timestamp: '2026-07-16T08:00:04.000Z',
+            }),
             JSON.stringify({
               type: 'summary',
               summary: SESSION_TITLE,
-              leafUuid: `${SESSION_ID}-assistant-1`,
+              leafUuid: `${SESSION_ID}-assistant-2`,
             }),
           ]
           await fs.writeFile(path.join(projectDir, `${SESSION_ID}.jsonl`), `${lines.join('\n')}\n`)
@@ -509,14 +595,20 @@ test.describe('Restore Matrix', () => {
 
       // (b) Content is NEVER silently blank: either the resumed CLI renders
       // real output, or a visible status/error notice explains why not --
-      // but something must be visible.
+      // but something must be visible. Scoped to THIS tab's terminal
+      // (`data-context="terminal"][data-tab-id="..."]`) rather than a bare
+      // `.xterm` query -- with the original tab's terminal still mounted
+      // (just hidden) alongside this new tab, an unscoped `.first()` can
+      // resolve to the WRONG (hidden) pane's xterm, same class of bug noted
+      // in SCENARIO 2's `findFreshAgentLeaf` comment above.
+      const newTabTerminal = page.locator(`[data-context="terminal"][data-tab-id="${newTabId}"]`)
       await expect(async () => {
-        const xtermVisible = await page.locator('.xterm').first().isVisible().catch(() => false)
+        const xtermVisible = await newTabTerminal.locator('.xterm').first().isVisible().catch(() => false)
         const buffer = xtermVisible
-          ? await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer())
+          ? await page.evaluate((tid) => window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer(tid), (await harness.getPaneLayout(newTabId!))?.content?.terminalId)
           : null
         const hasBufferContent = typeof buffer === 'string' && buffer.trim().length > 0
-        const hasVisibleStatusNotice = await page
+        const hasVisibleStatusNotice = await newTabTerminal
           .getByText(/error|exited|failed|not found/i)
           .first()
           .isVisible()
@@ -525,6 +617,7 @@ test.describe('Restore Matrix', () => {
       }).toPass({ timeout: 30_000 })
     } finally {
       await server.stop().catch(() => {})
+      await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
 
