@@ -20,6 +20,7 @@ mod boot;
 mod checkpoints;
 mod extensions;
 mod files;
+mod logging;
 mod network;
 mod proxy;
 mod screenshots;
@@ -91,6 +92,17 @@ async fn main() -> ExitCode {
     let port = resolve_port();
     let bind_host = resolve_bind_host();
     let home = resolve_home();
+
+    // DIAG-01/DIAG-03: structured JSONL logging to
+    // `<home>/.freshell/logs/rust-server.jsonl`, redacted from the first
+    // byte (the live AUTH_TOKEN is the ONE secret this process itself
+    // knows verbatim). A failure here (e.g. an unwritable log dir) must
+    // never prevent boot -- the pre-existing stderr "listening on" line
+    // below still gets the operator to a running server either way.
+    let logging_config = logging::resolve_config(home.as_deref(), auth_token.as_str().to_string());
+    if let Err(err) = logging::init(logging_config) {
+        eprintln!("freshell-server: structured logging disabled: {err}");
+    }
 
     // Boot-scoped identifiers, stable for the life of the process (as in the
     // original's single `WsHandler`). Normalized away by the oracle.
@@ -330,7 +342,21 @@ async fn main() -> ExitCode {
     // requests while it's in flight.
     if let Some(index) = &session_index {
         let index = Arc::clone(index);
-        tokio::spawn(async move { index.warm().await });
+        // DIAG-01: log the initial warm sweep's count + duration (an
+        // equivalent call to `index.warm()`'s own body -- `snapshot()` is
+        // what `warm()` calls internally -- but keeping the return value
+        // here lets this main.rs-scoped call site report a real count
+        // instead of discarding it).
+        tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            let items = index.snapshot().await;
+            tracing::info!(
+                event = "session_index_warm",
+                count = items.len(),
+                duration_ms = start.elapsed().as_millis() as u64,
+                "session index warm sweep complete"
+            );
+        });
     }
     let session_directory_state = session_directory::SessionDirectoryState {
         auth_token: Arc::clone(&auth_token),
@@ -463,7 +489,16 @@ async fn main() -> ExitCode {
         // `application/json`. Normalize every plain-`application/json` response to
         // the original's exact charset suffix, globally, so no individual handler
         // has to remember it.
-        .layer(axum::middleware::map_response(ensure_json_charset));
+        .layer(axum::middleware::map_response(ensure_json_charset))
+        // DIAG-01: the outermost layer, so it wraps every route INCLUDING the
+        // fallback (unmatched-path 404/401, the retained SPA, and the `/ws`
+        // upgrade) -- one `http_request` JSONL event per response, carrying a
+        // fresh `request_id`, the sanitized route, method, status, and
+        // duration. See `logging.rs` for exactly what this does and does not
+        // cover (WS post-upgrade lifecycle is out of scope for this layer).
+        .layer(axum::middleware::from_fn(
+            logging::request_logging_middleware,
+        ));
 
     let ip: IpAddr = bind_host.parse().unwrap_or(IpAddr::from([127, 0, 0, 1]));
     let addr = SocketAddr::new(ip, port);

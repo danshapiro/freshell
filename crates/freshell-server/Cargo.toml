@@ -61,6 +61,24 @@ dotenvy = "0.15.7"
 # `createHash('sha1')` (`fresh-agent-extras-router.ts:76`) -- not a security
 # use of SHA-1, just a deterministic per-cwd bucket name.
 sha1 = "0.10"
+# DIAG-01/DIAG-03: structured JSONL logging. `tracing` is the event/span API;
+# `tracing-subscriber`'s `registry` (default feature) gives the `Layer` +
+# `LookupSpan` machinery `logging.rs`'s custom formatter builds on, and
+# `env-filter` backs the RUST_LOG-compatible level control. We deliberately do
+# NOT pull in `tracing-subscriber`'s `fmt`/`json` formatting layer or
+# `tracing-appender`'s rolling writer -- `logging.rs` hand-rolls both the JSON
+# shape (exact `ts`/`level`/`target`/`msg` field names, not `fmt`'s
+# `timestamp`/`message`) and size-based rotation (`fmt`'s only rotation is
+# time-based), which is simpler than fighting either for this shape.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The from-the-first-byte redaction scrub (DIAG-03): matches `"...token...":"…"`
+# and `"cookie":"…"` JSON fields (and a raw `Cookie:`/`Set-Cookie:` header
+# fragment, belt-and-braces) regardless of which call site produced them.
+# Already a common transitive dependency in this workspace (pulled in by
+# `tracing-subscriber`'s own `env-filter` via `matchers`); declared directly
+# here because `logging.rs` uses it explicitly, not just transitively.
+regex = "1"
 
 [target.'cfg(unix)'.dependencies]
 # `flock(2)` for `settings_store.rs`'s advisory cross-process config lock
