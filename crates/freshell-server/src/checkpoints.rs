@@ -44,8 +44,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::collections::HashMap;
+
+use axum::routing::get as get_method;
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
@@ -90,10 +93,23 @@ pub struct CheckpointsApiState {
     pub home: Arc<PathBuf>,
 }
 
-/// The `/api/fresh-agent/checkpoints` sub-router.
+/// The `/api/fresh-agent/checkpoints` sub-router. `GET` (list) and `POST`
+/// (create) share the one `/checkpoints` path; `restore` and `metadata` are
+/// their own POST-only sibling paths (`fresh-agent-extras-router.ts:230-232`).
 pub fn router(state: CheckpointsApiState) -> Router {
     Router::new()
-        .route("/api/fresh-agent/checkpoints", post(post_checkpoint))
+        .route(
+            "/api/fresh-agent/checkpoints",
+            post(post_checkpoint).get(get_method(get_checkpoints)),
+        )
+        .route(
+            "/api/fresh-agent/checkpoints/restore",
+            post(post_checkpoint_restore),
+        )
+        .route(
+            "/api/fresh-agent/checkpoints/metadata",
+            post(post_checkpoint_metadata),
+        )
         .with_state(state)
 }
 
@@ -369,6 +385,280 @@ async fn update_checkpoint_metadata(
     entry.insert("requestId".to_string(), json!(request_id));
     metadata.insert(sha.to_string(), Value::Object(entry));
     write_checkpoint_metadata(git_dir, &metadata).await
+}
+
+// ── list / restore / metadata routes (fresh-agent-extras-router.ts:114-232,370-428) ──
+
+/// `CHECKPOINT_LIST_LIMIT` (`fresh-agent-extras-router.ts:72`): cap on the
+/// number of commits `git log` returns for a listing.
+const CHECKPOINT_LIST_LIMIT: u32 = 100;
+
+/// `isValidCheckpointId` (`fresh-agent-extras-router.ts:114-116`):
+/// `/^[0-9a-f]{7,40}$/i` — a short (7+) to full (40) hex commit id. Rejects
+/// anything that couldn't possibly be a git object id before ever shelling
+/// out to git.
+fn is_valid_checkpoint_id(id: &str) -> bool {
+    let len = id.chars().count();
+    (7..=40).contains(&len) && id.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// `listCheckpoints` (`fresh-agent-extras-router.ts:186-213`): read the shadow
+/// repo's commit log (newest-first, `git log`'s default order — no explicit
+/// sort needed) and decorate each entry with any persisted `requestId`/
+/// `turnId` metadata. A cwd that has never been checkpointed (no shadow repo
+/// yet) or whose shadow repo has zero commits both degrade to `[]`, not an
+/// error — mirrors the two `try {} catch { return [] }` guards in legacy.
+async fn list_checkpoints(home: &Path, cwd: &Path) -> Result<Vec<Value>, String> {
+    let git_dir = checkpoint_git_dir(home, cwd);
+    if tokio::fs::metadata(git_dir.join("HEAD")).await.is_err() {
+        return Ok(Vec::new());
+    }
+    let git_dir_arg = format!("--git-dir={}", git_dir.display());
+    let limit = CHECKPOINT_LIST_LIMIT.to_string();
+    let raw = match run_git(
+        &[
+            &git_dir_arg,
+            "log",
+            "-n",
+            &limit,
+            "--pretty=format:%H%x09%ct%x09%s",
+        ],
+        None,
+    )
+    .await
+    {
+        Ok(raw) => raw,
+        // Empty repo (no commits yet) — `git log` errors on a HEAD-less repo.
+        Err(_) => return Ok(Vec::new()),
+    };
+    let metadata = read_checkpoint_metadata(&git_dir).await?;
+    let mut entries = Vec::new();
+    for line in raw.split('\n') {
+        if line.is_empty() {
+            continue;
+        }
+        // `[id, ts, ...rest] = line.split('\t'); label: rest.join('\t')` —
+        // `splitn(3, ...)` reproduces this: the third piece is left intact
+        // (re-joined) even if the subject itself contained tab characters.
+        let mut parts = line.splitn(3, '\t');
+        let id = parts.next().unwrap_or_default().to_string();
+        let ts = parts
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let label = parts.next().unwrap_or_default().to_string();
+        let mut entry = Map::new();
+        entry.insert("id".to_string(), json!(id));
+        entry.insert("ts".to_string(), json!(ts));
+        entry.insert("label".to_string(), json!(label));
+        if let Some(meta) = metadata.get(&id).and_then(Value::as_object) {
+            if let Some(request_id) = meta.get("requestId") {
+                entry.insert("requestId".to_string(), request_id.clone());
+            }
+            if let Some(turn_id) = meta.get("turnId") {
+                entry.insert("turnId".to_string(), turn_id.clone());
+            }
+        }
+        entries.push(Value::Object(entry));
+    }
+    Ok(entries)
+}
+
+/// Resolve a (possibly abbreviated) checkpoint id to the full 40-hex commit
+/// sha via `git rev-parse --verify <id>^{commit}` — the resolution step
+/// `updateCheckpointMetadata` performs (`fresh-agent-extras-router.ts:160`)
+/// before it merges a metadata patch, so a short prefix from the client
+/// always keys the persisted metadata file by full sha.
+async fn resolve_checkpoint_commit(git_dir: &Path, id: &str) -> Result<String, String> {
+    let git_dir_arg = format!("--git-dir={}", git_dir.display());
+    let revision = format!("{id}^{{commit}}");
+    let out = run_git(&[&git_dir_arg, "rev-parse", "--verify", &revision], None).await?;
+    Ok(out.trim().to_string())
+}
+
+/// `updateCheckpointMetadata` (`fresh-agent-extras-router.ts:151-172`), full
+/// version backing the `/checkpoints/metadata` route: validate the id's
+/// *format*, resolve it to a full sha, merge whichever of `requestId`/
+/// `turnId` the caller supplied into that sha's metadata entry, persist, then
+/// re-read the entry back out of `list_checkpoints` (matching legacy's own
+/// `listCheckpoints(cwd)` + `.find(...)` round-trip) so the response always
+/// reflects the merged, persisted state rather than just the patch applied.
+async fn apply_checkpoint_metadata_patch(
+    home: &Path,
+    cwd: &Path,
+    id: &str,
+    request_id: Option<&str>,
+    turn_id: Option<&str>,
+) -> Result<Value, String> {
+    if !is_valid_checkpoint_id(id) {
+        return Err("invalid checkpoint id".to_string());
+    }
+    let git_dir = ensure_checkpoint_repo(home, cwd).await?;
+    let resolved_id = resolve_checkpoint_commit(&git_dir, id).await?;
+
+    let mut metadata = read_checkpoint_metadata(&git_dir).await?;
+    let mut entry = metadata
+        .get(&resolved_id)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(request_id) = request_id {
+        entry.insert("requestId".to_string(), json!(request_id));
+    }
+    if let Some(turn_id) = turn_id {
+        entry.insert("turnId".to_string(), json!(turn_id));
+    }
+    metadata.insert(resolved_id.clone(), Value::Object(entry));
+    write_checkpoint_metadata(&git_dir, &metadata).await?;
+
+    let entries = list_checkpoints(home, cwd).await?;
+    entries
+        .into_iter()
+        .find(|entry| entry.get("id").and_then(Value::as_str) == Some(resolved_id.as_str()))
+        .ok_or_else(|| "invalid checkpoint id".to_string())
+}
+
+/// `restoreCheckpoint` (`fresh-agent-extras-router.ts:215-221`): `git checkout
+/// <id> -- .` in the shadow repo, using the real cwd as `--work-tree`. Git's
+/// default *overlay* checkout semantics govern the observable behavior (see
+/// the module doc comment): tracked paths that exist in the checkpoint's tree
+/// are written back (recreating deleted files, reverting modified ones);
+/// paths that exist in the working tree but NOT in the checkpoint's tree
+/// (i.e. files created after the checkpoint) are left completely alone — this
+/// is not a `git reset --hard` / `git clean`, so nothing is ever deleted.
+async fn restore_checkpoint(home: &Path, cwd: &Path, id: &str) -> Result<(), String> {
+    if !is_valid_checkpoint_id(id) {
+        return Err("invalid checkpoint id".to_string());
+    }
+    let git_dir = ensure_checkpoint_repo(home, cwd).await?;
+    let git_dir_arg = format!("--git-dir={}", git_dir.display());
+    let work_tree_arg = format!("--work-tree={}", cwd.display());
+    run_git(
+        &[
+            &git_dir_arg,
+            &work_tree_arg,
+            "checkout",
+            "-q",
+            id,
+            "--",
+            ".",
+        ],
+        Some(cwd),
+    )
+    .await?;
+    Ok(())
+}
+
+// ── list / restore / metadata route handlers (fresh-agent-extras-router.ts:370-428) ──
+
+/// `GET /checkpoints?cwd=` (`fresh-agent-extras-router.ts:370-380`). Note:
+/// unlike the sibling POST routes in this file, legacy does NOT check that
+/// `cwd` exists on disk here — a cwd that's never been checkpointed (or
+/// doesn't exist at all) just yields an empty list, not a 400.
+async fn get_checkpoints(
+    State(state): State<CheckpointsApiState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return unauthorized();
+    }
+    let cwd = match params
+        .get("cwd")
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        Some(cwd) => cwd.to_string(),
+        None => return bad_request("cwd query parameter required"),
+    };
+    match list_checkpoints(&state.home, Path::new(&cwd)).await {
+        Ok(entries) => Json(json!({ "checkpoints": entries })).into_response(),
+        Err(message) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": message })),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /checkpoints/metadata` (`fresh-agent-extras-router.ts:382-408`).
+async fn post_checkpoint_metadata(
+    State(state): State<CheckpointsApiState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return unauthorized();
+    }
+
+    let cwd = body.get("cwd").and_then(Value::as_str).unwrap_or("");
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    let request_id = body
+        .get("requestId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let turn_id = body
+        .get("turnId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if cwd.is_empty() || id.is_empty() {
+        return bad_request("cwd and id are required");
+    }
+    if request_id.is_none() && turn_id.is_none() {
+        return bad_request("requestId or turnId is required");
+    }
+    if tokio::fs::metadata(cwd).await.is_err() {
+        return bad_request(&format!("cwd does not exist: {cwd}"));
+    }
+
+    match apply_checkpoint_metadata_patch(&state.home, Path::new(cwd), id, request_id, turn_id)
+        .await
+    {
+        Ok(entry) => Json(entry).into_response(),
+        Err(message) => {
+            let status = if message.contains("invalid checkpoint id") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(json!({ "error": message }))).into_response()
+        }
+    }
+}
+
+/// `POST /checkpoints/restore` (`fresh-agent-extras-router.ts:410-428`).
+async fn post_checkpoint_restore(
+    State(state): State<CheckpointsApiState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return unauthorized();
+    }
+
+    let cwd = body.get("cwd").and_then(Value::as_str).unwrap_or("");
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    if cwd.is_empty() || id.is_empty() {
+        return bad_request("cwd and id are required");
+    }
+    if tokio::fs::metadata(cwd).await.is_err() {
+        return bad_request(&format!("cwd does not exist: {cwd}"));
+    }
+
+    match restore_checkpoint(&state.home, Path::new(cwd), id).await {
+        Ok(()) => Json(json!({ "restored": true })).into_response(),
+        Err(message) => {
+            let status = if message.contains("invalid checkpoint id") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(json!({ "error": message }))).into_response()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -656,5 +946,660 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(request).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── is_valid_checkpoint_id ──────────────────────────────────────────
+
+    #[test]
+    fn checkpoint_id_format_accepts_7_to_40_hex_chars_case_insensitively() {
+        assert!(is_valid_checkpoint_id("abc1234")); // 7 chars, minimum
+        assert!(is_valid_checkpoint_id("ABC1234")); // uppercase hex ok
+        assert!(is_valid_checkpoint_id(&"a".repeat(40))); // 40 chars, maximum
+    }
+
+    #[test]
+    fn checkpoint_id_format_rejects_too_short_too_long_or_non_hex() {
+        assert!(!is_valid_checkpoint_id("abc123")); // 6 chars, too short
+        assert!(!is_valid_checkpoint_id(&"a".repeat(41))); // 41 chars, too long
+        assert!(!is_valid_checkpoint_id("nothexch")); // contains non-hex chars
+        assert!(!is_valid_checkpoint_id(""));
+    }
+
+    // ── GET /checkpoints (list) ─────────────────────────────────────────
+
+    fn list_query(cwd: &str) -> Query<HashMap<String, String>> {
+        Query(HashMap::from([("cwd".to_string(), cwd.to_string())]))
+    }
+
+    #[tokio::test]
+    async fn list_missing_auth_is_401() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let resp = get_checkpoints(
+            State(state(home_dir.path())),
+            HeaderMap::new(),
+            list_query("/tmp"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn list_wrong_auth_token_is_401() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let resp = get_checkpoints(
+            State(state(home_dir.path())),
+            headers_with_token("wrong"),
+            list_query("/tmp"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn list_missing_cwd_query_param_is_400() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let resp = get_checkpoints(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Query(HashMap::new()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn list_returns_empty_checkpoints_for_a_cwd_with_no_checkpoints_yet() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let resp = get_checkpoints(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            list_query(cwd_dir.path().to_str().unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value = body_json(resp).await;
+        assert_eq!(value["checkpoints"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn list_does_not_require_cwd_to_exist_on_disk() {
+        // Legacy GET /checkpoints has no fsp.access(cwd) guard (unlike POST
+        // /checkpoints, /diff, /exec) -- fresh-agent-extras-router.ts:370-380.
+        let home_dir = tempfile::tempdir().unwrap();
+        let missing = home_dir.path().join("does-not-exist-anywhere");
+        let resp = get_checkpoints(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            list_query(missing.to_str().unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value = body_json(resp).await;
+        assert_eq!(value["checkpoints"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn list_returns_checkpoints_newest_first_with_id_ts_label() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+
+        let resp1 = post_checkpoint(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(json!({ "cwd": cwd_dir.path().to_str().unwrap(), "label": "first" })),
+        )
+        .await
+        .into_response();
+        let id1 = body_json(resp1).await["id"].as_str().unwrap().to_string();
+
+        let resp2 = post_checkpoint(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(json!({ "cwd": cwd_dir.path().to_str().unwrap(), "label": "second" })),
+        )
+        .await
+        .into_response();
+        let id2 = body_json(resp2).await["id"].as_str().unwrap().to_string();
+        assert_ne!(id1, id2);
+
+        let resp = get_checkpoints(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            list_query(cwd_dir.path().to_str().unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value = body_json(resp).await;
+        let checkpoints = value["checkpoints"].as_array().unwrap();
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(checkpoints[0]["id"], json!(id2), "newest checkpoint first");
+        assert_eq!(checkpoints[0]["label"], json!("second"));
+        assert_eq!(checkpoints[1]["id"], json!(id1));
+        assert_eq!(checkpoints[1]["label"], json!("first"));
+        assert!(checkpoints[0]["ts"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn list_includes_persisted_request_id_metadata() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let resp = post_checkpoint(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(json!({
+                "cwd": cwd_dir.path().to_str().unwrap(),
+                "label": "with metadata",
+                "requestId": "req-1",
+            })),
+        )
+        .await
+        .into_response();
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+        let resp = get_checkpoints(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            list_query(cwd_dir.path().to_str().unwrap()),
+        )
+        .await;
+        let value = body_json(resp).await;
+        let checkpoints = value["checkpoints"].as_array().unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0]["id"], json!(id));
+        assert_eq!(checkpoints[0]["requestId"], json!("req-1"));
+    }
+
+    // ── POST /checkpoints/metadata ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn metadata_missing_auth_is_401() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let resp = post_checkpoint_metadata(
+            State(state(home_dir.path())),
+            HeaderMap::new(),
+            Json(json!({ "cwd": "/tmp", "id": "abc1234", "turnId": "t1" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn metadata_missing_cwd_or_id_is_400() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let resp = post_checkpoint_metadata(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(json!({ "turnId": "t1" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let value = body_json(resp).await;
+        assert_eq!(value["error"], json!("cwd and id are required"));
+    }
+
+    #[tokio::test]
+    async fn metadata_missing_request_id_and_turn_id_is_400() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let resp = post_checkpoint_metadata(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(json!({ "cwd": cwd_dir.path().to_str().unwrap(), "id": "abc1234" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let value = body_json(resp).await;
+        assert_eq!(value["error"], json!("requestId or turnId is required"));
+    }
+
+    #[tokio::test]
+    async fn metadata_nonexistent_cwd_is_400() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let missing = home_dir.path().join("does-not-exist");
+        let resp = post_checkpoint_metadata(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(json!({ "cwd": missing.to_str().unwrap(), "id": "abc1234", "turnId": "t1" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let value = body_json(resp).await;
+        assert!(value["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("cwd does not exist:"));
+    }
+
+    #[tokio::test]
+    async fn metadata_invalid_checkpoint_id_format_is_400() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let resp = post_checkpoint_metadata(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(json!({
+                "cwd": cwd_dir.path().to_str().unwrap(),
+                "id": "nothex!!", // fails the hex-chars format check
+                "turnId": "t1",
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let value = body_json(resp).await;
+        assert_eq!(value["error"], json!("invalid checkpoint id"));
+    }
+
+    #[tokio::test]
+    async fn metadata_well_formed_but_nonexistent_commit_id_is_500() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        // Create the shadow repo (with at least one commit) so rev-parse has
+        // a repo to search, but reference a sha that was never committed.
+        post_checkpoint(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(valid_body(cwd_dir.path().to_str().unwrap())),
+        )
+        .await;
+        let resp = post_checkpoint_metadata(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(json!({
+                "cwd": cwd_dir.path().to_str().unwrap(),
+                "id": "0000000000000000000000000000000000000f",
+                "turnId": "t1",
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn metadata_round_trip_persists_request_id_and_turn_id_and_returns_merged_entry() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let resp = post_checkpoint(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(valid_body(cwd_dir.path().to_str().unwrap())),
+        )
+        .await
+        .into_response();
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+        let resp = post_checkpoint_metadata(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(json!({
+                "cwd": cwd_dir.path().to_str().unwrap(),
+                "id": id,
+                "requestId": "req-9",
+                "turnId": "turn-9",
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value = body_json(resp).await;
+        assert_eq!(value["id"], json!(id));
+        assert_eq!(value["requestId"], json!("req-9"));
+        assert_eq!(value["turnId"], json!("turn-9"));
+
+        // The patch must be visible via the list route too (same persisted file).
+        let list_resp = get_checkpoints(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            list_query(cwd_dir.path().to_str().unwrap()),
+        )
+        .await;
+        let list_value = body_json(list_resp).await;
+        let checkpoints = list_value["checkpoints"].as_array().unwrap();
+        assert_eq!(checkpoints[0]["turnId"], json!("turn-9"));
+    }
+
+    #[tokio::test]
+    async fn metadata_short_sha_prefix_resolves_to_full_sha_entry() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let resp = post_checkpoint(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(valid_body(cwd_dir.path().to_str().unwrap())),
+        )
+        .await
+        .into_response();
+        let full_id = body_json(resp).await["id"].as_str().unwrap().to_string();
+        let short_id = &full_id[..8];
+
+        let resp = post_checkpoint_metadata(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(json!({
+                "cwd": cwd_dir.path().to_str().unwrap(),
+                "id": short_id,
+                "turnId": "turn-short",
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value = body_json(resp).await;
+        assert_eq!(
+            value["id"],
+            json!(full_id),
+            "response id must be the resolved full sha, not the short prefix"
+        );
+    }
+
+    // ── POST /checkpoints/restore ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn restore_missing_auth_is_401() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let resp = post_checkpoint_restore(
+            State(state(home_dir.path())),
+            HeaderMap::new(),
+            Json(json!({ "cwd": "/tmp", "id": "abc1234" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn restore_missing_cwd_or_id_is_400() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let resp = post_checkpoint_restore(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(json!({ "cwd": "/tmp" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let value = body_json(resp).await;
+        assert_eq!(value["error"], json!("cwd and id are required"));
+    }
+
+    #[tokio::test]
+    async fn restore_nonexistent_cwd_is_400() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let missing = home_dir.path().join("does-not-exist");
+        let resp = post_checkpoint_restore(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(json!({ "cwd": missing.to_str().unwrap(), "id": "abc1234" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn restore_invalid_checkpoint_id_format_is_400() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let resp = post_checkpoint_restore(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(json!({ "cwd": cwd_dir.path().to_str().unwrap(), "id": "nothex!!" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let value = body_json(resp).await;
+        assert_eq!(value["error"], json!("invalid checkpoint id"));
+    }
+
+    #[tokio::test]
+    async fn restore_well_formed_but_nonexistent_commit_id_is_500() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let resp = post_checkpoint_restore(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(json!({
+                "cwd": cwd_dir.path().to_str().unwrap(),
+                "id": "0000000000000000000000000000000000000f",
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn restore_reverts_a_tracked_file_mutation() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let file_path = cwd_dir.path().join("file.txt");
+        tokio::fs::write(&file_path, "original").await.unwrap();
+
+        let resp = post_checkpoint(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(valid_body(cwd_dir.path().to_str().unwrap())),
+        )
+        .await
+        .into_response();
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+        tokio::fs::write(&file_path, "modified after checkpoint")
+            .await
+            .unwrap();
+
+        let resp = post_checkpoint_restore(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(json!({ "cwd": cwd_dir.path().to_str().unwrap(), "id": id })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value = body_json(resp).await;
+        assert_eq!(value["restored"], json!(true));
+
+        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(content, "original");
+    }
+
+    #[tokio::test]
+    async fn restore_leaves_files_created_after_the_checkpoint_in_place() {
+        // Pinning legacy's documented v1 semantics (fresh-agent-extras-router.ts:67-68,
+        // and the client's own confirm-dialog copy in FreshAgentView.tsx:1719):
+        // "Files created since are left in place." Restore uses overlay-mode
+        // `git checkout <id> -- .`, which never deletes paths absent from the
+        // checkpoint's tree.
+        let home_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let tracked_path = cwd_dir.path().join("tracked.txt");
+        tokio::fs::write(&tracked_path, "original").await.unwrap();
+
+        let resp = post_checkpoint(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(valid_body(cwd_dir.path().to_str().unwrap())),
+        )
+        .await
+        .into_response();
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+        let new_path = cwd_dir.path().join("created-after.txt");
+        tokio::fs::write(&new_path, "new stuff").await.unwrap();
+        tokio::fs::write(&tracked_path, "modified").await.unwrap();
+
+        let resp = post_checkpoint_restore(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(json!({ "cwd": cwd_dir.path().to_str().unwrap(), "id": id })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert_eq!(
+            tokio::fs::read_to_string(&tracked_path).await.unwrap(),
+            "original",
+            "tracked file changed since the checkpoint must be reverted"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&new_path).await.unwrap(),
+            "new stuff",
+            "a file created after the checkpoint must be left in place, not deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_recreates_a_tracked_file_deleted_after_the_checkpoint() {
+        // Overlay-mode `git checkout <id> -- .` restores any path present in
+        // the checkpoint's tree, including one that was deleted from the
+        // working tree afterward -- pinning this less-obvious corner of the
+        // "restore" contract (not merely "revert modifications").
+        let home_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let file_path = cwd_dir.path().join("file.txt");
+        tokio::fs::write(&file_path, "original").await.unwrap();
+
+        let resp = post_checkpoint(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(valid_body(cwd_dir.path().to_str().unwrap())),
+        )
+        .await
+        .into_response();
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+        tokio::fs::remove_file(&file_path).await.unwrap();
+        assert!(tokio::fs::metadata(&file_path).await.is_err());
+
+        let resp = post_checkpoint_restore(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(json!({ "cwd": cwd_dir.path().to_str().unwrap(), "id": id })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(content, "original");
+    }
+
+    #[tokio::test]
+    async fn restore_never_touches_cwds_own_git_state() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        run_git(&["init", "-q"], Some(cwd_dir.path()))
+            .await
+            .unwrap();
+        let file_path = cwd_dir.path().join("file.txt");
+        tokio::fs::write(&file_path, "original").await.unwrap();
+
+        let resp = post_checkpoint(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(valid_body(cwd_dir.path().to_str().unwrap())),
+        )
+        .await
+        .into_response();
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+        tokio::fs::write(&file_path, "modified").await.unwrap();
+        let resp = post_checkpoint_restore(
+            State(state(home_dir.path())),
+            headers_with_token("tok"),
+            Json(json!({ "cwd": cwd_dir.path().to_str().unwrap(), "id": id })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The cwd's own .git must remain exactly what `git init` produced --
+        // no HEAD/index mutation from the shadow-repo restore.
+        let head = tokio::fs::read_to_string(cwd_dir.path().join(".git/HEAD"))
+            .await
+            .unwrap();
+        assert!(head.starts_with("ref:"));
+    }
+
+    // ── outer end-to-end test: real HTTP routes, create -> list -> mutate -> restore ──
+
+    #[tokio::test]
+    async fn end_to_end_rewind_actually_rewinds_via_real_http_routes() {
+        use tower::ServiceExt;
+
+        let home_dir = tempfile::tempdir().unwrap();
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let file_path = cwd_dir.path().join("code.rs");
+        tokio::fs::write(&file_path, "fn original() {}")
+            .await
+            .unwrap();
+
+        async fn send(app: &Router, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
+            let request = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("x-auth-token", "tok")
+                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            let resp = app.clone().oneshot(request).await.unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: Value = if bytes.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_slice(&bytes).unwrap()
+            };
+            (status, value)
+        }
+
+        let app = router(state(home_dir.path()));
+
+        // 1. create
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/fresh-agent/checkpoints",
+            json!({ "cwd": cwd_dir.path().to_str().unwrap(), "label": "before the fix" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let checkpoint_id = body["id"].as_str().unwrap().to_string();
+
+        // 2. list -- the checkpoint we just created must appear.
+        let (status, body) = send(
+            &app,
+            "GET",
+            &format!(
+                "/api/fresh-agent/checkpoints?cwd={}",
+                cwd_dir.path().to_str().unwrap()
+            ),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let checkpoints = body["checkpoints"].as_array().unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0]["id"], json!(checkpoint_id));
+
+        // 3. mutate the working tree (simulating an agent turn editing code).
+        tokio::fs::write(&file_path, "fn broken() { panic!() }")
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(&file_path).await.unwrap(),
+            "fn broken() { panic!() }"
+        );
+
+        // 4. restore -- the whole point of "rewind code to here".
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/fresh-agent/checkpoints/restore",
+            json!({ "cwd": cwd_dir.path().to_str().unwrap(), "id": checkpoint_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["restored"], json!(true));
+
+        // 5. verify: the file bytes are back to their checkpointed state.
+        let restored_content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(
+            restored_content, "fn original() {}",
+            "rewind must actually rewind the file to its checkpointed contents"
+        );
     }
 }
