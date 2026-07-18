@@ -32,6 +32,12 @@ const MATRIX_SPECS = [
   // of the TERM-22/SAFE-11/TAURI-30 implementation wave). See
   // restore-sync05.spec.ts for the full acceptance-text mirror.
   /restore-sync05\.spec\.ts$/,
+  // Permanent regression pin for the double-restart-mid-restore production
+  // incident (client fix in commit cd35c24c): a FreshCodex session must
+  // survive two rapid, overlapping server restarts without a blank
+  // replacement pane, and a genuinely-missing durable thread must degrade
+  // to a bounded, recoverable lost state. See restore-double-restart.spec.ts.
+  /restore-double-restart\.spec\.ts$/,
   // AGENT-08 -- OpenCode continuity via REST (`/api/tabs` +
   // `/api/panes/:id/send-keys`): one durable id across repeat sends, a
   // different id per pane. See agent-continuity-matrix.spec.ts.
