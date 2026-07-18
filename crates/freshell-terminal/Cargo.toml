@@ -18,6 +18,14 @@ serde_json = { workspace = true }
 # Real pseudo-terminal spawn/read/write/resize/kill (node-pty's role).
 portable-pty = "0.8"
 
+[target.'cfg(unix)'.dependencies]
+# SAFE-11/TERM-22: `PtyTerminal::kill` additionally SIGKILLs the whole process
+# GROUP (not just the pty's direct child), so a foreground command the shell
+# spawned (e.g. `sleep 300`) is reliably reaped too. Already resolved in the
+# workspace lock transitively (freshell-server/freshell-freshagent both
+# already depend on it directly), so this adds no new download.
+libc = "0.2"
+
 [dev-dependencies]
 # The T1 fidelity test asserts sha256-equality with the committed goldens.
 sha2 = "0.10"

@@ -112,6 +112,13 @@ pub struct PtyTerminal {
     terminal_id: String,
     stream_id: String,
     reaped: bool,
+    // SAFE-11/TERM-22: the pty child's own pid (unix only; `None` on windows or
+    // if the library can't report it), captured before the `Child` handle moves
+    // into `waiter_thread`. `kill()` uses it to additionally signal the WHOLE
+    // process GROUP (`-pid`), not just this single process -- see `kill`'s doc
+    // comment for why `killer.kill()` alone is not sufficient.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pid: Option<u32>,
 }
 
 impl PtyTerminal {
@@ -214,6 +221,10 @@ impl PtyTerminal {
         // On unix the reader EOFs by itself (slave closed \u2192 EIO), and the master
         // must stay open until Drop so no pending output is truncated.
         let killer = child.clone_killer();
+        // SAFE-11/TERM-22: captured BEFORE `child` moves into `waiter_thread`,
+        // so `kill()` can additionally signal the whole process GROUP (see
+        // `kill`'s doc comment).
+        let pid = child.process_id();
         let master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>> =
             Arc::new(Mutex::new(Some(pair.master)));
         let waiter_master = Arc::clone(&master);
@@ -248,6 +259,7 @@ impl PtyTerminal {
             terminal_id,
             stream_id,
             reaped: false,
+            pid,
         })
     }
 
@@ -300,12 +312,37 @@ impl PtyTerminal {
     /// Idempotent. The waiter thread reaps it (`child.wait()`) and \u2014 on Windows \u2014
     /// closes the ConPTY master so the reader thread EOFs; on unix the child's
     /// death closes its slave fds and the reader EOFs via EIO after draining.
+    ///
+    /// SAFE-11/TERM-22: `self.killer.kill()` alone only signals the pty's
+    /// DIRECT child (the shell). A foreground command that child itself
+    /// spawned (e.g. a user typing `sleep 300`) is a SEPARATE process in the
+    /// SAME process group, not a target of that single-pid signal. Relying
+    /// solely on it left such a command orphaned in exactly the shutdown
+    /// scenario this fix closes (verified empirically: an intermittent
+    /// leaked descendant pid under `scripts/sandbox-test.sh`, racing against
+    /// the incidental SIGHUP a pty master's close delivers to its foreground
+    /// group -- present on unix, but never guaranteed, and absent on
+    /// Windows). SIGKILL to the NEGATIVE pid (the whole process group) closes
+    /// that gap: it reaches the shell AND every process it spawned into its
+    /// own foreground group, deterministically, without depending on the
+    /// pty's own hangup semantics.
     pub fn kill(&mut self) {
         if self.reaped {
             return;
         }
         self.reaped = true;
         let _ = self.killer.kill();
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            // SAFETY: `libc::kill` with a negative pid signals the whole
+            // process group rooted at that pid; a process's own group is
+            // always safe to signal (we only ever signal a group WE
+            // spawned). Best-effort: ESRCH (already gone) is expected and
+            // ignored, matching `killer.kill()`'s own idempotent contract.
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+        }
     }
 }
 

@@ -513,11 +513,31 @@ async fn main() -> ExitCode {
     // Single startup line (stderr, so it never pollutes any stdout protocol).
     eprintln!("freshell-server listening on http://{addr} (ws://{addr}/ws)");
 
-    // Serve with graceful shutdown on SIGTERM/SIGINT so the fresh-agent opencode
-    // serve sidecar is reaped (SIGTERM + `/proc` ownership sweep) — no orphans.
+    // Serve with graceful shutdown on SIGTERM/SIGINT so every owned child (PTY
+    // terminals, the Codex/claude/opencode sidecars) is reaped — no orphans.
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(Arc::clone(&shutdown_notify)))
         .await;
+    // SAFE-11/TERM-22: reap every owned child tree before exit. Legacy parity
+    // (`server/index.ts:981-1049`'s `shutdown()`): after the HTTP/WS surface is
+    // drained, `joinCodexShutdownOwners` reaps `registry.shutdownGracefully()`
+    // (terminals) and the Codex/opencode sidecars together, then
+    // `codingCliSessionManager.shutdown()` covers any remaining coding-CLI
+    // session. This port's equivalents run in the same spot:
+    //   * `registry.kill_all()` — every tracked PTY terminal (`mode:'shell'`
+    //     and any other registry-tracked terminal, e.g. a plain `sleep 300`
+    //     shell) — the gap this fix closes; nothing previously killed these.
+    //   * `fresh_agent_state.shutdown()` — the shared opencode `serve`
+    //     sidecar. Legacy parity note: the original DOES tear this down on a
+    //     general server shutdown (`codexFreshAgentRuntime.shutdown()` in
+    //     `server/index.ts:330-332` calls `opencodeFreshAgentAdapter.shutdown`,
+    //     which reaches `OpencodeServeManager.shutdown()`,
+    //     `server/fresh-agent/adapters/opencode/serve-manager.ts:573-591`) — it
+    //     is NOT deliberately left running across a general restart, so this
+    //     port matches that (already implemented before this fix).
+    //   * `fresh_codex_state.shutdown()` / `fresh_claude_state.shutdown()` —
+    //     the Codex app-server and claude Node sidecars (already implemented).
+    registry.kill_all();
     fresh_agent_state.shutdown().await;
     // Reap every owned codex app-server sidecar (SIGKILL + `/proc` ownership sweep) so a
     // freshcodex T2 run leaves no orphaned app-server.
@@ -533,9 +553,17 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// SAFE-11: the hard ceiling on the whole shutdown sequence — WS drain +
+/// terminal/sidecar reaping — measured from the moment a shutdown signal
+/// arrives. "Use the full grace period" (not less), but never hang forever:
+/// [`shutdown_signal`] arms a watchdog at this exact instant that force-exits
+/// nonzero if the process is still alive once it elapses.
+const SHUTDOWN_HARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Resolve once a shutdown signal arrives (SIGTERM from the oracle harness's
-/// `stop()`, or Ctrl-C). Drives `axum`'s graceful shutdown so the opencode serve
-/// sidecar is reaped before exit.
+/// `stop()`, or Ctrl-C). Drives `axum`'s graceful shutdown so every owned
+/// child (PTY terminals, the Codex/claude/opencode sidecars) is reaped before
+/// exit.
 async fn shutdown_signal(notify_ws: Arc<tokio::sync::Notify>) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -559,6 +587,22 @@ async fn shutdown_signal(notify_ws: Arc<tokio::sync::Notify>) {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
+
+    // SAFE-11 fail-safe watchdog: arm the hard timeout THE INSTANT the signal
+    // arrives (not at process boot — a long-lived server must never carry a
+    // ticking bomb while just serving requests). If the graceful sequence
+    // below (WS drain, then `registry.kill_all()` + every fresh-agent
+    // sidecar's `shutdown()`) hasn't exited the process by the time this
+    // fires, something hung — log it and force-exit nonzero rather than
+    // leave the operator's terminal blocked forever.
+    tokio::spawn(async {
+        tokio::time::sleep(SHUTDOWN_HARD_TIMEOUT).await;
+        eprintln!(
+            "freshell-server: graceful shutdown exceeded {SHUTDOWN_HARD_TIMEOUT:?}; force-exiting"
+        );
+        std::process::exit(1);
+    });
+
     // Close every live WS connection with `4009 "Server shutting down"`
     // (ws-handler.ts:3843 parity) and give the close frames a beat to flush
     // before axum tears the listener down.

@@ -97,3 +97,8 @@ tempfile = "3"
 # writable connection before `OpencodeSource` opens it read-only (same bundled
 # engine `freshell-sessions` uses, unified by cargo).
 rusqlite = { version = "0.31", features = ["bundled"] }
+# SAFE-11/TERM-22: the shutdown-reaping outer test drives a REAL `/ws` client
+# against the compiled binary (same version freshell-ws's own tests already
+# use, `crates/freshell-ws/Cargo.toml`) — no mock, the actual wire protocol.
+tokio-tungstenite = "0.24"
+futures-util = "0.3"

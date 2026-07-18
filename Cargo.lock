@@ -1335,6 +1335,7 @@ dependencies = [
  "freshell-sessions",
  "freshell-terminal",
  "freshell-ws",
+ "futures-util",
  "libc",
  "regex",
  "reqwest",
@@ -1344,6 +1345,7 @@ dependencies = [
  "sha1",
  "tempfile",
  "tokio",
+ "tokio-tungstenite 0.24.0",
  "tower",
  "tracing",
  "tracing-subscriber",
@@ -1385,6 +1387,7 @@ version = "0.1.0"
 dependencies = [
  "freshell-platform",
  "freshell-protocol",
+ "libc",
  "portable-pty",
  "serde_json",
  "sha2",

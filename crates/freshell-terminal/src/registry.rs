@@ -741,6 +741,28 @@ impl TerminalRegistry {
         true
     }
 
+    /// SAFE-11/TERM-22: reap **every** currently-tracked terminal on server
+    /// shutdown — legacy parity with `terminal-registry.ts:4843`
+    /// `shutdownGracefully()` (SIGTERM every running PTY, wait up to a
+    /// timeout, force-kill the remainder) applied to the whole registry
+    /// instead of one id at a time. This port's per-terminal [`Self::kill`]
+    /// is already an immediate SIGKILL-and-reap (see `PtyTerminal::kill`'s
+    /// doc comment), so `kill_all` reuses that same convention for every
+    /// tracked terminal rather than introducing a second, SIGTERM-then-wait
+    /// code path that no other caller in this port uses.
+    ///
+    /// Snapshots the id set first (rather than holding the registry lock
+    /// while killing) so a `kill()` reentered from a terminal's own exit
+    /// fan-out can't deadlock against this call. Returns the number of
+    /// terminals actually killed, for shutdown logging/tests.
+    pub fn kill_all(&self) -> usize {
+        let ids: Vec<String> = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner.terminals.keys().cloned().collect()
+        };
+        ids.iter().filter(|id| self.kill(id)).count()
+    }
+
     /// `finishTerminalPtyExit` (`terminal-registry.ts:1479-1510`), non-codex core —
     /// the NATURAL-exit path (the kill path stays in [`kill`](Self::kill), which
     /// removes the record first so this lookup misses, mirroring the original's
@@ -1389,6 +1411,39 @@ mod tests {
         assert!(got_exit);
         // Killing an unknown terminal is a no-op false.
         assert!(!reg.kill("T"));
+    }
+
+    #[test]
+    fn kill_all_reaps_every_running_terminal_and_notifies_subscribers() {
+        // SAFE-11/TERM-22: the shutdown path must reap EVERY tracked terminal
+        // (not just the one a caller happens to name), mirroring
+        // `terminal-registry.ts:4843` `shutdownGracefully()` applied to the
+        // whole registry instead of one id at a time.
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T-a", "S1");
+        reg.insert_headless("T-b", "S2");
+        let (sink_a, seen_a) = collector();
+        let (sink_b, seen_b) = collector();
+        reg.attach("T-a", 1, sink_a, None, 0, false);
+        reg.attach("T-b", 2, sink_b, None, 0, false);
+        let rev_before = reg.revision();
+
+        let killed = reg.kill_all();
+
+        assert_eq!(killed, 2, "both tracked terminals were reaped");
+        assert!(!reg.is_running("T-a"));
+        assert!(!reg.is_running("T-b"));
+        assert!(reg.revision() > rev_before, "revision bumped");
+        for seen in [&seen_a, &seen_b] {
+            let got_exit = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| matches!(m, ServerMessage::TerminalExit(_)));
+            assert!(got_exit, "each attached subscriber saw terminal.exit");
+        }
+        // Idempotent / empty-registry-safe: a second call finds nothing left to kill.
+        assert_eq!(reg.kill_all(), 0);
     }
 
     #[test]
