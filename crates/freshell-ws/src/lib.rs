@@ -113,6 +113,20 @@ pub struct WsState {
     /// so WS create/kill and REST override changes stamp ONE monotonic sequence,
     /// exactly like the original's single per-handler counter.
     pub terminals_revision: Arc<std::sync::atomic::AtomicI64>,
+    /// SESSION-09: the monotonic `sessions.changed` revision counter for the
+    /// periodic session-directory sweep (`freshell-server`'s
+    /// `spawn_sessions_sweep`, `main.rs`). Legacy's `SessionsSyncService`
+    /// (`server/sessions-sync/service.ts:31-73`) owns ONE such counter per
+    /// server process and stamps it on every coalesced directory-change
+    /// broadcast (`ws-handler.ts:3662-3668` `broadcastAuthenticated`); this
+    /// field is that same per-process counter for the port. NOTE: this is
+    /// deliberately independent of `freshell-freshagent`'s own internal
+    /// `sessions_revision` (used only for the narrower
+    /// placeholder-\u2192durable materialization broadcast on a fresh-agent
+    /// turn) -- the two are not unified in this slice; see
+    /// `crate::terminal::broadcast_sessions_changed`'s doc comment for the
+    /// known consequence.
+    pub sessions_revision: Arc<std::sync::atomic::AtomicI64>,
     /// The registered coding-CLI command specs (`claude`/`codex`/`opencode`/...),
     /// used to resolve `terminal.create { mode: <cli> }` into a real CLI launch
     /// (`resolveCodingCliCommand`). Populated from the extension registry at boot;
@@ -502,6 +516,7 @@ mod tests {
             tabs: crate::tabs::TabsRegistry::new(),
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
             ping_interval_ms: 30_000,
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),

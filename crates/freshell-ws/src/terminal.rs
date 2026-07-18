@@ -938,6 +938,45 @@ fn broadcast_terminals_changed(state: &WsState) {
     let _ = state.broadcast_tx.send(frame);
 }
 
+/// SESSION-09: fan `{type:'sessions.changed', revision}` to every authenticated
+/// connection over the shared broadcast bus, stamping the handler-scoped
+/// monotonic `WsState::sessions_revision` counter -- the same shape/pattern as
+/// [`broadcast_terminals_changed`] above, just for the session-directory
+/// live-update slice. Legacy parity: `SessionsSyncService`'s coalesced
+/// revision bump (`server/sessions-sync/service.ts:62`), fanned out by
+/// `WsHandler.broadcastAuthenticated` (`ws-handler.ts:3662-3668`). The
+/// client-side consumer is `src/App.tsx:924-932` -- it only refetches when
+/// `revision` INCREASES over the last one it saw, so callers must always
+/// route through this function (never hand-construct the frame) to keep the
+/// counter monotonic.
+///
+/// Caller: `freshell-server`'s periodic session-directory sweep task
+/// (`spawn_sessions_sweep`, `main.rs`) -- there is no filesystem watcher
+/// wired to the session directory in this port (see
+/// `freshell_sessions::directory_index` module docs), so a plain interval
+/// sweep is what detects "did anything change" and invokes this.
+///
+/// NOTE: `freshell-freshagent` also emits a `sessions.changed` frame (on a
+/// fresh-agent turn's placeholder-\u2192durable session materialization) using
+/// its OWN internal `sessions_revision` counter, entirely independent of
+/// `WsState::sessions_revision`. The two counters are NOT unified in this
+/// slice. Because the client's dedupe is "accept only if revision increases",
+/// two independently-incrementing producers of the same message type can, in
+/// rare interleavings, cause a real change from one producer to be masked by
+/// a lower-or-equal revision number from the other (the client already
+/// advanced its watermark past that value from the first producer's frame).
+/// This is a known architectural gap flagged for follow-up reconciliation
+/// (e.g. sharing ONE counter across both producers), not fixed here because
+/// `freshell-freshagent` is owned by a different concurrent workstream.
+pub fn broadcast_sessions_changed(state: &WsState) {
+    let revision = state
+        .sessions_revision
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
+    let frame = serde_json::json!({ "type": "sessions.changed", "revision": revision }).to_string();
+    let _ = state.broadcast_tx.send(frame);
+}
+
 /// Send the reference's `sendError` frame for a failed `terminal.create`
 /// (`ws-handler.ts:2606-2614`): `{ code, message, requestId }`.
 async fn send_create_error(
@@ -1558,6 +1597,7 @@ mod terminals_changed_tests {
             tabs: crate::tabs::TabsRegistry::new(),
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
             ping_interval_ms: 30_000,
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
@@ -1583,6 +1623,28 @@ mod terminals_changed_tests {
         assert_eq!(
             f2,
             serde_json::json!({ "type": "terminals.changed", "revision": 2 })
+        );
+    }
+
+    /// SESSION-09: `sessions.changed` mirrors the same frame-shape + monotonic-
+    /// counter contract as `terminals.changed` above (legacy's
+    /// `sessions-sync/service.ts:62` revision bump, fanned out by
+    /// `ws-handler.ts:3662-3668` `broadcastAuthenticated`) -- just stamped over
+    /// `WsState::sessions_revision` instead of `terminals_revision`.
+    #[test]
+    fn broadcast_sessions_changed_emits_monotonic_revision_frames() {
+        let (state, mut rx) = state_with_bus();
+        broadcast_sessions_changed(&state);
+        broadcast_sessions_changed(&state);
+        let f1: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        let f2: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            f1,
+            serde_json::json!({ "type": "sessions.changed", "revision": 1 })
+        );
+        assert_eq!(
+            f2,
+            serde_json::json!({ "type": "sessions.changed", "revision": 2 })
         );
     }
 
@@ -1731,6 +1793,7 @@ mod terminal_meta_created_tests {
             tabs: crate::tabs::TabsRegistry::new(),
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: std::sync::Arc::new(Vec::new()),
             ping_interval_ms: 30_000,
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),

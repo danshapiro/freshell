@@ -231,6 +231,12 @@ async fn main() -> ExitCode {
     // REST `/api/terminals` PATCH/DELETE broadcasts — the original keeps a single
     // `terminalsRevision` on the WsHandler that both surfaces stamp.
     let terminals_revision = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    // SESSION-09: ONE handler-scoped `sessions.changed` revision counter,
+    // stamped by the periodic session-directory sweep task (spawned below,
+    // once `session_index` exists) -- see `freshell_ws::WsState::sessions_revision`'s
+    // doc comment for the full parity rationale and the known independence
+    // from `freshell-freshagent`'s own internal counter of the same name.
+    let sessions_revision = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let ws_state = WsState {
         identity: terminal_identity.clone(),
         auth_token: Arc::clone(&auth_token),
@@ -246,6 +252,7 @@ async fn main() -> ExitCode {
         tabs: tabs.clone(),
         screenshots: screenshots.clone(),
         terminals_revision: Arc::clone(&terminals_revision),
+        sessions_revision: Arc::clone(&sessions_revision),
         cli_commands: Arc::clone(&cli_commands),
         shutdown: Arc::clone(&shutdown_notify),
         ping_interval_ms: resolve_ping_interval_ms(),
@@ -341,7 +348,7 @@ async fn main() -> ExitCode {
     // (inside `SessionIndex::snapshot`), so this never delays serving other
     // requests while it's in flight.
     if let Some(index) = &session_index {
-        let index = Arc::clone(index);
+        let warm_index = Arc::clone(index);
         // DIAG-01: log the initial warm sweep's count + duration (an
         // equivalent call to `index.warm()`'s own body -- `snapshot()` is
         // what `warm()` calls internally -- but keeping the return value
@@ -349,7 +356,7 @@ async fn main() -> ExitCode {
         // instead of discarding it).
         tokio::spawn(async move {
             let start = std::time::Instant::now();
-            let items = index.snapshot().await;
+            let items = warm_index.snapshot().await;
             tracing::info!(
                 event = "session_index_warm",
                 count = items.len(),
@@ -357,6 +364,12 @@ async fn main() -> ExitCode {
                 "session index warm sweep complete"
             );
         });
+        // SESSION-09: start the periodic sessions.changed sweep -- see
+        // `spawn_sessions_sweep`'s doc comment for the full parity rationale.
+        // `ws_state` is Clone (cheap: every field is an Arc/primitive), so
+        // this borrows nothing from the `ws_state` binding consumed by the
+        // router merge below.
+        spawn_sessions_sweep(Arc::clone(index), ws_state.clone(), SESSIONS_SWEEP_INTERVAL);
     }
     let session_directory_state = session_directory::SessionDirectoryState {
         auth_token: Arc::clone(&auth_token),
@@ -777,6 +790,296 @@ fn resolve_client_dir() -> PathBuf {
         return compiled;
     }
     PathBuf::from("dist/client")
+}
+
+/// SESSION-09 sweep cadence: >= `SessionIndex`'s own TTL (`DEFAULT_TTL`, 1s)
+/// so every tick's `snapshot()` call re-validates the on-disk corpus rather
+/// than reading a stale cached snapshot. See [`spawn_sessions_sweep`]'s doc
+/// comment for the full rationale (why a plain interval poll substitutes for
+/// legacy's filesystem watcher, and why 2s also subsumes legacy's ~150ms
+/// coalescing window).
+const SESSIONS_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// SESSION-09 (live sidebar updates): the signature a sessions-sweep tick
+/// compares against the previous tick's signature to decide whether a
+/// `sessions.changed` broadcast is warranted: `(corpus size, max
+/// lastActivityAt)`. Cheap -- one pass over the already-parsed
+/// `IndexedSession`s the sweep's `snapshot()` call already produced, no
+/// extra I/O.
+///
+/// BOTH halves matter; max-`lastActivityAt` ALONE is not sufficient. A real
+/// session-directory corpus routinely has some provider already sitting at
+/// a later `lastActivityAt` than a session that just landed (e.g. a
+/// restored/imported claude session appearing alongside codex/opencode
+/// sessions dated further ahead -- exactly the shape
+/// `session-directory-matrix.spec.ts`'s seeded corpus has). In that case the
+/// max never moves, so a max-only token would silently swallow a real
+/// corpus change (caught by `new_older_session_file_is_still_detected_as_a_change`
+/// below -- this is not a hypothetical). Including the item COUNT catches
+/// any add/remove regardless of the new item's own timestamp; the max
+/// half still catches same-count changes (a new turn appended to an
+/// existing session, bumping ITS `lastActivityAt` without changing corpus
+/// size).
+///
+/// KNOWN GAP (v1, deliberately not fixed here): a change that touches
+/// neither corpus size nor any session's `lastActivityAt` -- e.g. a
+/// title-only rename with no new turn -- would not trip this signature. No
+/// committed provider parser currently allows that combination (a title is
+/// always derived from message content that also carries its own
+/// timestamp), so this is not observed in practice. Legacy's fuller
+/// comparison (`hasSessionDirectorySnapshotChange`,
+/// `server/sessions-sync/service.ts`) additionally hashes file
+/// content/mtime to catch this class of edit; that fuller comparison is
+/// intentionally NOT ported here.
+fn sessions_sweep_signature(
+    items: &[freshell_sessions::directory_index::IndexedSession],
+) -> (usize, i64) {
+    let max_last_activity_at = items.iter().map(|s| s.last_activity_at).max().unwrap_or(0);
+    (items.len(), max_last_activity_at)
+}
+
+/// SESSION-09: periodic sweep that detects session-directory changes and
+/// broadcasts `sessions.changed` so the sidebar (`src/App.tsx:924-932`)
+/// refetches its active session window WITHOUT a page reload. Legacy's
+/// `SessionsSyncService` (`server/sessions-sync/service.ts:31-73`) watches
+/// the directory with a real filesystem watcher and coalesces bursts of
+/// writes into ONE broadcast (a ~150ms debounce); this port has no
+/// filesystem watcher wired to the session directory (see
+/// `freshell_sessions::directory_index` module docs -- the index is
+/// request-pull / TTL-refreshed, not push-driven), so this sweep
+/// substitutes a plain `tokio::time::interval` poll for "was there a
+/// change" instead.
+///
+/// The interval (`SESSIONS_SWEEP_INTERVAL`, 2s) is deliberately >= the
+/// `SessionIndex`'s own TTL (1s) so every tick's `snapshot()` call
+/// re-validates the corpus against disk -- a cheap stat-only pass over
+/// every file when nothing changed (see the incremental-cache design on
+/// `SessionIndex`'s module doc: only a file whose `(mtime, size)` changed
+/// since the last sweep gets re-parsed; an unchanged file costs one
+/// `fs::metadata` call, not a re-read + re-parse). The 2s cadence also
+/// subsumes legacy's ~150ms coalescing window: any burst of writes that
+/// lands inside one tick collapses into a single broadcast -- same end
+/// result, coarser granularity.
+///
+/// `MissedTickBehavior::Skip` (rather than tokio's default `Burst`): if a
+/// tick is delayed (e.g. the sweep's own `snapshot()` call runs long on an
+/// exceptionally large corpus), catch up by skipping the missed ticks
+/// instead of firing them back-to-back -- there's nothing to gain from
+/// re-sweeping the same on-disk state twice in quick succession.
+///
+/// Seeds `last_token` from a snapshot taken BEFORE the loop starts so boot
+/// never emits a spurious broadcast: the client's own initial HTTP fetch
+/// already reflects this exact corpus, so a `sessions.changed` firing
+/// immediately after boot would trigger a redundant (harmless but
+/// wasteful) refetch.
+///
+/// FENCE: no filesystem watcher (inotify/`notify`) is introduced here, and
+/// `freshell_sessions::directory_index`'s internals are untouched -- this
+/// function only calls the existing public `SessionIndex::snapshot()` API.
+fn spawn_sessions_sweep(
+    session_index: Arc<freshell_sessions::directory_index::SessionIndex>,
+    ws_state: WsState,
+    interval: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        let mut last_signature = sessions_sweep_signature(&session_index.snapshot().await);
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let items = session_index.snapshot().await;
+            let signature = sessions_sweep_signature(&items);
+            if signature != last_signature {
+                last_signature = signature;
+                freshell_ws::terminal::broadcast_sessions_changed(&ws_state);
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod sessions_sweep_tests {
+    use super::*;
+    use freshell_sessions::directory_index::{
+        ClaudeSource, IndexedSession, SessionIndex, SessionSource,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        std::env::temp_dir().join(format!(
+            "freshell-sessions-sweep-{label}-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ))
+    }
+
+    /// A minimal `<home>/.claude/projects/-p/<name>.jsonl` layout (same
+    /// two-level shape `freshell_sessions::directory_index`'s own
+    /// `claude_home_with` test helper uses -- that one is private to its
+    /// crate, so this is a from-scratch equivalent, not a reuse). Each
+    /// session gets ONE `user`-typed line carrying a canonical-shaped
+    /// (36-char, dashed, v4) `sessionId`, a real `cwd` (required -- R10b
+    /// excludes cwd-less files), and an explicit `timestamp` so the test
+    /// fully controls `lastActivityAt` instead of depending on committed
+    /// fixture content.
+    fn write_claude_session(claude_home: &Path, session_id: &str, cwd: &str, timestamp: &str) {
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        let line = serde_json::json!({
+            "type": "user",
+            "sessionId": session_id,
+            "cwd": cwd,
+            "message": { "role": "user", "content": "hello" },
+            "timestamp": timestamp,
+        })
+        .to_string();
+        std::fs::write(
+            project.join(format!("{session_id}.jsonl")),
+            format!("{line}\n"),
+        )
+        .unwrap();
+    }
+
+    fn mk_indexed(last_activity_at: i64) -> IndexedSession {
+        IndexedSession {
+            session_id: "s".to_string(),
+            provider: "claude".to_string(),
+            project_path: "/tmp".to_string(),
+            title: None,
+            summary: None,
+            first_user_message: None,
+            last_activity_at,
+            created_at: None,
+            cwd: Some("/tmp".to_string()),
+            is_subagent: false,
+            is_non_interactive: false,
+        }
+    }
+
+    #[test]
+    fn empty_snapshot_signature_is_zero_count_zero_activity() {
+        assert_eq!(sessions_sweep_signature(&[]), (0, 0));
+    }
+
+    #[test]
+    fn signature_pairs_count_with_the_max_last_activity_at() {
+        let items = vec![mk_indexed(100), mk_indexed(500), mk_indexed(200)];
+        assert_eq!(sessions_sweep_signature(&items), (3, 500));
+    }
+
+    /// The scenario the sweep task depends on: writing a NEW session file
+    /// (with a later `lastActivityAt`) into the watched home changes the
+    /// signature on the next `SessionIndex::snapshot()` call. `with_ttl(0)`
+    /// forces every `snapshot()` call to re-validate against disk (no TTL
+    /// window to wait out), matching the task pattern
+    /// `SessionIndex::with_ttl(0ms) + tempdir claude fixtures`.
+    #[tokio::test]
+    async fn new_session_file_changes_the_signature() {
+        let claude_home = unique_temp_dir("advance").join(".claude");
+        write_claude_session(
+            &claude_home,
+            "11111111-1111-4111-8111-111111111111",
+            "/tmp/sweep-test/alpha",
+            "2025-01-01T00:00:00.000Z",
+        );
+        let index = SessionIndex::with_ttl(
+            vec![Arc::new(ClaudeSource::new(claude_home.clone())) as Arc<dyn SessionSource>],
+            std::time::Duration::from_millis(0),
+        );
+        let before = sessions_sweep_signature(&index.snapshot().await);
+        assert_ne!(
+            before,
+            (0, 0),
+            "seed session should produce a nonzero signature"
+        );
+
+        // A second, distinct session with a LATER timestamp lands in the
+        // same watched home -- simulating a real provider write mid-session.
+        write_claude_session(
+            &claude_home,
+            "22222222-2222-4222-8222-222222222222",
+            "/tmp/sweep-test/beta",
+            "2025-01-02T00:00:00.000Z",
+        );
+        let after = sessions_sweep_signature(&index.snapshot().await);
+        assert_ne!(
+            after, before,
+            "signature should change after a new, later-activity session file appears (before={before:?}, after={after:?})"
+        );
+
+        std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
+    }
+
+    /// The corpus-composition bug this reproduces: a REAL session-directory
+    /// mix routinely has SOME provider already at a later `lastActivityAt`
+    /// than a brand-new session that just landed (e.g. codex/opencode seeds
+    /// dated ahead of a freshly-restored/imported claude session). A pure
+    /// max-`lastActivityAt` token would NOT change here, silently swallowing
+    /// a real corpus change. The sweep signature must also account for
+    /// corpus SIZE so a new session is detected even when its own activity
+    /// timestamp is not the new maximum.
+    #[tokio::test]
+    async fn new_older_session_file_is_still_detected_as_a_change() {
+        let claude_home = unique_temp_dir("older").join(".claude");
+        // Seed session is ALREADY the max-activity session in the corpus.
+        write_claude_session(
+            &claude_home,
+            "44444444-4444-4444-8444-444444444444",
+            "/tmp/sweep-test/already-latest",
+            "2030-01-01T00:00:00.000Z",
+        );
+        let index = SessionIndex::with_ttl(
+            vec![Arc::new(ClaudeSource::new(claude_home.clone())) as Arc<dyn SessionSource>],
+            std::time::Duration::from_millis(0),
+        );
+        let before = sessions_sweep_signature(&index.snapshot().await);
+
+        // A new session lands with an OLDER timestamp than the existing
+        // max -- e.g. a restored/imported session, or (as in the
+        // `session-directory-matrix` E2E corpus) a claude session seeded
+        // alongside codex/opencode sessions dated further ahead.
+        write_claude_session(
+            &claude_home,
+            "55555555-5555-4555-8555-555555555555",
+            "/tmp/sweep-test/new-but-older",
+            "2020-01-01T00:00:00.000Z",
+        );
+        let after = sessions_sweep_signature(&index.snapshot().await);
+        assert_ne!(
+            after, before,
+            "a new session file must be detected as a change even when its own \
+             activity timestamp is older than an already-present session (before={before:?}, after={after:?})"
+        );
+
+        std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
+    }
+
+    /// The counterpart: an UNCHANGED home (no writes between sweeps) must
+    /// keep a stable signature -- the sweep must never broadcast spuriously.
+    #[tokio::test]
+    async fn unchanged_home_keeps_a_stable_signature() {
+        let claude_home = unique_temp_dir("stable").join(".claude");
+        write_claude_session(
+            &claude_home,
+            "33333333-3333-4333-8333-333333333333",
+            "/tmp/sweep-test/gamma",
+            "2025-01-01T00:00:00.000Z",
+        );
+        let index = SessionIndex::with_ttl(
+            vec![Arc::new(ClaudeSource::new(claude_home.clone())) as Arc<dyn SessionSource>],
+            std::time::Duration::from_millis(0),
+        );
+        let first = sessions_sweep_signature(&index.snapshot().await);
+        let second = sessions_sweep_signature(&index.snapshot().await);
+        assert_eq!(first, second, "an unchanged home must yield a stable token");
+
+        std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
+    }
 }
 
 #[cfg(test)]

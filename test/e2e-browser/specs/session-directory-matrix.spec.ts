@@ -258,4 +258,52 @@ test.describe('Session Directory Matrix', () => {
     await expect(page.getByText(/harness-02 matrix gamma/i)).toBeVisible({ timeout: 15_000 })
     await expect(page.getByText(/harness-02 matrix delta/i)).toBeVisible({ timeout: 15_000 })
   })
+
+  // SESSION-09 -- live sidebar updates. A session written to the isolated
+  // HOME's provider directory AFTER boot (not via `setupHome`, which only
+  // seeds BEFORE the server starts) must appear in the sidebar without a
+  // page reload. Legacy's `SessionsSyncService` (a real filesystem watcher,
+  // `server/sessions-sync/service.ts`) already does this -- this spec's
+  // `legacy-chromium` run is the CONTROL proving the assertion itself is
+  // sound. The Rust port has no filesystem watcher (see
+  // `crates/freshell-server/src/main.rs`'s `spawn_sessions_sweep` doc
+  // comment); it substitutes a periodic sweep that broadcasts
+  // `sessions.changed`, which `src/App.tsx:924-932` folds into a
+  // active-session-window refetch.
+  test('a session written mid-test appears in the sidebar without a reload', async ({ freshellPage, page, serverInfo }) => {
+    const sessionList = page.getByTestId('sidebar-session-list')
+    await expect(sessionList).toBeVisible({ timeout: 15_000 })
+
+    // Sanity: the boot-seeded sessions are already there (same assertion as
+    // the first test above) -- confirms the sidebar is live and this test
+    // isn't accidentally passing on an empty/broken page.
+    await expect(page.getByText(/harness-02 matrix alpha/i)).toBeVisible({ timeout: 10_000 })
+
+    const LIVE_SESSION_ID = '00000000-0000-4000-8000-0000000c3333'
+    const liveTitle = 'harness-02 matrix live-update'
+
+    // Not present yet -- this session is written AFTER the page has already
+    // loaded and rendered its initial sidebar snapshot.
+    await expect(page.getByText(new RegExp(liveTitle, 'i'))).not.toBeVisible()
+
+    // Write a NEW session into the isolated HOME's live provider directory,
+    // reusing the SAME `buildSessionJsonl` seeding helper the `setupHome`
+    // hook above uses (just invoked live, mid-test, instead of pre-boot).
+    const projectsDir = path.join(serverInfo.homeDir, '.claude', 'projects')
+    const liveDir = path.join(projectsDir, 'matrix-live-update-project')
+    await fs.mkdir(liveDir, { recursive: true })
+    await fs.writeFile(
+      path.join(liveDir, `${LIVE_SESSION_ID}.jsonl`),
+      buildSessionJsonl({
+        sessionId: LIVE_SESSION_ID,
+        cwd: '/tmp/freshell-matrix/live-update-project',
+        title: liveTitle,
+      }),
+    )
+
+    // The sidebar must discover it WITHOUT a page reload, within ~10s --
+    // Playwright's `expect(...).toBeVisible` polls internally, so this
+    // proves the live-update path (not just an eventual-after-reload one).
+    await expect(page.getByText(new RegExp(liveTitle, 'i'))).toBeVisible({ timeout: 10_000 })
+  })
 })
