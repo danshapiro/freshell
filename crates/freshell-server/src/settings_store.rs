@@ -1416,6 +1416,12 @@ pub struct SettingsRouterState {
     /// So the codex fresh-agent create-gate reflects the ONE settings source of
     /// truth (`settings.freshAgent.enabled`) instead of its own stale copy.
     pub fresh_codex: freshell_freshagent::FreshCodexState,
+    /// NARROW live-reload target (this fix): the shared terminal registry, so a
+    /// successful patch can push `settings.safety.autoKillIdleMinutes` and
+    /// `settings.terminal.scrollback` into it immediately instead of only at
+    /// boot (`main.rs`'s TERM-11/TERM-13 seeding). Mirrors the legacy
+    /// `registry.setSettings(updated)` call, `server/settings-router.ts:138`.
+    pub registry: freshell_terminal::TerminalRegistry,
 }
 
 /// `GET`/`PATCH`/`PUT` `/api/settings` (R1: PUT === PATCH, matching
@@ -1447,6 +1453,7 @@ async fn patch_settings(
     match state.store.patch(&body).await {
         Ok(merged) => {
             state.fresh_codex.set_enabled(merged.fresh_agent.enabled);
+            apply_live_registry_settings(&state.registry, &merged);
             if let Ok(frame) =
                 serde_json::to_string(&json!({ "type": "settings.updated", "settings": &merged }))
             {
@@ -1458,12 +1465,202 @@ async fn patch_settings(
     }
 }
 
+/// NARROW live-reload (this fix): push exactly the two knobs the legacy
+/// `registry.setSettings(updated)` applies without a restart
+/// (`terminal-registry.ts:1316-1322`) into the shared [`TerminalRegistry`]
+/// after every successful patch/put, whether or not those specific fields
+/// were the ones the caller touched. Deliberately scoped to just these two --
+/// no general hot-reload framework.
+///
+/// * `safety.autoKillIdleMinutes` -> [`TerminalRegistry::set_auto_kill_idle_minutes`]
+///   (read fresh by the periodic idle-sweep, `freshell_ws::spawn_idle_monitor`
+///   / legacy `enforceIdleKills`, `terminal-registry.ts:1406-1410` -- so the
+///   effect lands on the sweep's own cadence, matching legacy).
+/// * `terminal.scrollback` -> [`freshell_terminal::compute_scrollback_max_bytes`] ->
+///   [`TerminalRegistry::set_scrollback_max_bytes`] (applies to terminals
+///   created AFTER this call -- the registry's documented scope limit,
+///   `registry.rs`'s `set_scrollback_max_bytes` doc comment; legacy ALSO
+///   resizes already-open buffers in place, which this narrow port does not).
+///
+/// A patch that never mutates the value it targets (invalid patch rejected
+/// before this is even reached, or the value simply absent from the request
+/// body) reads back the value already sitting in the merged tree -- i.e. this
+/// is a same-value no-op, never a reset to the registry/settings default.
+fn apply_live_registry_settings(
+    registry: &freshell_terminal::TerminalRegistry,
+    merged: &ServerSettings,
+) {
+    registry.set_auto_kill_idle_minutes(merged.safety.auto_kill_idle_minutes);
+    registry.set_scrollback_max_bytes(freshell_terminal::compute_scrollback_max_bytes(
+        merged.terminal.scrollback,
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn store_at(dir: &Path) -> SettingsStore {
         SettingsStore::load(Some(dir), vec!["claude".into(), "codex".into()])
+    }
+
+    /// Full `SettingsRouterState` for exercising the `PATCH`/`PUT` handler
+    /// itself (not just `SettingsStore::patch`), so the registry-wiring
+    /// added by this fix is proven through the REAL route, not a shortcut.
+    fn router_state_at(dir: &Path) -> SettingsRouterState {
+        let auth_token = Arc::new("tok".to_string());
+        let (broadcast_tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
+        let broadcast_tx = Arc::new(broadcast_tx);
+        let store = store_at(dir);
+        let fresh_codex = freshell_freshagent::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            json!({}),
+        );
+        SettingsRouterState {
+            store,
+            auth_token,
+            broadcast_tx,
+            fresh_codex,
+            registry: freshell_terminal::TerminalRegistry::new(),
+        }
+    }
+
+    fn authed_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-token", "tok".parse().unwrap());
+        headers
+    }
+
+    /// RED/GREEN target (narrow live-reload, this fix): a successful
+    /// `PATCH /api/settings` changing `safety.autoKillIdleMinutes` must be
+    /// reflected on `registry.auto_kill_idle_minutes()` IMMEDIATELY -- no
+    /// restart, no waiting for the next idle-sweep tick to pick up a NEW
+    /// value out of the settings tree (the sweep itself still runs on its
+    /// own 30s cadence, matching legacy `enforceIdleKills`, but the value it
+    /// reads must already be current the instant this handler returns).
+    /// Mirrors the legacy fixture `registry.setSettings(updated)` proves
+    /// against (`server/settings-router.ts:138` -> `terminal-registry.ts:1316-1322`).
+    #[tokio::test]
+    async fn patch_applies_auto_kill_idle_minutes_live_to_registry() {
+        let dir = std::env::temp_dir().join(format!("frs-live-settings-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let state = router_state_at(&dir);
+        assert_eq!(state.registry.auto_kill_idle_minutes(), 15); // default, pre-patch
+
+        let resp = patch_settings(
+            State(state.clone()),
+            authed_headers(),
+            Json(json!({ "safety": { "autoKillIdleMinutes": 42 } })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert_eq!(state.registry.auto_kill_idle_minutes(), 42);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// RED/GREEN target (narrow live-reload, this fix): a successful patch
+    /// changing `terminal.scrollback` must be reflected on
+    /// `registry.scrollback_max_bytes()` immediately, via the SAME
+    /// `compute_scrollback_max_bytes` conversion the boot-time seeding in
+    /// `main.rs` already uses (TERM-13).
+    #[tokio::test]
+    async fn patch_applies_scrollback_live_to_registry() {
+        let dir = std::env::temp_dir().join(format!("frs-live-settings-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let state = router_state_at(&dir);
+        // `TerminalRegistry::new()`'s OWN pre-boot-seeding fallback
+        // (`DEFAULT_MAX_SCROLLBACK_CHARS`, `registry.rs:75`) -- this test
+        // constructs a bare registry (no `main.rs` boot-time
+        // `set_scrollback_max_bytes` seeding), so THIS is the correct
+        // pre-patch baseline, not `compute_scrollback_max_bytes` of the
+        // settings-tree default.
+        assert_eq!(state.registry.scrollback_max_bytes(), 512 * 1024);
+
+        let resp = patch_settings(
+            State(state.clone()),
+            authed_headers(),
+            Json(json!({ "terminal": { "scrollback": 500 } })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let expected = freshell_terminal::compute_scrollback_max_bytes(500);
+        assert_eq!(state.registry.scrollback_max_bytes(), expected);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A patch touching an UNRELATED field must not disturb either live
+    /// knob: absent fields are preserved as-is by `deep_merge`, so
+    /// re-applying them to the registry is a same-value no-op, never a
+    /// reset to the registry's/settings' own defaults.
+    #[tokio::test]
+    async fn patch_of_unrelated_field_leaves_live_registry_settings_unchanged() {
+        let dir = std::env::temp_dir().join(format!("frs-live-settings-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let state = router_state_at(&dir);
+
+        // First, establish non-default values on both knobs.
+        patch_settings(
+            State(state.clone()),
+            authed_headers(),
+            Json(json!({ "safety": { "autoKillIdleMinutes": 7 }, "terminal": { "scrollback": 900 } })),
+        )
+        .await;
+        assert_eq!(state.registry.auto_kill_idle_minutes(), 7);
+        let scrollback_after_first_patch = state.registry.scrollback_max_bytes();
+
+        // An unrelated patch (logging.debug) must not move either knob.
+        let resp = patch_settings(
+            State(state.clone()),
+            authed_headers(),
+            Json(json!({ "logging": { "debug": true } })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert_eq!(state.registry.auto_kill_idle_minutes(), 7);
+        assert_eq!(state.registry.scrollback_max_bytes(), scrollback_after_first_patch);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An INVALID patch is rejected by validation before the store ever
+    /// mutates (`SettingsStore::patch`'s `validate_patch` guard, checked
+    /// before any mutation) -- so it must never reach the registry either.
+    /// Established non-default values must survive an invalid patch attempt
+    /// completely untouched.
+    #[tokio::test]
+    async fn invalid_patch_does_not_change_live_registry_settings() {
+        let dir = std::env::temp_dir().join(format!("frs-live-settings-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let state = router_state_at(&dir);
+
+        patch_settings(
+            State(state.clone()),
+            authed_headers(),
+            Json(json!({ "safety": { "autoKillIdleMinutes": 11 }, "terminal": { "scrollback": 1234 } })),
+        )
+        .await;
+        let kill_minutes_before = state.registry.auto_kill_idle_minutes();
+        let scrollback_before = state.registry.scrollback_max_bytes();
+
+        // `editor.externalEditor` only accepts a fixed enum -- "bogus" is invalid.
+        let resp = patch_settings(
+            State(state.clone()),
+            authed_headers(),
+            Json(json!({ "editor": { "externalEditor": "bogus" } })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        assert_eq!(state.registry.auto_kill_idle_minutes(), kill_minutes_before);
+        assert_eq!(state.registry.scrollback_max_bytes(), scrollback_before);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Live-pinned 2026-07-12: `knownProviders` is SEEDED from discovery when

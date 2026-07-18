@@ -36,6 +36,10 @@ const MATRIX_SPECS = [
   // `/api/panes/:id/send-keys`): one durable id across repeat sends, a
   // different id per pane. See agent-continuity-matrix.spec.ts.
   /agent-continuity-matrix\.spec\.ts$/,
+  // Narrow live settings reload (safety.autoKillIdleMinutes / terminal.scrollback
+  // take effect via PATCH /api/settings without a restart) -- runs against
+  // both server kinds as a parity control. See settings-live-reload.spec.ts.
+  /settings-live-reload\.spec\.ts$/,
 ]
 
 export default defineConfig({
