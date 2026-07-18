@@ -17,6 +17,12 @@ import {
   runCodexStartupReaper,
 } from '../../../../../server/coding-cli/codex-app-server/runtime.js'
 import { allocateLocalhostPort, type LoopbackServerEndpoint } from '../../../../../server/local-port.js'
+import { consumeCapturedLogRecords } from '../../../../../server/test-log-capture.js'
+
+const REFUSE_SIGNAL_UNVERIFIED_LOG =
+  'Refusing to signal Codex app-server sidecar because its process-group ownership is not verified (before SIGTERM)'
+const GROUP_ALIVE_AFTER_SHUTDOWN_LOG =
+  'Codex app-server sidecar process group remained alive after shutdown'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -836,6 +842,9 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     })
 
     try {
+      // The refusal-to-signal error log is emitted from the group teardown that races the
+      // ensureReady rejection, so its count/timing here is non-deterministic; allow it wholesale.
+      ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true
       await expect(runtime.ensureReady()).rejects.toThrow(/teardown failed|process-group teardown failed/i)
       expect(metadataWriteAttempts).toBe(1)
     } finally {
@@ -858,6 +867,7 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     ownership.metadata.processGroupId = await readCurrentProcessGroupId()
 
     await expect(runtime.shutdown()).rejects.toThrow(/could not be verified|failed/i)
+    expect(consumeCapturedLogRecords((r) => r.msg === REFUSE_SIGNAL_UNVERIFIED_LOG)).toHaveLength(1)
 
     runtimes.delete(runtime)
     await killProcessGroupForTest(ready.processGroupId)
@@ -1021,6 +1031,7 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
       await expect(runtime.shutdown()).rejects.toThrow(/could not be verified|failed|ownership/i)
       expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
       await expect(fsp.stat(indeterminateMetadataPath)).resolves.toBeDefined()
+      expect(consumeCapturedLogRecords((r) => r.msg === REFUSE_SIGNAL_UNVERIFIED_LOG)).toHaveLength(1)
     } finally {
       readFileSpy.mockRestore()
       runtimes.delete(runtime)
@@ -1054,6 +1065,7 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
       await expect(runtime.shutdown()).rejects.toThrow(/could not be verified|failed|ownership/i)
       await expect(fsp.stat(metadataPath)).resolves.toBeDefined()
       expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
+      expect(consumeCapturedLogRecords((r) => r.msg === REFUSE_SIGNAL_UNVERIFIED_LOG)).toHaveLength(1)
     } finally {
       readFileSpy.mockRestore()
       runtimes.delete(runtime)
@@ -1088,6 +1100,7 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
       await expect(runtime.shutdown()).rejects.toThrow(/could not be verified|failed|ownership/i)
       await expect(fsp.stat(metadataPath)).resolves.toBeDefined()
       expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
+      expect(consumeCapturedLogRecords((r) => r.msg === REFUSE_SIGNAL_UNVERIFIED_LOG)).toHaveLength(1)
     } finally {
       readFileSpy.mockRestore()
       runtimes.delete(runtime)
@@ -1122,6 +1135,7 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
       await expect(runtime.shutdown()).rejects.toThrow(/could not be verified|failed|ownership/i)
       await expect(fsp.stat(metadataPath)).resolves.toBeDefined()
       expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
+      expect(consumeCapturedLogRecords((r) => r.msg === REFUSE_SIGNAL_UNVERIFIED_LOG)).toHaveLength(1)
     } finally {
       readFileSpy.mockRestore()
       runtimes.delete(runtime)
@@ -1183,6 +1197,7 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     await expect(runtime.shutdown()).rejects.toThrow(/could not be verified|failed/i)
     await expect(runtime.ensureReady()).rejects.toThrow(/teardown failed|blocked/i)
     expect(metadataWriteAttempts).toBe(metadataWriteAttemptsAfterReady)
+    expect(consumeCapturedLogRecords((r) => r.msg === REFUSE_SIGNAL_UNVERIFIED_LOG)).toHaveLength(1)
 
     runtimes.delete(runtime)
     await killProcessGroupForTest(ready.processGroupId)
@@ -1211,6 +1226,7 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     try {
       await expect(runtime.shutdown()).rejects.toThrow(/could not be verified|failed|ownership/i)
       expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
+      expect(consumeCapturedLogRecords((r) => r.msg === REFUSE_SIGNAL_UNVERIFIED_LOG)).toHaveLength(1)
     } finally {
       readdirSpy.mockRestore()
       runtimes.delete(runtime)
@@ -2111,6 +2127,7 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
       expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
       const state = JSON.parse(await fsp.readFile(`${ready.metadataPath}.reaper.json`, 'utf8'))
       expect(state.attempts).toBe(1)
+      expect(consumeCapturedLogRecords((r) => r.msg === GROUP_ALIVE_AFTER_SHUTDOWN_LOG)).toHaveLength(1)
     } finally {
       killSpy.mockRestore()
     }
