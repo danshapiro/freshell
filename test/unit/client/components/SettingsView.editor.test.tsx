@@ -342,6 +342,7 @@ describe('SettingsView Editor pane section', () => {
   it('rolls back debounced custom command previews when the save fails', async () => {
     const store = createTestStore({ editor: { externalEditor: 'custom' } })
     vi.mocked(api.patch).mockRejectedValueOnce(new Error('save failed'))
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
 
     render(
       <Provider store={store}>
@@ -361,6 +362,11 @@ describe('SettingsView Editor pane section', () => {
     })
 
     expect(store.getState().settings.settings.editor?.customEditorCommand).toBeUndefined()
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('[settingsThunks]'),
+      expect.stringContaining('Failed to save server settings patch'),
+      expect.anything(),
+    )
   })
 
   it('rolls back pending debounced custom command previews on unmount before save dispatch', async () => {
