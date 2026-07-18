@@ -274,7 +274,7 @@ fix exists. This is the FIRST and only intentional divergence from the frozen `s
 the icon to ship. Oracle equivalence is unaffected (server-side only).
 
 src/ deviation grown to 3 files — restore fixes cherry-picked from main 5c56ecc3 (#516) so the
-port client carries them before reconciliation; adaptations listed in commit <sha>.
+port client carries them before reconciliation; adaptations listed in commit cd35c24c (none needed - clean apply).
 
 2026-07-17 (commits `64083989`, `8888df30` — non-bisectable span, harmless at HEAD): these two
 Batch 1 commits do not build standalone in isolation. `64083989` ("add Amplifier as a fourth
