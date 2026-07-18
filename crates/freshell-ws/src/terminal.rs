@@ -127,13 +127,39 @@ pub async fn run(
     // This connection's single outbound channel. The registry delivers this
     // connection's attach.ready / replay / live-output / exit frames here (via the
     // FrameSink below); the loop drains it to the socket in FIFO — hence in-order.
+    //
+    // TERM-09: live terminal OUTPUT frames (`TerminalOutput`/`TerminalOutputBatch`)
+    // are intercepted by `output_queue` BEFORE reaching this channel -- a bounded,
+    // drop-oldest queue (mirrors `ClientOutputQueue`) that keeps ONE slow reader
+    // from growing server memory without bound. Every other frame family
+    // (`attach.ready`, `terminal.created`, `terminal.exit`, ...) is unaffected,
+    // exactly matching legacy's scoping (see `freshell_terminal::output_queue`
+    // and `crate::backpressure` module docs for the full mapping).
     let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let output_queue = Arc::new(crate::backpressure::ConnectionOutputQueue::new(
+        state.term09.queue_max_bytes,
+    ));
     let conn_sink: FrameSink = {
         let tx = conn_tx.clone();
+        let output_queue = Arc::clone(&output_queue);
         Arc::new(move |msg| {
-            let _ = tx.send(msg);
+            if let Some(msg) = output_queue.route(msg) {
+                let _ = tx.send(msg);
+            }
         })
     };
+    // Catastrophic-backpressure monitor: fires if this connection's queued
+    // output stays above `catastrophic_buffered_bytes` continuously for
+    // `catastrophic_stall_ms` (mirrors `broker.ts`'s `catastrophicBlocked`).
+    // Checked on a dedicated ticker rather than only between sends -- see
+    // `crate::backpressure` module doc for why, and its one known trade-off.
+    let mut catastrophic = crate::backpressure::CatastrophicMonitor::new(
+        state.term09.catastrophic_buffered_bytes,
+        state.term09.catastrophic_stall_ms,
+    );
+    let mut catastrophic_ticker = tokio::time::interval(std::time::Duration::from_millis(
+        (state.term09.catastrophic_stall_ms / 4).max(10),
+    ));
 
     // Whether the broadcast bus is still open (guards the select branch so a closed
     // bus can never busy-loop). The bus outlives every connection in practice.
@@ -240,6 +266,47 @@ pub async fn run(
                         close_reason = "send_error";
                         break;
                     }
+                }
+            }
+            // TERM-09: this connection's bounded terminal-output queue has new
+            // (or still-pending) frames -- drain everything currently queued
+            // and send it, in order (gaps first, then frames; see
+            // `OutputQueue::drain_all`).
+            _ = output_queue.notified() => {
+                let mut send_failed = false;
+                for out in output_queue.drain_all() {
+                    if !send(&mut ws_tx, &out).await {
+                        send_failed = true;
+                        break;
+                    }
+                }
+                if send_failed {
+                    close_reason = "send_error";
+                    break;
+                }
+            }
+            // TERM-09 catastrophic backpressure: this connection's queued
+            // output has stayed above the threshold continuously for the
+            // full stall duration -- close now (mirrors `broker.ts`'s
+            // `catastrophicBlocked` closing with 4008 "Catastrophic backpressure").
+            _ = catastrophic_ticker.tick() => {
+                if catastrophic.tick(output_queue.pending_bytes()) {
+                    tracing::warn!(
+                        connection_id = conn_id,
+                        pending_bytes = output_queue.pending_bytes(),
+                        threshold = state.term09.catastrophic_buffered_bytes,
+                        "ws.terminal_stream.catastrophic_close"
+                    );
+                    use axum::extract::ws::CloseFrame;
+                    let _ = ws_tx
+                        .send(Message::Close(Some(CloseFrame {
+                            code: 4008,
+                            reason: "Catastrophic backpressure".into(),
+                        })))
+                        .await;
+                    close_reason = "catastrophic_backpressure";
+                    close_code = Some(4008);
+                    break;
                 }
             }
             frame = bcast_rx.recv(), if bus_open => {
@@ -1671,6 +1738,8 @@ mod terminals_changed_tests {
             cli_commands: Arc::new(Vec::new()),
             ping_interval_ms: 30_000,
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
+            ws_max_payload_bytes: 16 * 1024 * 1024,
+            term09: crate::backpressure::Term09Config::default(),
         };
         (state, rx)
     }
@@ -1867,6 +1936,8 @@ mod terminal_meta_created_tests {
             cli_commands: std::sync::Arc::new(Vec::new()),
             ping_interval_ms: 30_000,
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
+            ws_max_payload_bytes: 16 * 1024 * 1024,
+            term09: crate::backpressure::Term09Config::default(),
         };
         (state, rx)
     }

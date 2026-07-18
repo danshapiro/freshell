@@ -73,3 +73,11 @@ tokio = { version = "1", features = ["net", "rt-multi-thread", "test-util"] }
 # Same version already pinned in the workspace lockfile via freshell-codex's
 # (default-off) `real-transport` feature — reused here as a plain WS test client.
 tokio-tungstenite = "0.24"
+# TERM-09 slow-client test: shrinks a test client's SO_RCVBUF to a few KB so a
+# non-reading peer creates GENUINE, deterministic TCP-level backpressure on
+# loopback (rather than relying on default OS buffer auto-tuning, which can
+# silently absorb a multi-MB flood and make the test flaky). `"0.6"` matches
+# the version already resolved in the workspace lockfile (a transitive dep
+# elsewhere), so this promotes it to a direct dev-dependency without pulling
+# in a second copy at a different version.
+socket2 = "0.6"

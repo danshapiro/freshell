@@ -20,6 +20,7 @@
 //! The crate emits the frozen [`freshell_protocol`] server-message types so its
 //! wire bytes are contract-locked.
 
+pub mod backpressure;
 pub mod identity;
 pub mod origin;
 pub mod screenshot;
@@ -154,6 +155,19 @@ pub struct WsState {
     /// connection whose `Origin` is present but neither same-origin (Host
     /// match) nor on this list is rejected before any session state is sent.
     pub allowed_origins: Arc<Vec<String>>,
+    /// TERM-09: bounded per-connection output-queue + catastrophic-backpressure
+    /// tunables (legacy parity: `server/terminal-stream/constants.ts` +
+    /// `client-output-queue.ts`). See [`crate::backpressure::Term09Config`].
+    pub term09: crate::backpressure::Term09Config,
+    /// SAFE-06: inbound WS frame/message size bound (legacy parity:
+    /// `ws-handler.ts:226` `wsMaxPayloadBytes: Number(process.env.WS_MAX_PAYLOAD_BYTES
+    /// || 16 * 1024 * 1024)`, passed to the `ws` library's `maxPayload` at
+    /// `ws-handler.ts:728`, which aborts a connection whose message exceeds
+    /// it). Configured once at boot (mirrors `ping_interval_ms`) and applied
+    /// to the `WebSocketUpgrade` before `.on_upgrade()` in [`ws_handler`], so
+    /// both the `hello` frame and every later `terminal.*` frame on this
+    /// connection are bounded identically.
+    pub ws_max_payload_bytes: usize,
 }
 
 /// The `/ws` sub-router, pre-bound to its state (mergeable into the server app).
@@ -176,7 +190,17 @@ async fn ws_handler(
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    ws.on_upgrade(move |socket| handle_socket(socket, state, origin, host))
+    // SAFE-06: bound BOTH the frame size and the reassembled-message size to
+    // the same value (legacy's `ws` library only exposes one `maxPayload`
+    // knob, applied to the fully-reassembled message; this protocol never
+    // fragments a JSON frame across multiple WS frames, so a single shared
+    // bound is a faithful, simpler mapping). Applied on the upgrade itself so
+    // it governs every read on this connection, including the pre-handshake
+    // `hello` frame.
+    let max_payload = state.ws_max_payload_bytes;
+    ws.max_message_size(max_payload)
+        .max_frame_size(max_payload)
+        .on_upgrade(move |socket| handle_socket(socket, state, origin, host))
 }
 
 /// Constant-time byte-slice equality. Mirrors `auth.ts#timingSafeCompare`:
@@ -543,6 +567,8 @@ mod tests {
             cli_commands: Arc::new(Vec::new()),
             ping_interval_ms: 30_000,
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
+            ws_max_payload_bytes: 16 * 1024 * 1024,
+            term09: crate::backpressure::Term09Config::default(),
         }
     }
 

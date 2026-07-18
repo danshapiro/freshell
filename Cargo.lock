@@ -1363,6 +1363,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1410,6 +1411,7 @@ dependencies = [
  "freshell-terminal",
  "futures-util",
  "serde_json",
+ "socket2",
  "tokio",
  "tokio-tungstenite 0.24.0",
  "tracing",
