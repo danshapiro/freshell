@@ -27,6 +27,10 @@ freshell-protocol = { path = "../freshell-protocol" }
 # handlers drive, and the SpawnSpec builder that resolves the shell.
 freshell-terminal = { path = "../freshell-terminal" }
 freshell-platform = { path = "../freshell-platform" }
+# The amplifier session locator (Enter↔session-dir correlation for restore
+# across server restart, docs/plans/2026-07-18-amplifier-restore-spec.md) --
+# a pure/poll-based crate this crate arms/drains but doesn't own the fs logic of.
+freshell-sessions = { path = "../freshell-sessions" }
 # The freshcodex WS fresh-agent slice (freshAgent.create/send → codex app-server). The
 # post-handshake loop dispatches the codex client→server messages to this shared state,
 # which spawns the app-server sidecar and broadcasts freshAgent.created/send.accepted/event.

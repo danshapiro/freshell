@@ -288,8 +288,22 @@ async fn main() -> ExitCode {
     // exists) -- see `freshell_ws::WsState::sessions_revision`'s doc comment
     // for the full parity rationale. Both producers now share this ONE
     // sequence (fix-forward: they previously used two independent counters).
+    // Restore-across-restart fix (`docs/plans/2026-07-18-amplifier-restore-spec.md`):
+    // the amplifier session locator, resolved against the SAME real-home root
+    // `AmplifierSource` above uses (`session_directory::provider_home()`), so
+    // an amplifier terminal's cwd is compared against the SAME
+    // `AMPLIFIER_HOME`/`<home>/.amplifier` the CLI itself writes into. `None`
+    // when the provider home can't be resolved (mirrors `session_index`'s own
+    // `Option` convention) -- every `amplifier_association` entry point
+    // no-ops in that case.
+    let amplifier_locator = session_directory::provider_home().map(|h| {
+        Arc::new(freshell_sessions::amplifier_locator::AmplifierLocator::new(
+            freshell_sessions::amplifier::amplifier_home(&h),
+        ))
+    });
     let ws_state = WsState {
         identity: terminal_identity.clone(),
+        amplifier_locator: amplifier_locator.clone(),
         auth_token: Arc::clone(&auth_token),
         // Shared (not moved) so `GET /api/health` reports the SAME `instanceId`.
         server_instance_id: Arc::clone(&server_instance_id),
@@ -423,6 +437,18 @@ async fn main() -> ExitCode {
         // this borrows nothing from the `ws_state` binding consumed by the
         // router merge below.
         spawn_sessions_sweep(Arc::clone(index), ws_state.clone(), SESSIONS_SWEEP_INTERVAL);
+    }
+    // Restore-across-restart fix: the amplifier locator's polling cycle (its
+    // Enter↔session-dir correlation is entirely poll-driven -- see
+    // `freshell_sessions::amplifier_locator`'s module doc for why this
+    // substitutes for a live filesystem watcher). Independent of
+    // `session_index`/the History feature -- restore must work even when the
+    // History sidebar itself is unavailable.
+    if amplifier_locator.is_some() {
+        freshell_ws::amplifier_association::spawn_amplifier_locator_sweep(
+            ws_state.clone(),
+            AMPLIFIER_LOCATOR_SWEEP_INTERVAL,
+        );
     }
     // DIAG-05: the diag router's `sessionsProjects` reads the SAME session
     // index (clone before the move below into `session_directory_state`).
@@ -919,6 +945,14 @@ fn resolve_client_dir() -> PathBuf {
 /// legacy's filesystem watcher, and why 2s also subsumes legacy's ~150ms
 /// coalescing window).
 const SESSIONS_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// Restore-across-restart fix: the amplifier locator's poll cadence. Well
+/// under `AMPLIFIER_DIR_APPEAR_WINDOW_MS` (2000ms) so a session dir that
+/// appears anywhere in the correlation window is observed (and its
+/// `events.jsonl` probed/confirmed) well before that window closes --
+/// `freshell_sessions::amplifier_locator`'s module doc has the full
+/// poll-vs-watcher rationale.
+const AMPLIFIER_LOCATOR_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// SESSION-09 (live sidebar updates): the signature a sessions-sweep tick
 /// compares against the previous tick's signature to decide whether a

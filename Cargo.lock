@@ -1363,6 +1363,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -1408,6 +1409,7 @@ dependencies = [
  "freshell-opencode",
  "freshell-platform",
  "freshell-protocol",
+ "freshell-sessions",
  "freshell-terminal",
  "futures-util",
  "serde_json",

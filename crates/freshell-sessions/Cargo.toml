@@ -25,6 +25,10 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # `spawn_blocking` (the full-sweep scan runs off the async executor thread),
 # `time` for the TTL-expiry test, `macros` for `#[tokio::test]`.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# The amplifier-locator's single warn on an ambiguous (never-guess) same-cwd
+# correlation refusal (`amplifier-session-locator.ts:727-733`'s `log.warn`
+# equivalent) -- same version already used by `freshell-ws`.
+tracing = "0.1"
 
 [dev-dependencies]
 # The opencode SQLite parity test builds fixture databases with a writable connection

@@ -79,8 +79,10 @@ async fn send(ws_tx: &mut WsSink, msg: &ServerMessage) -> bool {
     }
 }
 
-/// `Date.now()` — epoch milliseconds (`terminal.created.createdAt`).
-fn now_ms() -> i64 {
+/// `Date.now()` — epoch milliseconds (`terminal.created.createdAt`). Also
+/// reused by `crate::amplifier_association` for the locator's `now_ms`
+/// clock -- one wall-clock source for the whole crate.
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -459,6 +461,15 @@ async fn handle_client_text(
             state
                 .registry
                 .input(&input.terminal_id, input.data.as_bytes());
+            // Restore-across-restart fix: an armed amplifier terminal's first
+            // Enter/submit opens the locator's Enter↔session-dir correlation
+            // window. No-ops for every other terminal/mode (never armed) and
+            // for non-submit-shaped input.
+            crate::amplifier_association::note_possible_submit(
+                state,
+                &input.terminal_id,
+                &input.data,
+            );
             true
         }
         ClientMessage::TerminalResize(resize) => {
@@ -930,10 +941,18 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         // -> `terminalMetadata.retire(terminalId)` (`server/index.ts:526-534`), so a
         // rename cascade still resolves after this terminal's process has exited.
         let identity = state.identity.clone();
+        // Restore-across-restart fix: disarm the amplifier locator too, so an
+        // exited (never-submitted, or already-associated) terminal's armed
+        // entry is never left dangling (mirrors `handleExit`,
+        // `amplifier-session-locator.ts:220-223`).
+        let amplifier_locator = state.amplifier_locator.clone();
         Some(Box::new(move |exit_code: i64| {
             cleanup_mcp_config(&RealMcpRuntime, &tid, &cleanup_mode, cleanup_cwd.as_deref());
             registry.finish_pty_exit(&tid, exit_code);
             identity.retire(&tid);
+            if let Some(locator) = &amplifier_locator {
+                locator.disarm(&tid);
+            }
         }))
     };
 
@@ -978,6 +997,16 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         None,
         Some(mode.clone()),
         resume_session_id.clone(),
+    );
+
+    // Restore-across-restart fix: arm the amplifier locator for a FRESH
+    // (non-resuming) amplifier pane. No-ops for every other mode/resume case.
+    crate::amplifier_association::maybe_arm(
+        state,
+        &terminal_id,
+        &mode,
+        resolved_cwd.as_deref(),
+        resume_session_id.as_deref(),
     );
 
     // Snapshot the id before it's moved into `created` below -- needed for the
@@ -1802,6 +1831,7 @@ mod terminals_changed_tests {
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
+            amplifier_locator: None,
         };
         (state, rx)
     }
@@ -2000,6 +2030,7 @@ mod terminal_meta_created_tests {
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
+            amplifier_locator: None,
         };
         (state, rx)
     }

@@ -20,6 +20,7 @@
 //! The crate emits the frozen [`freshell_protocol`] server-message types so its
 //! wire bytes are contract-locked.
 
+pub mod amplifier_association;
 pub mod backpressure;
 pub mod identity;
 pub mod origin;
@@ -168,6 +169,16 @@ pub struct WsState {
     /// both the `hello` frame and every later `terminal.*` frame on this
     /// connection are bounded identically.
     pub ws_max_payload_bytes: usize,
+    /// The amplifier session locator (restore-across-restart fix,
+    /// `docs/plans/2026-07-18-amplifier-restore-spec.md`): correlates a fresh
+    /// amplifier PTY's first Enter/submit with the new
+    /// `~/.amplifier/projects/.../sessions/<id>/` dir amplifier lazily creates,
+    /// so the terminal can be bound to a session identity and `terminal.rs`'s
+    /// generic resume-id derivation can drive `amplifier resume <id>` on
+    /// restart. `None` when the provider home couldn't be resolved (mirrors
+    /// `SessionDirectoryState::session_index`'s `Option` convention) -- every
+    /// [`crate::amplifier_association`] entry point no-ops in that case.
+    pub amplifier_locator: Option<Arc<freshell_sessions::amplifier_locator::AmplifierLocator>>,
 }
 
 /// The `/ws` sub-router, pre-bound to its state (mergeable into the server app).
@@ -569,6 +580,7 @@ mod tests {
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
+            amplifier_locator: None,
         }
     }
 

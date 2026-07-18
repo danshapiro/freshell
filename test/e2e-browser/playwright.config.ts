@@ -87,8 +87,18 @@ export default defineConfig({
       use: { ...devices['Desktop Chrome'], e2eServerKind: 'rust' },
       // Also includes the HARNESS-01 self-test, which always drives an owned
       // RustServer directly (independent of `e2eServerKind`) and therefore
-      // only needs to run once, under this project.
-      testMatch: [...MATRIX_SPECS, /harness-01-rust-server\.spec\.ts$/],
+      // only needs to run once, under this project. Also includes the
+      // amplifier restore-across-restart spec
+      // (`docs/plans/2026-07-18-amplifier-restore-spec.md`) -- the legacy
+      // `server/` tree is FROZEN and predates upstream #514 (no amplifier
+      // provider registered at all there, see `session-directory-matrix.spec.ts`'s
+      // KNOWN DIVERGENCE notes), so this is a genuinely rust-only feature,
+      // not a parity gap to gate per-assertion.
+      testMatch: [
+        ...MATRIX_SPECS,
+        /harness-01-rust-server\.spec\.ts$/,
+        /amplifier-restore-rust\.spec\.ts$/,
+      ],
     },
     ...(process.env.CI ? [
       {

@@ -77,6 +77,7 @@ async fn spawn_server(term09: Term09Config) -> String {
         allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
         ws_max_payload_bytes: 64 * 1024 * 1024,
         term09,
+        amplifier_locator: None,
     };
 
     let router = freshell_ws::router(state);
