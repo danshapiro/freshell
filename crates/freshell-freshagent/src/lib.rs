@@ -128,6 +128,20 @@ impl FreshAgentState {
         }
     }
 
+    /// SESSION-09 fix-forward: replace this state's own `sessions_revision`
+    /// counter with a SHARED one -- in production, `freshell-server` wires
+    /// this to the SAME `Arc<AtomicI64>` as `freshell_ws::WsState::sessions_revision`
+    /// (the periodic session-directory sweep's counter), so this crate's
+    /// `sessions.changed` emission (`broadcast_sessions_changed`) and that
+    /// sweep draw from ONE monotonic sequence instead of two independent
+    /// ones. Without this, the client's "accept only if revision increases"
+    /// watermark (`src/App.tsx:924-932`) can silently drop a real change from
+    /// one producer behind a lower-or-equal revision from the other.
+    pub fn with_shared_sessions_revision(mut self, shared: Arc<AtomicI64>) -> Self {
+        self.sessions_revision = shared;
+        self
+    }
+
     /// Reap the opencode serve sidecar (SIGTERM/SIGKILL + the `/proc` ownership sweep).
     /// Called on server shutdown so the spawned serve leaves no orphan.
     pub async fn shutdown(&self) {
@@ -140,6 +154,19 @@ impl FreshAgentState {
     /// Shared with [`opencode_ws::FreshOpencodeState`] (same crate root), which pushes
     /// `freshAgent.created` / `freshAgent.send.accepted` / `freshAgent.session.materialized`
     /// / `freshAgent.killed` onto the SAME bus this REST slice uses.
+    /// SESSION-09 fix-forward: bump the (possibly-shared, see
+    /// `with_shared_sessions_revision`) `sessions_revision` counter and
+    /// broadcast the resulting `sessions.changed` frame. Extracted from the
+    /// durable-session materialization call site so the counter-unification
+    /// fix is independently unit-testable without driving a full opencode
+    /// `send-keys` turn.
+    pub(crate) fn broadcast_sessions_changed(&self) {
+        let revision = self.sessions_revision.fetch_add(1, Ordering::SeqCst) + 1;
+        self.broadcast(&ServerMessage::SessionsChanged(SessionsChanged {
+            revision,
+        }));
+    }
+
     pub(crate) fn broadcast(&self, msg: &ServerMessage) {
         if let Ok(frame) = serde_json::to_string(msg) {
             // A send with no live receivers is fine (returns Err) — the capture socket
@@ -1223,11 +1250,11 @@ async fn send_keys(
         // A durable session was persisted → sessions.changed (the original's
         // session-indexer watcher fires this on the isolated opencode.db write; we
         // surface it directly). Also once-only: subsequent turns on an already-durable
-        // session don't create a new session-directory entry.
-        let revision = state.sessions_revision.fetch_add(1, Ordering::SeqCst) + 1;
-        state.broadcast(&ServerMessage::SessionsChanged(SessionsChanged {
-            revision,
-        }));
+        // session don't create a new session-directory entry. SESSION-09 fix-forward:
+        // routes through `broadcast_sessions_changed` so this draws from the SAME
+        // shared revision sequence as `freshell-ws`'s sweep when the server wires
+        // `with_shared_sessions_revision` (see that method's doc comment).
+        state.broadcast_sessions_changed();
 
         durable_id
     };
@@ -1449,6 +1476,67 @@ mod tests {
     async fn shutdown_is_safe_when_no_serve_started() {
         // No manager was ever created → shutdown is a clean no-op (never panics).
         state().shutdown().await;
+    }
+
+    // -- SESSION-09 fix-forward: unify `sessions.changed` revision counters --
+    //
+    // `freshell-freshagent` previously maintained its OWN `sessions_revision`
+    // counter, entirely independent of `freshell-ws`'s `WsState::sessions_revision`
+    // (the periodic session-directory sweep's counter). Because the client's
+    // dedupe watermark (`src/App.tsx:924-932`) only accepts a `sessions.changed`
+    // frame whose `revision` INCREASES over the last one it saw, two
+    // independently-incrementing producers of the same message type could, in
+    // rare interleavings, cause a real change from one producer to be masked by
+    // a lower-or-equal revision from the other. `with_shared_sessions_revision`
+    // lets the real server wiring (`freshell-server`'s `main.rs`) point this
+    // crate's counter at the SAME `Arc<AtomicI64>` `WsState` uses, so both
+    // producers draw from one monotonic sequence.
+
+    #[test]
+    fn with_shared_sessions_revision_draws_from_the_injected_counter() {
+        let shared = Arc::new(AtomicI64::new(41));
+        let st = state().with_shared_sessions_revision(Arc::clone(&shared));
+
+        // The crate's own emission (`broadcast_sessions_changed`, the refactor
+        // of the inline fetch_add call at the durable-session materialization
+        // site) must bump the INJECTED counter, not a fresh internal one.
+        st.broadcast_sessions_changed();
+
+        assert_eq!(
+            shared.load(Ordering::SeqCst),
+            42,
+            "the crate's own sessions.changed emission must bump the shared counter"
+        );
+    }
+
+    #[test]
+    fn sessions_changed_revision_is_unified_across_ws_and_freshagent_producers() {
+        // Reproduces the exact `fetch_add(1, SeqCst) + 1` pattern
+        // `freshell_ws::terminal::broadcast_sessions_changed` uses, on the SAME
+        // shared `Arc<AtomicI64>`, interleaved with THIS crate's own emission --
+        // proving both producers now draw from one unified, never-regressing
+        // sequence (the two-independent-counters bug this fix closes).
+        let shared = Arc::new(AtomicI64::new(0));
+        let st = state().with_shared_sessions_revision(Arc::clone(&shared));
+
+        // "ws" producer bumps first.
+        let ws_revision_1 = shared.fetch_add(1, Ordering::SeqCst) + 1;
+        assert_eq!(ws_revision_1, 1);
+
+        // "freshagent" producer bumps next -- must see revision 1 and produce 2,
+        // not restart its own independent sequence at 1.
+        st.broadcast_sessions_changed();
+        assert_eq!(shared.load(Ordering::SeqCst), 2);
+
+        // "ws" producer bumps again -- must see freshagent's bump reflected.
+        let ws_revision_2 = shared.fetch_add(1, Ordering::SeqCst) + 1;
+        assert_eq!(
+            ws_revision_2, 3,
+            "ws and freshagent producers must share ONE strictly-increasing \
+             sequence -- a lower-or-equal revision from either side risks the \
+             client's \"accept only if revision increases\" watermark silently \
+             dropping a real change"
+        );
     }
 
     // ── GET /api/fresh-agent/threads/freshopencode/opencode/:threadId (Batch D PR-5) ──

@@ -169,12 +169,22 @@ async fn main() -> ExitCode {
     // create gate is the SHARED settings.freshAgent.enabled flag (owned by fresh_codex).
     let fresh_claude_state = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
 
+    // SESSION-09 fix-forward: mint the shared `sessions.changed` revision
+    // counter BEFORE `fresh_agent_state` so it can be wired into both
+    // producers -- see `FreshAgentState::with_shared_sessions_revision`'s doc
+    // comment for the full rationale (previously `freshell-freshagent` kept
+    // its OWN independent counter, which could mask a real change from one
+    // producer behind a lower-or-equal revision from the other).
+    let sessions_revision = Arc::new(std::sync::atomic::AtomicI64::new(0));
     // The fresh-agent REST surface (opencode slice): shares the auth token + the
     // broadcast bus so its create/send broadcasts reach every WS client. Constructed
     // here (before `ws_state`) so the WS freshopencode slice below can wrap the SAME
     // instance -- one `opencode serve` sidecar shared by both surfaces (Batch D PR-2).
+    // `with_shared_sessions_revision` unifies its `sessions.changed` emission onto the
+    // SAME sequence as `ws_state.sessions_revision` below (SESSION-09 fix-forward).
     let fresh_agent_state =
-        FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx));
+        FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx))
+            .with_shared_sessions_revision(Arc::clone(&sessions_revision));
     // The freshopencode WS fresh-agent slice: the post-handshake loop dispatches
     // `freshAgent.create`/`send`/`kill`/`interrupt` (opencode) here.
     let fresh_opencode_state =
@@ -231,12 +241,13 @@ async fn main() -> ExitCode {
     // REST `/api/terminals` PATCH/DELETE broadcasts — the original keeps a single
     // `terminalsRevision` on the WsHandler that both surfaces stamp.
     let terminals_revision = Arc::new(std::sync::atomic::AtomicI64::new(0));
-    // SESSION-09: ONE handler-scoped `sessions.changed` revision counter,
-    // stamped by the periodic session-directory sweep task (spawned below,
-    // once `session_index` exists) -- see `freshell_ws::WsState::sessions_revision`'s
-    // doc comment for the full parity rationale and the known independence
-    // from `freshell-freshagent`'s own internal counter of the same name.
-    let sessions_revision = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    // SESSION-09: the SAME handler-scoped `sessions.changed` revision counter
+    // minted above (and already wired into `fresh_agent_state` via
+    // `with_shared_sessions_revision`), stamped ALSO by the periodic
+    // session-directory sweep task (spawned below, once `session_index`
+    // exists) -- see `freshell_ws::WsState::sessions_revision`'s doc comment
+    // for the full parity rationale. Both producers now share this ONE
+    // sequence (fix-forward: they previously used two independent counters).
     let ws_state = WsState {
         identity: terminal_identity.clone(),
         auth_token: Arc::clone(&auth_token),
