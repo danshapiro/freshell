@@ -4,33 +4,49 @@ import { test, expect } from '../helpers/fixtures.js'
  * HARNESS-02 mutation negative-proof (the "bite" test).
  *
  * Proves the Node/Rust project matrix is not silently reusing one
- * implementation for the other by asserting a REAL, already-present
- * behavioral difference in how each implementation's `/api/health`
- * `instanceId` behaves across a same-home restart:
+ * implementation for the other.
  *
- * - Legacy (Node) persists `instanceId` to `<home>/.freshell/instance-id`
- *   (`server/instance-id.ts`'s `loadOrCreateServerInstanceId`) -- restarting
- *   the OWNED server on the SAME home therefore returns the SAME instanceId.
- * - Rust regenerates `instanceId` fresh in `main()` on every process boot
- *   (`crates/freshell-server/src/main.rs`: `format!("srv-{}", Uuid::new_v4())`),
- *   with no on-disk persistence -- restarting the OWNED server on the SAME
- *   home therefore returns a DIFFERENT instanceId.
+ * ## History (pre-CFG-07)
  *
- * The assertion below is keyed to `e2eServerKind` and therefore encodes what
- * each REAL implementation is supposed to do. If `rust-chromium`'s fixture
- * were ever mis-wired to secretly reuse (or accidentally point at) a Node
- * server instead of booting the real Rust binary, the *rust-chromium* branch
- * of this assertion would fail -- a Node server's instanceId does NOT change
- * across a same-home restart -- while `legacy-chromium`, genuinely running
- * Node, would continue to pass. That divergence is exactly what proves the
- * matrix is not "accidentally reusing Node": a bug in the wiring surfaces as
- * a failure confined to the Rust project, never a false pass on both.
+ * This bite test originally keyed its node-vs-rust discriminator on
+ * `/api/health` `instanceId` across a same-home restart: legacy PERSISTED it
+ * (`server/instance-id.ts`), Rust REGENERATED it fresh on every boot (no
+ * on-disk persistence) -- a real, already-present behavioral difference.
+ *
+ * ## CFG-07 changed the ground truth (the conflict this rewiring resolves)
+ *
+ * CFG-07 (`docs/plans/2026-07-18-wave8-specs.md`, SPEC A) makes the Rust
+ * server ALSO persist `serverInstanceId` per home (`crates/freshell-server/src/instance_id.rs`,
+ * a port of `server/instance-id.ts`'s `loadOrCreateServerInstanceId`) --
+ * matching legacy's stable-installation-identity semantics. Once BOTH
+ * implementations persist, `instanceId` stability across a restart is no
+ * longer a node-vs-rust discriminator: a mis-wired `rust-chromium` fixture
+ * that secretly booted (or reused) a Node server would now ALSO show a
+ * stable `instanceId` and incorrectly PASS the old assertion.
+ *
+ * ## The resolution: split "did a real restart happen" from "which binary is it"
+ *
+ * 1. **`serverInstanceId` equal + restart genuinely happened** -- now a
+ *    CORRECTNESS assertion true on BOTH kinds post-CFG-07 (not a
+ *    discriminator): across a same-home restart, `instanceId` is STABLE
+ *    (installation identity, CFG-07) while the OS pid changes (a REAL
+ *    process restart, not the same process still running).
+ * 2. **Which binary actually booted** -- re-keyed to the PERMANENT,
+ *    structural node/rust discriminator: `GET /api/server-info` (DIAG-05,
+ *    SPEC D, `crates/freshell-server/src/diag.rs`). The Rust port emits
+ *    `runtime: "rust"` and NO `nodeVersion`; legacy emits a real
+ *    `nodeVersion` string (`server/server-info-router.ts`) and no `runtime`
+ *    field at all. Unlike `instanceId` regeneration (an incidental gap
+ *    CFG-07 legitimately closes), "has a real Node version string" vs "is
+ *    the Rust runtime" can never converge -- this is the discriminator that
+ *    actually proves the matrix isn't reusing Node.
  *
  * (A permanent RED demonstration of this property lives in the HARNESS-02
- * implementation report/commit: the branch below was temporarily inverted
- * for the 'rust' case, run under `--project=rust-chromium`, and observed to
- * fail with the exact instanceId-did-not-change assertion error, before
- * being restored to the correct direction captured here.)
+ * implementation report/commit: the `runtime`/`nodeVersion` branch below was
+ * temporarily inverted for the 'rust' case, run under
+ * `--project=rust-chromium`, and observed to fail with the exact
+ * runtime-mismatch assertion error, before being restored to the correct
+ * direction captured here.)
  */
 
 async function fetchHealthInstanceId(baseUrl: string): Promise<string> {
@@ -41,6 +57,13 @@ async function fetchHealthInstanceId(baseUrl: string): Promise<string> {
   expect(typeof body.instanceId).toBe('string')
   expect((body.instanceId as string).length).toBeGreaterThan(0)
   return body.instanceId as string
+}
+
+/** `GET /api/server-info` -- the DIAG-05 route this bite's discriminator now keys on. */
+async function fetchServerInfo(baseUrl: string): Promise<{ runtime?: unknown; nodeVersion?: unknown }> {
+  const res = await fetch(`${baseUrl}/api/server-info`)
+  expect(res.ok).toBe(true)
+  return (await res.json()) as { runtime?: unknown; nodeVersion?: unknown }
 }
 
 /** True if `pid` (or its process group, when `pid` is negative) is alive. */
@@ -89,15 +112,32 @@ test.describe('HARNESS-02: Node/Rust matrix mutation negative-proof', () => {
 
     const instanceIdAfterRestart = await fetchHealthInstanceId(restartedInfo.baseUrl)
 
-    // --- (3) the identity oracle: keyed to what THIS implementation
-    // actually, verifiably does. This is the mutation negative-proof: a
-    // misconfigured rust-chromium fixture that actually boots (or reuses) a
-    // Node server would fail HERE, in the `rust` branch, because a Node
-    // server's instanceId does not change across a same-home restart.
-    if (e2eServerKind === 'rust') {
-      expect(instanceIdAfterRestart).not.toBe(instanceIdBeforeRestart)
-    } else {
-      expect(instanceIdAfterRestart).toBe(instanceIdBeforeRestart)
+    // --- (3) CFG-07 correctness assertion (NOT the discriminator): post
+    // CFG-07, `serverInstanceId` is STABLE installation identity across a
+    // same-home restart on BOTH implementations. This alone no longer proves
+    // which binary is running (that's assertion (4) below) -- it only proves
+    // the restart didn't lose the persisted identity.
+    expect(instanceIdAfterRestart).toBe(instanceIdBeforeRestart)
+
+    // --- (4) the REAL identity oracle: `GET /api/server-info`'s permanent,
+    // structural node/rust discriminator (DIAG-05). This is the mutation
+    // negative-proof: a misconfigured rust-chromium fixture that actually
+    // boots (or reuses) a Node server would fail HERE, because a real Node
+    // process always reports a `nodeVersion` string and never `runtime`,
+    // while the Rust binary always reports `runtime: "rust"` and never
+    // `nodeVersion` -- a property of the binary itself, unaffected by
+    // whether CFG-07 makes `instanceId` stable on both sides.
+    const infoBeforeRestart = await fetchServerInfo(serverInfo.baseUrl)
+    const infoAfterRestart = await fetchServerInfo(restartedInfo.baseUrl)
+    for (const info of [infoBeforeRestart, infoAfterRestart]) {
+      if (e2eServerKind === 'rust') {
+        expect(info.runtime).toBe('rust')
+        expect(info.nodeVersion).toBeUndefined()
+      } else {
+        expect(typeof info.nodeVersion).toBe('string')
+        expect(info.nodeVersion as string).toMatch(/^v\d+\./)
+        expect(info.runtime).toBeUndefined()
+      }
     }
   })
 })

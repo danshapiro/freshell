@@ -311,6 +311,16 @@ const DEFAULT_AUTO_KILL_IDLE_MINUTES: i64 = 15;
 pub struct TerminalRegistry {
     inner: Arc<Mutex<RegistryInner>>,
     conn_seq: Arc<AtomicU64>,
+    /// DIAG-05: a LIVE count of currently-open `/ws` connections (distinct
+    /// from `conn_seq`, which is a monotonic minting counter that never goes
+    /// down). Incremented in [`Self::new_connection_id`] (called once per
+    /// connection establish, `freshell_ws::terminal::run`), decremented in
+    /// [`Self::remove_connection`] (called once per connection close, same
+    /// call site) -- both call sites already exist and are unchanged; only
+    /// their bodies gained this counter. Surfaced via [`Self::connection_count`]
+    /// as `GET /api/debug`'s `wsConnections` (legacy
+    /// `wsHandler.connectionCount()`, `server/debug-router.ts:16`).
+    active_connections: Arc<AtomicI64>,
     /// `this.settings.safety.autoKillIdleMinutes` (`terminal-registry.ts:1409`,
     /// read fresh on every sweep tick from `this.settings`, which `setSettings`
     /// keeps current). Stored as an atomic so `enforce_idle_kills` never needs
@@ -347,6 +357,7 @@ impl TerminalRegistry {
                 revision: 0,
             })),
             conn_seq: Arc::new(AtomicU64::new(1)),
+            active_connections: Arc::new(AtomicI64::new(0)),
             auto_kill_idle_minutes: Arc::new(AtomicI64::new(DEFAULT_AUTO_KILL_IDLE_MINUTES)),
             scrollback_max_bytes: Arc::new(AtomicI64::new(DEFAULT_MAX_SCROLLBACK_CHARS)),
         }
@@ -355,7 +366,16 @@ impl TerminalRegistry {
     /// Mint a unique id for one WS connection (used to key its subscriptions so
     /// socket-close can sweep them out of every terminal).
     pub fn new_connection_id(&self) -> u64 {
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
         self.conn_seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// DIAG-05: the live count of currently-open `/ws` connections (see
+    /// `active_connections`'s field doc for exactly which call sites
+    /// increment/decrement it). Surfaced as `GET /api/debug`'s
+    /// `wsConnections`.
+    pub fn connection_count(&self) -> usize {
+        self.active_connections.load(Ordering::Relaxed).max(0) as usize
     }
 
     /// `registry.setSettings(settings)`'s `autoKillIdleMinutes` slice
@@ -673,6 +693,7 @@ impl TerminalRegistry {
     /// On socket close: sweep `conn_id` out of EVERY terminal's subscriber set. All
     /// PTYs keep running (background sessions), reattachable by a future socket.
     pub fn remove_connection(&self, conn_id: u64) {
+        self.active_connections.fetch_sub(1, Ordering::Relaxed);
         let shareds: Vec<Arc<Mutex<TerminalShared>>> = {
             let inner = self.inner.lock().expect("registry lock");
             inner

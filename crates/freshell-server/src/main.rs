@@ -18,8 +18,10 @@
 
 mod boot;
 mod checkpoints;
+mod diag;
 mod extensions;
 mod files;
+mod instance_id;
 mod logging;
 mod network;
 mod proxy;
@@ -105,12 +107,44 @@ async fn main() -> ExitCode {
         eprintln!("freshell-server: structured logging disabled: {err}");
     }
 
-    // Boot-scoped identifiers, stable for the life of the process (as in the
-    // original's single `WsHandler`). Normalized away by the oracle.
-    // `server_instance_id` is shared (Arc::clone) into BOTH the WS handshake
-    // (`ready.serverInstanceId`) AND `GET /api/health` (`instanceId`), so the id an
-    // Electron discovery candidate records matches the handshake it later opens.
-    let server_instance_id = Arc::new(format!("srv-{}", Uuid::new_v4()));
+    // Boot-scoped identifiers. `server_instance_id` is shared (Arc::clone) into
+    // BOTH the WS handshake (`ready.serverInstanceId`) AND `GET /api/health`
+    // (`instanceId`), so the id an Electron discovery candidate records matches
+    // the handshake it later opens.
+    //
+    // CFG-07: `server_instance_id` is now PERSISTED per home (port of
+    // `server/instance-id.ts#loadOrCreateServerInstanceId`) -- stable across
+    // restarts of the SAME home, distinct across DIFFERENT homes. This is the
+    // stable *installation* identity (tab-registry keying, session-locator
+    // priority, live-terminal ownership -- see `instance_id.rs`'s module doc).
+    // A `None` home (no `FRESHELL_HOME`/`HOME`, e.g. a headless/ephemeral run)
+    // has nowhere to persist to, so it mints a fresh ephemeral id every boot --
+    // matching legacy's `baseDir`-optional shape (`instance-id.ts`'s
+    // `resolveInstanceIdPath` falls back to `getFreshellConfigDir()`, which
+    // itself falls back to `os.homedir()`; a Rust `None` home has no such
+    // fallback, so ephemeral-per-boot is the correct terminal case here).
+    // A persistence FAILURE (e.g. an unwritable/corrupt home) also falls back
+    // to an ephemeral id + a `warn` log rather than blocking boot -- mirrors
+    // logging's own boot-tolerance (`logging::init`, above) and is a
+    // documented degradation (A.9), not silent regeneration on the happy path.
+    let server_instance_id = Arc::new(
+        home.as_deref()
+            .map(|h| instance_id::load_or_create(&h.join(".freshell")))
+            .transpose()
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    error = %err,
+                    "CFG-07: instance-id persistence failed; using an ephemeral id for this boot"
+                );
+                None
+            })
+            .unwrap_or_else(|| format!("srv-{}", Uuid::new_v4())),
+    );
+    // `boot_id` stays per-boot, regenerated every process start -- this is the
+    // RESTART signal (A.10: never persist or rotate this). Restart detection is
+    // owned by the terminal-inventory frame's `bootId` (an empty inventory +
+    // changed `bootId` on reconnect means the server restarted), never by
+    // `server_instance_id`.
     let boot_id = Arc::new(format!("boot-{}", Uuid::new_v4()));
 
     // The app version string, resolved ONCE and shared (Arc::clone) into BOTH
@@ -124,6 +158,11 @@ async fn main() -> ExitCode {
     // `server/health-router.ts`). Surfaced as health `startedAt`.
     let started_at =
         Arc::new(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    // DIAG-05: the SAME boot moment, captured as a monotonic `Instant` (not the
+    // ISO-8601 string above) so `GET /api/server-info`'s `uptime` is immune to
+    // wall-clock adjustments (matches legacy's `Date.now() - startedAt` intent
+    // without legacy's wall-clock fragility).
+    let boot_instant = std::time::Instant::now();
 
     // R2/R3/R4 root-cause fix: a single LIVE settings store, not a boot-time
     // snapshot. `allCliNames` (`server/index.ts:267-269`) is discovered here via
@@ -385,6 +424,9 @@ async fn main() -> ExitCode {
         // router merge below.
         spawn_sessions_sweep(Arc::clone(index), ws_state.clone(), SESSIONS_SWEEP_INTERVAL);
     }
+    // DIAG-05: the diag router's `sessionsProjects` reads the SAME session
+    // index (clone before the move below into `session_directory_state`).
+    let diag_session_index = session_index.clone();
     let session_directory_state = session_directory::SessionDirectoryState {
         auth_token: Arc::clone(&auth_token),
         settings: settings_store.clone(),
@@ -486,7 +528,22 @@ async fn main() -> ExitCode {
     let rate_limiter =
         rate_limit::RateLimiter::new_system(rate_limit::RateLimitConfig::default_api());
 
+    // DIAG-05: `/api/server-info`, `/api/debug`, `/api/perf` -- shares the
+    // live settings store, terminal registry, tabs registry, and session
+    // index every other authenticated REST surface above already threads.
+    let diag_state = diag::DiagState {
+        auth_token: Arc::clone(&auth_token),
+        app_version: Arc::clone(&app_version),
+        boot_instant,
+        settings: settings_store.clone(),
+        registry: registry.clone(),
+        tabs: tabs.clone(),
+        session_index: diag_session_index,
+        broadcast_tx: Arc::clone(&broadcast_tx),
+    };
+
     let app = freshell_api::router(api_state)
+        .merge(diag::router(diag_state))
         .merge(freshell_ws::router(ws_state))
         .merge(freshell_freshagent::router(fresh_agent_state.clone()))
         .merge(freshell_freshagent::snapshot::router(snapshot_state))
