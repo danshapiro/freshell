@@ -375,4 +375,150 @@ describe('TerminalView codex identity', () => {
 
     expect(sentMessages().filter((msg) => msg?.type === 'terminal.create')).toHaveLength(1)
   })
+
+  it('preserves a durable-identity breadcrumb instead of silently wiping restoreError when a codex pane has no resumable identity on INVALID_TERMINAL_ID', async () => {
+    // Regression test: previously this branch persisted a totally clean slate
+    // (restoreError: undefined) the instant the live terminal died with no
+    // sessionRef/codexDurability candidate -- destroying any trace that this
+    // pane used to be a durable codex session, so a refresh mid-restore
+    // showed a blank, unexplained fresh terminal with no way to recognize
+    // what happened. Scoped to codex only: it's the only terminal mode with
+    // a durable-identity capture mechanism (codexDurability) to have lost --
+    // claude/gemini terminal mode has an existing, intentional "silent clean
+    // fresh recovery" contract (see TerminalView.lifecycle.test.tsx: "starts
+    // explicit fresh recovery for a live-only INVALID_TERMINAL_ID reconnect").
+    const store = createStore({
+      kind: 'terminal',
+      createRequestId: 'req-codex-lost',
+      status: 'running',
+      mode: 'codex',
+      shell: 'system',
+      terminalId: 'term-codex-lost',
+      serverInstanceId: 'srv-local',
+      // No sessionRef, no codexDurability candidate: genuinely no durable
+      // identity breadcrumb is recoverable for this pane.
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalViewFromStore tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(sentMessages().some((msg) => msg?.type === 'terminal.attach' && msg.terminalId === 'term-codex-lost')).toBe(true)
+    })
+
+    act(() => {
+      wsHarness.emit({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        terminalId: 'term-codex-lost',
+        message: 'terminal not found',
+      })
+    })
+
+    await waitFor(() => {
+      const leaf = findLeaf(store.getState().panes.layouts['tab-1'], 'pane-1')
+      const content = leaf?.content as TerminalPaneContent
+      expect(content.terminalId).toBeUndefined()
+      expect(content.status).toBe('creating')
+      expect(content.restoreError).toBeDefined()
+      expect(content.restoreError?.reason).toBe('durable_artifact_missing')
+    })
+  })
+
+  it('leaves restoreError untouched (fresh path stays silent) for a plain shell pane on the same INVALID_TERMINAL_ID collapse', async () => {
+    const store = createStore({
+      kind: 'terminal',
+      createRequestId: 'req-shell-lost',
+      status: 'running',
+      mode: 'shell',
+      shell: 'system',
+      terminalId: 'term-shell-lost',
+      serverInstanceId: 'srv-local',
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalViewFromStore tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(sentMessages().some((msg) => msg?.type === 'terminal.attach' && msg.terminalId === 'term-shell-lost')).toBe(true)
+    })
+
+    act(() => {
+      wsHarness.emit({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        terminalId: 'term-shell-lost',
+        message: 'terminal not found',
+      })
+    })
+
+    await waitFor(() => {
+      const leaf = findLeaf(store.getState().panes.layouts['tab-1'], 'pane-1')
+      const content = leaf?.content as TerminalPaneContent
+      expect(content.terminalId).toBeUndefined()
+      expect(content.status).toBe('creating')
+    })
+    const leaf = findLeaf(store.getState().panes.layouts['tab-1'], 'pane-1')
+    expect((leaf?.content as TerminalPaneContent).restoreError).toBeUndefined()
+  })
+
+  it('re-drives creation for a still-unanchored pane on a second reconnect (bounded, idempotent re-anchor)', async () => {
+    // Regression test: ws-client drops any queued terminal.attach on
+    // reconnect (nothing to attach to for a pane with no live terminal yet),
+    // and the pane's own onReconnect handler previously did nothing when it
+    // had no terminalId. A create/attach in flight when a SECOND disconnect
+    // landed mid-restore was therefore a one-shot: nothing ever retried it,
+    // leaving the pane permanently half-restored.
+    const store = createStore({
+      kind: 'terminal',
+      createRequestId: 'req-reanchor',
+      status: 'creating',
+      mode: 'claude',
+      shell: 'system',
+      serverInstanceId: 'srv-local',
+      // No terminalId yet: this pane is still awaiting terminal.created.
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalViewFromStore tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(sentMessages().some((msg) => msg?.type === 'terminal.create' && msg.requestId === 'req-reanchor')).toBe(true)
+    })
+
+    wsHarness.send.mockClear()
+
+    // Simulate reconnect completion (e.g. the server restarted a second time
+    // mid-restore): the ready handler fires every registered reconnect
+    // handler on each reconnect, regardless of how many there were before.
+    const reconnectHandler = wsHarness.onReconnect.mock.calls[0]?.[0]
+    expect(reconnectHandler).toBeTypeOf('function')
+    act(() => {
+      reconnectHandler()
+    })
+
+    await waitFor(() => {
+      expect(sentMessages().some((msg) => msg?.type === 'terminal.create' && msg.requestId === 'req-reanchor')).toBe(true)
+    })
+
+    // Idempotent: a second reconnect with the pane still unanchored must not
+    // spawn duplicate creates beyond what the re-drive already sent once.
+    const createCountAfterFirstReanchor = sentMessages().filter((msg) => msg?.type === 'terminal.create').length
+    act(() => {
+      reconnectHandler()
+    })
+    await waitFor(() => {
+      expect(sentMessages().filter((msg) => msg?.type === 'terminal.create').length).toBeGreaterThanOrEqual(createCountAfterFirstReanchor)
+    })
+    expect(sentMessages().filter((msg) => msg?.type === 'terminal.create').every((msg) => msg.requestId === 'req-reanchor')).toBe(true)
+  })
 })

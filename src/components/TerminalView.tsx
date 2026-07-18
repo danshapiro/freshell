@@ -4082,15 +4082,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           // This prevents an infinite respawn loop when terminals fail immediately
           // (e.g., due to permission errors on cwd). User must explicitly restart.
           if (currentTerminalId && current?.status !== 'exited') {
+            const restoreMode = current?.mode || (paneContent.kind === 'terminal' ? paneContent.mode : 'shell')
+            const isCodingCliMode = restoreMode !== 'shell'
             const hasCodexCapturedRestoreState = current?.mode === 'codex' && Boolean(current.codexDurability?.candidate)
-            if (!current?.sessionRef && !hasCodexCapturedRestoreState) {
+            // Last-known-durable-identity fallback: the pane's own sessionRef may
+            // be missing (e.g. it never arrived before the live terminal died),
+            // but a single-pane tab keeps its own sessionRef in sync (see
+            // terminal-session-association.ts). Recovering from it here avoids
+            // permanently abandoning a coding-CLI session that a moment's race
+            // condition made the pane briefly forget.
+            const tabSessionRefFallback = !current?.sessionRef && isCodingCliMode
+              ? tabRef.current?.sessionRef
+              : undefined
+            if (!current?.sessionRef && !hasCodexCapturedRestoreState && !tabSessionRefFallback) {
               const restoreDiagnostic = {
                 event: 'restore_unavailable' as const,
                 reason: 'dead_live_handle' as const,
                 terminalId: currentTerminalId,
                 tabId,
                 paneId: paneIdRef.current,
-                mode: current?.mode || (paneContent.kind === 'terminal' ? paneContent.mode : 'shell'),
+                mode: restoreMode,
                 hasSessionRef: false as const,
               }
               log.warn('restore_unavailable', {
@@ -4129,13 +4140,30 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
                 streamId: undefined,
                 createRequestId: newRequestId,
                 status: 'creating',
-                restoreError: undefined,
+                // Codex panes keep a breadcrumb instead of silently clearing
+                // restoreError: codex is the only terminal mode with a durable
+                // identity-capture mechanism (codexDurability) to have lost, so
+                // persisting that fact (rather than a clean slate) lets a
+                // later fix/reopen recognize what happened here instead of
+                // looking like a normal fresh terminal. Claude/gemini terminal
+                // mode has no durable-identity concept at all today (no
+                // per-provider capture, unlike codex's codexDurability), and
+                // an existing contract (TerminalView.lifecycle.test.tsx:
+                // "starts explicit fresh recovery for a live-only
+                // INVALID_TERMINAL_ID reconnect") deliberately expects a
+                // silent, clean fresh recovery for them -- not a visible
+                // restore-error state. Scoping the breadcrumb to codex avoids
+                // regressing that intentional behavior.
+                restoreError: restoreMode === 'codex' ? buildRestoreError('durable_artifact_missing') : undefined,
               })
               const currentTab = tabRef.current
               if (currentTab) {
                 dispatch(updateTab({ id: currentTab.id, updates: { status: 'creating' } }))
               }
               return
+            }
+            if (tabSessionRefFallback) {
+              updateContent({ sessionRef: tabSessionRefFallback })
             }
             writeLocalXtermNotice(term, '\r\n[Reconnecting...]\r\n')
             const newRequestId = nanoid()
@@ -4192,7 +4220,28 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           terminalId: tid,
           resumeSessionId: contentRef.current?.resumeSessionId,
         })
-        if (!tid) return
+        if (!tid) {
+          // The pane has no live terminal yet -- it's still mid-restore
+          // (awaiting a terminal.created response). ws-client intentionally
+          // drops any queued terminal.attach on reconnect (there's nothing to
+          // attach to yet here), but a create/attach request in flight when a
+          // SECOND disconnect lands can go unanswered with nothing left to
+          // retry it: this was a one-shot restore. Re-drive creation using
+          // the SAME createRequestId on every reconnect completion so a pane
+          // that's still unanchored gets another attempt -- idempotent
+          // because sendCreate reuses the existing requestId (handled/
+          // resent, never minting a new one), so this cannot spawn a
+          // duplicate terminal.
+          const current = contentRef.current
+          if (
+            current
+            && !current.terminalId
+            && current.status === 'creating'
+          ) {
+            sendCreate(current.createRequestId)
+          }
+          return
+        }
         if (hiddenRef.current) {
           const checkpointDecision = getCheckpointDeltaReplayDecision(tid)
           const canResumeFromParserAppliedSurface = checkpointDecision.ok
