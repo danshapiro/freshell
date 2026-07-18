@@ -24,6 +24,7 @@ export default defineConfig({
   test: {
     environment: 'node',
     globalSetup: ['./test/setup/server-global-setup.ts'],
+    setupFiles: ['./test/setup/server.ts'],
     include: [
       'test/server/**/*.test.ts',
       'test/unit/server/**/*.test.ts',
@@ -48,6 +49,9 @@ export default defineConfig({
       threads: {
         singleThread: false,
         isolate: true,
+        // node:sqlite emits a one-time ExperimentalWarning on first load. That is
+        // runtime infrastructure noise, not test output, so silence it in workers.
+        execArgv: ['--disable-warning=ExperimentalWarning'],
       },
     },
     fileParallelism: true,
