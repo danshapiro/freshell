@@ -166,7 +166,12 @@ describe('TabsRegistryStore compact state', () => {
     expect(missingRef).toBeDefined()
     await fs.rm(path.join(tempDir, 'v1', missingRef!.path))
 
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const restarted = await createTabsRegistryStore(tempDir, { now: () => now })
+    expect(warnSpy.mock.calls.some(([arg]) =>
+      typeof arg === 'string' && arg.includes('compact_manifest_archived_missing_object'),
+    )).toBe(true)
+    warnSpy.mockRestore()
     expect(restarted.count()).toBe(0)
 
     const entries = await fs.readdir(path.join(tempDir, 'v1'))
