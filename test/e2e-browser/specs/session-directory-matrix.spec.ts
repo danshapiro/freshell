@@ -27,6 +27,12 @@ const SESSION_BETA_ID = '00000000-0000-4000-8000-0000000b2222'
 // single sidebar assertion can look for all three providers.
 const CODEX_SESSION_ID = 'codex-matrix-gamma-0001'
 const OPENCODE_SESSION_ID = 'oc-matrix-delta-0001'
+// SESSION-01 review follow-up -- the 4th provider family named in the
+// acceptance text (Amplifier). Seeded newest of the five so ordering
+// assertions below have an unambiguous newest anchor.
+const AMPLIFIER_SESSION_ID = 'amp-matrix-epsilon-0001'
+const AMPLIFIER_CREATED_AT = '2026-07-19T08:00:00.000Z'
+const AMPLIFIER_LAST_ACTIVITY_AT_ISO = '2026-07-19T08:00:02.000Z'
 
 function buildSessionJsonl(input: {
   sessionId: string
@@ -218,6 +224,62 @@ const test = base.extend({
           } finally {
             db.close()
           }
+
+          // SESSION-01 review follow-up -- seed an Amplifier session, the
+          // 4th provider family named in the acceptance text. Shape mirrors
+          // `crates/freshell-sessions/src/amplifier.rs`'s own unit-test
+          // fixtures (`sample_metadata`, `write_session`,
+          // `amplifier_source_parses_fixture_session_with_first_user_message`):
+          // a `metadata.json` document with `session_id`/`working_dir`/
+          // `created`/`description_updated_at`/`name`/`description` fields,
+          // at `<amplifier_home>/projects/<slug>/sessions/<id>/metadata.json`,
+          // plus a sibling `transcript.jsonl` whose first `"role":"user"`
+          // line supplies the first-user-message preview
+          // (`read_first_user_message_from_transcript`,
+          // `providers/amplifier.ts:106-140`). `amplifier_home()` defaults to
+          // `<home>/.amplifier` (no env override needed -- same convention as
+          // the Codex/OpenCode seeds above; the isolated `homeDir` IS the
+          // real home for the spawned server).
+          //
+          // KNOWN DIVERGENCE (codex-first triage note): this checked-out
+          // branch's `server/` tree (legacy Node implementation, FROZEN for
+          // this task) predates upstream `origin/main` commit `05c6b1fa`
+          // ("feat(amplifier): durable session tracking via events.jsonl"),
+          // where `server/coding-cli/providers/amplifier.ts` was introduced
+          // -- verified via `git log --oneline HEAD..origin/main --
+          // server/coding-cli/providers/amplifier.ts` (49 commits behind) and
+          // by grepping for zero "amplifier" occurrences anywhere under
+          // `server/`, `shared/`, or the built `dist/server/index.js` in this
+          // checkout. So legacy has NO Amplifier provider registered at all
+          // in this branch -- not a home-layout mismatch to align, an
+          // absent feature. The seed below is still written unconditionally
+          // (same as every other provider seed in this hook) so a future
+          // merge of that upstream commit into this branch picks it up for
+          // free; the per-assertion `e2eServerKind === 'rust'` guards below
+          // are where the divergence is actually handled.
+          const amplifierSessionDir = path.join(
+            homeDir, '.amplifier', 'projects', 'matrix-epsilon-project', 'sessions', AMPLIFIER_SESSION_ID,
+          )
+          await fs.mkdir(amplifierSessionDir, { recursive: true })
+          await fs.mkdir('/tmp/freshell-matrix/epsilon-project', { recursive: true })
+          await fs.writeFile(
+            path.join(amplifierSessionDir, 'metadata.json'),
+            JSON.stringify({
+              session_id: AMPLIFIER_SESSION_ID,
+              working_dir: '/tmp/freshell-matrix/epsilon-project',
+              created: AMPLIFIER_CREATED_AT,
+              description_updated_at: AMPLIFIER_LAST_ACTIVITY_AT_ISO,
+              name: 'harness-02 matrix epsilon',
+              description: 'harness-02 matrix epsilon summary',
+            }),
+          )
+          await fs.writeFile(
+            path.join(amplifierSessionDir, 'transcript.jsonl'),
+            [
+              JSON.stringify({ role: 'user', content: 'harness-02 matrix epsilon request 1' }),
+              JSON.stringify({ role: 'assistant', content: 'harness-02 matrix epsilon reply 1' }),
+            ].join('\n') + '\n',
+          )
         },
       },
     })
@@ -241,22 +303,163 @@ test.describe('Session Directory Matrix', () => {
   })
 
   // SESSION-01 -- "Index Claude, Codex, OpenCode, and Amplifier histories."
-  // Extends the Claude-only assertion above to the seeded Codex + OpenCode
-  // sessions, proving the sidebar surfaces all three provider families in
-  // one page against the SAME server (either project kind).
-  test('seeded Codex and OpenCode sessions appear in the sidebar alongside Claude', async ({ freshellPage, page }) => {
+  // Extends the Claude-only assertion above to the seeded Codex + OpenCode +
+  // Amplifier sessions, proving the sidebar surfaces all four provider
+  // families in one page against the SAME server (either project kind).
+  test('seeded Codex, OpenCode, and Amplifier sessions appear in the sidebar alongside Claude', async ({ freshellPage, page, e2eServerKind }) => {
     const sessionList = page.getByTestId('sidebar-session-list')
     await expect(sessionList).toBeVisible({ timeout: 15_000 })
     await expect(page.getByText('No sessions yet')).not.toBeVisible()
 
-    // All four titled sessions from all three providers are discoverable in
-    // the SAME sidebar listing -- ordering isn't asserted here (SESSION-01's
-    // "ordering" clause is int entionally left to a follow-up spec once
-    // HARNESS-04's fuller corpus lands), but presence/identity is.
+    // Four titled sessions from the three PRE-EXISTING provider families are
+    // discoverable in the SAME sidebar listing -- ordering is asserted
+    // separately in the API-parity test below; this test covers
+    // presence/identity only.
     await expect(page.getByText(/harness-02 matrix alpha/i)).toBeVisible({ timeout: 10_000 })
     await expect(page.getByText(/harness-02 matrix beta/i)).toBeVisible({ timeout: 10_000 })
     await expect(page.getByText(/harness-02 matrix gamma/i)).toBeVisible({ timeout: 15_000 })
     await expect(page.getByText(/harness-02 matrix delta/i)).toBeVisible({ timeout: 15_000 })
+
+    // SESSION-01's 4th provider family: Amplifier -- this is the first e2e
+    // proof of the Rust-side Amplifier indexing feature
+    // (`crates/freshell-sessions/src/amplifier.rs`, wired as the fourth
+    // session source in `crates/freshell-server/src/main.rs`).
+    //
+    // KNOWN DIVERGENCE (codex-first triage note): scoped to `rust-chromium`
+    // only. This checked-out branch's `server/` tree (legacy Node
+    // implementation, FROZEN for this task) predates upstream
+    // `origin/main` commit `05c6b1fa` ("feat(amplifier): durable session
+    // tracking via events.jsonl"), which is where
+    // `server/coding-cli/providers/amplifier.ts` was introduced --
+    // verified via `git log --oneline HEAD..origin/main --
+    // server/coding-cli/providers/amplifier.ts` (49 commits behind at time
+    // of writing) and by grepping for zero "amplifier" occurrences under
+    // `server/`, `shared/`, or the built `dist/server/index.js` used by the
+    // `legacy-chromium` project's `TestServer`. So on `legacy-chromium` the
+    // legacy indexer has NO Amplifier provider registered at all and will
+    // never surface this seed -- that is not a home-layout mismatch to
+    // align (legacy and Rust already agree `~/.amplifier` is the right
+    // home; see `amplifier_home()` in `amplifier.rs` vs
+    // `defaultAmplifierHome()` referenced in its doc comment), it is an
+    // absent feature on this branch, outside this task's frozen `server/`
+    // ownership. A follow-up merge of that upstream commit into this
+    // branch (or a Codex-driven port pass) would close the gap; flagging
+    // it here rather than silently asserting only what happens to pass.
+    if (e2eServerKind === 'rust') {
+      await expect(page.getByText(/harness-02 matrix epsilon/i)).toBeVisible({ timeout: 15_000 })
+    }
+  })
+
+  // SESSION-01 -- API-level field-parity + ordering proof. Cheaper and more
+  // precise than scraping the DOM: queries the SAME `GET /api/session-directory`
+  // read model the sidebar itself calls (`querySessionDirectory` in
+  // `server/session-directory/service.ts`; same route path on the Rust side
+  // at `crates/freshell-server/src/session_directory.rs:315`) and asserts
+  // identity (provider+sessionId), cwd/project, and lastActivityAt for each
+  // seeded session, plus that the matrix sessions come back ordered by
+  // lastActivityAt DESC -- the acceptance text's "ordering" clause.
+  //
+  // Scope note (honesty per SESSION-01's Playwright validation, which also
+  // names "resumable identities"): this test proves the READ MODEL's field
+  // parity and sort order only. It does NOT exercise resuming a session
+  // through the UI (clicking a sidebar entry, reattaching a terminal,
+  // confirming the PTY/thread reconnects, etc.) -- that remains UNPROVEN by
+  // this spec and is left to a dedicated resume-flow spec. Conflating field
+  // parity with a working resume flow here would overreach past what's
+  // actually asserted below.
+  test('session-directory API reports identity, cwd, and lastActivityAt for every seeded session, ordered by recency', async ({ freshellPage, page, serverInfo, e2eServerKind }) => {
+    // Sanity: wait for the sidebar to be populated (indexer's initial scan
+    // complete) before querying the API directly.
+    await expect(page.getByTestId('sidebar-session-list')).toBeVisible({ timeout: 15_000 })
+    await expect(page.getByText(/harness-02 matrix gamma/i)).toBeVisible({ timeout: 15_000 })
+
+    const response = await page.request.get(
+      `${serverInfo.baseUrl}/api/session-directory?priority=visible&limit=50`,
+      { headers: { 'x-auth-token': serverInfo.token } },
+    )
+    expect(response.ok()).toBe(true)
+    const payload = await response.json() as {
+      items: Array<{
+        sessionId: string
+        provider: string
+        projectPath: string
+        cwd?: string
+        title?: string
+        lastActivityAt: number
+      }>
+    }
+
+    // Preserve the API's OWN response order -- this is what's actually
+    // being tested for the "ordering" assertions below, not a client-side
+    // re-sort (which would prove nothing about the server).
+    const matrixItems = payload.items.filter((item) => (item.title ?? '').startsWith('harness-02 matrix'))
+
+    function findItem(provider: string, sessionId: string) {
+      const item = matrixItems.find((i) => i.provider === provider && i.sessionId === sessionId)
+      expect(item, `expected a session-directory item for ${provider}:${sessionId}`).toBeTruthy()
+      return item!
+    }
+
+    // Identity + cwd/project parity for the three pre-existing providers.
+    // `lastActivityAt` is only loosely checked here (finite/present) --
+    // each provider's exact recency-derivation formula is outside this
+    // task's frozen-file scope; the ordering assertions below cover
+    // recency pragmatically instead of re-deriving each provider's formula.
+    const alpha = findItem('claude', SESSION_ALPHA_ID)
+    expect(alpha.projectPath).toBe('/tmp/freshell-matrix/alpha-project')
+    expect(alpha.cwd).toBe('/tmp/freshell-matrix/alpha-project')
+    expect(Number.isFinite(alpha.lastActivityAt)).toBe(true)
+
+    const beta = findItem('claude', SESSION_BETA_ID)
+    expect(beta.projectPath).toBe('/tmp/freshell-matrix/beta-project')
+
+    const gamma = findItem('codex', CODEX_SESSION_ID)
+    expect(gamma.projectPath).toBe('/tmp/freshell-matrix/gamma-project')
+    expect(Number.isFinite(gamma.lastActivityAt)).toBe(true)
+
+    // OpenCode's `time_updated` is a plain epoch-ms integer written
+    // directly into the seed DB (no timestamp-string parsing involved) --
+    // safe to assert exactly.
+    const delta = findItem('opencode', OPENCODE_SESSION_ID)
+    expect(delta.projectPath).toBe('/tmp/freshell-matrix/delta-project')
+    expect(delta.lastActivityAt).toBe(1774000000001)
+
+    // Ordering (both kinds): `lastActivityAt` DESC among sessions with
+    // unambiguous (non-tied) timestamps -- gamma (2026-07-18) is newer than
+    // delta (~Mar 2026 epoch ms). Alpha and beta share IDENTICAL seeded
+    // timestamps (`buildSessionJsonl` uses the same fixed relative-time
+    // scheme for both), so their mutual order is a legitimate tie and is
+    // deliberately NOT asserted -- only their position relative to the
+    // unambiguous pair (after gamma, before delta) is.
+    const orderedIds = matrixItems.map((item) => `${item.provider}:${item.sessionId}`)
+    const gammaIdx = orderedIds.indexOf(`codex:${CODEX_SESSION_ID}`)
+    const alphaIdx = orderedIds.indexOf(`claude:${SESSION_ALPHA_ID}`)
+    const betaIdx = orderedIds.indexOf(`claude:${SESSION_BETA_ID}`)
+    const deltaIdx = orderedIds.indexOf(`opencode:${OPENCODE_SESSION_ID}`)
+    expect(gammaIdx).toBeGreaterThanOrEqual(0)
+    expect(alphaIdx).toBeGreaterThanOrEqual(0)
+    expect(betaIdx).toBeGreaterThanOrEqual(0)
+    expect(deltaIdx).toBeGreaterThanOrEqual(0)
+    expect(gammaIdx).toBeLessThan(alphaIdx)
+    expect(gammaIdx).toBeLessThan(betaIdx)
+    expect(alphaIdx).toBeLessThan(deltaIdx)
+    expect(betaIdx).toBeLessThan(deltaIdx)
+
+    // Amplifier (rust-chromium only -- see the KNOWN DIVERGENCE note in the
+    // previous test): exact identity/cwd/lastActivityAt match, computed
+    // directly from the metadata.json fixture seeded above -- this is this
+    // task's field-parity proof for the 4th provider family. Seeded newest
+    // of the five, so it must sort before gamma.
+    if (e2eServerKind === 'rust') {
+      const epsilon = findItem('amplifier', AMPLIFIER_SESSION_ID)
+      expect(epsilon.projectPath).toBe('/tmp/freshell-matrix/epsilon-project')
+      expect(epsilon.cwd).toBe('/tmp/freshell-matrix/epsilon-project')
+      expect(epsilon.lastActivityAt).toBe(Date.parse(AMPLIFIER_LAST_ACTIVITY_AT_ISO))
+
+      const epsilonIdx = orderedIds.indexOf(`amplifier:${AMPLIFIER_SESSION_ID}`)
+      expect(epsilonIdx).toBeGreaterThanOrEqual(0)
+      expect(epsilonIdx).toBeLessThan(gammaIdx)
+    }
   })
 
   // SESSION-09 -- live sidebar updates. A session written to the isolated
