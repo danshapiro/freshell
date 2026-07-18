@@ -1,3 +1,4 @@
+import type { MouseEvent as ReactMouseEvent } from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, cleanup } from '@testing-library/react'
 import { useElectronExternalLinks } from '@/hooks/useElectronExternalLinks'
@@ -8,6 +9,13 @@ vi.mock('@/lib/open-url', () => ({
   openExternalUrl: openExternalUrlMock,
   shouldOpenLinkExternally: (event: MouseEvent) => event.ctrlKey || event.shiftKey,
 }))
+
+// Prevent jsdom from attempting a real (unimplemented) navigation on a click
+// the hook intentionally leaves alone. The hook acts in the capture phase, so
+// this bubble-phase guard never masks its behavior.
+function preventNavigation(event: ReactMouseEvent) {
+  event.preventDefault()
+}
 
 function TestHarness() {
   useElectronExternalLinks()
@@ -76,11 +84,13 @@ describe('useElectronExternalLinks', () => {
     vi.stubGlobal('freshellDesktop', { isElectron: true })
     function TestHarnessWithMail() {
       useElectronExternalLinks()
-      return <a href="mailto:test@example.com">email</a>
+      return <a href="mailto:test@example.com" onClick={preventNavigation}>email</a>
     }
     const { container } = render(<TestHarnessWithMail />)
     const link = container.querySelector('a')!
-    const clickEvent = new MouseEvent('click', { ctrlKey: true, bubbles: true })
+    // cancelable so the anchor's onClick preventDefault actually stops jsdom
+    // from attempting a real (unimplemented) mailto navigation.
+    const clickEvent = new MouseEvent('click', { ctrlKey: true, bubbles: true, cancelable: true })
 
     link.dispatchEvent(clickEvent)
 
