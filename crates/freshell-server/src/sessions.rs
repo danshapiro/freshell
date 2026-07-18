@@ -46,6 +46,22 @@ pub struct SessionsState {
     pub registry: freshell_terminal::TerminalRegistry,
     pub broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
     pub terminals_revision: Arc<std::sync::atomic::AtomicI64>,
+    /// GAP-1 fix (reviewer Important, SESSION-09 follow-up): the shared
+    /// `sessions.changed` revision counter (the SAME `Arc<AtomicI64>` as
+    /// `freshell_ws::WsState::sessions_revision` and
+    /// `FreshAgentState`'s, unified in commit b068d28b), wired here so a
+    /// rename/archive/delete OVERRIDE write can broadcast directly instead
+    /// of relying on the periodic session-directory sweep
+    /// (`spawn_sessions_sweep`, `main.rs`) -- that sweep's `(count, max
+    /// lastActivityAt)` signature is structurally blind to override-only
+    /// changes (`IndexedSession` carries no archived/title-override
+    /// fields), so an archive/rename toggle would otherwise never trip a
+    /// broadcast. Legacy parity: `SessionsSyncService`'s differ
+    /// (`hasSessionDirectorySnapshotChange`, `projection.ts:23`) diffs the
+    /// FULL comparable snapshot -- including `archived`/`title` -- on
+    /// every `codingCliIndexer.refresh()` call, which the legacy PATCH
+    /// route always triggers.
+    pub sessions_revision: Arc<std::sync::atomic::AtomicI64>,
 }
 
 /// The sessions sub-router (`PATCH /api/sessions/:id` + `POST .../generate-title`).
@@ -174,6 +190,26 @@ async fn patch_session(
         "cascadedTerminalId".into(),
         cascaded_terminal_id.map(Value::from).unwrap_or(Value::Null),
     );
+
+    // GAP-1 fix: broadcast `sessions.changed` directly for this override
+    // write, rather than relying on the periodic session-directory sweep
+    // (which is structurally blind to override-only changes -- see the
+    // `sessions_revision` field doc comment on `SessionsState` above).
+    // Guarded on a non-empty patch: an empty body (no recognized fields) is
+    // schema-valid but performs no actual write, so nothing changed to
+    // broadcast. Emitted AFTER the terminal cascade (if any) so a rename
+    // that also cascades produces `terminals.changed` before
+    // `sessions.changed`, preserving the existing cascade test's
+    // single-`try_recv()` assumption.
+    if !patch.is_empty() {
+        let revision = state
+            .sessions_revision
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let frame = json!({ "type": "sessions.changed", "revision": revision }).to_string();
+        let _ = state.broadcast_tx.send(frame);
+    }
+
     Json(Value::Object(out)).into_response()
 }
 
@@ -319,6 +355,7 @@ mod tests {
             registry: freshell_terminal::TerminalRegistry::new(),
             broadcast_tx: std::sync::Arc::new(tx),
             terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }
     }
 
@@ -524,6 +561,120 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// GAP-1 fix (reviewer Important, SESSION-09 follow-up): the periodic
+    /// session-directory sweep (`spawn_sessions_sweep`, `main.rs`) is
+    /// structurally blind to override-only changes -- its `(count, max
+    /// lastActivityAt)` signature never moves for a title-override write,
+    /// since `IndexedSession` carries no override fields at all. Legacy
+    /// broadcasts `sessions.changed` on ANY sidebar-visible change (its
+    /// differ, `projection.ts:23`, diffs the full comparable snapshot
+    /// including `title`), so THIS write site must broadcast directly.
+    /// Proves a rename PATCH produces exactly one `sessions.changed` frame
+    /// with a positive, monotonic revision.
+    #[tokio::test]
+    async fn patch_rename_broadcasts_sessions_changed_with_increased_revision() {
+        let dir = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let st = state(&dir);
+
+        // Subscribe BEFORE the PATCH so the `sessions.changed` send lands in
+        // this receiver's buffer.
+        let mut broadcast_rx = st.broadcast_tx.subscribe();
+
+        let app = super::router(st.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/sessions/abc123?provider=claude")
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"titleOverride":"Renamed Session"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let frame = broadcast_rx
+            .try_recv()
+            .expect("sessions.changed broadcast fired for the rename override write");
+        let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(frame["type"], serde_json::json!("sessions.changed"));
+        let revision = frame["revision"].as_i64().expect("revision is a number");
+        assert!(revision > 0, "revision must be a positive counter value");
+
+        // Exactly one frame -- no duplicate/extra broadcast for a plain
+        // rename (no live-terminal cascade in play here).
+        assert!(
+            broadcast_rx.try_recv().is_err(),
+            "exactly one broadcast frame expected for a plain rename PATCH"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Companion to the rename case above: an archive toggle is exactly the
+    /// kind of sidebar-visible, sweep-invisible change GAP-1 covers (the
+    /// reviewer's own example). Also proves the revision counter is shared
+    /// across successive PATCHes (strictly increasing, not reset per call).
+    #[tokio::test]
+    async fn patch_archive_broadcasts_sessions_changed_and_revision_is_monotonic() {
+        let dir = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let st = state(&dir);
+        let mut broadcast_rx = st.broadcast_tx.subscribe();
+
+        let app = super::router(st.clone());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/sessions/abc123?provider=claude")
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"archived":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let first_frame = broadcast_rx
+            .try_recv()
+            .expect("sessions.changed broadcast fired for the archive override write");
+        let first_frame: serde_json::Value = serde_json::from_str(&first_frame).unwrap();
+        let first_revision = first_frame["revision"].as_i64().unwrap();
+
+        // A second override write on the SAME state must bump the counter
+        // further (shared, monotonic sequence -- not reset per request).
+        let resp2 = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/sessions/abc123?provider=claude")
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"archived":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let second_frame = broadcast_rx
+            .try_recv()
+            .expect("sessions.changed broadcast fired for the second override write");
+        let second_frame: serde_json::Value = serde_json::from_str(&second_frame).unwrap();
+        let second_revision = second_frame["revision"].as_i64().unwrap();
+
+        assert!(
+            second_revision > first_revision,
+            "revision must strictly increase across successive override writes"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn patch_requires_auth() {
         let dir = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));
@@ -724,6 +875,7 @@ mod tests {
             registry: freshell_terminal::TerminalRegistry::new(),
             broadcast_tx: std::sync::Arc::new(tx),
             terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         });
         let patch_resp = sessions_app
             .oneshot(

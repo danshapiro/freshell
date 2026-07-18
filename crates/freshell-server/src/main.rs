@@ -483,6 +483,10 @@ async fn main() -> ExitCode {
                 auth_token: Arc::clone(&auth_token),
                 broadcast_tx: Arc::clone(&broadcast_tx),
                 fresh_codex: fresh_codex_state.clone(),
+                // NARROW live-reload fix: same shared registry seeded at boot
+                // (TERM-11/TERM-13, above) so a successful PATCH also pushes
+                // `safety.autoKillIdleMinutes`/`terminal.scrollback` live.
+                registry: registry.clone(),
             },
         ))
         .merge(boot::router(boot_state))
@@ -495,6 +499,13 @@ async fn main() -> ExitCode {
             registry: registry.clone(),
             broadcast_tx: Arc::clone(&broadcast_tx),
             terminals_revision: Arc::clone(&terminals_revision),
+            // GAP-1 fix (reviewer Important, SESSION-09 follow-up): the SAME
+            // shared `sessions.changed` revision counter minted above (and
+            // already wired into `fresh_agent_state`/`ws_state`) so an
+            // override write (rename/archive/delete) broadcasts on the ONE
+            // unified sequence instead of drifting out of sync with the
+            // sweep/fresh-agent producers.
+            sessions_revision: Arc::clone(&sessions_revision),
         }))
         .merge(files::router(files_state))
         .merge(terminals::router(terminals_state))
@@ -832,13 +843,58 @@ const SESSIONS_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_m
 /// existing session, bumping ITS `lastActivityAt` without changing corpus
 /// size).
 ///
-/// KNOWN GAP (v1, deliberately not fixed here): a change that touches
-/// neither corpus size nor any session's `lastActivityAt` -- e.g. a
-/// title-only rename with no new turn -- would not trip this signature. No
-/// committed provider parser currently allows that combination (a title is
-/// always derived from message content that also carries its own
-/// timestamp), so this is not observed in practice. Legacy's fuller
-/// comparison (`hasSessionDirectorySnapshotChange`,
+/// KNOWN GAPS (this sweep's signature ALONE is blind to all three; see the
+/// per-item notes below for what closes or accepts each one):
+///
+/// 1. **Override-only changes (title/summary/archived/deleted overrides) --
+///    CLOSED at the write site, not here.** `IndexedSession` carries no
+///    override fields at all, so a rename/archive/delete PATCH never moves
+///    this signature. Reviewer finding (Important): legacy broadcasts
+///    `sessions.changed` on ANY sidebar-visible change (its differ,
+///    `hasSessionDirectorySnapshotChange` / `projection.ts:23`, diffs the
+///    FULL comparable snapshot including `archived`/`title`, re-run on
+///    every `codingCliIndexer.refresh()` the legacy PATCH route triggers).
+///    This port closes the gap at the SOURCE instead of widening the
+///    sweep's signature: `sessions::patch_session` broadcasts
+///    `sessions.changed` directly on a successful override write, sharing
+///    this SAME `sessions_revision` counter (see
+///    `sessions::SessionsState::sessions_revision`'s doc comment). Proven
+///    by `patch_rename_broadcasts_sessions_changed_with_increased_revision`
+///    and `patch_archive_broadcasts_sessions_changed_and_revision_is_monotonic`
+///    in `sessions.rs`.
+///
+/// 2. **Delete+add in the SAME tick, count-neutral AND max-neutral --
+///    ACCEPTED, exotic.** If one session is deleted and a different one
+///    added within the same ~2s sweep window, and the composition happens
+///    to leave both `len()` and the max `lastActivityAt` unchanged, this
+///    signature cannot distinguish the pre/post corpus. This requires a
+///    coincidental timestamp match across two unrelated sessions landing in
+///    the same tick -- accepted as out of scope for a v1 poll-based sweep;
+///    a filesystem watcher (not introduced here, see the FENCE note below)
+///    would not have this gap either.
+///
+/// 3. **External-process override edits (bake-in with the legacy Node
+///    server writing the SAME `config.json`) -- ACCEPTED for bake-in.** The
+///    `SettingsStore`'s mtime-checked freshness reload
+///    (`maybe_reload_overrides`, `settings_store.rs`) adopts an
+///    externally-written override into THIS process's in-memory settings
+///    on the next override READ, but that reload is READ-path-triggered
+///    and does not itself broadcast -- so a bake-in-partner write to
+///    `config.json` (not routed through THIS process's `patch_session`)
+///    updates what the next request sees without pushing a
+///    `sessions.changed` frame to already-connected WS clients. Only
+///    writes that go through `sessions::patch_session` on THIS process
+///    close gap 1 above; a foreign process's direct file write does not.
+///    Accepted: bake-in is a transitional deployment mode, not the target
+///    single-process architecture.
+///
+/// No committed provider parser currently allows a title-only rename with
+/// no new turn to ALSO leave the sweep signature blind at the source-file
+/// level (a title is always derived from message content that also carries
+/// its own timestamp) -- gap 1 above is about the OVERRIDE layer
+/// (`sessionOverrides` in `config.json`), which is orthogonal to the
+/// parsed-file layer this signature covers. Legacy's fuller comparison
+/// (`hasSessionDirectorySnapshotChange`,
 /// `server/sessions-sync/service.ts`) additionally hashes file
 /// content/mtime to catch this class of edit; that fuller comparison is
 /// intentionally NOT ported here.
