@@ -187,7 +187,12 @@ describe('sidebar staleness', () => {
         },
       })
 
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
       await store.dispatch(queueActiveSessionWindowRefresh() as any)
+
+      // The failed background refresh logs a structured warning.
+      expect(warnSpy).toHaveBeenCalledWith('[SessionsThunks]', 'Background refresh failed for', expect.anything(), 'Network error')
+      warnSpy.mockRestore()
 
       const sidebar = store.getState().sessions.windows.sidebar
       // After a failed refresh, loading should be false
