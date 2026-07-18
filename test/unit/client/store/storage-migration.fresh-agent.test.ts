@@ -253,7 +253,11 @@ describe('storage-migration fresh-agent', () => {
     Object.defineProperty(globalThis, 'localStorage', { value: storage, writable: true })
     storage.seed(LAYOUT_KEY, originalRaw)
 
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     await import('@/store/storage-migration')
+
+    expect(warnSpy).toHaveBeenCalledWith('[StorageMigration]', expect.stringContaining('fresh_agent_layout_backup_write_failed'))
+    warnSpy.mockRestore()
 
     expect(localStorage.getItem(LAYOUT_KEY)).toBe(originalRaw)
     expect(localStorage.getItem(BACKUP_KEY)).toBeNull()
@@ -269,7 +273,11 @@ describe('storage-migration fresh-agent', () => {
     Object.defineProperty(globalThis, 'localStorage', { value: storage, writable: true })
     storage.seed(LAYOUT_KEY, originalRaw)
 
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     await import('@/store/storage-migration')
+
+    expect(warnSpy).toHaveBeenCalledWith('[StorageMigration]', expect.stringContaining('fresh_agent_layout_write_failed'))
+    warnSpy.mockRestore()
 
     expect(localStorage.getItem(LAYOUT_KEY)).toBe(originalRaw)
     expect(localStorage.getItem(BACKUP_KEY)).toBe(originalRaw)
@@ -296,8 +304,12 @@ describe('storage-migration fresh-agent', () => {
     Object.defineProperty(globalThis, 'localStorage', { value: storage, writable: true })
     storage.seed(LAYOUT_KEY, originalRaw)
 
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     await import('@/store/storage-migration')
     const { readRecoverablePersistedLayoutRaw } = await import('@/store/persistedState')
+
+    expect(warnSpy).toHaveBeenCalledWith('[StorageMigration]', expect.stringContaining('fresh_agent_layout_interleaving_write_detected'))
+    warnSpy.mockRestore()
 
     expect(localStorage.getItem(LAYOUT_KEY)).toBe(concurrentRaw)
     expect(localStorage.getItem(BACKUP_KEY)).toBeNull()
@@ -325,8 +337,12 @@ describe('storage-migration fresh-agent', () => {
     Object.defineProperty(globalThis, 'localStorage', { value: storage, writable: true })
     storage.seed(LAYOUT_KEY, originalRaw)
 
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     await import('@/store/storage-migration')
     const { readRecoverablePersistedLayoutRaw } = await import('@/store/persistedState')
+
+    expect(warnSpy).toHaveBeenCalledWith('[StorageMigration]', expect.stringContaining('fresh_agent_layout_commit_marker_write_failed'))
+    warnSpy.mockRestore()
 
     expect(localStorage.getItem(LAYOUT_KEY)).toBe(concurrentRaw)
     expect(localStorage.getItem(BACKUP_KEY)).toBe(originalRaw)
