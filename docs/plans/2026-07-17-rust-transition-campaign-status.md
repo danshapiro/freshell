@@ -159,10 +159,35 @@ the SAME agent conversation from both; terminals/layouts are per-server (differe
 2. **Investigate before building.** Non-obvious items get a read-only code-intel pass first,
    producing an implementer-ready spec with legacy/origin-main file:line citations (this caught
    "amplifier lists via metadata.json, not events.jsonl" before we built the wrong thing).
-3. **Parallel TDD implementation.** 2–3 implementers at once. Each must: cite its parity source
-   (frozen server/ or origin/main, stated per task), prove RED before GREEN, run focused crate
-   tests + fmt/clippy, keep frozen paths clean, and do a REAL-DATA acceptance check against the
-   staging clone or a throwaway home (caught the all-opencode bug and the 5-min cold boot).
+3. **Parallel TDD implementation — OUTCOME-ORIENTED (double loop).** Every item starts with an
+   OUTER EXPERIENCE TEST: the thing the user/operator would actually do, failing the way they'd
+   actually feel it (Playwright matrix spec for browser outcomes; process/filesystem-level
+   harness test for operator outcomes like logs/shutdown/backup). Prove the outer test RED
+   against the current binary FIRST, then inner unit TDD until the outer loop goes green.
+   "Done" = OUTER green (unit-green with a broken experience does not count — the fresh-agent
+   keepalive saga is the cautionary tale). Outer tests land in the permanent suites so outcomes
+   can't regress. Where legacy supports the same outcome, legacy-chromium is the parity control.
+   Each implementer must also: cite its parity source (frozen server/ or origin/main, stated per
+   task), run focused crate tests + fmt/clippy, keep frozen paths clean, and do a REAL-DATA
+   acceptance check against the staging clone or a throwaway home.
+
+   **Destructive-test safety contract** (outer tests kill processes and corrupt files — on the
+   machine that hosts the LIVE daily driver, real data, and the bake-in):
+   - Destructive operations run ONLY against harness-owned servers on ephemeral 127.0.0.1:0
+     ports with throwaway homes under /tmp. NEVER against ports 3001/3002/17871/17872/17874 or
+     any process the test did not spawn.
+   - Kill by RECORDED PID only, identity-verified (ps -fp + cmdline/cwd match) before signal.
+     NEVER pattern/name-based kills (pkill/pgrep by name) — a real codex/claude/node is always
+     running somewhere on this box.
+   - Child-reap assertions check the recorded child PIDs, never sweep process names. Prefer
+     fake sidecars (fake codex app-server) over real CLIs so kills hit fakes.
+   - File-corruption tests (e.g. CFG-03) use guard assertions IN CODE: destructive helpers
+     refuse any path not under the test's own tempdir (assert path starts with the sandbox
+     root before truncate/rm). Real ~/.freshell is never a test target.
+   - systemd experiments: user scope only, uniquely-named unit, no sudo, removed after.
+   - Prefer mechanism over instruction: put these guards in shared harness helpers (kill_tree
+     that refuses unrecorded PIDs; sandbox-path assertions) so the safe path is the easy path.
+   - Reviewers explicitly audit destructive tests for blast radius as a named review item.
 4. **Independent adversarial review.** Every commit reviewed at a pinned SHA in an isolated
    worktree; reviewer re-reads legacy sources itself, re-runs tests, and reverts implementations
    to prove tests bite (caught the untested reverse cascade and the chars-vs-bytes scrollback
