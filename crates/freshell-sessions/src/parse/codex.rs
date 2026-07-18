@@ -28,7 +28,11 @@ const SEMANTIC_CODEX_EVENT_TYPES: &[&str] = &[
     "user_message",
 ];
 
-fn extract_text_content(items: Option<&Value>) -> String {
+/// SESSION-07: `pub(crate)` (was private) so
+/// `crate::search::extract_codex_message` can reuse the exact same
+/// `extractTextContent` port for the file-content search tiers instead of
+/// duplicating this logic.
+pub(crate) fn extract_text_content(items: Option<&Value>) -> String {
     let Some(Value::Array(items)) = items else {
         return String::new();
     };

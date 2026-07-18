@@ -45,6 +45,9 @@ use axum::{
 };
 use base64::Engine as _;
 use freshell_sessions::directory_index::{IndexedSession, SessionIndex};
+// SESSION-07: the `userMessages`/`fullText` tier file-content search
+// (`apply_file_search`, below) -- ports `server/session-directory/file-search.ts`.
+use freshell_sessions::{search_session_file, FileSearchTier};
 // Batch B: only the `#[cfg(test)]`-gated reference functions below
 // (`list_claude_sessions`/`parse_claude_file`/`item_from_meta`) still need the
 // raw parse layer directly -- production reads `IndexedSession` from the
@@ -119,6 +122,12 @@ struct DirItem {
     /// in this port (the original's parsed items don't set it either, see
     /// `toItems`/`joinRunningState`, `service.ts:132-151`).
     session_type: Option<String>,
+    /// SESSION-07: the on-disk transcript to scan for the `userMessages`/
+    /// `fullText` tiers (`IndexedSession::source_file`). Internal only --
+    /// never serialized (`to_value` never reads it), mirroring
+    /// `sourceFiles.get(key)` (`session-directory/service.ts:164-173`), which
+    /// is looked up server-side and never sent to the client either.
+    source_file: Option<PathBuf>,
 }
 
 impl DirItem {
@@ -180,12 +189,27 @@ impl DirItem {
     }
 }
 
+/// `SessionDirectoryQuerySchema.tier` (`shared/read-models.ts:30`,
+/// `z.enum(['title', 'userMessages', 'fullText']).default('title')`).
+/// SESSION-07: `UserMessages`/`FullText` dispatch to
+/// `freshell_sessions::search::search_session_file` (see
+/// [`apply_file_search`]); `Title` keeps the existing metadata-only
+/// [`apply_title_search`] path unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Tier {
+    #[default]
+    Title,
+    UserMessages,
+    FullText,
+}
+
 /// The parsed query (`SessionDirectoryQuerySchema` — `read-models.ts:28-38`), the
 /// subset this port honors. Booleans arrive as `'1'` (present) / absent, matching
 /// the client's `buildQueryString` (`src/lib/api.ts:253-255`).
 #[derive(Debug, Default)]
 struct DirQuery {
     query: Option<String>,
+    tier: Tier,
     cursor: Option<String>,
     limit: Option<usize>,
     include_subagents: bool,
@@ -229,6 +253,25 @@ fn validate_query(raw: &std::collections::HashMap<String, String>) -> Result<Dir
         },
     };
 
+    // SESSION-07: `tier` (`SessionDirectoryQuerySchema.tier`,
+    // `shared/read-models.ts:30`) -- `z.enum([...]).default('title')`, so an
+    // ABSENT value is valid (defaults), only a PRESENT-but-unrecognized value
+    // is a validation error (same shape convention as `priority` above).
+    let tier = match raw.get("tier").map(String::as_str) {
+        None | Some("title") => Tier::Title,
+        Some("userMessages") => Tier::UserMessages,
+        Some("fullText") => Tier::FullText,
+        Some(_) => {
+            details.push(json!({
+                "code": "invalid_value",
+                "values": ["title", "userMessages", "fullText"],
+                "path": ["tier"],
+                "message": "Invalid option: expected one of \"title\"|\"userMessages\"|\"fullText\"",
+            }));
+            Tier::Title
+        }
+    };
+
     if !details.is_empty() {
         return Err(json!(details));
     }
@@ -236,6 +279,7 @@ fn validate_query(raw: &std::collections::HashMap<String, String>) -> Result<Dir
     let flag = |k: &str| raw.get(k).map(|v| v == "1" || v == "true").unwrap_or(false);
     Ok(DirQuery {
         query: raw.get("query").filter(|s| !s.is_empty()).cloned(),
+        tier,
         cursor: raw.get("cursor").filter(|s| !s.is_empty()).cloned(),
         limit,
         include_subagents: flag("includeSubagents"),
@@ -443,6 +487,7 @@ fn dir_item_from_indexed(idx: &IndexedSession) -> DirItem {
         running_terminal_id: None,
         live_terminal_only: false,
         session_type: None,
+        source_file: idx.source_file.clone(),
     }
 }
 
@@ -546,7 +591,13 @@ fn parse_claude_file(path: &Path, force_subagent: bool) -> Option<DirItem> {
     // `includeSubagents&includeNonInteractive&includeEmpty=true` still returns
     // `{items:[],nextCursor:null,revision:0}` \u2014 the file was never indexed at all.
     meta.cwd.as_ref()?;
-    Some(item_from_meta(&meta, "claude", &fallback, force_subagent))
+    Some(item_from_meta(
+        &meta,
+        "claude",
+        &fallback,
+        force_subagent,
+        Some(path.to_path_buf()),
+    ))
 }
 
 /// Build a [`DirItem`] from a parsed meta (pure — unit-tested). `session_id` falls
@@ -559,6 +610,7 @@ fn item_from_meta(
     provider: &str,
     fallback_session_id: &str,
     force_subagent: bool,
+    source_file: Option<PathBuf>,
 ) -> DirItem {
     DirItem {
         session_id: meta
@@ -585,6 +637,7 @@ fn item_from_meta(
         running_terminal_id: None,
         live_terminal_only: false,
         session_type: None,
+        source_file,
     }
 }
 
@@ -706,6 +759,7 @@ fn build_live_terminal_session_item(
         running_terminal_id: Some(identity.terminal_id.clone()),
         live_terminal_only: identity.session_id.is_none(),
         session_type: Some(provider),
+        source_file: None,
     })
 }
 
@@ -763,6 +817,7 @@ mod join_tests {
             running_terminal_id: None,
             live_terminal_only: false,
             session_type: None,
+            source_file: None,
         }
     }
 
@@ -1008,12 +1063,32 @@ fn apply_query(
         });
     }
 
-    // Title-tier metadata search (service.ts:266-271 + applySearch:66-75).
+    // SESSION-07: search dispatch (service.ts:266-278). `title` stays the
+    // existing metadata-only path (`applySearch:66-75`); `userMessages`/
+    // `fullText` scan the source transcripts (`applyFileSearch:153-226`) and
+    // may report `partial`/`partialReason`.
+    let mut partial = false;
+    let mut partial_reason: Option<&'static str> = None;
     if let Some(query_text) = q.query.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        items = items
-            .into_iter()
-            .filter_map(|i| apply_title_search(i, query_text))
-            .collect();
+        match q.tier {
+            Tier::Title => {
+                items = items
+                    .into_iter()
+                    .filter_map(|i| apply_title_search(i, query_text))
+                    .collect();
+            }
+            Tier::UserMessages | Tier::FullText => {
+                let file_tier = if q.tier == Tier::UserMessages {
+                    FileSearchTier::UserMessages
+                } else {
+                    FileSearchTier::FullText
+                };
+                let result = apply_file_search(items, query_text, file_tier, limit);
+                items = result.items;
+                partial = result.partial;
+                partial_reason = result.partial_reason;
+            }
+        }
     }
 
     // Page + next cursor (service.ts:281-291).
@@ -1028,11 +1103,96 @@ fn apply_query(
         Value::Null
     };
 
-    Ok(json!({
+    let mut page = json!({
         "items": page_items,
         "nextCursor": next_cursor,
         "revision": revision,
-    }))
+    });
+    // `SessionDirectoryPage.partial`/`partialReason` (`shared/read-models.ts:66-67`):
+    // omitted entirely when not partial (matches the zod `.optional()` shape;
+    // the original only sets these keys at all inside `if (partial) {...}`,
+    // `service.ts:293-296`).
+    if partial {
+        page["partial"] = json!(true);
+        if let Some(reason) = partial_reason {
+            page["partialReason"] = json!(reason);
+        }
+    }
+    Ok(page)
+}
+
+/// The file-tier search outcome: the (possibly annotated + reordered-to-matches)
+/// item list plus the `partial`/`partialReason` page annotations.
+struct FileSearchOutcome {
+    items: Vec<DirItem>,
+    partial: bool,
+    partial_reason: Option<&'static str>,
+}
+
+/// `applyFileSearch` (`service.ts:153-226`): scan each post-cursor item's
+/// source transcript for the `userMessages`/`fullText` tiers. Bounded by a
+/// scan budget (`maxScan = limit * 10`, `service.ts:176`) and an early stop
+/// once `limit + 1` matches accumulate (`service.ts:182`) -- the `+1` lets
+/// [`apply_query`]'s existing `items.len() > limit` next-cursor check detect
+/// "more exist" without this function ever scanning the entire remaining
+/// list (unlike the title tier, which does).
+///
+/// An item with no [`DirItem::source_file`] (a live-terminal-only item, or a
+/// provider with no per-file source -- opencode/amplifier) or an unsupported
+/// `provider` is skipped WITHOUT counting against the scan budget, mirroring
+/// `service.ts:191-195`'s `if (!sourceFile) continue` / `if (!provider) continue`
+/// (both `continue` before the `scanned++` at :197).
+fn apply_file_search(
+    items: Vec<DirItem>,
+    query_text: &str,
+    tier: FileSearchTier,
+    limit: usize,
+) -> FileSearchOutcome {
+    let max_scan = limit * 10;
+    let mut results: Vec<DirItem> = Vec::new();
+    let mut scanned = 0usize;
+    let mut partial = false;
+    let mut partial_reason: Option<&'static str> = None;
+
+    for item in items {
+        if results.len() > limit {
+            break;
+        }
+        if scanned >= max_scan {
+            partial = true;
+            partial_reason = Some("budget");
+            break;
+        }
+        let Some(source_file) = item.source_file.clone() else {
+            continue;
+        };
+        if !matches!(item.provider.as_str(), "claude" | "codex") {
+            continue;
+        }
+        scanned += 1;
+
+        match search_session_file(&source_file, &item.provider, query_text, tier) {
+            Ok(Some(m)) => {
+                let mut matched = item;
+                matched.matched_in = Some(m.matched_in.to_string());
+                matched.snippet = Some(m.snippet);
+                results.push(matched);
+            }
+            Ok(None) => {}
+            Err(_) => {
+                partial = true;
+                if partial_reason.is_none() {
+                    partial_reason = Some("io_error");
+                }
+            }
+        }
+    }
+
+    FileSearchOutcome {
+        items: results,
+        partial,
+        partial_reason,
+    }
 }
 
 /// `applySearch` (`service.ts:66-75`) at the title tier: match the query against
@@ -1169,7 +1329,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let item = item_from_meta(&meta, "claude", "real-corrupted", false);
+        let item = item_from_meta(&meta, "claude", "real-corrupted", false, None);
         assert_eq!(item.session_id, "b7936c10-4935-441c-837c-c1f33cafec2d");
         assert_eq!(item.provider, "claude");
         assert_eq!(
@@ -1201,7 +1361,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let item = item_from_meta(&meta, "claude", "healthy", false);
+        let item = item_from_meta(&meta, "claude", "healthy", false, None);
         assert_eq!(item.session_id, "healthy"); // not a canonical UUID
     }
 
@@ -1392,6 +1552,7 @@ mod tests {
             running_terminal_id: None,
             live_terminal_only: false,
             session_type: None,
+            source_file: None,
         };
         let items = vec![mk("a", 100), mk("b", 200)];
         let q = DirQuery {
@@ -1604,6 +1765,7 @@ mod tests {
             running_terminal_id: None,
             live_terminal_only: false,
             session_type: None,
+            source_file: None,
         };
         let items = vec![mk("keep"), mk("gone")];
 
@@ -1646,6 +1808,7 @@ mod tests {
             running_terminal_id: None,
             live_terminal_only: false,
             session_type: None,
+            source_file: None,
         };
         let overlaid = apply_session_overrides(vec![item], &serde_json::Map::new());
         let v = overlaid[0].to_value();
@@ -2133,5 +2296,311 @@ mod tests {
         assert_eq!(opencode_item["archived"], json!(true));
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── SESSION-07: userMessages/fullText tier search + partial ──
+
+    /// Isolated claude home with ONE synthetic session file containing a
+    /// distinct user turn and a distinct assistant turn -- lets a test assert
+    /// tier scoping (`userMessages` must never match the assistant-only
+    /// phrase) precisely.
+    fn synthetic_claude_home_with_turns(
+        session_uuid: &str,
+        user_text: &str,
+        assistant_text: &str,
+    ) -> PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "freshell-s07-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let project = home.join(".claude").join("projects").join("-home-dan-proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let user_uuid = format!("{session_uuid}-u001");
+        let asst_uuid = format!("{session_uuid}-a001");
+        let content = format!(
+            "{{\"parentUuid\":null,\"cwd\":\"/home/dan/proj\",\"sessionId\":\"{session_uuid}\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"{user_text}\"}},\"uuid\":\"{user_uuid}\",\"timestamp\":\"2026-01-30T06:15:56.713Z\"}}\n\
+             {{\"parentUuid\":\"{user_uuid}\",\"cwd\":\"/home/dan/proj\",\"sessionId\":\"{session_uuid}\",\"type\":\"assistant\",\"message\":{{\"model\":\"m\",\"id\":\"msg1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{assistant_text}\"}}]}},\"uuid\":\"{asst_uuid}\",\"timestamp\":\"2026-01-30T06:16:00.000Z\"}}\n\
+             {{\"parentUuid\":\"{asst_uuid}\",\"cwd\":\"/home/dan/proj\",\"sessionId\":\"{session_uuid}\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"a second user turn so the session isn't single-turn non-interactive\"}},\"uuid\":\"{session_uuid}-u002\",\"timestamp\":\"2026-01-30T06:17:00.000Z\"}}\n"
+        );
+        std::fs::write(project.join(format!("{session_uuid}.jsonl")), content).unwrap();
+        home
+    }
+
+    #[test]
+    fn tier_user_messages_matches_only_the_user_turn() {
+        let home = synthetic_claude_home_with_turns(
+            "bbbbbbbb-0000-4000-8000-000000000001",
+            "unique-search-term-alpha",
+            "unique-search-term-alpha-assistant-only",
+        );
+        let items = list_claude_sessions(&claude_home(&home));
+        assert_eq!(items.len(), 1);
+        assert!(
+            items[0].source_file.is_some(),
+            "a real session file must carry a source_file for tier search"
+        );
+
+        // Matches the user turn.
+        let q_user_hit = DirQuery {
+            include_non_interactive: true,
+            tier: Tier::UserMessages,
+            query: Some("unique-search-term-alpha".into()),
+            ..DirQuery::default()
+        };
+        let page = apply_query(items.clone(), &q_user_hit, &[]).unwrap();
+        let arr = page["items"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "userMessages tier must match the user turn");
+        assert_eq!(arr[0]["matchedIn"], json!("userMessage"));
+        assert_eq!(arr[0]["snippet"], json!("unique-search-term-alpha"));
+
+        // The assistant-only phrase must NOT match under userMessages.
+        let q_assistant_only = DirQuery {
+            include_non_interactive: true,
+            tier: Tier::UserMessages,
+            query: Some("assistant-only".into()),
+            ..DirQuery::default()
+        };
+        let page2 = apply_query(items, &q_assistant_only, &[]).unwrap();
+        assert_eq!(
+            page2["items"].as_array().unwrap().len(),
+            0,
+            "userMessages tier must never match assistant-only text"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn tier_full_text_matches_assistant_turn_too() {
+        let home = synthetic_claude_home_with_turns(
+            "bbbbbbbb-0000-4000-8000-000000000002",
+            "hello there",
+            "unique-fulltext-only-phrase",
+        );
+        let items = list_claude_sessions(&claude_home(&home));
+        let q = DirQuery {
+            include_non_interactive: true,
+            tier: Tier::FullText,
+            query: Some("unique-fulltext-only-phrase".into()),
+            ..DirQuery::default()
+        };
+        let page = apply_query(items, &q, &[]).unwrap();
+        let arr = page["items"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "fullText tier must match assistant text");
+        assert_eq!(arr[0]["matchedIn"], json!("assistantMessage"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn tier_search_is_case_insensitive() {
+        let home = synthetic_claude_home_with_turns(
+            "bbbbbbbb-0000-4000-8000-000000000003",
+            "MixedCase NeedleValue Here",
+            "irrelevant",
+        );
+        let items = list_claude_sessions(&claude_home(&home));
+        let q = DirQuery {
+            include_non_interactive: true,
+            tier: Tier::UserMessages,
+            query: Some("needlevalue".into()),
+            ..DirQuery::default()
+        };
+        let page = apply_query(items, &q, &[]).unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn tier_search_empty_no_match_returns_empty_items_without_partial() {
+        let home = synthetic_claude_home_with_turns(
+            "bbbbbbbb-0000-4000-8000-000000000004",
+            "nothing relevant here at all",
+            "still nothing relevant",
+        );
+        let items = list_claude_sessions(&claude_home(&home));
+        let q = DirQuery {
+            include_non_interactive: true,
+            tier: Tier::FullText,
+            query: Some("zzz-absent-query-text".into()),
+            ..DirQuery::default()
+        };
+        let page = apply_query(items, &q, &[]).unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 0);
+        assert_eq!(page["nextCursor"], Value::Null);
+        assert!(
+            page.get("partial").is_none(),
+            "an exhausted, non-budget-limited scan must not report partial"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn tier_search_combined_with_cursor_pagination() {
+        // Three sessions, all matching, distinct lastActivityAt (from
+        // distinct timestamps) -> limit 1 must page through all three via
+        // nextCursor, newest first, no duplicates, no omissions.
+        let home = std::env::temp_dir().join(format!(
+            "freshell-s07-page-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let project = home.join(".claude").join("projects").join("-home-dan-proj");
+        std::fs::create_dir_all(&project).unwrap();
+        for (n, ts) in [
+            (
+                "cccccccc-0000-4000-8000-000000000001",
+                "2026-01-30T06:10:00.000Z",
+            ),
+            (
+                "cccccccc-0000-4000-8000-000000000002",
+                "2026-01-30T06:20:00.000Z",
+            ),
+            (
+                "cccccccc-0000-4000-8000-000000000003",
+                "2026-01-30T06:30:00.000Z",
+            ),
+        ] {
+            let content = format!(
+                "{{\"parentUuid\":null,\"cwd\":\"/home/dan/proj\",\"sessionId\":\"{n}\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"paginated-search-term\"}},\"uuid\":\"{n}-u001\",\"timestamp\":\"{ts}\"}}\n\
+                 {{\"parentUuid\":\"{n}-u001\",\"cwd\":\"/home/dan/proj\",\"sessionId\":\"{n}\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"second turn\"}},\"uuid\":\"{n}-u002\",\"timestamp\":\"{ts}\"}}\n"
+            );
+            std::fs::write(project.join(format!("{n}.jsonl")), content).unwrap();
+        }
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..3 {
+            let items = list_claude_sessions(&claude_home(&home));
+            let q = DirQuery {
+                include_non_interactive: true,
+                tier: Tier::UserMessages,
+                query: Some("paginated-search-term".into()),
+                limit: Some(1),
+                cursor: cursor.clone(),
+                ..DirQuery::default()
+            };
+            let page = apply_query(items, &q, &[]).unwrap();
+            let arr = page["items"].as_array().unwrap();
+            assert_eq!(arr.len(), 1, "each page must have exactly 1 item");
+            seen.push(arr[0]["sessionId"].as_str().unwrap().to_string());
+            cursor = page["nextCursor"].as_str().map(str::to_string);
+        }
+        assert_eq!(cursor, None, "the third page must be the last");
+        // Newest first (highest timestamp -> DESC sort), no duplicates.
+        assert_eq!(
+            seen,
+            vec![
+                "cccccccc-0000-4000-8000-000000000003",
+                "cccccccc-0000-4000-8000-000000000002",
+                "cccccccc-0000-4000-8000-000000000001",
+            ]
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn tier_search_reports_partial_budget_when_scan_budget_exceeded() {
+        // limit=1 -> max_scan = limit*10 = 10; seed 11 NON-matching sessions
+        // so the budget is exhausted before `limit + 1` matches are ever
+        // found (`service.ts:176,182-186`).
+        let home = std::env::temp_dir().join(format!(
+            "freshell-s07-budget-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let project = home.join(".claude").join("projects").join("-home-dan-proj");
+        std::fs::create_dir_all(&project).unwrap();
+        for n in 0..11u32 {
+            let sid = format!("dddddddd-0000-4000-8000-{n:012}");
+            let content = format!(
+                "{{\"parentUuid\":null,\"cwd\":\"/home/dan/proj\",\"sessionId\":\"{sid}\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"no match here\"}},\"uuid\":\"{sid}-u001\",\"timestamp\":\"2026-01-30T06:{n:02}:00.000Z\"}}\n\
+                 {{\"parentUuid\":\"{sid}-u001\",\"cwd\":\"/home/dan/proj\",\"sessionId\":\"{sid}\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"second turn\"}},\"uuid\":\"{sid}-u002\",\"timestamp\":\"2026-01-30T06:{n:02}:30.000Z\"}}\n"
+            );
+            std::fs::write(project.join(format!("{sid}.jsonl")), content).unwrap();
+        }
+
+        let items = list_claude_sessions(&claude_home(&home));
+        assert_eq!(items.len(), 11);
+        let q = DirQuery {
+            include_non_interactive: true,
+            tier: Tier::UserMessages,
+            query: Some("zzz-never-present".into()),
+            limit: Some(1),
+            ..DirQuery::default()
+        };
+        let page = apply_query(items, &q, &[]).unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 0);
+        assert_eq!(page["partial"], json!(true));
+        assert_eq!(page["partialReason"], json!("budget"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn invalid_tier_value_is_rejected_with_zod_like_400_shape() {
+        let mut raw = std::collections::HashMap::new();
+        raw.insert("priority".to_string(), "visible".to_string());
+        raw.insert("tier".to_string(), "bogus-tier".to_string());
+        let err = validate_query(&raw).unwrap_err();
+        let details = err.as_array().unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|d| d["path"] == json!(["tier"]) && d["code"] == json!("invalid_value")),
+            "expected a tier invalid_value issue, got {details:?}"
+        );
+    }
+
+    #[test]
+    fn absent_tier_defaults_to_title() {
+        let mut raw = std::collections::HashMap::new();
+        raw.insert("priority".to_string(), "visible".to_string());
+        let q = validate_query(&raw).unwrap();
+        assert_eq!(q.tier, Tier::Title);
+    }
+
+    #[test]
+    fn title_tier_search_matches_a_renamed_sessions_override_title() {
+        // Mirrors the production composition order
+        // (`apply_session_overrides` before `apply_query`,
+        // `session_directory` handler, main.rs wiring): a session whose
+        // PARSED title is unrelated must still be found by searching its
+        // OVERRIDE (renamed) title.
+        let item = DirItem {
+            session_id: "s1".into(),
+            provider: "claude".into(),
+            project_path: "/p".into(),
+            title: Some("original parsed title".into()),
+            summary: None,
+            first_user_message: None,
+            last_activity_at: 100,
+            created_at: None,
+            cwd: Some("/p".into()),
+            is_subagent: false,
+            is_non_interactive: false,
+            is_running: false,
+            archived: false,
+            matched_in: None,
+            snippet: None,
+            running_terminal_id: None,
+            live_terminal_only: false,
+            session_type: None,
+            source_file: None,
+        };
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "claude:s1".into(),
+            json!({ "titleOverride": "My Renamed Special Project" }),
+        );
+        let overlaid = apply_session_overrides(vec![item], &overrides);
+
+        let q = DirQuery {
+            query: Some("Renamed Special".into()),
+            ..DirQuery::default()
+        };
+        let page = apply_query(overlaid, &q, &[]).unwrap();
+        let arr = page["items"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "search must match the OVERRIDE title");
+        assert_eq!(arr[0]["title"], json!("My Renamed Special Project"));
+        assert_eq!(arr[0]["matchedIn"], json!("title"));
     }
 }

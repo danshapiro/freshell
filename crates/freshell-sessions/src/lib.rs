@@ -19,11 +19,13 @@ pub mod directory_index;
 pub mod indexer;
 pub mod meta;
 pub mod parse;
+pub mod search;
 pub mod text;
 pub mod time;
 
 pub use meta::{CodexTaskEventSnapshot, ParsedSessionMeta, TokenSummary};
 pub use parse::{parse_codex_session_content, parse_session_content, ParseSessionOptions};
+pub use search::{extract_snippet, search_session_file, FileSearchMatch, FileSearchTier};
 
 #[cfg(test)]
 mod tests {

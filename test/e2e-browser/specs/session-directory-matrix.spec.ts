@@ -521,4 +521,52 @@ test.describe('Session Directory Matrix', () => {
     // proves the live-update path (not just an eventual-after-reload one).
     await expect(page.getByText(new RegExp(liveTitle, 'i'))).toBeVisible({ timeout: 10_000 })
   })
+
+  // SESSION-07 -- "Implement full-text and user-message search with
+  // complete pagination and stale-query cancellation." This is a SLICE of
+  // that acceptance text, not the full PW-RUST validation (which seeds
+  // 100+ sessions with distinct late user/full-text matches across all
+  // four providers and races a slow query against a fast one -- deferred to
+  // a dedicated future spec): it proves the REAL sidebar search box
+  // (`src/components/Sidebar.tsx`'s `<input placeholder="Search...">`,
+  // `filter`/`setFilter` state) actually filters the rendered session list
+  // to matching titles only, across TWO different provider kinds (claude's
+  // "harness-02 matrix beta" and codex's "harness-02 matrix gamma"), and
+  // that clearing the search (`aria-label="Clear search"`) restores the
+  // full list -- on BOTH projects, with `legacy-chromium` as the control
+  // proving the assertions themselves are sound (legacy already has full
+  // title-tier search; this proves the Rust port's pre-existing title-tier
+  // search reaches the same real UI element identically, not just a raw
+  // API check).
+  test('typing into the sidebar search box filters the session list to matching titles only', async ({ freshellPage, page }) => {
+    const sessionList = page.getByTestId('sidebar-session-list')
+    await expect(sessionList).toBeVisible({ timeout: 15_000 })
+    await expect(page.getByText(/harness-02 matrix alpha/i)).toBeVisible({ timeout: 10_000 })
+    await expect(page.getByText(/harness-02 matrix beta/i)).toBeVisible({ timeout: 10_000 })
+    await expect(page.getByText(/harness-02 matrix gamma/i)).toBeVisible({ timeout: 15_000 })
+
+    const searchBox = page.getByPlaceholder('Search...')
+
+    // First provider kind: a claude-only match hides every other seeded
+    // session, including the other claude session (alpha) and codex (gamma).
+    await searchBox.fill('matrix beta')
+    await expect(page.getByText(/harness-02 matrix beta/i)).toBeVisible({ timeout: 10_000 })
+    await expect(page.getByText(/harness-02 matrix alpha/i)).not.toBeVisible()
+    await expect(page.getByText(/harness-02 matrix gamma/i)).not.toBeVisible()
+
+    // Second provider kind: a codex-only match behaves identically --
+    // search is not accidentally scoped to a single provider.
+    await searchBox.fill('matrix gamma')
+    await expect(page.getByText(/harness-02 matrix gamma/i)).toBeVisible({ timeout: 10_000 })
+    await expect(page.getByText(/harness-02 matrix beta/i)).not.toBeVisible()
+    await expect(page.getByText(/harness-02 matrix alpha/i)).not.toBeVisible()
+
+    // Clearing the search (the real "Clear search" button) restores the
+    // full, unfiltered list -- proves the filter is live/reversible, not a
+    // one-way narrowing.
+    await page.getByLabel('Clear search').click()
+    await expect(page.getByText(/harness-02 matrix alpha/i)).toBeVisible({ timeout: 10_000 })
+    await expect(page.getByText(/harness-02 matrix beta/i)).toBeVisible({ timeout: 10_000 })
+    await expect(page.getByText(/harness-02 matrix gamma/i)).toBeVisible({ timeout: 10_000 })
+  })
 })

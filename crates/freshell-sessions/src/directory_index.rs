@@ -67,6 +67,17 @@ pub struct IndexedSession {
     pub cwd: Option<String>,
     pub is_subagent: bool,
     pub is_non_interactive: bool,
+    /// SESSION-07: the on-disk transcript this session was parsed from, when
+    /// the source is a discrete per-session file (claude/codex). `None` for
+    /// direct-listed sources with no stable per-session file (opencode's
+    /// single sqlite db) -- those sessions are simply unsearchable at the
+    /// `userMessages`/`fullText` tiers (title-tier metadata search still
+    /// works for every provider, since it never reads this field). Consumed
+    /// by `crates/freshell-server/src/session_directory.rs`'s file-tier
+    /// search to locate the transcript to scan
+    /// (`server/session-directory/service.ts`'s `sourceFiles` lookup map,
+    /// `service.ts:164-173`).
+    pub source_file: Option<PathBuf>,
 }
 
 impl IndexedSession {
@@ -278,7 +289,13 @@ fn parse_claude_file(path: &Path, force_subagent: bool) -> Option<IndexedSession
     // R10b: never index a session with no resolvable `cwd` (the ORIGINAL's
     // discovery-time gate, `session-indexer.ts:756,1124`).
     meta.cwd.as_ref()?;
-    Some(item_from_meta(&meta, "claude", &fallback, force_subagent))
+    Some(item_from_meta(
+        &meta,
+        "claude",
+        &fallback,
+        force_subagent,
+        Some(path.to_path_buf()),
+    ))
 }
 
 fn item_from_meta(
@@ -286,6 +303,7 @@ fn item_from_meta(
     provider: &str,
     fallback_session_id: &str,
     force_subagent: bool,
+    source_file: Option<PathBuf>,
 ) -> IndexedSession {
     IndexedSession {
         session_id: meta
@@ -302,6 +320,7 @@ fn item_from_meta(
         cwd: meta.cwd.clone(),
         is_subagent: force_subagent || meta.is_subagent.unwrap_or(false),
         is_non_interactive: meta.is_non_interactive.unwrap_or(false),
+        source_file,
     }
 }
 
@@ -379,7 +398,13 @@ fn parse_codex_file(path: &Path) -> Option<IndexedSession> {
     let meta = parse_codex_session_content(&content);
     meta.cwd.as_ref()?;
     let fallback = extract_codex_session_id_from_filename(path);
-    Some(item_from_meta(&meta, "codex", &fallback, false))
+    Some(item_from_meta(
+        &meta,
+        "codex",
+        &fallback,
+        false,
+        Some(path.to_path_buf()),
+    ))
 }
 
 /// `extractSessionIdFromFilename` (`providers/codex.ts:417-420`): the
@@ -501,6 +526,11 @@ fn opencode_session_to_indexed(s: crate::parse::OpencodeSession) -> IndexedSessi
         cwd: Some(s.cwd),
         is_subagent: s.is_subagent.unwrap_or(false),
         is_non_interactive: s.is_non_interactive.unwrap_or(false),
+        // SESSION-07: opencode is direct-listed from one sqlite db, not a
+        // per-session file -- there is no stable path to scan, so this
+        // provider is un-searchable at the `userMessages`/`fullText` tiers
+        // (title-tier metadata search is unaffected).
+        source_file: None,
     }
 }
 
@@ -1194,6 +1224,7 @@ mod tests {
             cwd: Some("/p".to_string()),
             is_subagent: false,
             is_non_interactive: false,
+            source_file: None,
         }
     }
 

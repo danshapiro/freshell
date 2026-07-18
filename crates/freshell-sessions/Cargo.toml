@@ -30,3 +30,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 # The opencode SQLite parity test builds fixture databases with a writable connection
 # before the parser opens them read-only (same bundled engine, unified by cargo).
 rusqlite = { version = "0.31", features = ["bundled"] }
+# SESSION-07: unique temp-file names for `search.rs`'s file-content search
+# tests (same version/feature set as every other crate's `uuid` dependency).
+uuid = { version = "1", features = ["v4"] }

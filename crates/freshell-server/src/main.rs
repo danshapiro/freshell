@@ -269,6 +269,8 @@ async fn main() -> ExitCode {
         shutdown: Arc::clone(&shutdown_notify),
         ping_interval_ms: resolve_ping_interval_ms(),
         allowed_origins: Arc::new(resolve_allowed_origins()),
+        ws_max_payload_bytes: resolve_ws_max_payload_bytes(),
+        term09: freshell_ws::backpressure::Term09Config::from_env(),
     };
     let api_state = ApiState {
         auth_token: Arc::clone(&auth_token),
@@ -740,6 +742,17 @@ fn resolve_ping_interval_ms() -> u64 {
         .unwrap_or(30_000)
 }
 
+/// SAFE-06: resolve the inbound WS frame/message size bound. Mirrors
+/// `ws-handler.ts:226`: `wsMaxPayloadBytes: Number(process.env.WS_MAX_PAYLOAD_BYTES
+/// || 16 * 1024 * 1024)`.
+fn resolve_ws_max_payload_bytes() -> usize {
+    std::env::var("WS_MAX_PAYLOAD_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(16 * 1024 * 1024)
+}
+
 /// SAFE-03: resolve the WS Origin allow-list from process env, mirroring
 /// `server/auth.ts#parseAllowedOrigins` (`ALLOWED_ORIGINS`) plus
 /// `server/network-manager.ts`'s user-facing `EXTRA_ALLOWED_ORIGINS` knob
@@ -1053,6 +1066,7 @@ mod sessions_sweep_tests {
             cwd: Some("/tmp".to_string()),
             is_subagent: false,
             is_non_interactive: false,
+            source_file: None,
         }
     }
 

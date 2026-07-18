@@ -304,6 +304,11 @@ fn indexed_from_meta(
         cwd: meta.cwd.clone(),
         is_subagent: meta.is_subagent.unwrap_or(false),
         is_non_interactive: meta.is_non_interactive.unwrap_or(false),
+        // SESSION-07: amplifier session-file content search is not ported
+        // (the amplifier transcript shape has no ported file-search parser);
+        // `None` makes it un-searchable at the `userMessages`/`fullText`
+        // tiers (title-tier metadata search is unaffected).
+        source_file: None,
     }
 }
 
