@@ -37,6 +37,7 @@ the container. Without `--corpus`, no real user data is mounted at all.
 | Repo | Bind-mounted read-write at `/workspace` so test output/artifacts are inspectable from the host. |
 | Container lifetime | `--rm`: disposable, nothing persists in the container filesystem across runs. |
 | HOME inside container | The sandbox user's own `/home/sandbox`, never the host's `$HOME`. |
+| Mount-point ownership | `scripts/sandbox-test.sh` pre-creates `target/`, `node_modules/`, etc. as you before docker runs, and fails loudly with a `chown` remediation if any root-owned entry ever appears directly under the repo root afterward — so a fresh worktree's `target/`/`node_modules/` never end up root-owned by dockerd. |
 
 ## Cache volumes and reset
 

@@ -66,7 +66,48 @@ if [ "${MOUNT_CORPUS}" -eq 1 ]; then
   fi
 fi
 
+# Docker creates any bind-mount point that doesn't yet exist on the host as
+# root (dockerd itself runs as root), before the container ever hands off to
+# its non-root user. A named volume layered under a path inside our
+# bind-mounted repo (e.g. -v ...:/workspace/target) needs a mount point at
+# ${REPO_ROOT}/target on the host side; in a freshly cloned/worktree'd repo
+# that path doesn't exist yet, so dockerd creates it — root-owned. That stub
+# then breaks host-side `cargo`/`npm` in this worktree with EACCES the next
+# time a human (not root) tries to write there.
+#
+# Fix: pre-create every such mount point ourselves, as the invoking user,
+# so dockerd never has to. Derived from DOCKER_ARGS itself (rather than a
+# hardcoded list) so a future volume added above is covered automatically.
+for entry in "${DOCKER_ARGS[@]}"; do
+  case "${entry}" in
+  *:/workspace/*)
+    subpath="${entry#*:/workspace/}"
+    subpath="${subpath%%:*}" # strip a trailing :ro/:rw suffix, if present
+    if [ -n "${subpath}" ]; then
+      mkdir -p "${REPO_ROOT}/${subpath}"
+    fi
+    ;;
+  esac
+done
+
 # Plain (non-login) shell: a login shell (-l) would source /etc/profile,
 # which on Debian unconditionally overwrites PATH and would clobber the
 # cargo/rustup PATH entry set via the image's Dockerfile ENV.
-docker "${DOCKER_ARGS[@]}" "${IMAGE_TAG}" bash -c "${CMD}"
+DOCKER_STATUS=0
+docker "${DOCKER_ARGS[@]}" "${IMAGE_TAG}" bash -c "${CMD}" || DOCKER_STATUS=$?
+
+# Guard-rail: verify the pre-create step above actually did its job, rather
+# than assuming it. If dockerd (or a future volume/mount this script doesn't
+# yet know to pre-create) still left a root-owned entry directly under the
+# repo root, fail loudly with a concrete remediation instead of leaving the
+# next `cargo build`/`npm install` on the host to fail with a bare EACCES.
+ROOT_DROPPINGS="$(find "${REPO_ROOT}" -maxdepth 1 -user root 2>/dev/null || true)"
+if [ -n "${ROOT_DROPPINGS}" ]; then
+  echo "[sandbox] ERROR: root-owned entries found directly under ${REPO_ROOT}:" >&2
+  echo "${ROOT_DROPPINGS}" >&2
+  echo "[sandbox] dockerd (which runs as root) created these as bind-mount points." >&2
+  echo "[sandbox] Remediation: sudo chown -R \"\$(id -u):\$(id -g)\" <path>, for each path listed above, then re-run." >&2
+  exit 1
+fi
+
+exit "${DOCKER_STATUS}"
