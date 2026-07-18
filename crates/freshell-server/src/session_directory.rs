@@ -369,6 +369,32 @@ async fn session_directory(
     }
 }
 
+/// Resolve the REAL home directory for coding-CLI provider transcript
+/// sources (claude/codex), deliberately IGNORING `FRESHELL_HOME`.
+///
+/// Legacy parity: `server/claude-home.ts` (`getClaudeHome`) and
+/// `server/coding-cli/providers/codex.ts` (`defaultCodexHome`) both derive
+/// from `os.homedir()` directly -- NEVER from `getFreshellHomeDir()`
+/// (`server/freshell-home.ts`), which is reserved for the isolated
+/// `.freshell/config.json` root (`server/config-store.ts:79`,
+/// `server/bootstrap.ts:168`). `FRESHELL_HOME` re-roots the config dir ONLY;
+/// provider session directories always resolve against the real `HOME`
+/// (`CLAUDE_HOME`/`CODEX_HOME` overrides are applied afterwards, inside
+/// [`claude_home`]/[`codex_home`] themselves).
+///
+/// Fixes a bake-in-launch regression: `main.rs`'s single `resolve_home()`
+/// (FRESHELL_HOME-then-HOME) previously fed BOTH the settings-store's
+/// isolated config root AND this module's provider-source wiring, so a
+/// launch that set `FRESHELL_HOME` to a temp dir (while leaving `HOME` as
+/// the real user home) made claude/codex sessions invisible -- they were
+/// looked up under `<FRESHELL_HOME>/.claude` / `.codex`, which don't exist.
+pub(crate) fn provider_home() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
 /// `getClaudeHome()` (`server/claude-home.ts:4-7`): `CLAUDE_HOME` env else
 /// `<home>/.claude`. `pub(crate)` so `main.rs` (boot-time `SessionIndex`
 /// wiring) and `sessions.rs` (the cross-router override-overlay test) resolve
@@ -1072,6 +1098,64 @@ mod tests {
 
     fn default_query() -> DirQuery {
         DirQuery::default()
+    }
+
+    // `provider_home()` (FRESHELL_HOME root-alignment fix): coding-CLI provider
+    // session sources must resolve against the REAL `HOME`, never the
+    // `FRESHELL_HOME`-overridden config root. Each test saves + restores both
+    // vars around itself since they're real process env (no injected `Env`
+    // plumbing exists at this call site), matching the existing convention in
+    // `files.rs` (`expand_tilde_uses_home` et al.) -- but ALSO serializes on
+    // `PROVIDER_HOME_ENV_LOCK` because cargo runs tests in parallel THREADS
+    // within one process: two tests racing to mutate the SAME process-global
+    // `HOME`/`FRESHELL_HOME` vars would otherwise flake (one test's assertion
+    // observing the OTHER test's in-flight env state).
+    static PROVIDER_HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn provider_home_ignores_freshell_home_uses_real_home() {
+        let _guard = PROVIDER_HOME_ENV_LOCK.lock().unwrap();
+        let saved_freshell_home = std::env::var("FRESHELL_HOME").ok();
+        let saved_home = std::env::var("HOME").ok();
+
+        std::env::set_var("FRESHELL_HOME", "/tmp/freshell-isolated-config-root");
+        std::env::set_var("HOME", "/home/real-user-fixture");
+
+        assert_eq!(
+            provider_home(),
+            Some(PathBuf::from("/home/real-user-fixture")),
+            "provider_home() must resolve the real HOME, ignoring FRESHELL_HOME"
+        );
+
+        match saved_freshell_home {
+            Some(v) => std::env::set_var("FRESHELL_HOME", v),
+            None => std::env::remove_var("FRESHELL_HOME"),
+        }
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn provider_home_none_when_home_unset() {
+        let _guard = PROVIDER_HOME_ENV_LOCK.lock().unwrap();
+        let saved_freshell_home = std::env::var("FRESHELL_HOME").ok();
+        let saved_home = std::env::var("HOME").ok();
+
+        std::env::set_var("FRESHELL_HOME", "/tmp/freshell-isolated-config-root-2");
+        std::env::remove_var("HOME");
+
+        assert_eq!(provider_home(), None);
+
+        match saved_freshell_home {
+            Some(v) => std::env::set_var("FRESHELL_HOME", v),
+            None => std::env::remove_var("FRESHELL_HOME"),
+        }
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]

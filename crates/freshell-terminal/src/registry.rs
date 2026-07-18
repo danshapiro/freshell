@@ -44,7 +44,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -67,11 +67,31 @@ use crate::pty::{MessageSink, PtyTerminal};
 /// that forwards into that connection's tokio mpsc → WebSocket.
 pub type FrameSink = Arc<dyn Fn(ServerMessage) + Send + Sync>;
 
-/// Replay-log byte cap per terminal. Whole-frame FIFO eviction past this (the
-/// `ReplayDeque` byte-budget eviction, `replay-deque.ts:159-187`). Deliberately
-/// generous — the shell scrollback in every graded flow is far under this, so no
-/// eviction (hence no gap) occurs; it only bounds a pathological long session.
-const DEFAULT_REPLAY_LOG_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// `DEFAULT_MAX_SCROLLBACK_CHARS` (`terminal-registry.ts:57`): the replay-log
+/// byte cap used when no `settings.terminal.scrollback` value has been wired
+/// into the registry yet (TERM-13's "absent" default -- mirrors the legacy
+/// `computeScrollbackMaxChars`'s not-a-finite-number fallback).
+const DEFAULT_MAX_SCROLLBACK_CHARS: i64 = 512 * 1024;
+/// `MIN_SCROLLBACK_CHARS` (`terminal-registry.ts:58`).
+const MIN_SCROLLBACK_CHARS: i64 = 64 * 1024;
+/// `MAX_SCROLLBACK_CHARS` (`terminal-registry.ts:59`).
+const MAX_SCROLLBACK_CHARS: i64 = 4 * 1024 * 1024;
+/// `APPROX_CHARS_PER_LINE` (`terminal-registry.ts:60`).
+const APPROX_CHARS_PER_LINE: i64 = 300;
+
+/// `computeScrollbackMaxChars(settings)` (`terminal-registry.ts:1328-1333`):
+/// `settings.terminal.scrollback` LINES converted to an approximate byte cap
+/// via `APPROX_CHARS_PER_LINE`, clamped to `[MIN_SCROLLBACK_CHARS, MAX_SCROLLBACK_CHARS]`.
+/// Callers (`freshell-server`'s boot wiring) pass the real
+/// `settings.terminal.scrollback` value; the registry's OWN default before any
+/// such wiring happens is `DEFAULT_MAX_SCROLLBACK_CHARS` (see
+/// `TerminalRegistry::new`), matching the legacy not-a-number fallback for a
+/// constructor called with no settings at all.
+pub fn compute_scrollback_max_bytes(scrollback_lines: i64) -> i64 {
+    scrollback_lines
+        .saturating_mul(APPROX_CHARS_PER_LINE)
+        .clamp(MIN_SCROLLBACK_CHARS, MAX_SCROLLBACK_CHARS)
+}
 
 /// `Date.now()` — epoch milliseconds.
 fn now_ms() -> i64 {
@@ -140,6 +160,11 @@ struct TerminalShared {
     /// `terminal.output.batch` (batch-capable).
     replay: VecDeque<RetainedFrame>,
     replay_bytes: usize,
+    /// `settings.terminal.scrollback`, converted to a byte cap via
+    /// [`compute_scrollback_max_bytes`] and captured ONCE at terminal-creation
+    /// time (TERM-13). Replaces the previous fixed 8MiB constant in the
+    /// eviction loop below.
+    max_replay_bytes: usize,
     /// The per-terminal stateful VT [`BarrierScanner`] (`replay-ring.ts:48`). Classifies
     /// each ingested frame in order; its mode/CSI/string state persists across frames.
     scanner: BarrierScanner,
@@ -247,10 +272,28 @@ struct RegistryInner {
 /// Shared, cheaply-cloneable owner of all live terminals, keyed by `terminalId`.
 /// Lives in `WsState` so every `/ws` connection resolves terminals through the SAME
 /// registry — the whole point: a terminal survives its creating socket.
+/// `settings.safety.autoKillIdleMinutes` default (`server/settings.ts:791`,
+/// mirrored at `crates/freshell-server/src/settings.rs:70`). Applied whenever
+/// a [`TerminalRegistry`] is constructed but `set_auto_kill_idle_minutes`
+/// hasn't been called yet (e.g. before the boot-time settings load completes).
+const DEFAULT_AUTO_KILL_IDLE_MINUTES: i64 = 15;
+
 #[derive(Clone)]
 pub struct TerminalRegistry {
     inner: Arc<Mutex<RegistryInner>>,
     conn_seq: Arc<AtomicU64>,
+    /// `this.settings.safety.autoKillIdleMinutes` (`terminal-registry.ts:1409`,
+    /// read fresh on every sweep tick from `this.settings`, which `setSettings`
+    /// keeps current). Stored as an atomic so `enforce_idle_kills` never needs
+    /// the registry lock just to read the threshold, and so a live settings
+    /// change (`set_auto_kill_idle_minutes`) is visible on the NEXT sweep
+    /// without restarting the monitor.
+    auto_kill_idle_minutes: Arc<AtomicI64>,
+    /// `this.scrollbackMaxChars` (`terminal-registry.ts:1276`, computed by
+    /// `computeScrollbackMaxChars` from `settings.terminal.scrollback`).
+    /// Captured into each new terminal's `max_replay_bytes` at [`Self::create`]
+    /// time (TERM-13) -- see [`compute_scrollback_max_bytes`].
+    scrollback_max_bytes: Arc<AtomicI64>,
 }
 
 impl Default for TerminalRegistry {
@@ -275,6 +318,8 @@ impl TerminalRegistry {
                 revision: 0,
             })),
             conn_seq: Arc::new(AtomicU64::new(1)),
+            auto_kill_idle_minutes: Arc::new(AtomicI64::new(DEFAULT_AUTO_KILL_IDLE_MINUTES)),
+            scrollback_max_bytes: Arc::new(AtomicI64::new(DEFAULT_MAX_SCROLLBACK_CHARS)),
         }
     }
 
@@ -282,6 +327,92 @@ impl TerminalRegistry {
     /// socket-close can sweep them out of every terminal).
     pub fn new_connection_id(&self) -> u64 {
         self.conn_seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// `registry.setSettings(settings)`'s `autoKillIdleMinutes` slice
+    /// (`terminal-registry.ts:1316-1322`): update the idle-kill threshold the
+    /// NEXT sweep reads. Callers (the boot-time settings load, and any future
+    /// live `PATCH /api/settings` wiring) push `settings.safety.autoKillIdleMinutes`
+    /// here; `<= 0` disables the sweep (legacy: `!killMinutes || killMinutes <= 0`).
+    pub fn set_auto_kill_idle_minutes(&self, minutes: i64) {
+        self.auto_kill_idle_minutes
+            .store(minutes, Ordering::Relaxed);
+    }
+
+    /// The currently-configured idle-kill threshold, minutes.
+    pub fn auto_kill_idle_minutes(&self) -> i64 {
+        self.auto_kill_idle_minutes.load(Ordering::Relaxed)
+    }
+
+    /// `registry.setSettings(settings)`'s `scrollbackMaxChars` recompute
+    /// (`terminal-registry.ts:1317-1321`): update the replay-log byte cap NEW
+    /// terminals will be created with (TERM-13). Callers pass
+    /// `compute_scrollback_max_bytes(settings.terminal.scrollback)`, keeping this
+    /// crate settings-type-agnostic (mirrors `set_auto_kill_idle_minutes`).
+    ///
+    /// NOTE (documented scope limit): legacy's `setSettings` ALSO resizes every
+    /// ALREADY-CREATED terminal's buffer in place (`t.buffer.setMaxChars(...)`
+    /// loop). This port only applies the cap to terminals created AFTER this
+    /// call, matching the task's "respected at create" acceptance bar; live
+    /// resize of existing terminals is deferred (no live `PATCH /api/settings`
+    /// -> registry wiring exists yet at all -- see `enforce_idle_kills`'同 note).
+    pub fn set_scrollback_max_bytes(&self, max_bytes: i64) {
+        self.scrollback_max_bytes
+            .store(max_bytes, Ordering::Relaxed);
+    }
+
+    /// The byte cap NEW terminals are created with.
+    pub fn scrollback_max_bytes(&self) -> i64 {
+        self.scrollback_max_bytes.load(Ordering::Relaxed)
+    }
+
+    /// `enforceIdleKills()` (`terminal-registry.ts:1406-1425`): auto-kill every
+    /// DETACHED **running** terminal idle beyond the configured threshold.
+    /// `auto_kill_idle_minutes() <= 0` is legacy's disabled state -- a no-op.
+    /// "Detached" mirrors `term.clients.size > 0` continue-guard: any attached
+    /// subscriber exempts the terminal regardless of idle time. Returns the
+    /// killed terminal ids (empty when nothing was eligible), for callers that
+    /// want to log/observe the sweep and for deterministic test assertions.
+    ///
+    /// Callers drive the 30s cadence externally (`startIdleMonitor`,
+    /// `tr:1335-1340`) -- this crate is deliberately tokio-free (see module
+    /// docs), so the periodic timer lives in `freshell-ws`
+    /// (`spawn_idle_monitor`), not here.
+    pub fn enforce_idle_kills(&self) -> Vec<String> {
+        let auto_kill_idle_minutes = self.auto_kill_idle_minutes();
+        if auto_kill_idle_minutes <= 0 {
+            return Vec::new();
+        }
+        let now = now_ms();
+        let idle_threshold_ms = auto_kill_idle_minutes.saturating_mul(60_000);
+        let mut candidates: Vec<String> = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .iter()
+                .filter_map(|(id, handle)| {
+                    let s = handle.shared.lock().expect("terminal lock");
+                    if s.status != TerminalRunStatus::Running {
+                        return None; // only running
+                    }
+                    if !s.subscribers.is_empty() {
+                        return None; // only detached
+                    }
+                    if now.saturating_sub(s.last_activity_at) < idle_threshold_ms {
+                        return None; // not idle long enough yet
+                    }
+                    Some(id.clone())
+                })
+                .collect()
+        };
+        // Deterministic order for observability/tests; the reference iterates a
+        // `Map` in insertion order, which this doesn't reproduce exactly, but no
+        // caller (log line, test) depends on kill ORDER across multiple victims.
+        candidates.sort();
+        for id in &candidates {
+            self.kill(id);
+        }
+        candidates
     }
 
     /// `registry.create()` (`terminal-registry.ts:1544-1740`): spawn the PTY and
@@ -305,6 +436,10 @@ impl TerminalRegistry {
             stream_id: stream_id.clone(),
             replay: VecDeque::new(),
             replay_bytes: 0,
+            // TERM-13: capture the CURRENTLY-configured scrollback cap at
+            // creation time (`compute_scrollback_max_bytes`'s output, seeded
+            // from `settings.terminal.scrollback` at boot).
+            max_replay_bytes: self.scrollback_max_bytes().max(0) as usize,
             scanner: BarrierScanner::new(),
             head_seq: 0,
             status: TerminalRunStatus::Running,
@@ -797,7 +932,7 @@ fn ingest(shared: &Arc<Mutex<TerminalShared>>, msg: ServerMessage) {
     // the byte cap (keep at least one frame).
     s.replay_bytes += retained.output.data.len();
     s.replay.push_back(retained);
-    while s.replay_bytes > DEFAULT_REPLAY_LOG_MAX_BYTES && s.replay.len() > 1 {
+    while s.replay_bytes > s.max_replay_bytes && s.replay.len() > 1 {
         if let Some(old) = s.replay.pop_front() {
             s.replay_bytes -= old.output.data.len();
         }
@@ -876,6 +1011,7 @@ mod tests {
                 stream_id: stream_id.to_string(),
                 replay: VecDeque::new(),
                 replay_bytes: 0,
+                max_replay_bytes: self.scrollback_max_bytes().max(0) as usize,
                 scanner: BarrierScanner::new(),
                 head_seq: 0,
                 status: TerminalRunStatus::Running,
@@ -898,6 +1034,14 @@ mod tests {
                 TerminalHandle { shared, pty: None },
             );
             inner.revision += 1;
+        }
+
+        /// Test-only: force a terminal's `lastActivityAt` to an arbitrary value so
+        /// idle-kill sweep tests don't need to sleep for real minutes.
+        fn backdate_last_activity(&self, terminal_id: &str, last_activity_at: i64) {
+            let inner = self.inner.lock().unwrap();
+            let handle = inner.terminals.get(terminal_id).unwrap();
+            handle.shared.lock().unwrap().last_activity_at = last_activity_at;
         }
 
         /// Simulate the reader thread producing one frame (append + fan-out).
@@ -1355,5 +1499,174 @@ mod tests {
         let exit = exit.expect("attach to an already-exited terminal must deliver terminal.exit");
         assert_eq!(exit.exit_code, 7);
         assert_eq!(exit.terminal_id, "T");
+    }
+
+    // `enforce_idle_kills` (TERM-11, `autoKillIdleMinutes`): legacy parity port
+    // of `enforceIdleKills` (`terminal-registry.ts:1406-1425`). Each test backdates
+    // `lastActivityAt` directly instead of sleeping for real minutes.
+
+    #[test]
+    fn new_registry_defaults_auto_kill_idle_minutes_to_legacy_default() {
+        // `server/settings.ts:791` `autoKillIdleMinutes: 15` -- the Rust default
+        // (`crates/freshell-server/src/settings.rs:70`) must match so a boot that
+        // never calls `set_auto_kill_idle_minutes` (e.g. a settings load failure)
+        // still behaves like the documented default, not "disabled".
+        let reg = TerminalRegistry::new();
+        assert_eq!(reg.auto_kill_idle_minutes(), 15);
+    }
+
+    #[test]
+    fn enforce_idle_kills_kills_detached_terminal_past_threshold() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.set_auto_kill_idle_minutes(5);
+        // 6 minutes idle, 5-minute threshold -> eligible.
+        reg.backdate_last_activity("T", now_ms() - 6 * 60_000);
+
+        let killed = reg.enforce_idle_kills();
+
+        assert_eq!(killed, vec!["T".to_string()]);
+        assert!(
+            reg.inventory().is_empty(),
+            "kill() removes the terminal record"
+        );
+    }
+
+    #[test]
+    fn enforce_idle_kills_leaves_terminal_under_threshold_running() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.set_auto_kill_idle_minutes(5);
+        // Only 4 minutes idle, 5-minute threshold -> not yet eligible.
+        reg.backdate_last_activity("T", now_ms() - 4 * 60_000);
+
+        let killed = reg.enforce_idle_kills();
+
+        assert!(killed.is_empty());
+        assert_eq!(reg.inventory().len(), 1);
+    }
+
+    #[test]
+    fn enforce_idle_kills_never_kills_an_attached_terminal() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let (sink, _seen) = collector();
+        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false);
+        assert!(outcome.found);
+        reg.set_auto_kill_idle_minutes(1);
+        // Far past any threshold, but a client is attached -- legacy:
+        // `if (term.clients.size > 0) continue // only detached`.
+        reg.backdate_last_activity("T", now_ms() - 999 * 60_000);
+
+        let killed = reg.enforce_idle_kills();
+
+        assert!(killed.is_empty());
+        assert_eq!(reg.inventory().len(), 1);
+    }
+
+    #[test]
+    fn enforce_idle_kills_disabled_when_minutes_zero() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.set_auto_kill_idle_minutes(0);
+        reg.backdate_last_activity("T", now_ms() - 999 * 60_000);
+
+        let killed = reg.enforce_idle_kills();
+
+        assert!(
+            killed.is_empty(),
+            "0 must disable the sweep, matching legacy's `!killMinutes` guard"
+        );
+        assert_eq!(reg.inventory().len(), 1);
+    }
+
+    #[test]
+    fn enforce_idle_kills_disabled_when_minutes_negative() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.set_auto_kill_idle_minutes(-1);
+        reg.backdate_last_activity("T", now_ms() - 999 * 60_000);
+
+        let killed = reg.enforce_idle_kills();
+
+        assert!(killed.is_empty());
+        assert_eq!(reg.inventory().len(), 1);
+    }
+
+    // `compute_scrollback_max_bytes` (TERM-13, `settings.terminal.scrollback`):
+    // legacy parity port of `computeScrollbackMaxChars` (`terminal-registry.ts:1328-1333`).
+
+    #[test]
+    fn compute_scrollback_max_bytes_converts_lines_via_chars_per_line() {
+        // Legacy's ACTUAL settings default (`server/settings.ts:794`): 10_000
+        // lines * 300 chars/line = 3_000_000 -- within [MIN, MAX], no clamp.
+        assert_eq!(compute_scrollback_max_bytes(10_000), 3_000_000);
+    }
+
+    #[test]
+    fn compute_scrollback_max_bytes_clamps_to_minimum() {
+        // 1 line * 300 = 300, far below MIN_SCROLLBACK_CHARS (64 KiB).
+        assert_eq!(compute_scrollback_max_bytes(1), 64 * 1024);
+    }
+
+    #[test]
+    fn compute_scrollback_max_bytes_clamps_to_maximum() {
+        // 100_000 lines * 300 = 30_000_000, far above MAX_SCROLLBACK_CHARS (4 MiB).
+        assert_eq!(compute_scrollback_max_bytes(100_000), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn compute_scrollback_max_bytes_clamps_negative_input_to_minimum() {
+        // A malformed/negative setting must never underflow or panic.
+        assert_eq!(compute_scrollback_max_bytes(-5), 64 * 1024);
+    }
+
+    #[test]
+    fn new_registry_defaults_scrollback_max_bytes_to_legacy_absent_default() {
+        // `DEFAULT_MAX_SCROLLBACK_CHARS` (`terminal-registry.ts:57`): the
+        // fallback when NO settings have been wired into the registry yet.
+        let reg = TerminalRegistry::new();
+        assert_eq!(reg.scrollback_max_bytes(), 512 * 1024);
+    }
+
+    #[test]
+    fn terminal_created_after_a_small_scrollback_cap_evicts_at_that_cap() {
+        // Configure a tiny cap BEFORE creating the terminal (mirrors "respected
+        // at create"), then feed frames well past it and confirm the earliest
+        // frame(s) were evicted -- proving `max_replay_bytes` (not the old fixed
+        // 8 MiB constant) drives the eviction threshold.
+        let reg = TerminalRegistry::new();
+        reg.set_scrollback_max_bytes(10); // 10 bytes -- tiny on purpose
+        reg.insert_headless("T", "S");
+
+        reg.feed("T", frame(1, "0123456789", "S")); // 10 bytes, exactly at cap
+        reg.feed("T", frame(2, "abcdefghij", "S")); // another 10 bytes -> over cap
+
+        let (sink, seen) = collector();
+        reg.attach("T", 1, sink, Some("a".into()), 0, false);
+        let replayed = outputs(&seen);
+        // Whole-frame FIFO eviction keeps at least one frame; the FIRST frame
+        // must have been evicted once the second pushed bytes over the cap.
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].data, "abcdefghij");
+    }
+
+    #[test]
+    fn terminal_created_after_a_large_scrollback_cap_retains_every_frame() {
+        let reg = TerminalRegistry::new();
+        reg.set_scrollback_max_bytes(4 * 1024 * 1024); // legacy MAX -- generous
+        reg.insert_headless("T", "S");
+
+        reg.feed("T", frame(1, "0123456789", "S"));
+        reg.feed("T", frame(2, "abcdefghij", "S"));
+
+        let (sink, seen) = collector();
+        reg.attach("T", 1, sink, Some("a".into()), 0, false);
+        let replayed = outputs(&seen);
+        assert_eq!(
+            replayed.len(),
+            2,
+            "a generous cap must not evict either frame"
+        );
     }
 }

@@ -167,6 +167,44 @@ pub fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+/// Run `f` on a repeating `interval` cadence, forever, on a spawned tokio task.
+/// The generic scheduling primitive behind `spawn_idle_monitor` -- split out so
+/// the ticker cadence itself (the actual new logic: a `tokio::time::interval`
+/// loop) is unit-testable with a fast interval + a plain counter, independent
+/// of any terminal-registry domain behavior (which
+/// `freshell_terminal::TerminalRegistry::enforce_idle_kills` already tests
+/// exhaustively).
+fn spawn_periodic(interval: std::time::Duration, mut f: impl FnMut() + Send + 'static) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            f();
+        }
+    });
+}
+
+/// Start the background idle-reaper task (TERM-11, `autoKillIdleMinutes`):
+/// legacy `startIdleMonitor` + `enforceIdleKills` (`terminal-registry.ts:1335-1425`),
+/// a 30s sweep cadence in production (`tr:1339`). Lives here, not
+/// `freshell-terminal` (deliberately tokio-free -- see that crate's module
+/// docs), for the same reason the WS keepalive ping ticker lives in
+/// `terminal.rs`: the periodic timer needs an async runtime.
+///
+/// Call once at boot (`freshell-server`'s `main`), after `TerminalRegistry::new()`
+/// and after seeding `registry.set_auto_kill_idle_minutes(settings.safety.auto_kill_idle_minutes)`
+/// from the loaded settings -- the registry itself owns the CURRENT threshold
+/// (`TerminalRegistry::auto_kill_idle_minutes`), so this sweep always reads
+/// whatever value was most recently set, with zero coupling to settings types.
+pub fn spawn_idle_monitor(
+    registry: freshell_terminal::TerminalRegistry,
+    sweep_interval: std::time::Duration,
+) {
+    spawn_periodic(sweep_interval, move || {
+        registry.enforce_idle_kills();
+    });
+}
+
 /// Build the ordered connect-handshake the original emits on a clean isolated
 /// boot. The `bootId` is shared by value between `ready` and `terminal.inventory`
 /// so both normalize to the same placeholder (the cross-message invariant).
@@ -509,5 +547,28 @@ mod tests {
         assert_eq!(wire[3]["bootId"], wire[0]["bootId"]);
         assert_eq!(wire[3]["terminals"], json!([]));
         assert_eq!(wire[3]["terminalMeta"], json!([]));
+    }
+
+    // `spawn_periodic` (TERM-11 idle-reaper scheduling primitive): proves the
+    // REAL tokio ticker cadence, decoupled from `enforce_idle_kills`' domain
+    // logic (already exhaustively unit-tested in `freshell-terminal`).
+
+    #[tokio::test(start_paused = true)]
+    async fn spawn_periodic_invokes_callback_on_every_tick() {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count2 = std::sync::Arc::clone(&count);
+        spawn_periodic(std::time::Duration::from_millis(10), move || {
+            count2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        // Paused tokio time: advance deterministically instead of sleeping wall
+        // time. Five 10ms ticks elapse; `tokio::time::advance` also yields so
+        // the spawned task actually runs between ticks.
+        for _ in 0..5 {
+            tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::task::yield_now().await;
+
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 5);
     }
 }
