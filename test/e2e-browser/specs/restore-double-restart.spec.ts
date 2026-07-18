@@ -464,10 +464,27 @@ test.describe('Restore Double-Restart Regression', () => {
         // and post-fix code on `rust-chromium` (a confound from the owned
         // Rust server's reconnect/health-check timing independently
         // re-sending the same request), and on `legacy-chromium` it did
-        // not reliably reach 2 within 20s even on FIXED code. Rather than
-        // assert a specific count this spec cannot currently prove is
-        // fix-attributable across BOTH server kinds, this asserts the
-        // weaker but still-real, task-mandated contract: the retry count
+        // not reliably reach 2 within 20s even on FIXED code.
+        //
+        // STRONGER CONCLUSION (the reviewer-proven finding, stated plainly
+        // rather than left implicit): Scenario 2 AS WRITTEN passes
+        // IDENTICALLY on pre-fix and post-fix code -- empirically verified
+        // on both projects. It provides NO regression protection for the
+        // FreshAgentView `triggerRecovery` gating fix itself; reverting that
+        // fix would NOT turn this scenario red. It guards only the broader,
+        // still-real contract this file's other assertions establish: the
+        // pane is never permanently blank/abandoned, the durable breadcrumb
+        // (sessionRef/resumeSessionId) survives across the reload, and the
+        // client's retry count never grows without bound. The server-side
+        // spawn-storm class this incident's root cause belongs to -- and
+        // that DOES mechanically pin the fix -- is covered separately by the
+        // crate test `handle_attach_repeated_dead_thread_spawns_sidecar_at_most_once`
+        // (exactly one sidecar spawn across 5 sequential dead-thread attach
+        // attempts; RED without the negative-cache fix, GREEN with it).
+        //
+        // Rather than assert a specific count this spec cannot currently
+        // prove is fix-attributable across BOTH server kinds, this asserts
+        // the weaker but still-real, task-mandated contract: the retry count
         // must never grow WITHOUT BOUND. See this test's final report for
         // the honest RED/GREEN finding on this specific line.
         // BOUNDED RETRY: sample the count of resume-shaped messages

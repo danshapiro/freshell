@@ -83,6 +83,14 @@ const SIDECAR_START_BUDGET: Duration = Duration::from_secs(45);
 /// wrong about -- or that genuinely becomes resumable again -- is not stuck unresumable for
 /// long.
 const DEAD_THREAD_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Hard cap on [`FreshCodexState::dead_threads`] entries (review item 2). Bounds
+/// worst-case memory for a long-lived server process that, over its lifetime, resumes
+/// many distinct thread ids that turn out dead and are never queried again -- without
+/// this, such entries would accumulate for the life of the process (the map's own doc
+/// comment previously described this as "a small, bounded amount of long-lived
+/// bookkeeping" without anything actually enforcing a bound). Enforced on insert in
+/// [`FreshCodexState::mark_thread_dead`].
+const DEAD_THREADS_CAP: usize = 256;
 
 /// Shared, cheaply-cloneable freshcodex WS state (mergeable into the server app + WsState).
 #[derive(Clone)]
@@ -564,13 +572,24 @@ impl FreshCodexState {
         }));
     }
 
+    /// REVIEW FIX (item 3): legacy's `freshAgent.create.failed` sends `retryable: true` on
+    /// EVERY path this port's `fail_create` corresponds to -- the disabled-gate rejection
+    /// (`ws-handler.ts:3334`) and the generic create-failure catch-all
+    /// (`ws-handler.ts:3403`) both hardcode `retryable: true`. Legacy's ONE
+    /// `retryable: false` path (`ws-handler.ts:3299`, no `freshAgentRuntimeManager`
+    /// configured at all) has no Rust analogue: this state IS the manager, so that
+    /// "manager absent" case never occurs here. The client reads this field to decide
+    /// whether to show a retry action (`src/lib/fresh-agent-ws.ts`, `FreshAgentView.tsx`),
+    /// so this was a real, user-visible gap: every Rust `fail_create` call previously sent
+    /// no `retryable` field at all (serde omits `None`), silently hiding the retry button
+    /// legacy always offers.
     fn fail_create(&self, request_id: &str, code: &str, message: &str) {
         self.broadcast(&ServerMessage::FreshAgentCreateFailed(
             FreshAgentCreateFailed {
                 code: code.to_string(),
                 message: message.to_string(),
                 request_id: request_id.to_string(),
-                retryable: None,
+                retryable: Some(true),
             },
         ));
     }
@@ -1451,10 +1470,30 @@ impl FreshCodexState {
     /// knows.
     async fn mark_thread_dead(&self, thread_id: &str) {
         let expires_at = Instant::now() + self.dead_thread_ttl;
-        self.dead_threads
-            .lock()
-            .await
-            .insert(thread_id.to_string(), expires_at);
+        let mut guard = self.dead_threads.lock().await;
+
+        // Enforce the cap (review item 2) only when inserting a genuinely NEW id -- an
+        // update to an already-tracked id never grows the map.
+        if guard.len() >= DEAD_THREADS_CAP && !guard.contains_key(thread_id) {
+            let now = Instant::now();
+            // Evict every already-expired entry first -- a free win, no reason to keep
+            // entries this cache would already report as not-dead.
+            guard.retain(|_, expires| *expires > now);
+            // Still at capacity? Evict the single soonest-to-expire entry: the closest
+            // proxy to "oldest" this map's data supports without extra bookkeeping, since
+            // every entry's expiry is its own insertion time plus the same TTL.
+            if guard.len() >= DEAD_THREADS_CAP {
+                if let Some(oldest_id) = guard
+                    .iter()
+                    .min_by_key(|(_, expires)| **expires)
+                    .map(|(id, _)| id.clone())
+                {
+                    guard.remove(&oldest_id);
+                }
+            }
+        }
+
+        guard.insert(thread_id.to_string(), expires_at);
     }
 
     /// Clear a negative-cache entry after a successful resume/create for `thread_id` -- the
@@ -1507,6 +1546,17 @@ impl FreshCodexState {
         // while we were waiting for the per-thread lock above.
         if let Some(resumed) = self.live_resumed_session(thread_id).await {
             return Ok(resumed);
+        }
+        // FIX (review item 1): also re-check the dead-thread cache here, not just before
+        // acquiring the lock above. Without this, a concurrent waiter that contended the
+        // lock while the FIRST caller's resume attempt was still in flight would, on
+        // waking, see no live session (correctly -- the thread is dead) and fall through
+        // to repeat the ENTIRE spawn/resume/fail cycle itself, even though the first
+        // caller already proved the thread gone and marked it dead before releasing the
+        // lock. This is what makes this function's doc comment's "before AND after
+        // acquiring the per-thread lock" claim actually true.
+        if self.is_known_dead_thread(thread_id).await {
+            return Err(ResumeSessionError::NotFound);
         }
 
         let (client, notifs, ownership_id, child) = self
@@ -3751,6 +3801,70 @@ pub(crate) mod tests {
         }
     }
 
+    /// REVIEW FIX (Minor, item 3): `fail_create`'s `freshAgent.create.failed` frame must
+    /// carry `retryable: true`, matching legacy's hardcoded `retryable: true` on every
+    /// create-failed path this port's `fail_create` corresponds to (`ws-handler.ts:3334`
+    /// the disabled-gate rejection, `ws-handler.ts:3403` the generic create-failure
+    /// catch-all). The client reads this field to decide whether to offer a retry action
+    /// (`src/lib/fresh-agent-ws.ts:141`, `FreshAgentView.tsx:1889`'s retry button), so an
+    /// omitted field (what `retryable: None` serializes to -- serde's
+    /// `skip_serializing_if`) silently hid that action from every Rust-server user.
+    /// Exercised via the same "sidecar unreachable" path
+    /// `handle_attach_unknown_session_with_transient_resume_failure_emits_resume_failed_error`
+    /// uses above, but through `handle_create` (`CODEX_APP_SERVER_START_FAILED`) --
+    /// deterministic and fast, no fake app-server needed.
+    #[tokio::test]
+    async fn fail_create_frame_carries_retryable_true() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(
+            "CODEX_CMD",
+            "/definitely/not/a/real/codex/binary-xyz-does-not-exist",
+        );
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
+        let (st, mut rx) = state_with_bus();
+
+        st.handle_create(FreshAgentCreate {
+            request_id: "req-retryable-1".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            provider: Some(freshell_protocol::AgentProvider::Codex),
+            cwd: None,
+            legacy_restore_context: None,
+            resume_session_id: None,
+            session_ref: None,
+            model: None,
+            model_selection: None,
+            permission_mode: None,
+            sandbox: None,
+            effort: None,
+            plugins: None,
+        })
+        .await;
+        std::env::remove_var("CODEX_CMD");
+
+        let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.create.failed" {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the unreachable-sidecar create failure resolves within the budget");
+
+        assert_eq!(
+            frame["code"], "CODEX_APP_SERVER_START_FAILED",
+            "sanity: this must be the sidecar-spawn-failure path, not some other \
+             create.failed cause: {frame}"
+        );
+        assert_eq!(
+            frame["retryable"], true,
+            "freshAgent.create.failed must carry retryable:true, matching legacy's \
+             hardcoded retryable:true on every create-failed path this port's fail_create \
+             corresponds to: {frame}"
+        );
+    }
+
     // -- freshAgent.create resume (CODEX-FIRST triage Finding 1) --
 
     /// FINDING 1 (CODEX-FIRST triage): `freshAgent.create` carrying `resumeSessionId` must
@@ -3923,6 +4037,26 @@ pub(crate) mod tests {
         );
     }
 
+    /// REVIEW FIX (Minor, item 2): the negative cache must never grow without bound.
+    /// Marking many more distinct thread ids dead than [`DEAD_THREADS_CAP`] must keep the
+    /// map's size at or under the cap -- a long-lived process that resumes many distinct,
+    /// never-re-queried dead ids over its lifetime must not leak memory for that map for
+    /// the life of the process.
+    #[tokio::test]
+    async fn dead_thread_cache_is_bounded_by_a_hard_cap() {
+        let (st, _rx) = state_with_bus();
+
+        for i in 0..(DEAD_THREADS_CAP + 50) {
+            st.mark_thread_dead(&format!("cap-unit-thread-{i}")).await;
+        }
+
+        let len = st.dead_threads.lock().await.len();
+        assert!(
+            len <= DEAD_THREADS_CAP,
+            "dead_threads must never exceed its hard cap of {DEAD_THREADS_CAP}, got {len}"
+        );
+    }
+
     /// FINDING 2 (CODEX-FIRST triage, empirically proven ~3 spawn/kill cycles PER SECOND): a
     /// client retrying `freshAgent.attach` against a permanently-dead thread id (no
     /// client-side backoff) must NOT spawn a fresh `codex app-server` sidecar on every
@@ -4046,6 +4180,76 @@ pub(crate) mod tests {
             spawn_count, 2,
             "expiry must allow a genuine SECOND spawn attempt (not permanently blocked): \
              {spawn_count}"
+        );
+    }
+
+    /// REVIEW FIX (Important, item 1): two GENUINELY CONCURRENT attaches racing against a
+    /// thread this process has NOT YET cached as dead must still spawn AT MOST ONE
+    /// sidecar. The per-thread `resuming` lock alone does not guarantee this: the FIRST
+    /// waiter marks the thread dead and releases the lock, but if the SECOND waiter (on
+    /// acquiring the now-free lock) only re-checks `live_resumed_session` -- never
+    /// resumable for a dead thread -- and NOT `is_known_dead_thread`, it repeats the
+    /// FIRST waiter's entire spawn/resume/fail cycle instead of failing fast against the
+    /// cache the first waiter just populated. `ensure_session_resumable`'s doc comment
+    /// has long claimed the dead-cache is "checked before AND after acquiring the
+    /// per-thread lock" -- this test is what makes that claim true instead of aspirational.
+    #[tokio::test]
+    async fn concurrent_attaches_against_a_not_yet_cached_dead_thread_spawn_at_most_one_sidecar() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        configure_fake_codex_cmd(
+            &json!({
+                // Widens the race window: while the FIRST waiter's resume is in flight,
+                // the SECOND waiter has time to finish acquiring (and blocking on) the
+                // per-thread lock, so it's guaranteed to be woken only AFTER the first
+                // waiter has marked the thread dead and released the lock.
+                "delayMethodsMs": { "thread/resume": 300 },
+                "overrides": {
+                    "thread/resume": {
+                        "error": { "code": -32001, "message": "Thread not found" }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+        let capture =
+            tracing_capture::capture_by_session("concurrent-dead-thread-race-marker-unused");
+
+        let st1 = st.clone();
+        let st2 = st.clone();
+        tokio::join!(
+            st1.handle_attach(attach_msg("thread-race-not-yet-dead")),
+            st2.handle_attach(attach_msg("thread-race-not-yet-dead")),
+        );
+
+        // Both racing attaches must resolve honestly (the thread really is gone), never
+        // hang, never silently succeed.
+        for _ in 0..2 {
+            let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    let raw = rx.recv().await.expect("bus stays open");
+                    let frame: Value = serde_json::from_str(&raw).unwrap();
+                    if frame["type"] == "freshAgent.event" {
+                        return frame;
+                    }
+                }
+            })
+            .await
+            .expect("both racing attaches resolve within the budget");
+            assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
+        }
+
+        let spawn_count = capture
+            .untagged_events_since_start()
+            .into_iter()
+            .filter(|e| e.message == "freshagent.sidecar.spawned")
+            .count();
+        assert_eq!(
+            spawn_count, 1,
+            "two GENUINELY CONCURRENT attaches racing the per-thread lock against a \
+             not-yet-cached dead thread must spawn the codex app-server sidecar exactly \
+             once -- the second waiter must fail fast against the dead-cache the first \
+             populated, not repeat the full spawn-resume-fail cycle: {spawn_count}"
         );
     }
 
