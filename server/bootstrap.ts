@@ -378,17 +378,30 @@ export function resolveProjectRoot(): string {
 }
 
 // --- Auto-run on import ---
-const projectRoot = resolveProjectRoot()
-const envPath = path.join(projectRoot, '.env')
+// Only run when this process was launched as the server entry (server/index.ts
+// in dev, dist/server/index.js in production, including the compiled server a
+// test spawns). When the module is merely imported for its exports — e.g. a unit
+// test, or network-manager pulling in detectLanIps — the import must not mutate
+// the real project .env or emit first-run setup output. A plain VITEST check is
+// insufficient: a test-spawned real server inherits VITEST yet must bootstrap.
+function isRunningAsServerEntry(): boolean {
+  const entry = process.argv[1] ?? ''
+  return /(^|[\\/])(dist[\\/])?server[\\/]index\.(js|ts)$/.test(entry)
+}
 
-const result = ensureEnvFile(envPath)
+if (isRunningAsServerEntry()) {
+  const projectRoot = resolveProjectRoot()
+  const envPath = path.join(projectRoot, '.env')
 
-if (result.action === 'created') {
-  console.log(`[bootstrap] Created .env with auto-generated AUTH_TOKEN`)
-  console.log(`[bootstrap] Token: ${result.token?.slice(0, 8)}...${result.token?.slice(-8)}`)
-} else if (result.action === 'patched') {
-  console.log(`[bootstrap] Patched .env with new AUTH_TOKEN`)
-  console.log(`[bootstrap] Token: ${result.token?.slice(0, 8)}...${result.token?.slice(-8)}`)
-} else if (result.action === 'error') {
-  console.error(`[bootstrap] Failed to ensure .env: ${result.error}`)
+  const result = ensureEnvFile(envPath)
+
+  if (result.action === 'created') {
+    console.log(`[bootstrap] Created .env with auto-generated AUTH_TOKEN`)
+    console.log(`[bootstrap] Token: ${result.token?.slice(0, 8)}...${result.token?.slice(-8)}`)
+  } else if (result.action === 'patched') {
+    console.log(`[bootstrap] Patched .env with new AUTH_TOKEN`)
+    console.log(`[bootstrap] Token: ${result.token?.slice(0, 8)}...${result.token?.slice(-8)}`)
+  } else if (result.action === 'error') {
+    console.error(`[bootstrap] Failed to ensure .env: ${result.error}`)
+  }
 }
