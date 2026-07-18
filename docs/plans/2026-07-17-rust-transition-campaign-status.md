@@ -150,6 +150,49 @@ the SAME agent conversation from both; terminals/layouts are per-server (differe
 3. Legacy on :3001 is now CURRENT MAIN (incl. #514 amplifier session indexing) — amplifier
    sessions appear in the legacy sidebar but NOT on :3002 (Rust doesn't index amplifier yet).
 
+## Standing priority directive (user, 2026-07-17)
+
+**Codex CLI issues come first.** Codex is the user's default agent for the transition — drive
+codex-related defects (terminal mode, freshcodex panes, resume, indexing, interrupt) to ZERO
+before polishing other providers. Triage all new defect reports through this lens.
+
+## Frozen-paths deviation record
+
+2026-07-17 (commit f7b2c9e6): `src/components/icons/provider-icons.tsx` gained a 27-line
+AmplifierIcon ported VERBATIM from origin/main (c5707455/ac0c2f09) — user-requested fix (amplifier
+picker icon rendered as a black circle); icons are a pure client-side code map, so no server-side
+fix exists. This is the FIRST and only intentional divergence from the frozen `src/` snapshot;
+`server/` and `shared/` remain byte-frozen. The client bundle (dist/client) must be rebuilt for
+the icon to ship. Oracle equivalence is unaffected (server-side only).
+
+2026-07-17 (commits `64083989`, `8888df30` — non-bisectable span, harmless at HEAD): these two
+Batch 1 commits do not build standalone in isolation. `64083989` ("add Amplifier as a fourth
+session-directory source") absorbed a concurrent agent's `main.rs` wiring change (the
+`provider_home()` threading later formalized in `f7b2c9e6`) before that commit existed, so
+`64083989` alone references symbols `f7b2c9e6` defines; `8888df30` ("persist the FileEntry parse
+cache to disk") likewise depends on wiring that landed slightly out of commit order because three
+implementer agents shared this one worktree concurrently. Neither commit was force-amended to
+restore standalone-buildability, since doing so risked re-introducing the exact race the
+concurrent-agent absorption avoided. Net effect: `git bisect` across this span may land on a
+non-building commit; the branch HEAD (and every commit from `f7b2c9e6` onward) builds and tests
+green. Treat `64083989..8888df30` as a single atomic unit for bisection purposes.
+
+2026-07-17 (commit `1cb497ee` — deliberate hardening BEYOND legacy, not a parity gap): SAFE-03
+(WS Origin policy) and part of SAFE-01 (auth) intentionally diverge from legacy to be MORE strict,
+not less:
+- **SAFE-03**: legacy's Origin check is advisory-only (logged, never enforced); the Rust port
+  enforces an allow-list and rejects hostile/mismatched Origins outright. A client that legacy
+  would have accepted (and merely logged) is rejected by the Rust server.
+- **SAFE-01**: legacy's conflicting-source precedence (`headerToken || cookieToken`, `auth.ts:41`)
+  is preserved byte-for-byte (header wins unconditionally when present, valid or not — see the
+  `wrong_header_rejects_even_with_correct_cookie_present` test), but the Rust port ALSO rejects
+  empty/too-short/default-value startup tokens that legacy's `validateStartupSecurity` would have
+  let through in some paths. A wrong header + a correct cookie is accepted by legacy today but
+  rejected by the Rust port.
+These are intentional security improvements adopted during the port, not accidental parity
+divergences — flagged here so a future bisection/regression hunt doesn't mistake "Rust rejects
+something legacy would accept" for a bug.
+
 ## Cutover plan (gated on explicit user "APPROVED")
 1. Backup real `~/.freshell` (tar + sha256). 2. Stop legacy on :3001 (record pid/cmd for rollback).
 3. Start Rust release binary on :3001 with real HOME + existing AUTH_TOKEN + GOOGLE key

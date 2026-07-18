@@ -56,7 +56,8 @@ use freshell_protocol::{
 
 use crate::barrier_scanner::{BarrierReason, BarrierScanner, ScannerState};
 use crate::batch::{
-    build_batch_wire_payloads, build_terminal_output_batches, BatchBuildInput, BatchInputFrame,
+    build_batch_wire_payloads, build_terminal_output_batches, utf16_len, BatchBuildInput,
+    BatchInputFrame,
 };
 use crate::fragment::terminal_stream_batch_max_bytes;
 use crate::pty::{MessageSink, PtyTerminal};
@@ -80,13 +81,28 @@ const MAX_SCROLLBACK_CHARS: i64 = 4 * 1024 * 1024;
 const APPROX_CHARS_PER_LINE: i64 = 300;
 
 /// `computeScrollbackMaxChars(settings)` (`terminal-registry.ts:1328-1333`):
-/// `settings.terminal.scrollback` LINES converted to an approximate byte cap
-/// via `APPROX_CHARS_PER_LINE`, clamped to `[MIN_SCROLLBACK_CHARS, MAX_SCROLLBACK_CHARS]`.
-/// Callers (`freshell-server`'s boot wiring) pass the real
-/// `settings.terminal.scrollback` value; the registry's OWN default before any
-/// such wiring happens is `DEFAULT_MAX_SCROLLBACK_CHARS` (see
-/// `TerminalRegistry::new`), matching the legacy not-a-number fallback for a
-/// constructor called with no settings at all.
+/// `settings.terminal.scrollback` LINES converted to an approximate **CHAR**
+/// cap (UTF-16 code units, matching legacy `ChunkRingBuffer`'s `chunk.length`
+/// accounting) via `APPROX_CHARS_PER_LINE`, clamped to
+/// `[MIN_SCROLLBACK_CHARS, MAX_SCROLLBACK_CHARS]`. Callers (`freshell-server`'s
+/// boot wiring) pass the real `settings.terminal.scrollback` value; the
+/// registry's OWN default before any such wiring happens is
+/// `DEFAULT_MAX_SCROLLBACK_CHARS` (see `TerminalRegistry::new`), matching the
+/// legacy not-a-number fallback for a constructor called with no settings at
+/// all.
+///
+/// NOTE (unit-honesty scope limit): this function, `TerminalRegistry::
+/// scrollback_max_bytes`/`set_scrollback_max_bytes`, and the
+/// `scrollback_max_bytes` field all keep their historical "bytes" names for
+/// public-API stability -- `crates/freshell-server/src/main.rs` calls them
+/// across the crate boundary, outside this fix's file ownership. Despite the
+/// name, every one of them carries a CHAR (UTF-16 code-unit) budget, never a
+/// byte budget. The consumer that actually measured this cap in bytes --
+/// `TerminalShared::replay_chars`/`max_replay_chars` in this same file, see
+/// `ingest()` below -- has been fixed to count chars, closing the real parity
+/// gap (a reviewer "Important" finding on commit f7b2c9e6). Renaming the
+/// public functions/fields is left for a follow-up that also touches
+/// `freshell-server`.
 pub fn compute_scrollback_max_bytes(scrollback_lines: i64) -> i64 {
     scrollback_lines
         .saturating_mul(APPROX_CHARS_PER_LINE)
@@ -159,12 +175,25 @@ struct TerminalShared {
     /// delivery stamps per-subscriber and projects to `terminal.output` (legacy) or
     /// `terminal.output.batch` (batch-capable).
     replay: VecDeque<RetainedFrame>,
-    replay_bytes: usize,
-    /// `settings.terminal.scrollback`, converted to a byte cap via
-    /// [`compute_scrollback_max_bytes`] and captured ONCE at terminal-creation
-    /// time (TERM-13). Replaces the previous fixed 8MiB constant in the
-    /// eviction loop below.
-    max_replay_bytes: usize,
+    /// Total retained scrollback size in **UTF-16 code units**, matching legacy
+    /// `ChunkRingBuffer`'s `this.size += chunk.length` accounting (`str.length`
+    /// is UTF-16 code units in JS) -- NOT UTF-8 bytes. See [`crate::batch::utf16_len`].
+    /// (Named `_chars` rather than `_bytes`: a prior port counted `data.len()`
+    /// UTF-8 bytes here, which evicted non-ASCII-heavy content, e.g. box-drawing
+    /// TUIs, up to 3x sooner than an ASCII session under the identical configured
+    /// `terminal.scrollback` cap. Fixed to count the same unit as legacy.)
+    replay_chars: usize,
+    /// `settings.terminal.scrollback`, converted to a **char** (UTF-16 code-unit)
+    /// cap via [`compute_scrollback_max_bytes`] and captured ONCE at
+    /// terminal-creation time (TERM-13). Replaces the previous fixed 8MiB
+    /// constant in the eviction loop below.
+    ///
+    /// NOTE: [`compute_scrollback_max_bytes`] keeps its historical "bytes" name
+    /// for public-API stability (`freshell-server`'s boot wiring calls it across
+    /// the crate boundary, outside this crate's ownership) despite returning a
+    /// CHAR budget -- see that function's doc comment. This field and
+    /// `replay_chars` are named honestly since they are private to this module.
+    max_replay_chars: usize,
     /// The per-terminal stateful VT [`BarrierScanner`] (`replay-ring.ts:48`). Classifies
     /// each ingested frame in order; its mode/CSI/string state persists across frames.
     scanner: BarrierScanner,
@@ -291,7 +320,7 @@ pub struct TerminalRegistry {
     auto_kill_idle_minutes: Arc<AtomicI64>,
     /// `this.scrollbackMaxChars` (`terminal-registry.ts:1276`, computed by
     /// `computeScrollbackMaxChars` from `settings.terminal.scrollback`).
-    /// Captured into each new terminal's `max_replay_bytes` at [`Self::create`]
+    /// Captured into each new terminal's `max_replay_chars` at [`Self::create`]
     /// time (TERM-13) -- see [`compute_scrollback_max_bytes`].
     scrollback_max_bytes: Arc<AtomicI64>,
 }
@@ -435,11 +464,12 @@ impl TerminalRegistry {
             terminal_id: terminal_id.clone(),
             stream_id: stream_id.clone(),
             replay: VecDeque::new(),
-            replay_bytes: 0,
+            replay_chars: 0,
             // TERM-13: capture the CURRENTLY-configured scrollback cap at
-            // creation time (`compute_scrollback_max_bytes`'s output, seeded
+            // creation time (`compute_scrollback_max_bytes`'s output -- a CHAR
+            // budget despite the name, see that fn's doc comment -- seeded
             // from `settings.terminal.scrollback` at boot).
-            max_replay_bytes: self.scrollback_max_bytes().max(0) as usize,
+            max_replay_chars: self.scrollback_max_bytes().max(0) as usize,
             scanner: BarrierScanner::new(),
             head_seq: 0,
             status: TerminalRunStatus::Running,
@@ -929,12 +959,16 @@ fn ingest(shared: &Arc<Mutex<TerminalShared>>, msg: ServerMessage) {
     }
 
     // Retain canonical (unstamped) for future replay; whole-frame FIFO eviction past
-    // the byte cap (keep at least one frame).
-    s.replay_bytes += retained.output.data.len();
+    // the char cap (keep at least one frame). Counts **UTF-16 code units**
+    // (`utf16_len`), matching legacy `ChunkRingBuffer`'s `this.size += chunk.length`
+    // -- NOT UTF-8 bytes -- so a box-drawing/unicode-heavy session evicts at the
+    // same rate as an ASCII session under the identical configured
+    // `terminal.scrollback` cap.
+    s.replay_chars += utf16_len(&retained.output.data).max(0) as usize;
     s.replay.push_back(retained);
-    while s.replay_bytes > s.max_replay_bytes && s.replay.len() > 1 {
+    while s.replay_chars > s.max_replay_chars && s.replay.len() > 1 {
         if let Some(old) = s.replay.pop_front() {
-            s.replay_bytes -= old.output.data.len();
+            s.replay_chars -= utf16_len(&old.output.data).max(0) as usize;
         }
     }
 }
@@ -1010,8 +1044,8 @@ mod tests {
                 terminal_id: terminal_id.to_string(),
                 stream_id: stream_id.to_string(),
                 replay: VecDeque::new(),
-                replay_bytes: 0,
-                max_replay_bytes: self.scrollback_max_bytes().max(0) as usize,
+                replay_chars: 0,
+                max_replay_chars: self.scrollback_max_bytes().max(0) as usize,
                 scanner: BarrierScanner::new(),
                 head_seq: 0,
                 status: TerminalRunStatus::Running,
@@ -1633,10 +1667,12 @@ mod tests {
     fn terminal_created_after_a_small_scrollback_cap_evicts_at_that_cap() {
         // Configure a tiny cap BEFORE creating the terminal (mirrors "respected
         // at create"), then feed frames well past it and confirm the earliest
-        // frame(s) were evicted -- proving `max_replay_bytes` (not the old fixed
-        // 8 MiB constant) drives the eviction threshold.
+        // frame(s) were evicted -- proving `max_replay_chars` (not the old fixed
+        // 8 MiB constant) drives the eviction threshold. All-ASCII data here, so
+        // "10 chars" and "10 bytes" are the same 10 UTF-16 code units either way
+        // -- see the box-drawing tests below for the unit-sensitive case.
         let reg = TerminalRegistry::new();
-        reg.set_scrollback_max_bytes(10); // 10 bytes -- tiny on purpose
+        reg.set_scrollback_max_bytes(10); // 10 chars (== bytes for ASCII) -- tiny on purpose
         reg.insert_headless("T", "S");
 
         reg.feed("T", frame(1, "0123456789", "S")); // 10 bytes, exactly at cap
@@ -1667,6 +1703,90 @@ mod tests {
             replayed.len(),
             2,
             "a generous cap must not evict either frame"
+        );
+    }
+
+    // Scrollback cap UNIT parity (reviewer finding on f7b2c9e6): the cap
+    // (`compute_scrollback_max_bytes`, legacy `computeScrollbackMaxChars`) is a
+    // UTF-16 CODE-UNIT ("char") budget -- legacy's `ChunkRingBuffer` measures
+    // `this.size += chunk.length` (JS `String.length` == UTF-16 code units), NOT
+    // `Buffer.byteLength`. The retained-scrollback accounting below must count the
+    // SAME unit, or non-ASCII-heavy sessions (box-drawing TUIs, unicode prompts)
+    // evict far sooner than an ASCII session configured with the identical
+    // `terminal.scrollback` setting.
+
+    #[test]
+    fn ascii_and_box_drawing_fills_retain_same_char_count_under_same_cap() {
+        // Box-drawing chars (U+2500 range) are 1 UTF-16 code unit each but 3 UTF-8
+        // bytes. A byte-denominated cap would retain roughly 1/3 as many
+        // box-drawing characters as ASCII for the identical configured cap; a
+        // correct char-denominated cap retains the SAME count either way.
+        let cap = 12; // 12 "chars" (UTF-16 code units) -- exactly two 6-char frames.
+
+        let reg_ascii = TerminalRegistry::new();
+        reg_ascii.set_scrollback_max_bytes(cap);
+        reg_ascii.insert_headless("A", "S");
+        reg_ascii.feed("A", frame(1, "abcdef", "S")); // 6 chars, 6 bytes
+        reg_ascii.feed("A", frame(2, "ghijkl", "S")); // 6 chars, 6 bytes -> 12 total, at cap
+        let (sink_a, seen_a) = collector();
+        reg_ascii.attach("A", 1, sink_a, Some("r".into()), 0, false);
+        let ascii_chars: usize = outputs(&seen_a)
+            .iter()
+            .map(|f| f.data.chars().count())
+            .sum();
+
+        let reg_box = TerminalRegistry::new();
+        reg_box.set_scrollback_max_bytes(cap);
+        reg_box.insert_headless("B", "S");
+        // Each frame: 6 box-drawing chars = 6 UTF-16 units but 18 UTF-8 bytes.
+        reg_box.feed(
+            "B",
+            frame(1, "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}", "S"),
+        );
+        reg_box.feed(
+            "B",
+            frame(2, "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}", "S"),
+        );
+        let (sink_b, seen_b) = collector();
+        reg_box.attach("B", 1, sink_b, Some("r".into()), 0, false);
+        let box_chars: usize = outputs(&seen_b)
+            .iter()
+            .map(|f| f.data.chars().count())
+            .sum();
+
+        assert_eq!(
+            ascii_chars, 12,
+            "ascii fill retains the full 12-char budget"
+        );
+        assert_eq!(
+            box_chars, ascii_chars,
+            "box-drawing fill must retain the SAME char count as ascii under an \
+             identical char-denominated cap -- a byte-denominated cap would evict \
+             one whole box-drawing frame that an equivalent ascii cap keeps"
+        );
+    }
+
+    #[test]
+    fn eviction_on_box_drawing_content_never_panics_and_stays_within_char_cap() {
+        // Many small multi-byte frames driving continuous eviction: proves the
+        // char-count bookkeeping never underflows/panics and the retained total
+        // never exceeds the configured char cap, even though every char here is a
+        // 3-byte (UTF-8) / 1-unit (UTF-16) box-drawing glyph.
+        let cap = 20;
+        let reg = TerminalRegistry::new();
+        reg.set_scrollback_max_bytes(cap);
+        reg.insert_headless("T", "S");
+
+        for i in 0..50 {
+            reg.feed("T", frame(i, "\u{2500}\u{2502}\u{2503}", "S")); // 3 chars/frame
+        }
+
+        let (sink, seen) = collector();
+        reg.attach("T", 1, sink, Some("r".into()), 0, false);
+        let retained_chars: usize = outputs(&seen).iter().map(|f| f.data.chars().count()).sum();
+        assert!(
+            retained_chars as i64 <= cap,
+            "retained {retained_chars} chars must not exceed the {cap}-char cap"
         );
     }
 }
