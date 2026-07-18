@@ -4,6 +4,16 @@
 # Crates live under crates/; this file and `target/` sit at the worktree root.
 # The frozen WS contract (port/contract/*.schema.json, WS_PROTOCOL_VERSION=7) is
 # the shared seam consumed by freshell-protocol.
+[profile.dev]
+# Keep file:line in OUR backtraces; drop full variable-level DWARF.
+# See docs/plans/2026-07-18-disk-usage-analysis.md (win #1: ~25-40 GB durable).
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+# Dependencies (incl. the huge tauri tree): no debuginfo at all.
+debug = false
+
 [workspace]
 resolver = "2"
 members = ["crates/*"]
