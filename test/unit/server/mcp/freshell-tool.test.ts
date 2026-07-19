@@ -120,6 +120,52 @@ describe('executeAction -- tab actions', () => {
     expect(mockClient.post).not.toHaveBeenCalled()
   })
 
+  // Regression coverage for a production incident: the CLI (server/cli/index.ts)
+  // and the REST route (POST /api/tabs) both use the field name `resumeSessionId`
+  // -- and it's the exact field name the server itself returns/broadcasts on
+  // created panes (see server/agent-api/router.ts `paneContent?.resumeSessionId`).
+  // Agents naturally echo that field name back on a subsequent new-tab call, but
+  // the MCP tool's schema only recognized the shorthand `resume`, so `resumeSessionId`
+  // was rejected outright as an "Unknown parameter". Fix: accept `resumeSessionId`
+  // as an alias for `resume` -- it still resolves to the canonical `sessionRef`
+  // (never forwarded raw), so the "resumeSessionId is legacy" invariant holds.
+  it('new-tab accepts resumeSessionId as an alias for resume, mapping to canonical sessionRef', async () => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+
+    const result = await executeAction('new-tab', {
+      name: 'Resume Work',
+      mode: 'claude',
+      resumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
+    })
+
+    expect(result).not.toHaveProperty('error')
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({
+      name: 'Resume Work',
+      mode: 'claude',
+      sessionRef: {
+        provider: 'claude',
+        sessionId: '550e8400-e29b-41d4-a716-446655440000',
+      },
+    }))
+    expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('resumeSessionId')
+  })
+
+  it('new-tab rejects raw Codex resumeSessionId ids (same guard as resume)', async () => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+
+    const result = await executeAction('new-tab', {
+      name: 'Codex',
+      mode: 'codex',
+      resumeSessionId: 'thread-pre-durable',
+    })
+
+    expect(result).toEqual({
+      error: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+      hint: 'Use sessionRef: { provider: "codex", sessionId } after Codex identity is durable.',
+    })
+    expect(mockClient.post).not.toHaveBeenCalled()
+  })
+
   it('new-tab passes explicit canonical Codex sessionRef', async () => {
     mockClient.post.mockResolvedValue({ id: 't1' })
 

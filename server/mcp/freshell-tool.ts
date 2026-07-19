@@ -300,7 +300,7 @@ async function handleDisplay(format: string, target?: string): Promise<string> {
 // ---------------------------------------------------------------------------
 
 const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> = {
-  'new-tab':         { required: [],                          optional: ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'sessionRef', 'prompt', 'agent', 'model', 'effort'] },
+  'new-tab':         { required: [],                          optional: ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'resumeSessionId', 'sessionRef', 'prompt', 'agent', 'model', 'effort'] },
   'list-tabs':       { required: [],                          optional: [] },
   'select-tab':      { required: ['target'],                  optional: [] },
   'kill-tab':        { required: ['target'],                  optional: [] },
@@ -415,7 +415,7 @@ Rules:
 ## Command reference
 
 Tab commands:
-  new-tab         Create a tab with a terminal pane (default). Params: name?, mode?, shell?, cwd?, browser?, editor?, resume?, sessionRef?, prompt?
+  new-tab         Create a tab with a terminal pane (default). Params: name?, mode?, shell?, cwd?, browser?, editor?, resume? (alias: resumeSessionId), sessionRef?, prompt?
                   mode values: shell (default), claude, codex, kimi, opencode, or any supported CLI.
                   prompt: text to send to the terminal after creation (via send-keys with literal mode).
                   To open a URL in a browser pane, use 'open-browser' instead.
@@ -637,11 +637,17 @@ async function routeAction(
     }
     // -- Tab actions --
     case 'new-tab': {
-      const { name, mode, shell, cwd, browser, editor, resume, sessionRef: explicitSessionRef, prompt, ...rest } = params || {}
-      const codexResumeError = rejectRawCodexResume(mode, resume, explicitSessionRef)
+      const { name, mode, shell, cwd, browser, editor, resume, resumeSessionId, sessionRef: explicitSessionRef, prompt, ...rest } = params || {}
+      // `resumeSessionId` is accepted as an alias for the shorthand `resume` --
+      // it's the exact field name the CLI sends and the server itself
+      // returns/broadcasts on created panes, so agents naturally reach for it.
+      // Both resolve to the canonical sessionRef below; the raw legacy field is
+      // never forwarded over the wire.
+      const legacyResume = typeof resume === 'string' ? resume : resumeSessionId
+      const codexResumeError = rejectRawCodexResume(mode, legacyResume, explicitSessionRef)
       if (codexResumeError) return codexResumeError
-      const sessionRef = explicitSessionRef ?? (typeof mode === 'string' && mode !== 'codex' && typeof resume === 'string'
-        ? { provider: mode, sessionId: resume }
+      const sessionRef = explicitSessionRef ?? (typeof mode === 'string' && mode !== 'codex' && typeof legacyResume === 'string'
+        ? { provider: mode, sessionId: legacyResume }
         : undefined)
       const tabResult = await c.post('/api/tabs', {
         name,
