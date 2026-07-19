@@ -120,6 +120,33 @@ pub struct FreshAgentState {
     /// tabId -> tab record, for `GET /api/tabs` (Slice 1). Populated by EVERY
     /// tab-creating path (fresh-agent, terminal, browser, editor).
     pub(crate) tabs: Arc<Mutex<HashMap<String, TabRecord>>>,
+    /// Slice 3a (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md): the
+    /// registered coding-CLI command specs (claude/codex/opencode/gemini/
+    /// kimi/amplifier/...), the SAME list `freshell_ws::WsState::cli_commands`
+    /// resolves `terminal.create { mode: <cli> }` against -- wired in from
+    /// `freshell-server`'s `main.rs` via [`Self::with_cli_commands`]. Empty
+    /// until wired, matching every other Slice-1/3a field's "`None`/empty ==
+    /// route degrades honestly instead of touching data it was never given"
+    /// convention.
+    pub(crate) cli_commands: Arc<Vec<freshell_platform::CliCommandSpec>>,
+    /// The SAME amplifier session locator the WS `terminal.create` path arms
+    /// (`freshell_ws::amplifier_association::maybe_arm`), wired in from
+    /// `freshell-server`'s main.rs via [`Self::with_amplifier_locator`] so a
+    /// REST-created fresh amplifier pane arms the identical instance the
+    /// periodic sweep (spawned once, against `WsState`, at boot) already
+    /// polls -- association/broadcast parity falls out of sharing the one
+    /// locator rather than standing up a second sweep loop this crate would
+    /// have no way to drive (the sweep's `identity.upsert` target,
+    /// `freshell_ws::identity::TerminalIdentityRegistry`, is `freshell-ws`-
+    /// owned and unreachable here without a circular crate dependency).
+    /// `None` when unwired (every pre-existing test) or when the provider
+    /// home can't be resolved (mirrors `main.rs`'s own `Option` convention).
+    pub(crate) amplifier_locator:
+        Option<Arc<freshell_sessions::amplifier_locator::AmplifierLocator>>,
+    /// Sibling to [`Self::amplifier_locator`] for the opencode terminal-pane
+    /// restore fix -- the SAME shared instance
+    /// `freshell_ws::opencode_association::maybe_arm` arms.
+    pub(crate) opencode_locator: Option<Arc<freshell_sessions::opencode_locator::OpencodeLocator>>,
 }
 
 /// A fresh-agent pane (the `paneContent` subset the opencode T2 path needs).
@@ -166,7 +193,49 @@ impl FreshAgentState {
             terminal_panes: Arc::new(Mutex::new(HashMap::new())),
             content_panes: Arc::new(Mutex::new(HashMap::new())),
             tabs: Arc::new(Mutex::new(HashMap::new())),
+            cli_commands: Arc::new(Vec::new()),
+            amplifier_locator: None,
+            opencode_locator: None,
         }
+    }
+
+    /// Slice 3a: wire in the SAME registered coding-CLI command specs the WS
+    /// `terminal.create` path resolves `mode` against
+    /// (`freshell_ws::WsState::cli_commands`) -- so `POST /api/tabs` with
+    /// `mode:"claude"/"codex"/"gemini"/"kimi"/"opencode"/"amplifier"` accepts
+    /// the SAME set of modes the WS create path does, generically (no
+    /// hardcoded mode list to drift out of sync). `freshell-server`'s
+    /// `main.rs` calls this once at boot with the same `Arc` `WsState` holds.
+    pub fn with_cli_commands(
+        mut self,
+        cli_commands: Arc<Vec<freshell_platform::CliCommandSpec>>,
+    ) -> Self {
+        self.cli_commands = cli_commands;
+        self
+    }
+
+    /// Slice 3a (`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md`): wire
+    /// in the SAME [`freshell_sessions::amplifier_locator::AmplifierLocator`]
+    /// the WS `terminal.create` path arms, so a REST-created fresh amplifier
+    /// pane is armed in the identical instance the already-running periodic
+    /// sweep polls. `freshell-server`'s `main.rs` calls this once at boot
+    /// with the same `Arc` (or `None`) `WsState` holds.
+    pub fn with_amplifier_locator(
+        mut self,
+        locator: Option<Arc<freshell_sessions::amplifier_locator::AmplifierLocator>>,
+    ) -> Self {
+        self.amplifier_locator = locator;
+        self
+    }
+
+    /// Sibling to [`Self::with_amplifier_locator`] for the opencode
+    /// terminal-pane restore fix's [`freshell_sessions::opencode_locator::OpencodeLocator`].
+    pub fn with_opencode_locator(
+        mut self,
+        locator: Option<Arc<freshell_sessions::opencode_locator::OpencodeLocator>>,
+    ) -> Self {
+        self.opencode_locator = locator;
+        self
     }
 
     /// Slice 1 (`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md` \u00a79 Risk 1):
@@ -1473,6 +1542,348 @@ fn collect_text_parts(value: &Value, out: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+}
+
+// ── freshAgent.create requestId dedup (provider-generic) ───────────────────────────
+
+/// Default bound for [`FreshAgentCreateDedup`]'s completed-create cache. Legacy's
+/// `createdFreshAgentByRequestId` (`server/ws-handler.ts:569`) has NO size bound at
+/// all -- entries live until `freshAgent.kill` clears them
+/// (`clearFreshAgentCreateCachesForSession`, `ws-handler.ts:1044-1050`, called only
+/// from `ws-handler.ts:3673`) or the process shuts down (`ws-handler.ts:3907`). This
+/// cap is a Rust-port addition BEYOND legacy parity: a long-lived server process that
+/// never restarts would otherwise grow this cache forever. 512 is generous relative to
+/// any realistic number of concurrently-`creating` panes.
+pub const DEFAULT_FRESH_AGENT_CREATE_DEDUP_CAP: usize = 512;
+
+/// Provider-generic single-flight + replay cache for `freshAgent.create`, keyed by
+/// `requestId`. A faithful port of legacy's `freshAgentCreateLocks` +
+/// `createdFreshAgentByRequestId` (`server/ws-handler.ts:568-569`, `1027-1050`,
+/// `3359-3425`) -- reusable across every fresh-agent provider (codex/claude/opencode),
+/// since the requestId-dedup problem it solves (the frozen client resends
+/// `freshAgent.create` with the SAME `requestId` on every reconnect while a pane is
+/// `status==creating`, `FreshAgentView.tsx`) is provider-agnostic.
+///
+/// Semantics:
+/// - **Single-flight**: concurrent `create`s sharing a `requestId` serialize --
+///   [`Self::acquire_or_replay`] blocks a second caller on the SAME key until the first
+///   finishes (its [`FreshAgentCreateGuard`] drops), then re-checks the cache before
+///   letting a genuinely new attempt proceed. Mirrors `withFreshAgentCreateLock`'s
+///   promise-chain-per-key (`ws-handler.ts:1027-1042`).
+/// - **Replay cache**: a completed create is cached by `requestId`
+///   ([`Self::record_success`]), so a REPLAYED `create` reattaches to the SAME session
+///   instead of minting a new one -- until [`Self::clear_for_session`] evicts it.
+/// - **Failures are never cached**: mirrors legacy (the `catch` branch,
+///   `ws-handler.ts:3443-3460`, never populates `createdFreshAgentByRequestId`) -- a
+///   later retry with the same `requestId` genuinely re-attempts creation. A caller
+///   that receives [`FreshAgentCreateOutcome::Proceed`] and does NOT call
+///   `record_success` (i.e. the attempt failed) simply drops the guard; the next
+///   attempt for that `requestId` finds no cache entry and proceeds fresh.
+/// - **A session that exits on its own is NOT evicted**: legacy calls
+///   `clearFreshAgentCreateCachesForSession` ONLY from the `freshAgent.kill` handler
+///   (`ws-handler.ts:3673`) -- an UNREQUESTED sidecar exit has no such hook. A replay
+///   after a natural/crash exit therefore re-serves the dead session's id, matching
+///   legacy behavior exactly rather than "helpfully" recreating. Callers must invoke
+///   [`Self::clear_for_session`] explicitly on an EXPLICIT kill, mirroring
+///   `ws-handler.ts:3673`, and must NOT invoke it on an unrequested exit.
+/// - **Bounded** (oldest-first eviction of entries whose per-key lock is provably
+///   unused, i.e. no in-flight creation still holds it): a Rust-port addition beyond
+///   legacy parity -- see [`DEFAULT_FRESH_AGENT_CREATE_DEDUP_CAP`].
+pub struct FreshAgentCreateDedup<T: Clone + Send + 'static> {
+    inner: tokio::sync::Mutex<FreshAgentCreateDedupInner<T>>,
+    cap: usize,
+}
+
+struct FreshAgentCreateDedupInner<T> {
+    /// requestId -> completed create record (the replay cache).
+    cache: HashMap<String, T>,
+    /// Insertion order of `cache` keys, oldest first, for bounded FIFO eviction.
+    cache_order: std::collections::VecDeque<String>,
+    /// requestId -> per-key single-flight lock. An entry exists for the lifetime of
+    /// every requestId this process has ever seen a `create` for, until opportunistic
+    /// eviction (see [`FreshAgentCreateDedupInner::evict_if_over_cap`]) reclaims it.
+    inflight: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl<T> FreshAgentCreateDedupInner<T> {
+    /// Reclaim `inflight` entries once the table grows past `cap`, but ONLY entries
+    /// whose lock nobody currently holds (`Arc::strong_count(..) <= 1`, i.e. only this
+    /// map's own reference remains) -- never evict a lock an in-flight creation (or a
+    /// waiting duplicate) still references, which would break single-flight
+    /// serialization for that requestId.
+    fn evict_if_over_cap(&mut self, cap: usize) {
+        if self.inflight.len() <= cap {
+            return;
+        }
+        let stale: Vec<String> = self
+            .inflight
+            .iter()
+            .filter(|(_, lock)| Arc::strong_count(lock) <= 1)
+            .map(|(key, _)| key.clone())
+            .take(self.inflight.len() - cap)
+            .collect();
+        for key in stale {
+            self.inflight.remove(&key);
+        }
+    }
+}
+
+/// The outcome of [`FreshAgentCreateDedup::acquire_or_replay`].
+pub enum FreshAgentCreateOutcome<T> {
+    /// A completed create already exists for this `requestId` -- replay it verbatim
+    /// (e.g. re-broadcast `freshAgent.created` with the cached sessionId); do NOT spawn
+    /// a second session.
+    Replay(T),
+    /// This caller won the single-flight race for this `requestId`: proceed with the
+    /// real creation. Hold the returned guard for the ENTIRE creation attempt
+    /// (including any resume/retry sub-calls) so concurrent duplicate `create`s keep
+    /// serializing against it; it releases automatically when dropped. On success, call
+    /// [`FreshAgentCreateDedup::record_success`] with the same `requestId` before the
+    /// guard drops -- the guard itself caches nothing (failures must never be cached).
+    Proceed(FreshAgentCreateGuard),
+}
+
+/// Holds the per-`requestId` single-flight lock for the duration of one `create`
+/// attempt. Dropping it (including via an early `return` on any failure path) releases
+/// the lock so a queued duplicate (or a fresh retry) can proceed.
+pub struct FreshAgentCreateGuard {
+    _permit: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl<T: Clone + Send + 'static> Default for FreshAgentCreateDedup<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Clone + Send + 'static> FreshAgentCreateDedup<T> {
+    /// Build a dedup engine with [`DEFAULT_FRESH_AGENT_CREATE_DEDUP_CAP`].
+    pub fn new() -> Self {
+        Self::with_cap(DEFAULT_FRESH_AGENT_CREATE_DEDUP_CAP)
+    }
+
+    /// Build a dedup engine with an explicit cap (tests use a small one).
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            inner: tokio::sync::Mutex::new(FreshAgentCreateDedupInner {
+                cache: HashMap::new(),
+                cache_order: std::collections::VecDeque::new(),
+                inflight: HashMap::new(),
+            }),
+            cap,
+        }
+    }
+
+    /// Single-flight-acquire (or replay) a `create` for `request_id`. See the type-level
+    /// doc for full semantics.
+    pub async fn acquire_or_replay(&self, request_id: &str) -> FreshAgentCreateOutcome<T> {
+        loop {
+            let key_lock = {
+                let mut inner = self.inner.lock().await;
+                if let Some(hit) = inner.cache.get(request_id) {
+                    return FreshAgentCreateOutcome::Replay(hit.clone());
+                }
+                let lock = inner
+                    .inflight
+                    .entry(request_id.to_string())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                    .clone();
+                inner.evict_if_over_cap(self.cap);
+                lock
+            };
+
+            let permit = key_lock.lock_owned().await;
+
+            // Re-check under the per-key permit: another caller may have completed
+            // (and cached) while we were waiting for the lock.
+            let inner = self.inner.lock().await;
+            if inner.cache.contains_key(request_id) {
+                drop(inner);
+                drop(permit);
+                continue;
+            }
+            drop(inner);
+            return FreshAgentCreateOutcome::Proceed(FreshAgentCreateGuard { _permit: permit });
+        }
+    }
+
+    /// Cache a completed create's result under `request_id` (bounded FIFO eviction of
+    /// the oldest cache entry once over `cap`). Call this ONLY on success -- legacy
+    /// never caches a failed create.
+    pub async fn record_success(&self, request_id: &str, value: T) {
+        let mut inner = self.inner.lock().await;
+        if !inner.cache.contains_key(request_id) {
+            inner.cache_order.push_back(request_id.to_string());
+        }
+        inner.cache.insert(request_id.to_string(), value);
+        while inner.cache.len() > self.cap {
+            match inner.cache_order.pop_front() {
+                Some(oldest) => {
+                    inner.cache.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Evict every cache entry whose value matches `predicate` (e.g. `|r| r.session_id
+    /// == killed_id`). Mirrors `clearFreshAgentCreateCachesForSession`
+    /// (`ws-handler.ts:1044-1050`) -- call this ONLY from an explicit kill path, never
+    /// from an unrequested-exit path (see the type-level doc).
+    pub async fn clear_for_session(&self, predicate: impl Fn(&T) -> bool) {
+        let mut inner = self.inner.lock().await;
+        let stale: Vec<String> = inner
+            .cache
+            .iter()
+            .filter(|(_, value)| predicate(value))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale {
+            inner.cache.remove(&key);
+            if let Some(pos) = inner.cache_order.iter().position(|k| k == &key) {
+                inner.cache_order.remove(pos);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fresh_agent_create_dedup_tests {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Rec(String);
+
+    #[tokio::test]
+    async fn sequential_duplicate_request_id_replays_the_cached_value() {
+        let dedup: FreshAgentCreateDedup<Rec> = FreshAgentCreateDedup::new();
+
+        match dedup.acquire_or_replay("req-1").await {
+            FreshAgentCreateOutcome::Proceed(_guard) => {
+                dedup
+                    .record_success("req-1", Rec("session-a".to_string()))
+                    .await;
+            }
+            FreshAgentCreateOutcome::Replay(_) => panic!("first call must not replay"),
+        }
+
+        match dedup.acquire_or_replay("req-1").await {
+            FreshAgentCreateOutcome::Replay(rec) => {
+                assert_eq!(rec, Rec("session-a".to_string()));
+            }
+            FreshAgentCreateOutcome::Proceed(_) => {
+                panic!("duplicate requestId must replay, not proceed to create again")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn distinct_request_ids_never_replay_each_other() {
+        let dedup: FreshAgentCreateDedup<Rec> = FreshAgentCreateDedup::new();
+
+        for (req, session) in [("req-a", "session-a"), ("req-b", "session-b")] {
+            match dedup.acquire_or_replay(req).await {
+                FreshAgentCreateOutcome::Proceed(_guard) => {
+                    dedup.record_success(req, Rec(session.to_string())).await;
+                }
+                FreshAgentCreateOutcome::Replay(_) => {
+                    panic!("distinct requestId must never replay another's cache entry")
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_request_id_serializes_and_both_see_the_same_value() {
+        let dedup: Arc<FreshAgentCreateDedup<Rec>> = Arc::new(FreshAgentCreateDedup::new());
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let run = |dedup: Arc<FreshAgentCreateDedup<Rec>>, barrier: Arc<tokio::sync::Barrier>| async move {
+            barrier.wait().await;
+            match dedup.acquire_or_replay("req-race").await {
+                FreshAgentCreateOutcome::Proceed(_guard) => {
+                    // Simulate real creation work, widening the race window so the
+                    // second task's `acquire_or_replay` is genuinely blocked on the
+                    // first's guard rather than winning outright.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    dedup
+                        .record_success("req-race", Rec("session-race".to_string()))
+                        .await;
+                    Rec("session-race".to_string())
+                }
+                FreshAgentCreateOutcome::Replay(rec) => rec,
+            }
+        };
+
+        let (a, b) = tokio::join!(
+            run(dedup.clone(), barrier.clone()),
+            run(dedup.clone(), barrier.clone()),
+        );
+
+        assert_eq!(a, Rec("session-race".to_string()));
+        assert_eq!(b, Rec("session-race".to_string()));
+    }
+
+    #[tokio::test]
+    async fn clear_for_session_evicts_matching_entries_so_a_later_duplicate_recreates() {
+        let dedup: FreshAgentCreateDedup<Rec> = FreshAgentCreateDedup::new();
+
+        match dedup.acquire_or_replay("req-1").await {
+            FreshAgentCreateOutcome::Proceed(_guard) => {
+                dedup
+                    .record_success("req-1", Rec("session-a".to_string()))
+                    .await;
+            }
+            FreshAgentCreateOutcome::Replay(_) => panic!("first call must not replay"),
+        }
+
+        dedup.clear_for_session(|rec| rec.0 == "session-a").await;
+
+        match dedup.acquire_or_replay("req-1").await {
+            FreshAgentCreateOutcome::Proceed(_guard) => {
+                // Expected: the explicit-kill eviction means a later duplicate
+                // genuinely re-creates instead of replaying the killed session.
+            }
+            FreshAgentCreateOutcome::Replay(_) => {
+                panic!("cache entry must be gone after clear_for_session matched it")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_cache_evicts_the_oldest_entry_past_cap() {
+        let dedup: FreshAgentCreateDedup<Rec> = FreshAgentCreateDedup::with_cap(2);
+
+        for req in ["req-1", "req-2", "req-3"] {
+            match dedup.acquire_or_replay(req).await {
+                FreshAgentCreateOutcome::Proceed(_guard) => {
+                    dedup
+                        .record_success(req, Rec(format!("session-{req}")))
+                        .await;
+                }
+                FreshAgentCreateOutcome::Replay(_) => panic!("{req} must not replay"),
+            }
+        }
+
+        // req-1 was the oldest of 3 entries against a cap of 2 -- evicted, so a
+        // duplicate for it must now genuinely re-create (Proceed), not replay.
+        match dedup.acquire_or_replay("req-1").await {
+            FreshAgentCreateOutcome::Proceed(_guard) => {}
+            FreshAgentCreateOutcome::Replay(_) => {
+                panic!("req-1 should have been evicted past the cap of 2")
+            }
+        }
+
+        // req-3 (most recent) must still replay.
+        match dedup.acquire_or_replay("req-3").await {
+            FreshAgentCreateOutcome::Replay(rec) => {
+                assert_eq!(rec, Rec("session-req-3".to_string()))
+            }
+            FreshAgentCreateOutcome::Proceed(_) => {
+                panic!("req-3 must still be cached (most recent, within cap)")
+            }
+        }
     }
 }
 

@@ -68,6 +68,8 @@ use freshell_protocol::{
     FreshAgentSend, FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
 };
 
+use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome};
+
 /// The codex fresh-agent `sessionType` (`AGENT_SESSION_TYPES.codex`).
 const SESSION_TYPE: &str = "freshcodex";
 /// The runtime provider (`AGENT_SESSION_TYPES.codex.provider`).
@@ -136,6 +138,24 @@ pub struct FreshCodexState {
     /// shrink it directly (private-field access from the `tests` submodule, same convention
     /// [`CodexSession`]'s test constructors already rely on) without needing a fake clock.
     dead_thread_ttl: Duration,
+    /// `freshAgent.create` requestId dedup (parity gap fix -- see the module doc on
+    /// [`crate::FreshAgentCreateDedup`]): single-flight + replay cache so a client
+    /// resending the SAME `requestId` on every reconnect while a pane is
+    /// `status==creating` reattaches to the ONE session it already created instead of
+    /// spawning a fresh `codex app-server` sidecar per resend. Cleared for a session's
+    /// entries only on an explicit `freshAgent.kill` ([`Self::handle_kill`]); an
+    /// unrequested sidecar exit does NOT evict (mirrors legacy, see the type doc).
+    create_dedup: Arc<FreshAgentCreateDedup<CodexCreateRecord>>,
+}
+
+/// The cached result of a completed codex `freshAgent.create`, keyed by `requestId` in
+/// [`FreshCodexState::create_dedup`]. Only `session_id` is needed: every other field of
+/// the `freshAgent.created` replay frame ([`FreshCodexState::handle_create`]'s replay
+/// branch) is either a codex-wide constant (`PROVIDER`/`SESSION_TYPE`) or derived from
+/// `session_id` itself (`sessionRef`).
+#[derive(Clone)]
+struct CodexCreateRecord {
+    session_id: String,
 }
 
 /// One live freshcodex session: the app-server client, its owned sidecar, and the
@@ -251,6 +271,7 @@ impl FreshCodexState {
             resuming: Arc::new(TokioMutex::new(HashMap::new())),
             dead_threads: Arc::new(TokioMutex::new(HashMap::new())),
             dead_thread_ttl: DEAD_THREAD_CACHE_TTL,
+            create_dedup: Arc::new(FreshAgentCreateDedup::new()),
         }
     }
 
@@ -308,6 +329,30 @@ impl FreshCodexState {
     /// dispatches this as a detached task and keeps fanning out the bus meanwhile.
     pub async fn handle_create(&self, msg: FreshAgentCreate) {
         let request_id = msg.request_id.clone();
+
+        // Dedup by requestId (parity gap fix -- see [`crate::FreshAgentCreateDedup`]'s
+        // doc and [`Self::create_dedup`]'s field doc). Held for the WHOLE creation
+        // attempt below (including the `handle_create_resume` sub-call), so concurrent
+        // duplicate `create`s for the same requestId serialize instead of each spawning
+        // their own sidecar.
+        let _dedup_guard = match self.create_dedup.acquire_or_replay(&request_id).await {
+            FreshAgentCreateOutcome::Replay(cached) => {
+                self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
+                    provider: PROVIDER.to_string(),
+                    request_id,
+                    runtime_provider: PROVIDER.to_string(),
+                    session_id: cached.session_id.clone(),
+                    session_type: SESSION_TYPE.to_string(),
+                    session_ref: Some(SessionLocator {
+                        provider: PROVIDER.to_string(),
+                        session_id: cached.session_id,
+                    }),
+                }));
+                return;
+            }
+            FreshAgentCreateOutcome::Proceed(guard) => guard,
+        };
+
         let cwd = msg.cwd.clone();
         let model = normalize_freshcodex_model(msg.model.as_deref());
         let effort = normalize_freshcodex_effort(Some(&model), msg.effort.as_deref());
@@ -433,8 +478,7 @@ impl FreshCodexState {
             return;
         }
 
-        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await
-        {
+        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
             Ok(parts) => parts,
             Err(err) => {
                 self.fail_create(&request_id, "CODEX_APP_SERVER_START_FAILED", &err);
@@ -557,6 +601,21 @@ impl FreshCodexState {
             cwd = %cwd.as_deref().unwrap_or(""),
             "freshagent.session.created"
         );
+
+        // Cache the completed create for requestId dedup BEFORE responding (mirrors
+        // legacy's `this.createdFreshAgentByRequestId.set(...)` preceding its
+        // `this.send(...)`, `ws-handler.ts:3425` before `3433`) -- a duplicate
+        // `freshAgent.create` for this requestId that arrives right after this point
+        // must see the cache populated, never a window where it could race past this
+        // guard's release and spawn a second sidecar.
+        self.create_dedup
+            .record_success(
+                &request_id,
+                CodexCreateRecord {
+                    session_id: thread_id.clone(),
+                },
+            )
+            .await;
 
         // Broadcast freshAgent.created (ws-handler.ts:3378). sessionId == durable (UUID).
         self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
@@ -788,6 +847,16 @@ impl FreshCodexState {
             // for it so the sidecar is actually gone before we broadcast success.
             let _ = session.watcher.await;
         }
+
+        // Explicit kill evicts this session's requestId dedup cache entries (mirrors
+        // `clearFreshAgentCreateCachesForSession`, `ws-handler.ts:1044-1050`, called from
+        // `ws-handler.ts:3673`) -- an EXPLICIT kill means a later duplicate `create` for
+        // the same requestId must genuinely mint a fresh session, not replay the one just
+        // killed. An UNREQUESTED sidecar exit does NOT reach this path (see
+        // [`crate::FreshAgentCreateDedup`]'s doc).
+        self.create_dedup
+            .clear_for_session(|record| record.session_id == session_id)
+            .await;
 
         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
             provider: PROVIDER.to_string(),
@@ -2886,7 +2955,10 @@ pub(crate) mod tests {
                     .lock()
                     .expect("capture lock")
                     .iter()
-                    .filter(|e| e.fields.get("session_id").map(String::as_str) == Some(self.session_id.as_str()))
+                    .filter(|e| {
+                        e.fields.get("session_id").map(String::as_str)
+                            == Some(self.session_id.as_str())
+                    })
                     .cloned()
                     .collect()
             }
@@ -3865,6 +3937,263 @@ pub(crate) mod tests {
         );
     }
 
+    // -- freshAgent.create requestId dedup (reconnect-spam parity gap fix) --
+
+    /// Helper: a minimal `FreshAgentCreate` for the dedup tests, varying only
+    /// `request_id`.
+    fn create_msg(request_id: &str) -> FreshAgentCreate {
+        FreshAgentCreate {
+            request_id: request_id.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            provider: Some(freshell_protocol::AgentProvider::Codex),
+            cwd: None,
+            legacy_restore_context: None,
+            resume_session_id: None,
+            session_ref: None,
+            model: None,
+            model_selection: None,
+            permission_mode: None,
+            sandbox: None,
+            effort: None,
+            plugins: None,
+        }
+    }
+
+    /// Count `freshagent.sidecar.spawned` events recorded since `capture` started.
+    fn spawn_count(capture: &tracing_capture::GlobalCapture) -> usize {
+        capture
+            .untagged_events_since_start()
+            .into_iter()
+            .filter(|e| e.message == "freshagent.sidecar.spawned")
+            .count()
+    }
+
+    /// Drain `rx` until the `freshAgent.created` (or `.create.failed`) frame for
+    /// `request_id` arrives.
+    async fn await_created(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        request_id: &str,
+    ) -> Value {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if (frame["type"] == "freshAgent.created"
+                    || frame["type"] == "freshAgent.create.failed")
+                    && frame["requestId"] == request_id
+                {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("freshAgent.created for {request_id} resolves within the budget")
+        })
+    }
+
+    /// THE regression this task fixes: the frozen client resends `freshAgent.create`
+    /// with the SAME `requestId` on every reconnect while a pane is `status==creating`
+    /// (no client-side in-flight guard, `FreshAgentView.tsx`). Without server-side dedup
+    /// (legacy's `withFreshAgentCreateLock` + `createdFreshAgentByRequestId`,
+    /// `ws-handler.ts:568-569,1027-1050,3359-3425`), a flappy connection mints one
+    /// `codex app-server` sidecar/session PER resend. Two SEQUENTIAL `create`s sharing a
+    /// `requestId` must produce exactly ONE session and ONE sidecar spawn -- the second
+    /// response must carry the SAME `sessionId` as the first (a replay), not a new one.
+    #[tokio::test]
+    async fn handle_create_duplicate_request_id_reuses_the_session_and_spawns_once() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        configure_fake_codex_cmd("{}");
+        let (st, mut rx) = state_with_bus();
+        let capture = tracing_capture::capture_by_session("dedup-sequential-marker-unused");
+
+        st.handle_create(create_msg("req-dedup-seq")).await;
+        let first = await_created(&mut rx, "req-dedup-seq").await;
+        assert_eq!(
+            first["type"], "freshAgent.created",
+            "sanity: first create must succeed: {first}"
+        );
+        let first_session_id = first["sessionId"].as_str().unwrap().to_string();
+
+        st.handle_create(create_msg("req-dedup-seq")).await;
+        let second = await_created(&mut rx, "req-dedup-seq").await;
+
+        assert_eq!(
+            second["type"], "freshAgent.created",
+            "the replay response must be a normal freshAgent.created frame: {second}"
+        );
+        assert_eq!(
+            second["sessionId"], first_session_id,
+            "a duplicate requestId must replay the SAME session, not mint a new one: {second}"
+        );
+        assert_eq!(
+            spawn_count(&capture),
+            1,
+            "two sequential creates sharing a requestId must spawn the codex app-server \
+             sidecar exactly once (the reconnect-spam duplicate-session parity gap)"
+        );
+    }
+
+    /// The concurrent variant of the sequential test above: two GENUINELY CONCURRENT
+    /// `create`s sharing a `requestId` (e.g. two reconnect-races landing back to back)
+    /// must still spawn at most one sidecar and both resolve to the SAME session --
+    /// single-flight serialization, not just cache-hit-after-the-fact.
+    #[tokio::test]
+    async fn handle_create_concurrent_duplicate_request_id_spawns_at_most_once() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        configure_fake_codex_cmd("{}");
+        let (st, mut rx) = state_with_bus();
+        let capture = tracing_capture::capture_by_session("dedup-concurrent-marker-unused");
+
+        let st1 = st.clone();
+        let st2 = st.clone();
+        tokio::join!(
+            st1.handle_create(create_msg("req-dedup-race")),
+            st2.handle_create(create_msg("req-dedup-race")),
+        );
+
+        let first = await_created(&mut rx, "req-dedup-race").await;
+        let second = await_created(&mut rx, "req-dedup-race").await;
+        let first_id = first["sessionId"].as_str().unwrap();
+        let second_id = second["sessionId"].as_str().unwrap();
+
+        assert_eq!(
+            first_id, second_id,
+            "both racing creates for the same requestId must resolve to the SAME session: \
+             {first} / {second}"
+        );
+        assert_eq!(
+            spawn_count(&capture),
+            1,
+            "two CONCURRENT creates racing on the same requestId must spawn the codex \
+             app-server sidecar exactly once"
+        );
+    }
+
+    /// Control: DISTINCT requestIds must never dedup against each other -- each is a
+    /// genuinely separate create, so this must still spawn once per request and produce
+    /// two distinct sessions.
+    #[tokio::test]
+    async fn handle_create_distinct_request_ids_create_distinct_sessions() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (st, mut rx) = state_with_bus();
+        let capture = tracing_capture::capture_by_session("dedup-distinct-marker-unused");
+
+        // The fake fixture's `thread/start` returns a FIXED default id
+        // (`'thread-new-1'`, `fake-app-server.mjs:191`) absent an override -- configure a
+        // distinct `threadStartThreadId` per call so this test proves "distinct
+        // requestIds -> distinct sessions" on its own merits, not on an accident of the
+        // fixture's default.
+        configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-dedup-a"}"#);
+        st.handle_create(create_msg("req-dedup-a")).await;
+        let a = await_created(&mut rx, "req-dedup-a").await;
+
+        configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-dedup-b"}"#);
+        st.handle_create(create_msg("req-dedup-b")).await;
+        let b = await_created(&mut rx, "req-dedup-b").await;
+
+        assert_ne!(
+            a["sessionId"], b["sessionId"],
+            "distinct requestIds must never replay each other's session: {a} / {b}"
+        );
+        assert_eq!(
+            spawn_count(&capture),
+            2,
+            "two distinct requestIds must spawn the sidecar once each (dedup must not \
+             over-suppress unrelated creates)"
+        );
+    }
+
+    /// Edge case (task-specified): a REPLAY after the cached session has ALREADY EXITED
+    /// on its own (not via `freshAgent.kill`) must re-serve the SAME dead session id, not
+    /// spawn a new one. Legacy has no hook from an unrequested sidecar exit to
+    /// `clearFreshAgentCreateCachesForSession` -- that eviction runs ONLY from the
+    /// `freshAgent.kill` handler (`ws-handler.ts:3673`) -- so a duplicate `create` after a
+    /// natural crash replays the dead session's id byte-for-byte, matching legacy exactly
+    /// rather than "helpfully" minting a fresh one.
+    #[tokio::test]
+    async fn handle_create_replay_after_unrequested_exit_reuses_the_dead_session_no_new_spawn() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
+        let (st, mut rx) = state_with_bus();
+        let capture = tracing_capture::capture_by_session("dedup-post-exit-marker-unused");
+
+        st.handle_create(create_msg("req-dedup-exit")).await;
+        let created = await_created(&mut rx, "req-dedup-exit").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        wait_for_self_heal(&st, &mut rx, &session_id).await;
+        assert_eq!(
+            spawn_count(&capture),
+            1,
+            "sanity: exactly one spawn before the replay attempt"
+        );
+
+        // Reset so a genuinely NEW spawn (if the bug regresses) would succeed cleanly --
+        // isolating the assertion below to "did dedup replay?" rather than "did the fake
+        // app-server fail?".
+        configure_fake_codex_cmd("{}");
+
+        st.handle_create(create_msg("req-dedup-exit")).await;
+        let replay = await_created(&mut rx, "req-dedup-exit").await;
+
+        assert_eq!(
+            replay["sessionId"], session_id,
+            "a replay after an UNREQUESTED exit must re-serve the SAME (dead) session id: \
+             {replay}"
+        );
+        assert_eq!(
+            spawn_count(&capture),
+            1,
+            "a replay after an unrequested exit must NOT spawn a new sidecar (legacy has \
+             no unrequested-exit cache-eviction hook)"
+        );
+    }
+
+    /// Cache invalidation (task-specified): an EXPLICIT `freshAgent.kill` DOES evict the
+    /// requestId dedup cache (`clearFreshAgentCreateCachesForSession`,
+    /// `ws-handler.ts:1044-1050`, called from `ws-handler.ts:3673`) -- unlike the
+    /// unrequested-exit case above, a duplicate `create` for the SAME requestId after an
+    /// explicit kill must genuinely mint a fresh session (a new spawn), not replay the
+    /// killed one.
+    #[tokio::test]
+    async fn handle_create_duplicate_after_explicit_kill_creates_a_fresh_session() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (st, mut rx) = state_with_bus();
+        let capture = tracing_capture::capture_by_session("dedup-post-kill-marker-unused");
+
+        configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-dedup-kill-1"}"#);
+        st.handle_create(create_msg("req-dedup-kill")).await;
+        let created = await_created(&mut rx, "req-dedup-kill").await;
+        let killed_session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: killed_session_id.clone(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+
+        // Distinct thread id (`fake-app-server.mjs:191` returns a FIXED default
+        // absent an override) so a genuine re-create is provably distinguishable from
+        // an accidental fixture coincidence, not just from a cache replay.
+        configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-dedup-kill-2"}"#);
+        st.handle_create(create_msg("req-dedup-kill")).await;
+        let recreated = await_created(&mut rx, "req-dedup-kill").await;
+
+        assert_ne!(
+            recreated["sessionId"], killed_session_id,
+            "a duplicate create after an EXPLICIT kill must mint a fresh session, not \
+             replay the killed one: {recreated}"
+        );
+        assert_eq!(
+            spawn_count(&capture),
+            2,
+            "the kill must evict the dedup cache, so the duplicate create genuinely \
+             re-spawns"
+        );
+    }
+
     // -- freshAgent.create resume (CODEX-FIRST triage Finding 1) --
 
     /// FINDING 1 (CODEX-FIRST triage): `freshAgent.create` carrying `resumeSessionId` must
@@ -3899,7 +4228,9 @@ pub(crate) mod tests {
         let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
-                if frame["type"] == "freshAgent.created" || frame["type"] == "freshAgent.create.failed" {
+                if frame["type"] == "freshAgent.created"
+                    || frame["type"] == "freshAgent.create.failed"
+                {
                     return frame;
                 }
             }
@@ -3969,7 +4300,9 @@ pub(crate) mod tests {
         let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
-                if frame["type"] == "freshAgent.created" || frame["type"] == "freshAgent.create.failed" {
+                if frame["type"] == "freshAgent.created"
+                    || frame["type"] == "freshAgent.create.failed"
+                {
                     return frame;
                 }
             }
@@ -4080,7 +4413,8 @@ pub(crate) mod tests {
         let capture = tracing_capture::capture_by_session("finding-2-storm-marker-unused");
 
         for attempt in 0..5 {
-            st.handle_attach(attach_msg("thread-permanently-dead")).await;
+            st.handle_attach(attach_msg("thread-permanently-dead"))
+                .await;
 
             let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
                 loop {
@@ -4128,7 +4462,8 @@ pub(crate) mod tests {
         st.dead_thread_ttl = std::time::Duration::from_millis(50);
         let capture = tracing_capture::capture_by_session("finding-2-expiry-marker-unused");
 
-        st.handle_attach(attach_msg("thread-temporarily-dead")).await;
+        st.handle_attach(attach_msg("thread-temporarily-dead"))
+            .await;
         let first: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let raw = rx.recv().await.expect("bus stays open");
@@ -4147,7 +4482,8 @@ pub(crate) mod tests {
         // Now the thread is genuinely resumable.
         configure_fake_codex_cmd("{}");
 
-        st.handle_attach(attach_msg("thread-temporarily-dead")).await;
+        st.handle_attach(attach_msg("thread-temporarily-dead"))
+            .await;
         let second: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let raw = rx.recv().await.expect("bus stays open");
