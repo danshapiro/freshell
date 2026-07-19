@@ -568,11 +568,22 @@ struct FileEntry {
 /// * The cheap path (fresh cache) never touches `.await` while holding the
 ///   `std::sync::Mutex` guard — the guard is dropped before any lock is even
 ///   contended, so it can never be held across an await point.
-/// * A stale/absent cache serializes its refresh through a `tokio::sync::Mutex`:
-///   the first task to arrive does the refresh; every other concurrent caller
-///   blocks on that same async lock and then re-checks freshness
-///   (double-checked locking) instead of refreshing again — N concurrent
-///   misses produce exactly 1 refresh sweep (B-T5).
+/// * **Stale-while-revalidate ("snapshot-swap").** A stale-but-PRESENT cache
+///   is served immediately, and the actual re-scan runs DETACHED
+///   (`tokio::spawn`) — no foreground caller ever waits on it. Production
+///   forensics on a real ~13-15k session corpus measured `snapshot()`
+///   sweeps taking up to 283s; the FIRST shipped version of this design
+///   held a single `AsyncMutex` guard for a sweep's ENTIRE duration, so
+///   every OTHER concurrent `snapshot()` caller (every foreground
+///   `GET /api/session-directory` request, and the periodic
+///   `spawn_sessions_sweep` poll) blocked on that same mutex for as long as
+///   the sweep ran, even though a perfectly servable snapshot already
+///   existed. Only a TRULY cold cache (nothing ever published — the very
+///   first call, e.g. boot's `warm()`) still waits inline; there is nothing
+///   else to serve. `refresh_lock`'s exclusivity (`try_lock_owned`) still
+///   guarantees N concurrent stale-misses trigger exactly 1 sweep, matching
+///   B-T5's original dedup guarantee — it now ALSO guarantees that sweep
+///   never blocks a reader who already has something to read.
 /// * The refresh (`refresh_snapshot`) runs inside `spawn_blocking`: `sources`
 ///   (an `Arc` refcount bump per source, not a deep clone of any scanned
 ///   data) and `file_cache` (an `Arc` refcount bump) are MOVED into the
@@ -587,8 +598,17 @@ struct FileEntry {
 pub struct SessionIndex {
     sources: Vec<Arc<dyn SessionSource>>,
     ttl: Duration,
-    snapshot: StdMutex<Option<CachedSnapshot>>,
-    refresh_lock: AsyncMutex<()>,
+    /// `Arc`-wrapped (not just `StdMutex`-wrapped) so a DETACHED background
+    /// refresh task (`spawn_background_refresh`) can publish into it without
+    /// holding a borrow of `&SessionIndex` for the task's lifetime.
+    snapshot: Arc<StdMutex<Option<CachedSnapshot>>>,
+    /// Exclusivity gate for "who is currently sweeping" -- `try_lock_owned`
+    /// (never blocks the caller) decides who starts a sweep;
+    /// `lock_owned().await` (blocks) is used ONLY by a caller racing another
+    /// caller on a truly cold (nothing-published-yet) cache, where waiting
+    /// for the other's result is correct because there is nothing else to
+    /// serve. See the struct doc comment's "Stale-while-revalidate" bullet.
+    refresh_lock: Arc<AsyncMutex<()>>,
     file_cache: Arc<StdMutex<HashMap<PathBuf, FileEntry>>>,
     /// Batch C: the per-source cache for direct-listed sources (opencode),
     /// keyed by the source's position in `sources` (fixed at construction, so
@@ -600,7 +620,10 @@ pub struct SessionIndex {
     /// Read at construction to pre-populate `file_cache`; written back
     /// opportunistically after a sweep (see `Self::take_pending_save`).
     persist_path: Option<PathBuf>,
-    persist_state: StdMutex<PersistState>,
+    /// `Arc`-wrapped for the same reason `snapshot` is: a detached
+    /// background refresh needs to update the save-debounce bookkeeping
+    /// without borrowing `&SessionIndex`.
+    persist_state: Arc<StdMutex<PersistState>>,
 }
 
 struct CachedSnapshot {
@@ -661,53 +684,171 @@ impl SessionIndex {
         Self {
             sources,
             ttl,
-            snapshot: StdMutex::new(None),
-            refresh_lock: AsyncMutex::new(()),
+            snapshot: Arc::new(StdMutex::new(None)),
+            refresh_lock: Arc::new(AsyncMutex::new(())),
             file_cache: Arc::new(StdMutex::new(file_cache)),
             direct_cache: Arc::new(StdMutex::new(HashMap::new())),
             persist_path,
-            persist_state: StdMutex::new(PersistState::default()),
+            persist_state: Arc::new(StdMutex::new(PersistState::default())),
         }
     }
 
-    /// Return a fresh snapshot, pre-sorted `lastActivityAt` DESC then `key()`
-    /// DESC (`projection.ts:51-62`'s comparator, applied once here instead of
-    /// once per request). Rebuilds via `spawn_blocking` when the cached
-    /// snapshot is stale or absent — and that rebuild is incremental (see
-    /// [`refresh_snapshot`]), not a full re-parse.
+    /// Return a snapshot, pre-sorted `lastActivityAt` DESC then `key()` DESC
+    /// (`projection.ts:51-62`'s comparator, applied once here instead of
+    /// once per request).
+    ///
+    /// Stale-while-revalidate ("snapshot-swap"): if the cache is stale but a
+    /// PREVIOUS snapshot exists, that snapshot is returned IMMEDIATELY and a
+    /// fresh sweep runs detached in the background (see
+    /// `spawn_background_refresh`) — this call never blocks on it. Only a
+    /// truly cold cache (nothing ever published) waits for the sweep
+    /// inline, via `run_refresh_inline`, since there is nothing else to
+    /// serve. Either way, the actual rebuild is incremental (see
+    /// [`refresh_snapshot`]), not a full re-parse of unchanged files.
     pub async fn snapshot(&self) -> Arc<Vec<IndexedSession>> {
         if let Some(items) = self.fresh_cached() {
             return items;
         }
-        // Serialize refreshes: only one concurrent caller actually sweeps.
-        let _guard = self.refresh_lock.lock().await;
-        // Double-checked: another task may have refreshed while we waited.
-        if let Some(items) = self.fresh_cached() {
-            return items;
+        // Stale or absent. Try to become this round's sweeper WITHOUT
+        // blocking -- `try_lock_owned` never waits, so a caller that
+        // already has something to serve is never delayed by another
+        // in-flight sweep.
+        match Arc::clone(&self.refresh_lock).try_lock_owned() {
+            Ok(guard) => {
+                if let Some(stale) = self.any_cached() {
+                    // Someone must read fresh data eventually, but not THIS
+                    // caller, and not by blocking anyone else either.
+                    self.spawn_background_refresh(guard);
+                    return stale;
+                }
+                // Truly cold: nothing to serve, so wait for the (only) sweep.
+                self.run_refresh_inline(guard).await
+            }
+            Err(_) => {
+                // Another caller is already sweeping this round.
+                if let Some(stale) = self.any_cached() {
+                    return stale;
+                }
+                // Truly cold AND racing another cold-start caller: wait for
+                // THEIR sweep instead of starting a second one (preserves
+                // B-T5's "N concurrent misses -> 1 sweep" guarantee for the
+                // cold-cache case).
+                let _guard = self.refresh_lock.lock().await;
+                self.fresh_cached()
+                    .or_else(|| self.any_cached())
+                    .unwrap_or_default()
+            }
         }
-        let sources = self.sources.clone(); // Vec<Arc<_>>: refcount bumps only.
+    }
+
+    /// The cached snapshot, if present and within the TTL window. A brief,
+    /// non-async lock: never held across an await point.
+    fn fresh_cached(&self) -> Option<Arc<Vec<IndexedSession>>> {
+        let guard = self.snapshot.lock().unwrap();
+        match guard.as_ref() {
+            Some(c) if c.fetched_at.elapsed() < self.ttl => Some(Arc::clone(&c.items)),
+            _ => None,
+        }
+    }
+
+    /// The cached snapshot, if present, regardless of TTL freshness -- the
+    /// stale-while-revalidate read: "is there ANYTHING to serve right now."
+    fn any_cached(&self) -> Option<Arc<Vec<IndexedSession>>> {
+        let guard = self.snapshot.lock().unwrap();
+        guard.as_ref().map(|c| Arc::clone(&c.items))
+    }
+
+    /// Cold-start path: run the sweep and wait for it (there is nothing else
+    /// to serve). `guard` is held for the sweep's full duration -- exactly
+    /// the pre-fix behavior, but now reachable ONLY when no snapshot has
+    /// ever been published, never for a routine stale-cache refresh.
+    async fn run_refresh_inline(
+        &self,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Arc<Vec<IndexedSession>> {
+        let items = Self::perform_refresh(
+            self.sources.clone(),
+            Arc::clone(&self.file_cache),
+            Arc::clone(&self.direct_cache),
+            Arc::clone(&self.snapshot),
+            self.persist_path.clone(),
+            Arc::clone(&self.persist_state),
+        )
+        .await;
+        drop(guard);
+        items
+    }
+
+    /// Warm-cache path: run the sweep DETACHED, so the caller that triggered
+    /// it (and every other concurrent caller) can go on serving the stale
+    /// snapshot immediately. `guard` moves into the spawned task and is
+    /// dropped only once that sweep fully completes, so `try_lock_owned`
+    /// correctly rejects any other concurrent sweeper until then.
+    fn spawn_background_refresh(&self, guard: tokio::sync::OwnedMutexGuard<()>) {
+        let sources = self.sources.clone();
         let file_cache = Arc::clone(&self.file_cache);
         let direct_cache = Arc::clone(&self.direct_cache);
-        let (items, changed) = tokio::task::spawn_blocking(move || {
-            let mut cache = file_cache.lock().unwrap();
-            let mut direct = direct_cache.lock().unwrap();
-            refresh_snapshot(&sources, &mut cache, &mut direct)
+        let snapshot = Arc::clone(&self.snapshot);
+        let persist_path = self.persist_path.clone();
+        let persist_state = Arc::clone(&self.persist_state);
+        tokio::spawn(async move {
+            let _ = Self::perform_refresh(
+                sources,
+                file_cache,
+                direct_cache,
+                snapshot,
+                persist_path,
+                persist_state,
+            )
+            .await;
+            drop(guard);
+        });
+    }
+
+    /// The actual sweep: discover/parse (incremental, off the async
+    /// executor thread via `spawn_blocking`), publish the result into
+    /// `snapshot`, then opportunistically persist the parse cache. Free of
+    /// any `&SessionIndex` borrow -- every input is an owned `Arc`/value --
+    /// so it runs identically whether awaited inline (cold start) or inside
+    /// a detached `tokio::spawn` (warm, stale-while-revalidate refresh).
+    async fn perform_refresh(
+        sources: Vec<Arc<dyn SessionSource>>,
+        file_cache: Arc<StdMutex<HashMap<PathBuf, FileEntry>>>,
+        direct_cache: Arc<StdMutex<HashMap<usize, DirectEntry>>>,
+        snapshot: Arc<StdMutex<Option<CachedSnapshot>>>,
+        persist_path: Option<PathBuf>,
+        persist_state: Arc<StdMutex<PersistState>>,
+    ) -> Arc<Vec<IndexedSession>> {
+        let (items, changed) = tokio::task::spawn_blocking({
+            let file_cache = Arc::clone(&file_cache);
+            let direct_cache = Arc::clone(&direct_cache);
+            move || {
+                let mut cache = file_cache.lock().unwrap();
+                let mut direct = direct_cache.lock().unwrap();
+                refresh_snapshot(&sources, &mut cache, &mut direct)
+            }
         })
         .await
         .unwrap_or_default();
         let items = Arc::new(items);
         {
-            let mut guard = self.snapshot.lock().unwrap();
+            let mut guard = snapshot.lock().unwrap();
             *guard = Some(CachedSnapshot {
                 items: Arc::clone(&items),
                 fetched_at: Instant::now(),
             });
         } // guard dropped here — never held across an .await.
           // Opportunistic persistence: gated (threshold/debounce) and, when
-          // warranted, saved via a DETACHED task -- never awaited here, so a
-          // real caller of `snapshot()` (an HTTP request handler) is never
-          // delayed by a disk write. See `Self::take_pending_save`.
-        if let Some((path, cache_snapshot)) = self.take_pending_save(changed) {
+          // warranted, saved via a DETACHED task -- never awaited here, so
+          // neither an HTTP request handler NOR this refresh itself is
+          // delayed by a disk write.
+        if let Some((path, cache_snapshot)) = take_pending_save_from_parts(
+            &persist_path,
+            &persist_state,
+            &file_cache,
+            changed,
+            SAVE_DEBOUNCE,
+        ) {
             tokio::spawn(async move {
                 let outcome =
                     tokio::task::spawn_blocking(move || save_cache_file(&path, &cache_snapshot))
@@ -726,16 +867,6 @@ impl SessionIndex {
         items
     }
 
-    /// The cached snapshot, if present and within the TTL window. A brief,
-    /// non-async lock: never held across an await point.
-    fn fresh_cached(&self) -> Option<Arc<Vec<IndexedSession>>> {
-        let guard = self.snapshot.lock().unwrap();
-        match guard.as_ref() {
-            Some(c) if c.fetched_at.elapsed() < self.ttl => Some(Arc::clone(&c.items)),
-            _ => None,
-        }
-    }
-
     /// Populate the cache once, eagerly. Call from `main.rs` via
     /// `tokio::spawn` at boot so the first real request never pays the cold
     /// full-sweep cost — cheap for a small home, and the sweep already runs
@@ -744,54 +875,47 @@ impl SessionIndex {
         let _ = self.snapshot().await;
     }
 
-    /// Decide whether a save is warranted after a sweep that changed
-    /// `changed_this_sweep` files/direct-listed sources, using the
-    /// production debounce window (`SAVE_DEBOUNCE`). `None` if persistence
-    /// is disabled (no `persist_path`) or no save is warranted right now.
-    /// See `Self::take_pending_save_with_debounce` for the gating rule.
-    fn take_pending_save(
-        &self,
-        changed_this_sweep: usize,
-    ) -> Option<(PathBuf, HashMap<PathBuf, FileEntry>)> {
-        self.take_pending_save_with_debounce(changed_this_sweep, SAVE_DEBOUNCE)
-    }
+}
 
-    /// Save-decision gate, with an injectable debounce window so tests can
-    /// exercise the debounce rule in milliseconds instead of the real 60s
-    /// (`SAVE_DEBOUNCE`). Rule: a save is warranted iff at least one file
-    /// changed since the last save AND (this is the very first-ever sweep,
-    /// OR the cumulative changed-since-save count has reached
-    /// `SAVE_CHANGED_THRESHOLD`, OR the debounce window has elapsed since
-    /// the last save). On a "yes", resets the changed-since-save counter and
-    /// returns a cloned snapshot of the file cache to write (cloned while
-    /// still holding the state lock, so two concurrent sweeps can never
-    /// both decide "yes" for the same window).
-    fn take_pending_save_with_debounce(
-        &self,
-        changed_this_sweep: usize,
-        debounce: Duration,
-    ) -> Option<(PathBuf, HashMap<PathBuf, FileEntry>)> {
-        let path = self.persist_path.clone()?;
-        let mut state = self.persist_state.lock().unwrap();
-        state.changed_since_save = state
-            .changed_since_save
-            .saturating_add(changed_this_sweep as u64);
-        if state.changed_since_save == 0 {
-            return None;
-        }
-        let should_save = !state.saved_once
-            || state.changed_since_save >= SAVE_CHANGED_THRESHOLD
-            || state.last_saved_at.is_none_or(|t| t.elapsed() >= debounce);
-        if !should_save {
-            return None;
-        }
-        state.changed_since_save = 0;
-        state.last_saved_at = Some(Instant::now());
-        state.saved_once = true;
-        drop(state);
-        let cache_snapshot = self.file_cache.lock().unwrap().clone();
-        Some((path, cache_snapshot))
+/// Free-function form of the save-decision gate (see
+/// `SessionIndex::take_pending_save_with_debounce`'s doc comment for the
+/// full rule) -- takes its inputs by reference instead of `&self` so a
+/// detached background-refresh task (which owns `Arc`s, not a
+/// `&SessionIndex`) can call it directly. Rule: a save is warranted iff at
+/// least one file changed since the last save AND (this is the very
+/// first-ever sweep, OR the cumulative changed-since-save count has reached
+/// `SAVE_CHANGED_THRESHOLD`, OR the debounce window has elapsed since the
+/// last save). On a "yes", resets the changed-since-save counter and
+/// returns a cloned snapshot of the file cache to write (cloned while still
+/// holding the state lock, so two concurrent sweeps can never both decide
+/// "yes" for the same window).
+fn take_pending_save_from_parts(
+    persist_path: &Option<PathBuf>,
+    persist_state: &StdMutex<PersistState>,
+    file_cache: &StdMutex<HashMap<PathBuf, FileEntry>>,
+    changed_this_sweep: usize,
+    debounce: Duration,
+) -> Option<(PathBuf, HashMap<PathBuf, FileEntry>)> {
+    let path = persist_path.clone()?;
+    let mut state = persist_state.lock().unwrap();
+    state.changed_since_save = state
+        .changed_since_save
+        .saturating_add(changed_this_sweep as u64);
+    if state.changed_since_save == 0 {
+        return None;
     }
+    let should_save = !state.saved_once
+        || state.changed_since_save >= SAVE_CHANGED_THRESHOLD
+        || state.last_saved_at.is_none_or(|t| t.elapsed() >= debounce);
+    if !should_save {
+        return None;
+    }
+    state.changed_since_save = 0;
+    state.last_saved_at = Some(Instant::now());
+    state.saved_once = true;
+    drop(state);
+    let cache_snapshot = file_cache.lock().unwrap().clone();
+    Some((path, cache_snapshot))
 }
 
 /// One cached direct-listed source's last successful listing, keyed by
@@ -1058,6 +1182,24 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    /// Poll `predicate` every 10ms until it's true or `timeout` elapses.
+    /// Returns whether it became true -- used to observe a detached
+    /// background refresh (stale-while-revalidate) settling, since that
+    /// refresh is deliberately NOT awaited by the `snapshot()` call that
+    /// triggers it.
+    async fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            if predicate() {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         std::env::temp_dir().join(format!(
@@ -1269,7 +1411,11 @@ mod tests {
         );
     }
 
-    // ── B-T4: after TTL expiry, the next snapshot() call rescans ──
+    // ── B-T4: after TTL expiry, a stale snapshot triggers exactly one more
+    // scan -- stale-while-revalidate means that scan runs DETACHED, so the
+    // triggering `snapshot()` call itself returns immediately with the OLD
+    // (still valid) data; poll for the background sweep to settle instead of
+    // asserting on the immediate return value. ──
 
     #[tokio::test]
     async fn after_ttl_expiry_the_next_snapshot_call_rescans() {
@@ -1282,12 +1428,12 @@ mod tests {
         let _ = index.snapshot().await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         tokio::time::sleep(Duration::from_millis(60)).await;
-        let _ = index.snapshot().await;
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "a stale snapshot must trigger exactly one more scan"
+        let _ = index.snapshot().await; // triggers (but does not wait for) the sweep
+        assert!(
+            wait_until(Duration::from_secs(2), || calls.load(Ordering::SeqCst) >= 2).await,
+            "a stale snapshot must trigger exactly one more (background) scan"
         );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     // ── B-T5: concurrent snapshot() calls on a cold cache scan exactly once ──
@@ -1400,7 +1546,15 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(30)).await; // past TTL
 
-        let snap2 = index.snapshot().await;
+        // Stale-while-revalidate: poll until the background sweep settles.
+        let mut snap2 = index.snapshot().await;
+        for _ in 0..50 {
+            if parse_calls.load(Ordering::SeqCst) >= 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            snap2 = index.snapshot().await;
+        }
         assert_eq!(snap2.len(), 3);
         assert_eq!(
             parse_calls.load(Ordering::SeqCst),
@@ -1535,7 +1689,17 @@ mod tests {
         std::fs::remove_file(project.join("remove.jsonl")).unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await; // past TTL
 
-        let snap2 = index.snapshot().await;
+        // Stale-while-revalidate: the triggering call may still return the
+        // OLD (2-item) snapshot while the background sweep re-validates the
+        // corpus -- poll until it settles.
+        let mut snap2 = index.snapshot().await;
+        for _ in 0..50 {
+            if snap2.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            snap2 = index.snapshot().await;
+        }
         assert_eq!(snap2.len(), 1, "the deleted file's session must be gone");
         assert_eq!(snap2[0].session_id, synthetic_session_id(1));
 
@@ -1579,7 +1743,15 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_millis(30)).await; // past TTL
 
-        let snap2 = index.snapshot().await;
+        // Stale-while-revalidate: poll until the background sweep settles.
+        let mut snap2 = index.snapshot().await;
+        for _ in 0..50 {
+            if snap2.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            snap2 = index.snapshot().await;
+        }
         assert_eq!(snap2.len(), 2);
         assert_eq!(
             parse_calls.load(Ordering::SeqCst),
@@ -1652,6 +1824,264 @@ mod tests {
             6000,
             "post-TTL sweep of 6000 UNCHANGED files must not re-parse ANY of them -- only re-stat"
         );
+
+        std::fs::remove_dir_all(&claude_home).ok();
+    }
+
+    // ── Bounded warm sweep (rust-tauri-port perf fix): production forensics on
+    // a real 12,745-15,324 session corpus measured `session_index_warm` sweeps
+    // taking 75s-283s, during which the first post-reconnect
+    // `GET /api/session-directory` took 990ms (vs the usual ~40ms). Root
+    // cause: the ORIGINAL `snapshot()` held a single `AsyncMutex` guard for
+    // the sweep's ENTIRE duration (discover + parse of every source), so any
+    // OTHER concurrent `snapshot()` caller blocked on that same mutex for as
+    // long as the sweep ran -- even though a perfectly servable (if slightly
+    // stale) snapshot already existed. The fix is stale-while-revalidate
+    // ("snapshot-swap"): once ANY snapshot has ever been published, a stale
+    // cache is served immediately and the actual sweep runs DETACHED
+    // (`tokio::spawn`), never held behind a lock a foreground reader waits
+    // on. Only a truly cold cache (nothing published yet, e.g. the very
+    // first call at boot) still waits inline -- there is nothing else to
+    // serve. See `SessionIndex::snapshot`'s doc comment. ─────────────────
+
+    /// A `SessionSource` whose `discover()` sleeps for a configurable delay,
+    /// simulating an in-flight sweep over a large real corpus long enough to
+    /// deterministically observe (not race) a concurrent `snapshot()` call
+    /// landing WHILE that sweep is still running.
+    struct SlowSource {
+        delay: Duration,
+        items: Vec<IndexedSession>,
+        discover_calls: Arc<AtomicUsize>,
+    }
+
+    impl SlowSource {
+        fn fake_path(item: &IndexedSession) -> PathBuf {
+            PathBuf::from(format!("mem://{}", item.key()))
+        }
+    }
+
+    impl SessionSource for SlowSource {
+        fn discover(&self) -> Vec<FileStat> {
+            self.discover_calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+            self.items
+                .iter()
+                .map(|item| FileStat {
+                    path: Self::fake_path(item),
+                    mtime_ms: 0,
+                    size: 0,
+                })
+                .collect()
+        }
+
+        fn parse(&self, path: &Path) -> Option<IndexedSession> {
+            self.items
+                .iter()
+                .find(|item| Self::fake_path(item) == path)
+                .cloned()
+        }
+    }
+
+    /// RED (before the stale-while-revalidate fix): a `snapshot()` call
+    /// issued while another sweep is mid-flight blocked on the shared
+    /// refresh mutex for the sweep's full duration (500ms here, 283s in
+    /// production) -- this assertion failed with an elapsed time close to
+    /// the sweep's delay, not under the 100ms SLA.
+    #[tokio::test]
+    async fn foreground_snapshot_never_blocks_on_an_inflight_sweep() {
+        let discover_calls = Arc::new(AtomicUsize::new(0));
+        let source = SlowSource {
+            delay: Duration::from_millis(500),
+            items: vec![mk("a", "claude", 1)],
+            discover_calls: Arc::clone(&discover_calls),
+        };
+        let index = Arc::new(SessionIndex::with_ttl(
+            vec![Arc::new(source)],
+            Duration::from_millis(10),
+        ));
+
+        // Cold start: nothing published yet, so this call legitimately waits
+        // for the (only) sweep -- matches `warm()`'s documented semantics.
+        let first = index.snapshot().await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(discover_calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::sleep(Duration::from_millis(30)).await; // past the 10ms TTL
+
+        // A stale cache now exists. Trigger a sweep from a background task,
+        // give it long enough to actually be mid-`discover()` (the 500ms
+        // sleep), then make a SECOND, independent `snapshot()` call and time
+        // it -- it must be served from the stale cache, not wait on the
+        // in-flight sweep.
+        let sweep_index = Arc::clone(&index);
+        let sweep_handle = tokio::spawn(async move { sweep_index.snapshot().await });
+        tokio::time::sleep(Duration::from_millis(100)).await; // sweep is now mid-`discover()`
+
+        let start = std::time::Instant::now();
+        let foreground = index.snapshot().await;
+        let elapsed = start.elapsed();
+        assert_eq!(
+            foreground.len(),
+            1,
+            "must still serve the stale-but-valid snapshot"
+        );
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "foreground snapshot() took {elapsed:?} while a sweep was in flight -- \
+             it must never block on an in-flight sweep (production: 283s sweeps \
+             blocked foreground /api/session-directory requests for their full duration)"
+        );
+
+        sweep_handle.await.unwrap();
+        // Let any detached background refresh finish before asserting the
+        // final call count: exactly one MORE sweep (the stale-triggered
+        // one), never two -- concurrent stale-misses must still dedup to a
+        // single sweep, same guarantee B-T5 proves for the cold-cache case.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            discover_calls.load(Ordering::SeqCst),
+            2,
+            "concurrent stale-misses must dedup to exactly one background sweep"
+        );
+        // No filesystem cleanup needed: `SlowSource` uses only synthetic
+        // `mem://` paths and never touches the real filesystem.
+    }
+
+    /// A post-TTL refresh sweep over a synthetic 3,000-file claude corpus
+    /// (smaller than B-T9's 6,000 -- kept fast for routine CI runs while
+    /// still representative) re-parses ZERO unchanged files, using a probe
+    /// counter (`CountingWrapper::parse_calls`) as the correctness oracle --
+    /// mtime/size-gating so an unchanged session file costs a stat, not a
+    /// parse.
+    #[tokio::test]
+    async fn mtime_gate_second_sweep_over_synthetic_3k_corpus_reparses_nothing() {
+        let claude_home = unique_temp_dir("mtime-gate-3k");
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        let content = std::fs::read_to_string(fixtures_dir().join("real-corrupted.jsonl")).unwrap();
+        const N: usize = 3000;
+        for i in 0..N {
+            let sid = format!("{i:08x}-0000-4000-8000-000000000000");
+            let file_content = content.replace("b7936c10-4935-441c-837c-c1f33cafec2d", &sid);
+            std::fs::write(project.join(format!("{sid}.jsonl")), file_content).unwrap();
+        }
+
+        let parse_calls = Arc::new(AtomicUsize::new(0));
+        let source = CountingWrapper {
+            parse_calls: Arc::clone(&parse_calls),
+            ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
+        };
+        let index = SessionIndex::with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
+
+        let warm_up = index.snapshot().await;
+        assert_eq!(warm_up.len(), N, "sanity: every synthetic file indexed");
+        assert_eq!(parse_calls.load(Ordering::SeqCst), N);
+
+        tokio::time::sleep(Duration::from_millis(30)).await; // past TTL, nothing changed
+
+        // Under the stale-while-revalidate design, the post-TTL call itself
+        // returns the (still-correct) stale snapshot immediately and the
+        // re-validation sweep runs detached -- poll until it settles instead
+        // of asserting on the immediate return value.
+        let _ = index.snapshot().await;
+        let mut settled = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if parse_calls.load(Ordering::SeqCst) >= N {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "background re-validation sweep never completed");
+        assert_eq!(
+            parse_calls.load(Ordering::SeqCst),
+            N,
+            "post-TTL sweep of {N} UNCHANGED files must not re-parse ANY of them -- only re-stat"
+        );
+        let items = index.snapshot().await;
+        assert_eq!(items.len(), N);
+
+        std::fs::remove_dir_all(&claude_home).ok();
+    }
+
+    /// Golden-compare correctness guard: the stale-while-revalidate
+    /// optimization must never change WHAT is indexed, only WHEN a caller
+    /// sees the update. The final, settled `SessionIndex` snapshot must be
+    /// byte-for-byte identical (same items, same sort order) to a direct
+    /// one-shot `ClaudeSource::scan()` (which bypasses the index/cache
+    /// entirely) over the same corpus, both on the very first (cold) sweep
+    /// and again after a file changes and the background re-validation sweep
+    /// has settled.
+    #[tokio::test]
+    async fn index_content_matches_direct_scan_before_and_after_background_refresh() {
+        let claude_home = unique_temp_dir("golden-compare");
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        write_session_file(
+            &project,
+            "a.jsonl",
+            &synthetic_session_id(1),
+            "/p/a",
+            "2025-01-30T10:00:00.000Z",
+            "hello a",
+        );
+        write_session_file(
+            &project,
+            "b.jsonl",
+            &synthetic_session_id(2),
+            "/p/b",
+            "2025-01-30T10:00:01.000Z",
+            "hello b",
+        );
+
+        let index = SessionIndex::with_ttl(
+            vec![Arc::new(ClaudeSource::new(claude_home.clone()))],
+            Duration::from_millis(10),
+        );
+
+        // Cold sweep: must match a direct scan exactly.
+        let indexed = index.snapshot().await;
+        let mut direct = ClaudeSource::new(claude_home.clone()).scan();
+        direct.sort_by(|a, b| {
+            b.last_activity_at
+                .cmp(&a.last_activity_at)
+                .then_with(|| b.key().cmp(&a.key()))
+        });
+        assert_eq!(*indexed, direct, "cold sweep must match a direct scan");
+
+        // Add a THIRD session file, wait past TTL, and let the background
+        // re-validation sweep settle -- the eventually-consistent snapshot
+        // must again match a direct scan exactly.
+        write_session_file(
+            &project,
+            "c.jsonl",
+            &synthetic_session_id(3),
+            "/p/c",
+            "2025-01-30T10:00:02.000Z",
+            "hello c",
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await; // past TTL
+        let _ = index.snapshot().await; // triggers the background sweep
+
+        let mut settled_items = index.snapshot().await;
+        for _ in 0..50 {
+            if settled_items.len() == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            settled_items = index.snapshot().await;
+        }
+        let mut direct_after = ClaudeSource::new(claude_home.clone()).scan();
+        direct_after.sort_by(|a, b| {
+            b.last_activity_at
+                .cmp(&a.last_activity_at)
+                .then_with(|| b.key().cmp(&a.key()))
+        });
+        assert_eq!(
+            *settled_items, direct_after,
+            "settled post-refresh snapshot must match a direct scan"
+        );
+        assert_eq!(settled_items.len(), 3);
 
         std::fs::remove_dir_all(&claude_home).ok();
     }
@@ -2452,33 +2882,45 @@ mod tests {
             Some(cache_path.clone()),
         );
 
-        let first = index.take_pending_save_with_debounce(1, Duration::from_millis(30));
+        // `take_pending_save_from_parts` is the free-function form of the
+        // save-decision gate (extracted so a detached background-refresh
+        // task can call it without a `&SessionIndex` borrow) -- exercised
+        // here directly against the index's own (crate-private, same-module
+        // accessible) fields.
+        let gate = |changed: usize, debounce: Duration| {
+            take_pending_save_from_parts(
+                &index.persist_path,
+                &index.persist_state,
+                &index.file_cache,
+                changed,
+                debounce,
+            )
+        };
+
+        let first = gate(1, Duration::from_millis(30));
         assert!(first.is_some(), "the first-ever sweep must always persist");
 
-        let second = index.take_pending_save_with_debounce(1, Duration::from_millis(30));
+        let second = gate(1, Duration::from_millis(30));
         assert!(
             second.is_none(),
             "a small change within the debounce window must not re-save"
         );
 
-        let third = index.take_pending_save_with_debounce(
-            SAVE_CHANGED_THRESHOLD as usize,
-            Duration::from_millis(30),
-        );
+        let third = gate(SAVE_CHANGED_THRESHOLD as usize, Duration::from_millis(30));
         assert!(
             third.is_some(),
             "a change at/above the threshold must save immediately"
         );
 
         tokio::time::sleep(Duration::from_millis(40)).await;
-        let fourth = index.take_pending_save_with_debounce(1, Duration::from_millis(30));
+        let fourth = gate(1, Duration::from_millis(30));
         assert!(
             fourth.is_some(),
             "any change after the debounce window elapses must save"
         );
 
         tokio::time::sleep(Duration::from_millis(40)).await;
-        let fifth = index.take_pending_save_with_debounce(0, Duration::from_millis(30));
+        let fifth = gate(0, Duration::from_millis(30));
         assert!(fifth.is_none(), "zero changes must never trigger a save");
 
         std::fs::remove_dir_all(&cache_dir).ok();

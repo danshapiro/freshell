@@ -1264,7 +1264,20 @@ mod sessions_sweep_tests {
             "/tmp/sweep-test/beta",
             "2025-01-02T00:00:00.000Z",
         );
-        let after = sessions_sweep_signature(&index.snapshot().await);
+        // Stale-while-revalidate (rust-tauri-port bounded-warm-sweep fix): the
+        // triggering `snapshot()` call may return the OLD signature
+        // immediately while the actual re-scan runs detached in the
+        // background -- poll until it settles instead of asserting on the
+        // immediate return value (the periodic `spawn_sessions_sweep` this
+        // mirrors already tolerates this same one-tick lag in production).
+        let mut after = sessions_sweep_signature(&index.snapshot().await);
+        for _ in 0..50 {
+            if after != before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            after = sessions_sweep_signature(&index.snapshot().await);
+        }
         assert_ne!(
             after, before,
             "signature should change after a new, later-activity session file appears (before={before:?}, after={after:?})"
@@ -1307,7 +1320,16 @@ mod sessions_sweep_tests {
             "/tmp/sweep-test/new-but-older",
             "2020-01-01T00:00:00.000Z",
         );
-        let after = sessions_sweep_signature(&index.snapshot().await);
+        // Stale-while-revalidate: poll until the detached background sweep
+        // settles (see `new_session_file_changes_the_signature`'s comment).
+        let mut after = sessions_sweep_signature(&index.snapshot().await);
+        for _ in 0..50 {
+            if after != before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            after = sessions_sweep_signature(&index.snapshot().await);
+        }
         assert_ne!(
             after, before,
             "a new session file must be detected as a change even when its own \
