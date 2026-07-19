@@ -51,6 +51,15 @@ const MATRIX_SPECS = [
   // runs on both kinds; the Amplifier leg self-skips on legacy via an
   // explicit `test.skip` KNOWN DIVERGENCE call). See sidebar-click-resume.spec.ts.
   /sidebar-click-resume\.spec\.ts$/,
+  // SAFE-01/SAFE-03/CFG-03 checklist closures -- auth/origin/config-backup
+  // matrices. Legacy is a true parity control for SAFE-01 (identical
+  // startup-token messages/order); legacy is a documented KNOWN-DIVERGENCE
+  // control for SAFE-03 and CFG-03 (both are deliberate Rust-only
+  // hardening beyond an advisory-only/data-losing legacy behavior -- see
+  // each spec's file doc comment).
+  /safe01-auth-matrix\.spec\.ts$/,
+  /safe03-origin-matrix\.spec\.ts$/,
+  /cfg03-backup-restore\.spec\.ts$/,
 ]
 
 export default defineConfig({
