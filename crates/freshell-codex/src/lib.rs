@@ -40,8 +40,11 @@
 pub mod app_server;
 pub mod durability;
 pub mod events;
+mod json_scan;
 pub mod model;
 pub mod protocol;
+pub mod remote_proxy_envelope;
+pub mod remote_proxy_side_effects;
 
 #[cfg(feature = "real-transport")]
 pub mod transport;
