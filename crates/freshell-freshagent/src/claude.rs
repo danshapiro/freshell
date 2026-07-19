@@ -956,12 +956,14 @@ rl.on('line', (line) => {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
 
-        st.handle_create(dedup_create_msg("req-claude-dedup-seq")).await;
+        st.handle_create(dedup_create_msg("req-claude-dedup-seq"))
+            .await;
         let first = await_claude_created(&mut rx, "req-claude-dedup-seq").await;
         assert_eq!(first["type"], "freshAgent.created", "sanity: {first}");
         let first_session_id = first["sessionId"].as_str().unwrap().to_string();
 
-        st.handle_create(dedup_create_msg("req-claude-dedup-seq")).await;
+        st.handle_create(dedup_create_msg("req-claude-dedup-seq"))
+            .await;
         let second = await_claude_created(&mut rx, "req-claude-dedup-seq").await;
 
         assert_eq!(
@@ -1015,10 +1017,12 @@ rl.on('line', (line) => {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
 
-        st.handle_create(dedup_create_msg("req-claude-dedup-a")).await;
+        st.handle_create(dedup_create_msg("req-claude-dedup-a"))
+            .await;
         let a = await_claude_created(&mut rx, "req-claude-dedup-a").await;
 
-        st.handle_create(dedup_create_msg("req-claude-dedup-b")).await;
+        st.handle_create(dedup_create_msg("req-claude-dedup-b"))
+            .await;
         let b = await_claude_created(&mut rx, "req-claude-dedup-b").await;
 
         assert_ne!(
@@ -1050,7 +1054,8 @@ rl.on('line', (line) => {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
 
-        st.handle_create(dedup_create_msg("req-claude-dedup-kill")).await;
+        st.handle_create(dedup_create_msg("req-claude-dedup-kill"))
+            .await;
         let created = await_claude_created(&mut rx, "req-claude-dedup-kill").await;
         let killed_session_id = created["sessionId"].as_str().unwrap().to_string();
 
@@ -1062,7 +1067,8 @@ rl.on('line', (line) => {
         })
         .await;
 
-        st.handle_create(dedup_create_msg("req-claude-dedup-kill")).await;
+        st.handle_create(dedup_create_msg("req-claude-dedup-kill"))
+            .await;
         let recreated = await_claude_created(&mut rx, "req-claude-dedup-kill").await;
 
         assert_ne!(
