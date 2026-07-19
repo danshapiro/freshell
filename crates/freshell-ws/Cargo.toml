@@ -85,3 +85,6 @@ tokio-tungstenite = "0.24"
 # elsewhere), so this promotes it to a direct dev-dependency without pulling
 # in a second copy at a different version.
 socket2 = "0.6"
+# opencode_association tests seed a real opencode.db fixture (same bundled
+# engine freshell-sessions uses) before the locator opens it read-only.
+rusqlite = { version = "0.31", features = ["bundled"] }

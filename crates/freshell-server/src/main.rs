@@ -237,6 +237,11 @@ async fn main() -> ExitCode {
     // Cloned (cheap Arc) into the files REST surface too, whose `candidate-dirs`
     // sources the running terminals' cwds for the DirectoryPicker.
     let registry = freshell_terminal::TerminalRegistry::new();
+    // Slice 1 (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md \u00a79 Risk 1): the
+    // Agent-API's terminal-mode `POST /api/tabs` shares THIS SAME registry --
+    // never a second one -- so an Agent-API-created shell terminal is a first-class
+    // citizen of the one PTY registry the WS `terminal.create`/attach/kill paths use.
+    let fresh_agent_state = fresh_agent_state.with_terminal_registry(registry.clone());
     // TERM-11 fix: honor `settings.safety.autoKillIdleMinutes` at boot (the
     // Rust registry previously never read it at all, so a config that raised
     // or lowered it from the default had no effect). See
@@ -301,9 +306,23 @@ async fn main() -> ExitCode {
             freshell_sessions::amplifier::amplifier_home(&h),
         ))
     });
+    // OpenCode terminal-pane restore fix
+    // (`docs/plans/2026-07-18-opencode-terminal-restore-spec.md`): sibling
+    // locator, resolved against the SAME `default_opencode_data_home()` root
+    // the `OpencodeSource` (History sidebar) uses above, so an opencode
+    // terminal's cwd is compared against the SAME `opencode.db` the CLI
+    // itself writes into. Unconditionally `Some` (unlike `amplifier_locator`,
+    // which depends on `session_directory::provider_home()`): opencode's data
+    // home resolves independent of the isolated `FRESHELL_HOME` config root.
+    let opencode_locator = Some(Arc::new(
+        freshell_sessions::opencode_locator::OpencodeLocator::new(
+            freshell_sessions::parse::default_opencode_data_home(),
+        ),
+    ));
     let ws_state = WsState {
         identity: terminal_identity.clone(),
         amplifier_locator: amplifier_locator.clone(),
+        opencode_locator: opencode_locator.clone(),
         auth_token: Arc::clone(&auth_token),
         // Shared (not moved) so `GET /api/health` reports the SAME `instanceId`.
         server_instance_id: Arc::clone(&server_instance_id),
@@ -446,6 +465,16 @@ async fn main() -> ExitCode {
     // History sidebar itself is unavailable.
     if amplifier_locator.is_some() {
         freshell_ws::amplifier_association::spawn_amplifier_locator_sweep(
+            ws_state.clone(),
+            AMPLIFIER_LOCATOR_SWEEP_INTERVAL,
+        );
+    }
+    // OpenCode terminal-pane restore fix: the opencode locator's polling
+    // cycle (its Enter/spawn<->session-row correlation is entirely
+    // poll-driven -- see `freshell_sessions::opencode_locator`'s module doc).
+    // Reuses the SAME cadence as the amplifier sweep above.
+    if opencode_locator.is_some() {
+        freshell_ws::opencode_association::spawn_opencode_locator_sweep(
             ws_state.clone(),
             AMPLIFIER_LOCATOR_SWEEP_INTERVAL,
         );

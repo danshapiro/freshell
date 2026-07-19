@@ -19,6 +19,7 @@ pub mod amplifier_locator;
 pub mod directory_index;
 pub mod indexer;
 pub mod meta;
+pub mod opencode_locator;
 pub mod parse;
 pub mod search;
 pub mod text;

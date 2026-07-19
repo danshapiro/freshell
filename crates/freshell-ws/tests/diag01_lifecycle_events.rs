@@ -164,6 +164,7 @@ async fn spawn_server(ping_interval_ms: u64) -> String {
         ws_max_payload_bytes: 16 * 1024 * 1024,
         term09: freshell_ws::backpressure::Term09Config::default(),
         amplifier_locator: None,
+        opencode_locator: None,
     };
 
     let router = freshell_ws::router(state);

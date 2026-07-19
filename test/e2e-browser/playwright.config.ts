@@ -98,6 +98,7 @@ export default defineConfig({
         ...MATRIX_SPECS,
         /harness-01-rust-server\.spec\.ts$/,
         /amplifier-restore-rust\.spec\.ts$/,
+        /opencode-terminal-restore-rust\.spec\.ts$/,
       ],
     },
     ...(process.env.CI ? [

@@ -78,6 +78,7 @@ async fn spawn_server(term09: Term09Config) -> String {
         ws_max_payload_bytes: 64 * 1024 * 1024,
         term09,
         amplifier_locator: None,
+        opencode_locator: None,
     };
 
     let router = freshell_ws::router(state);

@@ -104,6 +104,29 @@ pub fn run_opencode_listing_query(
     conn: &Connection,
     marker_pattern: &str,
 ) -> rusqlite::Result<OpencodeListingResult> {
+    run_opencode_query_inner(conn, marker_pattern, None, None)
+}
+
+/// `opencode_locator`'s bounded row-diff read
+/// (`docs/plans/2026-07-18-opencode-terminal-restore-spec.md` §5, Slice A): the SAME
+/// root-session listing as [`run_opencode_listing_query`], additionally bounded to
+/// `s.time_created >= floor_ms` with a `LIMIT` — avoids scanning the full (potentially
+/// multi-GB, WAL-mode) `session` table on every locator poll tick.
+pub fn run_opencode_candidate_query(
+    conn: &Connection,
+    marker_pattern: &str,
+    floor_ms: i64,
+    limit: i64,
+) -> rusqlite::Result<OpencodeListingResult> {
+    run_opencode_query_inner(conn, marker_pattern, Some(floor_ms), Some(limit))
+}
+
+fn run_opencode_query_inner(
+    conn: &Connection,
+    marker_pattern: &str,
+    floor_ms: Option<i64>,
+    limit: Option<i64>,
+) -> rusqlite::Result<OpencodeListingResult> {
     conn.busy_timeout(std::time::Duration::from_millis(
         OPENCODE_DB_BUSY_TIMEOUT_MS,
     ))?;
@@ -155,6 +178,18 @@ pub fn run_opencode_listing_query(
         format!("({})", marker_clauses.join(" OR "))
     };
 
+    // `floor_ms`/`limit` are internally-produced i64 values (never user/network
+    // text), so formatting them directly into the SQL text is safe and keeps the
+    // marker parameter list (the only untrusted-shaped input) untouched.
+    let floor_clause = match floor_ms {
+        Some(f) => format!("AND s.time_created >= {f}"),
+        None => String::new(),
+    };
+    let limit_clause = match limit {
+        Some(l) => format!("LIMIT {l}"),
+        None => String::new(),
+    };
+
     let sql = format!(
         "SELECT \
             s.id AS sessionId, \
@@ -168,7 +203,9 @@ pub fn run_opencode_listing_query(
          LEFT JOIN project p ON p.id = s.project_id \
          WHERE s.time_archived IS NULL \
             {root_filter} \
-         ORDER BY s.time_updated DESC"
+            {floor_clause} \
+         ORDER BY s.time_updated DESC \
+         {limit_clause}"
     );
 
     let mut stmt = conn.prepare(&sql)?;
@@ -300,6 +337,35 @@ impl OpencodeProvider {
         }
 
         Ok(OpencodeListing { sessions, degrade })
+    }
+
+    /// `opencode_locator`'s bounded row-diff read (spec §4.5/§5, Slice A): the
+    /// raw root-session rows (id/cwd/created_at/marker — everything the locator
+    /// needs to confirm/reject a candidate synchronously) filtered to
+    /// `time_created >= floor_ms`, bounded by `limit`. Tolerates a missing DB
+    /// (returns empty, no error — the locator has no separate degrade-reporting
+    /// need the way `list_sessions` does for the sidebar).
+    pub fn list_sessions_since(
+        &self,
+        floor_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<OpencodeSessionRow>, OpencodeReadError> {
+        let db_path = self.database_path();
+        if !db_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let conn = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| OpencodeReadError(e.to_string()))?;
+
+        let result =
+            run_opencode_candidate_query(&conn, THREE_VIEWS_MARKER_SQL_PATTERN, floor_ms, limit)
+                .map_err(|e| OpencodeReadError(e.to_string()))?;
+
+        Ok(result.rows)
     }
 }
 

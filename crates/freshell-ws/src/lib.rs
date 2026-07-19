@@ -23,6 +23,7 @@
 pub mod amplifier_association;
 pub mod backpressure;
 pub mod identity;
+pub mod opencode_association;
 pub mod origin;
 pub mod screenshot;
 pub mod tabs;
@@ -179,6 +180,17 @@ pub struct WsState {
     /// `SessionDirectoryState::session_index`'s `Option` convention) -- every
     /// [`crate::amplifier_association`] entry point no-ops in that case.
     pub amplifier_locator: Option<Arc<freshell_sessions::amplifier_locator::AmplifierLocator>>,
+    /// The opencode terminal-pane session locator (restore-across-restart fix,
+    /// `docs/plans/2026-07-18-opencode-terminal-restore-spec.md`): correlates a
+    /// fresh opencode PTY's first Enter/submit (or a row written at spawn) with
+    /// the new root `session` row opencode writes into its SQLite
+    /// `opencode.db`, so the terminal can be bound to a session identity and
+    /// `terminal.rs`'s generic resume-id derivation can drive
+    /// `opencode --session <id>` on restart. `None` when the data home
+    /// couldn't be resolved — every [`crate::opencode_association`] entry
+    /// point no-ops in that case. Sibling to `amplifier_locator` (spec §8: a
+    /// provider-parameterized locator was explicitly rejected).
+    pub opencode_locator: Option<Arc<freshell_sessions::opencode_locator::OpencodeLocator>>,
 }
 
 /// The `/ws` sub-router, pre-bound to its state (mergeable into the server app).
@@ -581,6 +593,7 @@ mod tests {
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
             amplifier_locator: None,
+            opencode_locator: None,
         }
     }
 

@@ -1,24 +1,25 @@
-//! Amplifier session association (Slice B + the input-submit seam) — the
-//! restore-across-restart fix,
-//! `docs/plans/2026-07-18-amplifier-restore-spec.md`.
+//! OpenCode terminal-pane session association (Slice B + the input-submit
+//! seam) — sibling of [`crate::amplifier_association`], bringing opencode
+//! TERMINAL panes (the raw `opencode` CLI in a PTY) to durable-restore parity
+//! with codex/amplifier (`docs/plans/2026-07-18-opencode-terminal-restore-spec.md`).
 //!
 //! [`crate::identity`] + `terminal.rs`'s existing `terminal.meta.updated`
 //! broadcast already close the client → persist → restart → resume chain for
-//! every OTHER provider (the sessionRef arrives at `terminal.create` time, via
-//! `resumeSessionId`). Amplifier is different: its session dir is created
-//! LAZILY at the first prompt submit, so there is no identity to seed at
-//! create time. [`freshell_sessions::amplifier_locator::AmplifierLocator`]
-//! closes that gap by correlating the PTY's first Enter with the new session
-//! dir amplifier writes; this module is the thin controller around it —
-//! arm/disarm the locator at the right terminal lifecycle points, feed it
-//! submit-shaped input, and (once it resolves) bind + broadcast the identity
-//! exactly like every other provider's create-time path does.
+//! every provider whose sessionRef arrives at `terminal.create` time. opencode
+//! terminal panes are different: nothing gives them a `resumeSessionId` at
+//! create time (legacy has NO opencode terminal locator at all — spec §2).
+//! [`freshell_sessions::opencode_locator::OpencodeLocator`] closes that gap by
+//! correlating a fresh opencode PTY with the new `session` row opencode
+//! writes into its SQLite `opencode.db`; this module is the thin controller
+//! around it — arm/disarm the locator at the right terminal lifecycle points,
+//! feed it submit-shaped input, and (once it resolves) bind + broadcast the
+//! identity exactly like every other provider's create-time path does.
 //!
-//! Mirrors `server/coding-cli/amplifier-session-controller.ts`'s reject
-//! checks (terminal missing/not running, wrong mode, already bound) as
-//! defense-in-depth — the locator's own single-bind-per-terminal design
-//! already makes these redundant in practice, but a terminal could
-//! legitimately be killed between `Located` and this draining tick.
+//! Mirrors `amplifier_association.rs`'s reject checks (terminal missing/not
+//! running, wrong mode, already bound) as defense-in-depth — the locator's
+//! own single-bind-per-terminal design already makes these redundant in
+//! practice, but a terminal could legitimately be killed between `Located`
+//! and this draining tick.
 
 use freshell_protocol::{
     ServerMessage, SessionLocator, TerminalMetaRecord, TerminalMetaUpdated, TerminalRunStatus,
@@ -31,14 +32,17 @@ use crate::WsState;
 /// `isSubmitInput` (`shared/turn-complete-signal.ts:125-127`): the input is
 /// ONLY a run of CR/LF bytes -- an Enter keypress, possibly repeated. Anything
 /// else (real text, control sequences, partial lines) is not a submit.
+/// Identical rule to `amplifier_association::is_submit_input` — duplicated
+/// rather than shared (spec §5, Slice B: "a one-liner, duplication
+/// acceptable").
 pub(crate) fn is_submit_input(data: &str) -> bool {
     !data.is_empty() && data.chars().all(|c| c == '\r' || c == '\n')
 }
 
 /// Arm the locator for a freshly-created terminal, iff it's a fresh
-/// (non-resuming) `amplifier` pane with a resolved cwd. No-ops when the
-/// locator is unavailable (`WsState::amplifier_locator` is `None`) or the
-/// mode isn't `amplifier` -- cheap enough to call unconditionally from
+/// (non-resuming) `opencode` pane with a resolved cwd. No-ops when the
+/// locator is unavailable (`WsState::opencode_locator` is `None`) or the mode
+/// isn't `opencode` — cheap enough to call unconditionally from
 /// `handle_create`.
 pub(crate) fn maybe_arm(
     state: &WsState,
@@ -47,23 +51,23 @@ pub(crate) fn maybe_arm(
     cwd: Option<&str>,
     resume_session_id: Option<&str>,
 ) {
-    if mode != "amplifier" {
+    if mode != "opencode" {
         return;
     }
-    let Some(locator) = &state.amplifier_locator else {
+    let Some(locator) = &state.opencode_locator else {
         return;
     };
     locator.arm(terminal_id, mode, true, resume_session_id, cwd, now_ms());
 }
 
 /// Feed a `terminal.input` write to the locator iff it's submit-shaped
-/// (Enter). No-ops for every other terminal (armed only for amplifier panes)
+/// (Enter). No-ops for every other terminal (armed only for opencode panes)
 /// and when the locator is unavailable.
 pub(crate) fn note_possible_submit(state: &WsState, terminal_id: &str, data: &str) {
     if !is_submit_input(data) {
         return;
     }
-    let Some(locator) = &state.amplifier_locator else {
+    let Some(locator) = &state.opencode_locator else {
         return;
     };
     locator.note_submit(terminal_id, now_ms());
@@ -71,20 +75,16 @@ pub(crate) fn note_possible_submit(state: &WsState, terminal_id: &str, data: &st
 
 /// Drive one locator polling cycle and bind + broadcast every association it
 /// resolved this tick. Intended to be called periodically (the sweep-timer
-/// pattern already used by `spawn_sessions_sweep`,
-/// `crates/freshell-server/src/main.rs`).
+/// pattern already used by `spawn_amplifier_locator_sweep`).
 ///
-/// `AmplifierLocator::tick` is synchronous `std::fs` I/O (a `projects/`
-/// directory walk plus bounded `events.jsonl` probe reads) whenever at
-/// least one terminal is armed -- see its doc comment for the idle
-/// short-circuit that makes it a zero-I/O no-op otherwise. Either way, this
-/// runs the tick inside `tokio::task::spawn_blocking` rather than directly
-/// on this async task's worker thread, mirroring `SessionIndex::snapshot`'s
-/// identical wrapping for the analogous `spawn_sessions_sweep` poll
-/// (`crates/freshell-server/src/main.rs`) -- a blocking filesystem call has
-/// no business running straight on a tokio executor thread.
+/// `OpencodeLocator::tick` is a synchronous, bounded SQLite read whenever at
+/// least one terminal is armed (see its module doc for the idle
+/// short-circuit that makes it a zero-I/O no-op otherwise). Either way, this
+/// runs the tick inside `tokio::task::spawn_blocking` rather than directly on
+/// this async task's worker thread — mirroring
+/// `amplifier_association::drain_and_associate`'s identical wrapping.
 pub(crate) async fn drain_and_associate(state: &WsState) {
-    let Some(locator) = &state.amplifier_locator else {
+    let Some(locator) = &state.opencode_locator else {
         return;
     };
     let locator = std::sync::Arc::clone(locator);
@@ -92,13 +92,12 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
     let located = match tokio::task::spawn_blocking(move || locator.tick(now)).await {
         Ok(located) => located,
         Err(join_error) => {
-            // The blocking closure only calls `AmplifierLocator::tick`,
-            // which does not itself panic in normal operation; a panic
-            // here would be a genuine bug, not a routine condition to
-            // silently swallow.
+            // The blocking closure only calls `OpencodeLocator::tick`, which
+            // does not itself panic in normal operation; a panic here would
+            // be a genuine bug, not a routine condition to silently swallow.
             tracing::warn!(
                 error = %join_error,
-                "amplifier_locator_tick_panicked: sweep tick task panicked, skipping this cycle"
+                "opencode_locator_tick_panicked: sweep tick task panicked, skipping this cycle"
             );
             return;
         }
@@ -113,29 +112,29 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
             tracing::warn!(
                 terminal_id = %located.terminal_id,
                 session_id = %located.session_id,
-                "amplifier_association_rejected: terminal_missing"
+                "opencode_association_rejected: terminal_missing"
             );
             continue;
         };
-        if entry.mode != "amplifier" || entry.status != TerminalRunStatus::Running {
+        if entry.mode != "opencode" || entry.status != TerminalRunStatus::Running {
             tracing::warn!(
                 terminal_id = %located.terminal_id,
                 mode = %entry.mode,
-                "amplifier_association_rejected: terminal_not_amplifier_or_not_running"
+                "opencode_association_rejected: terminal_not_opencode_or_not_running"
             );
             continue;
         }
         if entry.resume_session_id.is_some() {
             tracing::warn!(
                 terminal_id = %located.terminal_id,
-                "amplifier_association_rejected: terminal_already_bound"
+                "opencode_association_rejected: terminal_already_bound"
             );
             continue;
         }
 
         state.identity.upsert(
             &located.terminal_id,
-            Some("amplifier"),
+            Some("opencode"),
             Some(&located.session_id),
             entry.cwd.as_deref(),
             now_ms(),
@@ -144,7 +143,7 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
             &located.terminal_id,
             None,
             None,
-            Some("amplifier".to_string()),
+            Some("opencode".to_string()),
             Some(located.session_id.clone()),
         );
         broadcast_terminal_session_associated(
@@ -156,12 +155,11 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
     }
 }
 
-/// `broadcastTerminalSessionAssociation` (`session-association-broadcast.ts`)
-/// as applied by `amplifier-session-controller.ts`'s `associated` handler:
-/// fan `terminal.session.associated` (the sessionRef the client's
+/// Fan `terminal.session.associated` (the sessionRef the client's
 /// `reconcileTerminalSessionAssociation` persists) AND a `terminal.meta.updated`
 /// upsert (the same shape `terminal.rs`'s `broadcast_terminal_meta_created`
 /// emits at create time for every other provider) to every connection.
+/// Mirrors `amplifier_association::broadcast_terminal_session_associated`.
 fn broadcast_terminal_session_associated(
     state: &WsState,
     terminal_id: &str,
@@ -171,7 +169,7 @@ fn broadcast_terminal_session_associated(
     let associated = ServerMessage::TerminalSessionAssociated(TerminalSessionAssociated {
         terminal_id: terminal_id.to_string(),
         session_ref: SessionLocator {
-            provider: "amplifier".to_string(),
+            provider: "opencode".to_string(),
             session_id: session_id.to_string(),
         },
     });
@@ -189,7 +187,7 @@ fn broadcast_terminal_session_associated(
             cwd,
             display_subdir: None,
             is_dirty: None,
-            provider: Some("amplifier".to_string()),
+            provider: Some("opencode".to_string()),
             repo_root: None,
             session_id: Some(session_id.to_string()),
             token_usage: None,
@@ -200,11 +198,10 @@ fn broadcast_terminal_session_associated(
     }
 }
 
-/// The sweep-timer wiring (mirrors `freshell_ws::spawn_idle_monitor` /
-/// `freshell-server`'s `spawn_sessions_sweep`): periodically drive the
-/// locator's polling cycle and process any resolved associations, off the
-/// per-connection select loops.
-pub fn spawn_amplifier_locator_sweep(state: WsState, interval: std::time::Duration) {
+/// The sweep-timer wiring (mirrors `spawn_amplifier_locator_sweep`):
+/// periodically drive the locator's polling cycle and process any resolved
+/// associations, off the per-connection select loops.
+pub fn spawn_opencode_locator_sweep(state: WsState, interval: std::time::Duration) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         loop {
@@ -217,11 +214,11 @@ pub fn spawn_amplifier_locator_sweep(state: WsState, interval: std::time::Durati
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freshell_sessions::amplifier_locator::AmplifierLocator;
+    use freshell_sessions::opencode_locator::OpencodeLocator;
     use std::sync::Arc as StdArc;
 
     fn state_with_locator(
-        amplifier_home: std::path::PathBuf,
+        data_home: std::path::PathBuf,
     ) -> (WsState, tokio::sync::broadcast::Receiver<String>) {
         let auth_token = StdArc::new("s3cr3t-token-abcdef".to_string());
         let broadcast_tx = StdArc::new(tokio::sync::broadcast::channel::<String>(16).0);
@@ -272,8 +269,8 @@ mod tests {
             allowed_origins: StdArc::new(crate::origin::default_allowed_origins()),
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
-            amplifier_locator: Some(StdArc::new(AmplifierLocator::new(amplifier_home))),
-            opencode_locator: None,
+            amplifier_locator: None,
+            opencode_locator: Some(StdArc::new(OpencodeLocator::new(data_home))),
         };
         (state, rx)
     }
@@ -283,11 +280,49 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!(
-            "freshell-amplifier-association-test-{label}-{}-{n}",
+            "freshell-opencode-association-test-{label}-{}-{n}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn open_seed_db(data_home: &std::path::Path) -> rusqlite::Connection {
+        std::fs::create_dir_all(data_home).unwrap();
+        let conn = rusqlite::Connection::open(data_home.join("opencode.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+             CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                parent_id TEXT,
+                slug TEXT NOT NULL,
+                directory TEXT NOT NULL,
+                title TEXT NOT NULL,
+                version TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                time_archived INTEGER
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_session(conn: &rusqlite::Connection, id: &str, cwd: &str, time_created: i64) {
+        conn.execute(
+            "INSERT INTO project (id, worktree) VALUES (?1, ?2)",
+            rusqlite::params![format!("proj-{id}"), cwd],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session
+                (id, project_id, parent_id, slug, directory, title, version,
+                 time_created, time_updated, time_archived)
+             VALUES (?1, ?2, NULL, ?1, ?3, ?1, 'test', ?4, ?4, NULL)",
+            rusqlite::params![id, format!("proj-{id}"), cwd, time_created],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -303,35 +338,29 @@ mod tests {
     }
 
     #[test]
-    fn maybe_arm_ignores_non_amplifier_modes() {
+    fn maybe_arm_ignores_non_opencode_modes() {
         let home = unique_temp_dir("maybe-arm-wrong-mode");
         let (state, _rx) = state_with_locator(home.clone());
         maybe_arm(&state, "t1", "codex", Some("/proj"), None);
-        assert_eq!(state.amplifier_locator.as_ref().unwrap().armed_count(), 0);
+        assert_eq!(state.opencode_locator.as_ref().unwrap().armed_count(), 0);
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
-    fn maybe_arm_arms_a_fresh_amplifier_terminal() {
+    fn maybe_arm_arms_a_fresh_opencode_terminal() {
         let home = unique_temp_dir("maybe-arm-fresh");
         let (state, _rx) = state_with_locator(home.clone());
-        maybe_arm(&state, "t1", "amplifier", Some("/proj"), None);
-        assert_eq!(state.amplifier_locator.as_ref().unwrap().armed_count(), 1);
+        maybe_arm(&state, "t1", "opencode", Some("/proj"), None);
+        assert_eq!(state.opencode_locator.as_ref().unwrap().armed_count(), 1);
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
-    fn maybe_arm_skips_a_resuming_amplifier_terminal() {
+    fn maybe_arm_skips_a_resuming_opencode_terminal() {
         let home = unique_temp_dir("maybe-arm-resume");
         let (state, _rx) = state_with_locator(home.clone());
-        maybe_arm(
-            &state,
-            "t1",
-            "amplifier",
-            Some("/proj"),
-            Some("existing-id"),
-        );
-        assert_eq!(state.amplifier_locator.as_ref().unwrap().armed_count(), 0);
+        maybe_arm(&state, "t1", "opencode", Some("/proj"), Some("existing-id"));
+        assert_eq!(state.opencode_locator.as_ref().unwrap().armed_count(), 0);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -339,15 +368,11 @@ mod tests {
     fn note_possible_submit_ignores_non_enter_input() {
         let home = unique_temp_dir("note-submit-ignore");
         let (state, _rx) = state_with_locator(home.clone());
-        maybe_arm(&state, "t1", "amplifier", Some("/proj"), None);
+        maybe_arm(&state, "t1", "opencode", Some("/proj"), None);
         note_possible_submit(&state, "t1", "hello");
         // No window opened means a fresh Enter can still open one -- verify
         // indirectly via a real Enter succeeding right after.
         note_possible_submit(&state, "t1", "\r");
-        // If the "hello" call had wrongly opened/consumed a window slot, this
-        // second (real) submit would still succeed since note_submit allows a
-        // fresh window whenever none is open; the meaningful assertion is that
-        // "hello" alone never panics and never associates anything.
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -355,9 +380,10 @@ mod tests {
     async fn drain_and_associate_binds_identity_and_broadcasts_on_location() {
         let home = unique_temp_dir("drain-associate");
         let (state, mut rx) = state_with_locator(home.clone());
+        let db = open_seed_db(&home);
 
-        // A running amplifier terminal the locator can validate against at
-        // association time (mode/status/resume_session_id all read from
+        // A running opencode terminal the association controller can validate
+        // against (mode/status/resume_session_id all read from
         // `state.registry`, mirroring the controller's own reject checks).
         let spec = freshell_platform::build_spawn_spec(
             freshell_platform::ShellType::System,
@@ -383,27 +409,17 @@ mod tests {
             .expect("spawn a real shell for the test PTY");
         state
             .registry
-            .set_meta("t1", None, None, Some("amplifier".to_string()), None);
+            .set_meta("t1", None, None, Some("opencode".to_string()), None);
 
-        maybe_arm(&state, "t1", "amplifier", Some("/proj"), None);
+        maybe_arm(&state, "t1", "opencode", Some("/tmp"), None);
         note_possible_submit(&state, "t1", "\r");
 
-        let dir = home
-            .join("projects")
-            .join("proj")
-            .join("sessions")
-            .join("sess-drain");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("events.jsonl"),
-            "{\"event\":\"session:start\"}\n{\"event\":\"session:config\",\"working_dir\":\"/proj\"}\n",
-        )
-        .unwrap();
+        insert_session(&db, "ses_drain", "/tmp", crate::terminal::now_ms());
 
-        // Drain repeatedly until the locator's correlation window (2000ms)
-        // has definitely closed relative to wall-clock `now_ms()`.
+        // Drain repeatedly until the locator's correlation window has
+        // definitely closed relative to wall-clock `now_ms()`.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        for _ in 0..30 {
+        for _ in 0..40 {
             drain_and_associate(&state).await;
             if state
                 .identity
@@ -417,8 +433,8 @@ mod tests {
         }
 
         let identity = state.identity.get("t1").expect("identity seeded");
-        assert_eq!(identity.provider.as_deref(), Some("amplifier"));
-        assert_eq!(identity.session_id.as_deref(), Some("sess-drain"));
+        assert_eq!(identity.provider.as_deref(), Some("opencode"));
+        assert_eq!(identity.session_id.as_deref(), Some("ses_drain"));
 
         let dir_entry = state
             .registry
@@ -426,15 +442,15 @@ mod tests {
             .into_iter()
             .find(|e| e.terminal_id == "t1")
             .unwrap();
-        assert_eq!(dir_entry.resume_session_id.as_deref(), Some("sess-drain"));
+        assert_eq!(dir_entry.resume_session_id.as_deref(), Some("ses_drain"));
 
         let mut saw_associated = false;
         let mut saw_meta = false;
         while let Ok(frame) = rx.try_recv() {
-            if frame.contains("terminal.session.associated") && frame.contains("sess-drain") {
+            if frame.contains("terminal.session.associated") && frame.contains("ses_drain") {
                 saw_associated = true;
             }
-            if frame.contains("terminal.meta.updated") && frame.contains("sess-drain") {
+            if frame.contains("terminal.meta.updated") && frame.contains("ses_drain") {
                 saw_meta = true;
             }
         }

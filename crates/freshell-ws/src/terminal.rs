@@ -470,6 +470,14 @@ async fn handle_client_text(
                 &input.terminal_id,
                 &input.data,
             );
+            // Restore-across-restart fix (opencode): sibling seam for an
+            // armed opencode terminal's first Enter/submit. No-ops for every
+            // other terminal/mode and for non-submit-shaped input.
+            crate::opencode_association::note_possible_submit(
+                state,
+                &input.terminal_id,
+                &input.data,
+            );
             true
         }
         ClientMessage::TerminalResize(resize) => {
@@ -946,11 +954,18 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         // entry is never left dangling (mirrors `handleExit`,
         // `amplifier-session-locator.ts:220-223`).
         let amplifier_locator = state.amplifier_locator.clone();
+        // Restore-across-restart fix (opencode): sibling disarm, so an exited
+        // (never-submitted, or already-associated) opencode terminal's armed
+        // entry is never left dangling.
+        let opencode_locator = state.opencode_locator.clone();
         Some(Box::new(move |exit_code: i64| {
             cleanup_mcp_config(&RealMcpRuntime, &tid, &cleanup_mode, cleanup_cwd.as_deref());
             registry.finish_pty_exit(&tid, exit_code);
             identity.retire(&tid);
             if let Some(locator) = &amplifier_locator {
+                locator.disarm(&tid);
+            }
+            if let Some(locator) = &opencode_locator {
                 locator.disarm(&tid);
             }
         }))
@@ -1002,6 +1017,17 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
     // Restore-across-restart fix: arm the amplifier locator for a FRESH
     // (non-resuming) amplifier pane. No-ops for every other mode/resume case.
     crate::amplifier_association::maybe_arm(
+        state,
+        &terminal_id,
+        &mode,
+        resolved_cwd.as_deref(),
+        resume_session_id.as_deref(),
+    );
+
+    // Restore-across-restart fix (opencode): arm the opencode locator for a
+    // FRESH (non-resuming) opencode pane. No-ops for every other mode/resume
+    // case.
+    crate::opencode_association::maybe_arm(
         state,
         &terminal_id,
         &mode,
@@ -1832,6 +1858,7 @@ mod terminals_changed_tests {
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
             amplifier_locator: None,
+            opencode_locator: None,
         };
         (state, rx)
     }
@@ -2031,6 +2058,7 @@ mod terminal_meta_created_tests {
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
             amplifier_locator: None,
+            opencode_locator: None,
         };
         (state, rx)
     }
