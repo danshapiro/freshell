@@ -60,6 +60,12 @@ const MATRIX_SPECS = [
   /safe01-auth-matrix\.spec\.ts$/,
   /safe03-origin-matrix\.spec\.ts$/,
   /cfg03-backup-restore\.spec\.ts$/,
+  // AGENT-14 -- checkpoint create/list/metadata/restore driven through the
+  // real "Rewind code to here" UI gesture (hover, click, confirm dialog,
+  // POST restore, verify file bytes). Legacy is a true parity control: the
+  // checkpoint routes and the fresh-agent checkpoint UI are shared code
+  // paths, not a Rust-only feature. See agent-checkpoint-rewind.spec.ts.
+  /agent-checkpoint-rewind\.spec\.ts$/,
 ]
 
 export default defineConfig({
