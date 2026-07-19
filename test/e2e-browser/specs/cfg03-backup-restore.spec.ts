@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
+import WebSocket from 'ws'
 import { test, expect } from '../helpers/fixtures.js'
 import {
   findFreePort,
@@ -17,6 +18,7 @@ import {
   rustClientDistPath,
 } from '../helpers/rust-server.js'
 import type { E2eServerKind } from '../helpers/external-target.js'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 /**
  * CFG-03 -- matrix spec.
@@ -64,35 +66,34 @@ import type { E2eServerKind } from '../helpers/external-target.js'
  * asserts the DIFFERENT, per-kind-correct outcome: legacy is the CONTROL
  * that empirically proves the gap, rust proves the fix.
  *
- * NOT covered here (see file-by-file notes at each `test.skip`/comment):
- *   - The browser-visible "truthful fallback reason and backup
+ * GAP1/GAP2 FIXED (CFG-03 checklist follow-up, this commit): the two
+ * PRODUCT gaps this file's header used to document as "NOT covered here"
+ * are now closed and proven end-to-end below:
+ *   - GAP1 -- the browser-visible "truthful fallback reason and backup
  *     availability" WARNING BANNER (`ConfigFallback` in
  *     `crates/freshell-protocol/src/server_messages.rs`, rendered by
- *     `src/App.tsx`'s `configFallback` banner): confirmed by exhaustive
- *     grep across `crates/` that `ConfigFallback` is defined but NEVER
- *     constructed/sent anywhere in the Rust server. This is a genuine
- *     PRODUCT gap on the Rust port (the file-level backup/restore
- *     machinery works; the client-visible notice does not exist), not
- *     merely an untested clause -- filed as a follow-up, not fabricated
- *     here.
- *   - An explicit "Restore" UI action: `src/App.tsx`'s fallback banner has
- *     only a dismiss (X) button, no Restore button, on either kind today.
- *     The Rust port instead performs fully AUTOMATIC restoration, which
- *     the checklist's own parenthetical explicitly permits ("Automatic
- *     backup restoration is a deliberate safety improvement only if
- *     separately documented and tested") -- this spec IS that test. There
- *     is no manual Restore flow to click through on either kind.
- *   - "force a write failure and assert an error while primary/backup
- *     remain intact": `SettingsStore::persist()` has no `Result` return
- *     and no caller-visible error path at all (`persisted_ok` is computed
- *     and only gates the backup refresh; a failed primary write is never
- *     surfaced to the PATCH /api/settings caller). Confirmed by reading
- *     `settings_store.rs`'s `persist()` end to end. This is a genuine
- *     PRODUCT gap (no error surfacing exists to test), not an untested
- *     clause -- filed as a follow-up. The UNIT-level version of this exact
- *     scenario (`backup_is_not_refreshed_when_the_primary_persist_fails`)
- *     already proves the primary/backup-remain-intact half at the
- *     Rust-crate level with a real read-only-directory write failure.
+ *     `src/App.tsx`'s `configFallback` banner) was defined but NEVER
+ *     constructed/sent anywhere in the Rust server. Now emitted as part of
+ *     the ordered `/ws` handshake (`freshell_ws::build_handshake`, wired
+ *     from `SettingsStore::config_fallback()`) on EVERY connection --
+ *     proven in the "corrupt primary + valid backup" case below via a raw
+ *     WS client, including a SECOND, later connection to prove late-connect
+ *     delivery.
+ *   - GAP2 -- `SettingsStore::persist()` had no `Result` return and no
+ *     caller-visible error path at all. Now returns `Result<(), io::Error>`;
+ *     `patch()` surfaces a failure to `PATCH /api/settings` as a `500`
+ *     error envelope (mirroring the established repo-wide convention every
+ *     OTHER fs-backed router in the original applies to this failure
+ *     class -- see the new GAP2 test below and its task-report citations)
+ *     and leaves the live tree at its last successfully-persisted value.
+ *
+ * An explicit "Restore" UI action remains genuinely out of scope: `src/App
+ * .tsx`'s fallback banner has only a dismiss (X) button, no Restore button,
+ * on either kind today. The Rust port instead performs fully AUTOMATIC
+ * restoration, which the checklist's own parenthetical explicitly permits
+ * ("Automatic backup restoration is a deliberate safety improvement only if
+ * separately documented and tested") -- this spec IS that test. There is no
+ * manual Restore flow to click through on either kind.
  */
 
 const __filename = fileURLToPath(import.meta.url)
@@ -204,6 +205,44 @@ async function getSettings(baseUrl: string, token: string): Promise<any> {
   return res.json()
 }
 
+/**
+ * GAP1 (CFG-03 checklist follow-up): connect a raw WS client, send `hello`,
+ * and collect every handshake frame up to and including `terminal.inventory`
+ * (always the last message in the ordered handshake, both kinds -- see
+ * `ws-handler.ts:1723-1745` / `freshell_ws::build_handshake`). Returns the
+ * parsed frames so a caller can look for `config.fallback` (present only
+ * when the boot fell back) without depending on its exact position beyond
+ * "somewhere in the handshake."
+ */
+function collectHandshakeMessages(wsUrl: string, token: string): Promise<{ ws: WebSocket; messages: any[] }> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(wsUrl)
+    const messages: any[] = []
+    const timeout = setTimeout(() => {
+      ws.removeAllListeners()
+      ws.terminate()
+      reject(new Error(`Timed out waiting for terminal.inventory; got: ${JSON.stringify(messages)}`))
+    }, 10_000)
+
+    ws.on('open', () => {
+      ws.send(JSON.stringify({ type: 'hello', protocolVersion: WS_PROTOCOL_VERSION, token }))
+    })
+    ws.on('message', (raw) => {
+      const message = JSON.parse(String(raw))
+      messages.push(message)
+      if (message?.type === 'terminal.inventory') {
+        clearTimeout(timeout)
+        ws.removeAllListeners()
+        resolve({ ws, messages })
+      }
+    })
+    ws.on('error', (err) => {
+      clearTimeout(timeout)
+      reject(err)
+    })
+  })
+}
+
 const SENTINEL_AUTO_KILL_MINUTES = 77
 const LEGACY_DEFAULT_AUTO_KILL_MINUTES = 15
 
@@ -257,6 +296,27 @@ test.describe('CFG-03 backup/fallback matrix', () => {
         expect(settings.safety.autoKillIdleMinutes).toBe(SENTINEL_AUTO_KILL_MINUTES)
         const backupParsed = JSON.parse(backupOnDiskAfter)
         expect(backupParsed.settings.safety.autoKillIdleMinutes).toBe(SENTINEL_AUTO_KILL_MINUTES)
+
+        // GAP1 (CFG-03 checklist follow-up): the browser-visible
+        // `config.fallback` notice must reach a connecting WS client with
+        // the truthful reason (the corrupt-JSON primary is a PARSE_ERROR)
+        // and `backupExists: true` (the backup was present and used).
+        const wsUrl = server.baseUrl.replace(/^http/, 'ws') + '/ws'
+        const first = await collectHandshakeMessages(wsUrl, token)
+        const firstFallback = first.messages.find((m) => m.type === 'config.fallback')
+        expect(firstFallback).toBeTruthy()
+        expect(firstFallback.reason).toBe('PARSE_ERROR')
+        expect(firstFallback.backupExists).toBe(true)
+
+        // GAP1 late-connect delivery: a SECOND, independent connection made
+        // well after boot must receive the IDENTICAL notice -- proves this
+        // isn't a one-shot broadcast a late client would miss.
+        const second = await collectHandshakeMessages(wsUrl, token)
+        const secondFallback = second.messages.find((m) => m.type === 'config.fallback')
+        expect(secondFallback).toEqual(firstFallback)
+
+        first.ws.close()
+        second.ws.close()
       } else {
         // CONTROL (KNOWN DIVERGENCE): legacy falls back to bare defaults on
         // ANY read failure and unconditionally overwrites the backup with
@@ -314,6 +374,67 @@ test.describe('CFG-03 backup/fallback matrix', () => {
       const entries = await fsp.readdir(freshellDir)
       expect(entries.some((name) => name.startsWith('config.json.corrupt-'))).toBe(true)
       expect(entries.some((name) => name.startsWith('config.backup.json.corrupt-'))).toBe(true)
+    } finally {
+      await stopProcessGracefully(server.proc)
+      await fsp.rm(homeDir, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test('GAP2 (Rust-only): a read-only config dir surfaces the write failure to PATCH /api/settings as an error, leaving primary/backup intact', async ({ e2eServerKind }) => {
+    test.skip(
+      e2eServerKind === 'legacy',
+      'The original has NO caller-visible error path for this exact failure either: ' +
+      'settings-router.ts#handleSettingsPatch has no try/catch around configStore.patchSettings, ' +
+      'so a real write failure there is an unhandled promise rejection in Express 4 (not a clean, ' +
+      'reproducible response) -- not a legitimate parity control for this case. Confirmed by direct ' +
+      'source read of server/config-store.ts + server/settings-router.ts (see this fix\'s task report).',
+    )
+
+    const homeDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-e2e-cfg03-'))
+    const freshellDir = path.join(homeDir, '.freshell')
+    await fsp.mkdir(freshellDir, { recursive: true })
+
+    const token = randomUUID()
+    const server = await spawnServerAgainstHome(e2eServerKind, homeDir, token)
+
+    try {
+      // Establish a known-good baseline first, while the directory is still
+      // writable.
+      const patchOk = await fetch(`${server.baseUrl}/api/settings`, {
+        method: 'PATCH',
+        headers: { 'x-auth-token': token, 'content-type': 'application/json' },
+        body: JSON.stringify({ safety: { autoKillIdleMinutes: 3 } }),
+      })
+      expect(patchOk.status).toBe(200)
+      const configBefore = await fsp.readFile(path.join(freshellDir, 'config.json'), 'utf8')
+
+      // Make `.freshell` read+execute only: the primary write inside
+      // `persist()` can no longer create its tmp file.
+      await fsp.chmod(freshellDir, 0o500)
+
+      try {
+        const patchFail = await fetch(`${server.baseUrl}/api/settings`, {
+          method: 'PATCH',
+          headers: { 'x-auth-token': token, 'content-type': 'application/json' },
+          body: JSON.stringify({ safety: { autoKillIdleMinutes: 99 } }),
+        })
+        expect(patchFail.status).toBe(500)
+        const body = await patchFail.json()
+        expect(typeof body.error).toBe('string')
+        expect(body.error.length).toBeGreaterThan(0)
+
+        // The live tree must not reflect the failed patch.
+        const settingsAfter = await getSettings(server.baseUrl, token)
+        expect(settingsAfter.safety.autoKillIdleMinutes).toBe(3)
+      } finally {
+        // Restore permissions BEFORE cleanup, whether the assertions above
+        // passed or threw.
+        await fsp.chmod(freshellDir, 0o755)
+      }
+
+      // Primary on disk is untouched by the failed write.
+      const configAfter = await fsp.readFile(path.join(freshellDir, 'config.json'), 'utf8')
+      expect(configAfter).toBe(configBefore)
     } finally {
       await stopProcessGracefully(server.proc)
       await fsp.rm(homeDir, { recursive: true, force: true }).catch(() => {})

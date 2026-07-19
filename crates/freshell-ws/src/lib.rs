@@ -41,8 +41,8 @@ use axum::{
     Router,
 };
 use freshell_protocol::{
-    ErrorCode, ErrorMsg, PerfLogging, Ready, ServerMessage, ServerSettings, SettingsUpdated,
-    TerminalInventory, WS_PROTOCOL_VERSION,
+    ConfigFallback, ErrorCode, ErrorMsg, PerfLogging, Ready, ServerMessage, ServerSettings,
+    SettingsUpdated, TerminalInventory, WS_PROTOCOL_VERSION,
 };
 
 /// Shared, cheaply-cloneable state the `/ws` handler needs. Boot-scoped ids are
@@ -59,6 +59,21 @@ pub struct WsState {
     pub boot_id: Arc<String>,
     /// The default server settings tree emitted in `settings.updated`.
     pub settings: Arc<ServerSettings>,
+    /// GAP1 (CFG-03 checklist follow-up): the boot-time `config.fallback`
+    /// notice, if the primary configuration needed to fall back (corrupt
+    /// primary -> backup restore or defaults) at boot -- `None` for a
+    /// healthy config or an ordinary fresh install. Boot-frozen, exactly
+    /// like `settings` above (the original recomputes both `settings` AND
+    /// `configFallback` fresh on every connection, `server/index.ts:369-381`;
+    /// this crate already snapshots `settings` once at boot into `WsState`,
+    /// so this field follows that SAME established precedent rather than
+    /// inventing new live-recompute plumbing). Sent as part of
+    /// [`build_handshake`]'s ordered handshake on EVERY `/ws` connection --
+    /// not just the first -- so a client that connects minutes after boot
+    /// still receives it (mirrors the original's per-connection
+    /// `sendHandshakeSnapshot`, `ws-handler.ts:1723-1749`, which is how it
+    /// achieves late-connect delivery without a separate broadcast).
+    pub config_fallback: Option<ConfigFallback>,
     /// The shared server→client broadcast bus (pre-serialized JSON frames). REST
     /// handlers (e.g. fresh-agent create/send) push here; every authenticated `/ws`
     /// connection fans the frames out to its socket (the original `WsHandler.broadcast`).
@@ -305,7 +320,7 @@ pub fn spawn_idle_monitor(
 /// byte-identical to the clean-boot handshake the oracle's T0/determinism tiers pin.
 pub fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
     let boot_id = state.boot_id.as_ref().clone();
-    vec![
+    let mut messages = vec![
         ServerMessage::Ready(Ready {
             timestamp: now_iso(),
             boot_id: Some(boot_id.clone()),
@@ -315,12 +330,23 @@ pub fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
             settings: state.settings.as_ref().clone(),
         }),
         ServerMessage::PerfLogging(PerfLogging { enabled: false }),
-        ServerMessage::TerminalInventory(TerminalInventory {
-            boot_id,
-            terminals: state.registry.inventory(),
-            terminal_meta: Vec::new(),
-        }),
-    ]
+    ];
+    // GAP1 (CFG-03 checklist follow-up): `config.fallback` slots in right
+    // after `perf.logging`, mirroring the original's exact ordering
+    // (`ws-handler.ts:1730-1735`: `settings.updated` -> `perf.logging` ->
+    // `config.fallback` -> `terminal.inventory`). Sent on EVERY connection
+    // this `build_handshake` call produces (called fresh per `/ws` upgrade
+    // in `handle_socket`), so a late-connecting client sees it too --
+    // exactly like the original's per-connection `sendHandshakeSnapshot`.
+    if let Some(config_fallback) = state.config_fallback.clone() {
+        messages.push(ServerMessage::ConfigFallback(config_fallback));
+    }
+    messages.push(ServerMessage::TerminalInventory(TerminalInventory {
+        boot_id,
+        terminals: state.registry.inventory(),
+        terminal_meta: Vec::new(),
+    }));
+    messages
 }
 
 /// Outcome of validating a `hello` frame. `Accept` carries no data; the reject
@@ -630,6 +656,7 @@ mod tests {
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
+            config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
         }
@@ -715,6 +742,83 @@ mod tests {
         assert_eq!(wire[3]["bootId"], wire[0]["bootId"]);
         assert_eq!(wire[3]["terminals"], json!([]));
         assert_eq!(wire[3]["terminalMeta"], json!([]));
+    }
+
+    /// GAP1 (CFG-03 checklist follow-up) RED/GREEN target: when boot fell
+    /// back, `config.fallback` slots into the ordered handshake right after
+    /// `perf.logging` and before `terminal.inventory` -- mirrors the
+    /// original's exact ordering (`ws-handler.ts:1730-1735`).
+    #[test]
+    fn handshake_includes_config_fallback_when_boot_fell_back_and_in_correct_order() {
+        let mut s = state();
+        s.config_fallback = Some(freshell_protocol::ConfigFallback {
+            reason: freshell_protocol::ConfigFallbackReason::ParseError,
+            backup_exists: true,
+        });
+        let msgs = build_handshake(&s);
+        let wire: Vec<serde_json::Value> = msgs
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        let types: Vec<&str> = wire.iter().map(|v| v["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            vec![
+                "ready",
+                "settings.updated",
+                "perf.logging",
+                "config.fallback",
+                "terminal.inventory"
+            ]
+        );
+        assert_eq!(wire[3]["reason"], "PARSE_ERROR");
+        assert_eq!(wire[3]["backupExists"], true);
+    }
+
+    /// GAP1: a healthy boot (no fallback) must NOT inject a `config.fallback`
+    /// frame at all -- the clean-boot handshake shape must stay byte-
+    /// identical to before this fix (proves `handshake_is_ordered_with_
+    /// shared_bootid` above, asserting the 4-message shape, keeps passing
+    /// unchanged).
+    #[test]
+    fn handshake_omits_config_fallback_when_boot_was_healthy() {
+        let msgs = build_handshake(&state());
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, ServerMessage::ConfigFallback(_))),
+            "a healthy boot must never emit a config.fallback frame"
+        );
+    }
+
+    /// GAP1 late-connect delivery: `build_handshake` is called fresh on
+    /// EVERY `/ws` connection (`handle_socket` -> `sendHandshakeSnapshot`
+    /// equivalent), so a client that connects long after boot still
+    /// receives the SAME notice as the first connection -- this is how the
+    /// original achieves late-connect delivery too (per-connection
+    /// `sendHandshakeSnapshot`, `ws-handler.ts:1723-1749`, recomputed on
+    /// every hello rather than broadcast once at boot).
+    #[test]
+    fn handshake_delivers_config_fallback_identically_across_multiple_connections() {
+        let mut s = state();
+        s.config_fallback = Some(freshell_protocol::ConfigFallback {
+            reason: freshell_protocol::ConfigFallbackReason::Enoent,
+            backup_exists: false,
+        });
+
+        let first_connection = build_handshake(&s);
+        // Simulate a client connecting much later: the SAME frozen WsState
+        // (nothing mutates it between connections) produces an identical
+        // handshake on a second, independent call.
+        let late_connection = build_handshake(&s);
+
+        assert_eq!(first_connection, late_connection);
+        assert!(
+            late_connection
+                .iter()
+                .any(|m| matches!(m, ServerMessage::ConfigFallback(_))),
+            "a late-connecting client must still receive the config.fallback notice"
+        );
     }
 
     // `spawn_periodic` (TERM-11 idle-reaper scheduling primitive): proves the

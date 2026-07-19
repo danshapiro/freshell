@@ -199,6 +199,7 @@ async fn spawn_server() -> String {
         allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
         ws_max_payload_bytes: 16 * 1024 * 1024,
         term09: freshell_ws::backpressure::Term09Config::default(),
+        config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
     };
@@ -446,7 +447,10 @@ async fn claude_interrupt_frame_errors_for_an_unknown_session() {
 /// changes; exercises the same append path production code takes).
 #[test]
 fn interrupt_log_append_is_plain_fs_no_special_handling_needed() {
-    let dir = std::env::temp_dir().join(format!("freshell-interrupt-log-sanity-{}", uuid_like_suffix()));
+    let dir = std::env::temp_dir().join(format!(
+        "freshell-interrupt-log-sanity-{}",
+        uuid_like_suffix()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let log = dir.join("interrupt.log");
     let mut f = std::fs::OpenOptions::new()

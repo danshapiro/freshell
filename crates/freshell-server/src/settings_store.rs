@@ -30,7 +30,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use freshell_protocol::ServerSettings;
+use freshell_protocol::{ConfigFallback, ConfigFallbackReason, ServerSettings};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
@@ -90,6 +90,16 @@ pub struct SettingsStore {
     /// below). Compiled out of release builds -- there is no production path
     /// that ever sets anything other than the 1-second default.
     reload_throttle_window: std::time::Duration,
+    /// GAP1 (CFG-03 checklist follow-up): the boot-time `config.fallback`
+    /// notice, if the primary configuration needed to fall back (corrupt
+    /// primary -> backup restore or defaults) -- `None` for a healthy config
+    /// or an ordinary fresh install. Computed ONCE in [`SettingsStore::load`]
+    /// from the PRE-restore read (mirrors `configStore.getLastReadError()`,
+    /// `config-store.ts:304-306`, which is likewise set once at boot and
+    /// never re-derived from a since-healed file). Cheap to clone (two small
+    /// fields, no heap data) -- matches the struct's own "Cheap to clone"
+    /// contract, so no `Arc` wrapper is needed.
+    config_fallback: Option<ConfigFallback>,
 }
 
 /// Throttle + change-detection state for [`SettingsStore::maybe_reload_overrides`].
@@ -142,6 +152,19 @@ impl SettingsStore {
     /// allowlist is fixed at boot to the discovered set (`validCliProviders:
     /// allCliNames`, `server/index.ts:585`).
     pub fn load(home: Option<&Path>, discovered_cli_names: Vec<String>) -> Self {
+        // GAP1 (CFG-03 checklist follow-up): classify the primary's
+        // PRE-restore state FIRST -- `maybe_restore_config_from_backup`
+        // below may rewrite it (from the backup, or via this same
+        // function's later seed-migration `persist`), so this MUST run
+        // before that happens or a boot that genuinely needed a fallback
+        // notice would already read back healthy. See
+        // `classify_boot_config_fallback`'s own doc comment for the full
+        // reason mapping and its honest `VersionMismatch`-unreachable note.
+        let config_fallback = home.and_then(|home| {
+            let dir = home.join(".freshell");
+            classify_boot_config_fallback(&dir.join("config.json"), &backup_path(&dir))
+        });
+
         // CFG-03: conservative backup restore, BEFORE any of the tolerant
         // per-field readers below (`load_full_settings`,
         // `load_terminal_overrides`, `load_session_overrides`,
@@ -232,9 +255,22 @@ impl SettingsStore {
             terminal_overrides_dirty: Arc::new(std::sync::Mutex::new(Default::default())),
             overrides_reload_state: Arc::new(std::sync::Mutex::new(Default::default())),
             reload_throttle_window: std::time::Duration::from_secs(1),
+            config_fallback,
         };
         if needs_persist {
-            store.persist(&settings);
+            // GAP2 legacy parity (`config-store.ts:367-374`): a failed
+            // BOOT-time normalization/seed-migration persist logs a warning
+            // and keeps running on the in-memory value -- there is no HTTP
+            // caller here to surface an error envelope to (mirrors
+            // `logger.warn(..., 'Failed to persist normalized config; using
+            // in-memory normalized config')`, the ONLY place the original
+            // itself gracefully degrades a `saveInternal` failure instead of
+            // letting it propagate).
+            if let Err(err) = store.persist(&settings) {
+                eprintln!(
+                    "freshell-server: failed to persist normalized/seeded settings at boot (using in-memory value): {err}"
+                );
+            }
         }
         store
     }
@@ -242,6 +278,16 @@ impl SettingsStore {
     /// A clone of the live settings tree.
     pub async fn get(&self) -> ServerSettings {
         self.inner.read().await.clone()
+    }
+
+    /// GAP1 (CFG-03 checklist follow-up): the boot-time `config.fallback`
+    /// notice, if the primary configuration needed to fall back (corrupt
+    /// primary -> backup restore or defaults) at boot. `None` for a healthy
+    /// config or an ordinary fresh install -- mirrors
+    /// `configStore.getLastReadError()` returning `undefined`
+    /// (`config-store.ts:304-306`).
+    pub fn config_fallback(&self) -> Option<ConfigFallback> {
+        self.config_fallback.clone()
     }
 
     /// Deep-merge `patch_body` into the live settings (R1: same handler for
@@ -267,7 +313,7 @@ impl SettingsStore {
             ));
         }
 
-        let mut guard = self.inner.write().await;
+        let guard = self.inner.write().await;
         let mut value = serde_json::to_value(&*guard).unwrap_or_else(|_| json!({}));
         deep_merge(&mut value, patch_body);
         // NOTE: `knownProviders` is regular patchable, persisted state in the
@@ -283,9 +329,30 @@ impl SettingsStore {
                 ))
             }
         };
-        *guard = merged.clone();
         drop(guard);
-        self.persist(&merged);
+        // GAP2 fix + legacy parity (`config-store.ts#saveInternal`:
+        // `this.cache = cfg` runs only AFTER a successful `atomicWriteFile`
+        // -- a write failure must never leave the live tree holding a value
+        // that was never actually persisted, and must never vanish
+        // silently). Persist BEFORE committing to the live tree; a failure
+        // surfaces to the caller as an error envelope, mirroring the
+        // established repo-wide convention every OTHER fs-backed router in
+        // the original uses for exactly this failure class
+        // (`server/files-router.ts:109,136,164,228,278,296`:
+        // `res.status(500).json({ error: err.message })`). The original's
+        // OWN `settings-router.ts#handleSettingsPatch` has NO such handling
+        // -- `configStore.patchSettings`'s `saveInternal` throws unguarded
+        // and is never caught there, an accidental gap (an unhandled
+        // rejection), not a documented "log only" design -- so we mirror
+        // the convention the rest of the original codebase actually applies
+        // to this failure class instead of reproducing an unhandled crash.
+        if let Err(err) = self.persist(&merged) {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": err.to_string() }),
+            ));
+        }
+        *self.inner.write().await = merged.clone();
         Ok(merged)
     }
 
@@ -304,11 +371,14 @@ impl SettingsStore {
     /// key it didn't know about (observed in staging: `completedMigrations`
     /// removed entirely, `recentDirectories` emptied from 20 entries to 0).
     ///
-    /// A missing/unwritable home degrades silently (matches the isolated-
-    /// runtime / no-HOME case). A missing/unparseable/non-object existing
-    /// file degrades to `{}` (fresh install, or an already-corrupt file
-    /// we're about to overwrite anyway) -- same tolerance as every other
-    /// read in this module (`config-store.ts#readConfigFile`).
+    /// A missing home degrades silently, returning `Ok(())` (matches the
+    /// isolated-runtime / no-HOME case -- there is nothing to persist to,
+    /// which is not a failure). A missing/unparseable/non-object EXISTING
+    /// file (the round-trip read below) degrades to `{}` (fresh install, or
+    /// an already-corrupt file we're about to overwrite anyway) -- same
+    /// tolerance as every other read in this module
+    /// (`config-store.ts#readConfigFile`); that tolerance is orthogonal to
+    /// the WRITE failures this function surfaces (GAP2 fix, below).
     ///
     /// SIDE-BY-SIDE HARDENING (bake-in with the legacy Node server on the
     /// SAME real home): this whole read-modify-write is now additionally
@@ -323,12 +393,22 @@ impl SettingsStore {
     /// belong to whichever server the user is actively driving, and that
     /// residual is accepted (see the module-level docs / task report for
     /// the honest limits of this mechanism).
-    fn persist(&self, settings: &ServerSettings) {
-        let Some(home) = &self.home else { return };
+    ///
+    /// GAP2 fix (CFG-03 checklist follow-up): this used to return `()`,
+    /// swallowing every write failure (directory create, serialize, tmp
+    /// write, rename) with a silent early `return` -- a caller had no way
+    /// to know a patch never reached disk. Now returns `Result<(), io::Error>`
+    /// so [`SettingsStore::patch`] can surface a real failure (e.g. a
+    /// read-only config directory) to its HTTP caller instead of losing it.
+    /// The backup refresh below is UNCHANGED: still attempted only once the
+    /// primary write actually succeeds (now guaranteed by the `?` early
+    /// return above it, rather than the old `persisted_ok` bool).
+    fn persist(&self, settings: &ServerSettings) -> std::io::Result<()> {
+        let Some(home) = &self.home else {
+            return Ok(());
+        };
         let dir = home.join(".freshell");
-        if std::fs::create_dir_all(&dir).is_err() {
-            return;
-        }
+        std::fs::create_dir_all(&dir)?;
         let path = dir.join("config.json");
 
         // Advisory cross-process lock across the ENTIRE read-modify-write
@@ -420,23 +500,24 @@ impl SettingsStore {
         map.entry("projectColors").or_insert_with(|| json!({}));
         map.entry("recentDirectories").or_insert_with(|| json!([]));
 
-        let Ok(text) = serde_json::to_string_pretty(&doc) else {
-            return;
-        };
+        let text = serde_json::to_string_pretty(&doc)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let tmp = dir.join(format!("config.json.tmp-{}", std::process::id()));
-        let persisted_ok =
-            std::fs::write(&tmp, &text).is_ok() && std::fs::rename(&tmp, &path).is_ok();
+        std::fs::write(&tmp, &text)?;
+        std::fs::rename(&tmp, &path)?;
 
         // CFG-03 (backup + conservative auto-restore): refresh the backup
-        // ONLY after a SUCCESSFUL primary persist, and do it atomically
-        // (tmp+rename via `atomic_write`) -- unlike the original's plain,
-        // non-atomic `copyFile(configPath(), backupPath())`
-        // (`config-store.ts:427`), which can leave a torn/partial backup if
-        // the process dies mid-copy. Covered by the SAME `_lock` above.
-        if persisted_ok {
-            atomic_write(&backup_path(&dir), &text);
-        }
+        // ONLY after a SUCCESSFUL primary persist -- guaranteed here by the
+        // `?` early returns above (GAP2 fix: this used to be an explicit
+        // `if persisted_ok` bool gate; unreachable-on-failure via `?` is the
+        // same guarantee) -- and do it atomically (tmp+rename via
+        // `atomic_write`) -- unlike the original's plain, non-atomic
+        // `copyFile(configPath(), backupPath())` (`config-store.ts:427`),
+        // which can leave a torn/partial backup if the process dies
+        // mid-copy. Covered by the SAME `_lock` above.
+        atomic_write(&backup_path(&dir), &text);
         // `_lock` drops here, releasing the flock.
+        Ok(())
     }
 
     /// Cheap mtime-checked freshness reload for the override READ path
@@ -577,8 +658,13 @@ impl SettingsStore {
         };
         // Persist the whole config.json (same atomic tmp+rename write as a
         // settings patch; the doc embeds the live settings tree + overrides).
+        // GAP2's caller-visible error surfacing is scoped to `patch()`
+        // (`PATCH /api/settings`, this task's explicit target); a terminal-
+        // override write failure here is out of that scope and, like the
+        // original's own override-write paths, best-effort -- explicitly
+        // ignored rather than silently `#[must_use]`-warned.
         let settings = self.get().await;
-        self.persist(&settings);
+        let _ = self.persist(&settings);
         Value::Object(next)
     }
 
@@ -670,8 +756,14 @@ impl SettingsStore {
             (Value::Object(next), changed)
         };
         if changed {
+            // GAP2's caller-visible error surfacing is scoped to `patch()`
+            // (`PATCH /api/settings`, this task's explicit target); a
+            // session-override write failure here is out of that scope
+            // and, like the original's own override-write paths,
+            // best-effort -- explicitly ignored rather than silently
+            // `#[must_use]`-warned.
             let settings = self.get().await;
-            self.persist(&settings);
+            let _ = self.persist(&settings);
         }
         next
     }
@@ -829,6 +921,86 @@ fn config_file_health(path: &Path) -> ConfigFileHealth {
             Err(_) => ConfigFileHealth::Corrupt,
         },
     }
+}
+
+/// GAP1 (CFG-03 checklist follow-up): which of `config_file_health`'s two
+/// internal `Corrupt` branches actually fired for `path` -- an unreadable
+/// file (matches the original's `READ_ERROR`, `config-store.ts:227-231`) or
+/// one that read fine but didn't parse as JSON (matches the original's
+/// `PARSE_ERROR`, `config-store.ts:244-248`). Mirrors `config_file_health`'s
+/// OWN two branches exactly (same two fs calls, same order) rather than
+/// changing that already-tested function's Missing/Corrupt/Ok return shape,
+/// which [`maybe_restore_config_from_backup`]'s restore DECISION depends on.
+/// Only ever called after a caller has already confirmed
+/// `ConfigFileHealth::Corrupt` for this same path; the `Ok(_) =>` arm below
+/// is an honest TOCTOU fallback (file changed under us between the two
+/// checks), not a reachable steady-state case.
+fn classify_corrupt_reason(path: &Path) -> ConfigFallbackReason {
+    match std::fs::read_to_string(path) {
+        Err(_) => ConfigFallbackReason::ReadError,
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Err(_) => ConfigFallbackReason::ParseError,
+            Ok(_) => ConfigFallbackReason::ReadError,
+        },
+    }
+}
+
+/// GAP1 (CFG-03 checklist follow-up): classify a truthful `config.fallback`
+/// notice from the primary's PRE-restore read, mirroring
+/// `config-store.ts#readConfigFile`'s failure branches (`PARSE_ERROR` /
+/// `READ_ERROR`, via [`classify_corrupt_reason`]) plus the original's own
+/// silent `ENOENT` carve-out (`config-store.ts:260-262`: no error, ordinary
+/// fresh install) -- reused here as "primary AND backup both missing", the
+/// EXACT SAME carve-out [`maybe_restore_config_from_backup`] already applies
+/// for its own restore decision (see its early return a few lines below its
+/// own two health checks). A primary that parses (`ConfigFileHealth::Ok`,
+/// any shape) is healthy -- no notice, matching the original's success path.
+///
+/// MUST be called BEFORE [`maybe_restore_config_from_backup`] runs (which
+/// may rewrite the primary from the backup or trigger a fresh-defaults
+/// reseed a few lines later in [`SettingsStore::load`]) -- otherwise the
+/// primary would already read back as healthy and this would report "no
+/// fallback" for a boot that very much needed one. Exactly like the
+/// original's `lastReadError`, this is a boot-time snapshot, never
+/// recomputed from the (possibly since-healed) file.
+///
+/// `reason: VersionMismatch` is intentionally UNREACHABLE from this
+/// function today: unlike `PARSE_ERROR`/`READ_ERROR`, the original's
+/// `VERSION_MISMATCH` check (`(parsed as UserConfig)?.version !== 1`,
+/// `config-store.ts:251-257`) has no Rust-side equivalent anywhere in this
+/// module -- `load_full_settings` never inspects the top-level `version`
+/// field, so a version-mismatched-but-parseable file is `ConfigFileHealth
+/// ::Ok` and silently loads its `settings` as-is. Adding that check is a
+/// genuine, separately-scoped behavior change to settings LOADING (not just
+/// notice EMISSION) with no existing test coverage protecting it; out of
+/// this fix's explicit scope (`corrupt primary -> backup restore or
+/// defaults`) -- flagged honestly in the task report, not silently
+/// implemented or silently ignored.
+fn classify_boot_config_fallback(primary: &Path, backup: &Path) -> Option<ConfigFallback> {
+    let primary_health = config_file_health(primary);
+    if matches!(primary_health, ConfigFileHealth::Ok) {
+        return None;
+    }
+    let backup_health = config_file_health(backup);
+    if matches!(primary_health, ConfigFileHealth::Missing)
+        && matches!(backup_health, ConfigFileHealth::Missing)
+    {
+        return None; // Ordinary fresh install -- not a warning case.
+    }
+
+    let reason = match primary_health {
+        ConfigFileHealth::Missing => ConfigFallbackReason::Enoent,
+        ConfigFileHealth::Corrupt => classify_corrupt_reason(primary),
+        ConfigFileHealth::Ok => unreachable!("handled by the early return above"),
+    };
+    Some(ConfigFallback {
+        reason,
+        // Pure path-existence, matching the original's `backupExists()`
+        // (`config-store.ts:308-315`: `fsp.access(backupPath())`) exactly --
+        // it does not additionally require the backup to itself be
+        // parseable.
+        backup_exists: !matches!(backup_health, ConfigFileHealth::Missing),
+    })
 }
 
 /// CFG-03 -- backup + conservative auto-restore. Called ONCE at the very
@@ -2850,6 +3022,130 @@ mod tests {
     // stash/diff evidence) before the `persist()`/`load()`/
     // `maybe_restore_config_from_backup` changes above were added.
 
+    /// GAP1 (CFG-03 checklist follow-up) RED/GREEN target: a corrupt primary
+    /// with NO backup at all classifies as `ParseError` / `backup_exists:
+    /// false` -- mirrors the original's `PARSE_ERROR` branch
+    /// (`config-store.ts:244-248`).
+    #[tokio::test]
+    async fn config_fallback_reports_parse_error_when_primary_is_corrupt_json() {
+        let dir = std::env::temp_dir().join(format!("frs-gap1-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        std::fs::write(freshell.join("config.json"), "{ not valid json at all").unwrap();
+
+        let store = SettingsStore::load(Some(&dir), Vec::new());
+        let fallback = store
+            .config_fallback()
+            .expect("a corrupt primary with no backup must report a fallback notice");
+        assert_eq!(fallback.reason, ConfigFallbackReason::ParseError);
+        assert!(!fallback.backup_exists);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// GAP1: a MISSING primary with a backup PRESENT classifies as `Enoent`
+    /// / `backup_exists: true` -- the one case that is NOT the ordinary
+    /// fresh-install carve-out (that carve-out requires BOTH files missing).
+    /// The original itself never emits `ENOENT` (its own `readConfigFile`
+    /// treats a missing file as silent success, `config-store.ts:260-262`);
+    /// this is the honest, documented Rust-side extension the frozen wire
+    /// contract already anticipates (`shared/ws-protocol.ts:763`).
+    #[tokio::test]
+    async fn config_fallback_reports_enoent_when_primary_missing_but_backup_exists() {
+        let dir = std::env::temp_dir().join(format!("frs-gap1-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        std::fs::write(
+            freshell.join("config.backup.json"),
+            serde_json::to_string_pretty(&json!({ "version": 1, "settings": {} })).unwrap(),
+        )
+        .unwrap();
+
+        let store = SettingsStore::load(Some(&dir), Vec::new());
+        let fallback = store
+            .config_fallback()
+            .expect("a missing primary with a present backup must report a fallback notice");
+        assert_eq!(fallback.reason, ConfigFallbackReason::Enoent);
+        assert!(fallback.backup_exists);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// GAP1: an ordinary fresh install (primary AND backup both missing) is
+    /// NOT a warning case -- mirrors the original's silent `ENOENT` handling
+    /// (`config-store.ts:260-262`) and the SAME carve-out
+    /// `maybe_restore_config_from_backup` already applies for its own
+    /// restore decision.
+    #[tokio::test]
+    async fn config_fallback_is_none_for_an_ordinary_fresh_install() {
+        let dir = std::env::temp_dir().join(format!("frs-gap1-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+
+        let store = SettingsStore::load(Some(&dir), Vec::new());
+        assert_eq!(store.config_fallback(), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// GAP1: a healthy, parseable primary (any shape) is NOT a warning case
+    /// -- mirrors the original's success path (`readConfigFile` returns
+    /// `{config: parsed}` with no error, `config-store.ts:259`).
+    #[tokio::test]
+    async fn config_fallback_is_none_for_a_healthy_primary() {
+        let dir = std::env::temp_dir().join(format!("frs-gap1-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string_pretty(&json!({ "version": 1, "settings": {} })).unwrap(),
+        )
+        .unwrap();
+
+        let store = SettingsStore::load(Some(&dir), Vec::new());
+        assert_eq!(store.config_fallback(), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// GAP1: the notice is a PRE-restore snapshot -- a corrupt primary with
+    /// a VALID backup still reports the notice even though
+    /// `maybe_restore_config_from_backup` heals the primary moments later
+    /// in the SAME `load()` call. Without this, a boot that most needed the
+    /// warning (silent auto-recovery just happened!) would report "no
+    /// fallback" because the file already reads back healthy by the time
+    /// anything else looks at it.
+    #[tokio::test]
+    async fn config_fallback_survives_the_same_boots_auto_restore() {
+        let dir = std::env::temp_dir().join(format!("frs-gap1-{}", uuid_like()));
+        let freshell = dir.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        std::fs::write(freshell.join("config.json"), "{ corrupt, not json").unwrap();
+        std::fs::write(
+            freshell.join("config.backup.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "settings": { "safety": { "autoKillIdleMinutes": 55 } }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = SettingsStore::load(Some(&dir), Vec::new());
+
+        // The restore DID happen (sanity: proves this test's setup actually
+        // exercises the auto-restore path CFG-03 already covers).
+        assert_eq!(store.get().await.safety.auto_kill_idle_minutes, 55);
+
+        // ...and the notice survives it regardless.
+        let fallback = store
+            .config_fallback()
+            .expect("the notice must reflect the PRE-restore corrupt read, not the healed file");
+        assert_eq!(fallback.reason, ConfigFallbackReason::ParseError);
+        assert!(fallback.backup_exists);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// THE OUTER ACCEPTANCE TEST, written first. Seeds a realistic config
     /// (a settings patch, a terminal override, a session override, PLUS a
     /// top-level key this store never manages at all -- `completedMigrations`
@@ -3161,9 +3457,21 @@ mod tests {
     /// attempted." Makes `.freshell` read-only so the tmp-file write inside
     /// `persist()` fails, then asserts the pre-existing backup is
     /// byte-for-byte unchanged.
+    ///
+    /// GAP2 fix (CFG-03 checklist follow-up): this test used to assert the
+    /// OLD buggy behavior -- `patch()` returning `Ok` with the in-memory
+    /// tree silently updated even though nothing reached disk. It now
+    /// asserts the FIXED behavior: `patch()` returns an error envelope
+    /// (mirroring the established repo-wide convention every OTHER
+    /// fs-backed router in the original applies to exactly this failure
+    /// class -- `server/files-router.ts`'s `res.status(500).json({ error:
+    /// err.message })`) and the live tree is left untouched at its
+    /// last-successfully-persisted value (mirrors `config-store.ts
+    /// #saveInternal`: `this.cache = cfg` runs only after a successful
+    /// write).
     #[cfg(unix)]
     #[tokio::test]
-    async fn backup_is_not_refreshed_when_the_primary_persist_fails() {
+    async fn persist_failure_surfaces_as_error_and_leaves_live_tree_and_backup_untouched() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = std::env::temp_dir().join(format!("frs-cfg03-{}", uuid_like()));
@@ -3185,13 +3493,20 @@ mod tests {
         let original_perms = std::fs::metadata(&freshell).unwrap().permissions();
         std::fs::set_permissions(&freshell, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-        let merged = store
+        let (status, body) = store
             .patch(&json!({ "safety": { "autoKillIdleMinutes": 99 } }))
             .await
-            .unwrap();
-        // The in-memory tree still updates (persist failure is silent/best-
-        // effort, matching this module's existing tolerant-write policy).
-        assert_eq!(merged.safety.auto_kill_idle_minutes, 99);
+            .expect_err("a read-only config dir must surface the write failure as an Err");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body.get("error").and_then(Value::as_str).is_some(),
+            "the error envelope must carry a human-readable message, got: {body:?}"
+        );
+
+        // The live tree must NOT reflect the failed patch -- it stays at the
+        // last value that was actually persisted (3), never 99.
+        let still_live = store.get().await;
+        assert_eq!(still_live.safety.auto_kill_idle_minutes, 3);
 
         let backup_after = std::fs::read(freshell.join("config.backup.json")).unwrap();
         assert_eq!(

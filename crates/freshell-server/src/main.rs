@@ -181,6 +181,13 @@ async fn main() -> ExitCode {
             .discovered_cli_names();
     let settings_store = settings_store::SettingsStore::load(home.as_deref(), known_providers);
     let settings = Arc::new(settings_store.get().await);
+    // GAP1 (CFG-03 checklist follow-up): the boot-time `config.fallback`
+    // notice, if the primary config needed to fall back at boot. `None` for
+    // a healthy config or an ordinary fresh install. Threaded into
+    // `WsState` below so every `/ws` connection's handshake includes it
+    // (`freshell_ws::build_handshake`), mirroring the original's
+    // per-connection `configFallback` (`server/index.ts:372-380`).
+    let config_fallback = settings_store.config_fallback();
 
     // The shared server→client broadcast bus (pre-serialized frames). REST handlers
     // (fresh-agent create/send) push here; every `/ws` connection fans it out to its
@@ -339,6 +346,7 @@ async fn main() -> ExitCode {
         server_instance_id: Arc::clone(&server_instance_id),
         boot_id,
         settings: Arc::clone(&settings),
+        config_fallback: config_fallback.clone(),
         broadcast_tx: Arc::clone(&broadcast_tx),
         fresh_codex: fresh_codex_state.clone(),
         fresh_claude: fresh_claude_state.clone(),

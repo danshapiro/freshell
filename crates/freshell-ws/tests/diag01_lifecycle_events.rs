@@ -164,6 +164,7 @@ async fn spawn_server(ping_interval_ms: u64) -> String {
         allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
         ws_max_payload_bytes: 16 * 1024 * 1024,
         term09: freshell_ws::backpressure::Term09Config::default(),
+        config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
     };

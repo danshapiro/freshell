@@ -1885,6 +1885,7 @@ mod terminals_changed_tests {
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
+            config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
         };
@@ -2086,6 +2087,7 @@ mod terminal_meta_created_tests {
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
+            config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
         };
