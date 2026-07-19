@@ -632,4 +632,56 @@ test.describe('Session Directory Matrix', () => {
     await expect(page.getByText(/harness-02 matrix beta/i)).toBeVisible({ timeout: 10_000 })
     await expect(page.getByText(/harness-02 matrix gamma/i)).toBeVisible({ timeout: 10_000 })
   })
+
+  // SESSION-09 narrowed-MISSING closure -- the DELETE leg of "New, modified,
+  // moved, and deleted provider files must produce one effective directory
+  // revision/render." The "written mid-test" test above already closes the
+  // CREATE leg; this closes the sibling DELETE leg the checklist annotation
+  // named as untested. Mechanism proof (Rust side): `spawn_sessions_sweep`'s
+  // signature is `(corpus size, max lastActivityAt)` specifically so a
+  // removal -- which changes the COUNT regardless of the removed session's
+  // own timestamp -- is never missed (see that function's doc comment in
+  // `crates/freshell-server/src/main.rs`); `SessionIndex` itself already
+  // unit-proves pruning a deleted file from its cache/snapshot
+  // (`deleted_file_pruned`, `directory_index.rs`) -- this spec is the
+  // outer, browser-level proof that the same removal reaches the rendered
+  // sidebar with no reload. `legacy-chromium` is the control (its real
+  // filesystem watcher, `SessionsSyncService`, already handles deletions).
+  //
+  // Writes its OWN session (not alpha/beta/gamma, which earlier tests in
+  // this file still depend on being present) so deleting it cannot disturb
+  // any other test's assumptions -- same isolation discipline as the
+  // "written mid-test" test's `LIVE_SESSION_ID`.
+  test('a session file removed from disk disappears from the sidebar without a reload', async ({ freshellPage, page, serverInfo }) => {
+    const sessionList = page.getByTestId('sidebar-session-list')
+    await expect(sessionList).toBeVisible({ timeout: 15_000 })
+
+    const REMOVED_SESSION_ID = '00000000-0000-4000-8000-0000000d4444'
+    const removedTitle = 'harness-02 matrix removed'
+
+    // Write a new session mid-test (same technique as the "written
+    // mid-test" case above), then wait for it to appear -- re-proving the
+    // create leg as a live precondition rather than assuming it.
+    const projectsDir = path.join(serverInfo.homeDir, '.claude', 'projects')
+    const removedDir = path.join(projectsDir, 'matrix-removed-project')
+    const removedFile = path.join(removedDir, `${REMOVED_SESSION_ID}.jsonl`)
+    await fs.mkdir(removedDir, { recursive: true })
+    await fs.writeFile(
+      removedFile,
+      buildSessionJsonl({
+        sessionId: REMOVED_SESSION_ID,
+        cwd: '/tmp/freshell-matrix/removed-project',
+        title: removedTitle,
+      }),
+    )
+    await expect(page.getByText(new RegExp(removedTitle, 'i'))).toBeVisible({ timeout: 10_000 })
+
+    // Delete the underlying provider file entirely -- a real removal of the
+    // source file (not an archive/delete override, which is a different,
+    // already-covered code path -- see `sessions_sweep_signature`'s "gap 1"
+    // doc note). Must disappear from the sidebar WITHOUT a page reload,
+    // polling for up to two sweep cycles the same way the create leg does.
+    await fs.rm(removedFile)
+    await expect(page.getByText(new RegExp(removedTitle, 'i'))).not.toBeVisible({ timeout: 10_000 })
+  })
 })

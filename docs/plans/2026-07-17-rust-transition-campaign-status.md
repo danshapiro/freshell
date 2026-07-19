@@ -505,6 +505,64 @@ unchanged (own `RustServer`, random port, isolated `FRESHELL_HOME` -- never
 
 **What it would have caught (incident-to-assertion mapping):**
 
+## 2026-07-19 batch (waves 1-5)
+
+19 commits landed (`git log --oneline 8e7482e1..c76c1462` on this branch, 18
+commits, + `ec4aa188` on the main repo's `fix/client-guards`), each TDD'd,
+adversarially reviewed, and gate-verified.
+
+| Theme | Commits | Summary |
+|---|---|---|
+| Production fixes | `dddbf265`, `ffb99f4e`, `57a82817`, `d15923c2` (+ source `811ab39e` on main), `8c78e48e`, `c76c1462` | TERM-28 PATH-shadow + raw-abort-on-exec-failure fix; session-index warm-sweep lock bound so foreground reads never block (directory-latency regression fix); claude branches wired into `freshAgent.kill`/`interrupt` dispatch; persist-empty-tabs guard (ported + its main-branch source, already cherry-picked); `config.fallback` event emission + `persist()` write-failure surfacing (CFG-03 follow-up); panicked refresh sweep now preserves the last-good cached snapshot instead of losing it |
+| QA lever | `6f2899d4`, `bd33de41`, `e85784f9`, `57104f8a`, `f92869c4` | agent-api Slice 3b-2 (pane swap/navigate/respawn, tabs/has, layout snapshot); DEV-0006 S1 (codex remote-proxy envelope/side-effect extractors) + S2 (WS relay server); MCP QA smoke -- full mode-matrix pin (shell/amplifier/opencode/codex/browser/editor/pane-ops) + its ops doc |
+| DEV-0006 | `bd33de41` (S1), `e85784f9` (S2), `252c01fa` (implementer-ready spec for S3-S5) | S1+S2 landed INERT -- not yet wired into the codex launch path, so no runtime behavior change. S3-S5 (managed app-server launch, session association, metadata badges) remain gated whole-or-not per the existing council ruling (`DEVIATIONS.md:608`, DEV-0008); no partial shipment |
+| Conversions | `efd72c14`+`dddbf265` (TERM-28), `f18554a2` (SAFE-01/SAFE-03/CFG-03), `c82e59bc` (AGENT-02/AGENT-14), `fc1fc3fa` (TERM-13/SYNC-05), `8d60f7e7` (SESSION-01) | TERM-28: marked complete with evidence, **PARTIAL pending an upstream filing decision** (portable-pty's `.exists()` defect is worked around in-repo, not yet reported upstream). SAFE-05 (bake-in posture) advanced via the same wave. SESSION-01/TERM-13/SYNC-05/AGENT-02/AGENT-14/SAFE-01/SAFE-03/CFG-03: all narrowed this batch with new PARTIAL evidence (see each checklist entry for its exact MISSING remainder) |
+| Docs-only | `da428f73` | `json_scan` module-doc correction (the two legacy scanners genuinely differ on numeric token bounds) -- no behavior change |
+
+**Review cadence:** every commit above independently reviewed at its pinned
+SHA in an isolated worktree; all APPROVED. No separate fix-forward round was
+needed this batch -- corrections landed inside the listed commits themselves.
+
+**Discovered items:**
+- **Legacy codex click-resume defect** (SESSION-01, `8d60f7e7`): clicking a
+  seeded Codex session on `legacy-chromium` settles into
+  `content.status='error'` with no `terminalId`; reproduced with a real
+  `CODEX_CMD` override, `server/` FROZEN so unfixable on this branch. Filed
+  as **issue #517** (open).
+- **Legacy search never respects the scrollback cap** (TERM-13, `fc1fc3fa`):
+  legacy's `TerminalViewMirror` backs search with an unbounded `this.lines`
+  array, independent of its byte-capped `ReplayRing`. Rust's `terminals.rs`
+  search is genuinely bounded instead -- a real improvement, not a parity
+  gap.
+- **Rust-only improvements recorded, not gaps**: the two items above, plus
+  the pre-existing SAFE-01/SAFE-03 stricter-than-legacy auth/Origin
+  enforcement (reconfirmed this batch, not new) -- kept visible here so a
+  future bisection doesn't mistake "Rust does something legacy doesn't" for
+  a regression.
+
+**Open asks:**
+- **`fix/client-guards` PR approval** (main repo): 2 commits ahead of `main`
+  -- `811ab39e` (persist-empty guard, source already cherry-picked into this
+  branch's `d15923c2`) and `ec4aa188` (MCP `resumeSessionId` alias fix,
+  discovered via this batch's MCP QA smoke work, NOT yet cherry-picked into
+  the port branch). Awaiting user PR approval on `main`.
+- **portable-pty upstream filing decision** (TERM-28): the `.exists()`-
+  before-`X_OK` defect in `portable-pty` 0.8.1's `search_path` is worked
+  around in-repo (`dddbf265`) but not filed against upstream
+  `wezterm/portable-pty` -- outside this repo's scope; needs the user's call
+  on whether/who files it.
+- **`DEVIATIONS.md` scope call**: two e2e-discovered divergences this batch
+  (legacy's unbounded scrollback search; the codex click-resume mechanism
+  split between legacy's error path and Rust's JSON-RPC-sidecar path) are
+  documented in spec comments and checklist annotations only --
+  `port/oracle/DEVIATIONS.md` has a formal `/council`-adjudicated entry
+  format; needs a scope call on whether these warrant a formal entry there
+  or stay at spec-level documentation.
+- **`:3002` restart pending**: bake-in still runs the pre-batch binary; none
+  of this batch's 19 commits are live on `:3002` until the next
+  user-approved restart window (standing rule: never restart without
+  explicit "APPROVED").
+
 | Historical incident class | Guarding assertion in this suite |
 |---|---|
 | "Amplifier blank-tabs" class -- a coding-CLI pane silently launches FRESH instead of resuming, leaving the user looking at an empty prompt with no visible error and no way to tell their prior session was dropped | The amplifier-resume assertions: `wait-for` on `amplifier: resumed session` (not just `amplifier> `) after a `new-tab{resume:<id>}` call, PLUS the independent argv-log cross-check (`argv[0]==='resume' && argv[1]===sessionId`). A regression that silently drops the resume arg would show the fresh-launch banner instead and fail both checks -- not a blank pane that "looks fine" until inspected closely. |
