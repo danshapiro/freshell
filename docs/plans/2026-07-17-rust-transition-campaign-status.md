@@ -303,6 +303,64 @@ next flush) plus its regression test `test/unit/client/store/persistTabsEmptyGua
 were byte-identical to main at 811ab39e's parent, so the cherry-pick applied cleanly with zero
 adaptation. `dist/client` rebuilt so the fix ships on the next approved restart.
 
+2026-07-19: **src/ deviation grown from 5 to 7 files** — restore-flag persistence + persist-guard
+v2 cherry-picked from main `fix/restore-flag-guard` (commits `665c755a`, `d4300f79`, `6364a4cd`)
+to close the "every amplifier terminal restored as a fresh session after two server restarts
+landed 52s apart, the second mid-restore" incident, and its immediate reviewer follow-up, before
+reconciliation:
+
+- `665c755a` ("preserve restore flag across interrupted restore rounds") touches
+  `src/components/TerminalView.tsx` (already deviated — removes the now-redundant
+  `restoreRequestIdRef`/`restoreFlagRef` local cache) and **`src/lib/terminal-restore.ts`**
+  (NEW deviation file — `consumeTerminalRestoreRequestId()` becomes a non-destructive peek
+  instead of a one-shot consume, so a second `terminal.create` for an unanchored requestId no
+  longer silently carries `restore:false`).
+- `d4300f79` ("stateless persist-empty guard v2 with rolling backup") supersedes the v1
+  `distrustEmptyTabs` one-shot latch in `src/store/persistMiddleware.ts` and
+  `src/store/tabsSlice.ts` (both already deviated) with a permanent, stateless rule that is
+  checked on every flush, backed by a rolling `LAYOUT_BACKUP_STORAGE_KEY` snapshot, and ALSO
+  touches **`src/store/storage-keys.ts`** (NEW deviation file — adds the
+  `LAYOUT_BACKUP_STORAGE_KEY`/`layoutBackup` constant the v2 guard's backup write requires).
+- `6364a4cd` (test-only, `test/` not `src/`) adds a regression coupling the guard's literal
+  `'tabs/removeTab'` action-type match to the real `removeTab` action creator from
+  `tabsSlice.ts`, per reviewer follow-up on `d4300f79`.
+
+**Count discrepancy, documented rather than silently rounded**: scoping for this cherry-pick
+assumed only `terminal-restore.ts` would join the deviation set (5 → 6). The actual result is
+5 → 7: `storage-keys.ts` also picked up a real, unavoidable 2-line addition (the backup storage
+key constant) that the v2 guard's backup mechanism depends on — there was no way to land the
+data-loss-backup behavior without it. `git diff 737cb008 --name-only -- src/` now lists exactly
+7 files: `TerminalView.tsx`, `fresh-agent/FreshAgentView.tsx`, `icons/provider-icons.tsx`,
+`lib/terminal-restore.ts`, `store/persistMiddleware.ts`, `store/storage-keys.ts`,
+`store/tabsSlice.ts`.
+
+All three commits cherry-picked clean via `git cherry-pick -x` — **zero merge conflicts**,
+despite the port carrying the v1 guard (`d15923c2`) in `persistMiddleware.ts`/`tabsSlice.ts`.
+The port's v1-guard content was textually equivalent to the state main's `d4300f79` diffs
+against, so git's three-way merge resolved automatically to the correct v2 semantics with no
+manual intervention.
+
+Post-cherry-pick byte-identity verification against main branch tip `6364a4cd` (the tip of
+`fix/restore-flag-guard`, pending PR/merge to `main`): `TerminalView.tsx`,
+`fresh-agent/FreshAgentView.tsx`, `lib/terminal-restore.ts`, `store/persistMiddleware.ts`,
+`store/storage-keys.ts`, and `store/tabsSlice.ts` are all **byte-identical** to main tip.
+`icons/provider-icons.tsx` is the sole exception — it carries its own pre-existing, unrelated
+deviation from the 2026-07-17 `f7b2c9e6` entry above (the verbatim-ported `AmplifierIcon`
+function sits at a different position in the file; content is identical, only its location
+differs), confirmed unrelated by diffing the pre-cherry-pick port HEAD against main tip and
+finding the identical positional difference already present.
+
+Verification: `test/unit/lib/terminal-restore.test.ts` (7 tests), `persistTabsEmptyGuard.test.ts`
+(5 tests, including the new removeTab-coupling test), and
+`TerminalView.restore-flag-persistence.test.tsx` (3 tests) all green (15/15 focused); the full
+`test/unit/client/store/persist*` + `test/unit/client/components/TerminalView*` sweep is also
+green (24 test files / 301 tests). `npm run typecheck` (client + server) clean. `npm run
+build:client` succeeded — `dist/client` rebuilt, required for the fix to ship on the next
+approved restart (the running server serves the client bundle from disk; no server restart
+performed as part of this work). e2e `restore-matrix.spec.ts --project=rust-chromium` (8/8) and
+`restore-double-restart.spec.ts --project=rust-chromium` (2/2, the closest existing harness to
+this incident) both green.
+
 2026-07-17 (commits `64083989`, `8888df30` — non-bisectable span, harmless at HEAD): these two
 Batch 1 commits do not build standalone in isolation. `64083989` ("add Amplifier as a fourth
 session-directory source") absorbed a concurrent agent's `main.rs` wiring change (the
