@@ -212,6 +212,11 @@ fn create_content_tab(
             kind: kind.to_string(),
         },
     );
+    state
+        .pane_tabs
+        .lock()
+        .expect("pane_tabs mutex")
+        .insert(pane_id.clone(), tab_id.clone());
 
     state.broadcast(&ServerMessage::UiCommand(UiCommand {
         command: "tab.create".to_string(),
@@ -397,26 +402,75 @@ fn arm_locators_for_fresh_pane(
     }
 }
 
-/// The terminal-mode path (`router.ts:724-793`): resolve the requested mode
-/// against the registered coding-CLI specs, derive the resume identity
-/// (`acceptedSessionRefForMode`/`requestedResumeSessionIdForMode`), spawn
-/// through the shared registry with the SAME argv/env-building pipeline the
-/// WS `terminal.create` handler uses for `mode != "shell"`
+/// `sanitizeSessionRef` (`shared/session-contract.ts:55-62`) + `acceptedSessionRefForMode` /
+/// `requestedResumeSessionIdForMode` (`router.ts:214-236`), fused into one call so both
+/// `POST /api/tabs` ([`create_terminal_tab`]) and `POST /api/panes/:id/split`
+/// (`pane_ops::split_pane`) derive the SAME resume identity from the SAME body shape,
+/// matching the original router's own reuse of these two helpers across both routes
+/// (`router.ts:726-731` / `:1290-1300`). A malformed `sessionRef` (missing/empty
+/// `provider`/`sessionId`) is silently treated as absent, never a 400 -- `serde_json::from_value`
+/// on the `{provider,sessionId}` shape gives the same "well-formed or `None`" behavior a
+/// wrong-shaped JSON value would (`Err` -> `None`, since `SessionLocator`'s fields are
+/// non-optional strings).
+#[allow(clippy::result_large_err)]
+pub(crate) fn derive_resume_identity(
+    body: &Value,
+    mode: &str,
+) -> Result<(Option<String>, Option<SessionLocator>), Response> {
+    let session_ref: Option<SessionLocator> = body
+        .get("sessionRef")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok());
+    let legacy_resume_session_id = body
+        .get("resumeSessionId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let resume_session_id = requested_resume_session_id_for_mode(
+        session_ref.as_ref(),
+        mode,
+        legacy_resume_session_id.as_deref(),
+    )?;
+    let accepted_session_ref = accepted_session_ref_for_mode(session_ref.as_ref(), mode).cloned();
+    Ok((resume_session_id, accepted_session_ref))
+}
+
+/// The successful result of [`spawn_terminal_pane`]: the `paneContent` JSON + the
+/// resolved `mode`/`shell`/`cwd`/`terminal_id`, everything a caller (tab-create or
+/// pane-split) needs to build its own `ui.command` payload and success envelope
+/// without re-deriving anything this function already computed.
+pub(crate) struct TerminalSpawnResult {
+    pub(crate) pane_content: Value,
+    pub(crate) terminal_id: String,
+    pub(crate) mode: String,
+    pub(crate) shell: Option<String>,
+    pub(crate) cwd: Option<String>,
+}
+
+/// The terminal-mode spawn pipeline (`router.ts:724-793` for create,
+/// `router.ts:1326-1369` for split -- the original reuses the SAME
+/// `resolveSpawnProviderSettings`/`registry.create` sequence for both routes, and this
+/// port mirrors that reuse): resolve the requested mode against the registered
+/// coding-CLI specs, derive the resume identity ([`derive_resume_identity`]), spawn
+/// through the shared registry with the SAME argv/env-building pipeline the WS
+/// `terminal.create` handler uses for `mode != "shell"`
 /// (`crates/freshell-ws/src/terminal.rs:700-1050`: `cli_provider_target` ->
 /// `resolve_mcp_cwd` -> `generate_mcp_injection` -> `CliLaunchInputs` ->
-/// `resolve_coding_cli_command` -> `build_{cli_,windows_cli_,}spawn_spec`),
-/// arm the amplifier/opencode locator for a fresh pane, attach `paneContent`,
-/// broadcast `ui.command{tab.create}` with the legacy-exact payload keys. On
-/// failure: nothing was ever recorded (tab/pane ids are local variables until
-/// the spawn succeeds) -- atomic rollback by construction, matching the
-/// original's cleanup-then-error contract (`router.ts:817-831`) without
-/// needing an explicit cleanup step, PLUS the MCP-config cleanup the original
-/// also performs on a failed create (`router.ts:819`, `cw:429-448`).
-async fn create_terminal_tab(
+/// `resolve_coding_cli_command` -> `build_{cli_,windows_cli_,}spawn_spec`), arm the
+/// amplifier/opencode locator for a fresh pane, register the `terminal_panes` +
+/// `pane_tabs` bookkeeping, and return the built `paneContent`. Takes the caller-minted
+/// `tab_id`/`pane_id` as parameters (a brand-new pair for create; an existing tab + a
+/// brand-new pane for split) so this ONE pipeline serves both call sites -- on failure,
+/// NOTHING is recorded (no `terminal_panes`/`pane_tabs` entry, no registry entry left
+/// running) -- atomic rollback by construction, matching the original's
+/// cleanup-then-error contract (`router.ts:817-831`, `:1387-1393`) without needing an
+/// explicit cleanup step, PLUS the MCP-config cleanup the original also performs on a
+/// failed create (`router.ts:819`, `cw:429-448`).
+pub(crate) async fn spawn_terminal_pane(
     state: &FreshAgentState,
-    name: Option<String>,
     body: &Value,
-) -> Response {
+    tab_id: &str,
+    pane_id: &str,
+) -> Result<TerminalSpawnResult, Response> {
     let mode = body
         .get("mode")
         .and_then(Value::as_str)
@@ -425,7 +479,7 @@ async fn create_terminal_tab(
         .to_string();
 
     if !mode_is_known(state, &mode) {
-        return fail_json(
+        return Err(fail_json(
             StatusCode::BAD_REQUEST,
             format!(
                 "mode \"{mode}\" is not a registered terminal launch target on this server \
@@ -433,14 +487,14 @@ async fn create_terminal_tab(
                  {{\"agent\":\"opencode\"}} for the fresh-agent path, or open an issue if you \
                  need this mode."
             ),
-        );
+        ));
     }
 
     let Some(registry) = state.terminal_registry.clone() else {
-        return fail_json(
+        return Err(fail_json(
             StatusCode::SERVICE_UNAVAILABLE,
             "terminal registry not wired on this server".to_string(),
-        );
+        ));
     };
 
     let shell_str = body
@@ -448,20 +502,6 @@ async fn create_terminal_tab(
         .and_then(Value::as_str)
         .map(str::to_string);
     let cwd = body.get("cwd").and_then(Value::as_str).map(str::to_string);
-    let legacy_resume_session_id = body
-        .get("resumeSessionId")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    // `sanitizeSessionRef` (`shared/session-contract.ts:55-62`): a malformed
-    // `sessionRef` (missing/empty `provider`/`sessionId`) is silently treated
-    // as absent, never a 400 -- `serde_json::from_value` on the
-    // `{provider,sessionId}` shape gives the same "well-formed or None"
-    // behavior (a wrong-shaped JSON value -> `Err` -> `None` here, since
-    // `SessionLocator`'s fields are non-optional strings).
-    let session_ref: Option<SessionLocator> = body
-        .get("sessionRef")
-        .cloned()
-        .and_then(|v| serde_json::from_value(v).ok());
 
     // Validate `cwd` up front: a nonexistent directory would otherwise fail
     // INSIDE the spawned child (post-fork), which a synchronous `registry.create`
@@ -469,31 +509,17 @@ async fn create_terminal_tab(
     // (spec 2.1 "Atomic rollback is part of the contract") honest and testable.
     if let Some(dir) = &cwd {
         if !std::path::Path::new(dir).is_dir() {
-            return fail_json(
+            return Err(fail_json(
                 StatusCode::BAD_REQUEST,
                 format!("cwd \"{dir}\" does not exist"),
-            );
+            ));
         }
     }
 
-    let resume_session_id = match requested_resume_session_id_for_mode(
-        session_ref.as_ref(),
-        &mode,
-        legacy_resume_session_id.as_deref(),
-    ) {
-        Ok(r) => r,
-        Err(resp) => return resp,
-    };
-    let accepted_session_ref = accepted_session_ref_for_mode(session_ref.as_ref(), &mode).cloned();
+    let (resume_session_id, accepted_session_ref) = derive_resume_identity(body, &mode)?;
 
     let terminal_id = Uuid::new_v4().to_string();
     let stream_id = Uuid::new_v4().to_string();
-    // Minted BEFORE spawn (`router.ts:740-744` mints `{tabId,paneId}` via
-    // `layoutStore.createTab()` before `registry.create()`) so the CLI env
-    // (`FRESHELL_TAB_ID`/`FRESHELL_PANE_ID`) can carry them, matching the WS
-    // path's `create.tab_id`/`create.pane_id` plumbing.
-    let tab_id = Uuid::new_v4().to_string();
-    let pane_id = Uuid::new_v4().to_string();
 
     let mut cli: Option<CliLaunch> = None;
     let mut mcp_cwd: Option<String> = None;
@@ -522,7 +548,7 @@ async fn create_terminal_tab(
             target,
         ) {
             Ok(i) => i,
-            Err(e) => return fail_json(StatusCode::BAD_REQUEST, e.message),
+            Err(e) => return Err(fail_json(StatusCode::BAD_REQUEST, e.message)),
         };
 
         // opencode: allocate the loopback control endpoint BEFORE building the
@@ -531,7 +557,7 @@ async fn create_terminal_tab(
             use freshell_opencode::serve::PortAllocator as _;
             match freshell_opencode::transport::LoopbackPortAllocator.allocate() {
                 Ok(ep) => Some(ep),
-                Err(e) => return fail_json(StatusCode::BAD_REQUEST, e),
+                Err(e) => return Err(fail_json(StatusCode::BAD_REQUEST, e)),
             }
         } else {
             None
@@ -583,13 +609,13 @@ async fn create_terminal_tab(
         };
         let launch = match resolve_coding_cli_command(&state.cli_commands, &inputs, &RealEnv) {
             Ok(l) => l,
-            Err(e) => return fail_json(StatusCode::BAD_REQUEST, e.message()),
+            Err(e) => return Err(fail_json(StatusCode::BAD_REQUEST, e.message())),
         };
 
         let effective_shell = resolve_shell(shell_type, host_os, is_wsl);
         let windows_like = is_windows(host_os) || (is_wsl && effective_shell != ShellType::System);
         let overrides =
-            build_terminal_base_env(&RealEnv, &terminal_id, Some(&tab_id), Some(&pane_id));
+            build_terminal_base_env(&RealEnv, &terminal_id, Some(tab_id), Some(pane_id));
 
         spec = match &launch {
             Some(l) if windows_like => build_windows_cli_spawn_spec(
@@ -684,7 +710,7 @@ async fn create_terminal_tab(
             env_var.as_deref(),
             resume_session_id.is_some(),
         );
-        return fail_json(StatusCode::BAD_REQUEST, message);
+        return Err(fail_json(StatusCode::BAD_REQUEST, message));
     }
 
     registry.set_meta(
@@ -732,11 +758,58 @@ async fn create_terminal_tab(
         .lock()
         .expect("terminal_panes mutex")
         .insert(
-            pane_id.clone(),
+            pane_id.to_string(),
             TerminalPaneEntry {
                 terminal_id: terminal_id.clone(),
             },
         );
+    // Slice 3b-1: every pane-minting path records its owning tab in the
+    // shared reverse index (see `FreshAgentState::pane_tabs`'s doc comment)
+    // so `pane_ops`'s split/close/select handlers can resolve this pane's
+    // tab without a server-side layout tree.
+    state
+        .pane_tabs
+        .lock()
+        .expect("pane_tabs mutex")
+        .insert(pane_id.to_string(), tab_id.to_string());
+
+    Ok(TerminalSpawnResult {
+        pane_content,
+        terminal_id,
+        mode,
+        shell: shell_str,
+        cwd,
+    })
+}
+
+/// `POST /api/tabs` terminal-mode path (`router.ts:695-793`'s `else` branch):
+/// mint a fresh `{tabId,paneId}`, spawn via [`spawn_terminal_pane`], record the
+/// `TabRecord`, and broadcast `ui.command{tab.create}` with the legacy-exact
+/// payload keys.
+async fn create_terminal_tab(
+    state: &FreshAgentState,
+    name: Option<String>,
+    body: &Value,
+) -> Response {
+    // Minted BEFORE spawn (`router.ts:740-744` mints `{tabId,paneId}` via
+    // `layoutStore.createTab()` before `registry.create()`) so the CLI env
+    // (`FRESHELL_TAB_ID`/`FRESHELL_PANE_ID`) can carry them, matching the WS
+    // path's `create.tab_id`/`create.pane_id` plumbing.
+    let tab_id = Uuid::new_v4().to_string();
+    let pane_id = Uuid::new_v4().to_string();
+
+    let spawned = match spawn_terminal_pane(state, body, &tab_id, &pane_id).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let TerminalSpawnResult {
+        pane_content,
+        terminal_id,
+        mode,
+        shell: shell_str,
+        cwd,
+    } = spawned;
+
     state.tabs.lock().expect("tabs mutex").insert(
         tab_id.clone(),
         TabRecord {
@@ -814,6 +887,15 @@ pub(crate) async fn list_tabs(
 /// the direct-REST e2e round trip). Each row carries `id`/`tabId`/`title`/
 /// `kind`/`terminalId` -- the fields `resolvePaneTarget` and `handleDisplay`
 /// read (`freshell-tool.js:151-207`).
+/// `GET /api/panes` (`router.ts:898-902`): iterates the [`FreshAgentState::pane_tabs`]
+/// reverse index (NOT `state.tabs`) so every pane ANY pane-minting path has ever
+/// registered is listed -- including `pane_ops::split_pane` panes, which have no
+/// `TabRecord` of their own (a tab can now own more than one pane; `TabRecord` still
+/// only carries the tab's ORIGINAL pane for `GET /api/tabs`'s reduced row shape). Falls
+/// back to the owning tab's title (no independent per-pane title is tracked at this
+/// slice, matching `rename_pane`'s documented reduced fidelity) and resolves `kind`/
+/// `terminalId` from whichever per-kind map (`terminal_panes`/`content_panes`/
+/// fresh-agent `panes`) actually holds the pane.
 pub(crate) async fn list_panes(
     State(state): State<FreshAgentState>,
     headers: HeaderMap,
@@ -823,26 +905,42 @@ pub(crate) async fn list_panes(
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
     let tab_filter = params.get("tabId");
+    let pane_tabs = state.pane_tabs.lock().expect("pane_tabs mutex").clone();
+    let tabs = state.tabs.lock().expect("tabs mutex").clone();
     let terminal_panes = state
         .terminal_panes
         .lock()
         .expect("terminal_panes mutex")
         .clone();
-    let panes: Vec<Value> = state
-        .tabs
+    let content_panes = state
+        .content_panes
         .lock()
-        .expect("tabs mutex")
-        .values()
-        .filter(|t| tab_filter.is_none_or(|tid| tid == &t.id))
-        .map(|t| {
-            let terminal_id = terminal_panes
-                .get(&t.pane_id)
-                .map(|p| p.terminal_id.clone());
+        .expect("content_panes mutex")
+        .clone();
+    let panes: Vec<Value> = pane_tabs
+        .iter()
+        .filter(|(_, tab_id)| tab_filter.is_none_or(|tid| tid == *tab_id))
+        .map(|(pane_id, tab_id)| {
+            let title = tabs.get(tab_id).and_then(|t| t.title.clone());
+            let (kind, terminal_id) = if let Some(tp) = terminal_panes.get(pane_id) {
+                ("terminal".to_string(), Some(tp.terminal_id.clone()))
+            } else if let Some(content) = content_panes.get(pane_id) {
+                (
+                    content
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    None,
+                )
+            } else {
+                ("fresh-agent".to_string(), None)
+            };
             json!({
-                "id": t.pane_id,
-                "tabId": t.id,
-                "title": t.title,
-                "kind": t.kind,
+                "id": pane_id,
+                "tabId": tab_id,
+                "title": title,
+                "kind": kind,
                 "terminalId": terminal_id,
             })
         })

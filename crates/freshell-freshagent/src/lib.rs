@@ -39,6 +39,7 @@
 pub mod claude;
 pub mod codex;
 pub mod opencode_ws;
+pub mod pane_ops;
 pub mod snapshot;
 pub mod terminal_tabs;
 
@@ -120,6 +121,18 @@ pub struct FreshAgentState {
     /// tabId -> tab record, for `GET /api/tabs` (Slice 1). Populated by EVERY
     /// tab-creating path (fresh-agent, terminal, browser, editor).
     pub(crate) tabs: Arc<Mutex<HashMap<String, TabRecord>>>,
+    /// Slice 3b-1 (`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md`
+    /// \u00a72.2 pane routes): paneId -> owning tabId, the reverse index
+    /// `pane_ops`'s split/close/select handlers need to resolve a pane's tab
+    /// without a full server-side layout tree (see `rename_pane`'s doc
+    /// comment for why this port keeps no such tree). Populated by EVERY
+    /// pane-minting call site (fresh-agent `create_tab`, `terminal_tabs`'s
+    /// `create_content_tab`/`create_terminal_tab`/`spawn_terminal_pane`, and
+    /// `pane_ops::split_pane`), so a pane created by ANY path is resolvable
+    /// here -- this is the one piece of bookkeeping this slice adds to the
+    /// pre-existing per-kind maps (`terminal_panes`/`content_panes`/`panes`)
+    /// rather than duplicating tab-membership tracking inside each of them.
+    pub(crate) pane_tabs: Arc<Mutex<HashMap<String, String>>>,
     /// Slice 3a (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md): the
     /// registered coding-CLI command specs (claude/codex/opencode/gemini/
     /// kimi/amplifier/...), the SAME list `freshell_ws::WsState::cli_commands`
@@ -193,6 +206,7 @@ impl FreshAgentState {
             terminal_panes: Arc::new(Mutex::new(HashMap::new())),
             content_panes: Arc::new(Mutex::new(HashMap::new())),
             tabs: Arc::new(Mutex::new(HashMap::new())),
+            pane_tabs: Arc::new(Mutex::new(HashMap::new())),
             cli_commands: Arc::new(Vec::new()),
             amplifier_locator: None,
             opencode_locator: None,
@@ -1052,7 +1066,10 @@ fn build_opencode_snapshot_json(thread_id: &str, info: &Value, messages: &Value)
     Value::Object(snapshot)
 }
 
-/// The fresh-agent sub-router, pre-bound to its state.
+/// The fresh-agent sub-router, pre-bound to its state. Merges in
+/// [`pane_ops::router`] (Slice 3b-1's pane/tab lifecycle routes:
+/// split/close/select + tab select/rename/delete) so `freshell-server`'s
+/// `main.rs` keeps mounting ONE router for this crate, unchanged.
 pub fn router(state: FreshAgentState) -> Router {
     Router::new()
         .route("/api/tabs", post(create_tab).get(terminal_tabs::list_tabs))
@@ -1061,7 +1078,8 @@ pub fn router(state: FreshAgentState) -> Router {
         .route("/api/panes/{id}/send-keys", post(send_keys))
         .route("/api/panes/{id}/capture", get(capture))
         .route("/api/panes/{id}/wait-for", get(terminal_tabs::wait_for))
-        .with_state(state)
+        .with_state(state.clone())
+        .merge(pane_ops::router(state))
 }
 
 // ── auth (constant-time, matches auth.ts#httpAuthMiddleware x-auth-token) ────────
@@ -1210,6 +1228,17 @@ async fn create_tab(
             durable_id: None,
         },
     );
+    // Slice 3b-1: every pane-minting path records its owning tab in the
+    // shared `pane_tabs` reverse index (see the field's doc comment) so
+    // `pane_ops`'s split/close/select handlers can resolve this pane's tab
+    // even though this crate keeps no fresh-agent `TabRecord` (the
+    // fresh-agent path never touches `state.tabs` -- see `terminal_tabs`'s
+    // module doc for why that's an intentional, separately-scoped gap).
+    state
+        .pane_tabs
+        .lock()
+        .expect("pane_tabs mutex")
+        .insert(pane_id.clone(), tab_id.clone());
 
     ok_json(
         json!({ "tabId": tab_id, "paneId": pane_id, "sessionId": placeholder }),
@@ -1224,7 +1253,7 @@ async fn create_tab(
 const MAX_PANE_NAME_LEN: usize = 500;
 
 /// `parseRequiredName` (`agent-api/router.ts:603-606`): trim; empty/absent -> `None`.
-fn parse_required_name(value: Option<&Value>) -> Option<String> {
+pub(crate) fn parse_required_name(value: Option<&Value>) -> Option<String> {
     let trimmed = value.and_then(Value::as_str).unwrap_or("").trim();
     if trimmed.is_empty() {
         None
