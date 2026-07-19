@@ -44,6 +44,7 @@ import { registerTerminalCaptureHandler } from '@/lib/screenshot-capture-env'
 import {
   addTerminalFreshRecoveryRequestId,
   addTerminalRestoreRequestId,
+  clearTerminalRestoreRequestId,
   consumeTerminalFreshRecoveryRequest,
   consumeTerminalRestoreRequestId,
   type TerminalFreshRecoveryIntent,
@@ -565,8 +566,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const lastSessionActivityAtRef = useRef(0)
   const paneLastInputAtRef = useRef<number | undefined>(paneLastInputAt)
   const rateLimitRetryRef = useRef<{ count: number; timer: ReturnType<typeof setTimeout> | null }>({ count: 0, timer: null })
-  const restoreRequestIdRef = useRef<string | null>(null)
-  const restoreFlagRef = useRef(false)
   const freshRecoveryRequestIdRef = useRef<string | null>(null)
   const freshRecoveryIntentRef = useRef<TerminalFreshRecoveryIntent | undefined>(undefined)
   const turnCompleteSignalStateRef = useRef(createTurnCompleteSignalParserState())
@@ -2740,13 +2739,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       retryState.count = 0
     }
 
-    const getRestoreFlag = (requestId: string) => {
-      if (restoreRequestIdRef.current !== requestId) {
-        restoreRequestIdRef.current = requestId
-        restoreFlagRef.current = consumeTerminalRestoreRequestId(requestId)
-      }
-      return restoreFlagRef.current
-    }
+    // consumeTerminalRestoreRequestId is a non-destructive peek (see
+    // terminal-restore.ts) -- it's safe, and required for correctness, to
+    // call it fresh on every sendCreate for the same requestId. An
+    // interrupted restore round (dropped reconnect / server restart before
+    // terminal.created lands) must keep seeing restore:true on every retry
+    // until the pane genuinely anchors; the flag is only cleared explicitly,
+    // once anchored (see the terminal.created handler below).
+    const getRestoreFlag = (requestId: string) => consumeTerminalRestoreRequestId(requestId)
 
     const getFreshRecoveryIntent = (requestId: string) => {
       if (freshRecoveryRequestIdRef.current !== requestId) {
@@ -3687,6 +3687,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
         if (msg.type === 'terminal.created' && msg.requestId === reqId) {
           clearRateLimitRetry()
+          // This requestId has anchored -- it now has a real terminalId, so
+          // any pending restore flag for it is resolved. Clear it explicitly
+          // so it can't be resurrected (it's a non-destructive peek until
+          // this point; see terminal-restore.ts).
+          clearTerminalRestoreRequestId(reqId)
           const newId = msg.terminalId as string
           const handled = handledCreatedMessageRef.current
           if (handled?.requestId === reqId && handled.terminalId === newId) {
@@ -3944,7 +3949,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const repairContent = buildCodexIdentityMismatchRepairContent(current, expectedSessionRef, newRequestId)
           if (!repairContent) return
 
-          consumeTerminalRestoreRequestId(requestIdRef.current)
+          // Abandoning the old requestId in favor of a fresh mint -- resolve
+          // (clear) its restore flag explicitly rather than relying on a
+          // one-shot consume side effect (see terminal-restore.ts).
+          clearTerminalRestoreRequestId(requestIdRef.current)
           addTerminalRestoreRequestId(newRequestId)
           requestIdRef.current = newRequestId
           launchAttemptRef.current = null
@@ -4119,7 +4127,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               clearRateLimitRetry()
               setIsAttaching(false)
               dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
-              consumeTerminalRestoreRequestId(requestIdRef.current)
+              // Abandoning the old requestId in favor of a fresh recovery
+              // mint -- resolve (clear) its restore flag explicitly rather
+              // than relying on a one-shot consume side effect.
+              clearTerminalRestoreRequestId(requestIdRef.current)
               addTerminalFreshRecoveryRequestId(newRequestId, 'fresh_after_restore_unavailable')
               requestIdRef.current = newRequestId
               clearTerminalCursor(currentTerminalId)
@@ -4176,10 +4187,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             // Any INVALID_TERMINAL_ID reconnect is restoring a terminal that existed
             // before the server lost state. Always mark it as restore so the
             // subsequent terminal.create bypasses the server's rate limit.
-            // Consume the old ID's flag (if any) to clean up the set, but mark the
-            // new request regardless — non-restore terminals also need rate-limit
-            // bypass when burst-reconnecting after a server restart.
-            consumeTerminalRestoreRequestId(requestIdRef.current)
+            // Clear the old ID's flag (if any) to resolve/clean up the set, but
+            // mark the new request regardless — non-restore terminals also need
+            // rate-limit bypass when burst-reconnecting after a server restart.
+            clearTerminalRestoreRequestId(requestIdRef.current)
             addTerminalRestoreRequestId(newRequestId)
             requestIdRef.current = newRequestId
             clearQuarantineRepair()
@@ -4226,12 +4237,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           // drops any queued terminal.attach on reconnect (there's nothing to
           // attach to yet here), but a create/attach request in flight when a
           // SECOND disconnect lands can go unanswered with nothing left to
-          // retry it: this was a one-shot restore. Re-drive creation using
-          // the SAME createRequestId on every reconnect completion so a pane
-          // that's still unanchored gets another attempt -- idempotent
-          // because sendCreate reuses the existing requestId (handled/
-          // resent, never minting a new one), so this cannot spawn a
-          // duplicate terminal.
+          // retry it. Re-drive creation using the SAME createRequestId on
+          // every reconnect completion so a pane that's still unanchored
+          // gets another attempt -- idempotent because sendCreate reuses the
+          // existing requestId (handled/resent, never minting a new one), so
+          // this cannot spawn a duplicate terminal. This can legitimately
+          // fire more than once if additional disconnects land before the
+          // pane anchors: consumeTerminalRestoreRequestId is a non-destructive
+          // peek (see terminal-restore.ts), so restore:true is preserved
+          // across every interrupted round -- it's only cleared once this
+          // requestId actually anchors (terminal.created received) or is
+          // abandoned for a freshly-minted one.
           const current = contentRef.current
           if (
             current
