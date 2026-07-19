@@ -819,7 +819,7 @@ impl SessionIndex {
         persist_path: Option<PathBuf>,
         persist_state: Arc<StdMutex<PersistState>>,
     ) -> Arc<Vec<IndexedSession>> {
-        let (items, changed) = tokio::task::spawn_blocking({
+        let sweep_result = tokio::task::spawn_blocking({
             let file_cache = Arc::clone(&file_cache);
             let direct_cache = Arc::clone(&direct_cache);
             move || {
@@ -828,8 +828,32 @@ impl SessionIndex {
                 refresh_snapshot(&sources, &mut cache, &mut direct)
             }
         })
-        .await
-        .unwrap_or_default();
+        .await;
+        let (items, changed) = match sweep_result {
+            Ok(result) => result,
+            Err(join_err) => {
+                // `discover`/`parse` are documented never-panic (every
+                // `SessionSource` impl is corruption-tolerant), so this is
+                // currently unreachable -- but IF that invariant is ever
+                // violated, publishing `(vec![], 0)` here (the old
+                // `unwrap_or_default()` behavior) would silently overwrite a
+                // good, previously-published snapshot with an empty one
+                // marked FRESH. Preserve whatever's already published
+                // instead, mirroring `refresh_snapshot`'s own
+                // `direct_list`-error handling a few lines above
+                // (preserve-cached + log) rather than dropping data.
+                eprintln!(
+                    "session-directory: refresh sweep panicked (preserving cached \
+                     snapshot): {join_err}"
+                );
+                return snapshot
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|c| Arc::clone(&c.items))
+                    .unwrap_or_default();
+            }
+        };
         let items = Arc::new(items);
         {
             let mut guard = snapshot.lock().unwrap();
@@ -1945,6 +1969,74 @@ mod tests {
         );
         // No filesystem cleanup needed: `SlowSource` uses only synthetic
         // `mem://` paths and never touches the real filesystem.
+    }
+
+    /// A `SessionSource` whose `discover()` unconditionally panics --
+    /// simulates the blocking sweep closure panicking inside
+    /// `spawn_blocking` (documented as never happening today -- `discover`
+    /// and `parse` are both corruption-tolerant -- but this test guards
+    /// what happens if that invariant is ever violated).
+    struct PanicSource;
+
+    impl SessionSource for PanicSource {
+        fn discover(&self) -> Vec<FileStat> {
+            panic!("synthetic panic to exercise spawn_blocking JoinError handling");
+        }
+
+        fn parse(&self, _path: &Path) -> Option<IndexedSession> {
+            None
+        }
+    }
+
+    /// RED (before the fix): `perform_refresh`'s
+    /// `spawn_blocking(...).await.unwrap_or_default()` turns a `JoinError`
+    /// (the blocking closure panicked) into `(vec![], 0)`, which is then
+    /// unconditionally published as the new snapshot -- silently
+    /// overwriting a good, previously-published snapshot with an empty one
+    /// marked FRESH. A panicked sweep must instead be treated the same way
+    /// `direct_list`'s error path already is (`refresh_snapshot`, a few
+    /// lines above): preserve whatever was cached and log, never publish
+    /// empty-and-fresh over good data.
+    #[tokio::test]
+    async fn perform_refresh_preserves_cached_snapshot_when_blocking_sweep_panics() {
+        // Seed `snapshot` as if a previous, successful sweep had already
+        // published a good result -- exactly the state a real warm cache is
+        // in when a LATER refresh sweep panics.
+        let good_snapshot = Arc::new(vec![mk("a", "claude", 1)]);
+        let snapshot = Arc::new(StdMutex::new(Some(CachedSnapshot {
+            items: Arc::clone(&good_snapshot),
+            fetched_at: Instant::now(),
+        })));
+        let file_cache = Arc::new(StdMutex::new(HashMap::new()));
+        let direct_cache = Arc::new(StdMutex::new(HashMap::new()));
+        let persist_state = Arc::new(StdMutex::new(PersistState::default()));
+
+        let panicking_source: Arc<dyn SessionSource> = Arc::new(PanicSource);
+
+        let result = SessionIndex::perform_refresh(
+            vec![panicking_source],
+            Arc::clone(&file_cache),
+            Arc::clone(&direct_cache),
+            Arc::clone(&snapshot),
+            None,
+            Arc::clone(&persist_state),
+        )
+        .await;
+
+        assert_eq!(
+            result.len(),
+            1,
+            "a panicked blocking sweep must return the last-known-good snapshot, \
+             not an empty one"
+        );
+
+        let published = snapshot.lock().unwrap();
+        assert_eq!(
+            published.as_ref().map(|c| c.items.len()),
+            Some(1),
+            "the published snapshot must be preserved (not overwritten with an \
+             empty-but-fresh one) after the blocking sweep panics"
+        );
     }
 
     /// A post-TTL refresh sweep over a synthetic 3,000-file claude corpus
