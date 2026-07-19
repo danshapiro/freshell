@@ -109,6 +109,11 @@ export default defineConfig({
         // against an owned, ephemeral Rust server. Rust-only (no legacy
         // equivalent needed -- see the spec's own doc comment in that file).
         /mcp-bridge-rust\.spec\.ts$/,
+        // MCP QA smoke (the QA-lever payoff): full mode-matrix coverage
+        // (shell/amplifier/opencode/codex/browser/editor/pane-ops) driven
+        // through the same unmodified legacy MCP stdio binary. See
+        // mcp-qa-smoke-rust.spec.ts's own doc comment.
+        /mcp-qa-smoke-rust\.spec\.ts$/,
         // TERM-28 (`docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`):
         // proves the Rust `freshell-terminal`/`freshell-platform` PATH-only
         // bare-command resolution fix. Rust-only -- the bug is in the Rust
