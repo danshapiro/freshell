@@ -432,3 +432,84 @@ kimi) and the rest of the pane surface (split/close/select/resize/swap/
 respawn/attach/navigate, `run`, `screenshot`) land in Slice 3 / the "3a"
 follow-up wave; this lever's coverage grows alongside that work rather than
 being re-derived from scratch.
+
+## Ops: MCP QA smoke (added 2026-07-19, full mode-matrix payoff)
+
+Slice 1/3a/3b of the agent-API + MCP parity spec have since landed (rich
+terminal-mode `POST /api/tabs` for every registered coding-CLI extension,
+and the full Slice-3b-2 pane-lifecycle surface: split/close/select/resize/
+swap/respawn/attach/navigate + tab select/rename/delete/has/next/prev +
+`GET /api/layout/snapshot`). `test/e2e-browser/specs/mcp-qa-smoke-rust.spec.ts`
+is the payoff regression pass the `mcp-bridge-rust.spec.ts` pin (above) was
+built to unlock: it drives the SAME unmodified legacy MCP stdio binary
+against ONE owned, ephemeral Rust server, but across **every** pane mode
+instead of `shell` alone.
+
+**What it covers** (one server boot, sequential actions, wired into the
+`rust-chromium` project's `testMatch` alongside `mcp-bridge-rust.spec.ts`):
+
+- `shell` -- one quick control assertion (full shell coverage stays with
+  `mcp-bridge-rust.spec.ts`).
+- `amplifier` -- fresh launch + submit, THEN a **separate** fresh `new-tab`
+  call carrying `resume:<sessionId>` (MCP's `new-tab` derives
+  `sessionRef:{provider:'amplifier',sessionId}` automatically for any
+  non-codex mode). This is a different code path than
+  `amplifier-restore-rust.spec.ts` (which proves resume across a
+  browser-driven server *restart*) -- this proves resume works when an
+  external MCP agent asks for it directly on a brand-new pane, with no
+  browser involved at all.
+- `opencode` -- fresh launch + submit (mirrors
+  `opencode-terminal-restore-rust.spec.ts`'s fixture; resume-via-MCP for
+  opencode terminal panes follows the identical shape amplifier already
+  proves, so isn't re-proven here for runtime economy).
+- `codex` -- fresh launch, then resume via the **`sessionRef` param
+  directly** (`ACTION_PARAMS['new-tab']`'s optional `sessionRef` field). A
+  raw `resume`/`resumeSessionId` for `mode:"codex"` is rejected outright by
+  both the MCP tool's `rejectRawCodexResume` and the Rust
+  `requested_resume_session_id_for_mode` -- this suite proves BOTH sides:
+  the accepted `sessionRef` resume path, and the raw-resume rejection
+  itself (so the guard can't silently regress into accepting the invalid
+  shape).
+- `browser` + `editor` content panes -- creation, `list-panes` kind
+  cross-ref, and `navigate` on the browser pane.
+- Slice 3b-2 pane-lifecycle routes -- `split-pane`, `resize-pane`,
+  `swap-pane`, `respawn-pane`, `select-pane`, `select-tab`, `has-tab`,
+  `kill-pane`, `kill-tab`, all driven through the shell tab from step 1.
+  (`attach` is the one exposed-but-skipped action: it pairs a pane with a
+  bare `terminalId` minted outside this REST/MCP surface -- a scope choice,
+  not a coverage gap forced by the MCP binary lacking the action.)
+- One `server.restart()` at the very end, asserting the CURRENT, honest
+  behavior: the Slice-1/3a/3b agent-API registry
+  (`FreshAgentState.tabs`/`terminal_panes`/`content_panes`/`pane_tabs`,
+  `crates/freshell-freshagent/src/lib.rs`) is **in-process memory only** --
+  there is no durable backing store for it (unlike the browser client's own
+  localStorage-persisted layout, which this pure-REST/MCP suite never
+  touches). Every tab/pane id minted before the restart is gone from
+  `list-tabs`, and a stale pane's `capture-pane` 404s rather than returning
+  stale data. This matches the MCP tool's own advertised contract
+  (`freshell-tool.ts`'s `INSTRUCTIONS`: "Tab and pane IDs are ephemeral...").
+  **This is a real, current gap, not something this suite papers over** --
+  if the agent-API registry ever needs to survive a restart (e.g. to
+  support "reconnect and keep driving the same panes" for an MCP-controlled
+  session), that is follow-up scope, not something this pin claims already
+  works.
+
+**How to run it:**
+```bash
+npx playwright test --config test/e2e-browser/playwright.config.ts \
+  --project=rust-chromium mcp-qa-smoke-rust.spec.ts
+```
+Same ephemeral-target hard rule as `mcp-bridge-rust.spec.ts` above applies
+unchanged (own `RustServer`, random port, isolated `FRESHELL_HOME` -- never
+`:3001`/`:3002`).
+
+**What it would have caught (incident-to-assertion mapping):**
+
+| Historical incident class | Guarding assertion in this suite |
+|---|---|
+| "Amplifier blank-tabs" class -- a coding-CLI pane silently launches FRESH instead of resuming, leaving the user looking at an empty prompt with no visible error and no way to tell their prior session was dropped | The amplifier-resume assertions: `wait-for` on `amplifier: resumed session` (not just `amplifier> `) after a `new-tab{resume:<id>}` call, PLUS the independent argv-log cross-check (`argv[0]==='resume' && argv[1]===sessionId`). A regression that silently drops the resume arg would show the fresh-launch banner instead and fail both checks -- not a blank pane that "looks fine" until inspected closely. |
+| Codex resume-create silent-data-loss class -- a resume request for codex is accepted and appears to succeed, but the actual launched process never receives the resume identity (silently starts a new, unrelated thread), so the user's existing work is invisibly lost | The codex-resume assertions: `wait-for`/`capture-pane` on `codex: resumed session <id>` after `new-tab{sessionRef:{provider:'codex',sessionId}}`, cross-checked against the argv log's `resume <id>` entry, PLUS a companion assertion that a **raw** `resume`/`resumeSessionId` for `mode:"codex"` (no `sessionRef`) is REJECTED (`error` truthy) rather than silently accepted-and-ignored -- the exact shape of "looks like it worked, actually started fresh" this class describes. |
+| Stale-ID-after-restart false-success -- an MCP/automation client keeps using pane/tab ids from before a server restart and gets a misleading "success" or stale cached content instead of an honest failure | The restart section: `list-tabs` after `server.restart()` must NOT contain any pre-restart tab id, and `capture-pane` on a pre-restart pane id must return an `error`, not stale/blank data. |
+| Route-shape drift on the Slice-3b-2 pane-lifecycle surface (split/swap/respawn/etc. silently 404ing or changing response shape as the Rust port evolves) | The pane-ops section calls every one of those actions through the SAME unmodified MCP binary and asserts `status`/returned ids, so a regression in any one route surfaces as a broken assertion here rather than being discovered only when a real MCP agent hits it in the field. |
+
+Verified 3x green locally (`1 passed` each run, ~33-43s per run); `mcp-bridge-rust.spec.ts` still green after this addition; frozen `server/`/`shared/`/`src/` untouched.
