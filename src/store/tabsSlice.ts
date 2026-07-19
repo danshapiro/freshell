@@ -20,7 +20,7 @@ import {
 import { UNKNOWN_SERVER_INSTANCE_ID } from './tabRegistryConstants'
 import type { RootState } from './store'
 import { selectTabIdByTerminalId } from './selectors/paneTerminalSelectors'
-import { loadPersistedLayout } from './persistMiddleware'
+import { loadPersistedLayout, markTabsLoadRecovery } from './persistMiddleware'
 import { createLogger } from '@/lib/client-logger'
 import { mergeSessionMetadataByKey, sessionMetadataKey } from '@/lib/session-metadata'
 import { mergeSessionMetadataForPreferredResumeId } from './persistControl'
@@ -227,7 +227,13 @@ function loadInitialTabsState(): TabsState {
     if (!layout) return defaultState
 
     const tabsState = layout.tabs?.tabs as Partial<TabsState> | undefined
-    if (!Array.isArray(tabsState?.tabs)) return defaultState
+    if (!Array.isArray(tabsState?.tabs)) {
+      // The layout itself parsed, so something was genuinely persisted, but
+      // its tabs shape is unusable. Don't let a later flush treat the
+      // resulting empty array as a real "user has no tabs" signal.
+      markTabsLoadRecovery()
+      return defaultState
+    }
 
     const persistedAt = typeof layout.persistedAt === 'number' ? layout.persistedAt : undefined
     const ageMs = persistedAt ? Date.now() - persistedAt : undefined
@@ -241,6 +247,12 @@ function loadInitialTabsState(): TabsState {
       tabsState.tabs.map(migrateTabFields),
       (layout.panes?.layouts || {}) as Record<string, PaneNode | undefined>,
     )
+    if (tabsState.tabs.length > 0 && mappedTabs.length === 0) {
+      // Every persisted tab was pruned (e.g. its pane layout was missing or
+      // malformed). The persisted tabs were real; losing all of them during
+      // sanitization is a recovery, not a genuine empty state.
+      markTabsLoadRecovery()
+    }
     const desired = tabsState.activeTabId
     const has = desired && mappedTabs.some((t: Tab) => t.id === desired)
 
@@ -252,6 +264,7 @@ function loadInitialTabsState(): TabsState {
     }
   } catch (err) {
     log.error('Failed to load from localStorage:', err)
+    markTabsLoadRecovery()
     return defaultState
   }
 }

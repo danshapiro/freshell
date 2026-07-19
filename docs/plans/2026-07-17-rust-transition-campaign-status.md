@@ -293,6 +293,16 @@ the icon to ship. Oracle equivalence is unaffected (server-side only).
 src/ deviation grown to 3 files — restore fixes cherry-picked from main 5c56ecc3 (#516) so the
 port client carries them before reconciliation; adaptations listed in commit cd35c24c (none needed - clean apply).
 
+src/ deviation grown to 5 files — persist-empty guard cherry-picked from main 811ab39e
+(fix/client-guards: "fix(persist): guard against overwriting a non-empty layout with empty tabs")
+so port users get the data-loss protection before reconciliation. Adds
+`src/store/persistMiddleware.ts` + `src/store/tabsSlice.ts` guard logic (a transient tabs-load
+failure no longer permanently overwrites a non-empty persisted layout with an empty one on the
+next flush) plus its regression test `test/unit/client/store/persistTabsEmptyGuard.test.ts`
+(test/, not src/). The port's frozen `src/store/persistMiddleware.ts` and `src/store/tabsSlice.ts`
+were byte-identical to main at 811ab39e's parent, so the cherry-pick applied cleanly with zero
+adaptation. `dist/client` rebuilt so the fix ships on the next approved restart.
+
 2026-07-17 (commits `64083989`, `8888df30` — non-bisectable span, harmless at HEAD): these two
 Batch 1 commits do not build standalone in isolation. `64083989` ("add Amplifier as a fourth
 session-directory source") absorbed a concurrent agent's `main.rs` wiring change (the
