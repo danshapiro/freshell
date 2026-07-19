@@ -559,8 +559,25 @@ impl FreshCodexState {
         // `handle_send`, read/cleared by `handle_interrupt`, cleared by the consumer below.
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
 
-        // Start the notification consumer (the status-guarded completion edge lives here).
-        let consumer = self.spawn_consumer(notifs, thread_id.clone(), active_turn.clone());
+        // ORDERING FIX (wireshape-oracle flake, ~1-in-3): the app-server can already have
+        // pushed a `ThreadStarted` notification onto `notifs` (the fake app-server
+        // broadcasts it synchronously right after the `thread/start` RPC response,
+        // `fake-app-server.mjs:506-511`) BEFORE this task reaches the
+        // `broadcast(FreshAgentCreated)` below. Spawning the consumer gates its FIRST
+        // `notifs.recv()` on `created_tx` firing -- which happens only after `created` is
+        // broadcast -- so the consumer can never race the created broadcast, matching
+        // legacy's structural guarantee (its per-session lifecycle listener is attached
+        // only AFTER `freshAgent.created` is sent, `ws-handler.ts:3378` then `:3387`, so it
+        // cannot possibly observe an event that fired before it existed). The unbounded
+        // `notifs` channel buffers whatever arrives in the meantime -- nothing is lost,
+        // only its delivery to the consumer is deferred.
+        let (created_tx, created_rx) = oneshot::channel();
+        let consumer = self.spawn_consumer_after(
+            notifs,
+            thread_id.clone(),
+            active_turn.clone(),
+            Some(created_rx),
+        );
 
         // The exit-watcher owns the sidecar child: a REQUESTED kill (via `kill_tx`) tears it
         // down with no self-heal event; an UNREQUESTED exit self-heals (adapter.ts:935-946)
@@ -629,6 +646,12 @@ impl FreshCodexState {
                 session_id: thread_id,
             }),
         }));
+
+        // ORDERING FIX: release the consumer's gate now that `created` has been
+        // broadcast (see the `created_tx`/`created_rx` doc above) -- any `ThreadStarted`
+        // notification already buffered on `notifs` is only delivered to the consumer
+        // (and thus only broadcast) from this point on.
+        let _ = created_tx.send(());
     }
 
     /// REVIEW FIX (item 3): legacy's `freshAgent.create.failed` sends `retryable: true` on
@@ -1430,12 +1453,34 @@ impl FreshCodexState {
     /// `freshAgent.turn.complete` chime ONLY on a `completed` status.
     fn spawn_consumer(
         &self,
-        mut notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
+        notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
         thread_id: String,
         active_turn: Arc<StdMutex<Option<String>>>,
     ) -> tokio::task::JoinHandle<()> {
+        self.spawn_consumer_after(notifs, thread_id, active_turn, None)
+    }
+
+    /// Like [`Self::spawn_consumer`], but if `gate` is given, the consumer's first
+    /// `notifs.recv()` waits for it to fire before consuming anything -- see
+    /// [`Self::finish_create`]'s ordering-fix doc for why this exists. The unbounded
+    /// `notifs` channel buffers whatever arrives while gated; nothing is lost, only its
+    /// delivery to the consumer (and thus any resulting broadcast) is deferred. A
+    /// dropped/never-fired `gate` behaves identically to `None` (a dropped oneshot
+    /// sender resolves its receiver immediately with `Err`, which this ignores) --
+    /// callers must still fire it on every path, but a bug that forgets to can never
+    /// wedge the consumer forever.
+    fn spawn_consumer_after(
+        &self,
+        mut notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
+        thread_id: String,
+        active_turn: Arc<StdMutex<Option<String>>>,
+        gate: Option<oneshot::Receiver<()>>,
+    ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
         tokio::spawn(async move {
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
             let mut subscription = CodexSubscription::new(thread_id.clone());
             while let Some(notification) = notifs.recv().await {
                 let events = reduce_notification(&mut subscription, notification, &active_turn);
@@ -4192,6 +4237,75 @@ pub(crate) mod tests {
             "the kill must evict the dedup cache, so the duplicate create genuinely \
              re-spawns"
         );
+    }
+
+    // -- freshAgent.created-vs-session.snapshot wire-shape ordering (oracle flake fix) --
+
+    /// THE wireshape-oracle ordering flake this task fixes
+    /// (`test/unit/port/oracle/freshagent-wireshape-differential.test.ts`, ~1-in-3):
+    /// `finish_create` used to spawn the notification consumer BEFORE broadcasting
+    /// `freshAgent.created` -- a genuine race between the consumer task processing an
+    /// already-arrived `ThreadStarted` notification (the fake app-server broadcasts it
+    /// synchronously right after the `thread/start` RPC response,
+    /// `fake-app-server.mjs:506-511`, so it can already be buffered on the notification
+    /// channel by the time the consumer starts) and the main task's own
+    /// `broadcast(FreshAgentCreated)` a few lines later. Legacy structurally cannot
+    /// exhibit this: the per-session lifecycle listener that would translate
+    /// `thread_started` into a status snapshot is attached (`ensureFreshAgentSubscription`
+    /// -> `adapter.ts subscribe()`) strictly AFTER `freshAgent.created` is sent
+    /// (`ws-handler.ts:3378` then `:3387`), so it cannot observe an event that fired
+    /// before it existed. Run many independent creates and assert `created` always
+    /// precedes any `freshAgent.event` for that session -- this reproduced the race
+    /// roughly 1-in-3 before the fix and must be 0-in-N after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn handle_create_always_broadcasts_created_before_any_session_event() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (st, mut rx) = state_with_bus();
+
+        for i in 0..30 {
+            let request_id = format!("req-order-{i}");
+            configure_fake_codex_cmd(&format!(r#"{{"threadStartThreadId":"thread-order-{i}"}}"#));
+            st.handle_create(create_msg(&request_id)).await;
+
+            // Settle window: give the (possibly-racing) consumer task a chance to run
+            // and broadcast its first status-snapshot event, if it's going to.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let mut created_seen = false;
+            let mut violation: Option<Value> = None;
+            let mut session_id: Option<String> = None;
+            while let Ok(frame) = rx.try_recv() {
+                let wire: Value = serde_json::from_str(&frame).unwrap();
+                if wire["type"] == "freshAgent.created" && wire["requestId"] == request_id {
+                    created_seen = true;
+                    session_id = wire["sessionId"].as_str().map(|s| s.to_string());
+                } else if !created_seen && wire["type"] == "freshAgent.event" {
+                    violation = Some(wire);
+                }
+            }
+            assert!(
+                created_seen,
+                "iteration {i}: freshAgent.created must have been broadcast for {request_id}"
+            );
+            assert!(
+                violation.is_none(),
+                "iteration {i}: a freshAgent.event arrived BEFORE freshAgent.created: \
+                 {violation:?}"
+            );
+
+            if let Some(session_id) = session_id {
+                st.handle_kill(FreshAgentKill {
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id,
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    cwd: None,
+                })
+                .await;
+                // Drain the killed frame (+ any trailing notification) so the next
+                // iteration starts from an empty buffer.
+                while rx.try_recv().is_ok() {}
+            }
+        }
     }
 
     // -- freshAgent.create resume (CODEX-FIRST triage Finding 1) --
