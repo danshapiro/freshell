@@ -46,6 +46,10 @@ const MATRIX_SPECS = [
   // take effect via PATCH /api/settings without a restart) -- runs against
   // both server kinds as a parity control. See settings-live-reload.spec.ts.
   /settings-live-reload\.spec\.ts$/,
+  // TERM-13 -- two scrollback settings, Unicode-integrity, and
+  // search-at-boundary closure -- a true parity control on both server
+  // kinds. See term13-scrollback-boundary.spec.ts.
+  /term13-scrollback-boundary\.spec\.ts$/,
   /ws-ping-pong-matrix\.spec\.ts$/,
   // SESSION-01 narrowed-MISSING closure -- sidebar-click resume (Codex leg
   // runs on both kinds; the Amplifier leg self-skips on legacy via an
