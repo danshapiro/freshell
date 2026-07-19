@@ -651,6 +651,167 @@ path itself is intact).
 - status: accepted (terminals.changed parity CLOSED; terminal.meta.updated open gap, tracked for
   closure with DEV-0006)
 
+## E2E-discovered intentional divergences (EDEV-xx)
+
+**Scope — READ THIS FIRST.** This section is DELIBERATELY SEPARATE from the DEV-NNNN
+ledger above and does NOT participate in its contract. The DEV-NNNN ledger is the
+mechanical oracle harness's fingerprint whitelist: each entry is adjudicated by the
+antagonist reviewer, requires an *objective defect* in the original, and grants the
+differ a specific tolerance. The EDEV-xx entries below are a DIFFERENT artifact:
+intentional old-vs-new divergences SURFACED BY THE PLAYWRIGHT E2E BROWSER MATRIX
+(`test/e2e-browser/specs/*`, which runs each spec against BOTH a `legacy-chromium`
+and a `rust-chromium` target and asserts the per-kind-correct outcome). They are
+recorded here for human/operator traceability. They are NOT oracle fingerprints,
+they grant the T0-T3 differ NO tolerance, and they carry their own EDEV-NN numbering
+so they can never be confused with a DEV-NNNN harness whitelist id. Each entry states:
+what differs, why the divergence is intentional (which side is better + who decided),
+the evidence (spec::test + commit), and one plain-English user-impact sentence.
+
+Every EDEV entry here is a case where the E2E matrix asserts the DIFFERENT outcome
+per server kind on purpose — the legacy leg is retained as a CONTROL that empirically
+proves the pre-existing gap, and the rust leg proves the improvement.
+
+### EDEV-01 — WS Origin policy is ENFORCED (hostile / `null` / malformed Origin rejected before `ready`)
+- what_differs: The Rust `/ws` upgrade closes the socket with WS close code **4011
+  "Origin not allowed"** — *before* the `ready` handshake or any session state
+  (`ready`/`settings.updated`/`terminal.inventory`) is sent — whenever the `Origin`
+  header is present and neither same-origin nor allow-listed (a hostile DNS-rebinding
+  origin, the literal `null` of a sandboxed iframe/`file://`, or a malformed non-URL).
+  Legacy's Origin check is **advisory-only**: it logs a warning and NEVER closes, so a
+  hostile origin bearing a valid token still reaches `ready`.
+- why_intentional: Rust is the better side — a deliberate hardening. The Rust production
+  bind is `0.0.0.0` (LAN-reachable), where advisory-only leaves a classic DNS-rebinding
+  path open. Decided under the SAFE-03 checklist item; documented in the enforcing
+  module's own doc comment (`crates/freshell-ws/src/origin.rs:1-31`).
+- allowlist_mechanism (for operators permitting a proxy/tunnel hostname): an Origin is
+  ALLOWED when (a) there is **no `Origin` header at all** — curl/CLI/MCP tooling and some
+  VPN/mobile browsers omit it (`origin.rs:88-91,109-111`); (b) it **matches the request's
+  own `Host`** as `http://<host>` or `https://<host>` (same-origin, independent of the
+  allow-list — `origin.rs:118-122`); or (c) it is an **exact string match** in the
+  resolved allow-list. The allow-list defaults to localhost + 127.0.0.1 on ports
+  5173/3001/3002 (`origin.rs:36-48`). The `ALLOWED_ORIGINS` env var (comma-separated)
+  **REPLACES** the defaults entirely (`origin.rs:59-66`); `EXTRA_ALLOWED_ORIGINS` is
+  always **appended** on top of whichever branch was taken (`origin.rs:55-73`). The
+  literal `null` is ALWAYS rejected even if an operator lists it (`origin.rs:115-117`).
+  So: to permit a reverse-proxy/tunnel hostname, set `ALLOWED_ORIGINS` to the full
+  trusted set, or add just that host via `EXTRA_ALLOWED_ORIGINS`.
+- evidence: `test/e2e-browser/specs/safe03-origin-matrix.spec.ts` — hostile (`:139`),
+  `null` (`:154`), malformed (`:166`), each asserting rust `{closeCode:4011,
+  closeReason:'Origin not allowed'}` vs legacy `ready`; plus the allowed cases
+  (no-Origin `:123`, same-origin `:128`, allow-listed remote `:134`). Crate-level
+  real-socket proof: `crates/freshell-ws/tests/origin_policy.rs`. Commit `f18554a2`.
+- user_impact: On the Rust server, a web page served from an unrecognized host cannot
+  open a freshell WebSocket connection (ordinary browsing is unaffected — only pages
+  that embed or connect to freshell); operators allow a new host via `ALLOWED_ORIGINS`.
+
+### EDEV-02 — Terminal scrollback SEARCH is scoped to the bounded retained window
+- what_differs: Rust's `GET /api/terminals/{id}/search` searches the SAME byte-capped
+  structure that backs reattach-replay (`entry.snapshot`, built from the bounded
+  `s.replay` in `crates/freshell-server/src/terminals.rs`), so search results honor the
+  configured scrollback cap: a line evicted from the retained window returns zero
+  matches. Legacy's search reads a SEPARATE, **entirely unbounded** `this.lines` array
+  in `server/terminal-view/mirror.ts` (`appendLines` only ever grows) that never
+  reflects the scrollback cap — so legacy finds arbitrarily old text and grows memory
+  without bound.
+- why_intentional: Rust is the better side — correct AND bounded. The port deliberately
+  unifies the two legacy stores onto the one bounded replay ring, discovered during the
+  TERM-13 boundary spec (DISCOVERY 2). Decided under the TERM-13 checklist item.
+- evidence: `test/e2e-browser/specs/term13-scrollback-boundary.spec.ts` — SMALL-cap
+  eviction test asserts rust `matches:[]` vs legacy `matches.length>0` for an evicted
+  needle (`:271-277`); LARGE-cap test asserts the retained needle is found byte-perfect
+  and Unicode-clean (`:313-320`); DISCOVERY 2 note (`:56-72`) records the legacy
+  unbounded-`this.lines` finding empirically. Commit `fc1fc3fa`.
+- user_impact: On the Rust server, terminal search only finds text still within the
+  configured scrollback window; legacy could surface arbitrarily old text (at the cost
+  of unbounded server memory growth).
+
+### EDEV-03 — Settings-save WRITE FAILURES are surfaced (500 + error envelope), not silently swallowed
+- what_differs: On the Rust server, when `SettingsStore::persist()` fails to write
+  (e.g. a read-only config dir), `PATCH /api/settings` returns **HTTP 500 with a
+  populated `{error: string}` envelope** and does NOT commit the change to the live
+  in-memory tree (it stays at the last successfully-persisted value). Legacy's
+  `settings-router.ts#handleSettingsPatch` has NO `try/catch` around
+  `configStore.patchSettings`, so a real write failure there is an unhandled promise
+  rejection in Express 4 — no clean, reproducible caller-visible response at all.
+- why_intentional: Rust is the better side. `SettingsStore::persist()` was given a
+  `Result<(), io::Error>` return and `patch()` maps the failure to the same 500 error
+  envelope every other fs-backed router already uses. Decided under the CFG-03 checklist
+  follow-up (GAP2).
+- evidence: `test/e2e-browser/specs/cfg03-backup-restore.spec.ts` — the GAP2 test
+  (`:383-442`) makes `.freshell` read-only, asserts the PATCH returns `500` with a
+  non-empty `body.error`, that the live tree is unchanged (`autoKillIdleMinutes` still
+  `3`, not the failed `99`), and that the primary on disk is byte-identical; the legacy
+  leg is `test.skip`-ped with a source-cited explanation that legacy has no clean error
+  path (`:384-391`). Commit `8c78e48e`.
+- user_impact: On the Rust server a failed settings save shows an error instead of
+  silently pretending to have saved.
+
+### EDEV-04 — Corrupt config AUTO-RESTORES from backup, preserves a forensic copy, and NOTIFIES the browser
+- what_differs: On boot with a corrupt/unreadable primary `config.json` and a valid
+  `config.backup.json`, the Rust server **auto-restores the primary from the backup**
+  (preserving every last-good value) before anything else, and — when both primary and
+  backup are corrupt — preserves timestamped **forensic copies** (`config.json.corrupt-*`
+  / `config.backup.json.corrupt-*`) instead of destroying them. It also emits a
+  `config.fallback` frame (with the truthful `reason`, e.g. `PARSE_ERROR`, and
+  `backupExists: true`) in EVERY `/ws` handshake, including late connections, so the
+  browser can show a fallback notice. Legacy treats ANY read failure as "no config",
+  unconditionally writes bare defaults, and (via `saveInternal`'s own unconditional
+  `copyFile`) OVERWRITES the backup with those defaults too — destroying the very backup
+  its own console message (`server/config-store.ts:235`, "restore backup with: mv
+  ~/.freshell/config.backup.json ~/.freshell/config.json") tells the user to recover
+  from. The last-good value is lost from both files.
+- why_intentional: Rust is the better side — a data-preserving safety improvement the
+  CFG-03 acceptance text explicitly permits ("Automatic backup restoration is a
+  deliberate safety improvement only if separately documented and tested"; this ledger
+  entry + the spec ARE that documentation/test). Decided under CFG-03 (backup +
+  conservative auto-restore) and its GAP1 follow-up (the `config.fallback` notice).
+- evidence: `test/e2e-browser/specs/cfg03-backup-restore.spec.ts` — corrupt-primary +
+  valid-backup test asserts rust restores the sentinel value into both files and emits
+  the `config.fallback` frame (reason `PARSE_ERROR`, `backupExists:true`) on a first AND
+  a later second connection (`:279-319`), vs legacy losing the sentinel from both files
+  (`:320-328`); both-corrupt test asserts the forensic `.corrupt-*` copies exist
+  (`:357-381`). Commits `41b04143` (backup + auto-restore) and `8c78e48e`
+  (`config.fallback` emission).
+- user_impact: On the Rust server, corrupted settings self-heal from the last-good
+  backup with a visible in-browser notice, instead of silently resetting to defaults.
+
+### EDEV-05 — Claude interrupt missing-session error text is a STATIC string (cosmetic)
+- what_differs: When a `freshAgent.interrupt` targets an unknown claude session, the
+  Rust `FreshClaudeState::handle_interrupt` returns the static `SESSION_NOT_FOUND`
+  message `"claude session not found"` (`crates/freshell-freshagent/src/claude.rs:122`),
+  whereas legacy's adapter throws the session-id-embedded `Claude session ${sessionId}
+  is not available` (`server/fresh-agent/adapters/claude/adapter.ts:163-167`). Both are
+  fire-and-forget on success (no confirmation frame); only the missing-session error
+  text differs.
+- why_intentional: Neither side is "better" — this is a cosmetic wording difference. The
+  Rust static message follows the same `SESSION_NOT_FOUND` convention its sibling
+  codex/opencode `handle_interrupt` arms already use; standardized when the claude
+  kill/interrupt dispatch arms were wired in. Decided under commit `57a82817`.
+- evidence: commit `57a82817` (claude interrupt error path + unit coverage of the
+  unknown-session case); legacy text at `server/fresh-agent/adapters/claude/adapter.ts:166`.
+  (No e2e KNOWN-DIVERGENCE marker — surfaced from the commit, not the browser matrix.)
+- user_impact: On a rare interrupt of an already-gone claude session, the error text no
+  longer names the session id; no functional difference.
+
+### EDEV-06 — Whitespace-only auth token is REJECTED at startup (hardening)
+- what_differs: The Rust server rejects a whitespace-only `AUTH_TOKEN` (e.g. 20 spaces)
+  at startup via `token.trim().is_empty()` (`crates/freshell-server/src/main.rs:846-851`,
+  documented in `validate_auth_token`'s own doc comment) — the server refuses to boot.
+  Legacy's `!token` check is JS-falsy-only, so a 20-space string (truthy, ≥16 chars, not
+  in `DEFAULT_BAD_TOKENS`) passes every startup check and the server boots normally with
+  that unusable-in-practice secret.
+- why_intentional: Rust is the better side — a deliberate hardening (a whitespace string
+  is never an effective secret). Note the rest of the token contract is exact parity:
+  `main.rs::validate_auth_token` and `server/auth.ts` share the same messages/order and
+  `DEFAULT_BAD_TOKENS` set (confirmed by direct source read), so this whitespace case is
+  the SOLE token-validation divergence.
+- evidence: `test/e2e-browser/specs/safe01-auth-matrix.spec.ts` — the whitespace-only
+  token test asserts rust `started:false` vs legacy `started:true` (`:141-152`);
+  crate-level: `validate_auth_token`'s `rejects_whitespace_only_token` unit test
+  (`main.rs:1485`). Commit for the SAFE-01 matrix spec: `f18554a2`.
+- user_impact: On the Rust server, configuring an all-whitespace auth token fails fast at
+  startup instead of booting with a secret that can't realistically be typed/used.
+
 <!--
 Template:
 

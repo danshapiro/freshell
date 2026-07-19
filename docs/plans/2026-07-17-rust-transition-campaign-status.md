@@ -558,6 +558,7 @@ needed this batch -- corrections landed inside the listed commits themselves.
   `port/oracle/DEVIATIONS.md` has a formal `/council`-adjudicated entry
   format; needs a scope call on whether these warrant a formal entry there
   or stay at spec-level documentation.
+  - **RESOLVED (2026-07-19):** DEVIATIONS scope question answered — e2e-discovered intentional divergences are now recorded in `port/oracle/DEVIATIONS.md` under a separate `E2E-discovered intentional divergences` section (EDEV-01..06), kept distinct from the `/council`-adjudicated DEV-NNNN oracle fingerprint whitelist.
 - **`:3002` restart pending**: bake-in still runs the pre-batch binary; none
   of this batch's 19 commits are live on `:3002` until the next
   user-approved restart window (standing rule: never restart without
