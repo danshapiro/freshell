@@ -255,6 +255,23 @@ the SAME agent conversation from both; terminals/layouts are per-server (differe
    verify against real data; update THIS doc (deviations, follow-ups, checklist movement);
    push after every wave.
 
+   **Fail-closed deploy guard (provenance-hardening lane, 2026-07-19):** the incident this
+   closes -- a production investigation was slowed because the running binary's source commit
+   was unknowable (built mid-WIP from a dirty tree, with no way to confirm that after the
+   fact). The build+copy step of the rebuild above MUST abort if the tree is dirty:
+   ```bash
+   [ -z "$(git status --porcelain)" ] || { echo 'DIRTY TREE - refusing to deploy'; exit 1; }
+   ```
+   Run this guard immediately before the release build, from the worktree root that will be
+   built and deployed. `GET /api/server-info` now proves provenance post-deploy independent of
+   this guard: it reports `commit` (the git SHA baked in at compile time by
+   `crates/freshell-server/build.rs`) and `buildDirty` (whether `git status --porcelain` was
+   non-empty at that same build time, fail-closed to `true` if git was unavailable at build
+   time) -- an operator can confirm exactly which commit + dirty-state a running `:3002` binary
+   was built from without cross-referencing deploy logs. The boot line (`freshell-server
+   listening on ... [commit <sha>]`) reports the same `commit` value for a same-glance check
+   without an authenticated request.
+
 Cross-cutting rules: codex-first triage (below); data-safety verified on clones before real
 state; honest gaps stay visible (fixme-with-trail, N/A-with-reason — never silent skips).
 

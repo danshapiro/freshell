@@ -700,7 +700,14 @@ async fn main() -> ExitCode {
         }
     };
     // Single startup line (stderr, so it never pollutes any stdout protocol).
-    eprintln!("freshell-server listening on http://{addr} (ws://{addr}/ws)");
+    // Provenance-hardening lane: the commit suffix (same `commit` value
+    // `GET /api/server-info` reports, `diag.rs::build_commit()`) means an
+    // operator tailing boot logs can identify exactly which source commit
+    // is running without a separate authenticated request.
+    eprintln!(
+        "freshell-server listening on http://{addr} (ws://{addr}/ws) [commit {}]",
+        diag::build_commit()
+    );
 
     // Serve with graceful shutdown on SIGTERM/SIGINT so every owned child (PTY
     // terminals, the Codex/claude/opencode sidecars) is reaped — no orphans.

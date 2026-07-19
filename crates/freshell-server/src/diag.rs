@@ -96,7 +96,31 @@ fn server_info_body(state: &DiagState) -> Value {
         "runtime": "rust",
         "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
+        // Provenance-hardening lane: additive fields only, never replacing
+        // an existing one -- see `build.rs`'s module doc comment for the
+        // `git rev-parse HEAD` / `git status --porcelain` compile-time
+        // mechanism these two functions read back via `option_env!`.
+        "commit": build_commit(),
+        "buildDirty": build_dirty(),
     })
+}
+
+/// The git commit SHA this binary was built from, baked in at compile time
+/// by `build.rs`. Falls back to the literal `"unknown"` when git was
+/// unavailable at build time (e.g. a source tarball with no `.git`) -- this
+/// never happens as a runtime failure, only ever a build-time fallback.
+/// `pub(crate)` so `main.rs`'s boot line can print the SAME value
+/// `GET /api/server-info`'s `commit` field reports -- one source of truth.
+pub(crate) fn build_commit() -> &'static str {
+    option_env!("FRESHELL_BUILD_COMMIT").unwrap_or("unknown")
+}
+
+/// Whether `git status --porcelain` was non-empty (an uncommitted change
+/// present) at build time. Fail-closed: an unknown build-time git state
+/// (git unavailable) is reported as `true` (dirty) rather than `false` --
+/// an unverifiable build must never be silently reported clean.
+fn build_dirty() -> bool {
+    !matches!(option_env!("FRESHELL_BUILD_DIRTY"), Some("false"))
 }
 
 // ---------------------------------------------------------------------
@@ -356,6 +380,37 @@ mod tests {
         assert!(
             body["uptime"].as_u64().is_some(),
             "uptime must be a non-negative integer"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn server_info_body_includes_build_commit_and_dirty_provenance_fields() {
+        // Provenance-hardening lane: the running binary's source commit must
+        // be recoverable from a live server without cross-referencing
+        // deploy logs -- the incident this prevents was a mid-WIP binary
+        // whose source commit was unknowable during a production
+        // investigation. `commit` is baked in at compile time by
+        // `build.rs` (a real git SHA, or the literal fallback `"unknown"`
+        // when git is unavailable at build time); `buildDirty` records
+        // whether `git status --porcelain` was non-empty at that same
+        // build time. Additive fields only -- every existing field
+        // asserted by `server_info_body_emits_runtime_rust_and_no_node_version`
+        // above must be untouched by this.
+        let dir = unique_temp_dir("server-info-provenance");
+        let state = sample_state(&dir);
+        let body = server_info_body(&state);
+
+        let commit = body["commit"]
+            .as_str()
+            .expect("commit must be a string field");
+        assert!(!commit.is_empty(), "commit must never be an empty string");
+
+        assert!(
+            body["buildDirty"].as_bool().is_some(),
+            "buildDirty must be a boolean field, got: {:?}",
+            body["buildDirty"]
         );
 
         std::fs::remove_dir_all(&dir).ok();
