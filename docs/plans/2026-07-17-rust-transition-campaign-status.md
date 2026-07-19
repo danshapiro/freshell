@@ -329,3 +329,79 @@ AUTH_TOKEN="$TOK" setsid bash -c 'HOME=/home/dan PORT=3002 FRESHELL_BIND_HOST=0.
 ```
 
 Agents: NEVER kill by name/pattern; recorded-PID kills only (standing AGENTS.md rule).
+
+## Ops: MCP QA lever (added 2026-07-18, MCP slice 2)
+
+Slice 2 of the agent-API + MCP parity spec
+(`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md` §6/§8.3) is pinned by a
+permanent regression test: `test/e2e-browser/specs/mcp-bridge-rust.spec.ts`
+(wired into the `rust-chromium` Playwright project's `testMatch`, so it runs
+on every `npm run test:e2e -- --project=rust-chromium` and every full
+`test:e2e` pass). It boots an owned, ephemeral Rust `freshell-server`
+(`RustServer`, HARNESS-01) and spawns the **UNMODIFIED legacy Node MCP stdio
+binary** (`dist/server/mcp/server.js`, built from the FROZEN `server/mcp/`
+source — never edited) against it, speaking the real stdio JSON-RPC wire
+protocol end to end: `initialize` → `tools/list` → `new-tab` → `list-tabs` →
+`send-keys` → `wait-for` → `capture-pane` → `list-panes`. This is the
+"zero-Rust-MCP" lever the spec describes: there is no Rust-side MCP code at
+all, only Rust-side REST compatibility (Slice 1,
+`crates/freshell-freshagent/src/terminal_tabs.rs`) with the client the real
+coding-CLI agents already use unmodified.
+
+### How an operator/agent uses the lever
+
+The **main repo** (not this worktree) already carries the wrapper config an
+MCP client (e.g. Amplifier) registers to drive Freshell over stdio:
+`/home/dan/code/freshell/.amplifier/mcp.json`:
+
+```jsonc
+{
+  "mcpServers": {
+    "freshell": {
+      "command": "bash",
+      "args": ["-c", "FRESHELL_URL=${FRESHELL_URL:-http://127.0.0.1:3002} FRESHELL_TOKEN=$(grep -E '^AUTH_TOKEN=' /home/dan/code/freshell/.env | cut -d= -f2-) exec node /home/dan/code/freshell/dist/server/mcp/server.js"]
+    }
+  }
+}
+```
+
+It reads the auth token from `.env` and defaults `FRESHELL_URL` to the
+`:3002` bake-in — but `FRESHELL_URL` is an environment override, so pointing
+the SAME binary at an ephemeral QA target is just
+`FRESHELL_URL=http://127.0.0.1:<ephemeral-port> FRESHELL_TOKEN=<ephemeral-token> node dist/server/mcp/server.js`
+(exactly what `mcp-bridge-rust.spec.ts` does programmatically via
+`helpers/mcp-stdio-client.ts`'s `McpStdioClient`).
+
+**Action vocabulary exercised by the lever today:** `new-tab` (mode:`shell`
+only — Slice 1's supported terminal mode), `list-tabs`, `list-panes`,
+`send-keys` (terminal panes), `wait-for` (terminal panes, `pattern` only —
+`stable`/`exit`/`prompt` are Slice 3), `capture-pane` (terminal + editor
+panes). Slice 3
+(`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md` §7) will add the
+remaining registered `freshell` tool actions against Rust: `select-tab`,
+`kill-tab`, `rename-tab`, `has-tab`, `next-tab`, `prev-tab`, `split-pane`,
+`select-pane`, `rename-pane`, `kill-pane`, `resize-pane`, `swap-pane`,
+`respawn-pane`, `attach`, `navigate`, `run`, `screenshot` — the MCP tool
+schema itself (`ACTION_PARAMS`) never changes; only Rust-side REST coverage
+grows to match it.
+
+**Hard rule — ephemeral targets only:** every QA/test invocation of this
+lever (and any future one) MUST target an ephemeral, test-owned server
+(random loopback port, isolated `FRESHELL_HOME`, e.g. `RustServer` /
+`TestServer`) via `FRESHELL_URL` — **NEVER** point a QA run's `FRESHELL_URL`
+at `:3001` (live legacy daily driver) or `:3002` (Rust bake-in with real
+user data). This mirrors the standing destructive-test safety contract
+above (§"Standing wave process" step 3): ephemeral ports and homes are the
+wall between test automation and the user's live sessions.
+
+**Current Rust-side coverage boundary (Slice 1, as pinned by this test):**
+terminal-mode `POST /api/tabs` supports **`shell` only** (`claude` / `codex`
+/ `gemini` / `kimi` return an honest 400 naming the deferral, not a silent
+wrong-behavior fallback); `browser` and `editor` content-pane creation work
+(cheap content kinds, no process); the pre-existing OpenCode fresh-agent
+path (`agent:"opencode"`) is unchanged and still covered separately by
+`agent-continuity-matrix.spec.ts`. Rich terminal modes (claude/codex/gemini/
+kimi) and the rest of the pane surface (split/close/select/resize/swap/
+respawn/attach/navigate, `run`, `screenshot`) land in Slice 3 / the "3a"
+follow-up wave; this lever's coverage grows alongside that work rather than
+being re-derived from scratch.

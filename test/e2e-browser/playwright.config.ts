@@ -100,6 +100,11 @@ export default defineConfig({
         /harness-01-rust-server\.spec\.ts$/,
         /amplifier-restore-rust\.spec\.ts$/,
         /opencode-terminal-restore-rust\.spec\.ts$/,
+        // MCP bridge pin (Slice 2, docs/plans/2026-07-18-agent-api-mcp-parity-spec.md
+        // §6/§8.3): drives the UNMODIFIED legacy Node MCP stdio binary
+        // against an owned, ephemeral Rust server. Rust-only (no legacy
+        // equivalent needed -- see the spec's own doc comment in that file).
+        /mcp-bridge-rust\.spec\.ts$/,
       ],
     },
     ...(process.env.CI ? [
