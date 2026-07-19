@@ -56,8 +56,8 @@ use tokio::sync::Mutex as TokioMutex;
 
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated,
-    FreshAgentEvent, FreshAgentKill, FreshAgentKilled, FreshAgentSend, FreshAgentSendAccepted,
-    ServerMessage, SessionType,
+    FreshAgentEvent, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentSend,
+    FreshAgentSendAccepted, ServerMessage, SessionType,
 };
 
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome};
@@ -308,6 +308,36 @@ impl FreshClaudeState {
             session_type: session_type.to_string(),
             success: true,
         }));
+    }
+
+    // ── freshAgent.interrupt (WS) ────────────────────────────────────────────
+
+    /// Handle a `freshAgent.interrupt` for claude/kilroy: forward an `interrupt`
+    /// request to the owned sidecar, which calls the SDK's `query.interrupt()` --
+    /// mirrors `server/fresh-agent/adapters/claude/adapter.ts:163-168`'s
+    /// `interrupt(sessionId) { mapMissingResult(deps.sdkBridge.interrupt(sessionId), ...) }`
+    /// -> `server/sdk-bridge.ts:785-793`'s `sp.query.interrupt().catch(warn)`. Fire-and-
+    /// forget on success: legacy's `ws-handler.ts:3503-3517` sends NO confirmation frame
+    /// when `manager.interrupt(locator)` resolves, only `sendError` on a throw -- so a
+    /// successful interrupt here broadcasts nothing either. A missing session mirrors
+    /// the `SESSION_NOT_FOUND` convention [`Self::handle_send`] already established for
+    /// this provider (and codex/opencode's own `handle_interrupt`), rather than
+    /// reproducing legacy's adapter-specific message text verbatim.
+    pub async fn handle_interrupt(&self, msg: FreshAgentInterrupt) {
+        let session_id = msg.session_id.clone();
+
+        let interrupt_req = json!({ "type": "interrupt", "sessionId": session_id });
+        let mut guard = self.sessions.lock().await;
+        let Some(session) = guard.get_mut(&session_id) else {
+            drop(guard);
+            self.send_error(&None, "SESSION_NOT_FOUND", "claude session not found");
+            return;
+        };
+        if let Err(err) = write_line(&mut session.stdin, &interrupt_req).await {
+            drop(guard);
+            self.send_error(&None, "CLAUDE_INTERRUPT_FAILED", &err);
+        }
+        // Success: no broadcast (mirrors legacy's silent fire-and-forget interrupt).
     }
 
     // ── freshAgent.send (WS) ─────────────────────────────────────────────────────────
@@ -832,8 +862,11 @@ mod tests {
     /// no network, no cost): on `{"type":"create",...}` it appends a marker line to
     /// `FRESHELL_TEST_CLAUDE_SPAWN_LOG` (so tests can count spawns without a global
     /// tracing subscriber) and replies with a fresh `{"type":"created","sessionId":...}`;
-    /// on `{"type":"shutdown"}` it exits. `send` is intentionally unhandled -- the dedup
-    /// tests never exercise it.
+    /// on `{"type":"interrupt",sessionId}` it appends `sessionId` to
+    /// `FRESHELL_TEST_CLAUDE_INTERRUPT_LOG` (the observable proxy for "the sidecar's
+    /// `query.interrupt()` was actually invoked", mirroring the real sidecar's
+    /// `handleInterrupt`); on `{"type":"shutdown"}` it exits. `send` is intentionally
+    /// unhandled -- the dedup tests never exercise it.
     const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"
 import fs from 'node:fs'
 import readline from 'node:readline'
@@ -858,6 +891,9 @@ rl.on('line', (line) => {
     counter += 1
     const sessionId = `fake-claude-session-${process.pid}-${counter}`
     process.stdout.write(JSON.stringify({ type: 'created', sessionId }) + '\n')
+  } else if (msg.type === 'interrupt') {
+    const interruptLog = process.env.FRESHELL_TEST_CLAUDE_INTERRUPT_LOG
+    if (interruptLog) fs.appendFileSync(interruptLog, `${msg.sessionId}\n`)
   } else if (msg.type === 'shutdown') {
     process.exit(0)
   }
@@ -871,6 +907,7 @@ rl.on('line', (line) => {
     struct FakeClaudeSidecarEnv {
         dir: PathBuf,
         spawn_log: PathBuf,
+        interrupt_log: PathBuf,
     }
     impl FakeClaudeSidecarEnv {
         fn install() -> Self {
@@ -883,10 +920,17 @@ rl.on('line', (line) => {
             std::fs::write(&script, FAKE_CLAUDE_SIDECAR_SOURCE).expect("write fake sidecar");
             let spawn_log = dir.join("spawn.log");
             std::fs::write(&spawn_log, "").expect("init spawn log");
+            let interrupt_log = dir.join("interrupt.log");
+            std::fs::write(&interrupt_log, "").expect("init interrupt log");
             std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
             std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
             std::env::set_var("FRESHELL_TEST_CLAUDE_SPAWN_LOG", &spawn_log);
-            Self { dir, spawn_log }
+            std::env::set_var("FRESHELL_TEST_CLAUDE_INTERRUPT_LOG", &interrupt_log);
+            Self {
+                dir,
+                spawn_log,
+                interrupt_log,
+            }
         }
 
         /// Number of times the fake sidecar has been spawned so far (one marker line per
@@ -895,6 +939,12 @@ rl.on('line', (line) => {
             std::fs::read_to_string(&self.spawn_log)
                 .map(|s| s.lines().filter(|l| !l.is_empty()).count())
                 .unwrap_or(0)
+        }
+
+        /// Contents of the interrupt log (one `sessionId` per line the fake sidecar
+        /// received a `{"type":"interrupt",...}` request for).
+        fn interrupt_log_contents(&self) -> String {
+            std::fs::read_to_string(&self.interrupt_log).unwrap_or_default()
         }
     }
     impl Drop for FakeClaudeSidecarEnv {
@@ -1103,5 +1153,79 @@ rl.on('line', (line) => {
         assert_eq!(frame["type"], "freshAgent.killed");
         assert_eq!(frame["success"], true);
         assert_eq!(frame["sessionId"], "unknown-session");
+    }
+
+    // ── freshAgent.interrupt (parity gap fix -- see terminal.rs's dispatch arm) ────
+
+    /// A missing session mirrors the `SESSION_NOT_FOUND` convention already
+    /// established by [`FreshClaudeState::handle_send`] (and codex/opencode's own
+    /// `handle_interrupt`): an `error` frame, never a silent drop.
+    #[tokio::test]
+    async fn handle_interrupt_errors_for_unknown_session() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let st = FreshClaudeState::new(Arc::new(tx));
+
+        st.handle_interrupt(FreshAgentInterrupt {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: "does-not-exist".to_string(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+        })
+        .await;
+
+        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "error");
+        assert!(
+            frame["message"]
+                .as_str()
+                .unwrap()
+                .contains("claude session not found"),
+            "{frame}"
+        );
+    }
+
+    /// A known session's interrupt is forwarded to the sidecar (the Rust-side half of
+    /// the parity fix -- mirrors `adapters/claude/adapter.ts:163-168`'s
+    /// `sdkBridge.interrupt(sessionId)` -> `sp.query.interrupt()`), observed via the
+    /// fake sidecar's interrupt log since a successful interrupt broadcasts NOTHING
+    /// (fire-and-forget, matching legacy exactly -- there is no confirmation frame to
+    /// assert on instead).
+    #[tokio::test]
+    async fn handle_interrupt_forwards_the_request_to_the_sidecar_for_a_known_session() {
+        let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env = FakeClaudeSidecarEnv::install();
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let st = FreshClaudeState::new(Arc::new(tx));
+
+        st.handle_create(dedup_create_msg("req-claude-interrupt"))
+            .await;
+        let created = await_claude_created(&mut rx, "req-claude-interrupt").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        st.handle_interrupt(FreshAgentInterrupt {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: session_id.clone(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+        })
+        .await;
+
+        // Bounded poll for the fake sidecar's interrupt log (it's an OS-level pipe
+        // write, not synchronous with `handle_interrupt`'s `write_line` await).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if env.interrupt_log_contents().contains(&session_id) {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "sidecar never logged the interrupt for {session_id}: {:?}",
+                    env.interrupt_log_contents()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Success is silent -- no `error`/other frame was broadcast for this interrupt.
+        assert!(rx.try_recv().is_err(), "a successful interrupt must not broadcast");
     }
 }

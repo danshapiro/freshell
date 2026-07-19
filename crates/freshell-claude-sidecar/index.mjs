@@ -7,8 +7,9 @@
 // JSON to this process:
 //
 //   Rust → sidecar (stdin, one JSON per line):
-//     { type:'create', requestId, cwd?, model?, permissionMode?, effort?, resumeSessionId? }
-//     { type:'send',   sessionId, text }
+//     { type:'create',    requestId, cwd?, model?, permissionMode?, effort?, resumeSessionId? }
+//     { type:'send',      sessionId, text }
+//     { type:'interrupt', sessionId }
 //     { type:'shutdown' }
 //
 //   sidecar → Rust (stdout, one JSON per line):
@@ -247,6 +248,17 @@ function handleSend(req) {
     message: { role: 'user', content: [{ type: 'text', text: req.text }] },
     parent_tool_use_id: null,
     session_id: st.cliSessionId || 'default',
+  })
+}
+
+// Faithful port of `server/sdk-bridge.ts:785-793`'s `interrupt(sessionId)`:
+// `sp.query.interrupt().catch((err) => log.warn(...))` -- fire-and-forget, no reply on
+// success (the Rust side mirrors this: no confirmation frame is broadcast either).
+function handleInterrupt(req) {
+  const st = sessions.get(req.sessionId)
+  if (!st) { emit({ type: 'sdk.error', sessionId: req.sessionId, message: 'session not found' }); return }
+  st.query?.interrupt?.().catch((err) => {
+    logerr(`interrupt failed: ${err?.message || err}`)
   })
 }
 

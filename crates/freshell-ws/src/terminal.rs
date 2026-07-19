@@ -556,13 +556,21 @@ async fn handle_client_text(
         // (`is_codex_provider`) to `FreshCodexState::handle_interrupt`/`handle_kill`. Batch D
         // PR-2 adds opencode's kill (full removal, shared-sidecar-safe) and a cheap
         // best-effort interrupt (abort the in-flight turn task; the full status-guarded
-        // bridge is PR-3). Claude keeps the prior swallow behavior. Detached tasks, same
-        // pattern as `FreshAgentCreate`/`FreshAgentSend` above, so a cold interrupt/kill RPC
-        // never blocks this connection's select loop.
+        // bridge is PR-3). Parity-gap fix (review-confirmed): claude's `handle_kill`
+        // (9eaaf122) and `handle_interrupt` were unreachable from this dispatch -- a
+        // claude-provider frame fell through the `if`/`else if` chain and was silently
+        // dropped (kill was a no-op; the create-dedup cache was never evicted, so a
+        // later duplicate `create` replayed the dead session forever). Both providers now
+        // route the SAME as codex/opencode. Detached tasks, same pattern as
+        // `FreshAgentCreate`/`FreshAgentSend` above, so a cold interrupt/kill RPC never
+        // blocks this connection's select loop.
         ClientMessage::FreshAgentInterrupt(interrupt) => {
             if is_codex_provider(interrupt.provider) {
                 let fresh_codex = state.fresh_codex.clone();
                 tokio::spawn(async move { fresh_codex.handle_interrupt(interrupt).await });
+            } else if interrupt.provider == freshell_protocol::AgentProvider::Claude {
+                let fresh_claude = state.fresh_claude.clone();
+                tokio::spawn(async move { fresh_claude.handle_interrupt(interrupt).await });
             } else if interrupt.provider == freshell_protocol::AgentProvider::Opencode {
                 let fresh_opencode = state.fresh_opencode.clone();
                 tokio::spawn(async move { fresh_opencode.handle_interrupt(interrupt).await });
@@ -573,6 +581,9 @@ async fn handle_client_text(
             if is_codex_provider(kill.provider) {
                 let fresh_codex = state.fresh_codex.clone();
                 tokio::spawn(async move { fresh_codex.handle_kill(kill).await });
+            } else if kill.provider == freshell_protocol::AgentProvider::Claude {
+                let fresh_claude = state.fresh_claude.clone();
+                tokio::spawn(async move { fresh_claude.handle_kill(kill).await });
             } else if kill.provider == freshell_protocol::AgentProvider::Opencode {
                 let fresh_opencode = state.fresh_opencode.clone();
                 tokio::spawn(async move { fresh_opencode.handle_kill(kill).await });
