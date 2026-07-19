@@ -310,3 +310,22 @@ something legacy would accept" for a bug.
    (same-origin ⇒ Chrome carries tab/pane layout via localStorage automatically).
 4. Verify: health, sidebar, one terminal, one fresh-agent turn, reload restore.
 5. Rollback (one command): stop Rust, restart legacy exactly as before, restore config backup if needed.
+
+## Ops: :3002 launch procedure (rev 2026-07-18, post kill-incident)
+
+The 17:42 death was an external SIGTERM from a broad-scope kill (3x that day; fixtures
+exonerated — see bug-hunter verdict). Prevention: production runs a DISTINCT binary
+name+path that `pkill -f freshell-server` cannot match, outside the worktree:
+
+```bash
+cd /home/dan/code/freshell/.worktrees/rust-tauri-port
+cargo build --release -p freshell-server
+cp target/release/freshell-server /home/dan/.local/bin/freshell-prod
+TOK=$(grep -E '^AUTH_TOKEN=' /home/dan/code/freshell/.env | cut -d= -f2-)
+kill $(cat /tmp/freshell-bakein-3002.pid)   # verify ownership first (ps -fp)
+AUTH_TOKEN="$TOK" setsid bash -c 'HOME=/home/dan PORT=3002 FRESHELL_BIND_HOST=0.0.0.0 \
+  FRESHELL_CLIENT_DIR=/home/dan/code/freshell/.worktrees/rust-tauri-port/dist/client \
+  /home/dan/.local/bin/freshell-prod > /tmp/freshell-bakein-3002.log 2>&1 & echo $! > /tmp/freshell-bakein-3002.pid'
+```
+
+Agents: NEVER kill by name/pattern; recorded-PID kills only (standing AGENTS.md rule).
