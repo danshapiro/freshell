@@ -71,6 +71,7 @@ async fn spawn_server(allowed_origins: Vec<String>) -> (String, String) {
         cli_commands: Arc::new(Vec::new()),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         ping_interval_ms: 30_000,
+        hello_timeout_ms: 5_000,
         allowed_origins: Arc::new(allowed_origins),
         ws_max_payload_bytes: 16 * 1024 * 1024,
         term09: freshell_ws::backpressure::Term09Config::default(),

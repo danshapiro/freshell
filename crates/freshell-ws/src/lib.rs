@@ -152,6 +152,15 @@ pub struct WsState {
     /// here (e.g. in tests) makes the keepalive cadence observable without a real
     /// 30s wait.
     pub ping_interval_ms: u64,
+    /// SAFE-05: hello-handshake deadline, milliseconds (`ws-handler.ts:223`
+    /// `helloTimeoutMs: Number(process.env.HELLO_TIMEOUT_MS || 5_000)`). A
+    /// connection that never completes its `hello` within this window is
+    /// closed with `CLOSE_HELLO_TIMEOUT` (4002), mirroring `ws-handler.ts:1167-1171`
+    /// (`state.helloTimer = setTimeout(() => { if (!state.authenticated)
+    /// ws.close(CLOSE_CODES.HELLO_TIMEOUT, 'Hello timeout') }, helloTimeoutMs)`).
+    /// A small value here (e.g. in tests) makes the deadline observable
+    /// without a real multi-second wait.
+    pub hello_timeout_ms: u64,
     /// SAFE-03 WS Origin policy allow-list (resolved once at boot from
     /// `ALLOWED_ORIGINS`/`EXTRA_ALLOWED_ORIGINS`, see [`crate::origin`]). A
     /// connection whose `Origin` is present but neither same-origin (Host
@@ -372,12 +381,37 @@ async fn handle_socket(
     };
 
     // Read the first client frame (the hello), skipping any control frames.
-    let first = loop {
-        match socket.recv().await {
-            Some(Ok(Message::Text(text))) => break text,
-            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
-            // Closed / binary / error before a hello — nothing to do.
-            _ => return,
+    // SAFE-05: bounded by `hello_timeout_ms` (`ws-handler.ts:1167-1171` --
+    // `state.helloTimer = setTimeout(() => { if (!state.authenticated)
+    // ws.close(CLOSE_CODES.HELLO_TIMEOUT, 'Hello timeout') }, helloTimeoutMs)`).
+    // The original's timer starts the instant the connection opens and is
+    // cleared only once a VALID hello authenticates it (`ws-handler.ts:1856`);
+    // a connection that never sends anything, or that sends only control
+    // frames forever, must still be reaped -- so the deadline wraps the whole
+    // read-loop, not a single `recv()` call.
+    let hello_deadline = std::time::Duration::from_millis(state.hello_timeout_ms.max(1));
+    let first = match tokio::time::timeout(hello_deadline, async {
+        loop {
+            match socket.recv().await {
+                Some(Ok(Message::Text(text))) => break Some(text),
+                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
+                // Closed / binary / error before a hello — nothing to do.
+                _ => break None,
+            }
+        }
+    })
+    .await
+    {
+        Ok(Some(text)) => text,
+        Ok(None) => return,
+        Err(_elapsed) => {
+            // DIAG-01-style: no `connection_id` exists yet at this point (it's
+            // minted by `terminal::run` only after a successful handshake), so
+            // this logs without one -- matches the original, which likewise
+            // has no per-connection identity to report until `hello` succeeds.
+            tracing::warn!(reason = "hello_timeout", "ws.hello.rejected");
+            let _ = close_with(&mut socket, CLOSE_HELLO_TIMEOUT, "Hello timeout").await;
+            return;
         }
     };
 
@@ -488,6 +522,9 @@ async fn handle_socket(
 /// one of these codes + a short reason; the port previously just dropped the
 /// connection, which a client observes as an abnormal `1006` closure.
 const CLOSE_NOT_AUTHENTICATED: u16 = 4001;
+/// SAFE-05: `ws-handler.ts:255` `HELLO_TIMEOUT: 4002` -- a connection that
+/// never completes `hello` within `hello_timeout_ms` is closed with this code.
+const CLOSE_HELLO_TIMEOUT: u16 = 4002;
 const CLOSE_PROTOCOL_MISMATCH: u16 = 4010;
 /// SAFE-03: a NEW code (4011) -- the original has no Origin-rejection close
 /// code at all (its Origin handling never rejects, see [`crate::origin`]), so
@@ -589,6 +626,7 @@ mod tests {
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
             ping_interval_ms: 30_000,
+            hello_timeout_ms: 5_000,
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),

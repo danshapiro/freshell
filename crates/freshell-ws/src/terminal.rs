@@ -59,7 +59,7 @@ use freshell_platform::{
     RealFileProbe, ShellType,
 };
 use freshell_protocol::{
-    ClientMessage, ErrorCode, ErrorMsg, ServerMessage, Shell, TerminalAttach, TerminalCreate,
+    ClientMessage, ErrorCode, ErrorMsg, Pong, ServerMessage, Shell, TerminalAttach, TerminalCreate,
     TerminalCreated, TerminalIdOnly, TerminalKill, TerminalMetaRecord, TerminalMetaUpdated,
     TerminalResize,
 };
@@ -599,7 +599,23 @@ async fn handle_client_text(
             );
             true
         }
-        // Everything else (opencode fresh-agent, activity lists, other ui.*, ping) is
+        // Application-level liveness ping (legacy parity: `ws-handler.ts:1832-1835`
+        // -- `if (m.type === 'ping') { this.send(ws, { type: 'pong', timestamp:
+        // nowIso() }); return }`). Byte-identical reply shape: exactly
+        // `{type:"pong", timestamp}`, timestamp is ISO-8601 millis 'Z'
+        // (`crate::now_iso`, the same clock `build_handshake`'s `ready.timestamp`
+        // uses). No correlation id on either side -- the client matches by type,
+        // not by request/response pairing.
+        ClientMessage::Ping => {
+            send(
+                ws_tx,
+                &ServerMessage::Pong(Pong {
+                    timestamp: crate::now_iso(),
+                }),
+            )
+            .await
+        }
+        // Everything else (opencode fresh-agent, activity lists, other ui.*) is
         // out of scope for this path; ignore.
         _ => true,
     }
@@ -1854,6 +1870,7 @@ mod terminals_changed_tests {
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
             ping_interval_ms: 30_000,
+            hello_timeout_ms: 5_000,
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
@@ -2054,6 +2071,7 @@ mod terminal_meta_created_tests {
             sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: std::sync::Arc::new(Vec::new()),
             ping_interval_ms: 30_000,
+            hello_timeout_ms: 5_000,
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),

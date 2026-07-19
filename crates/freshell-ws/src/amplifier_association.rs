@@ -269,6 +269,7 @@ mod tests {
             sessions_revision: StdArc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: StdArc::new(Vec::new()),
             ping_interval_ms: 30_000,
+            hello_timeout_ms: 5_000,
             allowed_origins: StdArc::new(crate::origin::default_allowed_origins()),
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),

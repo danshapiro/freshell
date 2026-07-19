@@ -351,6 +351,7 @@ async fn main() -> ExitCode {
         cli_commands: Arc::clone(&cli_commands),
         shutdown: Arc::clone(&shutdown_notify),
         ping_interval_ms: resolve_ping_interval_ms(),
+        hello_timeout_ms: resolve_hello_timeout_ms(),
         allowed_origins: Arc::new(resolve_allowed_origins()),
         ws_max_payload_bytes: resolve_ws_max_payload_bytes(),
         term09: freshell_ws::backpressure::Term09Config::from_env(),
@@ -863,6 +864,16 @@ fn resolve_ping_interval_ms() -> u64 {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(30_000)
+}
+
+/// SAFE-05: resolve the hello-handshake deadline, milliseconds. Mirrors
+/// `ws-handler.ts:223`: `helloTimeoutMs: Number(process.env.HELLO_TIMEOUT_MS
+/// || 5_000)`.
+fn resolve_hello_timeout_ms() -> u64 {
+    std::env::var("HELLO_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(5_000)
 }
 
 /// SAFE-06: resolve the inbound WS frame/message size bound. Mirrors

@@ -81,6 +81,7 @@ async fn spawn_server(ws_max_payload_bytes: usize) -> String {
         cli_commands: Arc::new(Vec::new()),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         ping_interval_ms: 30_000,
+        hello_timeout_ms: 5_000,
         allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
         ws_max_payload_bytes,
         term09: freshell_ws::backpressure::Term09Config::default(),

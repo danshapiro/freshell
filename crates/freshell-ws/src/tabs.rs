@@ -644,7 +644,10 @@ mod tests {
             "Device A",
             "client-a1",
             1,
-            vec![open_record("t1", "from A", 100), open_record("t2", "solo", 100)],
+            vec![
+                open_record("t1", "from A", 100),
+                open_record("t2", "solo", 100),
+            ],
         )
         .expect("push accepted");
 
@@ -690,8 +693,8 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_counts_devicecount_excludes_devices_past_the_display_ttl_like_legacy_list_devices()
-    {
+    fn diagnostic_counts_devicecount_excludes_devices_past_the_display_ttl_like_legacy_list_devices(
+    ) {
         // Legacy `listDevices()` (server/tabs-registry/store.ts:1298-1304)
         // filters by `deviceDisplayTtlDays` BEFORE counting: `cutoff = now -
         // deviceDisplayTtlDays * DAY_MS`, `lastSeenAt >= cutoff` survives.
